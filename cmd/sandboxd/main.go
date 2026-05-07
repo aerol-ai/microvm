@@ -88,6 +88,7 @@ func main() {
 		gw, err := sshgateway.New(logger, sshgateway.Config{
 			ListenAddr:  cfg.SSHListenAddr,
 			HostKeyPath: cfg.SSHHostKeyPath,
+			ToolboxPort: cfg.ToolboxPort,
 		}, svc, dockerClient)
 		if err != nil {
 			logger.Error("failed to create ssh gateway", "error", err)

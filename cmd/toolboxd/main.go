@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -35,6 +36,8 @@ type server struct {
 
 	mu           sync.RWMutex
 	allowedPorts map[int]struct{}
+
+	sessions *sessions.Manager
 }
 
 func (s *server) setAllowedPorts(ports []int) {
@@ -68,6 +71,19 @@ func main() {
 	}
 
 	startReaper(logger)
+
+	sessionsMgr, err := sessions.New(logger, sessions.Config{
+		SandboxID:          srv.sandboxID,
+		RecordingDir:       envString("SB_RECORDING_DIR", "/var/lib/toolboxd/recordings"),
+		RecordingRetention: envDuration("SB_RECORDING_RETENTION", 7*24*time.Hour),
+		BufferBytes:        envInt("SB_SESSION_BUFFER_BYTES", 1<<20),
+	})
+	if err != nil {
+		logger.Warn("session manager init failed; sessions disabled", "error", err)
+	} else {
+		srv.sessions = sessionsMgr
+		defer sessionsMgr.Close()
+	}
 
 	if len(os.Args) > 1 {
 		startUserCommand(logger, os.Args[1:])
@@ -196,6 +212,13 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleExecStream(w, r)
+		case strings.HasPrefix(r.URL.Path, "/sessions"):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			if !s.handleSessionsRoute(w, r) {
+				writeError(w, http.StatusNotFound, "not found")
+			}
 		default:
 			writeError(w, http.StatusNotFound, "not found")
 		}
@@ -276,6 +299,8 @@ func isKnownToolboxPath(path string) bool {
 	case strings.HasPrefix(path, "/files/"):
 		return true
 	case strings.HasPrefix(path, "/proxy/"):
+		return true
+	case path == "/sessions" || strings.HasPrefix(path, "/sessions/"):
 		return true
 	default:
 		return false
@@ -537,6 +562,26 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envString(key, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
 	if err != nil {
 		return fallback
 	}

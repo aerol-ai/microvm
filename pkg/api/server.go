@@ -52,6 +52,10 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleExposePort)))
 	s.mux.Handle("DELETE /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleUnexposePort)))
 	s.mux.Handle("GET /v1/sandboxes/{id}/mounts", s.requireAuth(http.HandlerFunc(s.handleListMounts)))
+	// Explicit session routes are syntactic sugar for the toolbox proxy:
+	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
+	s.mux.Handle("/v1/sandboxes/{id}/sessions", s.requireAuth(http.HandlerFunc(s.handleSessionsProxy)))
+	s.mux.Handle("/v1/sandboxes/{id}/sessions/{path...}", s.requireAuth(http.HandlerFunc(s.handleSessionsProxy)))
 	s.mux.Handle("/v1/sandboxes/{id}/toolbox", s.requireAuth(http.HandlerFunc(s.handleToolboxProxy)))
 	s.mux.Handle("/v1/sandboxes/{id}/toolbox/{path...}", s.requireAuth(http.HandlerFunc(s.handleToolboxProxy)))
 }
@@ -223,6 +227,28 @@ func (s *Server) handleUnexposePort(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleToolboxProxy(w http.ResponseWriter, r *http.Request) {
+	path := r.PathValue("path")
+	if path == "" {
+		path = "/"
+	} else {
+		path = "/" + path
+	}
+	s.proxyToToolbox(w, r, path)
+}
+
+// handleSessionsProxy is sugar for /v1/sandboxes/{id}/sessions[/...] —
+// rewrites to /sessions[/...] on the toolbox. WebSocket upgrades pass through
+// transparently because httputil.ReverseProxy forwards Upgrade headers.
+func (s *Server) handleSessionsProxy(w http.ResponseWriter, r *http.Request) {
+	rest := r.PathValue("path")
+	target := "/sessions"
+	if rest != "" {
+		target = "/sessions/" + rest
+	}
+	s.proxyToToolbox(w, r, target)
+}
+
+func (s *Server) proxyToToolbox(w http.ResponseWriter, r *http.Request, path string) {
 	endpoint, err := s.service.ToolboxTarget(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeStoreAwareError(w, err)
@@ -235,13 +261,6 @@ func (s *Server) handleToolboxProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := r.PathValue("path")
-	if path == "" {
-		path = "/"
-	} else {
-		path = "/" + path
-	}
-
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
 	toolboxToken := endpoint.Token
@@ -249,8 +268,6 @@ func (s *Server) handleToolboxProxy(w http.ResponseWriter, r *http.Request) {
 		originalDirector(req)
 		req.URL.Path = path
 		req.Host = target.Host
-		// Replace the caller's PAT with the per-sandbox toolbox token so a
-		// compromised token can only access this one sandbox.
 		if toolboxToken != "" {
 			req.Header.Set("Authorization", "Bearer "+toolboxToken)
 		}

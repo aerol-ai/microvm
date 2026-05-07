@@ -45,6 +45,10 @@ type Config struct {
 	ListenAddr     string
 	HostKeyPath    string
 	AcceptDeadline time.Duration
+	// ToolboxPort is the in-container HTTP port toolboxd listens on. Used by
+	// session-attach mode to dial the WebSocket directly. If zero, session
+	// mode is disabled and the gateway falls back to one-shot exec.
+	ToolboxPort int
 }
 
 // Gateway terminates SSH connections on the host and bridges accepted shell /
@@ -55,11 +59,12 @@ type Config struct {
 // key is the only one authorized to SSH into that specific sandbox. There is
 // no global key.
 type Gateway struct {
-	logger    *slog.Logger
-	listenOn  string
-	signer    ssh.Signer
-	svc       SandboxLookup
-	dockerCli DockerExec
+	logger      *slog.Logger
+	listenOn    string
+	signer      ssh.Signer
+	svc         SandboxLookup
+	dockerCli   DockerExec
+	toolboxPort int
 }
 
 // New constructs a Gateway. It loads or generates the host key. Returns an
@@ -77,11 +82,12 @@ func New(logger *slog.Logger, cfg Config, svc SandboxLookup, dockerCli DockerExe
 		return nil, err
 	}
 	return &Gateway{
-		logger:    logger,
-		listenOn:  cfg.ListenAddr,
-		signer:    signer,
-		svc:       svc,
-		dockerCli: dockerCli,
+		logger:      logger,
+		listenOn:    cfg.ListenAddr,
+		signer:      signer,
+		svc:         svc,
+		dockerCli:   dockerCli,
+		toolboxPort: cfg.ToolboxPort,
 	}, nil
 }
 
@@ -131,10 +137,14 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 	defer serverConn.Close()
 
 	sandboxID := ""
+	mode := "exec"
+	sessionName := ""
 	if serverConn.Permissions != nil {
 		sandboxID = serverConn.Permissions.Extensions["sandbox_id"]
+		mode = serverConn.Permissions.Extensions["mode"]
+		sessionName = serverConn.Permissions.Extensions["session_name"]
 	}
-	g.logger.Info("ssh connection accepted", "remote", remote, "sandbox_id", sandboxID)
+	g.logger.Info("ssh connection accepted", "remote", remote, "sandbox_id", sandboxID, "mode", mode, "session_name", sessionName)
 
 	go ssh.DiscardRequests(reqs)
 
@@ -148,19 +158,46 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 			g.logger.Warn("ssh channel accept failed", "error", err)
 			continue
 		}
-		go g.handleSession(ctx, sandboxID, channel, requests)
+		go g.handleSession(ctx, sandboxID, mode, sessionName, channel, requests)
 	}
+}
+
+// parseSSHUser splits the SSH username into (sandbox_id, mode, name).
+// Forms:
+//   "<id>"           → mode="session", name="default"
+//   "<id>+<name>"    → mode="session", name=<name>
+//   "<id>+exec"      → mode="exec" (legacy one-shot via docker exec)
+// Returns ok=false if the input is empty.
+func parseSSHUser(raw string) (sandboxID, mode, name string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", "", false
+	}
+	id, suffix, found := strings.Cut(raw, "+")
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", "", "", false
+	}
+	if !found || suffix == "" {
+		return id, "session", "default", true
+	}
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "exec" {
+		return id, "exec", "", true
+	}
+	return id, "session", suffix, true
 }
 
 func (g *Gateway) publicKeyCallback(ctx context.Context) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 		username := strings.TrimSpace(conn.User())
-		if username == "" {
+		sandboxID, mode, sessionName, ok := parseSSHUser(username)
+		if !ok {
 			return nil, errors.New("empty username")
 		}
 		// Constant-time-ish auth regardless of which side fails: any failure
 		// becomes "permission denied" without leaking which step blew up.
-		sandbox, err := g.svc.GetSandbox(ctx, username)
+		sandbox, err := g.svc.GetSandbox(ctx, sandboxID)
 		if err != nil || sandbox == nil {
 			g.logger.Info("ssh auth: sandbox lookup failed", "username", username, "error", err)
 			return nil, errors.New("permission denied")
@@ -188,6 +225,8 @@ func (g *Gateway) publicKeyCallback(ctx context.Context) func(ssh.ConnMetadata, 
 			Extensions: map[string]string{
 				"sandbox_id":   sandbox.ID,
 				"container_id": sandbox.ContainerID,
+				"mode":         mode,
+				"session_name": sessionName,
 			},
 		}, nil
 	}
@@ -196,15 +235,25 @@ func (g *Gateway) publicKeyCallback(ctx context.Context) func(ssh.ConnMetadata, 
 // handleSession services a single SSH session channel. It implements the
 // minimum useful subset of RFC 4254: pty-req, env, shell, exec, window-change,
 // and exit-status reporting.
-func (g *Gateway) handleSession(ctx context.Context, sandboxID string, channel ssh.Channel, requests <-chan *ssh.Request) {
+//
+// mode: "session" → on shell, attach to/create a named toolboxd session
+// (default name "default"). "exec" → behave like the old one-shot path,
+// running every shell/exec via docker exec.
+func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionName string, channel ssh.Channel, requests <-chan *ssh.Request) {
 	defer channel.Close()
 
-	containerID, err := g.containerForSandbox(ctx, sandboxID)
-	if err != nil {
+	sandbox, err := g.svc.GetSandbox(ctx, sandboxID)
+	if err != nil || sandbox == nil {
 		g.writeStderr(channel, fmt.Sprintf("sandbox unavailable: %v\r\n", err))
 		_ = sendExitStatus(channel, 1)
 		return
 	}
+	if sandbox.Status != models.SandboxStatusStarted || sandbox.ContainerID == "" {
+		g.writeStderr(channel, fmt.Sprintf("sandbox not running: status=%s\r\n", sandbox.Status))
+		_ = sendExitStatus(channel, 1)
+		return
+	}
+	containerID := sandbox.ContainerID
 
 	state := &sessionState{
 		envVars: make([]string, 0, 4),
@@ -234,12 +283,13 @@ func (g *Gateway) handleSession(ctx context.Context, sandboxID string, channel s
 			replyRequest(req, true)
 
 		case "shell":
-			cmd := []string{"sh", "-l"}
-			// Best-effort: prefer bash if it's there. The decision is made via
-			// a single shell invocation that picks at runtime so we don't have
-			// to do a probe round-trip.
-			cmd = []string{"sh", "-c", "exec bash -l 2>/dev/null || exec sh -l"}
 			replyRequest(req, true)
+			if mode == "session" && g.toolboxPort > 0 && sandbox.ContainerIP != "" {
+				exitCode := g.attachToSession(ctx, channel, sandbox, sessionName, state)
+				_ = sendExitStatus(channel, uint32(exitCode))
+				return
+			}
+			cmd := []string{"sh", "-c", "exec bash -l 2>/dev/null || exec sh -l"}
 			g.runExec(ctx, channel, sandboxID, containerID, cmd, state)
 			return
 
@@ -367,20 +417,6 @@ func (g *Gateway) pumpStreams(channel ssh.Channel, session *docker.ExecSession, 
 
 func (g *Gateway) writeStderr(channel ssh.Channel, msg string) {
 	_, _ = channel.Stderr().Write([]byte(msg))
-}
-
-func (g *Gateway) containerForSandbox(ctx context.Context, sandboxID string) (string, error) {
-	sandbox, err := g.svc.GetSandbox(ctx, sandboxID)
-	if err != nil {
-		return "", err
-	}
-	if sandbox.Status != models.SandboxStatusStarted {
-		return "", fmt.Errorf("status=%s", sandbox.Status)
-	}
-	if sandbox.ContainerID == "" {
-		return "", errors.New("container id missing")
-	}
-	return sandbox.ContainerID, nil
 }
 
 // allowEnvVar restricts which env vars an SSH client can inject. We accept the

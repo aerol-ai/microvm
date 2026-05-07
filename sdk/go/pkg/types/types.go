@@ -12,6 +12,16 @@ type Sandbox = models.Sandbox
 type MountSpec = models.MountSpec
 type MountSpecRedacted = models.MountSpecRedacted
 type MountType = models.MountType
+type CreateSessionOptions = models.CreateSessionRequest
+type Session = models.Session
+type SessionStatus = models.SessionStatus
+
+const (
+	SessionStatusRunning = models.SessionStatusRunning
+	SessionStatusExited  = models.SessionStatusExited
+	SessionStatusKilled  = models.SessionStatusKilled
+	SessionStatusFailed  = models.SessionStatusFailed
+)
 
 const (
 	MountTypeS3     = models.MountTypeS3

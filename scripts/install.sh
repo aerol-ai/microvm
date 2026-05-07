@@ -306,6 +306,9 @@ SB_ENABLE_NETWORK_RULES=true
 SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
 SB_MOUNTS_CRED_DIR=/run/sandboxd
 SB_MOUNT_WAIT_TIMEOUT=30s
+SB_RECORDING_DIR=/var/lib/toolboxd/recordings
+SB_RECORDING_RETENTION=168h
+SB_SESSION_BUFFER_BYTES=1048576
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
