@@ -1,0 +1,25 @@
+{
+  "name": "sandbox-library-docs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.30.0",
+    "@fontsource/inter": "^5.1.1",
+    "@fontsource/space-mono": "^5.1.1",
+    "astro": "5.17.3",
+    "sass": "^1.89.2",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.3"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "prettier-plugin-astro": "^0.14.0"
+  }
+}

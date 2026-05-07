@@ -1,0 +1,132 @@
+@use '../mixins.scss' as *;
+
+.navbar {
+  background: var(--bg-color);
+
+  nav {
+    border-bottom: var(--border);
+  }
+
+  .desktop-only {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 16px 0;
+    max-width: 1248px;
+    margin: auto;
+
+    @include for-tablet-screen-sizes {
+      display: none;
+    }
+  }
+
+  .brand-lockup {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+
+    &:after {
+      content: '/';
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      color: var(--secondary-text-color);
+    }
+  }
+
+  .brand-mark {
+    width: 32px;
+    height: 32px;
+    border-radius: 9px;
+    background: var(--gradient-color);
+    display: grid;
+    place-items: center;
+    color: #041017;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 700;
+  }
+
+  .brand-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .brand-name {
+    color: var(--primary-text-color);
+    font-family: var(--font-mono);
+    font-size: 1rem;
+    line-height: 1;
+    letter-spacing: -0.03em;
+  }
+
+  .brand-subtitle {
+    color: var(--secondary-text-color);
+    font-family: var(--font-sans);
+    font-size: 0.78rem;
+    line-height: 1;
+  }
+
+  .navbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    margin-left: 22px;
+  }
+
+  .navbar-links a {
+    text-transform: uppercase;
+    font-size: 0.875rem;
+    font-family: var(--font-mono);
+    color: var(--primary-text-color);
+    transition: color 0.2s ease;
+    letter-spacing: -0.02em;
+  }
+
+  .navbar-links a.active,
+  .navbar-links a:hover {
+    color: var(--hover-color);
+  }
+
+  .nav__items_side_menu {
+    display: flex;
+    margin-left: auto;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .version-pill,
+  .source-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: var(--border);
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--primary-text-color);
+    transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+  }
+
+  .version-pill {
+    background: rgba(58, 161, 255, 0.08);
+    border-color: rgba(58, 161, 255, 0.25);
+  }
+
+  .source-link:hover {
+    color: var(--hover-color);
+    border-color: var(--hover-color);
+  }
+
+  .mobile-navigation {
+    display: none;
+    padding: 16px 20px;
+    align-items: center;
+    justify-content: space-between;
+
+    @include for-tablet-screen-sizes {
+      display: flex;
+    }
+  }
+}

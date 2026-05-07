@@ -1,0 +1,34 @@
+<div class="markdown-content"><slot /></div>
+
+<script>
+  const onReady = () => {
+    document.querySelectorAll('table').forEach(table => {
+      if (table.parentElement?.classList.contains('table-wrapper')) {
+        return
+      }
+
+      const wrapper = document.createElement('div')
+      wrapper.classList.add('table-wrapper')
+      table.parentNode?.insertBefore(wrapper, table)
+      wrapper.appendChild(table)
+    })
+
+    document
+      .querySelectorAll('.markdown-content h2[id], .markdown-content h3[id], .markdown-content h4[id], .markdown-content h5[id]')
+      .forEach(heading => {
+        if (heading.querySelector('.heading-anchor')) {
+          return
+        }
+
+        const anchor = document.createElement('a')
+        anchor.href = `#${heading.id}`
+        anchor.className = 'heading-anchor'
+        anchor.setAttribute('aria-hidden', 'true')
+        anchor.textContent = '#'
+        heading.prepend(anchor)
+      })
+  }
+
+  document.addEventListener('DOMContentLoaded', onReady)
+  document.addEventListener('astro:page-load', onReady)
+</script>

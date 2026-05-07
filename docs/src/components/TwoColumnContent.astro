@@ -1,0 +1,62 @@
+---
+const hasToc = Astro.props.toc
+---
+
+<div class={`main-pane-wrapper ${hasToc ? '' : 'no-toc'}`}>
+  {
+    hasToc && (
+      <aside class="right-sidebar-container">
+        <div class="right-sidebar">
+          <slot name="right-sidebar" />
+        </div>
+      </aside>
+    )
+  }
+  <div class="main-pane"><slot /></div>
+</div>
+
+<style>
+  .main-pane {
+    isolation: isolate;
+    width: 100%;
+  }
+
+  .main-pane-wrapper {
+    display: grid;
+    grid-template-columns: 7fr 2fr;
+    column-gap: 48px;
+  }
+
+  .main-pane-wrapper.no-toc {
+    grid-template-columns: 100%;
+  }
+
+  .right-sidebar-container {
+    order: 2;
+    position: relative;
+  }
+
+  .right-sidebar {
+    position: sticky;
+    top: 74px;
+    padding-top: 40px;
+    width: 100%;
+    height: calc(100vh - 74px);
+    overflow-y: auto;
+    scrollbar-width: none;
+  }
+
+  @media (max-width: 1024px) {
+    .main-pane-wrapper {
+      grid-template-columns: 100%;
+    }
+
+    .right-sidebar-container,
+    .right-sidebar {
+      order: unset;
+      position: unset;
+      height: unset;
+      padding-top: 0;
+    }
+  }
+</style>

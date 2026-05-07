@@ -1,0 +1,25 @@
+@use '../mixins.scss' as *;
+
+.explore-more-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+
+  @include for-mobile-screen-sizes {
+    grid-template-columns: 1fr;
+  }
+}
+
+.explore-more-card {
+  display: block;
+  background: var(--block-bg-color);
+  border: var(--border);
+  border-color: var(--block-bg-color);
+  padding: 20px;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.explore-more-card:hover {
+  border-color: var(--hover-color);
+  transform: translateY(-1px);
+}

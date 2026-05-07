@@ -1,0 +1,66 @@
+@use '../mixins.scss' as *;
+
+.docs-footer__container {
+  font-family: var(--font-sans);
+
+  &__support-links {
+    border-top: var(--border);
+    border-bottom: var(--border);
+    padding: 20px 0;
+    margin-top: 44px;
+    margin-bottom: 20px;
+  }
+
+  &__support-links p {
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--secondary-text-color);
+  }
+
+  &__support-links a {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--primary-text-color);
+  }
+
+  &__bottom {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px;
+    margin: 0 0 20px;
+  }
+
+  &__bottom-block {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  &__bottom-block p {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: var(--primary-text-color);
+    line-height: 1;
+  }
+
+  .divider::before {
+    content: '/';
+    display: block;
+    color: var(--border-color);
+    font-size: 0.875rem;
+    font-family: var(--font-mono);
+  }
+
+  .menu-list {
+    display: flex;
+    gap: 16px;
+  }
+
+  .menu-list a {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--secondary-text-color);
+  }
+}

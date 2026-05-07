@@ -1,0 +1,126 @@
+<starlight-menu-button>
+  <div id="blur-overlay"></div>
+  <button
+    aria-expanded="false"
+    aria-label="Toggle navigation"
+    aria-controls="starlight__sidebar"
+  >
+    <span class="icon icon-open" aria-hidden="true">
+      <span></span><span></span><span></span>
+    </span>
+    <span class="icon icon-close" aria-hidden="true">+</span>
+  </button>
+</starlight-menu-button>
+
+<script>
+  class StarlightMenuButton extends HTMLElement {
+    constructor() {
+      super()
+      this.button = this.querySelector('button')
+      this.button.addEventListener('click', () => this.toggleExpanded())
+
+      const parentNav = this.closest('nav')
+      if (parentNav) {
+        parentNav.addEventListener('keyup', event => this.closeOnEscape(event))
+      }
+    }
+
+    setExpanded(expanded) {
+      this.setAttribute('aria-expanded', String(expanded))
+      document.body.toggleAttribute('data-mobile-menu-expanded', expanded)
+      this.button.setAttribute('aria-expanded', String(expanded))
+    }
+
+    toggleExpanded() {
+      this.setExpanded(this.getAttribute('aria-expanded') !== 'true')
+    }
+
+    closeOnEscape(event) {
+      if (event.code === 'Escape') {
+        this.setExpanded(false)
+        this.button.focus()
+      }
+    }
+  }
+
+  customElements.define('starlight-menu-button', StarlightMenuButton)
+</script>
+
+<style>
+  button {
+    display: none;
+    position: fixed;
+    top: 18px;
+    right: 28px;
+    z-index: var(--sl-z-index-navbar);
+    padding: 0.5rem;
+    background-color: transparent;
+    border: var(--border);
+    border-radius: 10px;
+    cursor: pointer;
+    color: var(--primary-text-color);
+  }
+
+  .icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+  }
+
+  .icon-open {
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .icon-open span {
+    display: block;
+    width: 16px;
+    height: 1.5px;
+    background: currentColor;
+  }
+
+  .icon-close {
+    display: none;
+    font-size: 1.3rem;
+    transform: rotate(45deg);
+    line-height: 1;
+  }
+
+  [aria-expanded='true'] button .icon-open {
+    display: none;
+  }
+
+  [aria-expanded='true'] button .icon-close {
+    display: flex;
+  }
+
+  [aria-expanded='true'] #blur-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 4;
+    background-color: rgba(11, 17, 22, 0.7);
+    backdrop-filter: blur(2px);
+  }
+
+  @media (max-width: 1024px) {
+    button {
+      display: flex;
+    }
+  }
+
+  @media (max-width: 650px) {
+    button {
+      right: 20px;
+    }
+  }
+</style>
+
+<style is:global>
+  @media (max-width: 1024px) {
+    [data-mobile-menu-expanded] {
+      overflow: hidden;
+    }
+  }
+</style>

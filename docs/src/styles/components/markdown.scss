@@ -1,0 +1,125 @@
+.markdown-content {
+  > :not(h1, h2, h3, h4, h5, h6, p, aside) {
+    margin-bottom: 48px;
+  }
+
+  > h2[id],
+  > h3[id],
+  > h4[id],
+  > h5[id] {
+    margin-top: 48px;
+    margin-bottom: 16px;
+    position: relative;
+  }
+
+  > h2[id] .heading-anchor,
+  > h3[id] .heading-anchor,
+  > h4[id] .heading-anchor,
+  > h5[id] .heading-anchor {
+    opacity: 0;
+    position: absolute;
+    right: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    padding-right: 0.25em;
+    font-size: 0.875em;
+    color: var(--secondary-text-color);
+    text-decoration: none;
+    transition: opacity 150ms ease, color 150ms ease;
+  }
+
+  > h2[id]:hover .heading-anchor,
+  > h3[id]:hover .heading-anchor,
+  > h4[id]:hover .heading-anchor,
+  > h5[id]:hover .heading-anchor {
+    opacity: 1;
+  }
+
+  > p {
+    margin: 22px 0;
+  }
+
+  > p a,
+  > ol a,
+  > ul a,
+  > table a {
+    color: var(--primary-text-color);
+    font-weight: 500;
+    text-decoration: underline;
+    text-decoration-color: var(--active-state-color);
+    text-underline-offset: 3px;
+  }
+
+  > p a:hover,
+  > ol a:hover,
+  > ul a:hover,
+  > table a:hover {
+    text-decoration-color: var(--hover-color);
+  }
+
+  p > code,
+  li code,
+  strong > code,
+  td code {
+    font-family: var(--font-mono);
+    font-size: 0.875rem;
+    border: 0.5px solid var(--border-extra);
+    padding: 2px 6px;
+    color: var(--hover-color);
+    background-color: var(--block-bg-color);
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+
+  > blockquote {
+    margin: 0 0 34px;
+    border-left: 2px solid var(--hover-color);
+    padding-left: 20px;
+    font-style: italic;
+    opacity: 0.92;
+  }
+
+  > .table-wrapper {
+    position: relative;
+    overflow-x: auto;
+  }
+
+  > .table-wrapper > table {
+    border-collapse: collapse;
+    color: var(--primary-text-color);
+    width: 100%;
+  }
+
+  > .table-wrapper th,
+  > .table-wrapper td {
+    padding: 0.65rem;
+    text-align: left;
+    word-break: break-word;
+  }
+
+  > .table-wrapper td {
+    border-bottom: 1px solid var(--border-extra);
+  }
+
+  > .table-wrapper th {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    border-bottom: 3px solid var(--border-extra);
+  }
+
+  > ol {
+    padding-inline-start: 18px;
+    margin: 0 0 24px;
+  }
+
+  > ul {
+    padding: 0 10px 0 0;
+    margin: 0 0 24px 14px;
+  }
+
+  > ul li {
+    padding-left: 10px;
+    margin-bottom: 4px;
+  }
+}

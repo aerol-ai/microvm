@@ -1,0 +1,73 @@
+---
+import { PAGE_TITLE_ID } from './TableOfContent/constants'
+
+const { data } = Astro.props.entry
+const { title = data.title, tagline, actions = [] } = data.hero || {}
+---
+
+<div class="hero">
+  <h1 id={PAGE_TITLE_ID} data-page-title>{title}</h1>
+  {tagline && <div class="tagline" set:html={tagline} />}
+  {
+    actions.length > 0 && (
+      <div class="hero-actions">
+        {actions.map(action => (
+          <a href={action.link} class:list={['hero-action', action.variant || 'secondary']}>
+            {action.text}
+          </a>
+        ))}
+      </div>
+    )
+  }
+</div>
+
+<style>
+  .hero {
+    display: grid;
+    grid-template-columns: 100%;
+    margin-top: 40px;
+    margin-bottom: 56px;
+  }
+
+  .tagline {
+    max-width: 48rem;
+    font-family: var(--font-sans);
+    font-weight: 500;
+    font-size: 1.18rem;
+    letter-spacing: -0.01em;
+    line-height: 1.55;
+    color: var(--primary-text-color);
+  }
+
+  .hero-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 24px;
+  }
+
+  .hero-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    padding: 10px 16px;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    color: var(--primary-text-color);
+    border: 1px solid var(--border-extra);
+  }
+
+  .hero-action.primary {
+    background: var(--gradient-hover-color);
+    border-color: transparent;
+    color: #081017;
+  }
+
+  @media (max-width: 650px) {
+    .hero {
+      margin-bottom: 36px;
+    }
+  }
+</style>

@@ -1,0 +1,22 @@
+---
+import { getSidebarConfig } from '../content/config'
+import { getExploreMoreData } from '../utils/navigation'
+
+const exploreMoreData = getExploreMoreData(getSidebarConfig(), Astro.url.pathname)
+---
+
+{
+  exploreMoreData.map(group => (
+    <section>
+      <h2>{group.title || 'Explore more'}</h2>
+      <div class="explore-more-grid">
+        {group.items.map(item => (
+          <a href={item.href} class="explore-more-card">
+            <strong>{item.title}</strong>
+            <p>{item.subtitle}</p>
+          </a>
+        ))}
+      </div>
+    </section>
+  ))
+}

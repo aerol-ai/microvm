@@ -1,0 +1,58 @@
+---
+import { comparePaths, isActiveOrParentPath } from '../utils/navigation'
+
+const currentPath = Astro.url.pathname
+const version = import.meta.env.VERSION || 'dev'
+
+const navLinks = [
+  { href: '/', label: 'Docs', exact: true },
+  { href: '/getting-started', label: 'Getting Started' },
+  { href: '/sdk-clients', label: 'SDKs' },
+  { href: 'https://github.com/aerol-ai/microvm', label: 'GitHub', external: true },
+]
+
+const isActive = link =>
+  link.exact ? comparePaths(link.href, currentPath) : isActiveOrParentPath(link.href, currentPath)
+---
+
+<header class="navbar">
+  <nav class="desktop-only">
+    <a href={import.meta.env.BASE_URL} aria-label="Sandbox Library" class="brand-lockup">
+      <span class="brand-mark">SB</span>
+      <span class="brand-copy">
+        <span class="brand-name">Sandbox Library</span>
+        <span class="brand-subtitle">Astro + Starlight docs</span>
+      </span>
+    </a>
+    <div class="navbar-links">
+      {
+        navLinks.map(link => (
+          <a
+            href={link.href}
+            class:list={{ active: !link.external && isActive(link) }}
+            target={link.external ? '_blank' : undefined}
+            rel={link.external ? 'noreferrer' : undefined}
+          >
+            {link.label}
+          </a>
+        ))
+      }
+    </div>
+    <div class="nav__items_side_menu">
+      <span class="version-pill">{version}</span>
+      <a class="source-link" href="https://github.com/aerol-ai/microvm/tree/main/docs" target="_blank" rel="noreferrer">
+        View Source
+      </a>
+    </div>
+  </nav>
+
+  <nav class="mobile-navigation">
+    <a href={import.meta.env.BASE_URL} aria-label="Sandbox Library" class="brand-lockup">
+      <span class="brand-mark">SB</span>
+      <span class="brand-copy">
+        <span class="brand-name">Sandbox Library</span>
+        <span class="brand-subtitle">Docs</span>
+      </span>
+    </a>
+  </nav>
+</header>

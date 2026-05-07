@@ -1,0 +1,38 @@
+---
+title: Sandbox Library
+description: Self-hosted sandbox runner documentation for sandboxd, toolboxd, and the multi-language SDKs.
+template: splash
+hideTitleOnPage: true
+hero:
+  title: Sandbox Library
+  tagline: Turn a single Linux host into a <span class="hero-highlight">sandbox runner</span> with Docker-backed workloads, streamed exec, host-managed storage, public routing, and SDKs for four languages.
+  actions:
+    - text: Getting Started
+      link: /getting-started
+      variant: primary
+    - text: Architecture
+      link: /architecture
+---
+
+## What Ships
+
+This repository packages two binaries:
+
+- `sandboxd`: the host daemon that manages Docker, persisted state, public routing, and the REST API.
+- `toolboxd`: a lightweight in-container process mounted into each sandbox to provide health, command execution, file transfer, and local port proxying.
+
+## Core Capabilities
+
+- Create, list, inspect, start, stop, destroy, and resize sandboxes.
+- Expose container ports publicly through dynamic Caddy routes.
+- Proxy toolbox traffic through the host API.
+- Persist sandbox state in SQLite and reconcile it on restart.
+- Mount external storage without placing credentials inside containers.
+- Stream command execution with optional PTY support.
+
+## Docs Map
+
+- Start with [Getting Started](/getting-started) to build and run the daemon locally.
+- Read [Architecture](/architecture) for the control-plane and runtime split.
+- Use [SDK Clients](/sdk-clients) for language-specific entry points.
+- Review [Streaming Exec](/exec-streaming), [External Storage](/external-storage), [Network Isolation](/network-isolation), and [Port Allowlist](/port-allowlist) for the main advanced features.

@@ -1,0 +1,9 @@
+---
+import { getSidebarConfig } from '../content/config'
+import { getSidebar } from '../utils/navigation'
+import SidebarSublist from './SidebarSublist.astro'
+
+const sidebar = getSidebar(getSidebarConfig(), Astro.url.pathname)
+---
+
+<SidebarSublist sublist={sidebar} />
