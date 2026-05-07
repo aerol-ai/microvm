@@ -9,6 +9,7 @@ class RecordingMicroVM(MicroVM):
     def __init__(self) -> None:
         super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
         self.calls = []
+        self.raw_calls = []
 
     def _do_json(self, method, path, payload):  # type: ignore[override]
         self.calls.append((method, path, payload))
@@ -31,6 +32,60 @@ class RecordingMicroVM(MicroVM):
                 "updated_at": "2026-05-07T10:00:00Z",
                 "last_active_at": "2026-05-07T10:00:00Z",
             }
+        if method == "POST" and path == "/v1/sandboxes/sb-1/sessions":
+            return {
+                "id": "ses-1",
+                "name": payload.get("name", "default"),
+                "argv": payload.get("argv") or ["sh", "-c", payload.get("command", "")],
+                "workdir": payload.get("workdir"),
+                "pty": bool(payload.get("pty", False)),
+                "status": "running",
+                "exit_code": 0,
+                "created_at": "2026-05-07T10:05:00Z",
+                "started_at": "2026-05-07T10:05:01Z",
+                "recording": True,
+                "bytes": 0,
+                "attached": 1,
+            }
+        if method == "GET" and path == "/v1/sandboxes/sb-1/sessions":
+            return {
+                "sessions": [
+                    {
+                        "id": "ses-1",
+                        "name": "default",
+                        "argv": ["bash"],
+                        "pty": True,
+                        "status": "running",
+                        "exit_code": 0,
+                        "created_at": "2026-05-07T10:05:00Z",
+                        "started_at": "2026-05-07T10:05:01Z",
+                        "recording": True,
+                        "bytes": 12,
+                        "attached": 1,
+                    }
+                ]
+            }
+        if method == "GET" and path == "/v1/sandboxes/sb-1/sessions/ses-1":
+            return {
+                "id": "ses-1",
+                "name": "default",
+                "argv": ["bash"],
+                "workdir": "/workspace",
+                "pty": True,
+                "status": "running",
+                "exit_code": 0,
+                "created_at": "2026-05-07T10:05:00Z",
+                "started_at": "2026-05-07T10:05:01Z",
+                "recording": True,
+                "bytes": 99,
+                "attached": 2,
+            }
+        if method == "POST" and path == "/v1/sandboxes/sb-1/sessions/ses-1/signal":
+            return {}
+        if method == "POST" and path == "/v1/sandboxes/sb-1/sessions/ses-1/resize":
+            return {}
+        if method == "DELETE" and path == "/v1/sandboxes/sb-1/sessions/ses-1":
+            return {}
         if method == "POST" and path.endswith("/process/execute"):
             return {
                 "stdout": "ok",
@@ -47,6 +102,15 @@ class RecordingMicroVM(MicroVM):
                 "version": "dev",
             }
         raise AssertionError(f"unexpected call: {method} {path} {payload}")
+
+    def _request(self, method, url, body=None, content_type=None):  # type: ignore[override]
+        path = url.replace(self.api_url, "")
+        self.raw_calls.append((method, path, body, content_type))
+        if method == "GET" and path == "/v1/sandboxes/sb-1/sessions/ses-1/log":
+            return b"session log"
+        if method == "GET" and path == "/v1/sandboxes/sb-1/sessions/ses-1/recording":
+            return b'{"version":2}'
+        raise AssertionError(f"unexpected raw call: {method} {path}")
 
 
 class FakeABNF:
@@ -178,6 +242,100 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(json.loads(fake_ws.sent[0][0]), {"command": "bash", "tty": True, "cols": 120, "rows": 40})
             self.assertEqual(fake_ws.sent[1], (b"pwd\n", 2))
             self.assertEqual(json.loads(fake_ws.sent[2][0]), {"type": "resize", "cols": 120, "rows": 40})
+            self.assertEqual(json.loads(fake_ws.sent[3][0]), {"type": "signal", "signal": "INT"})
+        finally:
+            client_module._load_websocket_module = original_loader
+
+    def test_session_methods_map_api_shapes(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        created = sandbox.create_session(
+            {"name": "default", "command": "bash", "workDir": "/workspace", "pty": True, "cols": 120, "rows": 40}
+        )
+        listed = sandbox.list_sessions()
+        loaded = sandbox.get_session("ses-1")
+        sandbox.signal_session("ses-1", "TERM")
+        sandbox.resize_session("ses-1", 120, 40)
+        log = sandbox.session_log("ses-1")
+        recording = sandbox.session_recording("ses-1")
+        sandbox.delete_session("ses-1")
+
+        self.assertEqual(
+            client.calls[1],
+            (
+                "POST",
+                "/v1/sandboxes/sb-1/sessions",
+                {
+                    "name": "default",
+                    "command": "bash",
+                    "workdir": "/workspace",
+                    "pty": True,
+                    "cols": 120,
+                    "rows": 40,
+                },
+            ),
+        )
+        self.assertEqual(client.calls[2], ("GET", "/v1/sandboxes/sb-1/sessions", None))
+        self.assertEqual(client.calls[3], ("GET", "/v1/sandboxes/sb-1/sessions/ses-1", None))
+        self.assertEqual(client.calls[4], ("POST", "/v1/sandboxes/sb-1/sessions/ses-1/signal", {"signal": "TERM"}))
+        self.assertEqual(client.calls[5], ("POST", "/v1/sandboxes/sb-1/sessions/ses-1/resize", {"cols": 120, "rows": 40}))
+        self.assertEqual(client.calls[6], ("DELETE", "/v1/sandboxes/sb-1/sessions/ses-1", None))
+        self.assertEqual(client.raw_calls[0][:2], ("GET", "/v1/sandboxes/sb-1/sessions/ses-1/log"))
+        self.assertEqual(client.raw_calls[1][:2], ("GET", "/v1/sandboxes/sb-1/sessions/ses-1/recording"))
+
+        self.assertEqual(created["argv"], ["sh", "-c", "bash"])
+        self.assertEqual(listed[0]["status"], "running")
+        self.assertEqual(loaded["bytes"], 99)
+        self.assertEqual(log, b"session log")
+        self.assertEqual(recording, b'{"version":2}')
+
+    def test_attach_session_sends_control_frames_and_waits_for_exit(self):
+        stdout_chunks = []
+        stderr_chunks = []
+        errors = []
+        exits = []
+        fake_ws = FakeWebSocket(
+            [
+                bytes([1]) + b"hello",
+                bytes([2]) + b"warn",
+                json.dumps({"type": "exit", "code": 0, "signal": "TERM"}),
+            ]
+        )
+        fake_module = FakeWebSocketModule(fake_ws)
+        original_loader = client_module._load_websocket_module
+        client_module._load_websocket_module = lambda: fake_module
+        try:
+            client = RecordingMicroVM()
+            handle = client.attach_session(
+                "sb-1",
+                "ses-1",
+                {
+                    "cols": 120,
+                    "rows": 40,
+                    "onStdout": stdout_chunks.append,
+                    "onStderr": stderr_chunks.append,
+                    "onError": errors.append,
+                    "onExit": exits.append,
+                },
+            )
+
+            handle.write("pwd\n")
+            handle.resize(100, 30)
+            handle.signal("INT")
+            result = handle.wait(1)
+
+            self.assertEqual(result, {"code": 0, "signal": "TERM"})
+            self.assertEqual(stdout_chunks, [b"hello"])
+            self.assertEqual(stderr_chunks, [b"warn"])
+            self.assertEqual(errors, [])
+            self.assertEqual(exits, [{"code": 0, "signal": "TERM"}])
+            self.assertEqual(fake_module.calls[0][0], "wss://sandbox.example.com/v1/sandboxes/sb-1/sessions/ses-1/attach")
+            self.assertEqual(fake_module.calls[0][1], ["Authorization: Bearer pat-token"])
+            self.assertTrue(fake_module.calls[0][2])
+            self.assertEqual(json.loads(fake_ws.sent[0][0]), {"type": "resize", "cols": 120, "rows": 40})
+            self.assertEqual(fake_ws.sent[1], (b"pwd\n", 2))
+            self.assertEqual(json.loads(fake_ws.sent[2][0]), {"type": "resize", "cols": 100, "rows": 30})
             self.assertEqual(json.loads(fake_ws.sent[3][0]), {"type": "signal", "signal": "INT"})
         finally:
             client_module._load_websocket_module = original_loader

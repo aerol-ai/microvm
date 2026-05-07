@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, List, TypedDict
+from typing import Callable, Dict, List, Literal, TypedDict
 
 
 class RegistryAuth(TypedDict, total=False):
@@ -25,6 +25,17 @@ class ResizeOptions(TypedDict, total=False):
     cpu: int
     memoryMB: int
     diskGB: int
+
+
+class CreateSessionOptions(TypedDict, total=False):
+    name: str
+    argv: List[str]
+    command: str
+    workDir: str
+    env: Dict[str, str]
+    pty: bool
+    cols: int
+    rows: int
 
 
 class ExecRequest(TypedDict, total=False):
@@ -60,6 +71,38 @@ class ExecStreamOptions(TypedDict, total=False):
 class ExecExitInfo(TypedDict, total=False):
     code: int
     signal: str
+
+
+SessionStatus = Literal["running", "exited", "killed", "failed"]
+
+
+class Session(TypedDict, total=False):
+    id: str
+    name: str
+    argv: List[str]
+    workDir: str
+    pty: bool
+    status: SessionStatus
+    exitCode: int
+    exitSignal: str
+    createdAt: str
+    startedAt: str
+    exitedAt: str
+    recording: bool
+    bytes: int
+    attached: int
+
+
+ExitCallback = Callable[[ExecExitInfo], None]
+
+
+class SessionAttachOptions(TypedDict, total=False):
+    onStdout: ChunkCallback
+    onStderr: ChunkCallback
+    onError: ErrorCallback
+    onExit: ExitCallback
+    cols: int
+    rows: int
 
 
 class ExposedPort(TypedDict, total=False):

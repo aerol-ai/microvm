@@ -30,7 +30,6 @@ python examples/create_sandbox.py --api-url http://127.0.0.1:8080 --pat-token te
 ```
 
 ## Streaming exec
-
 ```python
 import sys
 
@@ -47,4 +46,36 @@ handle = sandbox.exec_stream(
 handle.write("echo hello\n")
 result = handle.wait()
 print(result)
+```
+
+## Sessions
+
+```python
+import sys
+
+session = sandbox.create_session(
+	{
+		"name": "shell",
+		"command": "bash",
+		"workDir": "/workspace",
+		"pty": True,
+		"cols": 120,
+		"rows": 40,
+	}
+)
+
+print(session)
+print(sandbox.list_sessions())
+print(sandbox.session_log(session["id"]).decode("utf-8"))
+
+handle = sandbox.attach_session(
+	session["id"],
+	{
+		"cols": 120,
+		"rows": 40,
+		"onStdout": lambda chunk: sys.stdout.buffer.write(chunk),
+	}
+)
+handle.write("echo attached\n")
+print(handle.wait())
 ```

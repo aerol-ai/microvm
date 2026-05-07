@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from .types import (
     CreateOptions,
+    CreateSessionOptions,
     ExecExitInfo,
     ExecRequest,
     ExecResult,
@@ -21,6 +22,8 @@ from .types import (
     HealthStatus,
     ResizeOptions,
     SandboxData,
+    Session,
+    SessionAttachOptions,
 )
 
 STREAM_PREFIX_STDOUT = 0x01
@@ -135,6 +138,107 @@ class ExecStreamHandle:
                 self._done.set_exception(MicroVMError(error_message))
 
 
+class SessionAttachHandle:
+    def __init__(self, websocket_module: Any, ws: Any, options: SessionAttachOptions) -> None:
+        self._websocket_module = websocket_module
+        self._ws = ws
+        self._options = options
+        self._done: Future[ExecExitInfo] = Future()
+        self._send_lock = threading.Lock()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    @property
+    def done(self) -> Future[ExecExitInfo]:
+        return self._done
+
+    def write(self, data: bytes | str) -> None:
+        payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+        with self._send_lock:
+            self._ws.send(payload, opcode=self._websocket_module.ABNF.OPCODE_BINARY)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self._send_json({"type": "resize", "cols": cols, "rows": rows})
+
+    def signal(self, name: str) -> None:
+        self._send_json({"type": "signal", "signal": name})
+
+    def close(self) -> None:
+        try:
+            self._send_json({"type": "close"})
+        finally:
+            self._ws.close()
+
+    def wait(self, timeout: Optional[float] = None) -> ExecExitInfo:
+        try:
+            return self._done.result(timeout)
+        except FutureTimeoutError as exc:
+            raise TimeoutError("timed out waiting for session completion") from exc
+
+    def _send_json(self, payload: Dict[str, Any]) -> None:
+        with self._send_lock:
+            self._ws.send(json.dumps(payload))
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                message = self._ws.recv()
+                if isinstance(message, str):
+                    self._handle_text_frame(message)
+                    if self._done.done():
+                        break
+                    continue
+
+                payload = bytes(message)
+                if len(payload) == 0:
+                    continue
+
+                stream = payload[0]
+                chunk = payload[1:]
+                if stream == STREAM_PREFIX_STDOUT:
+                    callback = self._options.get("onStdout")
+                    if callback is not None:
+                        callback(chunk)
+                elif stream == STREAM_PREFIX_STDERR:
+                    callback = self._options.get("onStderr")
+                    if callback is not None:
+                        callback(chunk)
+        except Exception as exc:
+            if not self._done.done():
+                self._done.set_exception(MicroVMError(f"session stream closed: {exc}"))
+        finally:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    def _handle_text_frame(self, payload: str) -> None:
+        try:
+            message = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+
+        if message.get("type") == "exit":
+            result: ExecExitInfo = {"code": int(message.get("code", 0))}
+            signal = message.get("signal")
+            if isinstance(signal, str) and signal != "":
+                result["signal"] = signal
+            callback = self._options.get("onExit")
+            if callback is not None:
+                callback(result)
+            if not self._done.done():
+                self._done.set_result(result)
+            return
+
+        if message.get("type") == "error":
+            error_message = str(message.get("message") or "session error")
+            callback = self._options.get("onError")
+            if callback is not None:
+                callback(error_message)
+            if not self._done.done():
+                self._done.set_exception(MicroVMError(error_message))
+
+
 class Sandbox:
     def __init__(self, client: "MicroVM", data: SandboxData) -> None:
         self._client = client
@@ -156,6 +260,33 @@ class Sandbox:
 
     def exec_stream(self, options: ExecStreamOptions) -> ExecStreamHandle:
         return self._client.exec_stream(self.id, options)
+
+    def create_session(self, options: CreateSessionOptions) -> Session:
+        return self._client.create_session(self.id, options)
+
+    def list_sessions(self) -> List[Session]:
+        return self._client.list_sessions(self.id)
+
+    def get_session(self, session_id: str) -> Session:
+        return self._client.get_session(self.id, session_id)
+
+    def delete_session(self, session_id: str) -> None:
+        self._client.delete_session(self.id, session_id)
+
+    def signal_session(self, session_id: str, signal: str) -> None:
+        self._client.signal_session(self.id, session_id, signal)
+
+    def resize_session(self, session_id: str, cols: int, rows: int) -> None:
+        self._client.resize_session(self.id, session_id, cols, rows)
+
+    def session_log(self, session_id: str) -> bytes:
+        return self._client.session_log(self.id, session_id)
+
+    def session_recording(self, session_id: str) -> bytes:
+        return self._client.session_recording(self.id, session_id)
+
+    def attach_session(self, session_id: str, options: Optional[SessionAttachOptions] = None) -> SessionAttachHandle:
+        return self._client.attach_session(self.id, session_id, options)
 
     def upload_file(self, target_path: str, data: bytes) -> None:
         self._client.upload_file(self.id, target_path, data)
@@ -255,6 +386,60 @@ class MicroVM:
         )
         ws.send(json.dumps(_to_api_exec_stream_request(options)))
         return ExecStreamHandle(websocket_module, ws, options)
+
+    def create_session(self, sandbox_id: str, options: CreateSessionOptions) -> Session:
+        session = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/sessions", _to_api_create_session_options(options))
+        return _from_api_session(session)
+
+    def list_sessions(self, sandbox_id: str) -> List[Session]:
+        payload = self._do_json("GET", f"/v1/sandboxes/{sandbox_id}/sessions", None)
+        sessions = _first_of(payload, "sessions") or []
+        if not isinstance(sessions, list):
+            return []
+        return [_from_api_session(item) for item in sessions]
+
+    def get_session(self, sandbox_id: str, session_id: str) -> Session:
+        session = self._do_json("GET", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+        return _from_api_session(session)
+
+    def delete_session(self, sandbox_id: str, session_id: str) -> None:
+        self._do_json("DELETE", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+
+    def signal_session(self, sandbox_id: str, session_id: str, signal: str) -> None:
+        self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/signal", {"signal": signal})
+
+    def resize_session(self, sandbox_id: str, session_id: str, cols: int, rows: int) -> None:
+        self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/resize", {"cols": cols, "rows": rows})
+
+    def session_log(self, sandbox_id: str, session_id: str) -> bytes:
+        return self._request("GET", self._url(f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/log"))
+
+    def session_recording(self, sandbox_id: str, session_id: str) -> bytes:
+        return self._request("GET", self._url(f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/recording"))
+
+    def attach_session(
+        self,
+        sandbox_id: str,
+        session_id: str,
+        options: Optional[SessionAttachOptions] = None,
+    ) -> SessionAttachHandle:
+        attach_options: SessionAttachOptions = options or {}
+        websocket_module = _load_websocket_module()
+        ws = websocket_module.create_connection(
+            _to_websocket_url(
+                self.api_url,
+                f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
+            ),
+            header=[f"Authorization: Bearer {self.pat_token}"],
+            enable_multithread=True,
+        )
+
+        cols = _first_of(attach_options, "cols")
+        rows = _first_of(attach_options, "rows")
+        if isinstance(cols, int) and isinstance(rows, int) and cols > 0 and rows > 0:
+            ws.send(json.dumps({"type": "resize", "cols": cols, "rows": rows}))
+
+        return SessionAttachHandle(websocket_module, ws, attach_options)
 
     def upload_file(self, sandbox_id: str, target_path: str, data: bytes) -> None:
         self._do_multipart(
@@ -411,6 +596,21 @@ def _to_api_exec_stream_request(options: ExecStreamOptions) -> Dict[str, Any]:
     )
 
 
+def _to_api_create_session_options(options: CreateSessionOptions) -> Dict[str, Any]:
+    return _compact(
+        {
+            "name": _first_of(options, "name"),
+            "argv": _first_of(options, "argv"),
+            "command": _first_of(options, "command"),
+            "workdir": _first_of(options, "workdir", "workDir"),
+            "env": _first_of(options, "env"),
+            "pty": _first_of(options, "pty"),
+            "cols": _first_of(options, "cols"),
+            "rows": _first_of(options, "rows"),
+        }
+    )
+
+
 def _from_api_exec_result(result: Dict[str, Any]) -> ExecResult:
     return {
         "stdout": str(_first_of(result, "stdout") or ""),
@@ -427,6 +627,33 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
         "publicURL": str(_first_of(port, "public_url", "publicURL") or ""),
         "createdAt": str(_first_of(port, "created_at", "createdAt") or ""),
     }
+
+
+def _from_api_session(session: Dict[str, Any]) -> Session:
+    result: Session = {
+        "id": str(_first_of(session, "id") or ""),
+        "name": str(_first_of(session, "name") or ""),
+        "argv": [str(item) for item in (_first_of(session, "argv") or [])],
+        "pty": bool(_first_of(session, "pty") or False),
+        "status": str(_first_of(session, "status") or "running"),
+        "exitCode": int(_first_of(session, "exit_code", "exitCode") or 0),
+        "createdAt": str(_first_of(session, "created_at", "createdAt") or ""),
+        "startedAt": str(_first_of(session, "started_at", "startedAt") or ""),
+        "recording": bool(_first_of(session, "recording") or False),
+        "bytes": int(_first_of(session, "bytes") or 0),
+        "attached": int(_first_of(session, "attached") or 0),
+    }
+
+    work_dir = _first_of(session, "workdir", "workDir")
+    if work_dir not in (None, ""):
+        result["workDir"] = str(work_dir)
+    exit_signal = _first_of(session, "exit_signal", "exitSignal")
+    if exit_signal not in (None, ""):
+        result["exitSignal"] = str(exit_signal)
+    exited_at = _first_of(session, "exited_at", "exitedAt")
+    if exited_at not in (None, ""):
+        result["exitedAt"] = str(exited_at)
+    return result
 
 
 def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
