@@ -47,6 +47,14 @@ type Config struct {
 	ToolboxWaitTimeout       time.Duration
 	ReconcileInterval        time.Duration
 	UploadMaxBytes           int64
+
+	// Admission control. Zero values disable the corresponding check.
+	MaxSandboxes           int
+	CPUReservationRatio    float64
+	MemoryReservationRatio float64
+	MemoryFloorMB          int
+	HostCPUCoresOverride   int
+	HostMemoryMBOverride   int
 }
 
 func Load() (Config, error) {
@@ -88,6 +96,13 @@ func Load() (Config, error) {
 		ToolboxWaitTimeout:       getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
 		ReconcileInterval:        getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+
+		MaxSandboxes:           getEnvInt("SB_MAX_SANDBOXES", 50),
+		CPUReservationRatio:    getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
+		MemoryReservationRatio: getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
+		MemoryFloorMB:          getEnvInt("SB_MEMORY_FLOOR_MB", 1024),
+		HostCPUCoresOverride:   getEnvInt("SB_HOST_CPU_CORES", 0),
+		HostMemoryMBOverride:   getEnvInt("SB_HOST_MEMORY_MB", 0),
 	}
 
 	if cfg.PATToken == "" {
@@ -150,6 +165,18 @@ func getEnvBool(key string, fallback bool) bool {
 		return fallback
 	}
 	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return fallback
 	}

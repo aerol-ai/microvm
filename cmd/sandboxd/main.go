@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -73,7 +74,37 @@ func main() {
 	}
 	defer mountManager.Close()
 
-	svc := service.New(cfg, logger, db, dockerClient, caddyClient, cipher, mountManager)
+	host, err := capacity.DetectHost()
+	if err != nil {
+		// Detection failure is non-fatal — operator can override via env. We
+		// log the cause so this isn't silent.
+		logger.Warn("host capacity detection failed; using overrides if set",
+			"error", err,
+		)
+	}
+	if cfg.HostCPUCoresOverride > 0 {
+		host.CPUCores = cfg.HostCPUCoresOverride
+	}
+	if cfg.HostMemoryMBOverride > 0 {
+		host.MemoryTotalMB = cfg.HostMemoryMBOverride
+	}
+	admitter := capacity.New(host, capacity.Limits{
+		MaxSandboxes:           cfg.MaxSandboxes,
+		CPUReservationRatio:    cfg.CPUReservationRatio,
+		MemoryReservationRatio: cfg.MemoryReservationRatio,
+		MemoryFloorMB:          cfg.MemoryFloorMB,
+	}, capacity.NewProcMeminfoProbe())
+	logger.Info("capacity admission configured",
+		"host_cpu_cores", host.CPUCores,
+		"host_memory_mb", host.MemoryTotalMB,
+		"max_sandboxes", cfg.MaxSandboxes,
+		"cpu_reservation_ratio", cfg.CPUReservationRatio,
+		"memory_reservation_ratio", cfg.MemoryReservationRatio,
+		"memory_floor_mb", cfg.MemoryFloorMB,
+	)
+
+	svc := service.New(cfg, logger, db, dockerClient, caddyClient, cipher, mountManager, admitter)
+	svc.ReplayReservations(ctx)
 
 	if cfg.AutoReconcile {
 		if err := svc.Reconcile(ctx); err != nil {

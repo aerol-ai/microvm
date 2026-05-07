@@ -13,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -40,6 +41,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
+	s.mux.Handle("GET /v1/capacity", s.requireAuth(http.HandlerFunc(s.handleCapacity)))
 	s.mux.Handle("GET /v1/tls-check", s.requireAuth(http.HandlerFunc(s.handleTLSCheck)))
 
 	s.mux.Handle("POST /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleCreateSandbox)))
@@ -102,6 +104,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.service.Capacity())
 }
 
 func (s *Server) handleTLSCheck(w http.ResponseWriter, r *http.Request) {
@@ -299,6 +305,20 @@ func writeError(w http.ResponseWriter, status int, message string) {
 func (s *Server) writeStoreAwareError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	// Capacity rejections are 503 with a Retry-After hint so well-behaved
+	// clients (and load balancers) back off instead of treating it as a
+	// permanent 4xx. The error string already carries human-readable
+	// reasons from the admitter.
+	if errors.Is(err, capacity.ErrCapacityExceeded) {
+		s.logger.Info("capacity rejected", "error", err)
+		w.Header().Set("Retry-After", "30")
+		msg := err.Error()
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		writeError(w, http.StatusServiceUnavailable, msg)
 		return
 	}
 	// Surface only the top-level error message; underlying causes (Docker

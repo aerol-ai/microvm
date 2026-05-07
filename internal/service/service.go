@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -26,24 +27,26 @@ import (
 )
 
 type Service struct {
-	cfg    config.Config
-	logger *slog.Logger
-	store  *store.Store
-	docker *docker.Client
-	caddy  *caddy.Client
-	cipher *secrets.Cipher
-	mounts *mounts.Manager
+	cfg      config.Config
+	logger   *slog.Logger
+	store    *store.Store
+	docker   *docker.Client
+	caddy    *caddy.Client
+	cipher   *secrets.Cipher
+	mounts   *mounts.Manager
+	admitter *capacity.Admitter
 }
 
-func New(cfg config.Config, logger *slog.Logger, db *store.Store, dockerClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager) *Service {
+func New(cfg config.Config, logger *slog.Logger, db *store.Store, dockerClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
 	return &Service{
-		cfg:    cfg,
-		logger: logger,
-		store:  db,
-		docker: dockerClient,
-		caddy:  caddyClient,
-		cipher: cipher,
-		mounts: mountManager,
+		cfg:      cfg,
+		logger:   logger,
+		store:    db,
+		docker:   dockerClient,
+		caddy:    caddyClient,
+		cipher:   cipher,
+		mounts:   mountManager,
+		admitter: admitter,
 	}
 }
 
@@ -84,8 +87,27 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, fmt.Errorf("generate sandbox id: %w", err)
 	}
 
+	// Admission check uses normalized values (req.CPU/MemoryMB are guaranteed
+	// > 0 by normalizeCreateRequest above), so a default-sized request still
+	// counts against the host budget. Reservation happens here; every failure
+	// path below must release it.
+	if s.admitter != nil {
+		if err := s.admitter.Admit(sandboxID, capacity.Request{
+			CPU:      req.CPU,
+			MemoryMB: req.MemoryMB,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	releaseAdmission := func() {
+		if s.admitter != nil {
+			s.admitter.Release(sandboxID)
+		}
+	}
+
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
 	if err != nil {
+		releaseAdmission()
 		return nil, fmt.Errorf("mount external storage: %w", err)
 	}
 	cleanupMounts := func() {
@@ -97,6 +119,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 	runtime, err := s.docker.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
+		releaseAdmission()
 		return nil, err
 	}
 
@@ -126,6 +149,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 		_ = s.docker.Destroy(ctx, sandbox)
 		cleanupMounts()
+		releaseAdmission()
 		return nil, err
 	}
 
@@ -133,6 +157,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.docker.Destroy(ctx, sandbox)
 		cleanupMounts()
+		releaseAdmission()
 		return nil, err
 	}
 
@@ -142,6 +167,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 			_ = s.docker.Destroy(ctx, sandbox)
 			cleanupMounts()
+			releaseAdmission()
 			return nil, fmt.Errorf("persist sandbox mounts: %w", err)
 		}
 	}
@@ -332,6 +358,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
+	if s.admitter != nil {
+		s.admitter.Release(id)
+	}
 	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	return nil
 }
@@ -341,7 +370,34 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	if err != nil {
 		return nil, err
 	}
+
+	// Decide what the post-resize footprint will be and re-admit against it
+	// before mutating Docker. Admit is idempotent per ID — it computes the
+	// delta against the existing reservation, so a downsize will free budget
+	// and an upsize that exceeds the budget is rejected with no changes.
+	if s.admitter != nil {
+		newCPU := sandbox.CPU
+		newMem := sandbox.MemoryMB
+		if req.CPU > 0 {
+			newCPU = req.CPU
+		}
+		if req.MemoryMB > 0 {
+			newMem = req.MemoryMB
+		}
+		if newCPU != sandbox.CPU || newMem != sandbox.MemoryMB {
+			if err := s.admitter.Admit(id, capacity.Request{CPU: newCPU, MemoryMB: newMem}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	if err := s.docker.Resize(ctx, sandboxContainerRef(sandbox), req); err != nil {
+		// Restore the prior reservation; the resize did not actually take
+		// effect on the container, so accounting must reflect the unchanged
+		// footprint.
+		if s.admitter != nil {
+			s.admitter.Reserve(id, capacity.Request{CPU: sandbox.CPU, MemoryMB: sandbox.MemoryMB})
+		}
 		return nil, err
 	}
 	if req.CPU > 0 {
@@ -473,6 +529,45 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		SSHGateway: sshStatus,
 		Version:    version.Version,
 	}, nil
+}
+
+// Capacity returns the admitter's current snapshot. Returns the zero value
+// when no admitter is configured (e.g. in tests).
+func (s *Service) Capacity() capacity.Snapshot {
+	if s.admitter == nil {
+		return capacity.Snapshot{CanAdmit: true}
+	}
+	return s.admitter.Snapshot()
+}
+
+// ReplayReservations re-populates the admitter from persistent state. Without
+// this, after a daemon restart the admitter sees zero reservations and the
+// host can be overcommitted on the first wave of new sandboxes. Destroyed
+// sandboxes are skipped — they still occupy a row but no longer hold
+// resources. Best-effort: a store error is logged, not returned, since
+// admission control degrading to "unaware" is preferable to refusing to
+// boot.
+func (s *Service) ReplayReservations(ctx context.Context) {
+	if s.admitter == nil {
+		return
+	}
+	sandboxes, err := s.store.List(ctx)
+	if err != nil {
+		s.logger.Warn("replay reservations: list failed", "error", err)
+		return
+	}
+	replayed := 0
+	for _, sandbox := range sandboxes {
+		if sandbox.Status == models.SandboxStatusDestroyed {
+			continue
+		}
+		s.admitter.Reserve(sandbox.ID, capacity.Request{
+			CPU:      sandbox.CPU,
+			MemoryMB: sandbox.MemoryMB,
+		})
+		replayed++
+	}
+	s.logger.Info("capacity reservations replayed", "count", replayed)
 }
 
 func (s *Service) TLSDomainAllowed(host string) bool {
