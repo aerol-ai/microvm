@@ -73,6 +73,66 @@ test("MicroVM create returns SSH key material", async () => {
   assert.equal(sandbox.id, "sb-create");
   assert.equal(sandbox.sshPublicKey, "ssh-ed25519 AAAA sandbox");
   assert.equal(sandbox.sshPrivateKey, "PRIVATE");
+  assert.deepEqual(sandbox.lifecycle, {});
+});
+
+test("MicroVM updateLifecycle returns wrapped sandboxes", async () => {
+  const seen: Array<{ method: string; url: string; body: unknown }> = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const bodyText = request.method === "GET" || request.method === "DELETE" ? undefined : await request.text();
+      seen.push({
+        method: request.method,
+        url: request.url,
+        body: bodyText ? JSON.parse(bodyText) : undefined,
+      });
+
+      if (request.url.endsWith("/v1/sandboxes/sb-lifecycle/lifecycle") && request.method === "PUT") {
+        return new Response(JSON.stringify({
+          id: "sb-lifecycle",
+          image: "ubuntu:22.04",
+          status: "started",
+          public_url: "https://sb-lifecycle.example.com",
+          cpu: 2,
+          memory_mb: 2048,
+          disk_gb: 20,
+          os_user: "root",
+          network_block_all: false,
+          toolbox_enabled: true,
+          exposed_ports: [],
+          created_at: "2026-05-07T10:00:00Z",
+          updated_at: "2026-05-07T11:00:00Z",
+          last_active_at: "2026-05-07T10:30:00Z",
+          lifecycle: {
+            stop_if_idle_for: 7_200_000_000_000,
+            destroy_at_age: 172_800_000_000_000,
+          },
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      throw new Error(`unexpected request: ${request.method} ${request.url}`);
+    },
+  });
+
+  const sandbox = await sdk.updateLifecycle("sb-lifecycle", {
+    stopIfIdleFor: 7_200_000_000_000,
+    destroyAtAge: 172_800_000_000_000,
+  });
+
+  assert.deepEqual(seen[0]?.body, {
+    stop_if_idle_for: 7_200_000_000_000,
+    destroy_at_age: 172_800_000_000_000,
+  });
+  assert.deepEqual(sandbox.lifecycle, {
+    stopIfIdleFor: 7_200_000_000_000,
+    destroyAtAge: 172_800_000_000_000,
+  });
 });
 
 test("MicroVM create serializes mounts and mounts endpoint returns redacted specs", async () => {

@@ -30,6 +30,17 @@ class MountSpecRedacted(TypedDict, total=False):
     hasCredentials: bool
 
 
+class Lifecycle(TypedDict, total=False):
+    # Durations are integer nanoseconds to match the API wire format.
+    stopIfIdleFor: int
+    destroyIfIdleFor: int
+    stopAtAge: int
+    destroyAtAge: int
+
+
+UpdateLifecycleOptions = Lifecycle
+
+
 class CreateOptions(TypedDict, total=False):
     image: str
     # cpu accepts fractional cores: 0.5 = half a core, 1.5 = one and a half.
@@ -42,6 +53,7 @@ class CreateOptions(TypedDict, total=False):
     registry: RegistryAuth
     containerCommand: List[str]
     mounts: List[MountSpec]
+    lifecycle: Lifecycle
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -157,6 +169,7 @@ class SandboxData(TypedDict, total=False):
     lastActiveAt: str
     lastError: str
     containerCommand: List[str]
+    lifecycle: Lifecycle
 
 
 class HealthStatus(TypedDict):

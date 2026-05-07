@@ -10,6 +10,7 @@ export type {
   ExecExitInfo,
   ExposedPort,
   HealthStatus,
+  Lifecycle,
   MountSpec,
   MountSpecRedacted,
   MountType,
@@ -21,4 +22,5 @@ export type {
   SessionAttachHandle,
   SessionAttachOptions,
   SessionStatus,
+  UpdateLifecycleOptions,
 } from "./types.js";

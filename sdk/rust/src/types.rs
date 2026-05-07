@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MountType {
@@ -65,7 +69,23 @@ pub struct CreateOptions {
     pub container_command: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mounts: Option<Vec<MountSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Lifecycle>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lifecycle {
+    #[serde(rename = "stop_if_idle_for", default, skip_serializing_if = "is_zero_u64")]
+    pub stop_if_idle_for: u64,
+    #[serde(rename = "destroy_if_idle_for", default, skip_serializing_if = "is_zero_u64")]
+    pub destroy_if_idle_for: u64,
+    #[serde(rename = "stop_at_age", default, skip_serializing_if = "is_zero_u64")]
+    pub stop_at_age: u64,
+    #[serde(rename = "destroy_at_age", default, skip_serializing_if = "is_zero_u64")]
+    pub destroy_at_age: u64,
+}
+
+pub type UpdateLifecycleOptions = Lifecycle;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ResizeOptions {
@@ -125,6 +145,8 @@ pub struct Sandbox {
     pub last_error: Option<String>,
     #[serde(rename = "container_command", skip_serializing_if = "Option::is_none")]
     pub container_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -17,7 +17,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
-pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus};
+pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus, UpdateLifecycleOptions};
 pub use types::CreateSandboxResponse;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
@@ -340,6 +340,12 @@ impl Sandbox {
         self.data = updated.data;
         Ok(self)
     }
+
+    pub fn update_lifecycle(&mut self, lifecycle: Lifecycle) -> Result<&Self, Error> {
+        let updated = self.client.update_lifecycle(&self.data.id, lifecycle)?;
+        self.data = updated.data;
+        Ok(self)
+    }
 }
 
 impl Client {
@@ -394,6 +400,11 @@ impl Client {
 
     pub fn resize(&self, id: &str, opts: ResizeOptions) -> Result<Sandbox, Error> {
         let raw = self.do_json::<ResizeOptions, SandboxData>(Method::POST, &format!("/v1/sandboxes/{}/resize", id), Some(&opts))?;
+        Ok(Sandbox::new(self.clone(), raw))
+    }
+
+    pub fn update_lifecycle(&self, id: &str, lifecycle: Lifecycle) -> Result<Sandbox, Error> {
+        let raw = self.do_json::<Lifecycle, SandboxData>(Method::PUT, &format!("/v1/sandboxes/{}/lifecycle", id), Some(&lifecycle))?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
@@ -935,7 +946,13 @@ mod tests {
             registry: None,
             container_command: None,
             mounts: None,
+            lifecycle: None,
         }
+    }
+
+    fn request_json_body(request: &str) -> serde_json::Value {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        serde_json::from_str(body).expect("request body should be valid JSON")
     }
 
     #[test]
@@ -987,6 +1004,112 @@ mod tests {
         assert!(request_lower.contains("authorization: bearer pat-token"), "missing bearer auth: {}", request);
         assert_eq!(sandbox.data.ssh_public_key.as_deref(), Some("ssh-ed25519 AAAA sandbox"));
         assert_eq!(sandbox.ssh_private_key.as_deref(), Some("PRIVATE"));
+    }
+
+    #[test]
+    fn create_sends_nested_lifecycle_body() {
+        let body = serde_json::json!({
+            "id": "sb-lifecycle-create",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-lifecycle-create.example.com",
+            "cpu": 2,
+            "memory_mb": 2048,
+            "disk_gb": 20,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "exposed_ports": [],
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z",
+            "lifecycle": {
+                "stop_if_idle_for": 3600000000000u64,
+                "destroy_at_age": 86400000000000u64
+            }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .create(CreateOptions {
+                lifecycle: Some(Lifecycle {
+                    stop_if_idle_for: 3600000000000,
+                    destroy_at_age: 86400000000000,
+                    ..Default::default()
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+
+        assert_eq!(body, serde_json::json!({
+            "image": "ubuntu:22.04",
+            "lifecycle": {
+                "stop_if_idle_for": 3600000000000u64,
+                "destroy_at_age": 86400000000000u64
+            }
+        }));
+        assert_eq!(sandbox.data.lifecycle, Lifecycle {
+            stop_if_idle_for: 3600000000000,
+            destroy_if_idle_for: 0,
+            stop_at_age: 0,
+            destroy_at_age: 86400000000000,
+        });
+    }
+
+    #[test]
+    fn update_lifecycle_sends_flat_body_and_maps_response() {
+        let body = serde_json::json!({
+            "id": "sb-lifecycle-update",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-lifecycle-update.example.com",
+            "cpu": 2,
+            "memory_mb": 2048,
+            "disk_gb": 20,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "exposed_ports": [],
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T11:00:00Z",
+            "last_active_at": "2026-05-07T10:30:00Z",
+            "lifecycle": {
+                "stop_if_idle_for": 7200000000000u64,
+                "destroy_at_age": 172800000000000u64
+            }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .update_lifecycle(
+                "sb-lifecycle-update",
+                Lifecycle {
+                    stop_if_idle_for: 7200000000000,
+                    destroy_at_age: 172800000000000,
+                    ..Default::default()
+                },
+            )
+            .expect("update lifecycle should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+
+        assert!(request.starts_with("PUT /v1/sandboxes/sb-lifecycle-update/lifecycle HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(body, serde_json::json!({
+            "stop_if_idle_for": 7200000000000u64,
+            "destroy_at_age": 172800000000000u64
+        }));
+        assert_eq!(sandbox.data.lifecycle, Lifecycle {
+            stop_if_idle_for: 7200000000000,
+            destroy_if_idle_for: 0,
+            stop_at_age: 0,
+            destroy_at_age: 172800000000000,
+        });
     }
 
     #[test]

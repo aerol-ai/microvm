@@ -32,7 +32,15 @@ test("internal client create maps request and response", async () => {
     },
   });
 
-  const sandbox = await client.create({ image: "ubuntu:22.04", memoryMB: 2048, networkBlockAll: true });
+  const sandbox = await client.create({
+    image: "ubuntu:22.04",
+    memoryMB: 2048,
+    networkBlockAll: true,
+    lifecycle: {
+      stopIfIdleFor: 3_600_000_000_000,
+      destroyAtAge: 86_400_000_000_000,
+    },
+  });
   assert.equal(sandbox.id, "sb-create");
   assert.ok(seenRequest);
   assert.equal(seenRequest.headers.get("authorization"), "Bearer pat-token");
@@ -40,6 +48,48 @@ test("internal client create maps request and response", async () => {
     image: "ubuntu:22.04",
     memory_mb: 2048,
     network_block_all: true,
+    lifecycle: {
+      stop_if_idle_for: 3_600_000_000_000,
+      destroy_at_age: 86_400_000_000_000,
+    },
+  });
+  assert.deepEqual(sandbox.lifecycle, {
+    stopIfIdleFor: 3_600_000_000_000,
+    destroyAtAge: 86_400_000_000_000,
+  });
+});
+
+test("internal client updateLifecycle sends flat request body", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-lifecycle", {
+        lifecycle: {
+          stop_if_idle_for: 7_200_000_000_000,
+          destroy_at_age: 172_800_000_000_000,
+        },
+      }));
+    },
+  });
+
+  const sandbox = await client.updateLifecycle("sb-lifecycle", {
+    stopIfIdleFor: 7_200_000_000_000,
+    destroyAtAge: 172_800_000_000_000,
+  });
+
+  assert.equal(sandbox.id, "sb-lifecycle");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "PUT");
+  assert.deepEqual(await seenRequest.json(), {
+    stop_if_idle_for: 7_200_000_000_000,
+    destroy_at_age: 172_800_000_000_000,
+  });
+  assert.deepEqual(sandbox.lifecycle, {
+    stopIfIdleFor: 7_200_000_000_000,
+    destroyAtAge: 172_800_000_000_000,
   });
 });
 
@@ -73,6 +123,14 @@ test("sandbox resource methods refresh and resize data", async () => {
       if (request.method === "POST" && request.url.endsWith("/resize")) {
         return jsonResponse(apiSandbox("sb-resource", { cpu: 8, memory_mb: 8192 }));
       }
+      if (request.method === "PUT" && request.url.endsWith("/lifecycle")) {
+        return jsonResponse(apiSandbox("sb-resource", {
+          lifecycle: {
+            stop_if_idle_for: 7_200_000_000_000,
+            destroy_if_idle_for: 14_400_000_000_000,
+          },
+        }));
+      }
       return jsonResponse(apiSandbox("sb-resource", { public_url: call === 1 ? "https://old.example.com" : "https://new.example.com" }));
     },
   });
@@ -83,6 +141,11 @@ test("sandbox resource methods refresh and resize data", async () => {
   await sandbox.resize({ cpu: 8, memoryMB: 8192 });
   assert.equal(sandbox.cpu, 8);
   assert.equal(sandbox.memoryMB, 8192);
+  await sandbox.updateLifecycle({ stopIfIdleFor: 7_200_000_000_000, destroyIfIdleFor: 14_400_000_000_000 });
+  assert.deepEqual(sandbox.lifecycle, {
+    stopIfIdleFor: 7_200_000_000_000,
+    destroyIfIdleFor: 14_400_000_000_000,
+  });
 });
 
 test("internal client decodes API errors", async () => {
@@ -199,6 +262,7 @@ function apiSandbox(id: string, overrides: Partial<Record<string, unknown>> = {}
     last_active_at: "2026-05-07T10:00:00Z",
     last_error: "",
     container_command: ["bash", "-lc", "echo hello"],
+    lifecycle: {},
     ...overrides,
   };
 }

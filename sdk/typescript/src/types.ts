@@ -26,6 +26,19 @@ export interface MountSpecRedacted {
   hasCredentials: boolean;
 }
 
+export interface Lifecycle {
+  /** Duration in integer nanoseconds. */
+  stopIfIdleFor?: number;
+  /** Duration in integer nanoseconds. */
+  destroyIfIdleFor?: number;
+  /** Duration in integer nanoseconds. */
+  stopAtAge?: number;
+  /** Duration in integer nanoseconds. */
+  destroyAtAge?: number;
+}
+
+export type UpdateLifecycleOptions = Lifecycle;
+
 export interface CreateOptions {
   image: string;
   /** Number of CPU cores to allocate. Fractional values are supported (e.g. 0.5 = half a core). */
@@ -38,6 +51,7 @@ export interface CreateOptions {
   registry?: RegistryAuth;
   containerCommand?: string[];
   mounts?: MountSpec[];
+  lifecycle?: Lifecycle;
 }
 
 export interface ResizeOptions {
@@ -106,6 +120,7 @@ export interface Sandbox {
   lastActiveAt: string;
   lastError?: string;
   containerCommand?: string[];
+  lifecycle: Lifecycle;
 }
 
 export interface ExecRequest {

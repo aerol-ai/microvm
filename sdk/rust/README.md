@@ -5,7 +5,7 @@ A Rust client for the Aerol.ai MicroVM sandbox API.
 ## Usage
 
 ```rust
-use microvm_sdk::{Client, CreateOptions};
+use microvm_sdk::{Client, CreateOptions, Lifecycle};
 
 let client = Client::new(Some("http://127.0.0.1:8080"), Some("your-pat-token"))?;
 let health = client.health()?;
@@ -22,10 +22,22 @@ let sandbox = client.create(CreateOptions {
 	registry: None,
 	container_command: None,
 	mounts: None,
+	lifecycle: Some(Lifecycle {
+		stop_if_idle_for: 3_600_000_000_000,
+		destroy_at_age: 86_400_000_000_000,
+		..Default::default()
+	}),
 })?;
 println!("ssh public key = {:?}", sandbox.data.ssh_public_key);
 println!("ssh private key = {:?}", sandbox.ssh_private_key); // only returned by create()
 println!("ssh gateway = {:?}", health.ssh_gateway);
+
+let mut sandbox = sandbox;
+sandbox.update_lifecycle(Lifecycle {
+	stop_if_idle_for: 7_200_000_000_000,
+	destroy_at_age: 172_800_000_000_000,
+	..Default::default()
+})?;
 ```
 
 ## Example

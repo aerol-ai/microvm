@@ -20,6 +20,7 @@ from .types import (
     ExecResult,
     ExecStreamOptions,
     HealthStatus,
+    Lifecycle,
     MountSpec,
     MountSpecRedacted,
     ResizeOptions,
@@ -320,6 +321,11 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
+    def update_lifecycle(self, lifecycle: Lifecycle) -> "Sandbox":
+        updated = self._client.update_lifecycle(self.id, lifecycle)
+        self._data = updated.to_dict()
+        return self
+
     @property
     def id(self) -> str:
         return str(self._data.get("id", ""))
@@ -366,6 +372,10 @@ class MicroVM:
 
     def resize(self, sandbox_id: str, options: ResizeOptions) -> Sandbox:
         sandbox = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options))
+        return self._wrap_sandbox(sandbox)
+
+    def update_lifecycle(self, sandbox_id: str, lifecycle: Lifecycle) -> Sandbox:
+        sandbox = self._do_json("PUT", f"/v1/sandboxes/{sandbox_id}/lifecycle", _to_api_lifecycle(lifecycle))
         return self._wrap_sandbox(sandbox)
 
     def health(self) -> HealthStatus:
@@ -556,6 +566,7 @@ def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
+    lifecycle = _first_of(options, "lifecycle")
     return _compact(
         {
             "image": _first_of(options, "image"),
@@ -568,6 +579,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "registry": _first_of(options, "registry"),
             "container_command": _first_of(options, "containerCommand", "container_command"),
             "mounts": [_to_api_mount_spec(item) for item in (_first_of(options, "mounts") or [])],
+            "lifecycle": _to_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else None,
         }
     )
 
@@ -617,6 +629,17 @@ def _to_api_create_session_options(options: CreateSessionOptions) -> Dict[str, A
             "pty": _first_of(options, "pty"),
             "cols": _first_of(options, "cols"),
             "rows": _first_of(options, "rows"),
+        }
+    )
+
+
+def _to_api_lifecycle(lifecycle: Lifecycle) -> Dict[str, Any]:
+    return _compact(
+        {
+            "stop_if_idle_for": _first_of(lifecycle, "stopIfIdleFor", "stop_if_idle_for"),
+            "destroy_if_idle_for": _first_of(lifecycle, "destroyIfIdleFor", "destroy_if_idle_for"),
+            "stop_at_age": _first_of(lifecycle, "stopAtAge", "stop_at_age"),
+            "destroy_at_age": _first_of(lifecycle, "destroyAtAge", "destroy_at_age"),
         }
     )
 
@@ -695,6 +718,7 @@ def _from_api_session(session: Dict[str, Any]) -> Session:
 
 def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     exposed_ports = _first_of(sandbox, "exposed_ports", "exposedPorts") or []
+    lifecycle = _first_of(sandbox, "lifecycle")
     result: SandboxData = {
         "id": str(_first_of(sandbox, "id") or ""),
         "image": str(_first_of(sandbox, "image") or ""),
@@ -710,6 +734,7 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
         "createdAt": str(_first_of(sandbox, "created_at", "createdAt") or ""),
         "updatedAt": str(_first_of(sandbox, "updated_at", "updatedAt") or ""),
         "lastActiveAt": str(_first_of(sandbox, "last_active_at", "lastActiveAt") or ""),
+        "lifecycle": _from_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else {},
     }
 
     container_id = _first_of(sandbox, "container_id", "containerID")
@@ -733,6 +758,28 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     container_command = _first_of(sandbox, "container_command", "containerCommand")
     if isinstance(container_command, list) and len(container_command) > 0:
         result["containerCommand"] = [str(item) for item in container_command]
+    return result
+
+
+def _from_api_lifecycle(lifecycle: Dict[str, Any]) -> Lifecycle:
+    result: Lifecycle = {}
+
+    stop_if_idle_for = _first_of(lifecycle, "stop_if_idle_for", "stopIfIdleFor")
+    if stop_if_idle_for is not None:
+        result["stopIfIdleFor"] = int(stop_if_idle_for)
+
+    destroy_if_idle_for = _first_of(lifecycle, "destroy_if_idle_for", "destroyIfIdleFor")
+    if destroy_if_idle_for is not None:
+        result["destroyIfIdleFor"] = int(destroy_if_idle_for)
+
+    stop_at_age = _first_of(lifecycle, "stop_at_age", "stopAtAge")
+    if stop_at_age is not None:
+        result["stopAtAge"] = int(stop_at_age)
+
+    destroy_at_age = _first_of(lifecycle, "destroy_at_age", "destroyAtAge")
+    if destroy_at_age is not None:
+        result["destroyAtAge"] = int(destroy_at_age)
+
     return result
 
 

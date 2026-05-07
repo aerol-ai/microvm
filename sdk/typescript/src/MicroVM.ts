@@ -6,6 +6,7 @@ import type {
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
+  Lifecycle,
   MountSpecRedacted,
   ResizeOptions,
   Sandbox as SandboxData,
@@ -79,6 +80,11 @@ export class MicroVM {
 
   async resize(id: string, options: ResizeOptions): Promise<Sandbox> {
     const sandbox = await this.client.resize(id, options);
+    return this.wrap(sandbox.toJSON());
+  }
+
+  async updateLifecycle(id: string, lifecycle: Lifecycle): Promise<Sandbox> {
+    const sandbox = await this.client.updateLifecycle(id, lifecycle);
     return this.wrap(sandbox.toJSON());
   }
 

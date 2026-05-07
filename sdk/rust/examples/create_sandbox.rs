@@ -22,6 +22,7 @@ fn main() {
             registry: None,
             container_command: None,
             mounts: None,
+            lifecycle: None,
         })
         .expect("sandbox creation failed");
 

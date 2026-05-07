@@ -31,6 +31,26 @@ class RecordingMicroVM(MicroVM):
                 "created_at": "2026-05-07T10:00:00Z",
                 "updated_at": "2026-05-07T10:00:00Z",
                 "last_active_at": "2026-05-07T10:00:00Z",
+                "lifecycle": payload.get("lifecycle", {}),
+            }
+        if method == "PUT" and path == "/v1/sandboxes/sb-1/lifecycle":
+            return {
+                "id": "sb-1",
+                "image": "ubuntu:22.04",
+                "status": "started",
+                "public_url": "https://sb-1.example.com",
+                "cpu": 2,
+                "memory_mb": 2048,
+                "disk_gb": 20,
+                "os_user": "root",
+                "network_block_all": True,
+                "toolbox_enabled": True,
+                "ssh_public_key": "ssh-ed25519 AAAA sandbox",
+                "exposed_ports": [],
+                "created_at": "2026-05-07T10:00:00Z",
+                "updated_at": "2026-05-07T11:00:00Z",
+                "last_active_at": "2026-05-07T10:30:00Z",
+                "lifecycle": payload,
             }
         if method == "GET" and path == "/v1/sandboxes/sb-1/mounts":
             return {
@@ -181,6 +201,10 @@ class ClientTests(unittest.TestCase):
                         "readOnly": True,
                     }
                 ],
+                "lifecycle": {
+                    "stopIfIdleFor": 3_600_000_000_000,
+                    "destroyAtAge": 86_400_000_000_000,
+                },
             }
         )
 
@@ -205,6 +229,10 @@ class ClientTests(unittest.TestCase):
                             "read_only": True,
                         }
                     ],
+                    "lifecycle": {
+                        "stop_if_idle_for": 3_600_000_000_000,
+                        "destroy_at_age": 86_400_000_000_000,
+                    },
                 },
             ),
         )
@@ -213,6 +241,68 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(sandbox.networkBlockAll)
         self.assertEqual(sandbox.sshPublicKey, "ssh-ed25519 AAAA sandbox")
         self.assertEqual(sandbox.sshPrivateKey, "PRIVATE")
+        self.assertEqual(
+            sandbox.lifecycle,
+            {
+                "stopIfIdleFor": 3_600_000_000_000,
+                "destroyAtAge": 86_400_000_000_000,
+            },
+        )
+
+    def test_update_lifecycle_maps_request_and_updates_sandbox_state(self):
+        client = RecordingMicroVM()
+
+        sandbox = client.create({"image": "ubuntu:22.04"})
+        updated = client.update_lifecycle(
+            "sb-1",
+            {
+                "stopIfIdleFor": 7_200_000_000_000,
+                "destroyAtAge": 172_800_000_000_000,
+            },
+        )
+        sandbox.update_lifecycle(
+            {
+                "stopIfIdleFor": 10_800_000_000_000,
+                "destroyIfIdleFor": 14_400_000_000_000,
+            }
+        )
+
+        self.assertEqual(
+            client.calls[1],
+            (
+                "PUT",
+                "/v1/sandboxes/sb-1/lifecycle",
+                {
+                    "stop_if_idle_for": 7_200_000_000_000,
+                    "destroy_at_age": 172_800_000_000_000,
+                },
+            ),
+        )
+        self.assertEqual(
+            client.calls[2],
+            (
+                "PUT",
+                "/v1/sandboxes/sb-1/lifecycle",
+                {
+                    "stop_if_idle_for": 10_800_000_000_000,
+                    "destroy_if_idle_for": 14_400_000_000_000,
+                },
+            ),
+        )
+        self.assertEqual(
+            updated.lifecycle,
+            {
+                "stopIfIdleFor": 7_200_000_000_000,
+                "destroyAtAge": 172_800_000_000_000,
+            },
+        )
+        self.assertEqual(
+            sandbox.lifecycle,
+            {
+                "stopIfIdleFor": 10_800_000_000_000,
+                "destroyIfIdleFor": 14_400_000_000_000,
+            },
+        )
 
     def test_exec_and_health_map_api_shapes(self):
         client = RecordingMicroVM()

@@ -22,6 +22,10 @@ print(health["sshGateway"])
 sandbox = client.create(
 	{
 		"image": "ghcr.io/aerol-ai/ubuntu:22.04",
+		"lifecycle": {
+			"stopIfIdleFor": 3_600_000_000_000,
+			"destroyAtAge": 86_400_000_000_000,
+		},
 		"mounts": [
 			{
 				"type": "s3",
@@ -35,6 +39,14 @@ sandbox = client.create(
 print(sandbox.sshPublicKey)
 print(sandbox.sshPrivateKey)  # only returned by create()
 print(client.mounts(sandbox.id))
+
+sandbox.update_lifecycle(
+	{
+		"stopIfIdleFor": 7_200_000_000_000,
+		"destroyAtAge": 172_800_000_000_000,
+	}
+)
+print(sandbox.lifecycle)
 ```
 
 ## Example

@@ -11,6 +11,7 @@ import type {
   ExecStreamOptions,
   ExposedPort,
   HealthStatus,
+  Lifecycle,
   MountSpec,
   MountSpecRedacted,
   ResizeOptions,
@@ -35,6 +36,13 @@ interface ApiExposedPort {
   created_at: string;
 }
 
+interface ApiLifecycle {
+  stop_if_idle_for?: number;
+  destroy_if_idle_for?: number;
+  stop_at_age?: number;
+  destroy_at_age?: number;
+}
+
 interface ApiSandbox {
   id: string;
   image: string;
@@ -56,6 +64,7 @@ interface ApiSandbox {
   last_active_at: string;
   last_error?: string;
   container_command?: string[];
+  lifecycle?: ApiLifecycle;
 }
 
 interface ApiCreateSandboxResponse extends ApiSandbox {
@@ -164,6 +173,11 @@ export class APIClient {
 
   async resize(id: string, options: ResizeOptions): Promise<SandboxResource> {
     const response = await this.doJSON<ApiSandbox>("POST", `/v1/sandboxes/${id}/resize`, toApiResizeOptions(options));
+    return this.wrap(response);
+  }
+
+  async updateLifecycle(id: string, lifecycle: Lifecycle): Promise<SandboxResource> {
+    const response = await this.doJSON<ApiSandbox>("PUT", `/v1/sandboxes/${id}/lifecycle`, toApiLifecycle(lifecycle));
     return this.wrap(response);
   }
 
@@ -319,6 +333,7 @@ export class SandboxResource implements Sandbox {
   declare lastActiveAt: string;
   declare lastError?: string;
   declare containerCommand?: string[];
+  declare lifecycle: Lifecycle;
 
   protected readonly client: APIClient;
 
@@ -415,6 +430,12 @@ export class SandboxResource implements Sandbox {
     return this;
   }
 
+  async updateLifecycle(lifecycle: Lifecycle): Promise<this> {
+    const updated = await this.client.updateLifecycle(this.id, lifecycle);
+    this.apply(updated.toJSON());
+    return this;
+  }
+
   toJSON(): Sandbox {
     return cloneSandbox(this);
   }
@@ -436,6 +457,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     registry: options.registry,
     container_command: options.containerCommand,
     mounts: options.mounts?.map(toApiMountSpec),
+    lifecycle: options.lifecycle ? toApiLifecycle(options.lifecycle) : undefined,
   };
 }
 
@@ -469,6 +491,15 @@ function toApiCreateSessionOptions(options: CreateSessionOptions): Record<string
   };
 }
 
+function toApiLifecycle(lifecycle: Lifecycle): ApiLifecycle {
+  return {
+    stop_if_idle_for: lifecycle.stopIfIdleFor,
+    destroy_if_idle_for: lifecycle.destroyIfIdleFor,
+    stop_at_age: lifecycle.stopAtAge,
+    destroy_at_age: lifecycle.destroyAtAge,
+  };
+}
+
 function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
   return {
     id: sandbox.id,
@@ -491,6 +522,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     lastActiveAt: sandbox.last_active_at,
     lastError: sandbox.last_error,
     containerCommand: sandbox.container_command,
+    lifecycle: fromApiLifecycle(sandbox.lifecycle),
   };
 }
 
@@ -571,12 +603,30 @@ function fromApiMountSpecRedacted(mount: ApiMountSpecRedacted): MountSpecRedacte
   };
 }
 
+function fromApiLifecycle(lifecycle?: ApiLifecycle): Lifecycle {
+  const result: Lifecycle = {};
+  if (lifecycle?.stop_if_idle_for !== undefined) {
+    result.stopIfIdleFor = lifecycle.stop_if_idle_for;
+  }
+  if (lifecycle?.destroy_if_idle_for !== undefined) {
+    result.destroyIfIdleFor = lifecycle.destroy_if_idle_for;
+  }
+  if (lifecycle?.stop_at_age !== undefined) {
+    result.stopAtAge = lifecycle.stop_at_age;
+  }
+  if (lifecycle?.destroy_at_age !== undefined) {
+    result.destroyAtAge = lifecycle.destroy_at_age;
+  }
+  return result;
+}
+
 function cloneSandbox(sandbox: Sandbox): Sandbox {
   return {
     ...sandbox,
     env: sandbox.env ? { ...sandbox.env } : undefined,
     exposedPorts: sandbox.exposedPorts?.map((port) => ({ ...port })),
     containerCommand: sandbox.containerCommand ? [...sandbox.containerCommand] : undefined,
+    lifecycle: { ...sandbox.lifecycle },
   };
 }
 
