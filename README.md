@@ -31,6 +31,27 @@ Artifacts:
 - `bin/sandboxd`
 - `bin/toolboxd`
 
+## Releases
+
+Pushing a tag that starts with `v` triggers the GitHub Actions release workflow in `.github/workflows/release.yml`.
+
+The workflow publishes these release assets:
+
+- `sandboxd_linux_amd64`
+- `toolboxd_linux_amd64`
+- `sandboxd_linux_arm64`
+- `toolboxd_linux_arm64`
+- `install-sandbox.sh`
+- `checksums.txt`
+
+The intended install path is:
+
+```bash
+curl -fsSL https://app.aerol.ai/install-sandbox.sh | sudo bash -s -- --domain sandbox.example.com
+```
+
+The installer defaults to downloading the latest GitHub release from `aerolai/sandbox-library`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
+
 ## Run locally
 
 Required services:

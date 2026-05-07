@@ -7,8 +7,11 @@ PUBLIC_HOST=""
 API_TOKEN=""
 INSTALL_PREFIX="/usr/local/bin"
 BUILD_FROM_SOURCE="auto"
+GITHUB_REPO="aerolai/sandbox-library"
+VERSION="latest"
 SANDBOXD_URL=""
 TOOLBOXD_URL=""
+CHECKSUMS_URL=""
 IDLE_TIMEOUT_MIN="0"
 
 usage() {
@@ -19,17 +22,97 @@ Options:
   --domain <domain>            Base domain for wildcard sandbox routes
   --public-host <host-or-ip>   Public host used for IP mode or local URLs
   --token <token>              API token for sandboxd
+  --github-repo <owner/repo>   GitHub repo used for release downloads
+  --version <tag|latest>       Release tag to install (default: latest)
   --sandboxd-url <url>         Download URL for sandboxd binary
   --toolboxd-url <url>         Download URL for toolboxd binary
+  --checksums-url <url>        Download URL for release checksums file
   --install-prefix <dir>       Binary install directory (default: /usr/local/bin)
   --idle-timeout-min <minutes> Idle auto-stop timeout in minutes
   --build-from-source          Build binaries from the current checkout
   --help                       Show this help
 
 Examples:
-  ./scripts/install.sh --domain sandbox.example.com --token dev-token
+  curl -fsSL https://app.aerol.ai/install-sandbox.sh | sudo bash -s -- --domain sandbox.example.com
+  ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
   ./scripts/install.sh --public-host 203.0.113.42 --token dev-token --build-from-source
 EOF
+}
+
+detect_platform() {
+	local os
+	local arch
+
+	os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	if [[ "$os" != "linux" ]]; then
+		echo "Only Linux hosts are supported by this installer" >&2
+		exit 1
+	fi
+
+	case "$(uname -m)" in
+		x86_64|amd64)
+			arch="amd64"
+			;;
+		aarch64|arm64)
+			arch="arm64"
+			;;
+		*)
+			echo "Unsupported architecture: $(uname -m)" >&2
+			exit 1
+			;;
+	esac
+
+	echo "${os}_${arch}"
+}
+
+resolve_release_urls() {
+	local platform
+	local release_base
+
+	platform="$(detect_platform)"
+	release_base="https://github.com/${GITHUB_REPO}/releases"
+
+	if [[ "$VERSION" == "latest" ]]; then
+		SANDBOXD_URL="${SANDBOXD_URL:-${release_base}/latest/download/sandboxd_${platform}}"
+		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/latest/download/toolboxd_${platform}}"
+		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/latest/download/checksums.txt}"
+	else
+		SANDBOXD_URL="${SANDBOXD_URL:-${release_base}/download/${VERSION}/sandboxd_${platform}}"
+		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/download/${VERSION}/toolboxd_${platform}}"
+		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
+	fi
+}
+
+download_asset() {
+	local url="$1"
+	local output="$2"
+
+	curl -fL --retry 5 --retry-delay 2 --retry-connrefused "$url" -o "$output"
+}
+
+verify_downloads() {
+	local tmp_dir="$1"
+	local sandboxd_asset="$2"
+	local toolboxd_asset="$3"
+
+	if [[ -z "$CHECKSUMS_URL" ]]; then
+		return 0
+	fi
+
+	if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
+		echo "Warning: failed to download checksums; skipping verification" >&2
+		return 0
+	fi
+
+	(
+		cd "$tmp_dir"
+		grep -E "[[:space:]](${sandboxd_asset}|${toolboxd_asset})$" checksums.txt > selected-checksums.txt || true
+		if [[ ! -s selected-checksums.txt ]]; then
+			echo "Warning: no checksum entries found for downloaded assets; skipping verification" >&2
+			exit 0
+		fi
+		sha256sum -c selected-checksums.txt
+	)
 }
 
 while [[ $# -gt 0 ]]; do
@@ -46,6 +129,14 @@ while [[ $# -gt 0 ]]; do
 			API_TOKEN="$2"
 			shift 2
 			;;
+		--github-repo)
+			GITHUB_REPO="$2"
+			shift 2
+			;;
+		--version)
+			VERSION="$2"
+			shift 2
+			;;
 		--sandboxd-url)
 			SANDBOXD_URL="$2"
 			BUILD_FROM_SOURCE="false"
@@ -53,6 +144,11 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--toolboxd-url)
 			TOOLBOXD_URL="$2"
+			BUILD_FROM_SOURCE="false"
+			shift 2
+			;;
+		--checksums-url)
+			CHECKSUMS_URL="$2"
 			BUILD_FROM_SOURCE="false"
 			shift 2
 			;;
@@ -103,8 +199,9 @@ if [[ "$BUILD_FROM_SOURCE" == "auto" ]]; then
 fi
 
 if [[ "$BUILD_FROM_SOURCE" != "true" ]]; then
+	resolve_release_urls
 	if [[ -z "$SANDBOXD_URL" || -z "$TOOLBOXD_URL" ]]; then
-		echo "download mode requires both --sandboxd-url and --toolboxd-url" >&2
+		echo "download mode requires release asset URLs or a valid --github-repo/--version combination" >&2
 		exit 1
 	fi
 fi
@@ -145,9 +242,21 @@ install_binaries() {
 		install -m 0755 ./bin/sandboxd "$INSTALL_PREFIX/sandboxd"
 		install -m 0755 ./bin/toolboxd "$INSTALL_PREFIX/toolboxd"
 	else
-		curl -fsSL "$SANDBOXD_URL" -o "$INSTALL_PREFIX/sandboxd"
-		curl -fsSL "$TOOLBOXD_URL" -o "$INSTALL_PREFIX/toolboxd"
-		chmod 0755 "$INSTALL_PREFIX/sandboxd" "$INSTALL_PREFIX/toolboxd"
+		local tmp_dir
+		local sandboxd_asset
+		local toolboxd_asset
+
+		tmp_dir="$(mktemp -d)"
+		sandboxd_asset="$(basename "${SANDBOXD_URL%%\?*}")"
+		toolboxd_asset="$(basename "${TOOLBOXD_URL%%\?*}")"
+
+		download_asset "$SANDBOXD_URL" "$tmp_dir/$sandboxd_asset"
+		download_asset "$TOOLBOXD_URL" "$tmp_dir/$toolboxd_asset"
+		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset"
+
+		install -m 0755 "$tmp_dir/$sandboxd_asset" "$INSTALL_PREFIX/sandboxd"
+		install -m 0755 "$tmp_dir/$toolboxd_asset" "$INSTALL_PREFIX/toolboxd"
+		rm -rf "$tmp_dir"
 	fi
 }
 

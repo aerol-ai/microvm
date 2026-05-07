@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.ref_name }}
+      LDFLAGS: -X github.com/aerolai/sandbox-library/internal/version.Version=${{ github.ref_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          build_binary() {
+            local binary="$1"
+            local arch="$2"
+            local cgo_enabled="$3"
+            local cc="$4"
+            local output="dist/${binary}_linux_${arch}"
+
+            if [[ "$cgo_enabled" == "1" ]]; then
+              CGO_ENABLED=1 GOOS=linux GOARCH="$arch" CC="$cc" \
+                go build -trimpath -ldflags "$LDFLAGS" -o "$output" "./cmd/${binary}"
+            else
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+                go build -trimpath -ldflags "$LDFLAGS" -o "$output" "./cmd/${binary}"
+            fi
+
+            chmod 0755 "$output"
+          }
+
+          build_binary sandboxd amd64 1 gcc
+          build_binary toolboxd amd64 0 gcc
+          build_binary sandboxd arm64 1 aarch64-linux-gnu-gcc
+          build_binary toolboxd arm64 0 gcc
+
+          cp scripts/install.sh dist/install-sandbox.sh
+          chmod 0755 dist/install-sandbox.sh
+
+          (
+            cd dist
+            sha256sum \
+              sandboxd_linux_amd64 \
+              toolboxd_linux_amd64 \
+              sandboxd_linux_arm64 \
+              toolboxd_linux_arm64 \
+              install-sandbox.sh \
+              > checksums.txt
+          )
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/sandboxd_linux_amd64
+            dist/toolboxd_linux_amd64
+            dist/sandboxd_linux_arm64
+            dist/toolboxd_linux_arm64
+            dist/install-sandbox.sh
+            dist/checksums.txt
