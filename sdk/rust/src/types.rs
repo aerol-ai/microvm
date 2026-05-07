@@ -132,3 +132,61 @@ pub struct ExecExitInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CreateSessionOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
+    pub work_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStatus {
+    Running,
+    Exited,
+    Killed,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub id: String,
+    pub name: String,
+    pub argv: Vec<String>,
+    #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
+    pub work_dir: Option<String>,
+    pub pty: bool,
+    pub status: SessionStatus,
+    #[serde(rename = "exit_code")]
+    pub exit_code: i32,
+    #[serde(rename = "exit_signal", skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<String>,
+    #[serde(rename = "created_at")]
+    pub created_at: String,
+    #[serde(rename = "started_at")]
+    pub started_at: String,
+    #[serde(rename = "exited_at", skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<String>,
+    pub recording: bool,
+    pub bytes: i64,
+    pub attached: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionList {
+    pub sessions: Vec<Session>,
+}

@@ -50,3 +50,33 @@ handle.write_string("echo hello\n")?;
 let result = handle.wait()?;
 println!("{:?}", result);
 ```
+
+## Sessions
+
+```rust
+use std::sync::Arc;
+
+let session = sandbox.create_session(microvm_sdk::CreateSessionOptions {
+	name: Some("shell".to_string()),
+	command: Some("bash".to_string()),
+	work_dir: Some("/workspace".to_string()),
+	pty: Some(true),
+	cols: Some(120),
+	rows: Some(40),
+	..Default::default()
+})?;
+
+println!("session = {:?}", session);
+println!("sessions = {:?}", sandbox.list_sessions()?);
+println!("log = {}", String::from_utf8_lossy(&sandbox.session_log(&session.id)?));
+
+let handle = sandbox.attach_session(&session.id, microvm_sdk::SessionAttachOptions {
+	cols: Some(120),
+	rows: Some(40),
+	on_stdout: Some(Arc::new(|chunk| print!("{}", String::from_utf8_lossy(&chunk)))),
+	..Default::default()
+})?;
+
+handle.write_string("echo attached\n")?;
+println!("{:?}", handle.wait()?);
+```
