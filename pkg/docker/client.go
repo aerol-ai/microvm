@@ -133,10 +133,16 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (*
 		managedLabelKey: "true",
 	}
 
+	userCommand := req.ContainerCommand
+	if len(userCommand) == 0 {
+		userCommand = append(append([]string{}, imageInspect.Config.Entrypoint...), imageInspect.Config.Cmd...)
+	}
+
 	createRequest := map[string]any{
 		"Image":      req.Image,
 		"WorkingDir": workingDir,
 		"Entrypoint": []string{c.toolboxMountPath},
+		"Cmd":        userCommand,
 		"Env":        envValues,
 		"Labels":     labels,
 	}
@@ -473,7 +479,9 @@ func containerStatus(inspect containerInspect) models.SandboxStatus {
 
 type imageInspect struct {
 	Config struct {
-		WorkingDir string `json:"WorkingDir"`
+		WorkingDir string   `json:"WorkingDir"`
+		Entrypoint []string `json:"Entrypoint"`
+		Cmd        []string `json:"Cmd"`
 	} `json:"Config"`
 }
 

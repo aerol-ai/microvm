@@ -14,14 +14,18 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+var userCommandPID int
 
 type server struct {
 	logger    *slog.Logger
@@ -40,6 +44,12 @@ func main() {
 		port:      envInt("SB_TOOLBOX_PORT", 2280),
 	}
 
+	startReaper(logger)
+
+	if len(os.Args) > 1 {
+		startUserCommand(logger, os.Args[1:])
+	}
+
 	addr := fmt.Sprintf(":%d", srv.port)
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -52,6 +62,46 @@ func main() {
 		logger.Error("toolboxd failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+func startUserCommand(logger *slog.Logger, args []string) {
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	if err := cmd.Start(); err != nil {
+		logger.Error("failed to start user command", "args", args, "error", err)
+		return
+	}
+	userCommandPID = cmd.Process.Pid
+	if err := cmd.Process.Release(); err != nil {
+		logger.Warn("failed to release user command handle", "error", err)
+	}
+	logger.Info("user command started", "pid", userCommandPID, "args", args)
+}
+
+func startReaper(logger *slog.Logger) {
+	sigs := make(chan os.Signal, 16)
+	signal.Notify(sigs, syscall.SIGCHLD)
+	go func() {
+		for range sigs {
+			for {
+				var status syscall.WaitStatus
+				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
+				if pid <= 0 || err != nil {
+					break
+				}
+				switch {
+				case pid == userCommandPID && status.Exited():
+					logger.Info("user command exited", "pid", pid, "code", status.ExitStatus())
+				case pid == userCommandPID && status.Signaled():
+					logger.Info("user command killed", "pid", pid, "signal", status.Signal())
+				default:
+					logger.Debug("reaped orphan", "pid", pid)
+				}
+			}
+		}
+	}()
 }
 
 func (s *server) routes() http.Handler {
