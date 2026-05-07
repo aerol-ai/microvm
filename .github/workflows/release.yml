@@ -92,9 +92,7 @@ jobs:
           build_binary sandboxd arm64 1 aarch64-linux-gnu-gcc
           build_binary toolboxd arm64 0 gcc
 
-          cp scripts/install.sh dist/install-sandbox.sh
           cp scripts/install.sh dist/install.sh
-          chmod 0755 dist/install-sandbox.sh
           chmod 0755 dist/install.sh
 
           (
@@ -105,7 +103,6 @@ jobs:
               sandboxd_linux_arm64 \
               toolboxd_linux_arm64 \
               install.sh \
-              install-sandbox.sh \
               > checksums.txt
           )
 
@@ -120,5 +117,4 @@ jobs:
             dist/sandboxd_linux_arm64
             dist/toolboxd_linux_arm64
             dist/install.sh
-            dist/install-sandbox.sh
             dist/checksums.txt

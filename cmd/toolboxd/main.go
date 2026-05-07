@@ -99,15 +99,12 @@ func (s *server) stripSandboxPrefix(r *http.Request) *http.Request {
 func readSandboxID() string {
 	hostname, err := os.Hostname()
 	if err != nil {
-		hostname = ""
+		return ""
 	}
-	return resolveSandboxID(os.Getenv("SB_SANDBOX_ID"), hostname)
+	return normalizeSandboxID(hostname)
 }
 
-func resolveSandboxID(envValue, hostname string) string {
-	if value := strings.TrimSpace(envValue); value != "" {
-		return value
-	}
+func normalizeSandboxID(hostname string) string {
 	return strings.TrimSpace(hostname)
 }
 

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -277,10 +276,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 
 	for _, sandbox := range known {
-		runtime, ok := managed.BySandboxID[sandbox.ID]
-		if !ok && sandbox.ContainerID != "" {
-			runtime, ok = managed.ByContainerID[sandbox.ContainerID]
-		}
+		runtime, ok := managed[sandbox.ID]
 		if !ok {
 			sandbox.Status = models.SandboxStatusDestroyed
 			sandbox.ContainerIP = ""
@@ -383,8 +379,5 @@ func sandboxContainerRef(sandbox *models.Sandbox) string {
 	if sandbox == nil {
 		return ""
 	}
-	if containerID := strings.TrimSpace(sandbox.ContainerID); containerID != "" {
-		return containerID
-	}
-	return sandbox.ID
+	return sandbox.ContainerID
 }

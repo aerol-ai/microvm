@@ -2,22 +2,20 @@ package main
 
 import "testing"
 
-func TestResolveSandboxIDCases(t *testing.T) {
+func TestNormalizeSandboxIDCases(t *testing.T) {
 	tests := []struct {
 		name     string
-		envValue string
 		hostname string
 		want     string
 	}{
-		{name: "env_value_wins", envValue: "manual-id", hostname: "host-id", want: "manual-id"},
-		{name: "hostname_fallback", envValue: "", hostname: "7f3c2a1b9d4e", want: "7f3c2a1b9d4e"},
-		{name: "blank_returns_empty", envValue: "", hostname: "", want: ""},
+		{name: "uses_trimmed_hostname", hostname: " 7f3c2a1b9d4e ", want: "7f3c2a1b9d4e"},
+		{name: "blank_returns_empty", hostname: "", want: ""},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveSandboxID(tc.envValue, tc.hostname); got != tc.want {
-				t.Fatalf("resolveSandboxID(%q, %q) = %q, want %q", tc.envValue, tc.hostname, got, tc.want)
+			if got := normalizeSandboxID(tc.hostname); got != tc.want {
+				t.Fatalf("normalizeSandboxID(%q) = %q, want %q", tc.hostname, got, tc.want)
 			}
 		})
 	}

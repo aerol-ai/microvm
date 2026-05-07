@@ -24,7 +24,6 @@ import (
 )
 
 const managedLabelKey = "sandbox-library.managed"
-const sandboxIDLabelKey = "sandbox-library.id"
 const sandboxIDLength = 12
 
 type SandboxRuntime struct {
@@ -32,11 +31,6 @@ type SandboxRuntime struct {
 	ContainerID string
 	ContainerIP string
 	Status      models.SandboxStatus
-}
-
-type ManagedSandboxes struct {
-	BySandboxID   map[string]*SandboxRuntime
-	ByContainerID map[string]*SandboxRuntime
 }
 
 type Client struct {
@@ -228,7 +222,7 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	}
 	containerRef := strings.TrimSpace(sandbox.ContainerID)
 	if containerRef == "" {
-		containerRef = sandbox.ID
+		return errors.New("sandbox container ID is not available")
 	}
 	return c.removeContainer(ctx, containerRef, true)
 }
@@ -267,7 +261,7 @@ func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRunt
 	}, nil
 }
 
-func (c *Client) ListManaged(ctx context.Context) (*ManagedSandboxes, error) {
+func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, error) {
 	query := queryValues(map[string]string{"all": "1"})
 	var containers []containerSummary
 	err := c.doJSON(ctx, http.MethodGet, "/containers/json", query, nil, nil, &containers)
@@ -275,10 +269,7 @@ func (c *Client) ListManaged(ctx context.Context) (*ManagedSandboxes, error) {
 		return nil, fmt.Errorf("list managed containers: %w", err)
 	}
 
-	result := &ManagedSandboxes{
-		BySandboxID:   make(map[string]*SandboxRuntime, len(containers)),
-		ByContainerID: make(map[string]*SandboxRuntime, len(containers)),
-	}
+	result := make(map[string]*SandboxRuntime, len(containers))
 	for _, summary := range containers {
 		if summary.Labels[managedLabelKey] != "true" {
 			continue
@@ -293,12 +284,8 @@ func (c *Client) ListManaged(ctx context.Context) (*ManagedSandboxes, error) {
 			ContainerIP: getContainerIP(inspect, c.network),
 			Status:      containerStatus(inspect),
 		}
-		result.ByContainerID[runtime.ContainerID] = runtime
 		if runtime.SandboxID != "" {
-			result.BySandboxID[runtime.SandboxID] = runtime
-		}
-		if legacyID := strings.TrimSpace(summary.Labels[sandboxIDLabelKey]); legacyID != "" {
-			result.BySandboxID[legacyID] = runtime
+			result[runtime.SandboxID] = runtime
 		}
 	}
 

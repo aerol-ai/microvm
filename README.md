@@ -42,7 +42,6 @@ The workflow publishes these release assets:
 - `sandboxd_linux_arm64`
 - `toolboxd_linux_arm64`
 - `install.sh`
-- `install-sandbox.sh`
 - `checksums.txt`
 
 The assets are downloadable directly from the latest published release:
@@ -63,8 +62,6 @@ https://github.com/aerol-ai/microvm/releases/latest/download/checksums.txt
 ```
 
 Only Linux amd64 and arm64 binaries are published today, because the host installer and runtime are Linux-only.
-
-`app.aerol.ai/install-sandbox.sh` is not created by this repository. If you want that URL, it must be hosted or redirected separately to the GitHub release asset above.
 
 The installer defaults to downloading the latest GitHub release from `aerol-ai/microvm`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
 
