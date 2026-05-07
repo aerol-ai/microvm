@@ -293,7 +293,16 @@ write_caddyfile() {
 	}
 }
 
-$DOMAIN, *.$DOMAIN {
+$DOMAIN {
+	tls {
+		on_demand
+	}
+	@api path /health /v1 /v1/*
+	reverse_proxy @api 127.0.0.1:8080
+	respond "Sandbox API not found" 404
+}
+
+*.$DOMAIN {
 	tls {
 		on_demand
 	}
@@ -410,8 +419,12 @@ echo "sandbox-library installed"
 echo "PAT token: $PAT_TOKEN"
 echo "Use header: Authorization: Bearer <PAT token>"
 if [[ -n "$DOMAIN" ]]; then
+	echo "API URL: https://$DOMAIN"
+	echo "Health URL: https://$DOMAIN/health"
 	echo "Public sandbox URL pattern: https://<docker-short-id>.$DOMAIN"
 else
+	echo "API URL: http://$PUBLIC_HOST:8080"
+	echo "Health URL: http://$PUBLIC_HOST:8080/health"
 	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<docker-short-id>/"
 fi
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"

@@ -92,6 +92,13 @@ Examples:
 
 Both `sandbox.aerol.ai` and `aerol.ai` work with the current codebase. No code change is required for either shape.
 
+When domain mode is enabled, the root domain also serves the control-plane API:
+
+- `https://<domain>/health`
+- `https://<domain>/v1/...`
+
+That means an install with `--domain sandbox.aerol.ai` creates sandboxes through `https://sandbox.aerol.ai/v1/sandboxes`, and each created sandbox receives its own public URL like `https://<docker-short-id>.sandbox.aerol.ai`.
+
 Required DNS records:
 
 - `A sandbox.aerol.ai -> <server-ip>`
@@ -180,7 +187,7 @@ TypeScript:
 import { MicroVM } from "@aerol-ai/microvm-sdk";
 
 const client = new MicroVM({
-	apiUrl: "https://sandbox-api.example.com",
+	apiUrl: "https://sandbox.example.com",
 	patToken: process.env.SB_PAT_TOKEN,
 });
 ```

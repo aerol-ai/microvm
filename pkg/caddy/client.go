@@ -76,10 +76,6 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 	}
 
 	routeID := sandboxRouteID(id)
-	if err := c.deleteByID(ctx, routeID); err != nil {
-		return err
-	}
-
 	route := map[string]any{
 		"@id": routeID,
 		"handle": []map[string]any{{
@@ -97,14 +93,14 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 		route["match"] = []map[string]any{{"path": []string{fmt.Sprintf("/%s", id), fmt.Sprintf("/%s/*", id)}}}
 	}
 
-	return c.appendRoute(ctx, route)
+	return c.upsertRoute(ctx, routeID, route)
 }
 
 func (c *Client) DeleteSandboxRoute(ctx context.Context, id string) error {
 	if !c.enabled {
 		return nil
 	}
-	return c.deleteByID(ctx, sandboxRouteID(id))
+	return c.deleteRoute(ctx, sandboxRouteID(id))
 }
 
 func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, port int) error {
@@ -113,10 +109,6 @@ func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, po
 	}
 
 	routeID := portRouteID(id, port)
-	if err := c.deleteByID(ctx, routeID); err != nil {
-		return err
-	}
-
 	route := map[string]any{
 		"@id":   routeID,
 		"match": []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}},
@@ -129,14 +121,14 @@ func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, po
 		"terminal": true,
 	}
 
-	return c.appendRoute(ctx, route)
+	return c.upsertRoute(ctx, routeID, route)
 }
 
 func (c *Client) DeletePortRoute(ctx context.Context, id string, port int) error {
 	if !c.enabled || c.domain == "" {
 		return nil
 	}
-	return c.deleteByID(ctx, portRouteID(id, port))
+	return c.deleteRoute(ctx, portRouteID(id, port))
 }
 
 func (c *Client) AllowTLSDomain(host string) bool {
@@ -147,14 +139,63 @@ func (c *Client) AllowTLSDomain(host string) bool {
 	return host == c.domain || strings.HasSuffix(host, "."+c.domain)
 }
 
-func (c *Client) appendRoute(ctx context.Context, route map[string]any) error {
-	body, err := json.Marshal(route)
+func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[string]any) error {
+	routes, err := c.loadRoutes(ctx)
 	if err != nil {
-		return fmt.Errorf("marshal route: %w", err)
+		return err
+	}
+
+	filtered := filterRoutesByID(routes, routeID)
+	updated := make([]map[string]any, 0, len(filtered)+1)
+	updated = append(updated, route)
+	updated = append(updated, filtered...)
+	return c.saveRoutes(ctx, updated)
+}
+
+func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
+	routes, err := c.loadRoutes(ctx)
+	if err != nil {
+		return err
+	}
+
+	updated := filterRoutesByID(routes, routeID)
+	if len(updated) == len(routes) {
+		return nil
+	}
+	return c.saveRoutes(ctx, updated)
+}
+
+func (c *Client) loadRoutes(ctx context.Context) ([]map[string]any, error) {
+	target := fmt.Sprintf("%s/config/apps/http/servers/%s/routes", c.baseURL, url.PathEscape(c.serverID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("load caddy routes: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("load caddy routes failed: %d", resp.StatusCode)
+	}
+
+	var routes []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
+		return nil, fmt.Errorf("decode caddy routes: %w", err)
+	}
+	return routes, nil
+}
+
+func (c *Client) saveRoutes(ctx context.Context, routes []map[string]any) error {
+	body, err := json.Marshal(routes)
+	if err != nil {
+		return fmt.Errorf("marshal caddy routes: %w", err)
 	}
 
 	target := fmt.Sprintf("%s/config/apps/http/servers/%s/routes", c.baseURL, url.PathEscape(c.serverID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -162,34 +203,24 @@ func (c *Client) appendRoute(ctx context.Context, route map[string]any) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("append caddy route: %w", err)
+		return fmt.Errorf("save caddy routes: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("append caddy route failed: %d", resp.StatusCode)
+		return fmt.Errorf("save caddy routes failed: %d", resp.StatusCode)
 	}
 	return nil
 }
 
-func (c *Client) deleteByID(ctx context.Context, routeID string) error {
-	target := fmt.Sprintf("%s/id/%s", c.baseURL, url.PathEscape(routeID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target, nil)
-	if err != nil {
-		return err
+func filterRoutesByID(routes []map[string]any, routeID string) []map[string]any {
+	filtered := make([]map[string]any, 0, len(routes))
+	for _, route := range routes {
+		if currentID, _ := route["@id"].(string); currentID == routeID {
+			continue
+		}
+		filtered = append(filtered, route)
 	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("delete caddy route: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil
-	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("delete caddy route failed: %d", resp.StatusCode)
-	}
-	return nil
+	return filtered
 }
 
 func sandboxRouteID(id string) string {
