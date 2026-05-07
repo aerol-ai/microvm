@@ -24,6 +24,36 @@ export interface ResizeOptions {
   diskGB?: number;
 }
 
+export interface CreateSessionOptions {
+  name?: string;
+  argv?: string[];
+  command?: string;
+  workDir?: string;
+  env?: Record<string, string>;
+  pty?: boolean;
+  cols?: number;
+  rows?: number;
+}
+
+export type SessionStatus = "running" | "exited" | "killed" | "failed";
+
+export interface Session {
+  id: string;
+  name: string;
+  argv: string[];
+  workDir?: string;
+  pty: boolean;
+  status: SessionStatus;
+  exitCode: number;
+  exitSignal?: string;
+  createdAt: string;
+  startedAt: string;
+  exitedAt?: string;
+  recording: boolean;
+  bytes: number;
+  attached: number;
+}
+
 export interface ExposedPort {
   sandboxID: string;
   port: number;
@@ -96,6 +126,28 @@ export interface ExecStreamHandle {
   /** Close stdin and gracefully end the stream. The process keeps running until it exits on its own. */
   close(): void;
   /** Resolves when the process exits, with its final exit code/signal. */
+  done: Promise<ExecExitInfo>;
+}
+
+export interface SessionAttachOptions {
+  onStdout?: (chunk: Uint8Array) => void;
+  onStderr?: (chunk: Uint8Array) => void;
+  onExit?: (info: ExecExitInfo) => void;
+  onError?: (message: string) => void;
+  cols?: number;
+  rows?: number;
+}
+
+export interface SessionAttachHandle {
+  /** Send raw stdin bytes (or a UTF-8 string) to the attached session. */
+  write(data: Uint8Array | string): void;
+  /** PTY sessions only — tell the session its terminal size has changed. */
+  resize(cols: number, rows: number): void;
+  /** Send a signal (e.g. "INT", "TERM", "KILL") to the session process group. */
+  signal(name: string): void;
+  /** Detach from the live stream without killing the session. */
+  close(): void;
+  /** Resolves when the session exits, or rejects if the attach stream drops first. */
   done: Promise<ExecExitInfo>;
 }
 

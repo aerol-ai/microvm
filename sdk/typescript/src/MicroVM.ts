@@ -1,6 +1,15 @@
 import { APIClient } from "./internal/client.js";
 import { Sandbox } from "./Sandbox.js";
-import type { CreateOptions, HealthStatus, ResizeOptions, Sandbox as SandboxData } from "./types.js";
+import type {
+  CreateOptions,
+  CreateSessionOptions,
+  HealthStatus,
+  ResizeOptions,
+  Sandbox as SandboxData,
+  Session,
+  SessionAttachHandle,
+  SessionAttachOptions,
+} from "./types.js";
 
 const defaultAPIURL = "http://127.0.0.1:8080";
 const authRequiredErrorMessage = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
@@ -72,6 +81,42 @@ export class MicroVM {
 
   async health(): Promise<HealthStatus> {
     return this.client.health();
+  }
+
+  async createSession(sandboxID: string, options: CreateSessionOptions): Promise<Session> {
+    return this.client.createSession(sandboxID, options);
+  }
+
+  async listSessions(sandboxID: string): Promise<Session[]> {
+    return this.client.listSessions(sandboxID);
+  }
+
+  async getSession(sandboxID: string, sessionID: string): Promise<Session> {
+    return this.client.getSession(sandboxID, sessionID);
+  }
+
+  async deleteSession(sandboxID: string, sessionID: string): Promise<void> {
+    await this.client.deleteSession(sandboxID, sessionID);
+  }
+
+  async signalSession(sandboxID: string, sessionID: string, signal: string): Promise<void> {
+    await this.client.signalSession(sandboxID, sessionID, signal);
+  }
+
+  async resizeSession(sandboxID: string, sessionID: string, cols: number, rows: number): Promise<void> {
+    await this.client.resizeSession(sandboxID, sessionID, cols, rows);
+  }
+
+  async sessionLog(sandboxID: string, sessionID: string): Promise<Uint8Array> {
+    return this.client.sessionLog(sandboxID, sessionID);
+  }
+
+  async sessionRecording(sandboxID: string, sessionID: string): Promise<Uint8Array> {
+    return this.client.sessionRecording(sandboxID, sessionID);
+  }
+
+  attachSession(sandboxID: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
+    return this.client.attachSession(sandboxID, sessionID, options);
   }
 
   private wrap(sandbox: SandboxData): Sandbox {

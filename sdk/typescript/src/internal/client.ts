@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import type {
   BinaryLike,
   CreateOptions,
+  CreateSessionOptions,
   ExecExitInfo,
   ExecRequest,
   ExecResult,
@@ -12,6 +13,9 @@ import type {
   HealthStatus,
   ResizeOptions,
   Sandbox,
+  Session,
+  SessionAttachHandle,
+  SessionAttachOptions,
 } from "../types.js";
 
 type FetchLike = typeof fetch;
@@ -54,6 +58,27 @@ interface ApiSandbox {
 
 interface ApiCreateSandboxResponse extends ApiSandbox {
   ssh_private_key?: string;
+}
+
+interface ApiSession {
+  id: string;
+  name: string;
+  argv: string[];
+  workdir?: string;
+  pty: boolean;
+  status: Session["status"];
+  exit_code: number;
+  exit_signal?: string;
+  created_at: string;
+  started_at: string;
+  exited_at?: string;
+  recording: boolean;
+  bytes: number;
+  attached: number;
+}
+
+interface ApiSessionList {
+  sessions: ApiSession[];
 }
 
 interface ApiExecResult {
@@ -126,6 +151,45 @@ export class APIClient {
     return openExecStream(this.baseURL, this.patToken, id, options);
   }
 
+  async createSession(id: string, options: CreateSessionOptions): Promise<Session> {
+    const response = await this.doJSON<ApiSession>("POST", `/v1/sandboxes/${id}/sessions`, toApiCreateSessionOptions(options));
+    return fromApiSession(response);
+  }
+
+  async listSessions(id: string): Promise<Session[]> {
+    const response = await this.doJSON<ApiSessionList>("GET", `/v1/sandboxes/${id}/sessions`);
+    return response.sessions.map(fromApiSession);
+  }
+
+  async getSession(id: string, sessionID: string): Promise<Session> {
+    const response = await this.doJSON<ApiSession>("GET", `/v1/sandboxes/${id}/sessions/${sessionID}`);
+    return fromApiSession(response);
+  }
+
+  async deleteSession(id: string, sessionID: string): Promise<void> {
+    await this.doJSON<void>("DELETE", `/v1/sandboxes/${id}/sessions/${sessionID}`);
+  }
+
+  async signalSession(id: string, sessionID: string, signal: string): Promise<void> {
+    await this.doJSON<void>("POST", `/v1/sandboxes/${id}/sessions/${sessionID}/signal`, { signal });
+  }
+
+  async resizeSession(id: string, sessionID: string, cols: number, rows: number): Promise<void> {
+    await this.doJSON<void>("POST", `/v1/sandboxes/${id}/sessions/${sessionID}/resize`, { cols, rows });
+  }
+
+  async sessionLog(id: string, sessionID: string): Promise<Uint8Array> {
+    return this.doBytes(`/v1/sandboxes/${id}/sessions/${sessionID}/log`);
+  }
+
+  async sessionRecording(id: string, sessionID: string): Promise<Uint8Array> {
+    return this.doBytes(`/v1/sandboxes/${id}/sessions/${sessionID}/recording`);
+  }
+
+  attachSession(id: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
+    return openSessionAttach(this.baseURL, this.patToken, id, sessionID, options);
+  }
+
   async uploadFile(id: string, targetPath: string, data: BinaryLike): Promise<void> {
     const form = new FormData();
     form.set("path", targetPath);
@@ -180,6 +244,14 @@ export class APIClient {
       return undefined as T;
     }
     return (await response.json()) as T;
+  }
+
+  private async doBytes(path: string): Promise<Uint8Array> {
+    const response = await this.request("GET", path);
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+    return new Uint8Array(await response.arrayBuffer());
   }
 
   private request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
@@ -237,6 +309,42 @@ export class SandboxResource implements Sandbox {
 
   execStream(options: ExecStreamOptions): ExecStreamHandle {
     return this.client.execStream(this.id, options);
+  }
+
+  async createSession(options: CreateSessionOptions): Promise<Session> {
+    return this.client.createSession(this.id, options);
+  }
+
+  async listSessions(): Promise<Session[]> {
+    return this.client.listSessions(this.id);
+  }
+
+  async getSession(sessionID: string): Promise<Session> {
+    return this.client.getSession(this.id, sessionID);
+  }
+
+  async deleteSession(sessionID: string): Promise<void> {
+    await this.client.deleteSession(this.id, sessionID);
+  }
+
+  async signalSession(sessionID: string, signal: string): Promise<void> {
+    await this.client.signalSession(this.id, sessionID, signal);
+  }
+
+  async resizeSession(sessionID: string, cols: number, rows: number): Promise<void> {
+    await this.client.resizeSession(this.id, sessionID, cols, rows);
+  }
+
+  async sessionLog(sessionID: string): Promise<Uint8Array> {
+    return this.client.sessionLog(this.id, sessionID);
+  }
+
+  async sessionRecording(sessionID: string): Promise<Uint8Array> {
+    return this.client.sessionRecording(this.id, sessionID);
+  }
+
+  attachSession(sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
+    return this.client.attachSession(this.id, sessionID, options);
   }
 
   async uploadFile(targetPath: string, data: BinaryLike): Promise<void> {
@@ -317,6 +425,19 @@ function toApiExecRequest(request: ExecRequest): Record<string, unknown> {
   };
 }
 
+function toApiCreateSessionOptions(options: CreateSessionOptions): Record<string, unknown> {
+  return {
+    name: options.name,
+    argv: options.argv,
+    command: options.command,
+    workdir: options.workDir,
+    env: options.env,
+    pty: options.pty,
+    cols: options.cols,
+    rows: options.rows,
+  };
+}
+
 function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
   return {
     id: sandbox.id,
@@ -346,6 +467,25 @@ function fromApiCreateSandboxResponse(response: ApiCreateSandboxResponse): Sandb
   return {
     ...fromApiSandbox(response),
     sshPrivateKey: response.ssh_private_key,
+  };
+}
+
+function fromApiSession(session: ApiSession): Session {
+  return {
+    id: session.id,
+    name: session.name,
+    argv: session.argv,
+    workDir: session.workdir,
+    pty: session.pty,
+    status: session.status,
+    exitCode: session.exit_code,
+    exitSignal: session.exit_signal,
+    createdAt: session.created_at,
+    startedAt: session.started_at,
+    exitedAt: session.exited_at,
+    recording: session.recording,
+    bytes: session.bytes,
+    attached: session.attached,
   };
 }
 
@@ -488,6 +628,111 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
 
   ws.addEventListener("close", () => {
     finishWith({ code: 0 });
+  });
+
+  ws.addEventListener("error", () => {
+    failWith("websocket error");
+  });
+
+  const sendBinary = (data: Uint8Array | string) => {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    ws.send(bytes);
+  };
+
+  return {
+    write: sendBinary,
+    resize(cols: number, rows: number) {
+      ws.send(JSON.stringify({ type: "resize", cols, rows }));
+    },
+    signal(name: string) {
+      ws.send(JSON.stringify({ type: "signal", signal: name }));
+    },
+    close() {
+      ws.send(JSON.stringify({ type: "close" }));
+      ws.close();
+    },
+    done,
+  };
+}
+
+function openSessionAttach(
+  baseURL: string,
+  patToken: string,
+  sandboxID: string,
+  sessionID: string,
+  options: SessionAttachOptions,
+): SessionAttachHandle {
+  const wsURL = baseURL.replace(/^http/, "ws") + `/v1/sandboxes/${encodeURIComponent(sandboxID)}/sessions/${encodeURIComponent(sessionID)}/attach`;
+
+  const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
+  if (!WS) {
+    throw new Error("WebSocket is not available in this runtime — Node 22+ or a browser is required");
+  }
+
+  const ws = new WS(wsURL, ["sandbox.bearer", patToken]);
+  ws.binaryType = "arraybuffer";
+
+  let exitResolve: ((info: ExecExitInfo) => void) | undefined;
+  let exitReject: ((err: Error) => void) | undefined;
+  const done = new Promise<ExecExitInfo>((resolve, reject) => {
+    exitResolve = resolve;
+    exitReject = reject;
+  });
+
+  let settled = false;
+  const finishWith = (info: ExecExitInfo) => {
+    if (settled) return;
+    settled = true;
+    options.onExit?.(info);
+    exitResolve?.(info);
+  };
+  const failWith = (msg: string) => {
+    if (settled) return;
+    settled = true;
+    exitReject?.(new Error(msg));
+  };
+
+  ws.addEventListener("open", () => {
+    if ((options.cols ?? 0) > 0 && (options.rows ?? 0) > 0) {
+      ws.send(JSON.stringify({ type: "resize", cols: options.cols, rows: options.rows }));
+    }
+  });
+
+  ws.addEventListener("message", (event: MessageEvent) => {
+    if (typeof event.data === "string") {
+      try {
+        const msg = JSON.parse(event.data) as { type: string; code?: number; signal?: string; message?: string };
+        if (msg.type === "exit") {
+          finishWith({ code: msg.code ?? 0, signal: msg.signal });
+          ws.close();
+        } else if (msg.type === "error") {
+          options.onError?.(msg.message ?? "session error");
+          failWith(msg.message ?? "session error");
+          ws.close();
+        }
+      } catch {
+        // ignore malformed control frames
+      }
+      return;
+    }
+
+    const buf = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : new Uint8Array((event.data as Uint8Array).buffer);
+    if (buf.length === 0) {
+      return;
+    }
+    const stream = buf[0];
+    const payload = buf.subarray(1);
+    if (stream === STREAM_PREFIX_STDOUT) {
+      options.onStdout?.(payload);
+    } else if (stream === STREAM_PREFIX_STDERR) {
+      options.onStderr?.(payload);
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    if (!settled) {
+      failWith("session stream closed before exit");
+    }
   });
 
   ws.addEventListener("error", () => {
