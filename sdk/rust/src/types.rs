@@ -115,3 +115,10 @@ pub struct ExecResult {
     #[serde(rename = "duration_ms")]
     pub duration_ms: i64,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExecExitInfo {
+    pub code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+}

@@ -12,7 +12,9 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: OS Independent"
 ]
-dependencies = []
+dependencies = [
+  "websocket-client>=1.8.0,<2"
+]
 
 [tool.setuptools.packages]
 find = {}

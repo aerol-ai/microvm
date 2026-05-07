@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, TypedDict
+from typing import Callable, Dict, List, TypedDict
 
 
 class RegistryAuth(TypedDict, total=False):
@@ -40,6 +39,27 @@ class ExecResult(TypedDict):
     stderr: str
     exitCode: int
     durationMS: int
+
+
+ChunkCallback = Callable[[bytes], None]
+ErrorCallback = Callable[[str], None]
+
+
+class ExecStreamOptions(TypedDict, total=False):
+    command: str
+    workdir: str
+    env: Dict[str, str]
+    tty: bool
+    cols: int
+    rows: int
+    onStdout: ChunkCallback
+    onStderr: ChunkCallback
+    onError: ErrorCallback
+
+
+class ExecExitInfo(TypedDict, total=False):
+    code: int
+    signal: str
 
 
 class ExposedPort(TypedDict, total=False):

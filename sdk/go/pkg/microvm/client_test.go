@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -79,6 +80,29 @@ func TestNewClientCases(t *testing.T) {
 				_, err := NewClientWithConfig(&sdktypes.MicroVMConfig{})
 				if err == nil {
 					t.Fatal("expected auth error")
+				}
+			},
+		},
+		{
+			name: "sandbox_exec_stream_requires_command",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+					PATToken: "config-pat",
+					APIUrl:   server.URL,
+				})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig() error = %v", err)
+				}
+
+				sandbox := &Sandbox{Sandbox: sdktypes.Sandbox{ID: "sb-stream"}, client: client}
+				_, err = sandbox.ExecStream(ctx, sdktypes.ExecStreamOptions{})
+				if err == nil || !strings.Contains(err.Error(), "command is required") {
+					t.Fatalf("unexpected error: %v", err)
 				}
 			},
 		},

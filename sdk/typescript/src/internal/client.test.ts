@@ -94,6 +94,83 @@ test("internal client decodes API errors", async () => {
   await assert.rejects(() => client.create({ image: "ubuntu:22.04" }), /bad request/);
 });
 
+test("internal client execStream uses sandbox bearer subprotocol", async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const stdoutChunks: Uint8Array[] = [];
+  const stderrChunks: Uint8Array[] = [];
+
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+
+    readonly url: string;
+    readonly protocols: string[];
+    binaryType = "blob";
+    sent: Array<string | Uint8Array> = [];
+    closed = false;
+    private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+    constructor(url: string, protocols?: string | string[]) {
+      this.url = url;
+      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(name: string, listener: (event?: unknown) => void): void {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+
+    send(data: string | Uint8Array): void {
+      this.sent.push(data);
+    }
+
+    close(): void {
+      this.closed = true;
+    }
+
+    emit(name: string, event?: unknown): void {
+      for (const listener of this.listeners.get(name) ?? []) {
+        listener(event);
+      }
+    }
+  }
+
+  try {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+    });
+
+    const handle = client.execStream("sb-stream", {
+      command: "npm install",
+      onStdout: (chunk) => stdoutChunks.push(chunk),
+      onStderr: (chunk) => stderrChunks.push(chunk),
+    });
+
+    const ws = FakeWebSocket.instances[0];
+    assert.ok(ws);
+    assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/toolbox/process/exec/stream");
+    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+
+    ws.emit("open");
+    assert.equal(ws.sent[0], JSON.stringify({ command: "npm install", tty: false, cols: 0, rows: 0 }));
+
+    ws.emit("message", { data: new Uint8Array([0x01, 0x68, 0x69]).buffer });
+    ws.emit("message", { data: new Uint8Array([0x02, 0x6f, 0x6b]).buffer });
+    ws.emit("message", { data: JSON.stringify({ type: "exit", code: 0 }) });
+
+    const result = await handle.done;
+    assert.equal(result.code, 0);
+    assert.equal(new TextDecoder().decode(stdoutChunks[0]), "hi");
+    assert.equal(new TextDecoder().decode(stderrChunks[0]), "ok");
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,

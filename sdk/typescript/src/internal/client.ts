@@ -407,11 +407,10 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
     throw new Error("WebSocket is not available in this runtime — Node 22+ or a browser is required");
   }
 
-  // The Node WebSocket global accepts auth via subprotocol or via a custom
-  // header. Browsers don't support custom headers on WebSocket constructors,
-  // so we send the PAT as the `bearer.<token>` subprotocol — sandboxd's
-  // proxy treats it as Authorization. Node's global also supports this.
-  const ws = new WS(wsURL, [`bearer.${patToken}`]);
+  // Browsers cannot attach Authorization headers to WebSocket handshakes,
+  // so sandboxd accepts the PAT via `Sec-WebSocket-Protocol` as
+  // `sandbox.bearer, <token>`.
+  const ws = new WS(wsURL, ["sandbox.bearer", patToken]);
   ws.binaryType = "arraybuffer";
 
   let exitResolve: ((info: ExecExitInfo) => void) | undefined;

@@ -25,6 +25,10 @@ type Sandbox struct {
 	client *Client
 }
 
+type ExecStreamHandle struct {
+	inner *apiclient.ExecStreamHandle
+}
+
 func NewClient() (*Client, error) {
 	return NewClientWithConfig(nil)
 }
@@ -125,6 +129,14 @@ func (c *Client) Health(ctx context.Context) (sdktypes.HealthStatus, error) {
 	return c.inner.Health(ctx)
 }
 
+func (c *Client) ExecStream(ctx context.Context, id string, options sdktypes.ExecStreamOptions) (*ExecStreamHandle, error) {
+	handle, err := c.inner.ExecStream(ctx, id, options)
+	if err != nil {
+		return nil, err
+	}
+	return &ExecStreamHandle{inner: handle}, nil
+}
+
 func (s *Sandbox) Refresh(ctx context.Context) error {
 	item, err := s.client.Get(ctx, s.ID)
 	if err != nil {
@@ -140,6 +152,10 @@ func (s *Sandbox) Exec(ctx context.Context, request sdktypes.ExecRequest) (sdkty
 
 func (s *Sandbox) ExecCommand(ctx context.Context, command string) (sdktypes.ExecResult, error) {
 	return s.client.inner.Exec(ctx, s.ID, sdktypes.ExecRequest{Command: command})
+}
+
+func (s *Sandbox) ExecStream(ctx context.Context, options sdktypes.ExecStreamOptions) (*ExecStreamHandle, error) {
+	return s.client.ExecStream(ctx, s.ID, options)
 }
 
 func (s *Sandbox) UploadFile(ctx context.Context, targetPath string, data []byte) error {
@@ -187,6 +203,30 @@ func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions
 	}
 	s.Sandbox = item.Sandbox
 	return nil
+}
+
+func (h *ExecStreamHandle) Write(data []byte) error {
+	return h.inner.Write(data)
+}
+
+func (h *ExecStreamHandle) WriteString(data string) error {
+	return h.inner.WriteString(data)
+}
+
+func (h *ExecStreamHandle) Resize(cols, rows int) error {
+	return h.inner.Resize(cols, rows)
+}
+
+func (h *ExecStreamHandle) Signal(name string) error {
+	return h.inner.Signal(name)
+}
+
+func (h *ExecStreamHandle) Close() error {
+	return h.inner.Close()
+}
+
+func (h *ExecStreamHandle) Wait() (sdktypes.ExecExitInfo, error) {
+	return h.inner.Wait()
 }
 
 func wrapSandbox(client *Client, item *apiclient.Sandbox) *Sandbox {

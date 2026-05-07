@@ -24,3 +24,23 @@ print(health)
 ```bash
 python examples/create_sandbox.py --api-url http://127.0.0.1:8080 --pat-token test --image ghcr.io/aerol-ai/ubuntu:22.04
 ```
+
+## Streaming exec
+
+```python
+import sys
+
+handle = sandbox.exec_stream(
+	{
+		"command": "bash",
+		"tty": True,
+		"cols": 120,
+		"rows": 40,
+		"onStdout": lambda chunk: sys.stdout.buffer.write(chunk),
+	}
+)
+
+handle.write("echo hello\n")
+result = handle.wait()
+print(result)
+```
