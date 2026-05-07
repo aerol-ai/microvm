@@ -24,15 +24,32 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential gcc-aarch64-linux-gnu
 
+      - name: Install TypeScript SDK dependencies
+        working-directory: sdk/typescript
+        run: npm ci
+
       - name: Run tests
         run: |
           go test -count=1 -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -n 1
+
+      - name: Run TypeScript SDK build and tests
+        working-directory: sdk/typescript
+        run: |
+          npm run build
+          npm test
 
       - name: Build release assets
         shell: bash

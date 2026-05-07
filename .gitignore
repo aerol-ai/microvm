@@ -1,7 +1,9 @@
 bin/
 dist/
+dist-test/
 .DS_Store
 *.db
 *.db-shm
 *.db-wal
 *.log
+node_modules/

@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  unit-tests:
+  go-tests:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -35,5 +35,30 @@ jobs:
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: coverage
+          name: go-coverage
           path: coverage.out
+
+  typescript-sdk-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      - name: Install TypeScript SDK dependencies
+        run: npm ci
+
+      - name: Build TypeScript SDK
+        run: npm run build
+
+      - name: Run TypeScript SDK tests
+        run: npm test
