@@ -51,6 +51,7 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /v1/sandboxes/{id}/stop", s.requireAuth(http.HandlerFunc(s.handleStopSandbox)))
 	s.mux.Handle("DELETE /v1/sandboxes/{id}", s.requireAuth(http.HandlerFunc(s.handleDestroySandbox)))
 	s.mux.Handle("POST /v1/sandboxes/{id}/resize", s.requireAuth(http.HandlerFunc(s.handleResizeSandbox)))
+	s.mux.Handle("PUT /v1/sandboxes/{id}/lifecycle", s.requireAuth(http.HandlerFunc(s.handleUpdateLifecycle)))
 	s.mux.Handle("POST /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleExposePort)))
 	s.mux.Handle("DELETE /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleUnexposePort)))
 	s.mux.Handle("GET /v1/sandboxes/{id}/mounts", s.requireAuth(http.HandlerFunc(s.handleListMounts)))
@@ -189,6 +190,20 @@ func (s *Server) handleResizeSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sandbox, err := s.service.ResizeSandbox(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		s.writeStoreAwareError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sandbox)
+}
+
+func (s *Server) handleUpdateLifecycle(w http.ResponseWriter, r *http.Request) {
+	var req models.UpdateLifecycleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	sandbox, err := s.service.UpdateLifecycle(r.Context(), r.PathValue("id"), req.Lifecycle)
 	if err != nil {
 		s.writeStoreAwareError(w, err)
 		return

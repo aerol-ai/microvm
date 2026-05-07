@@ -107,6 +107,19 @@ func (c *Client) Resize(ctx context.Context, id string, opts ResizeOptions) (*Sa
 	return c.wrap(response), nil
 }
 
+// UpdateLifecycle replaces the per-sandbox lifecycle timers. Send all four
+// fields; setting a field to zero clears that timer. The server validates,
+// rejecting durations beyond the configured maximum and inconsistent
+// stop/destroy pairs.
+func (c *Client) UpdateLifecycle(ctx context.Context, id string, lifecycle models.Lifecycle) (*Sandbox, error) {
+	var response models.Sandbox
+	body := models.UpdateLifecycleRequest{Lifecycle: lifecycle}
+	if err := c.doJSON(ctx, http.MethodPut, "/v1/sandboxes/"+id+"/lifecycle", body, &response); err != nil {
+		return nil, err
+	}
+	return c.wrap(response), nil
+}
+
 func (c *Client) Mounts(ctx context.Context, id string) ([]models.MountSpecRedacted, error) {
 	var response struct {
 		Mounts []models.MountSpecRedacted `json:"mounts"`
@@ -242,6 +255,15 @@ func (s *Sandbox) Destroy(ctx context.Context) error {
 
 func (s *Sandbox) Resize(ctx context.Context, opts ResizeOptions) error {
 	updated, err := s.client.Resize(ctx, s.ID, opts)
+	if err != nil {
+		return err
+	}
+	s.Sandbox = updated.Sandbox
+	return nil
+}
+
+func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycle) error {
+	updated, err := s.client.UpdateLifecycle(ctx, s.ID, lifecycle)
 	if err != nil {
 		return err
 	}

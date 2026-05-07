@@ -86,9 +86,16 @@ func Open(path string) (*Store, error) {
 	}
 
 	// Migrations for older DBs that pre-date columns above. Idempotent.
+	// Lifecycle fields are stored as INTEGER nanoseconds — same shape Go
+	// uses for time.Duration internally, so no parsing on read and no
+	// format ambiguity. Zero means "disabled" for that axis.
 	migrations := []string{
 		`ALTER TABLE sandboxes ADD COLUMN toolbox_token TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN ssh_public_key TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN stop_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN stop_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN destroy_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -121,8 +128,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			last_error, container_command_json, created_at, updated_at, last_active_at,
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -144,6 +152,10 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.CreatedAt.UTC(),
 		sandbox.UpdatedAt.UTC(),
 		sandbox.LastActiveAt.UTC(),
+		int64(sandbox.Lifecycle.StopIfIdleFor),
+		int64(sandbox.Lifecycle.DestroyIfIdleFor),
+		int64(sandbox.Lifecycle.StopAtAge),
+		int64(sandbox.Lifecycle.DestroyAtAge),
 	)
 	if err != nil {
 		return fmt.Errorf("insert sandbox: %w", err)
@@ -165,8 +177,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			last_error, container_command_json, created_at, updated_at, last_active_at,
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -185,7 +198,11 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			last_error = excluded.last_error,
 			container_command_json = excluded.container_command_json,
 			updated_at = excluded.updated_at,
-			last_active_at = excluded.last_active_at
+			last_active_at = excluded.last_active_at,
+			stop_if_idle_for_ns = excluded.stop_if_idle_for_ns,
+			destroy_if_idle_for_ns = excluded.destroy_if_idle_for_ns,
+			stop_at_age_ns = excluded.stop_at_age_ns,
+			destroy_at_age_ns = excluded.destroy_at_age_ns
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -207,6 +224,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.CreatedAt.UTC(),
 		sandbox.UpdatedAt.UTC(),
 		sandbox.LastActiveAt.UTC(),
+		int64(sandbox.Lifecycle.StopIfIdleFor),
+		int64(sandbox.Lifecycle.DestroyIfIdleFor),
+		int64(sandbox.Lifecycle.StopAtAge),
+		int64(sandbox.Lifecycle.DestroyAtAge),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert sandbox: %w", err)
@@ -218,7 +239,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at
+			last_error, container_command_json, created_at, updated_at, last_active_at,
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -244,7 +266,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at
+			last_error, container_command_json, created_at, updated_at, last_active_at,
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -340,6 +363,37 @@ func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, erro
 		return false, fmt.Errorf("check image references: %w", err)
 	}
 	return true, nil
+}
+
+// UpdateLifecycle replaces the four lifecycle timer fields on a sandbox row
+// and bumps updated_at. Other fields are untouched. Returns ErrNotFound if
+// no row matches id. The caller must validate the Lifecycle first; the
+// store does not re-validate (it would couple two layers for no gain).
+func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecycle) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET stop_if_idle_for_ns = ?,
+		    destroy_if_idle_for_ns = ?,
+		    stop_at_age_ns = ?,
+		    destroy_at_age_ns = ?,
+		    updated_at = ?
+		WHERE id = ?
+	`,
+		int64(l.StopIfIdleFor),
+		int64(l.DestroyIfIdleFor),
+		int64(l.StopAtAge),
+		int64(l.DestroyAtAge),
+		time.Now().UTC(),
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("update sandbox lifecycle: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // PurgeDestroyedBefore deletes sandbox rows that are in the destroyed state
@@ -481,6 +535,7 @@ func scanSandbox(scanner interface {
 	var networkBlocked int
 	var toolboxEnabled int
 	var commandJSON string
+	var stopIfIdleNs, destroyIfIdleNs, stopAtAgeNs, destroyAtAgeNs int64
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -503,6 +558,10 @@ func scanSandbox(scanner interface {
 		&sandbox.CreatedAt,
 		&sandbox.UpdatedAt,
 		&sandbox.LastActiveAt,
+		&stopIfIdleNs,
+		&destroyIfIdleNs,
+		&stopAtAgeNs,
+		&destroyAtAgeNs,
 	)
 	if err != nil {
 		return nil, err
@@ -521,6 +580,12 @@ func scanSandbox(scanner interface {
 
 	sandbox.NetworkBlockAll = networkBlocked == 1
 	sandbox.ToolboxEnabled = toolboxEnabled == 1
+	sandbox.Lifecycle = models.Lifecycle{
+		StopIfIdleFor:    time.Duration(stopIfIdleNs),
+		DestroyIfIdleFor: time.Duration(destroyIfIdleNs),
+		StopAtAge:        time.Duration(stopAtAgeNs),
+		DestroyAtAge:     time.Duration(destroyAtAgeNs),
+	}
 
 	return &sandbox, nil
 }

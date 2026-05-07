@@ -14,7 +14,7 @@ import (
 func TestStoreCases(t *testing.T) {
 	ctx := context.Background()
 
-	// 21 cases
+	// 24 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -421,6 +421,67 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "lifecycle_persists_through_create_and_get",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-lifecycle")
+				sandbox.Lifecycle = models.Lifecycle{
+					StopIfIdleFor:    time.Hour,
+					DestroyIfIdleFor: 4 * time.Hour,
+					StopAtAge:        2 * time.Hour,
+					DestroyAtAge:     24 * time.Hour,
+				}
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Lifecycle != sandbox.Lifecycle {
+					t.Fatalf("Lifecycle roundtrip mismatch: got %+v want %+v", got.Lifecycle, sandbox.Lifecycle)
+				}
+			},
+		},
+		{
+			name: "update_lifecycle_replaces_fields",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-update-lifecycle")
+				sandbox.Lifecycle = models.Lifecycle{StopIfIdleFor: time.Hour}
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				newL := models.Lifecycle{
+					DestroyAtAge: 24 * time.Hour,
+				}
+				if err := st.UpdateLifecycle(ctx, sandbox.ID, newL); err != nil {
+					t.Fatalf("UpdateLifecycle() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Lifecycle != newL {
+					t.Fatalf("Lifecycle replacement mismatch: got %+v want %+v", got.Lifecycle, newL)
+				}
+				// StopIfIdleFor should be cleared by full-replace semantics.
+				if got.Lifecycle.StopIfIdleFor != 0 {
+					t.Fatalf("expected StopIfIdleFor cleared, got %v", got.Lifecycle.StopIfIdleFor)
+				}
+			},
+		},
+		{
+			name: "update_lifecycle_returns_not_found_for_missing_id",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				err := st.UpdateLifecycle(ctx, "missing", models.Lifecycle{})
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound, got %v", err)
+				}
+			},
+		},
+		{
 			name: "list_returns_all_ports_with_one_query_per_call",
 			run: func(t *testing.T) {
 				// Three sandboxes: one with two ports, one with one port, one
@@ -490,6 +551,7 @@ func TestStoreHelperCases(t *testing.T) {
 		row := sqlRowStub{values: []any{
 			"sb-bad", "image", models.SandboxStatusStarted, "https://example.com", "container", "10.0.0.1",
 			float64(1), 1024, 10, "root", "{bad json", 0, 1, "", "", "", "[]", time.Now(), time.Now(), time.Now(),
+			int64(0), int64(0), int64(0), int64(0),
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

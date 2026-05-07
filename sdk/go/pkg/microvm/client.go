@@ -139,6 +139,18 @@ func (c *Client) Resize(ctx context.Context, id string, opts sdktypes.ResizeSand
 	return wrapSandbox(c, item), nil
 }
 
+// UpdateLifecycle replaces the per-sandbox lifecycle timers. Pass zero in
+// any field to clear that timer; pass non-zero to set or extend it. The
+// server validates and rejects negative durations, durations over the
+// configured cap, or stop/destroy pairs where destroy fires before stop.
+func (c *Client) UpdateLifecycle(ctx context.Context, id string, lifecycle sdktypes.Lifecycle) (*Sandbox, error) {
+	item, err := c.inner.UpdateLifecycle(ctx, id, lifecycle)
+	if err != nil {
+		return nil, err
+	}
+	return wrapSandbox(c, item), nil
+}
+
 func (c *Client) Health(ctx context.Context) (sdktypes.HealthStatus, error) {
 	return c.inner.Health(ctx)
 }
@@ -212,6 +224,15 @@ func (s *Sandbox) Destroy(ctx context.Context) error {
 
 func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions) error {
 	item, err := s.client.Resize(ctx, s.ID, opts)
+	if err != nil {
+		return err
+	}
+	s.Sandbox = item.Sandbox
+	return nil
+}
+
+func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle sdktypes.Lifecycle) error {
+	item, err := s.client.UpdateLifecycle(ctx, s.ID, lifecycle)
 	if err != nil {
 		return err
 	}

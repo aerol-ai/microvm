@@ -4,6 +4,8 @@ import "github.com/aerol-ai/microvm/pkg/models"
 
 type CreateSandboxOptions = models.CreateSandboxRequest
 type ResizeSandboxOptions = models.ResizeSandboxRequest
+type Lifecycle = models.Lifecycle
+type UpdateLifecycleOptions = models.UpdateLifecycleRequest
 type ExecRequest = models.ExecRequest
 type ExecResult = models.ExecResult
 type ExposedPort = models.ExposedPort

@@ -110,7 +110,7 @@ func main() {
 		}
 		svc.StartReconcileLoop(ctx)
 	}
-	svc.StartIdleMonitor(ctx)
+	svc.StartLifecycleSweep(ctx)
 	svc.StartEventMonitor(ctx)
 
 	if cfg.EnableSSHGateway {

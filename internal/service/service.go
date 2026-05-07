@@ -65,6 +65,14 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	var lifecycle models.Lifecycle
+	if req.Lifecycle != nil {
+		if err := req.Lifecycle.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid lifecycle: %w", err)
+		}
+		lifecycle = *req.Lifecycle
+	}
+
 	sealedMounts, err := s.sealMounts(req.Mounts)
 	if err != nil {
 		return nil, err
@@ -144,6 +152,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		UpdatedAt:        now,
 		LastActiveAt:     now,
 		ContainerCommand: req.ContainerCommand,
+		Lifecycle:        lifecycle,
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
@@ -412,6 +421,20 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	}
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
+		return nil, err
+	}
+	return s.store.Get(ctx, id)
+}
+
+// UpdateLifecycle replaces the lifecycle timers on an existing sandbox.
+// Full-replacement semantics: pass zero in any field to clear that timer.
+// The sweep picks up the new values on its next tick (within ~1 minute),
+// so a tightened deadline can fire as soon as the next sweep runs.
+func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifecycle) (*models.Sandbox, error) {
+	if err := l.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid lifecycle: %w", err)
+	}
+	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
 	}
 	return s.store.Get(ctx, id)
@@ -704,12 +727,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) StartIdleMonitor(ctx context.Context) {
-	idleTimeout := s.cfg.IdleTimeout()
-	if idleTimeout <= 0 {
-		return
-	}
-
+// StartLifecycleSweep launches the per-sandbox lifecycle ticker. Every minute
+// it evaluates each sandbox's Lifecycle timers (StopIfIdleFor / DestroyIfIdleFor
+// / StopAtAge / DestroyAtAge) plus the legacy global SB_IDLE_TIMEOUT_MIN
+// fallback for sandboxes that don't declare any per-sandbox timers. Without
+// either configured, the sweep still runs but is a no-op — kept on so a
+// later UpdateLifecycle call doesn't need to start a goroutine.
+func (s *Service) StartLifecycleSweep(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	go func() {
 		defer ticker.Stop()
@@ -719,32 +743,96 @@ func (s *Service) StartIdleMonitor(ctx context.Context) {
 				return
 			case <-ticker.C:
 				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				s.runIdleSweep(sweepCtx, idleTimeout)
+				s.runLifecycleSweep(sweepCtx)
 				cancel()
 			}
 		}
 	}()
 }
 
-func (s *Service) runIdleSweep(ctx context.Context, idleTimeout time.Duration) {
+func (s *Service) runLifecycleSweep(ctx context.Context) {
 	sandboxes, err := s.store.List(ctx)
 	if err != nil {
-		s.logger.Warn("idle sweep failed", "error", err)
+		s.logger.Warn("lifecycle sweep failed", "error", err)
 		return
 	}
 
-	deadline := time.Now().Add(-idleTimeout)
+	now := time.Now().UTC()
+	globalIdle := s.cfg.IdleTimeout()
 	for _, sandbox := range sandboxes {
-		if sandbox.Status != models.SandboxStatusStarted {
-			continue
-		}
-		if sandbox.LastActiveAt.After(deadline) {
-			continue
-		}
-		if _, err := s.StopSandbox(ctx, sandbox.ID); err != nil {
-			s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
+		switch lifecycleActionFor(sandbox, now, globalIdle) {
+		case lifecycleDestroy:
+			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
+				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
+			} else {
+				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
+			}
+		case lifecycleStop:
+			if _, err := s.StopSandbox(ctx, sandbox.ID); err != nil {
+				s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
+			} else {
+				s.logger.Info("audit lifecycle auto-stop", "sandbox_id", sandbox.ID)
+			}
 		}
 	}
+}
+
+type lifecycleAction int
+
+const (
+	lifecycleNone lifecycleAction = iota
+	lifecycleStop
+	lifecycleDestroy
+)
+
+// lifecycleActionFor decides what the sweep should do for one sandbox given
+// the current time and the operator's global idle fallback. Pure function:
+// no DB, no Docker, easy to exhaustively test.
+//
+// Priority rules:
+//   1. Already destroyed → none. The sweep cannot un-destroy or further
+//      destroy something already gone.
+//   2. Any destroy timer fired → destroy. Destroy supersedes stop on the
+//      same tick to avoid a wasted Stop call followed by Destroy.
+//   3. Any stop timer fired AND status is started → stop. Stopping an
+//      already-stopped sandbox would be a no-op so we skip it.
+//   4. No per-sandbox config and global SB_IDLE_TIMEOUT_MIN would fire →
+//      stop. Backwards-compat with the pre-Lifecycle behavior.
+//   5. Otherwise → none.
+func lifecycleActionFor(sb *models.Sandbox, now time.Time, globalIdle time.Duration) lifecycleAction {
+	if sb == nil || sb.Status == models.SandboxStatusDestroyed {
+		return lifecycleNone
+	}
+	idle := now.Sub(sb.LastActiveAt)
+	age := now.Sub(sb.CreatedAt)
+
+	l := sb.Lifecycle
+	// Destroy first: if any destroy condition is met we go straight there.
+	if l.DestroyIfIdleFor > 0 && idle >= l.DestroyIfIdleFor {
+		return lifecycleDestroy
+	}
+	if l.DestroyAtAge > 0 && age >= l.DestroyAtAge {
+		return lifecycleDestroy
+	}
+	// Stop only applies to running sandboxes — re-stopping a stopped one
+	// is wasted Docker calls and noisy logs.
+	if sb.Status != models.SandboxStatusStarted {
+		return lifecycleNone
+	}
+	if l.StopIfIdleFor > 0 && idle >= l.StopIfIdleFor {
+		return lifecycleStop
+	}
+	if l.StopAtAge > 0 && age >= l.StopAtAge {
+		return lifecycleStop
+	}
+	// Legacy global idle fallback: only applies when the sandbox has no
+	// per-sandbox config, so an explicit "no auto-stop" Lifecycle (e.g.
+	// just DestroyAtAge=24h with stop fields zero) doesn't accidentally
+	// inherit the operator's global timeout.
+	if l.IsZero() && globalIdle > 0 && idle >= globalIdle {
+		return lifecycleStop
+	}
+	return lifecycleNone
 }
 
 func (s *Service) StartReconcileLoop(ctx context.Context) {

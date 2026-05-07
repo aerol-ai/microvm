@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 type SandboxStatus string
 
@@ -29,6 +33,76 @@ type RegistryAuth struct {
 	Password string `json:"password"`
 }
 
+// Lifecycle declares automatic stop/destroy timers for a sandbox. Each field
+// is a duration; zero means "disabled" for that axis. Idle triggers measure
+// time since LastActiveAt (i.e. since the last toolbox/exec/SSH activity).
+// Age triggers measure time since CreatedAt — they are absolute deadlines
+// that do not reset on Stop+Start, so a "destroy at 24h" sandbox stays
+// destroyable even if the user restarts it minutes before the deadline.
+//
+// Multiple fields can be set; whichever timer fires first wins. Destroy
+// supersedes Stop for the same trigger axis. The lifecycle sweep runs every
+// minute, so deadlines are honored to roughly that resolution.
+type Lifecycle struct {
+	StopIfIdleFor    time.Duration `json:"stop_if_idle_for,omitempty"`
+	DestroyIfIdleFor time.Duration `json:"destroy_if_idle_for,omitempty"`
+	StopAtAge        time.Duration `json:"stop_at_age,omitempty"`
+	DestroyAtAge     time.Duration `json:"destroy_at_age,omitempty"`
+}
+
+// MaxLifecycleDuration caps each Lifecycle field. 30 days is generous for
+// any reasonable workload while still rejecting typos like "87600h" that
+// would otherwise sit in the DB pretending to be useful.
+const MaxLifecycleDuration = 30 * 24 * time.Hour
+
+// Validate enforces the invariants we rely on at sweep time:
+//   - no negative durations (zero means disabled, negative is meaningless),
+//   - each field <= MaxLifecycleDuration,
+//   - if both stop and destroy of the same trigger are set, destroy must
+//     not fire before stop. Without this we could surprise a user who set
+//     "stop at 2h, destroy at 1h" by skipping the stop entirely.
+func (l Lifecycle) Validate() error {
+	if l.StopIfIdleFor < 0 || l.DestroyIfIdleFor < 0 || l.StopAtAge < 0 || l.DestroyAtAge < 0 {
+		return errors.New("lifecycle durations must be non-negative")
+	}
+	checks := []struct {
+		name string
+		v    time.Duration
+	}{
+		{"stop_if_idle_for", l.StopIfIdleFor},
+		{"destroy_if_idle_for", l.DestroyIfIdleFor},
+		{"stop_at_age", l.StopAtAge},
+		{"destroy_at_age", l.DestroyAtAge},
+	}
+	for _, c := range checks {
+		if c.v > MaxLifecycleDuration {
+			return fmt.Errorf("%s exceeds maximum of %s", c.name, MaxLifecycleDuration)
+		}
+	}
+	if l.StopIfIdleFor > 0 && l.DestroyIfIdleFor > 0 && l.DestroyIfIdleFor < l.StopIfIdleFor {
+		return errors.New("destroy_if_idle_for must be >= stop_if_idle_for")
+	}
+	if l.StopAtAge > 0 && l.DestroyAtAge > 0 && l.DestroyAtAge < l.StopAtAge {
+		return errors.New("destroy_at_age must be >= stop_at_age")
+	}
+	return nil
+}
+
+// IsZero reports whether all four timers are disabled. Useful for skipping
+// Lifecycle inspection in the sweep when there's nothing to evaluate.
+func (l Lifecycle) IsZero() bool {
+	return l.StopIfIdleFor == 0 && l.DestroyIfIdleFor == 0 &&
+		l.StopAtAge == 0 && l.DestroyAtAge == 0
+}
+
+// UpdateLifecycleRequest is the body for PUT /v1/sandboxes/{id}/lifecycle.
+// Full-replacement semantics: send all four fields. To clear a field, set
+// it to zero. To preserve a field, send its current value (read it via GET
+// first if the caller doesn't already have it).
+type UpdateLifecycleRequest struct {
+	Lifecycle
+}
+
 type CreateSandboxRequest struct {
 	Image string `json:"image"`
 	// CPU is the number of CPU cores to allocate. Fractional values are
@@ -43,6 +117,7 @@ type CreateSandboxRequest struct {
 	Registry         *RegistryAuth     `json:"registry,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Mounts           []MountSpec       `json:"mounts,omitempty"`
+	Lifecycle        *Lifecycle        `json:"lifecycle,omitempty"`
 }
 
 type ResizeSandboxRequest struct {
@@ -73,6 +148,7 @@ type Sandbox struct {
 	LastActiveAt     time.Time         `json:"last_active_at"`
 	LastError        string            `json:"last_error,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
+	Lifecycle        Lifecycle         `json:"lifecycle"`
 }
 
 // CreateSandboxResponse is what the API returns from POST /v1/sandboxes.
