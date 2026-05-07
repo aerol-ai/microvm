@@ -10,7 +10,7 @@ This document maps every use case from `01-use-cases.md` to the implementation p
 |---|---|---|---|---|
 | UC-01 | Install on bare metal | `scripts/install.sh`, `packaging/sandboxd.service`, `packaging/Caddyfile.template` | ✅ Full | Script handles Docker + Caddy + sandboxd setup |
 | UC-02 | Create sandbox via REST | `pkg/api/handlers/sandbox.go` → `POST /v1/sandboxes`, `pkg/docker/create.go`, `pkg/caddy/routes.go` | ✅ Full | Full create → docker → caddy pipeline |
-| UC-03 | Create sandbox via Go SDK | `sdk/go/client.go`, `sdk/go/sandbox.go` | ✅ Full | SDK wraps REST API |
+| UC-03 | Create sandbox via Go SDK | `sdk/go/pkg/microvm/client.go`, `sdk/go/pkg/types/types.go` | ✅ Full | Structured SDK wraps REST API |
 | UC-04 | Execute commands in sandbox | `pkg/api/handlers/proxy.go` → `ANY /v1/sandboxes/:id/toolbox/*`, `sdk/go/sandbox.go Exec()` | ✅ Full | Proxied to Daytona toolbox daemon inside container |
 | UC-05 | Upload/download files | `sdk/go/files.go`, proxied through toolbox daemon file endpoints | ✅ Full | Toolbox daemon already handles file ops |
 | UC-06 | Expose specific port publicly | `pkg/api/handlers/sandbox.go ExposePort`, `pkg/caddy/routes.go`, `sdk/go/ports.go` | ✅ Full | Caddy route per port per sandbox |

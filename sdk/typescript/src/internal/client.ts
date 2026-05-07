@@ -9,17 +9,14 @@ import type {
   HealthStatus,
   ResizeOptions,
   Sandbox,
-} from "./types.js";
+} from "../types.js";
 
 type FetchLike = typeof fetch;
 
-export interface ClientOptions {
+export interface APIClientConfig {
+  baseURL: string;
   patToken?: string;
   fetch?: FetchLike;
-}
-
-export interface ClientConfig extends ClientOptions {
-  baseURL: string;
 }
 
 interface ApiExposedPort {
@@ -66,46 +63,39 @@ interface ApiHealthStatus {
   version: string;
 }
 
-export class Client {
+export class APIClient {
   readonly baseURL: string;
-  private patToken: string;
+
+  private readonly patToken: string;
   private readonly fetchFn: FetchLike;
 
-  constructor(baseURL: string, patToken?: string, options?: ClientOptions);
-  constructor(baseURL: string, options?: ClientOptions);
-  constructor(config: ClientConfig);
-  constructor(
-    baseURLOrConfig: string | ClientConfig,
-    patTokenOrOptions: string | ClientOptions = "",
-    options: ClientOptions = {},
-  ) {
-    const config = resolveClientConfig(baseURLOrConfig, patTokenOrOptions, options);
+  constructor(config: APIClientConfig) {
     this.baseURL = config.baseURL.replace(/\/+$/, "");
     this.patToken = config.patToken ?? "";
     this.fetchFn = config.fetch ?? fetch;
   }
 
-  async create(options: CreateOptions): Promise<SandboxHandle> {
+  async create(options: CreateOptions): Promise<SandboxResource> {
     const response = await this.doJSON<ApiSandbox>("POST", "/v1/sandboxes", toApiCreateOptions(options));
     return this.wrap(response);
   }
 
-  async list(): Promise<SandboxHandle[]> {
+  async list(): Promise<SandboxResource[]> {
     const response = await this.doJSON<ApiSandbox[]>("GET", "/v1/sandboxes");
     return response.map((item) => this.wrap(item));
   }
 
-  async get(id: string): Promise<SandboxHandle> {
+  async get(id: string): Promise<SandboxResource> {
     const response = await this.doJSON<ApiSandbox>("GET", `/v1/sandboxes/${id}`);
     return this.wrap(response);
   }
 
-  async start(id: string): Promise<SandboxHandle> {
+  async start(id: string): Promise<SandboxResource> {
     const response = await this.doJSON<ApiSandbox>("POST", `/v1/sandboxes/${id}/start`);
     return this.wrap(response);
   }
 
-  async stop(id: string): Promise<SandboxHandle> {
+  async stop(id: string): Promise<SandboxResource> {
     const response = await this.doJSON<ApiSandbox>("POST", `/v1/sandboxes/${id}/stop`);
     return this.wrap(response);
   }
@@ -114,7 +104,7 @@ export class Client {
     await this.doJSON<void>("DELETE", `/v1/sandboxes/${id}`);
   }
 
-  async resize(id: string, options: ResizeOptions): Promise<SandboxHandle> {
+  async resize(id: string, options: ResizeOptions): Promise<SandboxResource> {
     const response = await this.doJSON<ApiSandbox>("POST", `/v1/sandboxes/${id}/resize`, toApiResizeOptions(options));
     return this.wrap(response);
   }
@@ -157,8 +147,8 @@ export class Client {
     return fromApiHealthStatus(response);
   }
 
-  private wrap(sandbox: ApiSandbox): SandboxHandle {
-    return new SandboxHandle(this, fromApiSandbox(sandbox));
+  private wrap(sandbox: ApiSandbox): SandboxResource {
+    return new SandboxResource(this, fromApiSandbox(sandbox));
   }
 
   private async doJSON<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -193,28 +183,7 @@ export class Client {
   }
 }
 
-function resolveClientConfig(
-  baseURLOrConfig: string | ClientConfig,
-  patTokenOrOptions: string | ClientOptions,
-  options: ClientOptions,
-): ClientConfig {
-  if (typeof baseURLOrConfig !== "string") {
-    return baseURLOrConfig;
-  }
-  if (typeof patTokenOrOptions === "string") {
-    return {
-      baseURL: baseURLOrConfig,
-      patToken: patTokenOrOptions,
-      fetch: options.fetch,
-    };
-  }
-  return {
-    baseURL: baseURLOrConfig,
-    ...patTokenOrOptions,
-  };
-}
-
-export class SandboxHandle implements Sandbox {
+export class SandboxResource implements Sandbox {
   declare id: string;
   declare image: string;
   declare status: Sandbox["status"];
@@ -235,9 +204,9 @@ export class SandboxHandle implements Sandbox {
   declare lastError?: string;
   declare containerCommand?: string[];
 
-  protected readonly client: Client;
+  protected readonly client: APIClient;
 
-  constructor(client: Client, sandbox: Sandbox) {
+  constructor(client: APIClient, sandbox: Sandbox) {
     this.client = client;
     this.apply(sandbox);
   }
@@ -262,6 +231,10 @@ export class SandboxHandle implements Sandbox {
 
   async exposePort(port: number): Promise<string> {
     return this.client.exposePort(this.id, port);
+  }
+
+  async unexposePort(port: number): Promise<void> {
+    await this.client.unexposePort(this.id, port);
   }
 
   async start(): Promise<this> {

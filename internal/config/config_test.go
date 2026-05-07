@@ -13,7 +13,6 @@ func TestLoadCases(t *testing.T) {
 		t.Helper()
 		keys := []string{
 			"SB_PAT_TOKEN",
-			"SB_API_TOKEN",
 			"SB_API_HOST",
 			"SB_API_PORT",
 			"SB_DOMAIN",
@@ -77,20 +76,6 @@ func TestLoadCases(t *testing.T) {
 				}
 				if !strings.HasSuffix(cfg.ToolboxBinaryPath, string(filepath.Separator)+"toolboxd") {
 					t.Fatalf("unexpected toolbox binary path: %s", cfg.ToolboxBinaryPath)
-				}
-			},
-		},
-		{
-			name: "accepts_legacy_api_token_env",
-			run: func(t *testing.T) {
-				clearEnv(t)
-				t.Setenv("SB_API_TOKEN", "legacy-token")
-				cfg, err := Load()
-				if err != nil {
-					t.Fatalf("Load() error = %v", err)
-				}
-				if cfg.PATToken != "legacy-token" {
-					t.Fatalf("expected legacy token fallback, got %+v", cfg)
 				}
 			},
 		},

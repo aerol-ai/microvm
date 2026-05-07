@@ -1,26 +1,27 @@
-import { Client } from "./client.js";
+import { APIClient } from "./internal/client.js";
 import { Sandbox } from "./Sandbox.js";
-import type { ClientOptions } from "./client.js";
 import type { CreateOptions, HealthStatus, ResizeOptions, Sandbox as SandboxData } from "./types.js";
 
 const defaultAPIURL = "http://127.0.0.1:8080";
-const authRequiredErrorMessage = "PAT token is required. Set patToken, SB_PAT_TOKEN, or SB_API_TOKEN.";
+const authRequiredErrorMessage = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
 
-export interface MicroVMConfig extends Pick<ClientOptions, "fetch"> {
+type FetchLike = typeof fetch;
+
+export interface MicroVMConfig {
   patToken?: string;
   apiUrl?: string;
-  serverUrl?: string;
+  fetch?: FetchLike;
 }
 
 export class MicroVM {
   readonly apiUrl: string;
   readonly patToken: string;
 
-  private readonly client: Client;
+  private readonly client: APIClient;
 
   constructor(config: MicroVMConfig = {}) {
-    const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? readEnv("SB_API_TOKEN") ?? "";
-    const apiUrl = normalizeURL(config.apiUrl ?? config.serverUrl ?? readEnv("SB_API_URL") ?? readEnv("SB_SERVER_URL") ?? defaultAPIURL);
+    const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? "";
+    const apiUrl = normalizeURL(config.apiUrl ?? readEnv("SB_API_URL") ?? defaultAPIURL);
 
     if (patToken === "") {
       throw new Error(authRequiredErrorMessage);
@@ -28,7 +29,7 @@ export class MicroVM {
 
     this.apiUrl = apiUrl;
     this.patToken = patToken;
-    this.client = new Client({
+    this.client = new APIClient({
       baseURL: apiUrl,
       patToken,
       fetch: config.fetch,

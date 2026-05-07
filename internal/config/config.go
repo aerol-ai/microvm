@@ -41,7 +41,7 @@ func Load() (Config, error) {
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
 	cfg := Config{
-		PATToken:            firstNonEmptyEnv("SB_PAT_TOKEN", "SB_API_TOKEN"),
+		PATToken:            strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
 		APIHost:             getEnv("SB_API_HOST", "0.0.0.0"),
 		APIPort:             getEnvInt("SB_API_PORT", 8080),
 		Domain:              normalizeHost(os.Getenv("SB_DOMAIN")),
@@ -104,15 +104,6 @@ func getEnv(key, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func firstNonEmptyEnv(keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func getEnvInt(key string, fallback int) int {

@@ -76,7 +76,6 @@ func TestNewClientCases(t *testing.T) {
 			name: "new_client_requires_pat_token",
 			run: func(t *testing.T) {
 				t.Setenv("SB_PAT_TOKEN", "")
-				t.Setenv("SB_API_TOKEN", "")
 				_, err := NewClientWithConfig(&sdktypes.MicroVMConfig{})
 				if err == nil {
 					t.Fatal("expected auth error")

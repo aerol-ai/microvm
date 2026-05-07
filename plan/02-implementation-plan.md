@@ -68,11 +68,13 @@ sandbox-library/
 │
 ├── sdk/
 │   └── go/
-│       ├── client.go                # NewClient(apiURL, token) — HTTP client wrapper
-│       ├── sandbox.go               # Create/Get/List/Start/Stop/Destroy/Resize/Exec
-│       ├── files.go                 # UploadFile / DownloadFile
-│       ├── ports.go                 # ExposePort
-│       └── types.go                 # Sandbox, CreateOptions, ResizeOptions, ExecResult
+│       ├── internal/
+│       │   └── apiclient/client.go  # Internal HTTP transport for the structured SDK
+│       └── pkg/
+│           ├── microvm/client.go    # Public SDK entrypoint: NewClient()/NewClientWithConfig()
+│           └── types/
+│               ├── config.go        # MicroVMConfig
+│               └── types.go         # Sandbox, CreateSandboxOptions, ResizeSandboxOptions, ExecResult
 │
 ├── scripts/
 │   ├── install.sh                   # Main install script (Docker + Caddy + sandboxd)
@@ -233,7 +235,7 @@ Uses Caddy's [Admin API](https://caddyserver.com/docs/api) (`POST /config/apps/h
 }
 ```
 
-In IP mode, the mounted toolbox daemon strips the `/<sandbox-id>` prefix itself, using the Docker short ID or a path-shape fallback.
+In IP mode, the mounted toolbox daemon strips the `/<sandbox-id>` prefix itself.
 
 **TLS:** Caddy auto-manages Let's Encrypt certs for `*.sandbox.aerol.ai` when a wildcard DNS is configured. For IP mode, no TLS (HTTP only).
 
@@ -305,15 +307,20 @@ Adapted from `daytona/apps/runner/pkg/sshgateway/service.go`:
 ### 7. `sdk/go/` — Go SDK
 
 ```go
-import "github.com/aerol-ai/microvm/sdk/go"
+import (
+  "os"
 
-client := sandbox.NewClient(
-    sandbox.WithBaseURL("http://localhost:8080"),
-    sandbox.WithToken(os.Getenv("SB_PAT_TOKEN")),
+  microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+  "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
+client, err := microvm.NewClientWithConfig(&types.MicroVMConfig{
+  PATToken: os.Getenv("SB_PAT_TOKEN"),
+  APIUrl:   "http://localhost:8080",
+})
+
 // Create
-sb, err := client.Create(ctx, sandbox.CreateOptions{
+sb, err := client.Create(ctx, types.CreateSandboxOptions{
     Image:    "python:3.12",
     CPU:      2,
     MemoryMB: 4096,
@@ -321,7 +328,7 @@ sb, err := client.Create(ctx, sandbox.CreateOptions{
 })
 
 // Exec (proxied through toolbox daemon)
-result, err := sb.Exec(ctx, "python3 -c 'print(42)'")
+result, err := sb.ExecCommand(ctx, "python3 -c 'print(42)'")
 
 // Files
 err = sb.UploadFile(ctx, "/workspace/script.py", data)

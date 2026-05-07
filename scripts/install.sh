@@ -22,7 +22,6 @@ Options:
   --domain <domain>            Base domain for wildcard sandbox routes
   --public-host <host-or-ip>   Public host used for IP mode or local URLs
 	--pat-token <token>          PAT token required for sandbox API requests
-	--token <token>              Alias for --pat-token
   --github-repo <owner/repo>   GitHub repo used for release downloads
   --version <tag|latest>       Release tag to install (default: latest)
   --sandboxd-url <url>         Download URL for sandboxd binary
@@ -127,10 +126,6 @@ while [[ $# -gt 0 ]]; do
 			shift 2
 			;;
 		--pat-token)
-			PAT_TOKEN="$2"
-			shift 2
-			;;
-		--token)
 			PAT_TOKEN="$2"
 			shift 2
 			;;

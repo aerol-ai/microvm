@@ -46,12 +46,15 @@ curl -X POST http://localhost:8080/v1/sandboxes \
 **Trigger:** SDK call in application code  
 **Flow:**
 ```go
-client := sandbox.NewClient("http://localhost:8080", os.Getenv("API_TOKEN"))
-sb, err := client.Create(ctx, sandbox.CreateOptions{
-    Image:   "python:3.12",
-    CPU:     2,
+client, err := microvm.NewClientWithConfig(&types.MicroVMConfig{
+    PATToken: os.Getenv("SB_PAT_TOKEN"),
+    APIUrl:   "http://localhost:8080",
+})
+sb, err := client.Create(ctx, types.CreateSandboxOptions{
+    Image:    "python:3.12",
+    CPU:      2,
     MemoryMB: 4096,
-    Env:     map[string]string{"APP_ENV": "test"},
+    Env:      map[string]string{"APP_ENV": "test"},
 })
 fmt.Println(sb.PublicURL) // https://7f3c2a1b9d4e.sandbox.aerol.ai
 ```

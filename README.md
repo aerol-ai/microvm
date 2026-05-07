@@ -161,6 +161,13 @@ Both SDKs send the PAT as `Authorization: Bearer <token>`.
 Go:
 
 ```go
+import (
+	"os"
+
+	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/types"
+)
+
 client, err := microvm.NewClientWithConfig(&types.MicroVMConfig{
 	PATToken: os.Getenv("SB_PAT_TOKEN"),
 	APIUrl:   "https://sandbox-api.example.com",
@@ -170,6 +177,8 @@ client, err := microvm.NewClientWithConfig(&types.MicroVMConfig{
 TypeScript:
 
 ```ts
+import { MicroVM } from "@aerol-ai/microvm-sdk";
+
 const client = new MicroVM({
 	apiUrl: "https://sandbox-api.example.com",
 	patToken: process.env.SB_PAT_TOKEN,

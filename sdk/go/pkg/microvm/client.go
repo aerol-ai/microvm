@@ -7,17 +7,17 @@ import (
 	"os"
 	"strings"
 
-	basesdk "github.com/aerol-ai/microvm/sdk/go"
+	apiclient "github.com/aerol-ai/microvm/sdk/go/internal/apiclient"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
 const defaultAPIURL = "http://127.0.0.1:8080"
-const authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN/SB_API_TOKEN."
+const authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
 
 type Client struct {
 	apiURL   string
 	patToken string
-	inner    *basesdk.Client
+	inner    *apiclient.Client
 }
 
 type Sandbox struct {
@@ -41,10 +41,10 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	}
 
 	if patToken == "" {
-		patToken = firstNonEmptyEnv("SB_PAT_TOKEN", "SB_API_TOKEN")
+		patToken = strings.TrimSpace(os.Getenv("SB_PAT_TOKEN"))
 	}
 	if apiURL == "" {
-		apiURL = firstNonEmptyEnv("SB_API_URL", "SB_SERVER_URL")
+		apiURL = strings.TrimSpace(os.Getenv("SB_API_URL"))
 		if apiURL == "" {
 			apiURL = defaultAPIURL
 		}
@@ -53,7 +53,7 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		return nil, errors.New(authRequiredErrorMessage)
 	}
 
-	inner := basesdk.NewClientWithOptions(apiURL, basesdk.ClientOptions{
+	inner := apiclient.NewClient(apiURL, apiclient.ClientOptions{
 		PATToken:   patToken,
 		HTTPClient: httpClient,
 	})
@@ -189,7 +189,7 @@ func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions
 	return nil
 }
 
-func wrapSandbox(client *Client, item *basesdk.Sandbox) *Sandbox {
+func wrapSandbox(client *Client, item *apiclient.Sandbox) *Sandbox {
 	if item == nil {
 		return nil
 	}
@@ -197,13 +197,4 @@ func wrapSandbox(client *Client, item *basesdk.Sandbox) *Sandbox {
 		Sandbox: item.Sandbox,
 		client:  client,
 	}
-}
-
-func firstNonEmptyEnv(keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
-		}
-	}
-	return ""
 }
