@@ -14,7 +14,7 @@ import (
 func TestStoreCases(t *testing.T) {
 	ctx := context.Background()
 
-	// 13 cases
+	// 18 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -261,6 +261,132 @@ func TestStoreCases(t *testing.T) {
 				}
 				if len(ports) != 0 {
 					t.Fatalf("expected no ports, got %+v", ports)
+				}
+			},
+		},
+		{
+			name: "has_active_image_ref_returns_false_when_only_destroyed",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-img-destroyed")
+				sandbox.Image = "alpine:3.19"
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				if err := st.UpdateStatus(ctx, sandbox.ID, models.SandboxStatusDestroyed, ""); err != nil {
+					t.Fatalf("UpdateStatus() error = %v", err)
+				}
+				active, err := st.HasActiveImageRef(ctx, "alpine:3.19")
+				if err != nil {
+					t.Fatalf("HasActiveImageRef() error = %v", err)
+				}
+				if active {
+					t.Fatal("expected no active references for image with only destroyed rows")
+				}
+			},
+		},
+		{
+			name: "has_active_image_ref_returns_true_when_stopped_present",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				stopped := sampleSandbox("sb-img-stopped")
+				stopped.Image = "alpine:3.19"
+				stopped.Status = models.SandboxStatusStopped
+				if err := st.Create(ctx, stopped); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				dead := sampleSandbox("sb-img-dead")
+				dead.Image = "alpine:3.19"
+				if err := st.Create(ctx, dead); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				if err := st.UpdateStatus(ctx, dead.ID, models.SandboxStatusDestroyed, ""); err != nil {
+					t.Fatalf("UpdateStatus() error = %v", err)
+				}
+				active, err := st.HasActiveImageRef(ctx, "alpine:3.19")
+				if err != nil {
+					t.Fatalf("HasActiveImageRef() error = %v", err)
+				}
+				if !active {
+					t.Fatal("expected stopped sandbox to count as an active reference")
+				}
+			},
+		},
+		{
+			name: "has_active_image_ref_isolates_by_image",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				other := sampleSandbox("sb-img-other")
+				other.Image = "ubuntu:22.04"
+				if err := st.Create(ctx, other); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				active, err := st.HasActiveImageRef(ctx, "alpine:3.19")
+				if err != nil {
+					t.Fatalf("HasActiveImageRef() error = %v", err)
+				}
+				if active {
+					t.Fatal("expected no references for unrelated image")
+				}
+			},
+		},
+		{
+			name: "has_active_image_ref_returns_true_for_empty_image",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				active, err := st.HasActiveImageRef(ctx, "")
+				if err != nil {
+					t.Fatalf("HasActiveImageRef() error = %v", err)
+				}
+				if !active {
+					t.Fatal("expected empty image to be treated as still in use")
+				}
+			},
+		},
+		{
+			name: "list_returns_all_ports_with_one_query_per_call",
+			run: func(t *testing.T) {
+				// Three sandboxes: one with two ports, one with one port, one
+				// with zero. Validates that the bulk-port attach correctly
+				// distributes rows by sandbox_id and leaves zero-port
+				// sandboxes alone.
+				st := newTestStore(t)
+				a := sampleSandbox("sb-list-a")
+				b := sampleSandbox("sb-list-b")
+				c := sampleSandbox("sb-list-c")
+				for _, sb := range []*models.Sandbox{a, b, c} {
+					if err := st.Create(ctx, sb); err != nil {
+						t.Fatalf("Create(%s) error = %v", sb.ID, err)
+					}
+				}
+				now := time.Now().UTC()
+				ports := []models.ExposedPort{
+					{SandboxID: a.ID, Port: 3000, PublicURL: "https://a-3000.example.com", CreatedAt: now},
+					{SandboxID: a.ID, Port: 4000, PublicURL: "https://a-4000.example.com", CreatedAt: now},
+					{SandboxID: b.ID, Port: 5000, PublicURL: "https://b-5000.example.com", CreatedAt: now},
+				}
+				for _, p := range ports {
+					if err := st.UpsertPort(ctx, p); err != nil {
+						t.Fatalf("UpsertPort(%s:%d) error = %v", p.SandboxID, p.Port, err)
+					}
+				}
+
+				items, err := st.List(ctx)
+				if err != nil {
+					t.Fatalf("List() error = %v", err)
+				}
+				byID := map[string]*models.Sandbox{}
+				for _, sb := range items {
+					byID[sb.ID] = sb
+				}
+				if len(byID[a.ID].ExposedPorts) != 2 {
+					t.Fatalf("a: expected 2 ports, got %+v", byID[a.ID].ExposedPorts)
+				}
+				if len(byID[b.ID].ExposedPorts) != 1 || byID[b.ID].ExposedPorts[0].Port != 5000 {
+					t.Fatalf("b: expected 1 port == 5000, got %+v", byID[b.ID].ExposedPorts)
+				}
+				if len(byID[c.ID].ExposedPorts) != 0 {
+					t.Fatalf("c: expected 0 ports, got %+v", byID[c.ID].ExposedPorts)
 				}
 			},
 		},

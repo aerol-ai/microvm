@@ -609,6 +609,34 @@ func (c *Client) removeContainer(ctx context.Context, containerRef string, force
 	return c.doJSON(ctx, http.MethodDelete, "/containers/"+url.PathEscape(containerRef), query, nil, nil, nil)
 }
 
+// RemoveImage deletes an image from the local Docker daemon by reference
+// (name:tag or digest). 404 (already gone) and 409 (still in use) are treated
+// as success: the goal is "image is no longer occupying disk on our account",
+// and a 409 means another container raced ahead and started using the image
+// between the caller's eligibility check and this call — leaving it is
+// correct, not an error. Other failures are returned for the caller to log.
+func (c *Client) RemoveImage(ctx context.Context, imageRef string) error {
+	imageRef = strings.TrimSpace(imageRef)
+	if imageRef == "" {
+		return nil
+	}
+	err := c.doJSON(ctx, http.MethodDelete, "/images/"+url.PathEscape(imageRef), nil, nil, nil, nil)
+	if err == nil {
+		return nil
+	}
+	if isImageRemoveBenignError(err.Error()) {
+		return nil
+	}
+	return err
+}
+
+// isImageRemoveBenignError matches the substrings doRequest emits for HTTP
+// 404 and 409 from the Docker daemon. Both are non-failures for image GC:
+// 404 = already deleted, 409 = something is referencing it, leave it alone.
+func isImageRemoveBenignError(message string) bool {
+	return strings.Contains(message, "status 404") || strings.Contains(message, "status 409")
+}
+
 // sandboxIDFromContainerName extracts the sandbox ID from Docker's container
 // name field. Docker stores names with a leading slash (e.g. "/abc123def456");
 // we trim it. The sandbox ID is the canonical identifier we set as the

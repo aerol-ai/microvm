@@ -70,6 +70,12 @@ func Open(path string) (*Store, error) {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
+		// idx_sandboxes_image powers HasActiveImageRef so image GC stays
+		// constant-cost as the destroyed-row history grows beyond the live
+		// sandbox count. Plain (image) is sufficient: SQLite filters on
+		// status using the index's row pointers, and the cardinality of
+		// status values is small enough that a composite buys nothing.
+		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
 	}
 
 	for _, stmt := range stmts {
@@ -248,24 +254,92 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	defer rows.Close()
 
 	var sandboxes []*models.Sandbox
+	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
 		sandbox, err := scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
-		ports, err := s.loadPorts(ctx, sandbox.ID)
-		if err != nil {
-			return nil, err
-		}
-		sandbox.ExposedPorts = ports
 		sandboxes = append(sandboxes, sandbox)
+		byID[sandbox.ID] = sandbox
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes: %w", err)
 	}
 
+	// Single query for all exposed ports across all sandboxes in the result
+	// set, then attach by sandbox_id. Avoids the N+1 pattern that would do
+	// 10k individual SELECTs at large table sizes. Empty sandboxes table is
+	// a fast no-op because we skip the query entirely.
+	if len(sandboxes) > 0 {
+		if err := s.attachPortsBulk(ctx, byID); err != nil {
+			return nil, err
+		}
+	}
+
 	return sandboxes, nil
+}
+
+// attachPortsBulk reads every exposed_ports row for any sandbox in byID with
+// one query and writes it onto the matching sandbox. Sandboxes with no ports
+// keep their nil slice — callers must not assume non-nil. The query scans
+// the whole exposed_ports table, which is fine because that table only has
+// rows for sandboxes that have ever exposed a port (a small fraction in
+// practice). If exposed_ports ever grows large enough that this scan
+// dominates, switch to a chunked WHERE sandbox_id IN (...) with parameter
+// batches; the in-memory join below stays the same shape.
+func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, port, public_url, created_at
+		FROM exposed_ports
+		ORDER BY sandbox_id, port ASC
+	`)
+	if err != nil {
+		return fmt.Errorf("load exposed ports: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var exposure models.ExposedPort
+		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+			return fmt.Errorf("scan exposed port: %w", err)
+		}
+		if sb, ok := byID[exposure.SandboxID]; ok {
+			sb.ExposedPorts = append(sb.ExposedPorts, exposure)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate exposed ports: %w", err)
+	}
+	return nil
+}
+
+// HasActiveImageRef reports whether any sandbox row references image with a
+// status other than destroyed. Used by image GC: when this returns false the
+// caller may safely remove the image from Docker. Single indexed query —
+// constant cost regardless of how many destroyed rows have accumulated, so
+// 10k destroyed historical rows do not slow the destroy hot path. Returns
+// true on empty image as a conservative default (caller treats it as "still
+// in use, do not delete").
+func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, error) {
+	if image == "" {
+		return true, nil
+	}
+	var present int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM sandboxes
+		WHERE image = ? AND status != ?
+		LIMIT 1
+	`, image, string(models.SandboxStatusDestroyed)).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check image references: %w", err)
+	}
+	return true, nil
 }
 
 func (s *Store) Delete(ctx context.Context, id string) error {

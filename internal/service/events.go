@@ -152,6 +152,14 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		"exit_code", event.ExitCode,
 		"status", string(sandbox.Status),
 	)
+
+	// Image GC: only on destroy. die/stop transition to stopped, where the
+	// image is still needed for a future Start. The store row above has
+	// already been updated to destroyed, so the helper's predicate will
+	// skip this sandbox correctly.
+	if status == models.SandboxStatusDestroyed {
+		s.maybeRemoveImage(ctx, sandbox.Image)
+	}
 	return nil
 }
 

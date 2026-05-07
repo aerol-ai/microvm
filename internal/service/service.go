@@ -362,6 +362,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		s.admitter.Release(id)
 	}
 	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
+	s.maybeRemoveImage(ctx, sandbox.Image)
 	return nil
 }
 
@@ -593,6 +594,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	for _, sandbox := range known {
 		runtime, ok := managed[sandbox.ID]
 		if !ok {
+			previousStatus := sandbox.Status
 			sandbox.Status = models.SandboxStatusDestroyed
 			sandbox.ContainerIP = ""
 			sandbox.ContainerID = ""
@@ -605,6 +607,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port)
 			}
 			_ = s.mounts.UnmountAll(sandbox.ID)
+			// Only GC on the transition into destroyed — a row that was
+			// already destroyed at the start of this reconcile pass already
+			// had its chance, and re-running the check on every tick would
+			// be wasted work.
+			if previousStatus != models.SandboxStatusDestroyed {
+				s.maybeRemoveImage(ctx, sandbox.Image)
+			}
 			continue
 		}
 
@@ -785,6 +794,57 @@ func generateSandboxID() (string, error) {
 		return "", err
 	}
 	return "sb-" + hex.EncodeToString(buf), nil
+}
+
+// imageStillReferenced reports whether any sandbox in the given slice still
+// holds a live reference to image. A reference is "live" when the sandbox's
+// status is anything other than destroyed — stopped, started, creating, and
+// error all count, because their image is needed for a future start. The
+// check is exact-match on the Image string, so a sandbox created with
+// "alpine" and one with "alpine:latest" are treated as different images
+// (matching the way Docker stores tags).
+//
+// This is the in-memory specification of the GC policy and is used in unit
+// tests. Production callers go through Store.HasActiveImageRef so the check
+// stays constant-cost as the destroyed-row history grows.
+func imageStillReferenced(sandboxes []*models.Sandbox, image string) bool {
+	if image == "" {
+		return true
+	}
+	for _, sb := range sandboxes {
+		if sb == nil {
+			continue
+		}
+		if sb.Image == image && sb.Status != models.SandboxStatusDestroyed {
+			return true
+		}
+	}
+	return false
+}
+
+// maybeRemoveImage deletes the given image from Docker if no non-destroyed
+// sandbox still references it. Best-effort: store and Docker errors are
+// logged, never returned, because image GC must not block the sandbox
+// lifecycle path that called us. Uses Store.HasActiveImageRef so the cost
+// is one indexed query rather than a full table scan, even when there are
+// 10k+ destroyed rows in history.
+func (s *Service) maybeRemoveImage(ctx context.Context, image string) {
+	if image == "" {
+		return
+	}
+	stillUsed, err := s.store.HasActiveImageRef(ctx, image)
+	if err != nil {
+		s.logger.Warn("image gc reference check failed", "image", image, "error", err)
+		return
+	}
+	if stillUsed {
+		return
+	}
+	if err := s.docker.RemoveImage(ctx, image); err != nil {
+		s.logger.Warn("image gc remove failed", "image", image, "error", err)
+		return
+	}
+	s.logger.Info("audit image removed", "image", image)
 }
 
 // syncAllowedPorts pushes the sandbox's current set of exposed ports to
