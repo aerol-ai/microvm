@@ -44,6 +44,7 @@ type Client struct {
 	privileged         bool
 	resourceLimitsOff  bool
 	httpClient         *http.Client
+	toolboxClient      *http.Client
 	networkRules       *netrules.Manager
 	waitTimeout        time.Duration
 	toolboxWaitTimeout time.Duration
@@ -76,6 +77,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
+		toolboxClient:      &http.Client{Timeout: cfg.HTTPClientTimeout},
 		networkRules:       rules,
 		waitTimeout:        30 * time.Second,
 		toolboxWaitTimeout: 30 * time.Second,
@@ -365,7 +367,7 @@ func (c *Client) waitForToolbox(ctx context.Context, containerIP string) error {
 		if err != nil {
 			return err
 		}
-		resp, err := c.httpClient.Do(req)
+		resp, err := c.toolboxClient.Do(req)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
