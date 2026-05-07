@@ -45,6 +45,8 @@ export interface Sandbox {
   env?: Record<string, string>;
   networkBlockAll: boolean;
   toolboxEnabled: boolean;
+  sshPublicKey?: string;
+  sshPrivateKey?: string;
   exposedPorts?: ExposedPort[];
   createdAt: string;
   updatedAt: string;

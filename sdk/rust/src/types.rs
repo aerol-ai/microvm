@@ -72,6 +72,8 @@ pub struct Sandbox {
     pub network_block_all: bool,
     #[serde(rename = "toolbox_enabled")]
     pub toolbox_enabled: bool,
+    #[serde(rename = "ssh_public_key", skip_serializing_if = "Option::is_none")]
+    pub ssh_public_key: Option<String>,
     #[serde(rename = "exposed_ports", skip_serializing_if = "Option::is_none")]
     pub exposed_ports: Option<Vec<ExposedPort>>,
     #[serde(rename = "created_at")]
@@ -84,6 +86,14 @@ pub struct Sandbox {
     pub last_error: Option<String>,
     #[serde(rename = "container_command", skip_serializing_if = "Option::is_none")]
     pub container_command: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CreateSandboxResponse {
+    #[serde(flatten)]
+    pub sandbox: Sandbox,
+    #[serde(rename = "ssh_private_key", skip_serializing_if = "Option::is_none")]
+    pub ssh_private_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

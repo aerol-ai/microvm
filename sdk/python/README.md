@@ -17,6 +17,10 @@ from microvm import MicroVM
 client = MicroVM(pat_token="${SB_PAT_TOKEN}", api_url="https://sandbox.example.com")
 health = client.health()
 print(health)
+
+sandbox = client.create({"image": "ghcr.io/aerol-ai/ubuntu:22.04"})
+print(sandbox.sshPublicKey)
+print(sandbox.sshPrivateKey)  # only returned by create()
 ```
 
 ## Example

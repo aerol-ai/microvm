@@ -43,12 +43,17 @@ interface ApiSandbox {
   env?: Record<string, string>;
   network_block_all: boolean;
   toolbox_enabled: boolean;
+  ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
   created_at: string;
   updated_at: string;
   last_active_at: string;
   last_error?: string;
   container_command?: string[];
+}
+
+interface ApiCreateSandboxResponse extends ApiSandbox {
+  ssh_private_key?: string;
 }
 
 interface ApiExecResult {
@@ -79,8 +84,8 @@ export class APIClient {
   }
 
   async create(options: CreateOptions): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("POST", "/v1/sandboxes", toApiCreateOptions(options));
-    return this.wrap(response);
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", "/v1/sandboxes", toApiCreateOptions(options));
+    return new SandboxResource(this, fromApiCreateSandboxResponse(response));
   }
 
   async list(): Promise<SandboxResource[]> {
@@ -204,6 +209,8 @@ export class SandboxResource implements Sandbox {
   declare env?: Record<string, string>;
   declare networkBlockAll: boolean;
   declare toolboxEnabled: boolean;
+  declare sshPublicKey?: string;
+  declare sshPrivateKey?: string;
   declare exposedPorts?: ExposedPort[];
   declare createdAt: string;
   declare updatedAt: string;
@@ -325,12 +332,20 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     env: sandbox.env,
     networkBlockAll: sandbox.network_block_all,
     toolboxEnabled: sandbox.toolbox_enabled,
+    sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),
     createdAt: sandbox.created_at,
     updatedAt: sandbox.updated_at,
     lastActiveAt: sandbox.last_active_at,
     lastError: sandbox.last_error,
     containerCommand: sandbox.container_command,
+  };
+}
+
+function fromApiCreateSandboxResponse(response: ApiCreateSandboxResponse): Sandbox {
+  return {
+    ...fromApiSandbox(response),
+    sshPrivateKey: response.ssh_private_key,
   };
 }
 

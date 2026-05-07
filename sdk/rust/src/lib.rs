@@ -18,6 +18,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 pub use types::{CreateOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, RegistryAuth, ResizeOptions, Sandbox as SandboxData};
+pub use types::CreateSandboxResponse;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
@@ -103,6 +104,7 @@ pub struct Client {
 pub struct Sandbox {
     pub client: Client,
     pub data: SandboxData,
+    pub ssh_private_key: Option<String>,
 }
 
 pub struct ExecStreamHandle {
@@ -175,7 +177,19 @@ impl ExecStreamHandle {
 
 impl Sandbox {
     fn new(client: Client, data: SandboxData) -> Self {
-        Sandbox { client, data }
+        Sandbox {
+            client,
+            data,
+            ssh_private_key: None,
+        }
+    }
+
+    fn new_with_ssh_private_key(client: Client, data: SandboxData, ssh_private_key: Option<String>) -> Self {
+        Sandbox {
+            client,
+            data,
+            ssh_private_key,
+        }
     }
 
     pub fn refresh(&mut self) -> Result<&Self, Error> {
@@ -253,8 +267,8 @@ impl Client {
     }
 
     pub fn create(&self, opts: CreateOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<CreateOptions, SandboxData>(Method::POST, "/v1/sandboxes", Some(&opts))?;
-        Ok(Sandbox::new(self.clone(), raw))
+        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(Method::POST, "/v1/sandboxes", Some(&opts))?;
+        Ok(Sandbox::new_with_ssh_private_key(self.clone(), raw.sandbox, raw.ssh_private_key))
     }
 
     pub fn list(&self) -> Result<Vec<Sandbox>, Error> {
@@ -497,6 +511,82 @@ fn websocket_url(base_url: &str, path: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn spawn_json_server(body: String) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("server should accept");
+            let request = read_http_request(&mut stream);
+            request_tx.send(request).expect("request should be sent");
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream.write_all(response.as_bytes()).expect("response should write");
+        });
+
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut header_end = None;
+        let mut content_length = 0usize;
+
+        loop {
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).expect("request should read");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+
+            if header_end.is_none() {
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let headers = String::from_utf8_lossy(&buffer[..end]);
+                    for line in headers.lines() {
+                        if let Some(value) = line.split_once(':') {
+                            if value.0.eq_ignore_ascii_case("content-length") {
+                                content_length = value.1.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(end) = header_end {
+                if buffer.len() >= end + content_length {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&buffer).to_string()
+    }
+
+    fn minimal_create_options() -> CreateOptions {
+        CreateOptions {
+            image: "ubuntu:22.04".to_string(),
+            cpu: None,
+            memory_mb: None,
+            disk_gb: None,
+            env: None,
+            os_user: None,
+            network_block_all: None,
+            registry: None,
+            container_command: None,
+        }
+    }
 
     #[test]
     fn new_client_uses_environment_defaults() {
@@ -513,5 +603,39 @@ mod tests {
     fn websocket_url_switches_schemes() {
         let ws = websocket_url("https://sandbox.example.com", "/v1/sandboxes/sb/toolbox/process/exec/stream").expect("ws url");
         assert_eq!(ws, "wss://sandbox.example.com/v1/sandboxes/sb/toolbox/process/exec/stream");
+    }
+
+    #[test]
+    fn create_returns_ssh_key_material() {
+        let body = serde_json::json!({
+            "id": "sb-create",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-create.example.com",
+            "cpu": 2,
+            "memory_mb": 2048,
+            "disk_gb": 20,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "ssh_public_key": "ssh-ed25519 AAAA sandbox",
+            "ssh_private_key": "PRIVATE",
+            "exposed_ports": [],
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client.create(minimal_create_options()).expect("create should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let request_lower = request.to_ascii_lowercase();
+
+        assert!(request.starts_with("POST /v1/sandboxes HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(request_lower.contains("authorization: bearer pat-token"), "missing bearer auth: {}", request);
+        assert_eq!(sandbox.data.ssh_public_key.as_deref(), Some("ssh-ed25519 AAAA sandbox"));
+        assert_eq!(sandbox.ssh_private_key.as_deref(), Some("PRIVATE"));
     }
 }

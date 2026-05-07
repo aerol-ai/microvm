@@ -457,6 +457,12 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     env = _first_of(sandbox, "env")
     if isinstance(env, dict) and len(env) > 0:
         result["env"] = {str(key): str(value) for key, value in env.items()}
+    ssh_public_key = _first_of(sandbox, "ssh_public_key", "sshPublicKey")
+    if ssh_public_key not in (None, ""):
+        result["sshPublicKey"] = str(ssh_public_key)
+    ssh_private_key = _first_of(sandbox, "ssh_private_key", "sshPrivateKey")
+    if ssh_private_key not in (None, ""):
+        result["sshPrivateKey"] = str(ssh_private_key)
     last_error = _first_of(sandbox, "last_error", "lastError")
     if last_error not in (None, ""):
         result["lastError"] = str(last_error)

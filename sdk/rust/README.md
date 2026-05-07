@@ -10,6 +10,20 @@ use microvm_sdk::{Client, CreateOptions};
 let client = Client::new(Some("http://127.0.0.1:8080"), Some("your-pat-token"))?;
 let health = client.health()?;
 println!("health = {:?}", health);
+
+let sandbox = client.create(CreateOptions {
+	image: "ghcr.io/aerol-ai/ubuntu:22.04".to_string(),
+	cpu: None,
+	memory_mb: None,
+	disk_gb: None,
+	env: None,
+	os_user: None,
+	network_block_all: None,
+	registry: None,
+	container_command: None,
+})?;
+println!("ssh public key = {:?}", sandbox.data.ssh_public_key);
+println!("ssh private key = {:?}", sandbox.ssh_private_key); // only returned by create()
 ```
 
 ## Example

@@ -24,6 +24,8 @@ class RecordingMicroVM(MicroVM):
                 "os_user": "root",
                 "network_block_all": True,
                 "toolbox_enabled": True,
+                "ssh_public_key": "ssh-ed25519 AAAA sandbox",
+                "ssh_private_key": "PRIVATE",
                 "exposed_ports": [],
                 "created_at": "2026-05-07T10:00:00Z",
                 "updated_at": "2026-05-07T10:00:00Z",
@@ -111,6 +113,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(sandbox.publicURL, "https://sb-1.example.com")
         self.assertEqual(sandbox.memoryMB, 2048)
         self.assertTrue(sandbox.networkBlockAll)
+        self.assertEqual(sandbox.sshPublicKey, "ssh-ed25519 AAAA sandbox")
+        self.assertEqual(sandbox.sshPrivateKey, "PRIVATE")
 
     def test_exec_and_health_map_api_shapes(self):
         client = RecordingMicroVM()

@@ -83,6 +83,8 @@ class SandboxData(TypedDict, total=False):
     env: Dict[str, str]
     networkBlockAll: bool
     toolboxEnabled: bool
+    sshPublicKey: str
+    sshPrivateKey: str
     exposedPorts: List[ExposedPort]
     createdAt: str
     updatedAt: str

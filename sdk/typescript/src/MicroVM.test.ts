@@ -41,6 +41,40 @@ test("MicroVM uses explicit config and returns Sandbox resources", async () => {
   assert.equal(sandbox.id, "sb-structured");
 });
 
+test("MicroVM create returns SSH key material", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com/",
+    fetch: async () => new Response(JSON.stringify({
+      id: "sb-create",
+      image: "ubuntu:22.04",
+      status: "started",
+      public_url: "https://sb-create.example.com",
+      cpu: 2,
+      memory_mb: 2048,
+      disk_gb: 20,
+      os_user: "root",
+      network_block_all: false,
+      toolbox_enabled: true,
+      ssh_public_key: "ssh-ed25519 AAAA sandbox",
+      ssh_private_key: "PRIVATE",
+      exposed_ports: [],
+      created_at: "2026-05-07T10:00:00Z",
+      updated_at: "2026-05-07T10:00:00Z",
+      last_active_at: "2026-05-07T10:00:00Z",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+
+  const sandbox = await sdk.create({ image: "ubuntu:22.04" });
+
+  assert.equal(sandbox.id, "sb-create");
+  assert.equal(sandbox.sshPublicKey, "ssh-ed25519 AAAA sandbox");
+  assert.equal(sandbox.sshPrivateKey, "PRIVATE");
+});
+
 test("MicroVM reads PAT token and API URL from environment", async () => {
   const originalPat = process.env.SB_PAT_TOKEN;
   const originalURL = process.env.SB_API_URL;
