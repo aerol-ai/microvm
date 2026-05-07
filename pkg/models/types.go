@@ -4,6 +4,17 @@ import "time"
 
 type SandboxStatus string
 
+// Sandbox lifecycle states.
+//
+// SandboxStatusDestroyed marks a sandbox whose container is gone — either
+// because the user called DELETE /sandboxes/{id}, or because the container
+// died out-of-band and the event monitor / reconcile loop noticed. The DB
+// row is retained indefinitely as an audit record by default; operators
+// who want automatic cleanup of old destroyed rows can set
+// SB_DESTROYED_ROW_TTL (e.g. "720h" for 30 days) to have them purged by the
+// reconcile sweep. There is no automatic row-level GC otherwise — by
+// design, so post-incident "what ran last week?" questions remain
+// answerable from the DB.
 const (
 	SandboxStatusCreating  SandboxStatus = "creating"
 	SandboxStatusStarted   SandboxStatus = "started"

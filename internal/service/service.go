@@ -682,6 +682,25 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 	s.mounts.Sweep(keep)
 
+	// Optional row-level GC. Disabled by default (TTL=0): destroyed rows
+	// stay forever as an audit record. When enabled, anything in destroyed
+	// status that last transitioned more than TTL ago is deleted. Image GC
+	// has already had its turn on this tick, so a row being purged here is
+	// either holding the last reference to an image we already removed, or
+	// to one another live sandbox is keeping pinned — both are safe.
+	if ttl := s.cfg.DestroyedRowTTL; ttl > 0 {
+		cutoff := time.Now().UTC().Add(-ttl)
+		purged, err := s.store.PurgeDestroyedBefore(ctx, cutoff)
+		if err != nil {
+			s.logger.Warn("destroyed row purge failed", "error", err)
+		} else if purged > 0 {
+			s.logger.Info("audit destroyed rows purged",
+				"count", purged,
+				"older_than", ttl.String(),
+			)
+		}
+	}
+
 	return nil
 }
 

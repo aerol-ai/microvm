@@ -14,7 +14,7 @@ import (
 func TestStoreCases(t *testing.T) {
 	ctx := context.Background()
 
-	// 18 cases
+	// 21 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -340,6 +340,83 @@ func TestStoreCases(t *testing.T) {
 				}
 				if !active {
 					t.Fatal("expected empty image to be treated as still in use")
+				}
+			},
+		},
+		{
+			name: "purge_destroyed_before_only_affects_destroyed_rows",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+
+				live := sampleSandbox("sb-purge-live")
+				if err := st.Create(ctx, live); err != nil {
+					t.Fatalf("Create(live) error = %v", err)
+				}
+
+				dead := sampleSandbox("sb-purge-dead")
+				if err := st.Create(ctx, dead); err != nil {
+					t.Fatalf("Create(dead) error = %v", err)
+				}
+				if err := st.UpdateStatus(ctx, dead.ID, models.SandboxStatusDestroyed, ""); err != nil {
+					t.Fatalf("UpdateStatus() error = %v", err)
+				}
+
+				// Cutoff in the future ensures both rows are technically
+				// "before" cutoff — but only the destroyed one should be
+				// deleted. Live sandboxes are immune even if they're old.
+				purged, err := st.PurgeDestroyedBefore(ctx, time.Now().Add(time.Hour))
+				if err != nil {
+					t.Fatalf("PurgeDestroyedBefore() error = %v", err)
+				}
+				if purged != 1 {
+					t.Fatalf("expected 1 row purged, got %d", purged)
+				}
+
+				if _, err := st.Get(ctx, live.ID); err != nil {
+					t.Fatalf("live sandbox should still exist: %v", err)
+				}
+				if _, err := st.Get(ctx, dead.ID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("destroyed row should be gone, got err = %v", err)
+				}
+			},
+		},
+		{
+			name: "purge_destroyed_before_respects_cutoff",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+
+				dead := sampleSandbox("sb-purge-recent")
+				if err := st.Create(ctx, dead); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				if err := st.UpdateStatus(ctx, dead.ID, models.SandboxStatusDestroyed, ""); err != nil {
+					t.Fatalf("UpdateStatus() error = %v", err)
+				}
+
+				// Cutoff one hour in the past: the row was destroyed just
+				// now, so it's NEWER than cutoff and must not be purged.
+				purged, err := st.PurgeDestroyedBefore(ctx, time.Now().Add(-time.Hour))
+				if err != nil {
+					t.Fatalf("PurgeDestroyedBefore() error = %v", err)
+				}
+				if purged != 0 {
+					t.Fatalf("expected 0 rows purged for fresh destroy, got %d", purged)
+				}
+				if _, err := st.Get(ctx, dead.ID); err != nil {
+					t.Fatalf("recently destroyed row should still exist: %v", err)
+				}
+			},
+		},
+		{
+			name: "purge_destroyed_before_noop_on_empty_table",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				purged, err := st.PurgeDestroyedBefore(ctx, time.Now())
+				if err != nil {
+					t.Fatalf("PurgeDestroyedBefore() error = %v", err)
+				}
+				if purged != 0 {
+					t.Fatalf("expected 0 rows purged on empty table, got %d", purged)
 				}
 			},
 		},
