@@ -215,6 +215,30 @@ install_packages() {
 	if command -v apt-get >/dev/null 2>&1; then
 		apt-get update
 		apt-get install -y build-essential ca-certificates curl gnupg lsb-release software-properties-common
+		# Mount tooling for the host-managed external storage feature.
+		# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
+		# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
+		# we attempt an apt install first and fall back to the AWS download.
+		apt-get install -y fuse3 sshfs nfs-common rclone || true
+		if ! command -v mount-s3 >/dev/null 2>&1; then
+			local arch_suffix
+			case "$(uname -m)" in
+				x86_64|amd64) arch_suffix="x86_64" ;;
+				aarch64|arm64) arch_suffix="arm64" ;;
+				*) arch_suffix="" ;;
+			esac
+			if [[ -n "$arch_suffix" ]]; then
+				local tmp_deb
+				tmp_deb="$(mktemp --suffix=.deb)"
+				if curl -fsSL "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
+					apt-get install -y "$tmp_deb" || \
+						echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
+				else
+					echo "Warning: failed to download mountpoint-s3; s3 mounts will be unavailable until installed manually" >&2
+				fi
+				rm -f "$tmp_deb"
+			fi
+		fi
 		if ! command -v docker >/dev/null 2>&1; then
 			apt-get install -y docker.io
 			systemctl enable --now docker
@@ -261,7 +285,8 @@ install_binaries() {
 }
 
 write_environment() {
-	mkdir -p /etc/sandboxd /var/lib/sandboxd
+	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
 SB_API_HOST=0.0.0.0
@@ -278,6 +303,9 @@ SB_TOOLBOX_PORT=2280
 SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
 SB_ENABLE_CADDY=true
 SB_ENABLE_NETWORK_RULES=true
+SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
+SB_MOUNTS_CRED_DIR=/run/sandboxd
+SB_MOUNT_WAIT_TIMEOUT=30s
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
@@ -339,7 +367,14 @@ StartLimitBurst=10
 [Service]
 Type=simple
 EnvironmentFile=/etc/sandboxd/sandboxd.env
+ExecStartPre=/bin/mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
+ExecStartPre=/bin/chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
 ExecStart=$INSTALL_PREFIX/sandboxd
+# MountFlags=shared lets bind-mounts created by sandboxd (FUSE mounts under
+# /var/lib/sandboxd/mounts/<id>/) propagate into the Docker daemon's view
+# so containers actually see the storage. Without this some configurations
+# leave the daemon with a private mount namespace and the bind appears empty.
+MountFlags=shared
 Restart=always
 RestartSec=5
 TimeoutStartSec=60

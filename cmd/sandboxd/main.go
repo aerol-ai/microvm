@@ -18,6 +18,8 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
 )
 
@@ -53,7 +55,25 @@ func main() {
 	}
 
 	caddyClient := caddy.New(cfg)
-	svc := service.New(cfg, logger, db, dockerClient, caddyClient)
+
+	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
+	if err != nil {
+		logger.Error("failed to initialize credential cipher", "error", err)
+		os.Exit(1)
+	}
+
+	mountManager, err := mounts.New(logger, mounts.Config{
+		RootDir:     cfg.MountsRootPath,
+		CredDir:     cfg.MountsCredentialsRuntimeDir,
+		WaitTimeout: cfg.MountWaitTimeout,
+	})
+	if err != nil {
+		logger.Error("failed to initialize mount manager", "error", err)
+		os.Exit(1)
+	}
+	defer mountManager.Close()
+
+	svc := service.New(cfg, logger, db, dockerClient, caddyClient, cipher, mountManager)
 
 	if cfg.AutoReconcile {
 		if err := svc.Reconcile(ctx); err != nil {

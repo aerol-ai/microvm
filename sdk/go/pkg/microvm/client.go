@@ -104,6 +104,13 @@ func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
 	return wrapSandbox(c, item), nil
 }
 
+// Mounts returns the redacted mount config for a sandbox. Credentials are
+// never included; this endpoint is for showing the user what their sandbox
+// has configured, not for retrieving secrets.
+func (c *Client) Mounts(ctx context.Context, id string) ([]sdktypes.MountSpecRedacted, error) {
+	return c.inner.Mounts(ctx, id)
+}
+
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	item, err := c.inner.Start(ctx, id)
 	if err != nil {

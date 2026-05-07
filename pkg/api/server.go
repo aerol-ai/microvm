@@ -51,6 +51,7 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /v1/sandboxes/{id}/resize", s.requireAuth(http.HandlerFunc(s.handleResizeSandbox)))
 	s.mux.Handle("POST /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleExposePort)))
 	s.mux.Handle("DELETE /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleUnexposePort)))
+	s.mux.Handle("GET /v1/sandboxes/{id}/mounts", s.requireAuth(http.HandlerFunc(s.handleListMounts)))
 	s.mux.Handle("/v1/sandboxes/{id}/toolbox", s.requireAuth(http.HandlerFunc(s.handleToolboxProxy)))
 	s.mux.Handle("/v1/sandboxes/{id}/toolbox/{path...}", s.requireAuth(http.HandlerFunc(s.handleToolboxProxy)))
 }
@@ -197,6 +198,15 @@ func (s *Server) handleExposePort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"public_url": publicURL})
+}
+
+func (s *Server) handleListMounts(w http.ResponseWriter, r *http.Request) {
+	mounts, err := s.service.ListMounts(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeStoreAwareError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"mounts": mounts})
 }
 
 func (s *Server) handleUnexposePort(w http.ResponseWriter, r *http.Request) {

@@ -21,10 +21,10 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 const managedLabelKey = "sandbox-library.managed"
-const sandboxIDLength = 12
 
 type SandboxRuntime struct {
 	SandboxID   string
@@ -110,7 +110,16 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, toolboxToken string) (*SandboxRuntime, error) {
+// Create provisions and starts a managed container. The caller chooses the
+// sandbox ID up-front; we set it as the container's Docker name so the name
+// is the canonical sandbox identifier end-to-end (the container ID is an
+// internal detail). Host-side mounts are passed as bind sources prepared by
+// the mounts manager; sandboxd never writes a mounts.json into the container.
+func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID string, toolboxToken string, hostMounts []mounts.ContainerBind) (*SandboxRuntime, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil, errors.New("sandbox ID is required")
+	}
 	if err := c.ensureToolboxBinary(); err != nil {
 		return nil, err
 	}
@@ -157,11 +166,20 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, to
 		"Labels":     labels,
 	}
 
+	binds := []string{
+		fmt.Sprintf("%s:%s:ro", c.toolboxBinaryPath, c.toolboxMountPath),
+	}
+	for _, m := range hostMounts {
+		entry := fmt.Sprintf("%s:%s", m.HostPath, m.ContainerPath)
+		if m.ReadOnly {
+			entry += ":ro"
+		}
+		binds = append(binds, entry)
+	}
+
 	hostConfig := map[string]any{
 		"Privileged": c.privileged,
-		"Binds": []string{
-			fmt.Sprintf("%s:%s:ro", c.toolboxBinaryPath, c.toolboxMountPath),
-		},
+		"Binds":      binds,
 	}
 
 	if c.network != "" && c.network != "bridge" {
@@ -188,15 +206,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, to
 	var created struct {
 		ID string `json:"Id"`
 	}
-	err = c.doJSON(ctx, http.MethodPost, "/containers/create", nil, createRequest, nil, &created)
+	createQuery := url.Values{}
+	createQuery.Set("name", sandboxID)
+	err = c.doJSON(ctx, http.MethodPost, "/containers/create", createQuery, createRequest, nil, &created)
 	if err != nil {
 		return nil, fmt.Errorf("create container: %w", err)
-	}
-
-	sandboxID := sandboxIDFromContainerID(created.ID)
-	if sandboxID == "" {
-		_ = c.removeContainer(ctx, created.ID, true)
-		return nil, errors.New("docker returned empty container ID")
 	}
 
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
@@ -309,7 +323,7 @@ func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRunt
 		return nil, fmt.Errorf("inspect container: %w", err)
 	}
 	return &SandboxRuntime{
-		SandboxID:   sandboxIDFromContainerID(inspect.ID),
+		SandboxID:   sandboxIDFromContainerName(inspect.Name),
 		ContainerID: inspect.ID,
 		ContainerIP: getContainerIP(inspect, c.network),
 		Status:      containerStatus(inspect),
@@ -334,7 +348,7 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 			continue
 		}
 		runtime := &SandboxRuntime{
-			SandboxID:   sandboxIDFromContainerID(inspect.ID),
+			SandboxID:   sandboxIDFromContainerName(inspect.Name),
 			ContainerID: inspect.ID,
 			ContainerIP: getContainerIP(inspect, c.network),
 			Status:      containerStatus(inspect),
@@ -422,7 +436,7 @@ func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*Sand
 				return nil, err
 			}
 			return &SandboxRuntime{
-				SandboxID:   sandboxIDFromContainerID(inspect.ID),
+				SandboxID:   sandboxIDFromContainerName(inspect.Name),
 				ContainerID: inspect.ID,
 				ContainerIP: containerIP,
 				Status:      models.SandboxStatusStarted,
@@ -557,6 +571,7 @@ type imageInspect struct {
 
 type containerInspect struct {
 	ID    string `json:"Id"`
+	Name  string `json:"Name"`
 	State *struct {
 		Running bool   `json:"Running"`
 		Status  string `json:"Status"`
@@ -592,10 +607,12 @@ func (c *Client) removeContainer(ctx context.Context, containerRef string, force
 	return c.doJSON(ctx, http.MethodDelete, "/containers/"+url.PathEscape(containerRef), query, nil, nil, nil)
 }
 
-func sandboxIDFromContainerID(containerID string) string {
-	containerID = strings.TrimSpace(containerID)
-	if len(containerID) > sandboxIDLength {
-		return containerID[:sandboxIDLength]
-	}
-	return containerID
+// sandboxIDFromContainerName extracts the sandbox ID from Docker's container
+// name field. Docker stores names with a leading slash (e.g. "/abc123def456");
+// we trim it. The sandbox ID is the canonical identifier we set as the
+// container's name at create time.
+func sandboxIDFromContainerName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "/")
+	return name
 }

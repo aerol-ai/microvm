@@ -35,6 +35,11 @@ type Config struct {
 	EnableSSHGateway    bool
 	SSHListenAddr       string
 	SSHHostKeyPath      string
+	CredentialEncryptionKey     string
+	CredentialEncryptionKeyPath string
+	MountsRootPath              string
+	MountsCredentialsRuntimeDir string
+	MountWaitTimeout            time.Duration
 	LogLevel                 string
 	ShutdownTimeout          time.Duration
 	HTTPClientTimeout        time.Duration
@@ -71,6 +76,11 @@ func Load() (Config, error) {
 		EnableSSHGateway:    getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		SSHListenAddr:       getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:      getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
+		CredentialEncryptionKey:     strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
+		CredentialEncryptionKeyPath: getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
+		MountsRootPath:              getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
+		MountsCredentialsRuntimeDir: getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
+		MountWaitTimeout:            getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
 		LogLevel:            strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
 		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
 		HTTPClientTimeout:        getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 10*time.Second),

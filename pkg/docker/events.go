@@ -107,7 +107,10 @@ func (r rawDockerEvent) normalize() (DockerEvent, bool) {
 		return DockerEvent{}, false
 	}
 
-	sandboxID := sandboxIDFromContainerID(r.ID)
+	// Docker tags every container event Actor with the container's name. We
+	// set the name to the sandbox ID at create time, so it's the authoritative
+	// sandbox identifier here.
+	sandboxID := sandboxIDFromContainerName(r.Actor.Attributes["name"])
 	if sandboxID == "" {
 		return DockerEvent{}, false
 	}

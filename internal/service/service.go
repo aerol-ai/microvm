@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -27,15 +30,19 @@ type Service struct {
 	store  *store.Store
 	docker *docker.Client
 	caddy  *caddy.Client
+	cipher *secrets.Cipher
+	mounts *mounts.Manager
 }
 
-func New(cfg config.Config, logger *slog.Logger, db *store.Store, dockerClient *docker.Client, caddyClient *caddy.Client) *Service {
+func New(cfg config.Config, logger *slog.Logger, db *store.Store, dockerClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager) *Service {
 	return &Service{
 		cfg:    cfg,
 		logger: logger,
 		store:  db,
 		docker: dockerClient,
 		caddy:  caddyClient,
+		cipher: cipher,
+		mounts: mountManager,
 	}
 }
 
@@ -43,6 +50,20 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 	req = normalizeCreateRequest(req)
 	if req.Image == "" {
 		return nil, errors.New("image is required")
+	}
+
+	if len(req.Mounts) > models.MaxMountsPerSandbox {
+		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
+	}
+	for i := range req.Mounts {
+		if err := req.Mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
+			return nil, fmt.Errorf("mount %d: %w", i, err)
+		}
+	}
+
+	sealedMounts, err := s.sealMounts(req.Mounts)
+	if err != nil {
+		return nil, err
 	}
 
 	toolboxToken, err := generateToolboxToken()
@@ -55,13 +76,27 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, fmt.Errorf("generate ssh keypair: %w", err)
 	}
 
-	runtime, err := s.docker.Create(ctx, req, toolboxToken)
+	// Choose the sandbox ID up-front so we have stable host paths to bind
+	// before docker.Create runs. The ID also becomes the container's name.
+	sandboxID, err := generateSandboxID()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate sandbox id: %w", err)
 	}
-	if runtime.SandboxID == "" {
-		_ = s.docker.Destroy(ctx, &models.Sandbox{ContainerID: runtime.ContainerID, ContainerIP: runtime.ContainerIP})
-		return nil, errors.New("docker runtime did not return a sandbox ID")
+
+	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
+	if err != nil {
+		return nil, fmt.Errorf("mount external storage: %w", err)
+	}
+	cleanupMounts := func() {
+		if err := s.mounts.UnmountAll(sandboxID); err != nil {
+			s.logger.Warn("cleanup unmount failed", "sandbox_id", sandboxID, "error", err)
+		}
+	}
+
+	runtime, err := s.docker.Create(ctx, req, sandboxID, toolboxToken, binds)
+	if err != nil {
+		cleanupMounts()
+		return nil, err
 	}
 
 	now := time.Now().UTC()
@@ -89,13 +124,25 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 		_ = s.docker.Destroy(ctx, sandbox)
+		cleanupMounts()
 		return nil, err
 	}
 
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.docker.Destroy(ctx, sandbox)
+		cleanupMounts()
 		return nil, err
+	}
+
+	if len(sealedMounts) > 0 {
+		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
+			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			_ = s.docker.Destroy(ctx, sandbox)
+			cleanupMounts()
+			return nil, fmt.Errorf("persist sandbox mounts: %w", err)
+		}
 	}
 
 	s.logger.Info("audit sandbox created",
@@ -105,6 +152,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		"memory_mb", sandbox.MemoryMB,
 		"disk_gb", sandbox.DiskGB,
 		"network_block_all", sandbox.NetworkBlockAll,
+		"mount_count", len(req.Mounts),
 	)
 	stored, err := s.store.Get(ctx, sandbox.ID)
 	if err != nil {
@@ -114,6 +162,57 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		Sandbox:       *stored,
 		SSHPrivateKey: privateKeyPEM,
 	}, nil
+}
+
+// sealMounts marshals the user's mount specs and encrypts the JSON for
+// at-rest storage. Returns nil when there are no mounts.
+func (s *Service) sealMounts(specs []models.MountSpec) ([]byte, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	plain, err := json.Marshal(models.MountSpecFile{Mounts: specs})
+	if err != nil {
+		return nil, fmt.Errorf("marshal mounts: %w", err)
+	}
+	sealed, err := s.cipher.Encrypt(plain)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt mounts: %w", err)
+	}
+	return sealed, nil
+}
+
+// loadMounts reads, decrypts, and unmarshals a sandbox's stored mount specs.
+// Returns nil, nil when the sandbox has no mounts.
+func (s *Service) loadMounts(ctx context.Context, sandboxID string) ([]models.MountSpec, error) {
+	sealed, err := s.store.GetMounts(ctx, sandboxID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	plain, err := s.cipher.Decrypt(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt mounts: %w", err)
+	}
+	var file models.MountSpecFile
+	if err := json.Unmarshal(plain, &file); err != nil {
+		return nil, fmt.Errorf("unmarshal mounts: %w", err)
+	}
+	return file.Mounts, nil
+}
+
+// ListMounts returns the redacted mount config for a sandbox. Credentials are
+// never included in the response — they are write-only via CreateSandbox.
+func (s *Service) ListMounts(ctx context.Context, sandboxID string) ([]models.MountSpecRedacted, error) {
+	if _, err := s.store.Get(ctx, sandboxID); err != nil {
+		return nil, err
+	}
+	specs, err := s.loadMounts(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	return models.RedactMounts(specs), nil
 }
 
 // generateSandboxSSHKeys produces an ed25519 keypair scoped to a single
@@ -152,8 +251,19 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		return nil, err
 	}
 
+	specs, err := s.loadMounts(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(specs) > 0 {
+		if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+			return nil, fmt.Errorf("reestablish mounts: %w", err)
+		}
+	}
+
 	runtime, err := s.docker.Start(ctx, sandboxContainerRef(sandbox))
 	if err != nil {
+		_ = s.mounts.UnmountAll(id)
 		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 		return nil, err
 	}
@@ -192,6 +302,9 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 	if err := s.docker.Stop(ctx, sandboxContainerRef(sandbox)); err != nil {
 		return nil, err
 	}
+	if err := s.mounts.UnmountAll(id); err != nil {
+		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
+	}
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
@@ -211,6 +324,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 	if err := s.docker.Destroy(ctx, sandbox); err != nil {
 		return err
+	}
+	if err := s.mounts.UnmountAll(id); err != nil {
+		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", err)
 	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
@@ -376,6 +492,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port)
 			}
+			_ = s.mounts.UnmountAll(sandbox.ID)
 			continue
 		}
 
@@ -394,6 +511,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				}
 			}
 			s.syncAllowedPorts(ctx, sandbox)
+			// Re-establish host-side mounts for running sandboxes after a
+			// sandboxd restart. Idempotent — only mounts that aren't already
+			// tracked are spawned.
+			if specs, err := s.loadMounts(ctx, sandbox.ID); err != nil {
+				s.logger.Warn("load mounts during reconcile", "sandbox_id", sandbox.ID, "error", err)
+			} else if len(specs) > 0 {
+				if err := s.mounts.Reestablish(ctx, sandbox.ID, specs); err != nil {
+					s.logger.Warn("reestablish mounts", "sandbox_id", sandbox.ID, "error", err)
+				}
+			}
 		}
 		if err := s.store.Upsert(ctx, sandbox); err != nil {
 			return err
@@ -418,6 +545,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			)
 		}
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
+		_ = s.mounts.UnmountAll(sandboxID)
 	}
 
 	return nil
@@ -521,6 +649,17 @@ func generateToolboxToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// generateSandboxID returns a 16-hex-char sandbox identifier. It is used as
+// both the daemon's primary key for the sandbox and the Docker container's
+// name, so it must satisfy Docker's name restrictions ([a-zA-Z0-9_.-]).
+func generateSandboxID() (string, error) {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "sb-" + hex.EncodeToString(buf), nil
 }
 
 // syncAllowedPorts pushes the sandbox's current set of exposed ports to

@@ -107,6 +107,16 @@ func (c *Client) Resize(ctx context.Context, id string, opts ResizeOptions) (*Sa
 	return c.wrap(response), nil
 }
 
+func (c *Client) Mounts(ctx context.Context, id string) ([]models.MountSpecRedacted, error) {
+	var response struct {
+		Mounts []models.MountSpecRedacted `json:"mounts"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/v1/sandboxes/"+id+"/mounts", nil, &response); err != nil {
+		return nil, err
+	}
+	return response.Mounts, nil
+}
+
 func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (ExecResult, error) {
 	var response ExecResult
 	err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+id+"/toolbox/process/execute", request, &response)

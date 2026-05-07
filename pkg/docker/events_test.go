@@ -8,7 +8,8 @@ import (
 
 func TestRawDockerEventNormalize(t *testing.T) {
 	const containerID = "abcd1234ef567890"
-	const wantSandboxID = "abcd1234ef56"
+	const sandboxName = "/sb-abcd1234ef56"
+	const wantSandboxID = "sb-abcd1234ef56"
 
 	cases := []struct {
 		name        string
@@ -24,7 +25,7 @@ func TestRawDockerEventNormalize(t *testing.T) {
 				"status": "die",
 				"id": "` + containerID + `",
 				"time": 1700000000,
-				"Actor": {"Attributes": {"exitCode": "137"}}
+				"Actor": {"Attributes": {"name": "` + sandboxName + `", "exitCode": "137"}}
 			}`,
 			wantOK:      true,
 			wantAction:  "die",
@@ -36,7 +37,8 @@ func TestRawDockerEventNormalize(t *testing.T) {
 			payload: `{
 				"Action": "destroy",
 				"id": "` + containerID + `",
-				"time": 1700000001
+				"time": 1700000001,
+				"Actor": {"Attributes": {"name": "` + sandboxName + `"}}
 			}`,
 			wantOK:      true,
 			wantAction:  "destroy",
@@ -47,7 +49,8 @@ func TestRawDockerEventNormalize(t *testing.T) {
 			name: "oom",
 			payload: `{
 				"status": "oom",
-				"id": "` + containerID + `"
+				"id": "` + containerID + `",
+				"Actor": {"Attributes": {"name": "` + sandboxName + `"}}
 			}`,
 			wantOK:      true,
 			wantAction:  "oom",
@@ -62,6 +65,14 @@ func TestRawDockerEventNormalize(t *testing.T) {
 			name:    "missing action",
 			payload: `{"id":"` + containerID + `"}`,
 			wantOK:  false,
+		},
+		{
+			name: "missing name attribute",
+			payload: `{
+				"status": "die",
+				"id": "` + containerID + `"
+			}`,
+			wantOK: false,
 		},
 	}
 
@@ -96,9 +107,9 @@ func TestRawDockerEventNormalize(t *testing.T) {
 
 func TestRawDockerEventNormalizeStreamOrder(t *testing.T) {
 	// Multiple NDJSON frames decoded sequentially, simulating Docker's stream.
-	payload := `{"status":"start","id":"aaaaaaaaaaaaffff","time":1}
-{"status":"die","id":"aaaaaaaaaaaaffff","Actor":{"Attributes":{"exitCode":"0"}},"time":2}
-{"status":"destroy","id":"aaaaaaaaaaaaffff","time":3}
+	payload := `{"status":"start","id":"aaaaaaaaaaaaffff","time":1,"Actor":{"Attributes":{"name":"/sb-aaaa1111"}}}
+{"status":"die","id":"aaaaaaaaaaaaffff","Actor":{"Attributes":{"name":"/sb-aaaa1111","exitCode":"0"}},"time":2}
+{"status":"destroy","id":"aaaaaaaaaaaaffff","time":3,"Actor":{"Attributes":{"name":"/sb-aaaa1111"}}}
 `
 	decoder := json.NewDecoder(strings.NewReader(payload))
 	wantActions := []string{"start", "die", "destroy"}
@@ -115,8 +126,8 @@ func TestRawDockerEventNormalizeStreamOrder(t *testing.T) {
 		if ev.Action != want {
 			t.Errorf("frame %d action = %q, want %q", i, ev.Action, want)
 		}
-		if ev.SandboxID != "aaaaaaaaaaaa" {
-			t.Errorf("frame %d sandbox = %q, want %q", i, ev.SandboxID, "aaaaaaaaaaaa")
+		if ev.SandboxID != "sb-aaaa1111" {
+			t.Errorf("frame %d sandbox = %q, want %q", i, ev.SandboxID, "sb-aaaa1111")
 		}
 	}
 }

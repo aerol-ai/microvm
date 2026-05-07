@@ -2,22 +2,23 @@ package docker
 
 import "testing"
 
-func TestSandboxIDFromContainerIDCases(t *testing.T) {
+func TestSandboxIDFromContainerNameCases(t *testing.T) {
 	tests := []struct {
-		name        string
-		containerID string
-		want        string
+		name          string
+		containerName string
+		want          string
 	}{
-		{name: "truncates_full_container_id", containerID: "7f3c2a1b9d4e55aa00112233445566778899aabbccddeeff0011223344556677", want: "7f3c2a1b9d4e"},
-		{name: "keeps_short_container_id", containerID: "7f3c2a1b9d4e", want: "7f3c2a1b9d4e"},
-		{name: "trims_whitespace", containerID: "  7f3c2a1b9d4e55aa  ", want: "7f3c2a1b9d4e"},
-		{name: "returns_empty_for_blank", containerID: "", want: ""},
+		{name: "strips_leading_slash", containerName: "/sandbox-abc123def456", want: "sandbox-abc123def456"},
+		{name: "trims_whitespace", containerName: "  /sandbox-abc123  ", want: "sandbox-abc123"},
+		{name: "no_slash_returns_as_is", containerName: "sandbox-abc123", want: "sandbox-abc123"},
+		{name: "returns_empty_for_blank", containerName: "", want: ""},
+		{name: "returns_empty_for_only_slash", containerName: "/", want: ""},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := sandboxIDFromContainerID(tc.containerID); got != tc.want {
-				t.Fatalf("sandboxIDFromContainerID(%q) = %q, want %q", tc.containerID, got, tc.want)
+			if got := sandboxIDFromContainerName(tc.containerName); got != tc.want {
+				t.Fatalf("sandboxIDFromContainerName(%q) = %q, want %q", tc.containerName, got, tc.want)
 			}
 		})
 	}

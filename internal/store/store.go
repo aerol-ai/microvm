@@ -62,6 +62,12 @@ func Open(path string) (*Store, error) {
 			PRIMARY KEY (sandbox_id, port),
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		`CREATE TABLE IF NOT EXISTS sandbox_mounts (
+			sandbox_id TEXT PRIMARY KEY,
+			sealed_blob BLOB NOT NULL,
+			created_at DATETIME NOT NULL,
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
 	}
@@ -439,3 +445,43 @@ func boolToInt(value bool) int {
 }
 
 var ErrNotFound = errors.New("sandbox not found")
+
+// PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
+// to the store layer; encryption / decryption happens in the service layer.
+func (s *Store) PutMounts(ctx context.Context, sandboxID string, sealed []byte) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sandbox_mounts (sandbox_id, sealed_blob, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			sealed_blob = excluded.sealed_blob,
+			created_at = excluded.created_at
+	`, sandboxID, sealed, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("upsert sandbox mounts: %w", err)
+	}
+	return nil
+}
+
+// GetMounts returns the encrypted mount blob, or ErrNotFound if no row exists.
+func (s *Store) GetMounts(ctx context.Context, sandboxID string) ([]byte, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT sealed_blob FROM sandbox_mounts WHERE sandbox_id = ?`, sandboxID)
+	var blob []byte
+	if err := row.Scan(&blob); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get sandbox mounts: %w", err)
+	}
+	return blob, nil
+}
+
+// DeleteMounts removes mount config for a sandbox. The cascade on the
+// sandboxes table handles this when a sandbox is destroyed; explicit deletes
+// are useful for replacing mounts.
+func (s *Store) DeleteMounts(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_mounts WHERE sandbox_id = ?`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete sandbox mounts: %w", err)
+	}
+	return nil
+}

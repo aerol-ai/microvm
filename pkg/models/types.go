@@ -28,6 +28,7 @@ type CreateSandboxRequest struct {
 	NetworkBlockAll  bool              `json:"network_block_all"`
 	Registry         *RegistryAuth     `json:"registry,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
+	Mounts           []MountSpec       `json:"mounts,omitempty"`
 }
 
 type ResizeSandboxRequest struct {
