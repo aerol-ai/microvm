@@ -40,9 +40,9 @@ type Manager struct {
 	logger *slog.Logger
 	cfg    Config
 
-	mu       sync.Mutex
-	byID     map[string]*Session // primary key
-	byName   map[string]*Session // running, named-keyed; entry removed when session exits
+	mu     sync.Mutex
+	byID   map[string]*Session // primary key
+	byName map[string]*Session // running, named-keyed; entry removed when session exits
 
 	closeCh chan struct{}
 }
@@ -172,7 +172,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 	s := &Session{
 		id:        id,
 		name:      name,
-		argv:     argv,
+		argv:      argv,
 		workdir:   req.WorkDir,
 		pty:       req.PTY,
 		cols:      orDefault(req.Cols, 80),
@@ -204,6 +204,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		}
 		s.ptmx = ptmx
 		s.startedAt = time.Now().UTC()
+		s.pumpWG.Add(1)
 		go s.runPump(ptmx, StreamStdout)
 	} else {
 		stdin, err := cmd.StdinPipe()
@@ -228,6 +229,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		}
 		s.stdin = stdin
 		s.startedAt = time.Now().UTC()
+		s.pumpWG.Add(2)
 		go s.runPump(stdout, StreamStdout)
 		go s.runPump(stderr, StreamStderr)
 	}

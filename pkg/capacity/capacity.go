@@ -1,13 +1,15 @@
 // Package capacity implements admission control for sandbox creation.
 //
-// The admitter combines three signals before letting a sandbox in:
+// Admission is purely resource-math — there is no fixed "max sandboxes"
+// number. The admitter combines two signals before letting a sandbox in:
 //
-//  1. A simple count cap (MaxSandboxes) — the crudest backstop.
-//  2. Sum-of-reservations against host CPU cores and total memory, scaled by
+//  1. Sum-of-reservations against host CPU cores and total memory, scaled by
 //     configurable ratios. This is predictable: the operator knows that
 //     accepted requests will not collectively exceed the ratio of host
 //     capacity, regardless of whether the sandboxes are actually using it.
-//  3. A live free-memory floor read from /proc/meminfo. This catches the case
+//     A 64-core box can run 200 tiny sandboxes or 8 huge ones — whatever the
+//     math allows.
+//  2. A live free-memory floor read from /proc/meminfo. This catches the case
 //     where reservations look fine but the host is genuinely tight right now
 //     (e.g. another process is eating RAM).
 //
@@ -29,17 +31,19 @@ var ErrCapacityExceeded = errors.New("host capacity exceeded")
 
 // Limits configures the admitter. Zero values disable the corresponding check.
 type Limits struct {
-	// MaxSandboxes caps the number of concurrent sandboxes. 0 = unlimited.
-	MaxSandboxes int
 	// CPUReservationRatio is the maximum fraction of host CPU cores that may
 	// be reserved across all sandboxes. 0 = unlimited.
 	CPUReservationRatio float64
 	// MemoryReservationRatio is the maximum fraction of host memory that may
 	// be reserved across all sandboxes. 0 = unlimited.
 	MemoryReservationRatio float64
-	// MemoryFloorMB is the minimum live MemAvailable the host must report
-	// after admitting the request. 0 = no floor.
-	MemoryFloorMB int
+	// MemoryFloorRatio is the minimum live MemAvailable the host must retain
+	// after admitting the request, expressed as a fraction of total host
+	// memory (e.g. 0.05 = keep at least 5% of RAM free). Expressing this as a
+	// ratio means a 16 GB laptop and a 256 GB box scale their headroom
+	// proportionally — a fixed MB floor would be either pointless on big
+	// hosts or starve small ones. 0 = no floor.
+	MemoryFloorRatio float64
 }
 
 // Request is the per-sandbox resource ask, in normalized units.
@@ -51,18 +55,20 @@ type Request struct {
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
 // /capacity response.
 type Snapshot struct {
-	HostCPUCores      int     `json:"host_cpu_cores"`
-	HostMemoryTotalMB int     `json:"host_memory_total_mb"`
-	ReservedCPU       int     `json:"reserved_cpu"`
-	ReservedMemoryMB  int     `json:"reserved_memory_mb"`
-	LiveMemoryFreeMB  int     `json:"live_memory_free_mb"`
-	SandboxesActive   int     `json:"sandboxes_active"`
-	SandboxesMax      int     `json:"sandboxes_max"`
-	CanAdmit          bool    `json:"can_admit"`
+	HostCPUCores      int      `json:"host_cpu_cores"`
+	HostMemoryTotalMB int      `json:"host_memory_total_mb"`
+	ReservedCPU       int      `json:"reserved_cpu"`
+	ReservedMemoryMB  int      `json:"reserved_memory_mb"`
+	LiveMemoryFreeMB  int      `json:"live_memory_free_mb"`
+	SandboxesActive   int      `json:"sandboxes_active"`
+	CanAdmit          bool     `json:"can_admit"`
 	Reasons           []string `json:"reasons,omitempty"`
 	CPUReservationRatio    float64 `json:"cpu_reservation_ratio"`
 	MemoryReservationRatio float64 `json:"memory_reservation_ratio"`
-	MemoryFloorMB          int     `json:"memory_floor_mb"`
+	MemoryFloorRatio       float64 `json:"memory_floor_ratio"`
+	// MemoryFloorMB is the absolute floor derived from MemoryFloorRatio and
+	// host memory, exposed for operators reading /capacity.
+	MemoryFloorMB int `json:"memory_floor_mb"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads
@@ -134,19 +140,8 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 		projectedCPU -= prior.CPU
 		projectedMem -= prior.MemoryMB
 	}
-	projectedCount := len(a.reservations)
-	if !exists {
-		projectedCount++
-	}
 
 	var reasons []string
-
-	if a.limits.MaxSandboxes > 0 && projectedCount > a.limits.MaxSandboxes {
-		reasons = append(reasons, fmt.Sprintf(
-			"max sandboxes reached (%d/%d)",
-			len(a.reservations), a.limits.MaxSandboxes,
-		))
-	}
 
 	if a.limits.CPUReservationRatio > 0 && a.host.CPUCores > 0 {
 		cpuBudget := int(float64(a.host.CPUCores) * a.limits.CPUReservationRatio)
@@ -171,14 +166,14 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 		}
 	}
 
-	if a.limits.MemoryFloorMB > 0 && a.probe != nil {
+	if floor := a.memoryFloorMB(); floor > 0 && a.probe != nil {
 		free, err := a.probe.FreeMB()
 		// Probe failure is treated as "unknown, allow" — we'd rather admit
 		// occasionally over a transient probe error than wedge the daemon.
-		if err == nil && free-req.MemoryMB < a.limits.MemoryFloorMB {
+		if err == nil && free-req.MemoryMB < floor {
 			reasons = append(reasons, fmt.Sprintf(
 				"live memory floor breached (%d-%d MB free < %d MB floor)",
-				free, req.MemoryMB, a.limits.MemoryFloorMB,
+				free, req.MemoryMB, floor,
 			))
 		}
 	}
@@ -249,10 +244,10 @@ func (a *Admitter) Snapshot() Snapshot {
 		ReservedMemoryMB:       totalMem,
 		LiveMemoryFreeMB:       free,
 		SandboxesActive:        count,
-		SandboxesMax:           a.limits.MaxSandboxes,
 		CPUReservationRatio:    a.limits.CPUReservationRatio,
 		MemoryReservationRatio: a.limits.MemoryReservationRatio,
-		MemoryFloorMB:          a.limits.MemoryFloorMB,
+		MemoryFloorRatio:       a.limits.MemoryFloorRatio,
+		MemoryFloorMB:          a.memoryFloorMB(),
 	}
 	// Use the smallest meaningful request (1 CPU, 1 MB) as the probe ask.
 	// We don't use 0/0 because that bypasses every check and would always
@@ -265,15 +260,11 @@ func (a *Admitter) Snapshot() Snapshot {
 // admitted right now and the reasons if not, without mutating state.
 func (a *Admitter) dryRun(req Request) (bool, []string) {
 	a.mu.Lock()
-	count := len(a.reservations)
 	totalCPU := a.totalCPU
 	totalMem := a.totalMemMB
 	a.mu.Unlock()
 
 	var reasons []string
-	if a.limits.MaxSandboxes > 0 && count+1 > a.limits.MaxSandboxes {
-		reasons = append(reasons, fmt.Sprintf("max sandboxes reached (%d/%d)", count, a.limits.MaxSandboxes))
-	}
 	if a.limits.CPUReservationRatio > 0 && a.host.CPUCores > 0 {
 		cpuBudget := int(float64(a.host.CPUCores) * a.limits.CPUReservationRatio)
 		if cpuBudget < 1 {
@@ -289,10 +280,19 @@ func (a *Admitter) dryRun(req Request) (bool, []string) {
 			reasons = append(reasons, fmt.Sprintf("memory reservation exceeded (%d MB/%d MB)", totalMem, memBudget))
 		}
 	}
-	if a.limits.MemoryFloorMB > 0 && a.probe != nil {
-		if free, err := a.probe.FreeMB(); err == nil && free-req.MemoryMB < a.limits.MemoryFloorMB {
-			reasons = append(reasons, fmt.Sprintf("live memory floor breached (%d MB free, %d MB floor)", free, a.limits.MemoryFloorMB))
+	if floor := a.memoryFloorMB(); floor > 0 && a.probe != nil {
+		if free, err := a.probe.FreeMB(); err == nil && free-req.MemoryMB < floor {
+			reasons = append(reasons, fmt.Sprintf("live memory floor breached (%d MB free, %d MB floor)", free, floor))
 		}
 	}
 	return len(reasons) == 0, reasons
+}
+
+// memoryFloorMB resolves the configured ratio against current host memory.
+// Returns 0 when no floor is configured or host memory is unknown.
+func (a *Admitter) memoryFloorMB() int {
+	if a.limits.MemoryFloorRatio <= 0 || a.host.MemoryTotalMB <= 0 {
+		return 0
+	}
+	return int(float64(a.host.MemoryTotalMB) * a.limits.MemoryFloorRatio)
 }

@@ -47,14 +47,15 @@ type Session struct {
 	createdAt time.Time
 	startedAt time.Time
 
-	cmd  *exec.Cmd
-	ptmx *os.File // nil for pipe mode
+	cmd   *exec.Cmd
+	ptmx  *os.File       // nil for pipe mode
 	stdin io.WriteCloser // nil for PTY mode
-	cols int
-	rows int
+	cols  int
+	rows  int
 
 	buf      *ring
 	recorder *recorder
+	pumpWG   sync.WaitGroup
 
 	mu          sync.Mutex
 	subscribers map[uint64]chan Frame
@@ -127,31 +128,56 @@ func (s *Session) ExitInfo() (int, string) {
 }
 
 // Replay returns the current contents of the replay buffer (oldest→newest).
-func (s *Session) Replay() []byte { return s.buf.Snapshot() }
+func (s *Session) Replay() []byte {
+	s.mu.Lock()
+	replay := s.buf.Snapshot()
+	s.mu.Unlock()
+	return replay
+}
 
-// Subscribe registers a new attacher. The returned channel receives output
-// frames in order until the session ends or the caller calls the cancel
-// function. Channel buffer size is 64; slow consumers drop older frames.
+// Subscribe registers a new attacher. The returned channel first receives a
+// replay frame containing the current buffer contents (merged as stdout), then
+// live output frames in order until the session ends or the caller calls the
+// cancel function. Channel buffer size is 64; slow consumers drop older
+// frames.
 func (s *Session) Subscribe() (<-chan Frame, func()) {
 	s.mu.Lock()
+	replay := s.buf.Snapshot()
 	id := s.nextSubID
-	s.nextSubID++
 	ch := make(chan Frame, 64)
-	if s.subscribers == nil {
-		s.subscribers = map[uint64]chan Frame{}
+	if len(replay) > 0 {
+		ch <- Frame{Stream: StreamStdout, Data: replay}
 	}
-	s.subscribers[id] = ch
-	s.mu.Unlock()
-	s.attached.Add(1)
-
-	cancel := func() {
-		s.mu.Lock()
-		if existing, ok := s.subscribers[id]; ok {
-			delete(s.subscribers, id)
-			close(existing)
+	subscribed := false
+	if !s.exited.Load() {
+		s.nextSubID++
+		if s.subscribers == nil {
+			s.subscribers = map[uint64]chan Frame{}
 		}
-		s.mu.Unlock()
-		s.attached.Add(-1)
+		s.subscribers[id] = ch
+		subscribed = true
+	} else {
+		close(ch)
+	}
+	s.mu.Unlock()
+	if subscribed {
+		s.attached.Add(1)
+	}
+
+	var once sync.Once
+	cancel := func() {
+		if !subscribed {
+			return
+		}
+		once.Do(func() {
+			s.mu.Lock()
+			if existing, ok := s.subscribers[id]; ok {
+				delete(s.subscribers, id)
+				close(existing)
+			}
+			s.mu.Unlock()
+			s.attached.Add(-1)
+		})
 	}
 	return ch, cancel
 }
@@ -221,13 +247,14 @@ func (s *Session) fanout(stream Stream, data []byte) {
 		return
 	}
 	chunk := append([]byte(nil), data...)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.bytes.Add(int64(len(chunk)))
 	_, _ = s.buf.Write(chunk)
 	if s.recorder != nil {
 		s.recorder.WriteOutput(chunk)
 	}
 
-	s.mu.Lock()
 	for _, ch := range s.subscribers {
 		select {
 		case ch <- Frame{Stream: stream, Data: chunk}:
@@ -235,11 +262,11 @@ func (s *Session) fanout(stream Stream, data []byte) {
 			// Drop on backpressure. The replay buffer still has the bytes.
 		}
 	}
-	s.mu.Unlock()
 }
 
 // runPump reads from r and fans out frames until r returns EOF or error.
 func (s *Session) runPump(r io.Reader, stream Stream) {
+	defer s.pumpWG.Done()
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := r.Read(buf)
@@ -283,6 +310,7 @@ func (s *Session) finish(code int, signal string, failed bool) {
 // Manager wires output pumps before calling this.
 func (s *Session) waitAndFinish() {
 	code, sig := waitProcess(s.cmd)
+	s.pumpWG.Wait()
 	s.finish(code, sig, false)
 }
 

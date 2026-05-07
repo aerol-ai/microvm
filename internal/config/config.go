@@ -48,11 +48,12 @@ type Config struct {
 	ReconcileInterval        time.Duration
 	UploadMaxBytes           int64
 
-	// Admission control. Zero values disable the corresponding check.
-	MaxSandboxes           int
+	// Admission control. Admission is purely resource-math: CPU/memory
+	// reservation ratios plus a live memory floor. There is no fixed sandbox
+	// count cap — the host runs as many sandboxes as the math allows.
 	CPUReservationRatio    float64
 	MemoryReservationRatio float64
-	MemoryFloorMB          int
+	MemoryFloorRatio       float64
 	HostCPUCoresOverride   int
 	HostMemoryMBOverride   int
 }
@@ -97,10 +98,9 @@ func Load() (Config, error) {
 		ReconcileInterval:        getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
 
-		MaxSandboxes:           getEnvInt("SB_MAX_SANDBOXES", 50),
 		CPUReservationRatio:    getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio: getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
-		MemoryFloorMB:          getEnvInt("SB_MEMORY_FLOOR_MB", 1024),
+		MemoryFloorRatio:       getEnvFloat("SB_MEMORY_FLOOR_RATIO", 0.05),
 		HostCPUCoresOverride:   getEnvInt("SB_HOST_CPU_CORES", 0),
 		HostMemoryMBOverride:   getEnvInt("SB_HOST_MEMORY_MB", 0),
 	}

@@ -167,6 +167,35 @@ collect:
 	}
 }
 
+func TestManagerSubscribeAfterExitReplaysBufferedOutput(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+
+	sess, err := mgr.Create(ctx, models.CreateSessionRequest{
+		Name:    "already-done",
+		Command: "printf 'late-attach\n'",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	select {
+	case <-sess.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not exit within 5s")
+	}
+
+	ch, cancel := sess.Subscribe()
+	defer cancel()
+
+	var got []byte
+	for frame := range ch {
+		got = append(got, frame.Data...)
+	}
+	if !strings.Contains(string(got), "late-attach") {
+		t.Fatalf("unexpected frames: %q", string(got))
+	}
+}
+
 func TestManagerRecordingFileWritten(t *testing.T) {
 	mgr := newTestManager(t)
 	ctx := context.Background()

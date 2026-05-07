@@ -89,18 +89,16 @@ func main() {
 		host.MemoryTotalMB = cfg.HostMemoryMBOverride
 	}
 	admitter := capacity.New(host, capacity.Limits{
-		MaxSandboxes:           cfg.MaxSandboxes,
 		CPUReservationRatio:    cfg.CPUReservationRatio,
 		MemoryReservationRatio: cfg.MemoryReservationRatio,
-		MemoryFloorMB:          cfg.MemoryFloorMB,
+		MemoryFloorRatio:       cfg.MemoryFloorRatio,
 	}, capacity.NewProcMeminfoProbe())
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
-		"max_sandboxes", cfg.MaxSandboxes,
 		"cpu_reservation_ratio", cfg.CPUReservationRatio,
 		"memory_reservation_ratio", cfg.MemoryReservationRatio,
-		"memory_floor_mb", cfg.MemoryFloorMB,
+		"memory_floor_ratio", cfg.MemoryFloorRatio,
 	)
 
 	svc := service.New(cfg, logger, db, dockerClient, caddyClient, cipher, mountManager, admitter)

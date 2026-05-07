@@ -53,9 +53,9 @@ type sessionAttachControlIn struct {
 }
 
 type sessionAttachControlOut struct {
-	Type   string `json:"type"`
-	Code   int    `json:"code,omitempty"`
-	Signal string `json:"signal,omitempty"`
+	Type    string `json:"type"`
+	Code    int    `json:"code,omitempty"`
+	Signal  string `json:"signal,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
@@ -245,11 +245,6 @@ func (s *server) handleSessionAttach(w http.ResponseWriter, r *http.Request, id 
 }
 
 func pumpSession(s *server, conn *websocket.Conn, sess *sessions.Session) {
-	// Replay first so attaching clients see prior context.
-	if replay := sess.Replay(); len(replay) > 0 {
-		_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{streamFramePrefixStdoutSession}, replay...))
-	}
-
 	frames, cancel := sess.Subscribe()
 	defer cancel()
 

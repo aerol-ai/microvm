@@ -20,7 +20,7 @@ func TestWriteStoreAwareErrorMapsCapacityTo503(t *testing.T) {
 	server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	rec := httptest.NewRecorder()
 
-	err := fmt.Errorf("%w: [max sandboxes reached (50/50)]", capacity.ErrCapacityExceeded)
+	err := fmt.Errorf("%w: [cpu reservation exceeded (8+1 > 8 budget)]", capacity.ErrCapacityExceeded)
 	server.writeStoreAwareError(rec, err)
 
 	if rec.Code != http.StatusServiceUnavailable {
@@ -29,7 +29,7 @@ func TestWriteStoreAwareErrorMapsCapacityTo503(t *testing.T) {
 	if got := rec.Header().Get("Retry-After"); got != "30" {
 		t.Fatalf("Retry-After = %q, want 30", got)
 	}
-	if !strings.Contains(rec.Body.String(), "max sandboxes reached") {
+	if !strings.Contains(rec.Body.String(), "cpu reservation exceeded") {
 		t.Fatalf("body should include reasons, got %q", rec.Body.String())
 	}
 }

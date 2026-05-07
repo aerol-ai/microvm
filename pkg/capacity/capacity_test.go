@@ -2,6 +2,7 @@ package capacity
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -20,10 +21,9 @@ func (f fakeProbe) FreeMB() (int, error) {
 
 func TestAdmitUnderLimitsAccepts(t *testing.T) {
 	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
-		MaxSandboxes:           10,
 		CPUReservationRatio:    0.9,
 		MemoryReservationRatio: 0.85,
-		MemoryFloorMB:          1024,
+		MemoryFloorRatio:       0.0625, // 1024 MB on a 16384 MB host
 	}, fakeProbe{free: 8000})
 
 	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 1024}); err != nil {
@@ -35,16 +35,23 @@ func TestAdmitUnderLimitsAccepts(t *testing.T) {
 	}
 }
 
-func TestAdmitMaxCount(t *testing.T) {
-	a := New(HostInfo{CPUCores: 32, MemoryTotalMB: 65536}, Limits{
-		MaxSandboxes: 2,
+// TestAdmitNoCountCap exercises the design choice that admission is
+// pure-math — a host with very small per-sandbox requests should accept
+// arbitrarily many sandboxes as long as CPU/memory budgets allow.
+func TestAdmitNoCountCap(t *testing.T) {
+	a := New(HostInfo{CPUCores: 100, MemoryTotalMB: 100_000}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
 	}, nil)
-
-	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 100})
-	mustAdmit(t, a, "b", Request{CPU: 1, MemoryMB: 100})
-	err := a.Admit("c", Request{CPU: 1, MemoryMB: 100})
-	if !errors.Is(err, ErrCapacityExceeded) {
-		t.Fatalf("expected capacity exceeded, got %v", err)
+	for i := range 200 {
+		id := fmt.Sprintf("s-%d", i)
+		// Each sandbox asks for the smallest unit that still passes ints.
+		if err := a.Admit(id, Request{CPU: 0, MemoryMB: 100}); err != nil {
+			t.Fatalf("admit %s: %v", id, err)
+		}
+	}
+	if snap := a.Snapshot(); snap.SandboxesActive != 200 {
+		t.Fatalf("expected 200 active, got %d", snap.SandboxesActive)
 	}
 }
 
@@ -74,8 +81,9 @@ func TestAdmitMemoryReservationRatio(t *testing.T) {
 }
 
 func TestAdmitMemoryFloorBlocks(t *testing.T) {
+	// 2000 MB floor on a 16384 MB host = 0.122 ratio.
 	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
-		MemoryFloorMB: 2000,
+		MemoryFloorRatio: 2000.0 / 16384.0,
 	}, fakeProbe{free: 2500})
 
 	// 2500 - 1000 = 1500 < 2000 floor → reject.
@@ -87,9 +95,10 @@ func TestAdmitMemoryFloorBlocks(t *testing.T) {
 
 func TestAdmitMemoryFloorProbeErrorAllows(t *testing.T) {
 	// Probe error is treated as "unknown, allow". Otherwise a transient
-	// /proc/meminfo glitch would 503 every request.
+	// /proc/meminfo glitch would 503 every request. Ratio of 1.0 means floor
+	// equals total host memory — guaranteed to fail if probe were consulted.
 	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
-		MemoryFloorMB: 100000,
+		MemoryFloorRatio: 1.0,
 	}, fakeProbe{err: errors.New("probe boom")})
 
 	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 100}); err != nil {
@@ -130,7 +139,6 @@ func TestReserveBypassesAdmit(t *testing.T) {
 	// Replay path must overcommit if persistent state demands it; the
 	// admitter must reflect reality, not what its limits say.
 	a := New(HostInfo{CPUCores: 1, MemoryTotalMB: 100}, Limits{
-		MaxSandboxes:        1,
 		CPUReservationRatio: 0.5,
 	}, nil)
 
@@ -176,8 +184,11 @@ func TestAdmitConcurrentCorrectness(t *testing.T) {
 }
 
 func TestSnapshotCanAdmit(t *testing.T) {
+	// Tiny host: 1 core, 100 MB, full ratios. After admitting 1 CPU + 1 MB,
+	// there's no headroom for the dryRun probe ask, so CanAdmit must flip.
 	a := New(HostInfo{CPUCores: 1, MemoryTotalMB: 100}, Limits{
-		MaxSandboxes: 1,
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
 	}, nil)
 	if snap := a.Snapshot(); !snap.CanAdmit {
 		t.Fatalf("empty admitter should accept: %+v", snap)
