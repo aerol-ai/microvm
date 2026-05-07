@@ -1,0 +1,7 @@
+bin/
+dist/
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+*.log

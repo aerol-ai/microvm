@@ -1,0 +1,11 @@
+{
+    admin localhost:2019
+    on_demand_tls {
+        ask http://127.0.0.1:8080/v1/tls-check
+    }
+}
+
+{{SITE_ADDRESSES}} {
+    {{TLS_BLOCK}}
+    respond "Sandbox not found" 404
+}

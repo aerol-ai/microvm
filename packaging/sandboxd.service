@@ -1,0 +1,15 @@
+[Unit]
+Description=sandbox-library daemon
+After=docker.service caddy.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sandboxd/sandboxd.env
+ExecStart=/usr/local/bin/sandboxd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
