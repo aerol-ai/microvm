@@ -11,10 +11,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "example:create": "npm run build && node dist/examples/createSandbox.js",
+    "example:create:src": "npx tsx src/examples/createSandbox.ts",
     "test": "tsc -p tsconfig.test.json --outDir dist-test && node --test dist-test/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^22.15.17",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "tsx": "^4.21.0"
   }
 }
