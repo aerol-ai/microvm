@@ -33,7 +33,7 @@ Artifacts:
 
 ## Releases
 
-Pushing a tag that starts with `v` triggers the GitHub Actions release workflow in `.github/workflows/release.yml`.
+Publishing a GitHub Release, or pushing a tag that starts with `v`, triggers the GitHub Actions release workflow in `.github/workflows/release.yml`.
 
 The workflow publishes these release assets:
 
@@ -41,14 +41,30 @@ The workflow publishes these release assets:
 - `toolboxd_linux_amd64`
 - `sandboxd_linux_arm64`
 - `toolboxd_linux_arm64`
+- `install.sh`
 - `install-sandbox.sh`
 - `checksums.txt`
 
-The intended install path is:
+The assets are downloadable directly from the latest published release:
 
 ```bash
-curl -fsSL https://app.aerol.ai/install-sandbox.sh | sudo bash -s -- --domain sandbox.example.com
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com
 ```
+
+Examples:
+
+```text
+https://github.com/aerol-ai/microvm/releases/latest/download/install.sh
+https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_amd64
+https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_arm64
+https://github.com/aerol-ai/microvm/releases/latest/download/toolboxd_linux_amd64
+https://github.com/aerol-ai/microvm/releases/latest/download/toolboxd_linux_arm64
+https://github.com/aerol-ai/microvm/releases/latest/download/checksums.txt
+```
+
+Only Linux amd64 and arm64 binaries are published today, because the host installer and runtime are Linux-only.
+
+`app.aerol.ai/install-sandbox.sh` is not created by this repository. If you want that URL, it must be hosted or redirected separately to the GitHub release asset above.
 
 The installer defaults to downloading the latest GitHub release from `aerol-ai/microvm`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
 

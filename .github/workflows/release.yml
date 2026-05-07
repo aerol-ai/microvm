@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and publish, for example v0.1.0
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,11 +21,13 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ github.ref_name }}
-      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.ref_name }}
+      VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -82,7 +93,9 @@ jobs:
           build_binary toolboxd arm64 0 gcc
 
           cp scripts/install.sh dist/install-sandbox.sh
+          cp scripts/install.sh dist/install.sh
           chmod 0755 dist/install-sandbox.sh
+          chmod 0755 dist/install.sh
 
           (
             cd dist
@@ -91,6 +104,7 @@ jobs:
               toolboxd_linux_amd64 \
               sandboxd_linux_arm64 \
               toolboxd_linux_arm64 \
+              install.sh \
               install-sandbox.sh \
               > checksums.txt
           )
@@ -98,11 +112,13 @@ jobs:
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
           generate_release_notes: true
           files: |
             dist/sandboxd_linux_amd64
             dist/toolboxd_linux_amd64
             dist/sandboxd_linux_arm64
             dist/toolboxd_linux_arm64
+            dist/install.sh
             dist/install-sandbox.sh
             dist/checksums.txt

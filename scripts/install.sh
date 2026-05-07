@@ -33,7 +33,7 @@ Options:
   --help                       Show this help
 
 Examples:
-  curl -fsSL https://app.aerol.ai/install-sandbox.sh | sudo bash -s -- --domain sandbox.example.com
+	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
   ./scripts/install.sh --public-host 203.0.113.42 --token dev-token --build-from-source
 EOF
