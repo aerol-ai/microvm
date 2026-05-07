@@ -8,7 +8,7 @@ def main() -> None:
     parser.add_argument("--api-url", required=False, default="http://127.0.0.1:8080")
     parser.add_argument("--pat-token", required=True)
     parser.add_argument("--image", required=True)
-    parser.add_argument("--cpu", type=int, default=1)
+    parser.add_argument("--cpu", type=float, default=1.0)
     parser.add_argument("--memory-mb", type=int, default=1024)
     parser.add_argument("--disk-gb", type=int, default=10)
     args = parser.parse_args()

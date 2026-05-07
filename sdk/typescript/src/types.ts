@@ -28,6 +28,7 @@ export interface MountSpecRedacted {
 
 export interface CreateOptions {
   image: string;
+  /** Number of CPU cores to allocate. Fractional values are supported (e.g. 0.5 = half a core). */
   cpu?: number;
   memoryMB?: number;
   diskGB?: number;
@@ -40,6 +41,7 @@ export interface CreateOptions {
 }
 
 export interface ResizeOptions {
+  /** Number of CPU cores. Fractional values supported (e.g. 0.5). */
   cpu?: number;
   memoryMB?: number;
   diskGB?: number;

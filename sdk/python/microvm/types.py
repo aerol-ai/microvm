@@ -32,7 +32,8 @@ class MountSpecRedacted(TypedDict, total=False):
 
 class CreateOptions(TypedDict, total=False):
     image: str
-    cpu: int
+    # cpu accepts fractional cores: 0.5 = half a core, 1.5 = one and a half.
+    cpu: float
     memoryMB: int
     diskGB: int
     env: Dict[str, str]
@@ -44,7 +45,7 @@ class CreateOptions(TypedDict, total=False):
 
 
 class ResizeOptions(TypedDict, total=False):
-    cpu: int
+    cpu: float
     memoryMB: int
     diskGB: int
 
@@ -141,7 +142,7 @@ class SandboxData(TypedDict, total=False):
     publicURL: str
     containerID: str
     containerIP: str
-    cpu: int
+    cpu: float
     memoryMB: int
     diskGB: int
     osUser: str

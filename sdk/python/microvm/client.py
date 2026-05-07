@@ -700,7 +700,7 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
         "image": str(_first_of(sandbox, "image") or ""),
         "status": str(_first_of(sandbox, "status") or ""),
         "publicURL": str(_first_of(sandbox, "public_url", "publicURL") or ""),
-        "cpu": int(_first_of(sandbox, "cpu") or 0),
+        "cpu": float(_first_of(sandbox, "cpu") or 0),
         "memoryMB": int(_first_of(sandbox, "memory_mb", "memoryMB") or 0),
         "diskGB": int(_first_of(sandbox, "disk_gb", "diskGB") or 0),
         "osUser": str(_first_of(sandbox, "os_user", "osUser") or ""),
