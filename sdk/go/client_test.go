@@ -25,8 +25,21 @@ func TestGoSDKCases(t *testing.T) {
 			name: "new_client_trims_base_url",
 			run: func(t *testing.T) {
 				client := NewClient("http://localhost:8080/", "token")
-				if client.baseURL != "http://localhost:8080" || client.token != "token" {
+				if client.baseURL != "http://localhost:8080" || client.patToken != "token" {
 					t.Fatalf("unexpected client: %+v", client)
+				}
+			},
+		},
+		{
+			name: "new_client_with_options_uses_pat_token_and_http_client",
+			run: func(t *testing.T) {
+				httpClient := &http.Client{Timeout: 2 * time.Second}
+				client := NewClientWithOptions("http://localhost:8080/", ClientOptions{
+					PATToken:   "pat-token",
+					HTTPClient: httpClient,
+				})
+				if client.baseURL != "http://localhost:8080" || client.patToken != "pat-token" || client.httpClient != httpClient {
+					t.Fatalf("unexpected client with options: %+v", client)
 				}
 			},
 		},

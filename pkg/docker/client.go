@@ -40,7 +40,7 @@ type Client struct {
 	toolboxBinaryPath  string
 	toolboxMountPath   string
 	toolboxPort        int
-	apiToken           string
+	patToken           string
 	privileged         bool
 	resourceLimitsOff  bool
 	httpClient         *http.Client
@@ -72,7 +72,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxBinaryPath:  cfg.ToolboxBinaryPath,
 		toolboxMountPath:   cfg.ToolboxMountPath,
 		toolboxPort:        cfg.ToolboxPort,
-		apiToken:           cfg.APIToken,
+		patToken:           cfg.PATToken,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
@@ -120,7 +120,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (*
 	envValues := make([]string, 0, len(req.Env)+3)
 	envValues = append(envValues,
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", c.toolboxPort),
-		"SB_TOOLBOX_TOKEN="+c.apiToken,
+		"SB_TOOLBOX_TOKEN="+c.patToken,
 	)
 	for key, value := range req.Env {
 		envValues = append(envValues, key+"="+value)

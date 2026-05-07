@@ -13,7 +13,7 @@ import (
 const defaultToolboxPort = 2280
 
 type Config struct {
-	APIToken            string
+	PATToken            string
 	APIHost             string
 	APIPort             int
 	Domain              string
@@ -41,7 +41,7 @@ func Load() (Config, error) {
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
 	cfg := Config{
-		APIToken:            strings.TrimSpace(os.Getenv("SB_API_TOKEN")),
+		PATToken:            firstNonEmptyEnv("SB_PAT_TOKEN", "SB_API_TOKEN"),
 		APIHost:             getEnv("SB_API_HOST", "0.0.0.0"),
 		APIPort:             getEnvInt("SB_API_PORT", 8080),
 		Domain:              normalizeHost(os.Getenv("SB_DOMAIN")),
@@ -64,8 +64,8 @@ func Load() (Config, error) {
 		HTTPClientTimeout:   getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 10*time.Second),
 	}
 
-	if cfg.APIToken == "" {
-		return Config{}, errors.New("SB_API_TOKEN is required")
+	if cfg.PATToken == "" {
+		return Config{}, errors.New("SB_PAT_TOKEN is required")
 	}
 
 	if cfg.DBPath == "" {
@@ -104,6 +104,15 @@ func getEnv(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func getEnvInt(key string, fallback int) int {

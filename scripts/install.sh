@@ -4,7 +4,7 @@ set -euo pipefail
 
 DOMAIN=""
 PUBLIC_HOST=""
-API_TOKEN=""
+PAT_TOKEN=""
 INSTALL_PREFIX="/usr/local/bin"
 BUILD_FROM_SOURCE="auto"
 GITHUB_REPO="aerol-ai/microvm"
@@ -21,7 +21,8 @@ Usage: install.sh [options]
 Options:
   --domain <domain>            Base domain for wildcard sandbox routes
   --public-host <host-or-ip>   Public host used for IP mode or local URLs
-  --token <token>              API token for sandboxd
+	--pat-token <token>          PAT token required for sandbox API requests
+	--token <token>              Alias for --pat-token
   --github-repo <owner/repo>   GitHub repo used for release downloads
   --version <tag|latest>       Release tag to install (default: latest)
   --sandboxd-url <url>         Download URL for sandboxd binary
@@ -33,9 +34,9 @@ Options:
   --help                       Show this help
 
 Examples:
-	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com
+	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
-  ./scripts/install.sh --public-host 203.0.113.42 --token dev-token --build-from-source
+	./scripts/install.sh --public-host 203.0.113.42 --pat-token dev-token --build-from-source
 EOF
 }
 
@@ -125,8 +126,12 @@ while [[ $# -gt 0 ]]; do
 			PUBLIC_HOST="$2"
 			shift 2
 			;;
+		--pat-token)
+			PAT_TOKEN="$2"
+			shift 2
+			;;
 		--token)
-			API_TOKEN="$2"
+			PAT_TOKEN="$2"
 			shift 2
 			;;
 		--github-repo)
@@ -176,11 +181,11 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-if [[ -z "$API_TOKEN" ]]; then
+if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
-		API_TOKEN="$(openssl rand -hex 24)"
+		PAT_TOKEN="$(openssl rand -hex 24)"
 	else
-		echo "--token is required when openssl is unavailable" >&2
+		echo "--pat-token is required when openssl is unavailable" >&2
 		exit 1
 	fi
 fi
@@ -263,7 +268,7 @@ install_binaries() {
 write_environment() {
 	mkdir -p /etc/sandboxd /var/lib/sandboxd
 	cat > /etc/sandboxd/sandboxd.env <<EOF
-SB_API_TOKEN=$API_TOKEN
+SB_PAT_TOKEN=$PAT_TOKEN
 SB_API_HOST=0.0.0.0
 SB_API_PORT=8080
 SB_DOMAIN=$DOMAIN
@@ -279,6 +284,7 @@ SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
 SB_ENABLE_CADDY=true
 SB_ENABLE_NETWORK_RULES=true
 EOF
+	chmod 0600 /etc/sandboxd/sandboxd.env
 }
 
 write_caddyfile() {
@@ -406,7 +412,8 @@ systemctl daemon-reload
 systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
 
 echo "sandbox-library installed"
-echo "API token: $API_TOKEN"
+echo "PAT token: $PAT_TOKEN"
+echo "Use header: Authorization: Bearer <PAT token>"
 if [[ -n "$DOMAIN" ]]; then
 	echo "Public sandbox URL pattern: https://<docker-short-id>.$DOMAIN"
 else

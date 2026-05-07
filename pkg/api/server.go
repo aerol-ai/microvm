@@ -20,15 +20,15 @@ import (
 type Server struct {
 	logger   *slog.Logger
 	service  *service.Service
-	apiToken string
+	patToken string
 	mux      *http.ServeMux
 }
 
-func NewServer(logger *slog.Logger, service *service.Service, apiToken string) *Server {
+func NewServer(logger *slog.Logger, service *service.Service, patToken string) *Server {
 	s := &Server{
 		logger:   logger,
 		service:  service,
-		apiToken: apiToken,
+		patToken: patToken,
 		mux:      http.NewServeMux(),
 	}
 	s.routes()
@@ -60,7 +60,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		const prefix = "Bearer "
 		authorization := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authorization, prefix) || strings.TrimPrefix(authorization, prefix) != s.apiToken {
+		if !strings.HasPrefix(authorization, prefix) || strings.TrimPrefix(authorization, prefix) != s.patToken {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}

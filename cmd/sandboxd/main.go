@@ -61,7 +61,7 @@ func main() {
 	}
 	svc.StartIdleMonitor(ctx)
 
-	server := api.NewServer(logger, svc, cfg.APIToken)
+	server := api.NewServer(logger, svc, cfg.PATToken)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
 		Handler:           server.Handler(),

@@ -13,8 +13,13 @@ import type {
 
 type FetchLike = typeof fetch;
 
-interface ClientOptions {
+export interface ClientOptions {
+  patToken?: string;
   fetch?: FetchLike;
+}
+
+export interface ClientConfig extends ClientOptions {
+  baseURL: string;
 }
 
 interface ApiExposedPort {
@@ -63,13 +68,21 @@ interface ApiHealthStatus {
 
 export class Client {
   readonly baseURL: string;
-  private readonly token: string;
+  private patToken: string;
   private readonly fetchFn: FetchLike;
 
-  constructor(baseURL: string, token = "", options: ClientOptions = {}) {
-    this.baseURL = baseURL.replace(/\/+$/, "");
-    this.token = token;
-    this.fetchFn = options.fetch ?? fetch;
+  constructor(baseURL: string, patToken?: string, options?: ClientOptions);
+  constructor(baseURL: string, options?: ClientOptions);
+  constructor(config: ClientConfig);
+  constructor(
+    baseURLOrConfig: string | ClientConfig,
+    patTokenOrOptions: string | ClientOptions = "",
+    options: ClientOptions = {},
+  ) {
+    const config = resolveClientConfig(baseURLOrConfig, patTokenOrOptions, options);
+    this.baseURL = config.baseURL.replace(/\/+$/, "");
+    this.patToken = config.patToken ?? "";
+    this.fetchFn = config.fetch ?? fetch;
   }
 
   async create(options: CreateOptions): Promise<SandboxHandle> {
@@ -169,8 +182,8 @@ export class Client {
 
   private request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers);
-    if (this.token !== "") {
-      headers.set("Authorization", `Bearer ${this.token}`);
+    if (this.patToken !== "") {
+      headers.set("Authorization", `Bearer ${this.patToken}`);
     }
     return this.fetchFn(`${this.baseURL}${path}`, {
       ...init,
@@ -178,6 +191,27 @@ export class Client {
       headers,
     });
   }
+}
+
+function resolveClientConfig(
+  baseURLOrConfig: string | ClientConfig,
+  patTokenOrOptions: string | ClientOptions,
+  options: ClientOptions,
+): ClientConfig {
+  if (typeof baseURLOrConfig !== "string") {
+    return baseURLOrConfig;
+  }
+  if (typeof patTokenOrOptions === "string") {
+    return {
+      baseURL: baseURLOrConfig,
+      patToken: patTokenOrOptions,
+      fetch: options.fetch,
+    };
+  }
+  return {
+    baseURL: baseURLOrConfig,
+    ...patTokenOrOptions,
+  };
 }
 
 export class SandboxHandle implements Sandbox {

@@ -47,7 +47,7 @@ The workflow publishes these release assets:
 The assets are downloadable directly from the latest published release:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token your-secret-pat
 ```
 
 Examples:
@@ -64,6 +64,8 @@ https://github.com/aerol-ai/microvm/releases/latest/download/checksums.txt
 Only Linux amd64 and arm64 binaries are published today, because the host installer and runtime are Linux-only.
 
 The installer defaults to downloading the latest GitHub release from `aerol-ai/microvm`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
+
+The installer accepts `--pat-token <token>` and stores it in `/etc/sandboxd/sandboxd.env` as `SB_PAT_TOKEN` with `0600` permissions. If you omit `--pat-token`, the installer generates one automatically and prints it once at the end.
 
 The installer writes `sandboxd.service` with `Restart=always` and enables `sandboxd-healthcheck.timer`, which probes the local `/health` endpoint every 30 seconds and restarts `sandboxd` if the process is up but no longer responding.
 
@@ -125,7 +127,7 @@ Required services:
 Minimal environment:
 
 ```bash
-export SB_API_TOKEN=dev-token
+export SB_PAT_TOKEN=dev-token
 export SB_DB_PATH=$PWD/sandbox.db
 export SB_PUBLIC_HOST=127.0.0.1
 export SB_TOOLBOX_BINARY_PATH=$PWD/bin/toolboxd
@@ -150,4 +152,25 @@ If `SB_DOMAIN` is set, sandbox routes are created as subdomains like `https://<s
 - `ANY /v1/sandboxes/{id}/toolbox/{path...}`
 - `GET /v1/tls-check?domain=<host>`
 
-All `/v1` endpoints except `/v1/tls-check` require `Authorization: Bearer <SB_API_TOKEN>`.
+All `/v1` endpoints except `/v1/tls-check` require `Authorization: Bearer <SB_PAT_TOKEN>`.
+
+## SDK auth
+
+Both SDKs send the PAT as `Authorization: Bearer <token>`.
+
+Go:
+
+```go
+client := sandbox.NewClientWithOptions("https://sandbox-api.example.com", sandbox.ClientOptions{
+	PATToken: os.Getenv("SB_PAT_TOKEN"),
+})
+```
+
+TypeScript:
+
+```ts
+const client = new Client({
+	baseURL: "https://sandbox-api.example.com",
+	patToken: process.env.SB_PAT_TOKEN,
+});
+```

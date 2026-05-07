@@ -12,6 +12,7 @@ func TestLoadCases(t *testing.T) {
 	clearEnv := func(t *testing.T) {
 		t.Helper()
 		keys := []string{
+			"SB_PAT_TOKEN",
 			"SB_API_TOKEN",
 			"SB_API_HOST",
 			"SB_API_PORT",
@@ -44,12 +45,12 @@ func TestLoadCases(t *testing.T) {
 		run  func(t *testing.T)
 	}{
 		{
-			name: "missing_api_token_errors",
+			name: "missing_pat_token_errors",
 			run: func(t *testing.T) {
 				clearEnv(t)
 				_, err := Load()
-				if err == nil || !strings.Contains(err.Error(), "SB_API_TOKEN") {
-					t.Fatalf("expected SB_API_TOKEN error, got %v", err)
+				if err == nil || !strings.Contains(err.Error(), "SB_PAT_TOKEN") {
+					t.Fatalf("expected SB_PAT_TOKEN error, got %v", err)
 				}
 			},
 		},
@@ -57,10 +58,13 @@ func TestLoadCases(t *testing.T) {
 			name: "defaults_with_required_env",
 			run: func(t *testing.T) {
 				clearEnv(t)
-				t.Setenv("SB_API_TOKEN", "token")
+				t.Setenv("SB_PAT_TOKEN", "token")
 				cfg, err := Load()
 				if err != nil {
 					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.PATToken != "token" {
+					t.Fatalf("expected PATToken to be set, got %+v", cfg)
 				}
 				if cfg.APIHost != "0.0.0.0" || cfg.APIPort != 8080 {
 					t.Fatalf("unexpected listen defaults: %+v", cfg)
@@ -77,10 +81,24 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			name: "accepts_legacy_api_token_env",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_API_TOKEN", "legacy-token")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.PATToken != "legacy-token" {
+					t.Fatalf("expected legacy token fallback, got %+v", cfg)
+				}
+			},
+		},
+		{
 			name: "normalizes_domain_and_public_host",
 			run: func(t *testing.T) {
 				clearEnv(t)
-				t.Setenv("SB_API_TOKEN", "token")
+				t.Setenv("SB_PAT_TOKEN", "token")
 				t.Setenv("SB_DOMAIN", "https://sandbox.example.com")
 				t.Setenv("SB_PUBLIC_HOST", " http://203.0.113.10 ")
 				cfg, err := Load()
@@ -96,7 +114,7 @@ func TestLoadCases(t *testing.T) {
 			name: "rejects_relative_toolbox_mount_path",
 			run: func(t *testing.T) {
 				clearEnv(t)
-				t.Setenv("SB_API_TOKEN", "token")
+				t.Setenv("SB_PAT_TOKEN", "token")
 				t.Setenv("SB_TOOLBOX_MOUNT_PATH", "toolboxd")
 				_, err := Load()
 				if err == nil || !strings.Contains(err.Error(), "absolute path") {
@@ -108,7 +126,7 @@ func TestLoadCases(t *testing.T) {
 			name: "parses_overrides",
 			run: func(t *testing.T) {
 				clearEnv(t)
-				t.Setenv("SB_API_TOKEN", "token")
+				t.Setenv("SB_PAT_TOKEN", "token")
 				t.Setenv("SB_API_HOST", "127.0.0.1")
 				t.Setenv("SB_API_PORT", "9001")
 				t.Setenv("SB_DB_PATH", "/tmp/test.db")
@@ -148,7 +166,7 @@ func TestLoadCases(t *testing.T) {
 			name: "falls_back_on_invalid_values",
 			run: func(t *testing.T) {
 				clearEnv(t)
-				t.Setenv("SB_API_TOKEN", "token")
+				t.Setenv("SB_PAT_TOKEN", "token")
 				t.Setenv("SB_API_PORT", "bad")
 				t.Setenv("SB_TOOLBOX_PORT", "bad")
 				t.Setenv("SB_IDLE_TIMEOUT_MIN", "bad")

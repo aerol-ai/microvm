@@ -1,4 +1,5 @@
 export { Client, SandboxHandle } from "./client.js";
+export type { ClientConfig, ClientOptions } from "./client.js";
 export type {
   BinaryLike,
   CreateOptions,

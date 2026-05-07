@@ -18,8 +18,13 @@ import (
 
 type Client struct {
 	baseURL    string
-	token      string
+	patToken   string
 	httpClient *http.Client
+}
+
+type ClientOptions struct {
+	PATToken   string
+	HTTPClient *http.Client
 }
 
 type Sandbox struct {
@@ -28,10 +33,18 @@ type Sandbox struct {
 }
 
 func NewClient(baseURL, token string) *Client {
+	return NewClientWithOptions(baseURL, ClientOptions{PATToken: token})
+}
+
+func NewClientWithOptions(baseURL string, opts ClientOptions) *Client {
+	httpClient := opts.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
-		token:      token,
-		httpClient: &http.Client{},
+		patToken:   opts.PATToken,
+		httpClient: httpClient,
 	}
 }
 
@@ -258,8 +271,8 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 }
 
 func (c *Client) addAuth(request *http.Request) {
-	if c.token != "" {
-		request.Header.Set("Authorization", "Bearer "+c.token)
+	if c.patToken != "" {
+		request.Header.Set("Authorization", "Bearer "+c.patToken)
 	}
 }
 

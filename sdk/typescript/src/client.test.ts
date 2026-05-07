@@ -9,6 +9,36 @@ test("constructor trims base URL", () => {
   assert.equal(client.baseURL, "https://api.example.com");
 });
 
+test("constructor accepts config object with PAT token", async () => {
+  let seenAuthorization = "";
+  const client = new Client({
+    baseURL: "https://api.example.com/",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenAuthorization = new Request(input, init).headers.get("authorization") ?? "";
+      return jsonResponse(apiSandbox("sb-config"));
+    },
+  });
+
+  await client.get("sb-config");
+  assert.equal(client.baseURL, "https://api.example.com");
+  assert.equal(seenAuthorization, "Bearer pat-token");
+});
+
+test("constructor accepts PAT token inside options", async () => {
+  let seenAuthorization = "";
+  const client = new Client("https://api.example.com/", {
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenAuthorization = new Request(input, init).headers.get("authorization") ?? "";
+      return jsonResponse(apiSandbox("sb-options"));
+    },
+  });
+
+  await client.get("sb-options");
+  assert.equal(seenAuthorization, "Bearer pat-token");
+});
+
 test("create sends auth header and snake_case body", async () => {
   let seenRequest: Request | undefined;
   const client = new Client("https://api.example.com/", "token", {

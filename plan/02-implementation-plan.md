@@ -114,7 +114,7 @@ Startup sequence (mirrors Daytona runner's startup order):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SB_API_TOKEN` | (required) | Bearer token for API auth |
+| `SB_PAT_TOKEN` | (required) | Bearer token for API auth |
 | `SB_API_PORT` | `8080` | HTTP API port |
 | `SB_DOMAIN` | `""` | Base domain (e.g. `sandbox.aerol.ai`). Empty = IP mode |
 | `SB_CADDY_ADMIN_URL` | `http://localhost:2019` | Caddy admin endpoint |
@@ -243,7 +243,7 @@ In IP mode, the mounted toolbox daemon strips the `/<sandbox-id>` prefix itself,
 
 **Base URL:** `http(s)://<server>/v1`
 
-**Auth:** `Authorization: Bearer <SB_API_TOKEN>`
+**Auth:** `Authorization: Bearer <SB_PAT_TOKEN>`
 
 **Endpoints:**
 
@@ -309,7 +309,7 @@ import "github.com/aerol-ai/microvm/sdk/go"
 
 client := sandbox.NewClient(
     sandbox.WithBaseURL("http://localhost:8080"),
-    sandbox.WithToken(os.Getenv("SB_API_TOKEN")),
+    sandbox.WithToken(os.Getenv("SB_PAT_TOKEN")),
 )
 
 // Create
@@ -342,14 +342,14 @@ err = sb.Destroy(ctx)
 
 ```bash
 #!/bin/bash
-# Usage: curl -sSL https://get.aerol.ai | bash -s -- --domain sandbox.aerol.ai --token mytoken
+# Usage: curl -sSL https://get.aerol.ai | bash -s -- --domain sandbox.aerol.ai --pat-token mytoken
 
 # 1. Detect OS (Ubuntu/Debian/RHEL)
 # 2. Install Docker (if absent)
 # 3. Install Caddy (if absent) — systemd service
 # 4. Write /etc/caddy/Caddyfile with wildcard matcher + admin API enabled
 # 5. Download sandboxd binary from GitHub releases (or build from source)
-# 6. Write /etc/sandboxd/sandboxd.env with SB_DOMAIN, SB_API_TOKEN, etc.
+# 6. Write /etc/sandboxd/sandboxd.env with SB_DOMAIN, SB_PAT_TOKEN, etc.
 # 7. Write /etc/systemd/system/sandboxd.service
 # 8. systemctl daemon-reload && systemctl enable --now sandboxd caddy
 # 9. Print summary: API URL, SSH endpoint, public URL pattern
