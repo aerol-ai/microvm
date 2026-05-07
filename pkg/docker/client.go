@@ -25,11 +25,18 @@ import (
 
 const managedLabelKey = "sandbox-library.managed"
 const sandboxIDLabelKey = "sandbox-library.id"
+const sandboxIDLength = 12
 
 type SandboxRuntime struct {
+	SandboxID   string
 	ContainerID string
 	ContainerIP string
 	Status      models.SandboxStatus
+}
+
+type ManagedSandboxes struct {
+	BySandboxID   map[string]*SandboxRuntime
+	ByContainerID map[string]*SandboxRuntime
 }
 
 type Client struct {
@@ -97,7 +104,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) Create(ctx context.Context, id string, req models.CreateSandboxRequest) (*SandboxRuntime, error) {
+func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (*SandboxRuntime, error) {
 	if err := c.ensureToolboxBinary(); err != nil {
 		return nil, err
 	}
@@ -116,9 +123,8 @@ func (c *Client) Create(ctx context.Context, id string, req models.CreateSandbox
 		workingDir = "/"
 	}
 
-	envValues := make([]string, 0, len(req.Env)+4)
+	envValues := make([]string, 0, len(req.Env)+3)
 	envValues = append(envValues,
-		"SB_SANDBOX_ID="+id,
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", c.toolboxPort),
 		"SB_TOOLBOX_TOKEN="+c.apiToken,
 	)
@@ -128,12 +134,10 @@ func (c *Client) Create(ctx context.Context, id string, req models.CreateSandbox
 	sort.Strings(envValues)
 
 	labels := map[string]string{
-		managedLabelKey:   "true",
-		sandboxIDLabelKey: id,
+		managedLabelKey: "true",
 	}
 
 	createRequest := map[string]any{
-		"Hostname":   id,
 		"Image":      req.Image,
 		"WorkingDir": workingDir,
 		"Entrypoint": []string{c.toolboxMountPath},
@@ -172,38 +176,47 @@ func (c *Client) Create(ctx context.Context, id string, req models.CreateSandbox
 	var created struct {
 		ID string `json:"Id"`
 	}
-	err = c.doJSON(ctx, http.MethodPost, "/containers/create", queryValues(map[string]string{"name": id}), createRequest, nil, &created)
+	err = c.doJSON(ctx, http.MethodPost, "/containers/create", nil, createRequest, nil, &created)
 	if err != nil {
 		return nil, fmt.Errorf("create container: %w", err)
 	}
 
+	sandboxID := sandboxIDFromContainerID(created.ID)
+	if sandboxID == "" {
+		_ = c.removeContainer(ctx, created.ID, true)
+		return nil, errors.New("docker returned empty container ID")
+	}
+
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
+		_ = c.removeContainer(ctx, created.ID, true)
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 
 	runtime, err := c.waitForRuntime(ctx, created.ID)
 	if err != nil {
+		_ = c.removeContainer(ctx, created.ID, true)
 		return nil, err
 	}
 
 	if req.NetworkBlockAll {
 		if err := c.networkRules.BlockAllEgress(runtime.ContainerIP); err != nil {
-			c.logger.Warn("failed to apply network rule", "sandbox_id", id, "error", err)
+			c.logger.Warn("failed to apply network rule", "sandbox_id", runtime.SandboxID, "error", err)
 		}
 	}
 
+	runtime.SandboxID = sandboxID
 	return runtime, nil
 }
 
-func (c *Client) Start(ctx context.Context, id string) (*SandboxRuntime, error) {
-	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/start", nil, nil, nil, nil); err != nil {
+func (c *Client) Start(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/start", nil, nil, nil, nil); err != nil {
 		return nil, fmt.Errorf("start container: %w", err)
 	}
-	return c.waitForRuntime(ctx, id)
+	return c.waitForRuntime(ctx, containerRef)
 }
 
-func (c *Client) Stop(ctx context.Context, id string) error {
-	return c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/stop", queryValues(map[string]string{"t": "10"}), nil, nil, nil)
+func (c *Client) Stop(ctx context.Context, containerRef string) error {
+	return c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/stop", queryValues(map[string]string{"t": "10"}), nil, nil, nil)
 }
 
 func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
@@ -213,10 +226,14 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil {
 		return nil
 	}
-	return c.doJSON(ctx, http.MethodDelete, "/containers/"+url.PathEscape(sandbox.ID), queryValues(map[string]string{"force": "1"}), nil, nil, nil)
+	containerRef := strings.TrimSpace(sandbox.ContainerID)
+	if containerRef == "" {
+		containerRef = sandbox.ID
+	}
+	return c.removeContainer(ctx, containerRef, true)
 }
 
-func (c *Client) Resize(ctx context.Context, id string, req models.ResizeSandboxRequest) error {
+func (c *Client) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
 	if c.resourceLimitsOff {
 		return nil
 	}
@@ -231,25 +248,26 @@ func (c *Client) Resize(ctx context.Context, id string, req models.ResizeSandbox
 		updateRequest["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
 	}
 
-	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/update", nil, updateRequest, nil, nil); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/update", nil, updateRequest, nil, nil); err != nil {
 		return fmt.Errorf("resize container: %w", err)
 	}
 	return nil
 }
 
-func (c *Client) Inspect(ctx context.Context, id string) (*SandboxRuntime, error) {
-	inspect, err := c.inspectContainer(ctx, id)
+func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
+	inspect, err := c.inspectContainer(ctx, containerRef)
 	if err != nil {
 		return nil, fmt.Errorf("inspect container: %w", err)
 	}
 	return &SandboxRuntime{
+		SandboxID:   sandboxIDFromContainerID(inspect.ID),
 		ContainerID: inspect.ID,
 		ContainerIP: getContainerIP(inspect, c.network),
 		Status:      containerStatus(inspect),
 	}, nil
 }
 
-func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, error) {
+func (c *Client) ListManaged(ctx context.Context) (*ManagedSandboxes, error) {
 	query := queryValues(map[string]string{"all": "1"})
 	var containers []containerSummary
 	err := c.doJSON(ctx, http.MethodGet, "/containers/json", query, nil, nil, &containers)
@@ -257,20 +275,30 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 		return nil, fmt.Errorf("list managed containers: %w", err)
 	}
 
-	result := make(map[string]*SandboxRuntime, len(containers))
+	result := &ManagedSandboxes{
+		BySandboxID:   make(map[string]*SandboxRuntime, len(containers)),
+		ByContainerID: make(map[string]*SandboxRuntime, len(containers)),
+	}
 	for _, summary := range containers {
 		if summary.Labels[managedLabelKey] != "true" {
 			continue
 		}
-		id := summary.Labels[sandboxIDLabelKey]
 		inspect, err := c.inspectContainer(ctx, summary.ID)
 		if err != nil {
 			continue
 		}
-		result[id] = &SandboxRuntime{
+		runtime := &SandboxRuntime{
+			SandboxID:   sandboxIDFromContainerID(inspect.ID),
 			ContainerID: inspect.ID,
 			ContainerIP: getContainerIP(inspect, c.network),
 			Status:      containerStatus(inspect),
+		}
+		result.ByContainerID[runtime.ContainerID] = runtime
+		if runtime.SandboxID != "" {
+			result.BySandboxID[runtime.SandboxID] = runtime
+		}
+		if legacyID := strings.TrimSpace(summary.Labels[sandboxIDLabelKey]); legacyID != "" {
+			result.BySandboxID[legacyID] = runtime
 		}
 	}
 
@@ -315,10 +343,10 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 	return nil
 }
 
-func (c *Client) waitForRuntime(ctx context.Context, id string) (*SandboxRuntime, error) {
+func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
 	deadline := time.Now().Add(c.waitTimeout)
 	for time.Now().Before(deadline) {
-		inspect, err := c.inspectContainer(ctx, id)
+		inspect, err := c.inspectContainer(ctx, containerRef)
 		if err != nil {
 			return nil, fmt.Errorf("inspect container: %w", err)
 		}
@@ -329,6 +357,7 @@ func (c *Client) waitForRuntime(ctx context.Context, id string) (*SandboxRuntime
 				return nil, err
 			}
 			return &SandboxRuntime{
+				SandboxID:   sandboxIDFromContainerID(inspect.ID),
 				ContainerID: inspect.ID,
 				ContainerIP: containerIP,
 				Status:      models.SandboxStatusStarted,
@@ -338,7 +367,7 @@ func (c *Client) waitForRuntime(ctx context.Context, id string) (*SandboxRuntime
 		time.Sleep(300 * time.Millisecond)
 	}
 
-	return nil, fmt.Errorf("timed out waiting for sandbox runtime: %s", id)
+	return nil, fmt.Errorf("timed out waiting for sandbox runtime: %s", containerRef)
 }
 
 func (c *Client) waitForToolbox(ctx context.Context, containerIP string) error {
@@ -486,4 +515,20 @@ func queryValues(values map[string]string) url.Values {
 		query.Set(key, value)
 	}
 	return query
+}
+
+func (c *Client) removeContainer(ctx context.Context, containerRef string, force bool) error {
+	query := url.Values{}
+	if force {
+		query.Set("force", "1")
+	}
+	return c.doJSON(ctx, http.MethodDelete, "/containers/"+url.PathEscape(containerRef), query, nil, nil, nil)
+}
+
+func sandboxIDFromContainerID(containerID string) string {
+	containerID = strings.TrimSpace(containerID)
+	if len(containerID) > sandboxIDLength {
+		return containerID[:sandboxIDLength]
+	}
+	return containerID
 }

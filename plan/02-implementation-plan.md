@@ -174,18 +174,18 @@ Adapted directly from `daytona/apps/runner/pkg/docker/` with these changes:
 **CreateSandbox flow (adapted):**
 
 ```
-1. Generate sandbox ID (UUID v4)
-2. Pull Docker image (with optional registry auth)
-3. Write toolbox daemon binary into container via bind mount
-4. Create container:
-   - Entrypoint: ["/tmp/.sandboxd/daemon", "--port", "41100"]
-   - Env: SB_SANDBOX_ID, SB_API_TOKEN, SB_AUTH_TOKEN
-   - Labels: sandbox-library managed
-   - Resource limits: CPU shares, memory limit, disk quota
+1. Pull Docker image (with optional registry auth)
+2. Write toolbox daemon binary into container via bind mount
+3. Create Docker container
+  - Entrypoint: ["/tmp/.sandboxd/daemon", "--port", "41100"]
+  - Env: SB_TOOLBOX_PORT, SB_TOOLBOX_TOKEN
+  - Labels: sandbox-library managed
+  - Resource limits: CPU shares, memory limit, disk quota
+4. Derive sandbox ID from the Docker short ID (first 12 chars of the created container ID)
 5. Start container
 6. Wait for toolbox daemon health (GET /health on container IP:41100)
 7. Call caddy.AddRoute(sandboxID, containerIP, 41100, domain)
-8. Persist to SQLite
+8. Persist sandbox ID + full container ID mapping to SQLite
 9. Return sandbox ID + public URL
 ```
 
@@ -226,12 +226,14 @@ Uses Caddy's [Admin API](https://caddyserver.com/docs/api) (`POST /config/apps/h
 ```json
 {
   "match": [{"path": ["/<sandbox-id>/*"]}],
-  "handle": [
-    {"handler": "rewrite", "strip_path_prefix": "/<sandbox-id>"},
-    {"handler": "reverse_proxy", "upstreams": [{"dial": "<container-ip>:41100"}]}
-  ]
+  "handle": [{
+    "handler": "reverse_proxy",
+    "upstreams": [{"dial": "<container-ip>:41100"}]
+  }]
 }
 ```
+
+In IP mode, the mounted toolbox daemon strips the `/<sandbox-id>` prefix itself, using the Docker short ID or a path-shape fallback.
 
 **TLS:** Caddy auto-manages Let's Encrypt certs for `*.sandbox.aerol.ai` when a wildcard DNS is configured. For IP mode, no TLS (HTTP only).
 
@@ -438,7 +440,7 @@ go 1.22
 | `github.com/docker/docker` | Docker SDK |
 | `github.com/gin-gonic/gin` | HTTP API framework |
 | `github.com/mattn/go-sqlite3` | SQLite state store |
-| `github.com/google/uuid` | Sandbox ID generation |
+| Docker container short ID | Sandbox ID generation |
 | `github.com/coreos/go-iptables` | Network isolation rules |
 | `golang.org/x/crypto/ssh` | SSH gateway |
 | `github.com/google/go-containerregistry` | Image pulling with auth |

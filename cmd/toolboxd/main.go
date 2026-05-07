@@ -35,7 +35,7 @@ func main() {
 
 	srv := &server{
 		logger:    logger,
-		sandboxID: strings.TrimSpace(os.Getenv("SB_SANDBOX_ID")),
+		sandboxID: readSandboxID(),
 		authToken: strings.TrimSpace(os.Getenv("SB_TOOLBOX_TOKEN")),
 		port:      envInt("SB_TOOLBOX_PORT", 2280),
 	}
@@ -92,22 +92,86 @@ func (s *server) routes() http.Handler {
 }
 
 func (s *server) stripSandboxPrefix(r *http.Request) *http.Request {
-	if s.sandboxID == "" {
-		return r
+	r.URL.Path = normalizeSandboxPath(r.URL.Path, s.sandboxID)
+	return r
+}
+
+func readSandboxID() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = ""
+	}
+	return resolveSandboxID(os.Getenv("SB_SANDBOX_ID"), hostname)
+}
+
+func resolveSandboxID(envValue, hostname string) string {
+	if value := strings.TrimSpace(envValue); value != "" {
+		return value
+	}
+	return strings.TrimSpace(hostname)
+}
+
+func normalizeSandboxPath(path, sandboxID string) string {
+	if path == "" {
+		return "/"
 	}
 
-	prefix := "/" + s.sandboxID
-	if r.URL.Path == prefix {
-		r.URL.Path = "/"
-		return r
-	}
-	if strings.HasPrefix(r.URL.Path, prefix+"/") {
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
-		if r.URL.Path == "" {
-			r.URL.Path = "/"
+	if sandboxID != "" {
+		prefix := "/" + sandboxID
+		if path == prefix || path == prefix+"/" {
+			return "/"
+		}
+		if strings.HasPrefix(path, prefix+"/") {
+			trimmed := strings.TrimPrefix(path, prefix)
+			if trimmed == "" {
+				return "/"
+			}
+			return trimmed
 		}
 	}
-	return r
+
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return "/"
+	}
+
+	first, rest, found := strings.Cut(trimmed, "/")
+	if !found {
+		if isKnownToolboxPath("/" + first) {
+			return "/" + first
+		}
+		return "/"
+	}
+
+	if first == "" {
+		return path
+	}
+
+	candidate := "/" + rest
+	if isKnownToolboxPath(candidate) {
+		return candidate
+	}
+
+	return path
+}
+
+func isKnownToolboxPath(path string) bool {
+	switch {
+	case path == "/":
+		return true
+	case path == "/health":
+		return true
+	case path == "/version":
+		return true
+	case strings.HasPrefix(path, "/process/"):
+		return true
+	case strings.HasPrefix(path, "/files/"):
+		return true
+	case strings.HasPrefix(path, "/proxy/"):
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *server) requireAuth(w http.ResponseWriter, r *http.Request) bool {

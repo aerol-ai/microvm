@@ -344,7 +344,7 @@ systemctl enable --now caddy sandboxd
 echo "sandbox-library installed"
 echo "API token: $API_TOKEN"
 if [[ -n "$DOMAIN" ]]; then
-	echo "Public sandbox URL pattern: https://<sandbox-id>.$DOMAIN"
+	echo "Public sandbox URL pattern: https://<docker-short-id>.$DOMAIN"
 else
-	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<sandbox-id>/"
+	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<docker-short-id>/"
 fi

@@ -23,7 +23,7 @@ This document maps every use case from `01-use-cases.md` to the implementation p
 | UC-13 | Many concurrent sandboxes | Docker manages containers; `store/store.go` with per-row locking; Caddy handles routing | ✅ Full | Concurrency handled by Docker + SQLite WAL mode |
 | UC-14 | List and inspect sandboxes | `GET /v1/sandboxes`, `GET /v1/sandboxes/:id`, `sdk/go/sandbox.go List/Get` | ✅ Full | Returns status, URL, resource usage |
 | UC-15 | Network isolation | `pkg/docker/netrules/manager.go` (iptables), `network_block_all` field in create body | ✅ Full | Same iptables logic as Daytona runner |
-| UC-16 | IP mode (no domain) | `cmd/sandboxd/main.go` detects empty `SB_DOMAIN`, Caddy uses path-based routing | ✅ Full | Path-based routing `/<sandbox-id>/` on port 80 |
+| UC-16 | IP mode (no domain) | `cmd/sandboxd/main.go` detects empty `SB_DOMAIN`, Caddy uses path-based routing | ✅ Full | Path-based routing `/<sandbox-id>/` on port 80, where sandbox IDs are Docker short IDs |
 | UC-17 | Health check + observability | `pkg/api/handlers/health.go GET /health`, checks Docker ping + Caddy reachability | ✅ Full | Returns sandbox count, Docker status, Caddy status |
 | UC-18 | Automatic TLS via Let's Encrypt | Caddy handles this natively; `packaging/Caddyfile.template` configures ACME | ✅ Full | Zero code needed — Caddy owns cert lifecycle |
 | UC-19 | Sandbox auto-stop on idle | `pkg/idlemonitor/monitor.go`, configured via `SB_IDLE_TIMEOUT_MIN` | ✅ Full | Background goroutine checks activity timestamps |
@@ -67,7 +67,7 @@ This document maps every use case from `01-use-cases.md` to the implementation p
     }
 }
 ```
-sandboxd responds to `/v1/tls-check?domain=<sandbox-id>.sandbox.aerol.ai` with 200 if the sandbox exists.
+sandboxd responds to `/v1/tls-check?domain=<sandbox-id>.sandbox.aerol.ai` with 200 when the hostname is allowed; new sandbox IDs are Docker short IDs.
 
 ---
 

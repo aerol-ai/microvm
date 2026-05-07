@@ -4,6 +4,8 @@
 
 A self-hosted, standalone Go service that turns any bare-metal Linux server into a sandbox farm. It bundles Daytona's Docker-management logic (runner) with Caddy's reverse proxy to give every sandbox a globally-reachable HTTPS URL — with zero dependency on the Daytona cloud API.
 
+For externally visible URLs and API calls, `sandbox-id` is the Docker short ID: the first 12 characters of the full container ID. The full Docker container ID is still stored internally for lifecycle operations.
+
 ---
 
 ## Use Cases
@@ -34,7 +36,7 @@ curl -X POST http://localhost:8080/v1/sandboxes \
 **Outcome:**
 - A Docker container is created and started.
 - A Caddy route is added: `https://<sandbox-id>.sandbox.aerol.ai → container:toolbox-port`.
-- Response includes the sandbox ID and public URL.
+- Response includes the Docker short ID and public URL.
 
 ---
 
@@ -51,7 +53,7 @@ sb, err := client.Create(ctx, sandbox.CreateOptions{
     MemoryMB: 4096,
     Env:     map[string]string{"APP_ENV": "test"},
 })
-fmt.Println(sb.PublicURL) // https://abc123.sandbox.aerol.ai
+fmt.Println(sb.PublicURL) // https://7f3c2a1b9d4e.sandbox.aerol.ai
 ```
 **Outcome:** Sandbox created with a typed Go API.
 
@@ -263,7 +265,7 @@ curl http://localhost:8080/health
 
 **Actor:** Caddy (automatic)  
 **Trigger:** Wildcard DNS `*.sandbox.aerol.ai → server IP` configured by operator  
-**Flow:** First request to `https://<guid>.sandbox.aerol.ai` triggers Caddy's ACME flow.  
+**Flow:** First request to `https://<docker-short-id>.sandbox.aerol.ai` triggers Caddy's ACME flow.  
 **Outcome:** TLS cert issued and renewed automatically; zero manual cert management.
 
 ---

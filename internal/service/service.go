@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -13,7 +14,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/google/uuid"
 )
 
 type Service struct {
@@ -40,13 +40,23 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, errors.New("image is required")
 	}
 
-	id := uuid.NewString()
+	runtime, err := s.docker.Create(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.SandboxID == "" {
+		_ = s.docker.Destroy(ctx, &models.Sandbox{ContainerID: runtime.ContainerID, ContainerIP: runtime.ContainerIP})
+		return nil, errors.New("docker runtime did not return a sandbox ID")
+	}
+
 	now := time.Now().UTC()
 	sandbox := &models.Sandbox{
-		ID:               id,
+		ID:               runtime.SandboxID,
 		Image:            req.Image,
-		Status:           models.SandboxStatusCreating,
-		PublicURL:        s.caddy.SandboxPublicURL(id),
+		Status:           runtime.Status,
+		PublicURL:        s.caddy.SandboxPublicURL(runtime.SandboxID),
+		ContainerID:      runtime.ContainerID,
+		ContainerIP:      runtime.ContainerIP,
 		CPU:              req.CPU,
 		MemoryMB:         req.MemoryMB,
 		DiskGB:           req.DiskGB,
@@ -60,32 +70,18 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		ContainerCommand: req.ContainerCommand,
 	}
 
-	if err := s.store.Create(ctx, sandbox); err != nil {
-		return nil, err
-	}
-
-	runtime, err := s.docker.Create(ctx, id, req)
-	if err != nil {
-		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
-		return nil, err
-	}
-
-	sandbox.ContainerID = runtime.ContainerID
-	sandbox.ContainerIP = runtime.ContainerIP
-	sandbox.Status = runtime.Status
-	sandbox.UpdatedAt = time.Now().UTC()
-
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 		_ = s.docker.Destroy(ctx, sandbox)
-		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 		return nil, err
 	}
 
-	if err := s.store.Upsert(ctx, sandbox); err != nil {
+	if err := s.store.Create(ctx, sandbox); err != nil {
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.docker.Destroy(ctx, sandbox)
 		return nil, err
 	}
 
-	return s.store.Get(ctx, id)
+	return s.store.Get(ctx, sandbox.ID)
 }
 
 func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
@@ -102,7 +98,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		return nil, err
 	}
 
-	runtime, err := s.docker.Start(ctx, id)
+	runtime, err := s.docker.Start(ctx, sandboxContainerRef(sandbox))
 	if err != nil {
 		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 		return nil, err
@@ -134,7 +130,7 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.docker.Stop(ctx, id); err != nil {
+	if err := s.docker.Stop(ctx, sandboxContainerRef(sandbox)); err != nil {
 		return nil, err
 	}
 	sandbox.Status = models.SandboxStatusStopped
@@ -165,7 +161,7 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	if err != nil {
 		return nil, err
 	}
-	if err := s.docker.Resize(ctx, id, req); err != nil {
+	if err := s.docker.Resize(ctx, sandboxContainerRef(sandbox), req); err != nil {
 		return nil, err
 	}
 	if req.CPU > 0 {
@@ -281,7 +277,10 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 
 	for _, sandbox := range known {
-		runtime, ok := managed[sandbox.ID]
+		runtime, ok := managed.BySandboxID[sandbox.ID]
+		if !ok && sandbox.ContainerID != "" {
+			runtime, ok = managed.ByContainerID[sandbox.ContainerID]
+		}
 		if !ok {
 			sandbox.Status = models.SandboxStatusDestroyed
 			sandbox.ContainerIP = ""
@@ -378,4 +377,14 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 		req.Env = map[string]string{}
 	}
 	return req
+}
+
+func sandboxContainerRef(sandbox *models.Sandbox) string {
+	if sandbox == nil {
+		return ""
+	}
+	if containerID := strings.TrimSpace(sandbox.ContainerID); containerID != "" {
+		return containerID
+	}
+	return sandbox.ID
 }
