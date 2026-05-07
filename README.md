@@ -68,6 +68,8 @@ Only Linux amd64 and arm64 binaries are published today, because the host instal
 
 The installer defaults to downloading the latest GitHub release from `aerol-ai/microvm`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
 
+The installer writes `sandboxd.service` with `Restart=always` and enables `sandboxd-healthcheck.timer`, which probes the local `/health` endpoint every 30 seconds and restarts `sandboxd` if the process is up but no longer responding.
+
 ## Run locally
 
 Required services:

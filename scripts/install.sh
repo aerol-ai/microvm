@@ -319,6 +319,8 @@ Description=sandbox-library daemon
 After=docker.service caddy.service network-online.target
 Wants=network-online.target
 Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -326,9 +328,69 @@ EnvironmentFile=/etc/sandboxd/sandboxd.env
 ExecStart=$INSTALL_PREFIX/sandboxd
 Restart=always
 RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
+EOF
+}
+
+write_healthcheck_script() {
+	cat > "$INSTALL_PREFIX/sandboxd-healthcheck" <<'EOF'
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ENV_FILE="/etc/sandboxd/sandboxd.env"
+if [[ -f "$ENV_FILE" ]]; then
+	# shellcheck disable=SC1091
+	source "$ENV_FILE"
+fi
+
+if ! systemctl is-active --quiet sandboxd.service; then
+	exit 0
+fi
+
+HEALTH_HOST="127.0.0.1"
+HEALTH_PORT="${SB_API_PORT:-8080}"
+HEALTH_URL="http://${HEALTH_HOST}:${HEALTH_PORT}/health"
+
+if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+	logger -t sandboxd-healthcheck "health check failed for ${HEALTH_URL}; restarting sandboxd.service"
+	systemctl restart sandboxd.service
+	logger -t sandboxd-healthcheck "sandboxd.service restart requested"
+fi
+EOF
+	chmod 0755 "$INSTALL_PREFIX/sandboxd-healthcheck"
+}
+
+write_healthcheck_units() {
+	cat > /etc/systemd/system/sandboxd-healthcheck.service <<EOF
+[Unit]
+Description=sandbox-library health watchdog
+After=sandboxd.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_PREFIX/sandboxd-healthcheck
+EOF
+
+	cat > /etc/systemd/system/sandboxd-healthcheck.timer <<EOF
+[Unit]
+Description=Run sandbox-library health watchdog
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=sandboxd-healthcheck.service
+
+[Install]
+WantedBy=timers.target
 EOF
 }
 
@@ -337,9 +399,11 @@ install_binaries
 write_environment
 write_caddyfile
 write_systemd_unit
+write_healthcheck_script
+write_healthcheck_units
 
 systemctl daemon-reload
-systemctl enable --now caddy sandboxd
+systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
 
 echo "sandbox-library installed"
 echo "API token: $API_TOKEN"
@@ -348,3 +412,5 @@ if [[ -n "$DOMAIN" ]]; then
 else
 	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<docker-short-id>/"
 fi
+echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
+echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
