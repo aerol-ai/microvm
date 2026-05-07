@@ -318,6 +318,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return err
 	}
 
+	knownIDs := make(map[string]struct{}, len(known))
+	for _, sandbox := range known {
+		knownIDs[sandbox.ID] = struct{}{}
+	}
+
 	for _, sandbox := range known {
 		runtime, ok := managed[sandbox.ID]
 		if !ok {
@@ -354,6 +359,26 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if err := s.store.Upsert(ctx, sandbox); err != nil {
 			return err
 		}
+	}
+
+	// Orphan containers: managed by us but no DB row. Remove them so leaked
+	// state from a crashed create or a wiped DB doesn't accumulate.
+	for sandboxID, runtime := range managed {
+		if _, ok := knownIDs[sandboxID]; ok {
+			continue
+		}
+		s.logger.Warn("removing orphan container",
+			"sandbox_id", sandboxID,
+			"container_id", runtime.ContainerID,
+		)
+		stub := &models.Sandbox{ContainerID: runtime.ContainerID, ContainerIP: runtime.ContainerIP}
+		if err := s.docker.Destroy(ctx, stub); err != nil {
+			s.logger.Warn("orphan container removal failed",
+				"sandbox_id", sandboxID,
+				"error", err,
+			)
+		}
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
 	}
 
 	return nil

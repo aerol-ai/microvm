@@ -79,6 +79,57 @@ handle.signal("KILL");
 Signals target the **process group**, so children of the command also
 receive them.
 
+### Go
+
+```go
+handle, err := sandbox.ExecStream(ctx, types.ExecStreamOptions{
+  Command: "npm install",
+  Workdir: "/workspace",
+  OnStdout: func(chunk []byte) { _, _ = os.Stdout.Write(chunk) },
+  OnStderr: func(chunk []byte) { _, _ = os.Stderr.Write(chunk) },
+})
+if err != nil {
+  return err
+}
+
+exit, err := handle.Wait()
+if err != nil {
+  return err
+}
+fmt.Printf("npm install exited with %d\n", exit.Code)
+```
+
+### Python
+
+```py
+handle = sandbox.exec_stream(
+    {
+        "command": "npm install",
+        "workdir": "/workspace",
+        "onStdout": lambda chunk: print(chunk.decode("utf-8"), end=""),
+        "onStderr": lambda chunk: print(chunk.decode("utf-8"), end="", file=sys.stderr),
+    }
+)
+
+result = handle.wait()
+print(f"npm install exited with {result['code']}")
+```
+
+### Rust
+
+```rust
+let handle = sandbox.exec_stream(microvm_sdk::ExecStreamOptions {
+    command: "npm install".to_string(),
+    workdir: Some("/workspace".to_string()),
+    on_stdout: Some(Arc::new(|chunk| print!("{}", String::from_utf8_lossy(&chunk)))),
+    on_stderr: Some(Arc::new(|chunk| eprint!("{}", String::from_utf8_lossy(&chunk)))),
+    ..Default::default()
+})?;
+
+let exit = handle.wait()?;
+println!("npm install exited with {}", exit.code);
+```
+
 ## Wire protocol
 
 If you want to write a client in another language, here's the protocol.
@@ -244,6 +295,9 @@ that one sandbox's token, not the global PAT.
 | `pkg/api/server.go` | `requireAuth` accepts both `Authorization` header and `Sec-WebSocket-Protocol` token; toolbox proxy forwards WS upgrades and rewrites auth |
 | `sdk/typescript/src/types.ts` | `ExecStreamOptions`, `ExecStreamHandle`, `ExecExitInfo` |
 | `sdk/typescript/src/internal/client.ts` | `openExecStream` helper, `APIClient.execStream`, `SandboxResource.execStream` |
+| `sdk/go/pkg/types/exec_stream.go`, `sdk/go/internal/apiclient/exec_stream.go`, `sdk/go/pkg/microvm/client.go` | Go `ExecStream` types, transport, and public wrapper |
+| `sdk/python/microvm/client.py` | Python `exec_stream` handle plus API field normalization |
+| `sdk/rust/src/lib.rs`, `sdk/rust/src/types.rs` | Rust `ExecStreamHandle`, callbacks, and websocket transport |
 
 ## See also
 

@@ -43,6 +43,7 @@ type Client struct {
 	privileged         bool
 	resourceLimitsOff  bool
 	httpClient         *http.Client
+	streamClient       *http.Client
 	toolboxClient      *http.Client
 	networkRules       *netrules.Manager
 	waitTimeout        time.Duration
@@ -75,11 +76,22 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
+		streamClient:       &http.Client{Transport: transport},
 		toolboxClient:      &http.Client{Timeout: cfg.HTTPClientTimeout},
 		networkRules:       rules,
 		waitTimeout:        cfg.DockerRuntimeWaitTimeout,
 		toolboxWaitTimeout: cfg.ToolboxWaitTimeout,
 	}, nil
+}
+
+// ClearNetworkRules releases any per-IP network rules previously attached to a
+// sandbox. Used by the event-driven path when a container exits or is destroyed
+// out-of-band, since Destroy() handles this for us during normal teardown.
+func (c *Client) ClearNetworkRules(containerIP string) error {
+	if containerIP == "" {
+		return nil
+	}
+	return c.networkRules.ClearBlockAllEgress(containerIP)
 }
 
 func (c *Client) Ping(ctx context.Context) error {

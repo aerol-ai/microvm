@@ -61,6 +61,7 @@ func main() {
 		svc.StartReconcileLoop(ctx)
 	}
 	svc.StartIdleMonitor(ctx)
+	svc.StartEventMonitor(ctx)
 
 	server := api.NewServer(logger, svc, cfg.PATToken)
 	httpServer := &http.Server{

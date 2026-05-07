@@ -31,6 +31,7 @@ type Config struct {
 	AutoReconcile       bool
 	EnableCaddy         bool
 	EnableNetworkRules  bool
+	EnableEventMonitor  bool
 	LogLevel                 string
 	ShutdownTimeout          time.Duration
 	HTTPClientTimeout        time.Duration
@@ -63,6 +64,7 @@ func Load() (Config, error) {
 		AutoReconcile:       getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:         getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:  getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		EnableEventMonitor:  getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		LogLevel:            strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
 		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
 		HTTPClientTimeout:        getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 10*time.Second),

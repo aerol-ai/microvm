@@ -49,7 +49,7 @@ func TestExecStreamReceivesFramesAndExit(t *testing.T) {
 	var stderr string
 	client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
 	handle, err := client.ExecStream(context.Background(), "sb-stream", sdktypes.ExecStreamOptions{
-		Command: "npm install",
+		Command:  "npm install",
 		OnStdout: func(chunk []byte) { stdout += string(chunk) },
 		OnStderr: func(chunk []byte) { stderr += string(chunk) },
 	})
