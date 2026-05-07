@@ -218,3 +218,60 @@ var errFake = &fakeErr{msg: "build failed (simulated)"}
 type fakeErr struct{ msg string }
 
 func (e *fakeErr) Error() string { return e.msg }
+
+// TestSweepRemovesOrphanDirsButKeepsLive verifies the startup sweeper:
+// any directory under RootDir whose sandbox-id is not in the keep set or
+// the live tracked map is removed; everything else is left alone.
+func TestSweepRemovesOrphanDirsButKeepsLive(t *testing.T) {
+	root := t.TempDir()
+	credDir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m, err := New(logger, Config{RootDir: root, CredDir: credDir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Lay down three sandbox dirs:
+	//   sb-keep   → in the keep set (live container)
+	//   sb-live   → tracked in m.state (mid-mount)
+	//   sb-orphan → neither: should be removed
+	for _, id := range []string{"sb-keep", "sb-live", "sb-orphan"} {
+		if err := os.MkdirAll(filepath.Join(root, id, "0"), 0o700); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+	// Mark sb-live as tracked.
+	m.mu.Lock()
+	m.state["sb-live"] = []*mountState{{sandboxID: "sb-live", index: 0, hostPath: filepath.Join(root, "sb-live", "0")}}
+	m.mu.Unlock()
+
+	m.Sweep(map[string]struct{}{"sb-keep": {}})
+
+	// sb-keep and sb-live still present, sb-orphan gone.
+	if _, err := os.Stat(filepath.Join(root, "sb-keep")); err != nil {
+		t.Errorf("sb-keep was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sb-live")); err != nil {
+		t.Errorf("sb-live (tracked) was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sb-orphan")); !os.IsNotExist(err) {
+		t.Errorf("sb-orphan should be gone, stat err = %v", err)
+	}
+}
+
+// TestSweepIgnoresMissingRoot is the boring "first run before anything has
+// been mounted" path. It must not error or panic.
+func TestSweepIgnoresMissingRoot(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Build a Manager but then nuke its root behind its back.
+	root := t.TempDir()
+	credDir := t.TempDir()
+	m, err := New(logger, Config{RootDir: root, CredDir: credDir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	m.Sweep(map[string]struct{}{}) // must not panic
+}

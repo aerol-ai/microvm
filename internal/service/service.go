@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -444,17 +445,33 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		caddyStatus = err.Error()
 	}
 
+	// "disabled" is distinct from "ok" / failure — it tells the operator
+	// "we didn't probe this on purpose" rather than masking a real fault.
+	sshStatus := "disabled"
+	if s.cfg.EnableSSHGateway {
+		if err := probeSSHGateway(ctx, s.cfg.SSHListenAddr); err != nil {
+			sshStatus = err.Error()
+		} else {
+			sshStatus = "ok"
+		}
+	}
+
 	status := "ok"
 	if dockerStatus != "ok" || caddyStatus != "ok" {
 		status = "degraded"
 	}
+	// SSH gateway being down only degrades health when it's expected to be up.
+	if s.cfg.EnableSSHGateway && sshStatus != "ok" {
+		status = "degraded"
+	}
 
 	return models.HealthStatus{
-		Status:    status,
-		Sandboxes: len(sandboxes),
-		Docker:    dockerStatus,
-		Caddy:     caddyStatus,
-		Version:   version.Version,
+		Status:     status,
+		Sandboxes:  len(sandboxes),
+		Docker:     dockerStatus,
+		Caddy:      caddyStatus,
+		SSHGateway: sshStatus,
+		Version:    version.Version,
 	}, nil
 }
 
@@ -547,6 +564,19 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
 		_ = s.mounts.UnmountAll(sandboxID)
 	}
+
+	// Stale-mount sweep. Anything under /var/lib/sandboxd/mounts/ that
+	// doesn't correspond to a sandbox we're going to keep is a leftover
+	// from a crashed create or a previous orphan removal. Kill any FUSE
+	// process still attached and remove the directory tree. Mounts the
+	// manager already tracks in-process are skipped inside Sweep itself.
+	keep := make(map[string]struct{}, len(managed))
+	for id, runtime := range managed {
+		if runtime.Status == models.SandboxStatusStarted {
+			keep[id] = struct{}{}
+		}
+	}
+	s.mounts.Sweep(keep)
 
 	return nil
 }
@@ -676,4 +706,28 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	if err := s.docker.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
+}
+
+// probeSSHGateway opens a TCP connection to the gateway's listen address with
+// a short timeout. We don't speak the SSH handshake — connect is enough to
+// distinguish "process is up and accepting" from "wedged or never started."
+// Listener is bound to 0.0.0.0 in production; we dial 127.0.0.1 explicitly so
+// we don't depend on the box having a public IP.
+func probeSSHGateway(ctx context.Context, listenAddr string) error {
+	if listenAddr == "" {
+		return errors.New("ssh listen addr is empty")
+	}
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return fmt.Errorf("invalid ssh listen addr %q: %w", listenAddr, err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(probeCtx, "tcp", net.JoinHostPort("127.0.0.1", port))
+	if err != nil {
+		return fmt.Errorf("ssh gateway dial: %w", err)
+	}
+	_ = conn.Close()
+	return nil
 }

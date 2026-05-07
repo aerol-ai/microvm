@@ -170,6 +170,60 @@ func (m *Manager) HostBindsFor(sandboxID string) []ContainerBind {
 	return binds
 }
 
+// Sweep removes per-sandbox mount directories under RootDir that are not in
+// keep. For each orphan it best-effort:
+//   - finds any FUSE process whose argv mentions the orphan path and SIGKILLs it
+//   - umount(s) every mountpoint under the orphan dir, lazily if needed
+//   - removes the orphan directory tree
+//
+// Intended for sandboxd startup, after the reconciler has computed the set of
+// sandboxes that should still exist. A crash mid-MountAll can leave a FUSE
+// process attached to a directory whose sandbox row is gone or whose container
+// never came up; without this sweep those mounts pile up forever.
+func (m *Manager) Sweep(keep map[string]struct{}) {
+	entries, err := os.ReadDir(m.rootDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.logger.Warn("mounts sweep: read root failed", "root", m.rootDir, "error", err)
+		}
+		return
+	}
+
+	m.mu.Lock()
+	tracked := make(map[string]struct{}, len(m.state))
+	for id := range m.state {
+		tracked[id] = struct{}{}
+	}
+	m.mu.Unlock()
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		id := e.Name()
+		if _, ok := keep[id]; ok {
+			continue
+		}
+		if _, ok := tracked[id]; ok {
+			// We're already managing it in-process; never sweep an active mount.
+			continue
+		}
+		path := filepath.Join(m.rootDir, id)
+		m.logger.Info("mounts sweep: removing orphan", "sandbox_id", id, "path", path)
+		m.cleanupOrphanDir(path)
+	}
+}
+
+// cleanupOrphanDir kills FUSE processes attached to anything under dir,
+// unmounts every leaf, and removes the tree. Best-effort; logs failures.
+func (m *Manager) cleanupOrphanDir(dir string) {
+	killFUSEProcessesFor(m.logger, dir)
+	unmountTree(m.logger, dir)
+	if err := os.RemoveAll(dir); err != nil {
+		m.logger.Warn("mounts sweep: remove failed", "path", dir, "error", err)
+	}
+}
+
 // Reestablish ensures a sandbox's mounts are running, mounting any that are
 // missing. Called by the reconciler at startup and periodically.
 func (m *Manager) Reestablish(ctx context.Context, sandboxID string, mounts []models.MountSpec) error {

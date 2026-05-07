@@ -79,11 +79,12 @@ type ExposedPort struct {
 }
 
 type HealthStatus struct {
-	Status    string `json:"status"`
-	Sandboxes int    `json:"sandboxes"`
-	Docker    string `json:"docker"`
-	Caddy     string `json:"caddy"`
-	Version   string `json:"version"`
+	Status     string `json:"status"`
+	Sandboxes  int    `json:"sandboxes"`
+	Docker     string `json:"docker"`
+	Caddy      string `json:"caddy"`
+	SSHGateway string `json:"ssh_gateway"`
+	Version    string `json:"version"`
 }
 
 type ExecRequest struct {
