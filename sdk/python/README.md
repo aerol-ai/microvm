@@ -17,10 +17,24 @@ from microvm import MicroVM
 client = MicroVM(pat_token="${SB_PAT_TOKEN}", api_url="https://sandbox.example.com")
 health = client.health()
 print(health)
+print(health["sshGateway"])
 
-sandbox = client.create({"image": "ghcr.io/aerol-ai/ubuntu:22.04"})
+sandbox = client.create(
+	{
+		"image": "ghcr.io/aerol-ai/ubuntu:22.04",
+		"mounts": [
+			{
+				"type": "s3",
+				"target": "/workspace",
+				"source": "s3://bucket/prefix",
+				"credentials": {"access_key_id": "AKIA...", "secret_access_key": "SECRET"},
+			}
+		],
+	}
+)
 print(sandbox.sshPublicKey)
 print(sandbox.sshPrivateKey)  # only returned by create()
+print(client.mounts(sandbox.id))
 ```
 
 ## Example

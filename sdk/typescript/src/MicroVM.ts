@@ -3,7 +3,10 @@ import { Sandbox } from "./Sandbox.js";
 import type {
   CreateOptions,
   CreateSessionOptions,
+  ExecStreamHandle,
+  ExecStreamOptions,
   HealthStatus,
+  MountSpecRedacted,
   ResizeOptions,
   Sandbox as SandboxData,
   Session,
@@ -81,6 +84,14 @@ export class MicroVM {
 
   async health(): Promise<HealthStatus> {
     return this.client.health();
+  }
+
+  async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {
+    return this.client.mounts(sandboxID);
+  }
+
+  execStream(sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
+    return this.client.execStream(sandboxID, options);
   }
 
   async createSession(sandboxID: string, options: CreateSessionOptions): Promise<Session> {

@@ -1,10 +1,47 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MountType {
+    S3,
+    Nfs,
+    Sshfs,
+    Rclone,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RegistryAuth {
     pub server: String,
     pub username: String,
     pub password: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MountSpec {
+    #[serde(rename = "type")]
+    pub mount_type: MountType,
+    pub target: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<std::collections::HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<std::collections::HashMap<String, String>>,
+    #[serde(rename = "read_only", skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MountSpecRedacted {
+    #[serde(rename = "type")]
+    pub mount_type: MountType,
+    pub target: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<std::collections::HashMap<String, String>>,
+    #[serde(rename = "read_only", default)]
+    pub read_only: bool,
+    #[serde(rename = "has_credentials", default)]
+    pub has_credentials: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -26,6 +63,8 @@ pub struct CreateOptions {
     pub registry: Option<RegistryAuth>,
     #[serde(rename = "container_command", skip_serializing_if = "Option::is_none")]
     pub container_command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<Vec<MountSpec>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -102,6 +141,8 @@ pub struct HealthStatus {
     pub sandboxes: u32,
     pub docker: String,
     pub caddy: String,
+    #[serde(rename = "ssh_gateway", default)]
+    pub ssh_gateway: String,
     pub version: String,
 }
 

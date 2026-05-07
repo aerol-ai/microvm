@@ -75,6 +75,103 @@ test("MicroVM create returns SSH key material", async () => {
   assert.equal(sandbox.sshPrivateKey, "PRIVATE");
 });
 
+test("MicroVM create serializes mounts and mounts endpoint returns redacted specs", async () => {
+  const seen: Array<{ method: string; url: string; body: unknown }> = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const bodyText = request.method === "GET" || request.method === "DELETE" ? undefined : await request.text();
+      seen.push({
+        method: request.method,
+        url: request.url,
+        body: bodyText ? JSON.parse(bodyText) : undefined,
+      });
+
+      if (request.url.endsWith("/v1/sandboxes") && request.method === "POST") {
+        return new Response(JSON.stringify({
+          id: "sb-mounted",
+          image: "ubuntu:22.04",
+          status: "started",
+          public_url: "https://sb-mounted.example.com",
+          cpu: 2,
+          memory_mb: 2048,
+          disk_gb: 20,
+          os_user: "root",
+          network_block_all: false,
+          toolbox_enabled: true,
+          exposed_ports: [],
+          created_at: "2026-05-07T10:00:00Z",
+          updated_at: "2026-05-07T10:00:00Z",
+          last_active_at: "2026-05-07T10:00:00Z",
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (request.url.endsWith("/v1/sandboxes/sb-mounted/mounts") && request.method === "GET") {
+        return new Response(JSON.stringify({
+          mounts: [
+            {
+              type: "s3",
+              target: "/workspace",
+              source: "s3://bucket/prefix",
+              options: { region: "us-east-1" },
+              read_only: true,
+              has_credentials: true,
+            },
+          ],
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      throw new Error(`unexpected request: ${request.method} ${request.url}`);
+    },
+  });
+
+  await sdk.create({
+    image: "ubuntu:22.04",
+    mounts: [
+      {
+        type: "s3",
+        target: "/workspace",
+        source: "s3://bucket/prefix",
+        options: { region: "us-east-1" },
+        credentials: { access_key_id: "AKIA", secret_access_key: "SECRET" },
+        readOnly: true,
+      },
+    ],
+  });
+  const mounts = await sdk.mounts("sb-mounted");
+
+  assert.deepEqual(seen[0]?.body, {
+    image: "ubuntu:22.04",
+    mounts: [
+      {
+        type: "s3",
+        target: "/workspace",
+        source: "s3://bucket/prefix",
+        options: { region: "us-east-1" },
+        credentials: { access_key_id: "AKIA", secret_access_key: "SECRET" },
+        read_only: true,
+      },
+    ],
+  });
+  assert.deepEqual(mounts, [
+    {
+      type: "s3",
+      target: "/workspace",
+      source: "s3://bucket/prefix",
+      options: { region: "us-east-1" },
+      readOnly: true,
+      hasCredentials: true,
+    },
+  ]);
+});
+
 test("Sandbox session methods map API shapes", async () => {
   const seen: Array<{ method: string; url: string; body: unknown }> = [];
   const sandboxPayload = {
@@ -229,6 +326,28 @@ test("MicroVM requires a PAT token", () => {
   }, /PAT token is required/);
 });
 
+test("MicroVM health maps ssh gateway state", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async () => new Response(JSON.stringify({
+      status: "degraded",
+      sandboxes: 1,
+      docker: "ok",
+      caddy: "ok",
+      ssh_gateway: "disabled",
+      version: "dev",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+
+  const health = await sdk.health();
+
+  assert.equal(health.sshGateway, "disabled");
+});
+
 test("Sandbox execStream uses sandbox bearer subprotocol", async () => {
   const originalWebSocket = globalThis.WebSocket;
   const stdoutChunks: Uint8Array[] = [];
@@ -321,6 +440,68 @@ test("Sandbox execStream uses sandbox bearer subprotocol", async () => {
     assert.equal(result.code, 0);
     assert.equal(new TextDecoder().decode(stdoutChunks[0]), "hi");
     assert.equal(new TextDecoder().decode(stderrChunks[0]), "ok");
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("MicroVM execStream uses sandbox bearer subprotocol", async () => {
+  const originalWebSocket = globalThis.WebSocket;
+
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+
+    readonly url: string;
+    readonly protocols: string[];
+    binaryType = "blob";
+    sent: Array<string | Uint8Array> = [];
+    private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+    constructor(url: string, protocols?: string | string[]) {
+      this.url = url;
+      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(name: string, listener: (event?: unknown) => void): void {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+
+    send(data: string | Uint8Array): void {
+      this.sent.push(data);
+    }
+
+    close(): void {
+      this.emit("close");
+    }
+
+    emit(name: string, event?: unknown): void {
+      for (const listener of this.listeners.get(name) ?? []) {
+        listener(event);
+      }
+    }
+  }
+
+  try {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    const sdk = new MicroVM({ patToken: "pat-token", apiUrl: "https://api.example.com" });
+    sdk.execStream("sb-stream", { command: "bash", tty: true, cols: 120, rows: 40 });
+
+    const ws = FakeWebSocket.instances[0];
+    assert.ok(ws);
+    assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/toolbox/process/exec/stream");
+    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+
+    ws.emit("open");
+    assert.deepEqual(JSON.parse(String(ws.sent[0])), {
+      command: "bash",
+      tty: true,
+      cols: 120,
+      rows: 40,
+    });
   } finally {
     globalThis.WebSocket = originalWebSocket;
   }

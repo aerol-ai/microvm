@@ -3,10 +3,31 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Literal, TypedDict
 
 
+MountType = Literal["s3", "nfs", "sshfs", "rclone"]
+
+
 class RegistryAuth(TypedDict, total=False):
     server: str
     username: str
     password: str
+
+
+class MountSpec(TypedDict, total=False):
+    type: MountType
+    target: str
+    source: str
+    options: Dict[str, str]
+    credentials: Dict[str, str]
+    readOnly: bool
+
+
+class MountSpecRedacted(TypedDict, total=False):
+    type: MountType
+    target: str
+    source: str
+    options: Dict[str, str]
+    readOnly: bool
+    hasCredentials: bool
 
 
 class CreateOptions(TypedDict, total=False):
@@ -19,6 +40,7 @@ class CreateOptions(TypedDict, total=False):
     networkBlockAll: bool
     registry: RegistryAuth
     containerCommand: List[str]
+    mounts: List[MountSpec]
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -141,6 +163,7 @@ class HealthStatus(TypedDict):
     sandboxes: int
     docker: str
     caddy: str
+    sshGateway: str
     version: str
 
 

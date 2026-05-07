@@ -21,6 +21,7 @@ fn main() {
             network_block_all: None,
             registry: None,
             container_command: None,
+            mounts: None,
         })
         .expect("sandbox creation failed");
 

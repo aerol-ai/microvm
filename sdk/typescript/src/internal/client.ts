@@ -11,6 +11,8 @@ import type {
   ExecStreamOptions,
   ExposedPort,
   HealthStatus,
+  MountSpec,
+  MountSpecRedacted,
   ResizeOptions,
   Sandbox,
   Session,
@@ -93,7 +95,30 @@ interface ApiHealthStatus {
   sandboxes: number;
   docker: string;
   caddy: string;
+  ssh_gateway?: string;
   version: string;
+}
+
+interface ApiMountSpec {
+  type: MountSpec["type"];
+  target: string;
+  source: string;
+  options?: Record<string, string>;
+  credentials?: Record<string, string>;
+  read_only?: boolean;
+}
+
+interface ApiMountSpecRedacted {
+  type: MountSpecRedacted["type"];
+  target: string;
+  source: string;
+  options?: Record<string, string>;
+  read_only?: boolean;
+  has_credentials: boolean;
+}
+
+interface ApiMountList {
+  mounts: ApiMountSpecRedacted[];
 }
 
 export class APIClient {
@@ -221,6 +246,11 @@ export class APIClient {
   async health(): Promise<HealthStatus> {
     const response = await this.doJSON<ApiHealthStatus>("GET", "/health");
     return fromApiHealthStatus(response);
+  }
+
+  async mounts(id: string): Promise<MountSpecRedacted[]> {
+    const response = await this.doJSON<ApiMountList>("GET", `/v1/sandboxes/${id}/mounts`);
+    return response.mounts.map(fromApiMountSpecRedacted);
   }
 
   private wrap(sandbox: ApiSandbox): SandboxResource {
@@ -405,6 +435,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_block_all: options.networkBlockAll,
     registry: options.registry,
     container_command: options.containerCommand,
+    mounts: options.mounts?.map(toApiMountSpec),
   };
 }
 
@@ -513,7 +544,30 @@ function fromApiHealthStatus(status: ApiHealthStatus): HealthStatus {
     sandboxes: status.sandboxes,
     docker: status.docker,
     caddy: status.caddy,
+    sshGateway: status.ssh_gateway ?? "",
     version: status.version,
+  };
+}
+
+function toApiMountSpec(mount: MountSpec): ApiMountSpec {
+  return {
+    type: mount.type,
+    target: mount.target,
+    source: mount.source,
+    options: mount.options,
+    credentials: mount.credentials,
+    read_only: mount.readOnly,
+  };
+}
+
+function fromApiMountSpecRedacted(mount: ApiMountSpecRedacted): MountSpecRedacted {
+  return {
+    type: mount.type,
+    target: mount.target,
+    source: mount.source,
+    options: mount.options,
+    readOnly: mount.read_only ?? false,
+    hasCredentials: mount.has_credentials,
   };
 }
 

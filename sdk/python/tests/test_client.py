@@ -32,6 +32,19 @@ class RecordingMicroVM(MicroVM):
                 "updated_at": "2026-05-07T10:00:00Z",
                 "last_active_at": "2026-05-07T10:00:00Z",
             }
+        if method == "GET" and path == "/v1/sandboxes/sb-1/mounts":
+            return {
+                "mounts": [
+                    {
+                        "type": "s3",
+                        "target": "/workspace",
+                        "source": "s3://bucket/prefix",
+                        "options": {"region": "us-east-1"},
+                        "read_only": True,
+                        "has_credentials": True,
+                    }
+                ]
+            }
         if method == "POST" and path == "/v1/sandboxes/sb-1/sessions":
             return {
                 "id": "ses-1",
@@ -99,6 +112,7 @@ class RecordingMicroVM(MicroVM):
                 "sandboxes": 1,
                 "docker": "ok",
                 "caddy": "ok",
+                "ssh_gateway": "disabled",
                 "version": "dev",
             }
         raise AssertionError(f"unexpected call: {method} {path} {payload}")
@@ -157,6 +171,16 @@ class ClientTests(unittest.TestCase):
                 "diskGB": 20,
                 "networkBlockAll": True,
                 "containerCommand": ["bash", "-lc", "echo hi"],
+                "mounts": [
+                    {
+                        "type": "s3",
+                        "target": "/workspace",
+                        "source": "s3://bucket/prefix",
+                        "options": {"region": "us-east-1"},
+                        "credentials": {"access_key_id": "AKIA", "secret_access_key": "SECRET"},
+                        "readOnly": True,
+                    }
+                ],
             }
         )
 
@@ -171,6 +195,16 @@ class ClientTests(unittest.TestCase):
                     "disk_gb": 20,
                     "network_block_all": True,
                     "container_command": ["bash", "-lc", "echo hi"],
+                    "mounts": [
+                        {
+                            "type": "s3",
+                            "target": "/workspace",
+                            "source": "s3://bucket/prefix",
+                            "options": {"region": "us-east-1"},
+                            "credentials": {"access_key_id": "AKIA", "secret_access_key": "SECRET"},
+                            "read_only": True,
+                        }
+                    ],
                 },
             ),
         )
@@ -197,6 +231,27 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result["exitCode"], 0)
         self.assertEqual(result["durationMS"], 5)
         self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["sshGateway"], "disabled")
+
+    def test_mounts_maps_redacted_mount_shapes(self):
+        client = RecordingMicroVM()
+
+        mounts = client.mounts("sb-1")
+
+        self.assertEqual(client.calls[0], ("GET", "/v1/sandboxes/sb-1/mounts", None))
+        self.assertEqual(
+            mounts,
+            [
+                {
+                    "type": "s3",
+                    "target": "/workspace",
+                    "source": "s3://bucket/prefix",
+                    "options": {"region": "us-east-1"},
+                    "readOnly": True,
+                    "hasCredentials": True,
+                }
+            ],
+        )
 
     def test_exec_stream_sends_handshake_and_control_frames(self):
         stdout_chunks = []

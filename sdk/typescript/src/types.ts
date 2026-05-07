@@ -6,6 +6,26 @@ export interface RegistryAuth {
   password: string;
 }
 
+export type MountType = "s3" | "nfs" | "sshfs" | "rclone";
+
+export interface MountSpec {
+  type: MountType;
+  target: string;
+  source: string;
+  options?: Record<string, string>;
+  credentials?: Record<string, string>;
+  readOnly?: boolean;
+}
+
+export interface MountSpecRedacted {
+  type: MountType;
+  target: string;
+  source: string;
+  options?: Record<string, string>;
+  readOnly: boolean;
+  hasCredentials: boolean;
+}
+
 export interface CreateOptions {
   image: string;
   cpu?: number;
@@ -16,6 +36,7 @@ export interface CreateOptions {
   networkBlockAll?: boolean;
   registry?: RegistryAuth;
   containerCommand?: string[];
+  mounts?: MountSpec[];
 }
 
 export interface ResizeOptions {
@@ -156,6 +177,7 @@ export interface HealthStatus {
   sandboxes: number;
   docker: string;
   caddy: string;
+  sshGateway: string;
   version: string;
 }
 

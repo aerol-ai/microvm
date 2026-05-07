@@ -20,6 +20,8 @@ from .types import (
     ExecResult,
     ExecStreamOptions,
     HealthStatus,
+    MountSpec,
+    MountSpecRedacted,
     ResizeOptions,
     SandboxData,
     Session,
@@ -369,6 +371,13 @@ class MicroVM:
     def health(self) -> HealthStatus:
         return _from_api_health_status(self._do_json("GET", "/health", None))
 
+    def mounts(self, sandbox_id: str) -> List[MountSpecRedacted]:
+        payload = self._do_json("GET", f"/v1/sandboxes/{sandbox_id}/mounts", None)
+        mounts = _first_of(payload, "mounts") or []
+        if not isinstance(mounts, list):
+            return []
+        return [_from_api_mount_spec_redacted(item) for item in mounts]
+
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         response = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
         return _from_api_exec_result(response)
@@ -558,6 +567,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "network_block_all": _first_of(options, "networkBlockAll", "network_block_all"),
             "registry": _first_of(options, "registry"),
             "container_command": _first_of(options, "containerCommand", "container_command"),
+            "mounts": [_to_api_mount_spec(item) for item in (_first_of(options, "mounts") or [])],
         }
     )
 
@@ -627,6 +637,33 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
         "publicURL": str(_first_of(port, "public_url", "publicURL") or ""),
         "createdAt": str(_first_of(port, "created_at", "createdAt") or ""),
     }
+
+
+def _to_api_mount_spec(mount: MountSpec) -> Dict[str, Any]:
+    return _compact(
+        {
+            "type": _first_of(mount, "type"),
+            "target": _first_of(mount, "target"),
+            "source": _first_of(mount, "source"),
+            "options": _first_of(mount, "options"),
+            "credentials": _first_of(mount, "credentials"),
+            "read_only": _first_of(mount, "readOnly", "read_only"),
+        }
+    )
+
+
+def _from_api_mount_spec_redacted(mount: Dict[str, Any]) -> MountSpecRedacted:
+    result: MountSpecRedacted = {
+        "type": str(_first_of(mount, "type") or "s3"),
+        "target": str(_first_of(mount, "target") or ""),
+        "source": str(_first_of(mount, "source") or ""),
+        "readOnly": bool(_first_of(mount, "read_only", "readOnly") or False),
+        "hasCredentials": bool(_first_of(mount, "has_credentials", "hasCredentials") or False),
+    }
+    options = _first_of(mount, "options")
+    if isinstance(options, dict) and len(options) > 0:
+        result["options"] = {str(key): str(value) for key, value in options.items()}
+    return result
 
 
 def _from_api_session(session: Dict[str, Any]) -> Session:
@@ -705,5 +742,6 @@ def _from_api_health_status(status: Dict[str, Any]) -> HealthStatus:
         "sandboxes": int(_first_of(status, "sandboxes") or 0),
         "docker": str(_first_of(status, "docker") or ""),
         "caddy": str(_first_of(status, "caddy") or ""),
+        "sshGateway": str(_first_of(status, "ssh_gateway", "sshGateway") or ""),
         "version": str(_first_of(status, "version") or ""),
     }

@@ -17,7 +17,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
-pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus};
+pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus};
 pub use types::CreateSandboxResponse;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
@@ -399,6 +399,16 @@ impl Client {
 
     pub fn health(&self) -> Result<HealthStatus, Error> {
         self.do_json::<(), HealthStatus>(Method::GET, "/health", None)
+    }
+
+    pub fn mounts(&self, id: &str) -> Result<Vec<MountSpecRedacted>, Error> {
+        #[derive(serde::Deserialize)]
+        struct MountList {
+            mounts: Vec<MountSpecRedacted>,
+        }
+
+        let raw = self.do_json::<(), MountList>(Method::GET, &format!("/v1/sandboxes/{}/mounts", id), None)?;
+        Ok(raw.mounts)
     }
 
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
@@ -924,6 +934,7 @@ mod tests {
             network_block_all: None,
             registry: None,
             container_command: None,
+            mounts: None,
         }
     }
 
@@ -976,6 +987,60 @@ mod tests {
         assert!(request_lower.contains("authorization: bearer pat-token"), "missing bearer auth: {}", request);
         assert_eq!(sandbox.data.ssh_public_key.as_deref(), Some("ssh-ed25519 AAAA sandbox"));
         assert_eq!(sandbox.ssh_private_key.as_deref(), Some("PRIVATE"));
+    }
+
+    #[test]
+    fn mounts_returns_redacted_mount_specs() {
+        let body = serde_json::json!({
+            "mounts": [
+                {
+                    "type": "s3",
+                    "target": "/workspace",
+                    "source": "s3://bucket/prefix",
+                    "options": { "region": "us-east-1" },
+                    "read_only": true,
+                    "has_credentials": true
+                }
+            ]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mounts = client.mounts("sb-1").expect("mounts should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/mounts HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(
+            mounts,
+            vec![MountSpecRedacted {
+                mount_type: MountType::S3,
+                target: "/workspace".to_string(),
+                source: "s3://bucket/prefix".to_string(),
+                options: Some(std::collections::HashMap::from([(String::from("region"), String::from("us-east-1"))])),
+                read_only: true,
+                has_credentials: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn health_maps_ssh_gateway_status() {
+        let body = serde_json::json!({
+            "status": "degraded",
+            "sandboxes": 1,
+            "docker": "ok",
+            "caddy": "ok",
+            "ssh_gateway": "disabled",
+            "version": "dev"
+        })
+        .to_string();
+        let (url, _request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let health = client.health().expect("health should succeed");
+
+        assert_eq!(health.ssh_gateway, "disabled");
     }
 
     #[test]
