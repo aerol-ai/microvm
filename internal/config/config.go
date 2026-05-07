@@ -31,9 +31,13 @@ type Config struct {
 	AutoReconcile       bool
 	EnableCaddy         bool
 	EnableNetworkRules  bool
-	LogLevel            string
-	ShutdownTimeout     time.Duration
-	HTTPClientTimeout   time.Duration
+	LogLevel                 string
+	ShutdownTimeout          time.Duration
+	HTTPClientTimeout        time.Duration
+	DockerRuntimeWaitTimeout time.Duration
+	ToolboxWaitTimeout       time.Duration
+	ReconcileInterval        time.Duration
+	UploadMaxBytes           int64
 }
 
 func Load() (Config, error) {
@@ -60,8 +64,12 @@ func Load() (Config, error) {
 		EnableCaddy:         getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:  getEnvBool("SB_ENABLE_NETWORK_RULES", true),
 		LogLevel:            strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
-		ShutdownTimeout:     getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
-		HTTPClientTimeout:   getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 10*time.Second),
+		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
+		HTTPClientTimeout:        getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 10*time.Second),
+		DockerRuntimeWaitTimeout: getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
+		ToolboxWaitTimeout:       getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
+		ReconcileInterval:        getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
+		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
 	}
 
 	if cfg.PATToken == "" {

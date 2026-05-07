@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -41,7 +40,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
-	s.mux.HandleFunc("GET /v1/tls-check", s.handleTLSCheck)
+	s.mux.Handle("GET /v1/tls-check", s.requireAuth(http.HandlerFunc(s.handleTLSCheck)))
 
 	s.mux.Handle("POST /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleCreateSandbox)))
 	s.mux.Handle("GET /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleListSandboxes)))
@@ -71,7 +70,8 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	status, err := s.service.Health(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.logger.Warn("health check failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "health check failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
@@ -98,7 +98,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	sandbox, err := s.service.CreateSandbox(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, sandbox)
@@ -107,7 +107,8 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 	sandboxes, err := s.service.ListSandboxes(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.logger.Warn("list sandboxes failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	writeJSON(w, http.StatusOK, sandboxes)
@@ -116,7 +117,7 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	sandbox, err := s.service.GetSandbox(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sandbox)
@@ -125,7 +126,7 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStartSandbox(w http.ResponseWriter, r *http.Request) {
 	sandbox, err := s.service.StartSandbox(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sandbox)
@@ -134,7 +135,7 @@ func (s *Server) handleStartSandbox(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStopSandbox(w http.ResponseWriter, r *http.Request) {
 	sandbox, err := s.service.StopSandbox(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sandbox)
@@ -142,7 +143,7 @@ func (s *Server) handleStopSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDestroySandbox(w http.ResponseWriter, r *http.Request) {
 	if err := s.service.DestroySandbox(r.Context(), r.PathValue("id")); err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -156,7 +157,7 @@ func (s *Server) handleResizeSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	sandbox, err := s.service.ResizeSandbox(r.Context(), r.PathValue("id"), req)
 	if err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sandbox)
@@ -170,7 +171,7 @@ func (s *Server) handleExposePort(w http.ResponseWriter, r *http.Request) {
 	}
 	publicURL, err := s.service.ExposePort(r.Context(), r.PathValue("id"), port)
 	if err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"public_url": publicURL})
@@ -183,22 +184,22 @@ func (s *Server) handleUnexposePort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.service.UnexposePort(r.Context(), r.PathValue("id"), port); err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleToolboxProxy(w http.ResponseWriter, r *http.Request) {
-	targetBase, err := s.service.ToolboxTarget(r.Context(), r.PathValue("id"))
+	endpoint, err := s.service.ToolboxTarget(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeStoreAwareError(w, err)
+		s.writeStoreAwareError(w, err)
 		return
 	}
 
-	target, err := url.Parse(targetBase)
+	target, err := url.Parse(endpoint.URL)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "invalid toolbox target")
 		return
 	}
 
@@ -211,13 +212,19 @@ func (s *Server) handleToolboxProxy(w http.ResponseWriter, r *http.Request) {
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
+	toolboxToken := endpoint.Token
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		req.URL.Path = path
 		req.Host = target.Host
+		// Replace the caller's PAT with the per-sandbox toolbox token so a
+		// compromised token can only access this one sandbox.
+		if toolboxToken != "" {
+			req.Header.Set("Authorization", "Bearer "+toolboxToken)
+		}
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, http.StatusBadGateway, "toolbox unavailable")
 	}
 	proxy.ServeHTTP(w, r)
 }
@@ -240,12 +247,17 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, models.ErrorResponse{Error: message})
 }
 
-func writeStoreAwareError(w http.ResponseWriter, err error) {
+func (s *Server) writeStoreAwareError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
-	writeError(w, http.StatusBadRequest, err.Error())
+	// Surface only the top-level error message; underlying causes (Docker
+	// daemon strings, file paths) stay in the server log.
+	s.logger.Warn("request failed", "error", err)
+	msg := err.Error()
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	writeError(w, http.StatusBadRequest, msg)
 }
-
-var _ = fmt.Sprintf

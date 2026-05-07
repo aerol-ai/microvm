@@ -58,6 +58,7 @@ func main() {
 		if err := svc.Reconcile(ctx); err != nil {
 			logger.Warn("initial reconcile failed", "error", err)
 		}
+		svc.StartReconcileLoop(ctx)
 	}
 	svc.StartIdleMonitor(ctx)
 

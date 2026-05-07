@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -57,6 +56,8 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	go forwardShutdownSignals(logger, httpServer)
+
 	logger.Info("toolboxd listening", "addr", addr, "sandbox_id", srv.sandboxID, "version", version.Version)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("toolboxd failed", "error", err)
@@ -69,6 +70,7 @@ func startUserCommand(logger *slog.Logger, args []string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		logger.Error("failed to start user command", "args", args, "error", err)
 		return
@@ -78,6 +80,31 @@ func startUserCommand(logger *slog.Logger, args []string) {
 		logger.Warn("failed to release user command handle", "error", err)
 	}
 	logger.Info("user command started", "pid", userCommandPID, "args", args)
+}
+
+// forwardShutdownSignals catches SIGTERM/SIGINT (sent by `docker stop` to PID 1)
+// and propagates them to the user command's process group, then shuts the
+// HTTP server down. Without this, the user command gets SIGKILLed after the
+// docker stop grace period with no chance to clean up.
+func forwardShutdownSignals(logger *slog.Logger, srv *http.Server) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigs
+	logger.Info("toolboxd received shutdown signal", "signal", sig.String())
+
+	if userCommandPID > 0 {
+		// Negative PID targets the process group, so children of the user
+		// command also receive the signal.
+		if err := syscall.Kill(-userCommandPID, sig.(syscall.Signal)); err != nil {
+			logger.Warn("failed to forward signal to user command", "error", err)
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("http shutdown error", "error", err)
+	}
 }
 
 func startReaper(logger *slog.Logger) {
@@ -308,8 +335,10 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	maxBytes := envInt64("SB_UPLOAD_MAX_BYTES", 256*1024*1024)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid multipart form")
+		writeError(w, http.StatusBadRequest, "invalid multipart form (or too large)")
 		return
 	}
 
@@ -450,6 +479,18 @@ func envInt(key string, fallback int) int {
 	return parsed
 }
 
+func envInt64(key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -460,11 +501,3 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, models.ErrorResponse{Error: message})
 }
 
-func dialable(address string) bool {
-	conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}

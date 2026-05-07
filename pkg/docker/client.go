@@ -40,7 +40,6 @@ type Client struct {
 	toolboxBinaryPath  string
 	toolboxMountPath   string
 	toolboxPort        int
-	patToken           string
 	privileged         bool
 	resourceLimitsOff  bool
 	httpClient         *http.Client
@@ -73,14 +72,13 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxBinaryPath:  cfg.ToolboxBinaryPath,
 		toolboxMountPath:   cfg.ToolboxMountPath,
 		toolboxPort:        cfg.ToolboxPort,
-		patToken:           cfg.PATToken,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		toolboxClient:      &http.Client{Timeout: cfg.HTTPClientTimeout},
 		networkRules:       rules,
-		waitTimeout:        30 * time.Second,
-		toolboxWaitTimeout: 30 * time.Second,
+		waitTimeout:        cfg.DockerRuntimeWaitTimeout,
+		toolboxWaitTimeout: cfg.ToolboxWaitTimeout,
 	}, nil
 }
 
@@ -100,7 +98,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (*SandboxRuntime, error) {
+func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, toolboxToken string) (*SandboxRuntime, error) {
 	if err := c.ensureToolboxBinary(); err != nil {
 		return nil, err
 	}
@@ -122,7 +120,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (*
 	envValues := make([]string, 0, len(req.Env)+3)
 	envValues = append(envValues,
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", c.toolboxPort),
-		"SB_TOOLBOX_TOKEN="+c.patToken,
+		"SB_TOOLBOX_TOKEN="+toolboxToken,
 	)
 	for key, value := range req.Env {
 		envValues = append(envValues, key+"="+value)
@@ -334,8 +332,31 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 		return fmt.Errorf("pull image: %w", err)
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
-	return nil
+
+	// Docker's /images/create streams NDJSON progress. Errors are reported in
+	// the body (e.g. {"errorDetail":{"message":"manifest unknown"}}) with the
+	// HTTP status still 200, so we have to scan the stream.
+	decoder := json.NewDecoder(response.Body)
+	for {
+		var msg struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&msg); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("decode pull stream: %w", err)
+		}
+		if msg.ErrorDetail.Message != "" {
+			return fmt.Errorf("pull image %s: %s", imageRef, msg.ErrorDetail.Message)
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("pull image %s: %s", imageRef, msg.Error)
+		}
+	}
 }
 
 func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*SandboxRuntime, error) {

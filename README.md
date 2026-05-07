@@ -191,3 +191,19 @@ const client = new MicroVM({
 	patToken: process.env.SB_PAT_TOKEN,
 });
 ```
+
+Python:
+
+```py
+from microvm import MicroVM
+
+client = MicroVM(api_url="https://sandbox.example.com", pat_token="${SB_PAT_TOKEN}")
+```
+
+Rust:
+
+```rust
+use microvm_sdk::Client;
+
+let client = Client::new(Some("https://sandbox.example.com"), Some("your_token"))?;
+```

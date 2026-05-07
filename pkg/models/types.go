@@ -50,6 +50,7 @@ type Sandbox struct {
 	Env              map[string]string `json:"env,omitempty"`
 	NetworkBlockAll  bool              `json:"network_block_all"`
 	ToolboxEnabled   bool              `json:"toolbox_enabled"`
+	ToolboxToken     string            `json:"-"`
 	ExposedPorts     []ExposedPort     `json:"exposed_ports,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
 	UpdatedAt        time.Time         `json:"updated_at"`

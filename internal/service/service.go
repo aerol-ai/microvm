@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,7 +41,12 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, errors.New("image is required")
 	}
 
-	runtime, err := s.docker.Create(ctx, req)
+	toolboxToken, err := generateToolboxToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate toolbox token: %w", err)
+	}
+
+	runtime, err := s.docker.Create(ctx, req, toolboxToken)
 	if err != nil {
 		return nil, err
 	}
@@ -63,6 +70,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		Env:              req.Env,
 		NetworkBlockAll:  req.NetworkBlockAll,
 		ToolboxEnabled:   true,
+		ToolboxToken:     toolboxToken,
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		LastActiveAt:     now,
@@ -80,6 +88,14 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 
+	s.logger.Info("audit sandbox created",
+		"sandbox_id", sandbox.ID,
+		"image", sandbox.Image,
+		"cpu", sandbox.CPU,
+		"memory_mb", sandbox.MemoryMB,
+		"disk_gb", sandbox.DiskGB,
+		"network_block_all", sandbox.NetworkBlockAll,
+	)
 	return s.store.Get(ctx, sandbox.ID)
 }
 
@@ -152,7 +168,11 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.docker.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
-	return s.store.Delete(ctx, id)
+	if err := s.store.Delete(ctx, id); err != nil {
+		return err
+	}
+	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
+	return nil
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
@@ -212,18 +232,26 @@ func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
 	return s.store.DeletePort(ctx, id, port)
 }
 
-func (s *Service) ToolboxTarget(ctx context.Context, id string) (string, error) {
+type ToolboxEndpoint struct {
+	URL   string
+	Token string
+}
+
+func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint, error) {
 	if err := s.TouchSandbox(ctx, id); err != nil {
-		return "", err
+		return ToolboxEndpoint{}, err
 	}
 	sandbox, err := s.store.Get(ctx, id)
 	if err != nil {
-		return "", err
+		return ToolboxEndpoint{}, err
 	}
 	if sandbox.ContainerIP == "" {
-		return "", errors.New("sandbox container IP is not available")
+		return ToolboxEndpoint{}, errors.New("sandbox container IP is not available")
 	}
-	return fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, s.cfg.ToolboxPort), nil
+	return ToolboxEndpoint{
+		URL:   fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, s.cfg.ToolboxPort),
+		Token: sandbox.ToolboxToken,
+	}, nil
 }
 
 func (s *Service) TouchSandbox(ctx context.Context, id string) error {
@@ -329,7 +357,9 @@ func (s *Service) StartIdleMonitor(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.runIdleSweep(context.Background(), idleTimeout)
+				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				s.runIdleSweep(sweepCtx, idleTimeout)
+				cancel()
 			}
 		}
 	}()
@@ -356,6 +386,29 @@ func (s *Service) runIdleSweep(ctx context.Context, idleTimeout time.Duration) {
 	}
 }
 
+func (s *Service) StartReconcileLoop(ctx context.Context) {
+	interval := s.cfg.ReconcileInterval
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				if err := s.Reconcile(reconcileCtx); err != nil {
+					s.logger.Warn("periodic reconcile failed", "error", err)
+				}
+				cancel()
+			}
+		}
+	}()
+}
+
 func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandboxRequest {
 	if req.CPU <= 0 {
 		req.CPU = 1
@@ -380,4 +433,12 @@ func sandboxContainerRef(sandbox *models.Sandbox) string {
 		return ""
 	}
 	return sandbox.ContainerID
+}
+
+func generateToolboxToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
