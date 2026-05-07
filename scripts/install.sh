@@ -293,16 +293,20 @@ write_caddyfile() {
 	}
 }
 
-$DOMAIN {
+https://$DOMAIN {
 	tls {
 		on_demand
 	}
 	@api path /health /v1 /v1/*
-	reverse_proxy @api 127.0.0.1:8080
-	respond "Sandbox API not found" 404
+	handle @api {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle {
+		respond "Sandbox API not found" 404
+	}
 }
 
-*.$DOMAIN {
+https://*.$DOMAIN {
 	tls {
 		on_demand
 	}
