@@ -46,9 +46,10 @@ type Limits struct {
 	MemoryFloorRatio float64
 }
 
-// Request is the per-sandbox resource ask, in normalized units.
+// Request is the per-sandbox resource ask, in normalized units. CPU is
+// fractional cores (e.g. 0.5 = half a core); memory is whole MB.
 type Request struct {
-	CPU      int
+	CPU      float64
 	MemoryMB int
 }
 
@@ -57,7 +58,7 @@ type Request struct {
 type Snapshot struct {
 	HostCPUCores      int      `json:"host_cpu_cores"`
 	HostMemoryTotalMB int      `json:"host_memory_total_mb"`
-	ReservedCPU       int      `json:"reserved_cpu"`
+	ReservedCPU       float64  `json:"reserved_cpu"`
 	ReservedMemoryMB  int      `json:"reserved_memory_mb"`
 	LiveMemoryFreeMB  int      `json:"live_memory_free_mb"`
 	SandboxesActive   int      `json:"sandboxes_active"`
@@ -92,7 +93,7 @@ type Admitter struct {
 
 	mu           sync.Mutex
 	reservations map[string]Request
-	totalCPU     int
+	totalCPU     float64
 	totalMemMB   int
 }
 
@@ -144,13 +145,13 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	var reasons []string
 
 	if a.limits.CPUReservationRatio > 0 && a.host.CPUCores > 0 {
-		cpuBudget := int(float64(a.host.CPUCores) * a.limits.CPUReservationRatio)
-		if cpuBudget < 1 {
-			cpuBudget = 1
+		cpuBudget := float64(a.host.CPUCores) * a.limits.CPUReservationRatio
+		if cpuBudget < 0.01 {
+			cpuBudget = 0.01
 		}
 		if projectedCPU > cpuBudget {
 			reasons = append(reasons, fmt.Sprintf(
-				"cpu reservation exceeded (%d+%d > %d budget)",
+				"cpu reservation exceeded (%.2f+%.2f > %.2f budget)",
 				a.totalCPU, req.CPU, cpuBudget,
 			))
 		}
@@ -266,12 +267,12 @@ func (a *Admitter) dryRun(req Request) (bool, []string) {
 
 	var reasons []string
 	if a.limits.CPUReservationRatio > 0 && a.host.CPUCores > 0 {
-		cpuBudget := int(float64(a.host.CPUCores) * a.limits.CPUReservationRatio)
-		if cpuBudget < 1 {
-			cpuBudget = 1
+		cpuBudget := float64(a.host.CPUCores) * a.limits.CPUReservationRatio
+		if cpuBudget < 0.01 {
+			cpuBudget = 0.01
 		}
 		if totalCPU+req.CPU > cpuBudget {
-			reasons = append(reasons, fmt.Sprintf("cpu reservation exceeded (%d/%d)", totalCPU, cpuBudget))
+			reasons = append(reasons, fmt.Sprintf("cpu reservation exceeded (%.2f/%.2f)", totalCPU, cpuBudget))
 		}
 	}
 	if a.limits.MemoryReservationRatio > 0 && a.host.MemoryTotalMB > 0 {

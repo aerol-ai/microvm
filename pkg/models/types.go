@@ -19,8 +19,11 @@ type RegistryAuth struct {
 }
 
 type CreateSandboxRequest struct {
-	Image            string            `json:"image"`
-	CPU              int               `json:"cpu"`
+	Image string `json:"image"`
+	// CPU is the number of CPU cores to allocate. Fractional values are
+	// supported (e.g. 0.5 = half a core, 1.5 = one and a half cores).
+	// Translates to Docker's CpuQuota at 100ms periods.
+	CPU              float64           `json:"cpu"`
 	MemoryMB         int               `json:"memory_mb"`
 	DiskGB           int               `json:"disk_gb"`
 	Env              map[string]string `json:"env"`
@@ -32,9 +35,9 @@ type CreateSandboxRequest struct {
 }
 
 type ResizeSandboxRequest struct {
-	CPU      int `json:"cpu"`
-	MemoryMB int `json:"memory_mb"`
-	DiskGB   int `json:"disk_gb"`
+	CPU      float64 `json:"cpu"`
+	MemoryMB int     `json:"memory_mb"`
+	DiskGB   int     `json:"disk_gb"`
 }
 
 type Sandbox struct {
@@ -44,7 +47,7 @@ type Sandbox struct {
 	PublicURL        string            `json:"public_url"`
 	ContainerID      string            `json:"container_id,omitempty"`
 	ContainerIP      string            `json:"container_ip,omitempty"`
-	CPU              int               `json:"cpu"`
+	CPU              float64           `json:"cpu"`
 	MemoryMB         int               `json:"memory_mb"`
 	DiskGB           int               `json:"disk_gb"`
 	OSUser           string            `json:"os_user"`

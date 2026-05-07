@@ -189,8 +189,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if !c.resourceLimitsOff {
 		resources := map[string]any{}
 		if req.CPU > 0 {
+			// CpuPeriod 100ms + CpuQuota = CPU*100000μs gives fractional cores
+			// (e.g. 0.5 CPU → 50000μs quota per 100ms period).
 			resources["CpuPeriod"] = int64(100000)
-			resources["CpuQuota"] = int64(req.CPU) * 100000
+			resources["CpuQuota"] = int64(req.CPU * 100000)
 		}
 		if req.MemoryMB > 0 {
 			resources["Memory"] = int64(req.MemoryMB) * 1024 * 1024
@@ -267,7 +269,7 @@ func (c *Client) Resize(ctx context.Context, containerRef string, req models.Res
 	updateRequest := map[string]any{}
 	if req.CPU > 0 {
 		updateRequest["CpuPeriod"] = int64(100000)
-		updateRequest["CpuQuota"] = int64(req.CPU) * 100000
+		updateRequest["CpuQuota"] = int64(req.CPU * 100000)
 	}
 	if req.MemoryMB > 0 {
 		updateRequest["Memory"] = int64(req.MemoryMB) * 1024 * 1024

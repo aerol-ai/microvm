@@ -39,7 +39,7 @@ func Open(path string) (*Store, error) {
 			public_url TEXT NOT NULL,
 			container_id TEXT NOT NULL,
 			container_ip TEXT NOT NULL,
-			cpu INTEGER NOT NULL,
+			cpu REAL NOT NULL,
 			memory_mb INTEGER NOT NULL,
 			disk_gb INTEGER NOT NULL,
 			os_user TEXT NOT NULL,

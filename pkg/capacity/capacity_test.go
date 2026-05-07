@@ -55,6 +55,29 @@ func TestAdmitNoCountCap(t *testing.T) {
 	}
 }
 
+// TestAdmitFractionalCPU exercises the design choice that CPU is fractional
+// — eight 0.5-core sandboxes on a 4-core host with full ratio fits exactly,
+// the ninth must be rejected.
+func TestAdmitFractionalCPU(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	for i := range 8 {
+		id := fmt.Sprintf("s-%d", i)
+		if err := a.Admit(id, Request{CPU: 0.5, MemoryMB: 1}); err != nil {
+			t.Fatalf("admit %s: %v", id, err)
+		}
+	}
+	if err := a.Admit("overflow", Request{CPU: 0.1, MemoryMB: 1}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected fractional overflow rejection, got %v", err)
+	}
+	if snap := a.Snapshot(); snap.ReservedCPU != 4.0 {
+		t.Fatalf("ReservedCPU = %v, want 4.0", snap.ReservedCPU)
+	}
+}
+
 func TestAdmitCPUReservationRatio(t *testing.T) {
 	// 4 cores * 0.5 = budget of 2 CPU.
 	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 16384}, Limits{
