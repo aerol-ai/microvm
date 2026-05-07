@@ -67,6 +67,54 @@ The installer defaults to downloading the latest GitHub release from `aerol-ai/m
 
 The installer writes `sandboxd.service` with `Restart=always` and enables `sandboxd-healthcheck.timer`, which probes the local `/health` endpoint every 30 seconds and restarts `sandboxd` if the process is up but no longer responding.
 
+## Domain and DNS
+
+If you install with `--domain <domain>`, the value is used literally as the sandbox host suffix. That means all of these are valid:
+
+- `sandbox.aerol.ai`
+- `aerol.ai`
+- `sandbox.example.com`
+
+For newly created sandboxes, the public hostname is:
+
+- `https://<docker-short-id>.<domain>`
+
+For exposed application ports, the public hostname is:
+
+- `https://<docker-short-id>-<port>.<domain>`
+
+Examples:
+
+- If `--domain sandbox.aerol.ai`, sandbox URLs look like `https://7f3c2a1b9d4e.sandbox.aerol.ai`
+- If `--domain aerol.ai`, sandbox URLs look like `https://7f3c2a1b9d4e.aerol.ai`
+
+Both `sandbox.aerol.ai` and `aerol.ai` work with the current codebase. No code change is required for either shape.
+
+Required DNS records:
+
+- `A sandbox.aerol.ai -> <server-ip>`
+- `A *.sandbox.aerol.ai -> <server-ip>`
+
+Or, for IPv6:
+
+- `AAAA sandbox.aerol.ai -> <server-ipv6>`
+- `AAAA *.sandbox.aerol.ai -> <server-ipv6>`
+
+If you use `aerol.ai` instead, the equivalent records are:
+
+- `A aerol.ai -> <server-ip>`
+- `A *.aerol.ai -> <server-ip>`
+
+Why both records are needed:
+
+- `<domain>` itself is included in the generated Caddy site block
+- `*.<domain>` is needed so per-sandbox and per-port hostnames resolve to the server
+
+Operational notes:
+
+- Use DNS-only records for initial setup if your DNS provider offers HTTP proxying, because Caddy is handling ACME and TLS issuance directly.
+- The wildcard DNS record is for hostname resolution only. The current setup uses Caddy on-demand TLS per concrete hostname, not a single wildcard certificate.
+
 ## Run locally
 
 Required services:
