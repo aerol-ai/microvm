@@ -8,3 +8,19 @@ dist-test/
 *.log
 node_modules/
 sdk/typescript/node_modules
+
+# Python SDK artifacts
+sdk/python/__pycache__/
+sdk/python/.venv/
+sdk/python/venv/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.pytest_cache/
+.python-version
+
+# Rust SDK artifacts
+sdk/rust/target/
+**/target/
+Cargo.lock
