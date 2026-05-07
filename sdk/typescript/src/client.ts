@@ -235,53 +235,53 @@ export class SandboxHandle implements Sandbox {
   declare lastError?: string;
   declare containerCommand?: string[];
 
-  readonly #client: Client;
+  protected readonly client: Client;
 
   constructor(client: Client, sandbox: Sandbox) {
-    this.#client = client;
+    this.client = client;
     this.apply(sandbox);
   }
 
   async refresh(): Promise<this> {
-    const updated = await this.#client.get(this.id);
+    const updated = await this.client.get(this.id);
     this.apply(updated.toJSON());
     return this;
   }
 
   async exec(command: string | ExecRequest): Promise<ExecResult> {
-    return this.#client.exec(this.id, typeof command === "string" ? { command } : command);
+    return this.client.exec(this.id, typeof command === "string" ? { command } : command);
   }
 
   async uploadFile(targetPath: string, data: BinaryLike): Promise<void> {
-    await this.#client.uploadFile(this.id, targetPath, data);
+    await this.client.uploadFile(this.id, targetPath, data);
   }
 
   async downloadFile(targetPath: string): Promise<Uint8Array> {
-    return this.#client.downloadFile(this.id, targetPath);
+    return this.client.downloadFile(this.id, targetPath);
   }
 
   async exposePort(port: number): Promise<string> {
-    return this.#client.exposePort(this.id, port);
+    return this.client.exposePort(this.id, port);
   }
 
   async start(): Promise<this> {
-    const updated = await this.#client.start(this.id);
+    const updated = await this.client.start(this.id);
     this.apply(updated.toJSON());
     return this;
   }
 
   async stop(): Promise<this> {
-    const updated = await this.#client.stop(this.id);
+    const updated = await this.client.stop(this.id);
     this.apply(updated.toJSON());
     return this;
   }
 
   async destroy(): Promise<void> {
-    await this.#client.destroy(this.id);
+    await this.client.destroy(this.id);
   }
 
   async resize(options: ResizeOptions): Promise<this> {
-    const updated = await this.#client.resize(this.id, options);
+    const updated = await this.client.resize(this.id, options);
     this.apply(updated.toJSON());
     return this;
   }

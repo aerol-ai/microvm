@@ -1,5 +1,8 @@
 export { Client, SandboxHandle } from "./client.js";
+export { MicroVM } from "./MicroVM";
+export { Sandbox } from "./Sandbox";
 export type { ClientConfig, ClientOptions } from "./client.js";
+export type { MicroVMConfig } from "./MicroVM";
 export type {
   BinaryLike,
   CreateOptions,
@@ -9,6 +12,6 @@ export type {
   HealthStatus,
   RegistryAuth,
   ResizeOptions,
-  Sandbox,
+  Sandbox as SandboxData,
   SandboxStatus,
 } from "./types.js";

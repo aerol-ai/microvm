@@ -161,16 +161,17 @@ Both SDKs send the PAT as `Authorization: Bearer <token>`.
 Go:
 
 ```go
-client := sandbox.NewClientWithOptions("https://sandbox-api.example.com", sandbox.ClientOptions{
+client, err := microvm.NewClientWithConfig(&types.MicroVMConfig{
 	PATToken: os.Getenv("SB_PAT_TOKEN"),
+	APIUrl:   "https://sandbox-api.example.com",
 })
 ```
 
 TypeScript:
 
 ```ts
-const client = new Client({
-	baseURL: "https://sandbox-api.example.com",
+const client = new MicroVM({
+	apiUrl: "https://sandbox-api.example.com",
 	patToken: process.env.SB_PAT_TOKEN,
 });
 ```
