@@ -26,6 +26,23 @@ The original plan referenced embedding Daytona's toolbox daemon. This implementa
 make build
 ```
 
+## Docs Site
+
+The root [docs](/Users/sumansaurabh/Documents/startup-3/sandbox-library/docs) folder now contains a standalone Astro + Starlight docs app themed after the Daytona docs framework, but populated with this repository's content.
+
+Install and run it with:
+
+```bash
+make docs-install
+make docs-dev
+```
+
+Create a production build with:
+
+```bash
+make docs-build
+```
+
 Artifacts:
 
 - `bin/sandboxd`
