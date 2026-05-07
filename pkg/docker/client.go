@@ -254,6 +254,43 @@ func (c *Client) Resize(ctx context.Context, containerRef string, req models.Res
 	return nil
 }
 
+// PushAllowedPorts updates the toolbox's in-memory allowlist of ports that
+// /proxy/<port>/... is permitted to reach. The list should match the sandbox's
+// currently exposed ports. Best-effort: callers log on failure.
+func (c *Client) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken string, ports []int) error {
+	if containerIP == "" {
+		return errors.New("container IP is empty")
+	}
+	if ports == nil {
+		ports = []int{}
+	}
+	body, err := json.Marshal(map[string]any{"ports": ports})
+	if err != nil {
+		return fmt.Errorf("marshal ports: %w", err)
+	}
+
+	target := fmt.Sprintf("http://%s:%d/admin/allowed-ports", containerIP, c.toolboxPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if toolboxToken != "" {
+		req.Header.Set("Authorization", "Bearer "+toolboxToken)
+	}
+
+	resp, err := c.toolboxClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("push allowed ports: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("push allowed ports: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
 	inspect, err := c.inspectContainer(ctx, containerRef)
 	if err != nil {

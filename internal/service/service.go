@@ -137,7 +137,12 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err
 	}
-	return s.store.Get(ctx, id)
+	refreshed, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	s.syncAllowedPorts(ctx, refreshed)
+	return refreshed, nil
 }
 
 func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
@@ -222,6 +227,10 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int) (string, 
 	if err := s.store.UpsertPort(ctx, exposure); err != nil {
 		return "", err
 	}
+
+	if updated, err := s.store.Get(ctx, id); err == nil {
+		s.syncAllowedPorts(ctx, updated)
+	}
 	return publicURL, nil
 }
 
@@ -229,7 +238,13 @@ func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
 	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
 		return err
 	}
-	return s.store.DeletePort(ctx, id, port)
+	if err := s.store.DeletePort(ctx, id, port); err != nil {
+		return err
+	}
+	if updated, err := s.store.Get(ctx, id); err == nil {
+		s.syncAllowedPorts(ctx, updated)
+	}
+	return nil
 }
 
 type ToolboxEndpoint struct {
@@ -334,6 +349,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					return err
 				}
 			}
+			s.syncAllowedPorts(ctx, sandbox)
 		}
 		if err := s.store.Upsert(ctx, sandbox); err != nil {
 			return err
@@ -441,4 +457,20 @@ func generateToolboxToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// syncAllowedPorts pushes the sandbox's current set of exposed ports to
+// toolboxd's in-memory allowlist. Best-effort — logged on failure. Without
+// this, /proxy/<port>/ on the public sandbox URL refuses every request.
+func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox) {
+	if sandbox == nil || sandbox.Status != models.SandboxStatusStarted || sandbox.ContainerIP == "" {
+		return
+	}
+	ports := make([]int, 0, len(sandbox.ExposedPorts))
+	for _, p := range sandbox.ExposedPorts {
+		ports = append(ports, p.Port)
+	}
+	if err := s.docker.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
+		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
+	}
 }

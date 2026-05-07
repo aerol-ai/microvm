@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,16 +32,39 @@ type server struct {
 	sandboxID string
 	authToken string
 	port      int
+
+	mu           sync.RWMutex
+	allowedPorts map[int]struct{}
+}
+
+func (s *server) setAllowedPorts(ports []int) {
+	next := make(map[int]struct{}, len(ports))
+	for _, p := range ports {
+		if p > 0 && p <= 65535 {
+			next[p] = struct{}{}
+		}
+	}
+	s.mu.Lock()
+	s.allowedPorts = next
+	s.mu.Unlock()
+}
+
+func (s *server) portAllowed(port int) bool {
+	s.mu.RLock()
+	_, ok := s.allowedPorts[port]
+	s.mu.RUnlock()
+	return ok
 }
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
 
 	srv := &server{
-		logger:    logger,
-		sandboxID: readSandboxID(),
-		authToken: strings.TrimSpace(os.Getenv("SB_TOOLBOX_TOKEN")),
-		port:      envInt("SB_TOOLBOX_PORT", 2280),
+		logger:       logger,
+		sandboxID:    readSandboxID(),
+		authToken:    strings.TrimSpace(os.Getenv("SB_TOOLBOX_TOKEN")),
+		port:         envInt("SB_TOOLBOX_PORT", 2280),
+		allowedPorts: map[int]struct{}{},
 	}
 
 	startReaper(logger)
@@ -162,6 +186,11 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleDownload(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/allowed-ports":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleSetAllowedPorts(w, r)
 		default:
 			writeError(w, http.StatusNotFound, "not found")
 		}
@@ -397,6 +426,19 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func (s *server) handleSetAllowedPorts(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Ports []int `json:"ports"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	s.setAllowedPorts(body.Ports)
+	s.logger.Info("allowed ports updated", "ports", body.Ports)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "ports": body.Ports})
+}
+
 func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	segments := strings.Split(strings.TrimPrefix(r.URL.Path, "/proxy/"), "/")
 	if len(segments) == 0 || strings.TrimSpace(segments[0]) == "" {
@@ -407,6 +449,11 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	port, err := strconv.Atoi(segments[0])
 	if err != nil || port <= 0 || port > 65535 {
 		writeError(w, http.StatusBadRequest, "invalid port")
+		return
+	}
+
+	if !s.portAllowed(port) {
+		writeError(w, http.StatusForbidden, "port not exposed")
 		return
 	}
 
