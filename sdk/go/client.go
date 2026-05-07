@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/aerolai/sandbox-library/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type Client struct {

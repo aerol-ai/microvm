@@ -50,7 +50,7 @@ The intended install path is:
 curl -fsSL https://app.aerol.ai/install-sandbox.sh | sudo bash -s -- --domain sandbox.example.com
 ```
 
-The installer defaults to downloading the latest GitHub release from `aerolai/sandbox-library`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
+The installer defaults to downloading the latest GitHub release from `aerol-ai/microvm`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
 
 ## Run locally
 

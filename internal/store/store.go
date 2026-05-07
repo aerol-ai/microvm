@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/aerolai/sandbox-library/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/models"
 	_ "github.com/mattn/go-sqlite3"
 )
 

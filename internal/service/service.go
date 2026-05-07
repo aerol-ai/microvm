@@ -7,12 +7,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/aerolai/sandbox-library/internal/config"
-	"github.com/aerolai/sandbox-library/internal/store"
-	"github.com/aerolai/sandbox-library/internal/version"
-	"github.com/aerolai/sandbox-library/pkg/caddy"
-	"github.com/aerolai/sandbox-library/pkg/docker"
-	"github.com/aerolai/sandbox-library/pkg/models"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/uuid"
 )
 

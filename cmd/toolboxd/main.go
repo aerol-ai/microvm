@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aerolai/sandbox-library/internal/version"
-	"github.com/aerolai/sandbox-library/pkg/models"
+	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type server struct {

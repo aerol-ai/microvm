@@ -303,7 +303,7 @@ Adapted from `daytona/apps/runner/pkg/sshgateway/service.go`:
 ### 7. `sdk/go/` — Go SDK
 
 ```go
-import "github.com/aerolai/sandbox-library/sdk/go"
+import "github.com/aerol-ai/microvm/sdk/go"
 
 client := sandbox.NewClient(
     sandbox.WithBaseURL("http://localhost:8080"),
@@ -426,7 +426,7 @@ WantedBy=multi-user.target
 ## Go Module
 
 ```
-module github.com/aerolai/sandbox-library
+module github.com/aerol-ai/microvm
 
 go 1.22
 ```

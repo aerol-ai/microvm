@@ -1,4 +1,4 @@
-module github.com/aerolai/sandbox-library
+module github.com/aerol-ai/microvm
 
 go 1.22.0
 

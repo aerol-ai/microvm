@@ -10,14 +10,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aerolai/sandbox-library/internal/config"
-	"github.com/aerolai/sandbox-library/internal/service"
-	"github.com/aerolai/sandbox-library/internal/store"
-	"github.com/aerolai/sandbox-library/internal/version"
-	api "github.com/aerolai/sandbox-library/pkg/api"
-	"github.com/aerolai/sandbox-library/pkg/caddy"
-	"github.com/aerolai/sandbox-library/pkg/docker"
-	"github.com/aerolai/sandbox-library/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/version"
+	api "github.com/aerol-ai/microvm/pkg/api"
+	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 )
 
 func main() {

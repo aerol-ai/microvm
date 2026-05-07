@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aerolai/sandbox-library/internal/config"
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 type Client struct {

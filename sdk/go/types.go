@@ -1,6 +1,6 @@
 package sandbox
 
-import "github.com/aerolai/sandbox-library/pkg/models"
+import "github.com/aerol-ai/microvm/pkg/models"
 
 type CreateOptions = models.CreateSandboxRequest
 type ResizeOptions = models.ResizeSandboxRequest

@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aerolai/sandbox-library/internal/config"
-	"github.com/aerolai/sandbox-library/pkg/docker/netrules"
-	"github.com/aerolai/sandbox-library/pkg/models"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 const managedLabelKey = "sandbox-library.managed"

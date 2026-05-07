@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ github.ref_name }}
-      LDFLAGS: -X github.com/aerolai/sandbox-library/internal/version.Version=${{ github.ref_name }}
+      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.ref_name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
