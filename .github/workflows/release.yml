@@ -30,7 +30,9 @@ jobs:
           sudo apt-get install -y build-essential gcc-aarch64-linux-gnu
 
       - name: Run tests
-        run: go test ./...
+        run: |
+          go test -count=1 -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -n 1
 
       - name: Build release assets
         shell: bash
