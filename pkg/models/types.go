@@ -51,12 +51,23 @@ type Sandbox struct {
 	NetworkBlockAll  bool              `json:"network_block_all"`
 	ToolboxEnabled   bool              `json:"toolbox_enabled"`
 	ToolboxToken     string            `json:"-"`
+	SSHPublicKey     string            `json:"ssh_public_key,omitempty"`
 	ExposedPorts     []ExposedPort     `json:"exposed_ports,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
 	UpdatedAt        time.Time         `json:"updated_at"`
 	LastActiveAt     time.Time         `json:"last_active_at"`
 	LastError        string            `json:"last_error,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
+}
+
+// CreateSandboxResponse is what the API returns from POST /v1/sandboxes.
+// SSHPrivateKey is generated server-side per sandbox and returned exactly once
+// — it is never persisted and never returned again. The corresponding public
+// key is stored on the sandbox record and is the only key authorized to SSH
+// into that sandbox.
+type CreateSandboxResponse struct {
+	Sandbox
+	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
 }
 
 type ExposedPort struct {

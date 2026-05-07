@@ -22,7 +22,12 @@ type Client struct {
 
 type Sandbox struct {
 	sdktypes.Sandbox
-	client *Client
+	// SSHPrivateKey is populated only on the response from Client.Create. It
+	// is the per-sandbox ed25519 private key the gateway authorizes; persist
+	// it locally before discarding the create response, the server cannot
+	// regenerate it.
+	SSHPrivateKey string
+	client        *Client
 }
 
 type ExecStreamHandle struct {
@@ -70,11 +75,13 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 }
 
 func (c *Client) Create(ctx context.Context, opts sdktypes.CreateSandboxOptions) (*Sandbox, error) {
-	item, err := c.inner.Create(ctx, opts)
+	item, sshPrivateKey, err := c.inner.Create(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	return wrapSandbox(c, item), nil
+	wrapped := wrapSandbox(c, item)
+	wrapped.SSHPrivateKey = sshPrivateKey
+	return wrapped, nil
 }
 
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {

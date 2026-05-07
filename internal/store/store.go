@@ -47,6 +47,7 @@ func Open(path string) (*Store, error) {
 			network_block_all INTEGER NOT NULL DEFAULT 0,
 			toolbox_enabled INTEGER NOT NULL DEFAULT 1,
 			toolbox_token TEXT NOT NULL DEFAULT '',
+			ssh_public_key TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '',
 			container_command_json TEXT NOT NULL DEFAULT '[]',
 			created_at DATETIME NOT NULL,
@@ -75,6 +76,7 @@ func Open(path string) (*Store, error) {
 	// Migrations for older DBs that pre-date columns above. Idempotent.
 	migrations := []string{
 		`ALTER TABLE sandboxes ADD COLUMN toolbox_token TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN ssh_public_key TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -106,9 +108,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, last_error,
-			container_command_json, created_at, updated_at, last_active_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			last_error, container_command_json, created_at, updated_at, last_active_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -124,6 +126,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.NetworkBlockAll),
 		boolToInt(sandbox.ToolboxEnabled),
 		sandbox.ToolboxToken,
+		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
 		sandbox.CreatedAt.UTC(),
@@ -149,9 +152,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, last_error,
-			container_command_json, created_at, updated_at, last_active_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			last_error, container_command_json, created_at, updated_at, last_active_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -166,6 +169,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			network_block_all = excluded.network_block_all,
 			toolbox_enabled = excluded.toolbox_enabled,
 			toolbox_token = excluded.toolbox_token,
+			ssh_public_key = excluded.ssh_public_key,
 			last_error = excluded.last_error,
 			container_command_json = excluded.container_command_json,
 			updated_at = excluded.updated_at,
@@ -185,6 +189,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.NetworkBlockAll),
 		boolToInt(sandbox.ToolboxEnabled),
 		sandbox.ToolboxToken,
+		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
 		sandbox.CreatedAt.UTC(),
@@ -200,8 +205,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, last_error,
-			container_command_json, created_at, updated_at, last_active_at
+			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			last_error, container_command_json, created_at, updated_at, last_active_at
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -226,8 +231,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, last_error,
-			container_command_json, created_at, updated_at, last_active_at
+			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			last_error, container_command_json, created_at, updated_at, last_active_at
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -387,6 +392,7 @@ func scanSandbox(scanner interface {
 		&networkBlocked,
 		&toolboxEnabled,
 		&sandbox.ToolboxToken,
+		&sandbox.SSHPublicKey,
 		&sandbox.LastError,
 		&commandJSON,
 		&sandbox.CreatedAt,

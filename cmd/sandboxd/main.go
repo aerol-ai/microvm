@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/sshgateway"
 )
 
 func main() {
@@ -62,6 +63,22 @@ func main() {
 	}
 	svc.StartIdleMonitor(ctx)
 	svc.StartEventMonitor(ctx)
+
+	if cfg.EnableSSHGateway {
+		gw, err := sshgateway.New(logger, sshgateway.Config{
+			ListenAddr:  cfg.SSHListenAddr,
+			HostKeyPath: cfg.SSHHostKeyPath,
+		}, svc, dockerClient)
+		if err != nil {
+			logger.Error("failed to create ssh gateway", "error", err)
+			os.Exit(1)
+		}
+		go func() {
+			if err := gw.Start(ctx); err != nil {
+				logger.Warn("ssh gateway stopped", "error", err)
+			}
+		}()
+	}
 
 	server := api.NewServer(logger, svc, cfg.PATToken)
 	httpServer := &http.Server{

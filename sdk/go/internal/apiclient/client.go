@@ -51,12 +51,12 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 	}
 }
 
-func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, error) {
-	var response models.Sandbox
+func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, string, error) {
+	var response models.CreateSandboxResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes", opts, &response); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return c.wrap(response), nil
+	return c.wrap(response.Sandbox), response.SSHPrivateKey, nil
 }
 
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {

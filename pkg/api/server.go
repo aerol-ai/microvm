@@ -118,12 +118,12 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	sandbox, err := s.service.CreateSandbox(r.Context(), req)
+	response, err := s.service.CreateSandbox(r.Context(), req)
 	if err != nil {
 		s.writeStoreAwareError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, sandbox)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {

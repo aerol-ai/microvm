@@ -32,6 +32,9 @@ type Config struct {
 	EnableCaddy         bool
 	EnableNetworkRules  bool
 	EnableEventMonitor  bool
+	EnableSSHGateway    bool
+	SSHListenAddr       string
+	SSHHostKeyPath      string
 	LogLevel                 string
 	ShutdownTimeout          time.Duration
 	HTTPClientTimeout        time.Duration
@@ -65,6 +68,9 @@ func Load() (Config, error) {
 		EnableCaddy:         getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:  getEnvBool("SB_ENABLE_NETWORK_RULES", true),
 		EnableEventMonitor:  getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
+		EnableSSHGateway:    getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
+		SSHListenAddr:       getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
+		SSHHostKeyPath:      getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		LogLevel:            strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
 		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
 		HTTPClientTimeout:        getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 10*time.Second),

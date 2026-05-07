@@ -52,7 +52,10 @@ func TestNewClientCases(t *testing.T) {
 					if r.Method != http.MethodPost || r.URL.Path != "/v1/sandboxes" {
 						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 					}
-					_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb-structured", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted})
+					_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+						Sandbox:       models.Sandbox{ID: "sb-structured", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted},
+						SSHPrivateKey: "PRIVATE",
+					})
 				}))
 				defer server.Close()
 
@@ -70,6 +73,9 @@ func TestNewClientCases(t *testing.T) {
 				}
 				if sandbox.ID != "sb-structured" {
 					t.Fatalf("unexpected sandbox: %+v", sandbox)
+				}
+				if sandbox.SSHPrivateKey != "PRIVATE" {
+					t.Fatalf("unexpected ssh private key: %q", sandbox.SSHPrivateKey)
 				}
 			},
 		},

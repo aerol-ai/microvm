@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -15,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"golang.org/x/crypto/ssh"
 )
 
 type Service struct {
@@ -35,7 +39,7 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, dockerClient *
 	}
 }
 
-func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxRequest) (*models.Sandbox, error) {
+func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxRequest) (*models.CreateSandboxResponse, error) {
 	req = normalizeCreateRequest(req)
 	if req.Image == "" {
 		return nil, errors.New("image is required")
@@ -44,6 +48,11 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 	toolboxToken, err := generateToolboxToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate toolbox token: %w", err)
+	}
+
+	authorizedKey, privateKeyPEM, err := generateSandboxSSHKeys()
+	if err != nil {
+		return nil, fmt.Errorf("generate ssh keypair: %w", err)
 	}
 
 	runtime, err := s.docker.Create(ctx, req, toolboxToken)
@@ -71,6 +80,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		NetworkBlockAll:  req.NetworkBlockAll,
 		ToolboxEnabled:   true,
 		ToolboxToken:     toolboxToken,
+		SSHPublicKey:     authorizedKey,
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		LastActiveAt:     now,
@@ -96,7 +106,36 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		"disk_gb", sandbox.DiskGB,
 		"network_block_all", sandbox.NetworkBlockAll,
 	)
-	return s.store.Get(ctx, sandbox.ID)
+	stored, err := s.store.Get(ctx, sandbox.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &models.CreateSandboxResponse{
+		Sandbox:       *stored,
+		SSHPrivateKey: privateKeyPEM,
+	}, nil
+}
+
+// generateSandboxSSHKeys produces an ed25519 keypair scoped to a single
+// sandbox. The OpenSSH-format authorized public key is what the gateway will
+// store on the sandbox record; the PEM-encoded private key is returned to the
+// caller exactly once and never persisted.
+func generateSandboxSSHKeys() (authorizedKey, privateKeyPEM string, err error) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		return "", "", fmt.Errorf("derive signer: %w", err)
+	}
+	authorizedKey = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+	block, err := ssh.MarshalPrivateKey(priv, "sandbox-library sandbox key")
+	if err != nil {
+		return "", "", fmt.Errorf("marshal private key: %w", err)
+	}
+	privateKeyPEM = string(pem.EncodeToMemory(block))
+	return authorizedKey, privateKeyPEM, nil
 }
 
 func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, error) {

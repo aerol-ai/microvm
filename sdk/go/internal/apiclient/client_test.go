@@ -26,17 +26,23 @@ func TestTransportClientCases(t *testing.T) {
 					if r.Header.Get("Authorization") != "Bearer pat-token" {
 						t.Fatalf("unexpected authorization: %q", r.Header.Get("Authorization"))
 					}
-					_ = json.NewEncoder(w).Encode(models.Sandbox{ID: "sb-create", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted})
+					_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+						Sandbox:       models.Sandbox{ID: "sb-create", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted},
+						SSHPrivateKey: "PRIVATE",
+					})
 				}))
 				defer server.Close()
 
 				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
-				sandbox, err := client.Create(ctx, CreateOptions{Image: "ubuntu:22.04"})
+				sandbox, sshKey, err := client.Create(ctx, CreateOptions{Image: "ubuntu:22.04"})
 				if err != nil {
 					t.Fatalf("Create() error = %v", err)
 				}
 				if sandbox.ID != "sb-create" {
 					t.Fatalf("unexpected sandbox: %+v", sandbox)
+				}
+				if sshKey != "PRIVATE" {
+					t.Fatalf("unexpected ssh key: %q", sshKey)
 				}
 			},
 		},
@@ -103,7 +109,7 @@ func TestTransportClientCases(t *testing.T) {
 				defer server.Close()
 
 				client := NewClient(server.URL, ClientOptions{HTTPClient: server.Client()})
-				_, err := client.Create(ctx, CreateOptions{Image: "ubuntu:22.04"})
+				_, _, err := client.Create(ctx, CreateOptions{Image: "ubuntu:22.04"})
 				if err == nil || err.Error() != "bad request" {
 					t.Fatalf("unexpected error: %v", err)
 				}

@@ -286,7 +286,7 @@ func TestStoreHelperCases(t *testing.T) {
 	t.Run("scan_sandbox_invalid_env_json_returns_error", func(t *testing.T) {
 		row := sqlRowStub{values: []any{
 			"sb-bad", "image", models.SandboxStatusStarted, "https://example.com", "container", "10.0.0.1",
-			1, 1024, 10, "root", "{bad json", 0, 1, "", "", "[]", time.Now(), time.Now(), time.Now(),
+			1, 1024, 10, "root", "{bad json", 0, 1, "", "", "", "[]", time.Now(), time.Now(), time.Now(),
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {
