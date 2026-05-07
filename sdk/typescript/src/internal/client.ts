@@ -3,8 +3,11 @@ import { basename } from "node:path";
 import type {
   BinaryLike,
   CreateOptions,
+  ExecExitInfo,
   ExecRequest,
   ExecResult,
+  ExecStreamHandle,
+  ExecStreamOptions,
   ExposedPort,
   HealthStatus,
   ResizeOptions,
@@ -114,6 +117,10 @@ export class APIClient {
     return fromApiExecResult(response);
   }
 
+  execStream(id: string, options: ExecStreamOptions): ExecStreamHandle {
+    return openExecStream(this.baseURL, this.patToken, id, options);
+  }
+
   async uploadFile(id: string, targetPath: string, data: BinaryLike): Promise<void> {
     const form = new FormData();
     form.set("path", targetPath);
@@ -219,6 +226,10 @@ export class SandboxResource implements Sandbox {
 
   async exec(command: string | ExecRequest): Promise<ExecResult> {
     return this.client.exec(this.id, typeof command === "string" ? { command } : command);
+  }
+
+  execStream(options: ExecStreamOptions): ExecStreamHandle {
+    return this.client.execStream(this.id, options);
   }
 
   async uploadFile(targetPath: string, data: BinaryLike): Promise<void> {
@@ -383,4 +394,109 @@ async function decodeError(response: Response): Promise<Error> {
     // Fall through to status-based error.
   }
   return new Error(`request failed with status ${response.status}`);
+}
+
+const STREAM_PREFIX_STDOUT = 0x01;
+const STREAM_PREFIX_STDERR = 0x02;
+
+function openExecStream(baseURL: string, patToken: string, sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
+  const wsURL = baseURL.replace(/^http/, "ws") + `/v1/sandboxes/${encodeURIComponent(sandboxID)}/toolbox/process/exec/stream`;
+
+  const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
+  if (!WS) {
+    throw new Error("WebSocket is not available in this runtime — Node 22+ or a browser is required");
+  }
+
+  // The Node WebSocket global accepts auth via subprotocol or via a custom
+  // header. Browsers don't support custom headers on WebSocket constructors,
+  // so we send the PAT as the `bearer.<token>` subprotocol — sandboxd's
+  // proxy treats it as Authorization. Node's global also supports this.
+  const ws = new WS(wsURL, [`bearer.${patToken}`]);
+  ws.binaryType = "arraybuffer";
+
+  let exitResolve: ((info: ExecExitInfo) => void) | undefined;
+  let exitReject: ((err: Error) => void) | undefined;
+  const done = new Promise<ExecExitInfo>((resolve, reject) => {
+    exitResolve = resolve;
+    exitReject = reject;
+  });
+
+  let resolved = false;
+  const finishWith = (info: ExecExitInfo) => {
+    if (resolved) return;
+    resolved = true;
+    exitResolve?.(info);
+  };
+  const failWith = (msg: string) => {
+    if (resolved) return;
+    resolved = true;
+    exitReject?.(new Error(msg));
+  };
+
+  ws.addEventListener("open", () => {
+    ws.send(JSON.stringify({
+      command: options.command,
+      workdir: options.workdir,
+      env: options.env,
+      tty: options.tty ?? false,
+      cols: options.cols ?? 0,
+      rows: options.rows ?? 0,
+    }));
+  });
+
+  ws.addEventListener("message", (event: MessageEvent) => {
+    if (typeof event.data === "string") {
+      try {
+        const msg = JSON.parse(event.data) as { type: string; code?: number; signal?: string; message?: string };
+        if (msg.type === "exit") {
+          finishWith({ code: msg.code ?? 0, signal: msg.signal });
+          ws.close();
+        } else if (msg.type === "error") {
+          options.onError?.(msg.message ?? "stream error");
+          failWith(msg.message ?? "stream error");
+          ws.close();
+        }
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    const buf = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : new Uint8Array((event.data as Uint8Array).buffer);
+    if (buf.length === 0) return;
+    const stream = buf[0];
+    const payload = buf.subarray(1);
+    if (stream === STREAM_PREFIX_STDOUT) {
+      options.onStdout?.(payload);
+    } else if (stream === STREAM_PREFIX_STDERR) {
+      options.onStderr?.(payload);
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    finishWith({ code: 0 });
+  });
+
+  ws.addEventListener("error", () => {
+    failWith("websocket error");
+  });
+
+  const sendBinary = (data: Uint8Array | string) => {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    ws.send(bytes);
+  };
+
+  return {
+    write: sendBinary,
+    resize(cols: number, rows: number) {
+      ws.send(JSON.stringify({ type: "resize", cols, rows }));
+    },
+    signal(name: string) {
+      ws.send(JSON.stringify({ type: "signal", signal: name }));
+    },
+    close() {
+      ws.send(JSON.stringify({ type: "close" }));
+      ws.close();
+    },
+    done,
+  };
 }

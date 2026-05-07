@@ -57,14 +57,36 @@ func (s *Server) routes() {
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		const prefix = "Bearer "
-		authorization := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authorization, prefix) || strings.TrimPrefix(authorization, prefix) != s.patToken {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
+		if extractBearerToken(r) == s.patToken {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 	})
+}
+
+// extractBearerToken returns the caller's bearer token from either:
+//  1. the Authorization header, or
+//  2. the WebSocket Sec-WebSocket-Protocol header in the form
+//     `sandbox.bearer, <token>` (browsers cannot set Authorization on a
+//     WebSocket handshake, so subprotocol smuggling is the standard pattern).
+func extractBearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	authorization := r.Header.Get("Authorization")
+	if strings.HasPrefix(authorization, prefix) {
+		return strings.TrimPrefix(authorization, prefix)
+	}
+
+	for _, raw := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, part := range strings.Split(raw, ",") {
+			candidate := strings.TrimSpace(part)
+			if candidate == "" || candidate == "sandbox.bearer" {
+				continue
+			}
+			return candidate
+		}
+	}
+	return ""
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

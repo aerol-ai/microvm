@@ -191,6 +191,11 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleSetAllowedPorts(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/process/exec/stream":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleExecStream(w, r)
 		default:
 			writeError(w, http.StatusNotFound, "not found")
 		}

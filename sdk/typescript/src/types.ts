@@ -67,6 +67,36 @@ export interface ExecResult {
   durationMS: number;
 }
 
+export interface ExecStreamOptions {
+  command: string;
+  workdir?: string;
+  env?: Record<string, string>;
+  tty?: boolean;
+  cols?: number;
+  rows?: number;
+  onStdout?: (chunk: Uint8Array) => void;
+  onStderr?: (chunk: Uint8Array) => void;
+  onError?: (message: string) => void;
+}
+
+export interface ExecExitInfo {
+  code: number;
+  signal?: string;
+}
+
+export interface ExecStreamHandle {
+  /** Send raw stdin bytes (or a UTF-8 string) to the process. */
+  write(data: Uint8Array | string): void;
+  /** PTY mode only — tell the process its terminal size has changed. */
+  resize(cols: number, rows: number): void;
+  /** Send a signal (e.g. "INT", "TERM") to the process group. */
+  signal(name: string): void;
+  /** Close stdin and gracefully end the stream. The process keeps running until it exits on its own. */
+  close(): void;
+  /** Resolves when the process exits, with its final exit code/signal. */
+  done: Promise<ExecExitInfo>;
+}
+
 export interface HealthStatus {
   status: string;
   sandboxes: number;
