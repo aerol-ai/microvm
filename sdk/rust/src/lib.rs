@@ -6,7 +6,6 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 
 use futures_util::{SinkExt, StreamExt};
-use http::Request;
 use reqwest::blocking::{multipart::{Form, Part}, Client as HttpClient};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
@@ -15,6 +14,7 @@ use serde_json::Value;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus};
@@ -595,10 +595,12 @@ async fn run_exec_stream(
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<ExecExitInfo, Error> {
     let ws_url = websocket_url(&api_url, &format!("/v1/sandboxes/{}/toolbox/process/exec/stream", urlencoding::encode(&sandbox_id)))?;
-    let request = Request::builder()
-        .uri(&ws_url)
-        .header("Authorization", format!("Bearer {}", pat_token))
-        .body(())?;
+    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
+            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
+    );
 
     let (stream, _) = connect_async(request).await?;
     let (mut write, mut read) = stream.split();
@@ -684,10 +686,12 @@ async fn run_session_attach(
             urlencoding::encode(&session_id)
         ),
     )?;
-    let request = Request::builder()
-        .uri(&ws_url)
-        .header("Authorization", format!("Bearer {}", pat_token))
-        .body(())?;
+    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
+            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
+    );
 
     let (stream, _) = connect_async(request).await?;
     let (mut write, mut read) = stream.split();
@@ -1039,7 +1043,7 @@ mod tests {
             ]
         })
         .to_string();
-        let (url, _) = spawn_json_server(body);
+        let (url, _request_rx) = spawn_json_server(body);
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
         let sessions = client.list_sessions("sb-1").expect("list sessions should succeed");
@@ -1062,7 +1066,7 @@ mod tests {
 
     #[test]
     fn session_log_returns_bytes() {
-        let (url, _) = spawn_response_server("200 OK", "text/plain", b"session log".to_vec());
+        let (url, _request_rx) = spawn_response_server("200 OK", "text/plain", b"session log".to_vec());
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
         let body = client.session_log("sb-1", "ses-1").expect("session log should succeed");
@@ -1109,9 +1113,18 @@ mod tests {
         assert_eq!(stderr_chunks.lock().expect("stderr lock").clone(), vec![b"warn".to_vec()]);
         assert!(error_messages.lock().expect("error lock").is_empty());
         assert_eq!(exits.lock().expect("exit lock").clone(), vec![ExecExitInfo { code: 0, signal: Some("TERM".to_string()) }]);
-        assert_eq!(control_rx.recv().expect("initial resize should be captured"), "{\"type\":\"resize\",\"cols\":120,\"rows\":40}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&control_rx.recv().expect("initial resize should be captured")).expect("initial resize should parse"),
+            serde_json::json!({ "type": "resize", "cols": 120, "rows": 40 })
+        );
         assert_eq!(control_rx.recv().expect("stdin should be captured"), "binary:pwd\n");
-        assert_eq!(control_rx.recv().expect("resize should be captured"), "{\"type\":\"resize\",\"cols\":100,\"rows\":30}");
-        assert_eq!(control_rx.recv().expect("signal should be captured"), "{\"type\":\"signal\",\"signal\":\"INT\"}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&control_rx.recv().expect("resize should be captured")).expect("resize should parse"),
+            serde_json::json!({ "type": "resize", "cols": 100, "rows": 30 })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&control_rx.recv().expect("signal should be captured")).expect("signal should parse"),
+            serde_json::json!({ "type": "signal", "signal": "INT" })
+        );
     }
 }
