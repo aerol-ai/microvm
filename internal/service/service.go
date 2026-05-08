@@ -833,15 +833,15 @@ const (
 // no DB, no Docker, easy to exhaustively test.
 //
 // Priority rules:
-//   1. Already destroyed → none. The sweep cannot un-destroy or further
-//      destroy something already gone.
-//   2. Any destroy timer fired → destroy. Destroy supersedes stop on the
-//      same tick to avoid a wasted Stop call followed by Destroy.
-//   3. Any stop timer fired AND status is started → stop. Stopping an
-//      already-stopped sandbox would be a no-op so we skip it.
-//   4. No per-sandbox config and global SB_IDLE_TIMEOUT_MIN would fire →
-//      stop. Backwards-compat with the pre-Lifecycle behavior.
-//   5. Otherwise → none.
+//  1. Already destroyed → none. The sweep cannot un-destroy or further
+//     destroy something already gone.
+//  2. Any destroy timer fired → destroy. Destroy supersedes stop on the
+//     same tick to avoid a wasted Stop call followed by Destroy.
+//  3. Any stop timer fired AND status is started → stop. Stopping an
+//     already-stopped sandbox would be a no-op so we skip it.
+//  4. No per-sandbox config and global SB_IDLE_TIMEOUT_MIN would fire →
+//     stop. Backwards-compat with the pre-Lifecycle behavior.
+//  5. Otherwise → none.
 func lifecycleActionFor(sb *models.Sandbox, now time.Time, globalIdle time.Duration) lifecycleAction {
 	if sb == nil || sb.Status == models.SandboxStatusDestroyed {
 		return lifecycleNone
