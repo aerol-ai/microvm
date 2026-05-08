@@ -50,7 +50,7 @@ Artifacts:
 
 ## Releases
 
-Publishing a GitHub Release, or pushing a tag that starts with `v`, triggers the GitHub Actions release workflow in `.github/workflows/release.yml`.
+Publishing a GitHub Release triggers the GitHub Actions release workflow in `.github/workflows/release.yml`.
 
 The workflow publishes these release assets:
 
@@ -104,7 +104,7 @@ Only Linux amd64 and arm64 binaries are published today, because the host instal
 
 ## SDK publishing
 
-Publishing a GitHub Release, or pushing a tag that starts with `v`, also triggers `.github/workflows/publish-sdks.yml`.
+`.github/workflows/publish-sdks.yml` is manual-only. Run it with `workflow_dispatch` and provide the release tag you want to publish, for example `v0.1.1`.
 
 That workflow publishes:
 
@@ -113,7 +113,7 @@ That workflow publishes:
 - the Python SDK in `sdk/python` to PyPI as `aerolvm-sdk`
 - the Rust SDK in `sdk/rust` to crates.io as `aerolvm-sdk`
 
-The workflow requires the SDK versions to match the git tag without the leading `v`. For example, tag `v0.1.0` publishes SDK packages whose manifest version is `0.1.0`.
+The workflow requires the Java, TypeScript, Python, and Rust SDK versions to match the input tag without the leading `v`. For example, input `v0.1.1` publishes SDK packages whose manifest version is `0.1.1`.
 
 Required GitHub Actions repository secrets:
 
@@ -127,11 +127,19 @@ If the Java package version for a tag is already present in GitHub Packages, the
 
 These tokens must be added in the GitHub repository settings. They cannot be stored in git or created from inside this workspace.
 
-The Go SDK does not need a separate registry workflow. Consumers install it directly from module tags:
+The Go SDK does not need a separate registry workflow. Consumers install it directly from Go module tags:
 
 ```bash
 go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@v0.1.0
 ```
+
+The Go SDK does not have a separate version field under `sdk/go`. Its version comes from the repository tag because it is part of the root Go module declared in `go.mod`. To release Go SDK `v0.1.1`, publish the repository tag `v0.1.1`, and consumers can then install it with:
+
+```bash
+go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@v0.1.1
+```
+
+That means the Go SDK version is currently coupled to repository tags. If you want to version the Go SDK independently from the app release, `sdk/go` needs its own `go.mod` as a separate module.
 
 The installer defaults to downloading the latest GitHub release from `aerol-ai/microvm`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
 

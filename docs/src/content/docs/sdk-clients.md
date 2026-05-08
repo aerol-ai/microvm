@@ -16,6 +16,8 @@ This docs section mirrors the Daytona docs layout, but the content here is taken
 
 If you are working directly from this repository, each SDK can also be installed from its matching `sdk/<language>` directory.
 
+The Go SDK version is derived from repository tags, not a separate `sdk/go` manifest version. Pin it with a repo tag such as `@v0.1.1`.
+
 ## Shared Configuration
 
 All SDKs send the PAT as `Authorization: Bearer <token>`.

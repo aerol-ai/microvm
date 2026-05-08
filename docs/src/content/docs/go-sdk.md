@@ -11,6 +11,14 @@ The Go SDK lives under `sdk/go` and is imported as `github.com/aerol-ai/microvm/
 go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest
 ```
 
+To pin a specific release, use the repository tag, for example:
+
+```bash
+go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@v0.1.1
+```
+
+The Go SDK does not have a separate package manifest version under `sdk/go`. Its version comes from repository tags because it is part of the root Go module.
+
 The request and response types are re-exported from `github.com/aerol-ai/microvm/sdk/go/pkg/types`.
 
 ## Create A Client

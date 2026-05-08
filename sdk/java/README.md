@@ -24,7 +24,7 @@ The release workflow publishes the package to GitHub Packages as `ai.aerol:aerol
   <dependency>
     <groupId>ai.aerol</groupId>
     <artifactId>aerolvm-sdk</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
   </dependency>
 </dependencies>
 ```
