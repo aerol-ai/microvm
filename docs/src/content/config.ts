@@ -73,6 +73,12 @@ export const getSidebarConfig = (): NavigationGroup[] => [
         label: 'Volumes',
         description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
       },
+      {
+        type: 'link',
+        href: '/reconcile',
+        label: 'Reconcile',
+        description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
+      },
     ],
   },
   {

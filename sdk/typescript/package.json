@@ -15,6 +15,8 @@
     "build": "tsc -p tsconfig.json",
     "example:create": "npm run build && node dist/examples/createSandbox.js",
     "example:create:src": "npx tsx src/examples/createSandbox.ts",
+    "example:delete": "npm run build && node dist/examples/deleteSandbox.js",
+    "example:delete:src": "npx tsx src/examples/deleteSandbox.ts",
     "test": "tsc -p tsconfig.test.json --outDir dist-test && node --test dist-test/*.test.js"
   },
   "devDependencies": {

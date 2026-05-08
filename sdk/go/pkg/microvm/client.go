@@ -151,6 +151,10 @@ func (c *Client) UpdateLifecycle(ctx context.Context, id string, lifecycle sdkty
 	return wrapSandbox(c, item), nil
 }
 
+func (c *Client) Reconcile(ctx context.Context) error {
+	return c.inner.Reconcile(ctx)
+}
+
 func (c *Client) Health(ctx context.Context) (sdktypes.HealthStatus, error) {
 	return c.inner.Health(ctx)
 }

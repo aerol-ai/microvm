@@ -163,6 +163,10 @@ public class MicroVMClient {
         doNoContent("DELETE", sandboxPath(sandboxId) + "/ports/" + port, null);
     }
 
+    public void reconcile() {
+        doNoContent("POST", "/v1/admin/reconcile", null);
+    }
+
     public HealthStatus health() {
         return doJson("GET", "/health", null, HealthStatus.class);
     }

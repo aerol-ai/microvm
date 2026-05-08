@@ -378,6 +378,9 @@ class MicroVM:
         sandbox = self._do_json("PUT", f"/v1/sandboxes/{sandbox_id}/lifecycle", _to_api_lifecycle(lifecycle))
         return self._wrap_sandbox(sandbox)
 
+    def reconcile(self) -> None:
+        self._do_json("POST", "/v1/admin/reconcile", None)
+
     def health(self) -> HealthStatus:
         return _from_api_health_status(self._do_json("GET", "/health", None))
 

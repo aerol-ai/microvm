@@ -1,0 +1,123 @@
+---
+title: Reconcile
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Reconciliation syncs the server's database with the actual state of running containers. It is the fix for situations where the sandbox count in the database is out of sync with what Docker reports — for example, after a host reboot, a crash, or a manual `docker rm`.
+
+## When reconciliation runs automatically
+
+The server reconciles on its own in three situations:
+
+| Trigger | When |
+|---|---|
+| **Startup** | Once at boot, before accepting traffic, if `AUTO_RECONCILE=true` (the default). |
+| **Periodic loop** | Every reconcile interval (default 30 s) while the server is running. |
+| **Docker events** | Whenever a container exits or is destroyed, the event monitor updates the affected sandbox immediately. |
+
+For most deployments automatic reconciliation is sufficient. The manual API is useful when you need the database to reflect reality right now — for example, immediately after clearing stuck containers so a new sandbox creation can succeed.
+
+## What reconciliation does
+
+For every sandbox row in the database, the server checks whether a matching Docker container exists:
+
+- **Container missing** — the sandbox is marked `destroyed`, its Caddy routes are removed, and any mounts are unmounted.
+- **Container present** — the sandbox's status, IP address, and Caddy routes are refreshed to match the live container state.
+
+Rows that were already `destroyed` before the pass are left unchanged.
+
+## Trigger reconciliation manually
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.reconcile()
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.reconcile()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := client.Reconcile(ctx); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.reconcile()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.reconcile();
+    ```
+  </TabItem>
+</Tabs>
+
+The call blocks until the full reconcile pass completes. On success it returns with no data. On failure it throws with the server-side error message.
+
+## HTTP API
+
+```http
+POST /v1/admin/reconcile
+Authorization: Bearer <pat-token>
+```
+
+**200 OK**
+```json
+{ "status": "ok" }
+```
+
+## Common scenario: capacity exceeded after a restart
+
+If the host was rebooted or containers were removed outside of the API, the database still counts those sandboxes against the CPU and memory budget. Creating a new sandbox fails with `host capacity exceeded`.
+
+Fix:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Force the DB to reflect what Docker actually sees
+    await client.reconcile()
+
+    // Now create succeeds
+    const sandbox = await client.create({ image: 'ubuntu:22.04' })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.reconcile()
+    sandbox = client.create({'image': 'ubuntu:22.04'})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := client.Reconcile(ctx); err != nil {
+        log.Fatal(err)
+    }
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.reconcile()?;
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.reconcile();
+    Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+    ```
+  </TabItem>
+</Tabs>

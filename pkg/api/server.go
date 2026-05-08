@@ -42,6 +42,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.Handle("GET /v1/capacity", s.requireAuth(http.HandlerFunc(s.handleCapacity)))
+	s.mux.Handle("POST /v1/admin/reconcile", s.requireAuth(http.HandlerFunc(s.handleReconcile)))
 	s.mux.HandleFunc("GET /v1/tls-check", s.handleTLSCheck)
 
 	s.mux.Handle("POST /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleCreateSandbox)))
@@ -105,6 +106,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if err := s.service.Reconcile(r.Context()); err != nil {
+		s.logger.Warn("reconcile failed", "error", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
