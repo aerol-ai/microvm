@@ -61,11 +61,33 @@ The workflow publishes these release assets:
 - `install.sh`
 - `checksums.txt`
 
-The assets are downloadable directly from the latest published release:
+The assets are downloadable directly from the latest published release. Pick the install command that matches your scale:
+
+**Trial / single-user (HTTP-01 on-demand TLS — DO NOT use past ~50 sandboxes/week):**
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token your-secret-pat
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat
 ```
+
+**Production (DNS-01 wildcard TLS via Cloudflare — required for any real workload):**
+
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat \
+    --dns-provider cloudflare \
+    --dns-api-token your-cloudflare-api-token
+```
+
+> ⚠️ **Pick the right one up-front.** The default (HTTP-01) issues a fresh Let's Encrypt cert per sandbox subdomain on first hit. Let's Encrypt enforces hard rate limits per registered domain:
+>
+> - **50 certs / week** per registered domain (e.g. `example.com`)
+> - **5 duplicate certs / week** per identical SAN set
+> - **300 new orders / 3 hours** per ACME account
+>
+> At thousands of sandboxes you cap out at ~7/day before issuance starts returning HTTP 429 — and a single burst of sandbox creations can exhaust the burst budget for your whole ACME account, not just this service. The DNS-01 path issues exactly **two** certs total (`<domain>` + `*.<domain>`) regardless of how many sandboxes exist, so it scales indefinitely. See [Wildcard TLS via DNS-01](#wildcard-tls-via-dns-01-recommended-for-production) below for token setup.
 
 Examples:
 
@@ -152,7 +174,18 @@ Cloudflare API token scope: create a scoped token (not the legacy Global API Key
 
 The token is written to `/etc/default/caddy` (mode 0600) and read by Caddy via `{env.SB_DNS_API_TOKEN}` substitution.
 
-Other DNS providers (Route53, DigitalOcean, etc.) can be added by extending the `case "$DNS_PROVIDER"` switch in `scripts/install.sh` — Caddy's build server (`caddyserver.com/api/download`) supports any [`caddy-dns/*`](https://github.com/caddy-dns) plugin.
+#### Supported DNS providers
+
+**Cloudflare is the only provider wired up today.** Passing any other value to `--dns-provider` will be rejected by the installer.
+
+Adding another provider (Route53, DigitalOcean, Gandi, Namecheap, …) is not zero-work because each [`caddy-dns/*`](https://github.com/caddy-dns) plugin has its own Caddyfile syntax and credential shape. A single API token works for Cloudflare and DigitalOcean; Route53 expects AWS credentials (or an IAM role on the host) and no inline token; some providers want both a key and a secret. To add one you would need to:
+
+1. Allow the new value in the `case "$DNS_PROVIDER"` switch in `scripts/install.sh`.
+2. Add the matching `tls { dns <provider> ... }` block shape to `write_caddyfile` — the current single-token template (`dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}`) does not generalize.
+3. Plumb any extra env vars through `write_caddy_env` into `/etc/default/caddy`.
+4. Confirm Caddy's build server (`caddyserver.com/api/download?…&p=github.com/caddy-dns/<provider>`) returns a working binary for that plugin — it does for every official `caddy-dns/*` repo.
+
+If you need a provider beyond Cloudflare, open an issue with the plugin name and the credential shape and we'll wire it up.
 
 ## Run locally
 
