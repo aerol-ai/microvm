@@ -102,6 +102,32 @@ https://github.com/aerol-ai/microvm/releases/latest/download/checksums.txt
 
 Only Linux amd64 and arm64 binaries are published today, because the host installer and runtime are Linux-only.
 
+## SDK publishing
+
+Publishing a GitHub Release, or pushing a tag that starts with `v`, also triggers `.github/workflows/publish-sdks.yml`.
+
+That workflow publishes:
+
+- the TypeScript SDK in `sdk/typescript` to npm as `@aerol-ai/microvm-sdk`
+- the Python SDK in `sdk/python` to PyPI as `aerol-ai-microvm-sdk`
+- the Rust SDK in `sdk/rust` to crates.io as `microvm-sdk`
+
+The workflow requires the SDK versions to match the git tag without the leading `v`. For example, tag `v0.1.0` publishes SDK packages whose manifest version is `0.1.0`.
+
+Required GitHub Actions repository secrets:
+
+- `NPM_TOKEN`: npm automation token with publish access to `@aerol-ai/microvm-sdk`
+- `PYPI_API_TOKEN`: PyPI API token for `aerol-ai-microvm-sdk`
+- `CARGO_REGISTRY_TOKEN`: crates.io API token for `microvm-sdk`
+
+These tokens must be added in the GitHub repository settings. They cannot be stored in git or created from inside this workspace.
+
+The Go SDK does not need a separate registry workflow. Consumers install it directly from module tags:
+
+```bash
+go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@v0.1.0
+```
+
 The installer defaults to downloading the latest GitHub release from `aerol-ai/microvm`. You can pin a specific release with `--version vX.Y.Z` or override the repository with `--github-repo owner/repo`.
 
 The installer accepts `--pat-token <token>` and stores it in `/etc/sandboxd/sandboxd.env` as `SB_PAT_TOKEN` with `0600` permissions. If you omit `--pat-token`, the installer generates one automatically and prints it once at the end.

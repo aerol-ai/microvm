@@ -1,0 +1,180 @@
+name: Publish SDKs
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+  SDK_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+
+jobs:
+  npm:
+    name: Publish TypeScript SDK to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      - name: Verify npm token is configured
+        run: |
+          if [[ -z "${NPM_TOKEN:-}" ]]; then
+            echo "::error::Missing repository secret NPM_TOKEN"
+            exit 1
+          fi
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify package version matches tag
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          release_version="${SDK_VERSION#v}"
+          if [[ "$package_version" != "$release_version" ]]; then
+            echo "::error::sdk/typescript/package.json version $package_version does not match tag $release_version"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Validate publish payload
+        run: npm pack --dry-run
+
+      - name: Publish package
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  pypi:
+    name: Publish Python SDK to PyPI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: sdk/python/pyproject.toml
+
+      - name: Verify PyPI token is configured
+        run: |
+          if [[ -z "${PYPI_API_TOKEN:-}" ]]; then
+            echo "::error::Missing repository secret PYPI_API_TOKEN"
+            exit 1
+          fi
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Verify package version matches tag
+        run: |
+          package_version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          release_version="${SDK_VERSION#v}"
+          if [[ "$package_version" != "$release_version" ]]; then
+            echo "::error::sdk/python/pyproject.toml version $package_version does not match tag $release_version"
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . build twine
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Validate distributions
+        run: python -m twine check dist/*
+
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+  crates:
+    name: Publish Rust SDK to crates.io
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/rust
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify crates.io token is configured
+        run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "::error::Missing repository secret CARGO_REGISTRY_TOKEN"
+            exit 1
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Verify package version matches tag
+        run: |
+          package_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          release_version="${SDK_VERSION#v}"
+          if [[ "$package_version" != "$release_version" ]]; then
+            echo "::error::sdk/rust/Cargo.toml version $package_version does not match tag $release_version"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Validate publish payload
+        run: cargo publish --dry-run
+
+      - name: Publish crate
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
