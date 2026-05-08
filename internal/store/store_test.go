@@ -34,6 +34,32 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "open_applies_sqlite_contention_settings",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+
+				if got := st.db.Stats().MaxOpenConnections; got != 1 {
+					t.Fatalf("MaxOpenConnections = %d, want 1", got)
+				}
+
+				var busyTimeout int
+				if err := st.db.QueryRowContext(ctx, `PRAGMA busy_timeout;`).Scan(&busyTimeout); err != nil {
+					t.Fatalf("read busy_timeout pragma: %v", err)
+				}
+				if busyTimeout != sqliteBusyTimeoutMS {
+					t.Fatalf("busy_timeout = %d, want %d", busyTimeout, sqliteBusyTimeoutMS)
+				}
+
+				var foreignKeys int
+				if err := st.db.QueryRowContext(ctx, `PRAGMA foreign_keys;`).Scan(&foreignKeys); err != nil {
+					t.Fatalf("read foreign_keys pragma: %v", err)
+				}
+				if foreignKeys != 1 {
+					t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
+				}
+			},
+		},
+		{
 			name: "create_and_get_roundtrip",
 			run: func(t *testing.T) {
 				st := newTestStore(t)

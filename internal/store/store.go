@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,15 +20,22 @@ type Store struct {
 	db *sql.DB
 }
 
+const sqliteBusyTimeoutMS = 5000
+
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite3", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// SQLite has one-writer semantics. Keep one connection in this process so
+	// API handlers, event handling, and background sweeps queue in database/sql
+	// instead of racing separate SQLite connections into "database is locked".
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	stmts := []string{
 		`PRAGMA journal_mode = WAL;`,
@@ -105,6 +113,19 @@ func Open(path string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+func sqliteDSN(path string) string {
+	options := url.Values{}
+	options.Set("_busy_timeout", fmt.Sprintf("%d", sqliteBusyTimeoutMS))
+	options.Set("_foreign_keys", "on")
+	options.Set("_journal_mode", "WAL")
+
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + options.Encode()
 }
 
 func (s *Store) Close() error {
