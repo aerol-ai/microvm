@@ -133,51 +133,6 @@
     }
   }
 
-  .lang-picker-wrap {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-
-    &::after {
-      content: '';
-      position: absolute;
-      right: 10px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 0;
-      height: 0;
-      border-left: 4px solid transparent;
-      border-right: 4px solid transparent;
-      border-top: 4px solid var(--primary-text-color);
-      pointer-events: none;
-    }
-  }
-
-  .lang-picker {
-    appearance: none;
-    background: var(--bg-color);
-    border: var(--border);
-    border-radius: 999px;
-    padding: 6px 28px 6px 12px;
-    font-family: var(--font-mono);
-    font-size: 0.75rem;
-    color: var(--primary-text-color);
-    cursor: pointer;
-    transition: border-color 0.2s ease, color 0.2s ease;
-    outline: none;
-
-    &:hover,
-    &:focus {
-      border-color: var(--hover-color);
-      color: var(--hover-color);
-    }
-
-    option {
-      background: var(--bg-color);
-      color: var(--primary-text-color);
-    }
-  }
-
   .mobile-navigation {
     display: none;
     position: relative;

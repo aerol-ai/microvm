@@ -1,5 +1,6 @@
 ---
 import { comparePaths, isActiveOrParentPath } from '../utils/navigation'
+import LanguageSelect from './LanguageSelect.astro'
 import ThemeSelect from './ThemeSelect.astro'
 
 const currentPath = Astro.url.pathname
@@ -13,65 +14,6 @@ const isActive = link =>
 
 const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
 ---
-
-<script is:inline>
-  (function () {
-    var LANG_KEY = 'aerolvm-lang';
-    var SL_KEY = 'starlight-synced-tabs__lang';
-    var LANGS = ['TypeScript', 'Python', 'Go', 'Rust', 'Java'];
-
-    var saved = localStorage.getItem(LANG_KEY) || 'TypeScript';
-    sessionStorage.setItem(SL_KEY, saved);
-
-    function syncPicker(lang) {
-      var picker = document.getElementById('lang-picker');
-      if (picker) picker.value = lang;
-    }
-
-    function triggerTabSync(lang) {
-      localStorage.setItem(LANG_KEY, lang);
-      sessionStorage.setItem(SL_KEY, lang);
-      var firstGroup = document.querySelector('starlight-tabs');
-      if (firstGroup) {
-        var buttons = firstGroup.querySelectorAll('[role="tab"]');
-        for (var i = 0; i < buttons.length; i++) {
-          if (buttons[i].textContent.trim() === lang) {
-            buttons[i].click();
-            break;
-          }
-        }
-      }
-    }
-
-    function onReady() {
-      syncPicker(saved);
-
-      var picker = document.getElementById('lang-picker');
-      if (!picker) return;
-
-      picker.addEventListener('change', function () {
-        triggerTabSync(picker.value);
-      });
-
-      document.addEventListener('click', function (e) {
-        var btn = e.target.closest('[role="tab"]');
-        if (!btn) return;
-        var label = btn.textContent.trim();
-        if (LANGS.indexOf(label) !== -1 && picker.value !== label) {
-          picker.value = label;
-          localStorage.setItem(LANG_KEY, label);
-        }
-      });
-    }
-
-    document.addEventListener('DOMContentLoaded', onReady);
-    document.addEventListener('astro:page-load', function () {
-      var lang = sessionStorage.getItem(SL_KEY) || localStorage.getItem(LANG_KEY) || 'TypeScript';
-      sessionStorage.setItem(SL_KEY, lang);
-      syncPicker(lang);
-    });
-  })();
-</script>
 
 <header class="navbar">
   <nav class="desktop-only">
@@ -99,11 +41,7 @@ const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
       }
     </div>
     <div class="nav__items_side_menu">
-      <div class="lang-picker-wrap">
-        <select id="lang-picker" class="lang-picker" aria-label="Select SDK language">
-          {languages.map(lang => <option value={lang}>{lang}</option>)}
-        </select>
-      </div>
+      <LanguageSelect languages={languages} />
       <span class="version-pill">{version}</span>
       <a class="github-link" href="https://github.com/aerol-ai/microvm" target="_blank" rel="noreferrer" aria-label="GitHub">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
