@@ -88,8 +88,8 @@ const { hasSidebar = true } = Astro.props
 
     .sidebar-pane {
       display: none;
-      z-index: 5;
-      padding-top: 55px;
+      z-index: 20;
+      padding-top: 72px;
       position: fixed;
       right: 0;
       width: 75vw;
@@ -97,10 +97,12 @@ const { hasSidebar = true } = Astro.props
       padding-left: 20px;
       padding-right: 20px;
       top: 0;
+      bottom: 0;
+      height: 100vh;
       max-height: unset;
     }
 
-    [aria-expanded='true'] ~ .sidebar-pane {
+    :global(body[data-mobile-menu-expanded]) .sidebar-pane {
       display: block;
     }
 

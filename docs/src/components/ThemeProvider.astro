@@ -14,14 +14,10 @@
     return {
       updatePickers(themeName = storedTheme || 'auto') {
         document.querySelectorAll('theme-select').forEach(picker => {
-          const buttons = picker.querySelectorAll('button')
-          buttons.forEach(button => {
-            if (button.id === themeName) {
-              button.classList.add('theme-select-button-active')
-            } else {
-              button.classList.remove('theme-select-button-active')
-            }
-          })
+          const select = picker.querySelector('select')
+          if (select) {
+            select.value = themeName
+          }
         })
       },
     }

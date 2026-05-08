@@ -17,7 +17,23 @@
     constructor() {
       super()
       this.button = this.querySelector('button')
+      this.overlay = this.querySelector('#blur-overlay')
+      this.sidebar = document.getElementById('starlight__sidebar')
       this.button.addEventListener('click', () => this.toggleExpanded())
+
+      if (this.overlay) {
+        this.overlay.addEventListener('click', () => this.setExpanded(false))
+      }
+
+      if (this.sidebar) {
+        this.sidebar.addEventListener('click', event => {
+          if (event.target.closest('a')) {
+            this.setExpanded(false)
+          }
+        })
+      }
+
+      document.addEventListener('astro:page-load', () => this.setExpanded(false))
 
       const parentNav = this.closest('nav')
       if (parentNav) {
@@ -43,7 +59,9 @@
     }
   }
 
-  customElements.define('starlight-menu-button', StarlightMenuButton)
+  if (!customElements.get('starlight-menu-button')) {
+    customElements.define('starlight-menu-button', StarlightMenuButton)
+  }
 </script>
 
 <style>
@@ -51,8 +69,8 @@
     display: none;
     position: fixed;
     top: 18px;
-    right: 28px;
-    z-index: var(--sl-z-index-navbar);
+    right: 20px;
+    z-index: 31;
     padding: 0.5rem;
     background-color: transparent;
     border: var(--border);
@@ -99,9 +117,10 @@
   [aria-expanded='true'] #blur-overlay {
     position: fixed;
     inset: 0;
-    z-index: 4;
+    z-index: 3;
     background-color: rgba(11, 17, 22, 0.7);
     backdrop-filter: blur(2px);
+    cursor: pointer;
   }
 
   @media (max-width: 1024px) {

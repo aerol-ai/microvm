@@ -104,7 +104,6 @@ const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
           {languages.map(lang => <option value={lang}>{lang}</option>)}
         </select>
       </div>
-      <ThemeSelect />
       <span class="version-pill">{version}</span>
       <a class="github-link" href="https://github.com/aerol-ai/microvm" target="_blank" rel="noreferrer" aria-label="GitHub">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -112,6 +111,9 @@ const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
         </svg>
         GitHub
       </a>
+      <div class="theme-control theme-control-desktop">
+        <ThemeSelect />
+      </div>
     </div>
   </nav>
 

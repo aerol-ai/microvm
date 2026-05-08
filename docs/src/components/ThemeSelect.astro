@@ -1,20 +1,14 @@
 <theme-select class="theme-select-container">
-  <button type="button" id="dark" aria-label="Dark theme">
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M14.5 3.5A8.5 8.5 0 1 0 20.5 16 7 7 0 1 1 14.5 3.5Z" fill="currentColor"></path>
+  <span class="theme-select-icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24">
+      <path d="M12 3.25a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V4a.75.75 0 0 1 .75-.75ZM12 18.5a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V19.25a.75.75 0 0 1 .75-.75ZM5.813 5.813a.75.75 0 0 1 1.06 0l1.061 1.06a.75.75 0 1 1-1.06 1.061L5.812 6.873a.75.75 0 0 1 0-1.06ZM16.066 16.065a.75.75 0 0 1 1.06 0l1.061 1.061a.75.75 0 0 1-1.06 1.06l-1.061-1.06a.75.75 0 0 1 0-1.061ZM3.25 12a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5H4a.75.75 0 0 1-.75-.75ZM18.5 12a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75ZM6.873 16.065a.75.75 0 0 1 1.06 1.061l-1.06 1.06a.75.75 0 0 1-1.061-1.06l1.061-1.061ZM17.126 5.813a.75.75 0 0 1 1.06 1.06l-1.06 1.061a.75.75 0 1 1-1.061-1.06l1.061-1.061ZM12 8a4 4 0 1 1 0 8a4 4 0 0 1 0-8Z" fill="currentColor"></path>
     </svg>
-  </button>
-  <button type="button" id="light" aria-label="Light theme">
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="12" cy="12" r="4.5" fill="currentColor"></circle>
-      <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9 17 7M7 17 4.9 19.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"></path>
-    </svg>
-  </button>
-  <button type="button" id="auto" aria-label="System theme">
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v7A2.5 2.5 0 0 1 17.5 16H13l-4 4v-4H6.5A2.5 2.5 0 0 1 4 13.5v-7Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"></path>
-    </svg>
-  </button>
+  </span>
+  <select aria-label="Theme">
+    <option value="auto">System</option>
+    <option value="light">Light</option>
+    <option value="dark">Dark</option>
+  </select>
 </theme-select>
 
 <script is:inline>
@@ -27,12 +21,13 @@
 
     constructor() {
       super()
+      this.select = this.querySelector('select')
       this.#onThemeChange(this.#loadTheme())
-      this.querySelectorAll('button').forEach(button => {
-        button.addEventListener('click', () => {
-          this.#onThemeChange(button.id)
+      if (this.select) {
+        this.select.addEventListener('change', () => {
+          this.#onThemeChange(this.select.value)
         })
-      })
+      }
     }
 
     #parseTheme(theme) {
@@ -52,6 +47,9 @@
     #onThemeChange(theme) {
       const nextTheme = this.#parseTheme(theme)
       ThemeProvider.updatePickers(nextTheme)
+      if (this.select) {
+        this.select.value = nextTheme
+      }
       document.documentElement.dataset.theme =
         nextTheme === 'auto' ? this.#preferredTheme() : nextTheme
       this.#storeTheme(nextTheme)
@@ -76,36 +74,68 @@
     }
   }
 
-  customElements.define('theme-select', ThemeSelect)
+  if (!customElements.get('theme-select')) {
+    customElements.define('theme-select', ThemeSelect)
+  }
 </script>
 
 <style>
   .theme-select-container {
-    display: flex;
-    text-align: center;
-    gap: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border: var(--border);
+    border-radius: 999px;
+    background: var(--bg-color);
+    flex-shrink: 0;
+    color: var(--primary-text-color);
+    position: relative;
   }
 
-  .theme-select-container button {
-    background: none;
-    border: none;
-    padding: 4px;
+  .theme-select-icon {
     display: flex;
     align-items: center;
-    cursor: pointer;
-    color: var(--primary-text-color);
-    border-radius: 4px;
+    justify-content: center;
+    pointer-events: none;
   }
 
-  .theme-select-container button:hover,
-  .theme-select-container .theme-select-button-active {
-    background: var(--block-bg-color);
-    border-radius: 3px;
-    color: var(--primary-text-color);
+  .theme-select-container::after {
+    content: '';
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-35%);
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 4px solid currentColor;
+    pointer-events: none;
   }
 
   .theme-select-container svg {
     width: 16px;
     height: 16px;
+  }
+
+  .theme-select-container select {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: inherit;
+    padding: 0 20px 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    cursor: pointer;
+    outline: none;
+  }
+
+  .theme-select-container select:hover,
+  .theme-select-container select:focus {
+    color: var(--hover-color);
+  }
+
+  .theme-select-container option {
+    color: var(--primary-text-color);
+    background: var(--bg-color);
   }
 </style>

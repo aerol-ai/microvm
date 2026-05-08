@@ -95,6 +95,16 @@
     gap: 12px;
   }
 
+  .theme-control {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .theme-control-desktop {
+    margin-left: 4px;
+  }
+
   .version-pill,
   .github-link {
     display: inline-flex;
@@ -170,12 +180,20 @@
 
   .mobile-navigation {
     display: none;
-    padding: 16px 20px;
+    position: relative;
+    padding: 16px 72px 16px 20px;
+    min-height: 72px;
     align-items: center;
     justify-content: space-between;
 
     @include for-tablet-screen-sizes {
       display: flex;
+    }
+  }
+
+  @media (max-width: 650px) {
+    .mobile-navigation {
+      padding-right: 72px;
     }
   }
 }
