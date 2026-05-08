@@ -258,6 +258,10 @@ export class APIClient {
     await this.doJSON<void>("DELETE", `/v1/sandboxes/${id}/ports/${port}`);
   }
 
+  async reconcile(): Promise<void> {
+    await this.doJSON<unknown>("POST", "/v1/admin/reconcile");
+  }
+
   async health(): Promise<HealthStatus> {
     const response = await this.doJSON<ApiHealthStatus>("GET", "/health");
     return fromApiHealthStatus(response);

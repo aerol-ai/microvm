@@ -408,6 +408,10 @@ impl Client {
         Ok(Sandbox::new(self.clone(), raw))
     }
 
+    pub fn reconcile(&self) -> Result<(), Error> {
+        self.do_json::<(), serde_json::Value>(Method::POST, "/v1/admin/reconcile", None).map(|_| ())
+    }
+
     pub fn health(&self) -> Result<HealthStatus, Error> {
         self.do_json::<(), HealthStatus>(Method::GET, "/health", None)
     }

@@ -99,6 +99,10 @@ func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, "/v1/sandboxes/"+id, nil, nil)
 }
 
+func (c *Client) Reconcile(ctx context.Context) error {
+	return c.doJSON(ctx, http.MethodPost, "/v1/admin/reconcile", nil, nil)
+}
+
 func (c *Client) Resize(ctx context.Context, id string, opts ResizeOptions) (*Sandbox, error) {
 	var response models.Sandbox
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+id+"/resize", opts, &response); err != nil {

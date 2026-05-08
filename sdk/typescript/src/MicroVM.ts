@@ -88,6 +88,10 @@ export class MicroVM {
     return this.wrap(sandbox.toJSON());
   }
 
+  async reconcile(): Promise<void> {
+    await this.client.reconcile();
+  }
+
   async health(): Promise<HealthStatus> {
     return this.client.health();
   }
