@@ -16,7 +16,7 @@ The implementation in this repository covers the core single-node workflow:
 - proxy toolbox requests through the host API
 - persist sandbox state in SQLite and reconcile it on restart
 - optional idle auto-stop and basic egress blocking
-- Go SDK for the common control-plane operations
+- SDKs for the common control-plane operations, including Go and Java clients
 
 The original plan referenced embedding Daytona's toolbox daemon. This implementation keeps the same runner-style host/container split but uses a local `toolboxd` binary that is built from this repo and mounted into containers. That makes the repo self-contained and avoids depending on missing prebuilt Daytona assets.
 
@@ -108,6 +108,7 @@ Publishing a GitHub Release, or pushing a tag that starts with `v`, also trigger
 
 That workflow publishes:
 
+- the Java SDK in `sdk/java` to GitHub Packages as `ai.aerol:aerolvm-sdk`
 - the TypeScript SDK in `sdk/typescript` to npm as `@aerol-ai/microvm-sdk`
 - the Python SDK in `sdk/python` to PyPI as `aerol-ai-microvm-sdk`
 - the Rust SDK in `sdk/rust` to crates.io as `microvm-sdk`
@@ -119,6 +120,8 @@ Required GitHub Actions repository secrets:
 - `NPM_TOKEN`: npm automation token with publish access to `@aerol-ai/microvm-sdk`
 - `PYPI_API_TOKEN`: PyPI API token for `aerol-ai-microvm-sdk`
 - `CARGO_REGISTRY_TOKEN`: crates.io API token for `microvm-sdk`
+
+The Java publish job deploys to GitHub Packages with the workflow's built-in `GITHUB_TOKEN`, so it does not require an additional repository secret. The workflow must keep `packages: write` permission enabled.
 
 These tokens must be added in the GitHub repository settings. They cannot be stored in git or created from inside this workspace.
 
@@ -298,7 +301,7 @@ All `/v1` endpoints except `/v1/tls-check` require `Authorization: Bearer <SB_PA
 
 ## SDK auth
 
-Both SDKs send the PAT as `Authorization: Bearer <token>`.
+All SDKs send the PAT as `Authorization: Bearer <token>`.
 
 Go:
 
@@ -314,6 +317,19 @@ client, err := microvm.NewClientWithConfig(&types.MicroVMConfig{
 	PATToken: os.Getenv("SB_PAT_TOKEN"),
 	APIUrl:   "https://sandbox-api.example.com",
 })
+```
+
+Java:
+
+```java
+import ai.aerol.microvm.MicroVMClient;
+import ai.aerol.microvm.MicroVMConfig;
+
+MicroVMClient client = new MicroVMClient(
+    new MicroVMConfig()
+        .setApiUrl("https://sandbox.example.com")
+        .setPatToken(System.getenv("SB_PAT_TOKEN"))
+);
 ```
 
 TypeScript:
