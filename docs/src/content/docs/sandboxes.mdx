@@ -228,6 +228,58 @@ created ──► running ──► stopped ──► running
   </TabItem>
 </Tabs>
 
+## Connect to Existing Sandbox
+
+If you already have a sandbox running (from a previous session or another process), retrieve it by ID to get a fully usable sandbox object.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.get('sbx_abc123')
+
+    // sandbox is now ready - run commands, manage files, etc.
+    console.log(sandbox.id)
+    console.log(sandbox.publicURL)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.get('sbx_abc123')
+
+    # sandbox is now ready - run commands, manage files, etc.
+    print(sandbox.id)
+    print(sandbox.public_url)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Get(ctx, "sbx_abc123")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // sandbox is now ready - run commands, manage files, etc.
+    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.get("sbx_abc123")?;
+
+    // sandbox is now ready - run commands, manage files, etc.
+    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.get("sbx_abc123");
+
+    // sandbox is now ready - run commands, manage files, etc.
+    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    ```
+  </TabItem>
+</Tabs>
+
 ## Start and Stop
 
 Stopping persists all container-level state. Starting resumes from the persisted image layer - running processes are not retained across a stop/start cycle.

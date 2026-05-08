@@ -4,7 +4,7 @@ title: Reconcile
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Reconciliation syncs the server's database with the actual state of running containers. It is the fix for situations where the sandbox count in the database is out of sync with what Docker reports — for example, after a host reboot, a crash, or a manual `docker rm`.
+Reconciliation syncs the server's database with the actual state of running containers. It is the fix for situations where the sandbox count in the database is out of sync with what Docker reports - for example, after a host reboot, a crash, or a manual `docker rm`.
 
 ## When reconciliation runs automatically
 
@@ -16,14 +16,14 @@ The server reconciles on its own in three situations:
 | **Periodic loop** | Every reconcile interval (default 30 s) while the server is running. |
 | **Docker events** | Whenever a container exits or is destroyed, the event monitor updates the affected sandbox immediately. |
 
-For most deployments automatic reconciliation is sufficient. The manual API is useful when you need the database to reflect reality right now — for example, immediately after clearing stuck containers so a new sandbox creation can succeed.
+For most deployments automatic reconciliation is sufficient. The manual API is useful when you need the database to reflect reality right now - for example, immediately after clearing stuck containers so a new sandbox creation can succeed.
 
 ## What reconciliation does
 
 For every sandbox row in the database, the server checks whether a matching Docker container exists:
 
-- **Container missing** — the sandbox is marked `destroyed`, its Caddy routes are removed, and any mounts are unmounted.
-- **Container present** — the sandbox's status, IP address, and Caddy routes are refreshed to match the live container state.
+- **Container missing** - the sandbox is marked `destroyed`, its Caddy routes are removed, and any mounts are unmounted.
+- **Container present** - the sandbox's status, IP address, and Caddy routes are refreshed to match the live container state.
 
 Rows that were already `destroyed` before the pass are left unchanged.
 
@@ -61,17 +61,6 @@ Rows that were already `destroyed` before the pass are left unchanged.
 
 The call blocks until the full reconcile pass completes. On success it returns with no data. On failure it throws with the server-side error message.
 
-## HTTP API
-
-```http
-POST /v1/admin/reconcile
-Authorization: Bearer <pat-token>
-```
-
-**200 OK**
-```json
-{ "status": "ok" }
-```
 
 ## Common scenario: capacity exceeded after a restart
 
