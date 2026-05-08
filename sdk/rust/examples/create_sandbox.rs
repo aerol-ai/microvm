@@ -23,6 +23,7 @@ fn main() {
             container_command: None,
             mounts: None,
             lifecycle: None,
+            runtime: None,
         })
         .expect("sandbox creation failed");
 

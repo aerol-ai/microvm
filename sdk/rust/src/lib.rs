@@ -947,6 +947,7 @@ mod tests {
             container_command: None,
             mounts: None,
             lifecycle: None,
+            runtime: None,
         }
     }
 
