@@ -242,17 +242,18 @@ Sandboxes run under an OCI runtime selected per host (default for new sandboxes)
 
 ### Host setup for gVisor
 
-Install `runsc` and register it with Docker, then restart Docker:
+Pass `--with-gvisor` to the installer. It downloads the latest `runsc` from gVisor's official release bucket (verified by SHA-512), installs it to `/usr/local/bin/runsc`, merges a `runtimes.runsc` entry into `/etc/docker/daemon.json` (preserving anything already there), and restarts Docker only if `daemon.json` actually changed:
 
 ```bash
-# Debian/Ubuntu — see https://gvisor.dev/docs/user_guide/install/ for other distros
-sudo apt-get install -y runsc
-
-sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
-{ "runtimes": { "runsc": { "path": "/usr/bin/runsc" } } }
-JSON
-sudo systemctl restart docker
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat \
+    --with-gvisor
 ```
+
+The flag is opt-in and idempotent — re-running the installer without `--with-gvisor` does nothing to the runtime; re-running with it skips the download and the Docker restart when nothing has changed.
+
+If you've already installed `runsc` yourself (e.g. from `apt`, or a custom build), pass `--runsc-path /path/to/runsc` alongside `--with-gvisor` to skip the download and register your binary instead.
 
 ### Selection
 

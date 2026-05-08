@@ -44,15 +44,17 @@ Options:
   --dns-api-token <token>      API token for the configured DNS provider.
                                For cloudflare: a scoped API token with
                                Zone:Read + DNS:Edit on the target zone.
-  --with-gvisor                Register gVisor's runsc as an alternative OCI
-                               runtime in /etc/docker/daemon.json so that
-                               sandboxes can opt into gVisor isolation via
-                               runtime: "runsc" on create. Requires runsc to
-                               already be installed on PATH (or pass
-                               --runsc-path). Restarts Docker if a change is
-                               made.
-  --runsc-path <path>          Absolute path to the runsc binary. Defaults to
-                               whichever runsc is on PATH. Only consulted with
+  --with-gvisor                Install gVisor's runsc and register it as an
+                               alternative OCI runtime in
+                               /etc/docker/daemon.json so sandboxes can opt
+                               into gVisor isolation via runtime: "runsc" on
+                               create. Downloads runsc from the upstream
+                               release bucket (verified by SHA-512) if it
+                               isn't already on PATH. Restarts Docker if
+                               daemon.json actually changed.
+  --runsc-path <path>          Absolute path to a pre-installed runsc binary.
+                               Skips the download step and registers this
+                               binary instead. Only consulted with
                                --with-gvisor.
   --help                       Show this help
 
@@ -641,22 +643,67 @@ WantedBy=timers.target
 EOF
 }
 
+install_runsc_binary() {
+	# Download the latest runsc release from gVisor's official storage bucket
+	# and install it to /usr/local/bin. The bucket layout is:
+	#   storage.googleapis.com/gvisor/releases/release/latest/<arch>/{runsc,runsc.sha512}
+	# where <arch> is x86_64 or aarch64. We verify the SHA-512 published next
+	# to the binary before installing — the upstream-recommended pattern from
+	# https://gvisor.dev/docs/user_guide/install/.
+	local arch
+	case "$(uname -m)" in
+		x86_64|amd64)   arch="x86_64" ;;
+		aarch64|arm64)  arch="aarch64" ;;
+		*)
+			echo "--with-gvisor: unsupported architecture $(uname -m) for runsc" >&2
+			exit 1
+			;;
+	esac
+
+	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
+	trap "rm -rf '$tmp_dir'" RETURN
+
+	echo "Downloading runsc for ${arch} from ${base}"
+	if ! curl -fL --retry 5 --retry-delay 2 "${base}/runsc" -o "${tmp_dir}/runsc"; then
+		echo "--with-gvisor: failed to download runsc from ${base}/runsc" >&2
+		exit 1
+	fi
+	if ! curl -fL --retry 5 --retry-delay 2 "${base}/runsc.sha512" -o "${tmp_dir}/runsc.sha512"; then
+		echo "--with-gvisor: failed to download runsc.sha512 from ${base}/runsc.sha512" >&2
+		exit 1
+	fi
+
+	# gVisor's published checksum file uses the binary path under the bucket,
+	# not just the basename. Rewrite it to match what we have on disk so
+	# sha512sum -c finds the file. Format is "<hash>  <path>".
+	(
+		cd "$tmp_dir"
+		awk '{print $1"  runsc"}' runsc.sha512 > runsc.sha512.local
+		if ! sha512sum -c runsc.sha512.local; then
+			echo "--with-gvisor: runsc checksum verification failed" >&2
+			exit 1
+		fi
+	)
+
+	install -m 0755 "${tmp_dir}/runsc" /usr/local/bin/runsc
+	echo "Installed runsc to /usr/local/bin/runsc"
+}
+
 register_gvisor_runtime() {
 	# Idempotently register gVisor's runsc as an alternative OCI runtime in
-	# /etc/docker/daemon.json. The script does NOT download runsc itself —
-	# gVisor's release/arch matrix changes often enough that wiring it into
-	# this installer would mean tracking a moving target. We expect runsc to
-	# be on PATH (or at --runsc-path); operators install it from
-	# https://gvisor.dev/docs/user_guide/install/.
+	# /etc/docker/daemon.json. If runsc isn't already present we download and
+	# verify the upstream release first.
 	local runsc_bin
 	if [[ -n "$RUNSC_PATH" ]]; then
 		runsc_bin="$RUNSC_PATH"
 	elif command -v runsc >/dev/null 2>&1; then
 		runsc_bin="$(command -v runsc)"
 	else
-		echo "--with-gvisor: runsc not found on PATH and --runsc-path not provided" >&2
-		echo "  install runsc first: https://gvisor.dev/docs/user_guide/install/" >&2
-		exit 1
+		install_runsc_binary
+		runsc_bin="/usr/local/bin/runsc"
 	fi
 	if [[ ! -x "$runsc_bin" ]]; then
 		echo "--with-gvisor: runsc binary at $runsc_bin is not executable" >&2
