@@ -17,12 +17,56 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: write
 
 env:
   VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
   SDK_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
 
 jobs:
+  java:
+    name: Publish Java SDK to GitHub Packages
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/java
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: sdk/java/pom.xml
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Verify package version matches tag
+        run: |
+          package_version="$(python -c "import xml.etree.ElementTree as ET; root = ET.parse('pom.xml').getroot(); ns = {'m': 'http://maven.apache.org/POM/4.0.0'}; print(root.findtext('m:version', namespaces=ns) or '')")"
+          release_version="${SDK_VERSION#v}"
+          if [[ "$package_version" != "$release_version" ]]; then
+            echo "::error::sdk/java/pom.xml version $package_version does not match tag $release_version"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: mvn -B -ntp test
+
+      - name: Validate publish payload
+        run: mvn -B -ntp -DskipTests package
+
+      - name: Publish package
+        run: mvn -B -ntp -DskipTests deploy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GCR_TOKEN }}
+
   npm:
     name: Publish TypeScript SDK to npm
     runs-on: ubuntu-latest

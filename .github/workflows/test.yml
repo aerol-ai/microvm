@@ -38,6 +38,26 @@ jobs:
           name: go-coverage
           path: coverage.out
 
+  java-sdk-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/java
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: sdk/java/pom.xml
+
+      - name: Run Java SDK tests
+        run: mvn -B -ntp test
+
   typescript-sdk-tests:
     runs-on: ubuntu-latest
     defaults:
