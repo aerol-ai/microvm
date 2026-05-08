@@ -3,7 +3,7 @@ title: SSH Access
 description: Connect to a sandbox over SSH using the per-sandbox key pair provisioned at creation time.
 ---
 
-`sandboxd` runs an SSH gateway (`sshgateway`) on port `2220` (configurable via `SB_SSH_LISTEN_ADDR`). Each sandbox is provisioned with a unique Ed25519 key pair on creation. The private key is returned **only** in the create response and is not stored by the server.
+AerolVM runs an SSH gateway on port `2220` (configurable via `SB_SSH_LISTEN_ADDR`). Each sandbox is provisioned with a unique Ed25519 key pair on creation. The private key is returned **only** in the create response and is not stored by the server.
 
 ## Key Provisioning
 
@@ -46,7 +46,7 @@ ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123+myshell@<host>
 |---|---|---|
 | `SB_ENABLE_SSH_GATEWAY` | `true` | Enable or disable the SSH gateway. |
 | `SB_SSH_LISTEN_ADDR` | `0.0.0.0:2220` | Address and port for the SSH server. |
-| `SB_SSH_HOST_KEY_PATH` | `/var/lib/sandboxd/ssh_host_ed25519_key` | Host key path. Generated on first start if absent. |
+| `SB_SSH_HOST_KEY_PATH` | `/var/lib/aerolvm/ssh_host_ed25519_key` | Host key path. Generated on first start if absent. |
 
 ## SDK Usage
 
@@ -82,8 +82,8 @@ String privateKey = sandbox.sshPrivateKey; // save — only returned on create
 The gateway listens on `SB_SSH_LISTEN_ADDR`. On each connection it:
 
 1. Parses the SSH username to extract the sandbox ID and session name.
-2. Looks up the sandbox in SQLite and retrieves the stored public key.
+2. Looks up the sandbox and retrieves the stored public key.
 3. Validates the client's public key against the sandbox-specific key (public key auth only; password auth is disabled).
-4. Bridges the SSH channel into a `toolboxd` session inside the container.
+4. Bridges the SSH channel into a terminal session inside the sandbox.
 
 Each sandbox accepts exactly one authorized key. There is no shared host-level access.

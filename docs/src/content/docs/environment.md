@@ -3,7 +3,7 @@ title: Environment
 description: Configure the Docker image, environment variables, resource limits, and idle lifecycle for a sandbox.
 ---
 
-Every sandbox is a Docker container. The environment is fully specified at creation time through the create request body.
+The sandbox environment is fully specified at creation time through the create request body.
 
 ## Image
 
@@ -69,7 +69,7 @@ Sandboxes can self-terminate based on age or inactivity:
 
 | Field | Behavior |
 |---|---|
-| `stop_if_idle_for_ns` | Stop the sandbox after this many nanoseconds without a toolbox request. |
+| `stop_if_idle_for_ns` | Stop the sandbox after this many nanoseconds of inactivity. |
 | `destroy_at_age_ns` | Destroy the sandbox once it is older than this duration (wall clock from creation). |
 
 Either field can be set independently. Lifecycle parameters can be updated on a running sandbox:
@@ -86,4 +86,4 @@ Content-Type: application/json
 
 ## Entrypoint
 
-The sandbox image's default entrypoint and `CMD` are not used. `toolboxd` is the PID 1 of the container, injected from the host at runtime. Your workload runs as child processes of `toolboxd` via the exec or session APIs.
+The sandbox image's default entrypoint and `CMD` are not used. Your workload runs via the exec or session APIs instead.

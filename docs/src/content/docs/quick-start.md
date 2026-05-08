@@ -3,11 +3,27 @@ title: Quick Start
 description: Spin up a sandbox and run your first command in under five minutes.
 ---
 
-**AerolVM** is an open-source, self-hostable infrastructure for running isolated code environments. It provides composable sandboxes — ephemeral Docker-backed containers with complete isolation, a dedicated filesystem, network stack, and allocated vCPU, RAM, and disk.
+**AerolVM** is open-source infrastructure for running isolated code environments. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated vCPU, RAM, and disk.
 
-Sandboxes are the core primitive. Each sandbox is a Docker container managed by `sandboxd` (the host daemon) with `toolboxd` running inside to handle process execution, file transfers, and port management. Sandboxes spin up in seconds and can run any Docker image.
+## Runtimes
 
-Agents and developers interact with sandboxes through the REST API or one of the official SDKs (TypeScript, Python, Go, Rust, Java). Operations span the full lifecycle: create, exec, stream output, transfer files, expose ports, and destroy.
+AerolVM supports multiple container runtimes, giving you a choice between security and compatibility:
+
+| Runtime | Status | Use Case |
+|---|---|---|
+| Docker | ✅ Available | Fast startup, broad image compatibility, standard workloads |
+| GVisor | 🗓 Planned | Kernel-level isolation without a full VM — ideal for untrusted code |
+| Kata Containers | 🗓 Planned | Full VM isolation with hardware virtualization |
+| WebAssembly | 🗓 Planned | Ultra-lightweight, portable workloads |
+
+Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the roadmap.
+
+## Use Cases
+
+- **AI code execution** — run LLM-generated code safely in isolated environments
+- **CI / ephemeral build agents** — spin up a fresh environment per job, destroy when done
+- **Interactive developer environments** — persistent workspaces with SSH, port previews, and file sync
+- **Data processing pipelines** — attach cloud storage, run transforms, and extract results
 
 ---
 
@@ -30,8 +46,6 @@ cargo add aerolvm-sdk
 ```
 
 ## 2. Create a Sandbox
-
-Point the client at your `sandboxd` instance:
 
 ```ts
 import { MicroVM } from '@aerol-ai/aerolvm-sdk'
@@ -74,7 +88,7 @@ await sandbox.destroy()
 
 ## Next Steps
 
-- [Getting Started](/getting-started) — build and run `sandboxd` locally
+- [Getting Started](/getting-started) — self-host AerolVM on your own infrastructure
 - [Sandboxes](/sandboxes) — lifecycle states and configuration options
 - [Streaming Exec](/exec-streaming) — stream stdout/stderr live and use interactive PTY sessions
 - [Sessions](/sessions) — persistent terminal sessions that survive reconnects

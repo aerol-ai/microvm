@@ -5,17 +5,15 @@ description: Mount S3, NFS, SSHFS, and rclone-backed storage on the host and bin
 
 # External Storage (Bring Your Own Bucket)
 
-This sandbox platform deliberately does **not** expose host disk to user containers. Sandboxes are ephemeral; if you need durable workspace state, you mount your own cloud or network storage.
+Sandboxes are ephemeral by design. If you need durable workspace state across sandbox lifecycles, mount your own cloud or network storage into the sandbox.
 
-The daemon does the mounting on the host and bind-mounts the result into your container. Your image needs no mount tooling, and credentials never enter the container.
+The platform handles mounting on the host and bind-mounts the result into your sandbox. Your image needs no special mount tooling, and credentials never enter the sandbox.
 
 ## How it works
 
-1. You declare mounts in the create request. The daemon validates the spec and encrypts your credentials at rest.
-2. `sandboxd` spawns the appropriate mount tool on the host inside `/var/lib/sandboxd/mounts/<sandbox-id>/<index>/`.
-3. The Docker container is created with that path bind-mounted at the target you chose.
-4. If the FUSE process crashes, `sandboxd` restarts it. Repeated crashes disable the mount.
-5. On `Stop` the host mount is torn down. On `Start` it is re-established. Reconcile restores mounts after reboot.
+1. Declare mounts in the create request. The platform validates the spec and stores credentials encrypted at rest.
+2. At sandbox start, the platform establishes the mount on the host and makes it available inside the sandbox at the path you specified.
+3. On `Stop`, the mount is torn down. On `Start`, it is re-established. After a host reboot, mounts are restored automatically on the next sandbox start.
 
 ## Supported mount types
 
@@ -30,13 +28,13 @@ Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 Ki
 
 ## Security Model
 
-- Credentials never enter the container.
+- Credentials never enter the sandbox.
 - Credentials are encrypted at rest with AES-256-GCM.
 - Read APIs return `has_credentials: true` but never the actual values.
 
 ## Operational Notes
 
 - Mounts are established at `Create` and re-established at `Start`.
-- A FUSE process that exits is restarted once before the mount is disabled.
+- A failed mount is retried once before being disabled.
 - Host requirements include `fuse3`, `sshfs`, `nfs-common`, `rclone`, and AWS `mountpoint-s3`.
-- Egress blocking applies inside the container, not to the host mount helpers.
+- Network egress blocking applies inside the sandbox, not to the host mount process.

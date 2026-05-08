@@ -141,7 +141,7 @@ fmt.Println(code, signal, err)
 ## Additional Helpers
 
 - `client.Mounts()` returns redacted mount config for a sandbox.
-- `sandbox.UploadFile()` and `sandbox.DownloadFile()` move bytes through `toolboxd`.
+- `sandbox.UploadFile()` and `sandbox.DownloadFile()` transfer files to and from the sandbox.
 - `sandbox.ExposePort()` and `sandbox.UnexposePort()` manage public URLs.
 - `sandbox.SessionLog()` and `sandbox.SessionRecording()` return raw bytes.
 

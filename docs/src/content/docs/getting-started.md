@@ -1,6 +1,6 @@
 ---
 title: Getting Started
-description: Build the binaries, configure the daemon, and launch sandboxd on a local Linux host.
+description: Build the AerolVM server and run it on a local Linux host.
 ---
 
 ## Build
@@ -9,10 +9,7 @@ description: Build the binaries, configure the daemon, and launch sandboxd on a 
 make build
 ```
 
-Artifacts:
-
-- `bin/sandboxd`
-- `bin/toolboxd`
+This produces the server binary in `bin/`.
 
 ## Required Services
 
@@ -25,12 +22,11 @@ Artifacts:
 export SB_PAT_TOKEN=dev-token
 export SB_DB_PATH=$PWD/sandbox.db
 export SB_PUBLIC_HOST=127.0.0.1
-export SB_TOOLBOX_BINARY_PATH=$PWD/bin/toolboxd
 
-./bin/sandboxd
+./bin/aerolvm
 ```
 
-If `SB_DOMAIN` is set, sandbox routes are created as subdomains like `https://<sandbox-id>.<domain>`. If `SB_DOMAIN` is empty, the daemon falls back to path-based URLs like `http://<public-host>/<sandbox-id>/`.
+If `SB_DOMAIN` is set, sandbox routes are created as subdomains like `https://<sandbox-id>.<domain>`. If `SB_DOMAIN` is empty, the server falls back to path-based URLs like `http://<public-host>/<sandbox-id>/`.
 
 ## API Surface
 
@@ -51,8 +47,8 @@ All `/v1` endpoints except `/v1/tls-check` require `Authorization: Bearer <SB_PA
 
 ## Local Workflow
 
-1. Build `sandboxd` and `toolboxd`.
+1. Build the server.
 2. Start Caddy with the admin API exposed locally.
 3. Export the required environment variables.
-4. Launch `./bin/sandboxd`.
+4. Launch the server binary.
 5. Use one of the SDKs to create and control sandboxes.

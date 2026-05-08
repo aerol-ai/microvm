@@ -3,12 +3,12 @@ title: Sandboxes
 description: What a sandbox is, its lifecycle states, and the core create/start/stop/destroy operations.
 ---
 
-A sandbox is a Docker container managed by `sandboxd`. Each sandbox has:
+A sandbox is an isolated compute environment. Each sandbox has:
 
 - An isolated filesystem from a base OCI image.
 - Dedicated process, network, and mount namespaces.
-- A `toolboxd` binary injected at startup for command execution and file transfer.
-- Optional public HTTPS routes managed through Caddy.
+- Configurable vCPU, memory, and disk quotas.
+- Optional public HTTPS routes.
 - Optional external storage mounts and network egress blocking.
 
 ## Lifecycle States
@@ -22,9 +22,9 @@ created ──► running ──► stopped ──► running
 
 | State | Description |
 |---|---|
-| `running` | Container is up, `toolboxd` is accepting requests. |
-| `stopped` | Container is paused, state is persisted in SQLite. |
-| `destroyed` | Container and metadata are permanently removed. |
+| `running` | Sandbox is up and accepting requests. |
+| `stopped` | Sandbox is paused; state is persisted. |
+| `destroyed` | Sandbox and all its data are permanently removed. |
 
 ## Create
 
@@ -51,7 +51,7 @@ POST /v1/sandboxes/{id}/start
 POST /v1/sandboxes/{id}/stop
 ```
 
-Stopping persists all container-level state via Docker. Starting resumes the same filesystem and running processes were not retained — a start is a fresh container launch from the persisted image layer.
+Stopping persists all container-level state via Docker. Starting resumes from the persisted image layer — running processes are not retained across a stop/start cycle.
 
 ## Destroy
 
@@ -59,7 +59,7 @@ Stopping persists all container-level state via Docker. Starting resumes the sam
 DELETE /v1/sandboxes/{id}
 ```
 
-Permanently removes the container, all its data, and the SQLite record. External storage mounts are unmounted before removal.
+Permanently removes the sandbox, all its data, and its metadata record. External storage mounts are unmounted before removal.
 
 ## Resize
 
@@ -75,7 +75,7 @@ Content-Type: application/json
 }
 ```
 
-Resize updates Docker's cgroup constraints without restarting the container.
+Resize updates resource constraints without restarting the sandbox.
 
 ## Idle Lifecycle
 
@@ -90,7 +90,7 @@ Sandboxes can be configured to stop or destroy themselves when idle:
 }
 ```
 
-`stop_if_idle_for_ns` and `destroy_at_age_ns` are nanosecond durations. The daemon tracks the last time `toolboxd` received a request and shuts down idle sandboxes automatically.
+`stop_if_idle_for_ns` and `destroy_at_age_ns` are nanosecond durations. The platform tracks inactivity and shuts down idle sandboxes automatically.
 
 ## Environment
 

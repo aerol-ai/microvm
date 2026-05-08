@@ -104,7 +104,7 @@ print(attached.wait())
 
 - `client.health()` returns the daemon status payload, including `sshGateway`.
 - `client.mounts(sandbox_id)` returns redacted mount information.
-- `sandbox.upload_file()` and `sandbox.download_file()` move bytes through `toolboxd`.
+- `sandbox.upload_file()` and `sandbox.download_file()` transfer files to and from the sandbox.
 - `sandbox.expose_port()` and `sandbox.unexpose_port()` manage public URLs.
 - `sandbox.session_log()` and `sandbox.session_recording()` return raw `bytes`.
 

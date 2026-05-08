@@ -3,7 +3,7 @@ title: Sessions
 description: Long-running PTY terminal sessions that survive reconnects, replay history to new clients, and support concurrent attachment.
 ---
 
-Sessions are persistent processes managed by `toolboxd` inside a sandbox. Unlike `execStream`, which tears down the WebSocket when the connection drops, a session keeps running. Any new client that attaches receives a replay of buffered output and can then interact with the live process.
+Sessions are persistent processes running inside a sandbox. Unlike `execStream`, which tears down the WebSocket when the connection drops, a session keeps running. Any new client that attaches receives a replay of buffered output and can then interact with the live process.
 
 This makes sessions ideal for interactive shells, long-running agents, and any workflow where continuity across reconnects matters.
 
@@ -52,7 +52,7 @@ Upgrade: websocket
 Authorization: Bearer <token>
 ```
 
-On connect, `toolboxd` replays the in-memory buffer so the client sees past output immediately. Multiple clients can attach to the same session simultaneously.
+On connect, the sandbox replays the in-memory output buffer so the client sees past output immediately. Multiple clients can attach to the same session simultaneously.
 
 ## Session Log
 
@@ -148,9 +148,9 @@ attach.waitForExit();
 
 ## How Sessions Work
 
-Internally, `toolboxd` starts the process with either a PTY or a pipe pair. Output is written into a ring buffer in memory and fanned out to all currently attached WebSocket clients. When a new client attaches, it reads the entire ring buffer before receiving live frames — giving a seamless replay experience.
+The sandbox starts the process with either a PTY or a pipe pair. Output is written into a ring buffer in memory and fanned out to all currently attached WebSocket clients. When a new client attaches, it reads the entire ring buffer before receiving live frames — giving a seamless replay experience.
 
-Sessions are tied to the `toolboxd` process lifetime. If the sandbox is stopped and restarted, sessions do not persist across the restart.
+Sessions are tied to the sandbox's runtime. If the sandbox is stopped and restarted, sessions do not persist across the restart.
 
 ## Difference from execStream
 

@@ -1,9 +1,9 @@
 ---
 title: Preview
-description: Expose container ports publicly over HTTPS through Caddy subdomain or path routes.
+description: Expose sandbox ports publicly over HTTPS through subdomain or path routes.
 ---
 
-Every sandbox gets a public `sandboxd`-managed URL that routes through Caddy to the `toolboxd` process inside the container. You can also expose additional ports on separate public URLs so browsers and external tools can reach services running inside the sandbox.
+Every sandbox gets a public URL that routes to the sandbox's API endpoint. You can also expose additional ports on separate public URLs so browsers and external tools can reach services running inside the sandbox.
 
 ## Sandbox URL
 
@@ -13,7 +13,7 @@ When `SB_DOMAIN` is configured, sandboxes are reachable at:
 https://<sandbox-id>.<domain>
 ```
 
-Without `SB_DOMAIN`, the daemon falls back to a path-based URL:
+Without `SB_DOMAIN`, the server falls back to a path-based URL:
 
 ```
 http://<SB_PUBLIC_HOST>/<sandbox-id>/
@@ -23,7 +23,7 @@ The sandbox URL is returned as `public_url` in the create and get responses.
 
 ## Expose a Port
 
-Services running inside the sandbox are not reachable publicly by default. Call `exposePort` to add a port to the allowlist and create a Caddy route for it:
+Services running inside the sandbox are not reachable publicly by default. Call `exposePort` to add a port to the allowlist and create a public route for it:
 
 ```http
 POST /v1/sandboxes/{id}/ports/{port}
@@ -77,15 +77,11 @@ Authorization: Bearer <token>
 await sandbox.unexposePort(3000)
 ```
 
-## Port Allowlist
-
-`toolboxd` maintains an in-memory allowlist of exposed ports. The `/proxy/` path on `toolboxd` forwards traffic to container-local ports — but only if the target port is in the allowlist. This prevents unauthenticated access to accidental listeners such as databases or debug servers.
-
-See [Port Allowlist](/port-allowlist) for full details.
+See [Port Allowlist](/port-allowlist) for full details on how port access control works.
 
 ## TLS
 
-Caddy issues TLS certificates automatically:
+TLS certificates are issued automatically:
 
 - **Domain mode** (`SB_DOMAIN` set): Caddy issues per-sandbox wildcard certificates via DNS-01 (Cloudflare recommended) or per-port certificates via HTTP-01. See [Getting Started](/getting-started) for the rate-limit implications of HTTP-01 at scale.
 - **IP mode** (no `SB_DOMAIN`): Routes are HTTP-only, no TLS.

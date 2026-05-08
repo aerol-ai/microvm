@@ -1,9 +1,9 @@
 ---
 title: File System
-description: Upload files into a sandbox and download files from a sandbox using the toolbox HTTP API.
+description: Upload files into a sandbox and download files from a sandbox using the HTTP API.
 ---
 
-`toolboxd` exposes two endpoints for transferring files between the host and the sandbox container. All file operations are proxied through `sandboxd` and require the same bearer token used for the rest of the API.
+The sandbox API exposes two endpoints for transferring files between your application and the sandbox. All file operations use the same bearer token as the rest of the API.
 
 ## Upload
 
@@ -17,7 +17,7 @@ Content-Type: application/octet-stream
 <file bytes>
 ```
 
-The `path` query parameter specifies the absolute path inside the container. Parent directories are created automatically if they do not exist.
+The `path` query parameter specifies the absolute path inside the sandbox. Parent directories are created automatically if they do not exist.
 
 ### SDK Usage
 
@@ -111,4 +111,4 @@ const data = JSON.parse(bytes.toString())
 
 ## Limits
 
-File uploads are limited by `sandboxd`'s HTTP server body limit (default 256 MB). For larger transfers, use [External Storage](/external-storage) to mount an S3 bucket or NFS share directly into the container.
+File uploads are limited to 256 MB by default. For larger transfers, use [External Storage](/external-storage) to mount an S3 bucket or NFS share directly into the sandbox.

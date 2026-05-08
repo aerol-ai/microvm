@@ -1,9 +1,9 @@
 ---
 title: SDK Overview
-description: Package names, shared auth, and cross-language behavior for the Go, TypeScript, Python, and Rust SDKs.
+description: Package names, shared auth, and cross-language behavior for the Go, TypeScript, Python, Rust, and Java SDKs.
 ---
 
-This docs section mirrors the Daytona docs layout, but the content here is taken from the SDKs that live in this repository today.
+AerolVM provides official SDKs for five languages. All SDKs cover the same core surface and share the same authentication model.
 
 ## Packages
 
@@ -13,6 +13,7 @@ This docs section mirrors the Daytona docs layout, but the content here is taken
 | TypeScript | `@aerol-ai/aerolvm-sdk` | `npm install @aerol-ai/aerolvm-sdk` |
 | Python | `aerolvm-sdk` | `pip install aerolvm-sdk` |
 | Rust | `aerolvm-sdk` | `cargo add aerolvm-sdk` |
+| Java | `ai.aerol:microvm-sdk` | See [Java SDK](/java-sdk) for Maven/Gradle setup |
 
 If you are working directly from this repository, each SDK can also be installed from its matching `sdk/<language>` directory.
 
@@ -27,7 +28,7 @@ All SDKs send the PAT as `Authorization: Bearer <token>`.
 
 ## Shared Capabilities
 
-All four SDKs cover the main control-plane surface:
+All SDKs cover the main API surface:
 
 - create, list, get, start, stop, destroy, resize, and lifecycle updates
 - `GET /health`, mount inspection, file upload/download, and public port exposure
@@ -48,6 +49,7 @@ Go tracks the wire model most directly because `sdk/go/pkg/types` aliases the se
 - [TypeScript SDK](/typescript-sdk)
 - [Python SDK](/python-sdk)
 - [Rust SDK](/rust-sdk)
+- [Java SDK](/java-sdk)
 
 ## Quick Auth Example
 
@@ -94,4 +96,4 @@ use aerolvm_sdk::Client;
 let client = Client::new(Some("https://sandbox.example.com"), Some("your-token"))?;
 ```
 
-Start with the language page that matches your project, then pair it with [Getting Started](/getting-started) if you also need to stand up `sandboxd` locally.
+Start with the language page that matches your project. If you need to self-host AerolVM, see [Getting Started](/getting-started).

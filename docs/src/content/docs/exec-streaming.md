@@ -5,15 +5,9 @@ description: Stream stdout and stderr live, allocate PTYs, forward stdin, and co
 
 # Streaming exec (with optional PTY)
 
-`sandbox.exec()` runs a command, buffers its full output, and returns when the
-command exits. That's fine for short commands but unusable for long-running
-processes (you can't see output until it finishes), large outputs (`toolboxd`
-buffers everything in RAM), or interactive shells.
+`sandbox.exec()` runs a command, buffers its full output, and returns when the command exits. That works for short commands but is unsuitable for long-running processes or interactive shells.
 
-`sandbox.execStream()` is the streaming variant. It opens a WebSocket to the
-sandbox, streams stdout/stderr live, accepts stdin from the client, and
-optionally allocates a pseudo-terminal so interactive programs (`bash`,
-`vim`, `top`, and similar tools) work correctly.
+`sandbox.execStream()` is the streaming variant. It opens a WebSocket to the sandbox, streams stdout/stderr live, accepts stdin from the client, and optionally allocates a pseudo-terminal so interactive programs (`bash`, `vim`, `top`, and similar tools) work correctly.
 
 ## When to use which
 
@@ -42,9 +36,7 @@ const { code } = await handle.done
 console.log(`npm install exited with ${code}`)
 ```
 
-`onStdout` and `onStderr` receive `Uint8Array` chunks as they arrive with no
-buffering on the toolbox side. The `done` promise resolves when the process
-exits with the exit code and, if relevant, the signal name.
+`onStdout` and `onStderr` receive `Uint8Array` chunks as they arrive. The `done` promise resolves when the process exits with the exit code and, if relevant, the signal name.
 
 ### Interactive shell with PTY
 
@@ -67,8 +59,7 @@ process.stdout.on('resize', () => {
 await handle.done
 ```
 
-In TTY mode stdout and stderr are merged onto the PTY, so only `onStdout`
-fires. Without `tty: true`, the two streams are kept separate.
+In TTY mode stdout and stderr are merged onto the PTY, so only `onStdout` fires. Without `tty: true`, the two streams are kept separate.
 
 ### Sending signals
 
@@ -85,7 +76,7 @@ Signals target the process group, so child processes receive them too.
 ### Endpoint
 
 ```text
-WS  ws(s)://<sandboxd>/v1/sandboxes/<id>/toolbox/process/exec/stream
+WS  ws(s)://<host>/v1/sandboxes/<id>/toolbox/process/exec/stream
 ```
 
 ### Authentication
@@ -111,9 +102,3 @@ The first client frame is a JSON text frame that describes the process to run:
 ```
 
 `command` is required. Everything else is optional.
-
-## Toolboxd implementation notes
-
-- Endpoint registration lives in `cmd/toolboxd/exec_stream.go`.
-- The transport is WebSocket based.
-- The implementation is additive and does not replace the buffered `exec` path.
