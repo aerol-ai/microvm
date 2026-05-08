@@ -82,7 +82,7 @@ See [Port Allowlist](/port-allowlist) for full details on how port access contro
 
 TLS certificates are issued automatically:
 
-- **Domain mode** (`SB_DOMAIN` set): Caddy issues per-sandbox wildcard certificates via DNS-01 (Cloudflare recommended) or per-port certificates via HTTP-01. See [Getting Started](/getting-started) for the rate-limit implications of HTTP-01 at scale.
+- **Domain mode** (`SB_DOMAIN` set): Caddy issues per-sandbox wildcard certificates via DNS-01 (Cloudflare recommended) or per-port certificates via HTTP-01. See [Server Setup](/getting-started) for the rate-limit implications of HTTP-01 at scale.
 - **IP mode** (no `SB_DOMAIN`): Routes are HTTP-only, no TLS.
 
 For production use with many sandboxes, configure DNS-01 wildcard TLS to avoid Let's Encrypt rate limits.

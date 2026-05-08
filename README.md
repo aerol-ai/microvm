@@ -292,23 +292,6 @@ The persisted sandbox row records the resolved runtime so the choice cannot drif
 - gVisor does not honor Docker's `StorageOpt size` per-sandbox disk quota. `disk_gb` is silently dropped (with a warning log) when the runtime is `gvisor`. CPU and memory caps still work.
 - The host's cgroup driver must match Docker's. cgroupv2 + systemd is the recommended setup.
 
-## API summary
-
-- `GET /health`
-- `POST /v1/sandboxes`
-- `GET /v1/sandboxes`
-- `GET /v1/sandboxes/{id}`
-- `POST /v1/sandboxes/{id}/start`
-- `POST /v1/sandboxes/{id}/stop`
-- `DELETE /v1/sandboxes/{id}`
-- `POST /v1/sandboxes/{id}/resize`
-- `POST /v1/sandboxes/{id}/ports/{port}`
-- `DELETE /v1/sandboxes/{id}/ports/{port}`
-- `ANY /v1/sandboxes/{id}/toolbox/{path...}`
-- `GET /v1/tls-check?domain=<host>`
-
-All `/v1` endpoints except `/v1/tls-check` require `Authorization: Bearer <SB_PAT_TOKEN>`.
-
 ## SDK auth
 
 All SDKs send the PAT as `Authorization: Bearer <token>`.

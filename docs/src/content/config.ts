@@ -38,8 +38,14 @@ export const getSidebarConfig = (): NavigationGroup[] => [
       {
         type: 'link',
         href: '/getting-started',
-        label: 'Getting Started',
-        description: 'Build, configure, and run the sandbox daemon locally.',
+        label: 'Server Setup',
+        description: 'Install and configure AerolVM on a Linux host.',
+      },
+      {
+        type: 'link',
+        href: '/sdk-setup',
+        label: 'SDK Setup',
+        description: 'Connect an SDK to your AerolVM server.',
       },
       {
         type: 'link',

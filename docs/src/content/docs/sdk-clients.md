@@ -95,4 +95,4 @@ use aerolvm_sdk::Client;
 let client = Client::new(Some("https://sandbox.example.com"), Some("your-token"))?;
 ```
 
-Start with the language page that matches your project. If you need to self-host AerolVM, see [Getting Started](/getting-started).
+Start with the language page that matches your project. If you need to self-host AerolVM, see [Server Setup](/getting-started).
