@@ -6,7 +6,7 @@ AerolVM runs on a single Linux host. The one-line installer configures the serve
 
 ## Install
 
-**Trial / single-user** (HTTP-01 TLS — limit ~50 sandboxes/week):
+**Trial / single-user** (HTTP-01 TLS - limit ~50 sandboxes/week):
 
 ```bash
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
@@ -14,7 +14,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
     --pat-token your-secret-pat
 ```
 
-**Production** (DNS-01 wildcard TLS via Cloudflare — required for real workloads):
+**Production** (DNS-01 wildcard TLS via Cloudflare - required for real workloads):
 
 ```bash
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
@@ -24,7 +24,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
     --dns-api-token your-cloudflare-api-token
 ```
 
-> **Pick the right mode up-front.** HTTP-01 issues one Let's Encrypt certificate per sandbox subdomain on first access. Let's Encrypt caps you at 50 certs/week per registered domain — roughly 7/day at sustained load. DNS-01 issues exactly **two** certs total (`<domain>` + `*.<domain>`) regardless of sandbox count and scales indefinitely.
+> **Pick the right mode up-front.** HTTP-01 issues one Let's Encrypt certificate per sandbox subdomain on first access. Let's Encrypt caps you at 50 certs/week per registered domain - roughly 7/day at sustained load. DNS-01 issues exactly **two** certs total (`<domain>` + `*.<domain>`) regardless of sandbox count and scales indefinitely.
 
 If you omit `--pat-token`, the installer generates a token and prints it once at the end.
 
@@ -65,9 +65,9 @@ Create a scoped token (not the legacy Global API Key) restricted to the target z
 
 | Runtime | Installer flag | Notes |
 |---|---|---|
-| Docker (default) | — | Lowest overhead. Suitable for trusted workloads. |
+| Docker (default) | - | Lowest overhead. Suitable for trusted workloads. |
 | gVisor | `--with-gvisor` | User-space kernel between the workload and the host. Recommended for untrusted code (LLM-generated, third-party submissions). |
-| Kata Containers | — | Planned. Create requests return `runtime not yet implemented`. |
+| Kata Containers | - | Planned. Create requests return `runtime not yet implemented`. |
 
 Install with gVisor support:
 
@@ -115,5 +115,5 @@ Required services: Docker daemon and Caddy with the Admin API enabled at `http:/
 
 ## Next Steps
 
-- [SDK Setup](/sdk-setup) — connect an SDK to the running server
-- [Sandboxes](/sandboxes) — create and manage sandboxes
+- [SDK Setup](/sdk-setup) - connect an SDK to the running server
+- [Sandboxes](/sandboxes) - create and manage sandboxes

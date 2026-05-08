@@ -8,7 +8,7 @@ AerolVM runs an SSH gateway on port `2220` (configurable via `SB_SSH_LISTEN_ADDR
 
 ## Key Provisioning
 
-The SSH private key is available immediately when the sandbox is created. Save it — it cannot be retrieved later.
+The SSH private key is available immediately when the sandbox is created. Save it - it cannot be retrieved later.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -25,7 +25,7 @@ The SSH private key is available immediately when the sandbox is created. Save i
     ```python
     sandbox = client.create({'image': 'ubuntu:22.04'})
 
-    private_key = sandbox.sshPrivateKey  # save — only returned on create
+    private_key = sandbox.sshPrivateKey  # save - only returned on create
     public_key  = sandbox.sshPublicKey
     ```
   </TabItem>
@@ -36,7 +36,7 @@ The SSH private key is available immediately when the sandbox is created. Save i
     })
     if err != nil { log.Fatal(err) }
 
-    privateKey := sandbox.SSHPrivateKey  // save — only returned by Create()
+    privateKey := sandbox.SSHPrivateKey  // save - only returned by Create()
     publicKey  := sandbox.SSHPublicKey
     ```
   </TabItem>
@@ -47,7 +47,7 @@ The SSH private key is available immediately when the sandbox is created. Save i
         ..Default::default()
     })?;
 
-    let private_key = &sandbox.ssh_private_key; // save — only returned by create()
+    let private_key = &sandbox.ssh_private_key; // save - only returned by create()
     let public_key  = &sandbox.data.ssh_public_key;
     ```
   </TabItem>
@@ -55,7 +55,7 @@ The SSH private key is available immediately when the sandbox is created. Save i
     ```java
     Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
 
-    String privateKey = sandbox.sshPrivateKey;  // save — only returned by create()
+    String privateKey = sandbox.sshPrivateKey;  // save - only returned by create()
     String publicKey  = sandbox.sshPublicKey;
     ```
   </TabItem>

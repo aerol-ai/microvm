@@ -104,5 +104,5 @@ let client = Client::new(
 
 ## Next Steps
 
-- [Quick Start](/quick-start) — run your first command inside a sandbox
-- [Create Sandbox](/sandboxes) — full sandbox lifecycle with all SDK examples
+- [Quick Start](/quick-start) - run your first command inside a sandbox
+- [Create Sandbox](/sandboxes) - full sandbox lifecycle with all SDK examples
