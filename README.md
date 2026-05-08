@@ -233,6 +233,50 @@ export SB_TOOLBOX_BINARY_PATH=$PWD/bin/toolboxd
 
 If `SB_DOMAIN` is set, sandbox routes are created as subdomains like `https://<sandbox-id>.<domain>`. If `SB_DOMAIN` is empty, the daemon falls back to path-based URLs like `http://<public-host>/<sandbox-id>/`. For newly created sandboxes, `<sandbox-id>` is the Docker short ID: the first 12 characters of the full container ID.
 
+## Container runtime (Docker / gVisor)
+
+Sandboxes run under an OCI runtime selected per host (default for new sandboxes) and per request (override for a single sandbox). Two runtimes are supported today:
+
+- `runc` — Docker's standard runtime. Default. Lowest overhead. Trusted workloads.
+- `runsc` — [gVisor](https://gvisor.dev/). User-space kernel between the workload and the host. Significantly stronger isolation against kernel exploits. Recommended for untrusted code (LLM-generated, third-party submissions, CTFs).
+
+### Host setup for gVisor
+
+Install `runsc` and register it with Docker, then restart Docker:
+
+```bash
+# Debian/Ubuntu — see https://gvisor.dev/docs/user_guide/install/ for other distros
+sudo apt-get install -y runsc
+
+sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+{ "runtimes": { "runsc": { "path": "/usr/bin/runsc" } } }
+JSON
+sudo systemctl restart docker
+```
+
+### Selection
+
+```bash
+# Host default for new sandboxes (env on sandboxd):
+export SB_CONTAINER_OCI_RUNTIME=runc   # or "runsc" to default everything to gVisor
+```
+
+Per-sandbox override on the create request:
+
+```bash
+curl -X POST $SB_API/v1/sandboxes \
+  -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  -d '{"image":"alpine","cpu":0.5,"memory_mb":256,"runtime":"runsc"}'
+```
+
+The persisted sandbox row records the resolved runtime so the choice cannot drift across host restarts.
+
+### gVisor caveats
+
+- `--privileged` is incompatible with `runsc`. Sandboxd rejects the combination at create time with a clear error.
+- `runsc` does not honor Docker's `StorageOpt size` per-sandbox disk quota. `disk_gb` is silently dropped (with a warning log) when the runtime is `runsc`. CPU and memory caps still work.
+- The host's cgroup driver must match Docker's. cgroupv2 + systemd is the recommended setup.
+
 ## API summary
 
 - `GET /health`

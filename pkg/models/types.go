@@ -33,6 +33,38 @@ type RegistryAuth struct {
 	Password string `json:"password"`
 }
 
+// SandboxRuntimeState is the runtime view of a sandbox returned by the
+// container runtime layer (Docker today, gVisor/native runsc tomorrow). It
+// carries only what the service needs to reconcile and route — anything else
+// belongs on models.Sandbox or stays in the runtime implementation.
+type SandboxRuntimeState struct {
+	SandboxID   string
+	ContainerID string
+	ContainerIP string
+	Status      SandboxStatus
+}
+
+// OCI runtime identifiers. The empty string is reserved for legacy rows that
+// pre-date the runtime field — those resolve to the host default at start time.
+const (
+	RuntimeRunc  = "runc"
+	RuntimeRunsc = "runsc"
+)
+
+// ValidRuntime normalizes and validates an OCI runtime identifier. Empty input
+// passes through unchanged so the caller can substitute the host default; any
+// other value must be a recognized runtime. The intent here is "fail fast at
+// the API boundary" — by the time a request reaches the runtime layer, we
+// should already know the value is one we can act on.
+func ValidRuntime(value string) (string, error) {
+	switch value {
+	case "", RuntimeRunc, RuntimeRunsc:
+		return value, nil
+	default:
+		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s)", value, RuntimeRunc, RuntimeRunsc)
+	}
+}
+
 // Lifecycle declares automatic stop/destroy timers for a sandbox. Each field
 // is a duration; zero means "disabled" for that axis. Idle triggers measure
 // time since LastActiveAt (i.e. since the last toolbox/exec/SSH activity).
@@ -118,6 +150,10 @@ type CreateSandboxRequest struct {
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Mounts           []MountSpec       `json:"mounts,omitempty"`
 	Lifecycle        *Lifecycle        `json:"lifecycle,omitempty"`
+	// Runtime selects the OCI runtime for this sandbox. Empty falls back to
+	// the host default (SB_CONTAINER_OCI_RUNTIME). Allowed values: "runc"
+	// (default), "runsc" (gVisor). Use "runsc" for untrusted workloads.
+	Runtime string `json:"runtime,omitempty"`
 }
 
 type ResizeSandboxRequest struct {
@@ -149,6 +185,10 @@ type Sandbox struct {
 	LastError        string            `json:"last_error,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle         `json:"lifecycle"`
+	// Runtime is the OCI runtime this sandbox uses. Pre-migration rows carry
+	// "" and resolve to the host default at start time; new sandboxes always
+	// store the resolved value so the choice cannot drift across restarts.
+	Runtime string `json:"runtime"`
 }
 
 // CreateSandboxResponse is what the API returns from POST /v1/sandboxes.

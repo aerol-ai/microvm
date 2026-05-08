@@ -77,6 +77,29 @@ func TestStoreCases(t *testing.T) {
 				if !reflect.DeepEqual(got.Env, sandbox.Env) || !reflect.DeepEqual(got.ContainerCommand, sandbox.ContainerCommand) {
 					t.Fatalf("unexpected env/command: %+v", got)
 				}
+				if got.Runtime != sandbox.Runtime {
+					t.Fatalf("unexpected runtime: got %q, want %q", got.Runtime, sandbox.Runtime)
+				}
+			},
+		},
+		{
+			name: "runtime_empty_roundtrip",
+			run: func(t *testing.T) {
+				// Pre-migration rows carry empty Runtime; the store must
+				// preserve "" rather than coercing it to a default.
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-rt-empty")
+				sandbox.Runtime = ""
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Runtime != "" {
+					t.Fatalf("expected empty runtime, got %q", got.Runtime)
+				}
 			},
 		},
 		{
@@ -577,7 +600,7 @@ func TestStoreHelperCases(t *testing.T) {
 		row := sqlRowStub{values: []any{
 			"sb-bad", "image", models.SandboxStatusStarted, "https://example.com", "container", "10.0.0.1",
 			float64(1), 1024, 10, "root", "{bad json", 0, 1, "", "", "", "[]", time.Now(), time.Now(), time.Now(),
-			int64(0), int64(0), int64(0), int64(0),
+			int64(0), int64(0), int64(0), int64(0), "",
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {
@@ -631,5 +654,6 @@ func sampleSandbox(id string) *models.Sandbox {
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		LastActiveAt:     now,
+		Runtime:          models.RuntimeRunsc,
 	}
 }

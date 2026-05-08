@@ -16,6 +16,8 @@ IDLE_TIMEOUT_MIN="0"
 DNS_PROVIDER=""
 DNS_API_TOKEN=""
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
+WITH_GVISOR="false"
+RUNSC_PATH=""
 
 usage() {
 	cat <<'EOF'
@@ -42,6 +44,16 @@ Options:
   --dns-api-token <token>      API token for the configured DNS provider.
                                For cloudflare: a scoped API token with
                                Zone:Read + DNS:Edit on the target zone.
+  --with-gvisor                Register gVisor's runsc as an alternative OCI
+                               runtime in /etc/docker/daemon.json so that
+                               sandboxes can opt into gVisor isolation via
+                               runtime: "runsc" on create. Requires runsc to
+                               already be installed on PATH (or pass
+                               --runsc-path). Restarts Docker if a change is
+                               made.
+  --runsc-path <path>          Absolute path to the runsc binary. Defaults to
+                               whichever runsc is on PATH. Only consulted with
+                               --with-gvisor.
   --help                       Show this help
 
 Examples:
@@ -184,6 +196,14 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--dns-api-token)
 			DNS_API_TOKEN="$2"
+			shift 2
+			;;
+		--with-gvisor)
+			WITH_GVISOR="true"
+			shift
+			;;
+		--runsc-path)
+			RUNSC_PATH="$2"
 			shift 2
 			;;
 		--help)
@@ -621,7 +641,76 @@ WantedBy=timers.target
 EOF
 }
 
+register_gvisor_runtime() {
+	# Idempotently register gVisor's runsc as an alternative OCI runtime in
+	# /etc/docker/daemon.json. The script does NOT download runsc itself —
+	# gVisor's release/arch matrix changes often enough that wiring it into
+	# this installer would mean tracking a moving target. We expect runsc to
+	# be on PATH (or at --runsc-path); operators install it from
+	# https://gvisor.dev/docs/user_guide/install/.
+	local runsc_bin
+	if [[ -n "$RUNSC_PATH" ]]; then
+		runsc_bin="$RUNSC_PATH"
+	elif command -v runsc >/dev/null 2>&1; then
+		runsc_bin="$(command -v runsc)"
+	else
+		echo "--with-gvisor: runsc not found on PATH and --runsc-path not provided" >&2
+		echo "  install runsc first: https://gvisor.dev/docs/user_guide/install/" >&2
+		exit 1
+	fi
+	if [[ ! -x "$runsc_bin" ]]; then
+		echo "--with-gvisor: runsc binary at $runsc_bin is not executable" >&2
+		exit 1
+	fi
+
+	mkdir -p /etc/docker
+	local daemon_json="/etc/docker/daemon.json"
+	local desired
+	desired="$(printf '{"runtimes":{"runsc":{"path":"%s"}}}' "$runsc_bin")"
+
+	# Merge our runtimes.runsc entry into any existing daemon.json instead of
+	# replacing the file. jq does this cleanly when present; a Python fallback
+	# covers minimal hosts that don't have jq.
+	local merged
+	if [[ -s "$daemon_json" ]]; then
+		if command -v jq >/dev/null 2>&1; then
+			merged="$(jq --arg path "$runsc_bin" '.runtimes = (.runtimes // {}) | .runtimes.runsc = {"path": $path}' "$daemon_json")"
+		elif command -v python3 >/dev/null 2>&1; then
+			merged="$(RUNSC_PATH="$runsc_bin" python3 - <<'PY'
+import json, os, sys
+path = "/etc/docker/daemon.json"
+with open(path) as f:
+    cfg = json.load(f)
+cfg.setdefault("runtimes", {})
+cfg["runtimes"]["runsc"] = {"path": os.environ["RUNSC_PATH"]}
+print(json.dumps(cfg, indent=2))
+PY
+)"
+		else
+			echo "--with-gvisor: neither jq nor python3 available to merge $daemon_json" >&2
+			exit 1
+		fi
+	else
+		merged="$desired"
+	fi
+
+	# Skip the write+restart if the file already looks right. Avoids restarting
+	# Docker for re-runs of the installer, which would kick every running
+	# sandbox unnecessarily.
+	if [[ -s "$daemon_json" ]] && diff -q <(printf '%s\n' "$merged") "$daemon_json" >/dev/null 2>&1; then
+		echo "gVisor runsc runtime already registered in $daemon_json"
+		return 0
+	fi
+
+	printf '%s\n' "$merged" > "$daemon_json"
+	echo "Registered gVisor runtime in $daemon_json (path=$runsc_bin); restarting docker"
+	systemctl restart docker
+}
+
 install_packages
+if [[ "$WITH_GVISOR" == "true" ]]; then
+	register_gvisor_runtime
+fi
 if [[ -n "$DNS_PROVIDER" ]]; then
 	install_caddy_dns_plugin "$DNS_PROVIDER"
 fi

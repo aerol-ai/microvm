@@ -52,6 +52,13 @@ export interface CreateOptions {
   containerCommand?: string[];
   mounts?: MountSpec[];
   lifecycle?: Lifecycle;
+  /**
+   * OCI runtime to use for this sandbox. Omit to inherit the host default
+   * (`SB_CONTAINER_OCI_RUNTIME`). Use `"runsc"` for gVisor isolation when
+   * running untrusted workloads — note that gVisor rejects privileged
+   * containers and ignores per-sandbox disk quotas.
+   */
+  runtime?: "runc" | "runsc";
 }
 
 export interface ResizeOptions {
@@ -121,6 +128,11 @@ export interface Sandbox {
   lastError?: string;
   containerCommand?: string[];
   lifecycle: Lifecycle;
+  /**
+   * OCI runtime this sandbox is running under. Empty string indicates a
+   * pre-migration row that resolves to the host default at start time.
+   */
+  runtime: "" | "runc" | "runsc";
 }
 
 export interface ExecRequest {

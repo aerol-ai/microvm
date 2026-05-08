@@ -26,12 +26,11 @@ import (
 
 const managedLabelKey = "sandbox-library.managed"
 
-type SandboxRuntime struct {
-	SandboxID   string
-	ContainerID string
-	ContainerIP string
-	Status      models.SandboxStatus
-}
+// SandboxRuntime is the Docker-layer alias of the canonical
+// models.SandboxRuntimeState type. The alias keeps every existing reference
+// in pkg/docker compiling unchanged while letting non-Docker runtime
+// implementations import only pkg/models.
+type SandboxRuntime = models.SandboxRuntimeState
 
 type Client struct {
 	logger             *slog.Logger
@@ -42,6 +41,7 @@ type Client struct {
 	toolboxPort        int
 	privileged         bool
 	resourceLimitsOff  bool
+	defaultRuntime     string
 	httpClient         *http.Client
 	streamClient       *http.Client
 	toolboxClient      *http.Client
@@ -75,6 +75,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxPort:        cfg.ToolboxPort,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
+		defaultRuntime:     cfg.OCIRuntime,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		streamClient:       &http.Client{Transport: transport},
 		toolboxClient:      &http.Client{Timeout: cfg.HTTPClientTimeout},
@@ -122,6 +123,21 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if err := c.ensureToolboxBinary(); err != nil {
 		return nil, err
+	}
+
+	// Resolve effective OCI runtime: per-sandbox override wins over the host
+	// default. The service layer is expected to substitute the host default
+	// into req.Runtime before calling Create, but we re-resolve here as a
+	// safety net so direct use of the docker client (e.g. tests) still works.
+	effectiveRuntime := strings.TrimSpace(req.Runtime)
+	if effectiveRuntime == "" {
+		effectiveRuntime = c.defaultRuntime
+	}
+	// gVisor refuses privileged containers — its userspace kernel cannot
+	// safely grant the host capabilities --privileged implies. Catch the
+	// conflict here, before pulling the image and 30s into a doomed start.
+	if effectiveRuntime == models.RuntimeRunsc && c.privileged {
+		return nil, fmt.Errorf("runtime %q is incompatible with privileged containers", effectiveRuntime)
 	}
 
 	if err := c.pullImage(ctx, req.Image, req.Registry); err != nil {
@@ -186,6 +202,14 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		hostConfig["NetworkMode"] = c.network
 	}
 
+	// Only set HostConfig.Runtime when we actually need to override the
+	// daemon's default. Leaving it empty for runc is safer on hosts that
+	// haven't explicitly registered "runc" in /etc/docker/daemon.json — Docker
+	// then falls back to its compiled-in default runtime.
+	if effectiveRuntime != "" && effectiveRuntime != models.RuntimeRunc {
+		hostConfig["Runtime"] = effectiveRuntime
+	}
+
 	if !c.resourceLimitsOff {
 		resources := map[string]any{}
 		if req.CPU > 0 {
@@ -199,7 +223,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			resources["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
 		}
 		if req.DiskGB > 0 {
-			hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", req.DiskGB)}
+			// gVisor's runsc does not honor StorageOpt size — silently
+			// applying it would mislead operators into thinking quota is
+			// enforced. Drop the field with a warning when runsc is in use.
+			if effectiveRuntime == models.RuntimeRunsc {
+				c.logger.Warn("ignoring disk quota: runsc does not support StorageOpt size",
+					"sandbox_id", sandboxID, "disk_gb", req.DiskGB)
+			} else {
+				hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", req.DiskGB)}
+			}
 		}
 		hostConfig["Resources"] = resources
 	}

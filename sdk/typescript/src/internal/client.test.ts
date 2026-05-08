@@ -234,6 +234,36 @@ test("internal client execStream uses sandbox bearer subprotocol", async () => {
   }
 });
 
+test("internal client create forwards runtime selector and parses response", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-runtime", { runtime: "runsc" }));
+    },
+  });
+
+  const sandbox = await client.create({ image: "ubuntu:22.04", runtime: "runsc" });
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as { runtime?: string };
+  assert.equal(body.runtime, "runsc", "request body should carry runtime selector");
+  assert.equal(sandbox.runtime, "runsc", "response should expose runtime");
+});
+
+test("internal client create defaults runtime to '' when sandboxd omits the field", async () => {
+  // Older sandboxd builds don't send the runtime field. The SDK must surface
+  // it as the empty string rather than undefined so the type stays narrow.
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse(apiSandbox("sb-legacy")),
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  assert.equal(sandbox.runtime, "");
+});
+
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,

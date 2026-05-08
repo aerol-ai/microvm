@@ -101,7 +101,12 @@ func main() {
 		"memory_floor_ratio", cfg.MemoryFloorRatio,
 	)
 
-	svc := service.New(cfg, logger, db, dockerClient, caddyClient, cipher, mountManager, admitter)
+	// dockerClient is passed twice: as the runtime.Runtime driver (the
+	// abstraction service uses for sandbox lifecycle) and as the concrete
+	// *docker.Client used for the daemon /events stream. They point at the
+	// same instance today; the split exists so a future non-Docker runtime
+	// can replace the first without touching the second.
+	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
 	svc.ReplayReservations(ctx)
 
 	if cfg.AutoReconcile {
