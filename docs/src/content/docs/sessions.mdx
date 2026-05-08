@@ -1,0 +1,226 @@
+---
+title: Sessions
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Sessions are persistent processes running inside a sandbox. Unlike `execStream`, which tears down when the connection drops, a session keeps running. Any new client that attaches receives a replay of buffered output and can then interact with the live process.
+
+This makes sessions ideal for interactive shells, long-running agents, and any workflow where continuity across reconnects matters.
+
+## Create a Session
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const session = await sandbox.createSession({
+      name:    'shell',
+      command: 'bash',
+      workDir: '/workspace',
+      pty:     true,
+      cols:    120,
+      rows:    40,
+    })
+
+    console.log(session.id)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    session = sandbox.create_session({
+        'name':    'shell',
+        'command': 'bash',
+        'workDir': '/workspace',
+        'pty':     True,
+        'cols':    120,
+        'rows':    40,
+    })
+
+    print(session['id'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    session, err := sandbox.CreateSession(ctx, sdktypes.CreateSessionOptions{
+        Name:    "shell",
+        Command: "bash",
+        Workdir: "/workspace",
+        Pty:     true,
+        Cols:    120,
+        Rows:    40,
+    })
+    if err != nil { log.Fatal(err) }
+
+    fmt.Println(session.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let session = sandbox.create_session(aerolvm_sdk::CreateSessionOptions {
+        name:     Some("shell".to_string()),
+        command:  Some("bash".to_string()),
+        work_dir: Some("/workspace".to_string()),
+        pty:      Some(true),
+        cols:     Some(120),
+        rows:     Some(40),
+        ..Default::default()
+    })?;
+
+    println!("{}", session.id);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Session session = sandbox.createSession(
+        new CreateSessionOptions()
+            .setName("shell")
+            .setCommand("bash")
+            .setWorkDir("/workspace")
+            .setPty(true)
+            .setCols(120)
+            .setRows(40)
+    );
+
+    System.out.println(session.id);
+    ```
+  </TabItem>
+</Tabs>
+
+## Attach to a Session
+
+On connect, the sandbox replays the in-memory output buffer so the client sees past output immediately. Multiple clients can attach to the same session simultaneously.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const attach = sandbox.attachSession(session.id, {
+      cols:     120,
+      rows:     40,
+      onStdout: chunk => process.stdout.write(chunk),
+    })
+
+    attach.write('echo hello\n')
+    const exit = await attach.done
+    console.log(exit.code)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import sys
+
+    attach = sandbox.attach_session(
+        session['id'],
+        {
+            'cols':     120,
+            'rows':     40,
+            'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
+        },
+    )
+
+    attach.write('echo hello\n')
+    print(attach.wait())
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    attached, err := sandbox.AttachSession(ctx, session.ID, microvm.SessionAttachOptions{
+        Cols:     120,
+        Rows:     40,
+        OnStdout: func(chunk []byte) { os.Stdout.Write(chunk) },
+    })
+    if err != nil { log.Fatal(err) }
+
+    _ = attached.WriteString("echo hello\n")
+    code, signal, err := attached.Wait()
+    fmt.Println(code, signal, err)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::sync::Arc;
+
+    let attached = sandbox.attach_session(
+        &session.id,
+        aerolvm_sdk::SessionAttachOptions {
+            cols:      Some(120),
+            rows:      Some(40),
+            on_stdout: Some(Arc::new(|chunk| {
+                print!("{}", String::from_utf8_lossy(&chunk))
+            })),
+            ..Default::default()
+        },
+    )?;
+
+    attached.write_string("echo hello\n")?;
+    println!("{:?}", attached.wait()?);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    SessionAttachHandle attach = sandbox.attachSession(
+        session.id,
+        new SessionAttachOptions()
+            .setCols(120)
+            .setRows(40)
+            .setOnStdout(chunk ->
+                System.out.print(new String(chunk, StandardCharsets.UTF_8)))
+    );
+
+    attach.write("echo hello\n");
+    attach.waitForExit();
+    ```
+  </TabItem>
+</Tabs>
+
+## Session Log
+
+Retrieve buffered output without opening a WebSocket connection.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const log = await sandbox.sessionLog(session.id)
+    console.log(log.toString())
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    log = sandbox.session_log(session['id'])
+    print(log.decode())
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    log, err := sandbox.SessionLog(ctx, session.ID)
+    fmt.Println(string(log))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let log = sandbox.session_log(&session.id)?;
+    println!("{}", String::from_utf8_lossy(&log));
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    byte[] log = sandbox.sessionLog(session.id);
+    System.out.println(new String(log));
+    ```
+  </TabItem>
+</Tabs>
+
+## How Sessions Work
+
+The sandbox starts the process with either a PTY or a pipe pair. Output is written into a ring buffer in memory and fanned out to all currently attached clients. When a new client attaches, it reads the entire ring buffer before receiving live frames, giving a seamless replay experience.
+
+Sessions are tied to the sandbox's runtime. If the sandbox is stopped and restarted, sessions do not persist across the restart.
+
+## Difference from execStream
+
+| | `execStream` | Session |
+|---|---|---|
+| Process lifetime | Tied to WebSocket | Independent of connection |
+| Reconnect | Process killed on disconnect | Process keeps running |
+| Multi-client | No | Yes — concurrent attachment |
+| Output replay | No | Yes — ring buffer |
+| Use case | One-shot commands | Interactive shells, agents |

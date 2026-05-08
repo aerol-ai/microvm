@@ -74,7 +74,7 @@ defer client.Destroy(ctx, sandbox.ID)
 
 ## Java
 
-See [Java SDK](/java-sdk) for Maven/Gradle setup.
+Add the GitHub Packages repository and dependency to your `pom.xml`. See [Server Setup](/getting-started) for the GitHub token needed for `read:packages`.
 
 ```java
 import ai.aerol.microvm.MicroVMClient;
@@ -105,4 +105,4 @@ let client = Client::new(
 ## Next Steps
 
 - [Quick Start](/quick-start) — run your first command inside a sandbox
-- [SDK Reference](/sdk-clients) — full API surface for each language
+- [Create Sandbox](/sandboxes) — full sandbox lifecycle with all SDK examples

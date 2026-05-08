@@ -1,0 +1,309 @@
+---
+title: Process & Code Execution
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+# Process & Code Execution
+
+`exec` runs a command, buffers its full output, and returns when the command exits. Use it for short, non-interactive commands.
+
+`execStream` opens a live WebSocket connection that streams stdout/stderr in real time, accepts stdin, and optionally allocates a pseudo-terminal (PTY) for interactive programs like `bash`, `vim`, or `top`.
+
+## When to use which
+
+| Use case | Method |
+|---|---|
+| `ls`, `git status`, anything short and non-interactive | `exec` |
+| `npm install`, `make`, anything where you want live output | `execStream` |
+| `bash`, `python -i`, `vim`, anything interactive | `execStream` with `tty: true` |
+| Multi-gigabyte output | `execStream` |
+
+## One-shot exec
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({ command: 'echo hello' })
+    console.log(result.stdout)  // "hello\n"
+    console.log(result.exitCode)
+
+    // With working directory and environment variables
+    const result2 = await sandbox.exec({
+      command: 'node index.js',
+      workDir: '/workspace',
+      env: { NODE_ENV: 'production' },
+      timeoutSeconds: 30,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec_command('echo hello')
+    print(result['stdout'])   # "hello\n"
+    print(result['exit_code'])
+
+    # With options
+    result2 = sandbox.exec_command('node index.js', workdir='/workspace', env={'NODE_ENV': 'production'})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.ExecCommand(ctx, "echo hello")
+    if err != nil { log.Fatal(err) }
+    fmt.Println(result.Stdout)
+
+    // With full options
+    result2, err := sandbox.Exec(ctx, sdktypes.ExecOptions{
+        Command:        "node index.js",
+        Workdir:        "/workspace",
+        Env:            map[string]string{"NODE_ENV": "production"},
+        TimeoutSeconds: 30,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let result = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command: "echo hello".to_string(),
+        ..Default::default()
+    })?;
+    println!("{}", result.stdout);
+
+    // With options
+    let result2 = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command:         "node index.js".to_string(),
+        work_dir:        Some("/workspace".to_string()),
+        timeout_seconds: Some(30),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec(new ExecOptions().setCommand("echo hello"));
+    System.out.println(result.stdout);   // "hello\n"
+    System.out.println(result.exitCode);
+
+    // With options
+    ExecResult result2 = sandbox.exec(
+        new ExecOptions()
+            .setCommand("node index.js")
+            .setWorkDir("/workspace")
+            .setEnv(Map.of("NODE_ENV", "production"))
+            .setTimeoutSeconds(30)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Live streaming output
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const handle = sandbox.execStream({
+      command:   'npm install',
+      workdir:   '/workspace',
+      onStdout:  chunk => process.stdout.write(chunk),
+      onStderr:  chunk => process.stderr.write(chunk),
+    })
+
+    const { code } = await handle.done
+    console.log(`exited with ${code}`)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import sys
+
+    handle = sandbox.exec_stream({
+        'command':  'npm install',
+        'workdir':  '/workspace',
+        'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
+        'onStderr': lambda chunk: sys.stderr.buffer.write(chunk),
+    })
+
+    print(handle.wait())  # {'code': 0}
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    handle, err := sandbox.ExecStream(ctx, sdktypes.ExecStreamOptions{
+        Command: "npm install",
+        Workdir: "/workspace",
+        OnStdout: func(chunk []byte) { os.Stdout.Write(chunk) },
+        OnStderr: func(chunk []byte) { os.Stderr.Write(chunk) },
+    })
+    if err != nil { log.Fatal(err) }
+
+    exit, err := handle.Wait()
+    fmt.Println(exit.Code, exit.Signal)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::sync::Arc;
+
+    let handle = sandbox.exec_stream(aerolvm_sdk::ExecStreamOptions {
+        command:   "npm install".to_string(),
+        on_stdout: Some(Arc::new(|chunk| {
+            print!("{}", String::from_utf8_lossy(&chunk))
+        })),
+        ..Default::default()
+    })?;
+
+    println!("{:?}", handle.wait()?);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecStreamHandle handle = sandbox.execStream(
+        new ExecStreamOptions()
+            .setCommand("npm install")
+            .setWorkDir("/workspace")
+            .setOnStdout(chunk ->
+                System.out.print(new String(chunk, StandardCharsets.UTF_8)))
+    );
+
+    ExecExitInfo exit = handle.waitForExit();
+    System.out.println(exit.code);
+    ```
+  </TabItem>
+</Tabs>
+
+## Interactive shell with PTY
+
+In PTY mode, stdout and stderr are merged onto the terminal, so only `onStdout` fires.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const handle = sandbox.execStream({
+      command:  'bash',
+      tty:      true,
+      cols:     process.stdout.columns,
+      rows:     process.stdout.rows,
+      onStdout: chunk => process.stdout.write(chunk),
+    })
+
+    process.stdin.setRawMode?.(true)
+    process.stdin.on('data', chunk => handle.write(chunk))
+
+    process.stdout.on('resize', () => {
+      handle.resize(process.stdout.columns, process.stdout.rows)
+    })
+
+    await handle.done
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import sys
+
+    handle = sandbox.exec_stream({
+        'command':  'bash',
+        'tty':      True,
+        'cols':     120,
+        'rows':     40,
+        'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
+    })
+
+    handle.write('echo hello\n')
+    print(handle.wait())
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    handle, err := sandbox.ExecStream(ctx, sdktypes.ExecStreamOptions{
+        Command: "bash",
+        TTY:     true,
+        Cols:    120,
+        Rows:    40,
+        OnStdout: func(chunk []byte) { fmt.Print(string(chunk)) },
+    })
+    if err != nil { log.Fatal(err) }
+
+    if err := handle.WriteString("echo hello\n"); err != nil { log.Fatal(err) }
+
+    exit, err := handle.Wait()
+    fmt.Println(exit.Code, exit.Signal)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::sync::Arc;
+
+    let handle = sandbox.exec_stream(aerolvm_sdk::ExecStreamOptions {
+        command:   "bash".to_string(),
+        tty:       true,
+        cols:      Some(120),
+        rows:      Some(40),
+        on_stdout: Some(Arc::new(|chunk| {
+            print!("{}", String::from_utf8_lossy(&chunk))
+        })),
+        ..Default::default()
+    })?;
+
+    handle.write_string("echo hello\n")?;
+    println!("{:?}", handle.wait()?);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecStreamHandle handle = sandbox.execStream(
+        new ExecStreamOptions()
+            .setCommand("bash")
+            .setTty(true)
+            .setCols(120)
+            .setRows(40)
+            .setOnStdout(chunk ->
+                System.out.print(new String(chunk, StandardCharsets.UTF_8)))
+    );
+
+    handle.write("echo hello\n");
+    ExecExitInfo exit = handle.waitForExit();
+    System.out.println(exit.code);
+    ```
+  </TabItem>
+</Tabs>
+
+## Sending signals
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    handle.signal('INT')   // Ctrl-C
+    handle.signal('TERM')
+    handle.signal('KILL')
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    handle.signal('INT')
+    handle.signal('TERM')
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    handle.Signal("INT")
+    handle.Signal("TERM")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    handle.signal("INT")?;
+    handle.signal("TERM")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    handle.signal("INT");
+    handle.signal("TERM");
+    ```
+  </TabItem>
+</Tabs>
+
+Signals target the process group, so child processes receive them too.
+
+For persistent interactive processes that survive reconnects, see [Sessions](/sessions).

@@ -1,0 +1,358 @@
+---
+title: Create Sandbox
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A sandbox is an isolated compute environment. Each sandbox has its own filesystem, network namespace, and configurable vCPU, memory, and disk. Sandboxes spin up in under 90ms and run any OCI-compatible image.
+
+## Lifecycle States
+
+```
+created ──► running ──► stopped ──► running
+                │
+                ▼
+           destroyed
+```
+
+| State | Description |
+|---|---|
+| `running` | Sandbox is up and accepting requests. |
+| `stopped` | Sandbox is paused; state is persisted. |
+| `destroyed` | Sandbox and all its data are permanently removed. |
+
+## Create
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      cpu: 1,
+      memoryMB: 1024,
+      diskGB: 10,
+      lifecycle: {
+        stopIfIdleFor: 60 * 60 * 1_000_000_000,   // 1 hour in nanoseconds
+        destroyAtAge: 24 * 60 * 60 * 1_000_000_000, // 24 hours in nanoseconds
+      },
+    })
+
+    console.log(sandbox.id)
+    console.log(sandbox.publicURL)
+    console.log(sandbox.sshPrivateKey) // only returned by create()
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url='https://sandbox.example.com',
+        pat_token='your-token',
+    )
+
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'cpu': 1.0,
+        'memoryMB': 1024,
+        'diskGB': 10,
+        'lifecycle': {
+            'stopIfIdleFor': 3_600_000_000_000,    # 1 hour
+            'destroyAtAge':  86_400_000_000_000,   # 24 hours
+        },
+    })
+
+    print(sandbox.id)
+    print(sandbox.publicURL)
+    print(sandbox.sshPrivateKey)  # only returned by create()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+        "os"
+        "time"
+
+        microvm   "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes  "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   os.Getenv("SB_API_URL"),
+        PATToken: os.Getenv("SB_PAT_TOKEN"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        CPU:      1,
+        MemoryMB: 1024,
+        DiskGB:   10,
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: time.Hour,
+            DestroyAtAge:  24 * time.Hour,
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    fmt.Println(sandbox.SSHPrivateKey) // only returned by Create()
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions, Lifecycle};
+
+    let client = Client::new(
+        Some("https://sandbox.example.com"),
+        Some("your-token"),
+    )?;
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        cpu: Some(1),
+        memory_mb: Some(1024),
+        disk_gb: Some(10),
+        lifecycle: Some(Lifecycle {
+            stop_if_idle_for: 3_600_000_000_000,
+            destroy_at_age:   86_400_000_000_000,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+
+    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    println!("{:?}", sandbox.ssh_private_key); // only returned by create()
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.Lifecycle;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl("https://sandbox.example.com")
+            .setPatToken(System.getenv("SB_PAT_TOKEN"))
+    );
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setCpu(1.0)
+            .setMemoryMb(1024)
+            .setDiskGb(10)
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(3_600_000_000_000L)
+                .setDestroyAtAge(86_400_000_000_000L))
+    );
+
+    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    System.out.println(sandbox.sshPrivateKey); // only returned by create()
+    ```
+  </TabItem>
+</Tabs>
+
+## Start and Stop
+
+Stopping persists all container-level state. Starting resumes from the persisted image layer — running processes are not retained across a stop/start cycle.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.stop()
+    await sandbox.start()
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.stop()
+    sandbox.start()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := sandbox.Stop(ctx); err != nil { log.Fatal(err) }
+    if err := sandbox.Start(ctx); err != nil { log.Fatal(err) }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.stop()?;
+    sandbox.start()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.stop();
+    sandbox.start();
+    ```
+  </TabItem>
+</Tabs>
+
+## Destroy
+
+Permanently removes the sandbox, all its data, and its metadata. External storage mounts are unmounted before removal.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := sandbox.Destroy(ctx); err != nil { log.Fatal(err) }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.destroy()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.destroy();
+    ```
+  </TabItem>
+</Tabs>
+
+## Resize
+
+Change CPU or memory allocation on a running sandbox without restarting it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.resize({ cpu: 2, memoryMB: 2048 })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.resize({'cpu': 2, 'memoryMB': 2048})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.Resize(ctx, sdktypes.ResizeOptions{CPU: 2, MemoryMB: 2048})
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.resize(aerolvm_sdk::ResizeOptions { cpu: Some(2), memory_mb: Some(2048) })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.resize(new ResizeOptions().setCpu(2.0).setMemoryMb(2048));
+    ```
+  </TabItem>
+</Tabs>
+
+## List and Get
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandboxes = await client.list()
+    const sandbox   = await client.get(id)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandboxes = client.list()
+    sandbox   = client.get(sandbox_id)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandboxes, err := client.List(ctx)
+    sandbox, err   := client.Get(ctx, id)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandboxes = client.list()?;
+    let sandbox   = client.get(&id)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    var sandboxes = client.list();
+    var sandbox   = client.get(id);
+    ```
+  </TabItem>
+</Tabs>
+
+## Idle Lifecycle
+
+Sandboxes can self-terminate based on age or inactivity. Lifecycle parameters can be updated at any time without restarting the sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.updateLifecycle({
+      stopIfIdleFor: 2 * 60 * 60 * 1_000_000_000,  // 2 hours
+      destroyAtAge:  48 * 60 * 60 * 1_000_000_000, // 48 hours
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.update_lifecycle({
+        'stopIfIdleFor': 7_200_000_000_000,
+        'destroyAtAge':  172_800_000_000_000,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UpdateLifecycle(ctx, sdktypes.Lifecycle{
+        StopIfIdleFor: 2 * time.Hour,
+        DestroyAtAge:  48 * time.Hour,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.update_lifecycle(aerolvm_sdk::Lifecycle {
+        stop_if_idle_for: 7_200_000_000_000,
+        destroy_at_age:   172_800_000_000_000,
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.updateLifecycle(
+        new Lifecycle()
+            .setStopIfIdleFor(7_200_000_000_000L)
+            .setDestroyAtAge(172_800_000_000_000L)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+See [Environment](/environment) for image selection, environment variables, and resource defaults.

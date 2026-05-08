@@ -1,0 +1,169 @@
+---
+title: File System
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Transfer files between your application and the sandbox using the sandbox API. All file operations use the same bearer token as the rest of the API.
+
+## Upload
+
+Send a file into the sandbox. Parent directories are created automatically if they do not exist.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const content = Buffer.from('print("hello")')
+    await sandbox.uploadFile('/workspace/hello.py', content)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    content = b'print("hello")'
+    sandbox.upload_file('/workspace/hello.py', content)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    content := []byte(`print("hello")`)
+    err := sandbox.UploadFile(ctx, "/workspace/hello.py", content)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let content = b"print(\"hello\")";
+    sandbox.upload_file("/workspace/hello.py", content)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    byte[] content = "print(\"hello\")".getBytes();
+    sandbox.uploadFile("/workspace/hello.py", content);
+    ```
+  </TabItem>
+</Tabs>
+
+## Download
+
+Retrieve a file from the sandbox. The response is the raw file bytes.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const bytes = await sandbox.downloadFile('/workspace/output.txt')
+    console.log(bytes.toString())
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    data = sandbox.download_file('/workspace/output.txt')
+    print(data.decode())
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    data, err := sandbox.DownloadFile(ctx, "/workspace/output.txt")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let data = sandbox.download_file("/workspace/output.txt")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    byte[] data = sandbox.downloadFile("/workspace/output.txt");
+    System.out.println(new String(data));
+    ```
+  </TabItem>
+</Tabs>
+
+## Common Patterns
+
+### Upload and run a script
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.uploadFile('/run.sh', Buffer.from('#!/bin/bash\necho hello'))
+    const result = await sandbox.exec({ command: 'bash /run.sh' })
+    console.log(result.stdout)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.upload_file('/run.sh', b'#!/bin/bash\necho hello')
+    result = sandbox.exec_command('bash /run.sh')
+    print(result['stdout'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _ = sandbox.UploadFile(ctx, "/run.sh", []byte("#!/bin/bash\necho hello"))
+    result, err := sandbox.ExecCommand(ctx, "bash /run.sh")
+    fmt.Println(result.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.upload_file("/run.sh", b"#!/bin/bash\necho hello")?;
+    let result = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command: "bash /run.sh".to_string(),
+        ..Default::default()
+    })?;
+    println!("{}", result.stdout);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadFile("/run.sh", "#!/bin/bash\necho hello".getBytes());
+    ExecResult result = sandbox.exec(new ExecOptions().setCommand("bash /run.sh"));
+    System.out.println(result.stdout);
+    ```
+  </TabItem>
+</Tabs>
+
+### Retrieve generated output
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.exec({ command: 'python3 -c "import json; json.dump({\'x\': 1}, open(\'/out.json\', \'w\'))"' })
+    const bytes = await sandbox.downloadFile('/out.json')
+    const data  = JSON.parse(bytes.toString())
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.exec_command("python3 -c \"import json; json.dump({'x': 1}, open('/out.json', 'w'))\"")
+    data = sandbox.download_file('/out.json')
+    import json
+    print(json.loads(data))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox.ExecCommand(ctx, `python3 -c "import json; json.dump({'x': 1}, open('/out.json', 'w'))"`)
+    data, _ := sandbox.DownloadFile(ctx, "/out.json")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.exec(aerolvm_sdk::ExecRequest {
+        command: r#"python3 -c "import json; json.dump({'x': 1}, open('/out.json', 'w'))""#.to_string(),
+        ..Default::default()
+    })?;
+    let data = sandbox.download_file("/out.json")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.exec(new ExecOptions().setCommand("python3 -c \"import json; json.dump({'x': 1}, open('/out.json', 'w'))\""));
+    byte[] data = sandbox.downloadFile("/out.json");
+    ```
+  </TabItem>
+</Tabs>
+
+## Limits
+
+File uploads are limited to 256 MB by default. For larger transfers, use [External Storage](/external-storage) to mount an S3 bucket or NFS share directly into the sandbox.
