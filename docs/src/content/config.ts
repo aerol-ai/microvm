@@ -47,12 +47,6 @@ export const getSidebarConfig = (): NavigationGroup[] => [
         label: 'SDK Setup',
         description: 'Connect an SDK to your AerolVM server.',
       },
-      {
-        type: 'link',
-        href: '/sandboxes',
-        label: 'Sandboxes',
-        description: 'Sandbox concept, lifecycle states, and core API operations.',
-      },
     ],
   },
   {
