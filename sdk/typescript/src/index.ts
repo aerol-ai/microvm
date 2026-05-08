@@ -1,6 +1,6 @@
-export { MicroVM } from "./MicroVM";
-export { Sandbox } from "./Sandbox";
-export type { MicroVMConfig } from "./MicroVM";
+export { MicroVM } from "./MicroVM.js";
+export { Sandbox } from "./Sandbox.js";
+export type { MicroVMConfig } from "./MicroVM.js";
 export type {
   BinaryLike,
   CreateOptions,
