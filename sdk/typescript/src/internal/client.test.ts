@@ -234,6 +234,130 @@ test("internal client execStream uses sandbox bearer subprotocol", async () => {
   }
 });
 
+test("internal client execStream close keeps waiting for exit", async () => {
+  const originalWebSocket = globalThis.WebSocket;
+
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+
+    readonly url: string;
+    readonly protocols: string[];
+    binaryType = "blob";
+    sent: Array<string | Uint8Array> = [];
+    closed = false;
+    private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+    constructor(url: string, protocols?: string | string[]) {
+      this.url = url;
+      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(name: string, listener: (event?: unknown) => void): void {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+
+    send(data: string | Uint8Array): void {
+      this.sent.push(data);
+    }
+
+    close(): void {
+      this.closed = true;
+    }
+
+    emit(name: string, event?: unknown): void {
+      for (const listener of this.listeners.get(name) ?? []) {
+        listener(event);
+      }
+    }
+  }
+
+  try {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+    });
+
+    const handle = client.execStream("sb-stream", { command: "npm install" });
+    const ws = FakeWebSocket.instances[0];
+    assert.ok(ws);
+
+    ws.emit("open");
+    handle.close();
+
+    assert.equal(ws.sent[1], JSON.stringify({ type: "close" }));
+    assert.equal(ws.closed, false);
+
+    ws.emit("message", { data: JSON.stringify({ type: "exit", code: 0 }) });
+    const result = await handle.done;
+    assert.equal(result.code, 0);
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("internal client execStream rejects when stream closes before exit", async () => {
+  const originalWebSocket = globalThis.WebSocket;
+
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+
+    readonly url: string;
+    readonly protocols: string[];
+    binaryType = "blob";
+    sent: Array<string | Uint8Array> = [];
+    private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+    constructor(url: string, protocols?: string | string[]) {
+      this.url = url;
+      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(name: string, listener: (event?: unknown) => void): void {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+
+    send(data: string | Uint8Array): void {
+      this.sent.push(data);
+    }
+
+    close(): void {}
+
+    emit(name: string, event?: unknown): void {
+      for (const listener of this.listeners.get(name) ?? []) {
+        listener(event);
+      }
+    }
+  }
+
+  try {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+    });
+
+    const handle = client.execStream("sb-stream", { command: "npm install" });
+    const ws = FakeWebSocket.instances[0];
+    assert.ok(ws);
+
+    ws.emit("open");
+    ws.emit("close");
+
+    await assert.rejects(handle.done, /stream closed before exit/);
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test("internal client create forwards runtime selector and parses response", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

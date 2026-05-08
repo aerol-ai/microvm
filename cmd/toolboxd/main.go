@@ -368,8 +368,19 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stdoutBytes, _ := io.ReadAll(stdout)
-	stderrBytes, _ := io.ReadAll(stderr)
+	var stdoutBytes []byte
+	var stderrBytes []byte
+	var readWG sync.WaitGroup
+	readWG.Add(2)
+	go func() {
+		defer readWG.Done()
+		stdoutBytes, _ = io.ReadAll(stdout)
+	}()
+	go func() {
+		defer readWG.Done()
+		stderrBytes, _ = io.ReadAll(stderr)
+	}()
+	readWG.Wait()
 	waitErr := cmd.Wait()
 
 	result := models.ExecResult{
@@ -378,16 +389,12 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		DurationMS: time.Since(start).Milliseconds(),
 	}
 
+	result.ExitCode, _ = interpretWaitResult(waitErr)
 	if waitErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			result.ExitCode = exitErr.ExitCode()
-		} else {
-			result.ExitCode = -1
+		if !errors.As(waitErr, &exitErr) && !errors.Is(waitErr, syscall.ECHILD) {
 			result.Stderr = strings.TrimSpace(result.Stderr + "\n" + waitErr.Error())
 		}
-	} else {
-		result.ExitCode = 0
 	}
 
 	writeJSON(w, http.StatusOK, result)
@@ -597,4 +604,3 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, models.ErrorResponse{Error: message})
 }
-

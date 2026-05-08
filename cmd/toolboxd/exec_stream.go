@@ -197,8 +197,11 @@ func (s *server) runWithPipes(conn *websocket.Conn, cmd *exec.Cmd) {
 				if err := json.Unmarshal(data, &ctrl); err != nil {
 					continue
 				}
-				if ctrl.Type == "signal" {
+				switch ctrl.Type {
+				case "signal":
 					sendSignalToCmd(cmd, ctrl.Signal)
+				case "close":
+					_ = stdinPipe.Close()
 				}
 			}
 		}
@@ -301,7 +304,10 @@ func writeStreamControl(conn *websocket.Conn, msg execStreamControlOut) {
 }
 
 func waitForCommand(cmd *exec.Cmd) (int, string) {
-	err := cmd.Wait()
+	return interpretWaitResult(cmd.Wait())
+}
+
+func interpretWaitResult(err error) (int, string) {
 	if err == nil {
 		return 0, ""
 	}
@@ -320,8 +326,7 @@ func waitForCommand(cmd *exec.Cmd) (int, string) {
 	// rare races this can cause the kernel to return ECHILD for our direct
 	// child before cmd.Wait() gets there. Since we only call this after all
 	// pipe I/O has completed (process definitely exited), treat ECHILD as 0.
-	var se *os.SyscallError
-	if errors.As(err, &se) && errors.Is(se.Err, syscall.ECHILD) {
+	if errors.Is(err, syscall.ECHILD) {
 		return 0, ""
 	}
 	return -1, err.Error()

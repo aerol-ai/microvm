@@ -745,7 +745,7 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
   });
 
   ws.addEventListener("close", () => {
-    finishWith({ code: 0 });
+    failWith("stream closed before exit");
   });
 
   ws.addEventListener("error", () => {
@@ -767,7 +767,6 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
     },
     close() {
       ws.send(JSON.stringify({ type: "close" }));
-      ws.close();
     },
     done,
   };
