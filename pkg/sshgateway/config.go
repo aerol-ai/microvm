@@ -40,7 +40,7 @@ func LoadOrGenerateHostKey(path string) (ssh.Signer, error) {
 		return nil, fmt.Errorf("generate ed25519 key: %w", err)
 	}
 
-	block, err := ssh.MarshalPrivateKey(priv, "sandbox-library host key")
+	block, err := ssh.MarshalPrivateKey(priv, "AerolVM host key")
 	if err != nil {
 		return nil, fmt.Errorf("marshal host key: %w", err)
 	}

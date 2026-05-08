@@ -535,7 +535,7 @@ write_caddy_env() {
 	# enough. write_caddy_systemd_dropin() installs a drop-in that wires it
 	# in. 0600 root:root is fine — Caddy receives the value via process env.
 	cat > /etc/default/caddy <<EOF
-# Managed by sandbox-library install.sh.
+# Managed by AerolVM install.sh.
 # Read by Caddy via {env.SB_DNS_API_TOKEN} substitution in /etc/caddy/Caddyfile.
 SB_DNS_API_TOKEN=$DNS_API_TOKEN
 EOF
@@ -557,7 +557,7 @@ EOF
 write_systemd_unit() {
 	cat > /etc/systemd/system/sandboxd.service <<EOF
 [Unit]
-Description=sandbox-library daemon
+Description=AerolVM daemon
 After=docker.service caddy.service network-online.target
 Wants=network-online.target
 Requires=docker.service
@@ -618,7 +618,7 @@ EOF
 write_healthcheck_units() {
 	cat > /etc/systemd/system/sandboxd-healthcheck.service <<EOF
 [Unit]
-Description=sandbox-library health watchdog
+Description=AerolVM health watchdog
 After=sandboxd.service network-online.target
 Wants=network-online.target
 
@@ -629,7 +629,7 @@ EOF
 
 	cat > /etc/systemd/system/sandboxd-healthcheck.timer <<EOF
 [Unit]
-Description=Run sandbox-library health watchdog
+Description=Run AerolVM health watchdog
 
 [Timer]
 OnBootSec=45s
@@ -773,7 +773,7 @@ write_healthcheck_units
 systemctl daemon-reload
 systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
 
-echo "sandbox-library installed"
+echo "AerolVM installed"
 echo "PAT token: $PAT_TOKEN"
 echo "Use header: Authorization: Bearer <PAT token>"
 if [[ -n "$DOMAIN" ]]; then

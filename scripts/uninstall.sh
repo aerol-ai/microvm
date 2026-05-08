@@ -14,4 +14,4 @@ rm -f /usr/local/bin/sandboxd /usr/local/bin/toolboxd
 
 systemctl daemon-reload
 
-echo "sandbox-library removed. Docker, Caddy, and sandbox data were left in place."
+echo "AerolVM removed. Docker, Caddy, and sandbox data were left in place."

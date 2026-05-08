@@ -297,7 +297,7 @@ func generateSandboxSSHKeys() (authorizedKey, privateKeyPEM string, err error) {
 		return "", "", fmt.Errorf("derive signer: %w", err)
 	}
 	authorizedKey = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
-	block, err := ssh.MarshalPrivateKey(priv, "sandbox-library sandbox key")
+	block, err := ssh.MarshalPrivateKey(priv, "AerolVM sandbox key")
 	if err != nil {
 		return "", "", fmt.Errorf("marshal private key: %w", err)
 	}

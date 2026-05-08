@@ -1,6 +1,6 @@
-# sandbox-library
+# AerolVM
 
-`sandbox-library` turns a single Linux host into a sandbox runner with a small control-plane API, Docker-backed container lifecycle management, and dynamic Caddy routes for public access.
+`AerolVM` turns a single Linux host into a sandbox runner with a small control-plane API, Docker-backed container lifecycle management, and dynamic Caddy routes for public access.
 
 This repository ships two binaries:
 
@@ -28,7 +28,7 @@ make build
 
 ## Docs Site
 
-The root [docs](/Users/sumansaurabh/Documents/startup-3/sandbox-library/docs) folder now contains a standalone Astro + Starlight docs app themed after the Daytona docs framework, but populated with this repository's content.
+The root [docs](docs) folder now contains a standalone Astro + Starlight docs app themed after the Daytona docs framework, but populated with this repository's content.
 
 Install and run it with:
 

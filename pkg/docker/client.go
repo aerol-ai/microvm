@@ -24,7 +24,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
-const managedLabelKey = "sandbox-library.managed"
+const managedLabelKey = "aerolvm.managed"
 
 // SandboxRuntime is the Docker-layer alias of the canonical
 // models.SandboxRuntimeState type. The alias keeps every existing reference

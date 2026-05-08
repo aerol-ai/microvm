@@ -1,5 +1,5 @@
 [Unit]
-Description=sandbox-library daemon
+Description=AerolVM daemon
 After=docker.service caddy.service network-online.target
 Wants=network-online.target
 Requires=docker.service
