@@ -1,4 +1,6 @@
+---
 title: External Storage
+---
 
 # External Storage (Bring Your Own Bucket)
 

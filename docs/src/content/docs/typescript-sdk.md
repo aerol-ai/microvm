@@ -1,4 +1,6 @@
+---
 title: TypeScript SDK
+---
 
 The TypeScript SDK lives under `sdk/typescript` and publishes as `@aerol-ai/aerolvm-sdk`.
 

@@ -1,4 +1,6 @@
+---
 title: Preview
+---
 
 Every sandbox gets a public URL that routes to the sandbox's API endpoint. You can also expose additional ports on separate public URLs so browsers and external tools can reach services running inside the sandbox.
 

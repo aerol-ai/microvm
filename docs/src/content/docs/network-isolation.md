@@ -1,4 +1,6 @@
+---
 title: Network Isolation
+---
 
 # Network Isolation
 

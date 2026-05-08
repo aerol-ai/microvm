@@ -1,4 +1,6 @@
+---
 title: Sandboxes
+---
 
 A sandbox is an isolated compute environment. Each sandbox has:
 

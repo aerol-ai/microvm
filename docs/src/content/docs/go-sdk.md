@@ -1,4 +1,6 @@
+---
 title: Go SDK
+---
 
 The Go SDK lives under `sdk/go` and is imported as `github.com/aerol-ai/microvm/sdk/go/pkg/microvm`.
 

@@ -1,4 +1,6 @@
+---
 title: Python SDK
+---
 
 The Python SDK lives under `sdk/python`, publishes as `aerolvm-sdk`, and is imported as `microvm`.
 

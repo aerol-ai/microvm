@@ -1,4 +1,6 @@
+---
 title: Java SDK
+---
 
 The Java SDK lives under `sdk/java` and publishes to GitHub Packages as `ai.aerol:aerolvm-sdk`.
 

@@ -1,4 +1,6 @@
+---
 title: Streaming Exec
+---
 
 # Streaming exec (with optional PTY)
 

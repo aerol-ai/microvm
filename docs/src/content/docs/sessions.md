@@ -1,4 +1,6 @@
+---
 title: Sessions
+---
 
 Sessions are persistent processes running inside a sandbox. Unlike `execStream`, which tears down the WebSocket when the connection drops, a session keeps running. Any new client that attaches receives a replay of buffered output and can then interact with the live process.
 
