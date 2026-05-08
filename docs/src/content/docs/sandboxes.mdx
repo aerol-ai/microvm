@@ -6,6 +6,64 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 A sandbox is an isolated compute environment. Each sandbox has its own filesystem, network namespace, and configurable vCPU, memory, and disk. Sandboxes spin up in under 90ms and run any OCI-compatible image.
 
+## Runtimes
+
+| Runtime | Status | Description |
+|---|---|---|
+| `docker` | ✅ | Standard runc-backed Docker. Default for most workloads. |
+| `gvisor` | ✅ | gVisor (runsc) - user-space kernel. Intercepts syscalls for untrusted code. |
+| `kata` | 🗓 | Planned - full VM isolation with hardware virtualization. |
+| `wasm` | 🗓 | Planned - ultra-lightweight portable workloads. |
+
+The default runtime is `docker`. Pass `runtime: 'gvisor'` in the create request to run in the gVisor user-space kernel. gVisor is ideal when running LLM-generated or otherwise untrusted code - the container process never talks directly to the Linux kernel.
+
+### Create a GVisor Sandbox
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      runtime: 'gvisor',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'runtime': 'gvisor',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:   "ubuntu:22.04",
+        Runtime: sdktypes.RuntimeGvisor,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image:   "ubuntu:22.04".to_string(),
+        runtime: Some("gvisor".to_string()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setRuntime("gvisor")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
 ## Lifecycle States
 
 ```
