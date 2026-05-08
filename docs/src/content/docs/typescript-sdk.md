@@ -3,18 +3,18 @@ title: TypeScript SDK
 description: Use the TypeScript client from Node.js or other fetch-compatible runtimes to control sandboxes.
 ---
 
-The TypeScript SDK lives under `sdk/typescript` and publishes as `@aerol-ai/microvm-sdk`.
+The TypeScript SDK lives under `sdk/typescript` and publishes as `@aerol-ai/aerolvm-sdk`.
 
 ## Install
 
 ```bash
-npm install @aerol-ai/microvm-sdk
+npm install @aerol-ai/aerolvm-sdk
 ```
 
 ## Create A Client
 
 ```ts
-import { MicroVM } from '@aerol-ai/microvm-sdk'
+import { MicroVM } from '@aerol-ai/aerolvm-sdk'
 
 const client = new MicroVM({
   apiUrl: process.env.SB_API_URL,

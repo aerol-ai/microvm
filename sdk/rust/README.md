@@ -2,10 +2,16 @@
 
 A Rust client for the Aerol.ai MicroVM sandbox API.
 
+## Install
+
+```bash
+cargo add aerolvm-sdk
+```
+
 ## Usage
 
 ```rust
-use microvm_sdk::{Client, CreateOptions, Lifecycle};
+use aerolvm_sdk::{Client, CreateOptions, Lifecycle};
 
 let client = Client::new(Some("http://127.0.0.1:8080"), Some("your-pat-token"))?;
 let health = client.health()?;
@@ -51,7 +57,7 @@ cargo run --example create_sandbox -- http://127.0.0.1:8080 your-pat-token ghcr.
 ```rust
 use std::sync::Arc;
 
-let handle = sandbox.exec_stream(microvm_sdk::ExecStreamOptions {
+let handle = sandbox.exec_stream(aerolvm_sdk::ExecStreamOptions {
 	command: "bash".to_string(),
 	tty: true,
 	cols: Some(120),
@@ -70,7 +76,7 @@ println!("{:?}", result);
 ```rust
 use std::sync::Arc;
 
-let session = sandbox.create_session(microvm_sdk::CreateSessionOptions {
+let session = sandbox.create_session(aerolvm_sdk::CreateSessionOptions {
 	name: Some("shell".to_string()),
 	command: Some("bash".to_string()),
 	work_dir: Some("/workspace".to_string()),
@@ -84,7 +90,7 @@ println!("session = {:?}", session);
 println!("sessions = {:?}", sandbox.list_sessions()?);
 println!("log = {}", String::from_utf8_lossy(&sandbox.session_log(&session.id)?));
 
-let handle = sandbox.attach_session(&session.id, microvm_sdk::SessionAttachOptions {
+let handle = sandbox.attach_session(&session.id, aerolvm_sdk::SessionAttachOptions {
 	cols: Some(120),
 	rows: Some(40),
 	on_stdout: Some(Arc::new(|chunk| print!("{}", String::from_utf8_lossy(&chunk)))),

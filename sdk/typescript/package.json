@@ -1,5 +1,5 @@
 {
-  "name": "@aerol-ai/microvm-sdk",
+  "name": "@aerol-ai/aerolvm-sdk",
   "version": "0.1.0",
   "private": false,
   "type": "module",

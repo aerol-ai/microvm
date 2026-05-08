@@ -1,4 +1,4 @@
-use microvm_sdk::{Client, CreateOptions};
+use aerolvm_sdk::{Client, CreateOptions};
 use std::env;
 
 fn main() {
