@@ -39,8 +39,8 @@ const { hasSidebar = true } = Astro.props
   .grid-template {
     position: relative;
     display: grid;
-    grid-template-columns: 1fr 4fr;
-    column-gap: 48px;
+    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+    column-gap: 20px;
   }
 
   .no-sidebar .grid-template {
