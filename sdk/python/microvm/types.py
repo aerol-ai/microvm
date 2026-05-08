@@ -54,6 +54,11 @@ class CreateOptions(TypedDict, total=False):
     containerCommand: List[str]
     mounts: List[MountSpec]
     lifecycle: Lifecycle
+    # Container runtime to use for this sandbox. Omit to inherit the host
+    # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
+    # when running untrusted workloads. "kata" is reserved and rejected by the
+    # API today.
+    runtime: Literal["docker", "gvisor", "kata"]
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -170,6 +175,9 @@ class SandboxData(TypedDict, total=False):
     lastError: str
     containerCommand: List[str]
     lifecycle: Lifecycle
+    # Container runtime this sandbox is running under. Empty string indicates
+    # a pre-migration row that resolves to the host default at start time.
+    runtime: Literal["", "docker", "gvisor", "kata"]
 
 
 class HealthStatus(TypedDict):

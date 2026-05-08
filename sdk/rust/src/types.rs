@@ -71,6 +71,12 @@ pub struct CreateOptions {
     pub mounts: Option<Vec<MountSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<Lifecycle>,
+    /// Container runtime for this sandbox. Omit to inherit the host default
+    /// (SB_CONTAINER_RUNTIME). Use `"gvisor"` for runsc-backed isolation when
+    /// running untrusted workloads. `"kata"` is reserved and rejected by the
+    /// API today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -147,6 +153,10 @@ pub struct Sandbox {
     pub container_command: Option<Vec<String>>,
     #[serde(default)]
     pub lifecycle: Lifecycle,
+    /// Container runtime this sandbox is running under. Empty string indicates
+    /// a pre-migration row that resolves to the host default at start time.
+    #[serde(default)]
+    pub runtime: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

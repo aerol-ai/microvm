@@ -31,3 +31,9 @@ const (
 	MountTypeSSHFS  = models.MountTypeSSHFS
 	MountTypeRclone = models.MountTypeRclone
 )
+
+const (
+	RuntimeDocker = models.RuntimeDocker
+	RuntimeGvisor = models.RuntimeGvisor
+	RuntimeKata   = models.RuntimeKata
+)
