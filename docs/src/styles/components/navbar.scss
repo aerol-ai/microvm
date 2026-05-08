@@ -96,7 +96,7 @@
   }
 
   .version-pill,
-  .source-link {
+  .github-link {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -114,9 +114,13 @@
     border-color: rgba(58, 161, 255, 0.25);
   }
 
-  .source-link:hover {
-    color: var(--hover-color);
-    border-color: var(--hover-color);
+  .github-link {
+    gap: 6px;
+
+    &:hover {
+      color: var(--hover-color);
+      border-color: var(--hover-color);
+    }
   }
 
   .mobile-navigation {
