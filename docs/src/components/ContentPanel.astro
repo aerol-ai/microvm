@@ -12,10 +12,11 @@
   }
 
   .sl-container {
-    display: flex;
-    flex-direction: column;
-    gap: 24px;
     max-width: var(--sl-content-width);
+  }
+
+  .sl-container > :global(* + *) {
+    margin-top: 1.5rem;
   }
 
   @media (min-width: 72rem) {
