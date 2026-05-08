@@ -3,8 +3,8 @@ name: Publish SDKs
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Release tag to publish, for example v0.1.0
+      sdk_version:
+        description: SDK version to publish, for example v0.1.0
         required: true
         type: string
 
@@ -14,8 +14,7 @@ permissions:
   packages: write
 
 env:
-  VERSION: ${{ github.event.inputs.tag }}
-  SDK_VERSION: ${{ github.event.inputs.tag }}
+  SDK_VERSION: ${{ github.event.inputs.sdk_version }}
 
 jobs:
   java:
@@ -28,7 +27,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.VERSION }}
+          ref: refs/heads/main
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -41,12 +40,12 @@ jobs:
           server-username: GITHUB_ACTOR
           server-password: GITHUB_TOKEN
 
-      - name: Verify package version matches tag
+      - name: Verify package version matches requested SDK version
         run: |
           package_version="$(python -c "import xml.etree.ElementTree as ET; root = ET.parse('pom.xml').getroot(); ns = {'m': 'http://maven.apache.org/POM/4.0.0'}; print(root.findtext('m:version', namespaces=ns) or '')")"
           release_version="${SDK_VERSION#v}"
           if [[ "$package_version" != "$release_version" ]]; then
-            echo "::error::sdk/java/pom.xml version $package_version does not match tag $release_version"
+            echo "::error::sdk/java/pom.xml version $package_version does not match requested SDK version $release_version"
             exit 1
           fi
 
@@ -86,7 +85,7 @@ jobs:
           fi
 
           if [[ "$existing_artifacts" -ne "${#artifact_urls[@]}" ]]; then
-            echo "::error::Java SDK version ${SDK_VERSION#v} is only partially present in GitHub Packages. Delete that package version or publish a new SDK version and tag instead of retrying this deploy."
+            echo "::error::Java SDK version ${SDK_VERSION#v} is only partially present in GitHub Packages. Delete that package version or publish a new SDK version instead of retrying this deploy."
             exit 1
           fi
 
@@ -115,7 +114,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.VERSION }}
+          ref: refs/heads/main
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -134,12 +133,12 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Verify package version matches tag
+      - name: Verify package version matches requested SDK version
         run: |
           package_version="$(node -p "require('./package.json').version")"
           release_version="${SDK_VERSION#v}"
           if [[ "$package_version" != "$release_version" ]]; then
-            echo "::error::sdk/typescript/package.json version $package_version does not match tag $release_version"
+            echo "::error::sdk/typescript/package.json version $package_version does not match requested SDK version $release_version"
             exit 1
           fi
 
@@ -170,7 +169,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.VERSION }}
+          ref: refs/heads/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -188,12 +187,12 @@ jobs:
         env:
           PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
-      - name: Verify package version matches tag
+      - name: Verify package version matches requested SDK version
         run: |
           package_version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
           release_version="${SDK_VERSION#v}"
           if [[ "$package_version" != "$release_version" ]]; then
-            echo "::error::sdk/python/pyproject.toml version $package_version does not match tag $release_version"
+            echo "::error::sdk/python/pyproject.toml version $package_version does not match requested SDK version $release_version"
             exit 1
           fi
 
@@ -227,7 +226,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.VERSION }}
+          ref: refs/heads/main
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -241,12 +240,12 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Verify package version matches tag
+      - name: Verify package version matches requested SDK version
         run: |
           package_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
           release_version="${SDK_VERSION#v}"
           if [[ "$package_version" != "$release_version" ]]; then
-            echo "::error::sdk/rust/Cargo.toml version $package_version does not match tag $release_version"
+            echo "::error::sdk/rust/Cargo.toml version $package_version does not match requested SDK version $release_version"
             exit 1
           fi
 
