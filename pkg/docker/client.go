@@ -75,7 +75,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxPort:        cfg.ToolboxPort,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
-		defaultRuntime:     cfg.OCIRuntime,
+		defaultRuntime:     cfg.Runtime,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		streamClient:       &http.Client{Transport: transport},
 		toolboxClient:      &http.Client{Timeout: cfg.HTTPClientTimeout},
@@ -125,10 +125,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
-	// Resolve effective OCI runtime: per-sandbox override wins over the host
-	// default. The service layer is expected to substitute the host default
-	// into req.Runtime before calling Create, but we re-resolve here as a
-	// safety net so direct use of the docker client (e.g. tests) still works.
+	// Resolve the effective user-facing runtime: per-sandbox override wins
+	// over the host default. The service layer is expected to substitute the
+	// host default into req.Runtime before calling Create, but we re-resolve
+	// here as a safety net so direct use of the docker client (e.g. tests)
+	// still works.
 	effectiveRuntime := strings.TrimSpace(req.Runtime)
 	if effectiveRuntime == "" {
 		effectiveRuntime = c.defaultRuntime
@@ -136,8 +137,18 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// gVisor refuses privileged containers — its userspace kernel cannot
 	// safely grant the host capabilities --privileged implies. Catch the
 	// conflict here, before pulling the image and 30s into a doomed start.
-	if effectiveRuntime == models.RuntimeRunsc && c.privileged {
+	if effectiveRuntime == models.RuntimeGvisor && c.privileged {
 		return nil, fmt.Errorf("runtime %q is incompatible with privileged containers", effectiveRuntime)
+	}
+	// Translate user-facing name to the OCI runtime binary Docker actually
+	// looks up in /etc/docker/daemon.json. ResolveOCIRuntime returns "" for
+	// "docker" (let Docker use its compiled-in default) and "runsc" for
+	// "gvisor". "kata" returns ErrRuntimeNotImplemented; the service layer
+	// rejects those requests upfront, but we double-check here as a safety
+	// net for direct callers.
+	ociRuntime, err := models.ResolveOCIRuntime(effectiveRuntime)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := c.pullImage(ctx, req.Image, req.Registry); err != nil {
@@ -203,11 +214,12 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	// Only set HostConfig.Runtime when we actually need to override the
-	// daemon's default. Leaving it empty for runc is safer on hosts that
-	// haven't explicitly registered "runc" in /etc/docker/daemon.json — Docker
+	// daemon's default. ResolveOCIRuntime returns "" for the "docker"
+	// identifier so we leave the field unset — safer on hosts that haven't
+	// explicitly registered "runc" in /etc/docker/daemon.json, since Docker
 	// then falls back to its compiled-in default runtime.
-	if effectiveRuntime != "" && effectiveRuntime != models.RuntimeRunc {
-		hostConfig["Runtime"] = effectiveRuntime
+	if ociRuntime != "" {
+		hostConfig["Runtime"] = ociRuntime
 	}
 
 	if !c.resourceLimitsOff {
@@ -223,11 +235,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			resources["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
 		}
 		if req.DiskGB > 0 {
-			// gVisor's runsc does not honor StorageOpt size — silently
-			// applying it would mislead operators into thinking quota is
-			// enforced. Drop the field with a warning when runsc is in use.
-			if effectiveRuntime == models.RuntimeRunsc {
-				c.logger.Warn("ignoring disk quota: runsc does not support StorageOpt size",
+			// gVisor does not honor StorageOpt size — silently applying it
+			// would mislead operators into thinking quota is enforced. Drop
+			// the field with a warning when gvisor is in use.
+			if effectiveRuntime == models.RuntimeGvisor {
+				c.logger.Warn("ignoring disk quota: gvisor does not support StorageOpt size",
 					"sandbox_id", sandboxID, "disk_gb", req.DiskGB)
 			} else {
 				hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", req.DiskGB)}

@@ -233,12 +233,13 @@ export SB_TOOLBOX_BINARY_PATH=$PWD/bin/toolboxd
 
 If `SB_DOMAIN` is set, sandbox routes are created as subdomains like `https://<sandbox-id>.<domain>`. If `SB_DOMAIN` is empty, the daemon falls back to path-based URLs like `http://<public-host>/<sandbox-id>/`. For newly created sandboxes, `<sandbox-id>` is the Docker short ID: the first 12 characters of the full container ID.
 
-## Container runtime (Docker / gVisor)
+## Container runtime (Docker / gVisor / Kata)
 
-Sandboxes run under an OCI runtime selected per host (default for new sandboxes) and per request (override for a single sandbox). Two runtimes are supported today:
+Sandboxes run under a container runtime selected per host (default for new sandboxes) and per request (override for a single sandbox). The runtime is named in user-facing terms — what you'd search for, not which OCI binary backs it:
 
-- `runc` — Docker's standard runtime. Default. Lowest overhead. Trusted workloads.
-- `runsc` — [gVisor](https://gvisor.dev/). User-space kernel between the workload and the host. Significantly stronger isolation against kernel exploits. Recommended for untrusted code (LLM-generated, third-party submissions, CTFs).
+- `docker` — Docker's standard runtime (runc under the hood). Default. Lowest overhead. Trusted workloads.
+- `gvisor` — [gVisor](https://gvisor.dev/) (runsc under the hood). User-space kernel between the workload and the host. Significantly stronger isolation against kernel exploits. Recommended for untrusted code (LLM-generated, third-party submissions, CTFs).
+- `kata` — Reserved for [Kata Containers](https://katacontainers.io/) (full hardware-virtualized VMs). The identifier is accepted by configuration but create requests are rejected with `runtime not yet implemented` until the runtime is wired up.
 
 ### Host setup for gVisor
 
@@ -259,7 +260,7 @@ If you've already installed `runsc` yourself (e.g. from `apt`, or a custom build
 
 ```bash
 # Host default for new sandboxes (env on sandboxd):
-export SB_CONTAINER_OCI_RUNTIME=runc   # or "runsc" to default everything to gVisor
+export SB_CONTAINER_RUNTIME=docker   # or "gvisor" to default everything to gVisor
 ```
 
 Per-sandbox override on the create request:
@@ -267,15 +268,15 @@ Per-sandbox override on the create request:
 ```bash
 curl -X POST $SB_API/v1/sandboxes \
   -H "Authorization: Bearer $SB_PAT_TOKEN" \
-  -d '{"image":"alpine","cpu":0.5,"memory_mb":256,"runtime":"runsc"}'
+  -d '{"image":"alpine","cpu":0.5,"memory_mb":256,"runtime":"gvisor"}'
 ```
 
 The persisted sandbox row records the resolved runtime so the choice cannot drift across host restarts.
 
 ### gVisor caveats
 
-- `--privileged` is incompatible with `runsc`. Sandboxd rejects the combination at create time with a clear error.
-- `runsc` does not honor Docker's `StorageOpt size` per-sandbox disk quota. `disk_gb` is silently dropped (with a warning log) when the runtime is `runsc`. CPU and memory caps still work.
+- `--privileged` is incompatible with `gvisor`. Sandboxd rejects the combination at create time with a clear error.
+- gVisor does not honor Docker's `StorageOpt size` per-sandbox disk quota. `disk_gb` is silently dropped (with a warning log) when the runtime is `gvisor`. CPU and memory caps still work.
 - The host's cgroup driver must match Docker's. cgroupv2 + systemd is the recommended setup.
 
 ## API summary

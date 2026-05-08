@@ -75,7 +75,15 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	if chosenRuntime == "" {
-		chosenRuntime = s.cfg.OCIRuntime
+		chosenRuntime = s.cfg.Runtime
+	}
+	// "kata" is reserved as a future runtime. Accept it through validation
+	// (so operators can pre-stage the host default) but reject individual
+	// create requests until the runtime is wired up. Surfaced as a clear
+	// 4xx-shaped error so clients see "not implemented" rather than a
+	// generic Docker failure 30s later.
+	if chosenRuntime == models.RuntimeKata {
+		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
 	req.Runtime = chosenRuntime
 

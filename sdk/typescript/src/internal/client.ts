@@ -534,7 +534,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
 // tolerating older sandboxd versions that don't send the field at all (treat
 // as "" — i.e. host default at start time).
 function normalizeRuntime(value: string | undefined): Sandbox["runtime"] {
-  if (value === "runc" || value === "runsc") {
+  if (value === "docker" || value === "gvisor" || value === "kata") {
     return value;
   }
   return "";

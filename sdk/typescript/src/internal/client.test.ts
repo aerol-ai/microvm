@@ -241,15 +241,15 @@ test("internal client create forwards runtime selector and parses response", asy
     patToken: "pat-token",
     fetch: async (input, init) => {
       seenRequest = new Request(input, init);
-      return jsonResponse(apiSandbox("sb-runtime", { runtime: "runsc" }));
+      return jsonResponse(apiSandbox("sb-runtime", { runtime: "gvisor" }));
     },
   });
 
-  const sandbox = await client.create({ image: "ubuntu:22.04", runtime: "runsc" });
+  const sandbox = await client.create({ image: "ubuntu:22.04", runtime: "gvisor" });
   assert.ok(seenRequest);
   const body = (await seenRequest.json()) as { runtime?: string };
-  assert.equal(body.runtime, "runsc", "request body should carry runtime selector");
-  assert.equal(sandbox.runtime, "runsc", "response should expose runtime");
+  assert.equal(body.runtime, "gvisor", "request body should carry runtime selector");
+  assert.equal(sandbox.runtime, "gvisor", "response should expose runtime");
 });
 
 test("internal client create defaults runtime to '' when sandboxd omits the field", async () => {

@@ -53,12 +53,14 @@ export interface CreateOptions {
   mounts?: MountSpec[];
   lifecycle?: Lifecycle;
   /**
-   * OCI runtime to use for this sandbox. Omit to inherit the host default
-   * (`SB_CONTAINER_OCI_RUNTIME`). Use `"runsc"` for gVisor isolation when
-   * running untrusted workloads — note that gVisor rejects privileged
-   * containers and ignores per-sandbox disk quotas.
+   * Container runtime to use for this sandbox. Omit to inherit the host
+   * default (`SB_CONTAINER_RUNTIME`). Use `"gvisor"` for runsc-backed
+   * isolation when running untrusted workloads — note that gVisor rejects
+   * privileged containers and ignores per-sandbox disk quotas. `"kata"` is
+   * reserved for future Kata Containers support and is rejected by the API
+   * today.
    */
-  runtime?: "runc" | "runsc";
+  runtime?: "docker" | "gvisor" | "kata";
 }
 
 export interface ResizeOptions {
@@ -129,10 +131,10 @@ export interface Sandbox {
   containerCommand?: string[];
   lifecycle: Lifecycle;
   /**
-   * OCI runtime this sandbox is running under. Empty string indicates a
-   * pre-migration row that resolves to the host default at start time.
+   * Container runtime this sandbox is running under. Empty string indicates
+   * a pre-migration row that resolves to the host default at start time.
    */
-  runtime: "" | "runc" | "runsc";
+  runtime: "" | "docker" | "gvisor" | "kata";
 }
 
 export interface ExecRequest {

@@ -654,6 +654,6 @@ func sampleSandbox(id string) *models.Sandbox {
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		LastActiveAt:     now,
-		Runtime:          models.RuntimeRunsc,
+		Runtime:          models.RuntimeGvisor,
 	}
 }
