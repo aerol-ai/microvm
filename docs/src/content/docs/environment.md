@@ -1,7 +1,4 @@
----
 title: Environment
-description: Configure the Docker image, environment variables, resource limits, and idle lifecycle for a sandbox.
----
 
 The sandbox environment is fully specified at creation time through the create request body.
 

@@ -1,7 +1,4 @@
----
 title: SSH Access
-description: Connect to a sandbox over SSH using the per-sandbox key pair provisioned at creation time.
----
 
 AerolVM runs an SSH gateway on port `2220` (configurable via `SB_SSH_LISTEN_ADDR`). Each sandbox is provisioned with a unique Ed25519 key pair on creation. The private key is returned **only** in the create response and is not stored by the server.
 
@@ -17,7 +14,7 @@ When a sandbox is created, the API response includes:
 }
 ```
 
-Save `ssh_private_key` — it is not retrievable later. The `ssh_public_key` field is returned by the get and list endpoints.
+Save `ssh_private_key` - it is not retrievable later. The `ssh_public_key` field is returned by the get and list endpoints.
 
 ## Connecting
 
@@ -51,7 +48,7 @@ ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123+myshell@<host>
 ## SDK Usage
 
 ```ts
-// TypeScript — retrieve public key after creation
+// TypeScript - retrieve public key after creation
 const sandbox = await client.create({ image: 'ubuntu:22.04' })
 console.log(sandbox.sshPrivateKey)  // save this
 console.log(sandbox.sshPublicKey)   // available later via get()
@@ -60,7 +57,7 @@ console.log(sandbox.sshPublicKey)   // available later via get()
 ```python
 # Python
 sandbox = client.create(image='ubuntu:22.04')
-private_key = sandbox['ssh_private_key']  # save — only returned on create
+private_key = sandbox['ssh_private_key']  # save - only returned on create
 ```
 
 ```go
@@ -68,13 +65,13 @@ private_key = sandbox['ssh_private_key']  # save — only returned on create
 sandbox, err := client.Create(ctx, microvm.CreateOptions{
     Image: "ubuntu:22.04",
 })
-privateKey := sandbox.SSHPrivateKey // save — only returned on create
+privateKey := sandbox.SSHPrivateKey // save - only returned on create
 ```
 
 ```java
 // Java
 Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
-String privateKey = sandbox.sshPrivateKey; // save — only returned on create
+String privateKey = sandbox.sshPrivateKey; // save - only returned on create
 ```
 
 ## How the Gateway Works

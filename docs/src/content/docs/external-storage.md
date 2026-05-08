@@ -1,7 +1,4 @@
----
 title: External Storage
-description: Mount S3, NFS, SSHFS, and rclone-backed storage on the host and bind it into containers.
----
 
 # External Storage (Bring Your Own Bucket)
 

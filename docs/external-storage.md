@@ -2,14 +2,14 @@
 
 This sandbox platform deliberately does **not** expose host disk to user containers. Sandboxes are ephemeral; if you need durable workspace state, you mount your own cloud or network storage.
 
-The daemon does the mounting on the host and bind-mounts the result into your container. **Your image needs no mount tooling** — a vanilla `python:3.12` is enough — and **credentials never enter the container**.
+The daemon does the mounting on the host and bind-mounts the result into your container. **Your image needs no mount tooling** - a vanilla `python:3.12` is enough - and **credentials never enter the container**.
 
 ## How it works
 
 1. You declare mounts in the create request. The daemon validates the spec and encrypts your credentials at rest.
 2. Sandboxd spawns the appropriate mount tool (`mountpoint-s3`, `sshfs`, `mount.nfs`, `rclone mount`) on the host inside `/var/lib/sandboxd/mounts/<sandbox-id>/<index>/` (mode 0700, owned by the sandboxd user).
 3. The Docker container is created with that path bind-mounted at the target you chose. Inside the container `/workspace` (or whatever target) is just a directory.
-4. If the FUSE process crashes, sandboxd restarts it. Two crashes within 30 s and the mount is disabled — the kernel returns I/O errors at the mount point until you recreate the sandbox.
+4. If the FUSE process crashes, sandboxd restarts it. Two crashes within 30 s and the mount is disabled - the kernel returns I/O errors at the mount point until you recreate the sandbox.
 5. On `Stop` the host mount is torn down. On `Start` it's re-established. After a host or sandboxd reboot the reconciler re-mounts every running sandbox automatically.
 
 Cross-tenant isolation is enforced by the kernel's mount namespace: container A cannot see container B's bind source. The host parent directory is mode 0700 so even other host users can't traverse it.
@@ -17,7 +17,7 @@ Cross-tenant isolation is enforced by the kernel's mount namespace: container A 
 ## Threat model
 
 - **Credentials never enter the container.** They live encrypted in sandboxd's database and are materialized briefly as a tmpfs file (`/run/sandboxd/<id>-<i>.cred`, mode 0600) for the FUSE process to read at startup. For S3 / rclone the file is unlinked once the mount is ready; sshfs keeps its key file because the SSH session may reconnect.
-- **Encryption at rest.** AES-256-GCM with a host-resident key. Set `SB_CREDENTIAL_ENCRYPTION_KEY` (base64, 32 bytes) to bring your own; otherwise sandboxd auto-generates one at `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` (default `/var/lib/sandboxd/credential_encryption.key`, mode 0600). Back this file up alongside `state.db` — without it, stored credentials are unrecoverable.
+- **Encryption at rest.** AES-256-GCM with a host-resident key. Set `SB_CREDENTIAL_ENCRYPTION_KEY` (base64, 32 bytes) to bring your own; otherwise sandboxd auto-generates one at `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` (default `/var/lib/sandboxd/credential_encryption.key`, mode 0600). Back this file up alongside `state.db` - without it, stored credentials are unrecoverable.
 - **What sandboxd never does.** Make a network call to your storage on its own; log credentials; return them via any read API. The list-mounts endpoint shows `has_credentials: true` and never the values.
 
 ## Supported mount types

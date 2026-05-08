@@ -1,7 +1,4 @@
----
 title: File System
-description: Upload files into a sandbox and download files from a sandbox using the HTTP API.
----
 
 The sandbox API exposes two endpoints for transferring files between your application and the sandbox. All file operations use the same bearer token as the rest of the API.
 

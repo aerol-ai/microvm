@@ -37,7 +37,7 @@ const { code } = await handle.done;
 console.log(`npm install exited with ${code}`);
 ```
 
-`onStdout` and `onStderr` receive `Uint8Array` chunks as they arrive — no
+`onStdout` and `onStderr` receive `Uint8Array` chunks as they arrive - no
 buffering on the toolbox side. The `done` promise resolves when the process
 exits with the exit code (and signal name, if killed by a signal).
 
@@ -64,14 +64,14 @@ process.stdout.on("resize", () => {
 await handle.done;
 ```
 
-In TTY mode stdout and stderr are merged onto the PTY — only `onStdout`
+In TTY mode stdout and stderr are merged onto the PTY - only `onStdout`
 fires (matching standard terminal behavior). Without `tty: true`, the two
 streams are kept separate.
 
 ### Sending signals
 
 ```ts
-handle.signal("INT");   // SIGINT — like Ctrl-C in a terminal
+handle.signal("INT");   // SIGINT - like Ctrl-C in a terminal
 handle.signal("TERM");
 handle.signal("KILL");
 ```
@@ -144,9 +144,9 @@ WS  ws(s)://<sandboxd>/v1/sandboxes/<id>/toolbox/process/exec/stream
 
 Two equivalent ways:
 
-1. `Authorization: Bearer <pat-token>` — works for any HTTP client (curl,
+1. `Authorization: Bearer <pat-token>` - works for any HTTP client (curl,
    Go, Python, the `ws` npm package).
-2. `Sec-WebSocket-Protocol: sandbox.bearer, <pat-token>` — for browser
+2. `Sec-WebSocket-Protocol: sandbox.bearer, <pat-token>` - for browser
    `WebSocket`s, which can't set custom headers. The server echoes
    `sandbox.bearer` back as the agreed subprotocol.
 
@@ -301,6 +301,6 @@ that one sandbox's token, not the global PAT.
 
 ## See also
 
-- [Port allowlist](./port-allowlist.md) — gates `/proxy/<port>/...`
+- [Port allowlist](./port-allowlist.md) - gates `/proxy/<port>/...`
   on the same toolbox HTTP endpoint that hosts the streaming exec
   WebSocket.

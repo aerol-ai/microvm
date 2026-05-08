@@ -3,7 +3,7 @@
 When a sandbox is created with `network_block_all: true`, `sandboxd` installs
 a firewall rule on the host that drops every packet originating from that
 container's IP. The container can still receive incoming requests on its
-exposed ports, but it cannot make any outbound network calls — useful when
+exposed ports, but it cannot make any outbound network calls - useful when
 running untrusted code, model agents you don't want phoning home, or
 anything that should be airgapped from the network.
 
@@ -35,7 +35,7 @@ FORWARD (policy DROP)
 ```
 
 A rule appended directly to `FORWARD` lands *after* the jump to
-`DOCKER-FORWARD` — so by the time our rule would have run, line (2) has
+`DOCKER-FORWARD` - so by the time our rule would have run, line (2) has
 already accepted the packet and exited the chain. The rule is installed
 but never matches, with `0 packets, 0 bytes` in `iptables -L FORWARD -v`.
 
@@ -45,7 +45,7 @@ which is why our rule needs to live there.
 
 ### iptables-legacy vs nftables
 
-On Docker 28+ Ubuntu, `iptables` is actually `iptables-nft` — a shim that
+On Docker 28+ Ubuntu, `iptables` is actually `iptables-nft` - a shim that
 translates the iptables CLI / library API into native nftables rules.
 Writing to `DOCKER-USER` via the [`coreos/go-iptables`][go-ipt] library
 goes through this shim, so the same code works on:
@@ -57,7 +57,7 @@ goes through this shim, so the same code works on:
 
 No nftables-native backend is needed. If you're on a platform where the
 `iptables` binary is missing entirely (e.g. some minimal CoreOS images),
-this code will fail with "create iptables client" at startup — set
+this code will fail with "create iptables client" at startup - set
 `SB_ENABLE_NETWORK_RULES=false` to disable network blocking on that host.
 
 ## Verifying the rule works
@@ -90,12 +90,12 @@ should increment, confirming the rule is matching.
 If the counters stay at `0` while the container makes outbound requests,
 the rule isn't firing. Common causes:
 
-- **`SB_ENABLE_NETWORK_RULES=false`** — sandboxd skipped installation.
+- **`SB_ENABLE_NETWORK_RULES=false`** - sandboxd skipped installation.
   Look for `m.Enabled()` in [`netrules/manager.go`](../pkg/docker/netrules/manager.go).
-- **Wrong chain** — pre-fix versions of `sandboxd` (before this change)
+- **Wrong chain** - pre-fix versions of `sandboxd` (before this change)
   installed the rule in `FORWARD`, where it never matched on Docker 28+.
   Upgrade and recreate the sandbox.
-- **Custom DOCKER-USER rules** — if an operator added their own
+- **Custom DOCKER-USER rules** - if an operator added their own
   `ACCEPT` rule earlier in `DOCKER-USER`, it would short-circuit our
   `DROP`. We `Insert` at position 1, but a manually-added rule at
   position 1 with `--insert` after ours could displace it. Audit
@@ -103,16 +103,16 @@ the rule isn't firing. Common causes:
 
 ## Limitations
 
-- **No DNS-only blocking** — current rule blocks all egress (TCP, UDP,
+- **No DNS-only blocking** - current rule blocks all egress (TCP, UDP,
   ICMP, IPv4). There's no allowlist for "DNS allowed but nothing else."
-- **IPv4 only** — the rule is in the `filter` table for IPv4. If your
+- **IPv4 only** - the rule is in the `filter` table for IPv4. If your
   sandbox network has IPv6 routes, those are not blocked. Most Docker
   default-bridge setups are IPv4-only, but if you've enabled
   `--ipv6` on the daemon, add a parallel `ip6tables` rule.
-- **Per-sandbox only** — there's no allowlist of permitted hosts. If
+- **Per-sandbox only** - there's no allowlist of permitted hosts. If
   you need "egress allowed to S3 but nothing else," extend the manager
   to install a sequence of `ACCEPT` rules followed by a final `DROP`.
-- **Host shares the rule table** — `DOCKER-USER` is a global chain. If
+- **Host shares the rule table** - `DOCKER-USER` is a global chain. If
   many sandboxes are running with `networkBlockAll`, the chain accrues
   one rule per sandbox. iptables handles thousands of rules fine, but
   it's a linear scan on the hot path. nftables sets would be faster at
@@ -123,9 +123,9 @@ the rule isn't firing. Common causes:
 
 `ClearBlockAllEgress` is called in two places:
 
-1. `Destroy` (always) — removes the DROP rule when the sandbox is
+1. `Destroy` (always) - removes the DROP rule when the sandbox is
    destroyed.
-2. Reconcile (boot) — currently no-op for blocked containers (we don't
+2. Reconcile (boot) - currently no-op for blocked containers (we don't
    re-apply rules during reconcile because Docker's IPs may have
    changed; the rule survives reboots only if iptables is persisted by
    the host).
@@ -134,7 +134,7 @@ the rule isn't firing. Common causes:
 `networkBlockAll` is critical for security on your host, install
 `iptables-persistent` (Debian/Ubuntu) and persist after each
 sandbox change, OR run a periodic re-apply in `sandboxd`. The current
-implementation does the former — when the host reboots, the rules are
+implementation does the former - when the host reboots, the rules are
 gone until a new sandbox is created or destroyed.
 
 This is a real gap for production hardening; track in TODO.

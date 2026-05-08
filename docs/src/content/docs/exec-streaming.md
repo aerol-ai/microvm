@@ -1,7 +1,4 @@
----
 title: Streaming Exec
-description: Stream stdout and stderr live, allocate PTYs, forward stdin, and control long-running processes.
----
 
 # Streaming exec (with optional PTY)
 

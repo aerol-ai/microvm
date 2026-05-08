@@ -1,7 +1,4 @@
----
 title: Preview
-description: Expose sandbox ports publicly over HTTPS through subdomain or path routes.
----
 
 Every sandbox gets a public URL that routes to the sandbox's API endpoint. You can also expose additional ports on separate public URLs so browsers and external tools can reach services running inside the sandbox.
 

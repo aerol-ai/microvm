@@ -1,7 +1,4 @@
----
 title: Getting Started
-description: Build the AerolVM server and run it on a local Linux host.
----
 
 ## Build
 

@@ -1,7 +1,4 @@
----
 title: Python SDK
-description: Use the Python client for synchronous sandbox lifecycle, exec streaming, file transfer, and sessions.
----
 
 The Python SDK lives under `sdk/python`, publishes as `aerolvm-sdk`, and is imported as `microvm`.
 

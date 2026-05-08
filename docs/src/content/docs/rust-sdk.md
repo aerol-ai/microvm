@@ -1,7 +1,4 @@
----
 title: Rust SDK
-description: Use the Rust client for blocking API calls plus WebSocket-based exec and session attachment.
----
 
 The Rust SDK lives under `sdk/rust`, publishes as `aerolvm-sdk`, and is imported in code as `aerolvm_sdk`.
 

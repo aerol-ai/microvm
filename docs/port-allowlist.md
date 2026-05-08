@@ -2,8 +2,8 @@
 
 Sandboxes default to **closed** for public proxy access. A port inside a
 container is only reachable from the public internet if the caller has
-explicitly exposed it via the SDK's `exposePort(port)`. Unexposed ports —
-including everything bound to `localhost` inside the container — are not
+explicitly exposed it via the SDK's `exposePort(port)`. Unexposed ports -
+including everything bound to `localhost` inside the container - are not
 publicly reachable.
 
 This document describes the allowlist mechanism that enforces this default.
@@ -24,7 +24,7 @@ https://<sandbox-id>.<domain>/proxy/5432/   # any listener, any caller
 ```
 
 The allowlist closes that path. `/proxy/<port>/...` now returns
-`403 Forbidden — port not exposed` unless `<port>` has been explicitly
+`403 Forbidden - port not exposed` unless `<port>` has been explicitly
 exposed via the SDK.
 
 ## How it works
@@ -64,7 +64,7 @@ list every time it can change.
 | --- | --- |
 | `ExposePort` | new port added |
 | `UnexposePort` | port removed |
-| `StartSandbox` | container restart — toolboxd restarted with empty allowlist |
+| `StartSandbox` | container restart - toolboxd restarted with empty allowlist |
 | `Reconcile` (boot + every `SB_RECONCILE_INTERVAL`) | recover from missed pushes (e.g. sandboxd restart) |
 
 Pushes are best-effort: a failure is logged but does not fail the API call.
@@ -101,7 +101,7 @@ await fetch(`${sandbox.publicURL}/proxy/8080/`);     // 403
 // After exposePort, port 8080 becomes reachable two ways:
 const portURL = await sandbox.exposePort(8080);
 await fetch(`${sandbox.publicURL}/proxy/8080/`);     // 200
-await fetch(`${portURL}/`);                          // 200 — clean per-port URL
+await fetch(`${portURL}/`);                          // 200 - clean per-port URL
 
 // Removing the exposure closes both paths.
 await sandbox.unexposePort(8080);
@@ -110,10 +110,10 @@ await fetch(`${sandbox.publicURL}/proxy/8080/`);     // 403
 
 The two public paths to your app:
 
-1. **Per-port URL** — `https://<port>-<sandbox-id>.<domain>/`. Caddy
+1. **Per-port URL** - `https://<port>-<sandbox-id>.<domain>/`. Caddy
    reverse-proxies straight to the container; toolbox is not involved.
    Ideal for serving an app to end users.
-2. **Proxy path** — `https://<sandbox-id>.<domain>/proxy/<port>/`.
+2. **Proxy path** - `https://<sandbox-id>.<domain>/proxy/<port>/`.
    Goes through `toolboxd`, which checks the allowlist. Useful when you
    want all of a sandbox's traffic under one hostname.
 
@@ -132,7 +132,7 @@ running `toolboxd` until one of:
 
 Until then, `/proxy/<port>/` will return `403` even for ports that were
 previously exposed. The per-port URLs (`<port>-<id>.<domain>`) keep working
-throughout — they go through Caddy directly, not through toolbox.
+throughout - they go through Caddy directly, not through toolbox.
 
 To force an immediate sync, restart `sandboxd`; its boot reconcile pushes
 to every running sandbox.

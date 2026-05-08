@@ -1,7 +1,4 @@
----
 title: Port Allowlist
-description: Require explicit exposure before public traffic can reach a sandbox port.
----
 
 Sandboxes default to **closed** for public proxy access. A port inside a sandbox is only reachable from the public internet if it has been explicitly exposed via the SDK's `exposePort(port)`.
 

@@ -1,7 +1,4 @@
----
 title: Network Isolation
-description: Drop outbound traffic for individual sandboxes using host firewall rules.
----
 
 # Network Isolation
 

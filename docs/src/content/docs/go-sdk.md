@@ -1,7 +1,4 @@
----
 title: Go SDK
-description: Use the Go client to manage sandboxes, stream commands, transfer files, and work with sessions.
----
 
 The Go SDK lives under `sdk/go` and is imported as `github.com/aerol-ai/microvm/sdk/go/pkg/microvm`.
 

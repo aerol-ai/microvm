@@ -1,7 +1,4 @@
----
 title: SDK Overview
-description: Package names, shared auth, and cross-language behavior for the Go, TypeScript, Python, Rust, and Java SDKs.
----
 
 AerolVM provides official SDKs for five languages. All SDKs cover the same core surface and share the same authentication model.
 

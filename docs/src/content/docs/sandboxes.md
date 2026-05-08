@@ -1,7 +1,4 @@
----
 title: Sandboxes
-description: What a sandbox is, its lifecycle states, and the core create/start/stop/destroy operations.
----
 
 A sandbox is an isolated compute environment. Each sandbox has:
 
@@ -51,7 +48,7 @@ POST /v1/sandboxes/{id}/start
 POST /v1/sandboxes/{id}/stop
 ```
 
-Stopping persists all container-level state via Docker. Starting resumes from the persisted image layer — running processes are not retained across a stop/start cycle.
+Stopping persists all container-level state via Docker. Starting resumes from the persisted image layer - running processes are not retained across a stop/start cycle.
 
 ## Destroy
 

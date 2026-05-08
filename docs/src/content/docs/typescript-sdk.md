@@ -1,7 +1,4 @@
----
 title: TypeScript SDK
-description: Use the TypeScript client from Node.js or other fetch-compatible runtimes to control sandboxes.
----
 
 The TypeScript SDK lives under `sdk/typescript` and publishes as `@aerol-ai/aerolvm-sdk`.
 

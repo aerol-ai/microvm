@@ -1,7 +1,4 @@
----
 title: Java SDK
-description: Use the Java client for sandbox lifecycle management, exec streaming, file transfer, and persistent sessions.
----
 
 The Java SDK lives under `sdk/java` and publishes to GitHub Packages as `ai.aerol:aerolvm-sdk`.
 
