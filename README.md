@@ -109,17 +109,17 @@ Publishing a GitHub Release, or pushing a tag that starts with `v`, also trigger
 That workflow publishes:
 
 - the Java SDK in `sdk/java` to GitHub Packages as `ai.aerol:aerolvm-sdk`
-- the TypeScript SDK in `sdk/typescript` to npm as `@aerol-ai/microvm-sdk`
-- the Python SDK in `sdk/python` to PyPI as `aerol-ai-microvm-sdk`
-- the Rust SDK in `sdk/rust` to crates.io as `microvm-sdk`
+- the TypeScript SDK in `sdk/typescript` to npm as `@aerol-ai/aerolvm-sdk`
+- the Python SDK in `sdk/python` to PyPI as `aerolvm-sdk`
+- the Rust SDK in `sdk/rust` to crates.io as `aerolvm-sdk`
 
 The workflow requires the SDK versions to match the git tag without the leading `v`. For example, tag `v0.1.0` publishes SDK packages whose manifest version is `0.1.0`.
 
 Required GitHub Actions repository secrets:
 
-- `NPM_TOKEN`: npm automation token with publish access to `@aerol-ai/microvm-sdk`
-- `PYPI_API_TOKEN`: PyPI API token for `aerol-ai-microvm-sdk`
-- `CARGO_REGISTRY_TOKEN`: crates.io API token for `microvm-sdk`
+- `NPM_TOKEN`: npm automation token with publish access to `@aerol-ai/aerolvm-sdk`
+- `PYPI_API_TOKEN`: PyPI API token for `aerolvm-sdk`
+- `CARGO_REGISTRY_TOKEN`: crates.io API token for `aerolvm-sdk`
 
 The Java publish job deploys to GitHub Packages with the workflow's built-in `GITHUB_TOKEN`, so it does not require an additional repository secret. The workflow must keep `packages: write` permission enabled.
 
@@ -335,7 +335,7 @@ MicroVMClient client = new MicroVMClient(
 TypeScript:
 
 ```ts
-import { MicroVM } from "@aerol-ai/microvm-sdk";
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
 const client = new MicroVM({
 	apiUrl: "https://sandbox.example.com",

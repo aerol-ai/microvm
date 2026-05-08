@@ -3,18 +3,18 @@ title: Rust SDK
 description: Use the Rust client for blocking API calls plus WebSocket-based exec and session attachment.
 ---
 
-The Rust SDK lives under `sdk/rust`, publishes as `microvm-sdk`, and is imported in code as `microvm_sdk`.
+The Rust SDK lives under `sdk/rust`, publishes as `aerolvm-sdk`, and is imported in code as `aerovm_sdk`.
 
 ## Install
 
 ```bash
-cargo add microvm-sdk
+cargo add aerolvm-sdk
 ```
 
 ## Create A Client
 
 ```rust
-use microvm_sdk::Client;
+use aerovm_sdk::Client;
 
 let client = Client::new(
     Some("https://sandbox.example.com"),
@@ -27,7 +27,7 @@ If you pass `None`, the client falls back to `SB_API_URL`, `SB_PAT_TOKEN`, and t
 ## Create And Use A Sandbox
 
 ```rust
-use microvm_sdk::{Client, CreateOptions, Lifecycle};
+use aerovm_sdk::{Client, CreateOptions, Lifecycle};
 
 let client = Client::new(Some("https://sandbox.example.com"), Some("your-token"))?;
 
@@ -49,7 +49,7 @@ let mut sandbox = client.create(CreateOptions {
     }),
 })?;
 
-let result = sandbox.exec(microvm_sdk::ExecRequest {
+let result = sandbox.exec(aerovm_sdk::ExecRequest {
     command: "echo hello from rust".to_string(),
     work_dir: None,
     env: None,
@@ -69,7 +69,7 @@ The Rust wrapper stores the API record on `sandbox.data`, while the create-only 
 ```rust
 use std::sync::Arc;
 
-let handle = sandbox.exec_stream(microvm_sdk::ExecStreamOptions {
+let handle = sandbox.exec_stream(aerovm_sdk::ExecStreamOptions {
     command: "bash".to_string(),
     tty: true,
     cols: Some(120),
@@ -85,7 +85,7 @@ println!("{:?}", handle.wait()?);
 ```
 
 ```rust
-let session = sandbox.create_session(microvm_sdk::CreateSessionOptions {
+let session = sandbox.create_session(aerovm_sdk::CreateSessionOptions {
     name: Some("shell".to_string()),
     command: Some("bash".to_string()),
     work_dir: Some("/workspace".to_string()),
@@ -95,7 +95,7 @@ let session = sandbox.create_session(microvm_sdk::CreateSessionOptions {
     ..Default::default()
 })?;
 
-let attached = sandbox.attach_session(&session.id, microvm_sdk::SessionAttachOptions {
+let attached = sandbox.attach_session(&session.id, aerovm_sdk::SessionAttachOptions {
     cols: Some(120),
     rows: Some(40),
     on_stdout: Some(Arc::new(|chunk| {

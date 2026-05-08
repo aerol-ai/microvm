@@ -1,5 +1,5 @@
 [project]
-name = "aerol-ai-microvm-sdk"
+name = "aerolvm-sdk"
 version = "0.1.0"
 description = "A Python client for the Aerol.ai MicroVM sandbox API."
 readme = "README.md"

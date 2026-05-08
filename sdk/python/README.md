@@ -5,6 +5,12 @@ A lightweight Python SDK for the Aerol.ai MicroVM sandbox API.
 ## Install
 
 ```bash
+pip install aerolvm-sdk
+```
+
+For local development from this repository:
+
+```bash
 cd sdk/python
 pip install .
 ```

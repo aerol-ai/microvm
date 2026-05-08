@@ -3,12 +3,12 @@ title: Python SDK
 description: Use the Python client for synchronous sandbox lifecycle, exec streaming, file transfer, and sessions.
 ---
 
-The Python SDK lives under `sdk/python`, publishes as `aerol-ai-microvm-sdk`, and is imported as `microvm`.
+The Python SDK lives under `sdk/python`, publishes as `aerolvm-sdk`, and is imported as `microvm`.
 
 ## Install
 
 ```bash
-pip install aerol-ai-microvm-sdk
+pip install aerolvm-sdk
 ```
 
 For local development from this repository, `cd sdk/python && pip install .` also works.

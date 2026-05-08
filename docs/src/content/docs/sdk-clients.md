@@ -10,9 +10,9 @@ This docs section mirrors the Daytona docs layout, but the content here is taken
 | Language | Package | Install |
 | --- | --- | --- |
 | Go | `github.com/aerol-ai/microvm/sdk/go/pkg/microvm` | `go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest` |
-| TypeScript | `@aerol-ai/microvm-sdk` | `npm install @aerol-ai/microvm-sdk` |
-| Python | `aerol-ai-microvm-sdk` | `pip install aerol-ai-microvm-sdk` |
-| Rust | `microvm-sdk` | `cargo add microvm-sdk` |
+| TypeScript | `@aerol-ai/aerolvm-sdk` | `npm install @aerol-ai/aerolvm-sdk` |
+| Python | `aerolvm-sdk` | `pip install aerolvm-sdk` |
+| Rust | `aerolvm-sdk` | `cargo add aerolvm-sdk` |
 
 If you are working directly from this repository, each SDK can also be installed from its matching `sdk/<language>` directory.
 
@@ -68,7 +68,7 @@ client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
 ### TypeScript
 
 ```ts
-import { MicroVM } from '@aerol-ai/microvm-sdk'
+import { MicroVM } from '@aerol-ai/aerolvm-sdk'
 
 const client = new MicroVM({
   apiUrl: process.env.SB_API_URL,
@@ -87,7 +87,7 @@ client = MicroVM(api_url='https://sandbox.example.com', pat_token='your-token')
 ### Rust
 
 ```rust
-use microvm_sdk::Client;
+use aerovm_sdk::Client;
 
 let client = Client::new(Some("https://sandbox.example.com"), Some("your-token"))?;
 ```
