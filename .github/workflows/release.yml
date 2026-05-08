@@ -4,9 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       tag:
@@ -21,8 +18,8 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
-      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+      VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

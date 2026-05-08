@@ -1,9 +1,6 @@
 name: Publish SDKs
 
 on:
-  push:
-    tags:
-      - 'v*'
   release:
     types:
       - published
