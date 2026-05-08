@@ -71,6 +71,7 @@
   p > code,
   li code,
   strong > code,
+  th code,
   td code {
     font-family: var(--font-mono);
     font-size: 0.875rem;
@@ -79,6 +80,8 @@
     color: var(--hover-color);
     background-color: var(--block-bg-color);
     border-radius: 4px;
+    overflow-wrap: normal;
+    word-break: normal;
     white-space: nowrap;
   }
 
@@ -105,7 +108,8 @@
   > .table-wrapper td {
     padding: 0.65rem;
     text-align: left;
-    word-break: break-word;
+    overflow-wrap: break-word;
+    word-break: normal;
   }
 
   > .table-wrapper td {
