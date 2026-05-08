@@ -29,33 +29,33 @@ Services running inside the sandbox are not reachable publicly by default. Call 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const { url } = await sandbox.exposePort(3000)
-    console.log(url) // https://sandbox_abc123-3000.sandbox.example.com
+    const url = await sandbox.exposePort(3000)
+    console.log(url) // https://<sandbox-id>-3000.sandbox.example.com
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    result = sandbox.expose_port(3000)
-    print(result['url'])
+    url = sandbox.expose_port(3000)
+    print(url)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    result, err := sandbox.ExposePort(ctx, 3000)
+    url, err := sandbox.ExposePort(ctx, 3000)
     if err != nil { log.Fatal(err) }
-    fmt.Println(result.URL)
+    fmt.Println(url)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let result = sandbox.expose_port(3000)?;
-    println!("{}", result.url);
+    let url = sandbox.expose_port(3000)?;
+    println!("{}", url);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    var result = sandbox.exposePort(3000);
-    System.out.println(result.url);
+    String url = sandbox.exposePort(3000);
+    System.out.println(url);
     ```
   </TabItem>
 </Tabs>
