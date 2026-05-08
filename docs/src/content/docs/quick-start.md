@@ -2,7 +2,9 @@
 title: Quick Start
 ---
 
-**AerolVM** is open-source infrastructure for running isolated code environments. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated vCPU, RAM, and disk.
+**AerolVM** is open-source infrastructure for running isolated code environments. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated vCPU, RAM, and disk with a support of Docker, GVisor, Kata and Wasm.
+
+The idea is to provide a seamless, secure sandbox experience that can start in under 50ms to 1s.
 
 Sandboxes are the core component of the Aero.ai platform, spinning up in under 90ms from code to execution and running any code in Python, TypeScript, and JavaScript. Built on OCI/Docker compatibility, massive parallelization, and unlimited persistence, sandboxes deliver consistent, predictable environments for agent workflows.
 
@@ -28,68 +30,25 @@ Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the
 - **Interactive developer environments** - persistent workspaces with SSH, port previews, and file sync
 - **Data processing pipelines** - attach cloud storage, run transforms, and extract results
 
----
+## How AerolVM Compares
 
-## Workflow
+| | AerolVM | e2b | Daytona |
+|---|---|---|---|
+| **Hosting** | Self-hosted on your infra | Cloud (managed, no self-host) | Self-hosted |
+| **Open source** | ✅ | ✗ | ✅ |
+| **Primary use case** | AI agents + ephemeral CI | AI agent code execution | Developer workspaces |
+| **Sandbox startup** | <90ms | ~1s | Seconds (persistent VMs) |
+| **Runtime isolation** | Docker, gVisor (kernel-level) | Docker | Docker |
+| **Persistent stop/start** | ✅ | ✗ | ✅ |
+| **External storage** | S3, NFS, SSHFS, rclone | ✗ | ✗ |
+| **SSH access** | ✅ | ✗ | ✅ |
+| **Per-sandbox egress control** | ✅ | ✗ | ✗ |
+| **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python |
+| **Pricing** | Your infrastructure cost | Per sandbox-hour | Your infrastructure cost |
 
-### 1. Install the SDK
+**e2b** is a managed cloud service optimized for AI agent sandboxes. It requires no infrastructure but offers no self-hosting, no kernel-level isolation, and no control over where code runs. AerolVM covers the same AI execution use case while running entirely on your own host, with gVisor isolation for untrusted workloads and no per-sandbox billing.
 
-Pick any language:
-
-```bash
-# TypeScript / Node.js
-npm install @aerol-ai/aerolvm-sdk
-
-# Python
-pip install aerolvm-sdk
-
-# Go
-go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest
-
-# Rust
-cargo add aerolvm-sdk
-```
-
-### 2. Create a Sandbox
-
-```ts
-import { MicroVM } from '@aerol-ai/aerolvm-sdk'
-
-const client = new MicroVM({
-  apiUrl: process.env.SB_API_URL,
-  apiKey: process.env.SB_PAT_TOKEN,
-})
-
-const sandbox = await client.create({
-  image: 'ubuntu:22.04',
-})
-
-console.log(sandbox.id)
-console.log(sandbox.publicUrl)
-```
-
-### 3. Run a Command
-
-```ts
-const result = await sandbox.exec({ command: 'echo hello from sandbox' })
-console.log(result.stdout) // "hello from sandbox\n"
-```
-
-### 4. Transfer a File
-
-```ts
-const content = Buffer.from('print("hello")')
-await sandbox.uploadFile('/workspace/hello.py', content)
-
-const out = await sandbox.exec({ command: 'python3 /workspace/hello.py' })
-console.log(out.stdout) // "hello\n"
-```
-
-### 5. Destroy the Sandbox
-
-```ts
-await sandbox.destroy()
-```
+**Daytona** targets persistent developer workspaces with IDE and git integration - it is not designed for ephemeral, high-frequency sandbox creation. AerolVM prioritizes sub-second lifecycle operations, agent-friendly SDKs, and isolation runtimes over workspace ergonomics.
 
 ## Next Steps
 
