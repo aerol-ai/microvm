@@ -315,6 +315,15 @@ func waitForCommand(cmd *exec.Cmd) (int, string) {
 		}
 		return ee.ExitCode(), ""
 	}
+	// toolboxd runs as PID 1 in the container. Orphaned grandchildren (e.g.
+	// npm lifecycle scripts) are reparented to it and exit with SIGCHLD. In
+	// rare races this can cause the kernel to return ECHILD for our direct
+	// child before cmd.Wait() gets there. Since we only call this after all
+	// pipe I/O has completed (process definitely exited), treat ECHILD as 0.
+	var se *os.SyscallError
+	if errors.As(err, &se) && errors.Is(se.Err, syscall.ECHILD) {
+		return 0, ""
+	}
 	return -1, err.Error()
 }
 
