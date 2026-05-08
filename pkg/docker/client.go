@@ -436,9 +436,24 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 	}
 
 	query := queryValues(map[string]string{"fromImage": imageRef})
-	response, err := c.doRequest(ctx, http.MethodPost, "/images/create", query, nil, headers)
+	target := "http://docker/images/create?" + query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
 	if err != nil {
 		return fmt.Errorf("pull image: %w", err)
+	}
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	// Use streamClient (no timeout) — pulling large images can take minutes and
+	// http.Client.Timeout covers the entire response body read.
+	response, err := c.streamClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("pull image: %w", err)
+	}
+	if response.StatusCode >= 400 {
+		defer response.Body.Close()
+		data, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("docker API POST /images/create failed with status %d: %s", response.StatusCode, strings.TrimSpace(string(data)))
 	}
 	defer response.Body.Close()
 
