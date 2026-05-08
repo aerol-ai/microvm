@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,7 +14,6 @@ import (
 )
 
 func TestClientURLAndEnabledCases(t *testing.T) {
-	// 5 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -76,7 +76,6 @@ func TestClientURLAndEnabledCases(t *testing.T) {
 }
 
 func TestAllowTLSDomainCases(t *testing.T) {
-	// 4 cases
 	client := &Client{domain: "sandbox.example.com"}
 	tests := []struct {
 		name string
@@ -99,7 +98,6 @@ func TestAllowTLSDomainCases(t *testing.T) {
 }
 
 func TestPingCases(t *testing.T) {
-	// 3 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -152,7 +150,6 @@ func TestPingCases(t *testing.T) {
 }
 
 func TestRouteCases(t *testing.T) {
-	// 5 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -160,104 +157,117 @@ func TestRouteCases(t *testing.T) {
 		{
 			name: "delete_sandbox_route_success",
 			run: func(t *testing.T) {
-				fallback := []map[string]any{{
-					"handle": []map[string]any{{
-						"handler": "static_response",
-						"body":    "Sandbox not found",
-					}},
-					"terminal": true,
-				}}
-				requests := captureRouteRequests(t, append([]map[string]any{{"@id": "sandbox-abc"}}, fallback...))
+				fake := newFakeCaddy(t)
+				fake.routes["sandbox-abc"] = map[string]any{"@id": "sandbox-abc"}
 
-				client := &Client{enabled: true, serverID: "srv0", baseURL: requests.URL, httpClient: requests.Client}
+				client := &Client{enabled: true, serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
 				if err := client.DeleteSandboxRoute(context.Background(), "abc"); err != nil {
 					t.Fatalf("DeleteSandboxRoute() error = %v", err)
 				}
-				if len(requests.Records) != 2 || requests.Records[0].Method != http.MethodGet || requests.Records[1].Method != http.MethodPut {
-					t.Fatalf("unexpected request sequence: %+v", requests.Records)
+				if len(fake.records) != 1 {
+					t.Fatalf("expected 1 admin call, got %d: %+v", len(fake.records), fake.records)
 				}
-				if len(requests.Routes) != 1 {
-					t.Fatalf("expected one route after delete, got %d", len(requests.Routes))
+				rec := fake.records[0]
+				if rec.Method != http.MethodDelete || rec.Path != "/id/sandbox-abc" {
+					t.Fatalf("unexpected request: %+v", rec)
 				}
-				assertRouteBoolField(t, requests.Routes[0], "terminal", true)
-				assertRouteStaticResponse(t, requests.Routes[0], "Sandbox not found")
-				if requests.Records[0].Path != "/config/apps/http/servers/srv0/routes" || requests.Records[1].Path != "/config/apps/http/servers/srv0/routes" {
-					t.Fatalf("unexpected request paths: %+v", requests.Records)
+				if _, exists := fake.routes["sandbox-abc"]; exists {
+					t.Fatalf("route should be removed")
 				}
 			},
 		},
 		{
 			name: "delete_port_route_not_found_is_ignored",
 			run: func(t *testing.T) {
-				requests := captureRouteRequests(t, []map[string]any{{"@id": "sandbox-other-port-3000"}})
-
-				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: requests.URL, httpClient: requests.Client}
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
 				if err := client.DeletePortRoute(context.Background(), "abc", 3000); err != nil {
 					t.Fatalf("DeletePortRoute() error = %v", err)
 				}
-				if len(requests.Records) != 1 || requests.Records[0].Method != http.MethodGet {
-					t.Fatalf("unexpected request sequence: %+v", requests.Records)
+				if len(fake.records) != 1 || fake.records[0].Method != http.MethodDelete {
+					t.Fatalf("unexpected request sequence: %+v", fake.records)
 				}
 			},
 		},
 		{
-			name: "upsert_sandbox_route_domain_builds_host_match",
+			name: "upsert_sandbox_route_inserts_when_missing",
 			run: func(t *testing.T) {
-				fallback := map[string]any{
-					"handle": []map[string]any{{
-						"handler": "static_response",
-						"body":    "Sandbox not found",
-					}},
-					"terminal": true,
-				}
-				requests := captureRouteRequests(t, []map[string]any{fallback})
+				fake := newFakeCaddy(t)
 
-				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: requests.URL, httpClient: requests.Client}
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
 				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.2", 2280); err != nil {
 					t.Fatalf("UpsertSandboxRoute() error = %v", err)
 				}
-				if len(requests.Records) != 2 || requests.Records[0].Method != http.MethodGet || requests.Records[1].Method != http.MethodPut {
-					t.Fatalf("unexpected request sequence: %+v", requests.Records)
+				if len(fake.records) != 2 {
+					t.Fatalf("expected PATCH+PUT, got: %+v", fake.records)
 				}
-				if len(requests.Routes) != 2 {
-					t.Fatalf("expected two routes after upsert, got %d", len(requests.Routes))
+				if fake.records[0].Method != http.MethodPatch || fake.records[0].Path != "/id/sandbox-abc" {
+					t.Fatalf("unexpected first call: %+v", fake.records[0])
 				}
-				assertRouteField(t, requests.Routes[0], "@id", "sandbox-abc")
-				assertRouteHostMatch(t, requests.Routes[0], "abc.sandbox.example.com")
-				assertRouteDial(t, requests.Routes[0], "10.0.0.2:2280")
-				assertRouteStaticResponse(t, requests.Routes[1], "Sandbox not found")
+				if fake.records[1].Method != http.MethodPut || fake.records[1].Path != "/config/apps/http/servers/srv0/routes/0" {
+					t.Fatalf("unexpected second call: %+v", fake.records[1])
+				}
+				route, ok := fake.routes["sandbox-abc"]
+				if !ok {
+					t.Fatalf("route was not inserted; routes=%+v", fake.routes)
+				}
+				assertRouteHostMatch(t, route, "abc.sandbox.example.com")
+				assertRouteDial(t, route, "10.0.0.2:2280")
+			},
+		},
+		{
+			name: "upsert_sandbox_route_patches_when_present",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.routes["sandbox-abc"] = map[string]any{"@id": "sandbox-abc", "stale": true}
+
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.5", 2280); err != nil {
+					t.Fatalf("UpsertSandboxRoute() error = %v", err)
+				}
+				if len(fake.records) != 1 {
+					t.Fatalf("expected single PATCH, got: %+v", fake.records)
+				}
+				if fake.records[0].Method != http.MethodPatch || fake.records[0].Path != "/id/sandbox-abc" {
+					t.Fatalf("unexpected call: %+v", fake.records[0])
+				}
+				route := fake.routes["sandbox-abc"]
+				if _, ok := route["stale"]; ok {
+					t.Fatalf("PATCH should have replaced stale fields: %+v", route)
+				}
+				assertRouteDial(t, route, "10.0.0.5:2280")
 			},
 		},
 		{
 			name: "upsert_sandbox_route_ip_builds_path_match",
 			run: func(t *testing.T) {
-				requests := captureRouteRequests(t, nil)
-
-				client := &Client{enabled: true, publicHost: "203.0.113.10", serverID: "srv0", baseURL: requests.URL, httpClient: requests.Client}
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, publicHost: "203.0.113.10", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
 				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.2", 2280); err != nil {
 					t.Fatalf("UpsertSandboxRoute() error = %v", err)
 				}
-				if len(requests.Routes) != 1 {
-					t.Fatalf("expected one route after upsert, got %d", len(requests.Routes))
+				route, ok := fake.routes["sandbox-abc"]
+				if !ok {
+					t.Fatalf("route missing; routes=%+v", fake.routes)
 				}
-				assertRoutePathMatch(t, requests.Routes[0], []string{"/abc", "/abc/*"})
+				assertRoutePathMatch(t, route, []string{"/abc", "/abc/*"})
 			},
 		},
 		{
 			name: "upsert_port_route_builds_host_match",
 			run: func(t *testing.T) {
-				requests := captureRouteRequests(t, nil)
-
-				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: requests.URL, httpClient: requests.Client}
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
 				if err := client.UpsertPortRoute(context.Background(), "abc", "10.0.0.2", 3000); err != nil {
 					t.Fatalf("UpsertPortRoute() error = %v", err)
 				}
-				if len(requests.Routes) != 1 {
-					t.Fatalf("expected one route after upsert, got %d", len(requests.Routes))
+				route, ok := fake.routes["sandbox-abc-port-3000"]
+				if !ok {
+					t.Fatalf("port route missing; routes=%+v", fake.routes)
 				}
-				assertRouteField(t, requests.Routes[0], "@id", "sandbox-abc-port-3000")
-				assertRouteHostMatch(t, requests.Routes[0], "abc-3000.sandbox.example.com")
-				assertRouteDial(t, requests.Routes[0], "10.0.0.2:3000")
+				assertRouteField(t, route, "@id", "sandbox-abc-port-3000")
+				assertRouteHostMatch(t, route, "abc-3000.sandbox.example.com")
+				assertRouteDial(t, route, "10.0.0.2:3000")
 			},
 		},
 	}
@@ -272,81 +282,84 @@ type requestRecord struct {
 	Path   string
 }
 
-type capturedRequests struct {
+// fakeCaddy emulates the slice of the Caddy admin API the client touches:
+// PATCH/DELETE /id/<routeID> work against a routeID-keyed map; PUT to
+// /routes/0 inserts a route by its @id. That's enough to verify the per-@id
+// hot path without modeling the full config tree.
+type fakeCaddy struct {
 	URL     string
 	Client  *http.Client
-	Records []requestRecord
-	Routes  []map[string]any
+	records []requestRecord
+	routes  map[string]map[string]any
 }
 
-func captureRouteRequests(t *testing.T, initialRoutes []map[string]any) *capturedRequests {
+func newFakeCaddy(t *testing.T) *fakeCaddy {
 	t.Helper()
-	result := &capturedRequests{Routes: cloneRoutes(initialRoutes)}
+	fake := &fakeCaddy{routes: map[string]map[string]any{}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		record := requestRecord{Method: r.Method, Path: r.URL.Path}
-		if r.Method == http.MethodPut {
-			data, err := io.ReadAll(r.Body)
+		fake.records = append(fake.records, requestRecord{Method: r.Method, Path: r.URL.Path})
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/id/"):
+			routeID := strings.TrimPrefix(r.URL.Path, "/id/")
+			switch r.Method {
+			case http.MethodPatch:
+				if _, ok := fake.routes[routeID]; !ok {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				route, err := decodeRoute(r.Body)
+				if err != nil {
+					t.Fatalf("decode patch body: %v", err)
+				}
+				fake.routes[routeID] = route
+				w.WriteHeader(http.StatusOK)
+			case http.MethodDelete:
+				if _, ok := fake.routes[routeID]; !ok {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				delete(fake.routes, routeID)
+				w.WriteHeader(http.StatusOK)
+			default:
+				t.Fatalf("unexpected method %s for %s", r.Method, r.URL.Path)
+			}
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http/servers/srv0/routes/0":
+			route, err := decodeRoute(r.Body)
 			if err != nil {
-				t.Fatalf("ReadAll() error = %v", err)
+				t.Fatalf("decode insert body: %v", err)
 			}
-			if err := json.Unmarshal(data, &result.Routes); err != nil {
-				t.Fatalf("Unmarshal() error = %v", err)
+			id, _ := route["@id"].(string)
+			if id == "" {
+				t.Fatalf("inserted route missing @id: %+v", route)
 			}
+			fake.routes[id] = route
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-		result.Records = append(result.Records, record)
-		if r.Method == http.MethodGet {
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(result.Routes); err != nil {
-				t.Fatalf("Encode() error = %v", err)
-			}
-			return
-		}
-		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(server.Close)
-	result.URL = server.URL
-	result.Client = server.Client()
-	return result
+	fake.URL = server.URL
+	fake.Client = server.Client()
+	return fake
+}
+
+func decodeRoute(body io.Reader) (map[string]any, error) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	var route map[string]any
+	if err := json.Unmarshal(data, &route); err != nil {
+		return nil, err
+	}
+	return route, nil
 }
 
 func assertRouteField(t *testing.T, body map[string]any, key, want string) {
 	t.Helper()
 	if got, _ := body[key].(string); got != want {
 		t.Fatalf("route field %s = %q, want %q", key, got, want)
-	}
-}
-
-func assertRouteBoolField(t *testing.T, body map[string]any, key string, want bool) {
-	t.Helper()
-	if got, _ := body[key].(bool); got != want {
-		t.Fatalf("route field %s = %v, want %v", key, got, want)
-	}
-}
-
-func cloneRoutes(routes []map[string]any) []map[string]any {
-	if len(routes) == 0 {
-		return nil
-	}
-	data, err := json.Marshal(routes)
-	if err != nil {
-		panic(err)
-	}
-	var cloned []map[string]any
-	if err := json.Unmarshal(data, &cloned); err != nil {
-		panic(err)
-	}
-	return cloned
-}
-
-func assertRouteStaticResponse(t *testing.T, body map[string]any, want string) {
-	t.Helper()
-	handles, ok := body["handle"].([]any)
-	if !ok || len(handles) == 0 {
-		t.Fatalf("missing handle field: %#v", body)
-	}
-	handle, _ := handles[0].(map[string]any)
-	if got, _ := handle["body"].(string); got != want {
-		t.Fatalf("static response body = %q, want %q", got, want)
 	}
 }
 

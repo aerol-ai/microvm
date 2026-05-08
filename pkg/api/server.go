@@ -42,7 +42,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.Handle("GET /v1/capacity", s.requireAuth(http.HandlerFunc(s.handleCapacity)))
-	s.mux.Handle("GET /v1/tls-check", s.requireAuth(http.HandlerFunc(s.handleTLSCheck)))
+	s.mux.HandleFunc("GET /v1/tls-check", s.handleTLSCheck)
 
 	s.mux.Handle("POST /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleCreateSandbox)))
 	s.mux.Handle("GET /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleListSandboxes)))

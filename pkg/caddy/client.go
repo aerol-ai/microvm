@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 )
@@ -139,88 +137,77 @@ func (c *Client) AllowTLSDomain(host string) bool {
 	return host == c.domain || strings.HasSuffix(host, "."+c.domain)
 }
 
+// upsertRoute writes one route by its @id without touching the rest of the
+// routes array. PATCH /id/<routeID> replaces the existing node in place; if
+// it doesn't exist yet (404), we insert it at index 0 of the server's routes
+// list with PUT so it sits ahead of the fallback "Sandbox not found" route.
+// Per-route admin calls keep this O(1) regardless of how many sandboxes exist.
 func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[string]any) error {
-	routes, err := c.loadRoutes(ctx)
+	body, err := json.Marshal(route)
+	if err != nil {
+		return fmt.Errorf("marshal caddy route: %w", err)
+	}
+
+	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
+	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
 	if err != nil {
 		return err
 	}
-
-	filtered := filterRoutesByID(routes, routeID)
-	updated := make([]map[string]any, 0, len(filtered)+1)
-	updated = append(updated, route)
-	updated = append(updated, filtered...)
-	return c.saveRoutes(ctx, updated)
-}
-
-func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
-	routes, err := c.loadRoutes(ctx)
-	if err != nil {
-		return err
-	}
-
-	updated := filterRoutesByID(routes, routeID)
-	if len(updated) == len(routes) {
+	if status < 400 {
 		return nil
 	}
-	return c.saveRoutes(ctx, updated)
-}
-
-func (c *Client) loadRoutes(ctx context.Context) ([]map[string]any, error) {
-	target := fmt.Sprintf("%s/config/apps/http/servers/%s/routes", c.baseURL, url.PathEscape(c.serverID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return nil, err
+	if status != http.StatusNotFound {
+		return fmt.Errorf("patch caddy route failed: %d", status)
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("load caddy routes: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("load caddy routes failed: %d", resp.StatusCode)
-	}
-
-	var routes []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
-		return nil, fmt.Errorf("decode caddy routes: %w", err)
-	}
-	return routes, nil
-}
-
-func (c *Client) saveRoutes(ctx context.Context, routes []map[string]any) error {
-	body, err := json.Marshal(routes)
-	if err != nil {
-		return fmt.Errorf("marshal caddy routes: %w", err)
-	}
-
-	target := fmt.Sprintf("%s/config/apps/http/servers/%s/routes", c.baseURL, url.PathEscape(c.serverID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(body))
+	// Fresh route: insert at the front of the routes array. PUT to an array
+	// index is Caddy's "insert before" — existing entries shift right, so
+	// the catch-all fallback (if any) stays at the tail.
+	insertURL := fmt.Sprintf("%s/config/apps/http/servers/%s/routes/0", c.baseURL, c.serverID)
+	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("save caddy routes: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("save caddy routes failed: %d", resp.StatusCode)
+	if status >= 400 {
+		return fmt.Errorf("insert caddy route failed: %d", status)
 	}
 	return nil
 }
 
-func filterRoutesByID(routes []map[string]any, routeID string) []map[string]any {
-	filtered := make([]map[string]any, 0, len(routes))
-	for _, route := range routes {
-		if currentID, _ := route["@id"].(string); currentID == routeID {
-			continue
-		}
-		filtered = append(filtered, route)
+// deleteRoute removes one route by @id. 404 is treated as success — the route
+// already isn't there, which is the desired post-condition.
+func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
+	target := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target, nil)
+	if err != nil {
+		return err
 	}
-	return filtered
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete caddy route: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("delete caddy route failed: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (c *Client) sendJSON(ctx context.Context, method, target string, body []byte) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("%s %s: %w", method, target, err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
 }
 
 func sandboxRouteID(id string) string {
@@ -230,5 +217,3 @@ func sandboxRouteID(id string) string {
 func portRouteID(id string, port int) string {
 	return fmt.Sprintf("sandbox-%s-port-%d", id, port)
 }
-
-var _ = time.Second

@@ -341,6 +341,17 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 	if err := s.mounts.UnmountAll(id); err != nil {
 		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
 	}
+	// Drop the Caddy routes while the container is down so requests hit the
+	// fallback "sandbox not found" handler instead of a 502 from a stale
+	// upstream IP. StartSandbox re-upserts every route on the way back up.
+	for _, port := range sandbox.ExposedPorts {
+		if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
+			s.logger.Warn("caddy port route cleanup on stop failed", "sandbox_id", id, "port", port.Port, "error", err)
+		}
+	}
+	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+		s.logger.Warn("caddy route cleanup on stop failed", "sandbox_id", id, "error", err)
+	}
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
