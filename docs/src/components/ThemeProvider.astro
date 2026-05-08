@@ -14,9 +14,8 @@
     return {
       updatePickers(themeName = storedTheme || 'auto') {
         document.querySelectorAll('theme-select').forEach(picker => {
-          const select = picker.querySelector('select')
-          if (select) {
-            select.value = themeName
+          if (typeof picker.syncTheme === 'function') {
+            picker.syncTheme(themeName)
           }
         })
       },

@@ -1,14 +1,22 @@
 <theme-select class="theme-select-container">
-  <span class="theme-select-icon" aria-hidden="true">
-    <svg viewBox="0 0 24 24">
-      <path d="M12 3.25a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V4a.75.75 0 0 1 .75-.75ZM12 18.5a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V19.25a.75.75 0 0 1 .75-.75ZM5.813 5.813a.75.75 0 0 1 1.06 0l1.061 1.06a.75.75 0 1 1-1.06 1.061L5.812 6.873a.75.75 0 0 1 0-1.06ZM16.066 16.065a.75.75 0 0 1 1.06 0l1.061 1.061a.75.75 0 0 1-1.06 1.06l-1.061-1.06a.75.75 0 0 1 0-1.061ZM3.25 12a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5H4a.75.75 0 0 1-.75-.75ZM18.5 12a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75ZM6.873 16.065a.75.75 0 0 1 1.06 1.061l-1.06 1.06a.75.75 0 0 1-1.061-1.06l1.061-1.061ZM17.126 5.813a.75.75 0 0 1 1.06 1.06l-1.06 1.061a.75.75 0 1 1-1.061-1.06l1.061-1.061ZM12 8a4 4 0 1 1 0 8a4 4 0 0 1 0-8Z" fill="currentColor"></path>
-    </svg>
-  </span>
-  <select aria-label="Theme">
-    <option value="auto">System</option>
-    <option value="light">Light</option>
-    <option value="dark">Dark</option>
-  </select>
+  <button class="theme-select-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Theme">
+    <span class="theme-select-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24">
+        <path d="M12 3.25a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V4a.75.75 0 0 1 .75-.75ZM12 18.5a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V19.25a.75.75 0 0 1 .75-.75ZM5.813 5.813a.75.75 0 0 1 1.06 0l1.061 1.06a.75.75 0 1 1-1.06 1.061L5.812 6.873a.75.75 0 0 1 0-1.06ZM16.066 16.065a.75.75 0 0 1 1.06 0l1.061 1.061a.75.75 0 0 1-1.06 1.06l-1.061-1.06a.75.75 0 0 1 0-1.061ZM3.25 12a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5H4a.75.75 0 0 1-.75-.75ZM18.5 12a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75ZM6.873 16.065a.75.75 0 0 1 1.06 1.061l-1.06 1.06a.75.75 0 0 1-1.061-1.06l1.061-1.061ZM17.126 5.813a.75.75 0 0 1 1.06 1.06l-1.06 1.061a.75.75 0 1 1-1.061-1.06l1.061-1.061ZM12 8a4 4 0 1 1 0 8a4 4 0 0 1 0-8Z" fill="currentColor"></path>
+      </svg>
+    </span>
+    <span class="theme-select-value">System</span>
+    <span class="theme-select-chevron" aria-hidden="true">
+      <svg viewBox="0 0 16 16">
+        <path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" fill="currentColor"></path>
+      </svg>
+    </span>
+  </button>
+  <div class="theme-select-menu" role="listbox" aria-label="Theme options" hidden>
+    <button class="theme-select-option" type="button" role="option" data-theme-option="auto">System</button>
+    <button class="theme-select-option" type="button" role="option" data-theme-option="light">Light</button>
+    <button class="theme-select-option" type="button" role="option" data-theme-option="dark">Dark</button>
+  </div>
 </theme-select>
 
 <script is:inline>
@@ -18,15 +26,70 @@
 <script>
   class ThemeSelect extends HTMLElement {
     #key = 'theme'
+    #labels = {
+      auto: 'System',
+      light: 'Light',
+      dark: 'Dark',
+    }
 
     constructor() {
       super()
-      this.select = this.querySelector('select')
-      this.#onThemeChange(this.#loadTheme())
-      if (this.select) {
-        this.select.addEventListener('change', () => {
-          this.#onThemeChange(this.select.value)
+      this.trigger = this.querySelector('.theme-select-trigger')
+      this.menu = this.querySelector('.theme-select-menu')
+      this.valueNode = this.querySelector('.theme-select-value')
+      this.options = Array.from(this.querySelectorAll('[data-theme-option]'))
+      this.syncTheme = theme => {
+        const nextTheme = this.#parseTheme(theme)
+        if (this.valueNode) {
+          this.valueNode.textContent = this.#labels[nextTheme]
+        }
+        this.options.forEach(option => {
+          const isActive = option.dataset.themeOption === nextTheme
+          option.setAttribute('aria-selected', String(isActive))
+          option.classList.toggle('is-active', isActive)
         })
+        this.setAttribute('data-theme-value', nextTheme)
+        this.#positionMenu()
+      }
+      this.#onThemeChange(this.#loadTheme())
+      if (this.trigger) {
+        this.trigger.addEventListener('click', () => {
+          this.toggleMenu()
+        })
+      }
+
+      this.options.forEach(option => {
+        option.addEventListener('click', () => {
+          this.#onThemeChange(option.dataset.themeOption)
+          this.closeMenu()
+        })
+      })
+
+      this.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+          this.closeMenu()
+          this.trigger?.focus()
+        }
+      })
+
+      document.addEventListener('click', event => {
+        if (!this.contains(event.target)) {
+          this.closeMenu()
+        }
+      })
+    }
+
+    connectedCallback() {
+      this.ownerDocument.defaultView?.addEventListener('resize', this.#handleResize)
+    }
+
+    disconnectedCallback() {
+      this.ownerDocument.defaultView?.removeEventListener('resize', this.#handleResize)
+    }
+
+    #handleResize = () => {
+      if (this.hasAttribute('data-open')) {
+        this.#positionMenu()
       }
     }
 
@@ -47,12 +110,57 @@
     #onThemeChange(theme) {
       const nextTheme = this.#parseTheme(theme)
       ThemeProvider.updatePickers(nextTheme)
-      if (this.select) {
-        this.select.value = nextTheme
-      }
       document.documentElement.dataset.theme =
         nextTheme === 'auto' ? this.#preferredTheme() : nextTheme
       this.#storeTheme(nextTheme)
+    }
+
+    toggleMenu() {
+      if (this.hasAttribute('data-open')) {
+        this.closeMenu()
+      } else {
+        this.openMenu()
+      }
+    }
+
+    openMenu() {
+      this.setAttribute('data-open', '')
+      if (this.trigger) {
+        this.trigger.setAttribute('aria-expanded', 'true')
+      }
+      if (this.menu) {
+        this.menu.hidden = false
+      }
+      this.#positionMenu()
+    }
+
+    closeMenu() {
+      this.removeAttribute('data-open')
+      this.removeAttribute('data-menu-direction')
+      if (this.trigger) {
+        this.trigger.setAttribute('aria-expanded', 'false')
+      }
+      if (this.menu) {
+        this.menu.hidden = true
+      }
+    }
+
+    #positionMenu() {
+      if (!this.menu || this.menu.hidden) {
+        return
+      }
+
+      this.removeAttribute('data-menu-direction')
+      const rect = this.getBoundingClientRect()
+      const menuHeight = this.menu.offsetHeight
+      const roomBelow = window.innerHeight - rect.bottom
+      const roomAbove = rect.top
+
+      if (roomBelow < menuHeight + 12 && roomAbove > roomBelow) {
+        this.setAttribute('data-menu-direction', 'up')
+      } else {
+        this.setAttribute('data-menu-direction', 'down')
+      }
     }
 
     #storeTheme(theme) {
@@ -81,6 +189,13 @@
 
 <style>
   .theme-select-container {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+    color: var(--primary-text-color);
+  }
+
+  .theme-select-trigger {
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -88,28 +203,25 @@
     border: var(--border);
     border-radius: 999px;
     background: var(--bg-color);
-    flex-shrink: 0;
-    color: var(--primary-text-color);
-    position: relative;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
   }
 
-  .theme-select-icon {
+  .theme-select-trigger:hover,
+  .theme-select-trigger:focus-visible,
+  .theme-select-container[data-open] .theme-select-trigger {
+    border-color: var(--hover-color);
+    color: var(--hover-color);
+    outline: none;
+  }
+
+  .theme-select-icon,
+  .theme-select-chevron {
     display: flex;
     align-items: center;
     justify-content: center;
-    pointer-events: none;
-  }
-
-  .theme-select-container::after {
-    content: '';
-    position: absolute;
-    right: 12px;
-    top: 50%;
-    transform: translateY(-35%);
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 4px solid currentColor;
-    pointer-events: none;
   }
 
   .theme-select-container svg {
@@ -117,25 +229,73 @@
     height: 16px;
   }
 
-  .theme-select-container select {
-    appearance: none;
-    border: none;
-    background: transparent;
-    color: inherit;
-    padding: 0 20px 0 0;
+  .theme-select-value {
     font-family: var(--font-mono);
     font-size: 0.75rem;
+    line-height: 1;
+  }
+
+  .theme-select-chevron {
+    transition: transform 0.2s ease;
+  }
+
+  .theme-select-container[data-open] .theme-select-chevron {
+    transform: rotate(180deg);
+  }
+
+  .theme-select-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    min-width: 100%;
+    padding: 6px;
+    border: var(--border);
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--bg-color) 92%, transparent);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.24);
+    display: grid;
+    gap: 4px;
+    z-index: 40;
+  }
+
+  .theme-select-menu[hidden] {
+    display: none;
+  }
+
+  .theme-select-container[data-menu-direction='up'] .theme-select-menu {
+    top: auto;
+    bottom: calc(100% + 8px);
+  }
+
+  .theme-select-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    width: 100%;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 10px;
+    background: transparent;
+    color: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    line-height: 1.2;
     cursor: pointer;
     outline: none;
+    text-align: left;
   }
 
-  .theme-select-container select:hover,
-  .theme-select-container select:focus {
-    color: var(--hover-color);
-  }
-
-  .theme-select-container option {
+  .theme-select-option:hover,
+  .theme-select-option:focus-visible,
+  .theme-select-option.is-active {
+    background: var(--block-bg-color);
     color: var(--primary-text-color);
-    background: var(--bg-color);
+  }
+
+  .theme-select-option.is-active::after {
+    content: '✓';
+    color: var(--hover-color);
   }
 </style>
