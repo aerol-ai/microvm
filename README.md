@@ -123,6 +123,8 @@ Required GitHub Actions repository secrets:
 
 The Java publish job deploys to GitHub Packages with the workflow's built-in `GITHUB_TOKEN`, so it does not require an additional repository secret. The workflow must keep `packages: write` permission enabled.
 
+If the Java package version for a tag is already present in GitHub Packages, the workflow skips the deploy step on reruns instead of failing with a `409 Conflict`. If GitHub Packages already contains only part of the version's artifacts, the workflow now fails early with an explicit message because Maven versions there are immutable. Publishing a new Java artifact still requires bumping the SDK version and tag.
+
 These tokens must be added in the GitHub repository settings. They cannot be stored in git or created from inside this workspace.
 
 The Go SDK does not need a separate registry workflow. Consumers install it directly from module tags:
