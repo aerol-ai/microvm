@@ -51,7 +51,14 @@ const hasToc = Astro.props.toc
       grid-template-columns: 100%;
     }
 
-    .right-sidebar-container,
+    .right-sidebar-container {
+      height: 0;
+      overflow: hidden;
+      order: unset;
+      position: unset;
+      padding-top: 0;
+    }
+
     .right-sidebar {
       order: unset;
       position: unset;
