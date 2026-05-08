@@ -34,5 +34,480 @@ This repository packages two binaries:
 
 - Start with [Getting Started](/getting-started) to build and run the daemon locally.
 - Read [Architecture](/architecture) for the control-plane and runtime split.
-- Use [SDK Clients](/sdk-clients) for language-specific entry points.
+- Use [SDK Overview](/sdk-clients) for package names, auth, and shared SDK behavior.
+- Jump to [Go SDK](/go-sdk), [TypeScript SDK](/typescript-sdk), [Python SDK](/python-sdk), or [Rust SDK](/rust-sdk) for language-specific examples.
 - Review [Streaming Exec](/exec-streaming), [External Storage](/external-storage), [Network Isolation](/network-isolation), and [Port Allowlist](/port-allowlist) for the main advanced features.
+*** Add File: /Users/sumansaurabh/Documents/startup-3/sandbox-library/docs/src/content/docs/go-sdk.md
+---
+title: Go SDK
+description: Use the Go client to manage sandboxes, stream commands, transfer files, and work with sessions.
+---
+
+The Go SDK lives under `sdk/go` and is imported as `github.com/aerol-ai/microvm/sdk/go/pkg/microvm`.
+
+## Install
+
+```bash
+go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest
+```
+
+The request and response types are re-exported from `github.com/aerol-ai/microvm/sdk/go/pkg/types`.
+
+## Create A Client
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+)
+
+func main() {
+	client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+		APIUrl:   os.Getenv("SB_API_URL"),
+		PATToken: os.Getenv("SB_PAT_TOKEN"),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
+		Image:    "ghcr.io/aerol-ai/ubuntu:22.04",
+		CPU:      1,
+		MemoryMB: 1024,
+		DiskGB:   10,
+		Lifecycle: &sdktypes.Lifecycle{
+			StopIfIdleFor: time.Hour,
+			DestroyAtAge:  24 * time.Hour,
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(sandbox.ID, sandbox.PublicURL)
+	fmt.Println(sandbox.SSHPublicKey)
+	fmt.Println(sandbox.SSHPrivateKey) // returned only by Create
+}
+```
+
+`microvm.NewClient()` is also available and reads `SB_PAT_TOKEN` and `SB_API_URL` from the environment.
+
+## Run Commands
+
+```go
+result, err := sandbox.ExecCommand(context.Background(), "echo hello")
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Println(result.Stdout)
+```
+
+You can also call `sandbox.Exec()` with a full request object when you need `Workdir`, `Env`, or `TimeoutSeconds`.
+
+## Streaming Exec And Sessions
+
+```go
+handle, err := sandbox.ExecStream(context.Background(), sdktypes.ExecStreamOptions{
+	Command: "bash",
+	TTY:     true,
+	Cols:    120,
+	Rows:    40,
+	OnStdout: func(chunk []byte) {
+		fmt.Print(string(chunk))
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+if err := handle.WriteString("echo streamed\n"); err != nil {
+	log.Fatal(err)
+}
+
+exit, err := handle.Wait()
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Println(exit.Code, exit.Signal)
+```
+
+```go
+session, err := sandbox.CreateSession(context.Background(), sdktypes.CreateSessionOptions{
+	Name:    "shell",
+	Command: "bash",
+	Workdir: "/workspace",
+	Pty:     true,
+	Cols:    120,
+	Rows:    40,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+attached, err := sandbox.AttachSession(context.Background(), session.ID, microvm.SessionAttachOptions{
+	Cols: 120,
+	Rows: 40,
+	OnStdout: func(chunk []byte) {
+		fmt.Print(string(chunk))
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+_ = attached.WriteString("echo attached\n")
+code, signal, err := attached.Wait()
+fmt.Println(code, signal, err)
+```
+
+## Additional Helpers
+
+- `client.Mounts()` returns redacted mount config for a sandbox.
+- `sandbox.UploadFile()` and `sandbox.DownloadFile()` move bytes through `toolboxd`.
+- `sandbox.ExposePort()` and `sandbox.UnexposePort()` manage public URLs.
+- `sandbox.SessionLog()` and `sandbox.SessionRecording()` return raw bytes.
+
+Because the Go SDK reuses the server models, lifecycle values are plain `time.Duration` fields instead of raw nanosecond integers.
+*** Add File: /Users/sumansaurabh/Documents/startup-3/sandbox-library/docs/src/content/docs/typescript-sdk.md
+---
+title: TypeScript SDK
+description: Use the TypeScript client from Node.js or other fetch-compatible runtimes to control sandboxes.
+---
+
+The TypeScript SDK lives under `sdk/typescript` and publishes as `@aerol-ai/microvm-sdk`.
+
+## Install
+
+```bash
+npm install @aerol-ai/microvm-sdk
+```
+
+## Create A Client
+
+```ts
+import { MicroVM } from '@aerol-ai/microvm-sdk'
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+})
+```
+
+If you omit a field, the constructor falls back to `SB_API_URL`, `SB_PAT_TOKEN`, and finally `http://127.0.0.1:8080` for the API base URL.
+
+## Create And Use A Sandbox
+
+```ts
+const sandbox = await client.create({
+  image: 'ghcr.io/aerol-ai/ubuntu:22.04',
+  cpu: 1,
+  memoryMB: 1024,
+  diskGB: 10,
+  lifecycle: {
+  stopIfIdleFor: 60 * 60 * 1_000_000_000,
+  destroyAtAge: 24 * 60 * 60 * 1_000_000_000,
+  },
+})
+
+const result = await sandbox.exec({ command: 'echo hello from typescript' })
+
+console.log(result.stdout)
+console.log(sandbox.publicURL)
+console.log(sandbox.sshPublicKey)
+console.log(sandbox.sshPrivateKey) // returned only by create()
+```
+
+`sandbox.exec()` accepts either a plain command string or a full request object with `workDir`, `env`, and `timeoutSeconds`.
+
+## Streaming Exec And Sessions
+
+```ts
+const decoder = new TextDecoder()
+
+const handle = sandbox.execStream({
+  command: 'bash',
+  tty: true,
+  cols: 120,
+  rows: 40,
+  onStdout: chunk => process.stdout.write(decoder.decode(chunk, { stream: true })),
+})
+
+handle.write('echo streamed\n')
+
+const exit = await handle.done
+console.log(exit)
+```
+
+```ts
+const session = await sandbox.createSession({
+  name: 'shell',
+  command: 'bash',
+  workDir: '/workspace',
+  pty: true,
+  cols: 120,
+  rows: 40,
+})
+
+const attached = sandbox.attachSession(session.id, {
+  cols: 120,
+  rows: 40,
+  onStdout: chunk => process.stdout.write(decoder.decode(chunk, { stream: true })),
+})
+
+attached.write('echo attached\n')
+
+const sessionExit = await attached.done
+console.log(sessionExit)
+```
+
+## Additional Helpers
+
+- `client.health()` returns the daemon, Docker, Caddy, and SSH gateway status.
+- `client.mounts(id)` returns redacted mount specs with `hasCredentials` markers.
+- `sandbox.uploadFile()` and `sandbox.downloadFile()` move bytes through the toolbox proxy.
+- `sandbox.exposePort()` returns the public URL for that port.
+- `sandbox.sessionLog()` and `sandbox.sessionRecording()` return `Uint8Array` payloads.
+
+Lifecycle values are integer nanoseconds in the TypeScript API because the SDK maps the JSON wire format directly.
+*** Add File: /Users/sumansaurabh/Documents/startup-3/sandbox-library/docs/src/content/docs/python-sdk.md
+---
+title: Python SDK
+description: Use the Python client for synchronous sandbox lifecycle, exec streaming, file transfer, and sessions.
+---
+
+The Python SDK lives under `sdk/python`, publishes as `aerol-ai-microvm-sdk`, and is imported as `microvm`.
+
+## Install
+
+```bash
+pip install aerol-ai-microvm-sdk
+```
+
+For local development from this repository, `cd sdk/python && pip install .` also works.
+
+## Create A Client
+
+```python
+from microvm import MicroVM
+
+client = MicroVM(
+  api_url='https://sandbox.example.com',
+  pat_token='your-token',
+)
+```
+
+If you omit either field, the client falls back to `SB_API_URL`, `SB_PAT_TOKEN`, and then `http://127.0.0.1:8080` for the base URL.
+
+## Create And Use A Sandbox
+
+```python
+from microvm import MicroVM
+
+client = MicroVM(api_url='https://sandbox.example.com', pat_token='your-token')
+
+sandbox = client.create(
+  {
+    'image': 'ghcr.io/aerol-ai/ubuntu:22.04',
+    'cpu': 1.0,
+    'memoryMB': 1024,
+    'diskGB': 10,
+    'lifecycle': {
+      'stopIfIdleFor': 3_600_000_000_000,
+      'destroyAtAge': 86_400_000_000_000,
+    },
+  }
+)
+
+result = sandbox.exec_command('echo hello from python')
+
+print(result['stdout'])
+print(sandbox.publicURL)
+print(sandbox.sshPublicKey)
+print(sandbox.sshPrivateKey)  # returned only by create()
+```
+
+The `Sandbox` wrapper exposes response fields as attributes and also provides `to_dict()` if you need the raw payload back.
+
+## Streaming Exec And Sessions
+
+```python
+import sys
+
+handle = sandbox.exec_stream(
+  {
+    'command': 'bash',
+    'tty': True,
+    'cols': 120,
+    'rows': 40,
+    'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
+  }
+)
+
+handle.write('echo streamed\n')
+print(handle.wait())
+```
+
+```python
+session = sandbox.create_session(
+  {
+    'name': 'shell',
+    'command': 'bash',
+    'workDir': '/workspace',
+    'pty': True,
+    'cols': 120,
+    'rows': 40,
+  }
+)
+
+attached = sandbox.attach_session(
+  session['id'],
+  {
+    'cols': 120,
+    'rows': 40,
+    'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
+  },
+)
+
+attached.write('echo attached\n')
+print(attached.wait())
+```
+
+## Additional Helpers
+
+- `client.health()` returns the daemon status payload, including `sshGateway`.
+- `client.mounts(sandbox_id)` returns redacted mount information.
+- `sandbox.upload_file()` and `sandbox.download_file()` move bytes through `toolboxd`.
+- `sandbox.expose_port()` and `sandbox.unexpose_port()` manage public URLs.
+- `sandbox.session_log()` and `sandbox.session_recording()` return raw `bytes`.
+
+Lifecycle fields use integer nanoseconds in Python to match the JSON API.
+*** Add File: /Users/sumansaurabh/Documents/startup-3/sandbox-library/docs/src/content/docs/rust-sdk.md
+---
+title: Rust SDK
+description: Use the Rust client for blocking API calls plus WebSocket-based exec and session attachment.
+---
+
+The Rust SDK lives under `sdk/rust`, publishes as `microvm-sdk`, and is imported in code as `microvm_sdk`.
+
+## Install
+
+```bash
+cargo add microvm-sdk
+```
+
+## Create A Client
+
+```rust
+use microvm_sdk::Client;
+
+let client = Client::new(
+  Some("https://sandbox.example.com"),
+  Some("your-token"),
+)?;
+```
+
+If you pass `None`, the client falls back to `SB_API_URL`, `SB_PAT_TOKEN`, and then `http://127.0.0.1:8080` for the base URL.
+
+## Create And Use A Sandbox
+
+```rust
+use microvm_sdk::{Client, CreateOptions, Lifecycle};
+
+let client = Client::new(Some("https://sandbox.example.com"), Some("your-token"))?;
+
+let mut sandbox = client.create(CreateOptions {
+  image: "ghcr.io/aerol-ai/ubuntu:22.04".to_string(),
+  cpu: Some(1),
+  memory_mb: Some(1024),
+  disk_gb: Some(10),
+  env: None,
+  os_user: None,
+  network_block_all: None,
+  registry: None,
+  container_command: None,
+  mounts: None,
+  lifecycle: Some(Lifecycle {
+    stop_if_idle_for: 3_600_000_000_000,
+    destroy_at_age: 86_400_000_000_000,
+    ..Default::default()
+  }),
+})?;
+
+let result = sandbox.exec(microvm_sdk::ExecRequest {
+  command: "echo hello from rust".to_string(),
+  work_dir: None,
+  env: None,
+  timeout_seconds: None,
+})?;
+
+println!("{}", result.stdout);
+println!("{:?}", sandbox.data.public_url);
+println!("{:?}", sandbox.data.ssh_public_key);
+println!("{:?}", sandbox.ssh_private_key); // returned only by create()
+```
+
+The Rust wrapper stores the API record on `sandbox.data`, while the create-only private key is available separately as `sandbox.ssh_private_key`.
+
+## Streaming Exec And Sessions
+
+```rust
+use std::sync::Arc;
+
+let handle = sandbox.exec_stream(microvm_sdk::ExecStreamOptions {
+  command: "bash".to_string(),
+  tty: true,
+  cols: Some(120),
+  rows: Some(40),
+  on_stdout: Some(Arc::new(|chunk| {
+    print!("{}", String::from_utf8_lossy(&chunk))
+  })),
+  ..Default::default()
+})?;
+
+handle.write_string("echo streamed\n")?;
+println!("{:?}", handle.wait()?);
+```
+
+```rust
+let session = sandbox.create_session(microvm_sdk::CreateSessionOptions {
+  name: Some("shell".to_string()),
+  command: Some("bash".to_string()),
+  work_dir: Some("/workspace".to_string()),
+  pty: Some(true),
+  cols: Some(120),
+  rows: Some(40),
+  ..Default::default()
+})?;
+
+let attached = sandbox.attach_session(&session.id, microvm_sdk::SessionAttachOptions {
+  cols: Some(120),
+  rows: Some(40),
+  on_stdout: Some(Arc::new(|chunk| {
+    print!("{}", String::from_utf8_lossy(&chunk))
+  })),
+  ..Default::default()
+})?;
+
+attached.write_string("echo attached\n")?;
+println!("{:?}", attached.wait()?);
+```
+
+## Additional Helpers
+
+- `client.health()` returns the daemon, Docker, Caddy, and SSH gateway status.
+- `client.mounts(id)` returns redacted mount specs.
+- `sandbox.upload_file()` and `sandbox.download_file()` transfer file contents.
+- `sandbox.expose_port()` and `sandbox.unexpose_port()` manage public URLs.
+- `sandbox.session_log()` and `sandbox.session_recording()` return raw `Vec<u8>` payloads.
+
+HTTP calls are blocking. The crate spins up an internal Tokio runtime only for the WebSocket-backed streaming helpers.
