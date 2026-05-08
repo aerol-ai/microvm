@@ -1,12 +1,6 @@
 name: Publish SDKs
 
 on:
-  push:
-    tags:
-      - 'v*'
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       tag:
@@ -20,8 +14,8 @@ permissions:
   packages: write
 
 env:
-  VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
-  SDK_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+  VERSION: ${{ github.event.inputs.tag }}
+  SDK_VERSION: ${{ github.event.inputs.tag }}
 
 jobs:
   java:
@@ -56,6 +50,49 @@ jobs:
             exit 1
           fi
 
+      - name: Check whether package version is already published
+        id: java_publish_state
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mapfile -t artifact_urls < <(python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          ns = {'m': 'http://maven.apache.org/POM/4.0.0'}
+          root = ET.parse('pom.xml').getroot()
+          group_id = root.findtext('m:groupId', namespaces=ns) or root.findtext('m:parent/m:groupId', namespaces=ns) or ''
+          artifact_id = root.findtext('m:artifactId', namespaces=ns) or ''
+          version = root.findtext('m:version', namespaces=ns) or root.findtext('m:parent/m:version', namespaces=ns) or ''
+          packaging = root.findtext('m:packaging', namespaces=ns) or 'jar'
+
+          base = f"https://maven.pkg.github.com/aerol-ai/microvm/{group_id.replace('.', '/')}/{artifact_id}/{version}"
+          print(f"{base}/{artifact_id}-{version}.pom")
+          print(f"{base}/{artifact_id}-{version}.{packaging}")
+          print(f"{base}/{artifact_id}-{version}-sources.jar")
+          print(f"{base}/{artifact_id}-{version}-javadoc.jar")
+          PY
+          )
+
+          existing_artifacts=0
+          for artifact_url in "${artifact_urls[@]}"; do
+            if curl -fsSIL -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$artifact_url" >/dev/null; then
+              existing_artifacts=$((existing_artifacts + 1))
+            fi
+          done
+
+          if [[ "$existing_artifacts" -eq 0 ]]; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$existing_artifacts" -ne "${#artifact_urls[@]}" ]]; then
+            echo "::error::Java SDK version ${SDK_VERSION#v} is only partially present in GitHub Packages. Delete that package version or publish a new SDK version and tag instead of retrying this deploy."
+            exit 1
+          fi
+
+          echo "already_published=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Java SDK version ${SDK_VERSION#v} is already present in GitHub Packages; skipping deploy on this rerun."
+
       - name: Run tests
         run: mvn -B -ntp test
 
@@ -63,9 +100,10 @@ jobs:
         run: mvn -B -ntp -DskipTests package
 
       - name: Publish package
+        if: steps.java_publish_state.outputs.already_published != 'true'
         run: mvn -B -ntp -DskipTests deploy
         env:
-          GITHUB_TOKEN: ${{ secrets.GCR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   npm:
     name: Publish TypeScript SDK to npm
