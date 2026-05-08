@@ -14,14 +14,9 @@
     return {
       updatePickers(themeName = storedTheme || 'auto') {
         document.querySelectorAll('theme-select').forEach(picker => {
-          const buttons = picker.querySelectorAll('button')
-          buttons.forEach(button => {
-            if (button.id === themeName) {
-              button.classList.add('theme-select-button-active')
-            } else {
-              button.classList.remove('theme-select-button-active')
-            }
-          })
+          if (typeof picker.syncTheme === 'function') {
+            picker.syncTheme(themeName)
+          }
         })
       },
     }

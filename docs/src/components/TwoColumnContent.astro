@@ -23,8 +23,8 @@ const hasToc = Astro.props.toc
 
   .main-pane-wrapper {
     display: grid;
-    grid-template-columns: 7fr 2fr;
-    column-gap: 48px;
+    grid-template-columns: minmax(0, 1fr) minmax(180px, 220px);
+    column-gap: 24px;
   }
 
   .main-pane-wrapper.no-toc {
@@ -51,7 +51,14 @@ const hasToc = Astro.props.toc
       grid-template-columns: 100%;
     }
 
-    .right-sidebar-container,
+    .right-sidebar-container {
+      height: 0;
+      overflow: hidden;
+      order: unset;
+      position: unset;
+      padding-top: 0;
+    }
+
     .right-sidebar {
       order: unset;
       position: unset;

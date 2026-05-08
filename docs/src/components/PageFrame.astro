@@ -39,8 +39,8 @@ const { hasSidebar = true } = Astro.props
   .grid-template {
     position: relative;
     display: grid;
-    grid-template-columns: 1fr 4fr;
-    column-gap: 48px;
+    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+    column-gap: 20px;
   }
 
   .no-sidebar .grid-template {
@@ -88,8 +88,8 @@ const { hasSidebar = true } = Astro.props
 
     .sidebar-pane {
       display: none;
-      z-index: 5;
-      padding-top: 55px;
+      z-index: 20;
+      padding-top: 72px;
       position: fixed;
       right: 0;
       width: 75vw;
@@ -97,15 +97,17 @@ const { hasSidebar = true } = Astro.props
       padding-left: 20px;
       padding-right: 20px;
       top: 0;
+      bottom: 0;
+      height: 100vh;
       max-height: unset;
     }
 
-    [aria-expanded='true'] ~ .sidebar-pane {
+    :global(body[data-mobile-menu-expanded]) .sidebar-pane {
       display: block;
     }
 
     .main-frame {
-      padding-top: calc(48px + var(--sl-mobile-toc-height));
+      padding-top: 0;
     }
   }
 </style>

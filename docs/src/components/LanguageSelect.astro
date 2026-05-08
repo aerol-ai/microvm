@@ -1,0 +1,343 @@
+---
+const { languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java'] } = Astro.props
+const defaultLanguage = languages[0] || 'TypeScript'
+---
+
+<language-select class="language-select-container" data-default-language={defaultLanguage}>
+  <button
+    class="language-select-trigger"
+    type="button"
+    aria-haspopup="listbox"
+    aria-expanded="false"
+    aria-label="SDK language"
+  >
+    <span class="language-select-value">{defaultLanguage}</span>
+    <span class="language-select-chevron" aria-hidden="true">
+      <svg viewBox="0 0 16 16">
+        <path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" fill="currentColor"></path>
+      </svg>
+    </span>
+  </button>
+  <div class="language-select-menu" role="listbox" aria-label="SDK language options" hidden>
+    {
+      languages.map(language => (
+        <button
+          class="language-select-option"
+          type="button"
+          role="option"
+          data-language-option={language}
+        >
+          {language}
+        </button>
+      ))
+    }
+  </div>
+</language-select>
+
+<script>
+  class LanguageSelect extends HTMLElement {
+    #langKey = 'aerolvm-lang'
+    #starlightKey = 'starlight-synced-tabs__lang'
+
+    constructor() {
+      super()
+      this.trigger = this.querySelector('.language-select-trigger')
+      this.menu = this.querySelector('.language-select-menu')
+      this.valueNode = this.querySelector('.language-select-value')
+      this.options = Array.from(this.querySelectorAll('[data-language-option]'))
+      this.languages = this.options.map(option => option.dataset.languageOption)
+      this.defaultLanguage = this.dataset.defaultLanguage || this.languages[0] || 'TypeScript'
+
+      this.syncLanguage = language => {
+        const nextLanguage = this.#parseLanguage(language)
+        if (this.valueNode) {
+          this.valueNode.textContent = nextLanguage
+        }
+        this.options.forEach(option => {
+          const isActive = option.dataset.languageOption === nextLanguage
+          option.setAttribute('aria-selected', String(isActive))
+          option.classList.toggle('is-active', isActive)
+        })
+        this.setAttribute('data-language-value', nextLanguage)
+        this.#positionMenu()
+      }
+
+      const initialLanguage = this.#loadLanguage()
+      this.#persistLanguage(initialLanguage)
+      this.syncLanguage(initialLanguage)
+
+      this.handleTriggerClick = () => this.toggleMenu()
+      this.handleDocumentClick = event => {
+        if (!this.contains(event.target)) {
+          this.closeMenu()
+        }
+      }
+      this.handleTabClick = event => {
+        const button = event.target.closest('[role="tab"]')
+        if (!button) {
+          return
+        }
+        const label = button.textContent.trim()
+        if (!this.languages.includes(label)) {
+          return
+        }
+        this.#persistLanguage(label)
+        this.syncLanguage(label)
+      }
+      this.handlePageLoad = () => {
+        const language =
+          sessionStorage.getItem(this.#starlightKey) ||
+          localStorage.getItem(this.#langKey) ||
+          this.defaultLanguage
+        this.#persistLanguage(language)
+        this.syncLanguage(language)
+      }
+      this.handleResize = () => {
+        if (this.hasAttribute('data-open')) {
+          this.#positionMenu()
+        }
+      }
+      this.handleKeyDown = event => {
+        if (event.key === 'Escape') {
+          this.closeMenu()
+          this.trigger?.focus()
+        }
+      }
+
+      if (this.trigger) {
+        this.trigger.addEventListener('click', this.handleTriggerClick)
+      }
+
+      this.options.forEach(option => {
+        option.addEventListener('click', () => {
+          const nextLanguage = option.dataset.languageOption
+          this.#setLanguage(nextLanguage, { syncTabs: true })
+          this.closeMenu()
+        })
+      })
+
+      this.addEventListener('keydown', this.handleKeyDown)
+    }
+
+    connectedCallback() {
+      document.addEventListener('click', this.handleDocumentClick)
+      document.addEventListener('click', this.handleTabClick)
+      document.addEventListener('astro:page-load', this.handlePageLoad)
+      this.ownerDocument.defaultView?.addEventListener('resize', this.handleResize)
+    }
+
+    disconnectedCallback() {
+      document.removeEventListener('click', this.handleDocumentClick)
+      document.removeEventListener('click', this.handleTabClick)
+      document.removeEventListener('astro:page-load', this.handlePageLoad)
+      this.ownerDocument.defaultView?.removeEventListener('resize', this.handleResize)
+      if (this.trigger) {
+        this.trigger.removeEventListener('click', this.handleTriggerClick)
+      }
+      this.removeEventListener('keydown', this.handleKeyDown)
+    }
+
+    #parseLanguage(language) {
+      return this.languages.includes(language) ? language : this.defaultLanguage
+    }
+
+    #loadLanguage() {
+      const language =
+        typeof localStorage !== 'undefined' && localStorage.getItem(this.#langKey)
+      return this.#parseLanguage(language)
+    }
+
+    #persistLanguage(language) {
+      if (typeof localStorage === 'undefined') {
+        return
+      }
+      const nextLanguage = this.#parseLanguage(language)
+      localStorage.setItem(this.#langKey, nextLanguage)
+      sessionStorage.setItem(this.#starlightKey, nextLanguage)
+    }
+
+    #setLanguage(language, { syncTabs = false } = {}) {
+      const nextLanguage = this.#parseLanguage(language)
+      this.#persistLanguage(nextLanguage)
+      this.syncLanguage(nextLanguage)
+      if (syncTabs) {
+        this.#syncTabs(nextLanguage)
+      }
+    }
+
+    #syncTabs(language) {
+      const firstGroup = document.querySelector('starlight-tabs')
+      if (!firstGroup) {
+        return
+      }
+      const buttons = firstGroup.querySelectorAll('[role="tab"]')
+      for (const button of buttons) {
+        if (button.textContent.trim() === language) {
+          button.click()
+          break
+        }
+      }
+    }
+
+    toggleMenu() {
+      if (this.hasAttribute('data-open')) {
+        this.closeMenu()
+      } else {
+        this.openMenu()
+      }
+    }
+
+    openMenu() {
+      this.setAttribute('data-open', '')
+      if (this.trigger) {
+        this.trigger.setAttribute('aria-expanded', 'true')
+      }
+      if (this.menu) {
+        this.menu.hidden = false
+      }
+      this.#positionMenu()
+    }
+
+    closeMenu() {
+      this.removeAttribute('data-open')
+      this.removeAttribute('data-menu-direction')
+      if (this.trigger) {
+        this.trigger.setAttribute('aria-expanded', 'false')
+      }
+      if (this.menu) {
+        this.menu.hidden = true
+      }
+    }
+
+    #positionMenu() {
+      if (!this.menu || this.menu.hidden) {
+        return
+      }
+
+      this.removeAttribute('data-menu-direction')
+      const rect = this.getBoundingClientRect()
+      const menuHeight = this.menu.offsetHeight
+      const roomBelow = window.innerHeight - rect.bottom
+      const roomAbove = rect.top
+
+      if (roomBelow < menuHeight + 12 && roomAbove > roomBelow) {
+        this.setAttribute('data-menu-direction', 'up')
+      } else {
+        this.setAttribute('data-menu-direction', 'down')
+      }
+    }
+  }
+
+  if (!customElements.get('language-select')) {
+    customElements.define('language-select', LanguageSelect)
+  }
+</script>
+
+<style>
+  .language-select-container {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+    color: var(--primary-text-color);
+  }
+
+  .language-select-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border: var(--border);
+    border-radius: 999px;
+    background: var(--bg-color);
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+  }
+
+  .language-select-trigger:hover,
+  .language-select-trigger:focus-visible,
+  .language-select-container[data-open] .language-select-trigger {
+    border-color: var(--hover-color);
+    color: var(--hover-color);
+    outline: none;
+  }
+
+  .language-select-chevron {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.2s ease;
+  }
+
+  .language-select-container[data-open] .language-select-chevron {
+    transform: rotate(180deg);
+  }
+
+  .language-select-container svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .language-select-value {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    line-height: 1;
+  }
+
+  .language-select-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    min-width: 100%;
+    padding: 6px;
+    border: var(--border);
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--bg-color) 92%, transparent);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.24);
+    display: grid;
+    gap: 4px;
+    z-index: 40;
+  }
+
+  .language-select-menu[hidden] {
+    display: none;
+  }
+
+  .language-select-container[data-menu-direction='up'] .language-select-menu {
+    top: auto;
+    bottom: calc(100% + 8px);
+  }
+
+  .language-select-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    width: 100%;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 10px;
+    background: transparent;
+    color: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    line-height: 1.2;
+    cursor: pointer;
+    outline: none;
+    text-align: left;
+  }
+
+  .language-select-option:hover,
+  .language-select-option:focus-visible,
+  .language-select-option.is-active {
+    background: var(--block-bg-color);
+    color: var(--primary-text-color);
+  }
+
+  .language-select-option.is-active::after {
+    content: '✓';
+    color: var(--hover-color);
+  }
+</style>

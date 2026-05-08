@@ -37,7 +37,7 @@
     width: 32px;
     height: 32px;
     border-radius: 9px;
-    background: #000;
+    background: var(--brand-mark-bg-color);
     display: grid;
     place-items: center;
 
@@ -95,6 +95,16 @@
     gap: 12px;
   }
 
+  .theme-control {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .theme-control-desktop {
+    margin-left: 4px;
+  }
+
   .version-pill,
   .github-link {
     display: inline-flex;
@@ -123,59 +133,22 @@
     }
   }
 
-  .lang-picker-wrap {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-
-    &::after {
-      content: '';
-      position: absolute;
-      right: 10px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 0;
-      height: 0;
-      border-left: 4px solid transparent;
-      border-right: 4px solid transparent;
-      border-top: 4px solid var(--primary-text-color);
-      pointer-events: none;
-    }
-  }
-
-  .lang-picker {
-    appearance: none;
-    background: var(--bg-color);
-    border: var(--border);
-    border-radius: 999px;
-    padding: 6px 28px 6px 12px;
-    font-family: var(--font-mono);
-    font-size: 0.75rem;
-    color: var(--primary-text-color);
-    cursor: pointer;
-    transition: border-color 0.2s ease, color 0.2s ease;
-    outline: none;
-
-    &:hover,
-    &:focus {
-      border-color: var(--hover-color);
-      color: var(--hover-color);
-    }
-
-    option {
-      background: var(--bg-color);
-      color: var(--primary-text-color);
-    }
-  }
-
   .mobile-navigation {
     display: none;
-    padding: 16px 20px;
+    position: relative;
+    padding: 16px 72px 16px 20px;
+    min-height: 72px;
     align-items: center;
     justify-content: space-between;
 
     @include for-tablet-screen-sizes {
       display: flex;
+    }
+  }
+
+  @media (max-width: 650px) {
+    .mobile-navigation {
+      padding-right: 72px;
     }
   }
 }

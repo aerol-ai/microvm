@@ -24,7 +24,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
     --dns-api-token your-cloudflare-api-token
 ```
 
-> **Pick the right TLS mode up-front.** In HTTP-01 mode Caddy issues one Let's Encrypt certificate per sandbox subdomain on first access. Let's Encrypt caps **certificate issuance** at 50 new certs per registered domain per week — this is a TLS limit, not a sandbox capacity limit. Sandbox capacity is determined entirely by the host's CPU and memory. DNS-01 issues exactly **two** certs total (`<domain>` + `*.<domain>`) regardless of how many sandboxes exist, so it scales indefinitely and is required for any real workload.
+> **Pick the right TLS mode up-front.** In HTTP-01 mode Caddy issues one Let's Encrypt certificate per sandbox subdomain on first access. Let's Encrypt caps **certificate issuance** at 50 new certs per registered domain per week - this is a TLS limit, not a sandbox capacity limit. Sandbox capacity is determined entirely by the host's CPU and memory. DNS-01 issues exactly **two** certs total (`<domain>` + `*.<domain>`) regardless of how many sandboxes exist, so it scales indefinitely and is required for any real workload.
 
 If you omit `--pat-token`, the installer generates a token and prints it once at the end.
 

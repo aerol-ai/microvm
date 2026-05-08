@@ -29,6 +29,7 @@ body {
   --foreground-color: #eef5fb;
   --selection-bg-color: rgba(40, 199, 111, 0.18);
   --selection-text-color: #28c76f;
+  --brand-mark-bg-color: var(--border-color);
 }
 
 html[data-theme='light'] body {
@@ -42,8 +43,10 @@ html[data-theme='light'] body {
   --active-border: 1px solid var(--border-color);
   --blue-link: #156ecf;
   --cta-surface-neutral-primary: #dce8ef;
-  --hover-color: #1ea45c;
-  --secondary-hover-color: #1ea45c;
+  --hover-color: #145f3f;
+  --secondary-hover-color: #145f3f;
   --foreground-color: #3f5564;
-  --selection-text-color: #1b8c50;
+  --selection-text-color: #134c33;
+  --selection-bg-color: rgba(20, 95, 63, 0.12);
+  --brand-mark-bg-color: #4a6a84;
 }
