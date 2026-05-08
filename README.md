@@ -354,7 +354,7 @@ client = MicroVM(api_url="https://sandbox.example.com", pat_token="${SB_PAT_TOKE
 Rust:
 
 ```rust
-use microvm_sdk::Client;
+use aerolvm_sdk::Client;
 
 let client = Client::new(Some("https://sandbox.example.com"), Some("your_token"))?;
 ```
