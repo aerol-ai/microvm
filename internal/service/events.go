@@ -153,11 +153,15 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		"status", string(sandbox.Status),
 	)
 
-	// Image GC: only on destroy. die/stop transition to stopped, where the
-	// image is still needed for a future Start. The store row above has
-	// already been updated to destroyed, so the helper's predicate will
-	// skip this sandbox correctly.
+	// Image GC and admitter release: only on destroy. die/stop transition to
+	// stopped, where the image is still needed for a future Start and the
+	// reservation is still legitimately held. The store row above has already
+	// been updated to destroyed, so the GC helper's predicate will skip this
+	// sandbox correctly.
 	if status == models.SandboxStatusDestroyed {
+		if s.admitter != nil {
+			s.admitter.Release(sandbox.ID)
+		}
 		s.maybeRemoveImage(ctx, sandbox.Image)
 	}
 	return nil
