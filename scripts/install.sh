@@ -339,6 +339,28 @@ install_caddy_dns_plugin() {
 		exit 1
 	fi
 
+	if ! file "$tmp_binary" 2>/dev/null | grep -q ELF; then
+		echo "Caddy build server did not return an ELF binary; first bytes:" >&2
+		head -c 200 "$tmp_binary" >&2 || true
+		echo "" >&2
+		rm -f "$tmp_binary"
+		exit 1
+	fi
+
+	chmod +x "$tmp_binary"
+
+	# Verify the requested DNS plugin is actually compiled in. Without this
+	# the Caddyfile we generate later would fail to provision at runtime
+	# with a cryptic "loading module 'acme.dns.${provider}'" error.
+	local module_name="dns.providers.${provider}"
+	if ! "$tmp_binary" list-modules 2>/dev/null | grep -q "^${module_name}\$"; then
+		echo "Downloaded Caddy does not include ${module_name}." >&2
+		echo "Modules present matching 'dns':" >&2
+		"$tmp_binary" list-modules 2>/dev/null | grep -i dns >&2 || true
+		rm -f "$tmp_binary"
+		exit 1
+	fi
+
 	systemctl stop caddy >/dev/null 2>&1 || true
 	install -m 0755 "$tmp_binary" "$caddy_path"
 	rm -f "$tmp_binary"
@@ -486,9 +508,10 @@ write_caddy_env() {
 	if [[ -z "$DNS_PROVIDER" ]]; then
 		return
 	fi
-	# Caddy's debian unit reads /etc/default/caddy as systemd EnvironmentFile
-	# before exec, so 0600 root:root is sufficient — Caddy receives the value
-	# via process env regardless of the runtime user.
+	# The stock Caddy debian unit from Cloudsmith does NOT load
+	# /etc/default/caddy as an EnvironmentFile, so writing it alone is not
+	# enough. write_caddy_systemd_dropin() installs a drop-in that wires it
+	# in. 0600 root:root is fine — Caddy receives the value via process env.
 	cat > /etc/default/caddy <<EOF
 # Managed by sandbox-library install.sh.
 # Read by Caddy via {env.SB_DNS_API_TOKEN} substitution in /etc/caddy/Caddyfile.
@@ -496,6 +519,17 @@ SB_DNS_API_TOKEN=$DNS_API_TOKEN
 EOF
 	chmod 0600 /etc/default/caddy
 	chown root:root /etc/default/caddy
+}
+
+write_caddy_systemd_dropin() {
+	if [[ -z "$DNS_PROVIDER" ]]; then
+		return
+	fi
+	mkdir -p /etc/systemd/system/caddy.service.d
+	cat > /etc/systemd/system/caddy.service.d/override.conf <<'EOF'
+[Service]
+EnvironmentFile=/etc/default/caddy
+EOF
 }
 
 write_systemd_unit() {
@@ -594,6 +628,7 @@ fi
 install_binaries
 write_environment
 write_caddy_env
+write_caddy_systemd_dropin
 write_caddyfile
 write_systemd_unit
 write_healthcheck_script
