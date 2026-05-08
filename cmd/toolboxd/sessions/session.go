@@ -309,8 +309,8 @@ func (s *Session) finish(code int, signal string, failed bool) {
 // waitAndFinish waits for the process to exit and finalizes the session.
 // Manager wires output pumps before calling this.
 func (s *Session) waitAndFinish() {
-	code, sig := waitProcess(s.cmd)
 	s.pumpWG.Wait()
+	code, sig := waitProcess(s.cmd)
 	s.finish(code, sig, false)
 }
 
