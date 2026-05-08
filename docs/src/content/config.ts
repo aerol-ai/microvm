@@ -57,6 +57,12 @@ export const getSidebarConfig = (): NavigationGroup[] => [
     entries: [
       {
         type: 'link',
+        href: '/sandboxes',
+        label: 'Create Sandbox',
+        description: 'Create, start, stop, destroy, and resize sandboxes.',
+      },
+      {
+        type: 'link',
         href: '/environment',
         label: 'Environment',
         description: 'Docker image, env vars, resource limits, and idle lifecycle.',
@@ -79,7 +85,7 @@ export const getSidebarConfig = (): NavigationGroup[] => [
         type: 'link',
         href: '/file-system',
         label: 'File System',
-        description: 'Upload and download files via the in-container toolbox API.',
+        description: 'Upload and download files into and out of the sandbox.',
       },
       {
         type: 'link',
@@ -118,50 +124,6 @@ export const getSidebarConfig = (): NavigationGroup[] => [
         href: '/port-allowlist',
         label: 'Port Allowlist',
         description: 'Require explicit exposure before public traffic reaches a sandbox port.',
-      },
-    ],
-  },
-  {
-    type: 'group',
-    label: 'SDK Reference',
-    category: NavigationCategory.SDKS,
-    homePageHref: '/',
-    entries: [
-      {
-        type: 'link',
-        href: '/sdk-clients',
-        label: 'SDK Overview',
-        description: 'Package names, shared auth, and cross-language API notes.',
-      },
-      {
-        type: 'link',
-        href: '/go-sdk',
-        label: 'Go SDK',
-        description: 'Context-aware client methods for lifecycle, exec, files, and sessions.',
-      },
-      {
-        type: 'link',
-        href: '/typescript-sdk',
-        label: 'TypeScript SDK',
-        description: 'ES module client for Node.js and fetch-compatible runtimes.',
-      },
-      {
-        type: 'link',
-        href: '/python-sdk',
-        label: 'Python SDK',
-        description: 'Typed dict inputs with sync helpers for exec streaming and sessions.',
-      },
-      {
-        type: 'link',
-        href: '/rust-sdk',
-        label: 'Rust SDK',
-        description: 'Blocking HTTP client with WebSocket helpers for streaming workflows.',
-      },
-      {
-        type: 'link',
-        href: '/java-sdk',
-        label: 'Java SDK',
-        description: 'Maven client for lifecycle, exec streaming, file transfer, and sessions.',
       },
     ],
   },

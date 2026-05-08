@@ -94,7 +94,7 @@ await sandbox.destroy()
 ## Next Steps
 
 - [Server Setup](/getting-started) - self-host AerolVM on your own infrastructure
-- [Sandboxes](/sandboxes) - lifecycle states and configuration options
+- [Create Sandbox](/sandboxes) - lifecycle states, parameters, and configuration options
+- [Environment](/environment) - image selection, env vars, and resource limits
 - [Streaming Exec](/exec-streaming) - stream stdout/stderr live and use interactive PTY sessions
 - [Sessions](/sessions) - persistent terminal sessions that survive reconnects
-- [SDK Reference](/sdk-clients) - full API reference for every language

@@ -2,21 +2,64 @@
 title: SSH Access
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 AerolVM runs an SSH gateway on port `2220` (configurable via `SB_SSH_LISTEN_ADDR`). Each sandbox is provisioned with a unique Ed25519 key pair on creation. The private key is returned **only** in the create response and is not stored by the server.
 
 ## Key Provisioning
 
-When a sandbox is created, the API response includes:
+The SSH private key is available immediately when the sandbox is created. Save it - it cannot be retrieved later.
 
-```json
-{
-  "id": "sandbox_abc123",
-  "ssh_public_key": "ssh-ed25519 AAAA...",
-  "ssh_private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n..."
-}
-```
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: 'ubuntu:22.04' })
 
-Save `ssh_private_key` - it is not retrievable later. The `ssh_public_key` field is returned by the get and list endpoints.
+    const privateKey = sandbox.sshPrivateKey  // save this immediately
+    const publicKey  = sandbox.sshPublicKey   // available later via get()
+
+    console.log(privateKey)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({'image': 'ubuntu:22.04'})
+
+    private_key = sandbox.sshPrivateKey  # save - only returned on create
+    public_key  = sandbox.sshPublicKey
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+    })
+    if err != nil { log.Fatal(err) }
+
+    privateKey := sandbox.SSHPrivateKey  // save - only returned by Create()
+    publicKey  := sandbox.SSHPublicKey
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        ..Default::default()
+    })?;
+
+    let private_key = &sandbox.ssh_private_key; // save - only returned by create()
+    let public_key  = &sandbox.data.ssh_public_key;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+
+    String privateKey = sandbox.sshPrivateKey;  // save - only returned by create()
+    String publicKey  = sandbox.sshPublicKey;
+    ```
+  </TabItem>
+</Tabs>
 
 ## Connecting
 
@@ -46,35 +89,6 @@ ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123+myshell@<host>
 | `SB_ENABLE_SSH_GATEWAY` | `true` | Enable or disable the SSH gateway. |
 | `SB_SSH_LISTEN_ADDR` | `0.0.0.0:2220` | Address and port for the SSH server. |
 | `SB_SSH_HOST_KEY_PATH` | `/var/lib/aerolvm/ssh_host_ed25519_key` | Host key path. Generated on first start if absent. |
-
-## SDK Usage
-
-```ts
-// TypeScript - retrieve public key after creation
-const sandbox = await client.create({ image: 'ubuntu:22.04' })
-console.log(sandbox.sshPrivateKey)  // save this
-console.log(sandbox.sshPublicKey)   // available later via get()
-```
-
-```python
-# Python
-sandbox = client.create(image='ubuntu:22.04')
-private_key = sandbox['ssh_private_key']  # save - only returned on create
-```
-
-```go
-// Go
-sandbox, err := client.Create(ctx, microvm.CreateOptions{
-    Image: "ubuntu:22.04",
-})
-privateKey := sandbox.SSHPrivateKey // save - only returned on create
-```
-
-```java
-// Java
-Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
-String privateKey = sandbox.sshPrivateKey; // save - only returned on create
-```
 
 ## How the Gateway Works
 

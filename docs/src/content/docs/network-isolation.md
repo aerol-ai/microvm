@@ -2,8 +2,6 @@
 title: Network Isolation
 ---
 
-# Network Isolation
-
 When a sandbox is created with `network_block_all: true`, the platform installs a firewall rule on the host that drops every outbound packet from that sandbox. The sandbox can still receive incoming requests on its exposed ports, but cannot make any outbound network calls.
 
 ## How it works

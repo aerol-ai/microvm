@@ -1,0 +1,200 @@
+---
+title: External Storage
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Sandboxes are ephemeral by design. If you need durable workspace state across sandbox lifecycles, mount your own cloud or network storage into the sandbox.
+
+The platform handles mounting on the host and bind-mounts the result into your sandbox. Your image needs no special mount tooling, and credentials never enter the sandbox.
+
+## How it works
+
+1. Declare mounts in the create request. The platform validates the spec and stores credentials encrypted at rest.
+2. At sandbox start, the platform establishes the mount on the host and makes it available inside the sandbox at the path you specified.
+3. On `Stop`, the mount is torn down. On `Start`, it is re-established. After a host reboot, mounts are restored automatically on the next sandbox start.
+
+## Supported mount types
+
+| Type | Source format | Host binary used | Credentials field |
+|---|---|---|---|
+| `s3` | `s3://bucket[/prefix]` or `bucket` | `mount-s3` | `access_key_id`, `secret_access_key`, `session_token` |
+| `nfs` | `host:/exports/path` | `mount.nfs` | none |
+| `sshfs` | `user@host:/path` | `sshfs` | `private_key_pem` |
+| `rclone` | `remote:path` | `rclone mount` | `rclone_conf` |
+
+Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 KiB total payload.
+
+## Mount an S3 Bucket
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      mounts: [
+        {
+          type:   's3',
+          target: '/workspace',
+          source: 's3://my-bucket/prefix',
+          credentials: {
+            access_key_id:     'AKIA...',
+            secret_access_key: 'secret...',
+          },
+        },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'mounts': [
+            {
+                'type':   's3',
+                'target': '/workspace',
+                'source': 's3://my-bucket/prefix',
+                'credentials': {
+                    'access_key_id':     'AKIA...',
+                    'secret_access_key': 'secret...',
+                },
+            },
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Mounts: []sdktypes.MountSpec{
+            {
+                Type:   "s3",
+                Target: "/workspace",
+                Source: "s3://my-bucket/prefix",
+                Credentials: map[string]string{
+                    "access_key_id":     "AKIA...",
+                    "secret_access_key": "secret...",
+                },
+            },
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+
+    let mut creds = HashMap::new();
+    creds.insert("access_key_id".to_string(), "AKIA...".to_string());
+    creds.insert("secret_access_key".to_string(), "secret...".to_string());
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        mounts: Some(vec![aerolvm_sdk::MountSpec {
+            type_:       "s3".to_string(),
+            target:      "/workspace".to_string(),
+            source:      "s3://my-bucket/prefix".to_string(),
+            credentials: Some(creds),
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.MountSpec;
+    import java.util.List;
+    import java.util.Map;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setMounts(List.of(
+                new MountSpec()
+                    .setType("s3")
+                    .setTarget("/workspace")
+                    .setSource("s3://my-bucket/prefix")
+                    .setCredentials(Map.of(
+                        "access_key_id",     "AKIA...",
+                        "secret_access_key", "secret..."
+                    ))
+            ))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Mount NFS
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      mounts: [
+        { type: 'nfs', target: '/data', source: '10.0.0.1:/exports/data' },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'mounts': [
+            {'type': 'nfs', 'target': '/data', 'source': '10.0.0.1:/exports/data'},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Mounts: []sdktypes.MountSpec{
+            {Type: "nfs", Target: "/data", Source: "10.0.0.1:/exports/data"},
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        mounts: Some(vec![aerolvm_sdk::MountSpec {
+            type_:       "nfs".to_string(),
+            target:      "/data".to_string(),
+            source:      "10.0.0.1:/exports/data".to_string(),
+            credentials: None,
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setMounts(List.of(
+                new MountSpec().setType("nfs").setTarget("/data").setSource("10.0.0.1:/exports/data")
+            ))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Security Model
+
+- Credentials never enter the sandbox.
+- Credentials are encrypted at rest with AES-256-GCM.
+- Read APIs return `has_credentials: true` but never the actual values.
+
+## Operational Notes
+
+- Mounts are established at `Create` and re-established at `Start`.
+- A failed mount is retried once before being disabled.
+- Host requirements include `fuse3`, `sshfs`, `nfs-common`, `rclone`, and AWS `mountpoint-s3`.
+- Network egress blocking applies inside the sandbox, not to the host mount process.

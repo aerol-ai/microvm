@@ -1,0 +1,250 @@
+---
+title: Environment
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+The sandbox environment is fully specified at creation time. All fields are optional except `image`.
+
+## Image
+
+Any OCI-compatible image reachable by the Docker daemon on the host. Public images are pulled automatically. Private registries require the host Docker daemon to be pre-authenticated.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: 'ubuntu:22.04' })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({'image': 'ubuntu:22.04'})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+    ```
+  </TabItem>
+</Tabs>
+
+## Environment Variables
+
+Pass key-value pairs into the container at creation. Variables are stored encrypted at rest and are not returned by list or get endpoints.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      env: {
+        DATABASE_URL: 'postgres://...',
+        APP_ENV: 'sandbox',
+      },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'env': {
+            'DATABASE_URL': 'postgres://...',
+            'APP_ENV': 'sandbox',
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Env: map[string]string{
+            "DATABASE_URL": "postgres://...",
+            "APP_ENV":      "sandbox",
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+
+    let mut env = HashMap::new();
+    env.insert("DATABASE_URL".to_string(), "postgres://...".to_string());
+    env.insert("APP_ENV".to_string(), "sandbox".to_string());
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        env: Some(env),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import java.util.Map;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setEnv(Map.of("DATABASE_URL", "postgres://...", "APP_ENV", "sandbox"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Resource Limits
+
+| Field | Unit | Default | Description |
+|---|---|---|---|
+| `cpu` | vCPUs | 1 | CPU quota |
+| `memoryMB` | megabytes | 512 | Memory limit |
+| `diskGB` | gigabytes | 10 | Writable layer size |
+
+Resources can be changed on a live sandbox without a restart using [resize](/sandboxes#resize).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      cpu: 2,
+      memoryMB: 2048,
+      diskGB: 20,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'cpu': 2.0,
+        'memoryMB': 2048,
+        'diskGB': 20,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        CPU:      2,
+        MemoryMB: 2048,
+        DiskGB:   20,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image:     "ubuntu:22.04".to_string(),
+        cpu:       Some(2),
+        memory_mb: Some(2048),
+        disk_gb:   Some(20),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setCpu(2.0)
+            .setMemoryMb(2048)
+            .setDiskGb(20)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Idle Lifecycle
+
+Sandboxes can self-terminate based on age or inactivity. Both fields are optional and can be set independently.
+
+| Field | Behavior |
+|---|---|
+| `stopIfIdleFor` | Stop the sandbox after this duration of inactivity (nanoseconds). |
+| `destroyAtAge` | Destroy the sandbox once it is this old (nanoseconds from creation). |
+
+Go uses `time.Duration` for these fields. TypeScript, Python, and Rust use integer nanoseconds.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      lifecycle: {
+        stopIfIdleFor: 60 * 60 * 1_000_000_000,   // 1 hour
+        destroyAtAge:  24 * 60 * 60 * 1_000_000_000, // 24 hours
+      },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'lifecycle': {
+            'stopIfIdleFor': 3_600_000_000_000,
+            'destroyAtAge':  86_400_000_000_000,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: time.Hour,
+            DestroyAtAge:  24 * time.Hour,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        lifecycle: Some(Lifecycle {
+            stop_if_idle_for: 3_600_000_000_000,
+            destroy_at_age:   86_400_000_000_000,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(3_600_000_000_000L)
+                .setDestroyAtAge(86_400_000_000_000L))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Entrypoint
+
+The sandbox image's default entrypoint and `CMD` are not used. Your workload runs via the exec or session APIs instead. See [Process & Code Execution](/exec-streaming) and [Sessions](/sessions).
