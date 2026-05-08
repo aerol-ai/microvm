@@ -37,13 +37,13 @@
     width: 32px;
     height: 32px;
     border-radius: 9px;
-    background: var(--gradient-color);
+    background: #000;
     display: grid;
     place-items: center;
-    color: #041017;
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
-    font-weight: 700;
+
+    img {
+      display: block;
+    }
   }
 
   .brand-copy {

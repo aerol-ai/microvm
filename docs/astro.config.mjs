@@ -10,7 +10,7 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      title: 'Sandbox Library',
+      title: 'AerolVM',
       favicon: '/favicon.svg',
       social: {
         github: 'https://github.com/aerol-ai/microvm',
