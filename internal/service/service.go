@@ -558,6 +558,13 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		return models.HealthStatus{}, err
 	}
 
+	live := 0
+	for _, sandbox := range sandboxes {
+		if sandbox.Status != models.SandboxStatusDestroyed {
+			live++
+		}
+	}
+
 	dockerStatus := "ok"
 	if err := s.docker.Ping(ctx); err != nil {
 		dockerStatus = err.Error()
@@ -590,7 +597,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 
 	return models.HealthStatus{
 		Status:     status,
-		Sandboxes:  len(sandboxes),
+		Sandboxes:  live,
 		Docker:     dockerStatus,
 		Caddy:      caddyStatus,
 		SSHGateway: sshStatus,
@@ -673,11 +680,17 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port)
 			}
 			_ = s.mounts.UnmountAll(sandbox.ID)
-			// Only GC on the transition into destroyed — a row that was
-			// already destroyed at the start of this reconcile pass already
-			// had its chance, and re-running the check on every tick would
-			// be wasted work.
+			// Only GC and release admitter capacity on the transition into
+			// destroyed — a row that was already destroyed at the start of
+			// this reconcile pass already had its chance, and re-running the
+			// check on every tick would be wasted work. Without the Release
+			// here, capacity reservations leak when a container disappears
+			// out-of-band (manual `docker rm`, OOM kill, host reboot) and
+			// the admitter eventually refuses new sandboxes.
 			if previousStatus != models.SandboxStatusDestroyed {
+				if s.admitter != nil {
+					s.admitter.Release(sandbox.ID)
+				}
 				s.maybeRemoveImage(ctx, sandbox.Image)
 			}
 			continue

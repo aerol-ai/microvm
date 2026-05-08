@@ -67,6 +67,8 @@ async function main(): Promise<void> {
 
 	const health = await client.health();
 	console.log("health", JSON.stringify(health, null, 2));
+	const resp1 = await client.reconcile();
+	console.log("reconcile", JSON.stringify(resp1, null, 2));
 
 	const sandbox = await client.create({
 		image: options.image,
