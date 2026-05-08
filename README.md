@@ -342,3 +342,7 @@ use microvm_sdk::Client;
 
 let client = Client::new(Some("https://sandbox.example.com"), Some("your_token"))?;
 ```
+
+## License
+
+[MIT](LICENSE)
