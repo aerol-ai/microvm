@@ -13,6 +13,9 @@ SANDBOXD_URL=""
 TOOLBOXD_URL=""
 CHECKSUMS_URL=""
 IDLE_TIMEOUT_MIN="0"
+DNS_PROVIDER=""
+DNS_API_TOKEN=""
+CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
 
 usage() {
 	cat <<'EOF'
@@ -30,12 +33,23 @@ Options:
   --install-prefix <dir>       Binary install directory (default: /usr/local/bin)
   --idle-timeout-min <minutes> Idle auto-stop timeout in minutes
   --build-from-source          Build binaries from the current checkout
+  --dns-provider <name>        DNS provider for wildcard TLS (DNS-01 ACME).
+                               Currently supported: cloudflare. Requires --domain
+                               and --dns-api-token. Without this flag, Caddy
+                               falls back to on-demand HTTP-01 issuance, which
+                               does not scale past Let's Encrypt's 50-cert/week
+                               rate limit per registered domain.
+  --dns-api-token <token>      API token for the configured DNS provider.
+                               For cloudflare: a scoped API token with
+                               Zone:Read + DNS:Edit on the target zone.
   --help                       Show this help
 
 Examples:
 	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
 	./scripts/install.sh --public-host 203.0.113.42 --pat-token dev-token --build-from-source
+	./scripts/install.sh --domain sandbox.example.com --pat-token my-pat-token \
+	    --dns-provider cloudflare --dns-api-token cf-scoped-token
 EOF
 }
 
@@ -164,6 +178,14 @@ while [[ $# -gt 0 ]]; do
 			BUILD_FROM_SOURCE="true"
 			shift
 			;;
+		--dns-provider)
+			DNS_PROVIDER="$2"
+			shift 2
+			;;
+		--dns-api-token)
+			DNS_API_TOKEN="$2"
+			shift 2
+			;;
 		--help)
 			usage
 			exit 0
@@ -188,6 +210,25 @@ fi
 if [[ -z "$DOMAIN" && -z "$PUBLIC_HOST" ]]; then
 	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
 	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+fi
+
+if [[ -n "$DNS_PROVIDER" ]]; then
+	if [[ -z "$DOMAIN" ]]; then
+		echo "--dns-provider requires --domain" >&2
+		exit 1
+	fi
+	if [[ -z "$DNS_API_TOKEN" ]]; then
+		echo "--dns-provider requires --dns-api-token" >&2
+		exit 1
+	fi
+	case "$DNS_PROVIDER" in
+		cloudflare)
+			;;
+		*)
+			echo "Unsupported --dns-provider: $DNS_PROVIDER (currently supported: cloudflare)" >&2
+			exit 1
+			;;
+	esac
 fi
 
 if [[ "$BUILD_FROM_SOURCE" == "auto" ]]; then
@@ -259,6 +300,50 @@ install_packages() {
 	fi
 }
 
+install_caddy_dns_plugin() {
+	# Replace the apt-installed Caddy binary with a custom build that includes
+	# the chosen caddy-dns plugin. This is required for DNS-01 wildcard TLS.
+	# Caddy's official build server returns a single static binary with the
+	# requested modules baked in; no Go toolchain needed on the host.
+	local provider="$1"
+	local arch_tag
+
+	case "$(uname -m)" in
+		x86_64|amd64) arch_tag="amd64" ;;
+		aarch64|arm64) arch_tag="arm64" ;;
+		*)
+			echo "Unsupported architecture for custom Caddy build: $(uname -m)" >&2
+			exit 1
+			;;
+	esac
+
+	local caddy_path
+	caddy_path="$(command -v caddy 2>/dev/null || true)"
+	if [[ -z "$caddy_path" ]]; then
+		caddy_path="/usr/bin/caddy"
+	fi
+
+	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}&p=github.com/caddy-dns/${provider}"
+	local tmp_binary
+	tmp_binary="$(mktemp)"
+
+	if ! curl -fL --retry 5 --retry-delay 2 --retry-connrefused "$download_url" -o "$tmp_binary"; then
+		rm -f "$tmp_binary"
+		echo "Failed to download Caddy with ${provider} DNS plugin from ${download_url}" >&2
+		exit 1
+	fi
+
+	if [[ ! -s "$tmp_binary" ]]; then
+		rm -f "$tmp_binary"
+		echo "Caddy build server returned an empty binary" >&2
+		exit 1
+	fi
+
+	systemctl stop caddy >/dev/null 2>&1 || true
+	install -m 0755 "$tmp_binary" "$caddy_path"
+	rm -f "$tmp_binary"
+}
+
 install_binaries() {
 	mkdir -p "$INSTALL_PREFIX"
 	if [[ "$BUILD_FROM_SOURCE" == "true" ]]; then
@@ -315,8 +400,59 @@ EOF
 
 write_caddyfile() {
 	mkdir -p /etc/caddy
-	if [[ -n "$DOMAIN" ]]; then
+	if [[ -z "$DOMAIN" ]]; then
 		cat > /etc/caddy/Caddyfile <<EOF
+{
+	admin localhost:2019
+}
+
+:80 {
+	respond "Sandbox not found" 404
+}
+EOF
+		return
+	fi
+
+	if [[ -n "$DNS_PROVIDER" ]]; then
+		# DNS-01 wildcard issuance. Caddy issues exactly two certs that are
+		# renewed automatically:
+		#   - one for $DOMAIN
+		#   - one for *.$DOMAIN  (covers every sandbox subdomain forever)
+		# This sidesteps Let's Encrypt's per-registered-domain rate limits
+		# (50 certs/week) regardless of how many sandboxes are created.
+		# {env.SB_DNS_API_TOKEN} is read from /etc/default/caddy.
+		cat > /etc/caddy/Caddyfile <<EOF
+{
+	admin localhost:2019
+}
+
+https://$DOMAIN {
+	tls {
+		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
+	}
+	@api path /health /v1 /v1/*
+	handle @api {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle {
+		respond "Sandbox API not found" 404
+	}
+}
+
+https://*.$DOMAIN {
+	tls {
+		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
+	}
+	respond "Sandbox not found" 404
+}
+EOF
+		return
+	fi
+
+	# Fallback: HTTP-01 on-demand TLS. Each sandbox subdomain is issued its
+	# own cert at first hit. Suitable for small deployments only — Let's
+	# Encrypt rate limits will throttle creation past ~50 sandboxes/week.
+	cat > /etc/caddy/Caddyfile <<EOF
 {
 	admin localhost:2019
 	on_demand_tls {
@@ -344,17 +480,22 @@ https://*.$DOMAIN {
 	respond "Sandbox not found" 404
 }
 EOF
-	else
-		cat > /etc/caddy/Caddyfile <<EOF
-{
-	admin localhost:2019
 }
 
-:80 {
-	respond "Sandbox not found" 404
-}
-EOF
+write_caddy_env() {
+	if [[ -z "$DNS_PROVIDER" ]]; then
+		return
 	fi
+	# Caddy's debian unit reads /etc/default/caddy as systemd EnvironmentFile
+	# before exec, so 0600 root:root is sufficient — Caddy receives the value
+	# via process env regardless of the runtime user.
+	cat > /etc/default/caddy <<EOF
+# Managed by sandbox-library install.sh.
+# Read by Caddy via {env.SB_DNS_API_TOKEN} substitution in /etc/caddy/Caddyfile.
+SB_DNS_API_TOKEN=$DNS_API_TOKEN
+EOF
+	chmod 0600 /etc/default/caddy
+	chown root:root /etc/default/caddy
 }
 
 write_systemd_unit() {
@@ -447,8 +588,12 @@ EOF
 }
 
 install_packages
+if [[ -n "$DNS_PROVIDER" ]]; then
+	install_caddy_dns_plugin "$DNS_PROVIDER"
+fi
 install_binaries
 write_environment
+write_caddy_env
 write_caddyfile
 write_systemd_unit
 write_healthcheck_script
@@ -464,6 +609,12 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "API URL: https://$DOMAIN"
 	echo "Health URL: https://$DOMAIN/health"
 	echo "Public sandbox URL pattern: https://<docker-short-id>.$DOMAIN"
+	if [[ -n "$DNS_PROVIDER" ]]; then
+		echo "TLS: wildcard DNS-01 via $DNS_PROVIDER (one cert covers all subdomains)"
+	else
+		echo "TLS: on-demand HTTP-01 (per-subdomain). Subject to Let's Encrypt rate limits."
+		echo "  For production, re-run with --dns-provider cloudflare --dns-api-token <token>"
+	fi
 else
 	echo "API URL: http://$PUBLIC_HOST:8080"
 	echo "Health URL: http://$PUBLIC_HOST:8080/health"

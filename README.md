@@ -139,7 +139,20 @@ Why both records are needed:
 Operational notes:
 
 - Use DNS-only records for initial setup if your DNS provider offers HTTP proxying, because Caddy is handling ACME and TLS issuance directly.
-- The wildcard DNS record is for hostname resolution only. The current setup uses Caddy on-demand TLS per concrete hostname, not a single wildcard certificate.
+- The wildcard DNS record is for hostname resolution. By default the installer configures Caddy on-demand TLS, which issues one Let's Encrypt cert per concrete hostname on first hit. That works for trial-scale deployments only — Let's Encrypt caps you at 50 certs/week per registered domain.
+
+### Wildcard TLS via DNS-01 (recommended for production)
+
+For any deployment that creates more than a handful of sandboxes, pass `--dns-provider cloudflare --dns-api-token <token>` to `install.sh`. The installer then replaces the apt-installed Caddy binary with a custom build that includes the `caddy-dns/cloudflare` plugin and writes a Caddyfile that solves ACME via DNS-01. Caddy issues exactly two certs (`<domain>` and `*.<domain>`) and renews them on a schedule, regardless of how many sandboxes are created.
+
+Cloudflare API token scope: create a scoped token (not the legacy Global API Key) with permissions:
+
+- Zone → Zone → Read on the target zone
+- Zone → DNS → Edit on the target zone
+
+The token is written to `/etc/default/caddy` (mode 0600) and read by Caddy via `{env.SB_DNS_API_TOKEN}` substitution.
+
+Other DNS providers (Route53, DigitalOcean, etc.) can be added by extending the `case "$DNS_PROVIDER"` switch in `scripts/install.sh` — Caddy's build server (`caddyserver.com/api/download`) supports any [`caddy-dns/*`](https://github.com/caddy-dns) plugin.
 
 ## Run locally
 
