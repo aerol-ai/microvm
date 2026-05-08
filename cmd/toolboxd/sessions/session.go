@@ -328,7 +328,10 @@ func (s *Session) shutdown() {
 // waitProcess returns (exit_code, signal_name). signal_name is empty if the
 // process exited normally.
 func waitProcess(cmd *exec.Cmd) (int, string) {
-	err := cmd.Wait()
+	return interpretWaitProcessResult(cmd.Wait())
+}
+
+func interpretWaitProcessResult(err error) (int, string) {
 	if err == nil {
 		return 0, ""
 	}
@@ -341,6 +344,9 @@ func waitProcess(cmd *exec.Cmd) (int, string) {
 			return status.ExitStatus(), ""
 		}
 		return ee.ExitCode(), ""
+	}
+	if errors.Is(err, syscall.ECHILD) {
+		return 0, ""
 	}
 	return -1, err.Error()
 }
