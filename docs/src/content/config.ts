@@ -43,12 +43,6 @@ export const getSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
-        href: '/architecture',
-        label: 'Architecture',
-        description: 'How sandboxd, toolboxd, Docker, and storage fit together.',
-      },
-      {
-        type: 'link',
         href: '/sandboxes',
         label: 'Sandboxes',
         description: 'Sandbox concept, lifecycle states, and core API operations.',

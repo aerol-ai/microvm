@@ -3,7 +3,13 @@ title: Quick Start
 description: Spin up a sandbox and run your first command in under five minutes.
 ---
 
-This guide assumes you have a running `sandboxd` instance. If not, see [Getting Started](/getting-started) first.
+**AerolVM** is an open-source, self-hostable infrastructure for running isolated code environments. It provides composable sandboxes — ephemeral Docker-backed containers with complete isolation, a dedicated filesystem, network stack, and allocated vCPU, RAM, and disk.
+
+Sandboxes are the core primitive. Each sandbox is a Docker container managed by `sandboxd` (the host daemon) with `toolboxd` running inside to handle process execution, file transfers, and port management. Sandboxes spin up in seconds and can run any Docker image.
+
+Agents and developers interact with sandboxes through the REST API or one of the official SDKs (TypeScript, Python, Go, Rust, Java). Operations span the full lifecycle: create, exec, stream output, transfer files, expose ports, and destroy.
+
+---
 
 ## 1. Install the SDK
 
@@ -24,6 +30,8 @@ cargo add aerolvm-sdk
 ```
 
 ## 2. Create a Sandbox
+
+Point the client at your `sandboxd` instance:
 
 ```ts
 import { MicroVM } from '@aerol-ai/aerolvm-sdk'
@@ -66,6 +74,7 @@ await sandbox.destroy()
 
 ## Next Steps
 
+- [Getting Started](/getting-started) — build and run `sandboxd` locally
 - [Sandboxes](/sandboxes) — lifecycle states and configuration options
 - [Streaming Exec](/exec-streaming) — stream stdout/stderr live and use interactive PTY sessions
 - [Sessions](/sessions) — persistent terminal sessions that survive reconnects
