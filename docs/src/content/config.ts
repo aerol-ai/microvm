@@ -15,6 +15,7 @@ export const collections = {
 
 export enum NavigationCategory {
   OVERVIEW,
+  SDKS,
   FEATURES,
 }
 
@@ -48,6 +49,44 @@ export const getSidebarConfig = (): NavigationGroup[] => [
         href: '/sdk-clients',
         label: 'SDK Clients',
         description: 'The Go, TypeScript, Python, and Rust SDK surface area.',
+      },
+    ],
+  },
+  {
+    type: 'group',
+    label: 'SDK Reference',
+    category: NavigationCategory.SDKS,
+    homePageHref: '/',
+    entries: [
+      {
+        type: 'link',
+        href: '/sdk-clients',
+        label: 'SDK Overview',
+        description: 'Package names, shared auth, and cross-language API notes.',
+      },
+      {
+        type: 'link',
+        href: '/go-sdk',
+        label: 'Go SDK',
+        description: 'Context-aware client methods for lifecycle, exec, files, and sessions.',
+      },
+      {
+        type: 'link',
+        href: '/typescript-sdk',
+        label: 'TypeScript SDK',
+        description: 'ES module client for Node.js and fetch-compatible runtimes.',
+      },
+      {
+        type: 'link',
+        href: '/python-sdk',
+        label: 'Python SDK',
+        description: 'Typed dict inputs with sync helpers for exec streaming and sessions.',
+      },
+      {
+        type: 'link',
+        href: '/rust-sdk',
+        label: 'Rust SDK',
+        description: 'Blocking HTTP client with WebSocket helpers for streaming workflows.',
       },
     ],
   },
