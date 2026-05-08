@@ -2,11 +2,11 @@
 const { toc = [], depth = 0, isMobile = false } = Astro.props
 ---
 
-<ul class:list={{ isMobile }}>
+<ul class:list={{ isMobile, nested: depth > 0 }}>
   {
     toc.map(heading => (
       <li>
-        <a href={`#${heading.slug}`} style={`padding-left: ${depth * 8}px;`}>
+        <a href={`#${heading.slug}`}>
           <span>{heading.text}</span>
         </a>
         {
@@ -19,31 +19,66 @@ const { toc = [], depth = 0, isMobile = false } = Astro.props
   }
 </ul>
 
-<style>
+<style define:vars={{ depth }}>
   ul {
+    margin: 0;
     padding: 0;
     list-style: none;
-    row-gap: 4px;
+  }
+
+  ul:not(.isMobile) {
+    display: grid;
+    gap: 2px;
+  }
+
+  ul.nested {
+    margin-top: 4px;
+    margin-left: 12px;
+    padding-left: 10px;
+    border-left: 1px solid var(--border-extra);
+  }
+
+  li {
+    overflow-wrap: anywhere;
   }
 
   a {
+    display: block;
+    border-radius: 6px;
+    padding-block: 5px;
+    padding-inline: calc(0.45rem + (var(--depth) * 0.35rem)) 0.5rem;
     color: var(--secondary-text-color);
     font-family: var(--font-sans);
     font-size: 0.8125rem;
     font-weight: 500;
+    line-height: 1.35;
     letter-spacing: -0.015rem;
-    margin-bottom: 8px;
-    transition: color 0.1s ease-in-out;
+    text-decoration: none;
+    transition: color 0.1s ease-in-out, background-color 0.1s ease-in-out;
+  }
+
+  ul.nested > li > a {
+    font-size: 0.78125rem;
+    color: var(--accent-text-color);
   }
 
   a:hover {
-    text-decoration: underline;
     color: var(--primary-text-color) !important;
-    text-decoration-color: var(--hover-color) !important;
-    text-underline-offset: 3.2px;
+    background-color: var(--block-bg-color);
   }
 
   a[aria-current='true'] {
     color: var(--primary-text-color) !important;
+    background-color: var(--block-bg-color);
+  }
+
+  .isMobile.nested {
+    margin-left: 0;
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .isMobile a {
+    padding-inline: 0.75rem 0.5rem;
   }
 </style>

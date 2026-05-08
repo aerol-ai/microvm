@@ -30,7 +30,9 @@ Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the
 
 ---
 
-## 1. Install the SDK
+## Workflow
+
+### 1. Install the SDK
 
 Pick any language:
 
@@ -48,7 +50,7 @@ go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest
 cargo add aerolvm-sdk
 ```
 
-## 2. Create a Sandbox
+### 2. Create a Sandbox
 
 ```ts
 import { MicroVM } from '@aerol-ai/aerolvm-sdk'
@@ -66,14 +68,14 @@ console.log(sandbox.id)
 console.log(sandbox.publicUrl)
 ```
 
-## 3. Run a Command
+### 3. Run a Command
 
 ```ts
 const result = await sandbox.exec({ command: 'echo hello from sandbox' })
 console.log(result.stdout) // "hello from sandbox\n"
 ```
 
-## 4. Transfer a File
+### 4. Transfer a File
 
 ```ts
 const content = Buffer.from('print("hello")')
@@ -83,7 +85,7 @@ const out = await sandbox.exec({ command: 'python3 /workspace/hello.py' })
 console.log(out.stdout) // "hello\n"
 ```
 
-## 5. Destroy the Sandbox
+### 5. Destroy the Sandbox
 
 ```ts
 await sandbox.destroy()
