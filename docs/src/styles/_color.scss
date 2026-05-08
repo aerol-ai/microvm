@@ -28,8 +28,7 @@ body {
   --cta-surface-neutral-primary: #1c2833;
   --foreground-color: #eef5fb;
   --selection-bg-color: rgba(40, 199, 111, 0.18);
-  --selection-text-color: #28c76f;
-}
+  --selection-text-color: #28c76f;  --selection-bg-color: rgba(30, 164, 92, 0.18);}
 
 html[data-theme='light'] body {
   --bg-color: #f7fbfd;
