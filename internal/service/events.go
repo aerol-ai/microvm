@@ -41,7 +41,7 @@ func (s *Service) runEventMonitor(ctx context.Context) {
 
 		streamDone := make(chan error, 1)
 		go func() {
-			streamDone <- s.docker.StreamEvents(streamCtx, events)
+			streamDone <- s.events.StreamEvents(streamCtx, events)
 			close(events)
 		}()
 
@@ -167,24 +167,24 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	// Re-attach Caddy routes if the runtime IP changed (Docker daemon restart
 	// can reassign IPs). Inspect to get the current address rather than trust
 	// what's in the DB.
-	runtime, err := s.docker.Inspect(ctx, sandbox.ContainerID)
+	state, err := s.docker.Inspect(ctx, sandbox.ContainerID)
 	if err != nil {
 		return fmt.Errorf("inspect container: %w", err)
 	}
-	if runtime.ContainerIP == "" {
+	if state.ContainerIP == "" {
 		return nil
 	}
 
-	if runtime.ContainerIP != sandbox.ContainerIP {
+	if state.ContainerIP != sandbox.ContainerIP {
 		s.logger.Info("sandbox IP changed",
 			"sandbox_id", sandbox.ID,
 			"previous_ip", sandbox.ContainerIP,
-			"new_ip", runtime.ContainerIP,
+			"new_ip", state.ContainerIP,
 		)
 	}
 
-	sandbox.ContainerIP = runtime.ContainerIP
-	sandbox.Status = runtime.Status
+	sandbox.ContainerIP = state.ContainerIP
+	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return fmt.Errorf("update sandbox runtime: %w", err)

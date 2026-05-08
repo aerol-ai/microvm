@@ -104,6 +104,11 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN stop_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN destroy_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
+		// Per-sandbox OCI runtime selector (runc / runsc). Pre-migration rows
+		// get '' and resolve to the host default at start time; new sandboxes
+		// always store the resolved value so the choice cannot drift across
+		// host restarts.
+		`ALTER TABLE sandboxes ADD COLUMN runtime TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -150,8 +155,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
-			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			runtime
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -177,6 +183,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyIfIdleFor),
 		int64(sandbox.Lifecycle.StopAtAge),
 		int64(sandbox.Lifecycle.DestroyAtAge),
+		sandbox.Runtime,
 	)
 	if err != nil {
 		return fmt.Errorf("insert sandbox: %w", err)
@@ -199,8 +206,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
-			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			runtime
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -223,7 +231,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			stop_if_idle_for_ns = excluded.stop_if_idle_for_ns,
 			destroy_if_idle_for_ns = excluded.destroy_if_idle_for_ns,
 			stop_at_age_ns = excluded.stop_at_age_ns,
-			destroy_at_age_ns = excluded.destroy_at_age_ns
+			destroy_at_age_ns = excluded.destroy_at_age_ns,
+			runtime = excluded.runtime
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -249,6 +258,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyIfIdleFor),
 		int64(sandbox.Lifecycle.StopAtAge),
 		int64(sandbox.Lifecycle.DestroyAtAge),
+		sandbox.Runtime,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert sandbox: %w", err)
@@ -261,7 +271,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
-			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			runtime
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -288,7 +299,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
-			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			runtime
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -583,6 +595,7 @@ func scanSandbox(scanner interface {
 		&destroyIfIdleNs,
 		&stopAtAgeNs,
 		&destroyAtAgeNs,
+		&sandbox.Runtime,
 	)
 	if err != nil {
 		return nil, err

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/caddy"
@@ -27,22 +28,31 @@ import (
 )
 
 type Service struct {
-	cfg      config.Config
-	logger   *slog.Logger
-	store    *store.Store
-	docker   *docker.Client
+	cfg    config.Config
+	logger *slog.Logger
+	store  *store.Store
+	// docker holds the lifecycle-only runtime abstraction. The field name
+	// stays "docker" because every existing call site is shaped around it;
+	// the type is runtime.Runtime so a non-Docker driver can be slotted in
+	// without touching service code.
+	docker runtime.Runtime
+	// events is the concrete Docker client for the daemon /events stream and
+	// any other Docker-API-shaped surface that intentionally stays outside
+	// the runtime abstraction. Today both fields point at the same instance.
+	events   *docker.Client
 	caddy    *caddy.Client
 	cipher   *secrets.Cipher
 	mounts   *mounts.Manager
 	admitter *capacity.Admitter
 }
 
-func New(cfg config.Config, logger *slog.Logger, db *store.Store, dockerClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
+func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
 	return &Service{
 		cfg:      cfg,
 		logger:   logger,
 		store:    db,
-		docker:   dockerClient,
+		docker:   runtimeDriver,
+		events:   eventsClient,
 		caddy:    caddyClient,
 		cipher:   cipher,
 		mounts:   mountManager,
@@ -55,6 +65,27 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 	if req.Image == "" {
 		return nil, errors.New("image is required")
 	}
+
+	// Validate the requested runtime and resolve "" to the host default. We
+	// write the resolved value back into req so the runtime layer sees an
+	// explicit choice and the persisted sandbox row records what was actually
+	// used — empty stays empty only on pre-migration rows.
+	chosenRuntime, err := models.ValidRuntime(req.Runtime)
+	if err != nil {
+		return nil, err
+	}
+	if chosenRuntime == "" {
+		chosenRuntime = s.cfg.Runtime
+	}
+	// "kata" is reserved as a future runtime. Accept it through validation
+	// (so operators can pre-stage the host default) but reject individual
+	// create requests until the runtime is wired up. Surfaced as a clear
+	// 4xx-shaped error so clients see "not implemented" rather than a
+	// generic Docker failure 30s later.
+	if chosenRuntime == models.RuntimeKata {
+		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
+	}
+	req.Runtime = chosenRuntime
 
 	if len(req.Mounts) > models.MaxMountsPerSandbox {
 		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
@@ -124,7 +155,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	runtime, err := s.docker.Create(ctx, req, sandboxID, toolboxToken, binds)
+	state, err := s.docker.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
 		releaseAdmission()
@@ -133,12 +164,12 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	now := time.Now().UTC()
 	sandbox := &models.Sandbox{
-		ID:               runtime.SandboxID,
+		ID:               state.SandboxID,
 		Image:            req.Image,
-		Status:           runtime.Status,
-		PublicURL:        s.caddy.SandboxPublicURL(runtime.SandboxID),
-		ContainerID:      runtime.ContainerID,
-		ContainerIP:      runtime.ContainerIP,
+		Status:           state.Status,
+		PublicURL:        s.caddy.SandboxPublicURL(state.SandboxID),
+		ContainerID:      state.ContainerID,
+		ContainerIP:      state.ContainerIP,
 		CPU:              req.CPU,
 		MemoryMB:         req.MemoryMB,
 		DiskGB:           req.DiskGB,
@@ -153,6 +184,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		LastActiveAt:     now,
 		ContainerCommand: req.ContainerCommand,
 		Lifecycle:        lifecycle,
+		Runtime:          chosenRuntime,
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
@@ -297,16 +329,16 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 
-	runtime, err := s.docker.Start(ctx, sandboxContainerRef(sandbox))
+	state, err := s.docker.Start(ctx, sandboxContainerRef(sandbox))
 	if err != nil {
 		_ = s.mounts.UnmountAll(id)
 		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 		return nil, err
 	}
 
-	sandbox.ContainerID = runtime.ContainerID
-	sandbox.ContainerIP = runtime.ContainerIP
-	sandbox.Status = runtime.Status
+	sandbox.ContainerID = state.ContainerID
+	sandbox.ContainerIP = state.ContainerIP
+	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
 
@@ -626,7 +658,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 
 	for _, sandbox := range known {
-		runtime, ok := managed[sandbox.ID]
+		state, ok := managed[sandbox.ID]
 		if !ok {
 			previousStatus := sandbox.Status
 			sandbox.Status = models.SandboxStatusDestroyed
@@ -651,12 +683,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			continue
 		}
 
-		sandbox.ContainerID = runtime.ContainerID
-		sandbox.ContainerIP = runtime.ContainerIP
-		sandbox.Status = runtime.Status
+		sandbox.ContainerID = state.ContainerID
+		sandbox.ContainerIP = state.ContainerIP
+		sandbox.Status = state.Status
 		sandbox.PublicURL = s.caddy.SandboxPublicURL(sandbox.ID)
 		sandbox.UpdatedAt = time.Now().UTC()
-		if runtime.Status == models.SandboxStatusStarted {
+		if state.Status == models.SandboxStatusStarted {
 			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 				return err
 			}
@@ -684,15 +716,15 @@ func (s *Service) Reconcile(ctx context.Context) error {
 
 	// Orphan containers: managed by us but no DB row. Remove them so leaked
 	// state from a crashed create or a wiped DB doesn't accumulate.
-	for sandboxID, runtime := range managed {
+	for sandboxID, state := range managed {
 		if _, ok := knownIDs[sandboxID]; ok {
 			continue
 		}
 		s.logger.Warn("removing orphan container",
 			"sandbox_id", sandboxID,
-			"container_id", runtime.ContainerID,
+			"container_id", state.ContainerID,
 		)
-		stub := &models.Sandbox{ContainerID: runtime.ContainerID, ContainerIP: runtime.ContainerIP}
+		stub := &models.Sandbox{ContainerID: state.ContainerID, ContainerIP: state.ContainerIP}
 		if err := s.docker.Destroy(ctx, stub); err != nil {
 			s.logger.Warn("orphan container removal failed",
 				"sandbox_id", sandboxID,
@@ -709,8 +741,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// process still attached and remove the directory tree. Mounts the
 	// manager already tracks in-process are skipped inside Sweep itself.
 	keep := make(map[string]struct{}, len(managed))
-	for id, runtime := range managed {
-		if runtime.Status == models.SandboxStatusStarted {
+	for id, state := range managed {
+		if state.Status == models.SandboxStatusStarted {
 			keep[id] = struct{}{}
 		}
 	}

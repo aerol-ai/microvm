@@ -28,12 +28,6 @@ export const getSidebarConfig = (): NavigationGroup[] => [
     entries: [
       {
         type: 'link',
-        href: '/',
-        label: 'Introduction',
-        description: 'What this project ships and how the docs are organized.',
-      },
-      {
-        type: 'link',
         href: '/getting-started',
         label: 'Getting Started',
         description: 'Build, configure, and run the sandbox daemon locally.',
@@ -47,8 +41,8 @@ export const getSidebarConfig = (): NavigationGroup[] => [
       {
         type: 'link',
         href: '/sdk-clients',
-        label: 'SDK Clients',
-        description: 'The Go, TypeScript, Python, and Rust SDK surface area.',
+        label: 'SDK Overview',
+        description: 'Package names, shared auth, and cross-language API notes.',
       },
     ],
   },

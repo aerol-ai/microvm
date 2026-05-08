@@ -233,6 +233,52 @@ export SB_TOOLBOX_BINARY_PATH=$PWD/bin/toolboxd
 
 If `SB_DOMAIN` is set, sandbox routes are created as subdomains like `https://<sandbox-id>.<domain>`. If `SB_DOMAIN` is empty, the daemon falls back to path-based URLs like `http://<public-host>/<sandbox-id>/`. For newly created sandboxes, `<sandbox-id>` is the Docker short ID: the first 12 characters of the full container ID.
 
+## Container runtime (Docker / gVisor / Kata)
+
+Sandboxes run under a container runtime selected per host (default for new sandboxes) and per request (override for a single sandbox). The runtime is named in user-facing terms — what you'd search for, not which OCI binary backs it:
+
+- `docker` — Docker's standard runtime (runc under the hood). Default. Lowest overhead. Trusted workloads.
+- `gvisor` — [gVisor](https://gvisor.dev/) (runsc under the hood). User-space kernel between the workload and the host. Significantly stronger isolation against kernel exploits. Recommended for untrusted code (LLM-generated, third-party submissions, CTFs).
+- `kata` — Reserved for [Kata Containers](https://katacontainers.io/) (full hardware-virtualized VMs). The identifier is accepted by configuration but create requests are rejected with `runtime not yet implemented` until the runtime is wired up.
+
+### Host setup for gVisor
+
+Pass `--with-gvisor` to the installer. It downloads the latest `runsc` from gVisor's official release bucket (verified by SHA-512), installs it to `/usr/local/bin/runsc`, merges a `runtimes.runsc` entry into `/etc/docker/daemon.json` (preserving anything already there), and restarts Docker only if `daemon.json` actually changed:
+
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat \
+    --with-gvisor
+```
+
+The flag is opt-in and idempotent — re-running the installer without `--with-gvisor` does nothing to the runtime; re-running with it skips the download and the Docker restart when nothing has changed.
+
+If you've already installed `runsc` yourself (e.g. from `apt`, or a custom build), pass `--runsc-path /path/to/runsc` alongside `--with-gvisor` to skip the download and register your binary instead.
+
+### Selection
+
+```bash
+# Host default for new sandboxes (env on sandboxd):
+export SB_CONTAINER_RUNTIME=docker   # or "gvisor" to default everything to gVisor
+```
+
+Per-sandbox override on the create request:
+
+```bash
+curl -X POST $SB_API/v1/sandboxes \
+  -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  -d '{"image":"alpine","cpu":0.5,"memory_mb":256,"runtime":"gvisor"}'
+```
+
+The persisted sandbox row records the resolved runtime so the choice cannot drift across host restarts.
+
+### gVisor caveats
+
+- `--privileged` is incompatible with `gvisor`. Sandboxd rejects the combination at create time with a clear error.
+- gVisor does not honor Docker's `StorageOpt size` per-sandbox disk quota. `disk_gb` is silently dropped (with a warning log) when the runtime is `gvisor`. CPU and memory caps still work.
+- The host's cgroup driver must match Docker's. cgroupv2 + systemd is the recommended setup.
+
 ## API summary
 
 - `GET /health`
@@ -296,3 +342,7 @@ use microvm_sdk::Client;
 
 let client = Client::new(Some("https://sandbox.example.com"), Some("your_token"))?;
 ```
+
+## License
+
+[MIT](LICENSE)

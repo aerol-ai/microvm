@@ -26,12 +26,11 @@ import (
 
 const managedLabelKey = "sandbox-library.managed"
 
-type SandboxRuntime struct {
-	SandboxID   string
-	ContainerID string
-	ContainerIP string
-	Status      models.SandboxStatus
-}
+// SandboxRuntime is the Docker-layer alias of the canonical
+// models.SandboxRuntimeState type. The alias keeps every existing reference
+// in pkg/docker compiling unchanged while letting non-Docker runtime
+// implementations import only pkg/models.
+type SandboxRuntime = models.SandboxRuntimeState
 
 type Client struct {
 	logger             *slog.Logger
@@ -42,6 +41,7 @@ type Client struct {
 	toolboxPort        int
 	privileged         bool
 	resourceLimitsOff  bool
+	defaultRuntime     string
 	httpClient         *http.Client
 	streamClient       *http.Client
 	toolboxClient      *http.Client
@@ -75,6 +75,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxPort:        cfg.ToolboxPort,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
+		defaultRuntime:     cfg.Runtime,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		streamClient:       &http.Client{Transport: transport},
 		toolboxClient:      &http.Client{Timeout: cfg.HTTPClientTimeout},
@@ -121,6 +122,32 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, errors.New("sandbox ID is required")
 	}
 	if err := c.ensureToolboxBinary(); err != nil {
+		return nil, err
+	}
+
+	// Resolve the effective user-facing runtime: per-sandbox override wins
+	// over the host default. The service layer is expected to substitute the
+	// host default into req.Runtime before calling Create, but we re-resolve
+	// here as a safety net so direct use of the docker client (e.g. tests)
+	// still works.
+	effectiveRuntime := strings.TrimSpace(req.Runtime)
+	if effectiveRuntime == "" {
+		effectiveRuntime = c.defaultRuntime
+	}
+	// gVisor refuses privileged containers — its userspace kernel cannot
+	// safely grant the host capabilities --privileged implies. Catch the
+	// conflict here, before pulling the image and 30s into a doomed start.
+	if effectiveRuntime == models.RuntimeGvisor && c.privileged {
+		return nil, fmt.Errorf("runtime %q is incompatible with privileged containers", effectiveRuntime)
+	}
+	// Translate user-facing name to the OCI runtime binary Docker actually
+	// looks up in /etc/docker/daemon.json. ResolveOCIRuntime returns "" for
+	// "docker" (let Docker use its compiled-in default) and "runsc" for
+	// "gvisor". "kata" returns ErrRuntimeNotImplemented; the service layer
+	// rejects those requests upfront, but we double-check here as a safety
+	// net for direct callers.
+	ociRuntime, err := models.ResolveOCIRuntime(effectiveRuntime)
+	if err != nil {
 		return nil, err
 	}
 
@@ -186,6 +213,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		hostConfig["NetworkMode"] = c.network
 	}
 
+	// Only set HostConfig.Runtime when we actually need to override the
+	// daemon's default. ResolveOCIRuntime returns "" for the "docker"
+	// identifier so we leave the field unset — safer on hosts that haven't
+	// explicitly registered "runc" in /etc/docker/daemon.json, since Docker
+	// then falls back to its compiled-in default runtime.
+	if ociRuntime != "" {
+		hostConfig["Runtime"] = ociRuntime
+	}
+
 	if !c.resourceLimitsOff {
 		resources := map[string]any{}
 		if req.CPU > 0 {
@@ -199,7 +235,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			resources["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
 		}
 		if req.DiskGB > 0 {
-			hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", req.DiskGB)}
+			// gVisor does not honor StorageOpt size — silently applying it
+			// would mislead operators into thinking quota is enforced. Drop
+			// the field with a warning when gvisor is in use.
+			if effectiveRuntime == models.RuntimeGvisor {
+				c.logger.Warn("ignoring disk quota: gvisor does not support StorageOpt size",
+					"sandbox_id", sandboxID, "disk_gb", req.DiskGB)
+			} else {
+				hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", req.DiskGB)}
+			}
 		}
 		hostConfig["Resources"] = resources
 	}

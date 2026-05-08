@@ -27,6 +27,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_IDLE_TIMEOUT_MIN",
 			"SB_CONTAINER_PRIVILEGED",
 			"SB_RESOURCE_LIMITS_DISABLED",
+			"SB_CONTAINER_RUNTIME",
 			"SB_AUTO_RECONCILE",
 			"SB_ENABLE_CADDY",
 			"SB_ENABLE_NETWORK_RULES",
@@ -76,6 +77,36 @@ func TestLoadCases(t *testing.T) {
 				}
 				if !strings.HasSuffix(cfg.ToolboxBinaryPath, string(filepath.Separator)+"toolboxd") {
 					t.Fatalf("unexpected toolbox binary path: %s", cfg.ToolboxBinaryPath)
+				}
+				if cfg.Runtime != "docker" {
+					t.Fatalf("expected default Runtime=docker, got %q", cfg.Runtime)
+				}
+			},
+		},
+		{
+			name: "accepts_gvisor_runtime",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_CONTAINER_RUNTIME", "gvisor")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.Runtime != "gvisor" {
+					t.Fatalf("expected Runtime=gvisor, got %q", cfg.Runtime)
+				}
+			},
+		},
+		{
+			name: "rejects_unknown_runtime",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_CONTAINER_RUNTIME", "firecracker")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_CONTAINER_RUNTIME") {
+					t.Fatalf("expected SB_CONTAINER_RUNTIME error, got %v", err)
 				}
 			},
 		},

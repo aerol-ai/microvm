@@ -33,6 +33,74 @@ type RegistryAuth struct {
 	Password string `json:"password"`
 }
 
+// SandboxRuntimeState is the runtime view of a sandbox returned by the
+// container runtime layer (Docker today, gVisor/native runsc tomorrow). It
+// carries only what the service needs to reconcile and route — anything else
+// belongs on models.Sandbox or stays in the runtime implementation.
+type SandboxRuntimeState struct {
+	SandboxID   string
+	ContainerID string
+	ContainerIP string
+	Status      SandboxStatus
+}
+
+// User-facing runtime identifiers. These are the values the API, SDK, and
+// stored sandbox row carry — chosen to match what an operator searching for
+// "Docker" or "gVisor isolation" would type. The pkg/docker layer translates
+// each one to the underlying OCI runtime binary name (runc / runsc / ...)
+// when shaping the daemon request.
+//
+// The empty string is reserved for legacy rows that pre-date the runtime
+// field — those resolve to the host default at start time.
+const (
+	RuntimeDocker = "docker" // Docker's standard runc-backed runtime.
+	RuntimeGvisor = "gvisor" // gVisor (runsc). User-space kernel for untrusted workloads.
+	RuntimeKata   = "kata"   // Reserved: Kata Containers. Not yet implemented; rejected at create time.
+)
+
+// ErrRuntimeNotImplemented is returned when a runtime is recognized as a valid
+// identifier but the implementation has not been wired up yet. Today only
+// "kata" hits this path. Surfaced through the API as a 4xx so operators get
+// an actionable error instead of a generic 500.
+var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
+
+// ValidRuntime normalizes and validates a user-facing runtime identifier.
+// Empty input passes through unchanged so the caller can substitute the host
+// default; any other value must be one of the recognized names. The intent
+// here is "fail fast at the API boundary" — by the time a request reaches
+// the runtime layer, we should already know the value is one we can act on.
+func ValidRuntime(value string) (string, error) {
+	switch value {
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata:
+		return value, nil
+	default:
+		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s)", value, RuntimeDocker, RuntimeGvisor, RuntimeKata)
+	}
+}
+
+// ResolveOCIRuntime maps a user-facing runtime identifier to the OCI runtime
+// binary name to set on Docker's HostConfig.Runtime. Returns the binary name
+// and true on success, or ErrRuntimeNotImplemented if the identifier is valid
+// but the build does not implement it yet (today: kata).
+//
+// The empty string is treated as "no override" — the caller leaves
+// HostConfig.Runtime unset and Docker uses its compiled-in default. The
+// "docker" identifier maps to "" for the same reason: avoiding an explicit
+// "runc" entry means the daemon is happy even when /etc/docker/daemon.json
+// has no runtimes.runc map entry, which is the common case.
+func ResolveOCIRuntime(value string) (string, error) {
+	switch value {
+	case "", RuntimeDocker:
+		return "", nil
+	case RuntimeGvisor:
+		return "runsc", nil
+	case RuntimeKata:
+		return "", ErrRuntimeNotImplemented
+	default:
+		return "", fmt.Errorf("unsupported runtime %q", value)
+	}
+}
+
 // Lifecycle declares automatic stop/destroy timers for a sandbox. Each field
 // is a duration; zero means "disabled" for that axis. Idle triggers measure
 // time since LastActiveAt (i.e. since the last toolbox/exec/SSH activity).
@@ -118,6 +186,12 @@ type CreateSandboxRequest struct {
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Mounts           []MountSpec       `json:"mounts,omitempty"`
 	Lifecycle        *Lifecycle        `json:"lifecycle,omitempty"`
+	// Runtime selects the container runtime for this sandbox. Empty falls back
+	// to the host default (SB_CONTAINER_RUNTIME). Allowed values: "docker"
+	// (standard runc-backed Docker runtime, default), "gvisor" (runsc-backed
+	// userspace kernel — use for untrusted workloads), or "kata" (reserved,
+	// not yet implemented).
+	Runtime string `json:"runtime,omitempty"`
 }
 
 type ResizeSandboxRequest struct {
@@ -149,6 +223,11 @@ type Sandbox struct {
 	LastError        string            `json:"last_error,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle         `json:"lifecycle"`
+	// Runtime is the container runtime this sandbox uses (one of "docker",
+	// "gvisor", or "kata"). Pre-migration rows carry "" and resolve to the
+	// host default at start time; new sandboxes always store the resolved
+	// value so the choice cannot drift across host restarts.
+	Runtime string `json:"runtime"`
 }
 
 // CreateSandboxResponse is what the API returns from POST /v1/sandboxes.

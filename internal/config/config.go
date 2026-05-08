@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 const defaultToolboxPort = 2280
@@ -28,6 +30,10 @@ type Config struct {
 	IdleTimeoutMinutes  int
 	ContainerPrivileged bool
 	ResourceLimitsOff   bool
+	// Runtime is the host default container runtime for new sandboxes.
+	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
+	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
+	Runtime string
 	AutoReconcile       bool
 	EnableCaddy         bool
 	EnableNetworkRules  bool
@@ -85,6 +91,7 @@ func Load() (Config, error) {
 		IdleTimeoutMinutes:  getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
 		ContainerPrivileged: getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:   getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		Runtime:             getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		AutoReconcile:       getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:         getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:  getEnvBool("SB_ENABLE_NETWORK_RULES", true),
@@ -127,6 +134,16 @@ func Load() (Config, error) {
 
 	if cfg.Domain == "" && cfg.PublicHost == "" {
 		return Config{}, errors.New("SB_PUBLIC_HOST is required when SB_DOMAIN is empty")
+	}
+
+	// SB_CONTAINER_RUNTIME must be one of the runtimes we know how to drive.
+	// We reject "" here too: the caller substitutes the host default when a
+	// per-sandbox value is empty, but the host default itself must always be
+	// explicit. "kata" is a valid identifier but not implemented yet — we
+	// allow it as the host default so operators can pre-stage config, and
+	// reject individual create requests until the runtime is wired up.
+	if _, err := models.ValidRuntime(cfg.Runtime); err != nil || cfg.Runtime == "" {
+		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s)", cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata)
 	}
 
 	return cfg, nil

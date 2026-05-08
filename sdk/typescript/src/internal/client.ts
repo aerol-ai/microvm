@@ -65,6 +65,7 @@ interface ApiSandbox {
   last_error?: string;
   container_command?: string[];
   lifecycle?: ApiLifecycle;
+  runtime?: string;
 }
 
 interface ApiCreateSandboxResponse extends ApiSandbox {
@@ -334,6 +335,7 @@ export class SandboxResource implements Sandbox {
   declare lastError?: string;
   declare containerCommand?: string[];
   declare lifecycle: Lifecycle;
+  declare runtime: Sandbox["runtime"];
 
   protected readonly client: APIClient;
 
@@ -458,6 +460,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     container_command: options.containerCommand,
     mounts: options.mounts?.map(toApiMountSpec),
     lifecycle: options.lifecycle ? toApiLifecycle(options.lifecycle) : undefined,
+    runtime: options.runtime,
   };
 }
 
@@ -523,7 +526,18 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     lastError: sandbox.last_error,
     containerCommand: sandbox.container_command,
     lifecycle: fromApiLifecycle(sandbox.lifecycle),
+    runtime: normalizeRuntime(sandbox.runtime),
   };
+}
+
+// normalizeRuntime narrows the wire-level string to the union we expose, while
+// tolerating older sandboxd versions that don't send the field at all (treat
+// as "" — i.e. host default at start time).
+function normalizeRuntime(value: string | undefined): Sandbox["runtime"] {
+  if (value === "docker" || value === "gvisor" || value === "kata") {
+    return value;
+  }
+  return "";
 }
 
 function fromApiCreateSandboxResponse(response: ApiCreateSandboxResponse): Sandbox {
