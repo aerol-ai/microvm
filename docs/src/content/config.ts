@@ -225,14 +225,14 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           {
             type: 'link',
             href: '/use-cases/customer-facing-product-experiences/ai-app-hosting',
-            label: 'Web App hosting',
+            label: 'Live preview URLs for Web apps',
             description: 'Clone, build, and host a Bun website inside a disposable sandbox.',
           },
           {
             type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/embedded-code-runner',
-            label: 'Embedded code runner inside a SaaS product',
-            description: 'Execute user code safely behind strong isolation boundaries.',
+            href: '/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security',
+            label: 'gVisor kernel secure sandbox',
+            description: 'Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.',
           },
           {
             type: 'link',

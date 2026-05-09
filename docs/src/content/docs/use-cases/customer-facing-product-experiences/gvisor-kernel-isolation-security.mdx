@@ -1,0 +1,255 @@
+---
+title: gVisor Kernel Isolation Security
+description: Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.
+---
+
+## What you are building
+
+This page intentionally does not include breakout or exploit code. Instead, it shows a safe kernel-surface probe. The same Python probe runs twice: once in a direct Docker runtime and once in a gVisor runtime. The probe attempts host-facing privileged operations such as `unshare`, `mount`, and `dmesg`, records what happened, and writes a JSON report.
+
+## Why AerolVM fits
+
+- `runtime: "docker"` lets you show the baseline container model where workload syscalls target the host kernel directly.
+- `runtime: "gvisor"` swaps that direct host-kernel path for gVisor's user-space kernel boundary.
+- The same probe can run in both runtimes with only one field changed, which makes the comparison concrete and easy to explain.
+
+## Shared probe payload
+
+This Python payload is the same for both examples. It is a defensive probe, not an exploit. It tries a few privileged operations and records whether they succeeded, failed with `EPERM`, or were blocked in another way.
+
+```py
+import json
+import subprocess
+
+checks = [
+  ("capabilities", "sh -lc 'grep ^CapEff: /proc/self/status'"),
+  ("unshare_namespaces", "unshare --mount --uts --ipc --net true"),
+  ("mount_tmpfs", "sh -lc 'mkdir -p /tmp/probe-mount && mount -t tmpfs tmpfs /tmp/probe-mount'"),
+  ("read_dmesg", "sh -lc 'dmesg | head -n 5'"),
+]
+
+results = []
+for name, command in checks:
+  completed = subprocess.run(command, shell=True, capture_output=True, text=True)
+  results.append(
+    {
+      "check": name,
+      "command": command,
+      "exitCode": completed.returncode,
+      "stdout": completed.stdout.strip(),
+      "stderr": completed.stderr.strip(),
+    }
+  )
+
+payload = {"results": results}
+
+with open("/workspace/run/probe-report.json", "w", encoding="utf-8") as handle:
+  json.dump(payload, handle, indent=2)
+
+print(json.dumps(payload, indent=2))
+```
+
+## 1. Direct Docker runtime
+
+This script uses `runtime: "docker"`. The probe is still isolated by container boundaries, but the syscalls it makes are handled by the host kernel. That direct kernel exposure is the security difference gVisor is designed to reduce.
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+const probePython = `import json
+import subprocess
+
+checks = [
+  ("capabilities", "sh -lc 'grep ^CapEff: /proc/self/status'"),
+  ("unshare_namespaces", "unshare --mount --uts --ipc --net true"),
+  ("mount_tmpfs", "sh -lc 'mkdir -p /tmp/probe-mount && mount -t tmpfs tmpfs /tmp/probe-mount'"),
+  ("read_dmesg", "sh -lc 'dmesg | head -n 5'"),
+]
+
+results = []
+for name, command in checks:
+  completed = subprocess.run(command, shell=True, capture_output=True, text=True)
+  results.append(
+    {
+      "check": name,
+      "command": command,
+      "exitCode": completed.returncode,
+      "stdout": completed.stdout.strip(),
+      "stderr": completed.stderr.strip(),
+    }
+  )
+
+payload = {"runtime": "docker", "results": results}
+
+with open("/workspace/run/probe-report.json", "w", encoding="utf-8") as handle:
+  json.dump(payload, handle, indent=2)
+
+print(json.dumps(payload, indent=2))
+`;
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "python:3.12-bookworm",
+    runtime: "docker",
+    networkBlockAll: true,
+    cpu: 1,
+    memoryMB: 1024,
+    diskGB: 8,
+  });
+
+  try {
+    await sandbox.exec("mkdir -p /workspace/run");
+    await sandbox.uploadFile("/workspace/run/probe.py", probePython);
+
+    const result = await sandbox.exec({
+      command: "python /workspace/run/probe.py",
+      timeoutSeconds: 10,
+    );
+
+    const report = new TextDecoder().decode(
+      await sandbox.downloadFile("/workspace/run/probe-report.json"),
+    );
+
+    const payload = {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      report: JSON.parse(report),
+    };
+
+    await writeFile(
+      "docker-kernel-probe-result.json",
+      `${JSON.stringify(payload, null, 2)}\n`,
+    );
+
+    console.log(JSON.stringify(payload, null, 2));
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+## 2. gVisor runtime
+
+This script runs the same probe with `runtime: "gvisor"`. The goal is not that every check suddenly succeeds or fails differently. The point is that the workload is now talking to gVisor's user-space kernel layer instead of directly exercising host-kernel paths.
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+const probePython = `import json
+import subprocess
+
+checks = [
+    ("capabilities", "sh -lc 'grep ^CapEff: /proc/self/status'"),
+    ("unshare_namespaces", "unshare --mount --uts --ipc --net true"),
+    ("mount_tmpfs", "sh -lc 'mkdir -p /tmp/probe-mount && mount -t tmpfs tmpfs /tmp/probe-mount'"),
+    ("read_dmesg", "sh -lc 'dmesg | head -n 5'"),
+]
+
+results = []
+for name, command in checks:
+    completed = subprocess.run(command, shell=True, capture_output=True, text=True)
+    results.append(
+        {
+            "check": name,
+            "command": command,
+            "exitCode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+    )
+
+payload = {"runtime": "gvisor", "results": results}
+
+with open("/workspace/run/probe-report.json", "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2)
+
+print(json.dumps(payload, indent=2))
+`;
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "python:3.12-bookworm",
+    runtime: "gvisor",
+    networkBlockAll: true,
+    cpu: 1,
+    memoryMB: 1024,
+    diskGB: 8,
+  });
+
+  try {
+    await sandbox.exec("mkdir -p /workspace/run");
+    await sandbox.uploadFile("/workspace/run/probe.py", probePython);
+
+    const result = await sandbox.exec({
+      command: "python /workspace/run/probe.py",
+      timeoutSeconds: 10,
+    });
+
+    const report = new TextDecoder().decode(
+      await sandbox.downloadFile("/workspace/run/probe-report.json"),
+    );
+
+    const payload = {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      report: JSON.parse(report),
+    };
+
+    await writeFile(
+      "gvisor-kernel-probe-result.json",
+      `${JSON.stringify(payload, null, 2)}\n`,
+    );
+
+    console.log(JSON.stringify(payload, null, 2));
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+## How to explain the result
+
+- In the direct Docker case, the probe is still attempting privileged operations against the host-kernel interface.
+- In the gVisor case, the same workload is mediated by gVisor, so the host kernel is not directly exposed to the same syscall surface.
+- This page is intentionally a safety demo, not an exploit demo. It shows why gVisor is a better boundary for untrusted user code without shipping breakout code.
+
+## Product outputs
+
+- `docker-kernel-probe-result.json` with the Docker runtime probe output.
+- `gvisor-kernel-probe-result.json` with the gVisor runtime probe output.
+
+## Related docs
+
+- [Network Isolation](/network-isolation/)
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)
