@@ -154,9 +154,9 @@ func (c *Client) AttachSession(ctx context.Context, sandboxID, sessionID string,
 	if c.patToken != "" {
 		requestHeader.Set("Authorization", "Bearer "+c.patToken)
 	}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
 	if err != nil {
-		return nil, err
+		return nil, decorateHandshakeError("session attach", wsURL, resp, err)
 	}
 
 	handle := &SessionAttachHandle{
@@ -217,7 +217,7 @@ func (h *SessionAttachHandle) readLoop(options SessionAttachOptions) {
 	for {
 		messageType, payload, err := h.conn.ReadMessage()
 		if err != nil {
-			h.finish(0, "", fmt.Errorf("session stream closed: %w", err))
+			h.finish(0, "", fmt.Errorf("session stream closed: %w", describeReadErr(err)))
 			return
 		}
 		switch messageType {

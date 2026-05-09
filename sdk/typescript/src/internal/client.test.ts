@@ -358,6 +358,70 @@ test("internal client execStream rejects when stream closes before exit", async 
   }
 });
 
+test("internal client attachSession close detaches transport", async () => {
+  const originalWebSocket = globalThis.WebSocket;
+
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+
+    readonly url: string;
+    readonly protocols: string[];
+    binaryType = "blob";
+    sent: Array<string | Uint8Array> = [];
+    closed = false;
+    private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+    constructor(url: string, protocols?: string | string[]) {
+      this.url = url;
+      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(name: string, listener: (event?: unknown) => void): void {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+
+    send(data: string | Uint8Array): void {
+      this.sent.push(data);
+    }
+
+    close(): void {
+      this.closed = true;
+    }
+
+    emit(name: string, event?: unknown): void {
+      for (const listener of this.listeners.get(name) ?? []) {
+        listener(event);
+      }
+    }
+  }
+
+  try {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+    });
+
+    const handle = client.attachSession("sb-stream", "ses-1");
+    const ws = FakeWebSocket.instances[0];
+    assert.ok(ws);
+
+    ws.emit("open");
+    handle.close();
+
+    assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/sessions/ses-1/attach");
+    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+    assert.equal(ws.sent[0], JSON.stringify({ type: "close" }));
+    assert.equal(ws.closed, true);
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test("internal client create forwards runtime selector and parses response", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

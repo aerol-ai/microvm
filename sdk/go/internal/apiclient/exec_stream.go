@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -66,9 +67,9 @@ func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOp
 		requestHeader.Set("Authorization", "Bearer "+c.patToken)
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
 	if err != nil {
-		return nil, err
+		return nil, decorateHandshakeError("exec stream", wsURL, resp, err)
 	}
 
 	handle := &ExecStreamHandle{
@@ -140,7 +141,7 @@ func (h *ExecStreamHandle) readLoop(options ExecStreamOptions) {
 	for {
 		messageType, payload, err := h.conn.ReadMessage()
 		if err != nil {
-			h.finish(ExecExitInfo{}, fmt.Errorf("stream closed before exit: %w", err))
+			h.finish(ExecExitInfo{}, fmt.Errorf("stream closed before exit: %w", describeReadErr(err)))
 			return
 		}
 
@@ -204,6 +205,45 @@ func (h *ExecStreamHandle) finish(info ExecExitInfo, err error) {
 		h.resultMu.Unlock()
 		close(h.done)
 	})
+}
+
+// describeReadErr annotates a gorilla/websocket read error with the close
+// code/text when the peer sent one. Plain `err.Error()` says only "websocket:
+// close 1006 (abnormal closure)"; with this we surface the toolboxd-supplied
+// text frame too when present.
+func describeReadErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if ce, ok := err.(*websocket.CloseError); ok {
+		if ce.Text == "" {
+			return fmt.Errorf("close code=%d", ce.Code)
+		}
+		return fmt.Errorf("close code=%d text=%q", ce.Code, ce.Text)
+	}
+	return err
+}
+
+// decorateHandshakeError annotates a gorilla/websocket Dial error with the
+// HTTP status and body the server returned. On a non-101 response the dialer
+// surfaces only "websocket: bad handshake", which is useless for diagnosing
+// 401s ("auth dropped"), 404s ("route mismatch"), 502s ("toolbox unavailable"),
+// or 5xx from upstream. Caller passes the *http.Response the dialer also
+// returned (may be nil on transport-level errors).
+func decorateHandshakeError(label, wsURL string, resp *http.Response, err error) error {
+	if err == nil {
+		return nil
+	}
+	if resp == nil {
+		return fmt.Errorf("%s websocket dial %s: %w", label, wsURL, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return fmt.Errorf("%s websocket dial %s: %w (status=%d)", label, wsURL, err, resp.StatusCode)
+	}
+	return fmt.Errorf("%s websocket dial %s: %w (status=%d, body=%q)", label, wsURL, err, resp.StatusCode, trimmed)
 }
 
 func websocketURL(baseURL, path string) (string, error) {

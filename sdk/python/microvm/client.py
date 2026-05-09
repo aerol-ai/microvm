@@ -401,11 +401,8 @@ class MicroVM:
             raise MicroVMError("command is required")
 
         websocket_module = _load_websocket_module()
-        ws = websocket_module.create_connection(
-            _to_websocket_url(self.api_url, f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream"),
-            header=[f"Authorization: Bearer {self.pat_token}"],
-            enable_multithread=True,
-        )
+        ws_url = _to_websocket_url(self.api_url, f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
+        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "exec stream")
         ws.send(json.dumps(_to_api_exec_stream_request(options)))
         return ExecStreamHandle(websocket_module, ws, options)
 
@@ -447,14 +444,11 @@ class MicroVM:
     ) -> SessionAttachHandle:
         attach_options: SessionAttachOptions = options or {}
         websocket_module = _load_websocket_module()
-        ws = websocket_module.create_connection(
-            _to_websocket_url(
-                self.api_url,
-                f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
-            ),
-            header=[f"Authorization: Bearer {self.pat_token}"],
-            enable_multithread=True,
+        ws_url = _to_websocket_url(
+            self.api_url,
+            f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
+        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "session attach")
 
         cols = _first_of(attach_options, "cols")
         rows = _first_of(attach_options, "rows")
@@ -547,6 +541,35 @@ class MicroVM:
 
 def _load_websocket_module() -> Any:
     return importlib.import_module("websocket")
+
+
+def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label: str) -> Any:
+    """create_connection wrapper that surfaces HTTP status/body on bad
+    handshake. websocket-client raises WebSocketBadStatusException for non-101
+    responses, which carries .status_code and .resp_body but stringifies as
+    "Handshake status 401 Unauthorized" — we want the body too so 502s from
+    the toolbox proxy ("toolbox unavailable") and 401s with JSON error bodies
+    are decipherable without a packet capture.
+    """
+    try:
+        return websocket_module.create_connection(
+            ws_url,
+            header=[f"Authorization: Bearer {pat_token}"],
+            enable_multithread=True,
+        )
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        body = getattr(exc, "resp_body", None)
+        if isinstance(body, (bytes, bytearray)):
+            body = body.decode("utf-8", errors="replace").strip()
+        elif isinstance(body, str):
+            body = body.strip()
+        parts = [f"{label} websocket connect to {ws_url} failed: {exc}"]
+        if status is not None:
+            parts.append(f"status={status}")
+        if body:
+            parts.append(f"body={body!r}")
+        raise MicroVMError(" | ".join(parts)) from exc
 
 
 def _to_websocket_url(base_url: str, path: str) -> str:
