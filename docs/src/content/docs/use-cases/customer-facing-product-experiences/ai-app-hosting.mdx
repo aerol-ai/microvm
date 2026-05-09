@@ -1,0 +1,130 @@
+---
+title: AI App Hosting
+description: Clone a website repository into AerolVM, run npm install, npm run build, and npm run start, then return the hosted preview URL.
+---
+
+This workflow hosts a website inside AerolVM from a GitHub repository URL. It clones the repository, writes a production `.env`, runs `npm install`, `npm run build`, and `npm run start`, and exits by printing the hosted preview URL.
+
+## Copy-paste TypeScript script
+
+
+```ts
+import { randomBytes } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+const repoURL = "https://github.com/sumansaurabh/sumansaurabh-portfolio.git";
+const workDir = "/workspace/site";
+const port = 3000;
+
+function printChunk(chunk: Uint8Array) {
+  const text = Buffer.from(chunk).toString("utf8").trimEnd();
+  if (text) {
+    console.log(text);
+  }
+}
+
+async function runCommand(
+  sandbox: Awaited<ReturnType<MicroVM["create"]>>,
+  command: string,
+  workdir?: string,
+  env?: Record<string, string>,
+) {
+  console.log(`Running: ${command}`);
+
+  const handle = sandbox.execStream({
+    command,
+    workdir,
+    env,
+    onStdout: (chunk) => printChunk(chunk),
+    onStderr: (chunk) => printChunk(chunk),
+    onError: (message) => console.log(message),
+  });
+
+  const exit = await handle.done;
+  console.log(`Command exited with code ${exit.code}${exit.signal ? ` (${exit.signal})` : ""}`);
+
+  if (exit.code !== 0) {
+    throw new Error(`Command failed: ${command}`);
+  }
+}
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "node:22-bookworm",
+    cpu: 2,
+    memoryMB: 4096,
+    diskGB: 20,
+    lifecycle: {
+      destroyIfIdleFor: 45 * 60 * 1_000_000_000,
+    },
+  });
+
+  const previewURL = await sandbox.exposePort(port);
+  const runtimeEnv = {
+    NODE_ENV: "production",
+    PORT: String(port),
+    PUBLIC_URL: previewURL,
+    SESSION_SECRET: randomBytes(32).toString("hex"),
+  };
+
+  console.log(`Sandbox created: ${sandbox.id}`);
+  console.log(`Preview URL reserved: ${previewURL}`);
+
+  await runCommand(
+    sandbox,
+    "apt-get update && apt-get install -y git ca-certificates",
+    "/workspace",
+  );
+
+  await runCommand(sandbox, `git clone --depth=1 ${repoURL} ${workDir}`, "/workspace");
+
+  await sandbox.uploadFile(
+    `${workDir}/.env`,
+    [
+      "NODE_ENV=production",
+      `PORT=${port}`,
+      `PUBLIC_URL=${previewURL}`,
+      `SESSION_SECRET=${runtimeEnv.SESSION_SECRET}`,
+      "",
+    ].join("\n"),
+  );
+  console.log(`Wrote ${workDir}/.env`);
+
+  await runCommand(sandbox, "npm install", workDir, runtimeEnv);
+
+  await runCommand(sandbox, "npm run build", workDir, runtimeEnv);
+
+  console.log("Starting the app...");
+  const session = await sandbox.createSession({
+    name: "ai-app-hosting",
+    command: "npm run start",
+    workDir: workDir,
+    env: runtimeEnv,
+  });
+
+  const stream = sandbox.attachSession(session.id, {
+    onStdout: (chunk) => printChunk(chunk),
+    onStderr: (chunk) => printChunk(chunk),
+    onError: (message) => console.log(message),
+  });
+  void stream.done.catch(() => {});
+
+  stream.close();
+
+  console.log(`App has been hosted on the following URL: ${previewURL}`);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```

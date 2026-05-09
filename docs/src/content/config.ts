@@ -224,6 +224,12 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
         entries: [
           {
             type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/ai-app-hosting',
+            label: 'Web App hosting',
+            description: 'Clone, build, and host a Bun website inside a disposable sandbox.',
+          },
+          {
+            type: 'link',
             href: '/use-cases/customer-facing-product-experiences/embedded-code-runner',
             label: 'Embedded code runner inside a SaaS product',
             description: 'Execute user code safely behind strong isolation boundaries.',
@@ -239,12 +245,6 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
             href: '/use-cases/customer-facing-product-experiences/interactive-tutorial-lab-backend',
             label: 'Interactive tutorial or lab backend',
             description: 'Back tutorials and labs with per-user sandboxes and persistent shells.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/ai-app-builder-runtime',
-            label: 'AI app builder runtime',
-            description: 'Compile, boot, and preview generated projects inside disposable sandboxes.',
           },
           {
             type: 'link',
