@@ -980,6 +980,7 @@ mod tests {
             mounts: None,
             lifecycle: None,
             runtime: None,
+            gpus: None,
         }
     }
 

@@ -24,6 +24,7 @@ fn main() {
             mounts: None,
             lifecycle: None,
             runtime: None,
+            gpus: None,
         })
         .expect("sandbox creation failed");
 

@@ -34,6 +34,7 @@ let sandbox = client.create(CreateOptions {
 		..Default::default()
 	}),
 	runtime: None,
+	gpus: None,
 })?;
 println!("ssh public key = {:?}", sandbox.data.ssh_public_key);
 println!("ssh private key = {:?}", sandbox.ssh_private_key); // only returned by create()
