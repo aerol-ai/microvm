@@ -237,8 +237,8 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           {
             type: 'link',
             href: '/use-cases/customer-facing-product-experiences/live-preview-urls',
-            label: 'Live preview URLs for generated apps or APIs',
-            description: 'Turn generated files into running previews with public URLs.',
+            label: 'Deploy your own Supabase',
+            description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
           },
           {
             type: 'link',

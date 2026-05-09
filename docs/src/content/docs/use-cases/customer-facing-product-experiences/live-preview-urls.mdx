@@ -1,101 +1,259 @@
 ---
-title: Live Preview URLs For Generated Apps Or APIs
-description: Turn concrete project files into a live preview URL by exposing a sandbox port through AerolVM.
+title: Deploy Your Own Postgres
+description: Run a dedicated Postgres instance inside an AerolVM sandbox, keep credentials in env vars, and publish an HTTP admin endpoint on a public URL.
 ---
 
 ## What you are building
 
-This workflow takes a deterministic set of project files, uploads them into a sandbox, starts a web server, and returns a preview URL that can be opened immediately by a user or reviewer.
+This workflow boots a dedicated Postgres instance inside an AerolVM sandbox, initializes it from environment variables, and keeps the database alive in a long-running session. It also starts a tiny HTTP admin endpoint that checks the database and can be exposed on a public URL.
+
+This is the Postgres foundation, not the full Supabase control plane. If you want a Supabase-style stack, add PostgREST, GoTrue, storage, realtime, and pooling on top of this database runtime.
 
 ## Why AerolVM fits
 
-- `uploadFile` moves generated project files into the sandbox.
-- `createSession` keeps the web server alive after the initial setup step.
-- `exposePort` turns a local process into a shareable preview URL.
+- `create` gives each workspace or customer its own isolated database runtime.
+- Environment variables let you inject credentials without baking them into the image.
+- `createSession` keeps both Postgres and an optional HTTP admin surface alive after setup finishes.
+- Lifecycle policies let you stop or destroy idle database sandboxes automatically.
+
+## Important network limitation
+
+The generated URL from `exposePort()` in this repository is HTTP(S) only.
+
+- The Caddy template defines only `https://...` HTTP sites and `reverse_proxy` handlers.
+- The `UpsertPortRoute` path writes routes into Caddy's `apps/http` server, not a TCP proxy or layer 4 listener.
+- The SSH gateway only supports SSH `session` channels. It does not implement `direct-tcpip` port forwarding.
+
+That means a generated URL like `https://<sandbox-id>-5432.<domain>` is not a native Postgres endpoint. It will not work with `psql`, Prisma, or any other client expecting the PostgreSQL wire protocol. If you want a browser-accessible URL today, expose an HTTP layer that talks to Postgres. If you want native Postgres over the internet, place a TCP-capable proxy or load balancer in front of the sandbox instead of the current Caddy setup.
 
 ## Copy-paste TypeScript script
 
-This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
+Set these environment variables before running the script:
+
+- `SB_PAT_TOKEN`
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- Optional: `POSTGRES_DB` (defaults to `appdb`)
+- Optional: `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD` for the HTTP admin endpoint. If omitted, the script falls back to the Postgres credentials. In production, use separate values.
+
+If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
 
 ```ts
-import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
 const patToken = process.env.SB_PAT_TOKEN;
+const postgresUser = process.env.POSTGRES_USER;
+const postgresPassword = process.env.POSTGRES_PASSWORD;
+const postgresDB = process.env.POSTGRES_DB ?? "appdb";
+const publicAuthUser = process.env.PUBLIC_AUTH_USER ?? postgresUser;
+const publicAuthPassword = process.env.PUBLIC_AUTH_PASSWORD ?? postgresPassword;
+
+const postgresPort = 5432;
+const adminPort = 3000;
+const pgData = "/workspace/postgres/data";
 
 if (!patToken) {
   throw new Error("Set SB_PAT_TOKEN before running this example.");
 }
 
-const projectFiles = [
-  {
-    path: "index.html",
-    contents: `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AerolVM Live Preview</title>
-    <style>
-      body { font-family: sans-serif; margin: 40px; background: #f3f6fb; color: #102033; }
-      .card { max-width: 640px; padding: 24px; border-radius: 16px; background: white; box-shadow: 0 10px 30px rgba(16, 32, 51, 0.12); }
-      code { background: #eef2f7; padding: 2px 6px; border-radius: 6px; }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-      <h1>AerolVM preview is live</h1>
-      <p id="message">Waiting for JavaScript to load.</p>
-      <p>Served directly from a sandbox on port <code>3000</code>.</p>
-      <script src="./app.js"></script>
-    </div>
-  </body>
-</html>
-`,
-  },
-  {
-    path: "app.js",
-    contents: `document.getElementById("message").textContent = "Preview booted successfully inside AerolVM.";`,
-  },
-];
+if (!postgresUser || !postgresPassword) {
+  throw new Error("Set POSTGRES_USER and POSTGRES_PASSWORD before running this example.");
+}
+
+if (!publicAuthUser || !publicAuthPassword) {
+  throw new Error(
+    "Set PUBLIC_AUTH_USER / PUBLIC_AUTH_PASSWORD or provide POSTGRES_USER / POSTGRES_PASSWORD.",
+  );
+}
+
+const databaseURL = `postgresql://${encodeURIComponent(postgresUser)}:${encodeURIComponent(postgresPassword)}@127.0.0.1:${postgresPort}/${encodeURIComponent(postgresDB)}`;
+
+const adminServer = `import base64
+import json
+import os
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+AUTH_USER = os.environ["PUBLIC_AUTH_USER"]
+AUTH_PASSWORD = os.environ["PUBLIC_AUTH_PASSWORD"]
+PORT = int(os.environ.get("PORT", "3000"))
+
+
+def expected_auth_header() -> str:
+    token = base64.b64encode(f"{AUTH_USER}:{AUTH_PASSWORD}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def query_database() -> bytes:
+    result = subprocess.run(
+        [
+            "psql",
+            DATABASE_URL,
+            "-Atqc",
+            "select json_build_object('database', current_database(), 'current_user', current_user, 'server_version', current_setting('server_version'), 'now', now())::text;",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip().encode("utf-8")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/healthz":
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.headers.get("Authorization") != expected_auth_header():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="postgres-admin"')
+            self.end_headers()
+            return
+
+        try:
+            body = query_database()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except subprocess.CalledProcessError as error:
+            body = json.dumps(
+                {"error": error.stderr.strip() or "psql failed"},
+            ).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+
+ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+`;
+
+async function waitForPostgres(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const result = await sandbox.exec({
+      command: 'sh -lc \'pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"\'',
+      timeoutSeconds: 5,
+    });
+
+    if (result.exitCode === 0) {
+      return;
+    }
+
+    await delay(1000);
+  }
+
+  throw new Error("Postgres did not become ready in time.");
+}
+
+async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const result = await sandbox.exec({
+      command:
+        'python3 -c "import urllib.request; urllib.request.urlopen(\\"http://127.0.0.1:3000/healthz\\").read()"',
+      timeoutSeconds: 5,
+    });
+
+    if (result.exitCode === 0) {
+      return;
+    }
+
+    await delay(1000);
+  }
+
+  throw new Error("The HTTP admin endpoint did not become ready in time.");
+}
 
 async function main() {
   const client = new MicroVM({ apiUrl, patToken });
   const sandbox = await client.create({
-    image: "python:3.12-bookworm",
-    cpu: 1,
-    memoryMB: 1024,
-    diskGB: 8,
+    image: "postgres:16-bookworm",
+    osUser: "root",
+    cpu: 2,
+    memoryMB: 2048,
+    diskGB: 12,
+    env: {
+      POSTGRES_DB: postgresDB,
+      POSTGRES_USER: postgresUser,
+      POSTGRES_PASSWORD: postgresPassword,
+      PUBLIC_AUTH_USER: publicAuthUser,
+      PUBLIC_AUTH_PASSWORD: publicAuthPassword,
+      PGDATA: pgData,
+      PORT: String(adminPort),
+    },
     lifecycle: {
-      destroyIfIdleFor: 20 * 60 * 1_000_000_000,
+      stopIfIdleFor: 30 * 60 * 1_000_000_000,
+      destroyIfIdleFor: 6 * 60 * 60 * 1_000_000_000,
     },
   });
 
-  await sandbox.exec("mkdir -p /workspace/app");
-  await Promise.all(
-    projectFiles.map((file) =>
-      sandbox.uploadFile(`/workspace/app/${file.path}`, file.contents),
-    ),
-  );
+  console.log(`Sandbox created: ${sandbox.id}`);
 
-  const session = await sandbox.createSession({
-    name: "preview-server",
-    command: "python3 -m http.server 3000 --directory /workspace/app",
-    workDir: "/workspace/app",
+  await sandbox.exec({
+    command:
+      "apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*",
+    timeoutSeconds: 240,
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-  const previewURL = await sandbox.exposePort(3000);
+  await sandbox.exec("mkdir -p /workspace/postgres /workspace/admin");
+  await sandbox.uploadFile("/workspace/admin/postgres-admin.py", adminServer);
+
+  const postgresSession = await sandbox.createSession({
+    name: "postgres",
+    command: 'sh -lc \'exec docker-entrypoint.sh postgres -c listen_addresses="*" -p 5432\'',
+  });
+
+  await waitForPostgres(sandbox);
+
+  const adminSession = await sandbox.createSession({
+    name: "postgres-admin",
+    command: "python3 /workspace/admin/postgres-admin.py",
+    workDir: "/workspace/admin",
+    env: {
+      DATABASE_URL: databaseURL,
+      POSTGRES_DB: postgresDB,
+      POSTGRES_USER: postgresUser,
+      POSTGRES_PASSWORD: postgresPassword,
+      PUBLIC_AUTH_USER: publicAuthUser,
+      PUBLIC_AUTH_PASSWORD: publicAuthPassword,
+      PORT: String(adminPort),
+    },
+  });
+
+  await waitForAdmin(sandbox);
+  const adminURL = await sandbox.exposePort(adminPort);
 
   const payload = {
     sandboxID: sandbox.id,
-    sessionID: session.id,
-    previewURL,
-    cleanup: "The sandbox stays alive for the preview and auto-destroys after 20 idle minutes.",
+    postgresSessionID: postgresSession.id,
+    adminSessionID: adminSession.id,
+    adminURL,
+    database: {
+      hostInsideSandbox: "127.0.0.1",
+      port: postgresPort,
+      name: postgresDB,
+      userEnv: "POSTGRES_USER",
+      passwordEnv: "POSTGRES_PASSWORD",
+    },
+    note: "adminURL is an HTTP(S) endpoint in front of the sandbox. It is not a native Postgres DSN.",
   };
 
-  await writeFile("live-preview-urls.json", `${JSON.stringify(payload, null, 2)}\n`);
+  await writeFile("deploy-your-own-postgres.json", `${JSON.stringify(payload, null, 2)}\n`);
   console.log(JSON.stringify(payload, null, 2));
 }
 
@@ -105,13 +263,25 @@ main().catch((error) => {
 });
 ```
 
-## Product outputs
+## What the script gives you
 
-- `live-preview-urls.json` with the sandbox ID, session ID, and preview URL.
-- A live preview URL that stays available until the idle policy destroys the sandbox.
+- `deploy-your-own-postgres.json` with the sandbox ID, the running session IDs, and the public HTTP admin URL.
+- A Postgres server listening on port `5432` inside the sandbox.
+- A password-protected HTTP endpoint on port `3000` that proves the database is up and returns basic metadata.
+
+## Can a user access Postgres on the generated URL?
+
+No. In this repository, the generated URL can only reach HTTP(S) services.
+
+- `packaging/Caddyfile.template` defines HTTP sites and HTTP reverse proxies only.
+- `pkg/caddy/client.go` inserts per-port routes into Caddy's HTTP server and returns `https://<sandbox-id>-<port>.<domain>` URLs.
+- `pkg/sshgateway/gateway.go` rejects non-`session` SSH channels, so it is not a fallback TCP tunnel either.
+
+Use the generated URL for an HTTP layer such as an admin endpoint, PostgREST, or your own API. Do not hand it to a raw Postgres client.
 
 ## Related docs
 
+- [Environment](/environment/)
 - [Preview](/preview/)
+- [Port Allowlist](/port-allowlist/)
 - [Sessions](/sessions/)
-- [File System](/file-system/)
