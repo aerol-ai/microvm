@@ -41,6 +41,7 @@ Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the
 | **Sandbox startup** | <90ms | ~1s | Seconds (persistent VMs) |
 | **Runtime isolation** | Docker, gVisor (kernel-level) | Docker | Docker |
 | **Security** | gVisor(very secure) | ✗ | ✗ |
+| **Port Isolation** | ✅ | ✗ | ✗ |
 | **Persistent stop/start** | ✅ | ✗ | ✅ |
 | **Sandbox Lifecycle** | Infinite | 1 day | Infinite |
 | **External storage** | S3, NFS, SSHFS, rclone | ✗ | ✗ |
