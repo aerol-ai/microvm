@@ -3,24 +3,7 @@ title: Write Test Cases Agent
 description: Clone a GitHub repository, run Claude Code inside an AerolVM sandbox, generate 500 test cases, validate that at least 90% of the target was actually written, and optionally open a pull request.
 ---
 
-## What you are building
-
 This workflow takes a GitHub repository URL, a GitHub token, and an Anthropic key. It clones the repository inside an AerolVM sandbox, installs Claude Code plus repository-appropriate tooling, uploads a strict prompt with validation rules, asks Claude to write 500 real test cases, verifies how many test cases were actually added, runs the repository validation command, and optionally opens a pull request with the generated tests.
-
-## Validation gates
-
-- The target is `500` test cases.
-- The run fails unless at least `90%` of the target is validated, which means at least `450` manifest-backed tests must exist in the repository after generation.
-- Claude must write `test-case-manifest.json`, `bulk-test-generation-summary.md`, `bulk-test-generation-pr-title.txt`, and `bulk-test-generation-pr-body.md`.
-- Each manifest entry must point to a real file and a real test name that exists in the repository.
-- A repository validation command runs after generation so the result is not just a large patch, but a checked result.
-
-## Why AerolVM fits
-
-- Bulk test generation is a long-running job that needs cloned source, package installs, and streamed progress rather than a single short command.
-- The sandbox isolates GitHub credentials, Anthropic credentials, repo state, and generated artifacts from the host machine.
-- `createSession`, `attachSession`, and `sessionLog` fit large Claude Code runs much better than a single request-response call.
-- Downloaded artifacts give you a manifest, a validation report, the generated patch, and the PR URL outside the sandbox.
 
 ## Copy-paste TypeScript script
 
