@@ -3,7 +3,7 @@ title: Zero-Shot Code Execution Agent
 description: Take a repository URL plus a natural-language modification prompt, run Claude Code inside an AerolVM sandbox, validate the result, and open a pull request automatically.
 ---
 
-This workflow is a generic zero-shot repository modification agent. It takes a Claude-compatible agent command, a cloud API key, a GitHub PAT, a repository URL, and a natural-language prompt that describes the change you want. The script clones the repository inside an AerolVM sandbox, installs Claude Code and repository-appropriate tooling, writes a strict execution prompt with validation requirements, runs the agent in the cloned repository, validates the result, commits the changes, and opens a GitHub pull request automatically.
+This workflow is a generic zero-shot repository modification agent. It takes prompt as input and execute the task and raises the PR automatically.
 
 ## Inputs
 
@@ -16,7 +16,6 @@ This workflow is a generic zero-shot repository modification agent. It takes a C
 
 ## Copy-paste TypeScript script
 
-This script requires `SB_PAT_TOKEN`, `GITHUB_REPO_URL`, `ZERO_SHOT_TASK_PROMPT`, and either `CLOUD_API_KEY` or `ANTHROPIC_API_KEY`, plus either `GITHUB_PAT_TOKEN` or `GITHUB_TOKEN`. If `CLOUD_AGENT_COMMAND` is unset, the script defaults to `claude`. If `CLOUD_MODEL` is unset, it defaults to `claude-sonnet-4-6`. If `POST_PULL_REQUEST` is unset, it defaults to `true`. If `SANDBOX_IMAGE` is unset, it defaults to `node:22-bookworm`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
