@@ -290,16 +290,33 @@ async function startExpressServer(
 		publicURL: options.publicURL,
 	}, null, 2));
 
-	const handle = sandbox.execStream({
+	// Background servers should run as sessions so we can detach cleanly after
+	// readiness checks instead of keeping an exec stream transport open.
+	const session = await sandbox.createSession({
+		name: `express-server-${options.port}`,
 		command: "npm start",
-		workdir: options.workDir,
+		workDir: options.workDir,
 		env: options.env,
+	});
+	const handle = sandbox.attachSession(session.id, {
 		onStdout: (chunk) => stdoutLogger.write(chunk),
 		onStderr: (chunk) => stderrLogger.write(chunk),
 		onError: (message) => {
 			console.error(`[${actionName}:error] ${message}`);
-			rejectReady?.(new Error(message));
+			if (!ready) {
+				rejectReady?.(new Error(message));
+			}
 		},
+	});
+	let detached = false;
+	void handle.done.then((exit) => {
+		if (!ready) {
+			rejectReady?.(new Error(`${actionName} exited before it became ready (${formatExecExit(exit)})`));
+		}
+	}).catch((error: unknown) => {
+		if (!detached && !ready) {
+			rejectReady?.(error instanceof Error ? error : new Error(String(error)));
+		}
 	});
 
 	const healthURL = new URL("/health", options.publicURL).toString();
@@ -326,12 +343,22 @@ async function startExpressServer(
 			name: actionName,
 			status: "ready",
 			publicURL: options.publicURL,
+			sessionID: session.id,
 		}, null, 2));
 	} catch (error: unknown) {
-		handle.signal("TERM");
+		try {
+			await sandbox.deleteSession(session.id);
+		} catch {
+			// Best-effort cleanup. The original startup error is more useful.
+		}
 		throw error;
 	} finally {
-		handle.close();
+		detached = true;
+		try {
+			handle.close();
+		} catch {
+			// The attach stream may already be closed if startup failed early.
+		}
 		stdoutLogger.flush();
 		stderrLogger.flush();
 	}
@@ -417,6 +444,13 @@ function timeoutAfter(ms: number, message: string): Promise<never> {
 			reject(new Error(message));
 		}, ms);
 	});
+}
+
+function formatExecExit(exit: { code: number; signal?: string }): string {
+	if (exit.signal) {
+		return `signal ${exit.signal}`;
+	}
+	return `exit code ${exit.code}`;
 }
 
 function delay(ms: number): Promise<void> {

@@ -3,7 +3,9 @@ package ai.aerol.microvm.internal;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
+import java.net.http.WebSocketHandshakeException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -30,8 +32,39 @@ public final class JavaNetWebSocketConnector implements WebSocketConnector {
             WebSocket webSocket = builder.buildAsync(uri, new AdapterListener(listener)).join();
             return new AdapterSocket(webSocket);
         } catch (CompletionException ex) {
-            throw new MicroVMException("failed to connect websocket", resolveCause(ex));
+            Throwable cause = resolveCause(ex);
+            throw new MicroVMException(describeConnectFailure(uri, cause), cause);
         }
+    }
+
+    // describeConnectFailure pulls HTTP status / body off WebSocketHandshakeException
+    // so callers see "websocket connect to <uri> failed: status=502 body='toolbox unavailable'"
+    // instead of just "failed to connect websocket".
+    private static String describeConnectFailure(URI uri, Throwable cause) {
+        if (cause instanceof WebSocketHandshakeException) {
+            WebSocketHandshakeException handshake = (WebSocketHandshakeException) cause;
+            HttpResponse<?> response = handshake.getResponse();
+            int status = response == null ? -1 : response.statusCode();
+            String body = "";
+            if (response != null) {
+                Object rawBody = response.body();
+                if (rawBody instanceof byte[]) {
+                    body = new String((byte[]) rawBody).trim();
+                } else if (rawBody != null) {
+                    body = rawBody.toString().trim();
+                }
+            }
+            StringBuilder sb = new StringBuilder("websocket connect to ").append(uri).append(" failed");
+            if (status > 0) {
+                sb.append(": status=").append(status);
+            }
+            if (!body.isEmpty()) {
+                sb.append(" body=").append(body);
+            }
+            return sb.toString();
+        }
+        String message = cause == null || cause.getMessage() == null ? "" : ": " + cause.getMessage();
+        return "websocket connect to " + uri + " failed" + message;
     }
 
     private static final class AdapterSocket implements StreamingWebSocket {

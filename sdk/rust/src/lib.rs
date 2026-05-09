@@ -627,7 +627,9 @@ async fn run_exec_stream(
             .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
     );
 
-    let (stream, _) = connect_async(request).await?;
+    let (stream, _) = connect_async(request)
+        .await
+        .map_err(|err| decorate_ws_handshake("exec stream", err))?;
     let (mut write, mut read) = stream.split();
 
     let start = ExecStreamStartRequest {
@@ -718,7 +720,9 @@ async fn run_session_attach(
             .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
     );
 
-    let (stream, _) = connect_async(request).await?;
+    let (stream, _) = connect_async(request)
+        .await
+        .map_err(|err| decorate_ws_handshake("session attach", err))?;
     let (mut write, mut read) = stream.split();
 
     if let (Some(cols), Some(rows)) = (options.cols, options.rows) {
@@ -789,6 +793,30 @@ async fn run_session_attach(
                 }
             }
         }
+    }
+}
+
+// decorate_ws_handshake unwraps tungstenite's Http error variant so the
+// caller sees the actual status + body the server returned (e.g.
+// "status=502, body=\"toolbox unavailable\"") instead of just
+// "Http error: 502 Bad Gateway".
+fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
+    match err {
+        WebSocketError::Http(response) => {
+            let status = response.status();
+            let body = response.into_body().unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body);
+            let trimmed = body_str.trim();
+            if trimmed.is_empty() {
+                Error::Api(format!("{} websocket handshake failed: status={}", label, status))
+            } else {
+                Error::Api(format!(
+                    "{} websocket handshake failed: status={}, body={:?}",
+                    label, status, trimmed
+                ))
+            }
+        }
+        other => Error::WebSocket(other),
     }
 }
 

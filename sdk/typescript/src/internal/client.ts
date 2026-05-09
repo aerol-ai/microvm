@@ -676,6 +676,29 @@ async function decodeError(response: Response): Promise<Error> {
 const STREAM_PREFIX_STDOUT = 0x01;
 const STREAM_PREFIX_STDERR = 0x02;
 
+// Pull whatever diagnostic detail the runtime gave us off a WebSocket "error"
+// event. Node 22's native WebSocket fires an ErrorEvent with `.error` /
+// `.message`; browsers' base WebSocket fires a bare Event. Returns "" when
+// nothing useful is there so callers can fall back to a generic label.
+function describeWSError(event: unknown): string {
+  if (!event || typeof event !== "object") return "";
+  const e = event as { error?: unknown; message?: unknown };
+  if (e.error instanceof Error && e.error.message) return e.error.message;
+  if (typeof e.error === "string" && e.error !== "") return e.error;
+  if (typeof e.message === "string" && e.message !== "") return e.message;
+  return "";
+}
+
+function describeWSClose(event: unknown): string {
+  if (!event || typeof event !== "object") return "";
+  const e = event as { code?: unknown; reason?: unknown; wasClean?: unknown };
+  const parts: string[] = [];
+  if (typeof e.code === "number") parts.push(`code=${e.code}`);
+  if (typeof e.reason === "string" && e.reason !== "") parts.push(`reason=${JSON.stringify(e.reason)}`);
+  if (typeof e.wasClean === "boolean") parts.push(`wasClean=${e.wasClean}`);
+  return parts.join(" ");
+}
+
 function openExecStream(baseURL: string, patToken: string, sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
   const wsURL = baseURL.replace(/^http/, "ws") + `/v1/sandboxes/${encodeURIComponent(sandboxID)}/toolbox/process/exec/stream`;
 
@@ -689,6 +712,11 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
   // `sandbox.bearer, <token>`.
   const ws = new WS(wsURL, ["sandbox.bearer", patToken]);
   ws.binaryType = "arraybuffer";
+
+  // Captured by the "error" listener and consumed by "close" so we report the
+  // root cause (e.g. "Unexpected server response: 502") rather than the
+  // generic "stream closed before exit" that would otherwise win the race.
+  let lastErrorDetail = "";
 
   let exitResolve: ((info: ExecExitInfo) => void) | undefined;
   let exitReject: ((err: Error) => void) | undefined;
@@ -748,12 +776,20 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
     }
   });
 
-  ws.addEventListener("close", () => {
-    failWith("stream closed before exit");
+  ws.addEventListener("close", (event) => {
+    const closeDetail = describeWSClose(event);
+    const parts = [lastErrorDetail, closeDetail].filter((s) => s !== "");
+    const suffix = parts.length > 0 ? ` (${parts.join("; ")})` : "";
+    failWith(`stream closed before exit${suffix}`);
   });
 
-  ws.addEventListener("error", () => {
-    failWith("websocket error");
+  ws.addEventListener("error", (event) => {
+    const detail = describeWSError(event);
+    if (detail !== "") {
+      lastErrorDetail = detail;
+    }
+    options.onError?.(detail !== "" ? detail : "websocket error");
+    failWith(detail !== "" ? `websocket error: ${detail}` : "websocket error");
   });
 
   const sendBinary = (data: Uint8Array | string) => {
@@ -801,6 +837,7 @@ function openSessionAttach(
   });
 
   let settled = false;
+  let lastErrorDetail = "";
   const finishWith = (info: ExecExitInfo) => {
     if (settled) return;
     settled = true;
@@ -850,14 +887,22 @@ function openSessionAttach(
     }
   });
 
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (event) => {
     if (!settled) {
-      failWith("session stream closed before exit");
+      const closeDetail = describeWSClose(event);
+      const parts = [lastErrorDetail, closeDetail].filter((s) => s !== "");
+      const suffix = parts.length > 0 ? ` (${parts.join("; ")})` : "";
+      failWith(`session stream closed before exit${suffix}`);
     }
   });
 
-  ws.addEventListener("error", () => {
-    failWith("websocket error");
+  ws.addEventListener("error", (event) => {
+    const detail = describeWSError(event);
+    if (detail !== "") {
+      lastErrorDetail = detail;
+    }
+    options.onError?.(detail !== "" ? detail : "websocket error");
+    failWith(detail !== "" ? `websocket error: ${detail}` : "websocket error");
   });
 
   const sendBinary = (data: Uint8Array | string) => {
