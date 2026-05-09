@@ -9,11 +9,11 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  test:
+    name: Test
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ github.event.release.tag_name }}
-      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.event.release.tag_name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -33,16 +33,11 @@ jobs:
           cache: npm
           cache-dependency-path: sdk/typescript/package-lock.json
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu
-
       - name: Install TypeScript SDK dependencies
         working-directory: sdk/typescript
         run: npm ci
 
-      - name: Run tests
+      - name: Run Go tests
         run: |
           go test -count=1 -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -n 1
@@ -53,59 +48,203 @@ jobs:
           npm run build
           npm test
 
-      - name: Build release assets
-        shell: bash
+  build:
+    name: Build - ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      LDFLAGS: -X github.com/aerol-ai/microvm/internal/version.Version=${{ github.event.release.tag_name }}
+    strategy:
+      matrix:
+        include:
+          # Linux — sandboxd (CGO) + toolboxd
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            suffix: linux_amd64
+            cc: gcc
+            apt_pkgs: build-essential
+            goarm: ""
+
+          - name: Linux x86
+            runner: ubuntu-latest
+            goos: linux
+            goarch: "386"
+            suffix: linux_386
+            cc: gcc
+            apt_pkgs: "build-essential gcc-multilib"
+            goarm: ""
+
+          - name: Linux aarch64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            suffix: linux_arm64
+            cc: aarch64-linux-gnu-gcc
+            apt_pkgs: "build-essential gcc-aarch64-linux-gnu"
+            goarm: ""
+
+          - name: Linux armv7hf
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm
+            suffix: linux_armv7
+            cc: arm-linux-gnueabihf-gcc
+            apt_pkgs: "build-essential gcc-arm-linux-gnueabihf"
+            goarm: "7"
+
+          - name: Linux armv6
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm
+            suffix: linux_armv6
+            cc: arm-linux-gnueabi-gcc
+            apt_pkgs: "build-essential gcc-arm-linux-gnueabi"
+            goarm: "6"
+
+          # FreeBSD — toolboxd only (CGO=0, no cross-compiler available)
+          - name: Freebsd x86_64
+            runner: ubuntu-latest
+            goos: freebsd
+            goarch: amd64
+            suffix: freebsd_amd64
+            cc: ""
+            apt_pkgs: ""
+            goarm: ""
+
+          - name: Freebsd x86
+            runner: ubuntu-latest
+            goos: freebsd
+            goarch: "386"
+            suffix: freebsd_386
+            cc: ""
+            apt_pkgs: ""
+            goarm: ""
+
+          # macOS — toolboxd only
+          - name: MacOS x86_64
+            runner: macos-13
+            goos: darwin
+            goarch: amd64
+            suffix: darwin_amd64
+            cc: ""
+            apt_pkgs: ""
+            goarm: ""
+
+          - name: MacOS aarch64
+            runner: macos-14
+            goos: darwin
+            goarch: arm64
+            suffix: darwin_arm64
+            cc: ""
+            apt_pkgs: ""
+            goarm: ""
+
+          # Windows — toolboxd only
+          - name: Windows x86_64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+            suffix: windows_amd64
+            cc: ""
+            apt_pkgs: ""
+            goarm: ""
+
+          - name: Windows x86
+            runner: windows-latest
+            goos: windows
+            goarch: "386"
+            suffix: windows_386
+            cc: ""
+            apt_pkgs: ""
+            goarm: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux' && matrix.apt_pkgs != ''
         run: |
-          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
+      - name: Build sandboxd (Linux only, CGO enabled)
+        if: matrix.goos == 'linux'
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CC: ${{ matrix.cc }}
+        run: |
           mkdir -p dist
+          go build -trimpath -ldflags "$LDFLAGS" -o dist/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
+          chmod 0755 dist/sandboxd_${{ matrix.suffix }}
 
-          build_binary() {
-            local binary="$1"
-            local arch="$2"
-            local cgo_enabled="$3"
-            local cc="$4"
-            local output="dist/${binary}_linux_${arch}"
+      - name: Build toolboxd
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          mkdir -p dist
+          ext=""
+          [[ "${{ matrix.goos }}" == "windows" ]] && ext=".exe"
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/toolboxd_${{ matrix.suffix }}${ext}" ./cmd/toolboxd
+          [[ "${{ matrix.goos }}" != "windows" ]] && chmod 0755 "dist/toolboxd_${{ matrix.suffix }}${ext}"
 
-            if [[ "$cgo_enabled" == "1" ]]; then
-              CGO_ENABLED=1 GOOS=linux GOARCH="$arch" CC="$cc" \
-                go build -trimpath -ldflags "$LDFLAGS" -o "$output" "./cmd/${binary}"
-            else
-              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-                go build -trimpath -ldflags "$LDFLAGS" -o "$output" "./cmd/${binary}"
-            fi
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.suffix }}
+          path: dist/
 
-            chmod 0755 "$output"
-          }
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
 
-          build_binary sandboxd amd64 1 gcc
-          build_binary toolboxd amd64 0 gcc
-          build_binary sandboxd arm64 1 aarch64-linux-gnu-gcc
-          build_binary toolboxd arm64 0 gcc
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist/
+          merge-multiple: true
 
+      - name: Copy install script
+        run: |
           cp scripts/install.sh dist/install.sh
           chmod 0755 dist/install.sh
 
-          (
-            cd dist
-            sha256sum \
-              sandboxd_linux_amd64 \
-              toolboxd_linux_amd64 \
-              sandboxd_linux_arm64 \
-              toolboxd_linux_arm64 \
-              install.sh \
-              > checksums.txt
-          )
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
           generate_release_notes: true
-          files: |
-            dist/sandboxd_linux_amd64
-            dist/toolboxd_linux_amd64
-            dist/sandboxd_linux_arm64
-            dist/toolboxd_linux_arm64
-            dist/install.sh
-            dist/checksums.txt
+          files: dist/*

@@ -96,8 +96,17 @@ detect_platform() {
 		x86_64|amd64)
 			arch="amd64"
 			;;
+		i686|i386)
+			arch="386"
+			;;
 		aarch64|arm64)
 			arch="arm64"
+			;;
+		armv7l|armv7)
+			arch="armv7"
+			;;
+		armv6l|armv6)
+			arch="armv6"
 			;;
 		*)
 			echo "Unsupported architecture: $(uname -m)" >&2
@@ -352,10 +361,14 @@ install_caddy_dns_plugin() {
 	# requested modules baked in; no Go toolchain needed on the host.
 	local provider="$1"
 	local arch_tag
+	local arch_extra=""
 
 	case "$(uname -m)" in
-		x86_64|amd64) arch_tag="amd64" ;;
+		x86_64|amd64)  arch_tag="amd64" ;;
+		i686|i386)     arch_tag="386" ;;
 		aarch64|arm64) arch_tag="arm64" ;;
+		armv7l|armv7)  arch_tag="arm"; arch_extra="&arm=7" ;;
+		armv6l|armv6)  arch_tag="arm"; arch_extra="&arm=6" ;;
 		*)
 			echo "Unsupported architecture for custom Caddy build: $(uname -m)" >&2
 			exit 1
@@ -368,7 +381,7 @@ install_caddy_dns_plugin() {
 		caddy_path="/usr/bin/caddy"
 	fi
 
-	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}&p=github.com/caddy-dns/${provider}"
+	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/caddy-dns/${provider}"
 	local tmp_binary
 	tmp_binary="$(mktemp)"
 
