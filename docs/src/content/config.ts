@@ -200,8 +200,8 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           {
             type: 'link',
             href: '/use-cases/coding-agents/test-writing-failure-reproduction-agent',
-            label: 'Test-writing and failure reproduction agent',
-            description: 'Turn a bug report into failing tests and a reproducible harness.',
+            label: 'Write 500 test cases',
+            description: 'Clone a repository, have Claude generate 500 tests, and fail the run below a 90% completion threshold.',
           },
           {
             type: 'link',
