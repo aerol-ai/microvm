@@ -2,9 +2,46 @@
 title: Server Setup
 ---
 
-AerolVM runs on a single Linux host. The one-line installer configures the server, sets up Caddy for TLS, and registers a systemd service with automatic restarts and a health-check timer.
+AerolVM runs on a single host. The one-line installer configures the server and registers it as a system service with automatic restarts and a health-check timer.
 
-## Install
+## Local Setup (Mac / Linux)
+
+The fastest way to get started: run the server directly on your Mac or Linux machine. No domain, no TLS, no Caddy — the server listens on `http://localhost:21212` and your SDK connects there directly.
+
+**Prerequisites:** Docker Desktop (macOS) or Docker Engine (Linux) must already be running.
+
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --local \
+    --pat-token your-secret-pat
+```
+
+If you omit `--pat-token`, the installer generates a random token and prints it once.
+
+What the installer does:
+- Downloads and installs the `sandboxd` and `toolboxd` binaries to `/usr/local/bin`
+- Writes config to `/etc/sandboxd/sandboxd.env` with `SB_ENABLE_CADDY=false`
+- **macOS:** registers a launchd daemon (`com.aerol.sandboxd`) that starts automatically on boot
+- **Linux:** registers a systemd service (`sandboxd`) without a Caddy dependency
+
+After installation the API is immediately available:
+
+| | |
+|---|---|
+| API URL | `http://localhost:21212` |
+| PAT token | printed at install, or check `/etc/sandboxd/sandboxd.env` |
+| Logs (macOS) | `/var/log/sandboxd/sandboxd.log` |
+| Logs (Linux) | `journalctl -u sandboxd -f` |
+
+To stop the service:
+- **macOS:** `sudo launchctl unload /Library/LaunchDaemons/com.aerol.sandboxd.plist`
+- **Linux:** `sudo systemctl stop sandboxd`
+
+Point your SDK at the local server using `baseURL: "http://localhost:21212"` and `apiKey: "<your-pat>"`. See [SDK Setup](/sdk-setup) for connection examples.
+
+---
+
+## Install on a VPS
 
 **Trial / single-user** (HTTP-01 on-demand TLS):
 
@@ -150,9 +187,9 @@ See [GPU Sandboxes](/gpu-sandboxes) for code examples in all SDK languages.
 
 ---
 
-## Local Development
+## Building from Source
 
-To run the server locally without the installer:
+To run the server directly from a checkout (no installer):
 
 ```bash
 make build
@@ -160,11 +197,12 @@ make build
 export SB_PAT_TOKEN=dev-token
 export SB_DB_PATH=$PWD/sandbox.db
 export SB_PUBLIC_HOST=127.0.0.1
+export SB_ENABLE_CADDY=false
 
-./bin/aerolvm
+./bin/sandboxd
 ```
 
-Required services: Docker daemon and Caddy with the Admin API enabled at `http://localhost:2019`.
+Required: Docker daemon running on the host. No Caddy required when `SB_ENABLE_CADDY=false`; the API is served directly on `http://localhost:21212`.
 
 ## Next Steps
 

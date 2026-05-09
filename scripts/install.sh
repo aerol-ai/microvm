@@ -20,6 +20,7 @@ WITH_GVISOR="false"
 RUNSC_PATH=""
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
+LOCAL_MODE="false"
 
 usage() {
 	cat <<'EOF'
@@ -71,6 +72,13 @@ Options:
                                Requires the amdgpu kernel module loaded on the
                                host (the GPU must already be recognized by the
                                OS — /dev/kfd must exist).
+  --local                      Local development mode. The server binds to
+                               127.0.0.1:21212 with no Caddy or TLS. Supported
+                               on both macOS and Linux. Docker Desktop (macOS)
+                               or Docker Engine (Linux) must already be running.
+                               No domain name required. On macOS a launchd
+                               daemon is registered; on Linux a systemd unit
+                               without a Caddy dependency is used.
   --help                       Show this help
 
 Examples:
@@ -87,8 +95,12 @@ detect_platform() {
 	local arch
 
 	os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-	if [[ "$os" != "linux" ]]; then
-		echo "Only Linux hosts are supported by this installer" >&2
+	if [[ "$os" == "darwin" ]] && [[ "$LOCAL_MODE" != "true" ]]; then
+		echo "macOS is only supported with --local mode; for a VPS install use a Linux host" >&2
+		exit 1
+	fi
+	if [[ "$os" != "linux" && "$os" != "darwin" ]]; then
+		echo "Only Linux (and macOS with --local) hosts are supported by this installer" >&2
 		exit 1
 	fi
 
@@ -240,6 +252,10 @@ while [[ $# -gt 0 ]]; do
 			WITH_AMD_GPU="true"
 			shift
 			;;
+		--local)
+			LOCAL_MODE="true"
+			shift
+			;;
 		--help)
 			usage
 			exit 0
@@ -299,11 +315,6 @@ if [[ "$BUILD_FROM_SOURCE" != "true" ]]; then
 		echo "download mode requires release asset URLs or a valid --github-repo/--version combination" >&2
 		exit 1
 	fi
-fi
-
-if [[ $EUID -ne 0 ]]; then
-	echo "install.sh must run as root" >&2
-	exit 1
 fi
 
 install_packages() {
@@ -889,6 +900,165 @@ PY
 	echo "Registered gVisor runtime in $daemon_json (path=$runsc_bin); restarting docker"
 	systemctl restart docker
 }
+
+write_local_environment() {
+	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	cat > /etc/sandboxd/sandboxd.env <<EOF
+SB_PAT_TOKEN=$PAT_TOKEN
+SB_API_HOST=127.0.0.1
+SB_API_PORT=21212
+SB_PUBLIC_HOST=127.0.0.1
+SB_DB_PATH=/var/lib/sandboxd/state.db
+SB_DOCKER_NETWORK=bridge
+SB_TOOLBOX_BINARY_PATH=$INSTALL_PREFIX/toolboxd
+SB_TOOLBOX_MOUNT_PATH=/usr/local/bin/toolboxd
+SB_TOOLBOX_PORT=2280
+SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
+SB_ENABLE_CADDY=false
+SB_ENABLE_NETWORK_RULES=false
+SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
+SB_MOUNTS_CRED_DIR=/run/sandboxd
+SB_MOUNT_WAIT_TIMEOUT=30s
+SB_RECORDING_DIR=/var/lib/toolboxd/recordings
+SB_RECORDING_RETENTION=168h
+SB_SESSION_BUFFER_BYTES=1048576
+EOF
+	chmod 0600 /etc/sandboxd/sandboxd.env
+}
+
+write_local_systemd_unit() {
+	cat > /etc/systemd/system/sandboxd.service <<EOF
+[Unit]
+Description=AerolVM daemon (local)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sandboxd/sandboxd.env
+ExecStartPre=/bin/mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
+ExecStartPre=/bin/chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
+ExecStart=$INSTALL_PREFIX/sandboxd
+MountFlags=shared
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_launchd_plist() {
+	mkdir -p /var/lib/sandboxd /var/lib/sandboxd/mounts /var/log/sandboxd
+	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts
+	local plist_path="/Library/LaunchDaemons/com.aerol.sandboxd.plist"
+	cat > "$plist_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.aerol.sandboxd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$INSTALL_PREFIX/sandboxd</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SB_PAT_TOKEN</key>
+		<string>$PAT_TOKEN</string>
+		<key>SB_API_HOST</key>
+		<string>127.0.0.1</string>
+		<key>SB_API_PORT</key>
+		<string>21212</string>
+		<key>SB_PUBLIC_HOST</key>
+		<string>127.0.0.1</string>
+		<key>SB_DB_PATH</key>
+		<string>/var/lib/sandboxd/state.db</string>
+		<key>SB_DOCKER_NETWORK</key>
+		<string>bridge</string>
+		<key>SB_TOOLBOX_BINARY_PATH</key>
+		<string>$INSTALL_PREFIX/toolboxd</string>
+		<key>SB_TOOLBOX_MOUNT_PATH</key>
+		<string>/usr/local/bin/toolboxd</string>
+		<key>SB_TOOLBOX_PORT</key>
+		<string>2280</string>
+		<key>SB_IDLE_TIMEOUT_MIN</key>
+		<string>$IDLE_TIMEOUT_MIN</string>
+		<key>SB_ENABLE_CADDY</key>
+		<string>false</string>
+		<key>SB_ENABLE_NETWORK_RULES</key>
+		<string>false</string>
+		<key>SB_MOUNTS_ROOT</key>
+		<string>/var/lib/sandboxd/mounts</string>
+		<key>SB_RECORDING_DIR</key>
+		<string>/var/lib/toolboxd/recordings</string>
+		<key>SB_RECORDING_RETENTION</key>
+		<string>168h</string>
+		<key>SB_SESSION_BUFFER_BYTES</key>
+		<string>1048576</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/sandboxd/sandboxd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/sandboxd/sandboxd.err</string>
+</dict>
+</plist>
+EOF
+}
+
+if [[ "$LOCAL_MODE" == "true" ]]; then
+	if [[ -n "$DOMAIN" || -n "$DNS_PROVIDER" ]]; then
+		echo "--local is incompatible with --domain and --dns-provider" >&2
+		exit 1
+	fi
+	if [[ $EUID -ne 0 ]]; then
+		echo "install.sh must run as root (use sudo)" >&2
+		exit 1
+	fi
+	install_binaries
+	write_local_environment
+	if [[ "$(uname -s)" == "Darwin" ]]; then
+		write_launchd_plist
+		launchctl load /Library/LaunchDaemons/com.aerol.sandboxd.plist
+	else
+		write_local_systemd_unit
+		write_healthcheck_script
+		write_healthcheck_units
+		systemctl daemon-reload
+		systemctl enable --now sandboxd sandboxd-healthcheck.timer
+	fi
+	echo "AerolVM installed (local mode)"
+	echo "PAT token: $PAT_TOKEN"
+	echo "Use header: Authorization: Bearer <PAT token>"
+	echo "API URL: http://127.0.0.1:21212"
+	echo "Health URL: http://127.0.0.1:21212/health"
+	if [[ "$(uname -s)" == "Darwin" ]]; then
+		echo "Service: launchd daemon com.aerol.sandboxd (auto-starts on boot)"
+		echo "Logs: /var/log/sandboxd/sandboxd.log"
+		echo "Stop: sudo launchctl unload /Library/LaunchDaemons/com.aerol.sandboxd.plist"
+	else
+		echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
+		echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
+	fi
+	exit 0
+fi
+
+if [[ $EUID -ne 0 ]]; then
+	echo "install.sh must run as root" >&2
+	exit 1
+fi
 
 install_packages
 if [[ "$WITH_GVISOR" == "true" ]]; then
