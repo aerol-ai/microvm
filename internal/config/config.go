@@ -88,7 +88,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		PATToken:            strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
 		APIHost:             getEnv("SB_API_HOST", "0.0.0.0"),
-		APIPort:             getEnvInt("SB_API_PORT", 8080),
+		APIPort:             getEnvInt("SB_API_PORT", 21212),
 		Domain:              normalizeHost(os.Getenv("SB_DOMAIN")),
 		PublicHost:          normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
 		CaddyAdminURL:       getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),

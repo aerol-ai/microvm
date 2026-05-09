@@ -442,7 +442,7 @@ write_environment() {
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
 SB_API_HOST=0.0.0.0
-SB_API_PORT=8080
+SB_API_PORT=21212
 SB_DOMAIN=$DOMAIN
 SB_PUBLIC_HOST=$PUBLIC_HOST
 SB_CADDY_ADMIN_URL=http://127.0.0.1:2019
@@ -499,7 +499,7 @@ https://$DOMAIN {
 	}
 	@api path /health /v1 /v1/*
 	handle @api {
-		reverse_proxy 127.0.0.1:8080
+		reverse_proxy 127.0.0.1:21212
 	}
 	handle {
 		respond "Sandbox API not found" 404
@@ -523,7 +523,7 @@ EOF
 {
 	admin localhost:2019
 	on_demand_tls {
-		ask http://127.0.0.1:8080/v1/tls-check
+		ask http://127.0.0.1:21212/v1/tls-check
 	}
 }
 
@@ -533,7 +533,7 @@ https://$DOMAIN {
 	}
 	@api path /health /v1 /v1/*
 	handle @api {
-		reverse_proxy 127.0.0.1:8080
+		reverse_proxy 127.0.0.1:21212
 	}
 	handle {
 		respond "Sandbox API not found" 404
@@ -626,7 +626,7 @@ if ! systemctl is-active --quiet sandboxd.service; then
 fi
 
 HEALTH_HOST="127.0.0.1"
-HEALTH_PORT="${SB_API_PORT:-8080}"
+HEALTH_PORT="${SB_API_PORT:-21212}"
 HEALTH_URL="http://${HEALTH_HOST}:${HEALTH_PORT}/health"
 
 if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
@@ -916,8 +916,8 @@ if [[ -n "$DOMAIN" ]]; then
 		echo "  For production, re-run with --dns-provider cloudflare --dns-api-token <token>"
 	fi
 else
-	echo "API URL: http://$PUBLIC_HOST:8080"
-	echo "Health URL: http://$PUBLIC_HOST:8080/health"
+	echo "API URL: http://$PUBLIC_HOST:21212"
+	echo "Health URL: http://$PUBLIC_HOST:21212/health"
 	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<docker-short-id>/"
 fi
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"

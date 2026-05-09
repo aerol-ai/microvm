@@ -15,13 +15,13 @@ This pattern attaches a sandbox directly to a workspace object in your product. 
 
 ## Copy-paste TypeScript script
 
-This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
+This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:21212`.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
 
-const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 
 if (!patToken) {

@@ -337,7 +337,7 @@ class Sandbox:
 
 
 class MicroVM:
-    default_api_url = "http://127.0.0.1:8080"
+    default_api_url = "http://127.0.0.1:21212"
     auth_required_error_message = "PAT token is required. Set pat_token or SB_PAT_TOKEN."
 
     def __init__(self, api_url: Optional[str] = None, pat_token: Optional[str] = None) -> None:

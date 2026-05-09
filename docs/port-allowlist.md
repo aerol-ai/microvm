@@ -33,23 +33,23 @@ exposed via the SDK.
 ┌──────────────────────────────────────────────────────────────────┐
 │ sandboxd (host)                                                  │
 │                                                                  │
-│   sandbox.exposePort(8080)                                       │
+│   sandbox.exposePort(21212)                                       │
 │        │                                                         │
 │        ├──> store.UpsertPort  (persists in exposed_ports table)  │
-│        ├──> caddy.UpsertPortRoute  (creates 8080-<id>.<domain>)  │
+│        ├──> caddy.UpsertPortRoute  (creates 21212-<id>.<domain>)  │
 │        └──> docker.PushAllowedPorts ─────────┐                   │
 │                                              │                   │
 └──────────────────────────────────────────────┼───────────────────┘
                                                │  POST /admin/allowed-ports
                                                │  Authorization: Bearer <token>
-                                               │  {"ports":[8080]}
+                                               │  {"ports":[21212]}
                                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ toolboxd (PID 1 inside the container)                            │
 │                                                                  │
-│   allowedPorts: {8080}                                           │
+│   allowedPorts: {21212}                                           │
 │                                                                  │
-│   GET /proxy/8080/api  ──> 200 (proxied to localhost:8080)       │
+│   GET /proxy/21212/api  ──> 200 (proxied to localhost:21212)       │
 │   GET /proxy/5432/     ──> 403 (not in allowlist)                │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -81,7 +81,7 @@ POST /admin/allowed-ports
 Authorization: Bearer <SB_TOOLBOX_TOKEN value for this sandbox>
 Content-Type: application/json
 
-{"ports": [8080, 3000]}
+{"ports": [21212, 3000]}
 ```
 
 The token is generated when the sandbox is created and stored in the
@@ -96,16 +96,16 @@ calls now also gate `/proxy/<port>/...`:
 const sandbox = await client.create({ image: "ubuntu:22.04" });
 
 // Initially, /proxy/<port>/ on the sandbox URL refuses every port.
-await fetch(`${sandbox.publicURL}/proxy/8080/`);     // 403
+await fetch(`${sandbox.publicURL}/proxy/21212/`);     // 403
 
-// After exposePort, port 8080 becomes reachable two ways:
-const portURL = await sandbox.exposePort(8080);
-await fetch(`${sandbox.publicURL}/proxy/8080/`);     // 200
+// After exposePort, port 21212 becomes reachable two ways:
+const portURL = await sandbox.exposePort(21212);
+await fetch(`${sandbox.publicURL}/proxy/21212/`);     // 200
 await fetch(`${portURL}/`);                          // 200 - clean per-port URL
 
 // Removing the exposure closes both paths.
-await sandbox.unexposePort(8080);
-await fetch(`${sandbox.publicURL}/proxy/8080/`);     // 403
+await sandbox.unexposePort(21212);
+await fetch(`${sandbox.publicURL}/proxy/21212/`);     // 403
 ```
 
 The two public paths to your app:

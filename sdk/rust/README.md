@@ -13,7 +13,7 @@ cargo add aerolvm-sdk
 ```rust
 use aerolvm_sdk::{Client, CreateOptions, Lifecycle};
 
-let client = Client::new(Some("http://127.0.0.1:8080"), Some("your-pat-token"))?;
+let client = Client::new(Some("http://127.0.0.1:21212"), Some("your-pat-token"))?;
 let health = client.health()?;
 println!("health = {:?}", health);
 
@@ -50,7 +50,7 @@ sandbox.update_lifecycle(Lifecycle {
 ## Example
 
 ```bash
-cargo run --example create_sandbox -- http://127.0.0.1:8080 your-pat-token ghcr.io/aerol-ai/ubuntu:22.04
+cargo run --example create_sandbox -- http://127.0.0.1:21212 your-pat-token ghcr.io/aerol-ai/ubuntu:22.04
 ```
 
 ## Streaming exec

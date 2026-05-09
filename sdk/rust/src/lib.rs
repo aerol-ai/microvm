@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus, UpdateLifecycleOptions};
 pub use types::CreateSandboxResponse;
 
-const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
+const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
 const STREAM_PREFIX_STDERR: u8 = 0x02;
 

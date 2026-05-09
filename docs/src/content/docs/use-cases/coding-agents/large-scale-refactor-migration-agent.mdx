@@ -21,7 +21,7 @@ This workflow is a generic zero-shot repository modification agent. It takes pro
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
 
-const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 const cloudApiKey = process.env.CLOUD_API_KEY ?? process.env.ANTHROPIC_API_KEY;
 const githubPatToken = process.env.GITHUB_PAT_TOKEN ?? process.env.GITHUB_TOKEN;

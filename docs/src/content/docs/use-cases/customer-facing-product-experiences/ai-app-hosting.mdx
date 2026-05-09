@@ -13,7 +13,7 @@ import { randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 
 if (!patToken) {

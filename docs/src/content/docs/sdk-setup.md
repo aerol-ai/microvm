@@ -9,7 +9,7 @@ All AerolVM SDKs connect to the same REST API using a PAT token set during serve
 | Variable | Required | Description |
 |---|---|---|
 | `SB_PAT_TOKEN` | Yes | The token set with `--pat-token` during installation. |
-| `SB_API_URL` | No | Server base URL. Defaults to `http://127.0.0.1:8080` if omitted. |
+| `SB_API_URL` | No | Server base URL. Defaults to `http://127.0.0.1:21212` if omitted. |
 
 ## TypeScript
 

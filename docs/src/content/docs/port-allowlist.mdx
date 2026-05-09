@@ -30,15 +30,15 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     const sandbox = await client.create({ image: 'ubuntu:22.04' })
 
     // Before exposing - 403
-    await fetch(`${sandbox.publicURL}/proxy/8080/`)
+    await fetch(`${sandbox.publicURL}/proxy/21212/`)
 
     // Expose the port - returns the dedicated port URL
-    const portURL = await sandbox.exposePort(8080)
-    // portURL → "https://<sandbox-id>-8080.sandbox.example.com"
+    const portURL = await sandbox.exposePort(21212)
+    // portURL → "https://<sandbox-id>-21212.sandbox.example.com"
 
     // Both URLs now reach the service
     await fetch(portURL)                              // 200 - dedicated URL
-    await fetch(`${sandbox.publicURL}/proxy/8080/`)  // 200 - proxy path
+    await fetch(`${sandbox.publicURL}/proxy/21212/`)  // 200 - proxy path
     ```
   </TabItem>
   <TabItem label="Python">
@@ -46,14 +46,14 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     sandbox = client.create({'image': 'ubuntu:22.04'})
 
     # Before exposing - 403
-    # GET sandbox['publicURL'] + '/proxy/8080/'
+    # GET sandbox['publicURL'] + '/proxy/21212/'
 
-    port_url = sandbox.expose_port(8080)
-    # port_url → 'https://<sandbox-id>-8080.sandbox.example.com'
+    port_url = sandbox.expose_port(21212)
+    # port_url → 'https://<sandbox-id>-21212.sandbox.example.com'
 
     # Both URLs now reach the service
     # GET port_url                                      # dedicated URL
-    # GET sandbox['publicURL'] + '/proxy/8080/'        # proxy path
+    # GET sandbox['publicURL'] + '/proxy/21212/'        # proxy path
     ```
   </TabItem>
   <TabItem label="Go">
@@ -64,15 +64,15 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     if err != nil { log.Fatal(err) }
 
     // Before exposing - 403
-    // GET sandbox.PublicURL + "/proxy/8080/"
+    // GET sandbox.PublicURL + "/proxy/21212/"
 
-    portURL, err := sandbox.ExposePort(ctx, 8080)
+    portURL, err := sandbox.ExposePort(ctx, 21212)
     if err != nil { log.Fatal(err) }
-    // portURL → "https://<sandbox-id>-8080.sandbox.example.com"
+    // portURL → "https://<sandbox-id>-21212.sandbox.example.com"
 
     // Both URLs now reach the service
     fmt.Println(portURL)                            // dedicated URL
-    fmt.Println(sandbox.PublicURL + "/proxy/8080/") // proxy path
+    fmt.Println(sandbox.PublicURL + "/proxy/21212/") // proxy path
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -83,14 +83,14 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     })?;
 
     // Before exposing - 403
-    // GET sandbox.data.public_url + "/proxy/8080/"
+    // GET sandbox.data.public_url + "/proxy/21212/"
 
-    let port_url = sandbox.expose_port(8080)?;
-    // port_url → "https://<sandbox-id>-8080.sandbox.example.com"
+    let port_url = sandbox.expose_port(21212)?;
+    // port_url → "https://<sandbox-id>-21212.sandbox.example.com"
 
     // Both URLs now reach the service
     println!("{}", port_url);                                        // dedicated URL
-    println!("{}/proxy/8080/", sandbox.data.public_url);            // proxy path
+    println!("{}/proxy/21212/", sandbox.data.public_url);            // proxy path
     ```
   </TabItem>
   <TabItem label="Java">
@@ -100,14 +100,14 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     );
 
     // Before exposing - 403
-    // GET sandbox.publicUrl + "/proxy/8080/"
+    // GET sandbox.publicUrl + "/proxy/21212/"
 
-    String portUrl = sandbox.exposePort(8080);
-    // portUrl → "https://<sandbox-id>-8080.sandbox.example.com"
+    String portUrl = sandbox.exposePort(21212);
+    // portUrl → "https://<sandbox-id>-21212.sandbox.example.com"
 
     // Both URLs now reach the service
     System.out.println(portUrl);                               // dedicated URL
-    System.out.println(sandbox.publicUrl + "/proxy/8080/");   // proxy path
+    System.out.println(sandbox.publicUrl + "/proxy/21212/");   // proxy path
     ```
   </TabItem>
 </Tabs>
@@ -119,32 +119,32 @@ Removes the port from the allowlist and tears down its public route. Both URLs r
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.unexposePort(8080)
-    await fetch(`${sandbox.publicURL}/proxy/8080/`) // 403
+    await sandbox.unexposePort(21212)
+    await fetch(`${sandbox.publicURL}/proxy/21212/`) // 403
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.unexpose_port(8080)
-    # GET sandbox['publicURL'] + '/proxy/8080/'  → 403
+    sandbox.unexpose_port(21212)
+    # GET sandbox['publicURL'] + '/proxy/21212/'  → 403
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    if err := sandbox.UnexposePort(ctx, 8080); err != nil { log.Fatal(err) }
-    // GET sandbox.PublicURL + "/proxy/8080/"  → 403
+    if err := sandbox.UnexposePort(ctx, 21212); err != nil { log.Fatal(err) }
+    // GET sandbox.PublicURL + "/proxy/21212/"  → 403
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.unexpose_port(8080)?;
-    // GET sandbox.data.public_url + "/proxy/8080/"  → 403
+    sandbox.unexpose_port(21212)?;
+    // GET sandbox.data.public_url + "/proxy/21212/"  → 403
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.unexposePort(8080);
-    // GET sandbox.publicUrl + "/proxy/8080/"  → 403
+    sandbox.unexposePort(21212);
+    // GET sandbox.publicUrl + "/proxy/21212/"  → 403
     ```
   </TabItem>
 </Tabs>
