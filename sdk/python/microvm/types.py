@@ -41,6 +41,32 @@ class Lifecycle(TypedDict, total=False):
 UpdateLifecycleOptions = Lifecycle
 
 
+GPUVendor = Literal["nvidia", "amd", "apple"]
+
+
+class GPUOptions(TypedDict, total=False):
+    """GPU resources to attach to a sandbox at creation time.
+
+    Not compatible with runtime="gvisor" — the API returns an error if both
+    gpus and runtime="gvisor" are set.
+
+    vendor values:
+    - "nvidia": NVIDIA GPUs via nvidia-container-runtime. Requires
+      nvidia-container-toolkit on the host.
+    - "amd": AMD GPUs via ROCm (/dev/kfd + /dev/dri). Requires ROCm
+      drivers on the host.
+    - "apple": Apple Silicon GPU via Docker Desktop's experimental Metal
+      support. Only functional on macOS with Docker Desktop.
+    """
+    vendor: GPUVendor
+    # Number of GPUs. -1 = all available. 0/omit = default (1).
+    # Ignored for AMD (all AMD GPUs on the host are exposed).
+    count: int
+    # For NVIDIA: indices ("0", "1") or UUIDs ("GPU-abc123...").
+    # For AMD and Apple: ignored.
+    deviceIDs: List[str]
+
+
 class CreateOptions(TypedDict, total=False):
     image: str
     # cpu accepts fractional cores: 0.5 = half a core, 1.5 = one and a half.
@@ -57,8 +83,11 @@ class CreateOptions(TypedDict, total=False):
     # Container runtime to use for this sandbox. Omit to inherit the host
     # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
     # when running untrusted workloads. "kata" is reserved and rejected by the
-    # API today.
+    # API today. Not compatible with gpus.
     runtime: Literal["docker", "gvisor", "kata"]
+    # Attach GPU resources to the sandbox. Omit for CPU-only workloads.
+    # Not compatible with runtime="gvisor".
+    gpus: GPUOptions
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -178,6 +207,8 @@ class SandboxData(TypedDict, total=False):
     # Container runtime this sandbox is running under. Empty string indicates
     # a pre-migration row that resolves to the host default at start time.
     runtime: Literal["", "docker", "gvisor", "kata"]
+    # GPU configuration this sandbox was created with. Absent means no GPU.
+    gpus: GPUOptions
 
 
 class HealthStatus(TypedDict):

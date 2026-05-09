@@ -22,6 +22,8 @@ public class CreateOptions {
     public List<MountSpec> mounts;
     public Lifecycle lifecycle;
     public String runtime;
+    /** Attach GPU resources to the sandbox. Null means no GPU (CPU-only). */
+    public GpuOptions gpus;
 
     public CreateOptions setImage(String image) {
         this.image = image;
@@ -80,6 +82,11 @@ public class CreateOptions {
 
     public CreateOptions setRuntime(String runtime) {
         this.runtime = runtime;
+        return this;
+    }
+
+    public CreateOptions setGpus(GpuOptions gpus) {
+        this.gpus = gpus;
         return this;
     }
 }

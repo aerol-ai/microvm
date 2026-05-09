@@ -48,6 +48,37 @@ pub struct MountSpecRedacted {
     pub has_credentials: bool,
 }
 
+/// GPU hardware vendor for sandbox GPU allocation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GPUVendor {
+    /// NVIDIA GPUs via nvidia-container-runtime. Requires
+    /// nvidia-container-toolkit on the host.
+    Nvidia,
+    /// AMD GPUs via ROCm (/dev/kfd + /dev/dri). Requires ROCm drivers
+    /// on the host.
+    Amd,
+    /// Apple Silicon GPU via Docker Desktop's experimental Metal support.
+    /// Only functional on macOS with Docker Desktop.
+    Apple,
+}
+
+/// GPU resources to attach to a sandbox at creation time. Not compatible
+/// with runtime `"gvisor"`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GPUOptions {
+    /// GPU hardware vendor. Required.
+    pub vendor: GPUVendor,
+    /// Number of GPUs. `-1` = all available, `0`/omit = default (1).
+    /// Ignored for AMD (all AMD GPUs on the host are exposed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<i32>,
+    /// For NVIDIA: GPU indices (`"0"`, `"1"`) or UUIDs (`"GPU-abc123..."`).
+    /// For AMD and Apple: ignored.
+    #[serde(rename = "device_ids", skip_serializing_if = "Option::is_none")]
+    pub device_ids: Option<Vec<String>>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateOptions {
     pub image: String,
@@ -74,9 +105,13 @@ pub struct CreateOptions {
     /// Container runtime for this sandbox. Omit to inherit the host default
     /// (SB_CONTAINER_RUNTIME). Use `"gvisor"` for runsc-backed isolation when
     /// running untrusted workloads. `"kata"` is reserved and rejected by the
-    /// API today.
+    /// API today. Not compatible with `gpus`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Attach GPU resources to the sandbox. Omit for CPU-only workloads.
+    /// Not compatible with `runtime = "gvisor"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<GPUOptions>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -157,6 +192,10 @@ pub struct Sandbox {
     /// a pre-migration row that resolves to the host default at start time.
     #[serde(default)]
     pub runtime: String,
+    /// GPU configuration this sandbox was created with. `None` means no GPU
+    /// was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<GPUOptions>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
