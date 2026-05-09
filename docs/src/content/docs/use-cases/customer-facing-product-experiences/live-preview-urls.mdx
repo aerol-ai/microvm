@@ -1,11 +1,11 @@
 ---
 title: Live Preview URLs For Generated Apps Or APIs
-description: Turn generated source files into running web previews by exposing a sandbox port through AerolVM.
+description: Turn concrete project files into a live preview URL by exposing a sandbox port through AerolVM.
 ---
 
 ## What you are building
 
-This workflow takes generated or uploaded project files, installs dependencies inside a sandbox, starts the app, and returns a preview URL that can be opened immediately by the user or reviewer.
+This workflow takes a deterministic set of project files, uploads them into a sandbox, starts a web server, and returns a preview URL that can be opened immediately by a user or reviewer.
 
 ## Why AerolVM fits
 
@@ -13,49 +13,103 @@ This workflow takes generated or uploaded project files, installs dependencies i
 - `createSession` keeps the web server alive after the initial setup step.
 - `exposePort` turns a local process into a shareable preview URL.
 
-## TypeScript SDK walkthrough
+## Copy-paste TypeScript script
+
+This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
 
-const client = new MicroVM({
-  apiUrl: process.env.SB_API_URL,
-  patToken: process.env.SB_PAT_TOKEN,
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+const projectFiles = [
+  {
+    path: "index.html",
+    contents: `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AerolVM Live Preview</title>
+    <style>
+      body { font-family: sans-serif; margin: 40px; background: #f3f6fb; color: #102033; }
+      .card { max-width: 640px; padding: 24px; border-radius: 16px; background: white; box-shadow: 0 10px 30px rgba(16, 32, 51, 0.12); }
+      code { background: #eef2f7; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>AerolVM preview is live</h1>
+      <p id="message">Waiting for JavaScript to load.</p>
+      <p>Served directly from a sandbox on port <code>3000</code>.</p>
+      <script src="./app.js"></script>
+    </div>
+  </body>
+</html>
+`,
+  },
+  {
+    path: "app.js",
+    contents: `document.getElementById("message").textContent = "Preview booted successfully inside AerolVM.";`,
+  },
+];
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "python:3.12-bookworm",
+    cpu: 1,
+    memoryMB: 1024,
+    diskGB: 8,
+    containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
+    lifecycle: {
+      destroyIfIdleFor: 20 * 60 * 1_000_000_000,
+    },
+  });
+
+  await sandbox.exec("mkdir -p /workspace/app");
+  await Promise.all(
+    projectFiles.map((file) =>
+      sandbox.uploadFile(`/workspace/app/${file.path}`, file.contents),
+    ),
+  );
+
+  const session = await sandbox.createSession({
+    name: "preview-server",
+    command: "python3 -m http.server 3000 --directory /workspace/app",
+    workDir: "/workspace/app",
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  const previewURL = await sandbox.exposePort(3000);
+
+  const payload = {
+    sandboxID: sandbox.id,
+    sessionID: session.id,
+    previewURL,
+    cleanup: "The sandbox stays alive for the preview and auto-destroys after 20 idle minutes.",
+  };
+
+  await writeFile("live-preview-urls.json", `${JSON.stringify(payload, null, 2)}\n`);
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
 });
-
-const sandbox = await client.create({
-  image: "node:22-bookworm",
-  cpu: 2,
-  memoryMB: 4096,
-  diskGB: 18,
-  containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
-});
-
-await sandbox.exec("mkdir -p /workspace/app");
-await Promise.all(projectFiles.map((file) => sandbox.uploadFile(`/workspace/app/${file.path}`, file.contents)));
-
-await sandbox.execStream({
-  command: "npm install",
-  workdir: "/workspace/app",
-  onStdout: (chunk) => process.stdout.write(chunk),
-  onStderr: (chunk) => process.stderr.write(chunk),
-}).done;
-
-const session = await sandbox.createSession({
-  name: "preview-server",
-  command: "npm run dev -- --host 0.0.0.0 --port 3000",
-  workDir: "/workspace/app",
-  env: { PORT: "3000" },
-});
-
-const previewURL = await sandbox.exposePort(3000);
 ```
 
 ## Product outputs
 
-- A live preview URL.
-- Server logs via `attachSession` or `sessionLog`.
-- Optional build artifacts via `downloadFile`.
+- `live-preview-urls.json` with the sandbox ID, session ID, and preview URL.
+- A live preview URL that stays available until the idle policy destroys the sandbox.
 
 ## Related docs
 

@@ -1,77 +1,141 @@
 ---
 title: Pull-Request Review And Auto-Fix Agent
-description: Review an incoming pull request in an isolated AerolVM sandbox and export a safe follow-up fix patch.
+description: Review a simulated incoming PR inside a cloned public repository and export a safe follow-up patch.
 ---
 
 ## What you are building
 
-This workflow spins up a sandbox for a specific pull request, clones a real public repository, fetches the PR branch, runs review checks, and optionally produces a narrow patch that addresses the detected issue.
+This example simulates an incoming pull request inside a cloned public repository so the workflow stays deterministic and runnable. It creates a review branch, commits intentionally low-quality copy, fixes it, validates the repo, and exports both the review report and the follow-up patch.
 
 ## Why AerolVM fits
 
 - PR-specific sandboxes prevent review automation from mutating shared CI runners.
+- A cloned repository plus a review branch gives you a realistic git workflow without hidden inputs.
 - File transfer makes it straightforward to export a markdown review report and a follow-up patch.
 
-## TypeScript SDK walkthrough
+## Copy-paste TypeScript script
+
+This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
 
-const repoURL = "https://github.com/axios/axios.git";
-const pullRequestNumber = Number(process.env.PUBLIC_PR_NUMBER);
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
 
-const client = new MicroVM({
-  apiUrl: process.env.SB_API_URL,
-  patToken: process.env.SB_PAT_TOKEN,
-});
-
-const sandbox = await client.create({
-  image: "node:22-bookworm",
-  cpu: 2,
-  memoryMB: 3072,
-  diskGB: 16,
-});
-
-await sandbox.exec("mkdir -p /workspace/input /workspace/out");
-await Promise.all([
-  sandbox.uploadFile("/workspace/input/review-rules.md", reviewRulesMarkdown),
-]);
-
-await sandbox.exec({
-  command: [
-    `git clone ${repoURL} /workspace/app`,
-    `cd /workspace/app && git fetch origin pull/${pullRequestNumber}/head:review-pr`,
-    "cd /workspace/app && git checkout review-pr",
-  ].join(" && "),
-});
-
-
-Set `PUBLIC_PR_NUMBER` from your webhook or review event before starting the run.
-const review = sandbox.execStream({
-  command: "npm ci && npm test && ./scripts/review-pr.sh /workspace/app /workspace/input/review-rules.md /workspace/out",
-  workdir: "/workspace/app",
-  onStdout: (chunk) => process.stdout.write(chunk),
-  onStderr: (chunk) => process.stderr.write(chunk),
-});
-
-const exit = await review.done;
-if (exit.code !== 0) {
-  throw new Error(`review failed with exit code ${exit.code}`);
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
 }
 
-const report = new TextDecoder().decode(
-  await sandbox.downloadFile("/workspace/out/review.md"),
-);
-const patch = new TextDecoder().decode(
-  await sandbox.downloadFile("/workspace/out/auto-fix.patch"),
-);
+const repoURL = "https://github.com/axios/axios.git";
+const initialPullRequestCopy = `# Release note
+
+## Validation
+- Updated docs.
+- Small cleanup.
+`;
+
+const fixedPullRequestCopy = `# Release note
+
+## Validation
+- Replaced vague notes with explicit review details.
+- Added a concrete review summary.
+- Confirmed the repository still passes npm test.
+`;
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "node:22-bookworm",
+    cpu: 2,
+    memoryMB: 3072,
+    diskGB: 16,
+  });
+
+  try {
+    await sandbox.exec("apt-get update && apt-get install -y git");
+    await sandbox.exec("mkdir -p /workspace/out");
+    await sandbox.exec({
+      command: `git clone --depth=1 ${repoURL} /workspace/app`,
+    });
+    await sandbox.exec({
+      command: [
+        "git config user.email 'review-bot@example.com'",
+        "git config user.name 'AerolVM Review Bot'",
+        "git checkout -b review-me",
+      ].join(" && "),
+      workDir: "/workspace/app",
+    });
+
+    await sandbox.uploadFile(
+      "/workspace/app/AEROLVM_REVIEW.md",
+      initialPullRequestCopy,
+    );
+    await sandbox.exec({
+      command: "git add AEROLVM_REVIEW.md && git commit -m 'simulate incoming pull request'",
+      workDir: "/workspace/app",
+    });
+
+    await sandbox.uploadFile(
+      "/workspace/app/AEROLVM_REVIEW.md",
+      fixedPullRequestCopy,
+    );
+
+    const review = sandbox.execStream({
+      command: [
+        "npm install",
+        "npm test",
+        "printf '%s\\n' 'Finding: release note copy was too vague for review handoff' 'Fix: rewrote AEROLVM_REVIEW.md with explicit validation details' 'Validation: npm test passed' > /workspace/out/review.txt",
+        "git diff HEAD -- AEROLVM_REVIEW.md > /workspace/out/auto-fix.patch",
+      ].join(" && "),
+      workdir: "/workspace/app",
+      onStdout: (chunk) => process.stdout.write(chunk),
+      onStderr: (chunk) => process.stderr.write(chunk),
+    });
+
+    const exit = await review.done;
+    if (exit.code !== 0) {
+      throw new Error(`review failed with exit code ${exit.code}`);
+    }
+
+    const decoder = new TextDecoder();
+    const report = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/review.txt"),
+    );
+    const patch = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/auto-fix.patch"),
+    );
+
+    await writeFile("pull-request-review-report.txt", report);
+    await writeFile("pull-request-auto-fix.patch", patch);
+
+    console.log(
+      JSON.stringify(
+        {
+          sandboxID: sandbox.id,
+          reportFile: "pull-request-review-report.txt",
+          patchFile: "pull-request-auto-fix.patch",
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
 ```
 
 ## Deliverables
 
-- `review.md` for the human reviewer.
-- `auto-fix.patch` if the agent can make a safe, bounded change.
-- `test-results.txt` for evidence that the PR still passes.
+- `pull-request-review-report.txt` for the human reviewer.
+- `pull-request-auto-fix.patch` for the safe follow-up change.
 
 ## Related docs
 

@@ -1,77 +1,152 @@
 ---
 title: Large-Scale Refactor Or Migration Agent
-description: Run codemods or migration scripts in long-lived AerolVM sandboxes and export the resulting patch, logs, and validation output.
+description: Run a deterministic codemod across several files inside a cloned repository and export the resulting patch plus migration summary.
 ---
 
 ## What you are building
 
-This pattern handles repo-wide migrations such as framework upgrades, API renames, or codebase codemods. The agent runs in a long-lived sandbox, streams progress, and exports a reviewable patch when the migration passes validation.
+This example runs a deterministic codemod across several files inside a cloned public repository. It creates a small migration workspace, performs the refactor, validates the migrated files, and exports a reviewable patch plus a migration summary.
 
 ## Why AerolVM fits
 
 - The migration can run for longer than a single HTTP request.
-- Session attach and replay are useful when humans need to inspect progress mid-run.
-- Resource resizing gives you a path to run heavier codemods without changing the orchestrator model.
+- A deterministic codemod is easy to inspect and rerun.
+- Downloaded artifacts make the review handoff straightforward.
 
-## TypeScript SDK walkthrough
+## Copy-paste TypeScript script
+
+This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
 
-const repoURL = "https://github.com/expressjs/express.git";
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
 
-const client = new MicroVM({
-  apiUrl: process.env.SB_API_URL,
-  patToken: process.env.SB_PAT_TOKEN,
-});
-
-const sandbox = await client.create({
-  image: "node:22-bookworm",
-  cpu: 4,
-  memoryMB: 8192,
-  diskGB: 24,
-  containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
-  lifecycle: {
-    destroyIfIdleFor: 60 * 60 * 1_000_000_000,
-  },
-});
-
-await sandbox.exec("mkdir -p /workspace/input /workspace/out");
-await Promise.all([
-  sandbox.uploadFile("/workspace/input/migration-spec.md", migrationSpecMarkdown),
-]);
-
-await sandbox.exec({
-  command: `git clone --depth=1 ${repoURL} /workspace/app`,
-});
-
-const session = await sandbox.createSession({
-  name: "repo-migration",
-  command: "./scripts/run-migration.sh /workspace/app /workspace/input/migration-spec.md /workspace/out",
-  workDir: "/workspace/app",
-});
-
-const attach = sandbox.attachSession(session.id, {
-  onStdout: (chunk) => process.stdout.write(chunk),
-  onStderr: (chunk) => process.stderr.write(chunk),
-});
-
-const exit = await attach.done;
-if (exit.code !== 0) {
-  throw new Error(`migration session failed with exit code ${exit.code}`);
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
 }
 
-const patch = new TextDecoder().decode(
-  await sandbox.downloadFile("/workspace/out/migration.patch"),
-);
-const log = new TextDecoder().decode(await sandbox.sessionLog(session.id));
+const repoURL = "https://github.com/expressjs/express.git";
+const migrationFiles = [
+  {
+    path: "src/user-service.js",
+    contents: `var userTable = "users";
+var fetchUser = (id) => ({ id, table: userTable });
+export { fetchUser };
+`,
+  },
+  {
+    path: "src/report-service.js",
+    contents: `var reportTable = "reports";
+var fetchReport = (id) => ({ id, table: reportTable });
+export { fetchReport };
+`,
+  },
+];
+
+const migrationScript = `import { readFile, writeFile } from "node:fs/promises";
+const files = ["src/user-service.js", "src/report-service.js"];
+
+for (const file of files) {
+  const source = await readFile(file, "utf8");
+  const migrated = source.replaceAll("var ", "const ");
+  await writeFile(file, migrated);
+}
+
+console.log("migration complete");
+`;
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "node:22-bookworm",
+    cpu: 4,
+    memoryMB: 8192,
+    diskGB: 24,
+    containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
+    lifecycle: {
+      destroyIfIdleFor: 60 * 60 * 1_000_000_000,
+    },
+  });
+
+  try {
+    await sandbox.exec("apt-get update && apt-get install -y git");
+    await sandbox.exec("mkdir -p /workspace/out");
+    await sandbox.exec({
+      command: `git clone --depth=1 ${repoURL} /workspace/app`,
+    });
+    await sandbox.exec("mkdir -p /workspace/app/examples/aerolvm-migration/src");
+
+    await Promise.all(
+      migrationFiles.map((file) =>
+        sandbox.uploadFile(
+          `/workspace/app/examples/aerolvm-migration/${file.path}`,
+          file.contents,
+        ),
+      ),
+    );
+    await sandbox.uploadFile(
+      "/workspace/app/examples/aerolvm-migration/migrate.mjs",
+      migrationScript,
+    );
+
+    const run = sandbox.execStream({
+      command: [
+        "node migrate.mjs",
+        "node --check src/user-service.js",
+        "node --check src/report-service.js",
+        "printf '%s\\n' 'Workspace: examples/aerolvm-migration' 'Transform: replaced var declarations with const' 'Validation: node --check passed for both files' > /workspace/out/migration-summary.txt",
+        "git diff -- examples/aerolvm-migration > /workspace/out/migration.patch",
+      ].join(" && "),
+      workdir: "/workspace/app/examples/aerolvm-migration",
+      onStdout: (chunk) => process.stdout.write(chunk),
+      onStderr: (chunk) => process.stderr.write(chunk),
+    });
+
+    const exit = await run.done;
+    if (exit.code !== 0) {
+      throw new Error(`migration run failed with exit code ${exit.code}`);
+    }
+
+    const decoder = new TextDecoder();
+    const patch = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/migration.patch"),
+    );
+    const summary = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/migration-summary.txt"),
+    );
+
+    await writeFile("large-scale-refactor-migration.patch", patch);
+    await writeFile("large-scale-refactor-migration-summary.txt", summary);
+
+    console.log(
+      JSON.stringify(
+        {
+          sandboxID: sandbox.id,
+          patchFile: "large-scale-refactor-migration.patch",
+          summaryFile: "large-scale-refactor-migration-summary.txt",
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
 ```
 
 ## Deliverables
 
-- A repo-wide patch or branch bundle.
-- The session log for auditing and debugging.
-- Validation output from the migration test suite.
+- `large-scale-refactor-migration.patch` for review.
+- `large-scale-refactor-migration-summary.txt` with the exact migration result.
 
 ## Related docs
 
