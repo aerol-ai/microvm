@@ -44,6 +44,18 @@ type Limits struct {
 	// proportionally — a fixed MB floor would be either pointless on big
 	// hosts or starve small ones. 0 = no floor.
 	MemoryFloorRatio float64
+	// CPUOverProvisionFactor multiplies the CPU reservation budget. Docker
+	// --cpus is a CFS cap, not a hard reservation, so idle sandboxes share
+	// cores happily — a 10× default lets typical workloads pack densely.
+	// Values below 1.0 are clamped to 1.0 (no overcommit). 0 is treated as
+	// the default 1.0 so a zero-value Limits behaves as before.
+	CPUOverProvisionFactor float64
+	// MemoryOverProvisionFactor multiplies the memory reservation budget.
+	// Memory pressure is harder to recover from than CPU contention (OOM
+	// killer fires on hard limits), so the live MemoryFloorRatio check is
+	// the real backstop when this is set high. Same clamping as the CPU
+	// factor.
+	MemoryOverProvisionFactor float64
 }
 
 // Request is the per-sandbox resource ask, in normalized units. CPU is
@@ -64,12 +76,18 @@ type Snapshot struct {
 	SandboxesActive   int      `json:"sandboxes_active"`
 	CanAdmit          bool     `json:"can_admit"`
 	Reasons           []string `json:"reasons,omitempty"`
-	CPUReservationRatio    float64 `json:"cpu_reservation_ratio"`
-	MemoryReservationRatio float64 `json:"memory_reservation_ratio"`
-	MemoryFloorRatio       float64 `json:"memory_floor_ratio"`
+	CPUReservationRatio       float64 `json:"cpu_reservation_ratio"`
+	MemoryReservationRatio    float64 `json:"memory_reservation_ratio"`
+	MemoryFloorRatio          float64 `json:"memory_floor_ratio"`
+	CPUOverProvisionFactor    float64 `json:"cpu_overprovision_factor"`
+	MemoryOverProvisionFactor float64 `json:"memory_overprovision_factor"`
 	// MemoryFloorMB is the absolute floor derived from MemoryFloorRatio and
 	// host memory, exposed for operators reading /capacity.
 	MemoryFloorMB int `json:"memory_floor_mb"`
+	// CPUBudget and MemoryBudgetMB are the post-overcommit budgets actually
+	// used by Admit, exposed so operators can see the effective ceiling.
+	CPUBudget      float64 `json:"cpu_budget"`
+	MemoryBudgetMB int     `json:"memory_budget_mb"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads
@@ -145,10 +163,7 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	var reasons []string
 
 	if a.limits.CPUReservationRatio > 0 && a.host.CPUCores > 0 {
-		cpuBudget := float64(a.host.CPUCores) * a.limits.CPUReservationRatio
-		if cpuBudget < 0.01 {
-			cpuBudget = 0.01
-		}
+		cpuBudget := a.cpuBudget()
 		if projectedCPU > cpuBudget {
 			reasons = append(reasons, fmt.Sprintf(
 				"cpu reservation exceeded (%.2f+%.2f > %.2f budget)",
@@ -158,7 +173,7 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	}
 
 	if a.limits.MemoryReservationRatio > 0 && a.host.MemoryTotalMB > 0 {
-		memBudget := int(float64(a.host.MemoryTotalMB) * a.limits.MemoryReservationRatio)
+		memBudget := a.memBudgetMB()
 		if projectedMem > memBudget {
 			reasons = append(reasons, fmt.Sprintf(
 				"memory reservation exceeded (%d+%d MB > %d MB budget)",
@@ -239,16 +254,20 @@ func (a *Admitter) Snapshot() Snapshot {
 	}
 
 	snap := Snapshot{
-		HostCPUCores:           a.host.CPUCores,
-		HostMemoryTotalMB:      a.host.MemoryTotalMB,
-		ReservedCPU:            totalCPU,
-		ReservedMemoryMB:       totalMem,
-		LiveMemoryFreeMB:       free,
-		SandboxesActive:        count,
-		CPUReservationRatio:    a.limits.CPUReservationRatio,
-		MemoryReservationRatio: a.limits.MemoryReservationRatio,
-		MemoryFloorRatio:       a.limits.MemoryFloorRatio,
-		MemoryFloorMB:          a.memoryFloorMB(),
+		HostCPUCores:              a.host.CPUCores,
+		HostMemoryTotalMB:         a.host.MemoryTotalMB,
+		ReservedCPU:               totalCPU,
+		ReservedMemoryMB:          totalMem,
+		LiveMemoryFreeMB:          free,
+		SandboxesActive:           count,
+		CPUReservationRatio:       a.limits.CPUReservationRatio,
+		MemoryReservationRatio:    a.limits.MemoryReservationRatio,
+		MemoryFloorRatio:          a.limits.MemoryFloorRatio,
+		CPUOverProvisionFactor:    a.cpuOverProvisionFactor(),
+		MemoryOverProvisionFactor: a.memOverProvisionFactor(),
+		MemoryFloorMB:             a.memoryFloorMB(),
+		CPUBudget:                 a.cpuBudget(),
+		MemoryBudgetMB:            a.memBudgetMB(),
 	}
 	// Use the smallest meaningful request (1 CPU, 1 MB) as the probe ask.
 	// We don't use 0/0 because that bypasses every check and would always
@@ -267,16 +286,13 @@ func (a *Admitter) dryRun(req Request) (bool, []string) {
 
 	var reasons []string
 	if a.limits.CPUReservationRatio > 0 && a.host.CPUCores > 0 {
-		cpuBudget := float64(a.host.CPUCores) * a.limits.CPUReservationRatio
-		if cpuBudget < 0.01 {
-			cpuBudget = 0.01
-		}
+		cpuBudget := a.cpuBudget()
 		if totalCPU+req.CPU > cpuBudget {
 			reasons = append(reasons, fmt.Sprintf("cpu reservation exceeded (%.2f/%.2f)", totalCPU, cpuBudget))
 		}
 	}
 	if a.limits.MemoryReservationRatio > 0 && a.host.MemoryTotalMB > 0 {
-		memBudget := int(float64(a.host.MemoryTotalMB) * a.limits.MemoryReservationRatio)
+		memBudget := a.memBudgetMB()
 		if totalMem+req.MemoryMB > memBudget {
 			reasons = append(reasons, fmt.Sprintf("memory reservation exceeded (%d MB/%d MB)", totalMem, memBudget))
 		}
@@ -296,4 +312,37 @@ func (a *Admitter) memoryFloorMB() int {
 		return 0
 	}
 	return int(float64(a.host.MemoryTotalMB) * a.limits.MemoryFloorRatio)
+}
+
+// cpuOverProvisionFactor returns the effective CPU overcommit multiplier.
+// 0 or any value <1 is clamped to 1.0 so callers that don't set the field
+// (and tests that predate it) keep their original "fits exactly to host"
+// semantics.
+func (a *Admitter) cpuOverProvisionFactor() float64 {
+	if a.limits.CPUOverProvisionFactor < 1 {
+		return 1
+	}
+	return a.limits.CPUOverProvisionFactor
+}
+
+func (a *Admitter) memOverProvisionFactor() float64 {
+	if a.limits.MemoryOverProvisionFactor < 1 {
+		return 1
+	}
+	return a.limits.MemoryOverProvisionFactor
+}
+
+// cpuBudget is the post-overcommit reservation ceiling: cores × ratio × factor.
+// Floored at 0.01 so a host with extreme ratios still admits the smallest
+// fractional ask we model.
+func (a *Admitter) cpuBudget() float64 {
+	budget := float64(a.host.CPUCores) * a.limits.CPUReservationRatio * a.cpuOverProvisionFactor()
+	if budget < 0.01 {
+		budget = 0.01
+	}
+	return budget
+}
+
+func (a *Admitter) memBudgetMB() int {
+	return int(float64(a.host.MemoryTotalMB) * a.limits.MemoryReservationRatio * a.memOverProvisionFactor())
 }

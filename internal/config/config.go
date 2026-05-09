@@ -67,8 +67,18 @@ type Config struct {
 	CPUReservationRatio    float64
 	MemoryReservationRatio float64
 	MemoryFloorRatio       float64
-	HostCPUCoresOverride   int
-	HostMemoryMBOverride   int
+	// CPUOverProvisionFactor and MemoryOverProvisionFactor multiply the
+	// reservation budgets above. Docker --cpus is a CFS cap (not a hard
+	// reservation) and Linux lazy-allocates memory pages, so a host with
+	// mostly-idle sandboxes can safely accept far more reservations than its
+	// nominal capacity. The live MemoryFloorRatio check is the backstop that
+	// catches real pressure when reservations and reality diverge. 0 or <1
+	// is clamped to 1.0 (no overcommit) — operators that want strict packing
+	// should lower the reservation ratios instead.
+	CPUOverProvisionFactor    float64
+	MemoryOverProvisionFactor float64
+	HostCPUCoresOverride      int
+	HostMemoryMBOverride      int
 }
 
 func Load() (Config, error) {
@@ -113,11 +123,13 @@ func Load() (Config, error) {
 		DestroyedRowTTL:          getEnvDuration("SB_DESTROYED_ROW_TTL", 0),
 		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
 
-		CPUReservationRatio:    getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
-		MemoryReservationRatio: getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
-		MemoryFloorRatio:       getEnvFloat("SB_MEMORY_FLOOR_RATIO", 0.05),
-		HostCPUCoresOverride:   getEnvInt("SB_HOST_CPU_CORES", 0),
-		HostMemoryMBOverride:   getEnvInt("SB_HOST_MEMORY_MB", 0),
+		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
+		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
+		MemoryFloorRatio:          getEnvFloat("SB_MEMORY_FLOOR_RATIO", 0.05),
+		CPUOverProvisionFactor:    getEnvFloat("SB_CPU_OVERPROVISION_FACTOR", 10.0),
+		MemoryOverProvisionFactor: getEnvFloat("SB_MEMORY_OVERPROVISION_FACTOR", 10.0),
+		HostCPUCoresOverride:      getEnvInt("SB_HOST_CPU_CORES", 0),
+		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
 	}
 
 	if cfg.PATToken == "" {
