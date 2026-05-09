@@ -64,6 +64,54 @@ const (
 // an actionable error instead of a generic 500.
 var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
 
+// GPUVendor identifies the GPU hardware vendor for sandbox GPU allocation.
+type GPUVendor string
+
+const (
+	// GPUVendorNVIDIA selects NVIDIA GPUs via nvidia-container-runtime.
+	// Requires nvidia-container-toolkit installed on the host.
+	GPUVendorNVIDIA GPUVendor = "nvidia"
+	// GPUVendorAMD selects AMD GPUs via ROCm device bind-mounts (/dev/kfd,
+	// /dev/dri). Requires ROCm drivers on the host.
+	GPUVendorAMD GPUVendor = "amd"
+	// GPUVendorApple selects Apple Silicon GPU via Docker Desktop's
+	// experimental Metal support. Only functional on macOS with Docker Desktop;
+	// Linux hosts will receive a Docker daemon error at container creation.
+	GPUVendorApple GPUVendor = "apple"
+)
+
+// GPURequest describes the GPU resources to attach to a sandbox. The parent
+// CreateSandboxRequest.GPUs field is a pointer, so omitting it entirely means
+// no GPU — this struct only appears when the caller explicitly opts in.
+type GPURequest struct {
+	// Vendor is required. Allowed values: "nvidia", "amd", "apple".
+	Vendor GPUVendor `json:"vendor"`
+	// Count is the number of GPUs to allocate. Use -1 to request all GPUs on
+	// the host. Zero is treated as 1 (default). Ignored for AMD (all AMD GPUs
+	// on the host are exposed via /dev/kfd and /dev/dri).
+	Count int `json:"count,omitempty"`
+	// DeviceIDs pins the sandbox to specific GPU device indices or UUIDs.
+	// For NVIDIA: GPU indices ("0", "1") or UUIDs ("GPU-abc123...").
+	// For AMD and Apple: ignored.
+	DeviceIDs []string `json:"device_ids,omitempty"`
+}
+
+// Validate checks GPURequest fields for consistency.
+func (g *GPURequest) Validate() error {
+	if g == nil {
+		return nil
+	}
+	switch g.Vendor {
+	case GPUVendorNVIDIA, GPUVendorAMD, GPUVendorApple:
+	default:
+		return fmt.Errorf("unsupported GPU vendor %q (allowed: %s, %s, %s)", g.Vendor, GPUVendorNVIDIA, GPUVendorAMD, GPUVendorApple)
+	}
+	if g.Count < -1 {
+		return fmt.Errorf("gpu count must be -1 (all), 0 (default 1), or a positive integer")
+	}
+	return nil
+}
+
 // ValidRuntime normalizes and validates a user-facing runtime identifier.
 // Empty input passes through unchanged so the caller can substitute the host
 // default; any other value must be one of the recognized names. The intent
@@ -192,6 +240,10 @@ type CreateSandboxRequest struct {
 	// userspace kernel — use for untrusted workloads), or "kata" (reserved,
 	// not yet implemented).
 	Runtime string `json:"runtime,omitempty"`
+	// GPUs attaches GPU resources to the sandbox. Nil means no GPU. GPU access
+	// is not supported with the gVisor runtime — the API returns an error if
+	// both GPUs and runtime="gvisor" are set.
+	GPUs *GPURequest `json:"gpus,omitempty"`
 }
 
 type ResizeSandboxRequest struct {
@@ -228,6 +280,9 @@ type Sandbox struct {
 	// host default at start time; new sandboxes always store the resolved
 	// value so the choice cannot drift across host restarts.
 	Runtime string `json:"runtime"`
+	// GPUs is the GPU configuration this sandbox was created with. Nil means
+	// no GPU was requested.
+	GPUs *GPURequest `json:"gpus,omitempty"`
 }
 
 // CreateSandboxResponse is what the API returns from POST /v1/sandboxes.

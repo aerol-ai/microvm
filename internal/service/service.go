@@ -104,6 +104,12 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		lifecycle = *req.Lifecycle
 	}
 
+	if req.GPUs != nil {
+		if err := req.GPUs.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid gpu request: %w", err)
+		}
+	}
+
 	sealedMounts, err := s.sealMounts(req.Mounts)
 	if err != nil {
 		return nil, err
@@ -185,6 +191,7 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		ContainerCommand: req.ContainerCommand,
 		Lifecycle:        lifecycle,
 		Runtime:          chosenRuntime,
+		GPUs:             req.GPUs,
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
