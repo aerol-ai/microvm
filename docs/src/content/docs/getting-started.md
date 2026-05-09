@@ -148,6 +148,8 @@ Both flags can be combined with `--with-gvisor` if needed (gVisor and GPU run un
 
 See [GPU Sandboxes](/gpu-sandboxes) for code examples in all SDK languages.
 
+---
+
 ## Local Development
 
 To run the server locally without the installer:
