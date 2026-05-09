@@ -7,19 +7,9 @@ const { entry } = Astro.props
 {
   !entry.data.hideTitleOnPage && <h1 id={PAGE_TITLE_ID} class="page-title">{entry.data.title}</h1>
 }
-{
-  entry.data.description && <p class="page-intro">{entry.data.description}</p>
-}
 
 <style>
   .page-title {
     margin: 0;
-  }
-
-  .page-intro {
-    margin: 0;
-    max-width: 68ch;
-    color: var(--accent-text-color);
-    font-size: 1.05rem;
   }
 </style>

@@ -1,0 +1,61 @@
+---
+title: Embedded Code Runner Inside A SaaS Product
+description: Execute end-user code safely in AerolVM sandboxes using gVisor-backed isolation and bounded runtime controls.
+---
+
+## What you are building
+
+This is the classic code-interpreter backend: a user submits code, the product runs it in a disposable sandbox, and the UI receives stdout, stderr, exit status, and any generated files.
+
+## Why AerolVM fits
+
+- `runtime: "gvisor"` gives you a stronger isolation boundary for untrusted code.
+- `networkBlockAll` keeps the run self-contained.
+- `exec` works well for short-lived programs and returns structured output.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "python:3.12-bookworm",
+  runtime: "gvisor",
+  networkBlockAll: true,
+  cpu: 1,
+  memoryMB: 1024,
+  diskGB: 8,
+});
+
+await sandbox.exec("mkdir -p /workspace/run");
+await sandbox.uploadFile("/workspace/run/main.py", userSubmittedPython);
+
+const result = await sandbox.exec({
+  command: "python /workspace/run/main.py",
+  timeoutSeconds: 5,
+});
+
+return {
+  stdout: result.stdout,
+  stderr: result.stderr,
+  exitCode: result.exitCode,
+  durationMS: result.durationMS,
+};
+```
+
+## Product outputs
+
+- stdout and stderr for the user.
+- exit code and duration for analytics.
+- optional generated files pulled back with `downloadFile`.
+
+## Related docs
+
+- [Network Isolation](/network-isolation/)
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)

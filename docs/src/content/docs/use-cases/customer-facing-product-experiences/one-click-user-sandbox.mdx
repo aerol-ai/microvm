@@ -1,0 +1,69 @@
+---
+title: One-Click User Sandbox Per Workspace
+description: Provision a dedicated AerolVM sandbox for each user workspace and manage its lifecycle with start, stop, and idle cleanup controls.
+---
+
+## What you are building
+
+This pattern attaches a sandbox directly to a workspace object in your product. Each user gets an isolated runtime that can be resumed, previewed, and cleaned up independently.
+
+## Why AerolVM fits
+
+- `create`, `start`, and `stop` map directly to workspace lifecycle events.
+- Lifecycle policies make idle cleanup predictable.
+- SSH, sessions, and preview ports give you multiple ways to expose the workspace.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 2,
+  memoryMB: 4096,
+  diskGB: 20,
+  env: {
+    WORKSPACE_ID: workspaceID,
+    USER_ID: userID,
+  },
+  lifecycle: {
+    stopIfIdleFor: 30 * 60 * 1_000_000_000,
+    destroyIfIdleFor: 24 * 60 * 60 * 1_000_000_000,
+  },
+});
+
+await sandbox.exec("mkdir -p /workspace/app");
+await Promise.all(seedFiles.map((file) => sandbox.uploadFile(`/workspace/app/${file.path}`, file.contents)));
+
+const previewSession = await sandbox.createSession({
+  name: "workspace-preview",
+  command: "npm run dev -- --host 0.0.0.0 --port 3000",
+  workDir: "/workspace/app",
+});
+
+const previewURL = await sandbox.exposePort(3000);
+
+// Later, when the user leaves the workspace:
+await sandbox.stop();
+
+// And when they return:
+await sandbox.start();
+```
+
+## Product outputs
+
+- One runtime per workspace or tenant.
+- A preview URL or SSH entry point.
+- Predictable idle cleanup behavior.
+
+## Related docs
+
+- [Environment](/environment/)
+- [Preview](/preview/)
+- [SSH Access](/ssh-access/)

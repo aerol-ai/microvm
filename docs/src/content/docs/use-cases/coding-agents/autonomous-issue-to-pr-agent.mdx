@@ -1,0 +1,80 @@
+---
+title: Autonomous Issue-to-PR Coding Agent
+description: Run a coding agent in an isolated AerolVM sandbox, stream progress, and export the resulting patch and artifacts.
+---
+
+## What you are building
+
+This pattern takes a single engineering task from issue context to reviewable patch output. The orchestrator creates a sandbox, uploads the task package, runs the agent, and downloads the generated diff, notes, and test results.
+
+## Why AerolVM fits
+
+- The repo and prompt stay isolated from the host machine.
+- Streamed execution gives live progress while the agent edits, installs, and tests.
+- Files make it easy to move prompts in and patches out.
+- Lifecycle controls let you keep the sandbox alive until a reviewer has finished inspection.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 2,
+  memoryMB: 4096,
+  diskGB: 20,
+  containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
+  lifecycle: {
+    destroyIfIdleFor: 30 * 60 * 1_000_000_000,
+  },
+});
+
+await sandbox.exec("mkdir -p /workspace/context /workspace/out");
+await sandbox.uploadFile("/workspace/context/task.md", issuePromptMarkdown);
+await sandbox.uploadFile("/workspace/context/repo.tar.gz", repoArchiveBuffer);
+
+await sandbox.exec({
+  command: "tar -xzf /workspace/context/repo.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+});
+
+const run = sandbox.execStream({
+  command: "npm ci && npm test && ./scripts/run-agent.sh /workspace/app /workspace/context/task.md /workspace/out",
+  workdir: "/workspace/app",
+  onStdout: (chunk) => process.stdout.write(chunk),
+  onStderr: (chunk) => process.stderr.write(chunk),
+});
+
+const exit = await run.done;
+if (exit.code !== 0) {
+  throw new Error(`agent failed with exit code ${exit.code}`);
+}
+
+const patch = new TextDecoder().decode(
+  await sandbox.downloadFile("/workspace/out/fix.patch"),
+);
+```
+
+## What to export
+
+- `fix.patch` or a branch bundle for review.
+- `summary.md` with what the agent changed.
+- `test-results.txt` or JUnit output for validation.
+
+## AerolVM primitives used
+
+- `create`
+- `exec` and `execStream`
+- `uploadFile` and `downloadFile`
+- `updateLifecycle` when the reviewer needs more time before cleanup
+
+## Related docs
+
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)
+- [Sessions](/sessions/)

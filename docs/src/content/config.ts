@@ -20,9 +20,10 @@ export enum NavigationCategory {
   ACCESS,
   SDKS,
   FEATURES,
+  USE_CASES,
 }
 
-export const getSidebarConfig = (): NavigationGroup[] => [
+const getDocsSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
     label: 'Introduction',
@@ -166,3 +167,113 @@ export const getSidebarConfig = (): NavigationGroup[] => [
     ],
   },
 ]
+
+const getUseCasesSidebarConfig = (): NavigationGroup[] => [
+  {
+    type: 'group',
+    label: 'Use Cases',
+    category: NavigationCategory.USE_CASES,
+    entries: [
+      {
+        type: 'link',
+        href: '/use-cases',
+        label: 'Overview',
+        description: 'Top-priority AerolVM use cases selected from the planning matrix.',
+        exact: true,
+      },
+      {
+        type: 'group',
+        label: 'Coding Agents & Autonomous Engineering',
+        entries: [
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents',
+            label: 'Category Overview',
+            description: 'The highest-priority agent workflows selected from the use-case plan.',
+            exact: true,
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/autonomous-issue-to-pr-agent',
+            label: 'Autonomous issue-to-PR agent',
+            description: 'Take a repository task from intake to validated patch output.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/pull-request-review-auto-fix-agent',
+            label: 'Pull-request review and auto-fix agent',
+            description: 'Review a PR in isolation and generate a safe follow-up patch.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/test-writing-failure-reproduction-agent',
+            label: 'Test-writing and failure reproduction agent',
+            description: 'Turn a bug report into failing tests and a reproducible harness.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/dependency-upgrade-compatibility-agent',
+            label: 'Dependency upgrade and compatibility agent',
+            description: 'Upgrade dependencies, run the matrix, and export the results.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/large-scale-refactor-migration-agent',
+            label: 'Large-scale refactor or migration agent',
+            description: 'Run long codemods and staged migrations with streamed progress.',
+          },
+        ],
+      },
+      {
+        type: 'group',
+        label: 'Customer-Facing Product Experiences',
+        entries: [
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences',
+            label: 'Category Overview',
+            description: 'Product-facing workloads where AerolVM becomes part of the feature itself.',
+            exact: true,
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/embedded-code-runner',
+            label: 'Embedded code runner inside a SaaS product',
+            description: 'Execute user code safely behind strong isolation boundaries.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/live-preview-urls',
+            label: 'Live preview URLs for generated apps or APIs',
+            description: 'Turn generated files into running previews with public URLs.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/interactive-tutorial-lab-backend',
+            label: 'Interactive tutorial or lab backend',
+            description: 'Back tutorials and labs with per-user sandboxes and persistent shells.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/ai-app-builder-runtime',
+            label: 'AI app builder runtime',
+            description: 'Compile, boot, and preview generated projects inside disposable sandboxes.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
+            label: 'One-click user sandbox per workspace',
+            description: 'Provision an isolated sandbox as part of each product workspace.',
+          },
+        ],
+      },
+    ],
+  },
+]
+
+function isUseCasesPath(pathname: string): boolean {
+  return pathname === '/use-cases' || pathname.startsWith('/use-cases/')
+}
+
+export const getSidebarConfig = (pathname = '/'): NavigationGroup[] =>
+  isUseCasesPath(pathname) ? getUseCasesSidebarConfig() : getDocsSidebarConfig()

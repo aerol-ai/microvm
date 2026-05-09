@@ -1,0 +1,72 @@
+---
+title: Interactive Tutorial Or Lab Backend
+description: Back product tutorials and labs with per-user AerolVM sandboxes, persistent sessions, and optional preview ports.
+---
+
+## What you are building
+
+This pattern gives each learner or user a sandbox-backed lab environment with starter files, a persistent shell, and optionally a live preview port for web exercises.
+
+## Why AerolVM fits
+
+- Sessions preserve shell state across reconnects.
+- `uploadFile` makes it easy to seed the lab with starter content.
+- `updateLifecycle` lets you keep labs alive while the user is active and clean them up after idle time.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 1,
+  memoryMB: 2048,
+  diskGB: 12,
+  lifecycle: {
+    stopIfIdleFor: 20 * 60 * 1_000_000_000,
+    destroyIfIdleFor: 6 * 60 * 60 * 1_000_000_000,
+  },
+});
+
+await sandbox.exec("mkdir -p /workspace/lab");
+await Promise.all(labFiles.map((file) => sandbox.uploadFile(`/workspace/lab/${file.path}`, file.contents)));
+
+const session = await sandbox.createSession({
+  name: `lesson-${lessonID}`,
+  command: "/bin/bash",
+  workDir: "/workspace/lab",
+  pty: true,
+  cols: 120,
+  rows: 40,
+});
+
+const terminal = sandbox.attachSession(session.id, {
+  cols: 120,
+  rows: 40,
+  onStdout: (chunk) => websocket.send(chunk),
+  onStderr: (chunk) => websocket.send(chunk),
+});
+
+terminal.write("npm install\n");
+terminal.write("npm run start\n");
+
+const previewURL = await sandbox.exposePort(3000);
+```
+
+## Product outputs
+
+- A persistent shell for the user.
+- Optional preview URL for browser-based exercises.
+- Session logs or recordings for support and grading flows.
+
+## Related docs
+
+- [Sessions](/sessions/)
+- [Preview](/preview/)
+- [File System](/file-system/)

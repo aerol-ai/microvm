@@ -1,0 +1,79 @@
+---
+title: Large-Scale Refactor Or Migration Agent
+description: Run codemods or migration scripts in long-lived AerolVM sandboxes and export the resulting patch, logs, and validation output.
+---
+
+## What you are building
+
+This pattern handles repo-wide migrations such as framework upgrades, API renames, or codebase codemods. The agent runs in a long-lived sandbox, streams progress, and exports a reviewable patch when the migration passes validation.
+
+## Why AerolVM fits
+
+- The migration can run for longer than a single HTTP request.
+- Session attach and replay are useful when humans need to inspect progress mid-run.
+- Resource resizing gives you a path to run heavier codemods without changing the orchestrator model.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 4,
+  memoryMB: 8192,
+  diskGB: 24,
+  containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
+  lifecycle: {
+    destroyIfIdleFor: 60 * 60 * 1_000_000_000,
+  },
+});
+
+await sandbox.exec("mkdir -p /workspace/input /workspace/out");
+await Promise.all([
+  sandbox.uploadFile("/workspace/input/repo.tar.gz", repoArchiveBuffer),
+  sandbox.uploadFile("/workspace/input/migration-spec.md", migrationSpecMarkdown),
+]);
+
+await sandbox.exec({
+  command: "tar -xzf /workspace/input/repo.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+});
+
+const session = await sandbox.createSession({
+  name: "repo-migration",
+  command: "./scripts/run-migration.sh /workspace/app /workspace/input/migration-spec.md /workspace/out",
+  workDir: "/workspace/app",
+});
+
+const attach = sandbox.attachSession(session.id, {
+  onStdout: (chunk) => process.stdout.write(chunk),
+  onStderr: (chunk) => process.stderr.write(chunk),
+});
+
+const exit = await attach.done;
+if (exit.code !== 0) {
+  throw new Error(`migration session failed with exit code ${exit.code}`);
+}
+
+const patch = new TextDecoder().decode(
+  await sandbox.downloadFile("/workspace/out/migration.patch"),
+);
+const log = new TextDecoder().decode(await sandbox.sessionLog(session.id));
+```
+
+## Deliverables
+
+- A repo-wide patch or branch bundle.
+- The session log for auditing and debugging.
+- Validation output from the migration test suite.
+
+## Related docs
+
+- [Sessions](/sessions/)
+- [Process & Code Execution](/exec-streaming/)
+- [Environment](/environment/)

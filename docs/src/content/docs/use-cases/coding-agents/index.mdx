@@ -1,0 +1,40 @@
+---
+title: Coding Agents & Autonomous Engineering
+description: The highest-priority agent workflows from the AerolVM use-case plan, organized as a dedicated category with subpages.
+---
+
+This category is the highest-priority part of the use-case plan because it lines up with AerolVM's best primitives: isolated sandboxes, streamed execution, persistent sessions, file transfer, and explicit lifecycle control.
+
+## Selected subcategories
+
+| Use case | Rating | Why it made the cut |
+|---|---:|---|
+| [Autonomous issue-to-PR coding agent](/use-cases/coding-agents/autonomous-issue-to-pr-agent/) | 10/10 | This is the clearest agent-runtime story for AerolVM today. |
+| [Pull-request review and auto-fix agent](/use-cases/coding-agents/pull-request-review-auto-fix-agent/) | 9/10 | It keeps review automation isolated from developer machines and shared CI. |
+| [Test-writing and failure reproduction agent](/use-cases/coding-agents/test-writing-failure-reproduction-agent/) | 9/10 | It turns flaky or hard-to-reproduce bugs into controlled sandbox jobs. |
+| [Dependency upgrade and compatibility agent](/use-cases/coding-agents/dependency-upgrade-compatibility-agent/) | 9/10 | It is a practical, repeatable automation workflow with direct business value. |
+| [Large-scale refactor or migration agent](/use-cases/coding-agents/large-scale-refactor-migration-agent/) | 9/10 | It benefits from long-running sessions, large patches, and artifact export. |
+
+## Why AerolVM fits this category
+
+- `create` provisions one sandbox per task, repo, or branch.
+- `execStream` gives live stdout and stderr for agent progress.
+- `createSession` and `attachSession` keep long-running jobs alive across reconnects.
+- `uploadFile` and `downloadFile` move prompts, patches, logs, and artifacts in and out.
+- `updateLifecycle` keeps expensive work alive while an orchestrator or reviewer is still attached.
+
+## Recommended implementation pattern
+
+1. Create one sandbox per work item.
+2. Upload the repo bundle, prompt, task metadata, and policy files.
+3. Run the agent with `execStream` for shorter jobs or sessions for long migrations.
+4. Download the diff, report, or reproduction artifact.
+5. Destroy or stop the sandbox once the review loop is complete.
+
+## Related docs
+
+- [SDK Setup](/sdk-setup/)
+- [Process & Code Execution](/exec-streaming/)
+- [Sessions](/sessions/)
+- [File System](/file-system/)
+- [Network Isolation](/network-isolation/)

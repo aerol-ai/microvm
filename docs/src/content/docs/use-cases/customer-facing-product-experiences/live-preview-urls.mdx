@@ -1,0 +1,64 @@
+---
+title: Live Preview URLs For Generated Apps Or APIs
+description: Turn generated source files into running web previews by exposing a sandbox port through AerolVM.
+---
+
+## What you are building
+
+This workflow takes generated or uploaded project files, installs dependencies inside a sandbox, starts the app, and returns a preview URL that can be opened immediately by the user or reviewer.
+
+## Why AerolVM fits
+
+- `uploadFile` moves generated project files into the sandbox.
+- `createSession` keeps the web server alive after the initial setup step.
+- `exposePort` turns a local process into a shareable preview URL.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 2,
+  memoryMB: 4096,
+  diskGB: 18,
+  containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
+});
+
+await sandbox.exec("mkdir -p /workspace/app");
+await Promise.all(projectFiles.map((file) => sandbox.uploadFile(`/workspace/app/${file.path}`, file.contents)));
+
+await sandbox.execStream({
+  command: "npm install",
+  workdir: "/workspace/app",
+  onStdout: (chunk) => process.stdout.write(chunk),
+  onStderr: (chunk) => process.stderr.write(chunk),
+}).done;
+
+const session = await sandbox.createSession({
+  name: "preview-server",
+  command: "npm run dev -- --host 0.0.0.0 --port 3000",
+  workDir: "/workspace/app",
+  env: { PORT: "3000" },
+});
+
+const previewURL = await sandbox.exposePort(3000);
+```
+
+## Product outputs
+
+- A live preview URL.
+- Server logs via `attachSession` or `sessionLog`.
+- Optional build artifacts via `downloadFile`.
+
+## Related docs
+
+- [Preview](/preview/)
+- [Sessions](/sessions/)
+- [File System](/file-system/)

@@ -1,0 +1,74 @@
+---
+title: Pull-Request Review And Auto-Fix Agent
+description: Review an incoming pull request in an isolated AerolVM sandbox and export a safe follow-up fix patch.
+---
+
+## What you are building
+
+This workflow spins up a sandbox for a specific pull request, replays the branch state, runs review checks, and optionally produces a narrow patch that addresses the detected issue.
+
+## Why AerolVM fits
+
+- PR-specific sandboxes prevent review automation from mutating shared CI runners.
+- `networkBlockAll` can keep the review run offline once the source bundle is staged.
+- File transfer makes it straightforward to export a markdown review report and a follow-up patch.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 2,
+  memoryMB: 3072,
+  diskGB: 16,
+  networkBlockAll: true,
+});
+
+await sandbox.exec("mkdir -p /workspace/input /workspace/out");
+await Promise.all([
+  sandbox.uploadFile("/workspace/input/pr.tar.gz", pullRequestArchive),
+  sandbox.uploadFile("/workspace/input/review-rules.md", reviewRulesMarkdown),
+]);
+
+await sandbox.exec({
+  command: "tar -xzf /workspace/input/pr.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+});
+
+const review = sandbox.execStream({
+  command: "npm ci && npm test && ./scripts/review-pr.sh /workspace/app /workspace/input/review-rules.md /workspace/out",
+  workdir: "/workspace/app",
+  onStdout: (chunk) => process.stdout.write(chunk),
+  onStderr: (chunk) => process.stderr.write(chunk),
+});
+
+const exit = await review.done;
+if (exit.code !== 0) {
+  throw new Error(`review failed with exit code ${exit.code}`);
+}
+
+const report = new TextDecoder().decode(
+  await sandbox.downloadFile("/workspace/out/review.md"),
+);
+const patch = new TextDecoder().decode(
+  await sandbox.downloadFile("/workspace/out/auto-fix.patch"),
+);
+```
+
+## Deliverables
+
+- `review.md` for the human reviewer.
+- `auto-fix.patch` if the agent can make a safe, bounded change.
+- `test-results.txt` for evidence that the PR still passes.
+
+## Related docs
+
+- [Network Isolation](/network-isolation/)
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)

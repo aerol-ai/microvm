@@ -1,0 +1,72 @@
+---
+title: Dependency Upgrade And Compatibility Agent
+description: Upgrade packages inside an AerolVM sandbox, stream the compatibility run, and export a bounded patch plus report.
+---
+
+## What you are building
+
+This workflow upgrades one dependency set at a time, runs the compatibility matrix in isolation, and exports a patch only when the updated repo still passes the required checks.
+
+## Why AerolVM fits
+
+- The upgrade run happens away from shared CI and developer laptops.
+- Persistent sessions are useful because package upgrades often take longer than a single short command.
+- The final patch and report can be downloaded directly into a review system.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 2,
+  memoryMB: 4096,
+  diskGB: 18,
+  containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
+});
+
+await sandbox.exec("mkdir -p /workspace/input /workspace/out");
+await sandbox.uploadFile("/workspace/input/repo.tar.gz", repoArchiveBuffer);
+await sandbox.exec({
+  command: "tar -xzf /workspace/input/repo.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+});
+
+const session = await sandbox.createSession({
+  name: "dependency-upgrade",
+  command: "npm ci && npx npm-check-updates -u && npm install && npm test && git diff > /workspace/out/upgrade.patch",
+  workDir: "/workspace/app",
+});
+
+const stream = sandbox.attachSession(session.id, {
+  onStdout: (chunk) => process.stdout.write(chunk),
+  onStderr: (chunk) => process.stderr.write(chunk),
+});
+
+const exit = await stream.done;
+if (exit.code !== 0) {
+  throw new Error(`upgrade session failed with exit code ${exit.code}`);
+}
+
+const report = new TextDecoder().decode(await sandbox.sessionLog(session.id));
+const patch = new TextDecoder().decode(
+  await sandbox.downloadFile("/workspace/out/upgrade.patch"),
+);
+```
+
+## Deliverables
+
+- Upgrade patch.
+- Session log with install and test output.
+- Compatibility summary for the reviewer or release owner.
+
+## Related docs
+
+- [Sessions](/sessions/)
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)

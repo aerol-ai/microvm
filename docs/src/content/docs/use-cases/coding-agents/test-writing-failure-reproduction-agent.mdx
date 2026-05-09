@@ -1,0 +1,71 @@
+---
+title: Test-Writing And Failure Reproduction Agent
+description: Reproduce a bug in an AerolVM sandbox, generate a failing test, and export the reproduction artifacts.
+---
+
+## What you are building
+
+This workflow gives an agent a bug report, fixtures, and a repo snapshot. The agent reconstructs the failure in a clean sandbox, writes the failing test, and exports the resulting test file plus reproduction notes.
+
+## Why AerolVM fits
+
+- Fresh sandboxes remove local-machine drift from the reproduction process.
+- Streamed logs make it obvious where the failure starts.
+- Downloaded artifacts capture the exact failing test and reproduction transcript.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "python:3.12-bookworm",
+  cpu: 1,
+  memoryMB: 2048,
+  diskGB: 12,
+});
+
+await sandbox.exec("mkdir -p /workspace/input /workspace/out");
+await Promise.all([
+  sandbox.uploadFile("/workspace/input/repo.tar.gz", repoArchiveBuffer),
+  sandbox.uploadFile("/workspace/input/bug-report.md", bugReportMarkdown),
+  sandbox.uploadFile("/workspace/input/fixture.json", fixtureJSON),
+]);
+
+await sandbox.exec({
+  command: "tar -xzf /workspace/input/repo.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+});
+
+const reproduction = sandbox.execStream({
+  command: "pytest -q || true && ./scripts/write-repro-test.sh /workspace/app /workspace/input /workspace/out",
+  workdir: "/workspace/app",
+  onStdout: (chunk) => process.stdout.write(chunk),
+  onStderr: (chunk) => process.stderr.write(chunk),
+});
+
+const exit = await reproduction.done;
+if (exit.code !== 0) {
+  throw new Error(`reproduction agent failed with exit code ${exit.code}`);
+}
+
+const failingTest = new TextDecoder().decode(
+  await sandbox.downloadFile("/workspace/out/test_regression.py"),
+);
+```
+
+## Deliverables
+
+- The generated failing test.
+- A reproduction transcript.
+- Optional minimized fixtures or sample input files.
+
+## Related docs
+
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)
+- [Sessions](/sessions/)

@@ -1,0 +1,71 @@
+---
+title: AI App Builder Runtime
+description: Run LLM-generated projects in AerolVM sandboxes, install dependencies, and expose a preview URL for immediate feedback.
+---
+
+## What you are building
+
+This workflow takes generated application files from an LLM or agent, boots them inside a sandbox, and returns a live preview URL plus logs that can be shown directly in the product.
+
+## Why AerolVM fits
+
+- The generated code runs away from the host and shared web infrastructure.
+- Streamed install and boot logs can be reflected into the builder UI in real time.
+- The same runtime can expose previews, export artifacts, and later be destroyed automatically.
+
+## TypeScript SDK walkthrough
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM({
+  apiUrl: process.env.SB_API_URL,
+  patToken: process.env.SB_PAT_TOKEN,
+});
+
+const sandbox = await client.create({
+  image: "node:22-bookworm",
+  cpu: 2,
+  memoryMB: 4096,
+  diskGB: 20,
+  containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
+  lifecycle: {
+    destroyIfIdleFor: 45 * 60 * 1_000_000_000,
+  },
+});
+
+await sandbox.exec("mkdir -p /workspace/generated-app");
+await Promise.all(generatedFiles.map((file) => sandbox.uploadFile(`/workspace/generated-app/${file.path}`, file.contents)));
+
+const install = sandbox.execStream({
+  command: "npm install && npm run build",
+  workdir: "/workspace/generated-app",
+  onStdout: (chunk) => builderEvents.send(chunk),
+  onStderr: (chunk) => builderEvents.send(chunk),
+});
+
+const installExit = await install.done;
+if (installExit.code !== 0) {
+  throw new Error(`builder bootstrap failed with exit code ${installExit.code}`);
+}
+
+await sandbox.createSession({
+  name: "builder-preview",
+  command: "npm run dev -- --host 0.0.0.0 --port 3000",
+  workDir: "/workspace/generated-app",
+});
+
+const previewURL = await sandbox.exposePort(3000);
+```
+
+## Product outputs
+
+- A preview URL that updates after code generation.
+- Build and runtime logs for the UI.
+- Optional exported files or zips using `downloadFile`.
+
+## Related docs
+
+- [Preview](/preview/)
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)

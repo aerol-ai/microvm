@@ -11,14 +11,17 @@ export interface NavigationLink extends NavigationItem {
   label: string
   description?: string
   external?: boolean
+  exact?: boolean
 }
 
 export interface NavigationGroup extends NavigationItem {
   type: 'group'
-  category: NavigationCategory
+  category?: NavigationCategory
   homePageHref?: string
-  entries?: NavigationLink[]
+  entries?: NavigationEntry[]
 }
+
+export type NavigationEntry = NavigationLink | NavigationGroup
 
 function normalizePath(value: string): string {
   if (!value) return '/'
@@ -26,8 +29,14 @@ function normalizePath(value: string): string {
   return normalized === '' ? '/' : normalized
 }
 
+function flattenEntries(entries: NavigationEntry[]): NavigationLink[] {
+  return entries.flatMap(entry =>
+    entry.type === 'link' ? [entry] : flattenEntries(entry.entries || [])
+  )
+}
+
 function flattenLinks(sidebarConfig: NavigationGroup[]): NavigationLink[] {
-  return sidebarConfig.flatMap(group => group.entries || [])
+  return sidebarConfig.flatMap(group => flattenEntries(group.entries || []))
 }
 
 export function comparePaths(path1: string, path2: string): boolean {
@@ -90,7 +99,7 @@ export function getExploreMoreData(
   return sidebarConfig
     .map(group => ({
       title: group.label || '',
-      items: (group.entries || [])
+      items: flattenEntries(group.entries || [])
         .filter(link => !comparePaths(link.href, currentPath))
         .map(link => ({
           title: link.label,
