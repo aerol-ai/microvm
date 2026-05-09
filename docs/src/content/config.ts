@@ -187,9 +187,9 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
         entries: [
           {
             type: 'link',
-            href: '/use-cases/coding-agents/autonomous-issue-to-pr-agent',
-            label: 'Autonomous issue-to-PR agent',
-            description: 'Take a repository task from intake to validated patch output.',
+            href: '/use-cases/coding-agents/claude-code-repository-architecture-agent',
+            label: 'Generate architecture diagram of repository',
+            description: 'Clone a real repository, run Claude headlessly, and generate arch.md.',
           },
           {
             type: 'link',
