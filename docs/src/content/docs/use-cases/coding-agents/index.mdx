@@ -26,7 +26,7 @@ This category is the highest-priority part of the use-case plan because it lines
 ## Recommended implementation pattern
 
 1. Create one sandbox per work item.
-2. Upload the repo bundle, prompt, task metadata, and policy files.
+2. Clone the target public repository inside the sandbox, then upload prompts, task metadata, and policy files.
 3. Run the agent with `execStream` for shorter jobs or sessions for long migrations.
 4. Download the diff, report, or reproduction artifact.
 5. Destroy or stop the sandbox once the review loop is complete.

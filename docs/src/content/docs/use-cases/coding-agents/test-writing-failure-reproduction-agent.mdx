@@ -5,7 +5,7 @@ description: Reproduce a bug in an AerolVM sandbox, generate a failing test, and
 
 ## What you are building
 
-This workflow gives an agent a bug report, fixtures, and a repo snapshot. The agent reconstructs the failure in a clean sandbox, writes the failing test, and exports the resulting test file plus reproduction notes.
+This workflow gives an agent a bug report, fixtures, and a real public repository to clone. The agent reconstructs the failure in a clean sandbox, writes the failing test, and exports the resulting test file plus reproduction notes.
 
 ## Why AerolVM fits
 
@@ -17,6 +17,8 @@ This workflow gives an agent a bug report, fixtures, and a repo snapshot. The ag
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const repoURL = "https://github.com/psf/requests.git";
 
 const client = new MicroVM({
   apiUrl: process.env.SB_API_URL,
@@ -32,13 +34,12 @@ const sandbox = await client.create({
 
 await sandbox.exec("mkdir -p /workspace/input /workspace/out");
 await Promise.all([
-  sandbox.uploadFile("/workspace/input/repo.tar.gz", repoArchiveBuffer),
   sandbox.uploadFile("/workspace/input/bug-report.md", bugReportMarkdown),
   sandbox.uploadFile("/workspace/input/fixture.json", fixtureJSON),
 ]);
 
 await sandbox.exec({
-  command: "tar -xzf /workspace/input/repo.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+  command: `git clone --depth=1 ${repoURL} /workspace/app`,
 });
 
 const reproduction = sandbox.execStream({

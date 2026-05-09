@@ -5,18 +5,20 @@ description: Review an incoming pull request in an isolated AerolVM sandbox and 
 
 ## What you are building
 
-This workflow spins up a sandbox for a specific pull request, replays the branch state, runs review checks, and optionally produces a narrow patch that addresses the detected issue.
+This workflow spins up a sandbox for a specific pull request, clones a real public repository, fetches the PR branch, runs review checks, and optionally produces a narrow patch that addresses the detected issue.
 
 ## Why AerolVM fits
 
 - PR-specific sandboxes prevent review automation from mutating shared CI runners.
-- `networkBlockAll` can keep the review run offline once the source bundle is staged.
 - File transfer makes it straightforward to export a markdown review report and a follow-up patch.
 
 ## TypeScript SDK walkthrough
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const repoURL = "https://github.com/axios/axios.git";
+const pullRequestNumber = Number(process.env.PUBLIC_PR_NUMBER);
 
 const client = new MicroVM({
   apiUrl: process.env.SB_API_URL,
@@ -28,19 +30,23 @@ const sandbox = await client.create({
   cpu: 2,
   memoryMB: 3072,
   diskGB: 16,
-  networkBlockAll: true,
 });
 
 await sandbox.exec("mkdir -p /workspace/input /workspace/out");
 await Promise.all([
-  sandbox.uploadFile("/workspace/input/pr.tar.gz", pullRequestArchive),
   sandbox.uploadFile("/workspace/input/review-rules.md", reviewRulesMarkdown),
 ]);
 
 await sandbox.exec({
-  command: "tar -xzf /workspace/input/pr.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+  command: [
+    `git clone ${repoURL} /workspace/app`,
+    `cd /workspace/app && git fetch origin pull/${pullRequestNumber}/head:review-pr`,
+    "cd /workspace/app && git checkout review-pr",
+  ].join(" && "),
 });
 
+
+Set `PUBLIC_PR_NUMBER` from your webhook or review event before starting the run.
 const review = sandbox.execStream({
   command: "npm ci && npm test && ./scripts/review-pr.sh /workspace/app /workspace/input/review-rules.md /workspace/out",
   workdir: "/workspace/app",

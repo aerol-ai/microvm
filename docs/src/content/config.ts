@@ -187,13 +187,6 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
         entries: [
           {
             type: 'link',
-            href: '/use-cases/coding-agents',
-            label: 'Category Overview',
-            description: 'The highest-priority agent workflows selected from the use-case plan.',
-            exact: true,
-          },
-          {
-            type: 'link',
             href: '/use-cases/coding-agents/autonomous-issue-to-pr-agent',
             label: 'Autonomous issue-to-PR agent',
             description: 'Take a repository task from intake to validated patch output.',
@@ -228,13 +221,6 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
         type: 'group',
         label: 'Customer-Facing Product Experiences',
         entries: [
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences',
-            label: 'Category Overview',
-            description: 'Product-facing workloads where AerolVM becomes part of the feature itself.',
-            exact: true,
-          },
           {
             type: 'link',
             href: '/use-cases/customer-facing-product-experiences/embedded-code-runner',

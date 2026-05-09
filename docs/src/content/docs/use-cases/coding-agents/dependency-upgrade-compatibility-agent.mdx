@@ -18,6 +18,8 @@ This workflow upgrades one dependency set at a time, runs the compatibility matr
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
+const repoURL = "https://github.com/axios/axios.git";
+
 const client = new MicroVM({
   apiUrl: process.env.SB_API_URL,
   patToken: process.env.SB_PAT_TOKEN,
@@ -32,9 +34,8 @@ const sandbox = await client.create({
 });
 
 await sandbox.exec("mkdir -p /workspace/input /workspace/out");
-await sandbox.uploadFile("/workspace/input/repo.tar.gz", repoArchiveBuffer);
 await sandbox.exec({
-  command: "tar -xzf /workspace/input/repo.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+  command: `git clone --depth=1 ${repoURL} /workspace/app`,
 });
 
 const session = await sandbox.createSession({

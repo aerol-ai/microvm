@@ -5,7 +5,7 @@ description: Run a coding agent in an isolated AerolVM sandbox, stream progress,
 
 ## What you are building
 
-This pattern takes a single engineering task from issue context to reviewable patch output. The orchestrator creates a sandbox, uploads the task package, runs the agent, and downloads the generated diff, notes, and test results.
+This pattern takes a single engineering task from issue context to reviewable patch output. The orchestrator creates a sandbox, clones a real public repository, runs the agent, and downloads the generated diff, notes, and test results.
 
 ## Why AerolVM fits
 
@@ -18,6 +18,8 @@ This pattern takes a single engineering task from issue context to reviewable pa
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const repoURL = "https://github.com/expressjs/express.git";
 
 const client = new MicroVM({
   apiUrl: process.env.SB_API_URL,
@@ -37,10 +39,8 @@ const sandbox = await client.create({
 
 await sandbox.exec("mkdir -p /workspace/context /workspace/out");
 await sandbox.uploadFile("/workspace/context/task.md", issuePromptMarkdown);
-await sandbox.uploadFile("/workspace/context/repo.tar.gz", repoArchiveBuffer);
-
 await sandbox.exec({
-  command: "tar -xzf /workspace/context/repo.tar.gz -C /workspace && mv /workspace/repo /workspace/app",
+  command: `git clone --depth=1 ${repoURL} /workspace/app`,
 });
 
 const run = sandbox.execStream({
