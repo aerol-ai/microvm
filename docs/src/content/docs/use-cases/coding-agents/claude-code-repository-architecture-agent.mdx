@@ -7,12 +7,6 @@ description: Run Claude Code headlessly inside an AerolVM sandbox, clone a GitHu
 
 This workflow spins up a low-cost sandbox, installs Claude Code and GitHub CLI, clones a real repository with a GitHub token, and asks Claude to create `arch.md` with a Mermaid architecture diagram plus a short explanation. It is a strong fit for engineering due diligence, onboarding, solution-architecture reviews, and repo handoff automation.
 
-## Why AerolVM fits
-
-- The GitHub token, Anthropic API key, cloned repository, and generated artifact stay isolated from the host machine.
-- `0.5` CPU and `2048` MB RAM are enough for documentation-grade repo analysis without paying for a heavier runtime.
-- `execStream` gives live progress while the sandbox installs Claude Code, clones the repo, and runs the agent headlessly.
-- Files make it easy to export `arch.md`, the generated patch, and the Claude run log back to your machine.
 
 ## Copy-paste TypeScript script
 

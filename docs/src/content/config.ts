@@ -194,8 +194,8 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           {
             type: 'link',
             href: '/use-cases/coding-agents/pull-request-review-auto-fix-agent',
-            label: 'Pull-request review and auto-fix agent',
-            description: 'Review a PR in isolation and generate a safe follow-up patch.',
+            label: 'GitHub PR review agent',
+            description: 'Check out a real PR from its URL, post a GitHub review, and export any safe fixes.',
           },
           {
             type: 'link',
