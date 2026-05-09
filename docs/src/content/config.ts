@@ -183,7 +183,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'group',
-        label: 'Coding Agents & Autonomous Engineering',
+        label: 'Coding Agents & Harness Engineering',
         entries: [
           {
             type: 'link',
