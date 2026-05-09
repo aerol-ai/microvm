@@ -5,12 +5,11 @@ description: Run Claude Code headlessly inside an AerolVM sandbox, check out a r
 ---
 
 
-This workflow is the AerolVM version of a real GitHub coding-agent review loop. It installs Claude Code inside the sandbox, clones the repository identified by a user-provided GitHub PR URL, checks out the PR, asks Claude to write a production-grade review into `pr-review.md`, optionally applies narrow safe fixes, posts the review back to GitHub with `gh pr review`, and exports the resulting review body, patch, and session log.
+This workflow is the AerolVM version of a real GitHub coding-agent review loop. It works similarly as Github PR review agent or CodeRabbit PR Review agent.
 
 
 ## Copy-paste TypeScript script
 
-This script requires `SB_PAT_TOKEN`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, and `GITHUB_PR_URL`. If `ANTHROPIC_MODEL` is unset, it defaults to `claude-sonnet-4-6`. If `POST_REVIEW_TO_GITHUB` is unset, it defaults to `true`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
