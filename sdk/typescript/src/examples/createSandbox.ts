@@ -17,7 +17,7 @@ interface CLIOptions {
 type SandboxHandle = Awaited<ReturnType<MicroVM["create"]>>;
 
 const defaultImage = "node:22-bookworm";
-const defaultPort = 8080;
+const defaultPort = 21212;
 const defaultWorkDir = "/workspace/express-demo";
 const keepAliveCommand = ["sh", "-lc", "while true; do sleep 3600; done"];
 const expressPackageJSON = `${JSON.stringify({
@@ -37,7 +37,7 @@ const expressServerJS = [
 	"const express = require(\"express\");",
 	"",
 	"const app = express();",
-	"const port = Number(process.env.PORT || 8080);",
+	"const port = Number(process.env.PORT || 21212);",
 	"",
 	"app.get(\"/\", (_req, res) => {",
 	"\tres.json({",

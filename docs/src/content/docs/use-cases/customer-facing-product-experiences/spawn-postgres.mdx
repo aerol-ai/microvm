@@ -34,14 +34,14 @@ Set these environment variables before running the script:
 - Optional: `POSTGRES_DB` (defaults to `appdb`)
 - Optional: `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD` for the HTTP admin endpoint. If omitted, the script falls back to the Postgres credentials. In production, use separate values.
 
-If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
+If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:21212`.
 
 ```ts
 import { writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 const postgresUser = process.env.POSTGRES_USER;
 const postgresPassword = process.env.POSTGRES_PASSWORD;

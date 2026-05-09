@@ -15,7 +15,7 @@ import type {
   SessionAttachOptions,
 } from "./types.js";
 
-const defaultAPIURL = "http://127.0.0.1:8080";
+const defaultAPIURL = "http://127.0.0.1:21212";
 const authRequiredErrorMessage = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
 
 type FetchLike = typeof fetch;

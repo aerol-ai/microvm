@@ -66,7 +66,7 @@ func TestLoadCases(t *testing.T) {
 				if cfg.PATToken != "token" {
 					t.Fatalf("expected PATToken to be set, got %+v", cfg)
 				}
-				if cfg.APIHost != "0.0.0.0" || cfg.APIPort != 8080 {
+				if cfg.APIHost != "0.0.0.0" || cfg.APIPort != 21212 {
 					t.Fatalf("unexpected listen defaults: %+v", cfg)
 				}
 				if cfg.PublicHost != "127.0.0.1" || cfg.DockerNetwork != "bridge" {
@@ -192,7 +192,7 @@ func TestLoadCases(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Load() error = %v", err)
 				}
-				if cfg.APIPort != 8080 || cfg.ToolboxPort != 2280 || cfg.IdleTimeoutMinutes != 0 {
+				if cfg.APIPort != 21212 || cfg.ToolboxPort != 2280 || cfg.IdleTimeoutMinutes != 0 {
 					t.Fatalf("expected numeric fallbacks, got %+v", cfg)
 				}
 				if cfg.ContainerPrivileged {

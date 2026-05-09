@@ -5,7 +5,7 @@ from microvm import MicroVM
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a sandbox with the Aerol.ai MicroVM Python SDK")
-    parser.add_argument("--api-url", required=False, default="http://127.0.0.1:8080")
+    parser.add_argument("--api-url", required=False, default="http://127.0.0.1:21212")
     parser.add_argument("--pat-token", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--cpu", type=float, default=1.0)

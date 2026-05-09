@@ -58,7 +58,7 @@ print(sandbox.lifecycle)
 ## Example
 
 ```bash
-python examples/create_sandbox.py --api-url http://127.0.0.1:8080 --pat-token test --image ghcr.io/aerol-ai/ubuntu:22.04
+python examples/create_sandbox.py --api-url http://127.0.0.1:21212 --pat-token test --image ghcr.io/aerol-ai/ubuntu:22.04
 ```
 
 ## Streaming exec

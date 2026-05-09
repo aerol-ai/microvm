@@ -40,7 +40,7 @@ import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 
 public class MicroVMClient {
-    static final String DEFAULT_API_URL = "http://127.0.0.1:8080";
+    static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
     static final String AUTH_REQUIRED_ERROR_MESSAGE = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
     private static final int STREAM_PREFIX_STDOUT = 0x01;
     private static final int STREAM_PREFIX_STDERR = 0x02;

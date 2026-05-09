@@ -57,7 +57,7 @@ This script uses `runtime: "docker"`. The probe is still isolated by container b
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
 
-const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 
 if (!patToken) {
@@ -151,7 +151,7 @@ This script runs the same probe with `runtime: "gvisor"`. The goal is not that e
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
 
-const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 
 if (!patToken) {
