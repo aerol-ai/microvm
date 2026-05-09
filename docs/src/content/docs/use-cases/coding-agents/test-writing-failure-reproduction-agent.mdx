@@ -3,7 +3,7 @@ title: Write Test Cases Agent
 description: Clone a GitHub repository, run Claude Code inside an AerolVM sandbox, generate 500 test cases, validate that at least 90% of the target was actually written, and optionally open a pull request.
 ---
 
-This workflow takes a GitHub repository URL, a GitHub token, and an Anthropic key. It clones the repository inside an AerolVM sandbox, installs Claude Code plus repository-appropriate tooling, uploads a strict prompt with validation rules, asks Claude to write 500 real test cases, verifies how many test cases were actually added, runs the repository validation command, and optionally opens a pull request with the generated tests.
+This workflow takes a GitHub repository URL, a GitHub token, and an Anthropic key and writes 500 test cases. It asks Claude to write 500 real test cases, verifies how many test cases were actually added, runs the repository validation command, and optionally opens a pull request with the generated tests.
 
 ## Copy-paste TypeScript script
 
