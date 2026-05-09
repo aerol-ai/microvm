@@ -62,7 +62,6 @@ async function main() {
     cpu: 1,
     memoryMB: 2048,
     diskGB: 12,
-    containerCommand: ["sh", "-lc", "while true; do sleep 3600; done"],
     lifecycle: {
       stopIfIdleFor: 20 * 60 * 1_000_000_000,
       destroyIfIdleFor: 6 * 60 * 60 * 1_000_000_000,
