@@ -188,8 +188,14 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           {
             type: 'link',
             href: '/use-cases/coding-agents/claude-code-repository-architecture-agent',
-            label: 'Generate architecture diagram of repository',
+            label: 'Generate architecture diagram',
             description: 'Clone a real repository, run Claude headlessly, and generate arch.md.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/large-scale-refactor-migration-agent',
+            label: 'Zero-shot code execution agent',
+            description: 'Take a repository URL plus a code-change prompt, run Claude inside the repo, and raise a PR automatically.',
           },
           {
             type: 'link',
@@ -209,12 +215,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
             label: 'Security vulnerability and Fix agent',
             description: 'Scan CVEs across repository types, apply safe fixes with Claude, and raise a PR automatically.',
           },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/large-scale-refactor-migration-agent',
-            label: 'Large-scale refactor or migration agent',
-            description: 'Run long codemods and staged migrations with streamed progress.',
-          },
+          
         ],
       },
       {
