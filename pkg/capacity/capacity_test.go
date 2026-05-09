@@ -103,6 +103,64 @@ func TestAdmitMemoryReservationRatio(t *testing.T) {
 	}
 }
 
+// TestAdmitCPUOverProvisionFactor verifies the factor multiplies the budget.
+// 4 cores × 1.0 ratio × 10× factor = 40 CPU budget — twenty 2-CPU sandboxes
+// must fit, the twenty-first overflows.
+func TestAdmitCPUOverProvisionFactor(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 1_000_000}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		CPUOverProvisionFactor: 10.0,
+	}, nil)
+
+	for i := range 20 {
+		id := fmt.Sprintf("s-%d", i)
+		if err := a.Admit(id, Request{CPU: 2, MemoryMB: 1}); err != nil {
+			t.Fatalf("admit %s: %v", id, err)
+		}
+	}
+	if err := a.Admit("overflow", Request{CPU: 0.1, MemoryMB: 1}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected overcommit ceiling, got %v", err)
+	}
+	snap := a.Snapshot()
+	if snap.CPUBudget != 40 {
+		t.Fatalf("CPUBudget = %v, want 40", snap.CPUBudget)
+	}
+	if snap.CPUOverProvisionFactor != 10.0 {
+		t.Fatalf("CPUOverProvisionFactor = %v, want 10", snap.CPUOverProvisionFactor)
+	}
+}
+
+// TestAdmitMemoryOverProvisionFactor mirrors the CPU test for memory.
+func TestAdmitMemoryOverProvisionFactor(t *testing.T) {
+	a := New(HostInfo{CPUCores: 1000, MemoryTotalMB: 1000}, Limits{
+		CPUReservationRatio:       1.0,
+		MemoryReservationRatio:    1.0,
+		MemoryOverProvisionFactor: 10.0,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 9000})
+	mustAdmit(t, a, "b", Request{CPU: 1, MemoryMB: 1000})
+	if err := a.Admit("c", Request{CPU: 1, MemoryMB: 1}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected overcommit ceiling, got %v", err)
+	}
+}
+
+// TestOverProvisionFactorClampedToOne checks the zero/sub-1 clamp so existing
+// callers (and tests) that don't set the factor keep prior behaviour.
+func TestOverProvisionFactorClampedToOne(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 1000}, Limits{
+		CPUReservationRatio:       1.0,
+		MemoryReservationRatio:    1.0,
+		CPUOverProvisionFactor:    0,   // unset
+		MemoryOverProvisionFactor: 0.5, // sub-1, must clamp up
+	}, nil)
+	snap := a.Snapshot()
+	if snap.CPUBudget != 4 || snap.MemoryBudgetMB != 1000 {
+		t.Fatalf("clamp failed: %+v", snap)
+	}
+}
+
 func TestAdmitMemoryFloorBlocks(t *testing.T) {
 	// 2000 MB floor on a 16384 MB host = 0.122 ratio.
 	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{

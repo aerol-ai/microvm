@@ -89,9 +89,11 @@ func main() {
 		host.MemoryTotalMB = cfg.HostMemoryMBOverride
 	}
 	admitter := capacity.New(host, capacity.Limits{
-		CPUReservationRatio:    cfg.CPUReservationRatio,
-		MemoryReservationRatio: cfg.MemoryReservationRatio,
-		MemoryFloorRatio:       cfg.MemoryFloorRatio,
+		CPUReservationRatio:       cfg.CPUReservationRatio,
+		MemoryReservationRatio:    cfg.MemoryReservationRatio,
+		MemoryFloorRatio:          cfg.MemoryFloorRatio,
+		CPUOverProvisionFactor:    cfg.CPUOverProvisionFactor,
+		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
 	}, capacity.NewProcMeminfoProbe())
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
@@ -99,6 +101,8 @@ func main() {
 		"cpu_reservation_ratio", cfg.CPUReservationRatio,
 		"memory_reservation_ratio", cfg.MemoryReservationRatio,
 		"memory_floor_ratio", cfg.MemoryFloorRatio,
+		"cpu_overprovision_factor", cfg.CPUOverProvisionFactor,
+		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
 	)
 
 	// dockerClient is passed twice: as the runtime.Runtime driver (the
