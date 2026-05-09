@@ -64,6 +64,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/gpu-sandboxes',
+        label: 'GPU Sandboxes',
+        description: 'Attach NVIDIA, AMD, or Apple Silicon GPUs to a sandbox.',
+      },
+      {
+        type: 'link',
         href: '/environment',
         label: 'Environment',
         description: 'Docker image, env vars, resource limits, and idle lifecycle.',

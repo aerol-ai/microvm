@@ -1,0 +1,301 @@
+---
+title: GPU Sandboxes
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+GPU sandboxes give each container direct, dedicated access to host GPU hardware. Unlike most competing platforms (E2B, Daytona), AerolVM passes the full GPU through to the container - no shared tenancy, no synthetic limits.
+
+GPU access requires `runtime: "docker"` (the default). It is **not compatible with gVisor** - the API returns an error if both `gpus` and `runtime: "gvisor"` are set in the same request.
+
+See [Server Setup](/getting-started#gpu-support) for host installation (`--with-nvidia-gpu` / `--with-amd-gpu` installer flags).
+
+## Vendors
+
+| Vendor | Host requirement |
+|---|---|
+| `nvidia` | `nvidia-container-toolkit` installed + NVIDIA drivers present. Install with `--with-nvidia-gpu`. |
+| `amd` | AMD ROCm installed + `amdgpu` kernel module loaded. Install with `--with-amd-gpu`. x86_64 only. |
+| `apple` | Docker Desktop on macOS. No setup needed - Metal GPU support is built into Docker Desktop. |
+
+## NVIDIA
+
+Allocate one GPU:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'nvidia/cuda:12.2.0-base-ubuntu22.04',
+      gpus: { vendor: 'nvidia', count: 1 },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'nvidia/cuda:12.2.0-base-ubuntu22.04',
+        'gpus': {'vendor': 'nvidia', 'count': 1},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "nvidia/cuda:12.2.0-base-ubuntu22.04",
+        GPUs: &sdktypes.GPURequest{
+            Vendor: sdktypes.GPUVendorNVIDIA,
+            Count:  1,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".to_string(),
+        gpus: Some(GPUOptions {
+            vendor: GPUVendor::Nvidia,
+            count: Some(1),
+            device_ids: None,
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("nvidia/cuda:12.2.0-base-ubuntu22.04")
+            .setGpus(new GpuOptions().setVendor("nvidia").setCount(1))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Request all GPUs on the host (`count: -1`):
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'nvidia/cuda:12.2.0-base-ubuntu22.04',
+      gpus: { vendor: 'nvidia', count: -1 },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'nvidia/cuda:12.2.0-base-ubuntu22.04',
+        'gpus': {'vendor': 'nvidia', 'count': -1},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "nvidia/cuda:12.2.0-base-ubuntu22.04",
+        GPUs: &sdktypes.GPURequest{
+            Vendor: sdktypes.GPUVendorNVIDIA,
+            Count:  -1,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".to_string(),
+        gpus: Some(GPUOptions {
+            vendor: GPUVendor::Nvidia,
+            count: Some(-1),
+            device_ids: None,
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("nvidia/cuda:12.2.0-base-ubuntu22.04")
+            .setGpus(new GpuOptions().setVendor("nvidia").setCount(-1))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Pin specific GPUs by device index or UUID:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'nvidia/cuda:12.2.0-base-ubuntu22.04',
+      gpus: {
+        vendor: 'nvidia',
+        count: 2,
+        deviceIDs: ['GPU-abc123', 'GPU-def456'],
+      },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'nvidia/cuda:12.2.0-base-ubuntu22.04',
+        'gpus': {
+            'vendor': 'nvidia',
+            'count': 2,
+            'deviceIDs': ['GPU-abc123', 'GPU-def456'],
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "nvidia/cuda:12.2.0-base-ubuntu22.04",
+        GPUs: &sdktypes.GPURequest{
+            Vendor:    sdktypes.GPUVendorNVIDIA,
+            Count:     2,
+            DeviceIDs: []string{"GPU-abc123", "GPU-def456"},
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".to_string(),
+        gpus: Some(GPUOptions {
+            vendor: GPUVendor::Nvidia,
+            count: Some(2),
+            device_ids: Some(vec!["GPU-abc123".to_string(), "GPU-def456".to_string()]),
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("nvidia/cuda:12.2.0-base-ubuntu22.04")
+            .setGpus(new GpuOptions()
+                .setVendor("nvidia")
+                .setCount(2)
+                .setDeviceIds(List.of("GPU-abc123", "GPU-def456")))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## AMD
+
+All AMD GPUs on the host are exposed via `/dev/kfd` (compute) and `/dev/dri` (render nodes). The `count` and `deviceIDs` fields are ignored for AMD.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'rocm/rocm-terminal',
+      gpus: { vendor: 'amd' },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'rocm/rocm-terminal',
+        'gpus': {'vendor': 'amd'},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "rocm/rocm-terminal",
+        GPUs: &sdktypes.GPURequest{Vendor: sdktypes.GPUVendorAMD},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "rocm/rocm-terminal".to_string(),
+        gpus: Some(GPUOptions {
+            vendor: GPUVendor::Amd,
+            count: None,
+            device_ids: None,
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("rocm/rocm-terminal")
+            .setGpus(new GpuOptions().setVendor("amd"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Apple Silicon
+
+Requires Docker Desktop on macOS. Metal GPU support is built into Docker Desktop - no additional host setup.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      gpus: { vendor: 'apple' },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'gpus': {'vendor': 'apple'},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        GPUs: &sdktypes.GPURequest{Vendor: sdktypes.GPUVendorApple},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        gpus: Some(GPUOptions {
+            vendor: GPUVendor::Apple,
+            count: None,
+            device_ids: None,
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setGpus(new GpuOptions().setVendor("apple"))
+    );
+    ```
+  </TabItem>
+</Tabs>
