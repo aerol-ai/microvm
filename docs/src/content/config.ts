@@ -205,9 +205,9 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
-            href: '/use-cases/coding-agents/dependency-upgrade-compatibility-agent',
-            label: 'Dependency upgrade and compatibility agent',
-            description: 'Upgrade dependencies, run the matrix, and export the results.',
+            href: '/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent',
+            label: 'Security vulnerability and Fix agent',
+            description: 'Scan CVEs across repository types, apply safe fixes with Claude, and raise a PR automatically.',
           },
           {
             type: 'link',
