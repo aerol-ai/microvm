@@ -39,6 +39,36 @@ export interface Lifecycle {
 
 export type UpdateLifecycleOptions = Lifecycle;
 
+export type GPUVendor = "nvidia" | "amd" | "apple";
+
+export interface GPUOptions {
+  /**
+   * GPU hardware vendor. Required when gpus is set.
+   * - "nvidia": NVIDIA GPUs via nvidia-container-runtime. Requires
+   *   nvidia-container-toolkit on the host.
+   * - "amd": AMD GPUs via ROCm (/dev/kfd + /dev/dri). Requires ROCm
+   *   drivers on the host.
+   * - "apple": Apple Silicon GPU via Docker Desktop's experimental Metal
+   *   support. Only functional on macOS with Docker Desktop.
+   *
+   * GPU access is not supported with runtime="gvisor" — the API returns
+   * an error if both gpus and runtime="gvisor" are set.
+   */
+  vendor: GPUVendor;
+  /**
+   * Number of GPUs to allocate. Use -1 to request all GPUs on the host.
+   * Defaults to 1 when omitted. Ignored for AMD (all AMD GPUs are exposed
+   * via /dev/kfd and /dev/dri).
+   */
+  count?: number;
+  /**
+   * Pin the sandbox to specific GPU device indices or UUIDs.
+   * For NVIDIA: indices ("0", "1") or UUIDs ("GPU-abc123...").
+   * For AMD and Apple: ignored.
+   */
+  deviceIDs?: string[];
+}
+
 export interface CreateOptions {
   image: string;
   /** Number of CPU cores to allocate. Fractional values are supported (e.g. 0.5 = half a core). */
@@ -59,8 +89,15 @@ export interface CreateOptions {
    * privileged containers and ignores per-sandbox disk quotas. `"kata"` is
    * reserved for future Kata Containers support and is rejected by the API
    * today.
+   *
+   * GPU access is not supported with `"gvisor"`.
    */
   runtime?: "docker" | "gvisor" | "kata";
+  /**
+   * Attach GPU resources to the sandbox. Omit for CPU-only workloads.
+   * Not compatible with runtime="gvisor".
+   */
+  gpus?: GPUOptions;
 }
 
 export interface ResizeOptions {
@@ -135,6 +172,8 @@ export interface Sandbox {
    * a pre-migration row that resolves to the host default at start time.
    */
   runtime: "" | "docker" | "gvisor" | "kata";
+  /** GPU configuration this sandbox was created with. Absent means no GPU. */
+  gpus?: GPUOptions;
 }
 
 export interface ExecRequest {

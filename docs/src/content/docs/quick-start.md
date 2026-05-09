@@ -45,6 +45,7 @@ Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the
 | **Persistent stop/start** | ✅ | ✗ | ✅ |
 | **Sandbox Lifecycle** | Infinite | 1 day | Infinite |
 | **External storage** | S3, NFS, SSHFS, rclone | ✗ | ✗ |
+| **GPU Support** | ✅ | ✗ | ✗ |
 | **SSH access** | ✅ | ✗ | ✅ |
 | **Per-sandbox egress control** | ✅ | ✗ | ✗ |
 | **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python |

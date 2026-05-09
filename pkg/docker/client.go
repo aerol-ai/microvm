@@ -140,6 +140,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if effectiveRuntime == models.RuntimeGvisor && c.privileged {
 		return nil, fmt.Errorf("runtime %q is incompatible with privileged containers", effectiveRuntime)
 	}
+	// gVisor's user-space kernel cannot pass through host GPU drivers. Fail
+	// before any image pull so the error is immediate and actionable.
+	if req.GPUs != nil && effectiveRuntime == models.RuntimeGvisor {
+		return nil, fmt.Errorf(
+			"GPU access is not supported with the %q runtime: gVisor's user-space kernel "+
+				"cannot safely pass through host GPU drivers; use the %q runtime for GPU workloads",
+			models.RuntimeGvisor, models.RuntimeDocker,
+		)
+	}
 	// Translate user-facing name to the OCI runtime binary Docker actually
 	// looks up in /etc/docker/daemon.json. ResolveOCIRuntime returns "" for
 	// "docker" (let Docker use its compiled-in default) and "runsc" for
@@ -203,6 +212,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		binds = append(binds, entry)
 	}
+	// AMD ROCm exposes render nodes as a directory (/dev/dri). Bind-mount it
+	// before hostConfig captures the slice; /dev/kfd is added via Devices later.
+	if req.GPUs != nil && req.GPUs.Vendor == models.GPUVendorAMD {
+		binds = append(binds, "/dev/dri:/dev/dri")
+	}
 
 	hostConfig := map[string]any{
 		"Privileged": c.privileged,
@@ -247,6 +261,46 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		hostConfig["Resources"] = resources
 	}
+
+	if req.GPUs != nil {
+		count := req.GPUs.Count
+		if count == 0 {
+			count = 1
+		}
+		switch req.GPUs.Vendor {
+		case models.GPUVendorNVIDIA:
+			// Standard Docker GPU interface for NVIDIA. Requires
+			// nvidia-container-toolkit on the host.
+			hostConfig["DeviceRequests"] = []map[string]any{{
+				"Driver":       "nvidia",
+				"Count":        count,
+				"DeviceIDs":    req.GPUs.DeviceIDs,
+				"Capabilities": [][]string{{"gpu"}},
+				"Options":      map[string]string{},
+			}}
+		case models.GPUVendorAMD:
+			// AMD ROCm: /dev/kfd is the compute driver added as a cgroup device
+			// so Docker sets the correct cgroup permissions. /dev/dri (render
+			// nodes) is already in Binds above. Non-privileged containers also
+			// need the container user in the "video" and "render" groups.
+			hostConfig["Devices"] = []map[string]any{{
+				"PathOnHost":        "/dev/kfd",
+				"PathInContainer":   "/dev/kfd",
+				"CgroupPermissions": "mrw",
+			}}
+		case models.GPUVendorApple:
+			// Apple Metal GPU via Docker Desktop's experimental Metal support.
+			// Only functional on macOS with Docker Desktop; a Linux Docker host
+			// will receive a daemon error at container creation time.
+			hostConfig["DeviceRequests"] = []map[string]any{{
+				"Driver":       "apple",
+				"Count":        count,
+				"Capabilities": [][]string{{"gpu"}},
+				"Options":      map[string]string{},
+			}}
+		}
+	}
+
 	createRequest["HostConfig"] = hostConfig
 
 	var created struct {

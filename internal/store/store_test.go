@@ -600,7 +600,7 @@ func TestStoreHelperCases(t *testing.T) {
 		row := sqlRowStub{values: []any{
 			"sb-bad", "image", models.SandboxStatusStarted, "https://example.com", "container", "10.0.0.1",
 			float64(1), 1024, 10, "root", "{bad json", 0, 1, "", "", "", "[]", time.Now(), time.Now(), time.Now(),
-			int64(0), int64(0), int64(0), int64(0), "",
+			int64(0), int64(0), int64(0), int64(0), "", "",
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

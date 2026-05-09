@@ -37,6 +37,8 @@ public class SandboxData {
     public List<String> containerCommand;
     public Lifecycle lifecycle = new Lifecycle();
     public String runtime = "";
+    /** GPU configuration this sandbox was created with. Null means no GPU. */
+    public GpuOptions gpus;
 
     public SandboxData copy() {
         SandboxData copy = new SandboxData();
@@ -71,5 +73,6 @@ public class SandboxData {
         containerCommand = other.containerCommand == null ? null : new ArrayList<>(other.containerCommand);
         lifecycle = other.lifecycle == null ? new Lifecycle() : other.lifecycle.copy();
         runtime = other.runtime == null ? "" : other.runtime;
+        gpus = other.gpus == null ? null : other.gpus.copy();
     }
 }

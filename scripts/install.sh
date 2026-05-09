@@ -18,6 +18,8 @@ DNS_API_TOKEN=""
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
 WITH_GVISOR="false"
 RUNSC_PATH=""
+WITH_NVIDIA_GPU="false"
+WITH_AMD_GPU="false"
 
 usage() {
 	cat <<'EOF'
@@ -56,6 +58,19 @@ Options:
                                Skips the download step and registers this
                                binary instead. Only consulted with
                                --with-gvisor.
+  --with-nvidia-gpu            Install nvidia-container-toolkit and register
+                               the nvidia OCI runtime in daemon.json. Requires
+                               NVIDIA drivers already installed on the host
+                               (nvidia-smi must be present). Downloads the
+                               toolkit from the official NVIDIA package repo
+                               and runs nvidia-ctk to configure Docker.
+                               Restarts Docker on completion.
+  --with-amd-gpu               Install AMD ROCm from the official AMD package
+                               repository so containers can access AMD GPUs via
+                               /dev/kfd and /dev/dri. Only supported on x86_64.
+                               Requires the amdgpu kernel module loaded on the
+                               host (the GPU must already be recognized by the
+                               OS — /dev/kfd must exist).
   --help                       Show this help
 
 Examples:
@@ -207,6 +222,14 @@ while [[ $# -gt 0 ]]; do
 		--runsc-path)
 			RUNSC_PATH="$2"
 			shift 2
+			;;
+		--with-nvidia-gpu)
+			WITH_NVIDIA_GPU="true"
+			shift
+			;;
+		--with-amd-gpu)
+			WITH_AMD_GPU="true"
+			shift
 			;;
 		--help)
 			usage
@@ -643,6 +666,106 @@ WantedBy=timers.target
 EOF
 }
 
+install_nvidia_gpu() {
+	# Install nvidia-container-toolkit from the official NVIDIA repo and wire it
+	# into Docker via nvidia-ctk. The host NVIDIA driver (and nvidia-smi) must
+	# already be present — the toolkit only provides the container integration
+	# layer on top of the driver. We warn but continue when nvidia-smi is absent
+	# so pre-staging the toolkit before driver installation is also possible.
+	if ! command -v nvidia-smi >/dev/null 2>&1; then
+		echo "Warning: nvidia-smi not found — NVIDIA drivers may not be installed." >&2
+		echo "  Install the NVIDIA drivers first (https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)," >&2
+		echo "  then re-run with --with-nvidia-gpu, or continue if drivers will be installed separately." >&2
+	fi
+
+	case "$(uname -m)" in
+		x86_64|amd64|aarch64|arm64) ;;
+		*)
+			echo "--with-nvidia-gpu: unsupported architecture $(uname -m)" >&2
+			exit 1
+			;;
+	esac
+
+	local keyring="/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+	if [[ ! -f "$keyring" ]]; then
+		curl -fsSL "https://nvidia.github.io/libnvidia-container/gpgkey" \
+			| gpg --dearmor -o "$keyring"
+	fi
+
+	# nvidia-container-toolkit.list uses plain https:// refs; rewrite to
+	# include the signed-by pointer so apt can verify the packages.
+	if [[ ! -f /etc/apt/sources.list.d/nvidia-container-toolkit.list ]]; then
+		curl -fsSL "https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list" \
+			| sed "s#deb https://#deb [signed-by=${keyring}] https://#g" \
+			> /etc/apt/sources.list.d/nvidia-container-toolkit.list
+		apt-get update
+	fi
+
+	apt-get install -y nvidia-container-toolkit
+
+	# nvidia-ctk handles the daemon.json merge and sets the default runtime
+	# field so docker run --gpus just works out of the box.
+	nvidia-ctk runtime configure --runtime=docker
+
+	systemctl restart docker
+	echo "NVIDIA container toolkit installed. Docker restarted."
+	echo "Verify GPU access inside a container: docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi"
+}
+
+install_amd_gpu() {
+	# Install AMD ROCm so containers can access AMD GPUs via /dev/kfd
+	# (compute) and /dev/dri (render nodes). No Docker daemon.json changes
+	# are needed — sandboxd uses device bind-mounts for AMD, not a custom OCI
+	# runtime. Only x86_64 is supported by the ROCm stack.
+	case "$(uname -m)" in
+		x86_64|amd64) ;;
+		*)
+			echo "--with-amd-gpu: ROCm only supports x86_64; $(uname -m) is not supported" >&2
+			exit 1
+			;;
+	esac
+
+	if [[ ! -e /dev/kfd ]]; then
+		echo "Warning: /dev/kfd not found — amdgpu kernel module may not be loaded." >&2
+		echo "  Make sure the GPU is present and 'modprobe amdgpu' has run (or the" >&2
+		echo "  driver is loaded automatically via /etc/modules-load.d/)." >&2
+		echo "  Continuing; /dev/kfd will appear after the driver loads." >&2
+	fi
+
+	local dist_codename
+	dist_codename="$(lsb_release -cs 2>/dev/null || echo "jammy")"
+
+	# Try the amdgpu-install convenience package first — it's the approach AMD
+	# documents and handles kernel module + ROCm library installation together.
+	local tmp_deb
+	tmp_deb="$(mktemp --suffix=.deb)"
+	if curl -fsSL \
+		"https://repo.radeon.com/amdgpu-install/latest/ubuntu/${dist_codename}/amdgpu-install_latest_all.deb" \
+		-o "$tmp_deb" 2>/dev/null; then
+		apt-get install -y "$tmp_deb"
+		rm -f "$tmp_deb"
+		# --usecase=rocm installs the ROCm compute stack.
+		# --no-dkms skips recompiling kernel modules (existing amdgpu driver is enough).
+		amdgpu-install -y --usecase=rocm --no-dkms
+	else
+		rm -f "$tmp_deb"
+		echo "amdgpu-install package unavailable for '${dist_codename}'; falling back to direct ROCm apt repo" >&2
+		local keyring="/usr/share/keyrings/rocm-archive-keyring.gpg"
+		curl -fsSL "https://repo.radeon.com/rocm/rocm.gpg.key" | gpg --dearmor -o "$keyring"
+		echo "deb [arch=amd64 signed-by=${keyring}] https://repo.radeon.com/rocm/apt/latest ${dist_codename} main" \
+			> /etc/apt/sources.list.d/rocm.list
+		apt-get update
+		apt-get install -y rocm-hip-sdk || apt-get install -y rocm
+	fi
+
+	# Ensure the render group exists and add current user if running interactively.
+	groupadd -f render
+	groupadd -f video
+	echo "AMD ROCm installed."
+	echo "Note: container users need 'video' and 'render' group membership to access GPU devices."
+	echo "Verify with: rocm-smi"
+}
+
 install_runsc_binary() {
 	# Download the latest runsc release from gVisor's official storage bucket
 	# and install it to /usr/local/bin. The bucket layout is:
@@ -757,6 +880,12 @@ PY
 install_packages
 if [[ "$WITH_GVISOR" == "true" ]]; then
 	register_gvisor_runtime
+fi
+if [[ "$WITH_NVIDIA_GPU" == "true" ]]; then
+	install_nvidia_gpu
+fi
+if [[ "$WITH_AMD_GPU" == "true" ]]; then
+	install_amd_gpu
 fi
 if [[ -n "$DNS_PROVIDER" ]]; then
 	install_caddy_dns_plugin "$DNS_PROVIDER"

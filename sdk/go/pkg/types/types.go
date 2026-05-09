@@ -37,3 +37,12 @@ const (
 	RuntimeGvisor = models.RuntimeGvisor
 	RuntimeKata   = models.RuntimeKata
 )
+
+type GPURequest = models.GPURequest
+type GPUVendor = models.GPUVendor
+
+const (
+	GPUVendorNVIDIA = models.GPUVendorNVIDIA
+	GPUVendorAMD    = models.GPUVendorAMD
+	GPUVendorApple  = models.GPUVendorApple
+)

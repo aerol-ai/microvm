@@ -110,6 +110,45 @@ export SB_CONTAINER_RUNTIME=gvisor
 - Incompatible with `--privileged` containers.
 - `disk_gb` quota is silently ignored (CPU and memory caps still apply).
 - Requires cgroupv2 + systemd on the host.
+- **GPU access is not supported** - gVisor's user-space kernel cannot pass through host GPU drivers. Use the `docker` runtime for GPU workloads.
+
+## GPU Support
+
+AerolVM supports GPU-accelerated sandboxes for NVIDIA, AMD, and Apple Silicon hardware. Most competing sandbox platforms (E2B, Daytona) do not offer GPU passthrough - you get dedicated GPU access per sandbox with no shared-tenancy limitations.
+
+| Vendor | Installer flag | Notes |
+|---|---|---|
+| NVIDIA | `--with-nvidia-gpu` | Installs `nvidia-container-toolkit` and registers the `nvidia` OCI runtime in Docker. NVIDIA drivers must already be present on the host (`nvidia-smi` must work). |
+| AMD | `--with-amd-gpu` | Installs AMD ROCm and exposes `/dev/kfd` and `/dev/dri` to containers. x86_64 only. The `amdgpu` kernel module must be loaded. |
+| Apple Silicon | No flag needed | The installer is Linux-only, so there is nothing to install. Apple GPU access works automatically through Docker Desktop on macOS - Docker Desktop ships with built-in Metal GPU support. Just pass `vendor: "apple"` in the create request. |
+
+**GPU is not compatible with the gVisor runtime.** If you set `gpus` and `runtime: "gvisor"` in the same request, the API returns an error immediately.
+
+### Install with GPU support
+
+**NVIDIA:**
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat \
+    --with-nvidia-gpu
+```
+
+**AMD:**
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat \
+    --with-amd-gpu
+```
+
+Both flags can be combined with `--with-gvisor` if needed (gVisor and GPU run under separate containers, so they don't conflict at the host level - you just can't use both in the same sandbox).
+
+### Create a GPU sandbox
+
+See [GPU Sandboxes](/gpu-sandboxes) for code examples in all SDK languages.
+
+---
 
 ## Local Development
 

@@ -64,6 +64,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/gpu-sandboxes',
+        label: 'GPU Sandboxes',
+        description: 'Attach NVIDIA, AMD, or Apple Silicon GPUs to a sandbox.',
+      },
+      {
+        type: 'link',
         href: '/environment',
         label: 'Environment',
         description: 'Docker image, env vars, resource limits, and idle lifecycle.',
@@ -236,7 +242,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/live-preview-urls',
+            href: '/use-cases/customer-facing-product-experiences/spawn-postgres',
             label: 'Deploy your own Supabase',
             description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
           },

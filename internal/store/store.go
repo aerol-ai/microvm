@@ -109,6 +109,9 @@ func Open(path string) (*Store, error) {
 		// always store the resolved value so the choice cannot drift across
 		// host restarts.
 		`ALTER TABLE sandboxes ADD COLUMN runtime TEXT NOT NULL DEFAULT '';`,
+		// GPU configuration as a JSON blob. Empty string means no GPU was
+		// requested. Stored as JSON to avoid schema churn as GPU options grow.
+		`ALTER TABLE sandboxes ADD COLUMN gpus_json TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -149,6 +152,10 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	gpusJSON, err := marshalGPUs(sandbox.GPUs)
+	if err != nil {
+		return err
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
@@ -156,8 +163,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -184,6 +191,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.StopAtAge),
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
+		gpusJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("insert sandbox: %w", err)
@@ -200,6 +208,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	gpusJSON, err := marshalGPUs(sandbox.GPUs)
+	if err != nil {
+		return err
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
@@ -207,8 +219,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -232,7 +244,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			destroy_if_idle_for_ns = excluded.destroy_if_idle_for_ns,
 			stop_at_age_ns = excluded.stop_at_age_ns,
 			destroy_at_age_ns = excluded.destroy_at_age_ns,
-			runtime = excluded.runtime
+			runtime = excluded.runtime,
+			gpus_json = excluded.gpus_json
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -259,6 +272,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.StopAtAge),
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
+		gpusJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert sandbox: %w", err)
@@ -272,7 +286,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime
+			runtime, gpus_json
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -300,7 +314,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime
+			runtime, gpus_json
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -568,6 +582,7 @@ func scanSandbox(scanner interface {
 	var networkBlocked int
 	var toolboxEnabled int
 	var commandJSON string
+	var gpusJSON string
 	var stopIfIdleNs, destroyIfIdleNs, stopAtAgeNs, destroyAtAgeNs int64
 
 	err := scanner.Scan(
@@ -596,6 +611,7 @@ func scanSandbox(scanner interface {
 		&stopAtAgeNs,
 		&destroyAtAgeNs,
 		&sandbox.Runtime,
+		&gpusJSON,
 	)
 	if err != nil {
 		return nil, err
@@ -610,6 +626,13 @@ func scanSandbox(scanner interface {
 		if err := json.Unmarshal([]byte(commandJSON), &sandbox.ContainerCommand); err != nil {
 			return nil, fmt.Errorf("decode container command: %w", err)
 		}
+	}
+	if gpusJSON != "" {
+		var gpu models.GPURequest
+		if err := json.Unmarshal([]byte(gpusJSON), &gpu); err != nil {
+			return nil, fmt.Errorf("decode sandbox gpus: %w", err)
+		}
+		sandbox.GPUs = &gpu
 	}
 
 	sandbox.NetworkBlockAll = networkBlocked == 1
@@ -631,6 +654,19 @@ func marshalJSON(value any, fallback string) (string, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return "", fmt.Errorf("marshal json: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// marshalGPUs serializes a GPURequest pointer. Nil (no GPU) returns an empty
+// string, which the column default also holds for pre-GPU rows.
+func marshalGPUs(g *models.GPURequest) (string, error) {
+	if g == nil {
+		return "", nil
+	}
+	encoded, err := json.Marshal(g)
+	if err != nil {
+		return "", fmt.Errorf("marshal gpus: %w", err)
 	}
 	return string(encoded), nil
 }
