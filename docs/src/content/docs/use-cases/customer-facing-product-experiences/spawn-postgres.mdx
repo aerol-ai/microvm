@@ -3,8 +3,6 @@ title: Deploy Your Own Postgres
 description: Run a dedicated Postgres instance inside an AerolVM sandbox, keep credentials in env vars, and publish an HTTP admin endpoint on a public URL.
 ---
 
-## What you are building
-
 This workflow boots a dedicated Postgres instance inside an AerolVM sandbox, initializes it from environment variables, and keeps the database alive in a long-running session. It also starts a tiny HTTP admin endpoint that checks the database and can be exposed on a public URL.
 
 This is the Postgres foundation, not the full Supabase control plane. If you want a Supabase-style stack, add PostgREST, GoTrue, storage, realtime, and pooling on top of this database runtime.

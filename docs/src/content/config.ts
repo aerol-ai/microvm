@@ -236,7 +236,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/live-preview-urls',
+            href: '/use-cases/customer-facing-product-experiences/spawn-postgres',
             label: 'Deploy your own Supabase',
             description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
           },
