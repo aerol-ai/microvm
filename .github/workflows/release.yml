@@ -124,14 +124,14 @@ jobs:
             goarm: ""
 
           # macOS — toolboxd only
-          - name: MacOS x86_64
-            runner: macos-13
-            goos: darwin
-            goarch: amd64
-            suffix: darwin_amd64
-            cc: ""
-            apt_pkgs: ""
-            goarm: ""
+          # - name: MacOS x86_64
+          #   runner: macos-13
+          #   goos: darwin
+          #   goarch: amd64
+          #   suffix: darwin_amd64
+          #   cc: ""
+          #   apt_pkgs: ""
+          #   goarm: ""
 
           - name: MacOS aarch64
             runner: macos-14
