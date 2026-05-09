@@ -7,8 +7,6 @@ This workflow takes a GitHub repository URL, a GitHub token, and an Anthropic ke
 
 ## Copy-paste TypeScript script
 
-This script requires `SB_PAT_TOKEN`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, and `GITHUB_REPO_URL`. If `TARGET_TEST_COUNT` is unset, it defaults to `500`. If `MIN_COMPLETION_RATIO` is unset, it defaults to `0.9`. If `POST_PULL_REQUEST` is unset, it defaults to `true`. If `ANTHROPIC_MODEL` is unset, it defaults to `claude-sonnet-4-6`. If `SANDBOX_IMAGE` is unset, it defaults to `node:22-bookworm`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
-
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
