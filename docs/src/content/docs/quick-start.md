@@ -35,16 +35,19 @@ Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the
 | | AerolVM | e2b | Daytona |
 |---|---|---|---|
 | **Hosting** | Self-hosted on your infra | Cloud (managed, no self-host) | Self-hosted |
+| **Set Up Complexity** | Easy | No self-host | Extremely Complex |
 | **Open source** | ✅ | ✗ | ✅ |
 | **Primary use case** | AI agents + ephemeral CI | AI agent code execution | Developer workspaces |
 | **Sandbox startup** | <90ms | ~1s | Seconds (persistent VMs) |
 | **Runtime isolation** | Docker, gVisor (kernel-level) | Docker | Docker |
+| **Security** | gVisor(very secure) | ✗ | ✗ |
 | **Persistent stop/start** | ✅ | ✗ | ✅ |
+| **Sandbox Lifecycle** | Infinite | 1 day | Infinite |
 | **External storage** | S3, NFS, SSHFS, rclone | ✗ | ✗ |
 | **SSH access** | ✅ | ✗ | ✅ |
 | **Per-sandbox egress control** | ✅ | ✗ | ✗ |
 | **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python |
-| **Pricing** | Your infrastructure cost | Per sandbox-hour | Your infrastructure cost |
+| **Pricing** | Your infra cost(20$/Month with 1000+ Sandbox) | Per sandbox-hour(500$+ month) | Your infra cost(100$/Month with 1000+ Sandbox) |
 
 **e2b** is a managed cloud service optimized for AI agent sandboxes. It requires no infrastructure but offers no self-hosting, no kernel-level isolation, and no control over where code runs. AerolVM covers the same AI execution use case while running entirely on your own host, with gVisor isolation for untrusted workloads and no per-sandbox billing.
 
