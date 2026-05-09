@@ -1,0 +1,293 @@
+---
+title: GitHub PR Review And Auto-Fix
+
+description: Run Claude Code headlessly inside an AerolVM sandbox, check out a real GitHub PR from its URL, post a review with gh, and export any safe follow-up fixes.
+---
+
+
+This workflow is the AerolVM version of a real GitHub coding-agent review loop. It works similarly as Github PR review agent or CodeRabbit PR Review agent.
+
+
+## Copy-paste TypeScript script
+
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+const githubToken = process.env.GITHUB_TOKEN;
+const githubPrURL = process.env.GITHUB_PR_URL;
+const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+const reviewValidationCommand = process.env.REVIEW_VALIDATION_COMMAND ?? "";
+const postReviewToGitHub =
+  (process.env.POST_REVIEW_TO_GITHUB ?? "true").toLowerCase() !== "false";
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+if (!anthropicApiKey) {
+  throw new Error("Set ANTHROPIC_API_KEY before running this example.");
+}
+
+if (!githubToken) {
+  throw new Error("Set GITHUB_TOKEN before running this example.");
+}
+
+if (!githubPrURL) {
+  throw new Error("Set GITHUB_PR_URL before running this example.");
+}
+
+const pr = parseGitHubPullRequest(githubPrURL);
+
+const claudeSettings = JSON.stringify(
+  {
+    $schema: "https://json.schemastore.org/claude-code-settings.json",
+    model: anthropicModel,
+  },
+  null,
+  2,
+);
+
+const reviewSystemPrompt = `You are Claude Code running inside an AerolVM sandbox to review a GitHub pull request.
+
+Review standards:
+- Think like a staff-level reviewer.
+- Prioritize correctness, regressions, security, performance, compatibility, and missing tests.
+- Prefer concrete findings over generic praise.
+- Keep any code edits tightly scoped to the current PR.
+- Do not push commits.
+- Write the final GitHub review body to pr-review.md in the repository root.
+- The review must be ready to post with gh pr review --comment --body-file pr-review.md.
+- Use these sections in pr-review.md: Verdict, Summary, Findings, Applied fixes, Validation.
+`;
+
+const validationInstruction =
+  reviewValidationCommand === ""
+    ? "No REVIEW_VALIDATION_COMMAND was provided. Run the narrowest high-signal verification you can infer from the repository."
+    : `After any safe fixes, run this exact validation command: ${reviewValidationCommand}`;
+
+const reviewTask = `Review GitHub PR ${githubPrURL} inside the checked-out repository.
+
+Available context files:
+- .aerolvm-review/pr.json
+- .aerolvm-review/pr.diff
+
+Requirements:
+- Read the changed code and the surrounding implementation, not just the diff.
+- Write the final review to pr-review.md.
+- Findings must use severity labels: high, medium, or low.
+- If the PR is good, say so explicitly and still note residual risks or test gaps.
+- If you find a small, high-confidence, mechanical fix, implement it directly in the checked-out PR branch.
+- Keep fixes minimal and explain them in the Applied fixes section.
+- ${validationInstruction}
+- Modify only files that are necessary for the review and any safe fixes.
+`;
+
+const installToolsCommand = [
+  "apt-get update",
+  "DEBIAN_FRONTEND=noninteractive apt-get install -y git gh curl ca-certificates",
+  "curl -fsSL https://claude.ai/install.sh | bash",
+  'export PATH="$HOME/.local/bin:$PATH"',
+  "claude --version",
+  "gh --version",
+].join(" && ");
+
+const cloneAndCheckoutCommand = [
+  "mkdir -p /workspace/out /workspace/prompts",
+  "gh auth status -h github.com",
+  `gh repo clone ${pr.repoSlug} /workspace/repo -- --filter=blob:none`,
+  `cd /workspace/repo && gh pr checkout ${pr.prNumber}`,
+  "mkdir -p /workspace/repo/.claude /workspace/repo/.aerolvm-review",
+].join(" && ");
+
+const postReviewCommand =
+  `if [ "$POST_REVIEW_TO_GITHUB" = "true" ]; then ` +
+  `gh pr review ${pr.prNumber} --repo ${pr.repoSlug} --comment --body-file /workspace/repo/pr-review.md; ` +
+  `fi`;
+
+const runClaudeReviewCommand = [
+  'export PATH="$HOME/.local/bin:$PATH"',
+  `gh pr view ${pr.prNumber} --repo ${pr.repoSlug} --json number,title,body,author,baseRefName,headRefName,url > /workspace/repo/.aerolvm-review/pr.json`,
+  `gh pr diff ${pr.prNumber} --repo ${pr.repoSlug} > /workspace/repo/.aerolvm-review/pr.diff`,
+  'cd /workspace/repo',
+  'claude --model "$ANTHROPIC_MODEL" --dangerously-skip-permissions --append-system-prompt "$(cat /workspace/prompts/review-system-prompt.txt)" -p "$(cat /workspace/prompts/review-task.txt)"',
+  'test -f /workspace/repo/pr-review.md',
+  'cp /workspace/repo/pr-review.md /workspace/out/pr-review.md',
+  'git -C /workspace/repo diff --binary > /workspace/out/pull-request-auto-fix.patch',
+  postReviewCommand,
+].join(" && ");
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "node:22-bookworm",
+    cpu: 0.5,
+    memoryMB: 2048,
+    diskGB: 16,
+    env: {
+      ANTHROPIC_API_KEY: anthropicApiKey,
+      ANTHROPIC_MODEL: anthropicModel,
+      GITHUB_TOKEN: githubToken,
+      GH_TOKEN: githubToken,
+      POST_REVIEW_TO_GITHUB: String(postReviewToGitHub),
+      REVIEW_VALIDATION_COMMAND: reviewValidationCommand,
+    },
+    lifecycle: {
+      destroyIfIdleFor: 45 * 60 * 1_000_000_000,
+    },
+  });
+
+  try {
+    await sandbox.exec({
+      command: installToolsCommand,
+      timeoutSeconds: 900,
+    });
+
+    await sandbox.exec({
+      command: cloneAndCheckoutCommand,
+      timeoutSeconds: 900,
+    });
+
+    await sandbox.uploadFile(
+      "/workspace/repo/.claude/settings.json",
+      claudeSettings,
+    );
+    await sandbox.uploadFile(
+      "/workspace/prompts/review-system-prompt.txt",
+      reviewSystemPrompt,
+    );
+    await sandbox.uploadFile(
+      "/workspace/prompts/review-task.txt",
+      reviewTask,
+    );
+
+    const session = await sandbox.createSession({
+      name: `claude-pr-review-${pr.prNumber}`,
+      command: runClaudeReviewCommand,
+      workDir: "/workspace/repo",
+      env: {
+        ANTHROPIC_API_KEY: anthropicApiKey,
+        ANTHROPIC_MODEL: anthropicModel,
+        GITHUB_TOKEN: githubToken,
+        GH_TOKEN: githubToken,
+        POST_REVIEW_TO_GITHUB: String(postReviewToGitHub),
+        REVIEW_VALIDATION_COMMAND: reviewValidationCommand,
+      },
+    });
+
+    const review = sandbox.attachSession(session.id, {
+      onStdout: (chunk) => {
+        process.stdout.write(Buffer.from(chunk).toString("utf8"));
+      },
+      onStderr: (chunk) => {
+        process.stderr.write(Buffer.from(chunk).toString("utf8"));
+      },
+      onError: (message) => {
+        process.stderr.write(`${message}\n`);
+      },
+    });
+
+    const exit = await review.done;
+    if (exit.code !== 0) {
+      throw new Error(`review session failed with exit code ${exit.code}`);
+    }
+
+    const decoder = new TextDecoder();
+    const report = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/pr-review.md"),
+    );
+    const patch = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/pull-request-auto-fix.patch"),
+    );
+    const log = decoder.decode(await sandbox.sessionLog(session.id));
+
+    await writeFile("pull-request-review.md", report);
+    await writeFile("pull-request-auto-fix.patch", patch);
+    await writeFile("pull-request-review.log", log);
+
+    console.log("\n===== pr-review.md =====\n");
+    console.log(report);
+
+    console.log(
+      JSON.stringify(
+        {
+          sandboxID: sandbox.id,
+          prURL: githubPrURL,
+          repo: pr.repoSlug,
+          prNumber: pr.prNumber,
+          postedReviewToGitHub: postReviewToGitHub,
+          reportFile: "pull-request-review.md",
+          patchFile: "pull-request-auto-fix.patch",
+          logFile: "pull-request-review.log",
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+function parseGitHubPullRequest(prURL: string) {
+  const url = new URL(prURL);
+  if (url.hostname !== "github.com" && url.hostname !== "www.github.com") {
+    throw new Error(`Unsupported GitHub host: ${url.hostname}`);
+  }
+
+  const parts = url.pathname.replace(/^\/+|\/+$/g, "").split("/");
+  if (parts.length < 4 || parts[2] !== "pull") {
+    throw new Error(`Invalid GitHub PR URL: ${prURL}`);
+  }
+
+  const owner = parts[0];
+  const repo = parts[1];
+  const prNumber = Number(parts[3]);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error(`Invalid GitHub PR number in URL: ${prURL}`);
+  }
+
+  return {
+    owner,
+    repo,
+    repoSlug: `${owner}/${repo}`,
+    prNumber,
+  };
+}
+```
+
+## Deliverables
+
+- `pull-request-review.md` with the exact review body that Claude wrote and GitHub received.
+- `pull-request-auto-fix.patch` with any narrow, safe edits Claude made while reviewing.
+- `pull-request-review.log` with the full streamed Claude Code session.
+
+## What gets posted back to GitHub
+
+- The workflow posts `pr-review.md` with `gh pr review --comment --body-file` when `POST_REVIEW_TO_GITHUB` is `true`.
+- The checked-out PR branch is modified only when Claude finds a small, high-confidence fix that is worth applying.
+- No commit or push happens automatically; the patch is exported for a human to inspect first.
+
+## AerolVM primitives used
+
+- `create`
+- `exec`
+- `createSession`, `attachSession`, and `sessionLog`
+- `uploadFile` and `downloadFile`
+- lifecycle policies on sandbox creation
+
+## Related docs
+
+- [Sessions](/sessions/)
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)
+- [Environment](/environment/)

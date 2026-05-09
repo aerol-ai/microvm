@@ -1,0 +1,205 @@
+---
+title: Generate Architecture Diagram of Repository
+description: Run Claude Code headlessly inside an AerolVM sandbox, clone a GitHub repository, and generate arch.md as a reusable architecture artifact.
+---
+
+This workflow spins up a low-cost sandbox, installs Claude Code and GitHub CLI, clones a real repository with a GitHub token, and asks Claude to create `arch.md` with a Mermaid architecture diagram plus a short explanation. It is a strong fit for engineering due diligence, onboarding, solution-architecture reviews, and repo handoff automation.
+
+
+## Copy-paste TypeScript script
+
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+const githubToken = process.env.GITHUB_TOKEN;
+const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+if (!anthropicApiKey) {
+  throw new Error("Set ANTHROPIC_API_KEY before running this example.");
+}
+
+if (!githubToken) {
+  throw new Error("Set GITHUB_TOKEN before running this example.");
+}
+
+const repoSlug = "open-telemetry/opentelemetry-collector";
+const claudeSettings = JSON.stringify(
+  {
+    $schema: "https://json.schemastore.org/claude-code-settings.json",
+    model: anthropicModel,
+  },
+  null,
+  2,
+);
+
+const claudeProjectMemory = `# Claude Code instructions for this run
+
+You are running inside an AerolVM sandbox.
+
+- Focus on architecture, subsystem boundaries, and request flow.
+- Prefer a high-signal system diagram over file-by-file narration.
+- Write the final artifact to arch.md.
+- Do not edit any file other than arch.md.
+`;
+
+const claudeTask = `Create the architecture diagram of repository in arch.md.
+
+Requirements:
+- Write Markdown.
+- Include exactly one Mermaid flowchart.
+- Explain the main entrypoints, core packages, request flow, state and storage, and external integrations.
+- Add a section named How to read this architecture with 5 bullets.
+- Modify only arch.md.
+`;
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "node:22-bookworm",
+    cpu: 0.5,
+    memoryMB: 2048,
+    diskGB: 16,
+    env: {
+      ANTHROPIC_API_KEY: anthropicApiKey,
+      ANTHROPIC_MODEL: anthropicModel,
+      GITHUB_TOKEN: githubToken,
+      GH_TOKEN: githubToken,
+    },
+    lifecycle: {
+      destroyIfIdleFor: 30 * 60 * 1_000_000_000,
+    },
+  });
+
+  try {
+    await sandbox.exec({
+      command: [
+        "apt-get update",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y git gh curl ca-certificates",
+        "curl -fsSL https://claude.ai/install.sh | bash",
+        'export PATH="$HOME/.local/bin:$PATH"',
+        "claude --version",
+        "gh --version",
+      ].join(" && "),
+      timeoutSeconds: 900,
+    });
+
+    await sandbox.exec({
+      command: [
+        "mkdir -p /workspace /workspace/out",
+        "gh auth status -h github.com",
+        `gh repo clone ${repoSlug} /workspace/repo -- --depth=1`,
+        "mkdir -p /workspace/repo/.claude",
+      ].join(" && "),
+      timeoutSeconds: 900,
+    });
+
+    await sandbox.uploadFile(
+      "/workspace/repo/.claude/settings.json",
+      claudeSettings,
+    );
+    await sandbox.uploadFile(
+      "/workspace/repo/CLAUDE.md",
+      claudeProjectMemory,
+    );
+
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+
+    const run = sandbox.execStream({
+      command: [
+        'export PATH="$HOME/.local/bin:$PATH"',
+        `claude --model "$ANTHROPIC_MODEL" --dangerously-skip-permissions -p '${claudeTask}'`,
+        "git add --intent-to-add arch.md",
+        "git diff -- arch.md > /workspace/out/architecture.patch",
+      ].join(" && "),
+      workdir: "/workspace/repo",
+      onStdout: (chunk) => {
+        const text = Buffer.from(chunk).toString("utf8");
+        stdoutChunks.push(text);
+        process.stdout.write(text);
+      },
+      onStderr: (chunk) => {
+        const text = Buffer.from(chunk).toString("utf8");
+        stderrChunks.push(text);
+        process.stderr.write(text);
+      },
+      onError: (message) => {
+        process.stderr.write(`${message}\n`);
+      },
+    });
+
+    const exit = await run.done;
+    if (exit.code !== 0) {
+      throw new Error(`claude run failed with exit code ${exit.code}`);
+    }
+
+    const decoder = new TextDecoder();
+    const architectureMarkdown = decoder.decode(
+      await sandbox.downloadFile("/workspace/repo/arch.md"),
+    );
+    const patch = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/architecture.patch"),
+    );
+
+    await writeFile("repository-architecture.md", architectureMarkdown);
+    await writeFile("repository-architecture.patch", patch);
+    await writeFile(
+      "repository-architecture-claude.log",
+      `${stdoutChunks.join("")}\n${stderrChunks.join("")}`,
+    );
+
+    console.log("\n===== arch.md =====\n");
+    console.log(architectureMarkdown);
+
+    console.log(
+      JSON.stringify(
+        {
+          sandboxID: sandbox.id,
+          repo: repoSlug,
+          model: anthropicModel,
+          architectureFile: "repository-architecture.md",
+          patchFile: "repository-architecture.patch",
+          logFile: "repository-architecture-claude.log",
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+## What to export
+
+- `repository-architecture.md` as the final architecture artifact.
+- `repository-architecture.patch` if you want to review exactly what Claude added.
+- `repository-architecture-claude.log` for auditability and debugging.
+
+## AerolVM primitives used
+
+- `create`
+- `exec` and `execStream`
+- `uploadFile` and `downloadFile`
+- lifecycle policies on sandbox creation
+
+## Related docs
+
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)
+- [Environment](/environment/)

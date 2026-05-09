@@ -1,0 +1,40 @@
+---
+title: Coding Agents & Autonomous Engineering
+description: The highest-priority agent workflows from the AerolVM use-case plan, organized as a dedicated category with subpages.
+---
+
+This category is the highest-priority part of the use-case plan because it lines up with AerolVM's best primitives: isolated sandboxes, streamed execution, persistent sessions, file transfer, and explicit lifecycle control.
+
+## Selected subcategories
+
+| Use case | Rating | Why it made the cut |
+|---|---:|---|
+| [Claude Code repository architecture agent](/use-cases/coding-agents/claude-code-repository-architecture-agent/) | 10/10 | It shows a real headless agent workflow that turns an open-source repository into a reusable architecture artifact. |
+| [Claude Code GitHub PR review and auto-fix agent](/use-cases/coding-agents/pull-request-review-auto-fix-agent/) | 9/10 | It is the closest match to a real coding-agent review loop: check out the PR, review it with Claude, post the review, and export any safe fixes. |
+| [Write 500 test cases](/use-cases/coding-agents/test-writing-failure-reproduction-agent/) | 9/10 | It turns large-scale test authoring into a measurable agent workflow with a hard completion gate and exported validation artifacts. |
+| [Claude Code security vulnerability remediation agent](/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent/) | 9/10 | It turns dependency and code vulnerability remediation into a real multi-step security workflow that ends with an actual pull request. |
+| [Zero-shot code execution agent](/use-cases/coding-agents/large-scale-refactor-migration-agent/) | 9/10 | It turns an open-ended repository modification prompt into a real sandboxed execution loop that validates the result and opens a pull request. |
+
+## Why AerolVM fits this category
+
+- `create` provisions one sandbox per task, repo, or branch.
+- `execStream` gives live stdout and stderr for agent progress.
+- `createSession` and `attachSession` keep long-running jobs alive across reconnects.
+- `uploadFile` and `downloadFile` move prompts, patches, logs, and artifacts in and out.
+- `updateLifecycle` keeps expensive work alive while an orchestrator or reviewer is still attached.
+
+## Recommended implementation pattern
+
+1. Create one sandbox per work item.
+2. Clone the target public repository inside the sandbox, then upload prompts, task metadata, and policy files.
+3. Run the agent with `execStream` for shorter jobs or sessions for long migrations.
+4. Download the diff, report, or reproduction artifact.
+5. Destroy or stop the sandbox once the review loop is complete.
+
+## Related docs
+
+- [SDK Setup](/sdk-setup/)
+- [Process & Code Execution](/exec-streaming/)
+- [Sessions](/sessions/)
+- [File System](/file-system/)
+- [Network Isolation](/network-isolation/)

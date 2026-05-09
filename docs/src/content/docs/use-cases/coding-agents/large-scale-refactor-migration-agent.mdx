@@ -1,0 +1,475 @@
+---
+title: Zero-Shot Code Execution Agent
+description: Take a repository URL plus a natural-language modification prompt, run Claude Code inside an AerolVM sandbox, validate the result, and open a pull request automatically.
+---
+
+This workflow is a generic zero-shot repository modification agent. It takes prompt as input and execute the task and raises the PR automatically.
+
+## Inputs
+
+- `CLOUD_AGENT_COMMAND` points to the Claude-compatible CLI inside the sandbox. The default is `claude`.
+- `CLOUD_API_KEY` or `ANTHROPIC_API_KEY` supplies the model credentials.
+- `GITHUB_PAT_TOKEN` or `GITHUB_TOKEN` authenticates clone, push, and PR creation.
+- `GITHUB_REPO_URL` selects the repository to modify.
+- `ZERO_SHOT_TASK_PROMPT` is the exact fix or modification request you want the agent to implement.
+
+
+## Copy-paste TypeScript script
+
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+const cloudApiKey = process.env.CLOUD_API_KEY ?? process.env.ANTHROPIC_API_KEY;
+const githubPatToken = process.env.GITHUB_PAT_TOKEN ?? process.env.GITHUB_TOKEN;
+const githubRepoURL = process.env.GITHUB_REPO_URL;
+const zeroShotTaskPrompt = process.env.ZERO_SHOT_TASK_PROMPT;
+const cloudAgentCommand = process.env.CLOUD_AGENT_COMMAND ?? "claude";
+const cloudModel = process.env.CLOUD_MODEL ?? "claude-sonnet-4-6";
+const sandboxImage = process.env.SANDBOX_IMAGE ?? "node:22-bookworm";
+const repositoryValidationCommand =
+  process.env.REPOSITORY_VALIDATION_COMMAND ?? "";
+const postPullRequest =
+  (process.env.POST_PULL_REQUEST ?? "true").toLowerCase() !== "false";
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+if (!cloudApiKey) {
+  throw new Error(
+    "Set CLOUD_API_KEY or ANTHROPIC_API_KEY before running this example.",
+  );
+}
+
+if (!githubPatToken) {
+  throw new Error(
+    "Set GITHUB_PAT_TOKEN or GITHUB_TOKEN before running this example.",
+  );
+}
+
+if (!githubRepoURL) {
+  throw new Error("Set GITHUB_REPO_URL before running this example.");
+}
+
+if (!zeroShotTaskPrompt) {
+  throw new Error("Set ZERO_SHOT_TASK_PROMPT before running this example.");
+}
+
+const repo = parseGitHubRepositoryURL(githubRepoURL);
+const branchName =
+  process.env.ZERO_SHOT_BRANCH_NAME ??
+  `claude/zero-shot-${new Date().toISOString().slice(0, 10)}`;
+const sessionName = branchName.replace(/[^a-zA-Z0-9._-]/g, "-");
+
+const claudeSettings = JSON.stringify(
+  {
+    $schema: "https://json.schemastore.org/claude-code-settings.json",
+    model: cloudModel,
+  },
+  null,
+  2,
+);
+
+const systemPrompt = `# Zero-shot execution instructions
+
+You are running inside an AerolVM sandbox against a cloned GitHub repository.
+
+- Implement the user's prompt exactly, without expanding scope.
+- Prefer minimal, reviewable changes that fit the repository's conventions.
+- Do not leave placeholders, TODOs, or skipped work behind.
+- If a supporting fixture or helper is required, keep it minimal and deterministic.
+- Write these files in the repository root:
+  - zero-shot-execution-summary.md
+  - zero-shot-pr-title.txt
+  - zero-shot-pr-body.md
+`;
+
+const validationInstruction =
+  repositoryValidationCommand === ""
+    ? "After the change, infer the narrowest high-signal validation command from the repository and run it."
+    : `After the change, run this exact validation command: ${repositoryValidationCommand}`;
+
+const agentTask = `Implement this repository modification request:\n\n${zeroShotTaskPrompt}\n\nRequirements:\n- Write zero-shot-execution-summary.md with sections named Request, Files changed, Validation, Residual risk, Pull request summary.\n- Write zero-shot-pr-title.txt with exactly one line.\n- Write zero-shot-pr-body.md ready for gh pr create --body-file.\n- Keep the diff minimal and production-ready.\n- ${validationInstruction}\n- Modify only the files required to fulfill the request.\n`;
+
+const installToolingScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+cd "$repo_dir"
+
+packages=(git gh curl ca-certificates jq ripgrep python3)
+
+if [[ -f requirements.txt || -f pyproject.toml ]]; then
+  packages+=(python3-pip python3-venv)
+fi
+
+if [[ -f go.mod ]] && ! command -v go >/dev/null 2>&1; then
+  packages+=(golang-go)
+fi
+
+if [[ -f Cargo.toml ]] && ! command -v cargo >/dev/null 2>&1; then
+  packages+=(cargo rustc pkg-config libssl-dev)
+fi
+
+if [[ ( -f pom.xml || -f build.gradle || -f build.gradle.kts ) && ! command -v javac >/dev/null 2>&1 ]]; then
+  packages+=(openjdk-21-jdk maven)
+fi
+
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+
+curl -fsSL https://claude.ai/install.sh | bash
+
+if ! command -v "$CLOUD_AGENT_COMMAND" >/dev/null 2>&1; then
+  echo "CLOUD_AGENT_COMMAND must resolve to a Claude-compatible CLI inside the sandbox." >&2
+  exit 1
+fi
+
+"$CLOUD_AGENT_COMMAND" --version
+gh --version
+`;
+
+const prepareRepositoryScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+cd "$repo_dir"
+
+if [[ -f package-lock.json ]]; then
+  npm ci || npm install
+elif [[ -f package.json ]]; then
+  npm install --ignore-scripts || npm install
+fi
+
+if [[ -f requirements.txt ]]; then
+  python3 -m pip install --break-system-packages -r requirements.txt || true
+fi
+
+if [[ -f pyproject.toml ]]; then
+  python3 -m pip install --break-system-packages -e . || python3 -m pip install --break-system-packages . || true
+fi
+
+if [[ -f go.mod ]]; then
+  go mod download
+fi
+
+if [[ -f Cargo.toml ]]; then
+  cargo fetch
+fi
+
+if [[ -f pom.xml ]]; then
+  mvn -q -DskipTests dependency:go-offline || true
+fi
+
+if [[ -f gradlew ]]; then
+  chmod +x ./gradlew
+  ./gradlew testClasses >/dev/null 2>&1 || true
+fi
+`;
+
+const validateRepositoryScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+out_file="${2:-/workspace/out/repository-validation.log}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+cd "$repo_dir"
+
+if [[ -n "${REPOSITORY_VALIDATION_COMMAND:-}" ]]; then
+  bash -lc "$REPOSITORY_VALIDATION_COMMAND" > "$out_file" 2>&1
+elif [[ -f package.json ]]; then
+  npm run test --if-present > "$out_file" 2>&1
+elif [[ -f requirements.txt || -f pyproject.toml ]]; then
+  python3 -m pytest > "$out_file" 2>&1
+elif [[ -f go.mod ]]; then
+  go test ./... > "$out_file" 2>&1
+elif [[ -f Cargo.toml ]]; then
+  cargo test > "$out_file" 2>&1
+elif [[ -f pom.xml ]]; then
+  mvn -q -DskipTests=false test > "$out_file" 2>&1
+elif [[ -f gradlew ]]; then
+  chmod +x ./gradlew
+  ./gradlew test > "$out_file" 2>&1
+else
+  printf '%s\n' 'No validation command was inferred for this repository.' > "$out_file"
+fi
+`;
+
+const runZeroShotAgentScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+out_dir="${2:-/workspace/out}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+cd "$repo_dir"
+
+bash /workspace/tools/prepare-repository.sh "$repo_dir"
+
+"$CLOUD_AGENT_COMMAND" \
+  --model "$CLOUD_MODEL" \
+  --dangerously-skip-permissions \
+  --append-system-prompt "$(cat /workspace/prompts/zero-shot-system-prompt.txt)" \
+  -p "$(cat /workspace/prompts/zero-shot-task.txt)"
+
+test -f zero-shot-execution-summary.md
+test -f zero-shot-pr-title.txt
+test -f zero-shot-pr-body.md
+
+bash /workspace/tools/validate-repository.sh "$repo_dir" "$out_dir/repository-validation.log"
+
+git status --porcelain > "$out_dir/git-status.txt"
+test -s "$out_dir/git-status.txt"
+
+cp zero-shot-execution-summary.md "$out_dir/zero-shot-execution-summary.md"
+
+git config user.name "AerolVM Zero-Shot Bot"
+git config user.email "zero-shot-bot@aerolvm.local"
+git add .
+git commit -m "feat: apply zero-shot repository update"
+git push --set-upstream origin "$ZERO_SHOT_BRANCH_NAME"
+
+if [[ "$POST_PULL_REQUEST" == "true" ]]; then
+  gh pr create \
+    --repo "$GITHUB_REPO_SLUG" \
+    --title "$(head -n 1 zero-shot-pr-title.txt)" \
+    --body-file zero-shot-pr-body.md \
+    > "$out_dir/pull-request-url.txt"
+else
+  printf '%s\n' 'PR creation disabled by POST_PULL_REQUEST=false' > "$out_dir/pull-request-url.txt"
+fi
+
+git diff HEAD~1 HEAD --binary > "$out_dir/zero-shot-code-execution.patch"
+`;
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: sandboxImage,
+    cpu: 2,
+    memoryMB: 4096,
+    diskGB: 20,
+    env: {
+      ANTHROPIC_API_KEY: cloudApiKey,
+      CLOUD_AGENT_COMMAND: cloudAgentCommand,
+      CLOUD_MODEL: cloudModel,
+      GITHUB_TOKEN: githubPatToken,
+      GH_TOKEN: githubPatToken,
+      GITHUB_REPO_SLUG: repo.repoSlug,
+      POST_PULL_REQUEST: String(postPullRequest),
+      REPOSITORY_VALIDATION_COMMAND: repositoryValidationCommand,
+      ZERO_SHOT_BRANCH_NAME: branchName,
+    },
+    lifecycle: {
+      destroyIfIdleFor: 60 * 60 * 1_000_000_000,
+    },
+  });
+
+  try {
+    await sandbox.exec("mkdir -p /workspace/tools /workspace/prompts /workspace/out");
+
+    await Promise.all([
+      sandbox.uploadFile(
+        "/workspace/tools/install-tooling.sh",
+        installToolingScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/tools/prepare-repository.sh",
+        prepareRepositoryScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/tools/validate-repository.sh",
+        validateRepositoryScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/tools/run-zero-shot-agent.sh",
+        runZeroShotAgentScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/prompts/zero-shot-system-prompt.txt",
+        systemPrompt,
+      ),
+      sandbox.uploadFile(
+        "/workspace/prompts/zero-shot-task.txt",
+        agentTask,
+      ),
+    ]);
+
+    await sandbox.exec({
+      command: [
+        "chmod +x /workspace/tools/*.sh",
+        "gh auth setup-git",
+        "gh auth status -h github.com",
+        `gh repo clone ${repo.repoSlug} /workspace/repo -- --filter=blob:none`,
+        "bash /workspace/tools/install-tooling.sh /workspace/repo",
+        `cd /workspace/repo && git checkout -b ${shellQuote(branchName)}`,
+        "mkdir -p /workspace/repo/.claude /workspace/repo/.aerolvm-zero-shot",
+      ].join(" && "),
+      timeoutSeconds: 1800,
+    });
+
+    await Promise.all([
+      sandbox.uploadFile(
+        "/workspace/repo/.claude/settings.json",
+        claudeSettings,
+      ),
+      sandbox.uploadFile(
+        "/workspace/repo/CLAUDE.md",
+        systemPrompt,
+      ),
+    ]);
+
+    const session = await sandbox.createSession({
+      name: sessionName,
+      command: "bash /workspace/tools/run-zero-shot-agent.sh /workspace/repo /workspace/out",
+      workDir: "/workspace/repo",
+      env: {
+        ANTHROPIC_API_KEY: cloudApiKey,
+        CLOUD_AGENT_COMMAND: cloudAgentCommand,
+        CLOUD_MODEL: cloudModel,
+        GITHUB_TOKEN: githubPatToken,
+        GH_TOKEN: githubPatToken,
+        GITHUB_REPO_SLUG: repo.repoSlug,
+        POST_PULL_REQUEST: String(postPullRequest),
+        REPOSITORY_VALIDATION_COMMAND: repositoryValidationCommand,
+        ZERO_SHOT_BRANCH_NAME: branchName,
+      },
+    });
+
+    const attach = sandbox.attachSession(session.id, {
+      onStdout: (chunk) => {
+        process.stdout.write(Buffer.from(chunk).toString("utf8"));
+      },
+      onStderr: (chunk) => {
+        process.stderr.write(Buffer.from(chunk).toString("utf8"));
+      },
+      onError: (message) => {
+        process.stderr.write(`${message}\n`);
+      },
+    });
+
+    const exit = await attach.done;
+    if (exit.code !== 0) {
+      throw new Error(`zero-shot execution session failed with exit code ${exit.code}`);
+    }
+
+    const decoder = new TextDecoder();
+    const summary = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/zero-shot-execution-summary.md"),
+    );
+    const patch = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/zero-shot-code-execution.patch"),
+    );
+    const prURL = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/pull-request-url.txt"),
+    );
+    const repositoryValidationLog = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/repository-validation.log"),
+    );
+    const log = decoder.decode(await sandbox.sessionLog(session.id));
+
+    await writeFile("zero-shot-code-execution-summary.md", summary);
+    await writeFile("zero-shot-code-execution.patch", patch);
+    await writeFile("zero-shot-code-execution-pr-url.txt", prURL);
+    await writeFile(
+      "zero-shot-code-execution-repository-validation.log",
+      repositoryValidationLog,
+    );
+    await writeFile("zero-shot-code-execution.log", log);
+
+    console.log("\n===== zero-shot-execution-summary.md =====\n");
+    console.log(summary);
+
+    console.log(
+      JSON.stringify(
+        {
+          sandboxID: sandbox.id,
+          repo: repo.repoSlug,
+          branch: branchName,
+          prompt: zeroShotTaskPrompt,
+          summaryFile: "zero-shot-code-execution-summary.md",
+          patchFile: "zero-shot-code-execution.patch",
+          pullRequestURLFile: "zero-shot-code-execution-pr-url.txt",
+          repositoryValidationFile:
+            "zero-shot-code-execution-repository-validation.log",
+          logFile: "zero-shot-code-execution.log",
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+function parseGitHubRepositoryURL(repoURL: string) {
+  if (repoURL.startsWith("git@github.com:")) {
+    const path = repoURL
+      .slice("git@github.com:".length)
+      .replace(/\.git$/, "");
+    const parts = path.split("/");
+    if (parts.length !== 2) {
+      throw new Error(`Invalid GitHub repository URL: ${repoURL}`);
+    }
+
+    return {
+      owner: parts[0],
+      repo: parts[1],
+      repoSlug: `${parts[0]}/${parts[1]}`,
+    };
+  }
+
+  const url = new URL(repoURL);
+  if (url.hostname !== "github.com" && url.hostname !== "www.github.com") {
+    throw new Error(`Unsupported GitHub host: ${url.hostname}`);
+  }
+
+  const parts = url.pathname
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\.git$/, "")
+    .split("/");
+  if (parts.length < 2) {
+    throw new Error(`Invalid GitHub repository URL: ${repoURL}`);
+  }
+
+  return {
+    owner: parts[0],
+    repo: parts[1],
+    repoSlug: `${parts[0]}/${parts[1]}`,
+  };
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+```
+
+## What gets exported
+
+- `zero-shot-code-execution-summary.md` with the request, changed files, validation result, and residual risk.
+- `zero-shot-code-execution.patch` with the exact committed diff.
+- `zero-shot-code-execution-pr-url.txt` with the created pull request URL.
+- `zero-shot-code-execution-repository-validation.log` with the validation command output.
+- `zero-shot-code-execution.log` with the full Claude Code session log.
+
+## Related docs
+
+- [Sessions](/sessions/)
+- [Process & Code Execution](/exec-streaming/)
+- [Environment](/environment/)
+- [File System](/file-system/)

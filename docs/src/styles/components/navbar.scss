@@ -146,6 +146,15 @@
     }
   }
 
+  .mobile-navbar-links {
+    margin-left: auto;
+    gap: 12px;
+  }
+
+  .mobile-navbar-links a {
+    font-size: 0.75rem;
+  }
+
   @media (max-width: 650px) {
     .mobile-navigation {
       padding-right: 72px;

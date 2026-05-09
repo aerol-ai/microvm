@@ -1,0 +1,127 @@
+---
+title: Interactive Tutorial Or Lab Backend
+description: Back a tutorial flow with seeded lab files, a persistent shell session, and an optional live preview URL.
+---
+
+## What you are building
+
+This pattern gives each learner a sandbox-backed lab environment with starter files, a persistent shell session, and an optional preview port for browser-based exercises.
+
+## Why AerolVM fits
+
+- Sessions preserve shell state across reconnects.
+- `uploadFile` makes it easy to seed the lab with starter content.
+- Lifecycle policies let you keep labs alive while the user is active and clean them up after idle time.
+
+## Copy-paste TypeScript script
+
+This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+const labFiles = [
+  {
+    path: "README.md",
+    contents: `# Lesson 1\n\n1. Read index.html.\n2. Update the message in app.js.\n3. Refresh the preview URL.\n`,
+  },
+  {
+    path: "index.html",
+    contents: `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AerolVM Lab</title>
+  </head>
+  <body>
+    <h1>Interactive lab</h1>
+    <p id="message">Starter message from the lesson template.</p>
+    <script src="./app.js"></script>
+  </body>
+</html>
+`,
+  },
+  {
+    path: "app.js",
+    contents: `document.getElementById("message").textContent = "Lab assets loaded from the AerolVM sandbox.";`,
+  },
+];
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "python:3.12-bookworm",
+    cpu: 1,
+    memoryMB: 2048,
+    diskGB: 12,
+    lifecycle: {
+      stopIfIdleFor: 20 * 60 * 1_000_000_000,
+      destroyIfIdleFor: 6 * 60 * 60 * 1_000_000_000,
+    },
+  });
+
+  await sandbox.exec("mkdir -p /workspace/lab");
+  await Promise.all(
+    labFiles.map((file) =>
+      sandbox.uploadFile(`/workspace/lab/${file.path}`, file.contents),
+    ),
+  );
+
+  const shellSession = await sandbox.createSession({
+    name: "lesson-shell",
+    command: "/bin/bash",
+    workDir: "/workspace/lab",
+    pty: true,
+    cols: 120,
+    rows: 40,
+  });
+
+  const previewSession = await sandbox.createSession({
+    name: "lesson-preview",
+    command: "python3 -m http.server 3000 --directory /workspace/lab",
+    workDir: "/workspace/lab",
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  const previewURL = await sandbox.exposePort(3000);
+
+  const payload = {
+    sandboxID: sandbox.id,
+    shellSessionID: shellSession.id,
+    previewSessionID: previewSession.id,
+    previewURL,
+  };
+
+  await writeFile(
+    "interactive-tutorial-lab-backend.json",
+    `${JSON.stringify(payload, null, 2)}\n`,
+  );
+
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+## Product outputs
+
+- `interactive-tutorial-lab-backend.json` with the sandbox ID, shell session ID, preview session ID, and preview URL.
+- A persistent shell session for the learner.
+- An optional preview URL for browser-based exercises.
+
+## Related docs
+
+- [Sessions](/sessions/)
+- [Preview](/preview/)
+- [File System](/file-system/)

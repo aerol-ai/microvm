@@ -20,9 +20,10 @@ export enum NavigationCategory {
   ACCESS,
   SDKS,
   FEATURES,
+  USE_CASES,
 }
 
-export const getSidebarConfig = (): NavigationGroup[] => [
+const getDocsSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
     label: 'Introduction',
@@ -166,3 +167,100 @@ export const getSidebarConfig = (): NavigationGroup[] => [
     ],
   },
 ]
+
+const getUseCasesSidebarConfig = (): NavigationGroup[] => [
+  {
+    type: 'group',
+    label: 'Use Cases',
+    category: NavigationCategory.USE_CASES,
+    entries: [
+      {
+        type: 'link',
+        href: '/use-cases',
+        label: 'Overview',
+        description: 'Top-priority AerolVM use cases selected from the planning matrix.',
+        exact: true,
+      },
+      {
+        type: 'group',
+        label: 'Coding Agents & Harness Engineering',
+        entries: [
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/claude-code-repository-architecture-agent',
+            label: 'Generate architecture diagram',
+            description: 'Clone a real repository, run Claude headlessly, and generate arch.md.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/large-scale-refactor-migration-agent',
+            label: 'Zero-shot code execution agent',
+            description: 'Take a repository URL plus a code-change prompt, run Claude inside the repo, and raise a PR automatically.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/pull-request-review-auto-fix-agent',
+            label: 'GitHub PR review agent',
+            description: 'Check out a real PR from its URL, post a GitHub review, and export any safe fixes.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/test-writing-failure-reproduction-agent',
+            label: 'Write 500 test cases',
+            description: 'Clone a repository, have Claude generate 500 tests, and fail the run below a 90% completion threshold.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent',
+            label: 'Security vulnerability and Fix agent',
+            description: 'Scan CVEs across repository types, apply safe fixes with Claude, and raise a PR automatically.',
+          },
+          
+        ],
+      },
+      {
+        type: 'group',
+        label: 'Customer-Facing Product Experiences',
+        entries: [
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/ai-app-hosting',
+            label: 'Live preview URLs for Web apps',
+            description: 'Clone, build, and host a Bun website inside a disposable sandbox.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security',
+            label: 'gVisor kernel secure sandbox',
+            description: 'Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/live-preview-urls',
+            label: 'Deploy your own Supabase',
+            description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/interactive-tutorial-lab-backend',
+            label: 'Interactive tutorial or lab backend',
+            description: 'Back tutorials and labs with per-user sandboxes and persistent shells.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
+            label: 'One-click user sandbox per workspace',
+            description: 'Provision an isolated sandbox as part of each product workspace.',
+          },
+        ],
+      },
+    ],
+  },
+]
+
+function isUseCasesPath(pathname: string): boolean {
+  return pathname === '/use-cases' || pathname.startsWith('/use-cases/')
+}
+
+export const getSidebarConfig = (pathname = '/'): NavigationGroup[] =>
+  isUseCasesPath(pathname) ? getUseCasesSidebarConfig() : getDocsSidebarConfig()

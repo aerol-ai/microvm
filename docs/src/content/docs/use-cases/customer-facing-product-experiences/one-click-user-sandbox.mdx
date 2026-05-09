@@ -1,0 +1,139 @@
+---
+title: One-Click User Sandbox Per Workspace
+description: Provision a dedicated AerolVM sandbox for each workspace and manage start, stop, resume, and preview with no hidden inputs.
+---
+
+## What you are building
+
+This pattern attaches a sandbox directly to a workspace object in your product. Each workspace gets an isolated runtime that can be previewed, stopped, resumed, and cleaned up independently.
+
+## Why AerolVM fits
+
+- `create`, `start`, and `stop` map directly to workspace lifecycle events.
+- Lifecycle policies make idle cleanup predictable.
+- Preview ports and environment variables give you a straightforward product surface for each workspace.
+
+## Copy-paste TypeScript script
+
+This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:8080`.
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+const workspaceID = "workspace-demo-001";
+const userID = "user-demo-001";
+const seedFiles = [
+  {
+    path: "README.md",
+    contents: `# Workspace demo\n\nThis file proves that workspace state survives stop and start.\n`,
+  },
+  {
+    path: "index.html",
+    contents: `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Workspace Preview</title>
+  </head>
+  <body>
+    <h1>Workspace preview</h1>
+    <p>This page is served from a per-workspace AerolVM sandbox.</p>
+  </body>
+</html>
+`,
+  },
+];
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: "python:3.12-bookworm",
+    cpu: 2,
+    memoryMB: 2048,
+    diskGB: 12,
+    env: {
+      WORKSPACE_ID: workspaceID,
+      USER_ID: userID,
+    },
+    lifecycle: {
+      stopIfIdleFor: 30 * 60 * 1_000_000_000,
+      destroyIfIdleFor: 24 * 60 * 60 * 1_000_000_000,
+    },
+  });
+
+  await sandbox.exec("mkdir -p /workspace/app");
+  await Promise.all(
+    seedFiles.map((file) =>
+      sandbox.uploadFile(`/workspace/app/${file.path}`, file.contents),
+    ),
+  );
+
+  const previewSession = await sandbox.createSession({
+    name: "workspace-preview",
+    command: "python3 -m http.server 3000 --directory /workspace/app",
+    workDir: "/workspace/app",
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  const initialPreviewURL = await sandbox.exposePort(3000);
+
+  await sandbox.stop();
+  await sandbox.start();
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  const persistedReadme = await sandbox.exec({
+    command: "cat /workspace/app/README.md",
+    timeoutSeconds: 10,
+  });
+
+  const resumedPreviewSession = await sandbox.createSession({
+    name: "workspace-preview-resumed",
+    command: "python3 -m http.server 3000 --directory /workspace/app",
+    workDir: "/workspace/app",
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  const resumedPreviewURL = await sandbox.exposePort(3000);
+
+  const payload = {
+    sandboxID: sandbox.id,
+    previewSessionID: previewSession.id,
+    resumedPreviewSessionID: resumedPreviewSession.id,
+    initialPreviewURL,
+    resumedPreviewURL,
+    persistedReadme: persistedReadme.stdout,
+  };
+
+  await writeFile(
+    "one-click-user-sandbox.json",
+    `${JSON.stringify(payload, null, 2)}\n`,
+  );
+
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+## Product outputs
+
+- `one-click-user-sandbox.json` with initial and resumed preview details.
+- A per-workspace runtime that survives stop and start.
+- Predictable idle cleanup behavior through the lifecycle policy.
+
+## Related docs
+
+- [Environment](/environment/)
+- [Preview](/preview/)
+- [SSH Access](/ssh-access/)

@@ -1,0 +1,40 @@
+---
+title: Customer-Facing Product Experiences
+description: Product-facing AerolVM use cases where the sandbox is part of the feature, not just internal infrastructure.
+---
+
+This category is the second-highest priority in the plan because it turns AerolVM into part of the product surface itself. Instead of only helping internal engineering, the sandbox becomes the runtime behind previews, databases, code execution, labs, and per-user environments.
+
+## Selected subcategories
+
+| Use case | Rating | Why it made the cut |
+|---|---:|---|
+| [Embedded code runner inside a SaaS product](/use-cases/customer-facing-product-experiences/embedded-code-runner/) | 10/10 | It is one of the strongest direct product integrations for AerolVM. |
+| [Deploy your own Postgres](/use-cases/customer-facing-product-experiences/live-preview-urls/) | 10/10 | It shows how AerolVM can host a tenant-scoped database runtime while still publishing an HTTP surface for product integration. |
+| [Interactive tutorial or lab backend](/use-cases/customer-facing-product-experiences/interactive-tutorial-lab-backend/) | 9/10 | It maps well to sessions, previews, and short-lived isolated workspaces. |
+| [AI app hosting](/use-cases/customer-facing-product-experiences/ai-app-hosting/) | 9/10 | It clones a real website repo, runs the Bun build pipeline, and leaves the app live on a hosted preview URL. |
+| [One-click user sandbox per workspace](/use-cases/customer-facing-product-experiences/one-click-user-sandbox/) | 9/10 | It is the cleanest multi-tenant runtime pattern for developer and AI products. |
+
+## Why AerolVM fits this category
+
+- `create` turns a product event into a dedicated runtime in seconds.
+- `exposePort` makes app and API previews easy to surface to users.
+- Sessions support long-running tutorials, labs, and user-owned shells.
+- `runtime: "gvisor"` and `networkBlockAll` are useful when end users submit untrusted code.
+- Lifecycle controls let the platform shut down idle runtimes automatically.
+
+## Recommended implementation pattern
+
+1. Create a sandbox per user action, workspace, or generated project.
+2. Upload starter or generated files into the sandbox.
+3. Boot the app, shell, or interpreter with `execStream` or sessions.
+4. Expose the necessary preview or API port.
+5. Stop or destroy the sandbox when the workspace becomes idle.
+
+## Related docs
+
+- [Preview](/preview/)
+- [Process & Code Execution](/exec-streaming/)
+- [Sessions](/sessions/)
+- [File System](/file-system/)
+- [SSH Access](/ssh-access/)

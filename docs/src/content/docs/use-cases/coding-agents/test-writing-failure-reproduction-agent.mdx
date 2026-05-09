@@ -1,0 +1,568 @@
+---
+title: Write Test Cases Agent
+description: Clone a GitHub repository, run Claude Code inside an AerolVM sandbox, generate 500 test cases, validate that at least 90% of the target was actually written, and optionally open a pull request.
+---
+
+This workflow takes a GitHub repository URL, a GitHub token, and an Anthropic key and writes 500 test cases. It asks Claude to write 500 real test cases, verifies how many test cases were actually added, runs the repository validation command, and optionally opens a pull request with the generated tests.
+
+## Copy-paste TypeScript script
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:8080";
+const patToken = process.env.SB_PAT_TOKEN;
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+const githubToken = process.env.GITHUB_TOKEN;
+const githubRepoURL = process.env.GITHUB_REPO_URL;
+const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+const sandboxImage = process.env.SANDBOX_IMAGE ?? "node:22-bookworm";
+const targetTestCount = Number(process.env.TARGET_TEST_COUNT ?? "500");
+const minCompletionRatio = Number(process.env.MIN_COMPLETION_RATIO ?? "0.9");
+const testValidationCommand = process.env.TEST_VALIDATION_COMMAND ?? "";
+const testGenerationScope =
+  process.env.TEST_GENERATION_SCOPE ??
+  "Cover the highest-signal production paths, edge cases, regressions, and error handling paths in this repository.";
+const postPullRequest =
+  (process.env.POST_PULL_REQUEST ?? "true").toLowerCase() !== "false";
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+if (!anthropicApiKey) {
+  throw new Error("Set ANTHROPIC_API_KEY before running this example.");
+}
+
+if (!githubToken) {
+  throw new Error("Set GITHUB_TOKEN before running this example.");
+}
+
+if (!githubRepoURL) {
+  throw new Error("Set GITHUB_REPO_URL before running this example.");
+}
+
+if (!Number.isInteger(targetTestCount) || targetTestCount <= 0) {
+  throw new Error("TARGET_TEST_COUNT must be a positive integer.");
+}
+
+if (!Number.isFinite(minCompletionRatio) || minCompletionRatio <= 0 || minCompletionRatio > 1) {
+  throw new Error("MIN_COMPLETION_RATIO must be a number between 0 and 1.");
+}
+
+const repo = parseGitHubRepositoryURL(githubRepoURL);
+const minimumValidatedTests = Math.ceil(targetTestCount * minCompletionRatio);
+const testCaseBranchName =
+  process.env.TEST_CASE_BRANCH_NAME ??
+  `claude/write-${targetTestCount}-tests-${new Date().toISOString().slice(0, 10)}`;
+const sessionName = testCaseBranchName.replace(/[^a-zA-Z0-9._-]/g, "-");
+
+const claudeSettings = JSON.stringify(
+  {
+    $schema: "https://json.schemastore.org/claude-code-settings.json",
+    model: anthropicModel,
+  },
+  null,
+  2,
+);
+
+const claudeProjectMemory = `# Claude Code bulk test generation instructions
+
+You are running inside an AerolVM sandbox.
+
+- The goal is to add ${targetTestCount} production-grade test cases.
+- The run fails below ${minimumValidatedTests} validated tests.
+- Prefer extending existing test suites before creating new harnesses.
+- Add deterministic tests only. Do not add placeholders, TODOs, or skipped tests.
+- Small supporting fixtures are allowed when required.
+- Write these files in the repository root:
+  - test-case-manifest.json
+  - bulk-test-generation-summary.md
+  - bulk-test-generation-pr-title.txt
+  - bulk-test-generation-pr-body.md
+`;
+
+const validationInstruction =
+  testValidationCommand === ""
+    ? "After writing the tests, infer the narrowest high-signal validation command from the repository and run it."
+    : `After writing the tests, run this exact validation command: ${testValidationCommand}`;
+
+const claudeTask = `Generate ${targetTestCount} high-signal test cases in this repository.
+
+Scope:
+${testGenerationScope}
+
+Requirements:
+- Write test-case-manifest.json in the repository root using this shape:
+  {
+    "targetTestCount": number,
+    "tests": [
+      {
+        "file": string,
+        "framework": string,
+        "suite": string,
+        "testName": string,
+        "category": string
+      }
+    ]
+  }
+- The manifest must describe every newly added test case.
+- Test names in the manifest must exactly match the source code.
+- Write bulk-test-generation-summary.md with sections named Scope, Test inventory, Validation, Residual gaps, Pull request summary.
+- Write bulk-test-generation-pr-title.txt with exactly one line.
+- Write bulk-test-generation-pr-body.md ready for gh pr create --body-file.
+- Prefer modifying existing test directories and conventions over inventing a new structure.
+- The hard target is ${targetTestCount} tests. The run fails below ${minimumValidatedTests} validated tests.
+- ${validationInstruction}
+- Modify only files necessary to add tests and any minimal supporting fixtures.
+`;
+
+const installTestGenerationToolingScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+cd "$repo_dir"
+
+packages=(git gh curl ca-certificates jq ripgrep python3)
+
+if [[ -f requirements.txt || -f pyproject.toml ]]; then
+  packages+=(python3-pip python3-venv)
+fi
+
+if [[ -f go.mod ]] && ! command -v go >/dev/null 2>&1; then
+  packages+=(golang-go)
+fi
+
+if [[ -f Cargo.toml ]] && ! command -v cargo >/dev/null 2>&1; then
+  packages+=(cargo rustc pkg-config libssl-dev)
+fi
+
+if [[ ( -f pom.xml || -f build.gradle || -f build.gradle.kts ) && ! command -v javac >/dev/null 2>&1 ]]; then
+  packages+=(openjdk-21-jdk maven)
+fi
+
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+
+curl -fsSL https://claude.ai/install.sh | bash
+
+if [[ -f requirements.txt || -f pyproject.toml ]]; then
+  python3 -m pip install --break-system-packages --upgrade pip pytest
+fi
+
+claude --version
+gh --version
+`;
+
+const prepareRepositoryScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+cd "$repo_dir"
+
+if [[ -f package-lock.json ]]; then
+  npm ci || npm install
+elif [[ -f package.json ]]; then
+  npm install --ignore-scripts || npm install
+fi
+
+if [[ -f requirements.txt ]]; then
+  python3 -m pip install --break-system-packages -r requirements.txt || true
+fi
+
+if [[ -f pyproject.toml ]]; then
+  python3 -m pip install --break-system-packages -e . || python3 -m pip install --break-system-packages . || true
+fi
+
+if [[ -f go.mod ]]; then
+  go mod download
+fi
+
+if [[ -f Cargo.toml ]]; then
+  cargo fetch
+fi
+
+if [[ -f pom.xml ]]; then
+  mvn -q -DskipTests dependency:go-offline || true
+fi
+
+if [[ -f gradlew ]]; then
+  chmod +x ./gradlew
+  ./gradlew testClasses >/dev/null 2>&1 || true
+fi
+`;
+
+const validateRepositoryScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+out_file="${2:-/workspace/out/repository-validation.log}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+cd "$repo_dir"
+
+if [[ -n "${TEST_VALIDATION_COMMAND:-}" ]]; then
+  bash -lc "$TEST_VALIDATION_COMMAND" > "$out_file" 2>&1
+elif [[ -f package.json ]]; then
+  npm run test --if-present > "$out_file" 2>&1
+elif [[ -f requirements.txt || -f pyproject.toml ]]; then
+  python3 -m pytest > "$out_file" 2>&1
+elif [[ -f go.mod ]]; then
+  go test ./... > "$out_file" 2>&1
+elif [[ -f Cargo.toml ]]; then
+  cargo test > "$out_file" 2>&1
+elif [[ -f pom.xml ]]; then
+  mvn -q -DskipTests=false test > "$out_file" 2>&1
+elif [[ -f gradlew ]]; then
+  chmod +x ./gradlew
+  ./gradlew test > "$out_file" 2>&1
+else
+  printf '%s\n' 'No repository validation command was inferred.' > "$out_file"
+fi
+`;
+
+const validateGeneratedTestsScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+out_dir="${2:-/workspace/out}"
+manifest="$repo_dir/test-case-manifest.json"
+
+mkdir -p "$out_dir"
+cd "$repo_dir"
+
+test -f "$manifest"
+jq empty "$manifest" >/dev/null
+
+declared_tests="$(jq '.tests | length' "$manifest")"
+validated_tests=0
+missing_entries=0
+
+while IFS=$'\t' read -r file test_name; do
+  [[ -z "$file" ]] && continue
+  if [[ -f "$repo_dir/$file" ]] && rg -F --quiet "$test_name" "$repo_dir/$file"; then
+    validated_tests=$((validated_tests + 1))
+  else
+    missing_entries=$((missing_entries + 1))
+  fi
+done < <(jq -r '.tests[] | [.file, .testName] | @tsv' "$manifest")
+
+completion_ratio="$(python3 - "$TARGET_TEST_COUNT" "$validated_tests" <<'PY'
+import sys
+target = int(sys.argv[1])
+validated = int(sys.argv[2])
+print(f"{validated / target:.4f}")
+PY
+)"
+
+jq -n \
+  --argjson target "$TARGET_TEST_COUNT" \
+  --argjson minimum "$MINIMUM_VALIDATED_TESTS" \
+  --argjson declared "$declared_tests" \
+  --argjson validated "$validated_tests" \
+  --argjson missing "$missing_entries" \
+  --arg completion "$completion_ratio" \
+  '{
+    targetTestCount: $target,
+    minimumValidatedTests: $minimum,
+    declaredTests: $declared,
+    validatedTests: $validated,
+    missingManifestEntries: $missing,
+    completionRatio: ($completion | tonumber)
+  }' > "$out_dir/test-generation-validation.json"
+
+if (( validated_tests < MINIMUM_VALIDATED_TESTS )); then
+  echo "validated test count ${validated_tests} is below required threshold ${MINIMUM_VALIDATED_TESTS}" >&2
+  exit 1
+fi
+`;
+
+const runBulkTestGenerationScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="${1:-/workspace/repo}"
+out_dir="${2:-/workspace/out}"
+
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+cd "$repo_dir"
+
+bash /workspace/tools/prepare-repository.sh "$repo_dir"
+
+claude \
+  --model "$ANTHROPIC_MODEL" \
+  --dangerously-skip-permissions \
+  --append-system-prompt "$(cat /workspace/prompts/test-generation-system-prompt.txt)" \
+  -p "$(cat /workspace/prompts/test-generation-task.txt)"
+
+test -f test-case-manifest.json
+test -f bulk-test-generation-summary.md
+test -f bulk-test-generation-pr-title.txt
+test -f bulk-test-generation-pr-body.md
+
+bash /workspace/tools/validate-generated-tests.sh "$repo_dir" "$out_dir"
+bash /workspace/tools/validate-repository.sh "$repo_dir" "$out_dir/repository-validation.log"
+
+git status --porcelain > "$out_dir/git-status.txt"
+test -s "$out_dir/git-status.txt"
+
+cp test-case-manifest.json "$out_dir/test-case-manifest.json"
+cp bulk-test-generation-summary.md "$out_dir/bulk-test-generation-summary.md"
+
+git config user.name "AerolVM Test Bot"
+git config user.email "test-bot@aerolvm.local"
+git add .
+git commit -m "test: add Claude-generated test coverage"
+git push --set-upstream origin "$TEST_CASE_BRANCH_NAME"
+
+if [[ "$POST_PULL_REQUEST" == "true" ]]; then
+  gh pr create \
+    --repo "$GITHUB_REPO_SLUG" \
+    --title "$(head -n 1 bulk-test-generation-pr-title.txt)" \
+    --body-file bulk-test-generation-pr-body.md \
+    > "$out_dir/pull-request-url.txt"
+else
+  printf '%s\n' 'PR creation disabled by POST_PULL_REQUEST=false' > "$out_dir/pull-request-url.txt"
+fi
+
+git diff HEAD~1 HEAD --binary > "$out_dir/bulk-test-generation.patch"
+`;
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const sandbox = await client.create({
+    image: sandboxImage,
+    cpu: 2,
+    memoryMB: 4096,
+    diskGB: 20,
+    env: {
+      ANTHROPIC_API_KEY: anthropicApiKey,
+      ANTHROPIC_MODEL: anthropicModel,
+      GITHUB_TOKEN: githubToken,
+      GH_TOKEN: githubToken,
+      GITHUB_REPO_SLUG: repo.repoSlug,
+      MINIMUM_VALIDATED_TESTS: String(minimumValidatedTests),
+      POST_PULL_REQUEST: String(postPullRequest),
+      TARGET_TEST_COUNT: String(targetTestCount),
+      TEST_CASE_BRANCH_NAME: testCaseBranchName,
+      TEST_GENERATION_SCOPE: testGenerationScope,
+      TEST_VALIDATION_COMMAND: testValidationCommand,
+    },
+    lifecycle: {
+      destroyIfIdleFor: 60 * 60 * 1_000_000_000,
+    },
+  });
+
+  try {
+    await sandbox.exec("mkdir -p /workspace/tools /workspace/prompts /workspace/out");
+
+    await Promise.all([
+      sandbox.uploadFile(
+        "/workspace/tools/install-test-generation-tooling.sh",
+        installTestGenerationToolingScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/tools/prepare-repository.sh",
+        prepareRepositoryScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/tools/validate-repository.sh",
+        validateRepositoryScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/tools/validate-generated-tests.sh",
+        validateGeneratedTestsScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/tools/run-bulk-test-generation.sh",
+        runBulkTestGenerationScript,
+      ),
+      sandbox.uploadFile(
+        "/workspace/prompts/test-generation-system-prompt.txt",
+        claudeProjectMemory,
+      ),
+      sandbox.uploadFile(
+        "/workspace/prompts/test-generation-task.txt",
+        claudeTask,
+      ),
+    ]);
+
+    await sandbox.exec({
+      command: [
+        "chmod +x /workspace/tools/*.sh",
+        "gh auth setup-git",
+        "gh auth status -h github.com",
+        `gh repo clone ${repo.repoSlug} /workspace/repo -- --filter=blob:none`,
+        "bash /workspace/tools/install-test-generation-tooling.sh /workspace/repo",
+        `cd /workspace/repo && git checkout -b ${shellQuote(testCaseBranchName)}`,
+        "mkdir -p /workspace/repo/.claude /workspace/repo/.aerolvm-test-generation",
+      ].join(" && "),
+      timeoutSeconds: 1800,
+    });
+
+    await Promise.all([
+      sandbox.uploadFile(
+        "/workspace/repo/.claude/settings.json",
+        claudeSettings,
+      ),
+      sandbox.uploadFile(
+        "/workspace/repo/CLAUDE.md",
+        claudeProjectMemory,
+      ),
+    ]);
+
+    const session = await sandbox.createSession({
+      name: sessionName,
+      command: "bash /workspace/tools/run-bulk-test-generation.sh /workspace/repo /workspace/out",
+      workDir: "/workspace/repo",
+      env: {
+        ANTHROPIC_API_KEY: anthropicApiKey,
+        ANTHROPIC_MODEL: anthropicModel,
+        GITHUB_TOKEN: githubToken,
+        GH_TOKEN: githubToken,
+        GITHUB_REPO_SLUG: repo.repoSlug,
+        MINIMUM_VALIDATED_TESTS: String(minimumValidatedTests),
+        POST_PULL_REQUEST: String(postPullRequest),
+        TARGET_TEST_COUNT: String(targetTestCount),
+        TEST_CASE_BRANCH_NAME: testCaseBranchName,
+        TEST_GENERATION_SCOPE: testGenerationScope,
+        TEST_VALIDATION_COMMAND: testValidationCommand,
+      },
+    });
+
+    const attach = sandbox.attachSession(session.id, {
+      onStdout: (chunk) => {
+        process.stdout.write(Buffer.from(chunk).toString("utf8"));
+      },
+      onStderr: (chunk) => {
+        process.stderr.write(Buffer.from(chunk).toString("utf8"));
+      },
+      onError: (message) => {
+        process.stderr.write(`${message}\n`);
+      },
+    });
+
+    const exit = await attach.done;
+    if (exit.code !== 0) {
+      throw new Error(`bulk test generation session failed with exit code ${exit.code}`);
+    }
+
+    const decoder = new TextDecoder();
+    const summary = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/bulk-test-generation-summary.md"),
+    );
+    const manifest = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/test-case-manifest.json"),
+    );
+    const validation = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/test-generation-validation.json"),
+    );
+    const patch = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/bulk-test-generation.patch"),
+    );
+    const prURL = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/pull-request-url.txt"),
+    );
+    const repositoryValidationLog = decoder.decode(
+      await sandbox.downloadFile("/workspace/out/repository-validation.log"),
+    );
+    const log = decoder.decode(await sandbox.sessionLog(session.id));
+
+    await writeFile("write-500-test-cases-summary.md", summary);
+    await writeFile("write-500-test-cases-manifest.json", manifest);
+    await writeFile("write-500-test-cases-validation.json", validation);
+    await writeFile("write-500-test-cases.patch", patch);
+    await writeFile("write-500-test-cases-pr-url.txt", prURL);
+    await writeFile("write-500-test-cases-repository-validation.log", repositoryValidationLog);
+    await writeFile("write-500-test-cases.log", log);
+
+    console.log("\n===== bulk-test-generation-summary.md =====\n");
+    console.log(summary);
+
+    console.log(
+      JSON.stringify(
+        {
+          sandboxID: sandbox.id,
+          repo: repo.repoSlug,
+          branch: testCaseBranchName,
+          targetTestCount,
+          minimumValidatedTests,
+          summaryFile: "write-500-test-cases-summary.md",
+          manifestFile: "write-500-test-cases-manifest.json",
+          validationFile: "write-500-test-cases-validation.json",
+          patchFile: "write-500-test-cases.patch",
+          pullRequestURLFile: "write-500-test-cases-pr-url.txt",
+          repositoryValidationFile: "write-500-test-cases-repository-validation.log",
+          logFile: "write-500-test-cases.log",
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await sandbox.destroy();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+function parseGitHubRepositoryURL(repoURL: string) {
+  if (repoURL.startsWith("git@github.com:")) {
+    const path = repoURL.slice("git@github.com:".length).replace(/\.git$/, "");
+    const parts = path.split("/");
+    if (parts.length !== 2) {
+      throw new Error(`Invalid GitHub repository URL: ${repoURL}`);
+    }
+
+    return {
+      owner: parts[0],
+      repo: parts[1],
+      repoSlug: `${parts[0]}/${parts[1]}`,
+    };
+  }
+
+  const url = new URL(repoURL);
+  if (url.hostname !== "github.com" && url.hostname !== "www.github.com") {
+    throw new Error(`Unsupported GitHub host: ${url.hostname}`);
+  }
+
+  const parts = url.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").split("/");
+  if (parts.length < 2) {
+    throw new Error(`Invalid GitHub repository URL: ${repoURL}`);
+  }
+
+  return {
+    owner: parts[0],
+    repo: parts[1],
+    repoSlug: `${parts[0]}/${parts[1]}`,
+  };
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+```
+
+## What gets exported
+
+- `write-500-test-cases-summary.md` with the generation scope, what Claude wrote, and the residual gaps.
+- `write-500-test-cases-manifest.json` with the declared list of generated tests.
+- `write-500-test-cases-validation.json` with the validated test count and completion ratio.
+- `write-500-test-cases.patch` with the exact Git diff.
+- `write-500-test-cases-pr-url.txt` with the created pull request URL.
+- `write-500-test-cases-repository-validation.log` with the repository test or validation output.
+- `write-500-test-cases.log` with the full Claude Code session log.
+
+## Related docs
+
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)
+- [Sessions](/sessions/)
+- [Environment](/environment/)

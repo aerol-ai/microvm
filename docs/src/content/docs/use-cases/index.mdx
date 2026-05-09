@@ -1,0 +1,35 @@
+---
+title: Use Cases
+---
+
+This section is intentionally separate from the root docs navigation. It starts with the two highest-priority categories from the planning matrix and keeps only the five highest-rated use cases inside each category.
+
+The selection criteria come from the internal planning work in `plans/use-cases-plan.md` and the condensed implementation outline in `plans/use-cases-plan-empty.md`.
+
+## What is in this section
+
+| Category | Why it is here first | Selected subcategories |
+|---|---|---|
+| [Coding Agents & Autonomous Engineering](/use-cases/coding-agents/) | It is the highest-priority category in the plan and maps directly to AerolVM's strongest primitives: streamed execution, files, sessions, and isolation. | Claude Code repository architecture agent, Claude Code GitHub PR review agent, write 500 test cases, security vulnerability remediation agent, zero-shot code execution agent |
+| [Customer-Facing Product Experiences](/use-cases/customer-facing-product-experiences/) | It is the second-highest category in the plan and shows how AerolVM becomes part of the end-user product, not just internal infrastructure. | Embedded code runner, deploy your own Postgres, interactive tutorial backend, AI app hosting, one-click user sandbox |
+
+## Why this structure matches the request
+
+- The `Use Cases` button lives in the header and points into its own docs section.
+- The use-case pages have a separate left-hand navigation tree with categories and subcategories.
+- The root docs sidebar no longer lists `Use Cases` as part of the main introduction pages.
+- Every topic page includes an AerolVM SDK walkthrough grounded in the current TypeScript SDK.
+
+## Start Here
+
+- Go to [Coding Agents & Autonomous Engineering](/use-cases/coding-agents/) for agent-first workflows.
+- Go to [Customer-Facing Product Experiences](/use-cases/customer-facing-product-experiences/) for product-facing runtime patterns.
+
+## AerolVM building blocks used throughout
+
+- `create`, `start`, `stop`, `destroy`, and `updateLifecycle` for sandbox lifecycle control.
+- `exec` and `execStream` for one-shot commands and long-running streamed processes.
+- `createSession`, `attachSession`, `sessionLog`, and `sessionRecording` for persistent work.
+- `uploadFile` and `downloadFile` for source code, prompts, patches, and artifacts.
+- `exposePort` for live app and API previews.
+- `networkBlockAll` and `runtime: "gvisor"` for higher-trust execution boundaries.

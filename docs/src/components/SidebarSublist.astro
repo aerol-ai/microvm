@@ -1,10 +1,13 @@
 ---
-import { isActiveOrParentPath } from '../utils/navigation'
+import { comparePaths, isActiveOrParentPath } from '../utils/navigation'
 
 const { sublist = [], nested = false } = Astro.props
+
+const isActive = entry =>
+  entry.exact ? comparePaths(entry.href, Astro.url.pathname) : isActiveOrParentPath(entry.href, Astro.url.pathname)
 ---
 
-<ul class:list={{ 'top-level': !nested }}>
+<ul class:list={{ 'top-level': !nested, nested }}>
   {
     sublist.map(entry => (
       <li>
@@ -12,11 +15,11 @@ const { sublist = [], nested = false } = Astro.props
           entry.type === 'link' ? (
             <a
               href={entry.href}
-              aria-current={isActiveOrParentPath(entry.href, Astro.url.pathname)
+              aria-current={isActive(entry)
                 ? 'page'
                 : undefined}
               target={entry.external ? '_blank' : undefined}
-              class:list={{ active: isActiveOrParentPath(entry.href, Astro.url.pathname) }}
+              class:list={{ active: isActive(entry) }}
             >
               <span>{entry.label}</span>
             </a>
@@ -45,11 +48,11 @@ const { sublist = [], nested = false } = Astro.props
   }
 
   .large {
-    font-family: var(--font-mono);
-    font-size: 0.8125rem;
-    font-weight: 700;
+    font-family: var(--font-condensed);
+    font-size: 0.825rem;
+    font-weight: 600;
     line-height: 1;
-    letter-spacing: -0.12px;
+    letter-spacing: 0em;
     text-transform: uppercase;
     color: var(--primary-text-color);
   }
@@ -64,14 +67,19 @@ const { sublist = [], nested = false } = Astro.props
   li > a {
     display: flex;
     align-items: center;
-    font-family: var(--font-mono);
+    font-family: var(--font-condensed);
     font-size: 0.875rem;
     font-weight: 400;
-    letter-spacing: -0.04rem;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
     text-decoration: none;
     color: var(--secondary-text-color);
     padding: 4px 0;
     transition: color 0.2s ease;
+  }
+
+  ul.nested > li > a {
+    font-size: 0.9375rem;
   }
 
   li > a:hover {
