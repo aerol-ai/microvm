@@ -142,25 +142,6 @@ jobs:
             apt_pkgs: ""
             goarm: ""
 
-          # Windows — toolboxd only
-          - name: Windows x86_64
-            runner: windows-latest
-            goos: windows
-            goarch: amd64
-            suffix: windows_amd64
-            cc: ""
-            apt_pkgs: ""
-            goarm: ""
-
-          - name: Windows x86
-            runner: windows-latest
-            goos: windows
-            goarch: "386"
-            suffix: windows_386
-            cc: ""
-            apt_pkgs: ""
-            goarm: ""
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -202,10 +183,8 @@ jobs:
           GOARM: ${{ matrix.goarm }}
         run: |
           mkdir -p dist
-          ext=""
-          [[ "${{ matrix.goos }}" == "windows" ]] && ext=".exe"
-          go build -trimpath -ldflags "$LDFLAGS" -o "dist/toolboxd_${{ matrix.suffix }}${ext}" ./cmd/toolboxd
-          [[ "${{ matrix.goos }}" != "windows" ]] && chmod 0755 "dist/toolboxd_${{ matrix.suffix }}${ext}"
+          go build -trimpath -ldflags "$LDFLAGS" -o dist/toolboxd_${{ matrix.suffix }} ./cmd/toolboxd
+          chmod 0755 dist/toolboxd_${{ matrix.suffix }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
