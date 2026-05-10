@@ -365,12 +365,16 @@ install_packages() {
 	fi
 }
 
-install_caddy_dns_plugin() {
+install_custom_caddy() {
 	# Replace the apt-installed Caddy binary with a custom build that includes
-	# the chosen caddy-dns plugin. This is required for DNS-01 wildcard TLS.
+	# every plugin AerolVM needs. caddy-l4 is always required so sandboxes can
+	# expose native TCP endpoints (Postgres, Redis, MySQL, etc.) via the
+	# layer4 admin API. caddy-dns/$DNS_PROVIDER is added when --dns-provider
+	# is set so DNS-01 wildcard TLS works.
+	#
 	# Caddy's official build server returns a single static binary with the
 	# requested modules baked in; no Go toolchain needed on the host.
-	local provider="$1"
+	local provider="${1:-}"
 	local arch_tag
 	local arch_extra=""
 
@@ -392,13 +396,18 @@ install_caddy_dns_plugin() {
 		caddy_path="/usr/bin/caddy"
 	fi
 
-	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/caddy-dns/${provider}"
+	# Caddy build server accepts repeated &p= for additional modules.
+	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/mholt/caddy-l4"
+	if [[ -n "$provider" ]]; then
+		download_url="${download_url}&p=github.com/caddy-dns/${provider}"
+	fi
+
 	local tmp_binary
 	tmp_binary="$(mktemp)"
 
 	if ! curl -fL --retry 5 --retry-delay 2 --retry-connrefused "$download_url" -o "$tmp_binary"; then
 		rm -f "$tmp_binary"
-		echo "Failed to download Caddy with ${provider} DNS plugin from ${download_url}" >&2
+		echo "Failed to download custom Caddy build from ${download_url}" >&2
 		exit 1
 	fi
 
@@ -418,17 +427,25 @@ install_caddy_dns_plugin() {
 
 	chmod +x "$tmp_binary"
 
-	# Verify the requested DNS plugin is actually compiled in. Without this
-	# the Caddyfile we generate later would fail to provision at runtime
-	# with a cryptic "loading module 'acme.dns.${provider}'" error.
-	local module_name="dns.providers.${provider}"
-	if ! "$tmp_binary" list-modules 2>/dev/null | grep -q "^${module_name}\$"; then
-		echo "Downloaded Caddy does not include ${module_name}." >&2
-		echo "Modules present matching 'dns':" >&2
-		"$tmp_binary" list-modules 2>/dev/null | grep -i dns >&2 || true
-		rm -f "$tmp_binary"
-		exit 1
+	# Verify every requested module is actually compiled in. Without this the
+	# Caddyfile / admin API calls we make later would fail at runtime with a
+	# cryptic "loading module 'X'" error long after install.sh exits.
+	local required_modules=("layer4" "layer4.handlers.proxy")
+	if [[ -n "$provider" ]]; then
+		required_modules+=("dns.providers.${provider}")
 	fi
+	local module
+	local present
+	present="$("$tmp_binary" list-modules 2>/dev/null || true)"
+	for module in "${required_modules[@]}"; do
+		if ! grep -q "^${module}\$" <<<"$present"; then
+			echo "Downloaded Caddy does not include required module: ${module}" >&2
+			echo "Modules present (filtered):" >&2
+			grep -E "^(layer4|dns\.providers)" <<<"$present" >&2 || true
+			rm -f "$tmp_binary"
+			exit 1
+		fi
+	done
 
 	systemctl stop caddy >/dev/null 2>&1 || true
 	install -m 0755 "$tmp_binary" "$caddy_path"
@@ -485,6 +502,9 @@ SB_MOUNT_WAIT_TIMEOUT=30s
 SB_RECORDING_DIR=/var/lib/toolboxd/recordings
 SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
+SB_L4_PORT_RANGE_START=35000
+SB_L4_PORT_RANGE_END=45000
+SB_L4_TLS_LISTEN=:443
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
@@ -923,6 +943,9 @@ SB_MOUNT_WAIT_TIMEOUT=30s
 SB_RECORDING_DIR=/var/lib/toolboxd/recordings
 SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
+SB_L4_PORT_RANGE_START=35000
+SB_L4_PORT_RANGE_END=45000
+SB_L4_TLS_LISTEN=
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
@@ -1070,9 +1093,11 @@ fi
 if [[ "$WITH_AMD_GPU" == "true" ]]; then
 	install_amd_gpu
 fi
-if [[ -n "$DNS_PROVIDER" ]]; then
-	install_caddy_dns_plugin "$DNS_PROVIDER"
-fi
+# Always replace the apt-installed Caddy with a custom build that includes
+# caddy-l4 (TCP routing for sandbox-exposed ports). DNS plugin gets folded
+# into the same build when --dns-provider is set so we make exactly one
+# trip to the Caddy build server.
+install_custom_caddy "$DNS_PROVIDER"
 install_binaries
 write_environment
 write_caddy_env
@@ -1103,5 +1128,6 @@ else
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"
 	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<docker-short-id>/"
 fi
+echo "TCP port pool: 35000-45000 (open these on the host firewall to publish native TCP ports)"
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
 echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
