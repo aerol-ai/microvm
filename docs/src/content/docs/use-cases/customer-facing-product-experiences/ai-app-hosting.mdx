@@ -7,6 +7,8 @@ This workflow hosts a website inside AerolVM from a GitHub repository URL. It cl
 
 ## Copy-paste TypeScript script
 
+Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/ai-app-hosting](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/ai-app-hosting)
+
 
 ```ts
 import { randomBytes } from "node:crypto";
@@ -20,7 +22,10 @@ if (!patToken) {
   throw new Error("Set SB_PAT_TOKEN before running this example.");
 }
 
-const repoURL = "https://github.com/sumansaurabh/sumansaurabh-portfolio.git";
+const githubToken = process.env.GITHUB_TOKEN;
+const repoURL = githubToken
+  ? `https://${githubToken}@github.com/sumansaurabh/sumansaurabh-portfolio.git`
+  : "https://github.com/sumansaurabh/sumansaurabh-portfolio.git";
 const workDir = "/workspace/site";
 const port = 3000;
 
@@ -60,9 +65,9 @@ async function main() {
   const client = new MicroVM({ apiUrl, patToken });
   const sandbox = await client.create({
     image: "node:22-bookworm",
-    cpu: 2,
-    memoryMB: 4096,
-    diskGB: 20,
+    cpu: 0.5,
+    memoryMB: 256,
+    diskGB: 4,
     lifecycle: {
       destroyIfIdleFor: 45 * 60 * 1_000_000_000,
     },
@@ -82,10 +87,12 @@ async function main() {
   await runCommand(
     sandbox,
     "apt-get update && apt-get install -y git ca-certificates",
-    "/workspace",
+    "/",
   );
 
-  await runCommand(sandbox, `git clone --depth=1 ${repoURL} ${workDir}`, "/workspace");
+  await runCommand(sandbox, "npm install -g bun", "/");
+
+  await runCommand(sandbox, `mkdir -p /workspace && git clone --depth=1 ${repoURL} ${workDir}`, "/");
 
   await sandbox.uploadFile(
     `${workDir}/.env`,
@@ -99,14 +106,14 @@ async function main() {
   );
   console.log(`Wrote ${workDir}/.env`);
 
-  await runCommand(sandbox, "npm install", workDir, runtimeEnv);
+  await runCommand(sandbox, "bun install", workDir, runtimeEnv);
 
-  await runCommand(sandbox, "npm run build", workDir, runtimeEnv);
+  await runCommand(sandbox, "bun run build", workDir, runtimeEnv);
 
   console.log("Starting the app...");
   const session = await sandbox.createSession({
     name: "ai-app-hosting",
-    command: "npm run start",
+    command: "bun run server",
     workDir: workDir,
     env: runtimeEnv,
   });
@@ -118,6 +125,7 @@ async function main() {
   });
   void stream.done.catch(() => {});
 
+  await delay(5_000);
   stream.close();
 
   console.log(`App has been hosted on the following URL: ${previewURL}`);
