@@ -69,4 +69,11 @@ type Runtime interface {
 	// to a sandbox. Used by the event-driven path when a container exits or
 	// is destroyed out-of-band; Destroy() handles this during normal teardown.
 	ClearNetworkRules(containerIP string) error
+
+	// ApplyNetworkBlockAll installs the per-IP egress DROP rule for sandboxes
+	// created with NetworkBlockAll=true. Idempotent — safe to call on every
+	// Start and reconcile pass. Used to reapply the rule after Stop+Start
+	// cycles (which clear it on the stop event) and after host-side state
+	// loss (iptables flush, daemon restart that rebuilds chains).
+	ApplyNetworkBlockAll(containerIP string) error
 }
