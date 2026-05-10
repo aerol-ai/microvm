@@ -1,5 +1,5 @@
 ---
-import { getSidebarConfig } from '../content/config'
+import { getSidebarConfig } from '../content.config'
 import { getPagination } from '../utils/navigation'
 
 const { prev, next } = getPagination(getSidebarConfig(Astro.url.pathname), Astro.url.pathname)
