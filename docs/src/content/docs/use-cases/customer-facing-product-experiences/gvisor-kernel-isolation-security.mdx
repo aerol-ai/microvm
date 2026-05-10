@@ -48,7 +48,11 @@ print(json.dumps(payload, indent=2))
 
 ## 1. Direct Docker runtime
 
+
 This script uses `runtime: "docker"`. The probe is still isolated by container boundaries, but the syscalls it makes are handled by the host kernel. That direct kernel exposure is the security difference gVisor is designed to reduce.
+
+
+Code: [https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/dockerRuntime.ts](https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/dockerRuntime.ts)
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
@@ -64,25 +68,34 @@ if (!patToken) {
 const probePython = `import json
 import subprocess
 
+# These checks probe kernel information exposure.
+# In a Docker (runc) container the process shares the real host kernel, so
+# /proc surfaces the true kernel version, hardware memory layout, and I/O
+# regions — everything an attacker needs to fingerprint and target known CVEs.
+# Under gVisor the same reads return synthetic data from the Sentry user-space
+# kernel: the host kernel version, memory layout, and hardware topology are
+# never visible inside the sandbox.
 checks = [
-  ("capabilities", "sh -lc 'grep ^CapEff: /proc/self/status'"),
-  ("unshare_namespaces", "unshare --mount --uts --ipc --net true"),
-  ("mount_tmpfs", "sh -lc 'mkdir -p /tmp/probe-mount && mount -t tmpfs tmpfs /tmp/probe-mount'"),
-  ("read_dmesg", "sh -lc 'dmesg | head -n 5'"),
+    ("capabilities",          "sh -lc 'grep ^CapEff: /proc/self/status'"),
+    ("kernel_version",        "uname -r"),
+    ("kernel_build",          "cat /proc/version"),
+    ("physical_memory_buddy", "cat /proc/buddyinfo"),
+    ("hardware_io_regions",   "cat /proc/iomem"),
+    ("net_stats",             "cat /proc/net/sockstat"),
 ]
 
 results = []
 for name, command in checks:
-  completed = subprocess.run(command, shell=True, capture_output=True, text=True)
-  results.append(
-    {
-      "check": name,
-      "command": command,
-      "exitCode": completed.returncode,
-      "stdout": completed.stdout.strip(),
-      "stderr": completed.stderr.strip(),
-    }
-  )
+    completed = subprocess.run(command, shell=True, capture_output=True, text=True)
+    results.append(
+        {
+            "check": name,
+            "command": command,
+            "exitCode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+    )
 
 payload = {"runtime": "docker", "results": results}
 
@@ -98,9 +111,9 @@ async function main() {
     image: "python:3.12-bookworm",
     runtime: "docker",
     networkBlockAll: true,
-    cpu: 1,
-    memoryMB: 1024,
-    diskGB: 8,
+    cpu: 0.5,
+    memoryMB: 256,
+    diskGB: 4,
   });
 
   try {
@@ -110,7 +123,7 @@ async function main() {
     const result = await sandbox.exec({
       command: "python /workspace/run/probe.py",
       timeoutSeconds: 10,
-    );
+    });
 
     const report = new TextDecoder().decode(
       await sandbox.downloadFile("/workspace/run/probe-report.json"),
@@ -140,9 +153,14 @@ main().catch((error) => {
 });
 ```
 
+Sample output: [https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/docker-kernel-probe-result.json](https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/docker-kernel-probe-result.json)
+
 ## 2. gVisor runtime
 
 This script runs the same probe with `runtime: "gvisor"`. The goal is not that every check suddenly succeeds or fails differently. The point is that the workload is now talking to gVisor's user-space kernel layer instead of directly exercising host-kernel paths.
+
+Code: [https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/gVisorRuntime.ts](https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/gVisorRuntime.ts)
+
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
@@ -158,11 +176,18 @@ if (!patToken) {
 const probePython = `import json
 import subprocess
 
+# Same checks as the Docker probe so the two result files can be diffed
+# side-by-side. Under gVisor every kernel-exposure check should return either
+# empty output or a synthetic value — the Sentry user-space kernel never
+# forwards these reads to the real host kernel, so the host's identity,
+# hardware layout, and memory topology remain invisible to sandbox code.
 checks = [
-    ("capabilities", "sh -lc 'grep ^CapEff: /proc/self/status'"),
-    ("unshare_namespaces", "unshare --mount --uts --ipc --net true"),
-    ("mount_tmpfs", "sh -lc 'mkdir -p /tmp/probe-mount && mount -t tmpfs tmpfs /tmp/probe-mount'"),
-    ("read_dmesg", "sh -lc 'dmesg | head -n 5'"),
+    ("capabilities",          "sh -lc 'grep ^CapEff: /proc/self/status'"),
+    ("kernel_version",        "uname -r"),
+    ("kernel_build",          "cat /proc/version"),
+    ("physical_memory_buddy", "cat /proc/buddyinfo"),
+    ("hardware_io_regions",   "cat /proc/iomem"),
+    ("net_stats",             "cat /proc/net/sockstat"),
 ]
 
 results = []
@@ -192,9 +217,9 @@ async function main() {
     image: "python:3.12-bookworm",
     runtime: "gvisor",
     networkBlockAll: true,
-    cpu: 1,
-    memoryMB: 1024,
-    diskGB: 8,
+    cpu: 0.25,
+    memoryMB: 256,
+    diskGB: 4,
   });
 
   try {
@@ -233,6 +258,8 @@ main().catch((error) => {
   process.exitCode = 1;
 });
 ```
+
+Sample output: [https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/gvisor-kernel-probe-result.json](https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/gVisor-kernel/gvisor-kernel-probe-result.json)
 
 ## How to explain the result
 
