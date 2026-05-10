@@ -84,6 +84,16 @@ type Config struct {
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
 	// picks a random candidate first; collisions fall back to a deterministic
 	// scan. Both sides are inclusive.
+	//
+	// The default range [22000, 23000] sits ABOVE the Linux registered-ports
+	// boundary (1024) and BELOW the default ephemeral-port range
+	// (net.ipv4.ip_local_port_range, typically 32768-60999). Keeping the pool
+	// out of the ephemeral range matters: if these ports overlapped, the
+	// kernel could hand any of them to an unrelated outbound connection as a
+	// source port, and the next L4 expose attempt to bind() that number would
+	// race-fail with EADDRINUSE. 1000 slots is the deliberate concurrent-TCP-
+	// exposure cap per host; raise it via the env vars if you need more, but
+	// keep both bounds outside the host's ephemeral range.
 	L4PortRangeStart int
 	L4PortRangeEnd   int
 	// L4TLSListen is the listen address for the shared TLS-SNI multiplexer.
@@ -145,8 +155,8 @@ func Load() (Config, error) {
 		HostCPUCoresOverride:      getEnvInt("SB_HOST_CPU_CORES", 0),
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
 
-		L4PortRangeStart: getEnvInt("SB_L4_PORT_RANGE_START", 35000),
-		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 45000),
+		L4PortRangeStart: getEnvInt("SB_L4_PORT_RANGE_START", 22000),
+		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 23000),
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 	}
 

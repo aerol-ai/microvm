@@ -16,7 +16,7 @@ This is the Postgres foundation, not the full Supabase control plane. If you wan
 
 ## Native Postgres endpoint via `exposeTCPPort`
 
-This page exposes the Postgres wire protocol directly using `exposeTCPPort(5432)`. The daemon allocates a parent-host port from the configured `[35000, 45000]` pool and points caddy-l4 at the container's `5432`, so the generated URL is in `tcp://<public-host>:<host-port>` form and works with `psql`, Prisma, SQLAlchemy, pgAdmin, and any other client that speaks the PostgreSQL wire protocol.
+This page exposes the Postgres wire protocol directly using `exposeTCPPort(5432)`. The daemon allocates a parent-host port from the configured `[22000, 23000]` pool and points caddy-l4 at the container's `5432`, so the generated URL is in `tcp://<public-host>:<host-port>` form and works with `psql`, Prisma, SQLAlchemy, pgAdmin, and any other client that speaks the PostgreSQL wire protocol.
 
 If you only need browser-shaped traffic (a small admin UI, REST shim, PostgREST), use `exposePort()` instead — that's the HTTPS-only path documented in [Preview](/preview/). See [TCP & TLS Ports](/tcp-ports/) for the full surface.
 
@@ -279,7 +279,7 @@ The `postgresURL` returned by the script is a real Postgres DSN. Plug it into an
 psql "postgresql://user:pass@<public-host>:<host-port>/appdb"
 ```
 
-The host port is one of the parent-host ports allocated from the configured `[35000, 45000]` pool. Make sure that range is open on the host firewall — see [TCP & TLS Ports](/tcp-ports/) for the full surface and reconcile guarantees.
+The host port is one of the parent-host ports allocated from the configured `[22000, 23000]` pool. Make sure that range is open on the host firewall — see [TCP & TLS Ports](/tcp-ports/) for the full surface and reconcile guarantees.
 
 ## Related docs
 

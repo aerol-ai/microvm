@@ -13,7 +13,7 @@ For the API surface itself, see [TCP & TLS Ports](/tcp-ports/).
 
 ### Raw TCP — `exposeTCPPort(port)`
 
-caddy-l4 binds **one host port from the configured `[35000, 45000]` pool** per exposure and forwards bytes 1:1 into the container.
+caddy-l4 binds **one host port from the configured `[22000, 23000]` pool** per exposure and forwards bytes 1:1 into the container.
 
 ```
 client ──► public-host:37412 (caddy-l4)  ──► container:5432
@@ -149,7 +149,7 @@ You pay: the backend has to manage a certificate, and clients must send SNI. You
 
 | | `exposeTCPPort` | `exposeTLSPort` |
 |---|---|---|
-| Listener | Per-exposure host port from `[35000, 45000]` | Shared, default `:443` |
+| Listener | Per-exposure host port from `[22000, 23000]` | Shared, default `:443` |
 | URL shape | `tcp://<host>:<host-port>` | `tls://<id>-<port>.<domain>:<l4-port>` |
 | Reads bytes? | No | Only the SNI extension |
 | Terminates TLS? | n/a | **No** — passthrough |

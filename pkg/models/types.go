@@ -311,7 +311,7 @@ type ExposedPort struct {
 	// rows carry "http" via the column default.
 	Protocol  string    `json:"protocol"`
 	// HostPort is the parent-host TCP listener allocated for protocol="tcp"
-	// from the configured pool (default [35000, 45000]). Zero for http/tls
+	// from the configured pool (default [22000, 23000]). Zero for http/tls
 	// modes, which don't reserve a per-exposure host port.
 	HostPort  int       `json:"host_port,omitempty"`
 	PublicURL string    `json:"public_url"`

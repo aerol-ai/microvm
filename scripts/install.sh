@@ -502,8 +502,8 @@ SB_MOUNT_WAIT_TIMEOUT=30s
 SB_RECORDING_DIR=/var/lib/toolboxd/recordings
 SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
-SB_L4_PORT_RANGE_START=35000
-SB_L4_PORT_RANGE_END=45000
+SB_L4_PORT_RANGE_START=22000
+SB_L4_PORT_RANGE_END=23000
 # TLS-SNI multiplexing is opt-in. Setting this to e.g. ":443" makes
 # caddy-l4 take over that listener; until the HTTPS site is moved off
 # the same address it would conflict, so we leave it empty by default.
@@ -946,8 +946,8 @@ SB_MOUNT_WAIT_TIMEOUT=30s
 SB_RECORDING_DIR=/var/lib/toolboxd/recordings
 SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
-SB_L4_PORT_RANGE_START=35000
-SB_L4_PORT_RANGE_END=45000
+SB_L4_PORT_RANGE_START=22000
+SB_L4_PORT_RANGE_END=23000
 SB_L4_TLS_LISTEN=
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
@@ -1131,6 +1131,9 @@ else
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"
 	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<docker-short-id>/"
 fi
-echo "TCP port pool: 35000-45000 (open these on the host firewall to publish native TCP ports)"
+echo "TCP port pool: 22000-23000 (open these on the host firewall to publish native TCP ports)"
+echo "  This range sits below the Linux ephemeral range (32768-60999) on purpose so the"
+echo "  kernel never hands these out as outbound source ports — eliminates random EADDRINUSE"
+echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
 echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"

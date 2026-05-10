@@ -199,7 +199,7 @@ func (c *Client) ExposePort(ctx context.Context, id string, port int) (string, e
 // ExposeTCPPort publishes a raw TCP port through caddy-l4. The returned URL
 // is in tcp://<host>:<port> form and can be plugged straight into a Postgres /
 // Redis / MySQL / Mongo client. Requires the daemon to be configured with a
-// non-empty SB_L4_PORT_RANGE_START..END pool (default 35000-45000).
+// non-empty SB_L4_PORT_RANGE_START..END pool (default 22000-23000).
 func (c *Client) ExposeTCPPort(ctx context.Context, id string, port int) (string, error) {
 	return c.exposePortWithProtocol(ctx, id, port, "tcp")
 }

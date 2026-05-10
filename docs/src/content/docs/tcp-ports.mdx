@@ -18,7 +18,7 @@ Not sure which one fits your workload? See [TCP vs TLS Ports](/tcp-vs-tls-ports/
 
 ## Raw TCP
 
-`exposeTCPPort(port)` allocates a parent-host port from the configured pool (default `[35000, 45000]`) and points caddy-l4 at the sandbox's container IP. The returned URL is in `tcp://<public-host>:<host-port>` form and plugs straight into a native protocol client.
+`exposeTCPPort(port)` allocates a parent-host port from the configured pool (default `[22000, 23000]`) and points caddy-l4 at the sandbox's container IP. The returned URL is in `tcp://<public-host>:<host-port>` form and plugs straight into a native protocol client.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -63,12 +63,16 @@ The tuple `(public host, host port)` is everything you need to build a DSN for a
 
 The allocator picks a candidate at random from `[SB_L4_PORT_RANGE_START, SB_L4_PORT_RANGE_END]` and reserves it via a single atomic `INSERT OR IGNORE`. Random-first keeps p95 fast even with many concurrent allocations; on collision it falls back to a deterministic linear scan so the pool is exhausted fully before giving up.
 
-The defaults are wide enough for ~10k concurrent TCP exposures per host. Override the pool with environment variables on `sandboxd`:
+The default pool is `[22000, 23000]` — 1000 slots, which is the per-host cap on concurrent TCP exposures. The range is chosen to sit **below** the Linux ephemeral port range (`net.ipv4.ip_local_port_range`, typically `32768–60999`) so the kernel never picks one of these as the source port for an unrelated outbound connection. Overlap there caused intermittent `EADDRINUSE` failures when the allocator's `bind()` raced with a kernel-chosen ephemeral source port; keeping the pool out of that range eliminates the failure mode entirely.
+
+Override the pool with environment variables on `sandboxd`:
 
 ```
-SB_L4_PORT_RANGE_START=35000
-SB_L4_PORT_RANGE_END=45000
+SB_L4_PORT_RANGE_START=22000
+SB_L4_PORT_RANGE_END=23000
 ```
+
+If you raise these bounds, keep both sides outside your kernel's ephemeral range — check it with `cat /proc/sys/net/ipv4/ip_local_port_range`. Picking values inside the ephemeral range will reintroduce the random-collision failure mode on busy hosts.
 
 The host firewall must permit inbound traffic on that range. The installer prints a reminder, but does not auto-open the firewall — operators decide their own policy.
 
@@ -209,7 +213,7 @@ The daemon dispatches on the protocol stored on the `exposed_ports` row:
 | Recorded protocol | Caddy surface torn down | Host-side cleanup |
 |---|---|---|
 | `http` (or empty, for legacy rows) | `DELETE /id/sandbox-<id>-port-<port>` on the HTTP server | none |
-| `tcp` | `DELETE /config/apps/layer4/servers/tcp-port-<host-port>` | host port returns to the `[35000, 45000]` pool |
+| `tcp` | `DELETE /config/apps/layer4/servers/tcp-port-<host-port>` | host port returns to the `[22000, 23000]` pool |
 | `tls` | `DELETE /id/sandbox-<id>-port-<port>-tls` on the SNI mux | none |
 
 In every case the row in `exposed_ports` is deleted and the toolbox port allowlist is refreshed so subsequent calls to `/proxy/<port>/` on the public sandbox URL are rejected immediately.
