@@ -41,12 +41,14 @@ func NewClient() (*Client, error) {
 func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	apiURL := ""
 	patToken := ""
+	apiVersion := ""
 	var httpClient *http.Client
 
 	if config != nil {
 		apiURL = strings.TrimSpace(config.APIUrl)
 		patToken = strings.TrimSpace(config.PATToken)
 		httpClient = config.HTTPClient
+		apiVersion = strings.TrimSpace(config.APIVersion)
 	}
 
 	if patToken == "" {
@@ -65,6 +67,7 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	inner := apiclient.NewClient(apiURL, apiclient.ClientOptions{
 		PATToken:   patToken,
 		HTTPClient: httpClient,
+		APIVersion: apiclient.APIVersion(apiVersion),
 	})
 
 	return &Client{

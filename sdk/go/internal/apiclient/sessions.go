@@ -27,13 +27,13 @@ type SessionResizeRequest = models.SessionResizeRequest
 
 func (c *Client) CreateSession(ctx context.Context, sandboxID string, req CreateSessionRequest) (Session, error) {
 	var response Session
-	err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+sandboxID+"/sessions", req, &response)
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions", req, &response)
 	return response, err
 }
 
 func (c *Client) ListSessions(ctx context.Context, sandboxID string) ([]Session, error) {
 	var response SessionList
-	if err := c.doJSON(ctx, http.MethodGet, "/v1/sandboxes/"+sandboxID+"/sessions", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions", nil, &response); err != nil {
 		return nil, err
 	}
 	return response.Sessions, nil
@@ -41,26 +41,26 @@ func (c *Client) ListSessions(ctx context.Context, sandboxID string) ([]Session,
 
 func (c *Client) GetSession(ctx context.Context, sandboxID, sessionID string) (Session, error) {
 	var response Session
-	err := c.doJSON(ctx, http.MethodGet, "/v1/sandboxes/"+sandboxID+"/sessions/"+sessionID, nil, &response)
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions/"+sessionID, nil, &response)
 	return response, err
 }
 
 func (c *Client) DeleteSession(ctx context.Context, sandboxID, sessionID string) error {
-	return c.doJSON(ctx, http.MethodDelete, "/v1/sandboxes/"+sandboxID+"/sessions/"+sessionID, nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions/"+sessionID, nil, nil)
 }
 
 func (c *Client) SignalSession(ctx context.Context, sandboxID, sessionID, signal string) error {
-	return c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/signal", SessionSignalRequest{Signal: signal}, nil)
+	return c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/signal", SessionSignalRequest{Signal: signal}, nil)
 }
 
 func (c *Client) ResizeSession(ctx context.Context, sandboxID, sessionID string, cols, rows int) error {
-	return c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/resize", SessionResizeRequest{Cols: cols, Rows: rows}, nil)
+	return c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/resize", SessionResizeRequest{Cols: cols, Rows: rows}, nil)
 }
 
 // SessionLog returns the cached replay buffer as a flat byte stream. Useful
 // for "give me everything that's happened so far" without subscribing.
 func (c *Client) SessionLog(ctx context.Context, sandboxID, sessionID string) ([]byte, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/log", nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/log", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (c *Client) SessionLog(ctx context.Context, sandboxID, sessionID string) ([
 // SessionRecording returns the raw asciinema v2 cast file bytes. Caller can
 // pipe this to `asciinema play -` or save it for later replay.
 func (c *Client) SessionRecording(ctx context.Context, sandboxID, sessionID string) ([]byte, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/recording", nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+sandboxID+"/sessions/"+sessionID+"/recording", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +146,7 @@ func (c *Client) AttachSession(ctx context.Context, sandboxID, sessionID string,
 	if sandboxID == "" || sessionID == "" {
 		return nil, errors.New("sandbox id and session id are required")
 	}
-	wsURL, err := websocketURL(c.baseURL, "/v1/sandboxes/"+url.PathEscape(sandboxID)+"/sessions/"+url.PathEscape(sessionID)+"/attach")
+	wsURL, err := websocketURL(c.baseURL, c.versionPrefix+"/sandboxes/"+url.PathEscape(sandboxID)+"/sessions/"+url.PathEscape(sessionID)+"/attach")
 	if err != nil {
 		return nil, err
 	}

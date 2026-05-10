@@ -12,6 +12,7 @@ from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .types import (
     CreateOptions,
     CreateSessionOptions,
@@ -33,6 +34,15 @@ from .types import (
 
 STREAM_PREFIX_STDOUT = 0x01
 STREAM_PREFIX_STDERR = 0x02
+
+# Wire versions of the sandbox daemon API this SDK can call. Today only "v1"
+# exists; "v2" will be added when a wire-level breaking change ships on the
+# server. The SDK package version and the API wire version evolve
+# independently — bumping this SDK does not move the wire version.
+_DEFAULT_API_VERSION = "v1"
+_PATH_PREFIXES: Dict[str, str] = {
+    "v1": _V1_PATH_PREFIX,
+}
 
 
 def _normalize_url(value: str) -> str:
@@ -342,59 +352,78 @@ class MicroVM:
     default_api_url = "http://127.0.0.1:21212"
     auth_required_error_message = "PAT token is required. Set pat_token or SB_PAT_TOKEN."
 
-    def __init__(self, api_url: Optional[str] = None, pat_token: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        api_url: Optional[str] = None,
+        pat_token: Optional[str] = None,
+        *,
+        api_version: str = _DEFAULT_API_VERSION,
+    ) -> None:
         self.api_url = _normalize_url(api_url or _read_env("SB_API_URL") or self.default_api_url)
         self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or ""
 
         if not self.pat_token:
             raise MicroVMError(self.auth_required_error_message)
 
+        if api_version not in _PATH_PREFIXES:
+            raise MicroVMError(f"unsupported api_version {api_version!r}; supported: {sorted(_PATH_PREFIXES)}")
+        self.api_version = api_version
+        self._version_prefix = _PATH_PREFIXES[api_version]
+
+    def _versioned(self, suffix: str) -> str:
+        """Build a versioned API path. Pass the suffix beginning with "/" (e.g.
+        ``"/sandboxes"``) and the active version's prefix is prepended. Use
+        this for every versioned call so v2 (when it lands) is selected by the
+        ``api_version`` option without touching call sites.
+        """
+        return f"{self._version_prefix}{suffix}"
+
     def create(self, options: CreateOptions) -> Sandbox:
-        sandbox = self._do_json("POST", "/v1/sandboxes", _to_api_create_options(options))
+        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(options))
         return self._wrap_sandbox(sandbox)
 
     def list(self) -> List[Sandbox]:
-        sandboxes = self._do_json("GET", "/v1/sandboxes", None)
+        sandboxes = self._do_json("GET", self._versioned("/sandboxes"), None)
         return [self._wrap_sandbox(item) for item in sandboxes]
 
     def get(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("GET", f"/v1/sandboxes/{sandbox_id}", None)
+        sandbox = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
         return self._wrap_sandbox(sandbox)
 
     def start(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/start", None)
+        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/start", None)
         return self._wrap_sandbox(sandbox)
 
     def stop(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/stop", None)
+        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None)
         return self._wrap_sandbox(sandbox)
 
     def destroy(self, sandbox_id: str) -> None:
-        self._do_json("DELETE", f"/v1/sandboxes/{sandbox_id}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
 
     def resize(self, sandbox_id: str, options: ResizeOptions) -> Sandbox:
-        sandbox = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options))
+        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options))
         return self._wrap_sandbox(sandbox)
 
     def update_lifecycle(self, sandbox_id: str, lifecycle: Lifecycle) -> Sandbox:
-        sandbox = self._do_json("PUT", f"/v1/sandboxes/{sandbox_id}/lifecycle", _to_api_lifecycle(lifecycle))
+        sandbox = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/lifecycle", _to_api_lifecycle(lifecycle))
         return self._wrap_sandbox(sandbox)
 
     def reconcile(self) -> None:
-        self._do_json("POST", "/v1/admin/reconcile", None)
+        self._do_json("POST", self._versioned("/admin/reconcile"), None)
 
     def health(self) -> HealthStatus:
         return _from_api_health_status(self._do_json("GET", "/health", None))
 
     def mounts(self, sandbox_id: str) -> List[MountSpecRedacted]:
-        payload = self._do_json("GET", f"/v1/sandboxes/{sandbox_id}/mounts", None)
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/mounts", None)
         mounts = _first_of(payload, "mounts") or []
         if not isinstance(mounts, list):
             return []
         return [_from_api_mount_spec_redacted(item) for item in mounts]
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
-        response = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
         return _from_api_exec_result(response)
 
     def exec_stream(self, sandbox_id: str, options: ExecStreamOptions) -> ExecStreamHandle:
@@ -403,40 +432,40 @@ class MicroVM:
             raise MicroVMError("command is required")
 
         websocket_module = _load_websocket_module()
-        ws_url = _to_websocket_url(self.api_url, f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
+        ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
         ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "exec stream")
         ws.send(json.dumps(_to_api_exec_stream_request(options)))
         return ExecStreamHandle(websocket_module, ws, options)
 
     def create_session(self, sandbox_id: str, options: CreateSessionOptions) -> Session:
-        session = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/sessions", _to_api_create_session_options(options))
+        session = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", _to_api_create_session_options(options))
         return _from_api_session(session)
 
     def list_sessions(self, sandbox_id: str) -> List[Session]:
-        payload = self._do_json("GET", f"/v1/sandboxes/{sandbox_id}/sessions", None)
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", None)
         sessions = _first_of(payload, "sessions") or []
         if not isinstance(sessions, list):
             return []
         return [_from_api_session(item) for item in sessions]
 
     def get_session(self, sandbox_id: str, session_id: str) -> Session:
-        session = self._do_json("GET", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+        session = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None)
         return _from_api_session(session)
 
     def delete_session(self, sandbox_id: str, session_id: str) -> None:
-        self._do_json("DELETE", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None)
 
     def signal_session(self, sandbox_id: str, session_id: str, signal: str) -> None:
-        self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/signal", {"signal": signal})
+        self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/signal", {"signal": signal})
 
     def resize_session(self, sandbox_id: str, session_id: str, cols: int, rows: int) -> None:
-        self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/resize", {"cols": cols, "rows": rows})
+        self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/resize", {"cols": cols, "rows": rows})
 
     def session_log(self, sandbox_id: str, session_id: str) -> bytes:
-        return self._request("GET", self._url(f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/log"))
+        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/log"))
 
     def session_recording(self, sandbox_id: str, session_id: str) -> bytes:
-        return self._request("GET", self._url(f"/v1/sandboxes/{sandbox_id}/sessions/{session_id}/recording"))
+        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/recording"))
 
     def attach_session(
         self,
@@ -448,7 +477,7 @@ class MicroVM:
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(
             self.api_url,
-            f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
+            f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
         ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "session attach")
 
@@ -461,7 +490,7 @@ class MicroVM:
 
     def upload_file(self, sandbox_id: str, target_path: str, data: bytes) -> None:
         self._do_multipart(
-            f"/v1/sandboxes/{sandbox_id}/toolbox/files/upload",
+            f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload",
             {"path": target_path},
             "file",
             target_path,
@@ -469,7 +498,7 @@ class MicroVM:
         )
 
     def download_file(self, sandbox_id: str, target_path: str) -> bytes:
-        url = self._url(f"/v1/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
+        url = self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
         return self._request("GET", url)
 
     def expose_port(self, sandbox_id: str, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
@@ -488,11 +517,11 @@ class MicroVM:
         populated only on the ``"tcp"`` path.
         """
         body: Optional[Dict[str, Any]] = {"protocol": protocol} if protocol and protocol != "http" else None
-        response = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/ports/{port}", body)
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", body)
         return _from_api_expose_port_response(response)
 
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
-        self._do_json("DELETE", f"/v1/sandboxes/{sandbox_id}/ports/{port}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
     def _wrap_sandbox(self, response: Dict[str, Any]) -> Sandbox:
         return Sandbox(self, _from_api_sandbox(response))

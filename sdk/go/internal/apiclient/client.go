@@ -14,7 +14,25 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	apiv1 "github.com/aerol-ai/microvm/sdk/go/internal/apiclient/v1"
 )
+
+// APIVersion selects which wire version of the sandbox daemon API to call.
+// The SDK package version and the API wire version evolve independently —
+// pinning the SDK doesn't pin the wire version, and vice versa.
+type APIVersion string
+
+const (
+	// APIVersionV1 is the only version available today. Future versions add
+	// new constants here without removing v1.
+	APIVersionV1 APIVersion = "v1"
+
+	defaultAPIVersion = APIVersionV1
+)
+
+var pathPrefixes = map[APIVersion]string{
+	APIVersionV1: apiv1.PathPrefix,
+}
 
 type CreateOptions = models.CreateSandboxRequest
 type ResizeOptions = models.ResizeSandboxRequest
@@ -25,14 +43,20 @@ type ExposeResult = models.ExposePortResponse
 type HealthStatus = models.HealthStatus
 
 type Client struct {
-	baseURL    string
-	patToken   string
-	httpClient *http.Client
+	baseURL       string
+	patToken      string
+	httpClient    *http.Client
+	apiVersion    APIVersion
+	versionPrefix string
 }
 
 type ClientOptions struct {
 	PATToken   string
 	HTTPClient *http.Client
+	// APIVersion pins the wire version this client speaks. Empty defaults to
+	// the SDK's pinned default (v1 today). Pass APIVersionV1 explicitly to
+	// guarantee stability across SDK upgrades.
+	APIVersion APIVersion
 }
 
 type Sandbox struct {
@@ -45,16 +69,43 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{}
 	}
+	version := config.APIVersion
+	if version == "" {
+		version = defaultAPIVersion
+	}
+	prefix, ok := pathPrefixes[version]
+	if !ok {
+		// Unknown versions silently fall back to default to keep this
+		// constructor non-error-returning. Callers that need strictness
+		// should validate APIVersion themselves before constructing.
+		version = defaultAPIVersion
+		prefix = pathPrefixes[defaultAPIVersion]
+	}
 	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		patToken:   config.PATToken,
-		httpClient: httpClient,
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		patToken:      config.PATToken,
+		httpClient:    httpClient,
+		apiVersion:    version,
+		versionPrefix: prefix,
 	}
 }
 
+// versioned builds an API path with the active version's prefix prepended.
+// Use this for every versioned call so v2 (when it lands) can be selected
+// via ClientOptions.APIVersion without touching call sites.
+func (c *Client) versioned(suffix string) string {
+	return c.versionPrefix + suffix
+}
+
+// VersionPrefix exposes the active version's URL prefix so files in the same
+// package (sessions.go, exec_stream.go) can build URLs without each
+// re-implementing the helper. It is intentionally not exported outside the
+// package.
+func (c *Client) versionedURL() string { return c.versionPrefix }
+
 func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, string, error) {
 	var response models.CreateSandboxResponse
-	if err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes", opts, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes", opts, &response); err != nil {
 		return nil, "", err
 	}
 	return c.wrap(response.Sandbox), response.SSHPrivateKey, nil
@@ -62,7 +113,7 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, stri
 
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
 	var response []models.Sandbox
-	if err := c.doJSON(ctx, http.MethodGet, "/v1/sandboxes", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes", nil, &response); err != nil {
 		return nil, err
 	}
 	items := make([]*Sandbox, 0, len(response))
@@ -74,7 +125,7 @@ func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
 
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodGet, "/v1/sandboxes/"+id, nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id, nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -82,7 +133,7 @@ func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
 
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+id+"/start", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/start", nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -90,23 +141,23 @@ func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 
 func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+id+"/stop", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/stop", nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
 }
 
 func (c *Client) Destroy(ctx context.Context, id string) error {
-	return c.doJSON(ctx, http.MethodDelete, "/v1/sandboxes/"+id, nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+id, nil, nil)
 }
 
 func (c *Client) Reconcile(ctx context.Context) error {
-	return c.doJSON(ctx, http.MethodPost, "/v1/admin/reconcile", nil, nil)
+	return c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/admin/reconcile", nil, nil)
 }
 
 func (c *Client) Resize(ctx context.Context, id string, opts ResizeOptions) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+id+"/resize", opts, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/resize", opts, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -119,7 +170,7 @@ func (c *Client) Resize(ctx context.Context, id string, opts ResizeOptions) (*Sa
 func (c *Client) UpdateLifecycle(ctx context.Context, id string, lifecycle models.Lifecycle) (*Sandbox, error) {
 	var response models.Sandbox
 	body := models.UpdateLifecycleRequest{Lifecycle: lifecycle}
-	if err := c.doJSON(ctx, http.MethodPut, "/v1/sandboxes/"+id+"/lifecycle", body, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPut, c.versionPrefix+"/sandboxes/"+id+"/lifecycle", body, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -129,7 +180,7 @@ func (c *Client) Mounts(ctx context.Context, id string) ([]models.MountSpecRedac
 	var response struct {
 		Mounts []models.MountSpecRedacted `json:"mounts"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/v1/sandboxes/"+id+"/mounts", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/mounts", nil, &response); err != nil {
 		return nil, err
 	}
 	return response.Mounts, nil
@@ -137,7 +188,7 @@ func (c *Client) Mounts(ctx context.Context, id string) ([]models.MountSpecRedac
 
 func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (ExecResult, error) {
 	var response ExecResult
-	err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+id+"/toolbox/process/execute", request, &response)
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/toolbox/process/execute", request, &response)
 	return response, err
 }
 
@@ -156,7 +207,7 @@ func (c *Client) UploadFile(ctx context.Context, id, targetPath string, data []b
 		return err
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/sandboxes/"+id+"/toolbox/files/upload", &body)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", &body)
 	if err != nil {
 		return err
 	}
@@ -176,7 +227,7 @@ func (c *Client) UploadFile(ctx context.Context, id, targetPath string, data []b
 
 func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byte, error) {
 	encodedPath := url.QueryEscape(targetPath)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/sandboxes/"+id+"/toolbox/files/download?path="+encodedPath, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/download?path="+encodedPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -203,12 +254,12 @@ func (c *Client) ExposePort(ctx context.Context, id string, port int, protocol s
 		body = map[string]string{"protocol": protocol}
 	}
 	var response ExposeResult
-	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/v1/sandboxes/%s/ports/%d", id, port), body, &response)
+	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), body, &response)
 	return response, err
 }
 
 func (c *Client) UnexposePort(ctx context.Context, id string, port int) error {
-	return c.doJSON(ctx, http.MethodDelete, fmt.Sprintf("/v1/sandboxes/%s/ports/%d", id, port), nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), nil, nil)
 }
 
 func (c *Client) Health(ctx context.Context) (HealthStatus, error) {

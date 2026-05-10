@@ -105,10 +105,44 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+/// Wire version of the sandbox daemon API the [`Client`] speaks.
+///
+/// Today only [`ApiVersion::V1`] exists. The Rust SDK package version and the
+/// API wire version evolve independently — bumping the SDK does not move the
+/// wire version. When v2 lands, a new variant is added here without removing
+/// `V1`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ApiVersion {
+    V1,
+}
+
+impl ApiVersion {
+    /// URL prefix for routes at this version. Mirrors the constants exposed
+    /// by `pkg/api/v1/dto.go::PathPrefix` on the server.
+    pub fn path_prefix(self) -> &'static str {
+        match self {
+            ApiVersion::V1 => api_v1::PATH_PREFIX,
+        }
+    }
+}
+
+impl Default for ApiVersion {
+    fn default() -> Self {
+        ApiVersion::V1
+    }
+}
+
+/// v1 wire constants. Mirrors `microvm/_internal/api/v1/paths.py` in the
+/// Python SDK and `sdk/go/internal/apiclient/v1/paths.go` in the Go SDK.
+mod api_v1 {
+    pub const PATH_PREFIX: &str = "/v1";
+}
+
 #[derive(Clone, Debug)]
 pub struct Client {
     api_url: String,
     pat_token: String,
+    api_version: ApiVersion,
     inner: HttpClient,
 }
 
@@ -356,6 +390,17 @@ impl Sandbox {
 
 impl Client {
     pub fn new(api_url: Option<&str>, pat_token: Option<&str>) -> Result<Self, Error> {
+        Self::with_api_version(api_url, pat_token, ApiVersion::default())
+    }
+
+    /// Construct a client pinned to a specific wire version. Use this if you
+    /// need to test against a non-default version explicitly; otherwise
+    /// [`Client::new`] picks the SDK's default ("v1" today).
+    pub fn with_api_version(
+        api_url: Option<&str>,
+        pat_token: Option<&str>,
+        api_version: ApiVersion,
+    ) -> Result<Self, Error> {
         let token = pat_token
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
@@ -371,51 +416,57 @@ impl Client {
         Ok(Client {
             api_url,
             pat_token,
+            api_version,
             inner: HttpClient::new(),
         })
     }
 
+    /// URL prefix for the active wire version (e.g. `"/v1"`).
+    fn version_prefix(&self) -> &'static str {
+        self.api_version.path_prefix()
+    }
+
     pub fn create(&self, opts: CreateOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(Method::POST, "/v1/sandboxes", Some(&opts))?;
+        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(Method::POST, &format!("{}/sandboxes", self.version_prefix()), Some(&opts))?;
         Ok(Sandbox::new_with_ssh_private_key(self.clone(), raw.sandbox, raw.ssh_private_key))
     }
 
     pub fn list(&self) -> Result<Vec<Sandbox>, Error> {
-        let raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, "/v1/sandboxes", None)?;
+        let raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &format!("{}/sandboxes", self.version_prefix()), None)?;
         Ok(raw.into_iter().map(|item| Sandbox::new(self.clone(), item)).collect())
     }
 
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(Method::GET, &format!("/v1/sandboxes/{}", id), None)?;
+        let raw = self.do_json::<(), SandboxData>(Method::GET, &format!("{}/sandboxes/{}", self.version_prefix(), id), None)?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn start(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(Method::POST, &format!("/v1/sandboxes/{}/start", id), None)?;
+        let raw = self.do_json::<(), SandboxData>(Method::POST, &format!("{}/sandboxes/{}/start", self.version_prefix(), id), None)?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn stop(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(Method::POST, &format!("/v1/sandboxes/{}/stop", id), None)?;
+        let raw = self.do_json::<(), SandboxData>(Method::POST, &format!("{}/sandboxes/{}/stop", self.version_prefix(), id), None)?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn destroy(&self, id: &str) -> Result<(), Error> {
-        self.do_json::<(), ()>(Method::DELETE, &format!("/v1/sandboxes/{}", id), None)
+        self.do_json::<(), ()>(Method::DELETE, &format!("{}/sandboxes/{}", self.version_prefix(), id), None)
     }
 
     pub fn resize(&self, id: &str, opts: ResizeOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<ResizeOptions, SandboxData>(Method::POST, &format!("/v1/sandboxes/{}/resize", id), Some(&opts))?;
+        let raw = self.do_json::<ResizeOptions, SandboxData>(Method::POST, &format!("{}/sandboxes/{}/resize", self.version_prefix(), id), Some(&opts))?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn update_lifecycle(&self, id: &str, lifecycle: Lifecycle) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<Lifecycle, SandboxData>(Method::PUT, &format!("/v1/sandboxes/{}/lifecycle", id), Some(&lifecycle))?;
+        let raw = self.do_json::<Lifecycle, SandboxData>(Method::PUT, &format!("{}/sandboxes/{}/lifecycle", self.version_prefix(), id), Some(&lifecycle))?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn reconcile(&self) -> Result<(), Error> {
-        self.do_json::<(), serde_json::Value>(Method::POST, "/v1/admin/reconcile", None).map(|_| ())
+        self.do_json::<(), serde_json::Value>(Method::POST, &format!("{}/admin/reconcile", self.version_prefix()), None).map(|_| ())
     }
 
     pub fn health(&self) -> Result<HealthStatus, Error> {
@@ -428,35 +479,35 @@ impl Client {
             mounts: Vec<MountSpecRedacted>,
         }
 
-        let raw = self.do_json::<(), MountList>(Method::GET, &format!("/v1/sandboxes/{}/mounts", id), None)?;
+        let raw = self.do_json::<(), MountList>(Method::GET, &format!("{}/sandboxes/{}/mounts", self.version_prefix(), id), None)?;
         Ok(raw.mounts)
     }
 
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.do_json::<ExecRequest, ExecResult>(Method::POST, &format!("/v1/sandboxes/{}/toolbox/process/execute", id), Some(&request))
+        self.do_json::<ExecRequest, ExecResult>(Method::POST, &format!("{}/sandboxes/{}/toolbox/process/execute", self.version_prefix(), id), Some(&request))
     }
 
     pub fn create_session(&self, id: &str, opts: CreateSessionOptions) -> Result<Session, Error> {
-        self.do_json::<CreateSessionOptions, Session>(Method::POST, &format!("/v1/sandboxes/{}/sessions", id), Some(&opts))
+        self.do_json::<CreateSessionOptions, Session>(Method::POST, &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id), Some(&opts))
     }
 
     pub fn list_sessions(&self, id: &str) -> Result<Vec<Session>, Error> {
-        let raw = self.do_json::<(), SessionList>(Method::GET, &format!("/v1/sandboxes/{}/sessions", id), None)?;
+        let raw = self.do_json::<(), SessionList>(Method::GET, &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id), None)?;
         Ok(raw.sessions)
     }
 
     pub fn get_session(&self, id: &str, session_id: &str) -> Result<Session, Error> {
-        self.do_json::<(), Session>(Method::GET, &format!("/v1/sandboxes/{}/sessions/{}", id, session_id), None)
+        self.do_json::<(), Session>(Method::GET, &format!("{}/sandboxes/{}/sessions/{}", self.version_prefix(), id, session_id), None)
     }
 
     pub fn delete_session(&self, id: &str, session_id: &str) -> Result<(), Error> {
-        self.do_json::<(), ()>(Method::DELETE, &format!("/v1/sandboxes/{}/sessions/{}", id, session_id), None)
+        self.do_json::<(), ()>(Method::DELETE, &format!("{}/sandboxes/{}/sessions/{}", self.version_prefix(), id, session_id), None)
     }
 
     pub fn signal_session(&self, id: &str, session_id: &str, signal: &str) -> Result<(), Error> {
         self.do_json::<SessionSignalRequest, ()>(
             Method::POST,
-            &format!("/v1/sandboxes/{}/sessions/{}/signal", id, session_id),
+            &format!("{}/sandboxes/{}/sessions/{}/signal", self.version_prefix(), id, session_id),
             Some(&SessionSignalRequest {
                 signal: signal.to_string(),
             }),
@@ -466,13 +517,13 @@ impl Client {
     pub fn resize_session(&self, id: &str, session_id: &str, cols: u16, rows: u16) -> Result<(), Error> {
         self.do_json::<SessionResizeRequest, ()>(
             Method::POST,
-            &format!("/v1/sandboxes/{}/sessions/{}/resize", id, session_id),
+            &format!("{}/sandboxes/{}/sessions/{}/resize", self.version_prefix(), id, session_id),
             Some(&SessionResizeRequest { cols, rows }),
         )
     }
 
     pub fn session_log(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!("/v1/sandboxes/{}/sessions/{}/log", id, session_id));
+        let url = self.full_url(&format!("{}/sandboxes/{}/sessions/{}/log", self.version_prefix(), id, session_id));
         let response = self
             .inner
             .request(Method::GET, &url)
@@ -482,7 +533,7 @@ impl Client {
     }
 
     pub fn session_recording(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!("/v1/sandboxes/{}/sessions/{}/recording", id, session_id));
+        let url = self.full_url(&format!("{}/sandboxes/{}/sessions/{}/recording", self.version_prefix(), id, session_id));
         let response = self
             .inner
             .request(Method::GET, &url)
@@ -496,13 +547,14 @@ impl Client {
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let api_version = self.api_version;
         let sandbox_id = id.to_string();
         let session_id = session_id.to_string();
 
         thread::spawn(move || {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
-                Ok(runtime) => runtime.block_on(run_session_attach(api_url, pat_token, sandbox_id, session_id, options, control_rx)),
+                Ok(runtime) => runtime.block_on(run_session_attach(api_url, api_version, pat_token, sandbox_id, session_id, options, control_rx)),
                 Err(err) => Err(Error::Runtime(err)),
             };
             let _ = done_tx.send(result);
@@ -520,12 +572,13 @@ impl Client {
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let api_version = self.api_version;
         let sandbox_id = id.to_string();
 
         thread::spawn(move || {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
-                Ok(runtime) => runtime.block_on(run_exec_stream(api_url, pat_token, sandbox_id, options, control_rx)),
+                Ok(runtime) => runtime.block_on(run_exec_stream(api_url, api_version, pat_token, sandbox_id, options, control_rx)),
                 Err(err) => Err(Error::Runtime(err)),
             };
             let _ = done_tx.send(result);
@@ -544,11 +597,11 @@ impl Client {
             .text("path", target_path.to_string())
             .part("file", Part::bytes(data).file_name(file_name.to_string()));
 
-        self.do_multipart(&format!("/v1/sandboxes/{}/toolbox/files/upload", id), form)
+        self.do_multipart(&format!("{}/sandboxes/{}/toolbox/files/upload", self.version_prefix(), id), form)
     }
 
     pub fn download_file(&self, id: &str, target_path: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!("/v1/sandboxes/{}/toolbox/files/download?path={}", id, urlencoding::encode(target_path)));
+        let url = self.full_url(&format!("{}/sandboxes/{}/toolbox/files/download?path={}", self.version_prefix(), id, urlencoding::encode(target_path)));
         let response = self
             .inner
             .request(Method::GET, &url)
@@ -570,7 +623,7 @@ impl Client {
         };
         let wire = self.do_json::<Value, ExposePortResponseWire>(
             Method::POST,
-            &format!("/v1/sandboxes/{}/ports/{}", id, port),
+            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
             body.as_ref(),
         )?;
         match wire.protocol.as_str() {
@@ -586,7 +639,7 @@ impl Client {
     }
 
     pub fn unexpose_port(&self, id: &str, port: u16) -> Result<(), Error> {
-        self.do_json::<(), ()>(Method::DELETE, &format!("/v1/sandboxes/{}/ports/{}", id, port), None)
+        self.do_json::<(), ()>(Method::DELETE, &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port), None)
     }
 
     fn full_url(&self, path: &str) -> String {
@@ -639,12 +692,13 @@ impl Client {
 
 async fn run_exec_stream(
     api_url: String,
+    api_version: ApiVersion,
     pat_token: String,
     sandbox_id: String,
     options: ExecStreamOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<ExecExitInfo, Error> {
-    let ws_url = websocket_url(&api_url, &format!("/v1/sandboxes/{}/toolbox/process/exec/stream", urlencoding::encode(&sandbox_id)))?;
+    let ws_url = websocket_url(&api_url, &format!("{}/sandboxes/{}/toolbox/process/exec/stream", api_version.path_prefix(), urlencoding::encode(&sandbox_id)))?;
     let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
     request.headers_mut().insert(
         http::header::AUTHORIZATION,
@@ -724,6 +778,7 @@ async fn run_exec_stream(
 
 async fn run_session_attach(
     api_url: String,
+    api_version: ApiVersion,
     pat_token: String,
     sandbox_id: String,
     session_id: String,
@@ -733,7 +788,8 @@ async fn run_session_attach(
     let ws_url = websocket_url(
         &api_url,
         &format!(
-            "/v1/sandboxes/{}/sessions/{}/attach",
+            "{}/sandboxes/{}/sessions/{}/attach",
+            api_version.path_prefix(),
             urlencoding::encode(&sandbox_id),
             urlencoding::encode(&session_id)
         ),
