@@ -89,6 +89,24 @@ public class Sandbox extends SandboxData {
         return client.exposePort(id, port);
     }
 
+    /**
+     * Publish a raw TCP port through caddy-l4. Returns
+     * {@code tcp://<host>:<port>} ready to plug into native protocol clients
+     * (psql, redis-cli, mysql, mongosh).
+     */
+    public String exposeTCPPort(int port) {
+        return client.exposeTCPPort(id, port);
+    }
+
+    /**
+     * Publish a TCP port behind the shared TLS-SNI multiplexer. Returns
+     * {@code tls://<id>-<port>.<domain>:<l4-port>}. Requires the deployment
+     * to have a domain configured AND {@code SB_L4_TLS_LISTEN} set.
+     */
+    public String exposeTLSPort(int port) {
+        return client.exposeTLSPort(id, port);
+    }
+
     public void unexposePort(int port) {
         client.unexposePort(id, port);
     }

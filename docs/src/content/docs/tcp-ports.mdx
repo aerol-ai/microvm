@@ -1,0 +1,168 @@
+---
+title: TCP & TLS Ports
+description: Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo, gRPC) from a sandbox using caddy-l4.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`exposePort` publishes an HTTP route at `https://<sandbox-id>-<port>.<domain>`. That works for browser-shaped traffic but not for protocols that speak the raw TCP wire — Postgres, Redis, MySQL, MongoDB, MQTT, gRPC, SSH, dedicated game servers. For those, AerolVM exposes two additional surfaces backed by [`caddy-l4`](https://github.com/mholt/caddy-l4):
+
+| Mode | Method | URL shape | When |
+|---|---|---|---|
+| Raw TCP | `exposeTCPPort(port)` | `tcp://<public-host>:<host-port>` | Postgres, Redis, MySQL, Mongo, raw protocols |
+| TLS-SNI | `exposeTLSPort(port)` | `tls://<id>-<port>.<domain>:<l4-port>` | TLS-aware backends that already speak SNI |
+
+Both share the same lifecycle as `exposePort`: routes are torn down on stop / destroy and re-published on start.
+
+## Raw TCP
+
+`exposeTCPPort(port)` allocates a parent-host port from the configured pool (default `[35000, 45000]`) and points caddy-l4 at the sandbox's container IP. The returned URL is in `tcp://<public-host>:<host-port>` form and plugs straight into a native protocol client.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const url = await sandbox.exposeTCPPort(5432);
+    // url === "tcp://203.0.113.10:37412"
+    // psql "postgresql://user:pass@203.0.113.10:37412/appdb"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    url = sandbox.expose_tcp_port(5432)
+    # url == "tcp://203.0.113.10:37412"
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    url, err := sandbox.ExposeTCPPort(ctx, 5432)
+    if err != nil {
+        log.Fatal(err)
+    }
+    // url == "tcp://203.0.113.10:37412"
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let url = sandbox.expose_tcp_port(5432)?;
+    // url == "tcp://203.0.113.10:37412"
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String url = sandbox.exposeTCPPort(5432);
+    // url.equals("tcp://203.0.113.10:37412")
+    ```
+  </TabItem>
+</Tabs>
+
+The tuple `(public host, host port)` is everything you need to build a DSN for any TCP protocol — pass it directly to `psql`, `redis-cli`, `mysql`, `mongosh`, or your application's connection string.
+
+### Host port pool
+
+The allocator picks a candidate at random from `[SB_L4_PORT_RANGE_START, SB_L4_PORT_RANGE_END]` and reserves it via a single atomic `INSERT OR IGNORE`. Random-first keeps p95 fast even with many concurrent allocations; on collision it falls back to a deterministic linear scan so the pool is exhausted fully before giving up.
+
+The defaults are wide enough for ~10k concurrent TCP exposures per host. Override the pool with environment variables on `sandboxd`:
+
+```
+SB_L4_PORT_RANGE_START=35000
+SB_L4_PORT_RANGE_END=45000
+```
+
+The host firewall must permit inbound traffic on that range. The installer prints a reminder, but does not auto-open the firewall — operators decide their own policy.
+
+### What gets restored on restart
+
+The `host_port` reservation is persisted alongside the exposure row. After a sandboxd restart, the periodic reconcile re-publishes the layer4 server pointing at the (possibly new) container IP, and the same host port stays bound — clients with cached connection strings keep working.
+
+## TLS-SNI multiplexing
+
+When several backends already speak TLS and the deployment has wildcard DNS, `exposeTLSPort(port)` reuses one shared listener (default `:443`) and routes by SNI to per-sandbox subdomains. Returns `tls://<id>-<port>.<domain>:<l4-port>`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const url = await sandbox.exposeTLSPort(5432);
+    // url === "tls://abc-5432.sandbox.example.com:443"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    url = sandbox.expose_tls_port(5432)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    url, err := sandbox.ExposeTLSPort(ctx, 5432)
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let url = sandbox.expose_tls_port(5432)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String url = sandbox.exposeTLSPort(5432);
+    ```
+  </TabItem>
+</Tabs>
+
+Two requirements:
+
+1. **Domain mode** — `--domain` must be configured (the SNI hostname needs an A record pointing at the host).
+2. **`SB_L4_TLS_LISTEN`** must be non-empty on the daemon (default empty / opt-in). The shared `tls-mux` server binds this address; until the existing HTTPS site is moved off the same port, leave it unset to avoid a listener conflict.
+
+TLS-SNI is **passthrough** — Caddy does not terminate the connection. The certificate the client sees is the one the upstream presents, so the sandbox process must hold its own cert for that SNI hostname.
+
+## Reconciliation
+
+Reconcile keeps caddy and the sandbox database in sync across all three protocols (`http`, `tcp`, `tls`). The periodic loop and `POST /v1/admin/reconcile` both:
+
+- Re-upsert routes for running sandboxes whose caddy entries are missing.
+- Drop routes when the underlying sandbox is `destroyed`.
+- Garbage-collect zombie caddy routes / layer4 servers whose IDs match our convention but no longer correspond to any DB row (e.g. after a destroyed-row TTL purge or development DB wipe).
+
+See [Reconcile](/reconcile) for full details.
+
+## Unexposing
+
+`unexposePort(port)` works the same regardless of protocol — the daemon looks up the recorded protocol on the row and tears down the right caddy surface (HTTP route, layer4 TCP server, or TLS-SNI route).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.unexposePort(5432);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.unexpose_port(5432)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := sandbox.UnexposePort(ctx, 5432); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.unexpose_port(5432)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.unexposePort(5432);
+    ```
+  </TabItem>
+</Tabs>
+
+## Related docs
+
+- [Preview](/preview/) — HTTPS-shaped exposures.
+- [Port Allowlist](/port-allowlist/) — explicit exposure before public traffic is accepted.
+- [Reconcile](/reconcile/) — how caddy state is kept consistent with the database.

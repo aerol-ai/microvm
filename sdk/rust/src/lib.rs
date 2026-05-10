@@ -315,6 +315,22 @@ impl Sandbox {
         self.client.expose_port(&self.data.id, port)
     }
 
+    /// Publish a raw TCP port through caddy-l4.
+    ///
+    /// Returns a `tcp://<host>:<port>` URL ready to plug into native protocol
+    /// clients (psql, redis-cli, mysql, mongosh).
+    pub fn expose_tcp_port(&self, port: u16) -> Result<String, Error> {
+        self.client.expose_tcp_port(&self.data.id, port)
+    }
+
+    /// Publish a TCP port behind the shared TLS-SNI multiplexer.
+    ///
+    /// Returns `tls://<id>-<port>.<domain>:<l4-port>`. Requires the
+    /// deployment to have a domain configured AND `SB_L4_TLS_LISTEN` set.
+    pub fn expose_tls_port(&self, port: u16) -> Result<String, Error> {
+        self.client.expose_tls_port(&self.data.id, port)
+    }
+
     pub fn unexpose_port(&self, port: u16) -> Result<(), Error> {
         self.client.unexpose_port(&self.data.id, port)
     }
@@ -552,7 +568,20 @@ impl Client {
     }
 
     pub fn expose_port(&self, id: &str, port: u16) -> Result<String, Error> {
-        let response = self.do_json::<(), Value>(Method::POST, &format!("/v1/sandboxes/{}/ports/{}", id, port), None)?;
+        self.expose_port_with_protocol(id, port, None)
+    }
+
+    pub fn expose_tcp_port(&self, id: &str, port: u16) -> Result<String, Error> {
+        self.expose_port_with_protocol(id, port, Some("tcp"))
+    }
+
+    pub fn expose_tls_port(&self, id: &str, port: u16) -> Result<String, Error> {
+        self.expose_port_with_protocol(id, port, Some("tls"))
+    }
+
+    fn expose_port_with_protocol(&self, id: &str, port: u16, protocol: Option<&str>) -> Result<String, Error> {
+        let body = protocol.map(|p| serde_json::json!({"protocol": p}));
+        let response = self.do_json::<Value, Value>(Method::POST, &format!("/v1/sandboxes/{}/ports/{}", id, port), body.as_ref())?;
         response
             .get("public_url")
             .and_then(|value| value.as_str())

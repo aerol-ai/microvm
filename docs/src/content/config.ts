@@ -134,6 +134,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/tcp-ports',
+        label: 'TCP & TLS Ports',
+        description: 'Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo) via caddy-l4.',
+      },
+      {
+        type: 'link',
         href: '/port-allowlist',
         label: 'Port Allowlist',
         description: 'Require explicit exposure before public traffic reaches a sandbox port.',
