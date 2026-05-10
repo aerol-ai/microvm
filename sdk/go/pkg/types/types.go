@@ -9,6 +9,28 @@ type UpdateLifecycleOptions = models.UpdateLifecycleRequest
 type ExecRequest = models.ExecRequest
 type ExecResult = models.ExecResult
 type ExposedPort = models.ExposedPort
+
+// ExposeResult is the structured outcome of a successful expose call. Host
+// and HostPort are populated only when Protocol == ExposeProtocolTCP — for
+// HTTP and TLS exposures the dialable URL is in URL alone.
+type ExposeResult = models.ExposePortResponse
+
+// ExposeProtocol selects the wire surface an exposure publishes through.
+type ExposeProtocol string
+
+const (
+	// ExposeProtocolHTTP is the default — Caddy HTTP reverse proxy at
+	// https://<id>-<port>.<domain> (or the path-mode equivalent on an
+	// IP-only deployment).
+	ExposeProtocolHTTP ExposeProtocol = "http"
+	// ExposeProtocolTCP allocates a parent-host port from the configured
+	// pool and forwards raw bytes to the container via caddy-l4.
+	ExposeProtocolTCP ExposeProtocol = "tcp"
+	// ExposeProtocolTLS adds a TLS-SNI route to the shared layer4 server.
+	// Requires the daemon to have a domain configured AND
+	// SB_L4_TLS_LISTEN set.
+	ExposeProtocolTLS ExposeProtocol = "tls"
+)
 type HealthStatus = models.HealthStatus
 type Sandbox = models.Sandbox
 type MountSpec = models.MountSpec

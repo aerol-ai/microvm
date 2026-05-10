@@ -19,6 +19,8 @@ from .types import (
     ExecRequest,
     ExecResult,
     ExecStreamOptions,
+    ExposeProtocol,
+    ExposeResult,
     HealthStatus,
     Lifecycle,
     MountSpec,
@@ -297,25 +299,8 @@ class Sandbox:
     def download_file(self, target_path: str) -> bytes:
         return self._client.download_file(self.id, target_path)
 
-    def expose_port(self, port: int) -> str:
-        return self._client.expose_port(self.id, port)
-
-    def expose_tcp_port(self, port: int) -> str:
-        """Publish a raw TCP port through caddy-l4. Returns ``tcp://<host>:<port>``.
-
-        Plug the result straight into ``psql``, ``redis-cli``, ``mysql``,
-        ``mongosh``, or any other native-protocol client.
-        """
-        return self._client.expose_tcp_port(self.id, port)
-
-    def expose_tls_port(self, port: int) -> str:
-        """Publish a TCP port behind the shared TLS-SNI multiplexer.
-
-        Returns ``tls://<id>-<port>.<domain>:<l4-port>``. Requires the
-        deployment to have a domain configured AND ``SB_L4_TLS_LISTEN`` set
-        on the daemon.
-        """
-        return self._client.expose_tls_port(self.id, port)
+    def expose_port(self, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
+        return self._client.expose_port(self.id, port, protocol=protocol)
 
     def unexpose_port(self, port: int) -> None:
         self._client.unexpose_port(self.id, port)
@@ -487,19 +472,24 @@ class MicroVM:
         url = self._url(f"/v1/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
         return self._request("GET", url)
 
-    def expose_port(self, sandbox_id: str, port: int) -> str:
-        return self._expose_port_with_protocol(sandbox_id, port, None)
+    def expose_port(self, sandbox_id: str, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
+        """Publish a sandbox container port.
 
-    def expose_tcp_port(self, sandbox_id: str, port: int) -> str:
-        return self._expose_port_with_protocol(sandbox_id, port, "tcp")
+        ``protocol`` selects the wire surface and defaults to ``"http"``:
 
-    def expose_tls_port(self, sandbox_id: str, port: int) -> str:
-        return self._expose_port_with_protocol(sandbox_id, port, "tls")
+        - ``"http"``: Caddy HTTP reverse proxy at ``https://<id>-<port>.<domain>``.
+        - ``"tcp"``:  raw caddy-l4 listener on a parent-host port. Pair with
+                      native protocol clients (psql, redis-cli, mysql, mongosh).
+        - ``"tls"``:  caddy-l4 TLS-SNI route on the shared listener. Requires
+                      the daemon to have a domain configured AND
+                      ``SB_L4_TLS_LISTEN`` set.
 
-    def _expose_port_with_protocol(self, sandbox_id: str, port: int, protocol: Optional[str]) -> str:
-        body: Optional[Dict[str, Any]] = {"protocol": protocol} if protocol else None
+        Returns an :class:`ExposeResult`. ``host`` and ``host_port`` are
+        populated only on the ``"tcp"`` path.
+        """
+        body: Optional[Dict[str, Any]] = {"protocol": protocol} if protocol and protocol != "http" else None
         response = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/ports/{port}", body)
-        return str(_first_of(response, "public_url", "publicURL") or "")
+        return _from_api_expose_port_response(response)
 
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
         self._do_json("DELETE", f"/v1/sandboxes/{sandbox_id}/ports/{port}", None)
@@ -713,6 +703,24 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
         "publicURL": str(_first_of(port, "public_url", "publicURL") or ""),
         "createdAt": str(_first_of(port, "created_at", "createdAt") or ""),
     }
+
+
+def _from_api_expose_port_response(response: Dict[str, Any]) -> ExposeResult:
+    protocol_raw = str(_first_of(response, "protocol") or "http")
+    if protocol_raw not in ("http", "tcp", "tls"):
+        protocol_raw = "http"
+    protocol: ExposeProtocol = protocol_raw  # type: ignore[assignment]
+    url = str(_first_of(response, "public_url", "publicURL") or "")
+    if protocol == "tcp":
+        host_raw = _first_of(response, "host")
+        host_port_raw = _first_of(response, "host_port", "hostPort")
+        return ExposeResult(
+            protocol=protocol,
+            url=url,
+            host=str(host_raw) if host_raw is not None else None,
+            host_port=int(host_port_raw) if host_port_raw is not None else None,
+        )
+    return ExposeResult(protocol=protocol, url=url)
 
 
 def _to_api_mount_spec(mount: MountSpec) -> Dict[str, Any]:

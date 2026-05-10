@@ -83,7 +83,7 @@ async function main() {
   });
 
   await new Promise((resolve) => setTimeout(resolve, 2000));
-  const initialPreviewURL = await sandbox.exposePort(3000);
+  const initialPreviewURL = (await sandbox.exposePort(3000)).url;
 
   await sandbox.stop();
   await sandbox.start();
@@ -101,7 +101,7 @@ async function main() {
   });
 
   await new Promise((resolve) => setTimeout(resolve, 2000));
-  const resumedPreviewURL = await sandbox.exposePort(3000);
+  const resumedPreviewURL = (await sandbox.exposePort(3000)).url;
 
   const payload = {
     sandboxID: sandbox.id,

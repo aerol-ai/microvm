@@ -91,7 +91,7 @@ async function main() {
   });
 
   await new Promise((resolve) => setTimeout(resolve, 2000));
-  const previewURL = await sandbox.exposePort(3000);
+  const previewURL = (await sandbox.exposePort(3000)).url;
 
   const payload = {
     sandboxID: sandbox.id,

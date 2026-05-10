@@ -530,17 +530,17 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 //   - "tls": adds a TLS-SNI route to the shared layer4 server. Requires
 //     --domain (so the SNI hostname has a place to resolve) and a non-empty
 //     SB_L4_TLS_LISTEN. Returns tls://<id>-<port>.<domain>:<l4-port>.
-func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol string) (string, error) {
+func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol string) (models.ExposePortResponse, error) {
 	sandbox, err := s.store.Get(ctx, id)
 	if err != nil {
-		return "", err
+		return models.ExposePortResponse{}, err
 	}
 	if port <= 0 || port > 65535 {
-		return "", errors.New("invalid port")
+		return models.ExposePortResponse{}, errors.New("invalid port")
 	}
 	canonicalProto, err := models.ValidExposedPortProtocol(protocol)
 	if err != nil {
-		return "", err
+		return models.ExposePortResponse{}, err
 	}
 
 	now := time.Now().UTC()
@@ -548,7 +548,7 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 	case models.ExposedPortProtocolHTTP:
 		publicURL := s.caddy.PortPublicURL(id, port)
 		if err := s.caddy.UpsertPortRoute(ctx, id, sandbox.ContainerIP, port); err != nil {
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		exposure := models.ExposedPort{
 			SandboxID: id,
@@ -559,17 +559,17 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 		}
 		if err := s.store.UpsertPort(ctx, exposure); err != nil {
 			_ = s.caddy.DeletePortRoute(ctx, id, port)
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		s.touchAllowedPorts(ctx, id)
-		return publicURL, nil
+		return models.ExposePortResponse{Protocol: canonicalProto, PublicURL: publicURL}, nil
 
 	case models.ExposedPortProtocolTCP:
 		// Lazy bootstrap: boot's EnsureLayer4 is best-effort, so retry here
 		// in case caddy was not reachable at start-up. Idempotent and cheap
 		// after the first success (atomic load).
 		if err := s.EnsureLayer4Ready(ctx); err != nil {
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		// Fast-path idempotency: a re-expose for an already-TCP port reuses
 		// the existing host_port reservation. Without this, the allocator
@@ -578,19 +578,24 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 		// outright — the caller must unexpose first to switch protocols.
 		if existing := findExposure(sandbox, port); existing != nil {
 			if existing.Protocol != models.ExposedPortProtocolTCP {
-				return "", fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existing.Protocol)
+				return models.ExposePortResponse{}, fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existing.Protocol)
 			}
 			if existing.HostPort > 0 {
 				if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, existing.HostPort); err != nil {
-					return "", err
+					return models.ExposePortResponse{}, err
 				}
 				s.touchAllowedPorts(ctx, id)
-				return existing.PublicURL, nil
+				return models.ExposePortResponse{
+					Protocol:  canonicalProto,
+					PublicURL: existing.PublicURL,
+					Host:      s.caddy.PublicHost(),
+					HostPort:  existing.HostPort,
+				}, nil
 			}
 		}
 		hostPort, publicURL, reused, err := s.allocateHostPort(ctx, id, port, now)
 		if err != nil {
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, hostPort); err != nil {
 			// Only roll back rows we ourselves inserted. A reused row was
@@ -598,28 +603,33 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 			if !reused {
 				_ = s.store.DeletePort(ctx, id, port)
 			}
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		s.touchAllowedPorts(ctx, id)
-		return publicURL, nil
+		return models.ExposePortResponse{
+			Protocol:  canonicalProto,
+			PublicURL: publicURL,
+			Host:      s.caddy.PublicHost(),
+			HostPort:  hostPort,
+		}, nil
 
 	case models.ExposedPortProtocolTLS:
 		sniHost := s.caddy.SNIHost(id, port)
 		if sniHost == "" {
-			return "", errors.New("TLS-SNI exposure requires --domain to be configured")
+			return models.ExposePortResponse{}, errors.New("TLS-SNI exposure requires --domain to be configured")
 		}
 		if s.caddy.L4TLSListen() == "" {
-			return "", errors.New("TLS-SNI exposure requires SB_L4_TLS_LISTEN to be set")
+			return models.ExposePortResponse{}, errors.New("TLS-SNI exposure requires SB_L4_TLS_LISTEN to be set")
 		}
 		// Lazy bootstrap: retry here so a failed boot doesn't break the
 		// first TLS-SNI exposure. The shared SNI mux server lives inside
 		// the layer4 app, so this is the gate before any UpsertTLSSNIRoute.
 		if err := s.EnsureLayer4Ready(ctx); err != nil {
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		publicURL := s.caddy.TLSPublicEndpoint(id, port, s.caddy.L4TLSListen())
 		if err := s.caddy.UpsertTLSSNIRoute(ctx, id, sniHost, sandbox.ContainerIP, port); err != nil {
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		exposure := models.ExposedPort{
 			SandboxID: id,
@@ -630,12 +640,12 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 		}
 		if err := s.store.UpsertPort(ctx, exposure); err != nil {
 			_ = s.caddy.DeleteTLSSNIRoute(ctx, id, port)
-			return "", err
+			return models.ExposePortResponse{}, err
 		}
 		s.touchAllowedPorts(ctx, id)
-		return publicURL, nil
+		return models.ExposePortResponse{Protocol: canonicalProto, PublicURL: publicURL}, nil
 	}
-	return "", fmt.Errorf("unhandled protocol %q", canonicalProto)
+	return models.ExposePortResponse{}, fmt.Errorf("unhandled protocol %q", canonicalProto)
 }
 
 // EnsureLayer4Ready bootstraps the caddy-l4 app under a single-flight

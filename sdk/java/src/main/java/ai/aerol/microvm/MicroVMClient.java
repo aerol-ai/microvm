@@ -16,8 +16,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-
 import ai.aerol.microvm.internal.Environment;
 import ai.aerol.microvm.internal.JavaNetWebSocketConnector;
 import ai.aerol.microvm.internal.JsonSupport;
@@ -31,6 +29,9 @@ import ai.aerol.microvm.model.ExecExitInfo;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
+import ai.aerol.microvm.model.ExposeOptions;
+import ai.aerol.microvm.model.ExposeProtocol;
+import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpecRedacted;
@@ -154,32 +155,32 @@ public class MicroVMClient {
         return response.body();
     }
 
-    public String exposePort(String sandboxId, int port) {
-        return exposePortWithProtocol(sandboxId, port, null);
-    }
-
     /**
-     * Publish a raw TCP port through caddy-l4. Returns {@code tcp://<host>:<port>}
-     * ready to plug into native protocol clients (psql, redis-cli, mysql,
-     * mongosh).
+     * Publish a sandbox container port. {@link ExposeOptions} selects the wire
+     * surface — pass {@link ExposeOptions#tcp()} for raw caddy-l4 routing
+     * (Postgres / Redis / MySQL / Mongo clients), {@link ExposeOptions#tls()}
+     * for the TLS-SNI multiplexer, or {@code null} / {@link ExposeOptions#http()}
+     * for the historical HTTP reverse-proxy URL. Result {@code host} and
+     * {@code hostPort} are populated only on the TCP path.
      */
-    public String exposeTCPPort(String sandboxId, int port) {
-        return exposePortWithProtocol(sandboxId, port, "tcp");
+    public ExposeResult exposePort(String sandboxId, int port, ExposeOptions options) {
+        ExposeProtocol protocol = (options != null && options.protocol != null) ? options.protocol : ExposeProtocol.HTTP;
+        Object body = protocol == ExposeProtocol.HTTP ? null : new ExposePortRequest(protocol.getWireValue());
+        ExposeResult response = doJson("POST", sandboxPath(sandboxId) + "/ports/" + port, body, ExposeResult.class);
+        if (response == null) {
+            ExposeResult empty = new ExposeResult();
+            empty.protocol = ExposeProtocol.HTTP;
+            empty.url = "";
+            return empty;
+        }
+        if (response.protocol == null) {
+            response.protocol = ExposeProtocol.HTTP;
+        }
+        return response;
     }
 
-    /**
-     * Publish a TCP port behind the shared TLS-SNI multiplexer. Returns
-     * {@code tls://<id>-<port>.<domain>:<l4-port>}. Requires the deployment
-     * to have a domain configured AND {@code SB_L4_TLS_LISTEN} set.
-     */
-    public String exposeTLSPort(String sandboxId, int port) {
-        return exposePortWithProtocol(sandboxId, port, "tls");
-    }
-
-    private String exposePortWithProtocol(String sandboxId, int port, String protocol) {
-        Object body = protocol == null ? null : new ExposePortRequest(protocol);
-        PublicUrlResponse response = doJson("POST", sandboxPath(sandboxId) + "/ports/" + port, body, PublicUrlResponse.class);
-        return response == null ? "" : response.publicUrl;
+    public ExposeResult exposePort(String sandboxId, int port) {
+        return exposePort(sandboxId, port, null);
     }
 
     public void unexposePort(String sandboxId, int port) {
@@ -553,12 +554,6 @@ public class MicroVMClient {
 
     private static final class SessionListResponse {
         public List<Session> sessions;
-    }
-
-    private static final class PublicUrlResponse {
-        @SuppressWarnings("unused")
-        @JsonProperty("public_url")
-        public String publicUrl;
     }
 
     @SuppressWarnings("unused")

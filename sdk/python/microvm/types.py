@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Literal, TypedDict
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Literal, Optional, TypedDict
 
 
 MountType = Literal["s3", "nfs", "sshfs", "rclone"]
@@ -179,6 +180,27 @@ class ExposedPort(TypedDict, total=False):
     port: int
     publicURL: str
     createdAt: str
+
+
+# Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP
+# reverse proxy; "tcp" and "tls" map to caddy-l4 surfaces.
+ExposeProtocol = Literal["http", "tcp", "tls"]
+
+
+@dataclass(frozen=True)
+class ExposeResult:
+    """Result of ``MicroVM.expose_port`` / ``Sandbox.expose_port``.
+
+    ``host`` and ``host_port`` are populated only when ``protocol == "tcp"`` —
+    they are what native protocol clients (psql, redis-cli, mysql, mongosh)
+    need to dial. For ``"http"`` and ``"tls"`` exposures the dialable URL is
+    in ``url`` and the host/port fields are ``None``.
+    """
+
+    protocol: ExposeProtocol
+    url: str
+    host: Optional[str] = None
+    host_port: Optional[int] = None
 
 
 class SandboxData(TypedDict, total=False):

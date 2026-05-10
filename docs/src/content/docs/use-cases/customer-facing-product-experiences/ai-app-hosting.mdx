@@ -68,7 +68,7 @@ async function main() {
     },
   });
 
-  const previewURL = await sandbox.exposePort(port);
+  const previewURL = (await sandbox.exposePort(port)).url;
   const runtimeEnv = {
     NODE_ENV: "production",
     PORT: String(port),

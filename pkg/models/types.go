@@ -302,6 +302,18 @@ type ExposePortRequest struct {
 	Protocol string `json:"protocol,omitempty"`
 }
 
+// ExposePortResponse is the JSON body returned by POST /v1/sandboxes/{id}/ports/{port}.
+// Protocol is the canonical value the daemon picked ("http", "tcp", or "tls"),
+// PublicURL is the dialable URL for the exposure, and Host/HostPort are populated
+// only on the raw-TCP path so SDKs can hand them to native protocol clients
+// without parsing tcp://host:port out of PublicURL.
+type ExposePortResponse struct {
+	Protocol  string `json:"protocol"`
+	PublicURL string `json:"public_url"`
+	Host      string `json:"host,omitempty"`
+	HostPort  int    `json:"host_port,omitempty"`
+}
+
 type ExposedPort struct {
 	SandboxID string    `json:"sandbox_id"`
 	Port      int       `json:"port"`

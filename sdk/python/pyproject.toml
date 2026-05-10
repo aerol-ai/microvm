@@ -1,6 +1,6 @@
 [project]
 name = "aerolvm-sdk"
-version = "0.1.6"
+version = "0.2.0"
 description = "A Python client for the Aerol.ai MicroVM sandbox API."
 readme = "README.md"
 requires-python = ">=3.9"

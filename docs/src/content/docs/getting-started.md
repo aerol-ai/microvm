@@ -6,7 +6,7 @@ AerolVM runs on a single host. The one-line installer configures the server and 
 
 ## Local Setup (Mac / Linux)
 
-The fastest way to get started: run the server directly on your Mac or Linux machine. No domain, no TLS, no Caddy — the server listens on `http://localhost:21212` and your SDK connects there directly.
+The fastest way to get started: run the server directly on your Mac or Linux machine. No domain, no TLS, no Caddy - the server listens on `http://localhost:21212` and your SDK connects there directly.
 
 **Prerequisites:** Docker Desktop (macOS) or Docker Engine (Linux) must already be running.
 
