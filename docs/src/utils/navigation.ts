@@ -1,4 +1,4 @@
-import type { NavigationCategory } from '../content/config'
+import type { NavigationCategory } from '../content.config'
 
 export interface NavigationItem {
   type: 'link' | 'group'
