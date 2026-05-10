@@ -543,14 +543,33 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 		return publicURL, nil
 
 	case models.ExposedPortProtocolTCP:
-		hostPort, publicURL, err := s.allocateHostPort(ctx, id, port, now)
+		// Fast-path idempotency: a re-expose for an already-TCP port reuses
+		// the existing host_port reservation. Without this, the allocator
+		// would loop on PK collisions in TryReserveHostPort and exhaust the
+		// pool. A different protocol on the same (id, port) is rejected
+		// outright — the caller must unexpose first to switch protocols.
+		if existing := findExposure(sandbox, port); existing != nil {
+			if existing.Protocol != models.ExposedPortProtocolTCP {
+				return "", fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existing.Protocol)
+			}
+			if existing.HostPort > 0 {
+				if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, existing.HostPort); err != nil {
+					return "", err
+				}
+				s.touchAllowedPorts(ctx, id)
+				return existing.PublicURL, nil
+			}
+		}
+		hostPort, publicURL, reused, err := s.allocateHostPort(ctx, id, port, now)
 		if err != nil {
 			return "", err
 		}
 		if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, hostPort); err != nil {
-			// The reservation row exists from the allocator; clean it up so
-			// the host port returns to the pool.
-			_ = s.store.DeletePort(ctx, id, port)
+			// Only roll back rows we ourselves inserted. A reused row was
+			// installed by a concurrent caller and is not ours to delete.
+			if !reused {
+				_ = s.store.DeletePort(ctx, id, port)
+			}
 			return "", err
 		}
 		s.touchAllowedPorts(ctx, id)
@@ -592,35 +611,61 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 // the DB without a process-level lock. When randoms collide enough times we
 // fall back to a deterministic linear scan, which is the p99 path that
 // guarantees we exhaust the pool before giving up.
-func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, containerPort int, now time.Time) (int, string, error) {
+//
+// Returns reused=true when a concurrent caller installed the (sandbox_id,
+// port) row first; the returned host_port and public URL come from that
+// existing row. The flag lets the caller skip rollback on caddy failures so
+// it doesn't delete a row it didn't create.
+func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, containerPort int, now time.Time) (hostPort int, publicURL string, reused bool, err error) {
 	if s.cfg.L4PortRangeEnd <= s.cfg.L4PortRangeStart {
-		return 0, "", errors.New("L4 port pool is misconfigured")
+		return 0, "", false, errors.New("L4 port pool is misconfigured")
 	}
 	span := s.cfg.L4PortRangeEnd - s.cfg.L4PortRangeStart + 1
 
+	tryCandidate := func(candidate int) (int, string, bool, bool, error) {
+		candidateURL := s.caddy.TCPPublicEndpoint(candidate)
+		result, err := s.store.TryReserveHostPort(ctx, sandboxID, containerPort, candidate, models.ExposedPortProtocolTCP, candidateURL, now)
+		if err != nil {
+			return 0, "", false, false, err
+		}
+		if result.Reserved {
+			return candidate, candidateURL, false, true, nil
+		}
+		if result.Existing != nil {
+			// Race: a concurrent ExposePort installed the row first. Reuse
+			// when protocols match; otherwise refuse (avoids the pool walk
+			// AND prevents silently leaking the prior route).
+			if result.Existing.Protocol != models.ExposedPortProtocolTCP {
+				return 0, "", false, false, fmt.Errorf("port %d already exposed as %s; unexpose it first", containerPort, result.Existing.Protocol)
+			}
+			if result.Existing.HostPort > 0 {
+				return result.Existing.HostPort, result.Existing.PublicURL, true, true, nil
+			}
+		}
+		return 0, "", false, false, nil
+	}
+
 	for i := 0; i < allocatorRandomAttempts; i++ {
 		candidate := s.cfg.L4PortRangeStart + mathrand.Intn(span)
-		publicURL := s.caddy.TCPPublicEndpoint(candidate)
-		ok, err := s.store.TryReserveHostPort(ctx, sandboxID, containerPort, candidate, models.ExposedPortProtocolTCP, publicURL, now)
-		if err != nil {
-			return 0, "", err
+		hp, url, r, done, terr := tryCandidate(candidate)
+		if terr != nil {
+			return 0, "", false, terr
 		}
-		if ok {
-			return candidate, publicURL, nil
+		if done {
+			return hp, url, r, nil
 		}
 	}
 
 	for candidate := s.cfg.L4PortRangeStart; candidate <= s.cfg.L4PortRangeEnd; candidate++ {
-		publicURL := s.caddy.TCPPublicEndpoint(candidate)
-		ok, err := s.store.TryReserveHostPort(ctx, sandboxID, containerPort, candidate, models.ExposedPortProtocolTCP, publicURL, now)
-		if err != nil {
-			return 0, "", err
+		hp, url, r, done, terr := tryCandidate(candidate)
+		if terr != nil {
+			return 0, "", false, terr
 		}
-		if ok {
-			return candidate, publicURL, nil
+		if done {
+			return hp, url, r, nil
 		}
 	}
-	return 0, "", errors.New("L4 port pool exhausted")
+	return 0, "", false, errors.New("L4 port pool exhausted")
 }
 
 func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {

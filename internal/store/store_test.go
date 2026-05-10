@@ -314,6 +314,62 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "try_reserve_host_port_distinguishes_pk_collision_from_host_port_collision",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sb := sampleSandbox("sb-tcp-idem")
+				if err := st.Create(ctx, sb); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				now := time.Now().UTC()
+
+				// Initial reservation succeeds.
+				r, err := st.TryReserveHostPort(ctx, sb.ID, 5432, 37001, models.ExposedPortProtocolTCP, "tcp://host:37001", now)
+				if err != nil {
+					t.Fatalf("first reserve error = %v", err)
+				}
+				if !r.Reserved || r.Existing != nil {
+					t.Fatalf("first reserve = %+v, want Reserved=true Existing=nil", r)
+				}
+
+				// Re-reserving the same (sandbox, container_port) with a fresh
+				// host_port must surface the existing row, NOT look like a
+				// host_port collision (which would make the allocator walk
+				// the pool to exhaustion).
+				r, err = st.TryReserveHostPort(ctx, sb.ID, 5432, 37002, models.ExposedPortProtocolTCP, "tcp://host:37002", now)
+				if err != nil {
+					t.Fatalf("re-reserve error = %v", err)
+				}
+				if r.Reserved {
+					t.Fatalf("re-reserve unexpectedly inserted a duplicate row: %+v", r)
+				}
+				if r.Existing == nil {
+					t.Fatal("re-reserve returned no Existing row; allocator would walk the pool")
+				}
+				if r.Existing.HostPort != 37001 || r.Existing.Protocol != models.ExposedPortProtocolTCP {
+					t.Fatalf("Existing = %+v, want host_port=37001 protocol=tcp", r.Existing)
+				}
+
+				// A different (sandbox, container_port) racing for the same
+				// host_port must look like a host_port collision (Existing
+				// nil), so the allocator can retry with another candidate.
+				other := sampleSandbox("sb-tcp-other")
+				if err := st.Create(ctx, other); err != nil {
+					t.Fatalf("Create(other) error = %v", err)
+				}
+				r, err = st.TryReserveHostPort(ctx, other.ID, 6379, 37001, models.ExposedPortProtocolTCP, "tcp://host:37001", now)
+				if err != nil {
+					t.Fatalf("collision reserve error = %v", err)
+				}
+				if r.Reserved {
+					t.Fatal("collision reserve unexpectedly succeeded against taken host_port")
+				}
+				if r.Existing != nil {
+					t.Fatalf("collision reserve returned Existing = %+v, want nil so caller retries", r.Existing)
+				}
+			},
+		},
+		{
 			name: "has_active_image_ref_returns_false_when_only_destroyed",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
