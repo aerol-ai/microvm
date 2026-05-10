@@ -7,7 +7,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/gorilla/websocket v1.5.3
 	github.com/mattn/go-sqlite3 v1.14.24
-	golang.org/x/crypto v0.50.0
+	golang.org/x/crypto v0.51.0
 )
 
-require golang.org/x/sys v0.43.0 // indirect
+require golang.org/x/sys v0.44.0 // indirect
