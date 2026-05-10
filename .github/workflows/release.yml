@@ -187,7 +187,7 @@ jobs:
           chmod 0755 dist/toolboxd_${{ matrix.suffix }}
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.suffix }}
           path: dist/
