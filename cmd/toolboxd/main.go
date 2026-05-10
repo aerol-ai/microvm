@@ -69,6 +69,9 @@ func main() {
 		port:         envInt("SB_TOOLBOX_PORT", 2280),
 		allowedPorts: map[int]struct{}{},
 	}
+	// Evict the token from the process env table so child processes spawned
+	// for the user command and /exec endpoints don't inherit it via os.Environ().
+	os.Unsetenv("SB_TOOLBOX_TOKEN")
 
 	startReaper(logger)
 
