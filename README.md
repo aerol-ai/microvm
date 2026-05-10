@@ -20,7 +20,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
     --pat-token your-secret-pat
 ```
 
-**Production** (DNS-01 wildcard TLS via Cloudflare - required for real workloads):
+**Production** (DNS-01 wildcard TLS via Cloudflare):
 
 ```bash
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
@@ -30,7 +30,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
     --dns-api-token your-cloudflare-api-token
 ```
 
-> **Pick the right TLS mode up-front.** In HTTP-01 mode Caddy issues one Let's Encrypt certificate per sandbox subdomain on first access. Let's Encrypt caps **certificate issuance** at 50 new certs per registered domain per week. DNS-01 issues exactly **two** certs total (`<domain>` + `*.<domain>`) regardless of how many sandboxes exist, so it scales indefinitely and is required for real workloads.
+> **`--domain` requires `--dns-provider`.** The installer hard-fails otherwise. Caddy issues exactly two certificates — `<domain>` and `*.<domain>` — once at startup via DNS-01, then renews them on a schedule. Use `--local` for the only no-DNS path (binds to `127.0.0.1`, no TLS).
 
 If you omit `--pat-token`, the installer generates a token and prints it once at the end.
 

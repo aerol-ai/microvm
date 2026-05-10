@@ -932,10 +932,6 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	s.logger.Info("capacity reservations replayed", "count", replayed)
 }
 
-func (s *Service) TLSDomainAllowed(host string) bool {
-	return s.caddy.AllowTLSDomain(host)
-}
-
 func (s *Service) Reconcile(ctx context.Context) error {
 	known, err := s.store.List(ctx)
 	if err != nil {

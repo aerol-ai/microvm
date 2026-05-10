@@ -45,7 +45,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.Handle("GET /v1/capacity", s.requireAuth(http.HandlerFunc(s.handleCapacity)))
 	s.mux.Handle("POST /v1/admin/reconcile", s.requireAuth(http.HandlerFunc(s.handleReconcile)))
-	s.mux.HandleFunc("GET /v1/tls-check", s.handleTLSCheck)
 
 	s.mux.Handle("POST /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleCreateSandbox)))
 	s.mux.Handle("GET /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleListSandboxes)))
@@ -121,19 +120,6 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.service.Capacity())
-}
-
-func (s *Server) handleTLSCheck(w http.ResponseWriter, r *http.Request) {
-	host := strings.TrimSpace(r.URL.Query().Get("domain"))
-	if host == "" {
-		writeError(w, http.StatusBadRequest, "domain is required")
-		return
-	}
-	if !s.service.TLSDomainAllowed(host) {
-		writeError(w, http.StatusForbidden, "domain not allowed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {

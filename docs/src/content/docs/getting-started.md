@@ -43,15 +43,7 @@ Point your SDK at the local server using `baseURL: "http://localhost:21212"` and
 
 ## Install on a VPS
 
-**Trial / single-user** (HTTP-01 on-demand TLS):
-
-```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
-    --domain sandbox.example.com \
-    --pat-token your-secret-pat
-```
-
-**Production** (DNS-01 wildcard TLS via Cloudflare - required for real workloads):
+Domain-mode installs use DNS-01 wildcard TLS exclusively. The installer requires `--dns-provider` and `--dns-api-token` whenever `--domain` is set:
 
 ```bash
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
@@ -61,7 +53,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
     --dns-api-token your-cloudflare-api-token
 ```
 
-> **Pick the right TLS mode up-front.** In HTTP-01 mode Caddy issues one Let's Encrypt certificate per sandbox subdomain on first access. Let's Encrypt caps **certificate issuance** at 50 new certs per registered domain per week - this is a TLS limit, not a sandbox capacity limit. Sandbox capacity is determined entirely by the host's CPU and memory. DNS-01 issues exactly **two** certs total (`<domain>` + `*.<domain>`) regardless of how many sandboxes exist, so it scales indefinitely and is required for any real workload.
+> **DNS-01 wildcard TLS is required for domain mode.** Caddy issues exactly two certificates (`<domain>` and `*.<domain>`) once at startup and renews them on a schedule, so sandbox capacity is bounded only by the host's CPU and memory — not by Let's Encrypt issuance quota. If you cannot run DNS-01, install with `--local` instead (binds to `127.0.0.1`, no TLS).
 
 If you omit `--pat-token`, the installer generates a token and prints it once at the end.
 
@@ -94,11 +86,10 @@ Open the following inbound TCP ports on your host (EC2 security group, bare-meta
 
 | Port | Protocol | Required for | Notes |
 |---|---|---|---|
-| `21212` | TCP | HTTP-01 ACME challenges + HTTPS redirect | Not needed if using DNS-01 wildcard TLS only. |
 | `443` | TCP | HTTPS - REST API and sandbox preview URLs | Primary public-facing port in production. |
 | `2220` | TCP | SSH gateway - SSH access into sandboxes | Configurable via `SB_SSH_LISTEN_ADDR`. |
 
-Port `21212` is the internal API port (default `SB_API_PORT`). In production Caddy proxies it - you do **not** need to expose `21212` publicly. In local dev mode (no Caddy) you reach the API directly on `21212`.
+Port `21212` is the internal API port (default `SB_API_PORT`). Caddy proxies it via the public domain — you do **not** need to expose `21212` publicly. In local dev mode (no Caddy) you reach the API directly on `21212`.
 
 Port `2019` (Caddy Admin API) is bound to `127.0.0.1` only and must never be publicly exposed.
 

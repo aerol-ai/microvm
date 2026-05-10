@@ -75,28 +75,6 @@ func TestClientURLAndEnabledCases(t *testing.T) {
 	}
 }
 
-func TestAllowTLSDomainCases(t *testing.T) {
-	client := &Client{domain: "sandbox.example.com"}
-	tests := []struct {
-		name string
-		host string
-		want bool
-	}{
-		{name: "allow_base_domain", host: "sandbox.example.com", want: true},
-		{name: "allow_subdomain", host: "https://abc.sandbox.example.com/", want: true},
-		{name: "reject_other_domain", host: "other.example.com", want: false},
-		{name: "reject_blank_host", host: "", want: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := client.AllowTLSDomain(tc.host); got != tc.want {
-				t.Fatalf("AllowTLSDomain(%q) = %v, want %v", tc.host, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestPingCases(t *testing.T) {
 	tests := []struct {
 		name string

@@ -39,11 +39,12 @@ Options:
   --idle-timeout-min <minutes> Idle auto-stop timeout in minutes
   --build-from-source          Build binaries from the current checkout
   --dns-provider <name>        DNS provider for wildcard TLS (DNS-01 ACME).
-                               Currently supported: cloudflare. Requires --domain
-                               and --dns-api-token. Without this flag, Caddy
-                               falls back to on-demand HTTP-01 issuance, which
-                               does not scale past Let's Encrypt's 50-cert/week
-                               rate limit per registered domain.
+                               Currently supported: cloudflare. Required
+                               whenever --domain is set, alongside
+                               --dns-api-token. Operators that cannot run
+                               DNS-01 should use --local (no TLS, 127.0.0.1
+                               only) or omit --domain to fall back to
+                               IP/path mode.
   --dns-api-token <token>      API token for the configured DNS provider.
                                For cloudflare: a scoped API token with
                                Zone:Read + DNS:Edit on the target zone.
@@ -301,10 +302,24 @@ if [[ -n "$DNS_PROVIDER" ]]; then
 	esac
 fi
 
-# TLS-SNI multiplexing is gated on DNS-01 issuance because handing :443 to
-# caddy-l4 means HTTP-01 ACME validation can't bind there. With DNS-01 in
-# place ACME never needs :443, so caddy-l4 can own it and the regular Caddy
-# HTTPS site moves to 127.0.0.1:8443.
+# Domain mode requires DNS-01 wildcard issuance. The previous HTTP-01
+# on-demand fallback was removed because Caddy's `ask` endpoint accepts any
+# subdomain under the configured domain — random probes can burn the Let's
+# Encrypt 50-cert/week quota for the registered domain and DoS real sandbox
+# provisioning. Operators who can't run DNS-01 should use --local (no TLS,
+# 127.0.0.1 only) or omit --domain to fall back to IP/path mode.
+if [[ -n "$DOMAIN" && -z "$DNS_PROVIDER" ]]; then
+	echo "--domain requires --dns-provider and --dns-api-token (DNS-01 wildcard TLS)." >&2
+	echo "HTTP-01 on-demand TLS is no longer supported because it exposes the" >&2
+	echo "Let's Encrypt cert-issuance quota to arbitrary-subdomain probes." >&2
+	echo "Re-run with --dns-provider cloudflare --dns-api-token <token>, or use --local." >&2
+	exit 1
+fi
+
+# TLS-SNI multiplexing piggy-backs on the DNS-01 wildcard cert. With DNS-01
+# in place ACME never needs :443, so caddy-l4 can own it and the regular
+# Caddy HTTPS site moves to 127.0.0.1:8443. In IP/path mode (no --domain)
+# there is no TLS at all and the multiplexer stays off.
 if [[ -n "$DNS_PROVIDER" ]]; then
 	L4_TLS_LISTEN_DEFAULT=":443"
 else
@@ -514,11 +529,11 @@ SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
 SB_L4_PORT_RANGE_START=22000
 SB_L4_PORT_RANGE_END=23000
-# TLS-SNI multiplexing. With --dns-provider set we bind caddy-l4 to :443 by
-# default (the Caddyfile above moves the regular HTTPS site to
-# 127.0.0.1:8443 so they don't collide; ACME goes via DNS so :443 isn't
-# needed for issuance). Without --dns-provider we leave it empty so
-# HTTP-01 issuance keeps :443 for itself.
+# TLS-SNI multiplexing. In domain mode (--dns-provider required) we bind
+# caddy-l4 to :443 by default; the Caddyfile above moves the regular HTTPS
+# site to 127.0.0.1:8443 so they don't collide. ACME goes via DNS so :443
+# isn't needed for issuance. In IP/path mode (no --domain) this stays
+# empty and the layer4 multiplexer is never started.
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
@@ -540,28 +555,26 @@ EOF
 		return
 	fi
 
-	if [[ -n "$DNS_PROVIDER" ]]; then
-		# DNS-01 wildcard issuance. Caddy issues exactly two certs that are
-		# renewed automatically:
-		#   - one for $DOMAIN
-		#   - one for *.$DOMAIN  (covers every sandbox subdomain forever)
-		# This sidesteps Let's Encrypt's per-registered-domain rate limits
-		# (50 certs/week) regardless of how many sandboxes are created.
-		# {env.SB_DNS_API_TOKEN} is read from /etc/default/caddy.
-		#
-		# In DNS-01 mode we also enable TLS-SNI multiplexing by default.
-		# caddy-l4 owns :443, peeks at the ClientHello SNI, routes per-sandbox
-		# subdomains directly to the sandbox container, and forwards any
-		# unmatched SNI (the API host itself, stray probes) to this Caddy
-		# HTTPS listener on 127.0.0.1:8443. Two implications:
-		#   - The HTTPS sites below bind 127.0.0.1:8443, NOT :443. caddy-l4
-		#     gets :443, sandboxd writes the L4 server config via the admin
-		#     API on first L4 expose call.
-		#   - DNS-01 means we don't need :443 free for ACME (validation goes
-		#     through DNS), so handing :443 to caddy-l4 is safe.
-		# Without --dns-provider, TLS-SNI stays off so HTTP-01 ACME on :443
-		# keeps working — see the on-demand fallback branch below.
-		cat > /etc/caddy/Caddyfile <<EOF
+	# Domain mode: DNS-01 wildcard issuance is the only supported path
+	# (HTTP-01 on-demand was removed because the per-subdomain ask endpoint
+	# could be abused to burn the Let's Encrypt 50-cert/week quota — argument
+	# parsing has already required --dns-provider whenever --domain is set).
+	#
+	# Caddy issues exactly two certs that are renewed automatically:
+	#   - one for $DOMAIN
+	#   - one for *.$DOMAIN  (covers every sandbox subdomain forever)
+	# {env.SB_DNS_API_TOKEN} is read from /etc/default/caddy.
+	#
+	# TLS-SNI multiplexing is on by default. caddy-l4 owns :443, peeks at the
+	# ClientHello SNI, routes per-sandbox subdomains directly to the sandbox
+	# container, and forwards unmatched SNI (the API host itself, stray
+	# probes) to the Caddy HTTPS listener on 127.0.0.1:8443. Two implications:
+	#   - The HTTPS sites below bind 127.0.0.1:8443, NOT :443. caddy-l4 gets
+	#     :443, sandboxd writes the L4 server config via the admin API on
+	#     first L4 expose call.
+	#   - DNS-01 means we don't need :443 free for ACME (validation goes
+	#     through DNS), so handing :443 to caddy-l4 is safe.
+	cat > /etc/caddy/Caddyfile <<EOF
 {
 	admin localhost:2019
 	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
@@ -588,40 +601,6 @@ https://*.$DOMAIN:8443 {
 	bind 127.0.0.1
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
-	}
-	respond "Sandbox not found" 404
-}
-EOF
-		return
-	fi
-
-	# Fallback: HTTP-01 on-demand TLS. Each sandbox subdomain is issued its
-	# own cert at first hit. Suitable for small deployments only — Let's
-	# Encrypt rate limits will throttle creation past ~50 sandboxes/week.
-	cat > /etc/caddy/Caddyfile <<EOF
-{
-	admin localhost:2019
-	on_demand_tls {
-		ask http://127.0.0.1:21212/v1/tls-check
-	}
-}
-
-https://$DOMAIN {
-	tls {
-		on_demand
-	}
-	@api path /health /v1 /v1/*
-	handle @api {
-		reverse_proxy 127.0.0.1:21212
-	}
-	handle {
-		respond "Sandbox API not found" 404
-	}
-}
-
-https://*.$DOMAIN {
-	tls {
-		on_demand
 	}
 	respond "Sandbox not found" 404
 }
@@ -1154,17 +1133,10 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "API URL: https://$DOMAIN"
 	echo "Health URL: https://$DOMAIN/health"
 	echo "Public sandbox URL pattern: https://<docker-short-id>.$DOMAIN"
-	if [[ -n "$DNS_PROVIDER" ]]; then
-		echo "TLS: wildcard DNS-01 via $DNS_PROVIDER (one cert covers all subdomains)"
-		echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
-		echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
-		echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
-	else
-		echo "TLS: on-demand HTTP-01 (per-subdomain). Subject to Let's Encrypt rate limits."
-		echo "  For production, re-run with --dns-provider cloudflare --dns-api-token <token>"
-		echo "TLS-SNI multiplexing: DISABLED (HTTP-01 needs :443 free for ACME)."
-		echo "  Re-run with --dns-provider to enable exposeTLSPort()."
-	fi
+	echo "TLS: wildcard DNS-01 via $DNS_PROVIDER (one cert covers all subdomains)"
+	echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
+	echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
+	echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
 else
 	echo "API URL: http://$PUBLIC_HOST:21212"
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"

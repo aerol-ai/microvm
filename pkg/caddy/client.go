@@ -182,14 +182,6 @@ func (c *Client) DeletePortRoute(ctx context.Context, id string, port int) error
 	return c.deleteRoute(ctx, portRouteID(id, port))
 }
 
-func (c *Client) AllowTLSDomain(host string) bool {
-	host = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://"), "/"))
-	if host == "" || c.domain == "" {
-		return false
-	}
-	return host == c.domain || strings.HasSuffix(host, "."+c.domain)
-}
-
 // upsertRoute writes one route by its @id without touching the rest of the
 // routes array. PATCH /id/<routeID> replaces the existing node in place; if
 // it doesn't exist yet (404), we insert it at index 0 of the server's routes
