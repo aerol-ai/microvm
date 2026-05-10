@@ -48,7 +48,19 @@ Any expose / unexpose / reconcile path that touches BOTH caddy and the store can
 
 **Reviewer asks:** if step 2 of 3 fails, what state is the system in? Is the next request to the same sandbox going to succeed, fail confusingly, or leak resources?
 
-## 5. TCP host-port pool & L4 bootstrap
+## 5. Mount inputs run on the host
+
+Mount fields (`source`, `options.opts` for NFS, `options.extra_args` for S3, mount-tool flags generally) are passed verbatim into commands that execute on the host as the daemon user — outside the microVM isolation boundary. PAT holders are assumed to be host operators; the threat model treats their input as already-trusted.
+
+If you change who holds a PAT (sub-accounts, hosted offering, external CI), this assumption inverts and these fields become a host attack surface. Before that move:
+
+- Allowlist `options.opts` / `extra_args` keys instead of pass-through.
+- Isolate mount helpers (dedicated low-priv user, network namespace scoped to the declared endpoint, seccomp/AppArmor, or a helper VM).
+- Re-validate `source` schemes and reject control characters.
+
+**Reviewer asks:** does this PR widen what a PAT holder can pass into a host-side mount command? If yes, is it still safe under the "PAT == operator" assumption, and is the assumption still accurate?
+
+## 6. TCP host-port pool & L4 bootstrap
 
 These two areas are particularly fragile and have produced live incidents (PR #16):
 

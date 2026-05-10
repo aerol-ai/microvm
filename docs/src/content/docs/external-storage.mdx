@@ -191,6 +191,7 @@ Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 Ki
 - Credentials never enter the sandbox.
 - Credentials are encrypted at rest with AES-256-GCM.
 - Read APIs return `has_credentials: true` but never the actual values.
+- Mount fields (`source`, NFS `options.opts`, S3 `options.extra_args`, etc.) are passed verbatim to host-side mount tools (`mount`, `mount-s3`, `sshfs`, `rclone`) running as the daemon user, outside the sandbox isolation boundary. The platform assumes PAT holders are host operators.
 
 ## Operational Notes
 
