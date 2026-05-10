@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/aerol-ai/microvm"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
+reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 urlencoding = "2.1.2"
