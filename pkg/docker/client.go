@@ -24,6 +24,16 @@ import (
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
+// managedLabelKey is the Docker label every sandbox container we create
+// carries (value "true"). It is the ownership boundary between sandboxd-
+// managed containers and any other Docker workloads sharing the same
+// daemon: ListManaged filters on this label, and the Docker /events stream
+// is subscribed with the same label filter (see pkg/docker/events.go), so
+// reconcile and the event monitor are guaranteed never to see — let alone
+// stop, destroy, or modify — a container we did not create. Do not relax
+// either filter without first reasoning through the multi-tenant case;
+// without the gate, a `docker run` started by an unrelated process on the
+// host would be picked up as an "orphan" and force-removed.
 const managedLabelKey = "aerolvm.managed"
 
 // SandboxRuntime is the Docker-layer alias of the canonical

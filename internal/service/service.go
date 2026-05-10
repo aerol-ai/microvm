@@ -932,32 +932,42 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	for _, sandbox := range known {
 		state, ok := managed[sandbox.ID]
 		if !ok {
-			previousStatus := sandbox.Status
-			sandbox.Status = models.SandboxStatusDestroyed
-			sandbox.ContainerIP = ""
-			sandbox.ContainerID = ""
-			sandbox.UpdatedAt = time.Now().UTC()
-			if err := s.store.Upsert(ctx, sandbox); err != nil {
-				return err
-			}
+			// Container is gone (manual `docker rm`, OOM kill, host reboot,
+			// previous reconcile pass already destroyed it via events). Tear
+			// down all our state and delete the row outright. Cascades through
+			// exposed_ports, immediately freeing any reserved host_port back
+			// to the L4 allocator pool — the partial unique index on
+			// host_port doesn't filter by sandbox status, so a destroyed-but-
+			// retained row would otherwise hold its host_port slot forever.
+			//
+			// docker.Destroy is intentionally skipped: the container is the
+			// reason we're in this branch. Caddy / mounts / admitter / image
+			// cleanup is best-effort and mirrors DestroySandbox's order;
+			// failures here are picked up by gcZombieCaddyEntries on a later
+			// pass and by the mounts.Sweep at the end of Reconcile.
 			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 			}
-			_ = s.mounts.UnmountAll(sandbox.ID)
-			// Only GC and release admitter capacity on the transition into
-			// destroyed — a row that was already destroyed at the start of
-			// this reconcile pass already had its chance, and re-running the
-			// check on every tick would be wasted work. Without the Release
-			// here, capacity reservations leak when a container disappears
-			// out-of-band (manual `docker rm`, OOM kill, host reboot) and
-			// the admitter eventually refuses new sandboxes.
-			if previousStatus != models.SandboxStatusDestroyed {
-				if s.admitter != nil {
-					s.admitter.Release(sandbox.ID)
-				}
-				s.maybeRemoveImage(ctx, sandbox.Image)
+			if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
+				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
 			}
+			// store.Delete must happen BEFORE maybeRemoveImage: HasActiveImageRef
+			// queries the sandboxes table and treats any non-destroyed row as a
+			// live reference. While our row still exists with its pre-destroy
+			// status (typically "started"), the image GC would always skip,
+			// leaking image layers across reconcile cycles.
+			if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			if s.admitter != nil {
+				s.admitter.Release(sandbox.ID)
+			}
+			s.maybeRemoveImage(ctx, sandbox.Image)
+			s.logger.Info("audit reconcile destroyed",
+				"sandbox_id", sandbox.ID,
+				"image", sandbox.Image,
+			)
 			continue
 		}
 
@@ -1016,9 +1026,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already
 	// drops routes for sandboxes that exist in the DB but lost their
 	// container — this catches the orthogonal case where caddy holds an
-	// entry for a sandbox row that was purged out (DB wipe, destroyed-row
-	// TTL pass, manual surgery) and no destroy ran. Without this, caddy
-	// accumulates dead routes forever.
+	// entry for a sandbox row that was deleted out-of-band (DB wipe,
+	// manual surgery) and no destroy ran. Without this, caddy accumulates
+	// dead routes forever.
 	s.gcZombieCaddyEntries(ctx, known)
 
 	// Stale-mount sweep. Anything under /var/lib/sandboxd/mounts/ that
@@ -1033,25 +1043,6 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 	}
 	s.mounts.Sweep(keep)
-
-	// Optional row-level GC. Disabled by default (TTL=0): destroyed rows
-	// stay forever as an audit record. When enabled, anything in destroyed
-	// status that last transitioned more than TTL ago is deleted. Image GC
-	// has already had its turn on this tick, so a row being purged here is
-	// either holding the last reference to an image we already removed, or
-	// to one another live sandbox is keeping pinned — both are safe.
-	if ttl := s.cfg.DestroyedRowTTL; ttl > 0 {
-		cutoff := time.Now().UTC().Add(-ttl)
-		purged, err := s.store.PurgeDestroyedBefore(ctx, cutoff)
-		if err != nil {
-			s.logger.Warn("destroyed row purge failed", "error", err)
-		} else if purged > 0 {
-			s.logger.Info("audit destroyed rows purged",
-				"count", purged,
-				"older_than", ttl.String(),
-			)
-		}
-	}
 
 	return nil
 }
@@ -1168,7 +1159,9 @@ func lifecycleActionFor(sb *models.Sandbox, now time.Time, globalIdle time.Durat
 // server name) follows our convention but doesn't correspond to any live
 // sandbox row. The DB is the source of truth; anything in caddy that doesn't
 // trace back to a non-destroyed sandbox is a leak from one of:
-//   - a sandbox row that was purged (DestroyedRowTTL).
+//   - a sandbox row that was deleted on reconcile (the destroyed branch
+//     deletes rows immediately, so caddy entries can outlive their owner
+//     by one reconcile tick if a previous teardown's caddy DELETE failed).
 //   - a development DB wipe leaving caddy with stale state.
 //   - an out-of-band caddy admin call from a previous version of this code.
 //

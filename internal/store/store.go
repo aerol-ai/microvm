@@ -461,31 +461,6 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 	return nil
 }
 
-// PurgeDestroyedBefore deletes sandbox rows that are in the destroyed state
-// and whose updated_at is older than cutoff. Returns the number of rows
-// deleted. Only destroyed rows are eligible — live sandboxes are never
-// touched, so this is safe to call concurrently with normal lifecycle
-// operations. Cascades through the foreign key on exposed_ports and
-// sandbox_mounts. Powered by idx_sandboxes_status, so cost scales with the
-// number of destroyed rows being purged, not the total table size.
-func (s *Store) PurgeDestroyedBefore(ctx context.Context, cutoff time.Time) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `
-		DELETE FROM sandboxes
-		WHERE status = ? AND updated_at < ?
-	`, string(models.SandboxStatusDestroyed), cutoff.UTC())
-	if err != nil {
-		return 0, fmt.Errorf("purge destroyed sandboxes: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		// SQLite always supports RowsAffected, but the interface allows the
-		// driver to refuse. Treat the delete as having succeeded — the
-		// caller logs the count for observability, not correctness.
-		return 0, nil
-	}
-	return affected, nil
-}
-
 func (s *Store) Delete(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id)
 	if err != nil {
