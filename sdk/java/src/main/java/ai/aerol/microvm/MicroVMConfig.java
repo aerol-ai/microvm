@@ -6,6 +6,13 @@ public class MicroVMConfig {
     public String patToken;
     public String apiUrl;
     public HttpClient httpClient;
+    /**
+     * Wire version of the sandbox daemon API to call. Defaults to "v1" when
+     * null/empty. The Java SDK package version and the API wire version
+     * evolve independently — bumping this SDK does not move the wire
+     * version.
+     */
+    public String apiVersion;
 
     public MicroVMConfig setPatToken(String patToken) {
         this.patToken = patToken;
@@ -19,6 +26,11 @@ public class MicroVMConfig {
 
     public MicroVMConfig setHttpClient(HttpClient httpClient) {
         this.httpClient = httpClient;
+        return this;
+    }
+
+    public MicroVMConfig setApiVersion(String apiVersion) {
+        this.apiVersion = apiVersion;
         return this;
     }
 }

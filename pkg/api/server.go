@@ -1,22 +1,23 @@
+// Package api wires the top-level HTTP server. It is intentionally thin —
+// per-version routing lives in subpackages (pkg/api/v1, pkg/api/v2, ...) and
+// shared HTTP helpers live in pkg/api/apihttp. This file's job is:
+//
+//  1. construct the *Server with its dependencies,
+//  2. mount unversioned routes (/health),
+//  3. delegate /v1/... (and any future version) to that version's
+//     RegisterRoutes function.
+//
+// To add v2: create pkg/api/v2 mirroring pkg/api/v1, then add a single
+// v2.RegisterRoutes(...) call below. The two versions coexist on the same
+// mux without modifying v1.
 package api
 
 import (
-	"bufio"
-	"encoding/json"
-	"errors"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"strconv"
-	"strings"
-	"time"
 
+	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/internal/store"
-	"github.com/aerol-ai/microvm/pkg/capacity"
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type Server struct {
@@ -42,61 +43,17 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) routes() {
+	// /health is unversioned: it is meant for liveness probes (k8s, load
+	// balancers) which should keep working across API version rollouts.
 	s.mux.HandleFunc("GET /health", s.handleHealth)
-	s.mux.Handle("GET /v1/capacity", s.requireAuth(http.HandlerFunc(s.handleCapacity)))
-	s.mux.Handle("POST /v1/admin/reconcile", s.requireAuth(http.HandlerFunc(s.handleReconcile)))
 
-	s.mux.Handle("POST /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleCreateSandbox)))
-	s.mux.Handle("GET /v1/sandboxes", s.requireAuth(http.HandlerFunc(s.handleListSandboxes)))
-	s.mux.Handle("GET /v1/sandboxes/{id}", s.requireAuth(http.HandlerFunc(s.handleGetSandbox)))
-	s.mux.Handle("POST /v1/sandboxes/{id}/start", s.requireAuth(http.HandlerFunc(s.handleStartSandbox)))
-	s.mux.Handle("POST /v1/sandboxes/{id}/stop", s.requireAuth(http.HandlerFunc(s.handleStopSandbox)))
-	s.mux.Handle("DELETE /v1/sandboxes/{id}", s.requireAuth(http.HandlerFunc(s.handleDestroySandbox)))
-	s.mux.Handle("POST /v1/sandboxes/{id}/resize", s.requireAuth(http.HandlerFunc(s.handleResizeSandbox)))
-	s.mux.Handle("PUT /v1/sandboxes/{id}/lifecycle", s.requireAuth(http.HandlerFunc(s.handleUpdateLifecycle)))
-	s.mux.Handle("POST /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleExposePort)))
-	s.mux.Handle("DELETE /v1/sandboxes/{id}/ports/{port}", s.requireAuth(http.HandlerFunc(s.handleUnexposePort)))
-	s.mux.Handle("GET /v1/sandboxes/{id}/mounts", s.requireAuth(http.HandlerFunc(s.handleListMounts)))
-	// Explicit session routes are syntactic sugar for the toolbox proxy:
-	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
-	s.mux.Handle("/v1/sandboxes/{id}/sessions", s.requireAuth(http.HandlerFunc(s.handleSessionsProxy)))
-	s.mux.Handle("/v1/sandboxes/{id}/sessions/{path...}", s.requireAuth(http.HandlerFunc(s.handleSessionsProxy)))
-	s.mux.Handle("/v1/sandboxes/{id}/toolbox", s.requireAuth(http.HandlerFunc(s.handleToolboxProxy)))
-	s.mux.Handle("/v1/sandboxes/{id}/toolbox/{path...}", s.requireAuth(http.HandlerFunc(s.handleToolboxProxy)))
-}
-
-func (s *Server) requireAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if extractBearerToken(r) == s.patToken {
-			next.ServeHTTP(w, r)
-			return
-		}
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+	// Each registered version owns its own URL prefix and is responsible for
+	// every route under it. Auth is shared across versions via Deps.Auth.
+	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
+		Service: s.service,
+		Logger:  s.logger,
+		Auth:    s.requireAuth,
 	})
-}
-
-// extractBearerToken returns the caller's bearer token from either:
-//  1. the Authorization header, or
-//  2. the WebSocket Sec-WebSocket-Protocol header in the form
-//     `sandbox.bearer, <token>` (browsers cannot set Authorization on a
-//     WebSocket handshake, so subprotocol smuggling is the standard pattern).
-func extractBearerToken(r *http.Request) string {
-	const prefix = "Bearer "
-	authorization := r.Header.Get("Authorization")
-	if strings.HasPrefix(authorization, prefix) {
-		return strings.TrimPrefix(authorization, prefix)
-	}
-
-	for _, raw := range r.Header.Values("Sec-WebSocket-Protocol") {
-		for _, part := range strings.Split(raw, ",") {
-			candidate := strings.TrimSpace(part)
-			if candidate == "" || candidate == "sandbox.bearer" {
-				continue
-			}
-			return candidate
-		}
-	}
-	return ""
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -107,325 +64,4 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
-}
-
-func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
-	if err := s.service.Reconcile(r.Context()); err != nil {
-		s.logger.Warn("reconcile failed", "error", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-}
-
-func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.service.Capacity())
-}
-
-func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
-	var req models.CreateSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	response, err := s.service.CreateSandbox(r.Context(), req)
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, response)
-}
-
-func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := s.service.ListSandboxes(r.Context())
-	if err != nil {
-		s.logger.Warn("list sandboxes failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	writeJSON(w, http.StatusOK, sandboxes)
-}
-
-func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
-	sandbox, err := s.service.GetSandbox(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sandbox)
-}
-
-func (s *Server) handleStartSandbox(w http.ResponseWriter, r *http.Request) {
-	sandbox, err := s.service.StartSandbox(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sandbox)
-}
-
-func (s *Server) handleStopSandbox(w http.ResponseWriter, r *http.Request) {
-	sandbox, err := s.service.StopSandbox(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sandbox)
-}
-
-func (s *Server) handleDestroySandbox(w http.ResponseWriter, r *http.Request) {
-	if err := s.service.DestroySandbox(r.Context(), r.PathValue("id")); err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleResizeSandbox(w http.ResponseWriter, r *http.Request) {
-	var req models.ResizeSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	sandbox, err := s.service.ResizeSandbox(r.Context(), r.PathValue("id"), req)
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sandbox)
-}
-
-func (s *Server) handleUpdateLifecycle(w http.ResponseWriter, r *http.Request) {
-	var req models.UpdateLifecycleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	sandbox, err := s.service.UpdateLifecycle(r.Context(), r.PathValue("id"), req.Lifecycle)
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sandbox)
-}
-
-func (s *Server) handleExposePort(w http.ResponseWriter, r *http.Request) {
-	port, err := strconv.Atoi(r.PathValue("port"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid port")
-		return
-	}
-	// Body is optional — legacy callers POST with no body and get HTTP routing.
-	// New callers send {"protocol":"tcp"} or {"protocol":"tls"} to choose a
-	// caddy-l4 path. ContentLength == 0 is the unambiguous "no body" signal;
-	// we intentionally don't strict-decode an empty stream so old SDKs keep
-	// working unchanged.
-	var req models.ExposePortRequest
-	if r.ContentLength > 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
-			return
-		}
-	}
-	resp, err := s.service.ExposePort(r.Context(), r.PathValue("id"), port, req.Protocol)
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *Server) handleListMounts(w http.ResponseWriter, r *http.Request) {
-	mounts, err := s.service.ListMounts(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"mounts": mounts})
-}
-
-func (s *Server) handleUnexposePort(w http.ResponseWriter, r *http.Request) {
-	port, err := strconv.Atoi(r.PathValue("port"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid port")
-		return
-	}
-	if err := s.service.UnexposePort(r.Context(), r.PathValue("id"), port); err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleToolboxProxy(w http.ResponseWriter, r *http.Request) {
-	path := r.PathValue("path")
-	if path == "" {
-		path = "/"
-	} else {
-		path = "/" + path
-	}
-	s.proxyToToolbox(w, r, path)
-}
-
-// handleSessionsProxy is sugar for /v1/sandboxes/{id}/sessions[/...] —
-// rewrites to /sessions[/...] on the toolbox. WebSocket upgrades pass through
-// transparently because httputil.ReverseProxy forwards Upgrade headers.
-func (s *Server) handleSessionsProxy(w http.ResponseWriter, r *http.Request) {
-	rest := r.PathValue("path")
-	target := "/sessions"
-	if rest != "" {
-		target = "/sessions/" + rest
-	}
-	s.proxyToToolbox(w, r, target)
-}
-
-func (s *Server) proxyToToolbox(w http.ResponseWriter, r *http.Request, path string) {
-	endpoint, err := s.service.ToolboxTarget(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.writeStoreAwareError(w, err)
-		return
-	}
-
-	target, err := url.Parse(endpoint.URL)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "invalid toolbox target")
-		return
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	toolboxToken := endpoint.Token
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.URL.Path = path
-		req.Host = target.Host
-		if toolboxToken != "" {
-			req.Header.Set("Authorization", "Bearer "+toolboxToken)
-		}
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		writeError(w, http.StatusBadGateway, "toolbox unavailable")
-	}
-	proxy.ServeHTTP(w, r)
-}
-
-func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		// Wrap the writer so we can record the status code and whether the
-		// connection was hijacked (i.e. WebSocket upgrade succeeded). The
-		// wrapper proxies http.Hijacker / http.Flusher so the toolbox proxy
-		// can still upgrade through this middleware.
-		rec := &statusRecorder{ResponseWriter: w}
-		next.ServeHTTP(rec, r)
-		fields := []any{
-			"method", r.Method,
-			"path", r.URL.Path,
-			"duration", time.Since(start),
-			"status", rec.statusCode(),
-		}
-		if rec.hijacked {
-			fields = append(fields, "hijacked", true)
-		}
-		if upgrade := r.Header.Get("Upgrade"); upgrade != "" {
-			fields = append(fields, "upgrade", upgrade)
-		}
-		logger.Info("request complete", fields...)
-	})
-}
-
-// statusRecorder records the status the handler wrote (default 200, mirroring
-// net/http) and whether the connection was hijacked. The Hijack/Flush passthrough
-// is the load-bearing bit for WebSocket upgrades — the gorilla/websocket-style
-// proxy in handleToolboxProxy needs the underlying ResponseWriter to satisfy
-// http.Hijacker, and a wrapper that doesn't forward Hijack would silently break
-// every WS request flowing through this middleware.
-type statusRecorder struct {
-	http.ResponseWriter
-	status   int
-	wrote    bool
-	hijacked bool
-}
-
-func (s *statusRecorder) WriteHeader(code int) {
-	if !s.wrote {
-		s.status = code
-		s.wrote = true
-	}
-	s.ResponseWriter.WriteHeader(code)
-}
-
-func (s *statusRecorder) Write(b []byte) (int, error) {
-	if !s.wrote {
-		s.status = http.StatusOK
-		s.wrote = true
-	}
-	return s.ResponseWriter.Write(b)
-}
-
-func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hj, ok := s.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, errors.New("response writer does not implement http.Hijacker")
-	}
-	conn, rw, err := hj.Hijack()
-	if err == nil {
-		s.hijacked = true
-	}
-	return conn, rw, err
-}
-
-func (s *statusRecorder) Flush() {
-	if f, ok := s.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (s *statusRecorder) statusCode() int {
-	if s.hijacked {
-		return http.StatusSwitchingProtocols
-	}
-	if !s.wrote {
-		return http.StatusOK
-	}
-	return s.status
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, models.ErrorResponse{Error: message})
-}
-
-func (s *Server) writeStoreAwareError(w http.ResponseWriter, err error) {
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "sandbox not found")
-		return
-	}
-	// Capacity rejections are 503 with a Retry-After hint so well-behaved
-	// clients (and load balancers) back off instead of treating it as a
-	// permanent 4xx. The error string already carries human-readable
-	// reasons from the admitter.
-	if errors.Is(err, capacity.ErrCapacityExceeded) {
-		s.logger.Info("capacity rejected", "error", err)
-		w.Header().Set("Retry-After", "30")
-		msg := err.Error()
-		if len(msg) > 200 {
-			msg = msg[:200]
-		}
-		writeError(w, http.StatusServiceUnavailable, msg)
-		return
-	}
-	// Surface only the top-level error message; underlying causes (Docker
-	// daemon strings, file paths) stay in the server log.
-	s.logger.Warn("request failed", "error", err)
-	msg := err.Error()
-	if len(msg) > 200 {
-		msg = msg[:200]
-	}
-	writeError(w, http.StatusBadRequest, msg)
 }

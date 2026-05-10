@@ -1,4 +1,4 @@
-import { APIClient } from "./internal/client.js";
+import { APIClient, type APIVersion } from "./internal/client.js";
 import { Sandbox } from "./Sandbox.js";
 import type {
   CreateOptions,
@@ -24,6 +24,13 @@ export interface MicroVMConfig {
   patToken?: string;
   apiUrl?: string;
   fetch?: FetchLike;
+  /**
+   * Wire version of the sandbox daemon API to call. Defaults to the SDK's
+   * pinned default ("v1" today). The SDK package version and the API wire
+   * version evolve independently — you can pin one without affecting the
+   * other.
+   */
+  apiVersion?: APIVersion;
 }
 
 export class MicroVM {
@@ -46,6 +53,7 @@ export class MicroVM {
       baseURL: apiUrl,
       patToken,
       fetch: config.fetch,
+      apiVersion: config.apiVersion,
     });
   }
 

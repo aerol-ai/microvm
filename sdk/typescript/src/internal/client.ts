@@ -1,5 +1,6 @@
 import { basename } from "node:path";
 
+import { PATH_PREFIX as V1_PATH_PREFIX } from "./api/v1/paths.js";
 import type {
   BinaryLike,
   CreateOptions,
@@ -26,10 +27,30 @@ import type {
 
 type FetchLike = typeof fetch;
 
+/**
+ * Wire version of the sandbox daemon API this client speaks. The SDK and the
+ * server version independently — bumping the SDK package does not move the
+ * wire version. Today only "v1" exists; "v2" will be added when a wire-level
+ * breaking change is needed on the server.
+ */
+export type APIVersion = "v1";
+
+const DEFAULT_API_VERSION: APIVersion = "v1";
+
+const PATH_PREFIXES: Record<APIVersion, string> = {
+  v1: V1_PATH_PREFIX,
+};
+
 export interface APIClientConfig {
   baseURL: string;
   patToken?: string;
   fetch?: FetchLike;
+  /**
+   * Wire version to call. Defaults to "v1". Pin this if you need a specific
+   * version — otherwise the SDK will track its own default, which may move in
+   * a future major SDK release.
+   */
+  apiVersion?: APIVersion;
 }
 
 interface ApiExposedPort {
@@ -143,101 +164,115 @@ interface ApiMountList {
 
 export class APIClient {
   readonly baseURL: string;
+  readonly apiVersion: APIVersion;
 
   private readonly patToken: string;
   private readonly fetchFn: FetchLike;
+  private readonly versionPrefix: string;
 
   constructor(config: APIClientConfig) {
     this.baseURL = config.baseURL.replace(/\/+$/, "");
     this.patToken = config.patToken ?? "";
     this.fetchFn = config.fetch ?? fetch;
+    this.apiVersion = config.apiVersion ?? DEFAULT_API_VERSION;
+    this.versionPrefix = PATH_PREFIXES[this.apiVersion];
+  }
+
+  /**
+   * Build a versioned API path. Pass the suffix beginning with "/" (e.g.
+   * "/sandboxes") and the active version's prefix is prepended. Use this for
+   * every versioned API call so v2 (when it lands) can be selected by the
+   * apiVersion option without touching call sites.
+   */
+  private versioned(suffix: string): string {
+    return `${this.versionPrefix}${suffix}`;
   }
 
   async create(options: CreateOptions): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", "/v1/sandboxes", toApiCreateOptions(options));
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(options));
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
   }
 
   async list(): Promise<SandboxResource[]> {
-    const response = await this.doJSON<ApiSandbox[]>("GET", "/v1/sandboxes");
+    const response = await this.doJSON<ApiSandbox[]>("GET", this.versioned("/sandboxes"));
     return response.map((item) => this.wrap(item));
   }
 
   async get(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("GET", `/v1/sandboxes/${id}`);
+    const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${id}`);
     return this.wrap(response);
   }
 
   async start(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("POST", `/v1/sandboxes/${id}/start`);
+    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/start`);
     return this.wrap(response);
   }
 
   async stop(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("POST", `/v1/sandboxes/${id}/stop`);
+    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/stop`);
     return this.wrap(response);
   }
 
   async destroy(id: string): Promise<void> {
-    await this.doJSON<void>("DELETE", `/v1/sandboxes/${id}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}`);
   }
 
   async resize(id: string, options: ResizeOptions): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("POST", `/v1/sandboxes/${id}/resize`, toApiResizeOptions(options));
+    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/resize`, toApiResizeOptions(options));
     return this.wrap(response);
   }
 
   async updateLifecycle(id: string, lifecycle: Lifecycle): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("PUT", `/v1/sandboxes/${id}/lifecycle`, toApiLifecycle(lifecycle));
+    const response = await this.doJSON<ApiSandbox>("PUT", `${this.versionPrefix}/sandboxes/${id}/lifecycle`, toApiLifecycle(lifecycle));
     return this.wrap(response);
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {
-    const response = await this.doJSON<ApiExecResult>("POST", `/v1/sandboxes/${id}/toolbox/process/execute`, toApiExecRequest(request));
+    const response = await this.doJSON<ApiExecResult>("POST", `${this.versionPrefix}/sandboxes/${id}/toolbox/process/execute`, toApiExecRequest(request));
     return fromApiExecResult(response);
   }
 
   execStream(id: string, options: ExecStreamOptions): ExecStreamHandle {
-    return openExecStream(this.baseURL, this.patToken, id, options);
+    return openExecStream(this.baseURL, this.versionPrefix, this.patToken, id, options);
   }
 
   async createSession(id: string, options: CreateSessionOptions): Promise<Session> {
-    const response = await this.doJSON<ApiSession>("POST", `/v1/sandboxes/${id}/sessions`, toApiCreateSessionOptions(options));
+    const response = await this.doJSON<ApiSession>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions`, toApiCreateSessionOptions(options));
     return fromApiSession(response);
   }
 
   async listSessions(id: string): Promise<Session[]> {
-    const response = await this.doJSON<ApiSessionList>("GET", `/v1/sandboxes/${id}/sessions`);
+    const response = await this.doJSON<ApiSessionList>("GET", `${this.versionPrefix}/sandboxes/${id}/sessions`);
     return response.sessions.map(fromApiSession);
   }
 
   async getSession(id: string, sessionID: string): Promise<Session> {
-    const response = await this.doJSON<ApiSession>("GET", `/v1/sandboxes/${id}/sessions/${sessionID}`);
+    const response = await this.doJSON<ApiSession>("GET", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}`);
     return fromApiSession(response);
   }
 
   async deleteSession(id: string, sessionID: string): Promise<void> {
-    await this.doJSON<void>("DELETE", `/v1/sandboxes/${id}/sessions/${sessionID}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}`);
   }
 
   async signalSession(id: string, sessionID: string, signal: string): Promise<void> {
-    await this.doJSON<void>("POST", `/v1/sandboxes/${id}/sessions/${sessionID}/signal`, { signal });
+    await this.doJSON<void>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/signal`, { signal });
   }
 
   async resizeSession(id: string, sessionID: string, cols: number, rows: number): Promise<void> {
-    await this.doJSON<void>("POST", `/v1/sandboxes/${id}/sessions/${sessionID}/resize`, { cols, rows });
+    await this.doJSON<void>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/resize`, { cols, rows });
   }
 
   async sessionLog(id: string, sessionID: string): Promise<Uint8Array> {
-    return this.doBytes(`/v1/sandboxes/${id}/sessions/${sessionID}/log`);
+    return this.doBytes(`${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/log`);
   }
 
   async sessionRecording(id: string, sessionID: string): Promise<Uint8Array> {
-    return this.doBytes(`/v1/sandboxes/${id}/sessions/${sessionID}/recording`);
+    return this.doBytes(`${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/recording`);
   }
 
   attachSession(id: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
-    return openSessionAttach(this.baseURL, this.patToken, id, sessionID, options);
+    return openSessionAttach(this.baseURL, this.versionPrefix, this.patToken, id, sessionID, options);
   }
 
   async uploadFile(id: string, targetPath: string, data: BinaryLike): Promise<void> {
@@ -245,14 +280,14 @@ export class APIClient {
     form.set("path", targetPath);
     form.set("file", toBlob(data), basename(targetPath));
 
-    const response = await this.request("POST", `/v1/sandboxes/${id}/toolbox/files/upload`, { body: form });
+    const response = await this.request("POST", `${this.versionPrefix}/sandboxes/${id}/toolbox/files/upload`, { body: form });
     if (!response.ok) {
       throw await decodeError(response);
     }
   }
 
   async downloadFile(id: string, targetPath: string): Promise<Uint8Array> {
-    const response = await this.request("GET", `/v1/sandboxes/${id}/toolbox/files/download?path=${encodeURIComponent(targetPath)}`);
+    const response = await this.request("GET", `${this.versionPrefix}/sandboxes/${id}/toolbox/files/download?path=${encodeURIComponent(targetPath)}`);
     if (!response.ok) {
       throw await decodeError(response);
     }
@@ -276,18 +311,18 @@ export class APIClient {
     const body = options.protocol ? { protocol: options.protocol } : undefined;
     const response = await this.doJSON<ApiExposePortResponse>(
       "POST",
-      `/v1/sandboxes/${id}/ports/${port}`,
+      `${this.versionPrefix}/sandboxes/${id}/ports/${port}`,
       body,
     );
     return fromApiExposePortResponse(response);
   }
 
   async unexposePort(id: string, port: number): Promise<void> {
-    await this.doJSON<void>("DELETE", `/v1/sandboxes/${id}/ports/${port}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}/ports/${port}`);
   }
 
   async reconcile(): Promise<void> {
-    await this.doJSON<unknown>("POST", "/v1/admin/reconcile");
+    await this.doJSON<unknown>("POST", this.versioned("/admin/reconcile"));
   }
 
   async health(): Promise<HealthStatus> {
@@ -296,7 +331,7 @@ export class APIClient {
   }
 
   async mounts(id: string): Promise<MountSpecRedacted[]> {
-    const response = await this.doJSON<ApiMountList>("GET", `/v1/sandboxes/${id}/mounts`);
+    const response = await this.doJSON<ApiMountList>("GET", `${this.versionPrefix}/sandboxes/${id}/mounts`);
     return response.mounts.map(fromApiMountSpecRedacted);
   }
 
@@ -750,8 +785,8 @@ function toWebSocketBinaryFrame(data: Uint8Array | string): Uint8Array<ArrayBuff
   return frame;
 }
 
-function openExecStream(baseURL: string, patToken: string, sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
-  const wsURL = baseURL.replace(/^http/, "ws") + `/v1/sandboxes/${encodeURIComponent(sandboxID)}/toolbox/process/exec/stream`;
+function openExecStream(baseURL: string, versionPrefix: string, patToken: string, sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
+  const wsURL = baseURL.replace(/^http/, "ws") + `${versionPrefix}/sandboxes/${encodeURIComponent(sandboxID)}/toolbox/process/exec/stream`;
 
   const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
   if (!WS) {
@@ -864,12 +899,13 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
 
 function openSessionAttach(
   baseURL: string,
+  versionPrefix: string,
   patToken: string,
   sandboxID: string,
   sessionID: string,
   options: SessionAttachOptions,
 ): SessionAttachHandle {
-  const wsURL = baseURL.replace(/^http/, "ws") + `/v1/sandboxes/${encodeURIComponent(sandboxID)}/sessions/${encodeURIComponent(sessionID)}/attach`;
+  const wsURL = baseURL.replace(/^http/, "ws") + `${versionPrefix}/sandboxes/${encodeURIComponent(sandboxID)}/sessions/${encodeURIComponent(sessionID)}/attach`;
 
   const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
   if (!WS) {

@@ -19,6 +19,7 @@ import java.util.stream.Collectors;
 import ai.aerol.microvm.internal.Environment;
 import ai.aerol.microvm.internal.JavaNetWebSocketConnector;
 import ai.aerol.microvm.internal.JsonSupport;
+import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.internal.StreamControlMessage;
 import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
@@ -42,12 +43,19 @@ import ai.aerol.microvm.model.SessionAttachOptions;
 
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
+    static final String DEFAULT_API_VERSION = "v1";
     static final String AUTH_REQUIRED_ERROR_MESSAGE = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
     private static final int STREAM_PREFIX_STDOUT = 0x01;
     private static final int STREAM_PREFIX_STDERR = 0x02;
 
+    private static final java.util.Map<String, String> PATH_PREFIXES = java.util.Map.of(
+        "v1", Paths.PATH_PREFIX
+    );
+
     private final String apiUrl;
     private final String patToken;
+    private final String apiVersion;
+    private final String versionPrefix;
     private final HttpClient httpClient;
     private final WebSocketConnector webSocketConnector;
 
@@ -63,17 +71,34 @@ public class MicroVMClient {
         MicroVMConfig effectiveConfig = config == null ? new MicroVMConfig() : config;
         String configuredPatToken = trimToNull(effectiveConfig.patToken);
         String configuredApiUrl = trimToNull(effectiveConfig.apiUrl);
+        String configuredApiVersion = trimToNull(effectiveConfig.apiVersion);
         String envPatToken = trimToNull(environment.get("SB_PAT_TOKEN"));
         String envApiUrl = trimToNull(environment.get("SB_API_URL"));
 
         this.patToken = configuredPatToken != null ? configuredPatToken : envPatToken != null ? envPatToken : "";
         this.apiUrl = normalizeUrl(configuredApiUrl != null ? configuredApiUrl : envApiUrl != null ? envApiUrl : DEFAULT_API_URL);
+        this.apiVersion = configuredApiVersion != null ? configuredApiVersion : DEFAULT_API_VERSION;
+        String prefix = PATH_PREFIXES.get(this.apiVersion);
+        if (prefix == null) {
+            throw new MicroVMException("unsupported apiVersion: " + this.apiVersion);
+        }
+        this.versionPrefix = prefix;
         this.httpClient = httpClient != null ? httpClient : effectiveConfig.httpClient != null ? effectiveConfig.httpClient : HttpClient.newHttpClient();
         this.webSocketConnector = webSocketConnector != null ? webSocketConnector : new JavaNetWebSocketConnector(this.httpClient);
 
         if (this.patToken.isEmpty()) {
             throw new MicroVMException(AUTH_REQUIRED_ERROR_MESSAGE);
         }
+    }
+
+    /**
+     * Build a versioned API path. Pass the suffix beginning with "/" (e.g.
+     * {@code "/sandboxes"}); the active version's prefix is prepended. Use
+     * this for every versioned call so v2 (when it lands) can be selected via
+     * {@link MicroVMConfig#apiVersion} without touching call sites.
+     */
+    private String versioned(String suffix) {
+        return versionPrefix + suffix;
     }
 
     public String getApiUrl() {
@@ -85,11 +110,11 @@ public class MicroVMClient {
     }
 
     public Sandbox create(CreateOptions options) {
-        return wrap(doJson("POST", "/v1/sandboxes", options, SandboxData.class));
+        return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class));
     }
 
     public List<Sandbox> list() {
-        SandboxData[] response = doJson("GET", "/v1/sandboxes", null, SandboxData[].class);
+        SandboxData[] response = doJson("GET", versioned("/sandboxes"), null, SandboxData[].class);
         if (response == null) {
             return Collections.emptyList();
         }
@@ -196,7 +221,7 @@ public class MicroVMClient {
     }
 
     public void reconcile() {
-        doNoContent("POST", "/v1/admin/reconcile", null);
+        doNoContent("POST", versioned("/admin/reconcile"), null);
     }
 
     public HealthStatus health() {
@@ -474,7 +499,7 @@ public class MicroVMClient {
     }
 
     private String sandboxPath(String sandboxId) {
-        return "/v1/sandboxes/" + encodePathSegment(sandboxId);
+        return versioned("/sandboxes/" + encodePathSegment(sandboxId));
     }
 
     private static String normalizeUrl(String value) {
