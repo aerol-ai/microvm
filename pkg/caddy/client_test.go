@@ -277,6 +277,337 @@ func TestRouteCases(t *testing.T) {
 	}
 }
 
+func TestL4Cases(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "ensure_layer4_creates_app_and_tls_mux",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureLayer4(context.Background(), ":443"); err != nil {
+					t.Fatalf("EnsureLayer4() error = %v", err)
+				}
+				if !fake.layer4Exists {
+					t.Fatalf("layer4 app should exist after ensure")
+				}
+				if _, ok := fake.l4Servers[tlsMuxServerID]; !ok {
+					t.Fatalf("tls-mux server should exist after ensure; servers=%+v", fake.l4Servers)
+				}
+			},
+		},
+		{
+			name: "ensure_layer4_skips_tls_mux_when_listen_empty",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureLayer4(context.Background(), ""); err != nil {
+					t.Fatalf("EnsureLayer4() error = %v", err)
+				}
+				if !fake.layer4Exists {
+					t.Fatalf("layer4 app should exist even without tls listen")
+				}
+				if _, ok := fake.l4Servers[tlsMuxServerID]; ok {
+					t.Fatalf("tls-mux must not be created when listen is empty")
+				}
+			},
+		},
+		{
+			name: "ensure_layer4_is_idempotent",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureLayer4(context.Background(), ":443"); err != nil {
+					t.Fatalf("first EnsureLayer4() error = %v", err)
+				}
+				puts1 := countMethod(fake.records, http.MethodPut)
+				if err := client.EnsureLayer4(context.Background(), ":443"); err != nil {
+					t.Fatalf("second EnsureLayer4() error = %v", err)
+				}
+				puts2 := countMethod(fake.records, http.MethodPut)
+				if puts2 != puts1 {
+					t.Fatalf("idempotent ensure should not PUT again, got %d → %d", puts1, puts2)
+				}
+			},
+		},
+		{
+			name: "upsert_tcp_route_creates_server_with_route",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertTCPRoute(context.Background(), "abc", "10.0.0.5", 5432, 37412); err != nil {
+					t.Fatalf("UpsertTCPRoute() error = %v", err)
+				}
+				server, ok := fake.l4Servers["tcp-port-37412"]
+				if !ok {
+					t.Fatalf("tcp server missing; servers=%+v", fake.l4Servers)
+				}
+				assertL4Listen(t, server, ":37412")
+				route := firstL4Route(t, server)
+				assertRouteField(t, route, "@id", "sandbox-abc-port-5432-tcp")
+				assertL4Dial(t, route, "10.0.0.5:5432")
+			},
+		},
+		{
+			name: "upsert_tcp_route_replaces_existing_server",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertTCPRoute(context.Background(), "abc", "10.0.0.5", 5432, 37412); err != nil {
+					t.Fatalf("first UpsertTCPRoute error = %v", err)
+				}
+				if err := client.UpsertTCPRoute(context.Background(), "abc", "10.0.0.9", 5432, 37412); err != nil {
+					t.Fatalf("second UpsertTCPRoute error = %v", err)
+				}
+				server := fake.l4Servers["tcp-port-37412"]
+				route := firstL4Route(t, server)
+				assertL4Dial(t, route, "10.0.0.9:5432")
+			},
+		},
+		{
+			name: "delete_tcp_route_removes_server",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.l4Servers["tcp-port-37412"] = map[string]any{"listen": []any{":37412"}}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.DeleteTCPRoute(context.Background(), 37412); err != nil {
+					t.Fatalf("DeleteTCPRoute() error = %v", err)
+				}
+				if _, ok := fake.l4Servers["tcp-port-37412"]; ok {
+					t.Fatalf("tcp server should be removed")
+				}
+			},
+		},
+		{
+			name: "delete_tcp_route_swallows_404",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.DeleteTCPRoute(context.Background(), 99999); err != nil {
+					t.Fatalf("DeleteTCPRoute() should swallow 404, got %v", err)
+				}
+			},
+		},
+		{
+			name: "upsert_tls_sni_route_inserts_when_missing",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				fake.l4Servers[tlsMuxServerID] = map[string]any{
+					"listen": []any{":443"},
+					"routes": []any{},
+				}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertTLSSNIRoute(context.Background(), "abc", "abc-5432.sandbox.example.com", "10.0.0.5", 5432); err != nil {
+					t.Fatalf("UpsertTLSSNIRoute() error = %v", err)
+				}
+				route, ok := fake.routes["sandbox-abc-port-5432-tls"]
+				if !ok {
+					t.Fatalf("tls route should be inserted; routes=%+v", fake.routes)
+				}
+				assertL4SNI(t, route, "abc-5432.sandbox.example.com")
+				assertL4Dial(t, route, "10.0.0.5:5432")
+			},
+		},
+		{
+			name: "upsert_tls_sni_route_patches_when_present",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				fake.l4Servers[tlsMuxServerID] = map[string]any{"listen": []any{":443"}, "routes": []any{}}
+				fake.routes["sandbox-abc-port-5432-tls"] = map[string]any{"@id": "sandbox-abc-port-5432-tls", "stale": true}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertTLSSNIRoute(context.Background(), "abc", "abc-5432.sandbox.example.com", "10.0.0.7", 5432); err != nil {
+					t.Fatalf("UpsertTLSSNIRoute() error = %v", err)
+				}
+				route := fake.routes["sandbox-abc-port-5432-tls"]
+				if _, ok := route["stale"]; ok {
+					t.Fatalf("PATCH should have replaced stale fields: %+v", route)
+				}
+				assertL4Dial(t, route, "10.0.0.7:5432")
+			},
+		},
+		{
+			name: "delete_tls_sni_route_removes_by_id",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.routes["sandbox-abc-port-5432-tls"] = map[string]any{"@id": "sandbox-abc-port-5432-tls"}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.DeleteTLSSNIRoute(context.Background(), "abc", 5432); err != nil {
+					t.Fatalf("DeleteTLSSNIRoute() error = %v", err)
+				}
+				if _, ok := fake.routes["sandbox-abc-port-5432-tls"]; ok {
+					t.Fatalf("tls route should be removed")
+				}
+			},
+		},
+		{
+			name: "snapshot_collects_http_l4_tcp_and_tls_ids",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				fake.routes["sandbox-abc"] = map[string]any{"@id": "sandbox-abc"}
+				fake.routes["sandbox-abc-port-3000"] = map[string]any{"@id": "sandbox-abc-port-3000"}
+				fake.routes["unrelated"] = map[string]any{"@id": "unrelated"}
+				fake.l4Servers["tcp-port-37412"] = map[string]any{
+					"listen": []any{":37412"},
+					"routes": []any{map[string]any{"@id": "sandbox-abc-port-5432-tcp"}},
+				}
+				fake.l4Servers["tcp-port-38001"] = map[string]any{
+					"listen": []any{":38001"},
+					"routes": []any{map[string]any{"@id": "sandbox-xyz-port-6379-tcp"}},
+				}
+				fake.l4Servers[tlsMuxServerID] = map[string]any{
+					"listen": []any{":443"},
+					"routes": []any{
+						map[string]any{"@id": "sandbox-abc-port-5432-tls"},
+						map[string]any{"@id": "stranger"},
+					},
+				}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				snap, err := client.Snapshot(context.Background())
+				if err != nil {
+					t.Fatalf("Snapshot() error = %v", err)
+				}
+				assertContainsAll(t, "HTTPRouteIDs", snap.HTTPRouteIDs, "sandbox-abc", "sandbox-abc-port-3000")
+				assertExcludes(t, "HTTPRouteIDs", snap.HTTPRouteIDs, "unrelated")
+				assertContainsAll(t, "L4TCPServerIDs", snap.L4TCPServerIDs, "tcp-port-37412", "tcp-port-38001")
+				assertContainsAll(t, "L4TLSRouteIDs", snap.L4TLSRouteIDs, "sandbox-abc-port-5432-tls")
+				assertExcludes(t, "L4TLSRouteIDs", snap.L4TLSRouteIDs, "stranger")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+func TestPublicEndpointHelpers(t *testing.T) {
+	t.Run("tcp_endpoint_uses_public_host", func(t *testing.T) {
+		client := &Client{publicHost: "203.0.113.10"}
+		if got := client.TCPPublicEndpoint(37412); got != "tcp://203.0.113.10:37412" {
+			t.Fatalf("TCPPublicEndpoint() = %q", got)
+		}
+	})
+	t.Run("tls_endpoint_requires_domain_and_listen", func(t *testing.T) {
+		client := &Client{domain: "sandbox.example.com", publicHost: "203.0.113.10"}
+		if got := client.TLSPublicEndpoint("abc", 5432, ":443"); got != "tls://abc-5432.sandbox.example.com:443" {
+			t.Fatalf("TLSPublicEndpoint() = %q", got)
+		}
+		if got := client.TLSPublicEndpoint("abc", 5432, ""); got != "" {
+			t.Fatalf("TLSPublicEndpoint() with empty listen = %q, want empty", got)
+		}
+		ipClient := &Client{publicHost: "203.0.113.10"}
+		if got := ipClient.TLSPublicEndpoint("abc", 5432, ":443"); got != "" {
+			t.Fatalf("TLSPublicEndpoint() in IP mode = %q, want empty", got)
+		}
+	})
+}
+
+func countMethod(records []requestRecord, method string) int {
+	count := 0
+	for _, rec := range records {
+		if rec.Method == method {
+			count++
+		}
+	}
+	return count
+}
+
+func assertL4Listen(t *testing.T, server map[string]any, want string) {
+	t.Helper()
+	listens, ok := server["listen"].([]any)
+	if !ok || len(listens) == 0 {
+		t.Fatalf("missing listen: %#v", server)
+	}
+	if got, _ := listens[0].(string); got != want {
+		t.Fatalf("listen = %q, want %q", got, want)
+	}
+}
+
+func firstL4Route(t *testing.T, server map[string]any) map[string]any {
+	t.Helper()
+	routes, ok := server["routes"].([]any)
+	if !ok || len(routes) == 0 {
+		t.Fatalf("server has no routes: %#v", server)
+	}
+	route, _ := routes[0].(map[string]any)
+	if route == nil {
+		t.Fatalf("first route not an object: %#v", routes[0])
+	}
+	return route
+}
+
+func assertL4Dial(t *testing.T, route map[string]any, want string) {
+	t.Helper()
+	handles, ok := route["handle"].([]any)
+	if !ok || len(handles) == 0 {
+		t.Fatalf("missing handle: %#v", route)
+	}
+	handle, _ := handles[0].(map[string]any)
+	upstreams, ok := handle["upstreams"].([]any)
+	if !ok || len(upstreams) == 0 {
+		t.Fatalf("missing upstreams: %#v", route)
+	}
+	upstream, _ := upstreams[0].(map[string]any)
+	dials, ok := upstream["dial"].([]any)
+	if !ok || len(dials) == 0 {
+		t.Fatalf("missing dial entries: %#v", route)
+	}
+	if got, _ := dials[0].(string); got != want {
+		t.Fatalf("dial = %q, want %q", got, want)
+	}
+}
+
+func assertL4SNI(t *testing.T, route map[string]any, want string) {
+	t.Helper()
+	matches, ok := route["match"].([]any)
+	if !ok || len(matches) == 0 {
+		t.Fatalf("missing match: %#v", route)
+	}
+	match, _ := matches[0].(map[string]any)
+	tlsBlock, _ := match["tls"].(map[string]any)
+	snis, ok := tlsBlock["sni"].([]any)
+	if !ok || len(snis) == 0 {
+		t.Fatalf("missing sni list: %#v", route)
+	}
+	if got, _ := snis[0].(string); got != want {
+		t.Fatalf("sni = %q, want %q", got, want)
+	}
+}
+
+func assertContainsAll(t *testing.T, label string, got []string, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing %q; got %v", label, w, got)
+		}
+	}
+}
+
+func assertExcludes(t *testing.T, label string, got []string, unwanted ...string) {
+	t.Helper()
+	for _, u := range unwanted {
+		for _, g := range got {
+			if g == u {
+				t.Fatalf("%s should not include %q; got %v", label, u, got)
+			}
+		}
+	}
+}
+
 type requestRecord struct {
 	Method string
 	Path   string
@@ -284,18 +615,26 @@ type requestRecord struct {
 
 // fakeCaddy emulates the slice of the Caddy admin API the client touches:
 // PATCH/DELETE /id/<routeID> work against a routeID-keyed map; PUT to
-// /routes/0 inserts a route by its @id. That's enough to verify the per-@id
-// hot path without modeling the full config tree.
+// /config/apps/http/servers/srv0/routes/0 inserts a route by its @id; and
+// the layer4 surface mirrors the same shape — PATCH/DELETE /id/<routeID>
+// for tls-mux SNI routes plus PUT/DELETE on /config/apps/layer4/servers/<id>
+// for whole-server lifecycle. That's enough to verify the per-@id hot path
+// and the L4 server CRUD without modeling the full config tree.
 type fakeCaddy struct {
-	URL     string
-	Client  *http.Client
-	records []requestRecord
-	routes  map[string]map[string]any
+	URL          string
+	Client       *http.Client
+	records      []requestRecord
+	routes       map[string]map[string]any
+	l4Servers    map[string]map[string]any
+	layer4Exists bool
 }
 
 func newFakeCaddy(t *testing.T) *fakeCaddy {
 	t.Helper()
-	fake := &fakeCaddy{routes: map[string]map[string]any{}}
+	fake := &fakeCaddy{
+		routes:    map[string]map[string]any{},
+		l4Servers: map[string]map[string]any{},
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fake.records = append(fake.records, requestRecord{Method: r.Method, Path: r.URL.Path})
 		switch {
@@ -334,6 +673,75 @@ func newFakeCaddy(t *testing.T) *fakeCaddy {
 			}
 			fake.routes[id] = route
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/layer4":
+			if !fake.layer4Exists {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"servers": fake.l4Servers})
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/layer4":
+			fake.layer4Exists = true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/"):
+			id := strings.TrimPrefix(r.URL.Path, "/config/apps/layer4/servers/")
+			if _, ok := fake.l4Servers[id]; !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(fake.l4Servers[id])
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/"):
+			rest := strings.TrimPrefix(r.URL.Path, "/config/apps/layer4/servers/")
+			// /config/apps/layer4/servers/<id>/routes/0 — insert into existing server.
+			if strings.HasSuffix(rest, "/routes/0") {
+				serverID := strings.TrimSuffix(rest, "/routes/0")
+				server, ok := fake.l4Servers[serverID]
+				if !ok {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				route, err := decodeRoute(r.Body)
+				if err != nil {
+					t.Fatalf("decode l4 insert body: %v", err)
+				}
+				id, _ := route["@id"].(string)
+				if id != "" {
+					fake.routes[id] = route
+				}
+				routes, _ := server["routes"].([]any)
+				server["routes"] = append([]any{route}, routes...)
+				fake.l4Servers[serverID] = server
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			// PUT /config/apps/layer4/servers/<id> — create or replace server.
+			body, err := decodeRoute(r.Body)
+			if err != nil {
+				t.Fatalf("decode l4 server body: %v", err)
+			}
+			fake.l4Servers[rest] = body
+			fake.layer4Exists = true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/"):
+			id := strings.TrimPrefix(r.URL.Path, "/config/apps/layer4/servers/")
+			if _, ok := fake.l4Servers[id]; !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			delete(fake.l4Servers, id)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/config/":
+			snapshot := map[string]any{"apps": map[string]any{
+				"http": map[string]any{
+					"servers": map[string]any{
+						"srv0": map[string]any{"routes": fakeRoutesSlice(fake.routes)},
+					},
+				},
+				"layer4": map[string]any{"servers": fake.l4Servers},
+			}}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(snapshot)
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
@@ -342,6 +750,17 @@ func newFakeCaddy(t *testing.T) *fakeCaddy {
 	fake.URL = server.URL
 	fake.Client = server.Client()
 	return fake
+}
+
+// fakeRoutesSlice flattens the routeID-keyed map into the slice shape Caddy's
+// /config/ endpoint actually returns. Order is not stable; tests that need a
+// specific shape should match by @id, not slice index.
+func fakeRoutesSlice(routes map[string]map[string]any) []any {
+	out := make([]any, 0, len(routes))
+	for _, r := range routes {
+		out = append(out, r)
+	}
+	return out
 }
 
 func decodeRoute(body io.Reader) (map[string]any, error) {

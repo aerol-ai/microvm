@@ -56,6 +56,14 @@ func main() {
 	}
 
 	caddyClient := caddy.New(cfg)
+	// Bootstrap caddy-l4 once at boot. This creates /config/apps/layer4
+	// if absent and (when SB_L4_TLS_LISTEN is set) the shared SNI-mux
+	// server. Best-effort: if caddy isn't ready yet the daemon will retry
+	// implicitly the first time a TCP/TLS exposure is created, so we log
+	// rather than fail the whole start-up.
+	if err := caddyClient.EnsureLayer4(ctx, cfg.L4TLSListen); err != nil {
+		logger.Warn("failed to ensure caddy layer4 app at startup", "error", err)
+	}
 
 	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
 	if err != nil {

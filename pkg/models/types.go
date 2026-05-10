@@ -295,6 +295,13 @@ type CreateSandboxResponse struct {
 	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
 }
 
+// ExposePortRequest is the optional JSON body for POST /v1/sandboxes/{id}/ports/{port}.
+// Empty body or empty Protocol falls back to "http" — the historical default —
+// so old SDK callers keep working unchanged.
+type ExposePortRequest struct {
+	Protocol string `json:"protocol,omitempty"`
+}
+
 type ExposedPort struct {
 	SandboxID string    `json:"sandbox_id"`
 	Port      int       `json:"port"`

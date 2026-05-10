@@ -193,10 +193,33 @@ func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byt
 }
 
 func (c *Client) ExposePort(ctx context.Context, id string, port int) (string, error) {
+	return c.exposePortWithProtocol(ctx, id, port, "")
+}
+
+// ExposeTCPPort publishes a raw TCP port through caddy-l4. The returned URL
+// is in tcp://<host>:<port> form and can be plugged straight into a Postgres /
+// Redis / MySQL / Mongo client. Requires the daemon to be configured with a
+// non-empty SB_L4_PORT_RANGE_START..END pool (default 35000-45000).
+func (c *Client) ExposeTCPPort(ctx context.Context, id string, port int) (string, error) {
+	return c.exposePortWithProtocol(ctx, id, port, "tcp")
+}
+
+// ExposeTLSPort publishes a TCP port behind the shared TLS-SNI multiplexer.
+// Returns tls://<id>-<port>.<domain>:<l4-port>. Only available when the
+// deployment has a domain configured AND SB_L4_TLS_LISTEN is set.
+func (c *Client) ExposeTLSPort(ctx context.Context, id string, port int) (string, error) {
+	return c.exposePortWithProtocol(ctx, id, port, "tls")
+}
+
+func (c *Client) exposePortWithProtocol(ctx context.Context, id string, port int, protocol string) (string, error) {
+	var body any
+	if protocol != "" {
+		body = map[string]string{"protocol": protocol}
+	}
 	var response struct {
 		PublicURL string `json:"public_url"`
 	}
-	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/v1/sandboxes/%s/ports/%d", id, port), nil, &response)
+	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/v1/sandboxes/%s/ports/%d", id, port), body, &response)
 	return response.PublicURL, err
 }
 
@@ -233,6 +256,14 @@ func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, 
 
 func (s *Sandbox) ExposePort(ctx context.Context, port int) (string, error) {
 	return s.client.ExposePort(ctx, s.ID, port)
+}
+
+func (s *Sandbox) ExposeTCPPort(ctx context.Context, port int) (string, error) {
+	return s.client.ExposeTCPPort(ctx, s.ID, port)
+}
+
+func (s *Sandbox) ExposeTLSPort(ctx context.Context, port int) (string, error) {
+	return s.client.ExposeTLSPort(ctx, s.ID, port)
 }
 
 func (s *Sandbox) Start(ctx context.Context) error {

@@ -504,7 +504,10 @@ SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
 SB_L4_PORT_RANGE_START=35000
 SB_L4_PORT_RANGE_END=45000
-SB_L4_TLS_LISTEN=:443
+# TLS-SNI multiplexing is opt-in. Setting this to e.g. ":443" makes
+# caddy-l4 take over that listener; until the HTTPS site is moved off
+# the same address it would conflict, so we leave it empty by default.
+SB_L4_TLS_LISTEN=
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }

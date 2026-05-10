@@ -79,6 +79,20 @@ type Config struct {
 	MemoryOverProvisionFactor float64
 	HostCPUCoresOverride      int
 	HostMemoryMBOverride      int
+
+	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
+	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
+	// picks a random candidate first; collisions fall back to a deterministic
+	// scan. Both sides are inclusive.
+	L4PortRangeStart int
+	L4PortRangeEnd   int
+	// L4TLSListen is the listen address for the shared TLS-SNI multiplexer.
+	// Empty disables TLS-SNI exposure entirely (the daemon will reject
+	// protocol="tls" requests). When set, caddy-l4 binds this address and
+	// routes by SNI to per-sandbox subdomains; the operator is responsible
+	// for ensuring the address is free (the existing :443 HTTPS site has to
+	// move first, which is out of scope until install.sh is updated).
+	L4TLSListen string
 }
 
 func Load() (Config, error) {
@@ -130,6 +144,10 @@ func Load() (Config, error) {
 		MemoryOverProvisionFactor: getEnvFloat("SB_MEMORY_OVERPROVISION_FACTOR", 10.0),
 		HostCPUCoresOverride:      getEnvInt("SB_HOST_CPU_CORES", 0),
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
+
+		L4PortRangeStart: getEnvInt("SB_L4_PORT_RANGE_START", 35000),
+		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 45000),
+		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 	}
 
 	if cfg.PATToken == "" {
@@ -156,6 +174,13 @@ func Load() (Config, error) {
 	// reject individual create requests until the runtime is wired up.
 	if _, err := models.ValidRuntime(cfg.Runtime); err != nil || cfg.Runtime == "" {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s)", cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata)
+	}
+
+	// L4 port pool sanity. Out-of-range or inverted bounds would silently
+	// brick raw-TCP exposure later; surface it at boot instead.
+	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
+		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
+			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
 
 	return cfg, nil

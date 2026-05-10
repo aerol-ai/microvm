@@ -136,8 +136,8 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
 	}
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
-			s.logger.Warn("delete port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
+			s.logger.Warn("delete port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 		}
 	}
 	if previousIP != "" {
@@ -198,8 +198,8 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 		return fmt.Errorf("upsert sandbox route: %w", err)
 	}
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port); err != nil {
-			s.logger.Warn("upsert port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+			s.logger.Warn("upsert port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 		}
 	}
 	s.syncAllowedPorts(ctx, sandbox)

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	mathrand "math/rand"
 	"net"
 	"strings"
 	"time"
@@ -26,6 +27,12 @@ import (
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"golang.org/x/crypto/ssh"
 )
+
+// allocatorRandomAttempts caps the random-first phase of host-port allocation.
+// With a 10k-port pool and a few hundred allocations live, collisions are
+// rare; the linear-scan fallback only runs when the pool is genuinely
+// near-full, so this keeps p95 low without spinning forever in tight pools.
+const allocatorRandomAttempts = 16
 
 type Service struct {
 	cfg    config.Config
@@ -353,7 +360,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		return nil, err
 	}
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port); err != nil {
+		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
 			return nil, err
 		}
 	}
@@ -384,8 +391,8 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 	// fallback "sandbox not found" handler instead of a 502 from a stale
 	// upstream IP. StartSandbox re-upserts every route on the way back up.
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
-			s.logger.Warn("caddy port route cleanup on stop failed", "sandbox_id", id, "port", port.Port, "error", err)
+		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
+			s.logger.Warn("caddy port route cleanup on stop failed", "sandbox_id", id, "port", port.Port, "protocol", port.Protocol, "error", err)
 		}
 	}
 	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
@@ -405,7 +412,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		return err
 	}
 	for _, port := range sandbox.ExposedPorts {
-		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port)
+		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
 	_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 	if err := s.docker.Destroy(ctx, sandbox); err != nil {
@@ -490,7 +497,18 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	return s.store.Get(ctx, id)
 }
 
-func (s *Service) ExposePort(ctx context.Context, id string, port int) (string, error) {
+// ExposePort publishes a sandbox container port through one of three caddy
+// surfaces, selected by protocol:
+//   - "" / "http": existing Caddy HTTP reverse-proxy route, returns
+//     https://<id>-<port>.<domain> (or the path-mode equivalent).
+//   - "tcp": allocates a parent-host TCP port from the [SB_L4_PORT_RANGE_START,
+//     SB_L4_PORT_RANGE_END] pool, points caddy-l4 at it, and returns
+//     tcp://<public-host>:<host-port>. This is what unblocks native Postgres /
+//     Redis / MySQL DSNs in the spawn-postgres docs.
+//   - "tls": adds a TLS-SNI route to the shared layer4 server. Requires
+//     --domain (so the SNI hostname has a place to resolve) and a non-empty
+//     SB_L4_TLS_LISTEN. Returns tls://<id>-<port>.<domain>:<l4-port>.
+func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol string) (string, error) {
 	sandbox, err := s.store.Get(ctx, id)
 	if err != nil {
 		return "", err
@@ -498,39 +516,191 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int) (string, 
 	if port <= 0 || port > 65535 {
 		return "", errors.New("invalid port")
 	}
-
-	publicURL := s.caddy.PortPublicURL(id, port)
-	if err := s.caddy.UpsertPortRoute(ctx, id, sandbox.ContainerIP, port); err != nil {
+	canonicalProto, err := models.ValidExposedPortProtocol(protocol)
+	if err != nil {
 		return "", err
 	}
 
-	exposure := models.ExposedPort{
-		SandboxID: id,
-		Port:      port,
-		PublicURL: publicURL,
-		CreatedAt: time.Now().UTC(),
+	now := time.Now().UTC()
+	switch canonicalProto {
+	case models.ExposedPortProtocolHTTP:
+		publicURL := s.caddy.PortPublicURL(id, port)
+		if err := s.caddy.UpsertPortRoute(ctx, id, sandbox.ContainerIP, port); err != nil {
+			return "", err
+		}
+		exposure := models.ExposedPort{
+			SandboxID: id,
+			Port:      port,
+			Protocol:  canonicalProto,
+			PublicURL: publicURL,
+			CreatedAt: now,
+		}
+		if err := s.store.UpsertPort(ctx, exposure); err != nil {
+			_ = s.caddy.DeletePortRoute(ctx, id, port)
+			return "", err
+		}
+		s.touchAllowedPorts(ctx, id)
+		return publicURL, nil
+
+	case models.ExposedPortProtocolTCP:
+		hostPort, publicURL, err := s.allocateHostPort(ctx, id, port, now)
+		if err != nil {
+			return "", err
+		}
+		if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, hostPort); err != nil {
+			// The reservation row exists from the allocator; clean it up so
+			// the host port returns to the pool.
+			_ = s.store.DeletePort(ctx, id, port)
+			return "", err
+		}
+		s.touchAllowedPorts(ctx, id)
+		return publicURL, nil
+
+	case models.ExposedPortProtocolTLS:
+		sniHost := s.caddy.SNIHost(id, port)
+		if sniHost == "" {
+			return "", errors.New("TLS-SNI exposure requires --domain to be configured")
+		}
+		if s.caddy.L4TLSListen() == "" {
+			return "", errors.New("TLS-SNI exposure requires SB_L4_TLS_LISTEN to be set")
+		}
+		publicURL := s.caddy.TLSPublicEndpoint(id, port, s.caddy.L4TLSListen())
+		if err := s.caddy.UpsertTLSSNIRoute(ctx, id, sniHost, sandbox.ContainerIP, port); err != nil {
+			return "", err
+		}
+		exposure := models.ExposedPort{
+			SandboxID: id,
+			Port:      port,
+			Protocol:  canonicalProto,
+			PublicURL: publicURL,
+			CreatedAt: now,
+		}
+		if err := s.store.UpsertPort(ctx, exposure); err != nil {
+			_ = s.caddy.DeleteTLSSNIRoute(ctx, id, port)
+			return "", err
+		}
+		s.touchAllowedPorts(ctx, id)
+		return publicURL, nil
 	}
-	if err := s.store.UpsertPort(ctx, exposure); err != nil {
-		return "", err
+	return "", fmt.Errorf("unhandled protocol %q", canonicalProto)
+}
+
+// allocateHostPort reserves a parent-host port for a raw-TCP exposure. The
+// random-first phase tries up to allocatorRandomAttempts candidates from the
+// configured pool — each attempt is one INSERT OR IGNORE protected by the
+// partial unique index on host_port, so concurrent allocators serialize at
+// the DB without a process-level lock. When randoms collide enough times we
+// fall back to a deterministic linear scan, which is the p99 path that
+// guarantees we exhaust the pool before giving up.
+func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, containerPort int, now time.Time) (int, string, error) {
+	if s.cfg.L4PortRangeEnd <= s.cfg.L4PortRangeStart {
+		return 0, "", errors.New("L4 port pool is misconfigured")
+	}
+	span := s.cfg.L4PortRangeEnd - s.cfg.L4PortRangeStart + 1
+
+	for i := 0; i < allocatorRandomAttempts; i++ {
+		candidate := s.cfg.L4PortRangeStart + mathrand.Intn(span)
+		publicURL := s.caddy.TCPPublicEndpoint(candidate)
+		ok, err := s.store.TryReserveHostPort(ctx, sandboxID, containerPort, candidate, models.ExposedPortProtocolTCP, publicURL, now)
+		if err != nil {
+			return 0, "", err
+		}
+		if ok {
+			return candidate, publicURL, nil
+		}
 	}
 
-	if updated, err := s.store.Get(ctx, id); err == nil {
-		s.syncAllowedPorts(ctx, updated)
+	for candidate := s.cfg.L4PortRangeStart; candidate <= s.cfg.L4PortRangeEnd; candidate++ {
+		publicURL := s.caddy.TCPPublicEndpoint(candidate)
+		ok, err := s.store.TryReserveHostPort(ctx, sandboxID, containerPort, candidate, models.ExposedPortProtocolTCP, publicURL, now)
+		if err != nil {
+			return 0, "", err
+		}
+		if ok {
+			return candidate, publicURL, nil
+		}
 	}
-	return publicURL, nil
+	return 0, "", errors.New("L4 port pool exhausted")
 }
 
 func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
-	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
+	sandbox, err := s.store.Get(ctx, id)
+	if err != nil {
 		return err
+	}
+	exposure := findExposure(sandbox, port)
+	// Best-effort tear-down of every caddy surface the exposure could be on.
+	// We dispatch on the recorded protocol when it's known, but also fall
+	// back to the legacy HTTP path so old rows that pre-date the protocol
+	// column are still cleaned up correctly.
+	if exposure == nil {
+		_ = s.caddy.DeletePortRoute(ctx, id, port)
+	} else {
+		if err := s.deleteExposedPortRoute(ctx, sandbox, *exposure); err != nil {
+			return err
+		}
 	}
 	if err := s.store.DeletePort(ctx, id, port); err != nil {
 		return err
 	}
+	s.touchAllowedPorts(ctx, id)
+	return nil
+}
+
+// findExposure returns the exposure matching port, or nil. Linear scan is
+// fine because ExposedPorts is bounded by the host port pool size and in
+// practice rarely exceeds a handful per sandbox.
+func findExposure(sandbox *models.Sandbox, port int) *models.ExposedPort {
+	if sandbox == nil {
+		return nil
+	}
+	for i := range sandbox.ExposedPorts {
+		if sandbox.ExposedPorts[i].Port == port {
+			return &sandbox.ExposedPorts[i]
+		}
+	}
+	return nil
+}
+
+// upsertExposedPortRoute republishes one exposure to caddy based on its
+// stored protocol. Used everywhere a sandbox transitions to running
+// (StartSandbox, Reconcile when a container is back, docker start events).
+func (s *Service) upsertExposedPortRoute(ctx context.Context, sandbox *models.Sandbox, port models.ExposedPort) error {
+	switch port.Protocol {
+	case "", models.ExposedPortProtocolHTTP:
+		return s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port)
+	case models.ExposedPortProtocolTCP:
+		return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port, port.HostPort)
+	case models.ExposedPortProtocolTLS:
+		return s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, s.caddy.SNIHost(sandbox.ID, port.Port), sandbox.ContainerIP, port.Port)
+	default:
+		return fmt.Errorf("unknown protocol %q on exposed port %d", port.Protocol, port.Port)
+	}
+}
+
+// deleteExposedPortRoute drops one exposure's caddy entity. Used everywhere
+// a sandbox transitions out of running (StopSandbox, DestroySandbox, exit
+// events, reconcile destroyed pass).
+func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sandbox, port models.ExposedPort) error {
+	switch port.Protocol {
+	case "", models.ExposedPortProtocolHTTP:
+		return s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port)
+	case models.ExposedPortProtocolTCP:
+		return s.caddy.DeleteTCPRoute(ctx, port.HostPort)
+	case models.ExposedPortProtocolTLS:
+		return s.caddy.DeleteTLSSNIRoute(ctx, sandbox.ID, port.Port)
+	default:
+		return fmt.Errorf("unknown protocol %q on exposed port %d", port.Protocol, port.Port)
+	}
+}
+
+// touchAllowedPorts is a small wrapper that refreshes the toolbox's allowlist
+// after a port-table mutation. The store round-trip pulls the fresh ExposedPorts
+// so syncAllowedPorts sees post-write state.
+func (s *Service) touchAllowedPorts(ctx context.Context, id string) {
 	if updated, err := s.store.Get(ctx, id); err == nil {
 		s.syncAllowedPorts(ctx, updated)
 	}
-	return nil
 }
 
 type ToolboxEndpoint struct {
@@ -684,7 +854,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 			for _, port := range sandbox.ExposedPorts {
-				_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port)
+				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 			}
 			_ = s.mounts.UnmountAll(sandbox.ID)
 			// Only GC and release admitter capacity on the transition into
@@ -713,7 +883,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				return err
 			}
 			for _, port := range sandbox.ExposedPorts {
-				if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port); err != nil {
+				if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
 					return err
 				}
 			}
