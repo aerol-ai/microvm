@@ -501,9 +501,22 @@ func TestL4Cases(t *testing.T) {
 }
 
 func TestPublicEndpointHelpers(t *testing.T) {
-	t.Run("tcp_endpoint_uses_public_host", func(t *testing.T) {
+	t.Run("tcp_endpoint_uses_127_in_local_mode", func(t *testing.T) {
+		// --local writes SB_PUBLIC_HOST=127.0.0.1 and no SB_DOMAIN.
+		client := &Client{publicHost: "127.0.0.1"}
+		if got := client.TCPPublicEndpoint(37412); got != "tcp://127.0.0.1:37412" {
+			t.Fatalf("TCPPublicEndpoint() = %q", got)
+		}
+	})
+	t.Run("tcp_endpoint_uses_public_host_in_ip_mode", func(t *testing.T) {
 		client := &Client{publicHost: "203.0.113.10"}
 		if got := client.TCPPublicEndpoint(37412); got != "tcp://203.0.113.10:37412" {
+			t.Fatalf("TCPPublicEndpoint() = %q", got)
+		}
+	})
+	t.Run("tcp_endpoint_uses_domain_in_domain_mode", func(t *testing.T) {
+		client := &Client{domain: "sandbox.example.com", publicHost: "203.0.113.10"}
+		if got := client.TCPPublicEndpoint(37412); got != "tcp://sandbox.example.com:37412" {
 			t.Fatalf("TCPPublicEndpoint() = %q", got)
 		}
 	})
