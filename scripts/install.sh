@@ -278,7 +278,7 @@ if [[ -z "$PAT_TOKEN" ]]; then
 	fi
 fi
 
-if [[ -z "$DOMAIN" && -z "$PUBLIC_HOST" ]]; then
+if [[ -z "$PUBLIC_HOST" ]]; then
 	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
 	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
 fi

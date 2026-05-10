@@ -61,10 +61,15 @@ func (c *Client) Enabled() bool {
 	return c.enabled
 }
 
-// PublicHost is the parent host's reachable address (IP or DNS) used as the
-// dial target for raw-TCP exposures. Surfaced so the service layer can return
-// it as a structured field on the expose response without re-parsing the URL.
-func (c *Client) PublicHost() string { return c.publicHost }
+// PublicHost returns the dial target for raw-TCP exposures. In domain mode the
+// base domain is returned so TCP URLs are consistent with HTTP sandbox URLs;
+// otherwise falls back to the configured publicHost IP.
+func (c *Client) PublicHost() string {
+	if c.domain != "" {
+		return c.domain
+	}
+	return c.publicHost
+}
 
 func (c *Client) Ping(ctx context.Context) error {
 	if !c.enabled {
@@ -100,12 +105,15 @@ func (c *Client) PortPublicURL(id string, port int) string {
 }
 
 // TCPPublicEndpoint returns the URL clients dial for a raw TCP exposure
-// allocated at hostPort. Always uses the publicHost as the dial target — TCP
-// has no DNS-shaped wildcard equivalent, so even in domain mode the parent
-// host's address is the right value here. Operators that want a friendly DNS
-// name should add their own A record pointing at PublicHost.
+// allocated at hostPort. In domain mode the base domain is used as the dial
+// target (e.g. tcp://sandbox.aerol.cloud:22534); otherwise falls back to
+// publicHost.
 func (c *Client) TCPPublicEndpoint(hostPort int) string {
-	return fmt.Sprintf("tcp://%s:%d", c.publicHost, hostPort)
+	host := c.publicHost
+	if c.domain != "" {
+		host = c.domain
+	}
+	return fmt.Sprintf("tcp://%s:%d", host, hostPort)
 }
 
 // TLSPublicEndpoint returns the dial target for a TLS-SNI multiplexed
