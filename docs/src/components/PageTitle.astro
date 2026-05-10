@@ -1,11 +1,12 @@
 ---
 import { PAGE_TITLE_ID } from './TableOfContent/constants'
 
-const { entry } = Astro.props
+const entry = Astro.locals.starlightRoute?.entry
+const data = entry?.data
 ---
 
 {
-  !entry.data.hideTitleOnPage && <h1 id={PAGE_TITLE_ID} class="page-title">{entry.data.title}</h1>
+  data && !data.hideTitleOnPage && <h1 id={PAGE_TITLE_ID} class="page-title">{data.title}</h1>
 }
 
 <style>
