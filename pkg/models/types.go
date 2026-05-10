@@ -295,11 +295,51 @@ type CreateSandboxResponse struct {
 	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
 }
 
+// ExposePortRequest is the optional JSON body for POST /v1/sandboxes/{id}/ports/{port}.
+// Empty body or empty Protocol falls back to "http" — the historical default —
+// so old SDK callers keep working unchanged.
+type ExposePortRequest struct {
+	Protocol string `json:"protocol,omitempty"`
+}
+
 type ExposedPort struct {
 	SandboxID string    `json:"sandbox_id"`
 	Port      int       `json:"port"`
+	// Protocol is one of "http" (default — Caddy HTTP reverse proxy), "tcp"
+	// (caddy-l4 listener bound to HostPort, raw TCP forward to the container),
+	// or "tls" (caddy-l4 SNI route on the shared TLS listener). Pre-migration
+	// rows carry "http" via the column default.
+	Protocol  string    `json:"protocol"`
+	// HostPort is the parent-host TCP listener allocated for protocol="tcp"
+	// from the configured pool (default [22000, 23000]). Zero for http/tls
+	// modes, which don't reserve a per-exposure host port.
+	HostPort  int       `json:"host_port,omitempty"`
 	PublicURL string    `json:"public_url"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// Exposed port protocols. http is the original behavior (Caddy HTTP reverse
+// proxy); tcp and tls are the caddy-l4 paths added with the L4 work.
+const (
+	ExposedPortProtocolHTTP = "http"
+	ExposedPortProtocolTCP  = "tcp"
+	ExposedPortProtocolTLS  = "tls"
+)
+
+// ValidExposedPortProtocol normalizes "" to http (the historical default) and
+// rejects unknown values. Any caller that surfaces user input must run it
+// through this before persistence.
+func ValidExposedPortProtocol(value string) (string, error) {
+	switch value {
+	case "", ExposedPortProtocolHTTP:
+		return ExposedPortProtocolHTTP, nil
+	case ExposedPortProtocolTCP:
+		return ExposedPortProtocolTCP, nil
+	case ExposedPortProtocolTLS:
+		return ExposedPortProtocolTLS, nil
+	default:
+		return "", fmt.Errorf("invalid port protocol %q (allowed: %s, %s, %s)", value, ExposedPortProtocolHTTP, ExposedPortProtocolTCP, ExposedPortProtocolTLS)
+	}
 }
 
 type HealthStatus struct {

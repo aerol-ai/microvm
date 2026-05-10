@@ -1,0 +1,242 @@
+---
+title: TCP & TLS Ports
+description: Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo, gRPC) from a sandbox using caddy-l4.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`exposePort` publishes an HTTP route at `https://<sandbox-id>-<port>.<domain>`. That works for browser-shaped traffic but not for protocols that speak the raw TCP wire — Postgres, Redis, MySQL, MongoDB, MQTT, gRPC, SSH, dedicated game servers. For those, AerolVM exposes two additional surfaces backed by [`caddy-l4`](https://github.com/mholt/caddy-l4):
+
+| Mode | Method | URL shape | When |
+|---|---|---|---|
+| Raw TCP | `exposeTCPPort(port)` | `tcp://<public-host>:<host-port>` | Postgres, Redis, MySQL, Mongo, raw protocols |
+| TLS-SNI | `exposeTLSPort(port)` | `tls://<id>-<port>.<domain>:<l4-port>` | TLS-aware backends that already speak SNI |
+
+Both share the same lifecycle as `exposePort`: routes are torn down on stop / destroy and re-published on start.
+
+Not sure which one fits your workload? See [TCP vs TLS Ports](/tcp-vs-tls-ports/) for a side-by-side mental model, a workload-by-workload picker, and the trade-offs each mode imposes.
+
+## Raw TCP
+
+`exposeTCPPort(port)` allocates a parent-host port from the configured pool (default `[22000, 23000]`) and points caddy-l4 at the sandbox's container IP. The returned URL is in `tcp://<public-host>:<host-port>` form and plugs straight into a native protocol client.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const url = await sandbox.exposeTCPPort(5432);
+    // url === "tcp://203.0.113.10:37412"
+    // psql "postgresql://user:pass@203.0.113.10:37412/appdb"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    url = sandbox.expose_tcp_port(5432)
+    # url == "tcp://203.0.113.10:37412"
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    url, err := sandbox.ExposeTCPPort(ctx, 5432)
+    if err != nil {
+        log.Fatal(err)
+    }
+    // url == "tcp://203.0.113.10:37412"
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let url = sandbox.expose_tcp_port(5432)?;
+    // url == "tcp://203.0.113.10:37412"
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String url = sandbox.exposeTCPPort(5432);
+    // url.equals("tcp://203.0.113.10:37412")
+    ```
+  </TabItem>
+</Tabs>
+
+The tuple `(public host, host port)` is everything you need to build a DSN for any TCP protocol — pass it directly to `psql`, `redis-cli`, `mysql`, `mongosh`, or your application's connection string.
+
+### Host port pool
+
+The allocator picks a candidate at random from `[SB_L4_PORT_RANGE_START, SB_L4_PORT_RANGE_END]` and reserves it via a single atomic `INSERT OR IGNORE`. Random-first keeps p95 fast even with many concurrent allocations; on collision it falls back to a deterministic linear scan so the pool is exhausted fully before giving up.
+
+The default pool is `[22000, 23000]` — 1000 slots, which is the per-host cap on concurrent TCP exposures. The range is chosen to sit **below** the Linux ephemeral port range (`net.ipv4.ip_local_port_range`, typically `32768–60999`) so the kernel never picks one of these as the source port for an unrelated outbound connection. Overlap there caused intermittent `EADDRINUSE` failures when the allocator's `bind()` raced with a kernel-chosen ephemeral source port; keeping the pool out of that range eliminates the failure mode entirely.
+
+Override the pool with environment variables on `sandboxd`:
+
+```
+SB_L4_PORT_RANGE_START=22000
+SB_L4_PORT_RANGE_END=23000
+```
+
+If you raise these bounds, keep both sides outside your kernel's ephemeral range — check it with `cat /proc/sys/net/ipv4/ip_local_port_range`. Picking values inside the ephemeral range will reintroduce the random-collision failure mode on busy hosts.
+
+The host firewall must permit inbound traffic on that range. The installer prints a reminder, but does not auto-open the firewall — operators decide their own policy.
+
+### What gets restored on restart
+
+The `host_port` reservation is persisted alongside the exposure row. After a sandboxd restart, the periodic reconcile re-publishes the layer4 server pointing at the (possibly new) container IP, and the same host port stays bound — clients with cached connection strings keep working.
+
+## TLS-SNI multiplexing
+
+`exposeTLSPort(port)` reuses one shared listener (default `:443`), terminates TLS at the edge using Caddy's wildcard certificate, and forwards plaintext bytes to the container. Returns `tls://<id>-<port>.<domain>:<l4-port>`.
+
+Your backend speaks plain TCP — no certificate management, no renewal, no private key inside the container. Caddy's wildcard cert lives on the host and never crosses the container boundary.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const url = await sandbox.exposeTLSPort(5432);
+    // url === "tls://abc-5432.sandbox.example.com:443"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    url = sandbox.expose_tls_port(5432)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    url, err := sandbox.ExposeTLSPort(ctx, 5432)
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let url = sandbox.expose_tls_port(5432)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String url = sandbox.exposeTLSPort(5432);
+    ```
+  </TabItem>
+</Tabs>
+
+Two requirements:
+
+1. **Domain mode** — `--domain` must be configured (the SNI hostname needs an A record pointing at the host).
+2. **DNS-01 issuance** — `install.sh` enables TLS-SNI on `:443` automatically when `--dns-provider` is set (`SB_L4_TLS_LISTEN=:443` in the daemon env). The installer also relocates the regular Caddy HTTPS listener to `127.0.0.1:8443` so caddy-l4 can own `:443` cleanly. Caddy's wildcard cert for `*.<domain>` is issued once via DNS-01 at startup and reused for every TLS-SNI exposure. Without `--dns-provider`, TLS-SNI stays disabled because HTTP-01 ACME needs `:443` for its own validation — re-run with `--dns-provider cloudflare --dns-api-token <token>` to enable it.
+
+TLS is **terminated at the edge** by caddy-l4. Caddy's auto-managed wildcard cert is presented to the client; bytes after the handshake are forwarded as plaintext to the container. This means:
+
+- **No cert lives inside the container.** Your sandbox process speaks plain TCP and is unaware that clients connected over TLS.
+- **No per-sandbox cert work happens at expose time.** The wildcard already exists; we just add an SNI route to the layer4 server. Expose latency is one Caddy admin API call plus one SQLite insert.
+- **mTLS, custom ALPN, and HTTP/2 client-cert auth are not supported in this mode** — the terminator consumes the original handshake. Use `exposeTCPPort` if you need those.
+
+## Reconciliation
+
+Reconcile keeps caddy and the sandbox database in sync across all three protocols (`http`, `tcp`, `tls`). The periodic loop and `POST /v1/admin/reconcile` both:
+
+- Re-upsert routes for running sandboxes whose caddy entries are missing.
+- Drop routes when the underlying sandbox is `destroyed`.
+- Garbage-collect zombie caddy routes / layer4 servers whose IDs match our convention but no longer correspond to any DB row (e.g. after a destroyed-row TTL purge or development DB wipe).
+
+See [Reconcile](/reconcile) for full details.
+
+## Unexposing
+
+There is **one** unexpose method, not three. `unexposePort(port)` handles HTTP, TCP, and TLS exposures uniformly — the daemon looks up the recorded protocol on the row and tears down the right caddy surface (HTTP route, layer4 TCP server, or TLS-SNI route), then deletes the row.
+
+`(sandboxID, port)` is the primary key on the exposure table, so there is at most one row per pair regardless of protocol. The caller does not need to remember whether the port was published with `exposePort`, `exposeTCPPort`, or `exposeTLSPort`:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Any of these:
+    await sandbox.exposePort(3000);       // -> https://<id>-3000.<domain>
+    await sandbox.exposeTCPPort(5432);    // -> tcp://<host>:<host-port>
+    await sandbox.exposeTLSPort(6379);    // -> tls://<id>-6379.<domain>:443
+
+    // All tear down with the same call:
+    await sandbox.unexposePort(3000);
+    await sandbox.unexposePort(5432);
+    await sandbox.unexposePort(6379);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.expose_port(3000)
+    sandbox.expose_tcp_port(5432)
+    sandbox.expose_tls_port(6379)
+
+    sandbox.unexpose_port(3000)
+    sandbox.unexpose_port(5432)
+    sandbox.unexpose_port(6379)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if _, err := sandbox.ExposePort(ctx, 3000); err != nil {
+        log.Fatal(err)
+    }
+    if _, err := sandbox.ExposeTCPPort(ctx, 5432); err != nil {
+        log.Fatal(err)
+    }
+    if _, err := sandbox.ExposeTLSPort(ctx, 6379); err != nil {
+        log.Fatal(err)
+    }
+
+    // Same call regardless of how the port was published.
+    _ = sandbox.UnexposePort(ctx, 3000)
+    _ = sandbox.UnexposePort(ctx, 5432)
+    _ = sandbox.UnexposePort(ctx, 6379)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.expose_port(3000)?;
+    sandbox.expose_tcp_port(5432)?;
+    sandbox.expose_tls_port(6379)?;
+
+    sandbox.unexpose_port(3000)?;
+    sandbox.unexpose_port(5432)?;
+    sandbox.unexpose_port(6379)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.exposePort(3000);
+    sandbox.exposeTCPPort(5432);
+    sandbox.exposeTLSPort(6379);
+
+    sandbox.unexposePort(3000);
+    sandbox.unexposePort(5432);
+    sandbox.unexposePort(6379);
+    ```
+  </TabItem>
+</Tabs>
+
+### What unexpose actually does
+
+The daemon dispatches on the protocol stored on the `exposed_ports` row:
+
+| Recorded protocol | Caddy surface torn down | Host-side cleanup |
+|---|---|---|
+| `http` (or empty, for legacy rows) | `DELETE /id/sandbox-<id>-port-<port>` on the HTTP server | none |
+| `tcp` | `DELETE /config/apps/layer4/servers/tcp-port-<host-port>` | host port returns to the `[22000, 23000]` pool |
+| `tls` | `DELETE /id/sandbox-<id>-port-<port>-tls` on the SNI mux | none |
+
+In every case the row in `exposed_ports` is deleted and the toolbox port allowlist is refreshed so subsequent calls to `/proxy/<port>/` on the public sandbox URL are rejected immediately.
+
+### Why there is no `unexposeTCPPort` / `unexposeTLSPort`
+
+Three reasons the API is asymmetric on purpose:
+
+1. **`(id, port)` is the unique key.** The protocol does not need to be passed in — the daemon already knows it from the row.
+2. **The HTTP verb is the same.** All three would issue `DELETE /v1/sandboxes/{id}/ports/{port}` with no body. Splitting into three SDK methods would just call the same endpoint three different ways.
+3. **It mirrors `close(fd)` in POSIX.** The system call is the same whether the descriptor is a TCP socket, a UNIX socket, or a pipe — the kernel knows which one it gave you.
+
+If your code needs to be defensive about not knowing which method was used to expose a port, the single-method shape is what you want anyway.
+
+## Related docs
+
+- [TCP vs TLS Ports](/tcp-vs-tls-ports/) — deeper picker for choosing between `exposeTCPPort` and `exposeTLSPort`.
+- [Preview](/preview/) — HTTPS-shaped exposures.
+- [Port Allowlist](/port-allowlist/) — explicit exposure before public traffic is accepted.
+- [Reconcile](/reconcile/) — how caddy state is kept consistent with the database.

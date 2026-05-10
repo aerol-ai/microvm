@@ -82,6 +82,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/preview',
+        label: 'Preview',
+        description: 'Expose container ports publicly over HTTPS through Caddy routes.',
+      },
+      {
+        type: 'link',
         href: '/reconcile',
         label: 'Reconcile',
         description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
@@ -131,6 +137,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         href: '/preview',
         label: 'Preview',
         description: 'Expose container ports publicly over HTTPS through Caddy routes.',
+      },
+      {
+        type: 'link',
+        href: '/tcp-ports',
+        label: 'TCP & TLS Ports',
+        description: 'Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo) via caddy-l4.',
       },
       {
         type: 'link',

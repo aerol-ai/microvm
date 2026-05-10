@@ -79,6 +79,39 @@ type Config struct {
 	MemoryOverProvisionFactor float64
 	HostCPUCoresOverride      int
 	HostMemoryMBOverride      int
+
+	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
+	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
+	// picks a random candidate first; collisions fall back to a deterministic
+	// scan. Both sides are inclusive.
+	//
+	// The default range [22000, 23000] sits ABOVE the Linux registered-ports
+	// boundary (1024) and BELOW the default ephemeral-port range
+	// (net.ipv4.ip_local_port_range, typically 32768-60999). Keeping the pool
+	// out of the ephemeral range matters: if these ports overlapped, the
+	// kernel could hand any of them to an unrelated outbound connection as a
+	// source port, and the next L4 expose attempt to bind() that number would
+	// race-fail with EADDRINUSE. 1000 slots is the deliberate concurrent-TCP-
+	// exposure cap per host; raise it via the env vars if you need more, but
+	// keep both bounds outside the host's ephemeral range.
+	L4PortRangeStart int
+	L4PortRangeEnd   int
+	// L4TLSListen is the listen address for the shared TLS-SNI multiplexer.
+	// Empty disables TLS-SNI exposure entirely (the daemon will reject
+	// protocol="tls" requests). When set, caddy-l4 binds this address and
+	// routes by SNI to per-sandbox subdomains.
+	//
+	// install.sh sets this to ":443" when --dns-provider is configured (the
+	// HTTPS Caddy server is moved to 127.0.0.1:8443 in that case so caddy-l4
+	// can own :443). Without --dns-provider, HTTP-01 issuance still needs
+	// :443 free for ACME, so we leave it empty.
+	L4TLSListen string
+	// L4TLSFallback is the local address caddy-l4 forwards a TLS connection
+	// to when no per-sandbox SNI route matches — i.e. the regular HTTPS site
+	// served by Caddy itself (sandbox API, on-demand TLS, the catch-all 404).
+	// Required when L4TLSListen is non-empty; ignored otherwise. Default is
+	// "127.0.0.1:8443" to match install.sh's relocated HTTPS listener.
+	L4TLSFallback string
 }
 
 func Load() (Config, error) {
@@ -130,6 +163,11 @@ func Load() (Config, error) {
 		MemoryOverProvisionFactor: getEnvFloat("SB_MEMORY_OVERPROVISION_FACTOR", 10.0),
 		HostCPUCoresOverride:      getEnvInt("SB_HOST_CPU_CORES", 0),
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
+
+		L4PortRangeStart: getEnvInt("SB_L4_PORT_RANGE_START", 22000),
+		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 23000),
+		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
+		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
 	}
 
 	if cfg.PATToken == "" {
@@ -156,6 +194,21 @@ func Load() (Config, error) {
 	// reject individual create requests until the runtime is wired up.
 	if _, err := models.ValidRuntime(cfg.Runtime); err != nil || cfg.Runtime == "" {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s)", cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata)
+	}
+
+	// L4 port pool sanity. Out-of-range or inverted bounds would silently
+	// brick raw-TCP exposure later; surface it at boot instead.
+	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
+		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
+			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+	}
+
+	// If TLS-SNI multiplexing is enabled, the fallback HTTPS address must be
+	// set — otherwise non-sandbox SNI (the API itself, on-demand TLS) would
+	// land nowhere. An operator who explicitly sets SB_L4_TLS_FALLBACK="" while
+	// also setting SB_L4_TLS_LISTEN is misconfigured; surface it at boot.
+	if cfg.L4TLSListen != "" && cfg.L4TLSFallback == "" {
+		return Config{}, errors.New("SB_L4_TLS_FALLBACK must be set when SB_L4_TLS_LISTEN is set (caddy-l4 needs a target for non-sandbox SNI)")
 	}
 
 	return cfg, nil

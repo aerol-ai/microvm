@@ -155,12 +155,43 @@ public class MicroVMClient {
     }
 
     public String exposePort(String sandboxId, int port) {
-        PublicUrlResponse response = doJson("POST", sandboxPath(sandboxId) + "/ports/" + port, null, PublicUrlResponse.class);
+        return exposePortWithProtocol(sandboxId, port, null);
+    }
+
+    /**
+     * Publish a raw TCP port through caddy-l4. Returns {@code tcp://<host>:<port>}
+     * ready to plug into native protocol clients (psql, redis-cli, mysql,
+     * mongosh).
+     */
+    public String exposeTCPPort(String sandboxId, int port) {
+        return exposePortWithProtocol(sandboxId, port, "tcp");
+    }
+
+    /**
+     * Publish a TCP port behind the shared TLS-SNI multiplexer. Returns
+     * {@code tls://<id>-<port>.<domain>:<l4-port>}. Requires the deployment
+     * to have a domain configured AND {@code SB_L4_TLS_LISTEN} set.
+     */
+    public String exposeTLSPort(String sandboxId, int port) {
+        return exposePortWithProtocol(sandboxId, port, "tls");
+    }
+
+    private String exposePortWithProtocol(String sandboxId, int port, String protocol) {
+        Object body = protocol == null ? null : new ExposePortRequest(protocol);
+        PublicUrlResponse response = doJson("POST", sandboxPath(sandboxId) + "/ports/" + port, body, PublicUrlResponse.class);
         return response == null ? "" : response.publicUrl;
     }
 
     public void unexposePort(String sandboxId, int port) {
         doNoContent("DELETE", sandboxPath(sandboxId) + "/ports/" + port, null);
+    }
+
+    static class ExposePortRequest {
+        public final String protocol;
+
+        ExposePortRequest(String protocol) {
+            this.protocol = protocol;
+        }
     }
 
     public void reconcile() {

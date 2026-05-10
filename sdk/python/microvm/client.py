@@ -300,6 +300,23 @@ class Sandbox:
     def expose_port(self, port: int) -> str:
         return self._client.expose_port(self.id, port)
 
+    def expose_tcp_port(self, port: int) -> str:
+        """Publish a raw TCP port through caddy-l4. Returns ``tcp://<host>:<port>``.
+
+        Plug the result straight into ``psql``, ``redis-cli``, ``mysql``,
+        ``mongosh``, or any other native-protocol client.
+        """
+        return self._client.expose_tcp_port(self.id, port)
+
+    def expose_tls_port(self, port: int) -> str:
+        """Publish a TCP port behind the shared TLS-SNI multiplexer.
+
+        Returns ``tls://<id>-<port>.<domain>:<l4-port>``. Requires the
+        deployment to have a domain configured AND ``SB_L4_TLS_LISTEN`` set
+        on the daemon.
+        """
+        return self._client.expose_tls_port(self.id, port)
+
     def unexpose_port(self, port: int) -> None:
         self._client.unexpose_port(self.id, port)
 
@@ -471,7 +488,17 @@ class MicroVM:
         return self._request("GET", url)
 
     def expose_port(self, sandbox_id: str, port: int) -> str:
-        response = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/ports/{port}", None)
+        return self._expose_port_with_protocol(sandbox_id, port, None)
+
+    def expose_tcp_port(self, sandbox_id: str, port: int) -> str:
+        return self._expose_port_with_protocol(sandbox_id, port, "tcp")
+
+    def expose_tls_port(self, sandbox_id: str, port: int) -> str:
+        return self._expose_port_with_protocol(sandbox_id, port, "tls")
+
+    def _expose_port_with_protocol(self, sandbox_id: str, port: int, protocol: Optional[str]) -> str:
+        body: Optional[Dict[str, Any]] = {"protocol": protocol} if protocol else None
+        response = self._do_json("POST", f"/v1/sandboxes/{sandbox_id}/ports/{port}", body)
         return str(_first_of(response, "public_url", "publicURL") or "")
 
     def unexpose_port(self, sandbox_id: str, port: int) -> None:

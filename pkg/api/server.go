@@ -229,12 +229,24 @@ func (s *Server) handleExposePort(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid port")
 		return
 	}
-	publicURL, err := s.service.ExposePort(r.Context(), r.PathValue("id"), port)
+	// Body is optional — legacy callers POST with no body and get HTTP routing.
+	// New callers send {"protocol":"tcp"} or {"protocol":"tls"} to choose a
+	// caddy-l4 path. ContentLength == 0 is the unambiguous "no body" signal;
+	// we intentionally don't strict-decode an empty stream so old SDKs keep
+	// working unchanged.
+	var req models.ExposePortRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
+	publicURL, err := s.service.ExposePort(r.Context(), r.PathValue("id"), port, req.Protocol)
 	if err != nil {
 		s.writeStoreAwareError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"public_url": publicURL})
+	writeJSON(w, http.StatusOK, map[string]string{"public_url": publicURL, "protocol": req.Protocol})
 }
 
 func (s *Server) handleListMounts(w http.ResponseWriter, r *http.Request) {

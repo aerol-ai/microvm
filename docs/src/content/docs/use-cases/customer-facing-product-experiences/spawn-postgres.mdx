@@ -14,15 +14,11 @@ This is the Postgres foundation, not the full Supabase control plane. If you wan
 - `createSession` keeps both Postgres and an optional HTTP admin surface alive after setup finishes.
 - Lifecycle policies let you stop or destroy idle database sandboxes automatically.
 
-## Important network limitation
+## Native Postgres endpoint via `exposeTCPPort`
 
-The generated URL from `exposePort()` in this repository is HTTP(S) only.
+This page exposes the Postgres wire protocol directly using `exposeTCPPort(5432)`. The daemon allocates a parent-host port from the configured `[22000, 23000]` pool and points caddy-l4 at the container's `5432`, so the generated URL is in `tcp://<public-host>:<host-port>` form and works with `psql`, Prisma, SQLAlchemy, pgAdmin, and any other client that speaks the PostgreSQL wire protocol.
 
-- The Caddy template defines only `https://...` HTTP sites and `reverse_proxy` handlers.
-- The `UpsertPortRoute` path writes routes into Caddy's `apps/http` server, not a TCP proxy or layer 4 listener.
-- The SSH gateway only supports SSH `session` channels. It does not implement `direct-tcpip` port forwarding.
-
-That means a generated URL like `https://<sandbox-id>-5432.<domain>` is not a native Postgres endpoint. It will not work with `psql`, Prisma, or any other client expecting the PostgreSQL wire protocol. If you want a browser-accessible URL today, expose an HTTP layer that talks to Postgres. If you want native Postgres over the internet, place a TCP-capable proxy or load balancer in front of the sandbox instead of the current Caddy setup.
+If you only need browser-shaped traffic (a small admin UI, REST shim, PostgREST), use `exposePort()` instead — that's the HTTPS-only path documented in [Preview](/preview/). See [TCP & TLS Ports](/tcp-ports/) for the full surface.
 
 ## Copy-paste TypeScript script
 
@@ -235,12 +231,20 @@ async function main() {
 
   await waitForAdmin(sandbox);
   const adminURL = await sandbox.exposePort(adminPort);
+  const postgresTCP = await sandbox.exposeTCPPort(postgresPort);
+
+  // exposeTCPPort returns "tcp://<host>:<port>" — strip the scheme to build a
+  // wire-protocol DSN for psql / Prisma / SQLAlchemy.
+  const dsnHost = postgresTCP.replace(/^tcp:\/\//, "");
+  const publicDatabaseURL = `postgresql://${encodeURIComponent(postgresUser)}:${encodeURIComponent(postgresPassword)}@${dsnHost}/${encodeURIComponent(postgresDB)}`;
 
   const payload = {
     sandboxID: sandbox.id,
     postgresSessionID: postgresSession.id,
     adminSessionID: adminSession.id,
     adminURL,
+    postgresURL: publicDatabaseURL,
+    postgresTCP,
     database: {
       hostInsideSandbox: "127.0.0.1",
       port: postgresPort,
@@ -248,7 +252,7 @@ async function main() {
       userEnv: "POSTGRES_USER",
       passwordEnv: "POSTGRES_PASSWORD",
     },
-    note: "adminURL is an HTTP(S) endpoint in front of the sandbox. It is not a native Postgres DSN.",
+    note: "postgresURL is a native Postgres DSN backed by a caddy-l4 TCP route.",
   };
 
   await writeFile("deploy-your-own-postgres.json", `${JSON.stringify(payload, null, 2)}\n`);
@@ -263,22 +267,23 @@ main().catch((error) => {
 
 ## What the script gives you
 
-- `deploy-your-own-postgres.json` with the sandbox ID, the running session IDs, and the public HTTP admin URL.
-- A Postgres server listening on port `5432` inside the sandbox.
+- `deploy-your-own-postgres.json` with the sandbox ID, the running session IDs, the public HTTP admin URL, and a native `postgresql://...` DSN.
+- A Postgres server listening on port `5432` inside the sandbox, published as a `tcp://<public-host>:<host-port>` endpoint via caddy-l4.
 - A password-protected HTTP endpoint on port `3000` that proves the database is up and returns basic metadata.
 
-## Can a user access Postgres on the generated URL?
+## Connecting natively
 
-No. In this repository, the generated URL can only reach HTTP(S) services.
+The `postgresURL` returned by the script is a real Postgres DSN. Plug it into any client:
 
-- `packaging/Caddyfile.template` defines HTTP sites and HTTP reverse proxies only.
-- `pkg/caddy/client.go` inserts per-port routes into Caddy's HTTP server and returns `https://<sandbox-id>-<port>.<domain>` URLs.
-- `pkg/sshgateway/gateway.go` rejects non-`session` SSH channels, so it is not a fallback TCP tunnel either.
+```
+psql "postgresql://user:pass@<public-host>:<host-port>/appdb"
+```
 
-Use the generated URL for an HTTP layer such as an admin endpoint, PostgREST, or your own API. Do not hand it to a raw Postgres client.
+The host port is one of the parent-host ports allocated from the configured `[22000, 23000]` pool. Make sure that range is open on the host firewall — see [TCP & TLS Ports](/tcp-ports/) for the full surface and reconcile guarantees.
 
 ## Related docs
 
+- [TCP & TLS Ports](/tcp-ports/)
 - [Environment](/environment/)
 - [Preview](/preview/)
 - [Port Allowlist](/port-allowlist/)

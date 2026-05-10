@@ -1,0 +1,182 @@
+---
+title: TCP vs TLS Ports
+description: When to use exposeTCPPort vs exposeTLSPort — mental model, trade-offs, and a workload-by-workload picker.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`exposeTCPPort` and `exposeTLSPort` both publish a sandbox-internal port through caddy-l4, but they listen and route very differently. This page is a deeper explainer of the two modes — when to pick each, what they cost, and why the API gives you a choice.
+
+For the API surface itself, see [TCP & TLS Ports](/tcp-ports/).
+
+## Mental model
+
+### Raw TCP — `exposeTCPPort(port)`
+
+caddy-l4 binds **one host port from the configured `[22000, 23000]` pool** per exposure and forwards bytes 1:1 into the container.
+
+```
+client ──► public-host:37412 (caddy-l4)  ──► container:5432
+                       ▲                            ▲
+                bytes go through unchanged
+```
+
+- URL shape: `tcp://<public-host>:<host-port>`
+- The proxy is **protocol-agnostic** — it doesn't read the bytes, just shovels them.
+- One TCP exposure consumes one host port in the pool, and one inbound firewall rule on that port.
+- Works for **any** TCP protocol, regardless of whether it speaks TLS.
+
+### TLS-SNI — `exposeTLSPort(port)`
+
+caddy-l4 binds **one shared port** (typically `:443`), reads the SNI extension from the ClientHello to pick a route, and **terminates TLS at the edge** using the wildcard certificate Caddy already manages for `*.<domain>`. After termination, plaintext bytes are forwarded to the container on its native port.
+
+```
+client ──TLS──► public-host:443 (caddy-l4)
+                       │
+                       │ terminate TLS using the wildcard cert
+                       │ Caddy auto-issued for *.<domain>
+                       ▼
+                ┌────────────┐
+                │ SNI=        │
+                │  abc-5432.. │ ──plaintext──► sandbox abc, container:5432
+                │  xyz-6379.. │ ──plaintext──► sandbox xyz, container:6379
+                └────────────┘
+        many backends, one shared port, one wildcard cert
+```
+
+- URL shape: `tls://<id>-<port>.<domain>:<l4-port>`
+- TLS is **terminated at caddy-l4** using Caddy's existing wildcard cert. The container speaks **plaintext TCP** — it does not need to hold a cert, manage renewals, or know anything about TLS.
+- Many exposures share the same listener and the same cert — no host-port pool burn, no per-service firewall hole, no cert provisioning per sandbox.
+- Caddy's private key never leaves the host. Containers see only the decrypted bytes.
+- Requires the client to send SNI. If your client does not send SNI (very rare in 2026 — basically only ancient legacy clients), use `exposeTCPPort` instead.
+- **Not for mTLS / client-cert auth / custom ALPN selection by the backend.** Those need access to the original TLS handshake and require raw TCP — see the trade-offs section.
+
+## Workload picker
+
+| Workload | Recommended mode | Why |
+|---|---|---|
+| Postgres (plaintext) | **TCP** | Default Postgres setups are plaintext; simplest and works with any client. |
+| Postgres (TLS) | **TLS-SNI** | libpq has sent SNI since v17. Saves a firewall hole; reuses `:443`. |
+| Redis | **TCP** | Redis TLS support is rarely deployed; plain TCP dominates. |
+| MySQL / MariaDB | **TCP** | Most clients skip TLS for ephemeral test data. |
+| MongoDB | **TCP** | Plain mongo wire protocol over TCP is the default. |
+| MQTT broker | TCP for `mqtt://`, **TLS-SNI** for `mqtts://` | Match the client's URI scheme. |
+| gRPC plaintext / h2c | **TCP** | No TLS, no SNI, just bytes. |
+| gRPC over TLS | **TLS-SNI** | gRPC clients send SNI; backend holds the cert. |
+| HTTPS-shaped TCP behind a CDN | **TLS-SNI** | Looks identical to a normal HTTPS service from outside. |
+| SSH bastion / Git server | **TCP** | SSH does not speak SNI. TLS-SNI cannot route it. |
+| Dedicated game server | **TCP** | Game protocols are bespoke. |
+| Custom binary protocol (no TLS) | **TCP** | Same reason as game servers. |
+
+## Trade-offs
+
+### Pick TCP when
+
+- The protocol does not speak TLS, **or**
+- You don't want the sandbox to manage a TLS certificate, **or**
+- The client expects a `<host>:<port>` connection string (`psql`, `redis-cli`, `mongosh`).
+
+You pay: one host port + one firewall rule per exposure, and a random high port number visible in the URL.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const url = await sandbox.exposeTCPPort(5432);
+    // tcp://203.0.113.10:37412
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    url = sandbox.expose_tcp_port(5432)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    url, err := sandbox.ExposeTCPPort(ctx, 5432)
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let url = sandbox.expose_tcp_port(5432)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String url = sandbox.exposeTCPPort(5432);
+    ```
+  </TabItem>
+</Tabs>
+
+### Pick TLS-SNI when
+
+- The client sends SNI (libpq, browsers, gRPC, modern Mongo / Redis / MySQL drivers all do), **and**
+- The backend speaks plain TCP and you want clients to see TLS, **and**
+- You want many backends sharing `:443` so the URL looks like a normal HTTPS service.
+
+You pay: only what you give up by terminating at the edge — mTLS, custom ALPN, and HTTP/2 client-cert auth no longer reach the backend. You save: no per-sandbox cert management, no host-port pool burn, no per-service firewall rule, no awkward high-port suffix in the URL.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const url = await sandbox.exposeTLSPort(5432);
+    // tls://abc-5432.sandbox.example.com:443
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    url = sandbox.expose_tls_port(5432)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    url, err := sandbox.ExposeTLSPort(ctx, 5432)
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let url = sandbox.expose_tls_port(5432)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String url = sandbox.exposeTLSPort(5432);
+    ```
+  </TabItem>
+</Tabs>
+
+## Side-by-side cheat sheet
+
+| | `exposeTCPPort` | `exposeTLSPort` |
+|---|---|---|
+| Listener | Per-exposure host port from `[22000, 23000]` | Shared, default `:443` |
+| URL shape | `tcp://<host>:<host-port>` | `tls://<id>-<port>.<domain>:<l4-port>` |
+| Reads bytes? | No | Yes — terminates the TLS handshake |
+| Terminates TLS? | n/a | **Yes**, at caddy-l4 (using Caddy's wildcard) |
+| Cert held by | n/a | Caddy on the host (private key never enters the container) |
+| Backend speaks | Whatever it likes | **Plaintext TCP** |
+| Supports mTLS / client certs? | n/a | **No** (terminator strips them) |
+| Client must send SNI? | No | **Yes** |
+| Needs `--domain`? | No | **Yes** |
+| Needs `--dns-provider`? | No | **Yes** (so the wildcard exists) |
+| Firewall holes per exposure | 1 | 0 (shared listener) |
+| Multiplexing model | One server per host port | One server, many SNI routes |
+
+## A useful rule of thumb
+
+> **TCP** is the answer for plain wire-protocol endpoints, and the only answer for protocols that need the original TLS handshake to reach the backend (mTLS, custom ALPN, HTTP/2 client-cert auth).
+>
+> **TLS-SNI** is the answer for "I want a `tls://` URL on `:443` with a real cert, and my backend just speaks plain TCP."
+
+If you're picking between them and not sure, default to **TLS-SNI** when DNS-01 is configured — it gives you the friendly URL, the real cert, and zero per-firewall ports. Fall back to **TCP** if your client doesn't send SNI, your backend needs the raw handshake, or your install isn't using `--dns-provider`.
+
+## Related docs
+
+- [TCP & TLS Ports](/tcp-ports/) — the API surface, host-port pool, and reconcile guarantees.
+- [Preview](/preview/) — HTTPS-shaped exposures via Caddy's HTTP reverse proxy.
+- [Port Allowlist](/port-allowlist/) — explicit exposure before public traffic is accepted.

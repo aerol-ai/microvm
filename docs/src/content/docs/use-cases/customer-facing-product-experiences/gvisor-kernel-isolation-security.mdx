@@ -3,15 +3,12 @@ title: gVisor Kernel Isolation Security
 description: Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.
 ---
 
-## What you are building
-
-This page intentionally does not include breakout or exploit code. Instead, it shows a safe kernel-surface probe. The same Python probe runs twice: once in a direct Docker runtime and once in a gVisor runtime. The probe attempts host-facing privileged operations such as `unshare`, `mount`, and `dmesg`, records what happened, and writes a JSON report.
-
-## Why AerolVM fits
+This page shows a safe kernel-surface probe. The same Python probe runs twice: once in a direct Docker runtime and once in a gVisor runtime. The probe attempts host-facing privileged operations such as `unshare`, `mount`, and `dmesg`, records what happened, and writes a JSON report.
 
 - `runtime: "docker"` lets you show the baseline container model where workload syscalls target the host kernel directly.
 - `runtime: "gvisor"` swaps that direct host-kernel path for gVisor's user-space kernel boundary.
 - The same probe can run in both runtimes with only one field changed, which makes the comparison concrete and easy to explain.
+- Currently, both Daytona and E2B use direct Docker isolation. This demo shows how gVisor's kernel mediation provides a stronger security boundary for untrusted code, which is why we are building it as a core runtime option for AerolVM.
 
 ## Shared probe payload
 

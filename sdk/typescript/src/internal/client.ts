@@ -250,7 +250,30 @@ export class APIClient {
   }
 
   async exposePort(id: string, port: number): Promise<string> {
-    const response = await this.doJSON<{ public_url: string }>("POST", `/v1/sandboxes/${id}/ports/${port}`);
+    return this.exposePortWithProtocol(id, port);
+  }
+
+  /**
+   * Publish a raw TCP port through caddy-l4. The returned URL is in
+   * `tcp://<host>:<port>` form and works directly with `psql`, `redis-cli`,
+   * `mysql`, `mongosh`, and any other native-protocol client.
+   */
+  async exposeTCPPort(id: string, port: number): Promise<string> {
+    return this.exposePortWithProtocol(id, port, "tcp");
+  }
+
+  /**
+   * Publish a TCP port behind the shared TLS-SNI multiplexer. Returns
+   * `tls://<id>-<port>.<domain>:<l4-port>`. Requires the daemon to have a
+   * domain configured AND `SB_L4_TLS_LISTEN` set.
+   */
+  async exposeTLSPort(id: string, port: number): Promise<string> {
+    return this.exposePortWithProtocol(id, port, "tls");
+  }
+
+  private async exposePortWithProtocol(id: string, port: number, protocol?: string): Promise<string> {
+    const body = protocol ? { protocol } : undefined;
+    const response = await this.doJSON<{ public_url: string }>("POST", `/v1/sandboxes/${id}/ports/${port}`, body);
     return response.public_url;
   }
 
@@ -408,6 +431,14 @@ export class SandboxResource implements Sandbox {
 
   async exposePort(port: number): Promise<string> {
     return this.client.exposePort(this.id, port);
+  }
+
+  async exposeTCPPort(port: number): Promise<string> {
+    return this.client.exposeTCPPort(this.id, port);
+  }
+
+  async exposeTLSPort(port: number): Promise<string> {
+    return this.client.exposeTLSPort(this.id, port);
   }
 
   async unexposePort(port: number): Promise<void> {

@@ -301,6 +301,16 @@ if [[ -n "$DNS_PROVIDER" ]]; then
 	esac
 fi
 
+# TLS-SNI multiplexing is gated on DNS-01 issuance because handing :443 to
+# caddy-l4 means HTTP-01 ACME validation can't bind there. With DNS-01 in
+# place ACME never needs :443, so caddy-l4 can own it and the regular Caddy
+# HTTPS site moves to 127.0.0.1:8443.
+if [[ -n "$DNS_PROVIDER" ]]; then
+	L4_TLS_LISTEN_DEFAULT=":443"
+else
+	L4_TLS_LISTEN_DEFAULT=""
+fi
+
 if [[ "$BUILD_FROM_SOURCE" == "auto" ]]; then
 	if [[ -f ./go.mod ]]; then
 		BUILD_FROM_SOURCE="true"
@@ -365,12 +375,16 @@ install_packages() {
 	fi
 }
 
-install_caddy_dns_plugin() {
+install_custom_caddy() {
 	# Replace the apt-installed Caddy binary with a custom build that includes
-	# the chosen caddy-dns plugin. This is required for DNS-01 wildcard TLS.
+	# every plugin AerolVM needs. caddy-l4 is always required so sandboxes can
+	# expose native TCP endpoints (Postgres, Redis, MySQL, etc.) via the
+	# layer4 admin API. caddy-dns/$DNS_PROVIDER is added when --dns-provider
+	# is set so DNS-01 wildcard TLS works.
+	#
 	# Caddy's official build server returns a single static binary with the
 	# requested modules baked in; no Go toolchain needed on the host.
-	local provider="$1"
+	local provider="${1:-}"
 	local arch_tag
 	local arch_extra=""
 
@@ -392,13 +406,18 @@ install_caddy_dns_plugin() {
 		caddy_path="/usr/bin/caddy"
 	fi
 
-	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/caddy-dns/${provider}"
+	# Caddy build server accepts repeated &p= for additional modules.
+	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/mholt/caddy-l4"
+	if [[ -n "$provider" ]]; then
+		download_url="${download_url}&p=github.com/caddy-dns/${provider}"
+	fi
+
 	local tmp_binary
 	tmp_binary="$(mktemp)"
 
 	if ! curl -fL --retry 5 --retry-delay 2 --retry-connrefused "$download_url" -o "$tmp_binary"; then
 		rm -f "$tmp_binary"
-		echo "Failed to download Caddy with ${provider} DNS plugin from ${download_url}" >&2
+		echo "Failed to download custom Caddy build from ${download_url}" >&2
 		exit 1
 	fi
 
@@ -418,17 +437,25 @@ install_caddy_dns_plugin() {
 
 	chmod +x "$tmp_binary"
 
-	# Verify the requested DNS plugin is actually compiled in. Without this
-	# the Caddyfile we generate later would fail to provision at runtime
-	# with a cryptic "loading module 'acme.dns.${provider}'" error.
-	local module_name="dns.providers.${provider}"
-	if ! "$tmp_binary" list-modules 2>/dev/null | grep -q "^${module_name}\$"; then
-		echo "Downloaded Caddy does not include ${module_name}." >&2
-		echo "Modules present matching 'dns':" >&2
-		"$tmp_binary" list-modules 2>/dev/null | grep -i dns >&2 || true
-		rm -f "$tmp_binary"
-		exit 1
+	# Verify every requested module is actually compiled in. Without this the
+	# Caddyfile / admin API calls we make later would fail at runtime with a
+	# cryptic "loading module 'X'" error long after install.sh exits.
+	local required_modules=("layer4" "layer4.handlers.proxy")
+	if [[ -n "$provider" ]]; then
+		required_modules+=("dns.providers.${provider}")
 	fi
+	local module
+	local present
+	present="$("$tmp_binary" list-modules 2>/dev/null || true)"
+	for module in "${required_modules[@]}"; do
+		if ! grep -q "^${module}\$" <<<"$present"; then
+			echo "Downloaded Caddy does not include required module: ${module}" >&2
+			echo "Modules present (filtered):" >&2
+			grep -E "^(layer4|dns\.providers)" <<<"$present" >&2 || true
+			rm -f "$tmp_binary"
+			exit 1
+		fi
+	done
 
 	systemctl stop caddy >/dev/null 2>&1 || true
 	install -m 0755 "$tmp_binary" "$caddy_path"
@@ -485,6 +512,15 @@ SB_MOUNT_WAIT_TIMEOUT=30s
 SB_RECORDING_DIR=/var/lib/toolboxd/recordings
 SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
+SB_L4_PORT_RANGE_START=22000
+SB_L4_PORT_RANGE_END=23000
+# TLS-SNI multiplexing. With --dns-provider set we bind caddy-l4 to :443 by
+# default (the Caddyfile above moves the regular HTTPS site to
+# 127.0.0.1:8443 so they don't collide; ACME goes via DNS so :443 isn't
+# needed for issuance). Without --dns-provider we leave it empty so
+# HTTP-01 issuance keeps :443 for itself.
+SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
+SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
@@ -512,12 +548,30 @@ EOF
 		# This sidesteps Let's Encrypt's per-registered-domain rate limits
 		# (50 certs/week) regardless of how many sandboxes are created.
 		# {env.SB_DNS_API_TOKEN} is read from /etc/default/caddy.
+		#
+		# In DNS-01 mode we also enable TLS-SNI multiplexing by default.
+		# caddy-l4 owns :443, peeks at the ClientHello SNI, routes per-sandbox
+		# subdomains directly to the sandbox container, and forwards any
+		# unmatched SNI (the API host itself, stray probes) to this Caddy
+		# HTTPS listener on 127.0.0.1:8443. Two implications:
+		#   - The HTTPS sites below bind 127.0.0.1:8443, NOT :443. caddy-l4
+		#     gets :443, sandboxd writes the L4 server config via the admin
+		#     API on first L4 expose call.
+		#   - DNS-01 means we don't need :443 free for ACME (validation goes
+		#     through DNS), so handing :443 to caddy-l4 is safe.
+		# Without --dns-provider, TLS-SNI stays off so HTTP-01 ACME on :443
+		# keeps working — see the on-demand fallback branch below.
 		cat > /etc/caddy/Caddyfile <<EOF
 {
 	admin localhost:2019
+	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
+	# only receive traffic forwarded from caddy-l4's SNI fallback route.
+	# Disable Caddy's auto-managed :80 -> :443 redirect since :443 isn't ours.
+	auto_https disable_redirects
 }
 
-https://$DOMAIN {
+https://$DOMAIN:8443 {
+	bind 127.0.0.1
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
@@ -530,7 +584,8 @@ https://$DOMAIN {
 	}
 }
 
-https://*.$DOMAIN {
+https://*.$DOMAIN:8443 {
+	bind 127.0.0.1
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
@@ -923,6 +978,11 @@ SB_MOUNT_WAIT_TIMEOUT=30s
 SB_RECORDING_DIR=/var/lib/toolboxd/recordings
 SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
+SB_L4_PORT_RANGE_START=22000
+SB_L4_PORT_RANGE_END=23000
+# Local mode runs without Caddy, so TLS-SNI multiplexing is permanently off.
+SB_L4_TLS_LISTEN=
+SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
@@ -1070,9 +1130,11 @@ fi
 if [[ "$WITH_AMD_GPU" == "true" ]]; then
 	install_amd_gpu
 fi
-if [[ -n "$DNS_PROVIDER" ]]; then
-	install_caddy_dns_plugin "$DNS_PROVIDER"
-fi
+# Always replace the apt-installed Caddy with a custom build that includes
+# caddy-l4 (TCP routing for sandbox-exposed ports). DNS plugin gets folded
+# into the same build when --dns-provider is set so we make exactly one
+# trip to the Caddy build server.
+install_custom_caddy "$DNS_PROVIDER"
 install_binaries
 write_environment
 write_caddy_env
@@ -1094,14 +1156,23 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "Public sandbox URL pattern: https://<docker-short-id>.$DOMAIN"
 	if [[ -n "$DNS_PROVIDER" ]]; then
 		echo "TLS: wildcard DNS-01 via $DNS_PROVIDER (one cert covers all subdomains)"
+		echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
+		echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
+		echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
 	else
 		echo "TLS: on-demand HTTP-01 (per-subdomain). Subject to Let's Encrypt rate limits."
 		echo "  For production, re-run with --dns-provider cloudflare --dns-api-token <token>"
+		echo "TLS-SNI multiplexing: DISABLED (HTTP-01 needs :443 free for ACME)."
+		echo "  Re-run with --dns-provider to enable exposeTLSPort()."
 	fi
 else
 	echo "API URL: http://$PUBLIC_HOST:21212"
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"
 	echo "Public sandbox URL pattern: http://$PUBLIC_HOST/<docker-short-id>/"
 fi
+echo "TCP port pool: 22000-23000 (open these on the host firewall to publish native TCP ports)"
+echo "  This range sits below the Linux ephemeral range (32768-60999) on purpose so the"
+echo "  kernel never hands these out as outbound source ports — eliminates random EADDRINUSE"
+echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
 echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"

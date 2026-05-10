@@ -200,6 +200,21 @@ func (s *Sandbox) ExposePort(ctx context.Context, port int) (string, error) {
 	return s.client.inner.ExposePort(ctx, s.ID, port)
 }
 
+// ExposeTCPPort publishes a raw TCP endpoint for this sandbox via caddy-l4.
+// Returns a tcp:// URL ready to plug into native protocol clients (psql,
+// redis-cli, mysql, mongosh).
+func (s *Sandbox) ExposeTCPPort(ctx context.Context, port int) (string, error) {
+	return s.client.inner.ExposeTCPPort(ctx, s.ID, port)
+}
+
+// ExposeTLSPort publishes a TLS-multiplexed endpoint via caddy-l4. Returns a
+// tls:// URL whose host is the per-sandbox subdomain caddy uses for SNI
+// matching. Requires the deployment to have a domain configured AND
+// SB_L4_TLS_LISTEN set on the daemon.
+func (s *Sandbox) ExposeTLSPort(ctx context.Context, port int) (string, error) {
+	return s.client.inner.ExposeTLSPort(ctx, s.ID, port)
+}
+
 func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 	return s.client.inner.UnexposePort(ctx, s.ID, port)
 }

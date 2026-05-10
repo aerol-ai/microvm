@@ -112,12 +112,30 @@ func Open(path string) (*Store, error) {
 		// GPU configuration as a JSON blob. Empty string means no GPU was
 		// requested. Stored as JSON to avoid schema churn as GPU options grow.
 		`ALTER TABLE sandboxes ADD COLUMN gpus_json TEXT NOT NULL DEFAULT '';`,
+		// Protocol of an exposed port: "http" (Caddy HTTP reverse proxy,
+		// historical behavior), "tcp" (caddy-l4 listener at host_port), or
+		// "tls" (caddy-l4 SNI route on the shared TLS listener).
+		`ALTER TABLE exposed_ports ADD COLUMN protocol TEXT NOT NULL DEFAULT 'http';`,
+		// Parent-host TCP port reserved for protocol="tcp" exposures from the
+		// configured pool. Zero for http/tls. The partial unique index below
+		// rejects two reservations on the same host_port without preventing
+		// many rows at the default 0.
+		`ALTER TABLE exposed_ports ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			db.Close()
 			return nil, fmt.Errorf("run migration: %w", err)
 		}
+	}
+
+	// Partial unique index on host_port (only enforced when host_port > 0).
+	// This is the load-bearing primitive of the random-first allocator: two
+	// concurrent ExposePort calls race to INSERT a host_port row, and only
+	// one wins per port. SQLite's single writer keeps the contest serialized.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_exposed_ports_host_port ON exposed_ports(host_port) WHERE host_port > 0;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create exposed_ports host_port index: %w", err)
 	}
 
 	return &Store{db: db}, nil
@@ -361,7 +379,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 // batches; the in-memory join below stays the same shape.
 func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
 		FROM exposed_ports
 		ORDER BY sandbox_id, port ASC
 	`)
@@ -372,7 +390,7 @@ func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.San
 
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
 			return fmt.Errorf("scan exposed port: %w", err)
 		}
 		if sb, ok := byID[exposure.SandboxID]; ok {
@@ -525,17 +543,116 @@ func (s *Store) Touch(ctx context.Context, id string, at time.Time) error {
 }
 
 func (s *Store) UpsertPort(ctx context.Context, exposure models.ExposedPort) error {
+	if exposure.Protocol == "" {
+		exposure.Protocol = models.ExposedPortProtocolHTTP
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO exposed_ports (sandbox_id, port, public_url, created_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO exposed_ports (sandbox_id, port, protocol, host_port, public_url, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(sandbox_id, port) DO UPDATE SET
+			protocol = excluded.protocol,
+			host_port = excluded.host_port,
 			public_url = excluded.public_url,
 			created_at = excluded.created_at
-	`, exposure.SandboxID, exposure.Port, exposure.PublicURL, exposure.CreatedAt.UTC())
+	`, exposure.SandboxID, exposure.Port, exposure.Protocol, exposure.HostPort, exposure.PublicURL, exposure.CreatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("upsert exposed port: %w", err)
 	}
 	return nil
+}
+
+// ReserveHostPortResult is the three-state outcome of TryReserveHostPort.
+// Exactly one of Reserved/Existing/(neither) is set:
+//   - Reserved: the row was inserted; the candidate host port is now ours.
+//   - Existing != nil: a row for (sandbox_id, port) already exists. The
+//     allocator MUST stop walking the pool — no other host_port will satisfy
+//     the (sandbox_id, port) primary key. Caller decides whether to reuse
+//     the existing exposure or surface an error.
+//   - both zero: the partial unique index on host_port rejected this
+//     candidate (some other sandbox owns it). Caller may retry.
+type ReserveHostPortResult struct {
+	Reserved bool
+	Existing *models.ExposedPort
+}
+
+// TryReserveHostPort attempts to claim hostPort for (sandboxID, containerPort)
+// in a single INSERT OR IGNORE. The OR IGNORE swallows two distinct UNIQUE
+// failures — the (sandbox_id, port) primary key AND the partial index on
+// host_port — so on a no-op insert we follow up with a SELECT to disambiguate.
+// Without that disambiguation, retrying expose for an already-exposed port
+// looks identical to a host_port collision and walks the whole allocator pool
+// before failing with "exhausted".
+func (s *Store) TryReserveHostPort(ctx context.Context, sandboxID string, containerPort, hostPort int, protocol, publicURL string, now time.Time) (ReserveHostPortResult, error) {
+	if hostPort <= 0 {
+		return ReserveHostPortResult{}, errors.New("host port must be positive")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO exposed_ports (sandbox_id, port, protocol, host_port, public_url, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, sandboxID, containerPort, protocol, hostPort, publicURL, now.UTC())
+	if err != nil {
+		return ReserveHostPortResult{}, fmt.Errorf("reserve host port: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return ReserveHostPortResult{}, fmt.Errorf("reserve host port (affected): %w", err)
+	}
+	if affected == 1 {
+		return ReserveHostPortResult{Reserved: true}, nil
+	}
+	existing, err := s.getPort(ctx, sandboxID, containerPort)
+	if err != nil {
+		return ReserveHostPortResult{}, fmt.Errorf("reserve host port (lookup existing): %w", err)
+	}
+	if existing != nil {
+		return ReserveHostPortResult{Existing: existing}, nil
+	}
+	return ReserveHostPortResult{}, nil
+}
+
+// getPort returns the exposure row for (sandboxID, port), or nil if absent.
+func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
+	var exposure models.ExposedPort
+	err := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		FROM exposed_ports
+		WHERE sandbox_id = ? AND port = ?
+	`, sandboxID, port).Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &exposure, nil
+}
+
+// ListAllExposedPorts returns every row in exposed_ports across every
+// sandbox. Used by reconcile to GC zombie caddy routes / layer4 servers
+// without N+1 per-sandbox lookups.
+func (s *Store) ListAllExposedPorts(ctx context.Context) ([]models.ExposedPort, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		FROM exposed_ports
+		ORDER BY sandbox_id, port ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list all exposed ports: %w", err)
+	}
+	defer rows.Close()
+
+	var ports []models.ExposedPort
+	for rows.Next() {
+		var exposure models.ExposedPort
+		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan exposed port: %w", err)
+		}
+		ports = append(ports, exposure)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate exposed ports: %w", err)
+	}
+	return ports, nil
 }
 
 func (s *Store) DeletePort(ctx context.Context, sandboxID string, port int) error {
@@ -548,7 +665,7 @@ func (s *Store) DeletePort(ctx context.Context, sandboxID string, port int) erro
 
 func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.ExposedPort, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, port, public_url, created_at
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
 		FROM exposed_ports
 		WHERE sandbox_id = ?
 		ORDER BY port ASC
@@ -561,7 +678,7 @@ func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.Expos
 	var ports []models.ExposedPort
 	for rows.Next() {
 		var exposure models.ExposedPort
-		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
+		if err := rows.Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan exposed port: %w", err)
 		}
 		ports = append(ports, exposure)
