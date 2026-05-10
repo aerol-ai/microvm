@@ -92,7 +92,8 @@ async function main(): Promise<void> {
 
 	await uploadExpressApp(sandbox, options.workDir);
 
-	const publicURL = await sandbox.exposePort(options.port);
+	const exposure = await sandbox.exposePort(options.port);
+	const publicURL = exposure.url;
 	console.log("port", JSON.stringify({
 		port: options.port,
 		publicURL,

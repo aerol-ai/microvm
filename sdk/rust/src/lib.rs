@@ -17,8 +17,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
-pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus, UpdateLifecycleOptions};
+pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, ExposeOptions, ExposeProtocol, ExposeResult, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus, UpdateLifecycleOptions};
 pub use types::CreateSandboxResponse;
+use types::ExposePortResponseWire;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
@@ -311,24 +312,13 @@ impl Sandbox {
         self.client.download_file(&self.data.id, target_path)
     }
 
-    pub fn expose_port(&self, port: u16) -> Result<String, Error> {
-        self.client.expose_port(&self.data.id, port)
-    }
-
-    /// Publish a raw TCP port through caddy-l4.
-    ///
-    /// Returns a `tcp://<host>:<port>` URL ready to plug into native protocol
-    /// clients (psql, redis-cli, mysql, mongosh).
-    pub fn expose_tcp_port(&self, port: u16) -> Result<String, Error> {
-        self.client.expose_tcp_port(&self.data.id, port)
-    }
-
-    /// Publish a TCP port behind the shared TLS-SNI multiplexer.
-    ///
-    /// Returns `tls://<id>-<port>.<domain>:<l4-port>`. Requires the
-    /// deployment to have a domain configured AND `SB_L4_TLS_LISTEN` set.
-    pub fn expose_tls_port(&self, port: u16) -> Result<String, Error> {
-        self.client.expose_tls_port(&self.data.id, port)
+    /// Publish a sandbox container port. Pass [`ExposeOptions::default()`] (or
+    /// [`ExposeOptions::http()`]) for the historical HTTP routing, or
+    /// [`ExposeOptions::tcp()`] / [`ExposeOptions::tls()`] for the caddy-l4
+    /// surfaces. The returned [`ExposeResult`] is a discriminated enum —
+    /// pattern-match on it to read the variant-specific fields.
+    pub fn expose_port(&self, port: u16, options: ExposeOptions) -> Result<ExposeResult, Error> {
+        self.client.expose_port(&self.data.id, port, options)
     }
 
     pub fn unexpose_port(&self, port: u16) -> Result<(), Error> {
@@ -567,26 +557,32 @@ impl Client {
         self.handle_response(response)?.bytes().map_err(Error::Reqwest).map(|bytes| bytes.to_vec())
     }
 
-    pub fn expose_port(&self, id: &str, port: u16) -> Result<String, Error> {
-        self.expose_port_with_protocol(id, port, None)
-    }
-
-    pub fn expose_tcp_port(&self, id: &str, port: u16) -> Result<String, Error> {
-        self.expose_port_with_protocol(id, port, Some("tcp"))
-    }
-
-    pub fn expose_tls_port(&self, id: &str, port: u16) -> Result<String, Error> {
-        self.expose_port_with_protocol(id, port, Some("tls"))
-    }
-
-    fn expose_port_with_protocol(&self, id: &str, port: u16, protocol: Option<&str>) -> Result<String, Error> {
-        let body = protocol.map(|p| serde_json::json!({"protocol": p}));
-        let response = self.do_json::<Value, Value>(Method::POST, &format!("/v1/sandboxes/{}/ports/{}", id, port), body.as_ref())?;
-        response
-            .get("public_url")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| Error::Api("missing public_url in response".to_string()))
+    pub fn expose_port(&self, id: &str, port: u16, options: ExposeOptions) -> Result<ExposeResult, Error> {
+        let protocol_str = match options.protocol {
+            ExposeProtocol::Http => "http",
+            ExposeProtocol::Tcp => "tcp",
+            ExposeProtocol::Tls => "tls",
+        };
+        let body = if matches!(options.protocol, ExposeProtocol::Http) {
+            None
+        } else {
+            Some(serde_json::json!({"protocol": protocol_str}))
+        };
+        let wire = self.do_json::<Value, ExposePortResponseWire>(
+            Method::POST,
+            &format!("/v1/sandboxes/{}/ports/{}", id, port),
+            body.as_ref(),
+        )?;
+        match wire.protocol.as_str() {
+            "tcp" => Ok(ExposeResult::Tcp {
+                url: wire.public_url,
+                host: wire.host.unwrap_or_default(),
+                host_port: wire.host_port.unwrap_or(0),
+            }),
+            "tls" => Ok(ExposeResult::Tls { url: wire.public_url }),
+            "http" | "" => Ok(ExposeResult::Http { url: wire.public_url }),
+            other => Err(Error::Api(format!("unknown expose protocol: {}", other))),
+        }
     }
 
     pub fn unexpose_port(&self, id: &str, port: u16) -> Result<(), Error> {

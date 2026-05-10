@@ -196,23 +196,38 @@ func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, 
 	return s.client.inner.DownloadFile(ctx, s.ID, targetPath)
 }
 
-func (s *Sandbox) ExposePort(ctx context.Context, port int) (string, error) {
-	return s.client.inner.ExposePort(ctx, s.ID, port)
+// ExposeOption customizes an ExposePort call. Build values with WithProtocol;
+// the variadic shape leaves room for future expansion (e.g. tags, idle TTL)
+// without breaking call sites.
+type ExposeOption func(*exposeOptions)
+
+type exposeOptions struct {
+	protocol sdktypes.ExposeProtocol
 }
 
-// ExposeTCPPort publishes a raw TCP endpoint for this sandbox via caddy-l4.
-// Returns a tcp:// URL ready to plug into native protocol clients (psql,
-// redis-cli, mysql, mongosh).
-func (s *Sandbox) ExposeTCPPort(ctx context.Context, port int) (string, error) {
-	return s.client.inner.ExposeTCPPort(ctx, s.ID, port)
+// WithProtocol selects the wire surface the exposure publishes through.
+// Defaults to ExposeProtocolHTTP when omitted.
+func WithProtocol(p sdktypes.ExposeProtocol) ExposeOption {
+	return func(o *exposeOptions) { o.protocol = p }
 }
 
-// ExposeTLSPort publishes a TLS-multiplexed endpoint via caddy-l4. Returns a
-// tls:// URL whose host is the per-sandbox subdomain caddy uses for SNI
-// matching. Requires the deployment to have a domain configured AND
-// SB_L4_TLS_LISTEN set on the daemon.
-func (s *Sandbox) ExposeTLSPort(ctx context.Context, port int) (string, error) {
-	return s.client.inner.ExposeTLSPort(ctx, s.ID, port)
+// ExposePort publishes a sandbox container port. Use WithProtocol to choose a
+// non-HTTP surface:
+//
+//   - WithProtocol(ExposeProtocolTCP): raw caddy-l4 listener on a parent-host
+//     port. Pair with native protocol clients (psql, redis-cli, mysql,
+//     mongosh). Result.Host and Result.HostPort are populated on this path.
+//   - WithProtocol(ExposeProtocolTLS): caddy-l4 TLS-SNI route on the shared
+//     listener. Requires --domain and SB_L4_TLS_LISTEN.
+//
+// With no option (or WithProtocol(ExposeProtocolHTTP)) the result is the
+// default Caddy HTTP reverse-proxy URL.
+func (s *Sandbox) ExposePort(ctx context.Context, port int, opts ...ExposeOption) (sdktypes.ExposeResult, error) {
+	cfg := exposeOptions{protocol: sdktypes.ExposeProtocolHTTP}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return s.client.inner.ExposePort(ctx, s.ID, port, string(cfg.protocol))
 }
 
 func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {

@@ -6,6 +6,8 @@ import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
+import ai.aerol.microvm.model.ExposeOptions;
+import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.ResizeOptions;
 import ai.aerol.microvm.model.SandboxData;
@@ -85,26 +87,19 @@ public class Sandbox extends SandboxData {
         return client.downloadFile(id, targetPath);
     }
 
-    public String exposePort(int port) {
-        return client.exposePort(id, port);
+    public ExposeResult exposePort(int port) {
+        return client.exposePort(id, port, null);
     }
 
     /**
-     * Publish a raw TCP port through caddy-l4. Returns
-     * {@code tcp://<host>:<port>} ready to plug into native protocol clients
-     * (psql, redis-cli, mysql, mongosh).
+     * Publish a sandbox container port. Pass {@link ExposeOptions#tcp()} for
+     * raw caddy-l4 routing (Postgres / Redis / MySQL / Mongo), or
+     * {@link ExposeOptions#tls()} for the TLS-SNI multiplexer. The returned
+     * {@link ExposeResult} carries {@code host} and {@code hostPort} only on
+     * the TCP path.
      */
-    public String exposeTCPPort(int port) {
-        return client.exposeTCPPort(id, port);
-    }
-
-    /**
-     * Publish a TCP port behind the shared TLS-SNI multiplexer. Returns
-     * {@code tls://<id>-<port>.<domain>:<l4-port>}. Requires the deployment
-     * to have a domain configured AND {@code SB_L4_TLS_LISTEN} set.
-     */
-    public String exposeTLSPort(int port) {
-        return client.exposeTLSPort(id, port);
+    public ExposeResult exposePort(int port, ExposeOptions options) {
+        return client.exposePort(id, port, options);
     }
 
     public void unexposePort(int port) {

@@ -241,12 +241,12 @@ func (s *Server) handleExposePort(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	publicURL, err := s.service.ExposePort(r.Context(), r.PathValue("id"), port, req.Protocol)
+	resp, err := s.service.ExposePort(r.Context(), r.PathValue("id"), port, req.Protocol)
 	if err != nil {
 		s.writeStoreAwareError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"public_url": publicURL, "protocol": req.Protocol})
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleListMounts(w http.ResponseWriter, r *http.Request) {

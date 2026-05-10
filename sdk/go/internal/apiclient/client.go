@@ -21,6 +21,7 @@ type ResizeOptions = models.ResizeSandboxRequest
 type ExecRequest = models.ExecRequest
 type ExecResult = models.ExecResult
 type ExposedPort = models.ExposedPort
+type ExposeResult = models.ExposePortResponse
 type HealthStatus = models.HealthStatus
 
 type Client struct {
@@ -192,40 +193,18 @@ func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byt
 	return io.ReadAll(response.Body)
 }
 
-func (c *Client) ExposePort(ctx context.Context, id string, port int) (string, error) {
-	return c.exposePortWithProtocol(ctx, id, port, "")
-}
-
-// ExposeTCPPort publishes a raw TCP port through caddy-l4. The returned URL
-// is in tcp://<host>:<port> form and can be plugged straight into a Postgres /
-// Redis / MySQL / Mongo client. Requires the daemon to be configured with a
-// non-empty SB_L4_PORT_RANGE_START..END pool (default 22000-23000).
-func (c *Client) ExposeTCPPort(ctx context.Context, id string, port int) (string, error) {
-	return c.exposePortWithProtocol(ctx, id, port, "tcp")
-}
-
-// ExposeTLSPort publishes a TCP port behind the shared TLS-SNI multiplexer.
-// Returns tls://<id>-<port>.<domain>:<l4-port>. caddy-l4 terminates TLS at
-// the edge using Caddy's auto-managed wildcard cert and forwards plaintext
-// bytes to the container — your sandbox process speaks plain TCP and never
-// holds a cert. Available when the deployment has a domain AND
-// SB_L4_TLS_LISTEN is set; install.sh enables this automatically when run
-// with --dns-provider. mTLS / client-cert auth is not supported in this
-// mode (the terminator consumes the handshake) — use ExposeTCPPort for that.
-func (c *Client) ExposeTLSPort(ctx context.Context, id string, port int) (string, error) {
-	return c.exposePortWithProtocol(ctx, id, port, "tls")
-}
-
-func (c *Client) exposePortWithProtocol(ctx context.Context, id string, port int, protocol string) (string, error) {
+// ExposePort publishes a sandbox container port. Pass an empty protocol to
+// fall back to the default HTTP routing; pass "tcp" or "tls" to opt into the
+// caddy-l4 surfaces. Host and HostPort on the returned ExposeResult are
+// populated only on the "tcp" path.
+func (c *Client) ExposePort(ctx context.Context, id string, port int, protocol string) (ExposeResult, error) {
 	var body any
-	if protocol != "" {
+	if protocol != "" && protocol != "http" {
 		body = map[string]string{"protocol": protocol}
 	}
-	var response struct {
-		PublicURL string `json:"public_url"`
-	}
+	var response ExposeResult
 	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/v1/sandboxes/%s/ports/%d", id, port), body, &response)
-	return response.PublicURL, err
+	return response, err
 }
 
 func (c *Client) UnexposePort(ctx context.Context, id string, port int) error {
@@ -259,16 +238,8 @@ func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, 
 	return s.client.DownloadFile(ctx, s.ID, targetPath)
 }
 
-func (s *Sandbox) ExposePort(ctx context.Context, port int) (string, error) {
-	return s.client.ExposePort(ctx, s.ID, port)
-}
-
-func (s *Sandbox) ExposeTCPPort(ctx context.Context, port int) (string, error) {
-	return s.client.ExposeTCPPort(ctx, s.ID, port)
-}
-
-func (s *Sandbox) ExposeTLSPort(ctx context.Context, port int) (string, error) {
-	return s.client.ExposeTLSPort(ctx, s.ID, port)
+func (s *Sandbox) ExposePort(ctx context.Context, port int, protocol string) (ExposeResult, error) {
+	return s.client.ExposePort(ctx, s.ID, port, protocol)
 }
 
 func (s *Sandbox) Start(ctx context.Context) error {

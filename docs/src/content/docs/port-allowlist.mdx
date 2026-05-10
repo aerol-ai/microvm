@@ -32,12 +32,12 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     // Before exposing - 403
     await fetch(`${sandbox.publicURL}/proxy/21212/`)
 
-    // Expose the port - returns the dedicated port URL
-    const portURL = await sandbox.exposePort(21212)
-    // portURL → "https://<sandbox-id>-21212.sandbox.example.com"
+    // Expose the port - returns the discriminated ExposeResult
+    const exposure = await sandbox.exposePort(21212)
+    // exposure.url → "https://<sandbox-id>-21212.sandbox.example.com"
 
     // Both URLs now reach the service
-    await fetch(portURL)                              // 200 - dedicated URL
+    await fetch(exposure.url)                         // 200 - dedicated URL
     await fetch(`${sandbox.publicURL}/proxy/21212/`)  // 200 - proxy path
     ```
   </TabItem>
@@ -48,11 +48,11 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     # Before exposing - 403
     # GET sandbox['publicURL'] + '/proxy/21212/'
 
-    port_url = sandbox.expose_port(21212)
-    # port_url → 'https://<sandbox-id>-21212.sandbox.example.com'
+    exposure = sandbox.expose_port(21212)
+    # exposure.url → 'https://<sandbox-id>-21212.sandbox.example.com'
 
     # Both URLs now reach the service
-    # GET port_url                                      # dedicated URL
+    # GET exposure.url                                  # dedicated URL
     # GET sandbox['publicURL'] + '/proxy/21212/'        # proxy path
     ```
   </TabItem>
@@ -66,12 +66,12 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     // Before exposing - 403
     // GET sandbox.PublicURL + "/proxy/21212/"
 
-    portURL, err := sandbox.ExposePort(ctx, 21212)
+    exposure, err := sandbox.ExposePort(ctx, 21212)
     if err != nil { log.Fatal(err) }
-    // portURL → "https://<sandbox-id>-21212.sandbox.example.com"
+    // exposure.PublicURL → "https://<sandbox-id>-21212.sandbox.example.com"
 
     // Both URLs now reach the service
-    fmt.Println(portURL)                            // dedicated URL
+    fmt.Println(exposure.PublicURL)                  // dedicated URL
     fmt.Println(sandbox.PublicURL + "/proxy/21212/") // proxy path
     ```
   </TabItem>
@@ -85,12 +85,12 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     // Before exposing - 403
     // GET sandbox.data.public_url + "/proxy/21212/"
 
-    let port_url = sandbox.expose_port(21212)?;
-    // port_url → "https://<sandbox-id>-21212.sandbox.example.com"
-
-    // Both URLs now reach the service
-    println!("{}", port_url);                                        // dedicated URL
-    println!("{}/proxy/21212/", sandbox.data.public_url);            // proxy path
+    let exposure = sandbox.expose_port(21212, ExposeOptions::default())?;
+    if let ExposeResult::Http { url } = &exposure {
+        // url → "https://<sandbox-id>-21212.sandbox.example.com"
+        println!("{}", url);                                          // dedicated URL
+    }
+    println!("{}/proxy/21212/", sandbox.data.public_url);             // proxy path
     ```
   </TabItem>
   <TabItem label="Java">
@@ -102,11 +102,11 @@ Both URLs become active after `exposePort` and return 403 before it. The dedicat
     // Before exposing - 403
     // GET sandbox.publicUrl + "/proxy/21212/"
 
-    String portUrl = sandbox.exposePort(21212);
-    // portUrl → "https://<sandbox-id>-21212.sandbox.example.com"
+    ExposeResult exposure = sandbox.exposePort(21212);
+    // exposure.url → "https://<sandbox-id>-21212.sandbox.example.com"
 
     // Both URLs now reach the service
-    System.out.println(portUrl);                               // dedicated URL
+    System.out.println(exposure.url);                          // dedicated URL
     System.out.println(sandbox.publicUrl + "/proxy/21212/");   // proxy path
     ```
   </TabItem>

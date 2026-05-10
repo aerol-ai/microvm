@@ -10,6 +10,9 @@ import type {
   ExecStreamHandle,
   ExecStreamOptions,
   ExposedPort,
+  ExposePortOptions,
+  ExposeProtocol,
+  ExposeResult,
   HealthStatus,
   Lifecycle,
   MountSpec,
@@ -34,6 +37,13 @@ interface ApiExposedPort {
   port: number;
   public_url: string;
   created_at: string;
+}
+
+interface ApiExposePortResponse {
+  protocol: ExposeProtocol;
+  public_url: string;
+  host?: string;
+  host_port?: number;
 }
 
 interface ApiLifecycle {
@@ -249,32 +259,27 @@ export class APIClient {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  async exposePort(id: string, port: number): Promise<string> {
-    return this.exposePortWithProtocol(id, port);
-  }
-
   /**
-   * Publish a raw TCP port through caddy-l4. The returned URL is in
-   * `tcp://<host>:<port>` form and works directly with `psql`, `redis-cli`,
-   * `mysql`, `mongosh`, and any other native-protocol client.
+   * Publish a sandbox container port. The chosen wire protocol is selected by
+   * `options.protocol` (defaults to `"http"`):
+   *
+   *   - `"http"`: Caddy HTTP reverse proxy at `https://<id>-<port>.<domain>`.
+   *   - `"tcp"`:  raw caddy-l4 listener on a parent-host port — pair with
+   *               native protocol clients (psql, redis-cli, mysql, mongosh).
+   *   - `"tls"`:  caddy-l4 TLS-SNI route on the shared listener. Requires the
+   *               daemon to have a domain configured AND `SB_L4_TLS_LISTEN` set.
+   *
+   * Returns a discriminated result keyed on `protocol`. Only the `"tcp"`
+   * variant carries `host` / `hostPort` — everything else is in `url`.
    */
-  async exposeTCPPort(id: string, port: number): Promise<string> {
-    return this.exposePortWithProtocol(id, port, "tcp");
-  }
-
-  /**
-   * Publish a TCP port behind the shared TLS-SNI multiplexer. Returns
-   * `tls://<id>-<port>.<domain>:<l4-port>`. Requires the daemon to have a
-   * domain configured AND `SB_L4_TLS_LISTEN` set.
-   */
-  async exposeTLSPort(id: string, port: number): Promise<string> {
-    return this.exposePortWithProtocol(id, port, "tls");
-  }
-
-  private async exposePortWithProtocol(id: string, port: number, protocol?: string): Promise<string> {
-    const body = protocol ? { protocol } : undefined;
-    const response = await this.doJSON<{ public_url: string }>("POST", `/v1/sandboxes/${id}/ports/${port}`, body);
-    return response.public_url;
+  async exposePort(id: string, port: number, options: ExposePortOptions = {}): Promise<ExposeResult> {
+    const body = options.protocol ? { protocol: options.protocol } : undefined;
+    const response = await this.doJSON<ApiExposePortResponse>(
+      "POST",
+      `/v1/sandboxes/${id}/ports/${port}`,
+      body,
+    );
+    return fromApiExposePortResponse(response);
   }
 
   async unexposePort(id: string, port: number): Promise<void> {
@@ -429,16 +434,8 @@ export class SandboxResource implements Sandbox {
     return this.client.downloadFile(this.id, targetPath);
   }
 
-  async exposePort(port: number): Promise<string> {
-    return this.client.exposePort(this.id, port);
-  }
-
-  async exposeTCPPort(port: number): Promise<string> {
-    return this.client.exposeTCPPort(this.id, port);
-  }
-
-  async exposeTLSPort(port: number): Promise<string> {
-    return this.client.exposeTLSPort(this.id, port);
+  async exposePort(port: number, options?: ExposePortOptions): Promise<ExposeResult> {
+    return this.client.exposePort(this.id, port, options);
   }
 
   async unexposePort(port: number): Promise<void> {
@@ -608,6 +605,22 @@ function fromApiExposedPort(port: ApiExposedPort): ExposedPort {
     publicURL: port.public_url,
     createdAt: port.created_at,
   };
+}
+
+function fromApiExposePortResponse(response: ApiExposePortResponse): ExposeResult {
+  switch (response.protocol) {
+    case "tcp":
+      return {
+        protocol: "tcp",
+        url: response.public_url,
+        host: response.host ?? "",
+        hostPort: response.host_port ?? 0,
+      };
+    case "tls":
+      return { protocol: "tls", url: response.public_url };
+    case "http":
+      return { protocol: "http", url: response.public_url };
+  }
 }
 
 function fromApiExecResult(result: ApiExecResult): ExecResult {

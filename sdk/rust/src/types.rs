@@ -148,6 +148,81 @@ pub struct ExposedPort {
     pub created_at: String,
 }
 
+/// Wire protocol an exposure publishes through.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposeProtocol {
+    /// Caddy HTTP reverse proxy at `https://<id>-<port>.<domain>`.
+    Http,
+    /// Raw caddy-l4 listener on a parent-host port.
+    Tcp,
+    /// caddy-l4 TLS-SNI route on the shared layer4 server.
+    Tls,
+}
+
+impl Default for ExposeProtocol {
+    fn default() -> Self {
+        ExposeProtocol::Http
+    }
+}
+
+/// Options for [`Sandbox::expose_port`] / [`Client::expose_port`]. Defaults to
+/// `ExposeProtocol::Http` so `ExposeOptions::default()` keeps the historical
+/// behavior.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ExposeOptions {
+    pub protocol: ExposeProtocol,
+}
+
+impl ExposeOptions {
+    pub fn http() -> Self {
+        Self {
+            protocol: ExposeProtocol::Http,
+        }
+    }
+    pub fn tcp() -> Self {
+        Self {
+            protocol: ExposeProtocol::Tcp,
+        }
+    }
+    pub fn tls() -> Self {
+        Self {
+            protocol: ExposeProtocol::Tls,
+        }
+    }
+}
+
+/// Outcome of a successful expose call. The `Tcp` variant carries `host` and
+/// `host_port` because native protocol clients (psql, redis-cli, mysql,
+/// mongosh) need them to dial; HTTP and TLS exposures only need the URL.
+#[derive(Debug, Clone)]
+pub enum ExposeResult {
+    Http {
+        url: String,
+    },
+    Tcp {
+        url: String,
+        host: String,
+        host_port: u16,
+    },
+    Tls {
+        url: String,
+    },
+}
+
+/// Wire shape for the expose response — kept private; callers consume the
+/// public [`ExposeResult`] enum instead.
+#[derive(Deserialize)]
+pub(crate) struct ExposePortResponseWire {
+    pub protocol: String,
+    #[serde(rename = "public_url")]
+    pub public_url: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(rename = "host_port", default)]
+    pub host_port: Option<u16>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Sandbox {
     pub id: String,

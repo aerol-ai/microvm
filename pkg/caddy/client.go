@@ -61,6 +61,11 @@ func (c *Client) Enabled() bool {
 	return c.enabled
 }
 
+// PublicHost is the parent host's reachable address (IP or DNS) used as the
+// dial target for raw-TCP exposures. Surfaced so the service layer can return
+// it as a structured field on the expose response without re-parsing the URL.
+func (c *Client) PublicHost() string { return c.publicHost }
+
 func (c *Client) Ping(ctx context.Context) error {
 	if !c.enabled {
 		return nil

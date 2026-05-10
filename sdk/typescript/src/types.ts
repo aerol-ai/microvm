@@ -144,6 +144,30 @@ export interface ExposedPort {
   createdAt: string;
 }
 
+/**
+ * Wire protocol an exposure publishes through:
+ *   - "http": Caddy HTTP reverse proxy at https://<id>-<port>.<domain>.
+ *   - "tcp":  raw caddy-l4 listener on a parent-host port.
+ *   - "tls":  caddy-l4 TLS-SNI route on the shared :443 listener.
+ */
+export type ExposeProtocol = "http" | "tcp" | "tls";
+
+export interface ExposePortOptions {
+  /** Defaults to "http" when omitted. */
+  protocol?: ExposeProtocol;
+}
+
+/**
+ * Discriminated result from `exposePort`. Branch on `protocol` to access the
+ * fields that are meaningful for the chosen wire protocol — only the raw-TCP
+ * variant carries `host` and `hostPort`, which are what native protocol
+ * clients (psql, redis-cli, mysql, mongosh, …) need to dial.
+ */
+export type ExposeResult =
+  | { protocol: "http"; url: string }
+  | { protocol: "tcp"; url: string; host: string; hostPort: number }
+  | { protocol: "tls"; url: string };
+
 export interface Sandbox {
   id: string;
   image: string;
