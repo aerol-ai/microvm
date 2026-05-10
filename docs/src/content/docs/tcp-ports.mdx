@@ -14,6 +14,8 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Both share the same lifecycle as `exposePort`: routes are torn down on stop / destroy and re-published on start.
 
+Not sure which one fits your workload? See [TCP vs TLS Ports](/tcp-vs-tls-ports/) for a side-by-side mental model, a workload-by-workload picker, and the trade-offs each mode imposes.
+
 ## Raw TCP
 
 `exposeTCPPort(port)` allocates a parent-host port from the configured pool (default `[35000, 45000]`) and points caddy-l4 at the sandbox's container IP. The returned URL is in `tcp://<public-host>:<host-port>` form and plugs straight into a native protocol client.
@@ -129,40 +131,102 @@ See [Reconcile](/reconcile) for full details.
 
 ## Unexposing
 
-`unexposePort(port)` works the same regardless of protocol — the daemon looks up the recorded protocol on the row and tears down the right caddy surface (HTTP route, layer4 TCP server, or TLS-SNI route).
+There is **one** unexpose method, not three. `unexposePort(port)` handles HTTP, TCP, and TLS exposures uniformly — the daemon looks up the recorded protocol on the row and tears down the right caddy surface (HTTP route, layer4 TCP server, or TLS-SNI route), then deletes the row.
+
+`(sandboxID, port)` is the primary key on the exposure table, so there is at most one row per pair regardless of protocol. The caller does not need to remember whether the port was published with `exposePort`, `exposeTCPPort`, or `exposeTLSPort`:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
+    // Any of these:
+    await sandbox.exposePort(3000);       // -> https://<id>-3000.<domain>
+    await sandbox.exposeTCPPort(5432);    // -> tcp://<host>:<host-port>
+    await sandbox.exposeTLSPort(6379);    // -> tls://<id>-6379.<domain>:443
+
+    // All tear down with the same call:
+    await sandbox.unexposePort(3000);
     await sandbox.unexposePort(5432);
+    await sandbox.unexposePort(6379);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
+    sandbox.expose_port(3000)
+    sandbox.expose_tcp_port(5432)
+    sandbox.expose_tls_port(6379)
+
+    sandbox.unexpose_port(3000)
     sandbox.unexpose_port(5432)
+    sandbox.unexpose_port(6379)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    if err := sandbox.UnexposePort(ctx, 5432); err != nil {
+    if _, err := sandbox.ExposePort(ctx, 3000); err != nil {
         log.Fatal(err)
     }
+    if _, err := sandbox.ExposeTCPPort(ctx, 5432); err != nil {
+        log.Fatal(err)
+    }
+    if _, err := sandbox.ExposeTLSPort(ctx, 6379); err != nil {
+        log.Fatal(err)
+    }
+
+    // Same call regardless of how the port was published.
+    _ = sandbox.UnexposePort(ctx, 3000)
+    _ = sandbox.UnexposePort(ctx, 5432)
+    _ = sandbox.UnexposePort(ctx, 6379)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    sandbox.expose_port(3000)?;
+    sandbox.expose_tcp_port(5432)?;
+    sandbox.expose_tls_port(6379)?;
+
+    sandbox.unexpose_port(3000)?;
     sandbox.unexpose_port(5432)?;
+    sandbox.unexpose_port(6379)?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
+    sandbox.exposePort(3000);
+    sandbox.exposeTCPPort(5432);
+    sandbox.exposeTLSPort(6379);
+
+    sandbox.unexposePort(3000);
     sandbox.unexposePort(5432);
+    sandbox.unexposePort(6379);
     ```
   </TabItem>
 </Tabs>
 
+### What unexpose actually does
+
+The daemon dispatches on the protocol stored on the `exposed_ports` row:
+
+| Recorded protocol | Caddy surface torn down | Host-side cleanup |
+|---|---|---|
+| `http` (or empty, for legacy rows) | `DELETE /id/sandbox-<id>-port-<port>` on the HTTP server | none |
+| `tcp` | `DELETE /config/apps/layer4/servers/tcp-port-<host-port>` | host port returns to the `[35000, 45000]` pool |
+| `tls` | `DELETE /id/sandbox-<id>-port-<port>-tls` on the SNI mux | none |
+
+In every case the row in `exposed_ports` is deleted and the toolbox port allowlist is refreshed so subsequent calls to `/proxy/<port>/` on the public sandbox URL are rejected immediately.
+
+### Why there is no `unexposeTCPPort` / `unexposeTLSPort`
+
+Three reasons the API is asymmetric on purpose:
+
+1. **`(id, port)` is the unique key.** The protocol does not need to be passed in — the daemon already knows it from the row.
+2. **The HTTP verb is the same.** All three would issue `DELETE /v1/sandboxes/{id}/ports/{port}` with no body. Splitting into three SDK methods would just call the same endpoint three different ways.
+3. **It mirrors `close(fd)` in POSIX.** The system call is the same whether the descriptor is a TCP socket, a UNIX socket, or a pipe — the kernel knows which one it gave you.
+
+If your code needs to be defensive about not knowing which method was used to expose a port, the single-method shape is what you want anyway.
+
 ## Related docs
 
+- [TCP vs TLS Ports](/tcp-vs-tls-ports/) — deeper picker for choosing between `exposeTCPPort` and `exposeTLSPort`.
 - [Preview](/preview/) — HTTPS-shaped exposures.
 - [Port Allowlist](/port-allowlist/) — explicit exposure before public traffic is accepted.
 - [Reconcile](/reconcile/) — how caddy state is kept consistent with the database.
