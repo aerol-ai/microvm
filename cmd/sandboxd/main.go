@@ -56,14 +56,6 @@ func main() {
 	}
 
 	caddyClient := caddy.New(cfg)
-	// Bootstrap caddy-l4 once at boot. This creates /config/apps/layer4
-	// if absent and (when SB_L4_TLS_LISTEN is set) the shared SNI-mux
-	// server. Best-effort: if caddy isn't ready yet the daemon will retry
-	// implicitly the first time a TCP/TLS exposure is created, so we log
-	// rather than fail the whole start-up.
-	if err := caddyClient.EnsureLayer4(ctx, cfg.L4TLSListen); err != nil {
-		logger.Warn("failed to ensure caddy layer4 app at startup", "error", err)
-	}
 
 	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
 	if err != nil {
@@ -119,6 +111,14 @@ func main() {
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
+	// it. Best-effort by design: a cold-started caddy may still be coming
+	// up, in which case the next ExposePort(tcp|tls) will retry under the
+	// service's single-flight latch. Logging rather than exiting keeps the
+	// daemon serving HTTP exposures even when L4 is misconfigured.
+	if err := svc.EnsureLayer4Ready(ctx); err != nil {
+		logger.Warn("failed to ensure caddy layer4 app at startup; will retry on first L4 exposure", "error", err)
+	}
 	svc.ReplayReservations(ctx)
 
 	if cfg.AutoReconcile {

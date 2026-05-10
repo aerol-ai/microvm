@@ -13,6 +13,8 @@ import (
 	mathrand "math/rand"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -51,6 +53,13 @@ type Service struct {
 	cipher   *secrets.Cipher
 	mounts   *mounts.Manager
 	admitter *capacity.Admitter
+	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
+	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
+	// best-effort (caddy may not be reachable yet on a cold start), so the
+	// expose path retries under l4Mu when the latch is still false. atomic
+	// load gives a lock-free fast path on the steady-state hot path.
+	l4Mu    sync.Mutex
+	l4Ready atomic.Bool
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -543,6 +552,12 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 		return publicURL, nil
 
 	case models.ExposedPortProtocolTCP:
+		// Lazy bootstrap: boot's EnsureLayer4 is best-effort, so retry here
+		// in case caddy was not reachable at start-up. Idempotent and cheap
+		// after the first success (atomic load).
+		if err := s.EnsureLayer4Ready(ctx); err != nil {
+			return "", err
+		}
 		// Fast-path idempotency: a re-expose for an already-TCP port reuses
 		// the existing host_port reservation. Without this, the allocator
 		// would loop on PK collisions in TryReserveHostPort and exhaust the
@@ -583,6 +598,12 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 		if s.caddy.L4TLSListen() == "" {
 			return "", errors.New("TLS-SNI exposure requires SB_L4_TLS_LISTEN to be set")
 		}
+		// Lazy bootstrap: retry here so a failed boot doesn't break the
+		// first TLS-SNI exposure. The shared SNI mux server lives inside
+		// the layer4 app, so this is the gate before any UpsertTLSSNIRoute.
+		if err := s.EnsureLayer4Ready(ctx); err != nil {
+			return "", err
+		}
 		publicURL := s.caddy.TLSPublicEndpoint(id, port, s.caddy.L4TLSListen())
 		if err := s.caddy.UpsertTLSSNIRoute(ctx, id, sniHost, sandbox.ContainerIP, port); err != nil {
 			return "", err
@@ -602,6 +623,28 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 		return publicURL, nil
 	}
 	return "", fmt.Errorf("unhandled protocol %q", canonicalProto)
+}
+
+// EnsureLayer4Ready bootstraps the caddy-l4 app under a single-flight
+// mutex and latches success. Safe to call from boot AND from each L4
+// exposure path: the atomic fast-path turns it into a single load on the
+// steady state, and a failed boot is recovered by the very next TCP/TLS
+// expose call instead of surfacing as a confusing "layer4 app missing"
+// error from caddy.
+func (s *Service) EnsureLayer4Ready(ctx context.Context) error {
+	if s.l4Ready.Load() {
+		return nil
+	}
+	s.l4Mu.Lock()
+	defer s.l4Mu.Unlock()
+	if s.l4Ready.Load() {
+		return nil
+	}
+	if err := s.caddy.EnsureLayer4(ctx, s.cfg.L4TLSListen); err != nil {
+		return fmt.Errorf("bootstrap caddy layer4: %w", err)
+	}
+	s.l4Ready.Store(true)
+	return nil
 }
 
 // allocateHostPort reserves a parent-host port for a raw-TCP exposure. The
