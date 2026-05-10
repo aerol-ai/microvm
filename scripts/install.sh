@@ -301,6 +301,16 @@ if [[ -n "$DNS_PROVIDER" ]]; then
 	esac
 fi
 
+# TLS-SNI multiplexing is gated on DNS-01 issuance because handing :443 to
+# caddy-l4 means HTTP-01 ACME validation can't bind there. With DNS-01 in
+# place ACME never needs :443, so caddy-l4 can own it and the regular Caddy
+# HTTPS site moves to 127.0.0.1:8443.
+if [[ -n "$DNS_PROVIDER" ]]; then
+	L4_TLS_LISTEN_DEFAULT=":443"
+else
+	L4_TLS_LISTEN_DEFAULT=""
+fi
+
 if [[ "$BUILD_FROM_SOURCE" == "auto" ]]; then
 	if [[ -f ./go.mod ]]; then
 		BUILD_FROM_SOURCE="true"
@@ -504,10 +514,13 @@ SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
 SB_L4_PORT_RANGE_START=22000
 SB_L4_PORT_RANGE_END=23000
-# TLS-SNI multiplexing is opt-in. Setting this to e.g. ":443" makes
-# caddy-l4 take over that listener; until the HTTPS site is moved off
-# the same address it would conflict, so we leave it empty by default.
-SB_L4_TLS_LISTEN=
+# TLS-SNI multiplexing. With --dns-provider set we bind caddy-l4 to :443 by
+# default (the Caddyfile above moves the regular HTTPS site to
+# 127.0.0.1:8443 so they don't collide; ACME goes via DNS so :443 isn't
+# needed for issuance). Without --dns-provider we leave it empty so
+# HTTP-01 issuance keeps :443 for itself.
+SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
+SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
@@ -535,12 +548,30 @@ EOF
 		# This sidesteps Let's Encrypt's per-registered-domain rate limits
 		# (50 certs/week) regardless of how many sandboxes are created.
 		# {env.SB_DNS_API_TOKEN} is read from /etc/default/caddy.
+		#
+		# In DNS-01 mode we also enable TLS-SNI multiplexing by default.
+		# caddy-l4 owns :443, peeks at the ClientHello SNI, routes per-sandbox
+		# subdomains directly to the sandbox container, and forwards any
+		# unmatched SNI (the API host itself, stray probes) to this Caddy
+		# HTTPS listener on 127.0.0.1:8443. Two implications:
+		#   - The HTTPS sites below bind 127.0.0.1:8443, NOT :443. caddy-l4
+		#     gets :443, sandboxd writes the L4 server config via the admin
+		#     API on first L4 expose call.
+		#   - DNS-01 means we don't need :443 free for ACME (validation goes
+		#     through DNS), so handing :443 to caddy-l4 is safe.
+		# Without --dns-provider, TLS-SNI stays off so HTTP-01 ACME on :443
+		# keeps working — see the on-demand fallback branch below.
 		cat > /etc/caddy/Caddyfile <<EOF
 {
 	admin localhost:2019
+	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
+	# only receive traffic forwarded from caddy-l4's SNI fallback route.
+	# Disable Caddy's auto-managed :80 -> :443 redirect since :443 isn't ours.
+	auto_https disable_redirects
 }
 
-https://$DOMAIN {
+https://$DOMAIN:8443 {
+	bind 127.0.0.1
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
@@ -553,7 +584,8 @@ https://$DOMAIN {
 	}
 }
 
-https://*.$DOMAIN {
+https://*.$DOMAIN:8443 {
+	bind 127.0.0.1
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
@@ -948,7 +980,9 @@ SB_RECORDING_RETENTION=168h
 SB_SESSION_BUFFER_BYTES=1048576
 SB_L4_PORT_RANGE_START=22000
 SB_L4_PORT_RANGE_END=23000
+# Local mode runs without Caddy, so TLS-SNI multiplexing is permanently off.
 SB_L4_TLS_LISTEN=
+SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
@@ -1122,9 +1156,14 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "Public sandbox URL pattern: https://<docker-short-id>.$DOMAIN"
 	if [[ -n "$DNS_PROVIDER" ]]; then
 		echo "TLS: wildcard DNS-01 via $DNS_PROVIDER (one cert covers all subdomains)"
+		echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
+		echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
+		echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
 	else
 		echo "TLS: on-demand HTTP-01 (per-subdomain). Subject to Let's Encrypt rate limits."
 		echo "  For production, re-run with --dns-provider cloudflare --dns-api-token <token>"
+		echo "TLS-SNI multiplexing: DISABLED (HTTP-01 needs :443 free for ACME)."
+		echo "  Re-run with --dns-provider to enable exposeTLSPort()."
 	fi
 else
 	echo "API URL: http://$PUBLIC_HOST:21212"

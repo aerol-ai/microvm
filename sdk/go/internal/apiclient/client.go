@@ -205,8 +205,13 @@ func (c *Client) ExposeTCPPort(ctx context.Context, id string, port int) (string
 }
 
 // ExposeTLSPort publishes a TCP port behind the shared TLS-SNI multiplexer.
-// Returns tls://<id>-<port>.<domain>:<l4-port>. Only available when the
-// deployment has a domain configured AND SB_L4_TLS_LISTEN is set.
+// Returns tls://<id>-<port>.<domain>:<l4-port>. caddy-l4 terminates TLS at
+// the edge using Caddy's auto-managed wildcard cert and forwards plaintext
+// bytes to the container — your sandbox process speaks plain TCP and never
+// holds a cert. Available when the deployment has a domain AND
+// SB_L4_TLS_LISTEN is set; install.sh enables this automatically when run
+// with --dns-provider. mTLS / client-cert auth is not supported in this
+// mode (the terminator consumes the handshake) — use ExposeTCPPort for that.
 func (c *Client) ExposeTLSPort(ctx context.Context, id string, port int) (string, error) {
 	return c.exposePortWithProtocol(ctx, id, port, "tls")
 }

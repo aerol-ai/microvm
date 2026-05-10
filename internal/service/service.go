@@ -640,7 +640,7 @@ func (s *Service) EnsureLayer4Ready(ctx context.Context) error {
 	if s.l4Ready.Load() {
 		return nil
 	}
-	if err := s.caddy.EnsureLayer4(ctx, s.cfg.L4TLSListen); err != nil {
+	if err := s.caddy.EnsureLayer4(ctx, s.cfg.L4TLSListen, s.cfg.L4TLSFallback); err != nil {
 		return fmt.Errorf("bootstrap caddy layer4: %w", err)
 	}
 	s.l4Ready.Store(true)

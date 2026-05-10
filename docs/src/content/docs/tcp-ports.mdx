@@ -82,7 +82,9 @@ The `host_port` reservation is persisted alongside the exposure row. After a san
 
 ## TLS-SNI multiplexing
 
-When several backends already speak TLS and the deployment has wildcard DNS, `exposeTLSPort(port)` reuses one shared listener (default `:443`) and routes by SNI to per-sandbox subdomains. Returns `tls://<id>-<port>.<domain>:<l4-port>`.
+`exposeTLSPort(port)` reuses one shared listener (default `:443`), terminates TLS at the edge using Caddy's wildcard certificate, and forwards plaintext bytes to the container. Returns `tls://<id>-<port>.<domain>:<l4-port>`.
+
+Your backend speaks plain TCP — no certificate management, no renewal, no private key inside the container. Caddy's wildcard cert lives on the host and never crosses the container boundary.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -119,9 +121,13 @@ When several backends already speak TLS and the deployment has wildcard DNS, `ex
 Two requirements:
 
 1. **Domain mode** — `--domain` must be configured (the SNI hostname needs an A record pointing at the host).
-2. **`SB_L4_TLS_LISTEN`** must be non-empty on the daemon (default empty / opt-in). The shared `tls-mux` server binds this address; until the existing HTTPS site is moved off the same port, leave it unset to avoid a listener conflict.
+2. **DNS-01 issuance** — `install.sh` enables TLS-SNI on `:443` automatically when `--dns-provider` is set (`SB_L4_TLS_LISTEN=:443` in the daemon env). The installer also relocates the regular Caddy HTTPS listener to `127.0.0.1:8443` so caddy-l4 can own `:443` cleanly. Caddy's wildcard cert for `*.<domain>` is issued once via DNS-01 at startup and reused for every TLS-SNI exposure. Without `--dns-provider`, TLS-SNI stays disabled because HTTP-01 ACME needs `:443` for its own validation — re-run with `--dns-provider cloudflare --dns-api-token <token>` to enable it.
 
-TLS-SNI is **passthrough** — Caddy does not terminate the connection. The certificate the client sees is the one the upstream presents, so the sandbox process must hold its own cert for that SNI hostname.
+TLS is **terminated at the edge** by caddy-l4. Caddy's auto-managed wildcard cert is presented to the client; bytes after the handshake are forwarded as plaintext to the container. This means:
+
+- **No cert lives inside the container.** Your sandbox process speaks plain TCP and is unaware that clients connected over TLS.
+- **No per-sandbox cert work happens at expose time.** The wildcard already exists; we just add an SNI route to the layer4 server. Expose latency is one Caddy admin API call plus one SQLite insert.
+- **mTLS, custom ALPN, and HTTP/2 client-cert auth are not supported in this mode** — the terminator consumes the original handshake. Use `exposeTCPPort` if you need those.
 
 ## Reconciliation
 

@@ -14,24 +14,26 @@ import (
 )
 
 type Client struct {
-	baseURL     string
-	serverID    string
-	domain      string
-	publicHost  string
-	enabled     bool
-	l4TLSListen string
-	httpClient  *http.Client
+	baseURL       string
+	serverID      string
+	domain        string
+	publicHost    string
+	enabled       bool
+	l4TLSListen   string
+	l4TLSFallback string
+	httpClient    *http.Client
 }
 
 func New(cfg config.Config) *Client {
 	return &Client{
-		baseURL:     strings.TrimRight(cfg.CaddyAdminURL, "/"),
-		serverID:    cfg.CaddyServerID,
-		domain:      cfg.Domain,
-		publicHost:  cfg.PublicHost,
-		enabled:     cfg.EnableCaddy,
-		l4TLSListen: cfg.L4TLSListen,
-		httpClient:  &http.Client{Timeout: cfg.HTTPClientTimeout},
+		baseURL:       strings.TrimRight(cfg.CaddyAdminURL, "/"),
+		serverID:      cfg.CaddyServerID,
+		domain:        cfg.Domain,
+		publicHost:    cfg.PublicHost,
+		enabled:       cfg.EnableCaddy,
+		l4TLSListen:   cfg.L4TLSListen,
+		l4TLSFallback: cfg.L4TLSFallback,
+		httpClient:    &http.Client{Timeout: cfg.HTTPClientTimeout},
 	}
 }
 
@@ -39,6 +41,11 @@ func New(cfg config.Config) *Client {
 // multiplexer. Empty means TLS-SNI exposure is disabled — the service layer
 // should reject protocol="tls" requests and skip EnsureLayer4 of the mux.
 func (c *Client) L4TLSListen() string { return c.l4TLSListen }
+
+// L4TLSFallback returns the address caddy-l4 forwards non-sandbox SNI to
+// (the regular HTTPS Caddy site that handles the API, on-demand TLS, and the
+// 404 catch-all). Meaningful only when L4TLSListen is non-empty.
+func (c *Client) L4TLSFallback() string { return c.l4TLSFallback }
 
 // SNIHost is the per-sandbox subdomain caddy-l4 routes by for a TLS exposure.
 // Returns empty in IP mode (no domain configured), which the service layer
@@ -309,6 +316,13 @@ func portRouteID(id string, port int) string {
 // works the same way the HTTP path already does.
 const tlsMuxServerID = "tls-mux"
 
+// tlsFallbackRouteID is the @id of the unmatched-SNI route inside tls-mux.
+// Tail of the routes array; per-sandbox SNI routes are PUT at routes/0 so
+// they always shadow this one. Any SNI we don't recognize — the API host
+// itself, on-demand-TLS validation, plain SSL probes — ends up here and
+// gets proxied to the local HTTPS listener.
+const tlsFallbackRouteID = "tls-mux-fallback"
+
 func tcpServerID(hostPort int) string {
 	return fmt.Sprintf("tcp-port-%d", hostPort)
 }
@@ -328,9 +342,20 @@ func tlsRouteID(id string, port int) string {
 //
 // Without this bootstrap, the very first UpsertTCPRoute would fail because
 // /config/apps/layer4 doesn't exist yet on a fresh Caddy.
-func (c *Client) EnsureLayer4(ctx context.Context, tlsListen string) error {
+//
+// When tlsListen is non-empty, tlsFallback must point at the local HTTPS
+// listener that owned the same port before caddy-l4 took it over (the API
+// site, the on-demand-TLS catch-all, etc.). caddy-l4 routes by SNI for
+// sandbox subdomains and forwards the rest of the traffic — including ACME
+// HTTP-01 cert validation that piggy-backs on :443 ALPN and any non-sandbox
+// hostname — to the fallback. Empty tlsFallback with non-empty tlsListen is
+// rejected; the service layer surfaces it as a config error at boot.
+func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string) error {
 	if !c.enabled {
 		return nil
+	}
+	if tlsListen != "" && tlsFallback == "" {
+		return errors.New("tls fallback required when tls listen is set")
 	}
 
 	// Ensure /config/apps/layer4 exists. We only PUT it if it isn't there;
@@ -367,9 +392,21 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen string) error {
 	if exists {
 		return nil
 	}
+	// The fallback route has no match clause and sits at the END of the
+	// routes array; per-sandbox SNI routes inserted via UpsertTLSSNIRoute go
+	// to routes/0, so they always win over the fallback. Only connections
+	// whose SNI doesn't match any sandbox subdomain hit the proxy below.
 	server := map[string]any{
 		"listen": []string{tlsListen},
-		"routes": []any{},
+		"routes": []any{
+			map[string]any{
+				"@id": tlsFallbackRouteID,
+				"handle": []map[string]any{{
+					"handler":   "proxy",
+					"upstreams": []map[string]any{{"dial": []string{tlsFallback}}},
+				}},
+			},
+		},
 	}
 	body, err := json.Marshal(server)
 	if err != nil {
@@ -456,6 +493,14 @@ func (c *Client) DeleteTCPRoute(ctx context.Context, hostPort int) error {
 // place without disturbing siblings; if the @id isn't there yet (404) we PUT
 // at routes/0 so SNI matching tries it ahead of any future fallback.
 //
+// The handler chain is [tls, proxy]: caddy-l4 terminates TLS using Caddy's
+// own cert manager (which already holds the wildcard for *.$DOMAIN, issued
+// once at startup via DNS-01), then proxies the now-plaintext bytes to the
+// container on its native port. The container speaks raw TCP — no cert, no
+// private key, nothing TLS-related lives inside the user's sandbox. The
+// connection_policies entry is intentionally empty: Caddy picks the cert by
+// SNI from the shared cert manager, so there is no per-route cert config.
+//
 // Caller must have already called EnsureLayer4 with a non-empty tlsListen at
 // least once; otherwise the routes/0 PUT will land on a missing server.
 func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP string, port int) error {
@@ -468,10 +513,16 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 		"match": []map[string]any{{
 			"tls": map[string]any{"sni": []string{sniHost}},
 		}},
-		"handle": []map[string]any{{
-			"handler":   "proxy",
-			"upstreams": []map[string]any{{"dial": []string{fmt.Sprintf("%s:%d", containerIP, port)}}},
-		}},
+		"handle": []map[string]any{
+			{
+				"handler":             "tls",
+				"connection_policies": []map[string]any{{}},
+			},
+			{
+				"handler":   "proxy",
+				"upstreams": []map[string]any{{"dial": []string{fmt.Sprintf("%s:%d", containerIP, port)}}},
+			},
+		},
 	}
 	body, err := json.Marshal(route)
 	if err != nil {

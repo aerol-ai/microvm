@@ -287,7 +287,7 @@ func TestL4Cases(t *testing.T) {
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
 				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
-				if err := client.EnsureLayer4(context.Background(), ":443"); err != nil {
+				if err := client.EnsureLayer4(context.Background(), ":443", "127.0.0.1:8443"); err != nil {
 					t.Fatalf("EnsureLayer4() error = %v", err)
 				}
 				if !fake.layer4Exists {
@@ -299,11 +299,44 @@ func TestL4Cases(t *testing.T) {
 			},
 		},
 		{
+			name: "ensure_layer4_seeds_fallback_route",
+			run: func(t *testing.T) {
+				// Regression test for the TLS-SNI default-on path: caddy-l4 has
+				// to forward unmatched SNI (the API host, on-demand validation,
+				// stray probes) to the relocated HTTPS listener. If this
+				// fallback route is missing, every non-sandbox SNI connection
+				// drops, including the API itself — the symptom would be "site
+				// works locally, dies when SB_L4_TLS_LISTEN is set".
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureLayer4(context.Background(), ":443", "127.0.0.1:8443"); err != nil {
+					t.Fatalf("EnsureLayer4() error = %v", err)
+				}
+				server, ok := fake.l4Servers[tlsMuxServerID]
+				if !ok {
+					t.Fatalf("tls-mux server missing")
+				}
+				route := firstL4Route(t, server)
+				assertRouteField(t, route, "@id", tlsFallbackRouteID)
+				assertL4Dial(t, route, "127.0.0.1:8443")
+			},
+		},
+		{
+			name: "ensure_layer4_rejects_listen_without_fallback",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureLayer4(context.Background(), ":443", ""); err == nil {
+					t.Fatalf("EnsureLayer4 should reject empty fallback when listen is set")
+				}
+			},
+		},
+		{
 			name: "ensure_layer4_skips_tls_mux_when_listen_empty",
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
 				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
-				if err := client.EnsureLayer4(context.Background(), ""); err != nil {
+				if err := client.EnsureLayer4(context.Background(), "", ""); err != nil {
 					t.Fatalf("EnsureLayer4() error = %v", err)
 				}
 				if !fake.layer4Exists {
@@ -319,11 +352,11 @@ func TestL4Cases(t *testing.T) {
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
 				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
-				if err := client.EnsureLayer4(context.Background(), ":443"); err != nil {
+				if err := client.EnsureLayer4(context.Background(), ":443", "127.0.0.1:8443"); err != nil {
 					t.Fatalf("first EnsureLayer4() error = %v", err)
 				}
 				puts1 := countMethod(fake.records, http.MethodPut)
-				if err := client.EnsureLayer4(context.Background(), ":443"); err != nil {
+				if err := client.EnsureLayer4(context.Background(), ":443", "127.0.0.1:8443"); err != nil {
 					t.Fatalf("second EnsureLayer4() error = %v", err)
 				}
 				puts2 := countMethod(fake.records, http.MethodPut)
@@ -411,6 +444,7 @@ func TestL4Cases(t *testing.T) {
 				}
 				assertL4SNI(t, route, "abc-5432.sandbox.example.com")
 				assertL4Dial(t, route, "10.0.0.5:5432")
+				assertHasTLSTerminator(t, route)
 			},
 		},
 		{
@@ -429,6 +463,7 @@ func TestL4Cases(t *testing.T) {
 					t.Fatalf("PATCH should have replaced stale fields: %+v", route)
 				}
 				assertL4Dial(t, route, "10.0.0.7:5432")
+				assertHasTLSTerminator(t, route)
 			},
 		},
 		{
@@ -549,7 +584,23 @@ func assertL4Dial(t *testing.T, route map[string]any, want string) {
 	if !ok || len(handles) == 0 {
 		t.Fatalf("missing handle: %#v", route)
 	}
-	handle, _ := handles[0].(map[string]any)
+	// TLS-terminating SNI routes have [tls, proxy]; raw-TCP routes have just
+	// [proxy]. Walk the chain and pick the first handler that carries an
+	// upstreams list — that's the one with the dial target.
+	var handle map[string]any
+	for _, h := range handles {
+		hm, _ := h.(map[string]any)
+		if hm == nil {
+			continue
+		}
+		if _, hasUpstreams := hm["upstreams"]; hasUpstreams {
+			handle = hm
+			break
+		}
+	}
+	if handle == nil {
+		t.Fatalf("no handler with upstreams in chain: %#v", route)
+	}
 	upstreams, ok := handle["upstreams"].([]any)
 	if !ok || len(upstreams) == 0 {
 		t.Fatalf("missing upstreams: %#v", route)
@@ -562,6 +613,41 @@ func assertL4Dial(t *testing.T, route map[string]any, want string) {
 	if got, _ := dials[0].(string); got != want {
 		t.Fatalf("dial = %q, want %q", got, want)
 	}
+}
+
+// assertHasTLSTerminator walks the route's handler chain and asserts that a
+// "tls" handler appears before any "proxy" handler. Catches the regression
+// where someone removes TLS termination from UpsertTLSSNIRoute and the
+// route silently becomes passthrough — which would expose the user's
+// containers to the requirement of holding their own cert again.
+func assertHasTLSTerminator(t *testing.T, route map[string]any) {
+	t.Helper()
+	handles, ok := route["handle"].([]any)
+	if !ok || len(handles) < 2 {
+		t.Fatalf("expected handler chain of length >= 2 for terminated TLS, got %#v", route)
+	}
+	sawTLS := false
+	for _, h := range handles {
+		hm, _ := h.(map[string]any)
+		if hm == nil {
+			continue
+		}
+		handler, _ := hm["handler"].(string)
+		if handler == "tls" {
+			sawTLS = true
+			continue
+		}
+		if handler == "proxy" {
+			if !sawTLS {
+				t.Fatalf("proxy handler appears before tls in chain: %#v", route)
+			}
+			return
+		}
+	}
+	if !sawTLS {
+		t.Fatalf("no tls handler in chain (TLS-SNI route must terminate, not passthrough): %#v", route)
+	}
+	t.Fatalf("no proxy handler after tls: %#v", route)
 }
 
 func assertL4SNI(t *testing.T, route map[string]any, want string) {
