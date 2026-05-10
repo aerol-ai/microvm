@@ -102,9 +102,9 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 
 	switch event.Action {
 	case "die", "stop", "oom":
-		return s.markSandboxStopped(ctx, sandbox, event, models.SandboxStatusStopped)
+		return s.markSandboxStopped(ctx, sandbox, event)
 	case "destroy":
-		return s.markSandboxStopped(ctx, sandbox, event, models.SandboxStatusDestroyed)
+		return s.handleDestroyEvent(ctx, sandbox)
 	case "start":
 		return s.handleStartEvent(ctx, sandbox)
 	default:
@@ -112,14 +112,16 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 	}
 }
 
-func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent, status models.SandboxStatus) error {
+// markSandboxStopped handles die/stop/oom events: the container exited but the
+// sandbox row stays — Start can resurrect it, the image is still needed, and
+// the capacity reservation is legitimately held. Routes are torn down and
+// per-IP netrules cleared so a stopped sandbox doesn't leave dangling Caddy
+// upstreams pointing at an IP Docker may reassign on the next start.
+func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent) error {
 	previousIP := sandbox.ContainerIP
 
-	sandbox.Status = status
+	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
-	if status == models.SandboxStatusDestroyed {
-		sandbox.ContainerIP = ""
-	}
 	if event.Action == "oom" {
 		sandbox.LastError = "container killed by OOM"
 	} else if event.Action == "die" && event.ExitCode != 0 {
@@ -152,18 +154,60 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		"exit_code", event.ExitCode,
 		"status", string(sandbox.Status),
 	)
+	return nil
+}
 
-	// Image GC and admitter release: only on destroy. die/stop transition to
-	// stopped, where the image is still needed for a future Start and the
-	// reservation is still legitimately held. The store row above has already
-	// been updated to destroyed, so the GC helper's predicate will skip this
-	// sandbox correctly.
-	if status == models.SandboxStatusDestroyed {
-		if s.admitter != nil {
-			s.admitter.Release(sandbox.ID)
-		}
-		s.maybeRemoveImage(ctx, sandbox.Image)
+// handleDestroyEvent fires when Docker emits a destroy for a container we own
+// — typically `docker rm -f <id>` outside the API, OOM-then-autoremove, or a
+// daemon-side cleanup. Semantically equivalent to API DestroySandbox and the
+// reconcile destroyed-branch: delete the row, cascading exposed_ports and
+// freeing any L4 host_port reservation immediately. Without this, the row
+// would sit at status=destroyed until the next reconcile pass picked it up,
+// holding its host_port slot in the unique-index pool the entire time. With
+// SB_AUTO_RECONCILE=false or a stalled reconcile loop, that slot would be
+// stuck indefinitely.
+func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbox) error {
+	previousIP := sandbox.ContainerIP
+
+	// Best-effort teardown. Order matches DestroySandbox (caddy → mounts →
+	// store.Delete → admitter → maybeRemoveImage); container destroy is
+	// skipped because the event itself means the container is already gone.
+	// Failures here are picked up by gcZombieCaddyEntries / mounts.Sweep on
+	// the next reconcile pass.
+	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
 	}
+	for _, port := range sandbox.ExposedPorts {
+		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
+			s.logger.Warn("delete port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
+		}
+	}
+	if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
+		s.logger.Warn("unmount on destroy event failed", "sandbox_id", sandbox.ID, "error", err)
+	}
+	if previousIP != "" {
+		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
+			s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+		}
+	}
+
+	// store.Delete must happen BEFORE maybeRemoveImage: HasActiveImageRef
+	// queries the sandboxes table and treats any non-destroyed row as a live
+	// reference. Deleting first lets the image GC see the correct state.
+	// ErrNotFound is benign — the API-driven destroy path may have raced us.
+	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("delete sandbox: %w", err)
+	}
+
+	if s.admitter != nil {
+		s.admitter.Release(sandbox.ID)
+	}
+	s.maybeRemoveImage(ctx, sandbox.Image)
+
+	s.logger.Info("audit sandbox destroyed via docker event",
+		"sandbox_id", sandbox.ID,
+		"image", sandbox.Image,
+	)
 	return nil
 }
 
