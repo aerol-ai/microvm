@@ -925,6 +925,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		_ = s.mounts.UnmountAll(sandboxID)
 	}
 
+	// Zombie caddy entry sweep. The destroyed-sandbox loop above already
+	// drops routes for sandboxes that exist in the DB but lost their
+	// container — this catches the orthogonal case where caddy holds an
+	// entry for a sandbox row that was purged out (DB wipe, destroyed-row
+	// TTL pass, manual surgery) and no destroy ran. Without this, caddy
+	// accumulates dead routes forever.
+	s.gcZombieCaddyEntries(ctx, known)
+
 	// Stale-mount sweep. Anything under /var/lib/sandboxd/mounts/ that
 	// doesn't correspond to a sandbox we're going to keep is a leftover
 	// from a crashed create or a previous orphan removal. Kill any FUSE
@@ -1066,6 +1074,88 @@ func lifecycleActionFor(sb *models.Sandbox, now time.Time, globalIdle time.Durat
 		return lifecycleStop
 	}
 	return lifecycleNone
+}
+
+// gcZombieCaddyEntries deletes caddy routes/servers whose @id (or layer4
+// server name) follows our convention but doesn't correspond to any live
+// sandbox row. The DB is the source of truth; anything in caddy that doesn't
+// trace back to a non-destroyed sandbox is a leak from one of:
+//   - a sandbox row that was purged (DestroyedRowTTL).
+//   - a development DB wipe leaving caddy with stale state.
+//   - an out-of-band caddy admin call from a previous version of this code.
+//
+// Best-effort: every cleanup runs through a non-fatal path so a single
+// failing DELETE doesn't abort the rest of the sweep. The legitimate-set
+// computation excludes destroyed sandboxes — by the time this runs, the
+// destroyed-loop earlier in Reconcile has already cleaned their routes.
+func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.Sandbox) {
+	if !s.caddy.Enabled() {
+		return
+	}
+	snap, err := s.caddy.Snapshot(ctx)
+	if err != nil {
+		s.logger.Warn("caddy snapshot for zombie gc failed", "error", err)
+		return
+	}
+
+	expectedHTTP := make(map[string]struct{})
+	expectedTCPServers := make(map[string]struct{})
+	expectedTLSRoutes := make(map[string]struct{})
+
+	for _, sb := range sandboxes {
+		if sb == nil || sb.Status == models.SandboxStatusDestroyed {
+			continue
+		}
+		// The toolbox route lives at @id "sandbox-<id>"; per-port HTTP routes
+		// at "sandbox-<id>-port-<p>". Keep both unconditionally — the rest
+		// of Reconcile guarantees they're upserted for running sandboxes,
+		// but stopped sandboxes intentionally lack routes and should still
+		// not be GC'd here (they'll be rebuilt on Start).
+		expectedHTTP["sandbox-"+sb.ID] = struct{}{}
+		for _, p := range sb.ExposedPorts {
+			switch p.Protocol {
+			case "", models.ExposedPortProtocolHTTP:
+				expectedHTTP[fmt.Sprintf("sandbox-%s-port-%d", sb.ID, p.Port)] = struct{}{}
+			case models.ExposedPortProtocolTCP:
+				if p.HostPort > 0 {
+					expectedTCPServers[fmt.Sprintf("tcp-port-%d", p.HostPort)] = struct{}{}
+				}
+			case models.ExposedPortProtocolTLS:
+				expectedTLSRoutes[fmt.Sprintf("sandbox-%s-port-%d-tls", sb.ID, p.Port)] = struct{}{}
+			}
+		}
+	}
+
+	for _, id := range snap.HTTPRouteIDs {
+		if _, ok := expectedHTTP[id]; ok {
+			continue
+		}
+		if err := s.caddy.DeleteRouteByID(ctx, id); err != nil {
+			s.logger.Warn("zombie http route delete failed", "route_id", id, "error", err)
+			continue
+		}
+		s.logger.Info("audit zombie http route removed", "route_id", id)
+	}
+	for _, sid := range snap.L4TCPServerIDs {
+		if _, ok := expectedTCPServers[sid]; ok {
+			continue
+		}
+		if err := s.caddy.DeleteTCPServer(ctx, sid); err != nil {
+			s.logger.Warn("zombie tcp server delete failed", "server_id", sid, "error", err)
+			continue
+		}
+		s.logger.Info("audit zombie tcp server removed", "server_id", sid)
+	}
+	for _, id := range snap.L4TLSRouteIDs {
+		if _, ok := expectedTLSRoutes[id]; ok {
+			continue
+		}
+		if err := s.caddy.DeleteRouteByID(ctx, id); err != nil {
+			s.logger.Warn("zombie tls route delete failed", "route_id", id, "error", err)
+			continue
+		}
+		s.logger.Info("audit zombie tls route removed", "route_id", id)
+	}
 }
 
 func (s *Service) StartReconcileLoop(ctx context.Context) {

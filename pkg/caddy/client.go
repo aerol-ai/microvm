@@ -215,6 +215,43 @@ func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[stri
 	return nil
 }
 
+// DeleteRouteByID is the zombie-GC entry point: the reconcile sweep finds an
+// @id under apps/http or the tls-mux server that doesn't correspond to any
+// sandbox row, and calls this to drop it. Wraps the same DELETE /id/<routeID>
+// the typed helpers use, so 404 is still treated as success.
+func (c *Client) DeleteRouteByID(ctx context.Context, routeID string) error {
+	if !c.enabled || routeID == "" {
+		return nil
+	}
+	return c.deleteRoute(ctx, routeID)
+}
+
+// DeleteTCPServer drops a layer4 server by its name (e.g. tcp-port-37412).
+// Used by reconcile's zombie GC; not tied to a specific sandbox/port pair so
+// the caller doesn't have to know which exposure originally owned the port.
+func (c *Client) DeleteTCPServer(ctx context.Context, serverID string) error {
+	if !c.enabled || serverID == "" {
+		return nil
+	}
+	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, serverID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete l4 server: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("delete l4 server failed: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // deleteRoute removes one route by @id. 404 is treated as success — the route
 // already isn't there, which is the desired post-condition.
 func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
