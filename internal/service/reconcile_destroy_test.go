@@ -69,6 +69,9 @@ func (f *fakeReconcileRuntime) PushAllowedPorts(context.Context, string, string,
 func (f *fakeReconcileRuntime) ClearNetworkRules(string) error {
 	return nil
 }
+func (f *fakeReconcileRuntime) ApplyNetworkBlockAll(string) error {
+	return nil
+}
 
 // TestReconcileDestroyedRowFreesHostPort is the regression test required by
 // pr-review.md §5: a destroyed sandbox must free its TCP host_port reservation

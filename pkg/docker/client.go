@@ -105,6 +105,18 @@ func (c *Client) ClearNetworkRules(containerIP string) error {
 	return c.networkRules.ClearBlockAllEgress(containerIP)
 }
 
+// ApplyNetworkBlockAll installs the per-IP egress DROP rule. Idempotent —
+// the underlying rule manager checks for an existing match before inserting.
+// Called on Create (initial install), StartSandbox (after a Stop+Start cycle
+// drops the rule on the stop event), and reconcile (to heal after host-side
+// state loss).
+func (c *Client) ApplyNetworkBlockAll(containerIP string) error {
+	if containerIP == "" {
+		return nil
+	}
+	return c.networkRules.BlockAllEgress(containerIP)
+}
+
 func (c *Client) Ping(ctx context.Context) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/_ping", nil)
 	if err != nil {
@@ -336,7 +348,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	if req.NetworkBlockAll {
 		if err := c.networkRules.BlockAllEgress(runtime.ContainerIP); err != nil {
-			c.logger.Warn("failed to apply network rule", "sandbox_id", runtime.SandboxID, "error", err)
+			// Fail closed: the user opted into network isolation, so a sandbox
+			// that came up without the DROP rule must not be left running.
+			// Clear any partial state and tear the container down before
+			// returning the error.
+			_ = c.networkRules.ClearBlockAllEgress(runtime.ContainerIP)
+			_ = c.removeContainer(ctx, created.ID, true)
+			return nil, fmt.Errorf("apply network block: %w", err)
 		}
 	}
 

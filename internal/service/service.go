@@ -365,6 +365,19 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
 
+	// Reapply the per-IP egress DROP rule. The stop event clears it (the IP
+	// can be reassigned to another container), so a Stop+Start cycle would
+	// otherwise come back without network isolation. Fail closed: if we can't
+	// reinstall the rule, stop the container and surface the error.
+	if sandbox.NetworkBlockAll {
+		if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+			_ = s.docker.Stop(ctx, sandboxContainerRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+			return nil, fmt.Errorf("apply network block on start: %w", err)
+		}
+	}
+
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 		return nil, err
 	}
@@ -977,6 +990,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		sandbox.PublicURL = s.caddy.SandboxPublicURL(sandbox.ID)
 		sandbox.UpdatedAt = time.Now().UTC()
 		if state.Status == models.SandboxStatusStarted {
+			// Heal the per-IP egress DROP rule for sandboxes opted into
+			// NetworkBlockAll. Idempotent at the netrules layer (Exists check
+			// before insert), so this is safe to run on every reconcile pass.
+			// Catches host-side state loss: iptables flush, daemon restart
+			// rebuilding chains, or a missed Create/Start install.
+			if sandbox.NetworkBlockAll {
+				if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+					s.logger.Warn("reconcile reapply network block failed",
+						"sandbox_id", sandbox.ID,
+						"ip", sandbox.ContainerIP,
+						"error", err,
+					)
+				}
+			}
 			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 				return err
 			}
