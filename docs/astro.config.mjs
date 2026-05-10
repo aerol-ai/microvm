@@ -12,9 +12,13 @@ export default defineConfig({
     starlight({
       title: 'AerolVM',
       favicon: '/favicon.svg',
-      social: {
-        github: 'https://github.com/aerol-ai/microvm',
-      },
+      social: [
+        {
+          icon: 'github',
+          label: 'GitHub',
+          href: 'https://github.com/aerol-ai/microvm',
+        },
+      ],
       editLink: {
         baseUrl:
           'https://github.com/aerol-ai/microvm/blob/main/docs/src/content/docs/',

@@ -1,25 +1,30 @@
 ---
 import { PAGE_TITLE_ID } from './TableOfContent/constants'
 
-const { data } = Astro.props.entry
-const { title = data.title, tagline, actions = [] } = data.hero || {}
+const entry = Astro.locals.starlightRoute?.entry
+const data = entry?.data
+const { title = data?.title, tagline, actions = [] } = data?.hero || {}
 ---
 
-<div class="hero">
-  <h1 id={PAGE_TITLE_ID} data-page-title>{title}</h1>
-  {tagline && <div class="tagline" set:html={tagline} />}
-  {
-    actions.length > 0 && (
-      <div class="hero-actions">
-        {actions.map(action => (
-          <a href={action.link} class:list={['hero-action', action.variant || 'secondary']}>
-            {action.text}
-          </a>
-        ))}
-      </div>
-    )
-  }
-</div>
+{
+  data && (
+    <div class="hero">
+      <h1 id={PAGE_TITLE_ID} data-page-title>{title}</h1>
+      {tagline && <div class="tagline" set:html={tagline} />}
+      {
+        actions.length > 0 && (
+          <div class="hero-actions">
+            {actions.map(action => (
+              <a href={action.link} class:list={['hero-action', action.variant || 'secondary']}>
+                {action.text}
+              </a>
+            ))}
+          </div>
+        )
+      }
+    </div>
+  )
+}
 
 <style>
   .hero {
