@@ -44,7 +44,7 @@
   <properties>
     <maven.compiler.release>11</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <jackson.version>2.18.3</jackson.version>
+    <jackson.version>2.21</jackson.version>
     <junit.version>5.12.2</junit.version>
     <maven.surefire.version>3.5.2</maven.surefire.version>
     <maven.source.version>3.3.1</maven.source.version>
