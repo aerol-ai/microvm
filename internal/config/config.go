@@ -52,13 +52,6 @@ type Config struct {
 	DockerRuntimeWaitTimeout time.Duration
 	ToolboxWaitTimeout       time.Duration
 	ReconcileInterval        time.Duration
-	// DestroyedRowTTL controls how long sandbox rows in the destroyed state
-	// are retained before the reconcile sweep deletes them. Zero (the
-	// default) disables row purging — destroyed rows live forever as an
-	// audit record. Operators that prefer a bounded history can set e.g.
-	// "720h" for 30 days. Only affects rows already in destroyed status;
-	// live sandboxes are never touched by this sweep.
-	DestroyedRowTTL          time.Duration
 	UploadMaxBytes           int64
 
 	// Admission control. Admission is purely resource-math: CPU/memory
@@ -153,7 +146,6 @@ func Load() (Config, error) {
 		DockerRuntimeWaitTimeout: getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
 		ToolboxWaitTimeout:       getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
 		ReconcileInterval:        getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
-		DestroyedRowTTL:          getEnvDuration("SB_DESTROYED_ROW_TTL", 0),
 		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),

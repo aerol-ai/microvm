@@ -12,13 +12,13 @@ type SandboxStatus string
 //
 // SandboxStatusDestroyed marks a sandbox whose container is gone — either
 // because the user called DELETE /sandboxes/{id}, or because the container
-// died out-of-band and the event monitor / reconcile loop noticed. The DB
-// row is retained indefinitely as an audit record by default; operators
-// who want automatic cleanup of old destroyed rows can set
-// SB_DESTROYED_ROW_TTL (e.g. "720h" for 30 days) to have them purged by the
-// reconcile sweep. There is no automatic row-level GC otherwise — by
-// design, so post-incident "what ran last week?" questions remain
-// answerable from the DB.
+// died out-of-band and the event monitor noticed. The status exists as a
+// transient marker only: the API-driven destroy path deletes the row in the
+// same call, and the reconcile loop deletes any row whose container has
+// gone missing on its next pass. Destroyed rows are not retained — keeping
+// them around would also keep their host_port reservations in
+// exposed_ports, slowly exhausting the L4 TCP allocator pool over the
+// daemon's lifetime.
 const (
 	SandboxStatusCreating  SandboxStatus = "creating"
 	SandboxStatusStarted   SandboxStatus = "started"
