@@ -730,6 +730,13 @@ function describeWSClose(event: unknown): string {
   return parts.join(" ");
 }
 
+function toWebSocketBinaryFrame(data: Uint8Array | string): Uint8Array<ArrayBuffer> {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const frame = new Uint8Array(bytes.byteLength);
+  frame.set(bytes);
+  return frame;
+}
+
 function openExecStream(baseURL: string, patToken: string, sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
   const wsURL = baseURL.replace(/^http/, "ws") + `/v1/sandboxes/${encodeURIComponent(sandboxID)}/toolbox/process/exec/stream`;
 
@@ -824,8 +831,7 @@ function openExecStream(baseURL: string, patToken: string, sandboxID: string, op
   });
 
   const sendBinary = (data: Uint8Array | string) => {
-    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-    ws.send(bytes);
+    ws.send(toWebSocketBinaryFrame(data));
   };
 
   return {
@@ -937,8 +943,7 @@ function openSessionAttach(
   });
 
   const sendBinary = (data: Uint8Array | string) => {
-    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-    ws.send(bytes);
+    ws.send(toWebSocketBinaryFrame(data));
   };
 
   return {
