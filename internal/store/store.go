@@ -23,8 +23,18 @@ type Store struct {
 const sqliteBusyTimeoutMS = 5000
 
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// The DB stores secrets (env_json, toolbox_token, sealed mount blobs).
+	// Lock the directory and file to owner-only so a custom DBPath, a dev
+	// run on a shared host, or any setup that doesn't go through the
+	// installer can't leak them via the default 0o755 / umask-derived modes.
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
+	}
+	// MkdirAll leaves a pre-existing directory's mode untouched, so chmod
+	// explicitly to tighten dirs created by older builds at 0o755.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod db directory: %w", err)
 	}
 
 	db, err := sql.Open("sqlite3", sqliteDSN(path))
@@ -136,6 +146,19 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_exposed_ports_host_port ON exposed_ports(host_port) WHERE host_port > 0;`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create exposed_ports host_port index: %w", err)
+	}
+
+	// SQLite materialized the DB file (and the WAL/SHM sidecars on the
+	// first write) using the process umask — typically 0o644, leaving
+	// env_json and toolbox_token world-readable. Tighten to owner-only.
+	// Sidecars may not exist on a fresh DB if no transaction has run yet;
+	// ignore not-found and let the next writer create them with the now
+	// owner-only directory mode protecting them in transit.
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			db.Close()
+			return nil, fmt.Errorf("chmod db file %s: %w", p, err)
+		}
 	}
 
 	return &Store{db: db}, nil

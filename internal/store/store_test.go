@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -30,6 +32,62 @@ func TestStoreCases(t *testing.T) {
 				defer st.Close()
 				if err := st.Close(); err != nil {
 					t.Fatalf("Close() error = %v", err)
+				}
+			},
+		},
+		{
+			// Regression: env_json and toolbox_token are secrets. The DB
+			// directory and file must end up owner-only so a custom DBPath
+			// or a dev run on a shared host can't leak them via umask
+			// defaults. Re-chmod also has to tighten a directory the
+			// caller created at 0o755 before opening.
+			name: "open_locks_db_dir_and_file_to_owner_only",
+			run: func(t *testing.T) {
+				if runtime.GOOS == "windows" {
+					t.Skip("POSIX permission bits not meaningful on Windows")
+				}
+				dir := t.TempDir()
+				// Pre-create the dir at the old, lax mode so we exercise
+				// the chmod-on-existing path, not just MkdirAll.
+				if err := os.Chmod(dir, 0o755); err != nil {
+					t.Fatalf("seed dir mode: %v", err)
+				}
+				path := filepath.Join(dir, "state.db")
+				st, err := Open(path)
+				if err != nil {
+					t.Fatalf("Open() error = %v", err)
+				}
+				defer st.Close()
+
+				dirInfo, err := os.Stat(dir)
+				if err != nil {
+					t.Fatalf("stat dir: %v", err)
+				}
+				if mode := dirInfo.Mode().Perm(); mode != 0o700 {
+					t.Fatalf("dir mode = %o, want 0700", mode)
+				}
+
+				fileInfo, err := os.Stat(path)
+				if err != nil {
+					t.Fatalf("stat db file: %v", err)
+				}
+				if mode := fileInfo.Mode().Perm(); mode != 0o600 {
+					t.Fatalf("db file mode = %o, want 0600", mode)
+				}
+
+				// WAL/SHM sidecars carry the same data — if they exist
+				// after schema setup, they must be owner-only too.
+				for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+					info, err := os.Stat(sidecar)
+					if errors.Is(err, os.ErrNotExist) {
+						continue
+					}
+					if err != nil {
+						t.Fatalf("stat %s: %v", sidecar, err)
+					}
+					if mode := info.Mode().Perm(); mode != 0o600 {
+						t.Fatalf("%s mode = %o, want 0600", sidecar, mode)
+					}
 				}
 			},
 		},
