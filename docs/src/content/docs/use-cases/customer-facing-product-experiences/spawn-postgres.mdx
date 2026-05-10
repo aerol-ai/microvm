@@ -39,8 +39,8 @@ import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
-const postgresUser = process.env.POSTGRES_USER;
-const postgresPassword = process.env.POSTGRES_PASSWORD;
+const postgresUser = process.env.POSTGRES_USER || 'appuser';
+const postgresPassword = process.env.POSTGRES_PASSWORD ?? 'password';
 const postgresDB = process.env.POSTGRES_DB ?? "appdb";
 const publicAuthUser = process.env.PUBLIC_AUTH_USER ?? postgresUser;
 const publicAuthPassword = process.env.PUBLIC_AUTH_PASSWORD ?? postgresPassword;
@@ -138,7 +138,12 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 `;
 
+function log(msg: string) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
 async function waitForPostgres(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
+  log("Waiting for Postgres to accept connections...");
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const result = await sandbox.exec({
       command: 'sh -lc \'pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"\'',
@@ -146,16 +151,19 @@ async function waitForPostgres(sandbox: Awaited<ReturnType<MicroVM["create"]>>) 
     });
 
     if (result.exitCode === 0) {
+      log(`Postgres ready after ${attempt + 1} attempt(s)`);
       return;
     }
 
+    log(`  attempt ${attempt + 1}/30: not ready yet (exitCode=${result.exitCode})`);
     await delay(1000);
   }
 
   throw new Error("Postgres did not become ready in time.");
 }
 
-async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
+async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>, adminSessionID: string) {
+  log("Waiting for admin HTTP server on port 3000...");
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const result = await sandbox.exec({
       command:
@@ -164,17 +172,23 @@ async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
     });
 
     if (result.exitCode === 0) {
+      log(`Admin server ready after ${attempt + 1} attempt(s)`);
       return;
     }
 
+    log(`  attempt ${attempt + 1}/20: not ready yet (exitCode=${result.exitCode}) ${result.stderr.trim()}`);
     await delay(1000);
   }
 
+  const sessionLog = await sandbox.sessionLog(adminSessionID);
+  console.error("[admin session log]\n" + new TextDecoder().decode(sessionLog));
   throw new Error("The HTTP admin endpoint did not become ready in time.");
 }
 
 async function main() {
   const client = new MicroVM({ apiUrl, patToken });
+
+  log(`Creating sandbox (image=postgres:16-bookworm cpu=2 mem=2048MB disk=12GB)...`);
   const sandbox = await client.create({
     image: "postgres:16-bookworm",
     osUser: "root",
@@ -195,25 +209,34 @@ async function main() {
       destroyIfIdleFor: 6 * 60 * 60 * 1_000_000_000,
     },
   });
+  log(`Sandbox created: ${sandbox.id}`);
 
-  console.log(`Sandbox created: ${sandbox.id}`);
-
-  await sandbox.exec({
+  log("Installing python3...");
+  const aptResult = await sandbox.exec({
     command:
       "apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*",
     timeoutSeconds: 240,
   });
+  if (aptResult.exitCode !== 0) {
+    throw new Error(`apt-get failed (exitCode=${aptResult.exitCode}): ${aptResult.stderr}`);
+  }
+  log("python3 installed");
 
+  log("Creating workspace directories and uploading admin server script...");
   await sandbox.exec("mkdir -p /workspace/postgres /workspace/admin");
   await sandbox.uploadFile("/workspace/admin/postgres-admin.py", adminServer);
+  log("Admin script uploaded to /workspace/admin/postgres-admin.py");
 
+  log("Starting Postgres session...");
   const postgresSession = await sandbox.createSession({
     name: "postgres",
     command: 'sh -lc \'exec docker-entrypoint.sh postgres -c listen_addresses="*" -p 5432\'',
   });
+  log(`Postgres session started: ${postgresSession.id}`);
 
   await waitForPostgres(sandbox);
 
+  log("Starting admin HTTP server session...");
   const adminSession = await sandbox.createSession({
     name: "postgres-admin",
     command: "python3 /workspace/admin/postgres-admin.py",
@@ -228,25 +251,56 @@ async function main() {
       PORT: String(adminPort),
     },
   });
+  log(`Admin session started: ${adminSession.id}`);
 
-  await waitForAdmin(sandbox);
+  await waitForAdmin(sandbox, adminSession.id);
+
+  log(`Exposing admin HTTP port ${adminPort}...`);
   const adminExposure = await sandbox.exposePort(adminPort);
-  const postgresExposure = await sandbox.exposePort(postgresPort, { protocol: "tcp" });
+  log(`Admin port exposed: ${adminExposure.url}`);
 
-  if (postgresExposure.protocol !== "tcp") {
-    throw new Error("expected tcp exposure for Postgres");
+  log(`Exposing Postgres port ${postgresPort} via TLS-SNI...`);
+  const postgresExposure = await sandbox.exposePort(postgresPort, { protocol: "tls" });
+  log(`Postgres TLS endpoint: ${postgresExposure.url}`);
+
+  if (postgresExposure.protocol !== "tls") {
+    throw new Error("expected tls exposure for Postgres");
   }
 
-  // The "tcp" variant carries host / hostPort directly - no URL parsing needed.
-  const publicDatabaseURL = `postgresql://${encodeURIComponent(postgresUser)}:${encodeURIComponent(postgresPassword)}@${postgresExposure.host}:${postgresExposure.hostPort}/${encodeURIComponent(postgresDB)}`;
+  // tls:// URL → extract host and port for tunnel instructions.
+  const tlsURL = new URL(postgresExposure.url.replace(/^tls:\/\//, "https://"));
+  const tlsHost = tlsURL.hostname;
+  const tlsPort = tlsURL.port || "443";
+
+  // Clients cannot connect directly — postgres wire protocol sends SSLRequest
+  // before the TLS ClientHello, so caddy-l4 never sees the SNI. Use a local
+  // TLS tunnel (socat or stunnel) that opens a real TLS socket to caddy and
+  // forwards the plaintext postgres stream through it. Connect with sslmode=disable.
+  //
+  // socat example (pick any free local port, e.g. 15432):
+  //   socat TCP-LISTEN:15432,reuseaddr,fork \
+  //         OPENSSL:${tlsHost}:${tlsPort},cafile=/etc/ssl/certs/ca-certificates.crt
+  //   psql "postgresql://<user>:<pass>@127.0.0.1:15432/<db>?sslmode=disable"
+  //
+  // stunnel example (stunnel.conf):
+  //   [postgres]
+  //   client  = yes
+  //   accept  = 127.0.0.1:15432
+  //   connect = ${tlsHost}:${tlsPort}
+  //   sni     = ${tlsHost}
+  const tunnelDSN = `postgresql://${encodeURIComponent(postgresUser)}:${encodeURIComponent(postgresPassword)}@127.0.0.1:15432/${encodeURIComponent(postgresDB)}?sslmode=disable`;
 
   const payload = {
     sandboxID: sandbox.id,
     postgresSessionID: postgresSession.id,
     adminSessionID: adminSession.id,
     adminURL: adminExposure.url,
-    postgresURL: publicDatabaseURL,
-    postgresTCP: postgresExposure.url,
+    postgresTLSEndpoint: postgresExposure.url,
+    tunnelDSN,
+    tunnelSetup: {
+      socat: `socat TCP-LISTEN:15432,reuseaddr,fork OPENSSL:${tlsHost}:${tlsPort},cafile=/etc/ssl/certs/ca-certificates.crt`,
+      stunnel: `[postgres]\nclient  = yes\naccept  = 127.0.0.1:15432\nconnect = ${tlsHost}:${tlsPort}\nsni     = ${tlsHost}`,
+    },
     database: {
       hostInsideSandbox: "127.0.0.1",
       port: postgresPort,
@@ -254,10 +308,12 @@ async function main() {
       userEnv: "POSTGRES_USER",
       passwordEnv: "POSTGRES_PASSWORD",
     },
-    note: "postgresURL is a native Postgres DSN backed by a caddy-l4 TCP route.",
+    note: "TLS is terminated by caddy-l4 using the wildcard domain cert. Connect via a local TLS tunnel (socat/stunnel) with sslmode=disable.",
   };
 
   await writeFile("deploy-your-own-postgres.json", `${JSON.stringify(payload, null, 2)}\n`);
+  log("Written deploy-your-own-postgres.json");
+  log(`To connect: run the socat tunnel, then psql "${tunnelDSN}"`);
   console.log(JSON.stringify(payload, null, 2));
 }
 
@@ -265,6 +321,7 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
+
 ```
 
 ## What the script gives you

@@ -1,0 +1,286 @@
+---
+title: Create your own Upstash Redis
+description: Run a dedicated Redis instance inside an AerolVM sandbox, keep credentials in env vars, and publish an HTTP admin endpoint on a public URL.
+---
+
+This workflow boots a dedicated Redis instance inside an AerolVM sandbox, initializes it from environment variables, and keeps the database alive in a long-running session. It also starts a tiny HTTP admin endpoint that checks the database and can be exposed on a public URL.
+
+This is the Redis foundation, providing a serverless-like experience where each user or project gets its own isolated instance.
+
+## Why AerolVM fits
+
+- `create` gives each workspace or customer its own isolated Redis runtime.
+- Environment variables let you inject credentials (like `REDIS_PASSWORD`) without baking them into the image.
+- `createSession` keeps Redis and an optional HTTP admin surface alive after setup finishes.
+- Lifecycle policies let you stop or destroy idle Redis sandboxes automatically to save resources.
+
+## Native Redis endpoint via `exposePort` with `protocol: "tcp"`
+
+This page exposes the Redis protocol directly using `exposePort(6379, { protocol: "tcp" })`. The daemon allocates a parent-host port from the configured pool and points caddy-l4 at the container's `6379`, so the returned result has a `tcp://<public-host>:<host-port>` URL. This works with `redis-cli`, Ioredis, StackExchange.Redis, and any other client that speaks the Redis protocol.
+
+If you only need browser-shaped traffic (a small admin UI, REST shim), call `exposePort()` with no options - that's the HTTPS-only path.
+
+## Copy-paste TypeScript script
+
+Set these environment variables before running the script:
+
+- `SB_PAT_TOKEN`
+- `REDIS_PASSWORD`
+- Optional: `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD` for the HTTP admin endpoint.
+
+If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:21212`.
+
+```ts
+import { writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
+const patToken = process.env.SB_PAT_TOKEN;
+const redisPassword = process.env.REDIS_PASSWORD ?? 'password';
+const publicAuthUser = process.env.PUBLIC_AUTH_USER ?? 'admin';
+const publicAuthPassword = process.env.PUBLIC_AUTH_PASSWORD ?? redisPassword;
+
+const redisPort = 6379;
+const adminPort = 3000;
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+const redisURL = `redis://:${encodeURIComponent(redisPassword)}@127.0.0.1:${redisPort}`;
+
+const adminServer = `import base64
+import json
+import os
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
+AUTH_USER = os.environ.get("PUBLIC_AUTH_USER")
+AUTH_PASSWORD = os.environ.get("PUBLIC_AUTH_PASSWORD")
+PORT = int(os.environ.get("PORT", "3000"))
+
+
+def expected_auth_header() -> str:
+    if not AUTH_USER or not AUTH_PASSWORD:
+        return None
+    token = base64.b64encode(f"{AUTH_USER}:{AUTH_PASSWORD}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def query_redis() -> bytes:
+    result = subprocess.run(
+        ["redis-cli", "-u", REDIS_URL, "INFO", "server"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip().encode("utf-8")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if (self.path == "/healthz"):
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        auth = expected_auth_header()
+        if auth and self.headers.get("Authorization") != auth:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="redis-admin"')
+            self.end_headers()
+            return
+
+        try:
+            body = query_redis()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except subprocess.CalledProcessError as error:
+            body = json.dumps(
+                {"error": error.stderr.strip() or "redis-cli failed"},
+            ).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+
+ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+`;
+
+function log(msg: string) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+async function waitForRedis(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
+  log("Waiting for Redis to accept connections...");
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const result = await sandbox.exec({
+      command: `redis-cli -a "${redisPassword}" ping`,
+      timeoutSeconds: 5,
+    });
+
+    if (result.exitCode === 0 && result.stdout.trim() === "PONG") {
+      log(`Redis ready after ${attempt + 1} attempt(s)`);
+      return;
+    }
+
+    log(`  attempt ${attempt + 1}/30: not ready yet (exitCode=${result.exitCode})`);
+    await delay(1000);
+  }
+
+  throw new Error("Redis did not become ready in time.");
+}
+
+async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>, adminSessionID: string) {
+  log("Waiting for admin HTTP server on port 3000...");
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const result = await sandbox.exec({
+      command:
+        'python3 -c "import urllib.request; urllib.request.urlopen("http://127.0.0.1:3000/healthz").read()"',
+      timeoutSeconds: 5,
+    });
+
+    if (result.exitCode === 0) {
+      log(`Admin server ready after ${attempt + 1} attempt(s)`);
+      return;
+    }
+
+    log(`  attempt ${attempt + 1}/20: not ready yet (exitCode=${result.exitCode}) ${result.stderr.trim()}`);
+    await delay(1000);
+  }
+
+  const sessionLog = await sandbox.sessionLog(adminSessionID);
+  console.error("[admin session log]
+" + new TextDecoder().decode(sessionLog));
+  throw new Error("The HTTP admin endpoint did not become ready in time.");
+}
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+
+  log(`Creating sandbox (image=redis:7-bookworm cpu=1 mem=1024MB disk=5GB)...`);
+  const sandbox = await client.create({
+    image: "redis:7-bookworm",
+    osUser: "root",
+    cpu: 1,
+    memoryMB: 1024,
+    diskGB: 5,
+    env: {
+      REDIS_PASSWORD: redisPassword,
+      PUBLIC_AUTH_USER: publicAuthUser,
+      PUBLIC_AUTH_PASSWORD: publicAuthPassword,
+      PORT: String(adminPort),
+    },
+    lifecycle: {
+      stopIfIdleFor: 30 * 60 * 1_000_000_000,
+      destroyIfIdleFor: 6 * 60 * 60 * 1_000_000_000,
+    },
+  });
+  log(`Sandbox created: ${sandbox.id}`);
+
+  log("Installing python3...");
+  const aptResult = await sandbox.exec({
+    command:
+      "apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*",
+    timeoutSeconds: 240,
+  });
+  if (aptResult.exitCode !== 0) {
+    throw new Error(`apt-get failed (exitCode=${aptResult.exitCode}): ${aptResult.stderr}`);
+  }
+  log("python3 installed");
+
+  log("Creating workspace directories and uploading admin server script...");
+  await sandbox.exec("mkdir -p /workspace/admin");
+  await sandbox.uploadFile("/workspace/admin/redis-admin.py", adminServer);
+  log("Admin script uploaded to /workspace/admin/redis-admin.py");
+
+  log("Starting Redis session...");
+  const redisSession = await sandbox.createSession({
+    name: "redis",
+    command: `redis-server --requirepass "${redisPassword}" --bind 0.0.0.0`,
+  });
+  log(`Redis session started: ${redisSession.id}`);
+
+  await waitForRedis(sandbox);
+
+  log("Starting admin HTTP server session...");
+  const adminSession = await sandbox.createSession({
+    name: "redis-admin",
+    command: "python3 /workspace/admin/redis-admin.py",
+    workDir: "/workspace/admin",
+    env: {
+      REDIS_URL: redisURL,
+      PUBLIC_AUTH_USER: publicAuthUser,
+      PUBLIC_AUTH_PASSWORD: publicAuthPassword,
+      PORT: String(adminPort),
+    },
+  });
+  log(`Admin session started: ${adminSession.id}`);
+
+  await waitForAdmin(sandbox, adminSession.id);
+
+  log(`Exposing admin HTTP port ${adminPort}...`);
+  const adminExposure = await sandbox.exposePort(adminPort);
+  log(`Admin port exposed: ${adminExposure.url}`);
+
+  log(`Exposing Redis port ${redisPort} via TCP...`);
+  const redisExposure = await sandbox.exposePort(redisPort, { protocol: "tcp" });
+  log(`Redis TCP endpoint: ${redisExposure.url}`);
+
+  const payload = {
+    sandboxID: sandbox.id,
+    redisSessionID: redisSession.id,
+    adminSessionID: adminSession.id,
+    adminURL: adminExposure.url,
+    redisEndpoint: redisExposure.url,
+    connectionString: `redis://:${redisPassword}@${redisExposure.url.replace('tcp://', '')}`,
+  };
+
+  await writeFile("create-upstash-redis.json", `${JSON.stringify(payload, null, 2)}
+`);
+  log("Written create-upstash-redis.json");
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+```
+
+## What the script gives you
+
+- `create-upstash-redis.json` with the sandbox ID, the running session IDs, the public HTTP admin URL, and a native `redis://...` connection string.
+- A Redis server listening on port `6379` inside the sandbox, published as a `tcp://<public-host>:<host-port>` endpoint.
+- A password-protected HTTP endpoint on port `3000` that returns basic Redis server info.
+
+## Connecting natively
+
+The `redisEndpoint` or `connectionString` returned by the script can be used with any Redis client:
+
+```bash
+redis-cli -u "redis://:password@<public-host>:<host-port>"
+```
+
+## Related docs
+
+- [TCP & TLS Ports](/tcp-ports/)
+- [Environment](/environment/)
+- [Preview](/preview/)
+- [Port Allowlist](/port-allowlist/)
+- [Sessions](/sessions/)
