@@ -186,7 +186,7 @@ You pay: only what you give up by terminating at the edge - mTLS, custom ALPN, a
 | Supports mTLS / client certs? | n/a | **No** (terminator strips them) |
 | Client must send SNI? | No | **Yes** |
 | Needs `--domain`? | No | **Yes** |
-| Needs `--dns-provider`? | No | **Yes** (so the wildcard exists) |
+| Needs `--dns-provider`? | No | **Yes** — required by the installer whenever `--domain` is set |
 | Firewall holes per exposure | 1 | 0 (shared listener) |
 | Multiplexing model | One server per host port | One server, many SNI routes |
 
@@ -196,7 +196,7 @@ You pay: only what you give up by terminating at the edge - mTLS, custom ALPN, a
 >
 > **TLS-SNI** is the answer for "I want a `tls://` URL on `:443` with a real cert, and my backend just speaks plain TCP."
 
-If you're picking between them and not sure, default to **TLS-SNI** when DNS-01 is configured - it gives you the friendly URL, the real cert, and zero per-firewall ports. Fall back to **TCP** if your client doesn't send SNI, your backend needs the raw handshake, or your install isn't using `--dns-provider`.
+If you're picking between them and not sure, default to **TLS-SNI** in domain mode — it gives you the friendly URL, the real cert, and zero per-firewall ports. Fall back to **TCP** if your client doesn't send SNI, your backend needs the raw handshake, or you're running in IP/path mode without `--domain`.
 
 ## Related docs
 

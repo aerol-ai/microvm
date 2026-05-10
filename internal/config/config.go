@@ -94,14 +94,15 @@ type Config struct {
 	// protocol="tls" requests). When set, caddy-l4 binds this address and
 	// routes by SNI to per-sandbox subdomains.
 	//
-	// install.sh sets this to ":443" when --dns-provider is configured (the
-	// HTTPS Caddy server is moved to 127.0.0.1:8443 in that case so caddy-l4
-	// can own :443). Without --dns-provider, HTTP-01 issuance still needs
-	// :443 free for ACME, so we leave it empty.
+	// install.sh sets this to ":443" in domain mode (which always uses
+	// DNS-01 wildcard issuance, so :443 is free of ACME traffic and caddy-l4
+	// can own it). The HTTPS Caddy server is moved to 127.0.0.1:8443 in that
+	// case. In IP/path mode (no --domain) this stays empty and caddy-l4
+	// is never started.
 	L4TLSListen string
 	// L4TLSFallback is the local address caddy-l4 forwards a TLS connection
 	// to when no per-sandbox SNI route matches — i.e. the regular HTTPS site
-	// served by Caddy itself (sandbox API, on-demand TLS, the catch-all 404).
+	// served by Caddy itself (sandbox API and the catch-all 404).
 	// Required when L4TLSListen is non-empty; ignored otherwise. Default is
 	// "127.0.0.1:8443" to match install.sh's relocated HTTPS listener.
 	L4TLSFallback string
@@ -196,9 +197,10 @@ func Load() (Config, error) {
 	}
 
 	// If TLS-SNI multiplexing is enabled, the fallback HTTPS address must be
-	// set — otherwise non-sandbox SNI (the API itself, on-demand TLS) would
-	// land nowhere. An operator who explicitly sets SB_L4_TLS_FALLBACK="" while
-	// also setting SB_L4_TLS_LISTEN is misconfigured; surface it at boot.
+	// set — otherwise non-sandbox SNI (the API itself, the catch-all 404)
+	// would land nowhere. An operator who explicitly sets
+	// SB_L4_TLS_FALLBACK="" while also setting SB_L4_TLS_LISTEN is
+	// misconfigured; surface it at boot.
 	if cfg.L4TLSListen != "" && cfg.L4TLSFallback == "" {
 		return Config{}, errors.New("SB_L4_TLS_FALLBACK must be set when SB_L4_TLS_LISTEN is set (caddy-l4 needs a target for non-sandbox SNI)")
 	}
