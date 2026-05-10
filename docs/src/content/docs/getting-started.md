@@ -187,23 +187,6 @@ See [GPU Sandboxes](/gpu-sandboxes) for code examples in all SDK languages.
 
 ---
 
-## Building from Source
-
-To run the server directly from a checkout (no installer):
-
-```bash
-make build
-
-export SB_PAT_TOKEN=dev-token
-export SB_DB_PATH=$PWD/sandbox.db
-export SB_PUBLIC_HOST=127.0.0.1
-export SB_ENABLE_CADDY=false
-
-./bin/sandboxd
-```
-
-Required: Docker daemon running on the host. No Caddy required when `SB_ENABLE_CADDY=false`; the API is served directly on `http://localhost:21212`.
-
 ## Next Steps
 
 - [SDK Setup](/sdk-setup) - connect an SDK to the running server

@@ -12,11 +12,11 @@ AerolVM is a self-hosted platform for creating isolated Docker-backed sandboxes 
 
 ## Install a Server
 
-**Trial / single-user** (HTTP-01 on-demand TLS):
+**Local Setup** :
 
 ```bash
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
-    --domain sandbox.example.com \
+    --local \
     --pat-token your-secret-pat
 ```
 
