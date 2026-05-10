@@ -3,6 +3,10 @@
     margin-top: 0;
   }
 
+  > .sl-heading-wrapper:first-child {
+    margin-top: 0;
+  }
+
   > h2[id]:first-child,
   > h3[id]:first-child,
   > h4[id]:first-child,
@@ -10,8 +14,17 @@
     margin-top: 0;
   }
 
-  > :not(h1, h2, h3, h4, h5, h6, p, aside) {
+  > :not(h1, h2, h3, h4, h5, h6, p, aside, .sl-heading-wrapper) {
     margin-bottom: 48px;
+  }
+
+  > .sl-heading-wrapper.level-h2,
+  > .sl-heading-wrapper.level-h3,
+  > .sl-heading-wrapper.level-h4,
+  > .sl-heading-wrapper.level-h5 {
+    margin-top: 48px;
+    margin-bottom: 16px;
+    position: relative;
   }
 
   > h2[id],
@@ -21,29 +34,6 @@
     margin-top: 48px;
     margin-bottom: 16px;
     position: relative;
-  }
-
-  > h2[id] .heading-anchor,
-  > h3[id] .heading-anchor,
-  > h4[id] .heading-anchor,
-  > h5[id] .heading-anchor {
-    opacity: 0;
-    position: absolute;
-    right: 100%;
-    top: 50%;
-    transform: translateY(-50%);
-    padding-right: 0.25em;
-    font-size: 0.875em;
-    color: var(--secondary-text-color);
-    text-decoration: none;
-    transition: opacity 150ms ease, color 150ms ease;
-  }
-
-  > h2[id]:hover .heading-anchor,
-  > h3[id]:hover .heading-anchor,
-  > h4[id]:hover .heading-anchor,
-  > h5[id]:hover .heading-anchor {
-    opacity: 1;
   }
 
   > p {
