@@ -274,10 +274,16 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
-            label: 'One-click user sandbox per workspace',
-            description: 'Provision an isolated sandbox as part of each product workspace.',
+            href: '/use-cases/customer-facing-product-experiences/secure-burner-browser',
+            label: 'Secure Burner Browser',
+            description: 'Launch a disposable Chromium desktop in a sandbox and stream it into the browser over noVNC.',
           },
+          // {
+          //   type: 'link',
+          //   href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
+          //   label: 'One-click user sandbox per workspace',
+          //   description: 'Provision an isolated sandbox as part of each product workspace.',
+          // },
         ],
       },
       {
