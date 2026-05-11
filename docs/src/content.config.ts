@@ -196,13 +196,6 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
     category: NavigationCategory.USE_CASES,
     entries: [
       {
-        type: 'link',
-        href: '/use-cases',
-        label: 'Overview',
-        description: 'Top-priority AerolVM use cases selected from the planning matrix.',
-        exact: true,
-      },
-      {
         type: 'group',
         label: 'Coding Agents & Harness Engineering',
         entries: [
@@ -278,6 +271,36 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
             href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
             label: 'One-click user sandbox per workspace',
             description: 'Provision an isolated sandbox as part of each product workspace.',
+          },
+        ],
+      },
+      {
+        type: 'group',
+        label: 'Data Processing & ML',
+        entries: [
+          {
+            type: 'link',
+            href: '/use-cases/data-processing-ml/kaggle-to-parquet',
+            label: 'Kaggle Dataset to Parquet',
+            description: 'Download a large dataset from Kaggle, process it using Polars inside an AerolVM sandbox, and export the optimized Parquet file.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/data-processing-ml/duckdb-dataset-explorer',
+            label: 'SQL on Kaggle with DuckDB',
+            description: 'Launch a DuckDB instance inside a sandbox to run SQL queries directly on Kaggle datasets without a traditional database setup.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/data-processing-ml/hyperparameter-tuning-farm',
+            label: 'Hyperparameter Tuning Farm',
+            description: 'Spin up multiple concurrent sandboxes to test different model configurations in parallel.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/data-processing-ml/headless-jupyter-notebook',
+            label: 'Headless Jupyter Notebook',
+            description: 'Spin up a full JupyterLab environment in a sandbox and access it via a public URL.',
           },
         ],
       },

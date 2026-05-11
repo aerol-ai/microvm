@@ -1,0 +1,70 @@
+---
+title: Headless Jupyter Notebook
+description: Spin up a full JupyterLab environment in a sandbox and access it via a public URL.
+---
+
+Sometimes you need a clean, interactive environment to explore a new dataset or library. This use case shows how to boot a sandbox, install a data science stack, and start a **JupyterLab** server that you can access from your browser.
+
+## Interactive Sandboxes
+
+- **Disposable Labs:** Spin up a new lab for every experiment.
+- **Pre-configured Stacks:** Launch a notebook with specific versions of PyTorch, TensorFlow, or JAX already installed.
+- **Secure Access:** Only the bearer of the token (and the public URL) can access the environment.
+
+## Copy-paste TypeScript script
+
+Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/headless-jupyter-notebook](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/headless-jupyter-notebook)
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
+const patToken = process.env.SB_PAT_TOKEN;
+const jupyterToken = "aerolvm-secret-token"; // Choose a secure token
+
+
+
+async function main() {
+  if (!patToken) throw new Error("Set SB_PAT_TOKEN.");
+  console.log("Initializing AerolVM client...");
+  const client = new MicroVM({ apiUrl, patToken });
+
+  console.log("Creating Jupyter sandbox (1 CPU, 2GB RAM)...");
+  const sandbox = await client.create({
+    image: "python:3.11-bookworm",
+    cpu: 1,
+    memoryMB: 2048,
+  });
+  console.log(`Sandbox created successfully! ID: ${sandbox.id}`);
+
+  console.log("Installing JupyterLab and Data Science stack (this may take a minute)...");
+  const installRes = await sandbox.exec("pip install jupyterlab pandas matplotlib polars");
+  console.log(`Packages installed (exit code: ${installRes.exitCode}, duration: ${installRes.durationMS}ms)`);
+
+  console.log("Starting JupyterLab server session...");
+  const session = await sandbox.createSession({
+    name: "jupyter-server",
+    command: `jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='${jupyterToken}' --allow-root`,
+  });
+  console.log(`JupyterLab session started! ID: ${session.id}`);
+
+  console.log("Exposing Jupyter port 8888...");
+  const exposure = await sandbox.exposePort(8888);
+  console.log(`Port exposed successfully!`);
+
+  console.log("\n--- JupyterLab Ready ---");
+  console.log(`URL: ${exposure.url}?token=${jupyterToken}`);
+  console.log("-------------------------\n");
+  
+  console.log("The sandbox will stay alive as long as you use the notebook.");
+}
+
+main().catch(console.error);
+
+```
+
+## Related docs
+- [Exposing Ports](/tcp-ports/)
+- [Sessions](/sessions/)
+- [Preview URLs](/preview/)
+---

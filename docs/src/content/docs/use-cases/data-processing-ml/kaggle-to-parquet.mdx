@@ -1,0 +1,130 @@
+---
+title: Kaggle Dataset to Parquet
+description: Download a large dataset from Kaggle, process it using Polars inside an AerolVM sandbox, and export the optimized Parquet file.
+---
+
+This workflow demonstrates how to use a high-memory AerolVM sandbox as an ephemeral ETL (Extract, Transform, Load) worker. We download a dataset from Kaggle, use **Polars** for lightning-fast data manipulation, and save the result as an optimized Parquet file.
+
+## Why use a sandbox for ETL?
+
+- **Isolation:** Don't clutter your local machine with multi-gigabyte CSVs.
+- **Resource Scaling:** Spin up a sandbox with 16GB or 32GB of RAM for heavy processing, then destroy it when done.
+- **Reproducibility:** The environment (Python version, libraries) is locked and consistent every time.
+
+## Copy-paste TypeScript script
+
+Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/kaggle-to-parquet](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/kaggle-to-parquet)
+
+Set these environment variables before running:
+- `SB_PAT_TOKEN`
+- `KAGGLE_USERNAME`
+- `KAGGLE_KEY`
+- `KAGGLE_DATASET` (e.g., `mlg-ulb/creditcardfraud`)
+
+```ts
+import { writeFile } from "node:fs/promises";
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
+const patToken = process.env.SB_PAT_TOKEN;
+const kaggleUsername = process.env.KAGGLE_USERNAME;
+const kaggleKey = process.env.KAGGLE_API_TOKEN ;
+const kaggleDataset = process.env.KAGGLE_DATASET ?? "mlg-ulb/creditcardfraud";
+
+
+
+const processingScript = `
+import os
+import polars as pl
+from kaggle.api.kaggle_api_extended import KaggleApi
+
+api = KaggleApi()
+api.authenticate()
+
+dataset = os.environ.get('KAGGLE_DATASET')
+print(f"Downloading {dataset}...")
+api.dataset_download_files(dataset, path='./data', unzip=True)
+
+# Find the CSV file
+csv_files = [f for f in os.listdir('./data') if f.endswith('.csv')]
+if not csv_files:
+    raise Exception("No CSV file found in dataset")
+
+input_file = os.path.join('./data', csv_files[0])
+output_file = "processed_data.parquet"
+
+print(f"Processing {input_file} with Polars...")
+df = pl.read_csv(input_file, infer_schema_length=1000000)
+
+# Perform some basic cleaning/optimization
+df = df.drop_nulls()
+
+print(f"Saving to {output_file}...")
+df.write_parquet(output_file)
+print("Done!")
+`;
+
+async function main() {
+  if (!patToken || !kaggleUsername || !kaggleKey) {
+    throw new Error("Set SB_PAT_TOKEN, KAGGLE_USERNAME, and KAGGLE_KEY before running.");
+  }
+  console.log("Initializing AerolVM client...");
+  const client = new MicroVM({ apiUrl, patToken });
+
+  console.log("Creating ETL sandbox (1 CPU, 2GB RAM)...");
+  const sandbox = await client.create({
+    image: "python:3.11-bookworm",
+    cpu: 1,
+    memoryMB: 2048,
+    env: {
+      KAGGLE_USERNAME: kaggleUsername,
+      KAGGLE_KEY: kaggleKey,
+      KAGGLE_DATASET: kaggleDataset,
+    }
+  });
+  console.log(`Sandbox created successfully! ID: ${sandbox.id}`);
+
+  console.log("Installing dependencies (polars, kaggle)...");
+  const installRes = await sandbox.exec("pip install polars kaggle");
+  console.log(`Dependencies installed (exit code: ${installRes.exitCode}, duration: ${installRes.durationMS}ms)`);
+
+  console.log("Preparing ETL directory...");
+  await sandbox.exec("mkdir -p /etl");
+
+  console.log("Uploading processing script...");
+  await sandbox.uploadFile("/etl/process.py", processingScript);
+  console.log("Script uploaded to /etl/process.py");
+
+  console.log("Running ETL pipeline (this downloads and processes data)...");
+  const result = await sandbox.exec({ command: "python3 /etl/process.py", workDir: "/etl" });
+  console.log(`ETL Pipeline finished! (exit code: ${result.exitCode}, duration: ${result.durationMS}ms)`);
+  
+  if (result.exitCode !== 0) {
+    console.error("ETL Failed.");
+    console.error("--- STDOUT ---");
+    console.error(result.stdout);
+    console.error("--- STDERR ---");
+    console.error(result.stderr);
+    process.exit(1)
+  }
+
+  console.log("ETL Complete. Downloading optimized Parquet file to local machine...");
+  const parquetData = await sandbox.downloadFile("/etl/processed_data.parquet");
+  console.log(`Downloaded ${parquetData.byteLength} bytes.`);
+  
+  await writeFile("processed_data.parquet", Buffer.from(parquetData));
+  console.log("Success! File saved to disk as processed_data.parquet");
+  
+  console.log("Cleaning up: Destroying sandbox...");
+  await sandbox.destroy();
+  console.log("Sandbox destroyed.");
+}
+
+main().catch(console.error);
+```
+
+## Related docs
+- [Creating Sandboxes](/environment/)
+- [File Transfers](/files/)
+- [Compute Resources](/compute/)
+---
