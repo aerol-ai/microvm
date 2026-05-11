@@ -286,3 +286,260 @@ func mustAdmit(t *testing.T, a *Admitter, id string, req Request) {
 		t.Fatalf("admit %q: %v", id, err)
 	}
 }
+
+// TestReleaseUnknownIDIsNoOp pins down the contract used by every Release
+// call site (Stop, Destroy, die-event, reconcile-stopped-branch): release on
+// an ID that was never reserved must be a silent no-op, not a panic or a
+// negative-counter corruption. Without this the lifecycle code would have to
+// guard every Release with a "did we Admit?" check.
+func TestReleaseUnknownIDIsNoOp(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	a.Release("never-existed")
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 0 || snap.ReservedCPU != 0 || snap.ReservedMemoryMB != 0 {
+		t.Fatalf("release of unknown id mutated state: %+v", snap)
+	}
+}
+
+// TestReleaseIdempotent: two Releases of the same ID must leave the admitter
+// in the post-first-release state. Stop → die event will both fire Release
+// in normal operation.
+func TestReleaseIdempotent(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 2, MemoryMB: 1024})
+	a.Release("a")
+	a.Release("a") // second release is the regression — must not double-subtract
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 0 || snap.ReservedCPU != 0 || snap.ReservedMemoryMB != 0 {
+		t.Fatalf("double release corrupted state: %+v", snap)
+	}
+	// And the freed budget is fully reusable.
+	mustAdmit(t, a, "b", Request{CPU: 4, MemoryMB: 4000})
+}
+
+// TestReserveOverwritesPriorReserve covers the replay → out-of-band-start
+// path. ReplayReservations sets initial state; if a sandbox then comes back
+// online with different specs (resize-while-stopped is a future feature, but
+// the safety property must hold today), the second Reserve must overwrite, not
+// stack.
+func TestReserveOverwritesPriorReserve(t *testing.T) {
+	a := New(HostInfo{CPUCores: 16, MemoryTotalMB: 32_000}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	a.Reserve("a", Request{CPU: 2, MemoryMB: 1024})
+	a.Reserve("a", Request{CPU: 8, MemoryMB: 16_000})
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 1 {
+		t.Fatalf("Reserve must overwrite, got %d active", snap.SandboxesActive)
+	}
+	if snap.ReservedCPU != 8 || snap.ReservedMemoryMB != 16_000 {
+		t.Fatalf("Reserve overwrite footprint wrong: %+v", snap)
+	}
+}
+
+// TestAdmitFailurePreservesPriorReservation: a rejected Admit must leave the
+// existing reservation intact. The bug we'd see otherwise is a resize that
+// fails to fit and silently zeroes out the original CPU/mem booking, which
+// would then let a *third* sandbox slip in over the host budget.
+func TestAdmitFailurePreservesPriorReservation(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 2, MemoryMB: 1024})
+	// Re-admit asking for the entire host; with one slot already reserved this
+	// must fail.
+	if err := a.Admit("a", Request{CPU: 8, MemoryMB: 8192}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected re-admit overflow, got %v", err)
+	}
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 1 || snap.ReservedCPU != 2 || snap.ReservedMemoryMB != 1024 {
+		t.Fatalf("rejected re-admit corrupted prior reservation: %+v", snap)
+	}
+}
+
+// TestAdmitDownsizeReleasesDelta: re-Admit with a *smaller* footprint must
+// give back the difference so the freed budget is immediately admittable.
+// Mirror image of TestAdmitFailurePreservesPriorReservation but for the
+// success branch.
+func TestAdmitDownsizeReleasesDelta(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 4, MemoryMB: 4096})
+	// Now host is fully reserved by "a". Downsize "a" and admit a second.
+	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 1024})
+	mustAdmit(t, a, "b", Request{CPU: 3, MemoryMB: 3072})
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 2 || snap.ReservedCPU != 4 || snap.ReservedMemoryMB != 4096 {
+		t.Fatalf("downsize delta accounting wrong: %+v", snap)
+	}
+}
+
+// TestAdmitUpsizeOverflowKeepsOriginal pairs with Downsize: an upsize that
+// pushes total over budget must reject AND leave the original reservation
+// untouched (no half-applied state).
+func TestAdmitUpsizeOverflowKeepsOriginal(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 2, MemoryMB: 1024})
+	mustAdmit(t, a, "b", Request{CPU: 2, MemoryMB: 1024})
+	// Host is at 4 CPU / 2048 MB. Upsizing "a" by 1 CPU would put us at 5 — reject.
+	if err := a.Admit("a", Request{CPU: 3, MemoryMB: 1024}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected upsize overflow, got %v", err)
+	}
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 2 || snap.ReservedCPU != 4 || snap.ReservedMemoryMB != 2048 {
+		t.Fatalf("upsize-overflow leaked state: %+v", snap)
+	}
+}
+
+// TestMemoryFloorDisabledWhenRatioZero: the floor check must short-circuit
+// on the zero-ratio config even if a probe is wired in. Useful so test setups
+// that don't care about the floor don't accidentally trigger it.
+func TestMemoryFloorDisabledWhenRatioZero(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		MemoryFloorRatio:       0,
+	}, fakeProbe{free: 0}) // probe says zero free; admit must still succeed
+
+	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 1024}); err != nil {
+		t.Fatalf("floor=0 should bypass probe entirely, got %v", err)
+	}
+}
+
+// TestMemoryFloorExactBoundary: free-req == floor must reject. The condition
+// is `free-req < floor`, so equality is the boundary case the operator
+// expects to *pass*.
+func TestMemoryFloorExactBoundary(t *testing.T) {
+	// Floor: 1000 MB on a 16384 MB host = ~0.061.
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		MemoryFloorRatio: 1000.0 / 16384.0,
+	}, fakeProbe{free: 1500})
+
+	// 1500 - 500 = 1000 — exactly at floor, must NOT reject.
+	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 500}); err != nil {
+		t.Fatalf("admit at exact floor boundary rejected: %v", err)
+	}
+	a.Release("a")
+	// 1500 - 501 = 999 — below floor, must reject.
+	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 501}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("admit one MB below floor accepted: %v", err)
+	}
+}
+
+// TestSnapshotReportsBudgetAndFloor: operators rely on /capacity to debug
+// "why was I rejected." The snapshot must surface the derived budgets and
+// floor the admitter uses internally.
+func TestSnapshotReportsBudgetAndFloor(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 10_000}, Limits{
+		CPUReservationRatio:       0.5,
+		MemoryReservationRatio:    0.8,
+		MemoryFloorRatio:          0.1, // 1000 MB
+		CPUOverProvisionFactor:    2.0,
+		MemoryOverProvisionFactor: 1.5,
+	}, fakeProbe{free: 5000})
+
+	snap := a.Snapshot()
+	if snap.CPUBudget != 8*0.5*2.0 {
+		t.Fatalf("CPUBudget = %v, want %v", snap.CPUBudget, 8*0.5*2.0)
+	}
+	if snap.MemoryBudgetMB != int(float64(10_000)*0.8*1.5) {
+		t.Fatalf("MemoryBudgetMB = %d, want %d", snap.MemoryBudgetMB, int(float64(10_000)*0.8*1.5))
+	}
+	if snap.MemoryFloorMB != 1000 {
+		t.Fatalf("MemoryFloorMB = %d, want 1000", snap.MemoryFloorMB)
+	}
+	if snap.LiveMemoryFreeMB != 5000 {
+		t.Fatalf("LiveMemoryFreeMB = %d, want 5000 (probe value)", snap.LiveMemoryFreeMB)
+	}
+}
+
+// TestZeroReservationRatiosAreUnlimited: documented contract for the zero
+// values of CPUReservationRatio and MemoryReservationRatio. With both at zero
+// every Admit must succeed regardless of host size — this is what hosted
+// development setups use to disable admission entirely.
+func TestZeroReservationRatiosAreUnlimited(t *testing.T) {
+	a := New(HostInfo{CPUCores: 1, MemoryTotalMB: 100}, Limits{
+		CPUReservationRatio:    0,
+		MemoryReservationRatio: 0,
+	}, nil)
+
+	for i := range 50 {
+		id := fmt.Sprintf("s-%d", i)
+		if err := a.Admit(id, Request{CPU: 100, MemoryMB: 1_000_000}); err != nil {
+			t.Fatalf("admit %s on unlimited admitter: %v", id, err)
+		}
+	}
+}
+
+// TestReleaseIsolatedBetweenSandboxes: releasing one sandbox must not affect
+// the reservation of another, even when both have identical CPU/mem footprints.
+// Map-based Release means this should be obvious, but it pins down the
+// invariant the lifecycle code depends on.
+func TestReleaseIsolatedBetweenSandboxes(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 1024})
+	mustAdmit(t, a, "b", Request{CPU: 1, MemoryMB: 1024})
+	mustAdmit(t, a, "c", Request{CPU: 1, MemoryMB: 1024})
+
+	a.Release("b")
+	snap := a.Snapshot()
+	if snap.SandboxesActive != 2 {
+		t.Fatalf("Release of b leaked: %+v", snap)
+	}
+	if snap.ReservedCPU != 2 || snap.ReservedMemoryMB != 2048 {
+		t.Fatalf("Release accounting wrong after isolating b: %+v", snap)
+	}
+	// The freed slot is exactly b-sized; refilling it brings us back to 3 reservations
+	// at 3/4 cores, then the next request must respect the remaining budget.
+	mustAdmit(t, a, "d", Request{CPU: 1, MemoryMB: 1024})
+	if err := a.Admit("e", Request{CPU: 2, MemoryMB: 1024}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected CPU rejection, only 1 core free: %v", err)
+	}
+}
+
+// TestSnapshotIsPointInTime: Snapshot() returns a copy, not a live view —
+// later mutations on the admitter must not affect a previously-captured
+// Snapshot. /capacity callers depend on this for stable response bodies.
+func TestSnapshotIsPointInTime(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 1024})
+	before := a.Snapshot()
+
+	mustAdmit(t, a, "b", Request{CPU: 2, MemoryMB: 2048})
+	a.Release("a")
+
+	if before.SandboxesActive != 1 || before.ReservedCPU != 1 || before.ReservedMemoryMB != 1024 {
+		t.Fatalf("captured snapshot mutated by later ops: %+v", before)
+	}
+	now := a.Snapshot()
+	if now.SandboxesActive != 1 || now.ReservedCPU != 2 || now.ReservedMemoryMB != 2048 {
+		t.Fatalf("live snapshot wrong: %+v", now)
+	}
+}

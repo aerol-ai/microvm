@@ -342,12 +342,33 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		return nil, err
 	}
 
+	// Re-Admit against the host budget before touching Docker. StopSandbox
+	// (and the die/stop/oom event handler) releases the reservation, so a
+	// stopped sandbox does not hold capacity. Admit is idempotent per ID:
+	// already-running sandboxes computed against the same footprint succeed
+	// without double-counting. A failed admission must not mutate any state.
+	if s.admitter != nil {
+		if err := s.admitter.Admit(id, capacity.Request{
+			CPU:      sandbox.CPU,
+			MemoryMB: sandbox.MemoryMB,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	releaseAdmission := func() {
+		if s.admitter != nil {
+			s.admitter.Release(id)
+		}
+	}
+
 	specs, err := s.loadMounts(ctx, id)
 	if err != nil {
+		releaseAdmission()
 		return nil, err
 	}
 	if len(specs) > 0 {
 		if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+			releaseAdmission()
 			return nil, fmt.Errorf("reestablish mounts: %w", err)
 		}
 	}
@@ -355,6 +376,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	state, err := s.docker.Start(ctx, sandboxContainerRef(sandbox))
 	if err != nil {
 		_ = s.mounts.UnmountAll(id)
+		releaseAdmission()
 		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 		return nil, err
 	}
@@ -373,6 +395,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
 			_ = s.docker.Stop(ctx, sandboxContainerRef(sandbox))
 			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			return nil, fmt.Errorf("apply network block on start: %w", err)
 		}
@@ -405,6 +428,15 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 	}
 	if err := s.docker.Stop(ctx, sandboxContainerRef(sandbox)); err != nil {
 		return nil, err
+	}
+	// Release the admitter slot now that the container is no longer running.
+	// A stopped sandbox holds no CPU/RAM on the host; keeping the reservation
+	// would let the host budget run out even though nothing is consuming it,
+	// and admins routinely use Stop+Start to free capacity for new work.
+	// StartSandbox re-Admits on the way back up. Release is idempotent so a
+	// concurrent die event running the same path is safe.
+	if s.admitter != nil {
+		s.admitter.Release(id)
 	}
 	if err := s.mounts.UnmountAll(id); err != nil {
 		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
@@ -905,10 +937,12 @@ func (s *Service) Capacity() capacity.Snapshot {
 // ReplayReservations re-populates the admitter from persistent state. Without
 // this, after a daemon restart the admitter sees zero reservations and the
 // host can be overcommitted on the first wave of new sandboxes. Destroyed
-// sandboxes are skipped — they still occupy a row but no longer hold
-// resources. Best-effort: a store error is logged, not returned, since
-// admission control degrading to "unaware" is preferable to refusing to
-// boot.
+// AND stopped sandboxes are skipped — neither holds host CPU/RAM (the stop
+// path releases the slot, and StartSandbox re-Admits on the way back up), so
+// counting them here would re-introduce the overcommit-budget bug we fixed
+// when stop began releasing capacity. Best-effort: a store error is logged,
+// not returned, since admission control degrading to "unaware" is preferable
+// to refusing to boot.
 func (s *Service) ReplayReservations(ctx context.Context) {
 	if s.admitter == nil {
 		return
@@ -920,7 +954,7 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	}
 	replayed := 0
 	for _, sandbox := range sandboxes {
-		if sandbox.Status == models.SandboxStatusDestroyed {
+		if sandbox.Status == models.SandboxStatusDestroyed || sandbox.Status == models.SandboxStatusStopped {
 			continue
 		}
 		s.admitter.Reserve(sandbox.ID, capacity.Request{
@@ -995,6 +1029,25 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		sandbox.Status = state.Status
 		sandbox.PublicURL = s.caddy.SandboxPublicURL(sandbox.ID)
 		sandbox.UpdatedAt = time.Now().UTC()
+		// Keep admitter accounting in sync with observed runtime state. The
+		// API and event paths handle the common transitions; this branch
+		// covers anything those missed — daemon restart with stale Stop
+		// events lost, out-of-band `docker stop`/`docker start` outside the
+		// event window, or a racy bootstrap. Reserve forces the slot for
+		// running containers (we cannot refuse host-side reality), Release
+		// frees it for stopped containers. Both helpers are idempotent, so
+		// running this every reconcile tick is safe and cheap.
+		if s.admitter != nil {
+			switch state.Status {
+			case models.SandboxStatusStarted:
+				s.admitter.Reserve(sandbox.ID, capacity.Request{
+					CPU:      sandbox.CPU,
+					MemoryMB: sandbox.MemoryMB,
+				})
+			case models.SandboxStatusStopped:
+				s.admitter.Release(sandbox.ID)
+			}
+		}
 		if state.Status == models.SandboxStatusStarted {
 			// Heal the per-IP egress DROP rule for sandboxes opted into
 			// NetworkBlockAll. Idempotent at the netrules layer (Exists check
