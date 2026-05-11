@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -132,6 +133,15 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
 
+	// Release the admitter slot — a stopped container holds no host CPU/RAM
+	// and the reservation would otherwise block new admissions until the
+	// sandbox is destroyed. handleStartEvent re-Reserves on the way back up
+	// (out-of-band `docker start`), and the API StartSandbox path calls
+	// Admit. Idempotent if a concurrent Stop API call also released.
+	if s.admitter != nil {
+		s.admitter.Release(sandbox.ID)
+	}
+
 	// Tear down routes and per-IP netrules best-effort. Caddy upsert/delete
 	// helpers and netrules.ClearBlockAllEgress are all idempotent.
 	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
@@ -236,6 +246,20 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return fmt.Errorf("update sandbox runtime: %w", err)
+	}
+
+	// Out-of-band start (operator ran `docker start <id>` directly): the
+	// container is already running, so we cannot refuse it via Admit. Use
+	// Reserve to force the slot regardless of budget — the host is already
+	// committed. The eventual-consistency model accepts a transient overcommit
+	// over silently dropping the reservation; the API Start path uses Admit
+	// to keep human-driven starts honest. Reserve is idempotent if the slot
+	// is already held (e.g. from API start that just upserted before us).
+	if s.admitter != nil {
+		s.admitter.Reserve(sandbox.ID, capacity.Request{
+			CPU:      sandbox.CPU,
+			MemoryMB: sandbox.MemoryMB,
+		})
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
