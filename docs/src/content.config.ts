@@ -197,43 +197,6 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
     entries: [
       {
         type: 'group',
-        label: 'Coding Agents & Harness Engineering',
-        entries: [
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/claude-code-repository-architecture-agent',
-            label: 'Generate architecture diagram',
-            description: 'Clone a real repository, run Claude headlessly, and generate arch.md.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/large-scale-refactor-migration-agent',
-            label: 'Zero-shot code execution agent',
-            description: 'Take a repository URL plus a code-change prompt, run Claude inside the repo, and raise a PR automatically.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/pull-request-review-auto-fix-agent',
-            label: 'GitHub PR review agent',
-            description: 'Check out a real PR from its URL, post a GitHub review, and export any safe fixes.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/test-writing-failure-reproduction-agent',
-            label: 'Write 500 test cases',
-            description: 'Clone a repository, have Claude generate 500 tests, and fail the run below a 90% completion threshold.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent',
-            label: 'Security vulnerability and Fix agent',
-            description: 'Scan CVEs across repository types, apply safe fixes with Claude, and raise a PR automatically.',
-          },
-
-        ],
-      },
-      {
-        type: 'group',
         label: 'Customer-Facing Product Experiences',
         entries: [
           {
@@ -286,6 +249,44 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           // },
         ],
       },
+      {
+        type: 'group',
+        label: 'AI Coding Agents & Harness Engineering',
+        entries: [
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/claude-code-repository-architecture-agent',
+            label: 'Generate architecture diagram',
+            description: 'Clone a real repository, run Claude headlessly, and generate arch.md.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/large-scale-refactor-migration-agent',
+            label: 'Zero-shot code execution agent',
+            description: 'Take a repository URL plus a code-change prompt, run Claude inside the repo, and raise a PR automatically.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/pull-request-review-auto-fix-agent',
+            label: 'GitHub PR review agent',
+            description: 'Check out a real PR from its URL, post a GitHub review, and export any safe fixes.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/test-writing-failure-reproduction-agent',
+            label: 'Write 500 test cases',
+            description: 'Clone a repository, have Claude generate 500 tests, and fail the run below a 90% completion threshold.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent',
+            label: 'Security vulnerability and Fix agent',
+            description: 'Scan CVEs across repository types, apply safe fixes with Claude, and raise a PR automatically.',
+          },
+
+        ],
+      },
+      
       {
         type: 'group',
         label: 'Data Processing & ML',
