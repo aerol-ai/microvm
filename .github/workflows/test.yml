@@ -10,7 +10,48 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      go_main: ${{ steps.filter.outputs.go_main }}
+      go_sdk: ${{ steps.filter.outputs.go_sdk }}
+      java_sdk: ${{ steps.filter.outputs.java_sdk }}
+      python_sdk: ${{ steps.filter.outputs.python_sdk }}
+      typescript_sdk: ${{ steps.filter.outputs.typescript_sdk }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+            go_main:
+              - 'cmd/**'
+              - 'internal/**'
+              - 'pkg/**'
+              - 'go.mod'
+              - 'go.sum'
+            go_sdk:
+              - 'sdk/go/**'
+              - 'go.mod'
+              - 'go.sum'
+            java_sdk:
+              - 'sdk/java/**'
+            python_sdk:
+              - 'sdk/python/**'
+            typescript_sdk:
+              - 'sdk/typescript/**'
+
   go-tests:
+    needs: changes
+    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_main == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -29,7 +70,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          go test -count=1 -coverprofile=coverage.out ./...
+          go test -count=1 -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
           go tool cover -func=coverage.out | tail -n 1
 
       - name: Upload coverage artifact
@@ -38,7 +79,26 @@ jobs:
           name: go-coverage
           path: coverage.out
 
+  go-sdk-tests:
+    needs: changes
+    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_sdk == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Go SDK tests
+        run: go test -count=1 ./sdk/go/...
+
   java-sdk-tests:
+    needs: changes
+    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.java_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -58,7 +118,33 @@ jobs:
       - name: Run Java SDK tests
         run: mvn -B -ntp test
 
+  python-sdk-tests:
+    needs: changes
+    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.python_sdk == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: sdk/python/pyproject.toml
+
+      - name: Install Python SDK dependencies
+        run: python -m pip install .
+
+      - name: Run Python SDK tests
+        run: python -m unittest discover -s tests -v
+
   typescript-sdk-tests:
+    needs: changes
+    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.typescript_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
