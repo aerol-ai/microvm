@@ -1,0 +1,277 @@
+---
+title: Secure burner browser
+description: Launch a disposable Chromium desktop inside an AerolVM sandbox and stream it into the user's browser over noVNC.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+This workflow launches a lightweight Linux desktop in an AerolVM sandbox, opens Chromium inside it, and publishes the UI over noVNC. Instead of handing a user your local browser or a long-lived shared VM, you give them a disposable browser session that can be created per click and destroyed on idle.
+
+It is the browser-isolation version of a preview URL: the product surface is not just a web app running in the sandbox, but a full remote browser running inside the sandbox.
+
+## Reference TypeScript example
+
+Code URL: [https://github.com/aerol-ai/aerovm-examples/tree/main/customer-facing/secure-burner-browser](https://github.com/aerol-ai/aerovm-examples/tree/main/customer-facing/secure-burner-browser)
+
+The reference example:
+
+- creates a sandbox with a keepalive container command so setup can happen incrementally,
+- uploads a bootstrap script that installs `chromium`, `xvfb`, `x11vnc`, `novnc`, and `websockify`,
+- reserves port `6080` with `exposePort`,
+- starts a long-running session that launches the desktop and browser, and
+- writes `secure-burner-browser.json` with the sandbox ID, session ID, preview URL, and start URL.
+
+## 1. Create the sandbox
+
+The desktop stack is easiest to bootstrap as `root` in a Debian-based image.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'debian:bookworm',
+      osUser: 'root',
+      cpu: 1,
+      memoryMB: 2048,
+      diskGB: 8,
+      containerCommand: ['sh', '-lc', 'trap : TERM INT; while true; do sleep 3600; done'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'debian:bookworm',
+        'osUser': 'root',
+        'cpu': 1,
+        'memoryMB': 2048,
+        'diskGB': 8,
+        'containerCommand': ['sh', '-lc', 'trap : TERM INT; while true; do sleep 3600; done'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:            "debian:bookworm",
+        OSUser:           "root",
+        CPU:              1,
+        MemoryMB:         2048,
+        DiskGB:           8,
+        ContainerCommand: []string{"sh", "-lc", "trap : TERM INT; while true; do sleep 3600; done"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image:             "debian:bookworm".to_string(),
+        os_user:           Some("root".to_string()),
+        cpu:               Some(1.0),
+        memory_mb:         Some(2048),
+        disk_gb:           Some(8),
+        container_command: Some(vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "trap : TERM INT; while true; do sleep 3600; done".to_string(),
+        ]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("debian:bookworm")
+            .setOsUser("root")
+            .setCpu(1)
+            .setMemoryMB(2048)
+            .setDiskGB(8)
+            .setContainerCommand(List.of("sh", "-lc", "trap : TERM INT; while true; do sleep 3600; done"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## 2. Upload the bootstrap script
+
+The reference example uploads a shell script that installs the desktop components and writes a `run-browser-isolation.sh` launcher inside the sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.uploadFile(
+      '/workspace/browser-isolation/bootstrap.sh',
+      Buffer.from(bootstrapScript),
+    )
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.upload_file(
+        '/workspace/browser-isolation/bootstrap.sh',
+        bootstrap_script.encode('utf-8'),
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UploadFile(ctx, "/workspace/browser-isolation/bootstrap.sh", []byte(bootstrapScript))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.upload_file(
+        "/workspace/browser-isolation/bootstrap.sh",
+        bootstrap_script.as_bytes(),
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadFile(
+        "/workspace/browser-isolation/bootstrap.sh",
+        bootstrapScript.getBytes()
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## 3. Reserve the noVNC preview URL
+
+The desktop UI is just another exposed HTTP port. The noVNC page itself is served from `vnc.html` on that exposed base URL.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const exposure = await sandbox.exposePort(6080)
+    console.log(exposure.url)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(6080)
+    print(exposure.url)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 6080)
+    if err != nil { log.Fatal(err) }
+    fmt.Println(exposure.PublicURL)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let exposure = sandbox.expose_port(6080, ExposeOptions::default())?;
+    if let ExposeResult::Http { url } = exposure {
+        println!("{}", url);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExposeResult exposure = sandbox.exposePort(6080);
+    System.out.println(exposure.url);
+    ```
+  </TabItem>
+</Tabs>
+
+The browser entry point is the exposed base URL plus `vnc.html?autoconnect=1&resize=remote&reconnect=1`.
+
+## 4. Keep the desktop alive as a session
+
+The actual browser desktop should run as a session, not a one-shot exec. That gives you a stable process to reconnect to while the noVNC server keeps serving frames.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const session = await sandbox.createSession({
+      name: 'secure-burner-browser',
+      command: './run-browser-isolation.sh',
+      workDir: '/workspace/browser-isolation',
+      env: {
+        NOVNC_PORT: '6080',
+        START_URL: 'https://example.com',
+      },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    session = sandbox.create_session({
+        'name': 'secure-burner-browser',
+        'command': './run-browser-isolation.sh',
+        'workDir': '/workspace/browser-isolation',
+        'env': {
+            'NOVNC_PORT': '6080',
+            'START_URL': 'https://example.com',
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    session, err := sandbox.CreateSession(ctx, sdktypes.CreateSessionOptions{
+        Name:    "secure-burner-browser",
+        Command: "./run-browser-isolation.sh",
+        Workdir: "/workspace/browser-isolation",
+        Env: map[string]string{
+            "NOVNC_PORT": "6080",
+            "START_URL":  "https://example.com",
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let session = sandbox.create_session(aerolvm_sdk::CreateSessionOptions {
+        name:     Some("secure-burner-browser".to_string()),
+        command:  Some("./run-browser-isolation.sh".to_string()),
+        work_dir: Some("/workspace/browser-isolation".to_string()),
+        env: Some(std::collections::HashMap::from([
+            ("NOVNC_PORT".to_string(), "6080".to_string()),
+            ("START_URL".to_string(), "https://example.com".to_string()),
+        ])),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Session session = sandbox.createSession(
+        new CreateSessionOptions()
+            .setName("secure-burner-browser")
+            .setCommand("./run-browser-isolation.sh")
+            .setWorkDir("/workspace/browser-isolation")
+            .setEnv(Map.of(
+                "NOVNC_PORT", "6080",
+                "START_URL", "https://example.com"
+            ))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## What the example gives you
+
+- A disposable Chromium instance running inside an isolated sandbox.
+- A browser-facing preview URL that opens straight into noVNC.
+- A long-running session ID you can track, stop, or destroy from your control plane.
+- A JSON artifact with the URLs and IDs your product backend needs to persist.
+
+## Operational notes
+
+- The current reference implementation uses noVNC, not WebRTC. It is a good fit for browser isolation and remote desktop previews, but not the final word on lowest-possible streaming latency.
+- The returned preview URL is the user-facing surface. Put your own auth and tenancy checks in front of it before exposing it to end users.
+- The example defaults to the Docker runtime for maximum compatibility with the desktop stack. If you want a tighter kernel boundary, validate your chosen browser image and X/VNC stack on `runtime: "gvisor"` before switching production traffic.
+- This pattern needs outbound network access because Chromium is meant to browse the public web.
+
+## Related docs
+
+- [Preview](/preview/)
+- [Sessions](/sessions/)
+- [Process & Code Execution](/exec-streaming/)
+- [File System](/file-system/)
+- [Create Sandbox](/sandboxes/)

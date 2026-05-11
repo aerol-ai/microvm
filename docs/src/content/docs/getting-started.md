@@ -53,7 +53,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
     --dns-api-token your-cloudflare-api-token
 ```
 
-> **DNS-01 wildcard TLS is required for domain mode.** Caddy issues exactly two certificates (`<domain>` and `*.<domain>`) once at startup and renews them on a schedule, so sandbox capacity is bounded only by the host's CPU and memory — not by Let's Encrypt issuance quota. If you cannot run DNS-01, install with `--local` instead (binds to `127.0.0.1`, no TLS).
+> **DNS-01 wildcard TLS is required for domain mode.** Caddy issues exactly two certificates (`<domain>` and `*.<domain>`) once at startup and renews them on a schedule, so sandbox capacity is bounded only by the host's CPU and memory - not by Let's Encrypt issuance quota. If you cannot run DNS-01, install with `--local` instead (binds to `127.0.0.1`, no TLS).
 
 If you omit `--pat-token`, the installer generates a token and prints it once at the end.
 
@@ -89,7 +89,7 @@ Open the following inbound TCP ports on your host (EC2 security group, bare-meta
 | `443` | TCP | HTTPS - REST API and sandbox preview URLs | Primary public-facing port in production. |
 | `2220` | TCP | SSH gateway - SSH access into sandboxes | Configurable via `SB_SSH_LISTEN_ADDR`. |
 
-Port `21212` is the internal API port (default `SB_API_PORT`). Caddy proxies it via the public domain — you do **not** need to expose `21212` publicly. In local dev mode (no Caddy) you reach the API directly on `21212`.
+Port `21212` is the internal API port (default `SB_API_PORT`). Caddy proxies it via the public domain - you do **not** need to expose `21212` publicly. In local dev mode (no Caddy) you reach the API directly on `21212`.
 
 Port `2019` (Caddy Admin API) is bound to `127.0.0.1` only and must never be publicly exposed.
 

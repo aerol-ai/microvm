@@ -197,7 +197,61 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
     entries: [
       {
         type: 'group',
-        label: 'Coding Agents & Harness Engineering',
+        label: 'Customer-Facing Product Experiences',
+        entries: [
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/ai-app-hosting',
+            label: 'Live preview URLs for Web apps',
+            description: 'Clone, build, and host a Bun website inside a disposable sandbox.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/secure-burner-browser',
+            label: 'Secure burner browser',
+            description: 'Launch a disposable Chromium desktop in a sandbox and stream it into the browser over noVNC.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security',
+            label: 'gVisor kernel secure sandbox',
+            description: 'Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/spawn-postgres',
+            label: 'Deploy your own Supabase',
+            description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/create-upstash-redis',
+            label: 'Create your own Upstash Redis',
+            description: 'Run a dedicated Redis instance in a sandbox and expose an HTTP admin surface on a public URL.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/coding-interview',
+            label: 'Create Coding Interview Platform',
+            description: 'Back tutorials and labs with per-user sandboxes and persistent shells.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/secure-burner-browser',
+            label: 'Secure Burner Browser',
+            description: 'Launch a disposable Chromium desktop in a sandbox and stream it into the browser over noVNC.',
+          },
+          // {
+          //   type: 'link',
+          //   href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
+          //   label: 'One-click user sandbox per workspace',
+          //   description: 'Provision an isolated sandbox as part of each product workspace.',
+          // },
+        ],
+      },
+      {
+        type: 'group',
+        label: 'AI Coding Agents & Harness Engineering',
         entries: [
           {
             type: 'link',
@@ -232,48 +286,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
 
         ],
       },
-      {
-        type: 'group',
-        label: 'Customer-Facing Product Experiences',
-        entries: [
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/ai-app-hosting',
-            label: 'Live preview URLs for Web apps',
-            description: 'Clone, build, and host a Bun website inside a disposable sandbox.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security',
-            label: 'gVisor kernel secure sandbox',
-            description: 'Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/spawn-postgres',
-            label: 'Deploy your own Supabase',
-            description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/create-upstash-redis',
-            label: 'Create your own Upstash Redis',
-            description: 'Run a dedicated Redis instance in a sandbox and expose an HTTP admin surface on a public URL.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/interactive-tutorial-lab-backend',
-            label: 'Interactive tutorial or lab backend',
-            description: 'Back tutorials and labs with per-user sandboxes and persistent shells.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
-            label: 'One-click user sandbox per workspace',
-            description: 'Provision an isolated sandbox as part of each product workspace.',
-          },
-        ],
-      },
+      
       {
         type: 'group',
         label: 'Data Processing & ML',

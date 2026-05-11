@@ -1,0 +1,103 @@
+---
+title: Coding Interview Platform
+description: Deploy a full coding interview app inside AerolVM that spins up per-language sandboxes to compile and run candidate code in 10 languages.
+---
+
+## What you are building
+
+A multi-language coding interview platform where the **entire web app** runs inside an AerolVM sandbox. When a candidate submits code, the app creates a short-lived, per-execution sandbox with the correct language runtime (Python, Rust, Go, Java, etc.), uploads the code, executes it, and returns the result - all from inside the parent sandbox.
+
+## Why AerolVM fits
+
+- **Nested sandboxes** - the interview app itself runs in a sandbox, and each code execution spins up an ephemeral child sandbox with the correct language image. No Docker-in-Docker needed.
+- **Per-execution isolation** - every submission runs in a fresh container that is destroyed immediately after, so candidates can never interfere with each other.
+- **Multi-language from one image** - the app image is Node-based; language runtimes are pulled on-demand via standard Docker images (`rust:1.75-slim`, `golang:1.21-alpine`, etc.).
+- **Instant cleanup** - child sandboxes are destroyed in the `finally` block, so resources are reclaimed even if execution fails.
+
+## Architecture
+
+The system has two layers:
+
+1. **Host script (`index.ts`)** - runs on your machine, creates the parent sandbox from a pre-built Docker image, waits for the Express server to become healthy, and exposes port 3000.
+2. **Interview app (`server.ts`)** - runs inside the parent sandbox, serves the Monaco-editor frontend, and handles `POST /execute` by creating ephemeral child sandboxes for each code run.
+
+## Copy-paste TypeScript scripts
+
+Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/edtech-coding-interviews](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/edtech-coding-interviews)
+
+### Host script - `index.ts`
+
+This script deploys the interview app container into an AerolVM sandbox and returns the public URL.
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
+
+const patToken = process.env.SB_PAT_TOKEN;
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
+const imageName =
+  process.env.IMAGE_NAME ??
+  "ghcr.io/aerol-ai/aerolvm-examples-interview-app:latest";
+
+if (!patToken) {
+  throw new Error("Set SB_PAT_TOKEN before running this example.");
+}
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+
+  // 1. Create the parent sandbox from the pre-built interview-app image.
+  //    Pass SB_PAT_TOKEN and SB_API_URL so the app can create child sandboxes.
+  const sandbox = await client.create({
+    image: imageName,
+    cpu: 1,
+    memoryMB: 1024,
+    env: {
+      SB_PAT_TOKEN: patToken!,
+      SB_API_URL: apiUrl,
+      PORT: "3000",
+    },
+  });
+
+  console.log(`Sandbox created: ${sandbox.id}`);
+
+  // 2. Wait for the Express server to be healthy.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const result = await sandbox.exec({
+      command:
+        'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000',
+      timeoutSeconds: 5,
+    });
+    if (result.exitCode === 0) break;
+    await delay(1_000);
+  }
+
+  // 3. Expose port 3000 and print the public URL.
+  const exposure = await sandbox.exposePort(3000);
+  console.log(`Interview App is live at: ${exposure.url}`);
+
+  await writeFile(
+    "interview-app-deployment.json",
+    `${JSON.stringify({ sandboxID: sandbox.id, appUrl: exposure.url }, null, 2)}\n`,
+  );
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+
+## Product outputs
+
+- `interview-app-deployment.json` with the sandbox ID and the public app URL.
+- A live web app with a Monaco code editor supporting 10 languages.
+- Each "Run Code" click creates an isolated, ephemeral sandbox - automatically destroyed after execution.
+
+## Related docs
+
+- [Exec](/exec/)
+- [File System](/file-system/)
+- [Preview](/preview/)

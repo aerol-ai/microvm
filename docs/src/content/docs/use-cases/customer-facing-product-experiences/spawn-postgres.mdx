@@ -272,7 +272,7 @@ async function main() {
   const tlsHost = tlsURL.hostname;
   const tlsPort = tlsURL.port || "443";
 
-  // Clients cannot connect directly — postgres wire protocol sends SSLRequest
+  // Clients cannot connect directly - postgres wire protocol sends SSLRequest
   // before the TLS ClientHello, so caddy-l4 never sees the SNI. Use a local
   // TLS tunnel (socat or stunnel) that opens a real TLS socket to caddy and
   // forwards the plaintext postgres stream through it. Connect with sslmode=disable.

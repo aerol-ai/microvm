@@ -100,5 +100,5 @@ See [Port Allowlist](/port-allowlist) for full details on how port access contro
 
 TLS certificates are issued automatically:
 
-- **Domain mode** (`SB_DOMAIN` set): Caddy issues a single wildcard certificate covering `<domain>` and `*.<domain>` via DNS-01 (Cloudflare). The installer requires `--dns-provider` whenever `--domain` is set — see [Server Setup](/getting-started).
+- **Domain mode** (`SB_DOMAIN` set): Caddy issues a single wildcard certificate covering `<domain>` and `*.<domain>` via DNS-01 (Cloudflare). The installer requires `--dns-provider` whenever `--domain` is set - see [Server Setup](/getting-started).
 - **IP mode** (no `SB_DOMAIN`): Routes are HTTP-only, no TLS.

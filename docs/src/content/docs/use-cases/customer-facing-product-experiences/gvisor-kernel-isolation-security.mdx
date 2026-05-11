@@ -71,7 +71,7 @@ import subprocess
 # These checks probe kernel information exposure.
 # In a Docker (runc) container the process shares the real host kernel, so
 # /proc surfaces the true kernel version, hardware memory layout, and I/O
-# regions — everything an attacker needs to fingerprint and target known CVEs.
+# regions - everything an attacker needs to fingerprint and target known CVEs.
 # Under gVisor the same reads return synthetic data from the Sentry user-space
 # kernel: the host kernel version, memory layout, and hardware topology are
 # never visible inside the sandbox.
@@ -178,7 +178,7 @@ import subprocess
 
 # Same checks as the Docker probe so the two result files can be diffed
 # side-by-side. Under gVisor every kernel-exposure check should return either
-# empty output or a synthetic value — the Sentry user-space kernel never
+# empty output or a synthetic value - the Sentry user-space kernel never
 # forwards these reads to the real host kernel, so the host's identity,
 # hardware layout, and memory topology remain invisible to sandbox code.
 checks = [
