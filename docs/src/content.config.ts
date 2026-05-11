@@ -244,6 +244,12 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/secure-burner-browser',
+            label: 'Secure burner browser',
+            description: 'Launch a disposable Chromium desktop in a sandbox and stream it into the browser over noVNC.',
+          },
+          {
+            type: 'link',
             href: '/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security',
             label: 'gVisor kernel secure sandbox',
             description: 'Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.',
@@ -262,8 +268,8 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/interactive-tutorial-lab-backend',
-            label: 'Interactive tutorial or lab backend',
+            href: '/use-cases/customer-facing-product-experiences/coding-interview',
+            label: 'Create Coding Interview Platform',
             description: 'Back tutorials and labs with per-user sandboxes and persistent shells.',
           },
           {

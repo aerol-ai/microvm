@@ -13,6 +13,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "example:browser-isolation:src": "npx tsx src/examples/browserIsolation.ts",
     "example:create": "npm run build && node dist/examples/createSandbox.js",
     "example:create:src": "npx tsx src/examples/createSandbox.ts",
     "example:delete": "npm run build && node dist/examples/deleteSandbox.js",
