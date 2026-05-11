@@ -1,0 +1,82 @@
+---
+title: Hyperparameter Tuning Farm
+description: Spin up multiple concurrent sandboxes to test different model configurations in parallel.
+---
+
+This pattern demonstrates the true power of AerolVM: horizontal scaling. By spinning up multiple sandboxes, you can benchmark different hyperparameters (like learning rates or model architectures) across a fleet of isolated workers simultaneously.
+
+## Parallel Tuning Benefits
+
+- **Speed:** Reduce total tuning time from hours to minutes by running jobs in parallel.
+- **Isolation:** A crash in one training job doesn't affect the others.
+- **Resource Management:** Each sandbox gets its own dedicated CPU and RAM, preventing resource contention.
+
+## Copy-paste TypeScript script
+
+Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/hyperparameter-tuning-farm](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/hyperparameter-tuning-farm)
+
+This script creates 3 concurrent sandboxes, each training a Scikit-Learn model with a different `n_estimators` value.
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
+const patToken = process.env.SB_PAT_TOKEN;
+
+if (!patToken) throw new Error("Set SB_PAT_TOKEN.");
+
+const trainingScript = `
+import os
+import time
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score
+
+n_estimators = int(os.environ.get("N_ESTIMATORS", 10))
+print(f"Training RandomForest with n_estimators={n_estimators}...")
+
+X, y = make_classification(n_samples=1000, n_features=20)
+clf = RandomForestClassifier(n_estimators=n_estimators)
+scores = cross_val_score(clf, X, y, cv=5)
+
+print(f"RESULT: accuracy={scores.mean():.4f}")
+`;
+
+async function trainModel(client: MicroVM, nEstimators: number) {
+  const sandbox = await client.create({
+    image: "python:3.11-bookworm",
+    cpu: 1,
+    memoryMB: 1024,
+    env: { N_ESTIMATORS: String(nEstimators) }
+  });
+
+  await sandbox.exec("pip install scikit-learn");
+  await sandbox.uploadFile("/train.py", trainingScript);
+  
+  const result = await sandbox.exec("python3 /train.py");
+  const output = result.stdout.split("RESULT: ")[1]?.trim();
+  
+  await sandbox.destroy();
+  return { nEstimators, output };
+}
+
+async function main() {
+  const client = new MicroVM({ apiUrl, patToken });
+  const hyperparams = [10, 50, 100];
+
+  console.log(\`Spinning up \${hyperparams.length} parallel training jobs...\`);
+  
+  const jobs = hyperparams.map(val => trainModel(client, val));
+  const results = await Promise.all(jobs);
+
+  console.table(results);
+}
+
+main().catch(console.error);
+```
+
+## Related docs
+- [Creating Sandboxes](/environment/)
+- [Executions](/executions/)
+- [Lifecycle](/lifecycle/)
+---
