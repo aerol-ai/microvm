@@ -2,7 +2,7 @@
 title: AerolVM vs Daytona vs e2b
 ---
 
-A side-by-side look at how AerolVM compares to the two most common alternatives for running isolated code environments — and why we built it.
+A side-by-side look at how AerolVM compares to the two most common alternatives for running isolated code environments - and why we built it.
 
 ## How AerolVM Compares
 
@@ -10,6 +10,7 @@ A side-by-side look at how AerolVM compares to the two most common alternatives 
 |---|---|---|---|
 | **Hosting** | Self-hosted on your infra | Cloud (managed, no self-host) | Self-hosted |
 | **Set Up Complexity** | Easy | No self-host | Extremely Complex |
+| **Can run locally** | ✅ | ✗ | ✗ |
 | **Open source** | ✅ | ✗ | ✅ |
 | **Primary use case** | AI agents + ephemeral CI | AI agent code execution | Developer workspaces |
 | **Sandbox startup** | <90ms | ~1s | Seconds (persistent VMs) |
@@ -41,9 +42,9 @@ AerolVM covers the same AI execution use case while running entirely on your own
 
 ## AerolVM vs Daytona
 
-**Daytona** targets persistent developer workspaces — IDE integration, git-based environments, long-lived dev containers. It is not designed for ephemeral, high-frequency sandbox creation that AI agents need.
+**Daytona** targets persistent developer workspaces - IDE integration, git-based environments, long-lived dev containers. It is not designed for ephemeral, high-frequency sandbox creation that AI agents need.
 
-- **Slow lifecycle.** Daytona workspaces take seconds to start because they're full persistent VMs. AerolVM boots a sandbox in under 90ms — the difference between an agent waiting on infrastructure and an agent running code.
+- **Slow lifecycle.** Daytona workspaces take seconds to start because they're full persistent VMs. AerolVM boots a sandbox in under 90ms - the difference between an agent waiting on infrastructure and an agent running code.
 - **Setup complexity.** Daytona is genuinely difficult to self-host: multiple components, infrastructure dependencies, and ongoing operational overhead. AerolVM is a single-binary install with a one-line script.
 - **No kernel-level isolation, no per-sandbox egress control, no port allowlist.** Daytona assumes you trust the people using your workspaces. AerolVM assumes you don't trust the code running inside the sandbox.
 - **Workspace ergonomics over agent ergonomics.** Daytona's SDK and feature surface are built for humans editing code in an IDE. AerolVM's SDKs (TS, Python, Go, Rust, Java) are built for programmatic, high-throughput use.
@@ -60,7 +61,7 @@ We started AerolVM after running into the same set of problems on every project 
 
 3. **Untrusted code needs real isolation.** LLM-generated code, customer-supplied code, and CI jobs all need to run somewhere safer than a shared Docker daemon. We wanted gVisor as a first-class runtime, not a custom integration users have to glue together.
 
-4. **Networking is the part everyone gets wrong.** Exposing sandbox ports to the public internet, controlling egress per sandbox, requiring explicit allowlists before traffic flows — these are the controls real teams need, and they're missing from every alternative we evaluated.
+4. **Networking is the part everyone gets wrong.** Exposing sandbox ports to the public internet, controlling egress per sandbox, requiring explicit allowlists before traffic flows - these are the controls real teams need, and they're missing from every alternative we evaluated.
 
 5. **AI agents and ephemeral CI have the same shape.** Both want sub-second startup, parallel execution, persistent state across resumes, file uploads, streaming exec, and a clean teardown. We wanted one platform that serves both, with SDKs in every language a backend team is likely to use.
 
