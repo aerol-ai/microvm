@@ -236,7 +236,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
             label: 'Security vulnerability and Fix agent',
             description: 'Scan CVEs across repository types, apply safe fixes with Claude, and raise a PR automatically.',
           },
-          
+
         ],
       },
       {
@@ -260,6 +260,12 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
             href: '/use-cases/customer-facing-product-experiences/spawn-postgres',
             label: 'Deploy your own Supabase',
             description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
+          },
+          {
+            type: 'link',
+            href: '/use-cases/customer-facing-product-experiences/create-upstash-redis',
+            label: 'Create your own Upstash Redis',
+            description: 'Run a dedicated Redis instance in a sandbox and expose an HTTP admin surface on a public URL.',
           },
           {
             type: 'link',

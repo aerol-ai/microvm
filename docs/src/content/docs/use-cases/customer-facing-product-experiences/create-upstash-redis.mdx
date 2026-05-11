@@ -7,14 +7,10 @@ This workflow boots a dedicated Redis instance inside an AerolVM sandbox, initia
 
 This is the Redis foundation, providing a serverless-like experience where each user or project gets its own isolated instance.
 
-## Why AerolVM fits
 
-- `create` gives each workspace or customer its own isolated Redis runtime.
-- Environment variables let you inject credentials (like `REDIS_PASSWORD`) without baking them into the image.
-- `createSession` keeps Redis and an optional HTTP admin surface alive after setup finishes.
-- Lifecycle policies let you stop or destroy idle Redis sandboxes automatically to save resources.
+## Native Redis endpoint 
 
-## Native Redis endpoint via `exposePort` with `protocol: "tcp"`
+- via `exposePort` with `protocol: "tcp"`
 
 This page exposes the Redis protocol directly using `exposePort(6379, { protocol: "tcp" })`. The daemon allocates a parent-host port from the configured pool and points caddy-l4 at the container's `6379`, so the returned result has a `tcp://<public-host>:<host-port>` URL. This works with `redis-cli`, Ioredis, StackExchange.Redis, and any other client that speaks the Redis protocol.
 
@@ -29,6 +25,8 @@ Set these environment variables before running the script:
 - Optional: `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD` for the HTTP admin endpoint.
 
 If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:21212`.
+
+Code Location: [https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/create-upstash-redis/index.ts](https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/create-upstash-redis/index.ts)
 
 ```ts
 import { writeFile } from "node:fs/promises";
@@ -53,76 +51,118 @@ const redisURL = `redis://:${encodeURIComponent(redisPassword)}@127.0.0.1:${redi
 const adminServer = `import base64
 import json
 import os
-import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import redis
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
-AUTH_USER = os.environ.get("PUBLIC_AUTH_USER")
-AUTH_PASSWORD = os.environ.get("PUBLIC_AUTH_PASSWORD")
+AUTH_TOKEN = os.environ.get("PUBLIC_AUTH_TOKEN")
 PORT = int(os.environ.get("PORT", "3000"))
 
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-def expected_auth_header() -> str:
-    if not AUTH_USER or not AUTH_PASSWORD:
-        return None
-    token = base64.b64encode(f"{AUTH_USER}:{AUTH_PASSWORD}".encode("utf-8")).decode("ascii")
-    return f"Basic {token}"
-
-
-def query_redis() -> bytes:
-    result = subprocess.run(
-        ["redis-cli", "-u", REDIS_URL, "INFO", "server"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip().encode("utf-8")
-
+def _encode(value, encoding):
+    # Mirror Upstash REST conventions: booleans are returned as 1/0 ints,
+    # and when the client sent "Upstash-Encoding: base64" all string values
+    # are base64-encoded (except the literal "OK" status reply).
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, list):
+        return [_encode(v, encoding) for v in value]
+    if isinstance(value, dict):
+        return {k: _encode(v, encoding) for k, v in value.items()}
+    if encoding == "base64" and isinstance(value, str) and value != "OK":
+        return base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return value
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if (self.path == "/healthz"):
-            body = b"ok\n"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        if self.path == "/healthz":
+            self._send_response(200, b"ok\\n", "text/plain")
+            return
+        self.send_error(404)
+
+    def do_POST(self) -> None:
+        if not self._authenticate():
             return
 
-        auth = expected_auth_header()
-        if auth and self.headers.get("Authorization") != auth:
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="redis-admin"')
-            self.end_headers()
-            return
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8")
 
         try:
-            body = query_redis()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        except subprocess.CalledProcessError as error:
-            body = json.dumps(
-                {"error": error.stderr.strip() or "redis-cli failed"},
-            ).encode("utf-8")
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            command_data = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON")
+            return
+
+        path = self.path.rstrip("/")
+        encoding = self.headers.get("Upstash-Encoding", "").lower()
+
+        try:
+            if path == "" or path == "/":
+                # Single command: ["SET", "key", "val"]
+                result = r.execute_command(*command_data)
+                self._send_json({"result": _encode(result, encoding)})
+            elif path == "/pipeline" or path == "/multi-exec":
+                # List of commands: [["SET", "a", "b"], ["GET", "a"]]
+                pipe = r.pipeline(transaction=(path == "/multi-exec"))
+                for cmd in command_data:
+                    pipe.execute_command(*cmd)
+                results = pipe.execute()
+                self._send_json([{"result": _encode(res, encoding)} for res in results])
+            else:
+                # Command in path: /set/key/value
+                parts = path.strip("/").split("/")
+                result = r.execute_command(*parts)
+                self._send_json({"result": _encode(result, encoding)})
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+    def _authenticate(self) -> bool:
+        if not AUTH_TOKEN:
+            return True
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header == f"Bearer {AUTH_TOKEN}":
+            return True
+        self.send_response(401)
+        self.end_headers()
+        return False
+
+    def _send_json(self, data, status=200) -> None:
+        body = json.dumps(data).encode("utf-8")
+        self._send_response(status, body, "application/json")
+
+    def _send_response(self, status, body, content_type) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format: str, *args) -> None:
         return
-
 
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 `;
 
 function log(msg: string) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 5): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const wait = Math.min(8000, 1000 * 2 ** i);
+      const cause = (err as { cause?: { code?: string } } | undefined)?.cause?.code;
+      log(`  ${label}: attempt ${i + 1}/${attempts} failed (${cause ?? (err as Error).message}); retrying in ${wait}ms`);
+      await delay(wait);
+    }
+  }
+  throw lastErr;
 }
 
 async function waitForRedis(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
@@ -146,16 +186,16 @@ async function waitForRedis(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
 }
 
 async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>, adminSessionID: string) {
-  log("Waiting for admin HTTP server on port 3000...");
+  log("Waiting for REST proxy on port 3000...");
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const result = await sandbox.exec({
       command:
-        'python3 -c "import urllib.request; urllib.request.urlopen("http://127.0.0.1:3000/healthz").read()"',
+        'python3 -c "import urllib.request; urllib.request.urlopen(\\"http://127.0.0.1:3000/healthz\\").read()"',
       timeoutSeconds: 5,
     });
 
     if (result.exitCode === 0) {
-      log(`Admin server ready after ${attempt + 1} attempt(s)`);
+      log(`REST proxy ready after ${attempt + 1} attempt(s)`);
       return;
     }
 
@@ -164,9 +204,8 @@ async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>, adm
   }
 
   const sessionLog = await sandbox.sessionLog(adminSessionID);
-  console.error("[admin session log]
-" + new TextDecoder().decode(sessionLog));
-  throw new Error("The HTTP admin endpoint did not become ready in time.");
+  console.error("[admin session log]\\n" + new TextDecoder().decode(sessionLog));
+  throw new Error("The REST proxy did not become ready in time.");
 }
 
 async function main() {
@@ -179,10 +218,12 @@ async function main() {
     cpu: 1,
     memoryMB: 1024,
     diskGB: 5,
+    // Prevent the image's default redis-server from starting so we can
+    // start our own instance with requirepass configured.
+    containerCommand: ["sleep", "infinity"],
     env: {
       REDIS_PASSWORD: redisPassword,
-      PUBLIC_AUTH_USER: publicAuthUser,
-      PUBLIC_AUTH_PASSWORD: publicAuthPassword,
+      PUBLIC_AUTH_TOKEN: patToken!,
       PORT: String(adminPort),
     },
     lifecycle: {
@@ -192,16 +233,16 @@ async function main() {
   });
   log(`Sandbox created: ${sandbox.id}`);
 
-  log("Installing python3...");
+  log("Installing python3 and redis-py...");
   const aptResult = await sandbox.exec({
     command:
-      "apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*",
+      "apt-get update && apt-get install -y --no-install-recommends python3 python3-redis ca-certificates && rm -rf /var/lib/apt/lists/*",
     timeoutSeconds: 240,
   });
   if (aptResult.exitCode !== 0) {
     throw new Error(`apt-get failed (exitCode=${aptResult.exitCode}): ${aptResult.stderr}`);
   }
-  log("python3 installed");
+  log("python3 and redis-py installed");
 
   log("Creating workspace directories and uploading admin server script...");
   await sandbox.exec("mkdir -p /workspace/admin");
@@ -245,13 +286,13 @@ async function main() {
     sandboxID: sandbox.id,
     redisSessionID: redisSession.id,
     adminSessionID: adminSession.id,
-    adminURL: adminExposure.url,
+    upstashRestUrl: adminExposure.url,
+    upstashToken: patToken,
     redisEndpoint: redisExposure.url,
     connectionString: `redis://:${redisPassword}@${redisExposure.url.replace('tcp://', '')}`,
   };
 
-  await writeFile("create-upstash-redis.json", `${JSON.stringify(payload, null, 2)}
-`);
+  await writeFile("create-upstash-redis.json", `${JSON.stringify(payload, null, 2)}\n`);
   log("Written create-upstash-redis.json");
   console.log(JSON.stringify(payload, null, 2));
 }
@@ -260,14 +301,28 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
-
 ```
 
 ## What the script gives you
 
-- `create-upstash-redis.json` with the sandbox ID, the running session IDs, the public HTTP admin URL, and a native `redis://...` connection string.
+- `create-upstash-redis.json` with the sandbox ID, the running session IDs, the public Upstash-compatible REST URL and Token, and a native `redis://...` connection string.
 - A Redis server listening on port `6379` inside the sandbox, published as a `tcp://<public-host>:<host-port>` endpoint.
-- A password-protected HTTP endpoint on port `3000` that returns basic Redis server info.
+- A REST proxy on port `3000` that mimics the Upstash REST API.
+
+## Connecting via Upstash SDK
+
+The `upstashRestUrl` and `upstashToken` returned by the script are compatible with the `@upstash/redis` library:
+
+```ts
+import { Redis } from '@upstash/redis'
+
+const redis = new Redis({
+  url: 'https://...', // your upstashRestUrl
+  token: '...',       // your upstashToken
+})
+
+const data = await redis.set('foo', 'bar')
+```
 
 ## Connecting natively
 
