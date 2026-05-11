@@ -51,6 +51,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'SDK Setup',
         description: 'Connect an SDK to your AerolVM server.',
       },
+      {
+        type: 'link',
+        href: '/comparison',
+        label: 'AerolVM vs Daytona vs e2b',
+        description: 'How AerolVM compares to e2b and Daytona, and why we built it.',
+      },
     ],
   },
   {
@@ -207,8 +213,8 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/secure-burner-browser',
-            label: 'Secure burner browser',
+            href: '/use-cases/customer-facing-product-experiences/secure-burner-vpn',
+            label: 'Impossible to Trace Burner VPN',
             description: 'Launch a disposable Chromium desktop in a sandbox and stream it into the browser over noVNC.',
           },
           {

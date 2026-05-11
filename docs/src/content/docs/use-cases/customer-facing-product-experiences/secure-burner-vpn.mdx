@@ -1,0 +1,201 @@
+---
+title: Secure burner VPN proxy
+description: Run a browser-facing dashboard and a native SOCKS5 proxy inside one AerolVM sandbox so users can browse through isolated egress without installing a Chrome extension.
+---
+
+This workflow turns AerolVM into a browser-scoped outbound tunnel. A user clicks a button in your product, you create one sandbox, and the sandbox exposes two surfaces:
+
+- an HTTP dashboard that explains how to connect and shows live stats, and
+- a raw TCP SOCKS5 endpoint that Chrome can use as its proxy.
+
+It is not a kernel-level device VPN. It is a disposable browser proxy that feels like a burner VPN session: the browser traffic exits from the sandbox instead of the user's laptop, and the whole environment can be destroyed when the session ends.
+
+## Reference TypeScript example
+
+Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/burner-vpn](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/burner-vpn)
+
+The reference example:
+
+- creates a sandbox from a pre-built image containing the dashboard and SOCKS5 server,
+- waits for the dashboard to become healthy on port 3000,
+- exposes the dashboard over HTTP and the SOCKS5 proxy over raw TCP,
+- uploads `runtime-config.json` back into the sandbox after the public endpoints are known, and
+- writes `burner-vpn-deployment.json` with the sandbox ID, dashboard URL, SOCKS5 endpoint, and ready-to-run Chrome command.
+
+## Why AerolVM fits
+
+- **One sandbox, two surfaces** - the dashboard and the proxy live in the same isolated environment.
+- **Raw TCP exposure** - `exposePort(..., { protocol: 'tcp' })` lets you publish a real SOCKS5 endpoint, not just HTTP.
+- **Disposable egress** - every user or browsing session can get its own short-lived outbound path.
+- **Host isolation** - risky browsing traffic leaves from the sandbox rather than the user's local machine.
+- **Simple teardown** - destroying the sandbox removes the proxy, the dashboard, and the network path in one step.
+
+## Architecture
+
+The system has two parts:
+
+1. **Host script (`index.ts`)** - runs on your machine or backend, creates the sandbox, health-checks the dashboard, exposes ports 3000 and 1080, then writes runtime metadata back into the sandbox.
+2. **Sandbox app (`server.ts`)** - runs inside the sandbox, serves the dashboard UI, exposes `/api/runtime-config` and `/api/stats/stream`, and implements a no-auth SOCKS5 CONNECT proxy using Node's `net` module.
+
+The dashboard is not just marketing UI. It is the control surface that tells the user exactly which SOCKS5 endpoint to use and shows live connection counters and traffic volume after they connect.
+
+## Copy-paste TypeScript host script
+
+This script provisions the burner VPN sandbox, exposes both ports, and writes a deployment file your product can store or return to the user.
+
+```ts
+import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+import * as dotenv from 'dotenv'
+import { writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
+import { fileURLToPath } from 'node:url'
+
+dotenv.config()
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+const patToken = process.env.SB_PAT_TOKEN
+const apiUrl = process.env.SB_API_URL ?? 'http://127.0.0.1:21212'
+const imageName =
+  process.env.IMAGE_NAME ?? 'ghcr.io/aerol-ai/aerolvm-examples-burner-vpn:latest'
+
+if (!patToken) {
+  throw new Error('Set SB_PAT_TOKEN before running this example.')
+}
+
+async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 5): Promise<T> {
+  let lastError: unknown
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error
+      const waitMs = Math.min(8000, 1000 * 2 ** attempt)
+      console.log(`${label} failed on attempt ${attempt + 1}/${attempts}; retrying in ${waitMs}ms`)
+      await delay(waitMs)
+    }
+  }
+
+  throw lastError
+}
+
+async function main() {
+  const dashboardPort = 3000
+  const socksPort = 1080
+  const client = new MicroVM({ apiUrl, patToken })
+
+  const sandbox = await client.create({
+    image: imageName,
+    cpu: 1,
+    memoryMB: 1024,
+    env: {
+      PORT: String(dashboardPort),
+      SOCKS_PORT: String(socksPort),
+    },
+  })
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const result = await sandbox.exec({
+      command: `node -e "const req = require('http').get('http://127.0.0.1:${dashboardPort}', (res) => process.exit(res.statusCode === 200 ? 0 : 1)); req.on('error', () => process.exit(1)); req.setTimeout(2000, () => process.exit(1));"`,
+      timeoutSeconds: 5,
+    })
+
+    if (result.exitCode === 0) {
+      break
+    }
+
+    await delay(1000)
+  }
+
+  const dashboardExposure = await withRetry('dashboard exposePort', () =>
+    sandbox.exposePort(dashboardPort),
+  )
+
+  const socksExposure = await withRetry('socks exposePort', () =>
+    sandbox.exposePort(socksPort, { protocol: 'tcp' }),
+  )
+
+  const dashboardUrl = dashboardExposure.url
+  const socksUrl = new URL(socksExposure.url)
+  const socksProxyHost = socksUrl.hostname
+  const socksProxyPort = Number.parseInt(socksUrl.port, 10)
+  const socksProxyEndpoint = `${socksProxyHost}:${socksProxyPort}`
+  const chromeLaunchCommand =
+    `open -na "Google Chrome" --args --proxy-server="socks5://${socksProxyEndpoint}" ` +
+    `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE ${socksProxyHost}"`
+
+  const runtimeConfig = {
+    proxyScheme: 'socks5',
+    authMode: 'none',
+    dashboardUrl,
+    socksProxyEndpoint,
+    socksProxyHost,
+    socksProxyPort,
+    chromeLaunchCommand,
+  }
+
+  await sandbox.uploadFile(
+    '/app/public/runtime-config.json',
+    `${JSON.stringify(runtimeConfig, null, 2)}\n`,
+  )
+
+  await writeFile(
+    path.join(__dirname, 'burner-vpn-deployment.json'),
+    `${JSON.stringify(
+      {
+        sandboxID: sandbox.id,
+        ...runtimeConfig,
+      },
+      null,
+      2,
+    )}\n`,
+  )
+
+  console.log(`Dashboard URL: ${dashboardUrl}`)
+  console.log(`SOCKS5 endpoint: ${socksProxyEndpoint}`)
+  console.log(`Chrome launch command: ${chromeLaunchCommand}`)
+}
+
+main().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
+```
+
+## Chrome connection flow
+
+1. Run the host script to create the sandbox and expose both ports.
+2. Read `burner-vpn-deployment.json` or open the dashboard URL.
+3. Launch Chrome with the generated command:
+
+   ```bash
+   open -na "Google Chrome" --args --proxy-server="socks5://HOST:PORT" --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE HOST"
+   ```
+
+4. Browse in that Chrome window. Requests now egress from the sandbox-backed SOCKS5 proxy.
+
+## Important browser limitation
+
+Chrome supports SOCKSv5, but it does not support SOCKSv5 username/password authentication. That is why the reference example intentionally runs the proxy in `authMode: 'none'`.
+
+If you need authenticated proxy credentials inside Chrome, use an HTTP or HTTPS proxy design instead of SOCKS5.
+
+## Product outputs
+
+- `burner-vpn-deployment.json` containing the sandbox ID, dashboard URL, SOCKS5 endpoint, and Chrome launch command.
+- A live dashboard that tells the user how to connect and streams proxy stats over Server-Sent Events.
+- A public SOCKS5 endpoint backed by a single AerolVM sandbox.
+
+## Security posture
+
+This pattern is strong for browser isolation and disposable outbound access, but the exact security level still depends on your sandbox image, runtime policy, idle timeouts, and whether the Chrome instance itself is isolated in a separate profile or device. The right claim is "sandbox-isolated burner proxy," not "perfect VPN."
+
+## Related docs
+
+- [Preview](/preview/)
+- [File System](/file-system/)
+- [Secure burner browser](/use-cases/customer-facing-product-experiences/secure-burner-browser/)
+- [gVisor kernel isolation security](/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security/)

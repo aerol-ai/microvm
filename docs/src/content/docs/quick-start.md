@@ -30,31 +30,6 @@ Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the
 - **Interactive developer environments** - persistent workspaces with SSH, port previews, and file sync
 - **Data processing pipelines** - attach cloud storage, run transforms, and extract results
 
-## How AerolVM Compares
-
-| | AerolVM | e2b | Daytona |
-|---|---|---|---|
-| **Hosting** | Self-hosted on your infra | Cloud (managed, no self-host) | Self-hosted |
-| **Set Up Complexity** | Easy | No self-host | Extremely Complex |
-| **Open source** | ✅ | ✗ | ✅ |
-| **Primary use case** | AI agents + ephemeral CI | AI agent code execution | Developer workspaces |
-| **Sandbox startup** | <90ms | ~1s | Seconds (persistent VMs) |
-| **Runtime isolation** | Docker, gVisor (kernel-level) | Docker | Docker |
-| **Security** | gVisor(very secure) | ✗ | ✗ |
-| **Port Isolation** | ✅ | ✗ | ✗ |
-| **Persistent stop/start** | ✅ | ✗ | ✅ |
-| **Sandbox Lifecycle** | Infinite | 1 day | Infinite |
-| **External storage** | S3, NFS, SSHFS, rclone | ✗ | ✗ |
-| **GPU Support** | ✅ | ✗ | ✗ |
-| **SSH access** | ✅ | ✗ | ✅ |
-| **Per-sandbox egress control** | ✅ | ✗ | ✗ |
-| **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python |
-| **Pricing** | Your infra cost(20$/Month with 1000+ Sandbox) | Per sandbox-hour(500$+ month) | Your infra cost(100$/Month with 1000+ Sandbox) |
-
-**e2b** is a managed cloud service optimized for AI agent sandboxes. It requires no infrastructure but offers no self-hosting, no kernel-level isolation, and no control over where code runs. AerolVM covers the same AI execution use case while running entirely on your own host, with gVisor isolation for untrusted workloads and no per-sandbox billing.
-
-**Daytona** targets persistent developer workspaces with IDE and git integration - it is not designed for ephemeral, high-frequency sandbox creation. AerolVM prioritizes sub-second lifecycle operations, agent-friendly SDKs, and isolation runtimes over workspace ergonomics.
-
 ## Next Steps
 
 - [Server Setup](/getting-started) - self-host AerolVM on your own infrastructure
