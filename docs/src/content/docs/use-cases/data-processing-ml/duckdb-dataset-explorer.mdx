@@ -23,12 +23,10 @@ import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 const kaggleUsername = process.env.KAGGLE_USERNAME;
-const kaggleKey = process.env.KAGGLE_KEY;
+const kaggleKey = process.env.KAGGLE_KEY || process.env.KAGGLE_API_TOKEN;
 const kaggleDataset = process.env.KAGGLE_DATASET ?? "dgomonov/new-york-city-airbnb-open-data";
 
-if (!patToken || !kaggleUsername || !kaggleKey) {
-  throw new Error("Set SB_PAT_TOKEN, KAGGLE_USERNAME, and KAGGLE_KEY.");
-}
+
 
 const sqlProxyScript = `
 import os
@@ -68,27 +66,41 @@ ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
 `;
 
 async function main() {
+  if (!patToken || !kaggleUsername || !kaggleKey) {
+    throw new Error("Set SB_PAT_TOKEN, KAGGLE_USERNAME, and KAGGLE_KEY (or KAGGLE_API_TOKEN).");
+  }
+  console.log("Initializing AerolVM client...");
   const client = new MicroVM({ apiUrl, patToken });
+  console.log("Creating DuckDB sandbox (0.5 CPU, 2GB RAM)...");
   const sandbox = await client.create({
     image: "python:3.11-bookworm",
-    cpu: 2,
-    memoryMB: 4096,
+    cpu: 0.5,
+    memoryMB: 2048,
     env: { KAGGLE_USERNAME: kaggleUsername, KAGGLE_KEY: kaggleKey, KAGGLE_DATASET: kaggleDataset }
   });
+  console.log(`Sandbox created successfully! ID: ${sandbox.id}`);
 
-  console.log("Installing DuckDB and Kaggle...");
-  await sandbox.exec("pip install duckdb kaggle pandas");
+  console.log("Installing DuckDB and Kaggle dependencies...");
+  const installRes = await sandbox.exec("pip install duckdb kaggle pandas");
+  console.log(`Dependencies installed (exit code: ${installRes.exitCode}, duration: ${installRes.durationMS}ms)`);
 
-  console.log("Starting DuckDB SQL Proxy...");
+  console.log("Uploading DuckDB SQL Proxy script...");
   await sandbox.uploadFile("/workspace/proxy.py", sqlProxyScript);
+  console.log("Script uploaded to /workspace/proxy.py");
+
+  console.log("Starting DuckDB SQL Proxy session...");
   const session = await sandbox.createSession({
     name: "duckdb-proxy",
     command: "python3 /workspace/proxy.py",
   });
+  console.log(`Session started! ID: ${session.id}`);
 
+  console.log("Exposing port 8080...");
   const exposure = await sandbox.exposePort(8080);
-  console.log(\`DuckDB SQL Proxy ready at: \${exposure.url}\`);
-  console.log(\`Try running: curl -X POST -d "SELECT * FROM data LIMIT 5" \${exposure.url}\`);
+  console.log(`Port exposed!`);
+  
+  console.log(`\n✅ DuckDB SQL Proxy ready at: ${exposure.url}`);
+  console.log(`Try running: curl -X POST -d "SELECT * FROM data LIMIT 5" ${exposure.url}`);
 }
 
 main().catch(console.error);
