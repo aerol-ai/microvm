@@ -47,6 +47,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/cluster-setup',
+        label: 'Cluster Setup',
+        description: 'Bootstrap a multi-node AerolVM cluster with raft-coordinated placement.',
+      },
+      {
+        type: 'link',
         href: '/sdk-setup',
         label: 'SDK Setup',
         description: 'Connect an SDK to your AerolVM server.',

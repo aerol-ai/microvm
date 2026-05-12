@@ -178,7 +178,12 @@ See [GPU Sandboxes](/gpu-sandboxes) for code examples in all SDK languages.
 
 ---
 
+## Multi-node clusters
+
+A single host is enough for most workloads. To run AerolVM across multiple hosts behind a single API surface (transparent forwarding, raft-coordinated placement, owner failover), see [Cluster Setup](/cluster-setup). Single-node installs are unaffected - cluster mode is opt-in via separate `cluster-init.sh` / `cluster-join.sh` scripts that layer on top of the base installer.
+
 ## Next Steps
 
 - [SDK Setup](/sdk-setup) - connect an SDK to the running server
 - [Sandboxes](/sandboxes) - create and manage sandboxes
+- [Cluster Setup](/cluster-setup) - run AerolVM across multiple hosts

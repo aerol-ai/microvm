@@ -211,10 +211,12 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      - name: Copy install script
+      - name: Copy install scripts
         run: |
           cp scripts/install.sh dist/install.sh
-          chmod 0755 dist/install.sh
+          cp scripts/cluster-init.sh dist/cluster-init.sh
+          cp scripts/cluster-join.sh dist/cluster-join.sh
+          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh
 
       - name: Generate checksums
         run: |
