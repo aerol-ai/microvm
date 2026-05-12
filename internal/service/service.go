@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -60,6 +61,13 @@ type Service struct {
 	// load gives a lock-free fast path on the steady-state hot path.
 	l4Mu    sync.Mutex
 	l4Ready atomic.Bool
+
+	// cluster is the cluster.Client used by the API layer for owner lookup
+	// and cross-node forwarding. Defaults to a Noop in single-node mode so
+	// callsites (and the API wrapper) can stay unconditional.
+	cluster      cluster.Client
+	clusterMu    sync.Mutex
+	clusterReady atomic.Bool
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -73,7 +81,62 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		cipher:   cipher,
 		mounts:   mountManager,
 		admitter: admitter,
+		// Default to Noop so callers don't have to nil-check the cluster
+		// reference. AttachCluster swaps in the real implementation when
+		// cluster mode is enabled at boot.
+		cluster: cluster.NewNoop("standalone", ""),
 	}
+}
+
+// AttachCluster swaps in a cluster.Client. Called from cmd/sandboxd/main after
+// service.New when SB_ENABLE_CLUSTER=true. Idempotent.
+func (s *Service) AttachCluster(c cluster.Client) {
+	if c == nil {
+		return
+	}
+	s.clusterMu.Lock()
+	defer s.clusterMu.Unlock()
+	s.cluster = c
+}
+
+// Cluster returns the attached cluster.Client. Always non-nil.
+func (s *Service) Cluster() cluster.Client {
+	s.clusterMu.Lock()
+	defer s.clusterMu.Unlock()
+	return s.cluster
+}
+
+// EnsureClusterReady blocks until the cluster has elected a leader, mirroring
+// the EnsureLayer4Ready single-flight latch shape. Single-node mode latches
+// immediately. The API wrapper calls this before any RecordPlacement so a
+// just-booted node doesn't 503 a CreateSandbox while raft is still catching up.
+func (s *Service) EnsureClusterReady(ctx context.Context) error {
+	if s.clusterReady.Load() {
+		return nil
+	}
+	s.clusterMu.Lock()
+	defer s.clusterMu.Unlock()
+	if s.clusterReady.Load() {
+		return nil
+	}
+	c := s.cluster
+	if c == nil {
+		return errors.New("cluster: not initialized")
+	}
+	// In single-node mode Leader() is always the standalone ID; latch immediately.
+	if c.Leader() == "" {
+		// One short retry — give raft a beat to elect on cold start.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+		if c.Leader() == "" {
+			return errors.New("cluster: no leader yet")
+		}
+	}
+	s.clusterReady.Store(true)
+	return nil
 }
 
 func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxRequest) (*models.CreateSandboxResponse, error) {

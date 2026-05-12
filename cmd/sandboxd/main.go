@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -111,6 +112,34 @@ func main() {
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+
+	// Cluster startup. When SB_ENABLE_CLUSTER=true, this node joins (or
+	// bootstraps) the Raft+gossip cluster before any external state-touching
+	// bootstrap so subsequent calls (EnsureLayer4Ready, ReplayReservations)
+	// can use cluster-aware logic. When false, AttachCluster is a no-op past
+	// the Noop default that service.New already installed.
+	if cfg.EnableCluster {
+		clusterClient, err := cluster.New(cfg, logger, admitter)
+		if err != nil {
+			logger.Error("failed to start cluster mode", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := clusterClient.Close(); err != nil {
+				logger.Warn("cluster shutdown returned error", "error", err)
+			}
+		}()
+		svc.AttachCluster(clusterClient)
+		logger.Info("cluster mode enabled",
+			"node_id", clusterClient.SelfNodeID(),
+			"api_url", clusterClient.SelfAPIURL(),
+			"raft_bind", cfg.RaftBindAddr,
+			"gossip_bind", cfg.GossipBindAddr,
+			"bootstrap", cfg.ClusterBootstrap,
+			"peers", cfg.BootstrapPeers,
+		)
+	}
+
 	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
 	// it. Best-effort by design: a cold-started caddy may still be coming
 	// up, in which case the next ExposePort(tcp|tls) will retry under the
@@ -120,6 +149,19 @@ func main() {
 		logger.Warn("failed to ensure caddy layer4 app at startup; will retry on first L4 exposure", "error", err)
 	}
 	svc.ReplayReservations(ctx)
+
+	// Cluster ownership replay. After local reservations are restored, tell
+	// the cluster which sandboxes this node owns so the FSM stays consistent
+	// across restarts. Best-effort: a missing leader on cold start is logged
+	// and recovered by the next reconcile or the next mutating call.
+	if cfg.EnableCluster {
+		ids, err := localSandboxIDs(ctx, svc)
+		if err != nil {
+			logger.Warn("cluster: could not list local sandbox ids for ownership replay", "error", err)
+		} else if err := svc.Cluster().AssertOwnership(ctx, ids); err != nil {
+			logger.Warn("cluster: AssertOwnership returned error at boot; reconcile will retry", "error", err)
+		}
+	}
 
 	if cfg.AutoReconcile {
 		if err := svc.Reconcile(ctx); err != nil {
@@ -169,4 +211,22 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown failed", "error", err)
 	}
+}
+
+// localSandboxIDs returns the IDs of every sandbox persisted in the local
+// store. Used at cluster-mode boot to seed the placement map with this node's
+// ownership claims.
+func localSandboxIDs(ctx context.Context, svc *service.Service) ([]string, error) {
+	sandboxes, err := svc.ListSandboxes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(sandboxes))
+	for _, sb := range sandboxes {
+		if sb == nil || sb.ID == "" {
+			continue
+		}
+		ids = append(ids, sb.ID)
+	}
+	return ids, nil
 }

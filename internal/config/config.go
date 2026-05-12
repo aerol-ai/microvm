@@ -106,6 +106,26 @@ type Config struct {
 	// Required when L4TLSListen is non-empty; ignored otherwise. Default is
 	// "127.0.0.1:8443" to match install.sh's relocated HTTPS listener.
 	L4TLSFallback string
+
+	// Cluster mode (Phase 1). When EnableCluster is false the daemon runs as
+	// a standalone single-node sandbox runner — byte-identical to the legacy
+	// behavior. When true, this node joins (or bootstraps) a Raft+gossip
+	// cluster that owns the placement map (sandbox_id -> owner node). Each
+	// sandbox is owned by exactly one node; the owner's local SQLite remains
+	// the source of truth for sandbox state. Hot-path traffic (toolbox,
+	// sessions, port forwards) is transparently reverse-proxied to the owner.
+	EnableCluster            bool
+	NodeID                   string
+	RaftBindAddr             string
+	RaftAdvertiseAddr        string
+	RaftDataDir              string
+	GossipBindAddr           string
+	GossipAdvertiseAddr      string
+	BootstrapPeers           []string
+	ClusterBootstrap         bool
+	SelfAPIAdvertiseURL      string
+	ClusterRaftCommitTimeout time.Duration
+	ClusterCapacityGossipInterval time.Duration
 }
 
 func Load() (Config, error) {
@@ -161,6 +181,19 @@ func Load() (Config, error) {
 		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 23000),
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
+
+		EnableCluster:                 getEnvBool("SB_ENABLE_CLUSTER", false),
+		NodeID:                        strings.TrimSpace(os.Getenv("SB_NODE_ID")),
+		RaftBindAddr:                  getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
+		RaftAdvertiseAddr:             strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
+		RaftDataDir:                   strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
+		GossipBindAddr:                getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
+		GossipAdvertiseAddr:           strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
+		BootstrapPeers:                splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
+		ClusterBootstrap:              getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
+		SelfAPIAdvertiseURL:           strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
+		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
+		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 	}
 
 	if cfg.PATToken == "" {
@@ -205,7 +238,45 @@ func Load() (Config, error) {
 		return Config{}, errors.New("SB_L4_TLS_FALLBACK must be set when SB_L4_TLS_LISTEN is set (caddy-l4 needs a target for non-sandbox SNI)")
 	}
 
+	// Cluster-mode invariants. Single-node mode (EnableCluster=false) skips
+	// all of this — defaults are non-load-bearing in that case.
+	if cfg.EnableCluster {
+		if cfg.RaftDataDir == "" {
+			cfg.RaftDataDir = filepath.Join(filepath.Dir(cfg.DBPath), "raft")
+		}
+		if cfg.RaftAdvertiseAddr == "" {
+			cfg.RaftAdvertiseAddr = cfg.RaftBindAddr
+		}
+		if cfg.GossipAdvertiseAddr == "" {
+			cfg.GossipAdvertiseAddr = cfg.GossipBindAddr
+		}
+		if cfg.SelfAPIAdvertiseURL == "" {
+			host, _ := os.Hostname()
+			if host == "" {
+				host = "127.0.0.1"
+			}
+			cfg.SelfAPIAdvertiseURL = fmt.Sprintf("http://%s:%d", host, cfg.APIPort)
+		}
+		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
+			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
+		}
+	}
+
 	return cfg, nil
+}
+
+func splitAndTrim(s, sep string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, sep)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (c Config) ListenAddr() string {
