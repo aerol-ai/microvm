@@ -41,6 +41,14 @@ var ErrNotLeader = errors.New("cluster: not raft leader")
 // they have just-created the sandbox and not yet committed its placement.
 var ErrUnknownSandbox = errors.New("cluster: unknown sandbox placement")
 
+// ErrOrphaned is returned by OwnerOf when a placement exists but its owner has
+// been auto-evicted (the node died and grace period expired). The sandbox is
+// permanently unreachable until an operator recovers it. Phase 2 only marks
+// orphans; true re-creation on a new owner is a Phase 2.5 follow-up that
+// requires a replicated sandbox-spec store (today specs live only in the dead
+// node's local SQLite).
+var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned")
+
 // Placement is one row of the FSM's placement map.
 type Placement struct {
 	SandboxID    string `json:"sandbox_id"`

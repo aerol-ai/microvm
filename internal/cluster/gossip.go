@@ -160,20 +160,22 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		interval = 5 * time.Second
 	}
 	refreshCtx, cancel := context.WithCancel(context.Background())
-	go runRefreshLoop(refreshCtx, delegate, interval)
-
-	return &gossipNode{
+	gn := &gossipNode{
 		ml:          ml,
 		delegate:    delegate,
 		stopRefresh: cancel,
 		logger:      logger,
-	}, nil
+	}
+	go gn.runRefreshLoop(refreshCtx, interval)
+	return gn, nil
 }
 
-// runRefreshLoop periodically rebuilds the node-metadata blob so peers see
-// fresh capacity numbers. memberlist re-disseminates metadata when the local
-// node calls UpdateNode (which we trigger after refreshMeta).
-func runRefreshLoop(ctx context.Context, d *gossipDelegate, interval time.Duration) {
+// runRefreshLoop periodically rebuilds the node-metadata blob and tells
+// memberlist to re-disseminate it. Without the UpdateNode call, peers would
+// see only the metadata observed at join time — power-of-two-choices
+// placement would then score against frozen capacity snapshots and slowly
+// pile load onto whichever nodes happened to look empty at gossip-join.
+func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -181,9 +183,13 @@ func runRefreshLoop(ctx context.Context, d *gossipDelegate, interval time.Durati
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			d.refreshMeta()
-			// We can't UpdateNode here without a back-reference to the
-			// memberlist; the gossipNode wrapper does that.
+			g.delegate.refreshMeta()
+			// UpdateNode triggers memberlist's NodeMeta callback and queues
+			// the new blob for gossip dissemination. Bound the call so a
+			// stalled gossip layer doesn't block the refresh ticker.
+			if err := g.ml.UpdateNode(2 * time.Second); err != nil {
+				g.logger.Warn("cluster: memberlist UpdateNode failed", "err", err)
+			}
 		}
 	}
 }

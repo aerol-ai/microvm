@@ -28,6 +28,12 @@ type Cluster struct {
 
 	// voterReconcileStop cancels the auto-voter reconcile goroutine on Close.
 	voterReconcileStop context.CancelFunc
+
+	// deadOwners tracks per-node "first observed dead" timestamps for the
+	// dead-owner reconciler. Lives on the cluster (not in dead_owner.go) so
+	// Close can stop its loop. See dead_owner.go for the reconciler logic.
+	deadOwners        *deadOwnerTracker
+	deadOwnerLoopStop context.CancelFunc
 }
 
 // New constructs a Cluster for cfg.EnableCluster=true. Caller takes ownership
@@ -76,6 +82,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		fsm:           fsm,
 		raft:          rn,
 		commitTimeout: commitTimeout,
+		deadOwners:    newDeadOwnerTracker(),
 	}
 
 	// Carry the raft transport's *advertise* address (post-resolution) so peers
@@ -110,6 +117,12 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// loop is no-op when self isn't leader.
 	c.startVoterReconcileLoop()
 
+	// Dead-owner reconciler: the leader periodically checks for nodes whose
+	// gossip-leave grace period has expired and orphans their placements +
+	// removes them from the raft configuration. Followers maintain the
+	// in-memory tracker (cheap) but never act.
+	c.startDeadOwnerLoop()
+
 	return c, nil
 }
 
@@ -117,11 +130,16 @@ func (c *Cluster) SelfNodeID() string { return c.nodeID }
 func (c *Cluster) SelfAPIURL() string { return c.apiURL }
 
 // OwnerOf reads the placement map from the local FSM (no network round-trip).
-// Returns ErrUnknownSandbox if no row exists.
+// Returns ErrUnknownSandbox if no row exists, or ErrOrphaned if the placement
+// exists but its owner field is empty (auto-orphaned after the owning node
+// died — see voter_autojoin / dead-owner reconciler).
 func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	p, ok := c.fsm.get(sandboxID)
 	if !ok {
 		return OwnerInfo{}, ErrUnknownSandbox
+	}
+	if p.OwnerNodeID == "" {
+		return OwnerInfo{}, ErrOrphaned
 	}
 	apiURL := p.OwnerAPIURL
 	if apiURL == "" {
@@ -262,6 +280,9 @@ func (c *Cluster) Close() error {
 	var firstErr error
 	if c.voterReconcileStop != nil {
 		c.voterReconcileStop()
+	}
+	if c.deadOwnerLoopStop != nil {
+		c.deadOwnerLoopStop()
 	}
 	if c.gossip != nil {
 		if err := c.gossip.Close(); err != nil {

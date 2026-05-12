@@ -43,6 +43,14 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 				local.ServeHTTP(w, r)
 				return
 			}
+			if errors.Is(err, cluster.ErrOrphaned) {
+				// 410 Gone: the sandbox's owning node died and was
+				// auto-evicted. The placement record exists but points
+				// nowhere. Clients should treat this as a permanent
+				// disappearance and (if they care to) issue a fresh create.
+				apihttp.WriteError(w, http.StatusGone, "sandbox owner died; placement orphaned (manual recovery required)")
+				return
+			}
 			apihttp.WriteError(w, http.StatusInternalServerError, "cluster lookup: "+err.Error())
 			return
 		}
@@ -193,6 +201,14 @@ func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, cluster.ErrUnknownSandbox) {
 			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+			return
+		}
+		if errors.Is(err, cluster.ErrOrphaned) {
+			apihttp.WriteJSON(w, http.StatusOK, map[string]any{
+				"orphaned": true,
+				"node_id":  "",
+				"api_url":  "",
+			})
 			return
 		}
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())

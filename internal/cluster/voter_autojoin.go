@@ -8,29 +8,42 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// voterAutoJoinDelegate bridges memberlist join events into the cluster so the
-// raft leader can promote freshly-discovered nodes to voters automatically.
-// In Phase 1 operators had to do this manually; this delegate is the Phase 2
-// shortcut.
+// voterAutoJoinDelegate bridges memberlist membership events into the cluster
+// so the raft leader can react to joins and leaves automatically. Only the
+// leader acts on these events; followers ignore them since raft membership
+// changes go through the leader's log.
 //
-// Only the leader acts on join events. Followers ignore them — raft membership
-// changes go through the leader's log. We also do nothing on Leave / Update:
-// auto-removal of dead members belongs to the "auto re-placement on owner
-// death" workstream and is intentionally deferred. Doing it here would evict
-// nodes on transient gossip flap, which is exactly the failure mode that
-// killed earlier Consul-style auto-removers.
+// Phase 2 behavior:
+//   - NotifyJoin: AddVoter on the leader (this file).
+//   - NotifyLeave: arms a grace timer; on expiry the leader orphans the
+//     dead node's placements and RemoveServer's it from the raft config
+//     (see dead_owner.go).
+//   - NotifyUpdate: ignored — metadata churn doesn't change membership.
+//
+// Why we don't auto-evict immediately on Leave: gossip will mis-mark a node
+// dead during transient network blips and long GC pauses. Consul shipped
+// without a grace period and operators got burned; we don't repeat it.
 type voterAutoJoinDelegate struct {
 	c *Cluster
 }
 
 func (d *voterAutoJoinDelegate) NotifyJoin(n *memberlist.Node) {
-	if d.c == nil {
+	if d.c == nil || n == nil {
 		return
 	}
 	go d.c.handleMemberJoin(n.Name)
+	// A join event also clears any in-flight dead-owner timer for this node:
+	// a flapped peer that comes back is not actually dead.
+	go d.c.cancelDeadOwnerWatch(n.Name)
 }
 
-func (d *voterAutoJoinDelegate) NotifyLeave(*memberlist.Node)  {}
+func (d *voterAutoJoinDelegate) NotifyLeave(n *memberlist.Node) {
+	if d.c == nil || n == nil {
+		return
+	}
+	go d.c.handleMemberLeave(n.Name)
+}
+
 func (d *voterAutoJoinDelegate) NotifyUpdate(*memberlist.Node) {}
 
 // handleMemberJoin tries to add nodeID as a raft voter. Idempotent and

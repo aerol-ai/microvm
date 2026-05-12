@@ -117,6 +117,20 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 	return p, ok
 }
 
+// idsOwnedBy returns the sandbox IDs whose current owner is nodeID. Used by
+// the dead-owner reconciler to enumerate orphan candidates.
+func (f *placementFSM) idsOwnedBy(nodeID string) []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var out []string
+	for id, p := range f.placements {
+		if p.OwnerNodeID == nodeID {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // snapshot copies the placement map for use by Snapshot().
 func (f *placementFSM) snapshot() map[string]Placement {
 	f.mu.RLock()

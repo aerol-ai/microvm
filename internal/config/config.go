@@ -126,6 +126,12 @@ type Config struct {
 	SelfAPIAdvertiseURL      string
 	ClusterRaftCommitTimeout time.Duration
 	ClusterCapacityGossipInterval time.Duration
+	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
+	// a node dead before orphaning its placements and removing it from the
+	// raft configuration. Long enough to absorb transient gossip flap
+	// (network blips, GC pauses) but short enough that operators don't have
+	// to wait minutes to recover.
+	ClusterDeadOwnerGrace time.Duration
 }
 
 func Load() (Config, error) {
@@ -194,6 +200,7 @@ func Load() (Config, error) {
 		SelfAPIAdvertiseURL:           strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
+		ClusterDeadOwnerGrace:         getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
 	}
 
 	if cfg.PATToken == "" {
