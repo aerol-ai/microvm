@@ -10,25 +10,30 @@ import (
 )
 
 // recordingRecreator captures every RecreateSandbox call so a test can assert
-// the cluster owner watcher fired with the expected (id, spec) tuple.
+// the cluster owner watcher fired with the expected (id, spec, ports) tuple.
 type recordingRecreator struct {
 	mu    sync.Mutex
-	calls map[string]models.CreateSandboxRequest
+	calls map[string]recordedRecreate
 	err   error
 }
 
-func newRecordingRecreator() *recordingRecreator {
-	return &recordingRecreator{calls: make(map[string]models.CreateSandboxRequest)}
+type recordedRecreate struct {
+	spec  models.CreateSandboxRequest
+	ports map[int]string
 }
 
-func (r *recordingRecreator) RecreateSandbox(_ context.Context, id string, spec models.CreateSandboxRequest) error {
+func newRecordingRecreator() *recordingRecreator {
+	return &recordingRecreator{calls: make(map[string]recordedRecreate)}
+}
+
+func (r *recordingRecreator) RecreateSandbox(_ context.Context, id string, spec models.CreateSandboxRequest, ports map[int]string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls[id] = spec
+	r.calls[id] = recordedRecreate{spec: spec, ports: ports}
 	return r.err
 }
 
-func (r *recordingRecreator) get(id string) (models.CreateSandboxRequest, bool) {
+func (r *recordingRecreator) get(id string) (recordedRecreate, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s, ok := r.calls[id]
@@ -87,8 +92,57 @@ func TestOwnerWatcherRecreatesOwnedSandbox(t *testing.T) {
 	if !ok {
 		t.Fatal("recreator was not invoked for sb-failover")
 	}
-	if got.Image != "alpine" || got.CPU != 1 || got.MemoryMB != 512 {
+	if got.spec.Image != "alpine" || got.spec.CPU != 1 || got.spec.MemoryMB != 512 {
 		t.Fatalf("recreator received wrong spec: %+v", got)
+	}
+}
+
+// TestOwnerWatcherReplaysExposedPorts verifies a placement carrying both a spec
+// and exposed-port intents drives the watcher to hand the recreator a deep-copy
+// of those ports. This is the failover signal the new owner needs to re-issue
+// ExposePort and restore L4/L7 routing for the sandbox.
+func TestOwnerWatcherReplaysExposedPorts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	rec := newRecordingRecreator()
+	c.AttachRecreator(rec)
+
+	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512}
+	place := command{Op: opPlace, SandboxID: "sb-with-ports", OwnerNodeID: "leader", Spec: spec}
+	payload, _ := encodeCommand(place)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply opPlace: %v", err)
+	}
+	for port, proto := range map[int]string{5432: "tcp", 8080: "http"} {
+		add := command{Op: opAddExposedPort, SandboxID: "sb-with-ports", Port: port, Protocol: proto}
+		payload, _ = encodeCommand(add)
+		if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+			t.Fatalf("raft Apply opAddExposedPort: %v", err)
+		}
+	}
+
+	c.recreateOwnedSandboxes(context.Background())
+	got, ok := rec.get("sb-with-ports")
+	if !ok {
+		t.Fatal("recreator was not invoked for sb-with-ports")
+	}
+	if got.ports[5432] != "tcp" || got.ports[8080] != "http" {
+		t.Fatalf("recreator received wrong ports: %+v", got.ports)
+	}
+	// Mutating the recreator's copy must not bleed back into the FSM — the
+	// watcher is supposed to deep-copy before handing the map over.
+	got.ports[9999] = "tcp"
+	stored, ok := c.fsm.get("sb-with-ports")
+	if !ok {
+		t.Fatal("placement disappeared from fsm")
+	}
+	if _, leaked := stored.ExposedPorts[9999]; leaked {
+		t.Fatal("watcher handed out a shared ExposedPorts map; mutation leaked into fsm")
 	}
 }
 
@@ -133,7 +187,7 @@ func TestEvictThenWatcherEndToEnd(t *testing.T) {
 	if !ok {
 		t.Fatal("recreator was not invoked after evict + watcher tick")
 	}
-	if got.Image != "alpine" {
+	if got.spec.Image != "alpine" {
 		t.Fatalf("recreator received wrong spec: %+v", got)
 	}
 }

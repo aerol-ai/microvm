@@ -207,12 +207,25 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // watcher invokes this for any FSM placement that points to self but has no
 // local sandbox row. The implementation delegates to CreateSandboxWithID,
 // whose store-existence short-circuit gives us the idempotency the watcher
-// contract requires.
-func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest) error {
+// contract requires, then re-issues ExposePort for each replicated port
+// intent so caddy/L4 routes get rebuilt on the new owner.
+//
+// Port replay is best-effort: a failure on one port is logged and the others
+// still try. The watcher loops every few seconds, so a transient failure (a
+// caddy not yet ready, the L4 app still bootstrapping) self-heals on the next
+// tick — ExposePort is idempotent at the service layer.
+func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, exposedPorts map[int]string) error {
 	if _, err := s.CreateSandboxWithID(ctx, spec, id); err != nil {
 		return err
 	}
-	s.logger.Info("cluster: recreated sandbox after failover", "sandbox_id", id)
+	for port, protocol := range exposedPorts {
+		if _, err := s.ExposePort(ctx, id, port, protocol); err != nil {
+			s.logger.Warn("cluster: re-expose after recreate failed; owner watcher will retry",
+				"sandbox_id", id, "port", port, "protocol", protocol, "err", err)
+		}
+	}
+	s.logger.Info("cluster: recreated sandbox after failover",
+		"sandbox_id", id, "replayed_ports", len(exposedPorts))
 	return nil
 }
 

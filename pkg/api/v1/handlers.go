@@ -146,11 +146,16 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	resp, err := h.deps.Service.ExposePort(r.Context(), r.PathValue("id"), port, req.Protocol)
+	id := r.PathValue("id")
+	resp, err := h.deps.Service.ExposePort(r.Context(), id, port, req.Protocol)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// Replicate the canonical protocol the service settled on (not the raw
+	// request value) so a future failover-recreate uses the same protocol the
+	// user is seeing.
+	h.replicateAddExposedPort(r.Context(), id, port, resp.Protocol)
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
@@ -160,10 +165,12 @@ func (h *handlers) unexposePort(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid port")
 		return
 	}
-	if err := h.deps.Service.UnexposePort(r.Context(), r.PathValue("id"), port); err != nil {
+	id := r.PathValue("id")
+	if err := h.deps.Service.UnexposePort(r.Context(), id, port); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	h.replicateRemoveExposedPort(r.Context(), id, port)
 	w.WriteHeader(http.StatusNoContent)
 }
 

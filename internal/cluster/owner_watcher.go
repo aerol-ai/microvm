@@ -57,7 +57,14 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 			continue
 		}
 		spec := *p.Spec
-		if err := r.RecreateSandbox(ctx, id, spec); err != nil {
+		var ports map[int]string
+		if len(p.ExposedPorts) > 0 {
+			ports = make(map[int]string, len(p.ExposedPorts))
+			for k, v := range p.ExposedPorts {
+				ports[k] = v
+			}
+		}
+		if err := r.RecreateSandbox(ctx, id, spec, ports); err != nil {
 			c.logger.Warn("cluster: recreate owned sandbox failed; will retry next tick",
 				"sandbox_id", id, "err", err)
 		}

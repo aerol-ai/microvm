@@ -16,22 +16,28 @@ import (
 type opCode uint8
 
 const (
-	opPlace      opCode = 1
-	opDelete     opCode = 2
-	opReassign   opCode = 3
-	opUpsertSpec opCode = 4 // overwrite Placement.Spec without touching ownership
+	opPlace            opCode = 1
+	opDelete           opCode = 2
+	opReassign         opCode = 3
+	opUpsertSpec       opCode = 4 // overwrite Placement.Spec without touching ownership
+	opAddExposedPort   opCode = 5 // record one (port, protocol) intent
+	opRemoveExposedPort opCode = 6 // drop one port intent
 )
 
 // command is the wire format for one raft log entry. Spec is non-nil for
 // opPlace (records the original creation request alongside the owner pointer)
-// and opUpsertSpec (records mutations like resize/lifecycle/expose-port that
-// must survive failover).
+// and opUpsertSpec (records mutations like resize/lifecycle that must survive
+// failover). Port/Protocol carry one (port, protocol) tuple for opAddExposedPort
+// and opRemoveExposedPort — replicated as intent-only so the new owner picks a
+// fresh host port from its own pool.
 type command struct {
 	Op          opCode                       `json:"op"`
 	SandboxID   string                       `json:"sandbox_id"`
 	OwnerNodeID string                       `json:"owner_node_id,omitempty"`
 	OwnerAPIURL string                       `json:"owner_api_url,omitempty"`
 	Spec        *models.CreateSandboxRequest `json:"spec,omitempty"`
+	Port        int                          `json:"port,omitempty"`
+	Protocol    string                       `json:"protocol,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -93,14 +99,22 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			// later opPlace that omits the payload.
 			spec = existing.Spec
 		}
+		var ports map[int]string
+		if exists {
+			// Same preservation rule as Spec: opPlace is the "owner + spec"
+			// write and must not erase the port intents accumulated by
+			// opAddExposedPort calls between creates.
+			ports = existing.ExposedPorts
+		}
 		f.placements[cmd.SandboxID] = Placement{
-			SandboxID:   cmd.SandboxID,
-			OwnerNodeID: cmd.OwnerNodeID,
-			OwnerAPIURL: cmd.OwnerAPIURL,
-			Version:     f.version,
-			CreatedUnix: created,
-			UpdatedUnix: now,
-			Spec:        spec,
+			SandboxID:    cmd.SandboxID,
+			OwnerNodeID:  cmd.OwnerNodeID,
+			OwnerAPIURL:  cmd.OwnerAPIURL,
+			Version:      f.version,
+			CreatedUnix:  created,
+			UpdatedUnix:  now,
+			Spec:         spec,
+			ExposedPorts: ports,
 		}
 		return nil
 	case opDelete:
@@ -131,6 +145,42 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			return nil
 		}
 		existing.Spec = cmd.Spec
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		f.placements[cmd.SandboxID] = existing
+		return nil
+	case opAddExposedPort:
+		existing, exists := f.placements[cmd.SandboxID]
+		if !exists || cmd.Port <= 0 {
+			return nil
+		}
+		if existing.ExposedPorts == nil {
+			existing.ExposedPorts = make(map[int]string)
+		}
+		// Same-protocol re-add is a no-op; protocol upgrade overwrites (the
+		// service layer rejects mid-flight protocol changes via the
+		// "unexpose first" guard, so this branch only fires on legitimate
+		// updates that already succeeded locally).
+		if existing.ExposedPorts[cmd.Port] == cmd.Protocol {
+			return nil
+		}
+		existing.ExposedPorts[cmd.Port] = cmd.Protocol
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		f.placements[cmd.SandboxID] = existing
+		return nil
+	case opRemoveExposedPort:
+		existing, exists := f.placements[cmd.SandboxID]
+		if !exists || cmd.Port <= 0 {
+			return nil
+		}
+		if _, present := existing.ExposedPorts[cmd.Port]; !present {
+			return nil
+		}
+		delete(existing.ExposedPorts, cmd.Port)
+		if len(existing.ExposedPorts) == 0 {
+			existing.ExposedPorts = nil
+		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing

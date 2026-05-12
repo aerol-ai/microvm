@@ -55,6 +55,11 @@ var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned
 // sandbox creation request used by the new owner to re-materialize a sandbox
 // after its previous owner died (see owner_watcher.go). Spec is a pointer so
 // older snapshots written before spec replication still decode cleanly.
+//
+// ExposedPorts is the replicated set of port→protocol intents; the host port
+// and public URL are deliberately not replicated because they're allocated
+// per-host. The new owner re-runs ExposePort for each entry after recreate so
+// caddy/L4 routes get rebuilt with whatever host port the new node picks.
 type Placement struct {
 	SandboxID    string                       `json:"sandbox_id"`
 	OwnerNodeID  string                       `json:"owner_node_id"`
@@ -63,6 +68,7 @@ type Placement struct {
 	CreatedUnix  int64                        `json:"created_unix"`
 	UpdatedUnix  int64                        `json:"updated_unix"`
 	Spec         *models.CreateSandboxRequest `json:"spec,omitempty"`
+	ExposedPorts map[int]string               `json:"exposed_ports,omitempty"`
 }
 
 // Member is a snapshot of a peer's gossiped state.
@@ -72,6 +78,18 @@ type Member struct {
 	RaftAddr string            `json:"raft_addr,omitempty"`
 	Alive    bool              `json:"alive"`
 	Capacity capacity.Snapshot `json:"capacity"`
+}
+
+// LocalSandboxState is one entry in the boot-time AssertOwnership payload.
+// Carrying Spec + ExposedPorts (rather than just an ID) lets the boot replay
+// backfill the FSM with everything a future failover-recreate needs — without
+// this, sandboxes that pre-date cluster mode (or pre-date the spec/ports
+// replication features) would never gain a replicated spec until their next
+// mutating call.
+type LocalSandboxState struct {
+	ID           string
+	Spec         *models.CreateSandboxRequest
+	ExposedPorts map[int]string
 }
 
 // PlacementTarget is returned by SelectPlacement.
@@ -94,11 +112,18 @@ type OwnerInfo struct {
 // no corresponding local sandbox — typically because the previous owner died
 // and the dead-owner reconciler reassigned the placement here.
 //
+// exposedPorts carries the replicated port→protocol intents the previous
+// owner had recorded; the implementation is expected to re-issue ExposePort
+// for each entry after the create succeeds. The host port is not replicated
+// because each node allocates from its own pool — the public URL may differ
+// after failover for "tcp" exposures (HTTP/TLS-SNI URLs are stable because
+// they're derived from id+port+domain).
+//
 // Implementations MUST be idempotent: the watcher polls and may invoke
 // RecreateSandbox multiple times for the same id while a previous attempt is
 // still in flight or after an unexpected restart.
 type SandboxRecreator interface {
-	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest) error
+	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, exposedPorts map[int]string) error
 }
 
 // Client is the surface the rest of the daemon (Service, API handlers)
@@ -138,12 +163,27 @@ type Client interface {
 	// pattern when patching a single field via UpsertSpec.
 	SpecOf(sandboxID string) *models.CreateSandboxRequest
 
+	// AddExposedPort records intent that sandboxID has port exposed under
+	// protocol. Replicated as intent only — the new owner allocates its own
+	// host port on recreate. Idempotent (same port+protocol is a no-op).
+	AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error
+
+	// RemoveExposedPort drops a port intent from the placement. Idempotent.
+	RemoveExposedPort(ctx context.Context, sandboxID string, port int) error
+
+	// ExposedPortsOf returns a copy of the replicated port→protocol map for
+	// sandboxID, or nil if none. Used by the recreator to replay exposures
+	// after a failover.
+	ExposedPortsOf(sandboxID string) map[int]string
+
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error
 
-	// AssertOwnership ensures the FSM lists self as owner for every id in
-	// localIDs. Used at boot to recover after a restart. Idempotent.
-	AssertOwnership(ctx context.Context, localIDs []string) error
+	// AssertOwnership ensures the FSM lists self as owner for every entry in
+	// local, and backfills any missing Spec / ExposedPorts so failover-recreate
+	// works for sandboxes that pre-date the spec-replication features. Used at
+	// boot. Idempotent.
+	AssertOwnership(ctx context.Context, local []LocalSandboxState) error
 
 	// ForwardHTTP reverse-proxies r to peerAPIURL, copying response back to w.
 	// Used by the API layer when OwnerOf != self.

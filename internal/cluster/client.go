@@ -246,17 +246,61 @@ func (c *Cluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 	return &cp
 }
 
+// AddExposedPort replicates a port-exposure intent. Idempotent (same
+// port+protocol is a no-op at the FSM layer). Must be called on the leader.
+func (c *Cluster) AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error {
+	if port <= 0 {
+		return nil
+	}
+	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, Port: port, Protocol: protocol}
+	return c.applyCommand(ctx, cmd)
+}
+
+// RemoveExposedPort drops a replicated port-exposure intent. Idempotent.
+func (c *Cluster) RemoveExposedPort(ctx context.Context, sandboxID string, port int) error {
+	if port <= 0 {
+		return nil
+	}
+	cmd := command{Op: opRemoveExposedPort, SandboxID: sandboxID, Port: port}
+	return c.applyCommand(ctx, cmd)
+}
+
+// ExposedPortsOf returns a copy of the replicated port→protocol map. Returns
+// nil if no placement exists or no ports are recorded.
+func (c *Cluster) ExposedPortsOf(sandboxID string) map[int]string {
+	p, ok := c.fsm.get(sandboxID)
+	if !ok || len(p.ExposedPorts) == 0 {
+		return nil
+	}
+	out := make(map[int]string, len(p.ExposedPorts))
+	for k, v := range p.ExposedPorts {
+		out[k] = v
+	}
+	return out
+}
+
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	cmd := command{Op: opDelete, SandboxID: sandboxID}
 	return c.applyCommand(ctx, cmd)
 }
 
-// AssertOwnership ensures every id in localIDs is recorded as owned by self.
-// Used at boot. Idempotent. Best-effort: errors are logged but do not abort
-// boot — the next reconcile loop will retry.
-func (c *Cluster) AssertOwnership(ctx context.Context, localIDs []string) error {
-	if len(localIDs) == 0 {
+// AssertOwnership ensures every entry in local is recorded as owned by self,
+// and backfills any missing Spec / ExposedPorts so a future failover-recreate
+// has everything it needs. Used at boot. Idempotent. Best-effort: errors are
+// logged but do not abort boot — the next reconcile loop will retry.
+//
+// Backfill rules:
+//   - If the FSM has no placement for this id, write opPlace with the local
+//     spec (if available) so the new placement is born with a recoverable spec.
+//   - If the FSM has a placement but no Spec and we have one locally, send
+//     opUpsertSpec to attach it. This is what closes the pre-cluster-sandbox
+//     limitation: a sandbox created before spec replication shipped will pick
+//     up its spec on the next boot under cluster mode.
+//   - For every locally-recorded port intent, send opAddExposedPort. The op
+//     is a no-op if the FSM already records the same (port, protocol).
+func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState) error {
+	if len(local) == 0 {
 		return nil
 	}
 	// Wait briefly for a leader to exist so we can apply. If no leader emerges
@@ -266,20 +310,32 @@ func (c *Cluster) AssertOwnership(ctx context.Context, localIDs []string) error 
 		return nil
 	}
 	var firstErr error
-	for _, id := range localIDs {
-		existing, ok := c.fsm.get(id)
-		if ok && existing.OwnerNodeID == c.nodeID {
+	for _, st := range local {
+		if st.ID == "" {
 			continue
 		}
-		// Either no placement exists or another node thinks they own this
-		// sandbox (unlikely but possible after a split-brain recovery). In
-		// both cases we (re)claim — this node has the sandbox locally so it
-		// IS the owner, and the FSM should reflect that.
-		// spec=nil at boot replay: the FSM preserves any previously-recorded
-		// spec for this id. See cluster.go RecordPlacement docs for the
-		// pre-cluster-sandbox limitation this implies.
-		if err := c.RecordPlacement(ctx, id, nil); err != nil && firstErr == nil {
-			firstErr = err
+		existing, ok := c.fsm.get(st.ID)
+		needsPlace := !ok || existing.OwnerNodeID != c.nodeID
+		needsSpecBackfill := ok && existing.Spec == nil && st.Spec != nil
+		if needsPlace {
+			// Either no placement exists or another node thinks they own this
+			// sandbox (unlikely but possible after a split-brain recovery). In
+			// both cases we (re)claim — this node has the sandbox locally so
+			// it IS the owner. Pass spec so the placement is born recoverable.
+			if err := c.RecordPlacement(ctx, st.ID, st.Spec); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		} else if needsSpecBackfill {
+			// Existing placement, no spec yet — attach one so future failover
+			// can recreate this pre-cluster sandbox.
+			if err := c.UpsertSpec(ctx, st.ID, st.Spec); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		for port, protocol := range st.ExposedPorts {
+			if err := c.AddExposedPort(ctx, st.ID, port, protocol); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr

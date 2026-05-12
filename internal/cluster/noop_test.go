@@ -40,7 +40,7 @@ func TestNoopAlwaysSelf(t *testing.T) {
 	if err := n.DeletePlacement(context.Background(), "x"); err != nil {
 		t.Fatalf("DeletePlacement: %v", err)
 	}
-	if err := n.AssertOwnership(context.Background(), []string{"a", "b"}); err != nil {
+	if err := n.AssertOwnership(context.Background(), []LocalSandboxState{{ID: "a"}, {ID: "b"}}); err != nil {
 		t.Fatalf("AssertOwnership: %v", err)
 	}
 	if err := n.Close(); err != nil {

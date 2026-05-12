@@ -257,6 +257,42 @@ func (h *handlers) replicateSpecPatch(ctx context.Context, id string, patch func
 	}
 }
 
+// replicateAddExposedPort write-throughs an expose-port intent to the FSM. The
+// failure profile is identical to replicateSpecPatch: log warn, don't fail the
+// response. The local store already has the exposure recorded; a stale FSM
+// only affects what survives an owner failover, and the next mutation
+// (re-expose, unexpose, or another sandbox change) will refresh it. ExposePort
+// itself is idempotent on the recreated owner so a missed write-through
+// degrades gracefully — the user keeps the local route, just not the
+// cluster-replicated intent.
+func (h *handlers) replicateAddExposedPort(ctx context.Context, id string, port int, protocol string) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		return
+	}
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.AddExposedPort(commitCtx, id, port, protocol); err != nil {
+		h.deps.Logger.Warn("cluster: AddExposedPort write-through failed; FSM port intent stale until next mutation",
+			"sandbox_id", id, "port", port, "protocol", protocol, "err", err)
+	}
+}
+
+// replicateRemoveExposedPort is the unexpose counterpart of
+// replicateAddExposedPort. Same best-effort semantics.
+func (h *handlers) replicateRemoveExposedPort(ctx context.Context, id string, port int) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		return
+	}
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.RemoveExposedPort(commitCtx, id, port); err != nil {
+		h.deps.Logger.Warn("cluster: RemoveExposedPort write-through failed; FSM port intent stale until next mutation",
+			"sandbox_id", id, "port", port, "err", err)
+	}
+}
+
 // capacityRequestFromCreate maps the wire CreateSandboxRequest into a
 // capacity.Request used for placement scoring. Defaults match the admission
 // floor so unspecified requests still produce a stable, comparable score.

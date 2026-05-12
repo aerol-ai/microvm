@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
@@ -161,10 +162,10 @@ func main() {
 	// across restarts. Best-effort: a missing leader on cold start is logged
 	// and recovered by the next reconcile or the next mutating call.
 	if cfg.EnableCluster {
-		ids, err := localSandboxIDs(ctx, svc)
+		states, err := localSandboxStates(ctx, svc)
 		if err != nil {
-			logger.Warn("cluster: could not list local sandbox ids for ownership replay", "error", err)
-		} else if err := svc.Cluster().AssertOwnership(ctx, ids); err != nil {
+			logger.Warn("cluster: could not list local sandbox states for ownership replay", "error", err)
+		} else if err := svc.Cluster().AssertOwnership(ctx, states); err != nil {
 			logger.Warn("cluster: AssertOwnership returned error at boot; reconcile will retry", "error", err)
 		}
 	}
@@ -219,20 +220,74 @@ func main() {
 	}
 }
 
-// localSandboxIDs returns the IDs of every sandbox persisted in the local
-// store. Used at cluster-mode boot to seed the placement map with this node's
-// ownership claims.
-func localSandboxIDs(ctx context.Context, svc *service.Service) ([]string, error) {
+// localSandboxStates returns boot-replay payloads for every sandbox in the
+// local store. Each entry carries the persisted Sandbox's identity, a derived
+// CreateSandboxRequest, and the set of currently-exposed (port, protocol)
+// intents — enough for AssertOwnership to backfill spec + ports for sandboxes
+// that pre-date the spec-replication features.
+//
+// Registry credentials aren't persisted on the Sandbox row, so they never get
+// backfilled. That matches existing behavior: a recreated sandbox relies on
+// whichever image is already cached on the new owner. New sandboxes created
+// post-cluster carry Registry through the create-time spec replication path.
+func localSandboxStates(ctx context.Context, svc *service.Service) ([]cluster.LocalSandboxState, error) {
 	sandboxes, err := svc.ListSandboxes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0, len(sandboxes))
+	out := make([]cluster.LocalSandboxState, 0, len(sandboxes))
 	for _, sb := range sandboxes {
 		if sb == nil || sb.ID == "" {
 			continue
 		}
-		ids = append(ids, sb.ID)
+		out = append(out, cluster.LocalSandboxState{
+			ID:           sb.ID,
+			Spec:         specFromSandbox(sb),
+			ExposedPorts: portsFromSandbox(sb),
+		})
 	}
-	return ids, nil
+	return out, nil
+}
+
+// specFromSandbox derives a CreateSandboxRequest from a persisted Sandbox row.
+// Used only for the pre-cluster backfill path — new sandboxes get their full
+// spec replicated at create time via clusterCreateWrap.
+func specFromSandbox(sb *models.Sandbox) *models.CreateSandboxRequest {
+	if sb == nil {
+		return nil
+	}
+	spec := &models.CreateSandboxRequest{
+		Image:            sb.Image,
+		CPU:              sb.CPU,
+		MemoryMB:         sb.MemoryMB,
+		DiskGB:           sb.DiskGB,
+		Env:              sb.Env,
+		OSUser:           sb.OSUser,
+		NetworkBlockAll:  sb.NetworkBlockAll,
+		ContainerCommand: sb.ContainerCommand,
+		Runtime:          sb.Runtime,
+		GPUs:             sb.GPUs,
+	}
+	// Lifecycle on Sandbox is value-typed; spec wants a pointer so the JSON
+	// "omitempty" stays meaningful for fresh creates that didn't pass one.
+	lc := sb.Lifecycle
+	spec.Lifecycle = &lc
+	return spec
+}
+
+// portsFromSandbox extracts the (containerPort, protocol) intents the sandbox
+// currently has exposed. Host ports and public URLs are deliberately dropped
+// because they're per-host concerns the new owner re-derives.
+func portsFromSandbox(sb *models.Sandbox) map[int]string {
+	if sb == nil || len(sb.ExposedPorts) == 0 {
+		return nil
+	}
+	out := make(map[int]string, len(sb.ExposedPorts))
+	for _, p := range sb.ExposedPorts {
+		if p.Port <= 0 {
+			continue
+		}
+		out[p.Port] = p.Protocol
+	}
+	return out
 }

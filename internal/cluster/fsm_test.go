@@ -144,6 +144,99 @@ func TestFSMReassignPreservesSpec(t *testing.T) {
 	}
 }
 
+// TestFSMAddRemoveExposedPort exercises the port-intent ops. opAdd is
+// idempotent for the same protocol; opRemove is idempotent for absent ports;
+// the empty map collapses to nil so JSON snapshots stay clean.
+func TestFSMAddRemoveExposedPort(t *testing.T) {
+	fsm := newPlacementFSM()
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A"})
+	fsm.Apply(&raft.Log{Data: c})
+
+	add1, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 80, Protocol: "http"})
+	add2, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 5432, Protocol: "tcp"})
+	fsm.Apply(&raft.Log{Data: add1})
+	fsm.Apply(&raft.Log{Data: add2})
+
+	got, _ := fsm.get("sb1")
+	if got.ExposedPorts[80] != "http" || got.ExposedPorts[5432] != "tcp" {
+		t.Fatalf("ports not recorded: %+v", got.ExposedPorts)
+	}
+
+	// Idempotent re-add: snapshot the version, re-apply, version must be unchanged.
+	preVer := got.Version
+	fsm.Apply(&raft.Log{Data: add1})
+	got, _ = fsm.get("sb1")
+	if got.Version != preVer {
+		t.Fatalf("idempotent re-add bumped version: %d -> %d", preVer, got.Version)
+	}
+
+	// Remove one and verify the other survives.
+	rem, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", Port: 80})
+	fsm.Apply(&raft.Log{Data: rem})
+	got, _ = fsm.get("sb1")
+	if _, present := got.ExposedPorts[80]; present {
+		t.Fatalf("port 80 should be gone; got %+v", got.ExposedPorts)
+	}
+	if got.ExposedPorts[5432] != "tcp" {
+		t.Fatalf("port 5432 should remain; got %+v", got.ExposedPorts)
+	}
+
+	// Remove the last entry — the map should collapse to nil so snapshots don't
+	// carry an empty container indefinitely.
+	rem2, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", Port: 5432})
+	fsm.Apply(&raft.Log{Data: rem2})
+	got, _ = fsm.get("sb1")
+	if got.ExposedPorts != nil {
+		t.Fatalf("empty ExposedPorts should collapse to nil; got %+v", got.ExposedPorts)
+	}
+
+	// Removing an absent port is a no-op.
+	preVer = got.Version
+	fsm.Apply(&raft.Log{Data: rem2})
+	got, _ = fsm.get("sb1")
+	if got.Version != preVer {
+		t.Fatalf("idempotent re-remove bumped version: %d -> %d", preVer, got.Version)
+	}
+}
+
+// TestFSMPlaceCarriesPortsThroughRetry asserts an idempotent opPlace retry
+// (e.g. AssertOwnership at boot writing spec=nil) does not erase the port
+// intents that had been added by opAddExposedPort calls in between.
+func TestFSMPlaceCarriesPortsThroughRetry(t *testing.T) {
+	fsm := newPlacementFSM()
+	p, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A"})
+	fsm.Apply(&raft.Log{Data: p})
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 8080, Protocol: "http"})
+	fsm.Apply(&raft.Log{Data: add})
+	// Retry place with same owner, no spec — must not erase ports.
+	fsm.Apply(&raft.Log{Data: p})
+	got, _ := fsm.get("sb1")
+	if got.ExposedPorts[8080] != "http" {
+		t.Fatalf("idempotent re-place erased ports; got %+v", got.ExposedPorts)
+	}
+}
+
+// TestFSMReassignPreservesPorts pairs with TestFSMReassignPreservesSpec — port
+// intents must survive a failover reassignment so the new owner can replay
+// exposures during recreate.
+func TestFSMReassignPreservesPorts(t *testing.T) {
+	fsm := newPlacementFSM()
+	p, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}})
+	fsm.Apply(&raft.Log{Data: p})
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 5432, Protocol: "tcp"})
+	fsm.Apply(&raft.Log{Data: add})
+	r, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B"})
+	fsm.Apply(&raft.Log{Data: r})
+	got, _ := fsm.get("sb1")
+	if got.OwnerNodeID != "B" {
+		t.Fatalf("expected owner B; got %q", got.OwnerNodeID)
+	}
+	if got.ExposedPorts[5432] != "tcp" {
+		t.Fatalf("reassign erased ports; got %+v", got.ExposedPorts)
+	}
+}
+
 // fakeSnapshotSink lets us drive Snapshot/Restore without a real BoltStore.
 type fakeSnapshotSink struct {
 	*bytes.Buffer

@@ -43,9 +43,14 @@ func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.Cr
 	return nil
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
-func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error { return nil }
+func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error {
+	return nil
+}
+func (n *Noop) RemoveExposedPort(ctx context.Context, sandboxID string, port int) error { return nil }
+func (n *Noop) ExposedPortsOf(sandboxID string) map[int]string                          { return nil }
+func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error             { return nil }
 
-func (n *Noop) AssertOwnership(ctx context.Context, localIDs []string) error { return nil }
+func (n *Noop) AssertOwnership(ctx context.Context, local []LocalSandboxState) error { return nil }
 
 func (n *Noop) ForwardHTTP(peerAPIURL string, w http.ResponseWriter, r *http.Request) {
 	// Should never be called in single-node mode (OwnerOf always reports

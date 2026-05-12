@@ -17,9 +17,10 @@ This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder 
 | Sandbox ID | Reused on next `Create` | Preserved if record persisted | Preserved (recreated on new owner) |
 | Environment variables, image, resource limits | N/A | Restored on `Start` | Restored from replicated spec |
 | Idle lifecycle policy | N/A | Restored on `Start` | Restored from replicated spec |
-| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | **Not replicated** - must be re-exposed |
-| Caddy routes | Removed | Restored on `Start` | Re-created when ports are re-exposed |
-| Host port number | N/A | Same host, same port | May differ on the new owner |
+| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Re-exposed on the new owner from replicated intent |
+| Caddy routes | Removed | Restored on `Start` | Re-created on the new owner when ports are re-exposed |
+| Host port number | N/A | Same host, same port | New host, new port allocated from the new owner's pool |
+| Public URL | Removed | Restored on `Start` | Re-issued — the host and host port change |
 
 ## Make workspace state durable
 
@@ -128,7 +129,7 @@ Anything written under `/workspace` outlives the container. Anything written els
 
 ## Cluster-mode failover
 
-When `SB_ENABLE_CLUSTER=true`, the cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle) into a Raft log. If the owner node leaves the cluster and stays gone past the dead-owner grace period, the leader reassigns every placement that carries a spec to a live node. The new owner detects the reassignment within a few seconds and recreates the sandbox locally with the original ID.
+When `SB_ENABLE_CLUSTER=true`, the cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle) and every exposed-port intent (port + protocol) into a Raft log. If the owner node leaves the cluster and stays gone past the dead-owner grace period, the leader reassigns every placement that carries a spec to a live node. The new owner detects the reassignment within a few seconds, recreates the sandbox locally with the original ID, and re-runs `ExposePort` for each replicated port intent.
 
 The recreated sandbox is a **fresh container** with the same identity:
 
@@ -136,9 +137,9 @@ The recreated sandbox is a **fresh container** with the same identity:
 - Same image, env, resource limits, mounts, lifecycle policy.
 - Mounted volumes attach to the same external sources, so workspace state under mount targets is intact.
 - Container writable layer is empty - any in-container files outside mounts are lost.
-- Exposed ports must be re-exposed by the client. The new owner's host port may differ.
+- Same set of exposed ports - re-issued automatically on the new owner. The host port and public URL change because they're allocated from the new owner's pool, so clients that hard-coded the old URL must re-fetch it from `GetSandbox`.
 
-Re-exposure is a single call once the recreated sandbox is up:
+If you ever need to re-expose a port manually (for example, the original `ExposePort` call landed during a network partition and was dropped), the API is idempotent:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -181,8 +182,8 @@ Re-exposure is a single call once the recreated sandbox is up:
 
 ## Limitations
 
-- **Pre-cluster sandboxes carry no spec.** Sandboxes created before the cluster was enabled, or before this feature shipped, have no replicated spec until the next mutating call (`Resize`, lifecycle update). A failover before that mutation marks the placement orphaned and the sandbox is unrecoverable without manual recreate. New sandboxes created under cluster mode always carry a spec.
-- **Exposed ports are not replicated.** The list of exposed ports lives outside the create spec. Re-expose ports after a failover.
+- **Pre-cluster sandboxes are backfilled at boot.** Sandboxes created before the cluster was enabled, or before spec replication shipped, get their spec and exposed-port intents written into the Raft log on the next daemon start under cluster mode. Registry credentials are the one field that's not backfilled - they aren't persisted on the sandbox row, so a failover relies on the new owner already having the image cached. New sandboxes created under cluster mode replicate everything (including registry credentials) at create time.
+- **Public URLs change on failover.** Host ports come from each node's local pool, so the URL surface re-derives on the new owner. Always look up the current URL via `GetSandbox` rather than caching the one from the original create.
 - **Writable-layer state is not replicated.** Treat anything outside a mount as cache. If you need it after a crash, write it to a mount.
 - **Single-node deployments inherit the same model.** A host crash loses the writable layer just as a failover does. Mount external storage for anything that must survive.
 
@@ -191,6 +192,6 @@ Re-exposure is a single call once the recreated sandbox is up:
 1. Pick the directory your workload writes durable state to (often a project root, a database data dir, or a model cache).
 2. Declare it as a mount target at `Create` time.
 3. Treat everything else inside the container as scratch.
-4. In cluster mode, expect to call `ExposePort` again after a failover - and surface the new public URL to your clients.
+4. In cluster mode, re-fetch the public URL from `GetSandbox` after a failover - the sandbox ID and exposed ports survive, but the host and host port change.
 
 This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable.
