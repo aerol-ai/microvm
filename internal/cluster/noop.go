@@ -49,6 +49,7 @@ func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, p
 func (n *Noop) RemoveExposedPort(ctx context.Context, sandboxID string, port int) error { return nil }
 func (n *Noop) ExposedPortsOf(sandboxID string) map[int]string                          { return nil }
 func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error             { return nil }
+func (n *Noop) ApplyEncoded(ctx context.Context, payload []byte) error                  { return nil }
 
 func (n *Noop) AssertOwnership(ctx context.Context, local []LocalSandboxState) error { return nil }
 

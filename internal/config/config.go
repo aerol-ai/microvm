@@ -132,6 +132,12 @@ type Config struct {
 	// (network blips, GC pauses) but short enough that operators don't have
 	// to wait minutes to recover.
 	ClusterDeadOwnerGrace time.Duration
+	// ClusterGossipSecretKey, when non-empty, enables AES gossip encryption +
+	// authentication. Accepts a base64-encoded 16/24/32-byte key (AES-128/192/256).
+	// When empty, gossip is plaintext — acceptable only on a fully private
+	// network, since voter auto-promotion will otherwise admit any reachable
+	// peer to the raft configuration. SB_GOSSIP_SECRET_KEY.
+	ClusterGossipSecretKey string
 }
 
 func Load() (Config, error) {
@@ -201,6 +207,7 @@ func Load() (Config, error) {
 		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterDeadOwnerGrace:         getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		ClusterGossipSecretKey:        strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 	}
 
 	if cfg.PATToken == "" {

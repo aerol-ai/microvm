@@ -6,7 +6,10 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +104,100 @@ func TestClusterTwoNodeReplication(t *testing.T) {
 	}
 }
 
+// TestFollowerWriteForwardsToLeader pins down the issue-1 fix: a
+// RecordPlacement issued on a follower must transparently forward to the
+// leader's /v1/cluster/internal/apply endpoint and succeed, instead of
+// returning ErrNotLeader. Without leader-forwarding every owner-side mutating
+// API on a non-leader node would 503 — the entire cluster would degrade to a
+// one-node cluster whenever the leader didn't happen to win placement.
+func TestFollowerWriteForwardsToLeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires opening real raft/memberlist sockets")
+	}
+
+	// Pre-bind the leader's API port so we can both advertise it via gossip and
+	// start an httptest server on it. Without this, the gossip delegate would
+	// publish the placeholder URL from newTestCluster, which the follower would
+	// then try to POST to.
+	apiListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("api listen: %v", err)
+	}
+	leaderAPIURL := "http://" + apiListener.Addr().String()
+
+	leader, cleanupLeader := newTestClusterWithAPI(t, "leader-fw", true, nil, leaderAPIURL)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	// Wire the internal apply route onto our pre-bound listener.
+	srv := startInternalApplyServer(t, leader, apiListener)
+	defer srv.Close()
+
+	follower, cleanupFollower := newTestCluster(t, "follower-fw", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupFollower()
+	waitForVoter(t, leader, "follower-fw", 10*time.Second)
+
+	// Give gossip a beat to propagate the leader's metadata to the follower so
+	// LeaderAPIURL resolves to a non-empty URL.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.HasPrefix(follower.LeaderAPIURL(), "http://") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := follower.LeaderAPIURL(); !strings.HasPrefix(got, "http://") {
+		t.Fatalf("follower never resolved leader API URL (got %q)", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// With the fix: forwarded to the leader and applied. Without the fix:
+	// returns ErrNotLeader from applyCommand on the follower.
+	if err := follower.RecordPlacement(ctx, "sb-forwarded", nil); err != nil {
+		t.Fatalf("follower RecordPlacement: %v", err)
+	}
+
+	owner, err := leader.OwnerOf("sb-forwarded")
+	if err != nil {
+		t.Fatalf("leader OwnerOf after follower-forwarded write: %v", err)
+	}
+	if owner.NodeID != "follower-fw" {
+		t.Fatalf("owner node = %q, want follower-fw", owner.NodeID)
+	}
+}
+
+// startInternalApplyServer mounts a minimal /v1/cluster/internal/apply route
+// onto the supplied listener and returns the running server. We can't import
+// pkg/api/v1 here without an import cycle, so the route contract is inlined.
+func startInternalApplyServer(t *testing.T, c *Cluster, ln net.Listener) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/cluster/internal/apply", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := c.ApplyEncoded(r.Context(), body); err != nil {
+			if err == ErrNotLeader {
+				http.Error(w, "not leader", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := &httptest.Server{
+		Listener: ln,
+		Config:   &http.Server{Handler: mux},
+	}
+	srv.Start()
+	return srv
+}
+
 // --- helpers below ---
 
 // newTestCluster builds a real *Cluster on dynamic ports under t.TempDir().
@@ -108,10 +205,18 @@ func TestClusterTwoNodeReplication(t *testing.T) {
 // addresses to join. Returns a cleanup that closes the cluster — defer it.
 func newTestCluster(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string) (*Cluster, func()) {
 	t.Helper()
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
+	return newTestClusterWithAPI(t, nodeID, bootstrap, gossipPeers, apiURL)
+}
+
+// newTestClusterWithAPI is newTestCluster with a caller-supplied API URL — used
+// when the test needs to advertise a URL it has already pre-bound a listener
+// on (so the gossip-published URL matches an HTTP server the test will start).
+func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, apiURL string) (*Cluster, func()) {
+	t.Helper()
 	raftPort := pickFreeTCPPort(t)
 	gossipPort := pickFreeTCPPort(t)
 	dir := t.TempDir()
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 
 	cfg := config.Config{
 		EnableCluster:                 true,

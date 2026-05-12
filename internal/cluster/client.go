@@ -1,10 +1,15 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +30,12 @@ type Cluster struct {
 	fsm    *placementFSM
 	raft   *raftNode
 	gossip *gossipNode
+
+	// patToken authenticates leader-forwarded raft applies. Sourced from
+	// cfg.PATToken at construction; same value every node already shares for
+	// regular API auth, so no new secret-distribution surface.
+	patToken   string
+	httpClient *http.Client
 
 	commitTimeout time.Duration
 
@@ -91,6 +102,8 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		apiURL:        cfg.SelfAPIAdvertiseURL,
 		fsm:           fsm,
 		raft:          rn,
+		patToken:      cfg.PATToken,
+		httpClient:    &http.Client{Timeout: commitTimeout + 2*time.Second},
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 	}
@@ -106,6 +119,18 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		raftAdvertise = string(rn.transport.LocalAddr())
 	}
 
+	secretKey, err := decodeGossipSecretKey(cfg.ClusterGossipSecretKey)
+	if err != nil {
+		_ = rn.Close()
+		return nil, fmt.Errorf("cluster.New: %w", err)
+	}
+	if len(secretKey) == 0 {
+		// Plaintext gossip + voter auto-promotion lets any reachable peer
+		// become a raft voter. Make this loud so operators see the warning at
+		// boot rather than discovering it after a hostile join.
+		logger.Warn("cluster: gossip is unencrypted (SB_GOSSIP_SECRET_KEY not set); voter auto-promotion will admit any reachable peer — keep raft+gossip ports on a private network")
+	}
+
 	gn, err := setupGossip(gossipSetupConfig{
 		NodeID:         nodeID,
 		BindAddr:       cfg.GossipBindAddr,
@@ -114,6 +139,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		RaftAddr:       raftAdvertise,
 		BootstrapPeers: cfg.BootstrapPeers,
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
+		SecretKey:      secretKey,
 		Events:         &voterAutoJoinDelegate{c: c},
 	}, admitter, logger)
 	if err != nil {
@@ -186,11 +212,10 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 }
 
 // RecordPlacement commits sandboxID -> self into the FSM via raft along with
-// the (optional) creation spec. Idempotent. Must be called on the leader; if
-// this node is not the leader, returns ErrNotLeader and the caller should
-// retry against c.Leader() (the API wrapper handles this by forwarding the
-// create to the leader if needed). Passing spec=nil preserves a previously-
-// recorded spec — see fsm.go opPlace handling.
+// the (optional) creation spec. Idempotent. Safe to call from any node:
+// applyCommand transparently forwards to the current leader if we're a
+// follower. Passing spec=nil preserves a previously-recorded spec — see
+// fsm.go opPlace handling.
 func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
 	cmd := command{
 		Op:          opPlace,
@@ -203,8 +228,8 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 }
 
 // UpsertSpec replicates a sandbox spec mutation (resize, lifecycle change)
-// without changing ownership. Idempotent; nil spec is a no-op. Must be called
-// on the leader.
+// without changing ownership. Idempotent; nil spec is a no-op. Safe to call
+// from any node — applyCommand forwards to the leader as needed.
 func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
 	if spec == nil {
 		return nil
@@ -247,7 +272,7 @@ func (c *Cluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 }
 
 // AddExposedPort replicates a port-exposure intent. Idempotent (same
-// port+protocol is a no-op at the FSM layer). Must be called on the leader.
+// port+protocol is a no-op at the FSM layer). Safe to call from any node.
 func (c *Cluster) AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error {
 	if port <= 0 {
 		return nil
@@ -341,16 +366,42 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 	return firstErr
 }
 
-// applyCommand encodes and submits a raft log entry. On non-leader rejections
-// we surface ErrNotLeader so callers can decide whether to forward.
+// applyCommand encodes and submits a raft log entry. On a follower the
+// command is forwarded over HTTP to the current leader's API; the leader
+// applies it on behalf of the caller. This makes mutating raft writes
+// (RecordPlacement, UpsertSpec, AddExposedPort, RemoveExposedPort,
+// DeletePlacement) safe to call from any node — without it, every owner-side
+// caller would have to know whether it's the leader and forward by hand.
 func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
-	if c.raft.raft.State() != raft.Leader {
-		return ErrNotLeader
-	}
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
+	if c.raft.raft.State() == raft.Leader {
+		return c.applyEncodedLocal(ctx, payload)
+	}
+	return c.forwardApplyToLeader(ctx, payload)
+}
+
+// ApplyEncoded is the receiving side of leader-forwarded raft writes. It
+// decodes-validates the payload (so a malformed body never reaches the FSM)
+// and applies it locally. Returns ErrNotLeader if leadership has changed
+// since the forwarder picked us — the caller is expected to retry.
+func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
+	if _, err := decodeCommand(payload); err != nil {
+		return fmt.Errorf("cluster: decode forwarded command: %w", err)
+	}
+	if c.raft.raft.State() != raft.Leader {
+		return ErrNotLeader
+	}
+	return c.applyEncodedLocal(ctx, payload)
+}
+
+// applyEncodedLocal submits an already-encoded command to the local raft.
+// Caller is responsible for verifying we're the leader before this point —
+// raft itself returns ErrNotLeader if we lost leadership between the check
+// and the Apply call, which is mapped back to cluster.ErrNotLeader.
+func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
 	timeout := c.commitTimeout
 	if dl, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(dl); remaining > 0 && remaining < timeout {
@@ -368,6 +419,40 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		return fmt.Errorf("cluster: fsm apply: %w", appErr)
 	}
 	return nil
+}
+
+// forwardApplyToLeader posts an encoded raft command to the current leader's
+// internal apply endpoint. Returns ErrNotLeader if no leader is known (so the
+// caller can surface the same retry semantics as a stale local leader-check).
+func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) error {
+	leaderURL := c.LeaderAPIURL()
+	if leaderURL == "" {
+		return ErrNotLeader
+	}
+	endpoint := strings.TrimRight(leaderURL, "/") + "/v1/cluster/internal/apply"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("cluster: build leader-forward request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.patToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cluster: leader-forward apply: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		// 503 from the receiving node means it's not the leader anymore — let
+		// the caller retry against a refreshed leader URL.
+		return ErrNotLeader
+	}
+	return fmt.Errorf("cluster: leader-forward apply: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 // waitForLeader blocks until raft reports a leader or the deadline passes.
@@ -435,6 +520,26 @@ func (c *Cluster) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// decodeGossipSecretKey parses the operator-provided gossip key. Empty input
+// returns (nil, nil) — that's the plaintext path. Non-empty input must be
+// base64-encoded and decode to 16, 24, or 32 bytes (AES-128/192/256-GCM).
+// Anything else is rejected at boot rather than silently shipping plaintext.
+func decodeGossipSecretKey(raw string) ([]byte, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	key, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("SB_GOSSIP_SECRET_KEY must be base64-encoded: %w", err)
+	}
+	switch len(key) {
+	case 16, 24, 32:
+		return key, nil
+	default:
+		return nil, fmt.Errorf("SB_GOSSIP_SECRET_KEY must decode to 16, 24, or 32 bytes (got %d)", len(key))
+	}
 }
 
 // HealthyForReads is true once the FSM has caught up to the leader's last

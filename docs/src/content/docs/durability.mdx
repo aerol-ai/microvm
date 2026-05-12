@@ -180,6 +180,27 @@ If you ever need to re-expose a port manually (for example, the original `Expose
   </TabItem>
 </Tabs>
 
+## Cluster network security
+
+Cluster traffic uses two transports:
+
+- **Gossip** (`SB_GOSSIP_BIND_ADDR`, default `:7001`) — SWIM membership and capacity dissemination.
+- **Raft** (`SB_RAFT_BIND_ADDR`, default `:7000`) — placement-map consensus.
+
+When a node successfully joins gossip, it is automatically promoted to a Raft voter. **Anyone who can reach these ports can join the cluster and influence consensus.** Run them on a private network the operator controls (VPC peering, WireGuard mesh, dedicated cluster subnet); never expose them to the public internet.
+
+To authenticate gossip and reject foreign joiners, set `SB_GOSSIP_SECRET_KEY` to a base64-encoded 16, 24, or 32-byte key (AES-128/192/256-GCM). The same key must be configured on every node in the cluster.
+
+```sh
+# Generate a 32-byte key once and distribute it to every node.
+openssl rand -base64 32
+
+# Then on each node:
+export SB_GOSSIP_SECRET_KEY="<the-base64-key>"
+```
+
+When `SB_GOSSIP_SECRET_KEY` is unset, the daemon logs a warning at boot. Raft itself remains plaintext today; the gossip key is what gates the join, so a peer that can't decrypt the gossip handshake never reaches Raft. Wrap Raft in TLS at the network layer (e.g., a private overlay) for defense in depth.
+
 ## Limitations
 
 - **Pre-cluster sandboxes are backfilled at boot.** Sandboxes created before the cluster was enabled, or before spec replication shipped, get their spec, exposed-port intents, and registry credentials written into the Raft log on the next daemon start under cluster mode. Registry credentials persisted before the encrypted column existed are absent from the row and won't be backfilled — those sandboxes rely on the new owner already having the image cached, or a fresh `Create` to re-seed credentials.

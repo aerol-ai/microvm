@@ -179,6 +179,13 @@ type Client interface {
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error
 
+	// ApplyEncoded is the receiving end of leader-forwarded raft writes. The
+	// internal API endpoint pipes the request body through here on the leader
+	// so any owner-side mutating call (Record/Upsert/Add/Remove/Delete) made on
+	// a follower can transparently land on the leader's raft. Returns
+	// ErrNotLeader if leadership has shifted; the forwarder retries.
+	ApplyEncoded(ctx context.Context, payload []byte) error
+
 	// AssertOwnership ensures the FSM lists self as owner for every entry in
 	// local, and backfills any missing Spec / ExposedPorts so failover-recreate
 	// works for sandboxes that pre-date the spec-replication features. Used at

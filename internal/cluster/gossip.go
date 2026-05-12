@@ -109,6 +109,12 @@ type gossipSetupConfig struct {
 	RaftAddr       string
 	BootstrapPeers []string
 	GossipInterval time.Duration
+	// SecretKey enables AES gossip encryption + authentication when non-nil.
+	// Must be 16, 24, or 32 bytes. When nil, gossip is plaintext — acceptable
+	// only on a fully private network the operator controls. Without it, any
+	// reachable peer can join the cluster and (via voter auto-promotion) gain
+	// raft voter status.
+	SecretKey []byte
 	// Events, if non-nil, receives memberlist join/leave/update notifications.
 	// Auto-voter promotion in Phase 2 plugs in here.
 	Events memberlist.EventDelegate
@@ -136,6 +142,21 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	mlCfg.Delegate = delegate
 	if cfg.Events != nil {
 		mlCfg.Events = cfg.Events
+	}
+	if len(cfg.SecretKey) > 0 {
+		// memberlist accepts 16/24/32-byte keys for AES-128/192/256-GCM. Anything
+		// else is rejected at construction so we surface a clear error rather
+		// than silently shipping plaintext.
+		switch len(cfg.SecretKey) {
+		case 16, 24, 32:
+		default:
+			return nil, fmt.Errorf("gossip setup: SecretKey must be 16, 24, or 32 bytes (got %d)", len(cfg.SecretKey))
+		}
+		mlCfg.SecretKey = cfg.SecretKey
+		// Force-encrypt outgoing traffic and reject unencrypted inbound packets;
+		// this is what actually closes the "anyone-on-the-wire can join" gap.
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
 	}
 	// memberlist defaults log to stderr at info level — silence it; we already
 	// log meaningful state changes ourselves.

@@ -193,6 +193,39 @@ func (h *handlers) clusterLeader(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"leader": c.Leader()})
 }
 
+// clusterInternalApply receives an encoded raft command from a follower and
+// applies it on this node. The handler is auth-gated by the same PAT bearer
+// as every other v1 route, so any caller able to forward here is already
+// trusted to mutate the cluster state directly. We respond 503 (and *not* a
+// generic 5xx) when raft says we're not the leader so the forwarder treats it
+// as a retry signal rather than a hard failure.
+func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	_ = r.Body.Close()
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	if len(body) == 0 {
+		apihttp.WriteError(w, http.StatusBadRequest, "empty raft command body")
+		return
+	}
+	if err := c.ApplyEncoded(r.Context(), body); err != nil {
+		if errors.Is(err, cluster.ErrNotLeader) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+			return
+		}
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // clusterPlacement returns the placement record for one sandbox.
 func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
