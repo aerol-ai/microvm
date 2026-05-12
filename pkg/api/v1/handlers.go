@@ -95,11 +95,17 @@ func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	sandbox, err := h.deps.Service.ResizeSandbox(r.Context(), r.PathValue("id"), req)
+	id := r.PathValue("id")
+	sandbox, err := h.deps.Service.ResizeSandbox(r.Context(), id, req)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	h.replicateSpecPatch(r.Context(), id, func(s *models.CreateSandboxRequest) {
+		s.CPU = req.CPU
+		s.MemoryMB = req.MemoryMB
+		s.DiskGB = req.DiskGB
+	})
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 
@@ -109,11 +115,16 @@ func (h *handlers) updateLifecycle(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	sandbox, err := h.deps.Service.UpdateLifecycle(r.Context(), r.PathValue("id"), req.Lifecycle)
+	id := r.PathValue("id")
+	sandbox, err := h.deps.Service.UpdateLifecycle(r.Context(), id, req.Lifecycle)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	lc := req.Lifecycle
+	h.replicateSpecPatch(r.Context(), id, func(s *models.CreateSandboxRequest) {
+		s.Lifecycle = &lc
+	})
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 

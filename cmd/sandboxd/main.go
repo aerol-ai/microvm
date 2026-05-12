@@ -130,6 +130,12 @@ func main() {
 			}
 		}()
 		svc.AttachCluster(clusterClient)
+		// The owner watcher needs a hook back into the service to recreate
+		// sandboxes whose placements were reassigned to this node after a
+		// dead-owner eviction. Wired here (after both objects exist) to keep
+		// the cluster→service direction one-way through the SandboxRecreator
+		// interface, avoiding an import cycle.
+		clusterClient.AttachRecreator(svc)
 		logger.Info("cluster mode enabled",
 			"node_id", clusterClient.SelfNodeID(),
 			"api_url", clusterClient.SelfAPIURL(),

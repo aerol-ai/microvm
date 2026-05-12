@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TestDeadOwnerTrackerMarkAndClear verifies the tiny piece of state the
@@ -106,6 +107,42 @@ func TestReconcileDeadOwnersRespectsGrace(t *testing.T) {
 	c.reconcileDeadOwners(context.Background())
 	if _, err := c.OwnerOf("sb-grace"); err != ErrOrphaned {
 		t.Fatalf("after grace, OwnerOf err = %v, want ErrOrphaned", err)
+	}
+}
+
+// TestEvictDeadOwnerReassignsWhenSpecExists drives the spec-replication
+// codepath: a placement carrying a Spec gets reassigned to a live node (the
+// only candidate is self/leader) instead of being marked orphan. This is the
+// behaviour change behind auto-recreation — the owner watcher on the new
+// owner picks up from there.
+func TestEvictDeadOwnerReassignsWhenSpecExists(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	// Placement with a non-nil spec belongs to a phantom dead node.
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-reassign", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256},
+	}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.evictDeadOwner(ctx, "dead-node")
+
+	owner, err := c.OwnerOf("sb-reassign")
+	if err != nil {
+		t.Fatalf("post-evict OwnerOf err = %v, want nil (reassigned to leader)", err)
+	}
+	if owner.NodeID != "leader" || !owner.IsSelf {
+		t.Fatalf("expected reassignment to self (leader); got %+v", owner)
 	}
 }
 

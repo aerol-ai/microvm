@@ -31,7 +31,7 @@ func TestClusterSingleNodeBootstrap(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.RecordPlacement(ctx, "sb-1"); err != nil {
+	if err := c.RecordPlacement(ctx, "sb-1", nil); err != nil {
 		t.Fatalf("RecordPlacement: %v", err)
 	}
 	owner, err := c.OwnerOf("sb-1")
@@ -78,7 +78,7 @@ func TestClusterTwoNodeReplication(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := leader.RecordPlacement(ctx, "sb-replicate"); err != nil {
+	if err := leader.RecordPlacement(ctx, "sb-replicate", nil); err != nil {
 		t.Fatalf("leader RecordPlacement: %v", err)
 	}
 

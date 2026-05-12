@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
 )
@@ -34,6 +36,14 @@ type Cluster struct {
 	// Close can stop its loop. See dead_owner.go for the reconciler logic.
 	deadOwners        *deadOwnerTracker
 	deadOwnerLoopStop context.CancelFunc
+
+	// recreator is the service-layer hook the owner watcher uses to bring up
+	// a sandbox the FSM says we own but the local store doesn't have. Set via
+	// AttachRecreator after construction (avoids a cluster→service import
+	// cycle). nil disables the watcher's effect — the loop still runs.
+	recreator           SandboxRecreator
+	recreatorMu         sync.Mutex
+	ownerWatcherStop    context.CancelFunc
 }
 
 // New constructs a Cluster for cfg.EnableCluster=true. Caller takes ownership
@@ -123,11 +133,32 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// in-memory tracker (cheap) but never act.
 	c.startDeadOwnerLoop()
 
+	// Owner watcher: every node polls the FSM for placements pointing to self
+	// that have no local sandbox row, and re-materializes them via the
+	// service recreate hook. This is the consume side of the spec-replication
+	// pipeline written by RecordPlacement / UpsertSpec.
+	c.startOwnerWatcher()
+
 	return c, nil
 }
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
 func (c *Cluster) SelfAPIURL() string { return c.apiURL }
+
+// AttachRecreator wires the service-layer recreate hook used by the owner
+// watcher. Called once from cmd/sandboxd/main after both service.New and
+// cluster.New have returned. Safe to call concurrently with the watcher loop.
+func (c *Cluster) AttachRecreator(r SandboxRecreator) {
+	c.recreatorMu.Lock()
+	defer c.recreatorMu.Unlock()
+	c.recreator = r
+}
+
+func (c *Cluster) currentRecreator() SandboxRecreator {
+	c.recreatorMu.Lock()
+	defer c.recreatorMu.Unlock()
+	return c.recreator
+}
 
 // OwnerOf reads the placement map from the local FSM (no network round-trip).
 // Returns ErrUnknownSandbox if no row exists, or ErrOrphaned if the placement
@@ -154,18 +185,65 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	}, nil
 }
 
-// RecordPlacement commits sandboxID -> self into the FSM via raft. Idempotent.
-// Must be called on the leader; if this node is not the leader, returns
-// ErrNotLeader and the caller should retry against c.Leader() (the API
-// wrapper handles this by forwarding the create to the leader if needed).
-func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string) error {
+// RecordPlacement commits sandboxID -> self into the FSM via raft along with
+// the (optional) creation spec. Idempotent. Must be called on the leader; if
+// this node is not the leader, returns ErrNotLeader and the caller should
+// retry against c.Leader() (the API wrapper handles this by forwarding the
+// create to the leader if needed). Passing spec=nil preserves a previously-
+// recorded spec — see fsm.go opPlace handling.
+func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
 	cmd := command{
 		Op:          opPlace,
 		SandboxID:   sandboxID,
 		OwnerNodeID: c.nodeID,
 		OwnerAPIURL: c.apiURL,
+		Spec:        spec,
 	}
 	return c.applyCommand(ctx, cmd)
+}
+
+// UpsertSpec replicates a sandbox spec mutation (resize, lifecycle change)
+// without changing ownership. Idempotent; nil spec is a no-op. Must be called
+// on the leader.
+func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
+	if spec == nil {
+		return nil
+	}
+	cmd := command{Op: opUpsertSpec, SandboxID: sandboxID, Spec: spec}
+	return c.applyCommand(ctx, cmd)
+}
+
+// SpecOf returns a deep-copy of the replicated spec for sandboxID, or nil if
+// none is recorded. Callers may safely mutate the returned struct (it shares
+// no memory with the FSM).
+func (c *Cluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
+	p, ok := c.fsm.get(sandboxID)
+	if !ok || p.Spec == nil {
+		return nil
+	}
+	cp := *p.Spec
+	// Copy the maps and slices we touch in the patch helpers so callers can
+	// freely mutate them. Other reference fields (Registry, GPUs, Lifecycle)
+	// are pointers to immutable-by-convention payloads — patch helpers replace
+	// the whole pointer rather than mutating in place.
+	if cp.Env != nil {
+		envCopy := make(map[string]string, len(cp.Env))
+		for k, v := range cp.Env {
+			envCopy[k] = v
+		}
+		cp.Env = envCopy
+	}
+	if cp.Mounts != nil {
+		ms := make([]models.MountSpec, len(cp.Mounts))
+		copy(ms, cp.Mounts)
+		cp.Mounts = ms
+	}
+	if cp.ContainerCommand != nil {
+		cmd := make([]string, len(cp.ContainerCommand))
+		copy(cmd, cp.ContainerCommand)
+		cp.ContainerCommand = cmd
+	}
+	return &cp
 }
 
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
@@ -197,7 +275,10 @@ func (c *Cluster) AssertOwnership(ctx context.Context, localIDs []string) error 
 		// sandbox (unlikely but possible after a split-brain recovery). In
 		// both cases we (re)claim — this node has the sandbox locally so it
 		// IS the owner, and the FSM should reflect that.
-		if err := c.RecordPlacement(ctx, id); err != nil && firstErr == nil {
+		// spec=nil at boot replay: the FSM preserves any previously-recorded
+		// spec for this id. See cluster.go RecordPlacement docs for the
+		// pre-cluster-sandbox limitation this implies.
+		if err := c.RecordPlacement(ctx, id, nil); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -283,6 +364,9 @@ func (c *Cluster) Close() error {
 	}
 	if c.deadOwnerLoopStop != nil {
 		c.deadOwnerLoopStop()
+	}
+	if c.ownerWatcherStop != nil {
+		c.ownerWatcherStop()
 	}
 	if c.gossip != nil {
 		if err := c.gossip.Close(); err != nil {

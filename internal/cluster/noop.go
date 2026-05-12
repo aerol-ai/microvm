@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // Noop is the single-node-mode Client implementation. Every method behaves as
@@ -35,7 +36,13 @@ func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 	return PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}, nil
 }
 
-func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string) error { return nil }
+func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
+	return nil
+}
+func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
+	return nil
+}
+func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
 func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error { return nil }
 
 func (n *Noop) AssertOwnership(ctx context.Context, localIDs []string) error { return nil }

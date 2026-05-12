@@ -101,6 +101,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'Reconcile',
         description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
       },
+      {
+        type: 'link',
+        href: '/durability',
+        label: 'Durability & Failover',
+        description: 'What survives host crashes and cluster-mode owner failover, and how to make workspace state durable.',
+      },
     ],
   },
   {

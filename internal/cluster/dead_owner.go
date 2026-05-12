@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
 
@@ -151,22 +153,40 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 	}
 }
 
-// evictDeadOwner orphans every placement owned by nodeID and then removes the
-// node from the raft configuration. Both steps are idempotent so a partial
-// failure is safe to retry on the next tick.
+// evictDeadOwner reassigns every placement owned by nodeID to a live peer
+// (chosen by SelectPlacement using the replicated spec for capacity scoring),
+// then removes the dead node from the raft configuration. Placements with no
+// replicated spec fall back to orphan-marking (owner=""), since recreation is
+// impossible without a spec — a clear observability signal that operator
+// intervention is required.
+//
+// All steps are idempotent so a partial failure is safe to retry on the next
+// tick: a placement already reassigned to live node X gets opReassign'd to
+// X again as a no-op; RemoveServer is a no-op once the dead node is gone.
 func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 	ids := c.fsm.idsOwnedBy(nodeID)
+	var reassigned, orphaned int
 	for _, id := range ids {
-		cmd := command{Op: opReassign, SandboxID: id, OwnerNodeID: "", OwnerAPIURL: ""}
+		p, ok := c.fsm.get(id)
+		if !ok {
+			continue
+		}
+		newOwnerID, newOwnerURL := c.pickRecreationTarget(p.Spec)
+		cmd := command{Op: opReassign, SandboxID: id, OwnerNodeID: newOwnerID, OwnerAPIURL: newOwnerURL}
 		if err := c.applyCommand(ctx, cmd); err != nil {
-			c.logger.Warn("cluster: orphan placement failed; will retry next tick",
-				"sandbox_id", id, "dead_node", nodeID, "err", err)
+			c.logger.Warn("cluster: reassign placement failed; will retry next tick",
+				"sandbox_id", id, "dead_node", nodeID, "new_owner", newOwnerID, "err", err)
 			return
 		}
+		if newOwnerID == "" {
+			orphaned++
+		} else {
+			reassigned++
+		}
 	}
-	if len(ids) > 0 {
-		c.logger.Warn("cluster: orphaned placements after owner death",
-			"dead_node", nodeID, "count", len(ids))
+	if reassigned > 0 || orphaned > 0 {
+		c.logger.Warn("cluster: handled placements after owner death",
+			"dead_node", nodeID, "reassigned", reassigned, "orphaned_no_spec", orphaned)
 	}
 	// RemoveServer is a no-op (returns nil) if the server isn't in the config,
 	// so we don't need to pre-check.
@@ -178,4 +198,29 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 	}
 	c.deadOwners.clear(nodeID)
 	c.logger.Info("cluster: evicted dead node from raft config", "dead_node", nodeID)
+}
+
+// pickRecreationTarget runs placement scoring against the replicated spec to
+// pick a live node for the recreated sandbox. Returns ("","") if spec is nil
+// (caller treats that as the orphan path) or if SelectPlacement errors out.
+// Self is a perfectly valid choice — the leader is a normal recreation target.
+func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeID, apiURL string) {
+	if spec == nil {
+		return "", ""
+	}
+	req := capacity.Request{CPU: spec.CPU, MemoryMB: spec.MemoryMB}
+	if req.CPU <= 0 {
+		req.CPU = 0.5
+	}
+	if req.MemoryMB <= 0 {
+		req.MemoryMB = 256
+	}
+	target, err := c.SelectPlacement(req)
+	if err != nil {
+		return "", ""
+	}
+	if target.IsSelf {
+		return c.nodeID, c.apiURL
+	}
+	return target.NodeID, target.APIURL
 }

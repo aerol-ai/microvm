@@ -29,6 +29,7 @@ import (
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // ErrNotLeader is returned by mutating Cluster operations when this node is not
@@ -42,21 +43,26 @@ var ErrNotLeader = errors.New("cluster: not raft leader")
 var ErrUnknownSandbox = errors.New("cluster: unknown sandbox placement")
 
 // ErrOrphaned is returned by OwnerOf when a placement exists but its owner has
-// been auto-evicted (the node died and grace period expired). The sandbox is
-// permanently unreachable until an operator recovers it. Phase 2 only marks
-// orphans; true re-creation on a new owner is a Phase 2.5 follow-up that
-// requires a replicated sandbox-spec store (today specs live only in the dead
-// node's local SQLite).
+// been auto-evicted and the dead-owner reconciler has cleared the pointer
+// without yet selecting a new owner. With auto-recreation enabled this is a
+// brief transient — the next reconcile tick reassigns the placement to a live
+// node and the new owner re-creates the sandbox from the replicated spec.
+// Callers should treat this as 410 Gone (the sandbox is currently unreachable
+// but the system is converging).
 var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned")
 
-// Placement is one row of the FSM's placement map.
+// Placement is one row of the FSM's placement map. Spec is the replicated
+// sandbox creation request used by the new owner to re-materialize a sandbox
+// after its previous owner died (see owner_watcher.go). Spec is a pointer so
+// older snapshots written before spec replication still decode cleanly.
 type Placement struct {
-	SandboxID    string `json:"sandbox_id"`
-	OwnerNodeID  string `json:"owner_node_id"`
-	OwnerAPIURL  string `json:"owner_api_url"`
-	Version      uint64 `json:"version"`
-	CreatedUnix  int64  `json:"created_unix"`
-	UpdatedUnix  int64  `json:"updated_unix"`
+	SandboxID    string                       `json:"sandbox_id"`
+	OwnerNodeID  string                       `json:"owner_node_id"`
+	OwnerAPIURL  string                       `json:"owner_api_url"`
+	Version      uint64                       `json:"version"`
+	CreatedUnix  int64                        `json:"created_unix"`
+	UpdatedUnix  int64                        `json:"updated_unix"`
+	Spec         *models.CreateSandboxRequest `json:"spec,omitempty"`
 }
 
 // Member is a snapshot of a peer's gossiped state.
@@ -82,6 +88,19 @@ type OwnerInfo struct {
 	IsSelf bool
 }
 
+// SandboxRecreator is the cluster's escape hatch back into the service layer
+// for the failover-recreate path. The owner watcher (see owner_watcher.go)
+// invokes RecreateSandbox for any FSM placement that points to self but has
+// no corresponding local sandbox — typically because the previous owner died
+// and the dead-owner reconciler reassigned the placement here.
+//
+// Implementations MUST be idempotent: the watcher polls and may invoke
+// RecreateSandbox multiple times for the same id while a previous attempt is
+// still in flight or after an unexpected restart.
+type SandboxRecreator interface {
+	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest) error
+}
+
 // Client is the surface the rest of the daemon (Service, API handlers)
 // interacts with. Both *Cluster and *Noop satisfy it so callsites stay
 // unconditional.
@@ -99,9 +118,25 @@ type Client interface {
 	// resource request. In single-node mode it always returns self.
 	SelectPlacement(req capacity.Request) (PlacementTarget, error)
 
-	// RecordPlacement commits sandboxID -> self into the FSM. Idempotent —
-	// re-recording the same (id, owner) pair is a no-op.
-	RecordPlacement(ctx context.Context, sandboxID string) error
+	// RecordPlacement commits sandboxID -> self into the FSM along with the
+	// (optional) creation spec used to re-materialize the sandbox after a
+	// failover. Idempotent — re-recording with the same owner is a no-op, and
+	// passing spec=nil preserves any spec that was previously replicated for
+	// this id (so a boot-time replay can't erase a richer record written by
+	// the original CreateSandbox call).
+	RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error
+
+	// UpsertSpec replaces the replicated spec for sandboxID without touching
+	// ownership. Mutating handlers (resize, lifecycle) call this after a
+	// successful local mutation so the FSM stays current — otherwise a
+	// failover-recreated sandbox would revert to its create-time shape.
+	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error
+
+	// SpecOf returns the most-recently-replicated CreateSandboxRequest for
+	// sandboxID, or nil if no spec is recorded (pre-cluster sandbox, or no
+	// placement). Callers use this as the read half of a read-modify-write
+	// pattern when patching a single field via UpsertSpec.
+	SpecOf(sandboxID string) *models.CreateSandboxRequest
 
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error

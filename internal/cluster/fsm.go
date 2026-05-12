@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
 
@@ -15,17 +16,22 @@ import (
 type opCode uint8
 
 const (
-	opPlace    opCode = 1
-	opDelete   opCode = 2
-	opReassign opCode = 3
+	opPlace      opCode = 1
+	opDelete     opCode = 2
+	opReassign   opCode = 3
+	opUpsertSpec opCode = 4 // overwrite Placement.Spec without touching ownership
 )
 
-// command is the wire format for one raft log entry.
+// command is the wire format for one raft log entry. Spec is non-nil for
+// opPlace (records the original creation request alongside the owner pointer)
+// and opUpsertSpec (records mutations like resize/lifecycle/expose-port that
+// must survive failover).
 type command struct {
-	Op          opCode `json:"op"`
-	SandboxID   string `json:"sandbox_id"`
-	OwnerNodeID string `json:"owner_node_id,omitempty"`
-	OwnerAPIURL string `json:"owner_api_url,omitempty"`
+	Op          opCode                       `json:"op"`
+	SandboxID   string                       `json:"sandbox_id"`
+	OwnerNodeID string                       `json:"owner_node_id,omitempty"`
+	OwnerAPIURL string                       `json:"owner_api_url,omitempty"`
+	Spec        *models.CreateSandboxRequest `json:"spec,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -68,16 +74,24 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 
 	switch cmd.Op {
 	case opPlace:
-		// Idempotency: re-placing the same id with the same owner is a no-op.
-		// Re-placing with a different owner overwrites — this is intentional;
-		// it lets opReassign be expressed via opPlace too.
+		// Idempotency: re-placing the same id with the same owner AND the same
+		// spec payload is a no-op. If the spec changed, we still want the new
+		// spec to land — opPlace is the atomic "owner + spec" write used by
+		// CreateSandbox, so an idempotent retry that omits the spec must not
+		// erase a previously-recorded spec.
 		existing, exists := f.placements[cmd.SandboxID]
-		if exists && existing.OwnerNodeID == cmd.OwnerNodeID {
+		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil {
 			return nil
 		}
 		created := now
 		if exists {
 			created = existing.CreatedUnix
+		}
+		spec := cmd.Spec
+		if spec == nil && exists {
+			// Preserve the previously-replicated spec — never erase it via a
+			// later opPlace that omits the payload.
+			spec = existing.Spec
 		}
 		f.placements[cmd.SandboxID] = Placement{
 			SandboxID:   cmd.SandboxID,
@@ -86,6 +100,7 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			Version:     f.version,
 			CreatedUnix: created,
 			UpdatedUnix: now,
+			Spec:        spec,
 		}
 		return nil
 	case opDelete:
@@ -100,6 +115,22 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		}
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		f.placements[cmd.SandboxID] = existing
+		return nil
+	case opUpsertSpec:
+		existing, exists := f.placements[cmd.SandboxID]
+		if !exists {
+			// No placement to attach the spec to. Treat as no-op: the
+			// mutating handler that produced this entry will have already
+			// failed locally if the sandbox truly doesn't exist.
+			return nil
+		}
+		if cmd.Spec == nil {
+			return nil
+		}
+		existing.Spec = cmd.Spec
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing

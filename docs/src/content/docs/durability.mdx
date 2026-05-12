@@ -1,0 +1,196 @@
+---
+title: Durability and Failover
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A sandbox's container is ephemeral. Files written into the container's writable layer (`/tmp`, the working directory, anywhere not on a mount) live only as long as the container itself. If the container is destroyed - by an explicit `Destroy`, by a host crash, or by an owner-node failover in cluster mode - that data is gone.
+
+This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle.
+
+## What survives, what does not
+
+| Asset | Single-node `Destroy` | Single-node host crash | Cluster-mode owner failover |
+|---|---|---|---|
+| Container writable layer | Lost | Lost | Lost |
+| Mounted volumes (S3, NFS, SSHFS, rclone) | Survive (external) | Survive (external) | Survive (external) |
+| Sandbox ID | Reused on next `Create` | Preserved if record persisted | Preserved (recreated on new owner) |
+| Environment variables, image, resource limits | N/A | Restored on `Start` | Restored from replicated spec |
+| Idle lifecycle policy | N/A | Restored on `Start` | Restored from replicated spec |
+| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | **Not replicated** - must be re-exposed |
+| Caddy routes | Removed | Restored on `Start` | Re-created when ports are re-exposed |
+| Host port number | N/A | Same host, same port | May differ on the new owner |
+
+## Make workspace state durable
+
+Mount external storage at the path you want to keep across container lifetimes. The mount is established by the host (not the sandbox), so credentials never enter the container, and the data persists independently of any single sandbox or node.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      mounts: [
+        {
+          type:   's3',
+          target: '/workspace',
+          source: 's3://my-bucket/project-42',
+          credentials: {
+            access_key_id:     'AKIA...',
+            secret_access_key: 'secret...',
+          },
+        },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'mounts': [
+            {
+                'type':   's3',
+                'target': '/workspace',
+                'source': 's3://my-bucket/project-42',
+                'credentials': {
+                    'access_key_id':     'AKIA...',
+                    'secret_access_key': 'secret...',
+                },
+            },
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Mounts: []sdktypes.MountSpec{
+            {
+                Type:   "s3",
+                Target: "/workspace",
+                Source: "s3://my-bucket/project-42",
+                Credentials: map[string]string{
+                    "access_key_id":     "AKIA...",
+                    "secret_access_key": "secret...",
+                },
+            },
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+
+    let mut creds = HashMap::new();
+    creds.insert("access_key_id".to_string(), "AKIA...".to_string());
+    creds.insert("secret_access_key".to_string(), "secret...".to_string());
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        mounts: Some(vec![aerolvm_sdk::MountSpec {
+            type_:       "s3".to_string(),
+            target:      "/workspace".to_string(),
+            source:      "s3://my-bucket/project-42".to_string(),
+            credentials: Some(creds),
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.MountSpec;
+    import java.util.List;
+    import java.util.Map;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setMounts(List.of(
+                new MountSpec()
+                    .setType("s3")
+                    .setTarget("/workspace")
+                    .setSource("s3://my-bucket/project-42")
+                    .setCredentials(Map.of(
+                        "access_key_id",     "AKIA...",
+                        "secret_access_key", "secret..."
+                    ))
+            ))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Anything written under `/workspace` outlives the container. Anything written elsewhere does not. See [External Storage](/external-storage) for the full mount surface (S3, NFS, SSHFS, rclone).
+
+## Cluster-mode failover
+
+When `SB_ENABLE_CLUSTER=true`, the cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle) into a Raft log. If the owner node leaves the cluster and stays gone past the dead-owner grace period, the leader reassigns every placement that carries a spec to a live node. The new owner detects the reassignment within a few seconds and recreates the sandbox locally with the original ID.
+
+The recreated sandbox is a **fresh container** with the same identity:
+
+- Same sandbox ID - existing client references keep working.
+- Same image, env, resource limits, mounts, lifecycle policy.
+- Mounted volumes attach to the same external sources, so workspace state under mount targets is intact.
+- Container writable layer is empty - any in-container files outside mounts are lost.
+- Exposed ports must be re-exposed by the client. The new owner's host port may differ.
+
+Re-exposure is a single call once the recreated sandbox is up:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.exposePort(sandboxId, { port: 3000, protocol: 'http' })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.expose_port(sandbox_id, port=3000, protocol='http')
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := client.ExposePort(ctx, sandboxID, sdktypes.ExposePortOptions{
+        Port:     3000,
+        Protocol: "http",
+    }); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.expose_port(&sandbox_id, ExposePortOptions {
+        port:     3000,
+        protocol: "http".to_string(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.exposePort(sandboxId, new ExposePortOptions()
+        .setPort(3000)
+        .setProtocol("http"));
+    ```
+  </TabItem>
+</Tabs>
+
+## Limitations
+
+- **Pre-cluster sandboxes carry no spec.** Sandboxes created before the cluster was enabled, or before this feature shipped, have no replicated spec until the next mutating call (`Resize`, lifecycle update). A failover before that mutation marks the placement orphaned and the sandbox is unrecoverable without manual recreate. New sandboxes created under cluster mode always carry a spec.
+- **Exposed ports are not replicated.** The list of exposed ports lives outside the create spec. Re-expose ports after a failover.
+- **Writable-layer state is not replicated.** Treat anything outside a mount as cache. If you need it after a crash, write it to a mount.
+- **Single-node deployments inherit the same model.** A host crash loses the writable layer just as a failover does. Mount external storage for anything that must survive.
+
+## Recommended pattern
+
+1. Pick the directory your workload writes durable state to (often a project root, a database data dir, or a model cache).
+2. Declare it as a mount target at `Create` time.
+3. Treat everything else inside the container as scratch.
+4. In cluster mode, expect to call `ExposePort` again after a failover - and surface the new public URL to your clients.
+
+This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable.

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
 
@@ -76,6 +77,73 @@ func TestFSMDelete(t *testing.T) {
 	fsm.Apply(&raft.Log{Data: d})
 }
 
+// TestFSMPlaceCarriesSpec verifies the spec payload survives an opPlace round
+// trip and a no-op idempotent retry that omits the spec doesn't erase it.
+func TestFSMPlaceCarriesSpec(t *testing.T) {
+	fsm := newPlacementFSM()
+	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256}
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", Spec: spec})
+	fsm.Apply(&raft.Log{Data: c})
+	got, _ := fsm.get("sb1")
+	if got.Spec == nil || got.Spec.Image != "alpine" {
+		t.Fatalf("expected spec to be stored; got %+v", got.Spec)
+	}
+	// Idempotent retry without a spec must not erase the stored spec.
+	c2, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A"})
+	fsm.Apply(&raft.Log{Data: c2})
+	got2, _ := fsm.get("sb1")
+	if got2.Spec == nil || got2.Spec.Image != "alpine" {
+		t.Fatalf("idempotent re-place erased spec; got %+v", got2.Spec)
+	}
+}
+
+// TestFSMUpsertSpec exercises opUpsertSpec: it overwrites Placement.Spec
+// without touching the owner pointer.
+func TestFSMUpsertSpec(t *testing.T) {
+	fsm := newPlacementFSM()
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1}})
+	fsm.Apply(&raft.Log{Data: c})
+
+	// Resize: bump CPU via opUpsertSpec.
+	u, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2}})
+	fsm.Apply(&raft.Log{Data: u})
+
+	got, _ := fsm.get("sb1")
+	if got.OwnerNodeID != "A" {
+		t.Fatalf("opUpsertSpec must not touch owner; got %q", got.OwnerNodeID)
+	}
+	if got.Spec == nil || got.Spec.CPU != 2 {
+		t.Fatalf("expected CPU=2 after upsert; got %+v", got.Spec)
+	}
+
+	// Upsert against unknown sandbox: silent no-op.
+	u2, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "ghost",
+		Spec: &models.CreateSandboxRequest{Image: "x"}})
+	if got := fsm.Apply(&raft.Log{Data: u2}); got != nil {
+		t.Fatalf("upsert against unknown id returned %v, want nil", got)
+	}
+}
+
+// TestFSMReassignPreservesSpec asserts opReassign moves the owner but leaves
+// the replicated spec intact — that's what makes auto-recreation possible.
+func TestFSMReassignPreservesSpec(t *testing.T) {
+	fsm := newPlacementFSM()
+	spec := &models.CreateSandboxRequest{Image: "alpine"}
+	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", Spec: spec})
+	fsm.Apply(&raft.Log{Data: c})
+	r, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b"})
+	fsm.Apply(&raft.Log{Data: r})
+	got, _ := fsm.get("sb1")
+	if got.OwnerNodeID != "B" {
+		t.Fatalf("expected owner B, got %q", got.OwnerNodeID)
+	}
+	if got.Spec == nil || got.Spec.Image != "alpine" {
+		t.Fatalf("reassign erased spec; got %+v", got.Spec)
+	}
+}
+
 // fakeSnapshotSink lets us drive Snapshot/Restore without a real BoltStore.
 type fakeSnapshotSink struct {
 	*bytes.Buffer
@@ -89,7 +157,10 @@ func (f *fakeSnapshotSink) Close() error  { return nil }
 func TestFSMSnapshotRestoreRoundTrip(t *testing.T) {
 	src := newPlacementFSM()
 	for _, id := range []string{"a", "b", "c"} {
-		c, _ := encodeCommand(command{Op: opPlace, SandboxID: id, OwnerNodeID: "owner-" + id, OwnerAPIURL: "http://" + id})
+		c, _ := encodeCommand(command{
+			Op: opPlace, SandboxID: id, OwnerNodeID: "owner-" + id, OwnerAPIURL: "http://" + id,
+			Spec: &models.CreateSandboxRequest{Image: "img-" + id, CPU: 0.5, MemoryMB: 128},
+		})
 		src.Apply(&raft.Log{Data: c})
 	}
 	snap, err := src.Snapshot()
@@ -116,6 +187,9 @@ func TestFSMSnapshotRestoreRoundTrip(t *testing.T) {
 		}
 		if p.OwnerNodeID != "owner-"+id {
 			t.Errorf("wrong owner after restore for %s: %q", id, p.OwnerNodeID)
+		}
+		if p.Spec == nil || p.Spec.Image != "img-"+id {
+			t.Errorf("spec lost in snapshot/restore for %s: got %+v", id, p.Spec)
 		}
 	}
 }

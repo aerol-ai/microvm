@@ -31,8 +31,11 @@ func TestNoopAlwaysSelf(t *testing.T) {
 		t.Fatal("SelectPlacement must report IsSelf in single-node mode")
 	}
 
-	if err := n.RecordPlacement(context.Background(), "x"); err != nil {
+	if err := n.RecordPlacement(context.Background(), "x", nil); err != nil {
 		t.Fatalf("RecordPlacement: %v", err)
+	}
+	if err := n.UpsertSpec(context.Background(), "x", nil); err != nil {
+		t.Fatalf("UpsertSpec: %v", err)
 	}
 	if err := n.DeletePlacement(context.Background(), "x"); err != nil {
 		t.Fatalf("DeletePlacement: %v", err)

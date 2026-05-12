@@ -140,6 +140,83 @@ func (s *Service) EnsureClusterReady(ctx context.Context) error {
 }
 
 func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxRequest) (*models.CreateSandboxResponse, error) {
+	return s.createSandbox(ctx, req, "")
+}
+
+// CreateSandboxWithID is the failover-recreate entry point: it behaves like
+// CreateSandbox but uses the supplied ID instead of generating a fresh one.
+// Idempotent at the cluster boundary — if a sandbox with this ID already
+// exists locally we return the existing record without touching docker. Used
+// by the cluster owner watcher to re-materialize a sandbox after its previous
+// owner died.
+func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSandboxRequest, id string) (*models.CreateSandboxResponse, error) {
+	if id == "" {
+		return nil, errors.New("CreateSandboxWithID: id required")
+	}
+	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		// Already present locally — recreate is a no-op. The watcher tick that
+		// noticed the FSM-only entry must have raced with a local create.
+		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
+	}
+	return s.createSandbox(ctx, req, id)
+}
+
+// reconcileStaleOwnership destroys local sandboxes whose cluster placement
+// no longer points to self. Single-node mode (Noop client) reports IsSelf=true
+// for every id, so this is a no-op there. Errors are logged and swallowed —
+// the next reconcile tick retries.
+func (s *Service) reconcileStaleOwnership(ctx context.Context) {
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	self := c.SelfNodeID()
+	if self == "" {
+		return
+	}
+	known, err := s.store.List(ctx)
+	if err != nil {
+		s.logger.Warn("cluster: stale-ownership list failed", "err", err)
+		return
+	}
+	for _, sb := range known {
+		if sb == nil || sb.ID == "" {
+			continue
+		}
+		owner, err := c.OwnerOf(sb.ID)
+		if err != nil {
+			// ErrUnknownSandbox: no FSM record yet (fresh boot before
+			// AssertOwnership replay completes); leave it alone.
+			// ErrOrphaned: the dead-owner reconciler is still mid-flight or
+			// the sandbox has no spec to recreate from; leave it alone.
+			continue
+		}
+		if owner.NodeID == "" || owner.NodeID == self {
+			continue
+		}
+		s.logger.Warn("cluster: destroying stale local sandbox; ownership reassigned",
+			"sandbox_id", sb.ID, "current_owner", owner.NodeID)
+		if err := s.DestroySandbox(ctx, sb.ID); err != nil {
+			s.logger.Warn("cluster: stale-destroy failed; will retry next reconcile",
+				"sandbox_id", sb.ID, "err", err)
+		}
+	}
+}
+
+// RecreateSandbox satisfies cluster.SandboxRecreator. The cluster owner
+// watcher invokes this for any FSM placement that points to self but has no
+// local sandbox row. The implementation delegates to CreateSandboxWithID,
+// whose store-existence short-circuit gives us the idempotency the watcher
+// contract requires.
+func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest) error {
+	if _, err := s.CreateSandboxWithID(ctx, spec, id); err != nil {
+		return err
+	}
+	s.logger.Info("cluster: recreated sandbox after failover", "sandbox_id", id)
+	return nil
+}
+
+func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
 	req = normalizeCreateRequest(req)
 	if req.Image == "" {
 		return nil, errors.New("image is required")
@@ -206,9 +283,16 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	// Choose the sandbox ID up-front so we have stable host paths to bind
 	// before docker.Create runs. The ID also becomes the container's name.
-	sandboxID, err := generateSandboxID()
-	if err != nil {
-		return nil, fmt.Errorf("generate sandbox id: %w", err)
+	// idOverride is non-empty only on the cluster owner watcher's recreate
+	// path — preserving the original ID is what makes failover transparent
+	// to clients holding the sandbox URL.
+	sandboxID := idOverride
+	if sandboxID == "" {
+		var err error
+		sandboxID, err = generateSandboxID()
+		if err != nil {
+			return nil, fmt.Errorf("generate sandbox id: %w", err)
+		}
 	}
 
 	// Admission check uses normalized values (req.CPU/MemoryMB are guaranteed
@@ -1030,6 +1114,14 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 }
 
 func (s *Service) Reconcile(ctx context.Context) error {
+	// Stale-ownership sweep first: if the cluster FSM says another node now
+	// owns one of our local sandboxes (typical after a flapped node returns
+	// to find its placements were reassigned during the outage), destroy the
+	// local copy. This is the converse of the cluster owner watcher — the
+	// new owner has already recreated the sandbox; keeping the old copy
+	// running would double-bill capacity and serve stale state.
+	s.reconcileStaleOwnership(ctx)
+
 	known, err := s.store.List(ctx)
 	if err != nil {
 		return err
