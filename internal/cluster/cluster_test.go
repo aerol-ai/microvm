@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/hashicorp/raft"
 )
 
 // TestClusterSingleNodeBootstrap is the smallest possible end-to-end test of
@@ -55,10 +54,10 @@ func TestClusterSingleNodeBootstrap(t *testing.T) {
 	}
 }
 
-// TestClusterTwoNodeReplication validates that an FSM commit on the leader is
-// visible on the follower. Joins via memberlist, then the leader explicitly
-// adds the follower as a raft voter (the gossip layer doesn't auto-join raft;
-// that's a Phase 2 concern).
+// TestClusterTwoNodeReplication validates the Phase 2 auto-voter promotion:
+// a follower joins via memberlist alone, the leader auto-promotes it to a
+// raft voter, and an FSM commit on the leader replicates to the follower.
+// No manual AddVoter required.
 func TestClusterTwoNodeReplication(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires opening real raft/memberlist sockets")
@@ -72,12 +71,11 @@ func TestClusterTwoNodeReplication(t *testing.T) {
 	follower, cleanupFollower := newTestCluster(t, "follower", false, []string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupFollower()
 
-	// Tell raft about the new voter using its raft TCP advertise address.
-	addVoter(t, leader, follower)
+	// Wait for the leader to auto-promote the follower as a raft voter. This
+	// happens either via the NotifyJoin event (fast path) or the periodic
+	// reconcile loop (slow path) once the follower's gossiped RaftAddr arrives.
+	waitForVoter(t, leader, "follower", 10*time.Second)
 
-	// Wait for the follower's FSM to catch up — i.e. for the AddVoter log
-	// entry to be applied. We then commit a placement on the leader and wait
-	// for it to surface on the follower.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := leader.RecordPlacement(ctx, "sb-replicate"); err != nil {
@@ -169,16 +167,21 @@ func waitForLeader(t *testing.T, c *Cluster, max time.Duration) {
 	t.Fatalf("cluster %q never elected a leader within %s", c.SelfNodeID(), max)
 }
 
-// addVoter promotes follower to a raft voter by reaching into the leader's
-// raw raft handle. We bypass the public API because RecordPlacement on the
-// follower is exactly what's being tested — we shouldn't need it to set the
-// cluster up.
-func addVoter(t *testing.T, leader, follower *Cluster) {
+// waitForVoter blocks until nodeID appears in the leader's raft configuration
+// as a voter (i.e. the auto-voter promotion has fired), or fails the test.
+func waitForVoter(t *testing.T, leader *Cluster, nodeID string, max time.Duration) {
 	t.Helper()
-	addr := raft.ServerAddress(follower.raft.transport.LocalAddr())
-	id := raft.ServerID(follower.SelfNodeID())
-	f := leader.raft.raft.AddVoter(id, addr, 0, 5*time.Second)
-	if err := f.Error(); err != nil {
-		t.Fatalf("AddVoter(%s @ %s): %v", id, addr, err)
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		cfg := leader.raft.raft.GetConfiguration()
+		if cfg.Error() == nil {
+			for _, srv := range cfg.Configuration().Servers {
+				if string(srv.ID) == nodeID {
+					return
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
+	t.Fatalf("voter %q never appeared in leader config within %s", nodeID, max)
 }

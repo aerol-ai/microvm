@@ -19,27 +19,30 @@ import (
 // capacity.Snapshot grows past that, we'd need to switch to gossiped
 // user-events instead of node metadata.
 type nodeMeta struct {
-	NodeID   string             `json:"node_id"`
-	APIURL   string             `json:"api_url"`
-	Capacity capacity.Snapshot  `json:"capacity"`
+	NodeID   string            `json:"node_id"`
+	APIURL   string            `json:"api_url"`
+	RaftAddr string            `json:"raft_addr,omitempty"`
+	Capacity capacity.Snapshot `json:"capacity"`
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
 // node's metadata (which includes the capacity snapshot) and accept others'.
 type gossipDelegate struct {
-	mu        sync.RWMutex
-	selfMeta  nodeMeta
-	encoded   []byte
-	admitter  *capacity.Admitter
-	nodeID    string
-	apiURL    string
+	mu       sync.RWMutex
+	selfMeta nodeMeta
+	encoded  []byte
+	admitter *capacity.Admitter
+	nodeID   string
+	apiURL   string
+	raftAddr string
 }
 
-func newGossipDelegate(nodeID, apiURL string, admitter *capacity.Admitter) *gossipDelegate {
+func newGossipDelegate(nodeID, apiURL, raftAddr string, admitter *capacity.Admitter) *gossipDelegate {
 	d := &gossipDelegate{
 		admitter: admitter,
 		nodeID:   nodeID,
 		apiURL:   apiURL,
+		raftAddr: raftAddr,
 	}
 	d.refreshMeta()
 	return d
@@ -53,7 +56,7 @@ func (d *gossipDelegate) refreshMeta() {
 	if d.admitter != nil {
 		snap = d.admitter.Snapshot()
 	}
-	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, Capacity: snap}
+	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Capacity: snap}
 	enc, err := json.Marshal(meta)
 	if err != nil {
 		// JSON of a capacity.Snapshot can't fail; if it does, fall back to a
@@ -103,8 +106,12 @@ type gossipSetupConfig struct {
 	BindAddr       string
 	AdvertiseAddr  string
 	APIURL         string
+	RaftAddr       string
 	BootstrapPeers []string
 	GossipInterval time.Duration
+	// Events, if non-nil, receives memberlist join/leave/update notifications.
+	// Auto-voter promotion in Phase 2 plugs in here.
+	Events memberlist.EventDelegate
 }
 
 func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slog.Logger) (*gossipNode, error) {
@@ -125,8 +132,11 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		mlCfg.AdvertisePort = aport
 	}
 
-	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, admitter)
+	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.RaftAddr, admitter)
 	mlCfg.Delegate = delegate
+	if cfg.Events != nil {
+		mlCfg.Events = cfg.Events
+	}
 	// memberlist defaults log to stderr at info level — silence it; we already
 	// log meaningful state changes ourselves.
 	mlCfg.Logger = nil
@@ -191,6 +201,7 @@ func (g *gossipNode) members() []Member {
 					m.NodeID = meta.NodeID
 				}
 				m.APIURL = meta.APIURL
+				m.RaftAddr = meta.RaftAddr
 				m.Capacity = meta.Capacity
 			}
 		}

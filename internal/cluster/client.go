@@ -15,16 +15,19 @@ import (
 
 // Cluster is the multi-node Client implementation. Construct with New.
 type Cluster struct {
-	cfg      config.Config
-	logger   *slog.Logger
-	nodeID   string
-	apiURL   string
+	cfg    config.Config
+	logger *slog.Logger
+	nodeID string
+	apiURL string
 
 	fsm    *placementFSM
 	raft   *raftNode
 	gossip *gossipNode
 
 	commitTimeout time.Duration
+
+	// voterReconcileStop cancels the auto-voter reconcile goroutine on Close.
+	voterReconcileStop context.CancelFunc
 }
 
 // New constructs a Cluster for cfg.EnableCluster=true. Caller takes ownership
@@ -60,34 +63,54 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		return nil, fmt.Errorf("cluster.New: raft: %w", err)
 	}
 
-	gn, err := setupGossip(gossipSetupConfig{
-		NodeID:         nodeID,
-		BindAddr:       cfg.GossipBindAddr,
-		AdvertiseAddr:  cfg.GossipAdvertiseAddr,
-		APIURL:         cfg.SelfAPIAdvertiseURL,
-		BootstrapPeers: cfg.BootstrapPeers,
-		GossipInterval: cfg.ClusterCapacityGossipInterval,
-	}, admitter, logger)
-	if err != nil {
-		_ = rn.Close()
-		return nil, fmt.Errorf("cluster.New: gossip: %w", err)
-	}
-
 	commitTimeout := cfg.ClusterRaftCommitTimeout
 	if commitTimeout <= 0 {
 		commitTimeout = 5 * time.Second
 	}
 
-	return &Cluster{
+	c := &Cluster{
 		cfg:           cfg,
 		logger:        logger,
 		nodeID:        nodeID,
 		apiURL:        cfg.SelfAPIAdvertiseURL,
 		fsm:           fsm,
 		raft:          rn,
-		gossip:        gn,
 		commitTimeout: commitTimeout,
-	}, nil
+	}
+
+	// Carry the raft transport's *advertise* address (post-resolution) so peers
+	// can reach us. Falls back to the configured bind address if advertise
+	// wasn't set explicitly.
+	raftAdvertise := cfg.RaftAdvertiseAddr
+	if raftAdvertise == "" {
+		raftAdvertise = cfg.RaftBindAddr
+	}
+	if rn.transport != nil {
+		raftAdvertise = string(rn.transport.LocalAddr())
+	}
+
+	gn, err := setupGossip(gossipSetupConfig{
+		NodeID:         nodeID,
+		BindAddr:       cfg.GossipBindAddr,
+		AdvertiseAddr:  cfg.GossipAdvertiseAddr,
+		APIURL:         cfg.SelfAPIAdvertiseURL,
+		RaftAddr:       raftAdvertise,
+		BootstrapPeers: cfg.BootstrapPeers,
+		GossipInterval: cfg.ClusterCapacityGossipInterval,
+		Events:         &voterAutoJoinDelegate{c: c},
+	}, admitter, logger)
+	if err != nil {
+		_ = rn.Close()
+		return nil, fmt.Errorf("cluster.New: gossip: %w", err)
+	}
+	c.gossip = gn
+
+	// Slow reconcile loop: catches the "joined too fast" race where the
+	// memberlist event fires before the joiner's nodeMeta has propagated. The
+	// loop is no-op when self isn't leader.
+	c.startVoterReconcileLoop()
+
+	return c, nil
 }
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
@@ -237,6 +260,9 @@ func (c *Cluster) LeaderAPIURL() string {
 // Close shuts down gossip + raft. Idempotent.
 func (c *Cluster) Close() error {
 	var firstErr error
+	if c.voterReconcileStop != nil {
+		c.voterReconcileStop()
+	}
 	if c.gossip != nil {
 		if err := c.gossip.Close(); err != nil {
 			firstErr = fmt.Errorf("cluster: gossip close: %w", err)

@@ -53,10 +53,11 @@ type Placement struct {
 
 // Member is a snapshot of a peer's gossiped state.
 type Member struct {
-	NodeID    string             `json:"node_id"`
-	APIURL    string             `json:"api_url"`
-	Alive     bool               `json:"alive"`
-	Capacity  capacity.Snapshot  `json:"capacity"`
+	NodeID   string            `json:"node_id"`
+	APIURL   string            `json:"api_url"`
+	RaftAddr string            `json:"raft_addr,omitempty"`
+	Alive    bool              `json:"alive"`
+	Capacity capacity.Snapshot `json:"capacity"`
 }
 
 // PlacementTarget is returned by SelectPlacement.
