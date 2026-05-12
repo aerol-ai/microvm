@@ -53,19 +53,19 @@ If your use case is "developers SSH into a long-lived workspace once a day," Day
 
 ## Why we built AerolVM
 
-We started AerolVM after running into the same set of problems on every project that needed isolated code execution:
+We built AerolVM because running AI-generated code safely kept turning into the same painful choice.
 
-1. **Cloud sandbox vendors don't fit production AI workloads.** Per-sandbox-hour billing turns a cheap workload into a five-figure invoice the moment an agent loop misbehaves. We wanted a cost model that scales with hardware, not API calls.
+1. Hosted sandboxes were easy to start with, but the pricing made us nervous. If an agent got stuck in a loop, the meter kept running. E2B charges while sandboxes run, and Modal uses usage-based serverless pricing too.
 
-2. **Self-hosted alternatives are too heavy.** The available open-source options are either developer workspace tools (slow boots, complex setup, no agent-focused SDKs) or research-grade microVM stacks (operational nightmare, no managed surface). We wanted something a single engineer could install and operate.
+2. Running it ourselves was not much better. Firecracker gave us a solid microVM layer, but not the whole product we needed around it: files, logs, exec, networking, cleanup, and SDKs.
 
-3. **Untrusted code needs real isolation.** LLM-generated code, customer-supplied code, and CI jobs all need to run somewhere safer than a shared Docker daemon. We wanted gVisor as a first-class runtime, not a custom integration users have to glue together.
+3. We also did not want to run random AI code in plain Docker and hope for the best. Docker’s own docs call out the daemon attack surface and root privileges unless you use rootless mode.
 
-4. **Networking is the part everyone gets wrong.** Exposing sandbox ports to the public internet, controlling egress per sandbox, requiring explicit allowlists before traffic flows - these are the controls real teams need, and they're missing from every alternative we evaluated.
+4. We wanted gVisor built in from day one, because it adds another isolation layer between the code and the host OS.
 
-5. **AI agents and ephemeral CI have the same shape.** Both want sub-second startup, parallel execution, persistent state across resumes, file uploads, streaming exec, and a clean teardown. We wanted one platform that serves both, with SDKs in every language a backend team is likely to use.
+And we did not want to spend weeks gluing together the basics before we could ship: file upload, streaming exec, logs, exposed ports, egress rules, cleanup, and language SDKs.
 
-AerolVM is the system we wanted to exist: open source, single-host install, sub-100ms boots, gVisor by default, GPU-aware, with SDKs in five languages and a pricing model that's just your infrastructure cost.
+So we built AerolVM. AerolVM is a sandbox system you can run on your own infrastructure, with isolation, fast startup, networking controls.
 
 ## Next Steps
 
