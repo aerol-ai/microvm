@@ -182,7 +182,7 @@ If you ever need to re-expose a port manually (for example, the original `Expose
 
 ## Limitations
 
-- **Pre-cluster sandboxes are backfilled at boot.** Sandboxes created before the cluster was enabled, or before spec replication shipped, get their spec and exposed-port intents written into the Raft log on the next daemon start under cluster mode. Registry credentials are the one field that's not backfilled - they aren't persisted on the sandbox row, so a failover relies on the new owner already having the image cached. New sandboxes created under cluster mode replicate everything (including registry credentials) at create time.
+- **Pre-cluster sandboxes are backfilled at boot.** Sandboxes created before the cluster was enabled, or before spec replication shipped, get their spec, exposed-port intents, and registry credentials written into the Raft log on the next daemon start under cluster mode. Registry credentials persisted before the encrypted column existed are absent from the row and won't be backfilled — those sandboxes rely on the new owner already having the image cached, or a fresh `Create` to re-seed credentials.
 - **Public URLs change on failover.** Host ports come from each node's local pool, so the URL surface re-derives on the new owner. Always look up the current URL via `GetSandbox` rather than caching the one from the original create.
 - **Writable-layer state is not replicated.** Treat anything outside a mount as cache. If you need it after a crash, write it to a mount.
 - **Single-node deployments inherit the same model.** A host crash loses the writable layer just as a failover does. Mount external storage for anything that must survive.

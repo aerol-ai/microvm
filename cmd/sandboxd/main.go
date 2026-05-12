@@ -162,7 +162,7 @@ func main() {
 	// across restarts. Best-effort: a missing leader on cold start is logged
 	// and recovered by the next reconcile or the next mutating call.
 	if cfg.EnableCluster {
-		states, err := localSandboxStates(ctx, svc)
+		states, err := localSandboxStates(ctx, svc, logger)
 		if err != nil {
 			logger.Warn("cluster: could not list local sandbox states for ownership replay", "error", err)
 		} else if err := svc.Cluster().AssertOwnership(ctx, states); err != nil {
@@ -226,11 +226,12 @@ func main() {
 // intents — enough for AssertOwnership to backfill spec + ports for sandboxes
 // that pre-date the spec-replication features.
 //
-// Registry credentials aren't persisted on the Sandbox row, so they never get
-// backfilled. That matches existing behavior: a recreated sandbox relies on
-// whichever image is already cached on the new owner. New sandboxes created
-// post-cluster carry Registry through the create-time spec replication path.
-func localSandboxStates(ctx context.Context, svc *service.Service) ([]cluster.LocalSandboxState, error) {
+// Registry credentials are unsealed via svc.UnsealRegistry so the backfilled
+// spec carries the original auth — required for failover to re-pull a private
+// image on a new owner. A decrypt failure on a single sandbox is logged and
+// the spec falls back to nil-Registry rather than aborting boot for the
+// whole fleet.
+func localSandboxStates(ctx context.Context, svc *service.Service, logger *slog.Logger) ([]cluster.LocalSandboxState, error) {
 	sandboxes, err := svc.ListSandboxes(ctx)
 	if err != nil {
 		return nil, err
@@ -242,7 +243,7 @@ func localSandboxStates(ctx context.Context, svc *service.Service) ([]cluster.Lo
 		}
 		out = append(out, cluster.LocalSandboxState{
 			ID:           sb.ID,
-			Spec:         specFromSandbox(sb),
+			Spec:         specFromSandbox(svc, sb, logger),
 			ExposedPorts: portsFromSandbox(sb),
 		})
 	}
@@ -252,7 +253,7 @@ func localSandboxStates(ctx context.Context, svc *service.Service) ([]cluster.Lo
 // specFromSandbox derives a CreateSandboxRequest from a persisted Sandbox row.
 // Used only for the pre-cluster backfill path — new sandboxes get their full
 // spec replicated at create time via clusterCreateWrap.
-func specFromSandbox(sb *models.Sandbox) *models.CreateSandboxRequest {
+func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logger) *models.CreateSandboxRequest {
 	if sb == nil {
 		return nil
 	}
@@ -272,6 +273,18 @@ func specFromSandbox(sb *models.Sandbox) *models.CreateSandboxRequest {
 	// "omitempty" stays meaningful for fresh creates that didn't pass one.
 	lc := sb.Lifecycle
 	spec.Lifecycle = &lc
+
+	// Sealed only when the original create supplied a private registry. A
+	// decrypt failure here is non-fatal: we keep the spec but drop Registry,
+	// matching the legacy behaviour where the new owner relies on its image
+	// cache. Loud-warn so the misconfiguration shows up in logs.
+	auth, err := svc.UnsealRegistry(sb.RegistryAuthSealed)
+	if err != nil {
+		logger.Warn("cluster: unseal registry auth failed; spec backfill will omit credentials",
+			"sandbox_id", sb.ID, "err", err)
+	} else {
+		spec.Registry = auth
+	}
 	return spec
 }
 

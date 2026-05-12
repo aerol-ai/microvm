@@ -122,6 +122,12 @@ func Open(path string) (*Store, error) {
 		// GPU configuration as a JSON blob. Empty string means no GPU was
 		// requested. Stored as JSON to avoid schema churn as GPU options grow.
 		`ALTER TABLE sandboxes ADD COLUMN gpus_json TEXT NOT NULL DEFAULT '';`,
+		// AES-GCM-sealed RegistryAuth (server, username, password) from the
+		// create request. Empty blob means no credentials were supplied (public
+		// registry). Sealed bytes only; the encryption key never touches this
+		// table. Required for cluster failover to re-pull private images on a
+		// new owner — the runtime layer drops creds after the initial pull.
+		`ALTER TABLE sandboxes ADD COLUMN registry_auth_sealed BLOB NOT NULL DEFAULT X'';`,
 		// Protocol of an exposed port: "http" (Caddy HTTP reverse proxy,
 		// historical behavior), "tcp" (caddy-l4 listener at host_port), or
 		// "tls" (caddy-l4 SNI route on the shared TLS listener).
@@ -204,8 +210,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json, registry_auth_sealed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -233,11 +239,21 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
 		gpusJSON,
+		nullableBlob(sandbox.RegistryAuthSealed),
 	)
 	if err != nil {
 		return fmt.Errorf("insert sandbox: %w", err)
 	}
 	return nil
+}
+
+// nullableBlob normalizes a nil byte slice to an empty one so SQLite stores
+// X'' rather than NULL for the registry_auth_sealed column.
+func nullableBlob(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
 }
 
 func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
@@ -260,8 +276,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json, registry_auth_sealed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -286,7 +302,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			stop_at_age_ns = excluded.stop_at_age_ns,
 			destroy_at_age_ns = excluded.destroy_at_age_ns,
 			runtime = excluded.runtime,
-			gpus_json = excluded.gpus_json
+			gpus_json = excluded.gpus_json,
+			registry_auth_sealed = excluded.registry_auth_sealed
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -314,6 +331,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
 		gpusJSON,
+		nullableBlob(sandbox.RegistryAuthSealed),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert sandbox: %w", err)
@@ -327,7 +345,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
+			runtime, gpus_json, registry_auth_sealed
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -355,7 +373,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
+			runtime, gpus_json, registry_auth_sealed
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -727,6 +745,7 @@ func scanSandbox(scanner interface {
 		&destroyAtAgeNs,
 		&sandbox.Runtime,
 		&gpusJSON,
+		&sandbox.RegistryAuthSealed,
 	)
 	if err != nil {
 		return nil, err

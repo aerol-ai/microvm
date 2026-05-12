@@ -283,6 +283,12 @@ type Sandbox struct {
 	// GPUs is the GPU configuration this sandbox was created with. Nil means
 	// no GPU was requested.
 	GPUs *GPURequest `json:"gpus,omitempty"`
+	// RegistryAuthSealed is the AES-GCM-encrypted JSON of the original
+	// RegistryAuth supplied at create time, or nil/empty when the sandbox
+	// pulled from a public registry. Persisted so cluster failover can hand
+	// the credentials back to the new owner's docker pull. Never serialized
+	// over the API — it is internal store ↔ service plumbing.
+	RegistryAuthSealed []byte `json:"-"`
 }
 
 // CreateSandboxResponse is what the API returns from POST /v1/sandboxes.

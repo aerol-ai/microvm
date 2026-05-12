@@ -344,30 +344,43 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 
+	// Seal the registry creds (if any) BEFORE building the row so a marshal
+	// or encrypt error doesn't leave a half-created sandbox: we already passed
+	// docker.Create at this point, so failure here goes through the same
+	// rollback chain as any later store error below.
+	sealedRegistry, err := s.sealRegistry(req.Registry)
+	if err != nil {
+		_ = s.docker.Destroy(ctx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime})
+		cleanupMounts()
+		releaseAdmission()
+		return nil, err
+	}
+
 	now := time.Now().UTC()
 	sandbox := &models.Sandbox{
-		ID:               state.SandboxID,
-		Image:            req.Image,
-		Status:           state.Status,
-		PublicURL:        s.caddy.SandboxPublicURL(state.SandboxID),
-		ContainerID:      state.ContainerID,
-		ContainerIP:      state.ContainerIP,
-		CPU:              req.CPU,
-		MemoryMB:         req.MemoryMB,
-		DiskGB:           req.DiskGB,
-		OSUser:           req.OSUser,
-		Env:              req.Env,
-		NetworkBlockAll:  req.NetworkBlockAll,
-		ToolboxEnabled:   true,
-		ToolboxToken:     toolboxToken,
-		SSHPublicKey:     authorizedKey,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		LastActiveAt:     now,
-		ContainerCommand: req.ContainerCommand,
-		Lifecycle:        lifecycle,
-		Runtime:          chosenRuntime,
-		GPUs:             req.GPUs,
+		ID:                 state.SandboxID,
+		Image:              req.Image,
+		Status:             state.Status,
+		PublicURL:          s.caddy.SandboxPublicURL(state.SandboxID),
+		ContainerID:        state.ContainerID,
+		ContainerIP:        state.ContainerIP,
+		CPU:                req.CPU,
+		MemoryMB:           req.MemoryMB,
+		DiskGB:             req.DiskGB,
+		OSUser:             req.OSUser,
+		Env:                req.Env,
+		NetworkBlockAll:    req.NetworkBlockAll,
+		ToolboxEnabled:     true,
+		ToolboxToken:       toolboxToken,
+		SSHPublicKey:       authorizedKey,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
+		ContainerCommand:   req.ContainerCommand,
+		Lifecycle:          lifecycle,
+		Runtime:            chosenRuntime,
+		GPUs:               req.GPUs,
+		RegistryAuthSealed: sealedRegistry,
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
@@ -413,6 +426,44 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		Sandbox:       *stored,
 		SSHPrivateKey: privateKeyPEM,
 	}, nil
+}
+
+// sealRegistry encrypts the user-supplied RegistryAuth so it can ride on the
+// sandbox row without exposing credentials at rest. Returns nil for the
+// no-credentials case (public registry, or a partially-zero RegistryAuth) so
+// the column stays the empty-blob default for sandboxes that don't need it.
+func (s *Service) sealRegistry(auth *models.RegistryAuth) ([]byte, error) {
+	if auth == nil || (auth.Server == "" && auth.Username == "" && auth.Password == "") {
+		return nil, nil
+	}
+	plain, err := json.Marshal(auth)
+	if err != nil {
+		return nil, fmt.Errorf("marshal registry auth: %w", err)
+	}
+	sealed, err := s.cipher.Encrypt(plain)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt registry auth: %w", err)
+	}
+	return sealed, nil
+}
+
+// UnsealRegistry decrypts a previously sealed RegistryAuth. Returns nil/nil
+// when the input is empty (no credentials persisted). Exported for the
+// boot-time backfill in cmd/sandboxd that rebuilds CreateSandboxRequest from
+// the persisted Sandbox row.
+func (s *Service) UnsealRegistry(sealed []byte) (*models.RegistryAuth, error) {
+	if len(sealed) == 0 {
+		return nil, nil
+	}
+	plain, err := s.cipher.Decrypt(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt registry auth: %w", err)
+	}
+	var auth models.RegistryAuth
+	if err := json.Unmarshal(plain, &auth); err != nil {
+		return nil, fmt.Errorf("unmarshal registry auth: %w", err)
+	}
+	return &auth, nil
 }
 
 // sealMounts marshals the user's mount specs and encrypts the JSON for
