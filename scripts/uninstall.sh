@@ -9,6 +9,7 @@ fi
 
 systemctl disable --now sandboxd >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/sandboxd.service
+rm -rf /etc/systemd/system/sandboxd.service.d
 rm -rf /etc/sandboxd
 rm -f /usr/local/bin/sandboxd /usr/local/bin/toolboxd
 
