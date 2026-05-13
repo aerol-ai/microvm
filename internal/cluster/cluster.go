@@ -85,8 +85,13 @@ type Member struct {
 	NodeID   string            `json:"node_id"`
 	APIURL   string            `json:"api_url"`
 	RaftAddr string            `json:"raft_addr,omitempty"`
-	Alive    bool              `json:"alive"`
-	Capacity capacity.Snapshot `json:"capacity"`
+	// InternalURL is the cluster-internal mTLS endpoint used for raft
+	// leader-forward applies. Empty when the peer is running without
+	// SB_CLUSTER_TLS_DIR — the forwarder falls back to APIURL with PAT-only
+	// auth in that case.
+	InternalURL string            `json:"internal_url,omitempty"`
+	Alive       bool              `json:"alive"`
+	Capacity    capacity.Snapshot `json:"capacity"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.

@@ -22,6 +22,11 @@ GOSSIP_BIND_ADDR="0.0.0.0:7001"
 GOSSIP_ADVERTISE_ADDR=""
 GOSSIP_SECRET_KEY=""
 RAFT_DATA_DIR="/var/lib/sandboxd/raft"
+TLS_DIR="/etc/sandboxd/tls"
+INTERNAL_BIND_ADDR="0.0.0.0:7002"
+INTERNAL_ADVERTISE_URL=""
+NO_TLS="false"
+TLS_BUNDLE_OUT=""
 FORCE="false"
 
 usage() {
@@ -45,6 +50,18 @@ Options:
                                 bytes). Default: auto-generated 32-byte key.
                                 Save the printed value — every other node
                                 needs the same key to join.
+  --tls-dir <path>              Directory for cluster TLS material (CA + node
+                                cert). Default: /etc/sandboxd/tls
+  --internal-bind <host:port>   Cluster-internal mTLS listen address (used for
+                                leader-forwarded raft applies). Default: 0.0.0.0:7002
+  --internal-advertise <url>    HTTPS URL peers dial for the internal channel.
+                                Default: derived from primary IP + internal-bind port.
+  --tls-bundle-out <path>       Where to save the TLS bundle (tarball with CA +
+                                CA key) for distribution to joining nodes.
+                                Default: ./aerolvm-tls-bundle.tar.gz
+  --no-tls                      Skip TLS generation. Cluster-internal channels
+                                ride over the public API URL with PAT-only auth.
+                                ONLY safe on a fully isolated private network.
   --force                       Allow re-init even if the raft data dir
                                 already exists (DESTROYS existing raft state).
   --help                        Show this help.
@@ -65,6 +82,11 @@ while [[ $# -gt 0 ]]; do
 		--gossip-bind)        GOSSIP_BIND_ADDR="$2"; shift 2 ;;
 		--gossip-advertise)   GOSSIP_ADVERTISE_ADDR="$2"; shift 2 ;;
 		--gossip-key)         GOSSIP_SECRET_KEY="$2"; shift 2 ;;
+		--tls-dir)            TLS_DIR="$2"; shift 2 ;;
+		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
+		--internal-advertise) INTERNAL_ADVERTISE_URL="$2"; shift 2 ;;
+		--tls-bundle-out)     TLS_BUNDLE_OUT="$2"; shift 2 ;;
+		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
 		*) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
@@ -162,8 +184,88 @@ case "$DECODED_LEN" in
 		;;
 esac
 
+# --- Cluster TLS material (self-signed CA + per-node cert) -----------------
+# Generated once on the seed; the CA + CA key go into a tarball that the
+# operator copies to each joining node. The CA key is NOT required at daemon
+# runtime — only at join-time so cluster-join.sh can mint a fresh node cert.
+# We still keep ca.key under root-only perms to limit blast radius if a node
+# is compromised: the attacker needs root + the file to mint joiner certs.
+CLUSTER_SAN="aerolvm-cluster-node"
+TLS_GENERATED="false"
+if [[ "$NO_TLS" == "true" ]]; then
+	echo "WARNING: --no-tls given; cluster-internal channels will ride over the public API"
+	echo "         URL with PAT-only auth. Only safe on a fully isolated network."
+else
+	if ! command -v openssl >/dev/null 2>&1; then
+		echo "openssl not found — required for cluster TLS." >&2
+		echo "Install openssl, or pass --no-tls to skip (NOT recommended)." >&2
+		exit 1
+	fi
+
+	mkdir -p "$TLS_DIR"
+	chmod 0700 "$TLS_DIR"
+
+	if [[ -f "$TLS_DIR/ca.crt" ]] || [[ -f "$TLS_DIR/node.crt" ]]; then
+		if [[ "$FORCE" != "true" ]]; then
+			echo "Refusing to overwrite existing TLS material in $TLS_DIR." >&2
+			echo "  Pass --force to regenerate (will invalidate joined nodes' trust)." >&2
+			exit 1
+		fi
+		echo "WARNING: --force given; regenerating TLS material in $TLS_DIR"
+		rm -f "$TLS_DIR/ca.crt" "$TLS_DIR/ca.key" "$TLS_DIR/node.crt" "$TLS_DIR/node.key"
+	fi
+
+	# 1. CA. 10-year lifetime — operators rotate by re-running cluster-init
+	#    with --force and re-distributing the bundle. Long-lived intentionally
+	#    because the CA only signs cluster-internal node certs (never anything
+	#    user-visible).
+	openssl genrsa -out "$TLS_DIR/ca.key" 4096 2>/dev/null
+	openssl req -x509 -new -nodes -key "$TLS_DIR/ca.key" -sha256 -days 3650 \
+		-subj "/CN=AerolVM Cluster CA" \
+		-out "$TLS_DIR/ca.crt" 2>/dev/null
+
+	# 2. This node's keypair + cert. CN/SAN is fixed (clusterServerName in
+	#    Go); SAN intentionally doesn't include IP/hostname because the daemon
+	#    uses ServerName-based verification, not address-based.
+	openssl genrsa -out "$TLS_DIR/node.key" 4096 2>/dev/null
+	openssl req -new -key "$TLS_DIR/node.key" \
+		-subj "/CN=$CLUSTER_SAN" \
+		-out "$TLS_DIR/node.csr" 2>/dev/null
+
+	cat > "$TLS_DIR/node.ext" <<EOF
+subjectAltName = DNS:$CLUSTER_SAN
+extendedKeyUsage = serverAuth, clientAuth
+EOF
+
+	openssl x509 -req -in "$TLS_DIR/node.csr" \
+		-CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" -CAcreateserial \
+		-out "$TLS_DIR/node.crt" -days 3650 -sha256 \
+		-extfile "$TLS_DIR/node.ext" 2>/dev/null
+
+	rm -f "$TLS_DIR/node.csr" "$TLS_DIR/node.ext" "$TLS_DIR/ca.srl"
+	chmod 0600 "$TLS_DIR/ca.key" "$TLS_DIR/node.key"
+	chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.crt"
+
+	# Bundle CA + CA key for joiners. Uses tar so the operator can scp/curl
+	# a single artefact. This file MUST be transferred over a secure channel
+	# (anyone with the bundle can mint a node cert and join the cluster).
+	if [[ -z "$TLS_BUNDLE_OUT" ]]; then
+		TLS_BUNDLE_OUT="$(pwd)/aerolvm-tls-bundle.tar.gz"
+	fi
+	tar -C "$TLS_DIR" -czf "$TLS_BUNDLE_OUT" ca.crt ca.key
+	chmod 0600 "$TLS_BUNDLE_OUT"
+	TLS_GENERATED="true"
+fi
+
+# Derive internal advertise URL when operator didn't override.
+if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
+	INTERNAL_PORT="${INTERNAL_BIND_ADDR##*:}"
+	INTERNAL_ADVERTISE_URL="https://${PRIMARY_IP}:${INTERNAL_PORT}"
+fi
+
 mkdir -p /etc/sandboxd
-cat > /etc/sandboxd/cluster.env <<EOF
+{
+	cat <<EOF
 # Managed by cluster-init.sh. Layered on top of /etc/sandboxd/sandboxd.env
 # via the systemd drop-in at /etc/systemd/system/sandboxd.service.d/cluster.conf.
 SB_ENABLE_CLUSTER=true
@@ -177,6 +279,16 @@ SB_GOSSIP_BIND_ADDR=$GOSSIP_BIND_ADDR
 SB_GOSSIP_ADVERTISE_ADDR=$GOSSIP_ADVERTISE_ADDR
 SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
 EOF
+	if [[ "$TLS_GENERATED" == "true" ]]; then
+		cat <<EOF
+SB_CLUSTER_TLS_DIR=$TLS_DIR
+SB_CLUSTER_INTERNAL_LISTEN=$INTERNAL_BIND_ADDR
+SB_CLUSTER_INTERNAL_ADVERTISE=$INTERNAL_ADVERTISE_URL
+EOF
+	else
+		echo "SB_CLUSTER_INSECURE_GOSSIP=false  # TLS off — relying on private network"
+	fi
+} > /etc/sandboxd/cluster.env
 chmod 0600 /etc/sandboxd/cluster.env
 
 mkdir -p /etc/systemd/system/sandboxd.service.d
@@ -210,12 +322,37 @@ if [[ "$GENERATED_KEY" == "true" ]]; then
 	echo
 fi
 
-cat <<EOF
-To add another node to this cluster, run on that host:
+if [[ "$TLS_GENERATED" == "true" ]]; then
+	cat <<EOF
+=========================================================================
+TLS BUNDLE (CA cert + CA key — required by every joining node):
+
+  $TLS_BUNDLE_OUT
+
+Copy this file to each joining node over a SECURE channel (scp, vault).
+Anyone with the bundle can mint a node cert and join the cluster.
+=========================================================================
+
+To add another node, on that host:
+
+  scp this-host:$TLS_BUNDLE_OUT /tmp/aerolvm-tls-bundle.tar.gz   # secure transfer
+  sudo ./cluster-join.sh \\
+      --gossip-key '$GOSSIP_SECRET_KEY' \\
+      --peers $GOSSIP_ADVERTISE_ADDR \\
+      --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+EOF
+else
+	cat <<EOF
+To add another node (NO TLS — keep all traffic on a private network), run:
 
   sudo ./cluster-join.sh \\
       --gossip-key '$GOSSIP_SECRET_KEY' \\
-      --peers $GOSSIP_ADVERTISE_ADDR
+      --peers $GOSSIP_ADVERTISE_ADDR \\
+      --no-tls
+EOF
+fi
+
+cat <<EOF
 
 Verify membership from this node:
 

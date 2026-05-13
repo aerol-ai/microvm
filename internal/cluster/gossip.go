@@ -22,27 +22,34 @@ type nodeMeta struct {
 	NodeID   string            `json:"node_id"`
 	APIURL   string            `json:"api_url"`
 	RaftAddr string            `json:"raft_addr,omitempty"`
-	Capacity capacity.Snapshot `json:"capacity"`
+	// InternalURL is this node's cluster-internal mTLS endpoint (e.g.
+	// https://10.0.0.5:7002). Set only when the node was started with cluster
+	// TLS material — peers receiving an empty value know to fall back to the
+	// public APIURL with PAT-only auth.
+	InternalURL string            `json:"internal_url,omitempty"`
+	Capacity    capacity.Snapshot `json:"capacity"`
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
 // node's metadata (which includes the capacity snapshot) and accept others'.
 type gossipDelegate struct {
-	mu       sync.RWMutex
-	selfMeta nodeMeta
-	encoded  []byte
-	admitter *capacity.Admitter
-	nodeID   string
-	apiURL   string
-	raftAddr string
+	mu          sync.RWMutex
+	selfMeta    nodeMeta
+	encoded     []byte
+	admitter    *capacity.Admitter
+	nodeID      string
+	apiURL      string
+	raftAddr    string
+	internalURL string
 }
 
-func newGossipDelegate(nodeID, apiURL, raftAddr string, admitter *capacity.Admitter) *gossipDelegate {
+func newGossipDelegate(nodeID, apiURL, raftAddr, internalURL string, admitter *capacity.Admitter) *gossipDelegate {
 	d := &gossipDelegate{
-		admitter: admitter,
-		nodeID:   nodeID,
-		apiURL:   apiURL,
-		raftAddr: raftAddr,
+		admitter:    admitter,
+		nodeID:      nodeID,
+		apiURL:      apiURL,
+		raftAddr:    raftAddr,
+		internalURL: internalURL,
 	}
 	d.refreshMeta()
 	return d
@@ -56,12 +63,12 @@ func (d *gossipDelegate) refreshMeta() {
 	if d.admitter != nil {
 		snap = d.admitter.Snapshot()
 	}
-	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Capacity: snap}
+	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Capacity: snap}
 	enc, err := json.Marshal(meta)
 	if err != nil {
 		// JSON of a capacity.Snapshot can't fail; if it does, fall back to a
 		// minimal blob so peers still know we're here.
-		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL})
+		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, InternalURL: d.internalURL})
 		enc = minimal
 	}
 	d.mu.Lock()
@@ -107,6 +114,7 @@ type gossipSetupConfig struct {
 	AdvertiseAddr  string
 	APIURL         string
 	RaftAddr       string
+	InternalURL    string
 	BootstrapPeers []string
 	GossipInterval time.Duration
 	// SecretKey enables AES gossip encryption + authentication when non-nil.
@@ -138,7 +146,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		mlCfg.AdvertisePort = aport
 	}
 
-	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.RaftAddr, admitter)
+	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.RaftAddr, cfg.InternalURL, admitter)
 	mlCfg.Delegate = delegate
 	if cfg.Events != nil {
 		mlCfg.Events = cfg.Events
@@ -238,6 +246,7 @@ func (g *gossipNode) members() []Member {
 				}
 				m.APIURL = meta.APIURL
 				m.RaftAddr = meta.RaftAddr
+				m.InternalURL = meta.InternalURL
 				m.Capacity = meta.Capacity
 			}
 		}
@@ -255,11 +264,12 @@ func (g *gossipNode) selfMember() Member {
 	meta := g.delegate.selfMeta
 	g.delegate.mu.RUnlock()
 	return Member{
-		NodeID:   meta.NodeID,
-		APIURL:   meta.APIURL,
-		RaftAddr: meta.RaftAddr,
-		Alive:    true,
-		Capacity: meta.Capacity,
+		NodeID:      meta.NodeID,
+		APIURL:      meta.APIURL,
+		RaftAddr:    meta.RaftAddr,
+		InternalURL: meta.InternalURL,
+		Alive:       true,
+		Capacity:    meta.Capacity,
 	}
 }
 
@@ -268,6 +278,18 @@ func (g *gossipNode) peerAPIURL(nodeID string) string {
 	for _, m := range g.members() {
 		if m.NodeID == nodeID {
 			return m.APIURL
+		}
+	}
+	return ""
+}
+
+// peerInternalURL returns the gossiped cluster-internal mTLS endpoint for
+// nodeID, or "" if the peer hasn't advertised one (it's running without
+// SB_CLUSTER_TLS_DIR). Callers fall back to peerAPIURL + PAT-only auth.
+func (g *gossipNode) peerInternalURL(nodeID string) string {
+	for _, m := range g.members() {
+		if m.NodeID == nodeID {
+			return m.InternalURL
 		}
 	}
 	return ""

@@ -30,6 +30,12 @@ type raftSetupConfig struct {
 	AdvertiseAddr    string // address peers should reach us at
 	DataDir          string // directory for log/stable/snapshot stores
 	BootstrapCluster bool   // single-node bootstrap flag
+	// TLS, when non-nil, switches the transport from plaintext TCP to mTLS via
+	// a custom StreamLayer. Both peer connect AND peer accept require a cert
+	// chained to the cluster CA — the same property the cluster-internal HTTP
+	// listener uses. nil keeps the legacy plaintext behaviour for operators on
+	// a fully isolated network.
+	TLS *ClusterTLS
 }
 
 // setupRaft starts a raft node with the placement FSM. On success the caller
@@ -78,11 +84,31 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		_ = stableStore.Close()
 		return nil, fmt.Errorf("raft setup: resolve advertise addr %q: %w", cfg.AdvertiseAddr, err)
 	}
-	transport, err := raft.NewTCPTransportWithLogger(cfg.BindAddr, advertise, 3, 10*time.Second, hclogAdapter(logger))
-	if err != nil {
-		_ = logStore.Close()
-		_ = stableStore.Close()
-		return nil, fmt.Errorf("raft setup: tcp transport on %q: %w", cfg.BindAddr, err)
+	var transport *raft.NetworkTransport
+	if cfg.TLS != nil {
+		// mTLS path: build a TLS StreamLayer ourselves and hand it to
+		// NewNetworkTransport. raft.NewTCPTransport doesn't expose this seam,
+		// which is why we duplicate the binding logic.
+		stream, terr := newTLSStreamLayer(cfg.BindAddr, advertise, cfg.TLS.serverConfig(), cfg.TLS.clientConfig())
+		if terr != nil {
+			_ = logStore.Close()
+			_ = stableStore.Close()
+			return nil, fmt.Errorf("raft setup: tls transport on %q: %w", cfg.BindAddr, terr)
+		}
+		transport = raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
+			Stream:                stream,
+			MaxPool:               3,
+			Timeout:               10 * time.Second,
+			Logger:                hclogAdapter(logger),
+			ServerAddressProvider: nil,
+		})
+	} else {
+		transport, err = raft.NewTCPTransportWithLogger(cfg.BindAddr, advertise, 3, 10*time.Second, hclogAdapter(logger))
+		if err != nil {
+			_ = logStore.Close()
+			_ = stableStore.Close()
+			return nil, fmt.Errorf("raft setup: tcp transport on %q: %w", cfg.BindAddr, err)
+		}
 	}
 
 	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, transport)

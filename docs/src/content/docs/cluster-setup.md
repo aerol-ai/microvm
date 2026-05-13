@@ -119,7 +119,91 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 | `SB_GOSSIP_BIND_ADDR` | yes | Gossip listen address. Default `0.0.0.0:7001`. |
 | `SB_GOSSIP_ADVERTISE_ADDR` | yes | Gossip address peers connect to. Cannot be `0.0.0.0`. |
 | `SB_GOSSIP_SECRET_KEY` | yes | Base64-encoded 16, 24, or 32-byte AES key. Same value on every node. |
+| `SB_CLUSTER_INSECURE_GOSSIP` | no | Set to `true` to opt out of the gossip-key requirement. **Only safe on a fully isolated network.** Without it, any reachable peer can join the raft configuration via voter auto-promotion. Default `false`. |
+| `SB_CLUSTER_TLS_DIR` | recommended | Directory holding the cluster CA + this node's keypair (`ca.crt`, `node.crt`, `node.key`). When set, raft replication and leader-forwarded applies require a peer cert chained to the cluster CA — possession of the PAT alone is no longer enough to forge an internal apply. `cluster-init.sh` / `cluster-join.sh` populate this automatically. |
+| `SB_CLUSTER_INTERNAL_LISTEN` | no | Bind address for the cluster-internal mTLS listener (used for leader-forwarded raft applies). Default `0.0.0.0:7002`. Ignored when `SB_CLUSTER_TLS_DIR` is empty. |
+| `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial for the internal channel (e.g. `https://10.0.0.5:7002`). Auto-derived from primary IP + internal-listen port when empty. Must be HTTPS. |
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses to join. Bootstrap node leaves this empty. |
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
 
+### Cluster-internal TLS (recommended)
+
+`cluster-init.sh` generates a self-signed CA + a per-node keypair under `SB_CLUSTER_TLS_DIR` (default `/etc/sandboxd/tls`) and emits a TLS bundle (tarball with `ca.crt` + `ca.key`) that you copy to each joining node. `cluster-join.sh --tls-bundle <path>` extracts the bundle, mints a fresh per-node keypair from the bundled CA, and writes the same env vars on the joiner. Once enabled:
+
+- **Raft replication** rides over mTLS (`raft.NewNetworkTransportWithConfig` + a custom TLS `StreamLayer`). A peer that can't present a cert chained to the cluster CA fails handshake.
+- **Leader-forwarded raft applies** ride over a separate HTTPS listener on `SB_CLUSTER_INTERNAL_LISTEN` (default port 7002), bypassing the public API URL entirely. Same CA-pinned mTLS rules apply.
+- **Falls back gracefully**: a node without `SB_CLUSTER_TLS_DIR` still works (the daemon advertises no `internal_url` via gossip, and peers fall back to the public API URL with PAT-only auth). Use `--no-tls` on `cluster-init.sh` / `cluster-join.sh` for ephemeral test setups on a fully private network.
+
+The CA bundle MUST be transferred over a secure channel (scp, vault) — anyone with the bundle can mint a node cert and join the cluster.
+
 See [Durability and Failover](/durability) for what gets replicated, what survives node loss, and the cluster network security model.
+
+## Quorum and node count
+
+Raft requires a majority of voters to commit any write. With `N` voters, the cluster tolerates the loss of `(N-1)/2` nodes before it loses quorum and stops accepting writes (placements, reassignments, port intents).
+
+| Voters | Failures tolerated | Notes |
+|---|---|---|
+| 1 | 0 | Single-node cluster. Any restart blocks writes briefly; any disk loss is total. |
+| 2 | 0 | **Worst case.** Quorum is 2. Losing either node halts the cluster. Avoid. |
+| 3 | 1 | Minimum recommended for any production deployment. |
+| 5 | 2 | Recommended for clusters that span availability zones. |
+| 7 | 3 | Diminishing returns; replication latency grows. |
+
+**Rules of thumb:**
+
+- Always run an **odd number** of voters (1, 3, 5, 7). Even counts only raise the quorum threshold without raising fault tolerance.
+- Treat a 2-node cluster as a single point of failure with extra steps. If you only have two hosts, run single-node mode on the more-reliable one.
+- `SB_NODE_ID` must be **stable** across restarts. A node that comes back with a new ID joins as a brand-new voter while the old voter sits in the configuration as dead — eventually evicted by the dead-owner reconciler, but until then it counts toward quorum and inflates the failure budget.
+
+## Lost-quorum recovery
+
+If you lose more than `(N-1)/2` voters at once, the surviving nodes cannot elect a leader and the cluster stops accepting writes. Reads from already-replicated state still work; new placements do not.
+
+**Before doing anything, confirm the diagnosis.** On a surviving node:
+
+```bash
+sudo journalctl -u sandboxd --since "10 minutes ago" | grep -i 'leader\|election'
+curl -s -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  http://127.0.0.1:21212/v1/cluster/leader
+```
+
+A persistent empty `Leader` field with repeated election timeouts is the signature.
+
+### Option A — wait for the lost nodes to come back
+
+If the lost voters' raft state on disk is intact, restarting them rejoins the existing configuration. No special procedure required. **Try this first** — it does not destroy any state.
+
+### Option B — manual quorum recovery (last resort)
+
+If the lost voters are gone for good (disk loss, hardware destroyed) and waiting is not an option, you can rewrite the raft configuration on a surviving node so it bootstraps a fresh single-node cluster from its existing log. This is **destructive to durability guarantees** — any committed entry that the surviving node never replicated is lost.
+
+1. Stop `sandboxd` on every surviving node.
+2. On the node with the most-recent raft log (highest `LastIndex` from `journalctl`), edit `/var/lib/sandboxd/raft/peers.json` to list only itself as a voter:
+
+   ```json
+   [
+     { "id": "this-node-id", "address": "10.0.0.5:7000", "non_voter": false, "suffrage": "Voter" }
+   ]
+   ```
+
+3. Start `sandboxd` on that node only. It will detect `peers.json` and rewrite the raft configuration to itself.
+4. Once it elects itself leader, re-add the other surviving nodes by joining them fresh:
+   ```bash
+   sudo rm -rf /var/lib/sandboxd/raft   # on each rejoining node
+   sudo ./cluster-join.sh --gossip-key '<key>' --peers <recovered-node>:7001 --force
+   ```
+5. Inspect placements via `GET /v1/cluster/members` and reconcile any sandboxes that were owned by permanently-lost nodes — their FSM placements remain but the dead-owner reconciler will reassign or orphan them on the next tick.
+
+Document this procedure in your runbook before you need it. Do not improvise during an outage.
+
+## Verifying cluster health
+
+A healthy cluster reports:
+
+- A non-empty `Leader` from `GET /v1/cluster/leader`.
+- All expected node IDs in `GET /v1/cluster/members` with `alive: true`.
+- No repeated `cluster: AssertOwnership skipped, no leader yet` warnings in `journalctl -u sandboxd`.
+- `cluster: voter promoted` log lines when joiners come online — silence here means the auto-voter loop isn't seeing the joiner.
+
+Set up monitoring on `GET /v1/cluster/leader` returning empty for more than 30 seconds: that's the earliest signal of a brewing quorum problem.

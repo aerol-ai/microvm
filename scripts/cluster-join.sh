@@ -17,6 +17,11 @@ GOSSIP_ADVERTISE_ADDR=""
 GOSSIP_SECRET_KEY=""
 PEERS=""
 RAFT_DATA_DIR="/var/lib/sandboxd/raft"
+TLS_DIR="/etc/sandboxd/tls"
+TLS_BUNDLE=""
+INTERNAL_BIND_ADDR="0.0.0.0:7002"
+INTERNAL_ADVERTISE_URL=""
+NO_TLS="false"
 FORCE="false"
 
 usage() {
@@ -39,6 +44,19 @@ Optional:
   --raft-advertise <host:port>  Raft address peers connect to. Default: derived.
   --gossip-bind <host:port>     Gossip listen address. Default: 0.0.0.0:7001
   --gossip-advertise <host:port> Gossip address peers connect to. Default: derived.
+  --tls-bundle <path>           Path to the TLS bundle (tarball with ca.crt +
+                                ca.key) emitted by cluster-init.sh on the seed.
+                                A fresh node cert is signed locally from the
+                                bundled CA. Required unless --no-tls.
+  --tls-dir <path>              Where to write the loaded TLS material.
+                                Default: /etc/sandboxd/tls
+  --internal-bind <host:port>   Cluster-internal mTLS listen address.
+                                Default: 0.0.0.0:7002
+  --internal-advertise <url>    HTTPS URL peers dial for the internal channel.
+                                Default: derived from primary IP + internal-bind port.
+  --no-tls                      Skip TLS. Cluster-internal channels ride over
+                                the public API URL with PAT-only auth. ONLY
+                                safe on a fully isolated network.
   --force                       Allow re-join even if the raft data dir
                                 already exists (DESTROYS local raft state).
   --help                        Show this help.
@@ -60,6 +78,11 @@ while [[ $# -gt 0 ]]; do
 		--gossip-advertise)   GOSSIP_ADVERTISE_ADDR="$2"; shift 2 ;;
 		--gossip-key)         GOSSIP_SECRET_KEY="$2"; shift 2 ;;
 		--peers)              PEERS="$2"; shift 2 ;;
+		--tls-bundle)         TLS_BUNDLE="$2"; shift 2 ;;
+		--tls-dir)            TLS_DIR="$2"; shift 2 ;;
+		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
+		--internal-advertise) INTERNAL_ADVERTISE_URL="$2"; shift 2 ;;
+		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
 		*) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
@@ -74,6 +97,17 @@ fi
 if [[ -z "$GOSSIP_SECRET_KEY" || -z "$PEERS" ]]; then
 	echo "--gossip-key and --peers are required" >&2
 	usage
+	exit 1
+fi
+
+if [[ "$NO_TLS" != "true" ]] && [[ -z "$TLS_BUNDLE" ]]; then
+	echo "--tls-bundle is required (or pass --no-tls for plaintext private-network setups)." >&2
+	echo "  The bundle is the tarball cluster-init.sh emits on the seed node." >&2
+	exit 1
+fi
+
+if [[ "$NO_TLS" != "true" ]] && [[ ! -f "$TLS_BUNDLE" ]]; then
+	echo "TLS bundle not found: $TLS_BUNDLE" >&2
 	exit 1
 fi
 
@@ -139,8 +173,72 @@ derive_advertise() {
 if [[ -z "$RAFT_ADVERTISE_ADDR" ]];   then RAFT_ADVERTISE_ADDR="$(derive_advertise "$RAFT_BIND_ADDR")"; fi
 if [[ -z "$GOSSIP_ADVERTISE_ADDR" ]]; then GOSSIP_ADVERTISE_ADDR="$(derive_advertise "$GOSSIP_BIND_ADDR")"; fi
 
+# --- Cluster TLS material -------------------------------------------------
+# Unpack the seed-emitted bundle (ca.crt + ca.key) and locally mint this
+# node's keypair + signed cert. Only ca.crt + node.{crt,key} are needed at
+# runtime; we keep ca.key on disk too (root-only) so future re-mints don't
+# need a fresh bundle copy.
+CLUSTER_SAN="aerolvm-cluster-node"
+TLS_GENERATED="false"
+if [[ "$NO_TLS" == "true" ]]; then
+	echo "WARNING: --no-tls given; cluster-internal channels will use the public"
+	echo "         API URL with PAT-only auth. Only safe on a fully isolated network."
+else
+	if ! command -v openssl >/dev/null 2>&1; then
+		echo "openssl not found — required to mint a node cert from the TLS bundle." >&2
+		exit 1
+	fi
+
+	mkdir -p "$TLS_DIR"
+	chmod 0700 "$TLS_DIR"
+
+	if [[ -f "$TLS_DIR/node.crt" ]]; then
+		if [[ "$FORCE" != "true" ]]; then
+			echo "Refusing to overwrite existing TLS material in $TLS_DIR." >&2
+			echo "  Pass --force to regenerate." >&2
+			exit 1
+		fi
+		echo "WARNING: --force given; regenerating TLS material in $TLS_DIR"
+		rm -f "$TLS_DIR/ca.crt" "$TLS_DIR/ca.key" "$TLS_DIR/node.crt" "$TLS_DIR/node.key"
+	fi
+
+	# Extract bundle. tar will refuse path traversals; we restrict the file
+	# list explicitly anyway.
+	tar -C "$TLS_DIR" -xzf "$TLS_BUNDLE" ca.crt ca.key
+	if [[ ! -f "$TLS_DIR/ca.crt" ]] || [[ ! -f "$TLS_DIR/ca.key" ]]; then
+		echo "TLS bundle did not contain ca.crt + ca.key" >&2
+		exit 1
+	fi
+
+	openssl genrsa -out "$TLS_DIR/node.key" 4096 2>/dev/null
+	openssl req -new -key "$TLS_DIR/node.key" \
+		-subj "/CN=$CLUSTER_SAN" \
+		-out "$TLS_DIR/node.csr" 2>/dev/null
+
+	cat > "$TLS_DIR/node.ext" <<EOF
+subjectAltName = DNS:$CLUSTER_SAN
+extendedKeyUsage = serverAuth, clientAuth
+EOF
+
+	openssl x509 -req -in "$TLS_DIR/node.csr" \
+		-CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" -CAcreateserial \
+		-out "$TLS_DIR/node.crt" -days 3650 -sha256 \
+		-extfile "$TLS_DIR/node.ext" 2>/dev/null
+
+	rm -f "$TLS_DIR/node.csr" "$TLS_DIR/node.ext" "$TLS_DIR/ca.srl"
+	chmod 0600 "$TLS_DIR/ca.key" "$TLS_DIR/node.key"
+	chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.crt"
+	TLS_GENERATED="true"
+fi
+
+if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
+	INTERNAL_PORT="${INTERNAL_BIND_ADDR##*:}"
+	INTERNAL_ADVERTISE_URL="https://${PRIMARY_IP}:${INTERNAL_PORT}"
+fi
+
 mkdir -p /etc/sandboxd
-cat > /etc/sandboxd/cluster.env <<EOF
+{
+	cat <<EOF
 # Managed by cluster-join.sh. Layered on top of /etc/sandboxd/sandboxd.env
 # via the systemd drop-in at /etc/systemd/system/sandboxd.service.d/cluster.conf.
 SB_ENABLE_CLUSTER=true
@@ -155,6 +253,14 @@ SB_GOSSIP_ADVERTISE_ADDR=$GOSSIP_ADVERTISE_ADDR
 SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
 SB_BOOTSTRAP_PEERS=$PEERS
 EOF
+	if [[ "$TLS_GENERATED" == "true" ]]; then
+		cat <<EOF
+SB_CLUSTER_TLS_DIR=$TLS_DIR
+SB_CLUSTER_INTERNAL_LISTEN=$INTERNAL_BIND_ADDR
+SB_CLUSTER_INTERNAL_ADVERTISE=$INTERNAL_ADVERTISE_URL
+EOF
+	fi
+} > /etc/sandboxd/cluster.env
 chmod 0600 /etc/sandboxd/cluster.env
 
 mkdir -p /etc/systemd/system/sandboxd.service.d

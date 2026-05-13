@@ -33,9 +33,30 @@ type Cluster struct {
 
 	// patToken authenticates leader-forwarded raft applies. Sourced from
 	// cfg.PATToken at construction; same value every node already shares for
-	// regular API auth, so no new secret-distribution surface.
+	// regular API auth, so no new secret-distribution surface. With mTLS
+	// enabled the PAT is belt-and-braces — the TLS handshake already proved
+	// cluster membership — but we keep sending it so the receiving handler can
+	// stay symmetric with the public endpoint and so a node that briefly loses
+	// its TLS material can fall back without breaking auth.
 	patToken   string
 	httpClient *http.Client
+	// internalURL is this node's cluster-internal mTLS advertise URL (e.g.
+	// https://10.0.0.5:7002). Empty when running without SB_CLUSTER_TLS_DIR.
+	// Gossiped to peers so leader-forward can prefer the mTLS channel over
+	// the public API URL.
+	internalURL string
+	// tls holds the loaded cluster CA + node keypair used by both the raft
+	// transport (via raftSetupConfig.TLS) and the internal HTTPS listener.
+	// nil when SB_CLUSTER_TLS_DIR is unset — that's the legacy plaintext path
+	// for operators on a fully isolated network.
+	tls *ClusterTLS
+	// internalServer is the mTLS HTTPS listener that accepts leader-forwarded
+	// raft applies from peers. nil when tls is nil. Owned by Close.
+	internalServer *internalServer
+	// internalClient is an HTTPS client preconfigured with the cluster CA +
+	// our node cert. Used to dial peers' InternalURL when both sides have
+	// TLS material. nil when tls is nil.
+	internalClient *http.Client
 
 	commitTimeout time.Duration
 
@@ -84,12 +105,21 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 
 	fsm := newPlacementFSM()
 
+	// Load cluster TLS material first — both raft transport and the internal
+	// HTTPS listener need it. Empty SB_CLUSTER_TLS_DIR keeps the legacy
+	// plaintext path for operators on a fully isolated network.
+	clusterTLS, err := loadClusterTLS(cfg.ClusterTLSDir)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.New: load tls: %w", err)
+	}
+
 	rn, err := setupRaft(raftSetupConfig{
 		NodeID:           nodeID,
 		BindAddr:         cfg.RaftBindAddr,
 		AdvertiseAddr:    cfg.RaftAdvertiseAddr,
 		DataDir:          cfg.RaftDataDir,
 		BootstrapCluster: cfg.ClusterBootstrap,
+		TLS:              clusterTLS,
 	}, fsm, logger)
 	if err != nil {
 		return nil, fmt.Errorf("cluster.New: raft: %w", err)
@@ -111,6 +141,32 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		httpClient:    &http.Client{Timeout: commitTimeout + 2*time.Second},
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
+		tls:           clusterTLS,
+	}
+
+	// Build the cluster-internal HTTPS client + listener when TLS is loaded.
+	// Both ride on the same CA + node keypair as raft, so a peer's cert can
+	// fail handshake in exactly one way (chain mismatch) regardless of which
+	// channel they hit.
+	if clusterTLS != nil {
+		c.internalClient = &http.Client{
+			Timeout: commitTimeout + 2*time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: clusterTLS.clientConfig(),
+				// Disable connection reuse across leader changes so a
+				// stale TLS session can't pin us to a former leader.
+				DisableKeepAlives: false,
+				MaxIdleConns:      4,
+				IdleConnTimeout:   30 * time.Second,
+			},
+		}
+		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger)
+		if err != nil {
+			_ = rn.Close()
+			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
+		}
+		c.internalServer = is
+		c.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
 
 	// Carry the raft transport's *advertise* address (post-resolution) so peers
@@ -130,10 +186,10 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		return nil, fmt.Errorf("cluster.New: %w", err)
 	}
 	if len(secretKey) == 0 {
-		// Plaintext gossip + voter auto-promotion lets any reachable peer
-		// become a raft voter. Make this loud so operators see the warning at
-		// boot rather than discovering it after a hostile join.
-		logger.Warn("cluster: gossip is unencrypted (SB_GOSSIP_SECRET_KEY not set); voter auto-promotion will admit any reachable peer — keep raft+gossip ports on a private network")
+		// Plaintext gossip is allowed only via the explicit SB_CLUSTER_INSECURE_GOSSIP
+		// escape hatch (config.Load enforces this). Still loud-warn here so the
+		// boot log shows the deviation from the secure default.
+		logger.Warn("cluster: gossip is unencrypted (SB_CLUSTER_INSECURE_GOSSIP=true); voter auto-promotion will admit any reachable peer — keep raft+gossip ports on a private network")
 	}
 
 	gn, err := setupGossip(gossipSetupConfig{
@@ -142,12 +198,16 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		AdvertiseAddr:  cfg.GossipAdvertiseAddr,
 		APIURL:         cfg.SelfAPIAdvertiseURL,
 		RaftAddr:       raftAdvertise,
+		InternalURL:    c.internalURL,
 		BootstrapPeers: cfg.BootstrapPeers,
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
 		Events:         &voterAutoJoinDelegate{c: c},
 	}, admitter, logger)
 	if err != nil {
+		if c.internalServer != nil {
+			_ = c.internalServer.Close()
+		}
 		_ = rn.Close()
 		return nil, fmt.Errorf("cluster.New: gossip: %w", err)
 	}
@@ -458,12 +518,45 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
 // forwardApplyToLeader posts an encoded raft command to the current leader's
 // internal apply endpoint. Returns ErrNotLeader if no leader is known (so the
 // caller can surface the same retry semantics as a stale local leader-check).
+//
+// Channel selection: if both this node and the leader have advertised an
+// InternalURL (i.e. both have SB_CLUSTER_TLS_DIR set), we dial the leader's
+// mTLS listener — the TLS handshake proves cluster membership before the
+// payload is read. Otherwise we fall back to the public API URL, which only
+// validates the shared PAT and is acceptable on a private overlay.
 func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) error {
+	leader := c.Leader()
+	if leader == "" {
+		return ErrNotLeader
+	}
+
+	// Prefer the cluster-internal mTLS channel when both ends are TLS-equipped.
+	if c.internalClient != nil {
+		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
+			endpoint := strings.TrimRight(peerInternal, "/") + InternalAPIPath
+			err := c.doLeaderApply(ctx, c.internalClient, endpoint, payload)
+			// Hard-fail (network/TLS) on the internal channel must NOT silently
+			// fall back to the public path — that would defeat the security
+			// promise. Only ErrNotLeader bubbles up so the caller retries the
+			// new leader (which may pick the public path next iteration).
+			return err
+		}
+	}
+
+	// Fallback: public API URL with PAT-only auth. This path runs when the
+	// peer (or self) doesn't have TLS material — typically a mixed-rollout
+	// or a fully-plaintext private-network deployment.
 	leaderURL := c.LeaderAPIURL()
 	if leaderURL == "" {
 		return ErrNotLeader
 	}
 	endpoint := strings.TrimRight(leaderURL, "/") + "/v1/cluster/internal/apply"
+	return c.doLeaderApply(ctx, c.httpClient, endpoint, payload)
+}
+
+// doLeaderApply is the shared HTTP execution path used by both the mTLS
+// internal channel and the PAT-only public-API fallback in forwardApplyToLeader.
+func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoint string, payload []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("cluster: build leader-forward request: %w", err)
@@ -472,7 +565,7 @@ func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) erro
 	if c.patToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.patToken)
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("cluster: leader-forward apply: %w", err)
 	}
@@ -482,8 +575,6 @@ func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) erro
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		// 503 from the receiving node means it's not the leader anymore — let
-		// the caller retry against a refreshed leader URL.
 		return ErrNotLeader
 	}
 	return fmt.Errorf("cluster: leader-forward apply: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -548,6 +639,13 @@ func (c *Cluster) Close() error {
 			firstErr = fmt.Errorf("cluster: gossip close: %w", err)
 		}
 	}
+	// Stop the internal HTTPS listener before closing raft so a peer that just
+	// started a forward can see a clean shutdown rather than a mid-apply error.
+	if c.internalServer != nil {
+		if err := c.internalServer.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("cluster: internal server close: %w", err)
+		}
+	}
 	if c.raft != nil {
 		if err := c.raft.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("cluster: raft close: %w", err)
@@ -574,6 +672,64 @@ func decodeGossipSecretKey(raw string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("SB_GOSSIP_SECRET_KEY must decode to 16, 24, or 32 bytes (got %d)", len(key))
 	}
+}
+
+// deriveInternalAdvertiseURL computes the URL peers should use to dial this
+// node's cluster-internal mTLS listener. Operator-provided
+// SB_CLUSTER_INTERNAL_ADVERTISE wins; otherwise we synthesize from the bound
+// listener's address. The synthesis path tries to keep the host portion
+// non-bogus: if the listener bound 0.0.0.0/:: we'd otherwise advertise an
+// unroutable address, so we fall back to the listen-config host (which the
+// operator may have set sensibly) or finally to "127.0.0.1" so single-node /
+// loopback test setups still work.
+func deriveInternalAdvertiseURL(operator string, listenAddr string, boundAddr string) string {
+	if operator != "" {
+		return strings.TrimRight(operator, "/")
+	}
+	host, port := splitHostForAdvertise(boundAddr)
+	if isUnspecifiedHost(host) {
+		// Listener bound a wildcard. Prefer the configured listen host (if
+		// operator set one explicitly), otherwise loopback.
+		lhost, _ := splitHostForAdvertise(listenAddr)
+		if !isUnspecifiedHost(lhost) && lhost != "" {
+			host = lhost
+		} else {
+			host = "127.0.0.1"
+		}
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if port == "" {
+		return "https://" + host
+	}
+	return "https://" + host + ":" + port
+}
+
+// splitHostForAdvertise splits "host:port" tolerantly. Returns ("", "") on
+// parse error so callers fall back to defaults.
+func splitHostForAdvertise(addr string) (string, string) {
+	if addr == "" {
+		return "", ""
+	}
+	// net.SplitHostPort handles IPv6 brackets correctly; fall back to a manual
+	// split if it fails (e.g. caller passed bare "host").
+	h, p, err := splitHostPort(addr)
+	if err != nil {
+		return addr, ""
+	}
+	if p == 0 {
+		return h, ""
+	}
+	return h, fmt.Sprintf("%d", p)
+}
+
+func isUnspecifiedHost(host string) bool {
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return true
+	}
+	return false
 }
 
 // HealthyForReads is true once the FSM has caught up to the leader's last

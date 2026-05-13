@@ -134,10 +134,35 @@ type Config struct {
 	ClusterDeadOwnerGrace time.Duration
 	// ClusterGossipSecretKey, when non-empty, enables AES gossip encryption +
 	// authentication. Accepts a base64-encoded 16/24/32-byte key (AES-128/192/256).
-	// When empty, gossip is plaintext — acceptable only on a fully private
-	// network, since voter auto-promotion will otherwise admit any reachable
-	// peer to the raft configuration. SB_GOSSIP_SECRET_KEY.
+	// Required in cluster mode (Load() refuses to start otherwise). The escape
+	// hatch is ClusterInsecureGossip below. SB_GOSSIP_SECRET_KEY.
 	ClusterGossipSecretKey string
+	// ClusterInsecureGossip explicitly opts out of the gossip-key requirement
+	// when SB_ENABLE_CLUSTER=true. Only safe on a fully isolated network where
+	// every peer that can reach gossip+raft ports is trusted. Default false —
+	// the daemon refuses to boot in cluster mode without a gossip key. Use only
+	// for ephemeral test setups. SB_CLUSTER_INSECURE_GOSSIP.
+	ClusterInsecureGossip bool
+
+	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
+	// any other future cluster-internal RPC) ride over a separate HTTPS listener
+	// that requires a client certificate signed by the cluster CA. Without TLS
+	// the same RPCs ride over the public API URL with only the shared PAT for
+	// auth — fine on a private overlay, but a client-cert pin is the right
+	// default for any internet-adjacent deployment.
+	//
+	// ClusterTLSDir holds ca.crt, ca.key (only on the bootstrap node and any
+	// joiner that received the bundle), node.crt, node.key. cluster-init.sh
+	// generates the CA and a node cert; cluster-join.sh signs a fresh node
+	// cert from the bundled CA. SB_CLUSTER_TLS_DIR.
+	ClusterTLSDir string
+	// ClusterInternalListenAddr is the bind address for the mTLS internal
+	// listener. SB_CLUSTER_INTERNAL_LISTEN. Default 0.0.0.0:7002.
+	ClusterInternalListenAddr string
+	// ClusterInternalAdvertiseURL is the URL peers dial for cluster-internal
+	// RPCs. Falls back to https://<derived-host>:<internal-port> when empty.
+	// Must be HTTPS — plaintext defeats the purpose. SB_CLUSTER_INTERNAL_ADVERTISE.
+	ClusterInternalAdvertiseURL string
 }
 
 func Load() (Config, error) {
@@ -208,6 +233,10 @@ func Load() (Config, error) {
 		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterDeadOwnerGrace:         getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
 		ClusterGossipSecretKey:        strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
+		ClusterInsecureGossip:         getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
+		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
+		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
+		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
 	}
 
 	if cfg.PATToken == "" {
@@ -273,6 +302,15 @@ func Load() (Config, error) {
 		}
 		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
 			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
+		}
+		// Gossip auth gates voter auto-promotion. Without it, any reachable peer
+		// can join the raft configuration. Refusing at boot is the safest default
+		// — operators who genuinely want plaintext gossip on a fully isolated
+		// network can set SB_CLUSTER_INSECURE_GOSSIP=true. The escape hatch is
+		// loud (separate variable, must be deliberate) rather than silently
+		// permissive.
+		if cfg.ClusterGossipSecretKey == "" && !cfg.ClusterInsecureGossip {
+			return Config{}, errors.New("SB_GOSSIP_SECRET_KEY is required when SB_ENABLE_CLUSTER=true (set SB_CLUSTER_INSECURE_GOSSIP=true to opt out — only safe on a fully isolated network)")
 		}
 	}
 
