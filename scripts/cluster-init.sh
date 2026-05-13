@@ -27,6 +27,8 @@ INTERNAL_BIND_ADDR="0.0.0.0:7002"
 INTERNAL_ADVERTISE_URL=""
 NO_TLS="false"
 TLS_BUNDLE_OUT=""
+CRED_KEY_PATH=""
+CRED_BUNDLE_OUT=""
 FORCE="false"
 
 usage() {
@@ -57,8 +59,20 @@ Options:
   --internal-advertise <url>    HTTPS URL peers dial for the internal channel.
                                 Default: derived from primary IP + internal-bind port.
   --tls-bundle-out <path>       Where to save the TLS bundle (tarball with CA +
-                                CA key) for distribution to joining nodes.
+                                CA key + credential encryption key) for
+                                distribution to joining nodes.
                                 Default: ./aerolvm-tls-bundle.tar.gz
+  --credential-key-path <path>  Path to the credential encryption key file.
+                                Default: SB_CREDENTIAL_ENCRYPTION_KEY_PATH from
+                                /etc/sandboxd/sandboxd.env, or
+                                /var/lib/sandboxd/credential_encryption.key.
+                                If the file is missing, a fresh 32-byte key is
+                                generated and written here.
+  --cred-bundle-out <path>      In --no-tls mode, where to save the standalone
+                                credential bundle (tarball with just the
+                                credential encryption key) for distribution to
+                                joining nodes.
+                                Default: ./aerolvm-cred-bundle.tar.gz
   --no-tls                      Skip TLS generation. Cluster-internal channels
                                 ride over the public API URL with PAT-only auth.
                                 ONLY safe on a fully isolated private network.
@@ -86,6 +100,8 @@ while [[ $# -gt 0 ]]; do
 		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
 		--internal-advertise) INTERNAL_ADVERTISE_URL="$2"; shift 2 ;;
 		--tls-bundle-out)     TLS_BUNDLE_OUT="$2"; shift 2 ;;
+		--credential-key-path) CRED_KEY_PATH="$2"; shift 2 ;;
+		--cred-bundle-out)    CRED_BUNDLE_OUT="$2"; shift 2 ;;
 		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
@@ -246,21 +262,74 @@ EOF
 	chmod 0600 "$TLS_DIR/ca.key" "$TLS_DIR/node.key"
 	chmod 0644 "$TLS_DIR/ca.crt" "$TLS_DIR/node.crt"
 
-	# Bundle CA + CA key for joiners. Uses tar so the operator can scp/curl
-	# a single artefact. This file MUST be transferred over a secure channel
-	# (anyone with the bundle can mint a node cert and join the cluster).
+	# Bundle CA + CA key + credential encryption key for joiners. Uses tar
+	# so the operator can scp/curl a single artefact. This file MUST be
+	# transferred over a secure channel — anyone with the bundle can mint
+	# a node cert and join the cluster, AND can decrypt every sandbox's
+	# sealed registry/mount credentials.
 	if [[ -z "$TLS_BUNDLE_OUT" ]]; then
 		TLS_BUNDLE_OUT="$(pwd)/aerolvm-tls-bundle.tar.gz"
 	fi
-	tar -C "$TLS_DIR" -czf "$TLS_BUNDLE_OUT" ca.crt ca.key
+	# Stage the credential key inside TLS_DIR (root-only) so all bundle
+	# entries share one tar root. Copy rather than move — the original at
+	# CRED_KEY_PATH must remain so the daemon can keep reading it.
+	install -m 0600 "$CRED_KEY_PATH" "$TLS_DIR/credential_encryption.key"
+	tar -C "$TLS_DIR" -czf "$TLS_BUNDLE_OUT" ca.crt ca.key credential_encryption.key
 	chmod 0600 "$TLS_BUNDLE_OUT"
 	TLS_GENERATED="true"
+fi
+
+# In --no-tls mode we still need to ship the credential key. Emit a tiny
+# standalone bundle so the joiner has a uniform extraction path.
+CRED_BUNDLE_GENERATED="false"
+if [[ "$NO_TLS" == "true" ]]; then
+	if [[ -z "$CRED_BUNDLE_OUT" ]]; then
+		CRED_BUNDLE_OUT="$(pwd)/aerolvm-cred-bundle.tar.gz"
+	fi
+	CRED_STAGE_DIR="$(mktemp -d)"
+	install -m 0600 "$CRED_KEY_PATH" "$CRED_STAGE_DIR/credential_encryption.key"
+	tar -C "$CRED_STAGE_DIR" -czf "$CRED_BUNDLE_OUT" credential_encryption.key
+	chmod 0600 "$CRED_BUNDLE_OUT"
+	rm -rf "$CRED_STAGE_DIR"
+	CRED_BUNDLE_GENERATED="true"
 fi
 
 # Derive internal advertise URL when operator didn't override.
 if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
 	INTERNAL_PORT="${INTERNAL_BIND_ADDR##*:}"
 	INTERNAL_ADVERTISE_URL="https://${PRIMARY_IP}:${INTERNAL_PORT}"
+fi
+
+# --- Credential encryption key --------------------------------------------
+# Sealed registry passwords and per-mount credentials replicated via raft are
+# decrypted with this key on the failover owner. Every node MUST share the
+# same value or recovered sandboxes lose access to private registries and
+# credentialed mounts. install.sh lazy-generates a per-node file by default;
+# we capture the seed's key (or generate one) and ship it to every joiner via
+# the bundle below.
+if [[ -z "$CRED_KEY_PATH" ]]; then
+	# Honor SB_CREDENTIAL_ENCRYPTION_KEY_PATH from sandboxd.env if the
+	# operator customized it; otherwise the daemon default.
+	CRED_KEY_PATH="$(grep -E '^SB_CREDENTIAL_ENCRYPTION_KEY_PATH=' /etc/sandboxd/sandboxd.env | tail -n1 | cut -d= -f2-)"
+	CRED_KEY_PATH="${CRED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key}"
+fi
+
+if [[ ! -f "$CRED_KEY_PATH" ]]; then
+	mkdir -p "$(dirname "$CRED_KEY_PATH")"
+	if ! command -v openssl >/dev/null 2>&1; then
+		echo "openssl not found — required to generate the credential encryption key." >&2
+		echo "Install openssl, or pre-create $CRED_KEY_PATH (base64-encoded 32 bytes)." >&2
+		exit 1
+	fi
+	openssl rand -base64 32 > "$CRED_KEY_PATH"
+	chmod 0600 "$CRED_KEY_PATH"
+fi
+
+CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_PATH")"
+CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+if [[ "$CRED_DECODED_LEN" != "32" ]]; then
+	echo "Invalid credential key at $CRED_KEY_PATH: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
+	exit 1
 fi
 
 mkdir -p /etc/sandboxd
@@ -278,6 +347,8 @@ SB_RAFT_DATA_DIR=$RAFT_DATA_DIR
 SB_GOSSIP_BIND_ADDR=$GOSSIP_BIND_ADDR
 SB_GOSSIP_ADVERTISE_ADDR=$GOSSIP_ADVERTISE_ADDR
 SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
+SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
+SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 EOF
 	if [[ "$TLS_GENERATED" == "true" ]]; then
 		cat <<EOF
@@ -325,12 +396,14 @@ fi
 if [[ "$TLS_GENERATED" == "true" ]]; then
 	cat <<EOF
 =========================================================================
-TLS BUNDLE (CA cert + CA key — required by every joining node):
+TLS BUNDLE (CA cert + CA key + credential encryption key —
+            required by every joining node):
 
   $TLS_BUNDLE_OUT
 
 Copy this file to each joining node over a SECURE channel (scp, vault).
-Anyone with the bundle can mint a node cert and join the cluster.
+Anyone with the bundle can mint a node cert AND decrypt every sandbox's
+sealed registry/mount credentials.
 =========================================================================
 
 To add another node, on that host:
@@ -343,11 +416,24 @@ To add another node, on that host:
 EOF
 else
 	cat <<EOF
+=========================================================================
+CREDENTIAL BUNDLE (sealed-secret encryption key —
+                   required by every joining node):
+
+  $CRED_BUNDLE_OUT
+
+Copy this file to each joining node over a SECURE channel (scp, vault).
+Anyone with the bundle can decrypt every sandbox's sealed registry/mount
+credentials.
+=========================================================================
+
 To add another node (NO TLS — keep all traffic on a private network), run:
 
+  scp this-host:$CRED_BUNDLE_OUT /tmp/aerolvm-cred-bundle.tar.gz   # secure transfer
   sudo ./cluster-join.sh \\
       --gossip-key '$GOSSIP_SECRET_KEY' \\
       --peers $GOSSIP_ADVERTISE_ADDR \\
+      --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz \\
       --no-tls
 EOF
 fi

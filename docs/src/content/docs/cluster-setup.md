@@ -120,6 +120,9 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 | `SB_GOSSIP_ADVERTISE_ADDR` | yes | Gossip address peers connect to. Cannot be `0.0.0.0`. |
 | `SB_GOSSIP_SECRET_KEY` | yes | Base64-encoded 16, 24, or 32-byte AES key. Same value on every node. |
 | `SB_CLUSTER_INSECURE_GOSSIP` | no | Set to `true` to opt out of the gossip-key requirement. **Only safe on a fully isolated network.** Without it, any reachable peer can join the raft configuration via voter auto-promotion. Default `false`. |
+| `SB_CREDENTIAL_ENCRYPTION_KEY` | yes | Base64-encoded 32-byte key used to seal/unseal sandbox registry passwords and per-mount credentials replicated via raft. Same value on every node. `cluster-init.sh` captures or generates this on the seed; `cluster-join.sh` extracts it from the bundle and writes it here. |
+| `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | no | Path the daemon falls back to when `SB_CREDENTIAL_ENCRYPTION_KEY` is empty. Default `/var/lib/sandboxd/credential_encryption.key`. The cluster scripts install the shared key here as a backup so re-running `install.sh` doesn't lazy-generate a divergent key file. |
+| `SB_CLUSTER_INSECURE_CREDENTIALS` | no | Set to `true` to opt out of the shared-credential-key requirement. **Recovered sandboxes lose access to private registries and credentialed mounts after failover** without it. Default `false`. |
 | `SB_CLUSTER_TLS_DIR` | recommended | Directory holding the cluster CA + this node's keypair (`ca.crt`, `node.crt`, `node.key`). When set, raft replication and leader-forwarded applies require a peer cert chained to the cluster CA — possession of the PAT alone is no longer enough to forge an internal apply. `cluster-init.sh` / `cluster-join.sh` populate this automatically. |
 | `SB_CLUSTER_INTERNAL_LISTEN` | no | Bind address for the cluster-internal mTLS listener (used for leader-forwarded raft applies). Default `0.0.0.0:7002`. Ignored when `SB_CLUSTER_TLS_DIR` is empty. |
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial for the internal channel (e.g. `https://10.0.0.5:7002`). Auto-derived from primary IP + internal-listen port when empty. Must be HTTPS. |
@@ -135,6 +138,19 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 - **Falls back gracefully**: a node without `SB_CLUSTER_TLS_DIR` still works (the daemon advertises no `internal_url` via gossip, and peers fall back to the public API URL with PAT-only auth). Use `--no-tls` on `cluster-init.sh` / `cluster-join.sh` for ephemeral test setups on a fully private network.
 
 The CA bundle MUST be transferred over a secure channel (scp, vault) — anyone with the bundle can mint a node cert and join the cluster.
+
+### Credential encryption key (required)
+
+Sandbox registry passwords and per-mount credentials replicated via raft are stored as sealed blobs encrypted with `SB_CREDENTIAL_ENCRYPTION_KEY`. Every node must hold the same value, or sandboxes that fail over to a new owner cannot pull from their private registry or attach their credentialed mounts — the recovered owner decrypts with a different key and silently fails.
+
+`cluster-init.sh` ships the key automatically:
+
+- In TLS mode (default), the key is added to `aerolvm-tls-bundle.tar.gz` alongside `ca.crt` + `ca.key`.
+- In `--no-tls` mode, the key is emitted as a standalone `aerolvm-cred-bundle.tar.gz` and `cluster-join.sh --cred-bundle <path>` is required.
+
+Both bundles MUST be transferred over a secure channel — anyone with the bundle can decrypt every sandbox's sealed credentials.
+
+The daemon refuses to boot in cluster mode unless `SB_CREDENTIAL_ENCRYPTION_KEY` is set or a key file already exists at `SB_CREDENTIAL_ENCRYPTION_KEY_PATH`. The `--no-tls` opt-out for gossip is independent; credential sharing is required regardless of TLS. Set `SB_CLUSTER_INSECURE_CREDENTIALS=true` to bypass the check, only for ephemeral test setups that don't use sealed registry/mount creds.
 
 See [Durability and Failover](/durability) for what gets replicated, what survives node loss, and the cluster network security model.
 

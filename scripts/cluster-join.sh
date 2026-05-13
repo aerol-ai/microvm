@@ -19,6 +19,8 @@ PEERS=""
 RAFT_DATA_DIR="/var/lib/sandboxd/raft"
 TLS_DIR="/etc/sandboxd/tls"
 TLS_BUNDLE=""
+CRED_BUNDLE=""
+CRED_KEY_PATH=""
 INTERNAL_BIND_ADDR="0.0.0.0:7002"
 INTERNAL_ADVERTISE_URL=""
 NO_TLS="false"
@@ -45,11 +47,24 @@ Optional:
   --gossip-bind <host:port>     Gossip listen address. Default: 0.0.0.0:7001
   --gossip-advertise <host:port> Gossip address peers connect to. Default: derived.
   --tls-bundle <path>           Path to the TLS bundle (tarball with ca.crt +
-                                ca.key) emitted by cluster-init.sh on the seed.
-                                A fresh node cert is signed locally from the
-                                bundled CA. Required unless --no-tls.
+                                ca.key + credential_encryption.key) emitted by
+                                cluster-init.sh on the seed. A fresh node cert
+                                is signed locally from the bundled CA, and the
+                                credential encryption key is installed so this
+                                node can decrypt sealed registry/mount creds
+                                replicated via raft. Required unless --no-tls.
+  --cred-bundle <path>          In --no-tls mode, path to the standalone
+                                credential bundle (tarball with just
+                                credential_encryption.key) emitted by
+                                cluster-init.sh. Required when --no-tls is
+                                set.
   --tls-dir <path>              Where to write the loaded TLS material.
                                 Default: /etc/sandboxd/tls
+  --credential-key-path <path>  Where to write the shared credential
+                                encryption key.
+                                Default: SB_CREDENTIAL_ENCRYPTION_KEY_PATH from
+                                /etc/sandboxd/sandboxd.env, or
+                                /var/lib/sandboxd/credential_encryption.key.
   --internal-bind <host:port>   Cluster-internal mTLS listen address.
                                 Default: 0.0.0.0:7002
   --internal-advertise <url>    HTTPS URL peers dial for the internal channel.
@@ -79,7 +94,9 @@ while [[ $# -gt 0 ]]; do
 		--gossip-key)         GOSSIP_SECRET_KEY="$2"; shift 2 ;;
 		--peers)              PEERS="$2"; shift 2 ;;
 		--tls-bundle)         TLS_BUNDLE="$2"; shift 2 ;;
+		--cred-bundle)        CRED_BUNDLE="$2"; shift 2 ;;
 		--tls-dir)            TLS_DIR="$2"; shift 2 ;;
+		--credential-key-path) CRED_KEY_PATH="$2"; shift 2 ;;
 		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
 		--internal-advertise) INTERNAL_ADVERTISE_URL="$2"; shift 2 ;;
 		--no-tls)             NO_TLS="true"; shift ;;
@@ -108,6 +125,20 @@ fi
 
 if [[ "$NO_TLS" != "true" ]] && [[ ! -f "$TLS_BUNDLE" ]]; then
 	echo "TLS bundle not found: $TLS_BUNDLE" >&2
+	exit 1
+fi
+
+if [[ "$NO_TLS" == "true" ]] && [[ -z "$CRED_BUNDLE" ]]; then
+	echo "--cred-bundle is required when --no-tls is set." >&2
+	echo "  cluster-init.sh --no-tls emits aerolvm-cred-bundle.tar.gz on the seed;" >&2
+	echo "  copy it here and pass --cred-bundle <path>." >&2
+	echo "  Without it, this node cannot decrypt sealed registry/mount credentials" >&2
+	echo "  replicated via raft, and recovered sandboxes will fail to pull images." >&2
+	exit 1
+fi
+
+if [[ -n "$CRED_BUNDLE" ]] && [[ ! -f "$CRED_BUNDLE" ]]; then
+	echo "Credential bundle not found: $CRED_BUNDLE" >&2
 	exit 1
 fi
 
@@ -204,9 +235,16 @@ else
 
 	# Extract bundle. tar will refuse path traversals; we restrict the file
 	# list explicitly anyway.
-	tar -C "$TLS_DIR" -xzf "$TLS_BUNDLE" ca.crt ca.key
+	tar -C "$TLS_DIR" -xzf "$TLS_BUNDLE" ca.crt ca.key credential_encryption.key
 	if [[ ! -f "$TLS_DIR/ca.crt" ]] || [[ ! -f "$TLS_DIR/ca.key" ]]; then
 		echo "TLS bundle did not contain ca.crt + ca.key" >&2
+		exit 1
+	fi
+	if [[ ! -f "$TLS_DIR/credential_encryption.key" ]]; then
+		echo "TLS bundle did not contain credential_encryption.key" >&2
+		echo "  Re-run cluster-init.sh on the seed with the updated script and copy" >&2
+		echo "  the regenerated bundle. Without the shared key, this node cannot" >&2
+		echo "  decrypt sealed registry/mount creds for failed-over sandboxes." >&2
 		exit 1
 	fi
 
@@ -236,6 +274,48 @@ if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
 	INTERNAL_ADVERTISE_URL="https://${PRIMARY_IP}:${INTERNAL_PORT}"
 fi
 
+# --- Credential encryption key --------------------------------------------
+# Sealed registry / mount creds replicated via raft are decrypted with this
+# key on the failover owner. Every node must hold the seed-generated value.
+# Source it from the TLS bundle (TLS path) or the standalone --cred-bundle
+# (no-tls path), validate it, and install it at the daemon's configured key
+# path so re-running install.sh later does not lazy-generate a divergent
+# key file. We also write SB_CREDENTIAL_ENCRYPTION_KEY into cluster.env so
+# the env var (highest precedence in pkg/secrets) carries the same value
+# regardless of file state.
+if [[ -z "$CRED_KEY_PATH" ]]; then
+	CRED_KEY_PATH="$(grep -E '^SB_CREDENTIAL_ENCRYPTION_KEY_PATH=' /etc/sandboxd/sandboxd.env | tail -n1 | cut -d= -f2-)"
+	CRED_KEY_PATH="${CRED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key}"
+fi
+
+if [[ "$NO_TLS" == "true" ]]; then
+	CRED_STAGE_DIR="$(mktemp -d)"
+	tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key
+	if [[ ! -f "$CRED_STAGE_DIR/credential_encryption.key" ]]; then
+		rm -rf "$CRED_STAGE_DIR"
+		echo "Credential bundle did not contain credential_encryption.key" >&2
+		exit 1
+	fi
+	CRED_KEY_SOURCE="$CRED_STAGE_DIR/credential_encryption.key"
+else
+	CRED_KEY_SOURCE="$TLS_DIR/credential_encryption.key"
+fi
+
+CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_SOURCE")"
+CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+if [[ "$CRED_DECODED_LEN" != "32" ]]; then
+	[[ "$NO_TLS" == "true" ]] && rm -rf "$CRED_STAGE_DIR"
+	echo "Invalid credential key in bundle: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
+	exit 1
+fi
+
+mkdir -p "$(dirname "$CRED_KEY_PATH")"
+install -m 0600 "$CRED_KEY_SOURCE" "$CRED_KEY_PATH"
+
+if [[ "$NO_TLS" == "true" ]]; then
+	rm -rf "$CRED_STAGE_DIR"
+fi
+
 mkdir -p /etc/sandboxd
 {
 	cat <<EOF
@@ -252,6 +332,8 @@ SB_GOSSIP_BIND_ADDR=$GOSSIP_BIND_ADDR
 SB_GOSSIP_ADVERTISE_ADDR=$GOSSIP_ADVERTISE_ADDR
 SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
 SB_BOOTSTRAP_PEERS=$PEERS
+SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
+SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 EOF
 	if [[ "$TLS_GENERATED" == "true" ]]; then
 		cat <<EOF

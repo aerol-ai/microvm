@@ -143,6 +143,17 @@ type Config struct {
 	// the daemon refuses to boot in cluster mode without a gossip key. Use only
 	// for ephemeral test setups. SB_CLUSTER_INSECURE_GOSSIP.
 	ClusterInsecureGossip bool
+	// ClusterInsecureCredentials opts out of the shared-credential-key
+	// requirement in cluster mode. Without a key shared across nodes, sealed
+	// registry passwords and per-mount credentials replicated via raft cannot
+	// be decrypted by a failover owner — recovered sandboxes lose access to
+	// private registries and credentialed mounts. Default false: the daemon
+	// refuses to boot in cluster mode unless either SB_CREDENTIAL_ENCRYPTION_KEY
+	// is set explicitly or a key file already exists at
+	// SB_CREDENTIAL_ENCRYPTION_KEY_PATH (the operator may have distributed it
+	// out of band). Set true only for ephemeral test setups that don't use
+	// sealed creds. SB_CLUSTER_INSECURE_CREDENTIALS.
+	ClusterInsecureCredentials bool
 
 	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
 	// any other future cluster-internal RPC) ride over a separate HTTPS listener
@@ -234,6 +245,7 @@ func Load() (Config, error) {
 		ClusterDeadOwnerGrace:         getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
 		ClusterGossipSecretKey:        strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 		ClusterInsecureGossip:         getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
+		ClusterInsecureCredentials:    getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
@@ -311,6 +323,21 @@ func Load() (Config, error) {
 		// permissive.
 		if cfg.ClusterGossipSecretKey == "" && !cfg.ClusterInsecureGossip {
 			return Config{}, errors.New("SB_GOSSIP_SECRET_KEY is required when SB_ENABLE_CLUSTER=true (set SB_CLUSTER_INSECURE_GOSSIP=true to opt out — only safe on a fully isolated network)")
+		}
+		// Sealed registry passwords and per-mount credentials replicated via
+		// raft are decrypted with this key on the failover owner. If every
+		// node lazy-generates its own key (the default in single-node mode),
+		// recovered sandboxes silently lose access to private registries and
+		// credentialed mounts. Accept either an explicit env var or an
+		// already-distributed key file on disk; refuse boot otherwise unless
+		// the operator has acknowledged the trade-off via the insecure flag.
+		if cfg.CredentialEncryptionKey == "" && !cfg.ClusterInsecureCredentials {
+			if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
+				if os.IsNotExist(err) {
+					return Config{}, fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — sealed registry/mount creds will not survive failover without a shared key)", cfg.CredentialEncryptionKeyPath)
+				}
+				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+			}
 		}
 	}
 

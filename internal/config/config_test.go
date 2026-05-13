@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -208,6 +209,62 @@ func TestLoadCases(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, tc.run)
 	}
+}
+
+func TestClusterCredentialKeyValidation(t *testing.T) {
+	// The cluster-mode credential-key check is the safety net for the silent
+	// per-node lazy-key divergence that breaks failover for sealed registry
+	// and mount creds. Cover the four matrix corners.
+	setClusterDefaults := func(t *testing.T, keyPath string) {
+		t.Helper()
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "true")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") // 32-byte base64
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", keyPath)
+		// Clear vars the test toggles per-case so previous cases don't leak.
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "")
+		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "")
+	}
+
+	t.Run("refuses_when_no_env_and_no_file", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CREDENTIAL_ENCRYPTION_KEY") {
+			t.Fatalf("expected SB_CREDENTIAL_ENCRYPTION_KEY error, got %v", err)
+		}
+	})
+
+	t.Run("accepts_when_env_set", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("accepts_when_key_file_present", func(t *testing.T) {
+		dir := t.TempDir()
+		keyPath := filepath.Join(dir, "cred.key")
+		if err := os.WriteFile(keyPath, []byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="), 0o600); err != nil {
+			t.Fatalf("seed key file: %v", err)
+		}
+		setClusterDefaults(t, keyPath)
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("accepts_when_opt_out_set", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
 }
 
 func TestConfigMethodCases(t *testing.T) {
