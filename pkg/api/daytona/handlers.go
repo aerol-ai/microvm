@@ -18,14 +18,12 @@ import (
 
 type handlers struct {
 	deps       Deps
-	meta       *metadataStore
 	httpClient *http.Client
 }
 
 func newHandlers(d Deps) *handlers {
 	return &handlers{
 		deps:       d,
-		meta:       newMetadataStore(),
 		httpClient: &http.Client{},
 	}
 }
@@ -60,11 +58,14 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	requestedName := trimmedString(req.Name)
 	if requestedName != "" {
-		if h.meta.nameInUse(requestedName) {
+		if _, err := h.deps.Service.GetSandbox(r.Context(), requestedName); err == nil {
 			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
 			return
+		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
 		}
-		if _, err := h.deps.Service.GetSandbox(r.Context(), requestedName); err == nil {
+		if _, err := h.deps.Service.ResolveDaytonaSandboxID(r.Context(), requestedName); err == nil {
 			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
 			return
 		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -110,15 +111,19 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		AutoArchiveInterval: int32MinutesPtr(req.AutoArchiveInterval),
 		AutoDeleteInterval:  int32MinutesPtr(req.AutoDeleteInterval),
 	}
-	if err := h.meta.upsert(response.ID, meta); err != nil {
+	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
 		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
 			h.deps.Logger.Warn("daytona metadata conflict cleanup failed", "sandbox_id", response.ID, "error", destroyErr)
 		}
-		apihttp.WriteError(w, http.StatusConflict, err.Error())
+		if errors.Is(err, store.ErrDaytonaNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
-	apihttp.WriteJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox))
+	apihttp.WriteJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +139,13 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := h.filteredSandboxes(r, sandboxes, filters)
+	metadata, err := h.listSandboxMeta(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
 	apihttp.WriteJSON(w, http.StatusOK, items)
 }
 
@@ -150,6 +161,11 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	metadata, err := h.listSandboxMeta(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 
 	page, err := parsePositiveFloatQuery(r, "page", 1)
 	if err != nil {
@@ -162,7 +178,7 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	items := h.filteredSandboxes(r, sandboxes, filters)
+	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
 	total := len(items)
 	start := int((page - 1) * limit)
 	if start > total {
@@ -191,7 +207,12 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox))
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
 }
 
 func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
@@ -200,16 +221,20 @@ func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	if err := h.deps.Service.DestroySandbox(r.Context(), sandboxID); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	h.meta.delete(sandboxID)
 	snapshot := *sandbox
 	snapshot.Status = models.SandboxStatusDestroyed
 	now := time.Now().UTC()
 	snapshot.UpdatedAt = now
-	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, &snapshot))
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, &snapshot, meta))
 }
 
 func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +248,12 @@ func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox))
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
 }
 
 func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +267,12 @@ func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox))
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
 }
 
 func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +297,12 @@ func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox))
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
 }
 
 func (h *handlers) toolboxProxyURL(w http.ResponseWriter, r *http.Request) {
@@ -308,13 +348,18 @@ func (h *handlers) replaceLabels(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	meta, ok := h.meta.get(sandboxID)
-	if !ok {
-		meta = sandboxMeta{Name: sandbox.ID, User: sandbox.OSUser}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
 	}
 	meta.Labels = cloneStringMap(req.Labels)
-	if err := h.meta.upsert(sandboxID, meta); err != nil {
-		apihttp.WriteError(w, http.StatusConflict, err.Error())
+	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
+		if errors.Is(err, store.ErrDaytonaNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, sandboxLabelsResponse{Labels: cloneStringMap(req.Labels)})
@@ -339,16 +384,21 @@ func (h *handlers) setAutoArchiveInterval(w http.ResponseWriter, r *http.Request
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid interval")
 		return
 	}
-	meta, ok := h.meta.get(sandboxID)
-	if !ok {
-		meta = sandboxMeta{Name: sandbox.ID, User: sandbox.OSUser}
-	}
-	meta.AutoArchiveInterval = float32Ptr(interval)
-	if err := h.meta.upsert(sandboxID, meta); err != nil {
-		apihttp.WriteError(w, http.StatusConflict, err.Error())
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox))
+	meta.AutoArchiveInterval = float32Ptr(interval)
+	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
+		if errors.Is(err, store.ErrDaytonaNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
 }
 
 func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, stop bool) {
@@ -381,20 +431,25 @@ func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, s
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	meta, ok := h.meta.get(sandboxID)
-	if !ok {
-		meta = sandboxMeta{Name: sandbox.ID, User: sandbox.OSUser}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
 	}
 	if stop {
 		meta.AutoStopInterval = float32Ptr(interval)
 	} else {
 		meta.AutoDeleteInterval = float32Ptr(interval)
 	}
-	if err := h.meta.upsert(sandboxID, meta); err != nil {
-		apihttp.WriteError(w, http.StatusConflict, err.Error())
+	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
+		if errors.Is(err, store.ErrDaytonaNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, updated))
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
 }
 
 func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models.Sandbox, string, error) {
@@ -406,27 +461,27 @@ func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, "", err
 	}
-	resolved := h.meta.resolve(trimmed)
-	if resolved == trimmed {
+	resolved, err := h.deps.Service.ResolveDaytonaSandboxID(ctx, trimmed)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, "", err
+	}
+	if err != nil {
 		return nil, "", err
 	}
 	sandbox, err = h.deps.Service.GetSandbox(ctx, resolved)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			h.meta.delete(resolved)
-		}
 		return nil, "", err
 	}
 	return sandbox, sandbox.ID, nil
 }
 
-func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbox, filters listFilters) []sandboxResponse {
+func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbox, metadata map[string]sandboxMeta, filters listFilters) []sandboxResponse {
 	items := make([]sandboxResponse, 0, len(sandboxes))
 	for _, sandbox := range sandboxes {
 		if sandbox == nil {
 			continue
 		}
-		item := h.toSandboxResponse(r, sandbox)
+		item := h.toSandboxResponse(r, sandbox, metadata[sandbox.ID])
 		if filters.ID != "" && !strings.Contains(item.ID, filters.ID) {
 			continue
 		}
@@ -461,6 +516,37 @@ func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbo
 	return items
 }
 
+func (h *handlers) persistSandboxMeta(ctx context.Context, sandboxID string, meta sandboxMeta) error {
+	return h.deps.Service.UpsertDaytonaMetadata(ctx, sandboxMetaToStored(sandboxID, meta))
+}
+
+func (h *handlers) loadSandboxMeta(ctx context.Context, sandbox *models.Sandbox) (sandboxMeta, error) {
+	if sandbox == nil {
+		return sandboxMeta{Labels: map[string]string{}}, nil
+	}
+	stored, err := h.deps.Service.GetDaytonaMetadata(ctx, sandbox.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return defaultSandboxMeta(sandbox), nil
+		}
+		return sandboxMeta{}, err
+	}
+	return sandboxMetaFromStored(stored, sandbox), nil
+}
+
+func (h *handlers) listSandboxMeta(ctx context.Context) (map[string]sandboxMeta, error) {
+	stored, err := h.deps.Service.ListDaytonaMetadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make(map[string]sandboxMeta, len(stored))
+	for sandboxID, meta := range stored {
+		copied := meta
+		items[sandboxID] = sandboxMetaFromStored(&copied, nil)
+	}
+	return items, nil
+}
+
 func labelsMatch(labels map[string]string, wanted map[string]string) bool {
 	for key, value := range wanted {
 		if labels[key] != value {
@@ -492,8 +578,7 @@ func parseListFilters(r *http.Request) (listFilters, error) {
 	return filters, nil
 }
 
-func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox) sandboxResponse {
-	meta, _ := h.meta.get(sandbox.ID)
+func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, meta sandboxMeta) sandboxResponse {
 	name := firstNonEmpty(meta.Name, sandbox.ID)
 	user := firstNonEmpty(meta.User, sandbox.OSUser)
 	labels := cloneStringMap(meta.Labels)

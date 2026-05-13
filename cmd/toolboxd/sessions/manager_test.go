@@ -92,6 +92,14 @@ func TestManagerGetOrCreateIsIdempotent(t *testing.T) {
 	if first.ID() != second.ID() {
 		t.Fatalf("expected same id; got %q vs %q", first.ID(), second.ID())
 	}
+
+	byName, err := mgr.GetByName("shared")
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	if byName.ID() != first.ID() {
+		t.Fatalf("GetByName() returned %q, want %q", byName.ID(), first.ID())
+	}
 }
 
 func TestManagerListSortedByCreatedAt(t *testing.T) {

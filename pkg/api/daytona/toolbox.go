@@ -56,14 +56,28 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 		h.workDir(w, r, sandboxID)
 	case r.Method == http.MethodPost && path == "process/execute":
 		h.executeCommand(w, r, sandboxID)
+	case path == "process/session" || strings.HasPrefix(path, "process/session/"):
+		h.forwardToolbox(w, r, sandboxID, "/"+path)
+	case r.Method == http.MethodGet && path == "files":
+		h.forwardToolbox(w, r, sandboxID, "/files")
+	case r.Method == http.MethodGet && path == "files/info":
+		h.forwardToolbox(w, r, sandboxID, "/files/info")
 	case r.Method == http.MethodPost && path == "files/upload":
 		h.forwardToolbox(w, r, sandboxID, "/files/upload")
 	case r.Method == http.MethodGet && path == "files/download":
 		h.forwardToolbox(w, r, sandboxID, "/files/download")
+	case r.Method == http.MethodPost && path == "files/move":
+		h.forwardToolbox(w, r, sandboxID, "/files/move")
+	case r.Method == http.MethodGet && path == "files/search":
+		h.forwardToolbox(w, r, sandboxID, "/files/search")
+	case r.Method == http.MethodGet && path == "files/find":
+		h.forwardToolbox(w, r, sandboxID, "/files/find")
 	case r.Method == http.MethodPost && path == "files/bulk-upload":
 		h.bulkUpload(w, r, sandboxID)
 	case r.Method == http.MethodPost && path == "files/bulk-download":
 		h.bulkDownload(w, r, sandboxID)
+	case strings.HasPrefix(path, "git/"):
+		h.forwardToolbox(w, r, sandboxID, "/"+path)
 	default:
 		apihttp.WriteError(w, http.StatusNotImplemented, "daytona toolbox route not implemented")
 	}

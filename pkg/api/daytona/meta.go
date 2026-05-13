@@ -3,7 +3,8 @@ package daytona
 import (
 	"errors"
 	"strings"
-	"sync"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 var errNameConflict = errors.New("daytona sandbox name already in use")
@@ -20,81 +21,52 @@ type sandboxMeta struct {
 	AutoDeleteInterval  *float32
 }
 
-type metadataStore struct {
-	mu     sync.RWMutex
-	byID   map[string]sandboxMeta
-	byName map[string]string
-}
-
-func newMetadataStore() *metadataStore {
-	return &metadataStore{
-		byID:   map[string]sandboxMeta{},
-		byName: map[string]string{},
+func defaultSandboxMeta(sandbox *models.Sandbox) sandboxMeta {
+	if sandbox == nil {
+		return sandboxMeta{Labels: map[string]string{}}
+	}
+	return sandboxMeta{
+		Name:   sandbox.ID,
+		User:   sandbox.OSUser,
+		Labels: map[string]string{},
 	}
 }
 
-func (m *metadataStore) nameInUse(name string) bool {
-	name = strings.TrimSpace(name)
+func sandboxMetaFromStored(meta *models.DaytonaSandboxMetadata, sandbox *models.Sandbox) sandboxMeta {
+	if meta == nil {
+		return defaultSandboxMeta(sandbox)
+	}
+	fallback := defaultSandboxMeta(sandbox)
+	return sandboxMeta{
+		Name:                firstNonEmpty(strings.TrimSpace(meta.Name), fallback.Name),
+		Snapshot:            emptyStringToPtr(meta.Snapshot),
+		User:                firstNonEmpty(strings.TrimSpace(meta.User), fallback.User),
+		Labels:              cloneStringMap(meta.Labels),
+		Target:              strings.TrimSpace(meta.Target),
+		NetworkAllowList:    emptyStringToPtr(meta.NetworkAllowList),
+		AutoStopInterval:    cloneFloat32Ptr(meta.AutoStopIntervalMinutes),
+		AutoArchiveInterval: cloneFloat32Ptr(meta.AutoArchiveIntervalMinutes),
+		AutoDeleteInterval:  cloneFloat32Ptr(meta.AutoDeleteIntervalMinutes),
+	}
+}
+
+func sandboxMetaToStored(sandboxID string, meta sandboxMeta) models.DaytonaSandboxMetadata {
+	name := strings.TrimSpace(meta.Name)
 	if name == "" {
-		return false
+		name = strings.TrimSpace(sandboxID)
 	}
-	m.mu.RLock()
-	_, ok := m.byName[name]
-	m.mu.RUnlock()
-	return ok
-}
-
-func (m *metadataStore) resolve(idOrName string) string {
-	trimmed := strings.TrimSpace(idOrName)
-	m.mu.RLock()
-	resolved, ok := m.byName[trimmed]
-	m.mu.RUnlock()
-	if ok {
-		return resolved
+	return models.DaytonaSandboxMetadata{
+		SandboxID:                  strings.TrimSpace(sandboxID),
+		Name:                       name,
+		Snapshot:                   strings.TrimSpace(valueOrEmpty(meta.Snapshot)),
+		User:                       strings.TrimSpace(meta.User),
+		Labels:                     cloneStringMap(meta.Labels),
+		Target:                     strings.TrimSpace(meta.Target),
+		NetworkAllowList:           strings.TrimSpace(valueOrEmpty(meta.NetworkAllowList)),
+		AutoStopIntervalMinutes:    cloneFloat32Ptr(meta.AutoStopInterval),
+		AutoArchiveIntervalMinutes: cloneFloat32Ptr(meta.AutoArchiveInterval),
+		AutoDeleteIntervalMinutes:  cloneFloat32Ptr(meta.AutoDeleteInterval),
 	}
-	return trimmed
-}
-
-func (m *metadataStore) get(id string) (sandboxMeta, bool) {
-	m.mu.RLock()
-	meta, ok := m.byID[id]
-	m.mu.RUnlock()
-	if !ok {
-		return sandboxMeta{}, false
-	}
-	return cloneMeta(meta), true
-}
-
-func (m *metadataStore) upsert(id string, meta sandboxMeta) error {
-	meta = cloneMeta(meta)
-	meta.Name = strings.TrimSpace(meta.Name)
-	if meta.Name == "" {
-		meta.Name = id
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if existingID, ok := m.byName[meta.Name]; ok && existingID != id {
-		return errNameConflict
-	}
-
-	if existing, ok := m.byID[id]; ok && existing.Name != "" && existing.Name != meta.Name {
-		delete(m.byName, existing.Name)
-	}
-
-	m.byID[id] = cloneMeta(meta)
-	m.byName[meta.Name] = id
-	return nil
-}
-
-func (m *metadataStore) delete(id string) {
-	m.mu.Lock()
-	if existing, ok := m.byID[id]; ok && existing.Name != "" {
-		delete(m.byName, existing.Name)
-	}
-	delete(m.byID, id)
-	m.mu.Unlock()
 }
 
 func cloneMeta(meta sandboxMeta) sandboxMeta {
@@ -109,6 +81,14 @@ func cloneMeta(meta sandboxMeta) sandboxMeta {
 		AutoArchiveInterval: cloneFloat32Ptr(meta.AutoArchiveInterval),
 		AutoDeleteInterval:  cloneFloat32Ptr(meta.AutoDeleteInterval),
 	}
+}
+
+func emptyStringToPtr(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func cloneStringMap(values map[string]string) map[string]string {
