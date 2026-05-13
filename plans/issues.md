@@ -161,6 +161,41 @@ network-backed mounts, not in-container persistence.
 
 ---
 
+## 3. AssertOwnership clobbered FSM on failover-recovery (FIXED)
+
+### Symptom
+
+Boot-time `AssertOwnership` treated *any* existing placement not owned by self
+as something this node should reclaim — including placements that already pointed
+to a live new owner after a failover-recreate. In the failover-recovery path:
+
+1. Node A owned sandbox X. A died hard.
+2. Dead-owner reconciler reassigned X to node B after `SB_DEAD_OWNER_GRACE`;
+   B recreated X locally from the replicated spec.
+3. A came back online with the stale local row still in its store.
+4. A's `AssertOwnership` saw `OwnerNodeID=B != self` and called
+   `RecordPlacement(self)`, overwriting B's ownership in the FSM.
+5. B's `reconcileStaleOwnership` then destroyed B's freshly-recreated
+   container (FSM said B no longer owned it). User state silently lost.
+
+### Fix
+
+`internal/cluster/client.go:AssertOwnership` now uses a three-way decision
+with the FSM as the source of truth for ownership:
+
+- **No FSM placement**: claim ownership, ship spec + ports + sealed secrets.
+- **FSM owner == self**: backfill missing spec/secrets, replay port intents.
+- **FSM owner != self**: log loudly and leave the FSM untouched. The local
+  row gets cleaned up by `service.reconcileStaleOwnership` on its next pass
+  (which also runs at boot via `Reconcile`).
+
+Pinned by `TestAssertOwnershipDoesNotReclaimForeignOwnedPlacement` in
+`internal/cluster/assert_ownership_test.go` — the test seeds a foreign-owned
+placement, calls `AssertOwnership` with a divergent local row + ports, and
+asserts the FSM owner / spec / ports / version are all unchanged.
+
+---
+
 ## What was fixed in the same pass (for context)
 
 - `pkg/docker/client.go` — `Create` now fails closed if `BlockAllEgress` errors (was a

@@ -401,20 +401,43 @@ func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	return c.applyCommand(ctx, cmd)
 }
 
-// AssertOwnership ensures every entry in local is recorded as owned by self,
-// and backfills any missing Spec / ExposedPorts so a future failover-recreate
-// has everything it needs. Used at boot. Idempotent. Best-effort: errors are
-// logged but do not abort boot — the next reconcile loop will retry.
+// AssertOwnership reconciles local sandbox state against the cluster FSM at
+// boot. Used at boot. Idempotent. Best-effort: errors are logged but do not
+// abort boot — the next reconcile loop will retry.
 //
-// Backfill rules:
-//   - If the FSM has no placement for this id, write opPlace with the local
-//     spec (if available) so the new placement is born with a recoverable spec.
-//   - If the FSM has a placement but no Spec and we have one locally, send
-//     opUpsertSpec to attach it. This is what closes the pre-cluster-sandbox
-//     limitation: a sandbox created before spec replication shipped will pick
-//     up its spec on the next boot under cluster mode.
-//   - For every locally-recorded port intent, send opAddExposedPort. The op
-//     is a no-op if the FSM already records the same (port, protocol).
+// Three-way decision per local row, with the FSM as the source of truth for
+// ownership (never overwrite an existing non-self owner):
+//
+//   - **No FSM placement.** Write opPlace claiming self as owner, with spec +
+//     sealed secrets so the new placement is born recoverable. This is the
+//     normal case for sandboxes created before AssertOwnership last ran.
+//
+//   - **FSM owner == self.** No ownership change. Backfill missing Spec /
+//     SealedSecrets via opUpsertSpec (closes the pre-spec-replication gap)
+//     and replay ExposedPort intents via opAddExposedPort (no-ops when
+//     already recorded).
+//
+//   - **FSM owner != self.** **Do NOT reclaim.** This is the failover-recovery
+//     case: this node died, the dead-owner reconciler reassigned the sandbox
+//     to a new owner, the new owner already recreated it from the replicated
+//     spec, and now this node is back online with a stale local row. Calling
+//     RecordPlacement here would overwrite the new owner's ownership in the
+//     FSM, then the new owner's stale-ownership reconciler would destroy its
+//     freshly-recreated container — silently destroying user state.
+//     Instead: log loudly and leave the FSM alone. service.reconcileStaleOwnership
+//     handles destroying the local container + store row on the next reconcile
+//     pass (it runs at boot too, so cleanup is prompt).
+//
+// Edge cases:
+//   - Owner unknown to gossip yet (fresh boot, gossip not converged): we still
+//     defer. Treating "presumed alive" as the safe default keeps us from racing
+//     a peer whose announce just hasn't reached us. The next reconcile pass
+//     reclassifies.
+//   - Owner is dead in gossip: still defer. The dead-owner reconciler orphans
+//     stale placements after SB_DEAD_OWNER_GRACE; once orphaned, the placement
+//     either gets reassigned to us (we have it locally) via the watcher, or
+//     stays orphaned for some other live node to pick up. Either way, racing
+//     it from here would just create the same overwrite hazard.
 func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState) error {
 	if len(local) == 0 {
 		return nil
@@ -431,30 +454,48 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			continue
 		}
 		existing, ok := c.fsm.get(st.ID)
-		needsPlace := !ok || existing.OwnerNodeID != c.nodeID
-		needsSpecBackfill := ok && existing.Spec == nil && st.Spec != nil
-		if needsPlace {
-			// Either no placement exists or another node thinks they own this
-			// sandbox (unlikely but possible after a split-brain recovery). In
-			// both cases we (re)claim — this node has the sandbox locally so
-			// it IS the owner. Pass spec + sealed secrets so the placement is
-			// born recoverable.
+
+		switch {
+		case !ok:
+			// No placement exists — claim ownership. Pass spec + sealed
+			// secrets so the placement is born recoverable.
 			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
-		} else if needsSpecBackfill {
-			// Existing placement, no spec yet — attach one so future failover
-			// can recreate this pre-cluster sandbox. Pass sealed secrets too
-			// so the failover doesn't lose the user's private-registry creds
-			// the moment the spec is backfilled.
-			if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
-				firstErr = err
+			// Replay port intents so the FSM matches local truth.
+			for port, protocol := range st.ExposedPorts {
+				if err := c.AddExposedPort(ctx, st.ID, port, protocol); err != nil && firstErr == nil {
+					firstErr = err
+				}
 			}
-		}
-		for port, protocol := range st.ExposedPorts {
-			if err := c.AddExposedPort(ctx, st.ID, port, protocol); err != nil && firstErr == nil {
-				firstErr = err
+
+		case existing.OwnerNodeID == c.nodeID:
+			// We legitimately own it. Backfill any missing spec/secrets so
+			// future failover-recreate has everything it needs (closes the
+			// pre-cluster-sandbox limitation), then replay port intents.
+			if existing.Spec == nil && st.Spec != nil {
+				if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
+					firstErr = err
+				}
 			}
+			for port, protocol := range st.ExposedPorts {
+				if err := c.AddExposedPort(ctx, st.ID, port, protocol); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+
+		default:
+			// existing.OwnerNodeID != self — we're the stale local copy from
+			// a failover-recreate that already ran on the new owner.
+			// MUST NOT call RecordPlacement here; see comment above.
+			// service.reconcileStaleOwnership destroys the local container
+			// and store row on its next pass (which runs at boot).
+			c.logger.Warn("cluster: local sandbox row is stale (FSM owner differs); leaving FSM alone, stale-ownership reconciler will clean up local state",
+				"sandbox_id", st.ID,
+				"fsm_owner", existing.OwnerNodeID,
+				"self", c.nodeID,
+				"placement_version", existing.Version,
+			)
 		}
 	}
 	return firstErr
