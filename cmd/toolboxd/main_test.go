@@ -32,6 +32,8 @@ func TestNormalizeSandboxPathCases(t *testing.T) {
 		{name: "exact_prefix_subpath", path: "/7f3c2a1b9d4e/process/execute", sandboxID: "7f3c2a1b9d4e", want: "/process/execute"},
 		{name: "heuristic_root_strip", path: "/7f3c2a1b9d4e/", sandboxID: "", want: "/"},
 		{name: "heuristic_proxy_strip", path: "/7f3c2a1b9d4e/proxy/3000", sandboxID: "", want: "/proxy/3000"},
+		{name: "heuristic_files_strip", path: "/7f3c2a1b9d4e/files", sandboxID: "", want: "/files"},
+		{name: "heuristic_git_strip", path: "/7f3c2a1b9d4e/git/status", sandboxID: "", want: "/git/status"},
 		{name: "direct_toolbox_path_kept", path: "/process/execute", sandboxID: "", want: "/process/execute"},
 		{name: "direct_proxy_path_kept", path: "/proxy/3000", sandboxID: "", want: "/proxy/3000"},
 	}

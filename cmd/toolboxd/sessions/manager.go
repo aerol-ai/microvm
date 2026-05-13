@@ -121,6 +121,19 @@ func (m *Manager) Get(id string) (*Session, error) {
 	return s, nil
 }
 
+// GetByName fetches a running session by its stable name. Exited sessions are
+// not returned because the byName map is cleared when a session finishes.
+func (m *Manager) GetByName(name string) (*Session, error) {
+	trimmed := strings.TrimSpace(name)
+	m.mu.Lock()
+	s := m.byName[trimmed]
+	m.mu.Unlock()
+	if s == nil {
+		return nil, ErrNotFound
+	}
+	return s, nil
+}
+
 // GetOrCreate returns the running session with the given Name (creating it
 // from req if absent). Used by SSH attach so `ssh sandbox+default@host`
 // idempotently lands on a single shared shell.

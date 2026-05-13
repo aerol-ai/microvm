@@ -372,6 +372,106 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "daytona_metadata_roundtrip_and_resolve_by_name",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-daytona")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				autoStop := float32(15)
+				autoArchive := float32(60)
+				meta := models.DaytonaSandboxMetadata{
+					SandboxID:                  sandbox.ID,
+					Name:                       "workspace-alpha",
+					Snapshot:                   "snapshot-123",
+					User:                       "ubuntu",
+					Labels:                     map[string]string{"team": "sdk"},
+					Target:                     "default",
+					NetworkAllowList:           "10.0.0.0/24",
+					AutoStopIntervalMinutes:    &autoStop,
+					AutoArchiveIntervalMinutes: &autoArchive,
+				}
+				if err := st.UpsertDaytonaMetadata(ctx, meta); err != nil {
+					t.Fatalf("UpsertDaytonaMetadata() error = %v", err)
+				}
+
+				got, err := st.GetDaytonaMetadata(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("GetDaytonaMetadata() error = %v", err)
+				}
+				if got.Name != meta.Name || got.Snapshot != meta.Snapshot || got.User != meta.User || got.Target != meta.Target || got.NetworkAllowList != meta.NetworkAllowList {
+					t.Fatalf("unexpected metadata: %+v", got)
+				}
+				if !reflect.DeepEqual(got.Labels, meta.Labels) {
+					t.Fatalf("labels = %+v, want %+v", got.Labels, meta.Labels)
+				}
+				if got.AutoStopIntervalMinutes == nil || *got.AutoStopIntervalMinutes != autoStop {
+					t.Fatalf("AutoStopIntervalMinutes = %+v, want %v", got.AutoStopIntervalMinutes, autoStop)
+				}
+				if got.AutoArchiveIntervalMinutes == nil || *got.AutoArchiveIntervalMinutes != autoArchive {
+					t.Fatalf("AutoArchiveIntervalMinutes = %+v, want %v", got.AutoArchiveIntervalMinutes, autoArchive)
+				}
+
+				resolved, err := st.ResolveDaytonaSandboxID(ctx, meta.Name)
+				if err != nil {
+					t.Fatalf("ResolveDaytonaSandboxID() error = %v", err)
+				}
+				if resolved != sandbox.ID {
+					t.Fatalf("resolved sandbox id = %q, want %q", resolved, sandbox.ID)
+				}
+
+				items, err := st.ListDaytonaMetadata(ctx)
+				if err != nil {
+					t.Fatalf("ListDaytonaMetadata() error = %v", err)
+				}
+				if listed, ok := items[sandbox.ID]; !ok || listed.Name != meta.Name {
+					t.Fatalf("expected listed metadata for %q, got %+v", sandbox.ID, items)
+				}
+			},
+		},
+		{
+			name: "daytona_metadata_name_conflict_returns_error",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				first := sampleSandbox("sb-daytona-first")
+				second := sampleSandbox("sb-daytona-second")
+				for _, sandbox := range []*models.Sandbox{first, second} {
+					if err := st.Create(ctx, sandbox); err != nil {
+						t.Fatalf("Create(%s) error = %v", sandbox.ID, err)
+					}
+				}
+				if err := st.UpsertDaytonaMetadata(ctx, models.DaytonaSandboxMetadata{SandboxID: first.ID, Name: "shared-name"}); err != nil {
+					t.Fatalf("first UpsertDaytonaMetadata() error = %v", err)
+				}
+				if err := st.UpsertDaytonaMetadata(ctx, models.DaytonaSandboxMetadata{SandboxID: second.ID, Name: "shared-name"}); !errors.Is(err, ErrDaytonaNameConflict) {
+					t.Fatalf("expected ErrDaytonaNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			name: "delete_sandbox_cascades_daytona_metadata",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-daytona-cascade")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				if err := st.UpsertDaytonaMetadata(ctx, models.DaytonaSandboxMetadata{SandboxID: sandbox.ID, Name: "cascade-name"}); err != nil {
+					t.Fatalf("UpsertDaytonaMetadata() error = %v", err)
+				}
+				if err := st.Delete(ctx, sandbox.ID); err != nil {
+					t.Fatalf("Delete() error = %v", err)
+				}
+				if _, err := st.GetDaytonaMetadata(ctx, sandbox.ID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+				if _, err := st.ResolveDaytonaSandboxID(ctx, "cascade-name"); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound from ResolveDaytonaSandboxID(), got %v", err)
+				}
+			},
+		},
+		{
 			name: "try_reserve_host_port_distinguishes_pk_collision_from_host_port_collision",
 			run: func(t *testing.T) {
 				st := newTestStore(t)

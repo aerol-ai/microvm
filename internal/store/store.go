@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 type Store struct {
@@ -84,6 +84,21 @@ func Open(path string) (*Store, error) {
 			sandbox_id TEXT PRIMARY KEY,
 			sealed_blob BLOB NOT NULL,
 			created_at DATETIME NOT NULL,
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
+		`CREATE TABLE IF NOT EXISTS daytona_sandboxes (
+			sandbox_id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			snapshot TEXT NOT NULL DEFAULT '',
+			user_name TEXT NOT NULL DEFAULT '',
+			labels_json TEXT NOT NULL DEFAULT '{}',
+			target TEXT NOT NULL DEFAULT '',
+			network_allow_list TEXT NOT NULL DEFAULT '',
+			auto_stop_interval_minutes REAL,
+			auto_archive_interval_minutes REAL,
+			auto_delete_interval_minutes REAL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
@@ -496,6 +511,111 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (s *Store) UpsertDaytonaMetadata(ctx context.Context, meta models.DaytonaSandboxMetadata) error {
+	labelsJSON, err := marshalJSON(meta.Labels, "{}")
+	if err != nil {
+		return fmt.Errorf("marshal daytona labels: %w", err)
+	}
+	name := strings.TrimSpace(meta.Name)
+	if name == "" {
+		name = strings.TrimSpace(meta.SandboxID)
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO daytona_sandboxes (
+			sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,
+			auto_stop_interval_minutes, auto_archive_interval_minutes, auto_delete_interval_minutes,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			name = excluded.name,
+			snapshot = excluded.snapshot,
+			user_name = excluded.user_name,
+			labels_json = excluded.labels_json,
+			target = excluded.target,
+			network_allow_list = excluded.network_allow_list,
+			auto_stop_interval_minutes = excluded.auto_stop_interval_minutes,
+			auto_archive_interval_minutes = excluded.auto_archive_interval_minutes,
+			auto_delete_interval_minutes = excluded.auto_delete_interval_minutes,
+			updated_at = excluded.updated_at
+	`,
+		strings.TrimSpace(meta.SandboxID),
+		name,
+		strings.TrimSpace(meta.Snapshot),
+		strings.TrimSpace(meta.User),
+		labelsJSON,
+		strings.TrimSpace(meta.Target),
+		strings.TrimSpace(meta.NetworkAllowList),
+		nullableFloat32(meta.AutoStopIntervalMinutes),
+		nullableFloat32(meta.AutoArchiveIntervalMinutes),
+		nullableFloat32(meta.AutoDeleteIntervalMinutes),
+		now,
+		now,
+	)
+	if err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			return ErrDaytonaNameConflict
+		}
+		return fmt.Errorf("upsert daytona metadata: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetDaytonaMetadata(ctx context.Context, sandboxID string) (*models.DaytonaSandboxMetadata, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,
+			auto_stop_interval_minutes, auto_archive_interval_minutes, auto_delete_interval_minutes
+		FROM daytona_sandboxes
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	meta, err := scanDaytonaMetadata(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get daytona metadata: %w", err)
+	}
+	return meta, nil
+}
+
+func (s *Store) ListDaytonaMetadata(ctx context.Context) (map[string]models.DaytonaSandboxMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,
+			auto_stop_interval_minutes, auto_archive_interval_minutes, auto_delete_interval_minutes
+		FROM daytona_sandboxes
+		ORDER BY sandbox_id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list daytona metadata: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.DaytonaSandboxMetadata{}
+	for rows.Next() {
+		meta, err := scanDaytonaMetadata(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan daytona metadata: %w", err)
+		}
+		items[meta.SandboxID] = *meta
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate daytona metadata: %w", err)
+	}
+	return items, nil
+}
+
+func (s *Store) ResolveDaytonaSandboxID(ctx context.Context, name string) (string, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT sandbox_id FROM daytona_sandboxes WHERE name = ?`, strings.TrimSpace(name))
+	var sandboxID string
+	if err := row.Scan(&sandboxID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("resolve daytona sandbox id: %w", err)
+	}
+	return sandboxID, nil
+}
+
 func (s *Store) UpdateStatus(ctx context.Context, id string, status models.SandboxStatus, lastError string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
@@ -762,6 +882,43 @@ func scanSandbox(scanner interface {
 	return &sandbox, nil
 }
 
+func scanDaytonaMetadata(scanner interface {
+	Scan(dest ...any) error
+}) (*models.DaytonaSandboxMetadata, error) {
+	var meta models.DaytonaSandboxMetadata
+	var labelsJSON string
+	var autoStop sql.NullFloat64
+	var autoArchive sql.NullFloat64
+	var autoDelete sql.NullFloat64
+	err := scanner.Scan(
+		&meta.SandboxID,
+		&meta.Name,
+		&meta.Snapshot,
+		&meta.User,
+		&labelsJSON,
+		&meta.Target,
+		&meta.NetworkAllowList,
+		&autoStop,
+		&autoArchive,
+		&autoDelete,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if labelsJSON != "" {
+		if err := json.Unmarshal([]byte(labelsJSON), &meta.Labels); err != nil {
+			return nil, fmt.Errorf("decode daytona labels: %w", err)
+		}
+	}
+	if meta.Labels == nil {
+		meta.Labels = map[string]string{}
+	}
+	meta.AutoStopIntervalMinutes = nullableFloat32Ptr(autoStop)
+	meta.AutoArchiveIntervalMinutes = nullableFloat32Ptr(autoArchive)
+	meta.AutoDeleteIntervalMinutes = nullableFloat32Ptr(autoDelete)
+	return &meta, nil
+}
+
 func marshalJSON(value any, fallback string) (string, error) {
 	if value == nil {
 		return fallback, nil
@@ -793,7 +950,32 @@ func boolToInt(value bool) int {
 	return 0
 }
 
+func nullableFloat32(value *float32) any {
+	if value == nil {
+		return nil
+	}
+	return float64(*value)
+}
+
+func nullableFloat32Ptr(value sql.NullFloat64) *float32 {
+	if !value.Valid {
+		return nil
+	}
+	v := float32(value.Float64)
+	return &v
+}
+
+func isSQLiteUniqueConstraint(err error) bool {
+	var sqliteErr sqlite3.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code == sqlite3.ErrConstraint && (sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique || sqliteErr.ExtendedCode == sqlite3.ErrConstraintPrimaryKey)
+}
+
 var ErrNotFound = errors.New("sandbox not found")
+
+var ErrDaytonaNameConflict = errors.New("daytona sandbox name already in use")
 
 // PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
 // to the store layer; encryption / decryption happens in the service layer.
