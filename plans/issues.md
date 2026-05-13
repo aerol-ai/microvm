@@ -79,6 +79,88 @@ window reliably; opportunistic and accidental traffic mostly will not.
 
 ---
 
+## 2. Failover-recreate loses in-container runtime state
+
+### Symptom
+
+When the owning node dies hard and the dead-owner reconciler reassigns a sandbox to a new
+owner, the new owner re-materializes the sandbox from the **replicated spec** — image, env,
+command, resources, mounts, exposed ports, sealed credentials. Anything the original
+container produced *after* boot is gone.
+
+### What's lost on failover
+
+- **Process tree** — long-running scripts, dev servers, agent processes. The new container
+  boots from the image entrypoint as if it were brand new.
+- **Filesystem writes outside mounts** — `apt install`, files in `/tmp`, `/home`, the
+  workdir. The image's writable layer is local to the dead host.
+- **In-flight sessions** — exec sessions, attached shells, established port forwards drop.
+  Clients must reconnect.
+- **Toolbox uploads** not yet flushed to a mount.
+- **Host-local mount data** — silently gone. The mount path doesn't exist on the new owner.
+  Worst case because the user may not realize until they go looking.
+
+### What survives
+
+- Spec (image, env, command, resources, mounts) — replicated via raft FSM.
+- Sealed credentials — re-merged on recreate by the service layer.
+- Sandbox ID and HTTP/TLS-SNI URLs (stable; derived from id+port+domain).
+- Exposed port intents (replayed; raw TCP exposures get a new host port — public TCP URL
+  changes).
+- Network-backed mount data (NFS, S3FS, anything not host-local).
+
+### Affected code
+
+- `internal/cluster/cluster.go:55-95` — `Placement` carries Spec + SealedSecrets +
+  ExposedPorts; explicitly does NOT carry runtime state.
+- `internal/cluster/owner_watcher.go` — invokes `SandboxRecreator.RecreateSandbox` on the
+  new owner; the recreator boots from the spec only.
+- `internal/cluster/cluster.go:131-156` — `SandboxRecreator` interface; documents that the
+  new owner re-runs `ExposePort` for each replicated intent but cannot recover writable-layer
+  state.
+
+### Trigger frequency
+
+Only when the owning node goes down hard (process crash + dead-owner reconciler reassigns
+after the ~30s `SB_DEAD_OWNER_GRACE` window). Graceful restarts on the same node do NOT
+trigger recreate — the local store + container resume in place.
+
+Blast radius per failover: "fraction of sandboxes owned by the dead node" × "how stateful
+those sandboxes are."
+
+### Severity by workload pattern
+
+| Pattern | Impact |
+|---|---|
+| Stateless CI runner, ephemeral test sandbox | Negligible — recreate from spec is the whole job. |
+| Long-running dev env with `npm install` / modified files | High — user loses all in-container work. |
+| Agent with active session | Session drops mid-task; agent must reconnect. |
+| Anything writing to host-local mounts | **Silent data loss** — path is empty on the new node. |
+
+### Industry baseline
+
+This is the same failover model as Kubernetes pods, ECS tasks, and Nomad allocations:
+recreate from spec, lose runtime state. The alternatives (CRIU live migration, periodic
+checkpointing) are operationally heavy and have their own failure modes.
+
+### Decision: document, do not fix
+
+The semantics are acceptable for v1. We expose them user-facing rather than engineer
+around them. If a workload needs durable runtime state across host failure, the answer is
+network-backed mounts, not in-container persistence.
+
+### Proposed follow-ups (when revisited)
+
+- **Cheap (do first):** user-facing docs page on failover semantics — what survives, what
+  doesn't, how to design workloads that tolerate it. Add a `host_local_mount` warning at
+  create time when cluster mode is on.
+- **Medium:** mount-type advisory in the SDK / API: surface a warning when a sandbox in
+  cluster mode uses a host-local mount.
+- **Heavy (not planned):** CRIU-based checkpoint/restore, or runtime-native snapshot for
+  gVisor/Kata. Deferred indefinitely; revisit only if a paying user blocks on it.
+
+---
+
 ## What was fixed in the same pass (for context)
 
 - `pkg/docker/client.go` — `Create` now fails closed if `BlockAllEgress` errors (was a
