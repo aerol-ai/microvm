@@ -415,35 +415,82 @@ based on capacity, and subsequent calls are transparently forwarded.
 
 ---
 
-## DNS for clusters
+## DNS and ingress for clusters
 
-Two common topologies:
+A cluster has **two distinct kinds of public traffic**, and they route
+differently. This is the most common source of confusion when standing up a
+cluster — read this section before configuring DNS.
 
-### Topology A — load balancer in front
+### Path 1 — API traffic (`sandbox.example.com/v1/...`)
+
+Lands on any node, gets reverse-proxied internally to the owner via mTLS on
+`:7002`. Routing is solved at the application layer
+(`internal/cluster.ForwardHTTP`). **You can put any LB or DNS scheme in
+front and the API will work.**
+
+### Path 2 — Sandbox URLs (`<id>.sandbox.example.com`, `<id>-<port>.sandbox.example.com`)
+
+Each sandbox container lives on exactly **one** node. Only that node's Caddy
+holds a route for `<id>.sandbox.example.com` → local container IP. **The
+cluster does not proxy sandbox-URL traffic between nodes today.** If the TCP
+connection lands on a node that isn't the owner, Caddy on that node has no
+matching route and returns a 404 / unmatched-SNI fallback.
+
+Your DNS / LB layer has to put each sandbox-URL connection on the right node.
+
+### Address you give to clients
+
+Always one hostname:
 
 ```
-                        api.example.com
-                              │
-                          ┌───┴───┐
-                          │  LB   │  (round-robin or geo-aware)
-                          └───┬───┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-           node-a          node-b          node-c
+https://sandbox.example.com         # API
+https://<sandbox-id>.sandbox.example.com   # sandbox URL
 ```
 
-DNS:
+No matter how many nodes you have, the SDK uses one `baseURL`. The DNS
+records below decide which physical node the connection actually reaches.
+
+### Topology A — SNI-aware L4 LB (recommended; works for both paths) — **2 DNS records**
 
 ```
-A   sandbox.example.com    →  <LB-IP>
-A   *.sandbox.example.com  →  <LB-IP>
+A   sandbox.example.com    →  <LB-public-IP>
+A   *.sandbox.example.com  →  <LB-public-IP>
 ```
 
-The LB terminates TLS and forwards to the nodes' `:443`. Nodes do their own
-internal forwarding so any node can serve any sandbox URL.
+The LB does **TLS pass-through** (TCP-mode listener on `:443`, no cert at the
+LB), preserving SNI. Each backend node terminates TLS with its own copy of
+the wildcard cert.
 
-### Topology B — DNS round-robin (no LB)
+For the **API path**, this works trivially — any backend forwards the call.
+
+For the **sandbox URL path**, this works **only when the LB happens to land
+the connection on the owner**. With pure round-robin across N nodes, ~1/N of
+sandbox-URL requests reach the right node and the rest 404. To make it
+reliable you need one of:
+
+- An LB that can dynamically steer per SNI to the owner backend (Envoy with
+  an SDS feed from the cluster's owner endpoint, or a custom HAProxy
+  config-rewriter). Not built into AerolVM today.
+- A small router process in front (e.g. another `sandboxd` running with
+  `SB_ENABLE_CADDY=true` but no sandboxes — it would still 404 because no
+  cross-node sandbox routes exist; this option is not viable today).
+- One of the alternate topologies below.
+
+### Topology B — Per-sandbox DNS (works for sandbox URLs but operational overhead)
+
+On each sandbox create, write a per-sandbox A record pointing at the owner:
+
+```
+A   <sandbox-id>.sandbox.example.com  →  <owner-node-IP>
+```
+
+On failover, update the record to point at the new owner. Pros: every
+request reaches the owner directly. Cons: Cloudflare TTL lag during failover
+(typically ≥60s of downtime), Cloudflare API rate limits at high create
+churn, one DNS record per sandbox. **Not implemented in `sandboxd` today** —
+you'd have to wire it up via a webhook on placement changes.
+
+### Topology C — DNS round-robin (NOT RECOMMENDED) — **6 records**
 
 ```
 A   sandbox.example.com    →  <node-a-IP>
@@ -454,11 +501,395 @@ A   *.sandbox.example.com  →  <node-b-IP>
 A   *.sandbox.example.com  →  <node-c-IP>
 ```
 
-Cheaper but lacks health checking. Use for low-stakes deployments.
+Same hit-the-wrong-owner problem as Topology A, plus no health checking
+(dead nodes still answer DNS). **API works** (every backend can forward).
+**Sandbox URLs partially work** (1/N hit rate). Use only for testing.
 
-The internal API forwarding means sandbox-affinity at the LB is **not**
-required — any node can serve any sandbox URL. The receiving node looks up
-the owner from gossip and proxies the request.
+### Practical recommendation
+
+| Your usage | Use this |
+|---|---|
+| Mostly SDK calls (exec, file, port-forward) — sandbox URLs rare or none | Topology A. Sandbox URL hit-rate is acceptable; SDK path is perfect. |
+| Public sandbox URLs are core to the product | Single-node today, OR build Topology B integration. |
+| Mixed | Topology A + accept retries on sandbox URL failures, OR build B. |
+
+The "any-node can serve any sandbox URL" property does **not** exist today
+for the public HTTPS data plane. It exists for the API only. Plan
+accordingly.
+
+---
+
+## Concrete deployment: AWS + Cloudflare (3 nodes)
+
+This is the path most operators take. Every step, no skipped pieces. Total
+time: ~45 minutes if you already have an AWS account and a Cloudflare zone.
+
+### What you'll build
+
+```
+            Cloudflare DNS                (sandbox.example.com → NLB)
+                  │
+                  ▼
+         AWS Network Load Balancer       (TCP :443, TLS pass-through)
+                  │
+        ┌─────────┼─────────┐
+        ▼         ▼         ▼
+     node-a    node-b    node-c           (EC2, one per AZ, EIP each)
+        │         │         │
+        └─────────┴─────────┘             (raft :7000, gossip :7001, mTLS :7002)
+              private subnet
+```
+
+**Important caveat upfront**: this gives you a working API and a working
+sandbox-URL plane that lands on the owner ~1/3 of the time (round-robin
+across 3 nodes). For a workload where public sandbox URLs are the primary
+use case, see "After the cluster is up" at the end.
+
+### Prerequisites checklist
+
+- [ ] AWS account, IAM user with EC2 + VPC + ELB permissions.
+- [ ] AWS CLI configured (`aws sts get-caller-identity` works).
+- [ ] Cloudflare account with the zone for `example.com` already added.
+- [ ] Cloudflare API token: scope **Zone → Zone → Read** + **Zone → DNS →
+      Edit** on the `example.com` zone. Save it; you'll need it twice.
+- [ ] An SSH keypair imported in the AWS region you'll deploy to.
+- [ ] A subdomain you control under the Cloudflare zone, e.g.
+      `sandbox.example.com`. The wildcard `*.sandbox.example.com` will be
+      yours too.
+
+### Step 1 — Create the VPC and subnets
+
+```bash
+# Region: pick one with ≥3 AZs. Example: us-east-1.
+export AWS_REGION=us-east-1
+aws configure set region $AWS_REGION
+
+# Create a VPC.
+VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=aerolvm-vpc}]' \
+  --query 'Vpc.VpcId' --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+
+# Internet gateway and attach.
+IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+
+# 3 public subnets, one per AZ.
+SUBNET_A=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
+  --availability-zone ${AWS_REGION}a --query 'Subnet.SubnetId' --output text)
+SUBNET_B=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 \
+  --availability-zone ${AWS_REGION}b --query 'Subnet.SubnetId' --output text)
+SUBNET_C=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.3.0/24 \
+  --availability-zone ${AWS_REGION}c --query 'Subnet.SubnetId' --output text)
+
+for s in $SUBNET_A $SUBNET_B $SUBNET_C; do
+  aws ec2 modify-subnet-attribute --subnet-id $s --map-public-ip-on-launch
+done
+
+# Route table → IGW.
+RT_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+aws ec2 create-route --route-table-id $RT_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+for s in $SUBNET_A $SUBNET_B $SUBNET_C; do
+  aws ec2 associate-route-table --route-table-id $RT_ID --subnet-id $s
+done
+
+echo "VPC=$VPC_ID  subnets=$SUBNET_A,$SUBNET_B,$SUBNET_C"
+```
+
+### Step 2 — Security groups
+
+Three groups: public-edge, cluster-internal, management.
+
+```bash
+# Public ingress (only what the world reaches).
+SG_PUBLIC=$(aws ec2 create-security-group --vpc-id $VPC_ID \
+  --group-name aerolvm-public --description "Public ingress" \
+  --query 'GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id $SG_PUBLIC \
+  --ip-permissions IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges='[{CidrIp=0.0.0.0/0}]'
+# Optional: SSH gateway
+aws ec2 authorize-security-group-ingress --group-id $SG_PUBLIC \
+  --ip-permissions IpProtocol=tcp,FromPort=2220,ToPort=2220,IpRanges='[{CidrIp=0.0.0.0/0}]'
+
+# Cluster-internal (raft, gossip, mTLS) — only from the SG itself.
+SG_CLUSTER=$(aws ec2 create-security-group --vpc-id $VPC_ID \
+  --group-name aerolvm-cluster --description "Cluster-internal" \
+  --query 'GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id $SG_CLUSTER \
+  --source-group $SG_CLUSTER --protocol tcp --port 7000-7002
+aws ec2 authorize-security-group-ingress --group-id $SG_CLUSTER \
+  --source-group $SG_CLUSTER --protocol udp --port 7001
+
+# Management (SSH from your IP only).
+MY_IP=$(curl -s https://api.ipify.org)
+SG_MGMT=$(aws ec2 create-security-group --vpc-id $VPC_ID \
+  --group-name aerolvm-mgmt --description "Operator SSH" \
+  --query 'GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id $SG_MGMT \
+  --ip-permissions IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges="[{CidrIp=$MY_IP/32}]"
+
+echo "SGs: public=$SG_PUBLIC cluster=$SG_CLUSTER mgmt=$SG_MGMT"
+```
+
+### Step 3 — Launch 3 EC2 instances
+
+```bash
+# Ubuntu 22.04 LTS AMI for your region (this is us-east-1 as of 2026; use SSM
+# for portability if you prefer):
+AMI=$(aws ssm get-parameters --names \
+  /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+  --query 'Parameters[0].Value' --output text)
+
+KEY_NAME=your-keypair-name           # imported in this region
+INSTANCE_TYPE=t3.medium              # bump for real workloads
+
+declare -A NODES=( [node-a]=$SUBNET_A [node-b]=$SUBNET_B [node-c]=$SUBNET_C )
+declare -A INSTANCE_IDS
+
+for name in "${!NODES[@]}"; do
+  id=$(aws ec2 run-instances \
+    --image-id $AMI --instance-type $INSTANCE_TYPE \
+    --key-name $KEY_NAME --subnet-id ${NODES[$name]} \
+    --security-group-ids $SG_PUBLIC $SG_CLUSTER $SG_MGMT \
+    --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=50,VolumeType=gp3}' \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$name}]" \
+    --query 'Instances[0].InstanceId' --output text)
+  INSTANCE_IDS[$name]=$id
+  echo "$name → $id"
+done
+
+# Wait for them all to be running.
+aws ec2 wait instance-running --instance-ids ${INSTANCE_IDS[@]}
+
+# Allocate and attach an Elastic IP to each (so node IPs are stable).
+for name in "${!NODES[@]}"; do
+  alloc=$(aws ec2 allocate-address --domain vpc --query 'AllocationId' --output text)
+  aws ec2 associate-address --instance-id ${INSTANCE_IDS[$name]} --allocation-id $alloc
+done
+```
+
+Get each node's **private** IP (you'll need these for `cluster-init.sh` and
+`cluster-join.sh`):
+
+```bash
+for name in "${!NODES[@]}"; do
+  ip=$(aws ec2 describe-instances --instance-ids ${INSTANCE_IDS[$name]} \
+    --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+  echo "$name private-ip=$ip"
+done
+```
+
+### Step 4 — Network Load Balancer with TLS pass-through
+
+```bash
+# Create the NLB across all 3 subnets.
+NLB_ARN=$(aws elbv2 create-load-balancer --name aerolvm-nlb \
+  --type network --scheme internet-facing \
+  --subnets $SUBNET_A $SUBNET_B $SUBNET_C \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+
+# Target group: TCP/:443. TLS pass-through means we DO NOT terminate at NLB.
+TG_ARN=$(aws elbv2 create-target-group --name aerolvm-tg-443 \
+  --protocol TCP --port 443 --vpc-id $VPC_ID \
+  --health-check-protocol TCP --health-check-port 443 \
+  --target-type instance \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+# Register all three instances.
+aws elbv2 register-targets --target-group-arn $TG_ARN \
+  --targets Id=${INSTANCE_IDS[node-a]} Id=${INSTANCE_IDS[node-b]} Id=${INSTANCE_IDS[node-c]}
+
+# Listener on :443 → forward TCP to the target group.
+aws elbv2 create-listener --load-balancer-arn $NLB_ARN \
+  --protocol TCP --port 443 \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
+
+# (Optional) :2220 listener for the SSH gateway:
+TG2220=$(aws elbv2 create-target-group --name aerolvm-tg-2220 \
+  --protocol TCP --port 2220 --vpc-id $VPC_ID \
+  --health-check-protocol TCP --health-check-port 2220 \
+  --target-type instance --query 'TargetGroups[0].TargetGroupArn' --output text)
+aws elbv2 register-targets --target-group-arn $TG2220 \
+  --targets Id=${INSTANCE_IDS[node-a]} Id=${INSTANCE_IDS[node-b]} Id=${INSTANCE_IDS[node-c]}
+aws elbv2 create-listener --load-balancer-arn $NLB_ARN \
+  --protocol TCP --port 2220 \
+  --default-actions Type=forward,TargetGroupArn=$TG2220
+
+NLB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $NLB_ARN \
+  --query 'LoadBalancers[0].DNSName' --output text)
+echo "NLB DNS: $NLB_DNS"
+```
+
+The key choice here is **TCP listener, not TLS**. TLS pass-through preserves
+the encrypted handshake to the backend, where each node's Caddy terminates
+TLS using its own copy of the wildcard cert (issued via DNS-01 — see Step 6).
+
+### Step 5 — Cloudflare DNS
+
+In the Cloudflare dashboard, add **two CNAME records** under your zone:
+
+| Type | Name | Target | Proxy status |
+|---|---|---|---|
+| CNAME | `sandbox` | `<NLB_DNS>` | **DNS only** (gray cloud) |
+| CNAME | `*.sandbox` | `<NLB_DNS>` | **DNS only** (gray cloud) |
+
+Or via the Cloudflare API:
+
+```bash
+ZONE_ID=<your-zone-id>
+CF_TOKEN=<cloudflare-api-token>
+
+curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+  -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"type\":\"CNAME\",\"name\":\"sandbox\",\"content\":\"$NLB_DNS\",\"proxied\":false}"
+
+curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+  -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"type\":\"CNAME\",\"name\":\"*.sandbox\",\"content\":\"$NLB_DNS\",\"proxied\":false}"
+```
+
+**Why DNS-only (gray cloud), not proxied?** Cloudflare's proxy terminates
+TLS itself and won't pass through your wildcard cert to the backend. With
+DNS-only, the SDK/browser connects directly through the NLB to the backend,
+preserving the SNI-based TLS handshake that DNS-01 issued certs depend on.
+
+Wait for propagation:
+
+```bash
+dig +short sandbox.example.com
+dig +short test.sandbox.example.com
+```
+
+Both should return the NLB's IP(s) (Amazon-assigned, may be multiple).
+
+### Step 6 — Run `install.sh` on each EC2 instance
+
+SSH to each instance (the EIPs you allocated earlier are the SSH targets):
+
+```bash
+ssh ubuntu@<node-a-EIP>
+sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+  | sudo bash -s -- \
+      --domain sandbox.example.com \
+      --pat-token shared-pat-token-pick-something-strong \
+      --dns-provider cloudflare \
+      --dns-api-token <cloudflare-token>
+```
+
+Repeat on `node-b` and `node-c`. **Use the same `--pat-token` and the same
+`--dns-api-token` on all three.**
+
+Each node's Caddy will independently solve a DNS-01 challenge against
+Cloudflare (writes a transient `_acme-challenge.sandbox.example.com` TXT
+record, waits for LE to verify, deletes the record). Allow 30-90 seconds
+per node for first issuance.
+
+Verify on each node:
+
+```bash
+sudo journalctl -u sandboxd -n 30 --no-pager | grep -iE 'health|caddy|cert'
+curl http://127.0.0.1:21212/health    # local
+curl https://sandbox.example.com/health   # via NLB → some backend
+```
+
+### Step 7 — Bootstrap the cluster on `node-a`
+
+```bash
+# On node-a:
+NODE_A_PRIVATE_IP=10.0.1.X    # from Step 3 output
+
+sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-init.sh \
+  -o /usr/local/bin/cluster-init.sh
+sudo chmod +x /usr/local/bin/cluster-init.sh
+
+sudo /usr/local/bin/cluster-init.sh \
+    --node-id node-a \
+    --api-advertise-url http://$NODE_A_PRIVATE_IP:21212
+```
+
+Save the printed gossip key and bundle path. The bundle is at
+`./aerolvm-tls-bundle.tar.gz` by default (the script prints the exact path).
+
+### Step 8 — Distribute the TLS bundle to `node-b` and `node-c`
+
+From your laptop:
+
+```bash
+scp ubuntu@<node-a-EIP>:aerolvm-tls-bundle.tar.gz /tmp/
+scp /tmp/aerolvm-tls-bundle.tar.gz ubuntu@<node-b-EIP>:/tmp/
+scp /tmp/aerolvm-tls-bundle.tar.gz ubuntu@<node-c-EIP>:/tmp/
+shred -u /tmp/aerolvm-tls-bundle.tar.gz
+```
+
+### Step 9 — Join `node-b` and `node-c`
+
+On each joiner:
+
+```bash
+# On node-b (and node-c, with --node-id node-c):
+NODE_A_PRIVATE_IP=10.0.1.X
+GOSSIP_KEY='<key-from-step-7>'
+
+sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-join.sh \
+  -o /usr/local/bin/cluster-join.sh
+sudo chmod +x /usr/local/bin/cluster-join.sh
+
+sudo /usr/local/bin/cluster-join.sh \
+    --node-id node-b \
+    --gossip-key "$GOSSIP_KEY" \
+    --peers $NODE_A_PRIVATE_IP:7001 \
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+```
+
+### Step 10 — Verify
+
+```bash
+PAT=shared-pat-token-pick-something-strong
+
+# From your laptop, hitting the NLB:
+curl -H "Authorization: Bearer $PAT" https://sandbox.example.com/v1/cluster/members
+curl -H "Authorization: Bearer $PAT" https://sandbox.example.com/v1/cluster/leader
+```
+
+You should see all three nodes alive, and a non-empty leader. From the
+SDK:
+
+```ts
+import { Sandbox } from "@aerol-ai/sdk";
+const sb = new Sandbox({
+  baseURL: "https://sandbox.example.com",
+  apiKey: process.env.SB_PAT_TOKEN,
+});
+const sandbox = await sb.create({ image: "node:20" });
+console.log(sandbox.id);   // confirm a sandbox actually got placed
+```
+
+The cluster picks the owner via power-of-two-choices over the gossip
+capacity table; subsequent SDK calls reach the right node automatically
+through API forwarding.
+
+### After the cluster is up — what works, what doesn't
+
+| Path | Status with this setup |
+|---|---|
+| SDK calls (`/v1/sandboxes/...`, exec, file copy, port-forward) | **Fully working.** Land on any node, internally forwarded to owner. |
+| Public sandbox URLs (`<id>.sandbox.example.com`) | **Round-robin: ~1/3 hit rate on a 3-node NLB.** Connection lands on a non-owner → 404. |
+| Failover (kill an EC2) | **Working.** After `SB_DEAD_OWNER_GRACE`, sandboxes reassign; new owner unseals creds with the shared key from the bundle. |
+| TLS issuance/renewal | **Working per node.** Three independent DNS-01 renewal loops, well under LE quota. |
+
+If your product depends on `<id>.sandbox.example.com` URLs being reliably
+reachable (not just SDK calls), you have three choices today:
+
+1. **Stay single-node** until you implement smarter ingress.
+2. **Per-sandbox DNS** (Topology B): write a record per sandbox pointing at
+   the owner; update on failover. Requires custom integration.
+3. **Build SNI-aware ingress**: replace the NLB with Envoy or HAProxy
+   driven by a control loop that polls `/v1/cluster/members` + placements
+   and rewrites the SNI→backend map. This is the "real" fix and is on the
+   roadmap.
+
+This isn't documented elsewhere because it's the architectural seam most
+operators don't notice until they ship public sandbox URLs in production.
 
 ---
 
