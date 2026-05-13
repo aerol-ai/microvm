@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -343,13 +344,13 @@ func (s *server) handleDaytonaGitClone(w http.ResponseWriter, r *http.Request) {
 		writeFilesystemError(w, err)
 		return
 	}
-	cloneURL := gitURLWithCredentials(req.URL, valueOrEmptyString(req.Username), valueOrEmptyString(req.Password))
+	cloneURL, gitEnv := gitCloneURLAndAuthEnv(req.URL, valueOrEmptyString(req.Username), valueOrEmptyString(req.Password))
 	args := []string{"clone"}
 	if branch := strings.TrimSpace(valueOrEmptyString(req.Branch)); branch != "" {
 		args = append(args, "--branch", branch)
 	}
 	args = append(args, cloneURL, clonePath)
-	if _, err := runGitNoRepo(args...); err != nil {
+	if _, err := runGitNoRepoWithEnv(gitEnv, args...); err != nil {
 		writeGitError(w, err)
 		return
 	}
@@ -615,7 +616,14 @@ func runGit(repoPath string, args ...string) (string, error) {
 }
 
 func runGitNoRepo(args ...string) (string, error) {
+	return runGitNoRepoWithEnv(nil, args...)
+}
+
+func runGitNoRepoWithEnv(extraEnv []string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(output))
@@ -627,25 +635,31 @@ func runGitNoRepo(args ...string) (string, error) {
 	return string(output), nil
 }
 
-func gitURLWithCredentials(rawURL, username, password string) string {
+func gitCloneURLAndAuthEnv(rawURL, username, password string) (string, []string) {
 	username = strings.TrimSpace(username)
 	password = strings.TrimSpace(password)
-	if username == "" && password == "" {
-		return rawURL
-	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return rawURL
+		return rawURL, nil
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return rawURL
+		return rawURL, nil
 	}
-	if password != "" {
-		parsed.User = url.UserPassword(username, password)
-	} else {
-		parsed.User = url.User(username)
+	if parsed.User != nil && username == "" && password == "" {
+		username = parsed.User.Username()
+		password, _ = parsed.User.Password()
 	}
-	return parsed.String()
+	parsed.User = nil
+	if username == "" && password == "" {
+		return parsed.String(), nil
+	}
+	header := "Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+	env := []string{
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http.extraHeader",
+		"GIT_CONFIG_VALUE_0=" + header,
+	}
+	return parsed.String(), env
 }
 
 func valueOrEmptyString(value *string) string {

@@ -96,6 +96,41 @@ func TestTranslateCreateSandboxRequestPreservesIdleLifecycleFields(t *testing.T)
 	}
 }
 
+func TestIntervalMetadataPtrRejectsNegativeAndClearsZero(t *testing.T) {
+	if _, err := intervalMetadataPtr(-1); err == nil {
+		t.Fatal("expected negative interval error")
+	}
+	if got, err := intervalMetadataPtr(0); err != nil || got != nil {
+		t.Fatalf("intervalMetadataPtr(0) = (%+v, %v), want nil, nil", got, err)
+	}
+	got, err := intervalMetadataPtr(2.5)
+	if err != nil {
+		t.Fatalf("intervalMetadataPtr(2.5) error = %v", err)
+	}
+	if got == nil || *got != 2.5 {
+		t.Fatalf("intervalMetadataPtr(2.5) = %+v, want 2.5", got)
+	}
+}
+
+func TestInt32MinutesPtrOmitsDisabledIntervals(t *testing.T) {
+	zero := int32(0)
+	negative := int32(-1)
+	positive := int32(7)
+	if got := int32MinutesPtr(nil); got != nil {
+		t.Fatalf("int32MinutesPtr(nil) = %+v, want nil", got)
+	}
+	if got := int32MinutesPtr(&zero); got != nil {
+		t.Fatalf("int32MinutesPtr(0) = %+v, want nil", got)
+	}
+	if got := int32MinutesPtr(&negative); got != nil {
+		t.Fatalf("int32MinutesPtr(-1) = %+v, want nil", got)
+	}
+	got := int32MinutesPtr(&positive)
+	if got == nil || *got != 7 {
+		t.Fatalf("int32MinutesPtr(7) = %+v, want 7", got)
+	}
+}
+
 func boolPtr(value bool) *bool {
 	return &value
 }

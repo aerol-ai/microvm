@@ -160,8 +160,6 @@ func (s *daytonaSessionState) command(commandID string) (*daytonaCommandState, b
 		return nil, false
 	}
 	copy := *command
-	theActiveID := s.activeCommandID
-	_ = theActiveID
 	s.mu.RUnlock()
 	return &copy, true
 }

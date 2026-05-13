@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -349,12 +350,17 @@ func (h *handlers) setAutoArchiveInterval(w http.ResponseWriter, r *http.Request
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid interval")
 		return
 	}
+	intervalPtr, err := intervalMetadataPtr(interval)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	meta.AutoArchiveInterval = float32Ptr(interval)
+	meta.AutoArchiveInterval = intervalPtr
 	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
 		if errors.Is(err, store.ErrDaytonaNameConflict) {
 			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
@@ -377,15 +383,20 @@ func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, s
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid interval")
 		return
 	}
+	intervalPtr, err := intervalMetadataPtr(interval)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	lifecycle := sandbox.Lifecycle
 	if stop {
-		if interval <= 0 {
+		if intervalPtr == nil {
 			lifecycle.StopIfIdleFor = 0
 		} else {
 			lifecycle.StopIfIdleFor = durationFromMinutes(interval)
 		}
 	} else {
-		if interval <= 0 {
+		if intervalPtr == nil {
 			lifecycle.DestroyIfIdleFor = 0
 		} else {
 			lifecycle.DestroyIfIdleFor = durationFromMinutes(interval)
@@ -402,9 +413,9 @@ func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	if stop {
-		meta.AutoStopInterval = float32Ptr(interval)
+		meta.AutoStopInterval = intervalPtr
 	} else {
-		meta.AutoDeleteInterval = float32Ptr(interval)
+		meta.AutoDeleteInterval = intervalPtr
 	}
 	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
 		if errors.Is(err, store.ErrDaytonaNameConflict) {
@@ -688,6 +699,9 @@ func parseFloat32Path(r *http.Request, name string) (float32, error) {
 	if err != nil {
 		return 0, err
 	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, errors.New(name + " must be finite")
+	}
 	return float32(value), nil
 }
 
@@ -749,6 +763,9 @@ func int32MinutesPtr(value *int32) *float32 {
 	if value == nil {
 		return nil
 	}
+	if *value <= 0 {
+		return nil
+	}
 	v := float32(*value)
 	return &v
 }
@@ -808,6 +825,16 @@ func stringPtr(value string) *string {
 
 func float32Ptr(value float32) *float32 {
 	return &value
+}
+
+func intervalMetadataPtr(value float32) (*float32, error) {
+	if value < 0 {
+		return nil, errors.New("interval must be non-negative")
+	}
+	if value == 0 {
+		return nil, nil
+	}
+	return float32Ptr(value), nil
 }
 
 func firstFloat32Ptr(primary *float32, fallback *float32) *float32 {

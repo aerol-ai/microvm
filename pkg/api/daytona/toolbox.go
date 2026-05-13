@@ -246,10 +246,17 @@ func (h *handlers) uploadSingleFile(ctx context.Context, sandboxID, targetPath s
 
 	reader, writer := io.Pipe()
 	multipartWriter := multipart.NewWriter(writer)
-	errCh := make(chan error, 1)
+	headers := http.Header{}
+	headers.Set("Content-Type", multipartWriter.FormDataContentType())
 
+	req, err := h.newToolboxRequest(ctx, sandboxID, http.MethodPost, "/files/upload", url.Values{"path": []string{targetPath}}, reader, headers)
+	if err != nil {
+		_ = reader.CloseWithError(err)
+		return err
+	}
+
+	errCh := make(chan error, 1)
 	go func() {
-		defer close(errCh)
 		part, err := multipartWriter.CreateFormFile("file", fileHeader.Filename)
 		if err == nil {
 			_, err = io.Copy(part, file)
@@ -262,10 +269,10 @@ func (h *handlers) uploadSingleFile(ctx context.Context, sandboxID, targetPath s
 		errCh <- err
 	}()
 
-	headers := http.Header{}
-	headers.Set("Content-Type", multipartWriter.FormDataContentType())
-	resp, err := h.sendToolboxRequest(ctx, sandboxID, http.MethodPost, "/files/upload", url.Values{"path": []string{targetPath}}, reader, headers)
+	resp, err := h.httpClient.Do(req)
 	if err != nil {
+		_ = reader.CloseWithError(err)
+		<-errCh
 		return err
 	}
 	defer resp.Body.Close()
@@ -344,6 +351,14 @@ func (h *handlers) sendToolboxJSON(ctx context.Context, sandboxID, method, path 
 }
 
 func (h *handlers) sendToolboxRequest(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
+	req, err := h.newToolboxRequest(ctx, sandboxID, method, path, query, body, headers)
+	if err != nil {
+		return nil, err
+	}
+	return h.httpClient.Do(req)
+}
+
+func (h *handlers) newToolboxRequest(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Request, error) {
 	endpoint, err := h.deps.Service.ToolboxTarget(ctx, sandboxID)
 	if err != nil {
 		return nil, err
@@ -365,7 +380,7 @@ func (h *handlers) sendToolboxRequest(ctx context.Context, sandboxID, method, pa
 	if endpoint.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+endpoint.Token)
 	}
-	return h.httpClient.Do(req)
+	return req, nil
 }
 
 func (h *handlers) writeToolboxError(w http.ResponseWriter, err error) {
