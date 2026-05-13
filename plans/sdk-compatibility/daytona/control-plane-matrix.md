@@ -38,12 +38,12 @@ These tables describe the current `/daytona` control-plane compatibility surface
 | `snapshot` | Partial | Accepted only as an image fallback/input alias, not as a true Daytona snapshot lifecycle. |
 | `target` | Partial | Stored as metadata only. No AerolVM scheduling or region semantics exist. |
 | `public=true` or omitted | Supported | Facade assumes public sandbox routing. |
-| `public=false` | Unsupported | Explicitly rejected by the facade. |
+| `public=false` | Partial | Accepted for compatibility, but AerolVM still treats the sandbox as public in the current Daytona facade. |
 | `networkBlockAll` | Supported | Mapped onto native egress-block setting. |
 | `networkAllowList` | Unsupported | Non-empty values are explicitly rejected on create. |
 | `gpu` | Unsupported | Positive GPU requests are explicitly rejected in the Daytona facade. |
 | `volumes` | Unsupported | Daytona volume lifecycle is not mapped. |
-| `buildInfo` | Unsupported | Native AerolVM sandbox create does not implement Daytona image-build semantics. |
+| `buildInfo` | Partial | The facade accepts the simple Daytona Go SDK shape `dockerfileContent: "FROM <image>"` and translates it to a native AerolVM image. Richer Dockerfile build semantics remain unsupported. |
 
 ## Known control-plane gaps
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
@@ -35,27 +36,6 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Public != nil && !*req.Public {
-		apihttp.WriteError(w, http.StatusBadRequest, "public=false is not supported by the Daytona facade")
-		return
-	}
-	if req.NetworkAllowList != nil && strings.TrimSpace(*req.NetworkAllowList) != "" {
-		apihttp.WriteError(w, http.StatusBadRequest, "networkAllowList is not supported by the Daytona facade")
-		return
-	}
-	if req.Gpu != nil && *req.Gpu > 0 {
-		apihttp.WriteError(w, http.StatusBadRequest, "gpu allocation is not supported by the Daytona facade")
-		return
-	}
-	if len(req.Volumes) > 0 {
-		apihttp.WriteError(w, http.StatusBadRequest, "volumes are not supported by the Daytona facade")
-		return
-	}
-	if req.BuildInfo != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, "buildInfo is not supported by the Daytona facade")
-		return
-	}
-
 	requestedName := trimmedString(req.Name)
 	if requestedName != "" {
 		if _, err := h.deps.Service.GetSandbox(r.Context(), requestedName); err == nil {
@@ -74,25 +54,10 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	lifecycle := models.Lifecycle{}
-	if req.AutoStopInterval != nil && *req.AutoStopInterval > 0 {
-		lifecycle.StopIfIdleFor = durationFromMinutes(float32(*req.AutoStopInterval))
-	}
-	if req.AutoDeleteInterval != nil && *req.AutoDeleteInterval > 0 {
-		lifecycle.DestroyIfIdleFor = durationFromMinutes(float32(*req.AutoDeleteInterval))
-	}
-
-	serviceReq := models.CreateSandboxRequest{
-		Image:           h.createImage(req),
-		CPU:             float64(int32Value(req.Cpu, 0)),
-		MemoryMB:        int(int32Value(req.Memory, 0)) * 1024,
-		DiskGB:          int(int32Value(req.Disk, 0)),
-		Env:             cloneStringMap(mapValue(req.Env)),
-		OSUser:          trimmedString(req.User),
-		NetworkBlockAll: boolValue(req.NetworkBlockAll),
-	}
-	if !lifecycle.IsZero() {
-		serviceReq.Lifecycle = &lifecycle
+	serviceReq, err := h.translateCreateSandboxRequest(req)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	response, err := h.deps.Service.CreateSandbox(r.Context(), serviceReq)
@@ -623,14 +588,87 @@ func (h *handlers) toolboxProxyBaseURL(r *http.Request) string {
 	return requestBaseURL(r) + ToolboxPrefix
 }
 
-func (h *handlers) createImage(req createSandboxRequest) string {
+func (h *handlers) translateCreateSandboxRequest(req createSandboxRequest) (models.CreateSandboxRequest, error) {
+	if req.NetworkAllowList != nil && strings.TrimSpace(*req.NetworkAllowList) != "" {
+		return models.CreateSandboxRequest{}, errors.New("networkAllowList is not supported by the Daytona facade")
+	}
+	if req.Gpu != nil && *req.Gpu > 0 {
+		return models.CreateSandboxRequest{}, errors.New("gpu allocation is not supported by the Daytona facade")
+	}
+	if len(req.Volumes) > 0 {
+		return models.CreateSandboxRequest{}, errors.New("volumes are not supported by the Daytona facade")
+	}
+
+	lifecycle := models.Lifecycle{}
+	if req.AutoStopInterval != nil && *req.AutoStopInterval > 0 {
+		lifecycle.StopIfIdleFor = durationFromMinutes(float32(*req.AutoStopInterval))
+	}
+	if req.AutoDeleteInterval != nil && *req.AutoDeleteInterval > 0 {
+		lifecycle.DestroyIfIdleFor = durationFromMinutes(float32(*req.AutoDeleteInterval))
+	}
+
+	image, err := h.createImage(req)
+	if err != nil {
+		return models.CreateSandboxRequest{}, err
+	}
+
+	serviceReq := models.CreateSandboxRequest{
+		Image:           image,
+		CPU:             float64(int32Value(req.Cpu, 0)),
+		MemoryMB:        int(int32Value(req.Memory, 0)) * 1024,
+		DiskGB:          int(int32Value(req.Disk, 0)),
+		Env:             cloneStringMap(mapValue(req.Env)),
+		OSUser:          trimmedString(req.User),
+		NetworkBlockAll: boolValue(req.NetworkBlockAll),
+	}
+	if !lifecycle.IsZero() {
+		serviceReq.Lifecycle = &lifecycle
+	}
+	return serviceReq, nil
+}
+
+func (h *handlers) createImage(req createSandboxRequest) (string, error) {
 	if snapshot := strings.TrimSpace(valueOrEmpty(req.Snapshot)); snapshot != "" {
-		return snapshot
+		return snapshot, nil
+	}
+	if buildImage, err := buildInfoBaseImage(req.BuildInfo); err != nil {
+		return "", err
+	} else if buildImage != "" {
+		return buildImage, nil
 	}
 	if configured := strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")); configured != "" {
-		return configured
+		return configured, nil
 	}
-	return "ubuntu:22.04"
+	return "ubuntu:22.04", nil
+}
+
+func buildInfoBaseImage(info *buildInfoRequest) (string, error) {
+	if info == nil {
+		return "", nil
+	}
+	dockerfile := strings.TrimSpace(valueOrEmpty(info.DockerfileContent))
+	if dockerfile == "" {
+		return "", errors.New("buildInfo is only supported when dockerfileContent is present")
+	}
+	lines := make([]string, 0, 4)
+	for _, line := range strings.Split(dockerfile, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		lines = append(lines, trimmed)
+	}
+	if len(lines) != 1 {
+		return "", errors.New("buildInfo is only supported for simple single-line Dockerfiles of the form `FROM <image>`")
+	}
+	parts := strings.Fields(lines[0])
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "FROM") {
+		return "", fmt.Errorf("buildInfo dockerfileContent %q is unsupported; expected `FROM <image>`", lines[0])
+	}
+	if strings.TrimSpace(parts[1]) == "" {
+		return "", errors.New("buildInfo dockerfileContent must include a base image")
+	}
+	return parts[1], nil
 }
 
 func parsePositiveFloatQuery(r *http.Request, key string, fallback float32) (float32, error) {

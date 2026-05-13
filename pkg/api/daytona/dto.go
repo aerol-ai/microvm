@@ -1,5 +1,9 @@
 package daytona
 
+type buildInfoRequest struct {
+	DockerfileContent *string `json:"dockerfileContent,omitempty"`
+}
+
 type createSandboxRequest struct {
 	Name                *string            `json:"name,omitempty"`
 	Snapshot            *string            `json:"snapshot,omitempty"`
@@ -19,7 +23,7 @@ type createSandboxRequest struct {
 	AutoArchiveInterval *int32             `json:"autoArchiveInterval,omitempty"`
 	AutoDeleteInterval  *int32             `json:"autoDeleteInterval,omitempty"`
 	Volumes             []map[string]any   `json:"volumes,omitempty"`
-	BuildInfo           map[string]any     `json:"buildInfo,omitempty"`
+	BuildInfo           *buildInfoRequest  `json:"buildInfo,omitempty"`
 }
 
 type resizeSandboxRequest struct {
