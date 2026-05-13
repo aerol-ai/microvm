@@ -16,8 +16,9 @@ import (
 	"log/slog"
 	"net/http"
 
-	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/daytona"
+	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 )
 
 type Server struct {
@@ -49,6 +50,12 @@ func (s *Server) routes() {
 
 	// Each registered version owns its own URL prefix and is responsible for
 	// every route under it. Auth is shared across versions via Deps.Auth.
+	daytona.RegisterRoutes(s.mux, daytona.Deps{
+		Service: s.service,
+		Logger:  s.logger,
+		Auth:    s.requireAuth,
+	})
+
 	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
 		Service: s.service,
 		Logger:  s.logger,
