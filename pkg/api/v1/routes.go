@@ -32,7 +32,11 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// local handler runs. The wrapper falls through to createSandbox when this
 	// node is the chosen owner.
 	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.clusterCreateWrap)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.listSandboxes)))
+	// GET /sandboxes is cluster-wide: clusterListWrap fans out to peers and
+	// merges with the local list so the "any node accepts any request"
+	// invariant covers list, not just per-sandbox routes. Single-node and
+	// already-forwarded requests fall through to listSandboxes unchanged.
+	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.clusterListWrap)))
 
 	// Per-sandbox routes are wrapped with clusterForwardWrap so that requests
 	// addressing a sandbox owned by another node are transparently forwarded

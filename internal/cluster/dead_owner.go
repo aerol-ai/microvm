@@ -210,10 +210,10 @@ func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeI
 	}
 	req := capacity.Request{CPU: spec.CPU, MemoryMB: spec.MemoryMB}
 	if req.CPU <= 0 {
-		req.CPU = 0.5
+		req.CPU = models.DefaultCPU
 	}
 	if req.MemoryMB <= 0 {
-		req.MemoryMB = 256
+		req.MemoryMB = models.DefaultMemoryMB
 	}
 	target, err := c.SelectPlacement(req)
 	if err != nil {

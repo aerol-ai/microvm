@@ -52,9 +52,14 @@ type Cluster struct {
 	// a sandbox the FSM says we own but the local store doesn't have. Set via
 	// AttachRecreator after construction (avoids a cluster→service import
 	// cycle). nil disables the watcher's effect — the loop still runs.
-	recreator           SandboxRecreator
-	recreatorMu         sync.Mutex
-	ownerWatcherStop    context.CancelFunc
+	recreator        SandboxRecreator
+	recreatorMu      sync.Mutex
+	ownerWatcherStop context.CancelFunc
+	// recreateFailures counts consecutive recreate failures per sandbox so
+	// the watcher can escalate to "ask for reassignment" instead of looping
+	// forever on a permanent local failure (image gone, runtime missing,
+	// disk full). Initialized in startOwnerWatcher.
+	recreateFailures *recreateFailureTracker
 }
 
 // New constructs a Cluster for cfg.EnableCluster=true. Caller takes ownership

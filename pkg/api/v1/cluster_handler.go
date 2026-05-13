@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -148,6 +149,127 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	apihttp.WriteJSON(w, http.StatusCreated, resp)
+}
+
+// clusterListWrap aggregates GET /v1/sandboxes results across the cluster so
+// the "any node accepts any request" promise also holds for list — without
+// this, list returns only the locally-owned subset and clients have to know
+// which node holds which sandbox to enumerate them.
+//
+// Per-peer requests carry X-Cluster-Forwarded: 1; each peer answers with its
+// own local list and never re-fans-out, so a malformed view (e.g. a peer that
+// thinks IT is the aggregator) cannot recurse. Per-peer errors degrade to
+// "log + skip" rather than failing the whole response — a partial list is
+// more useful than 5xx for an enumerate-everything call. The cap on
+// degradation is the per-peer 5s timeout: a slow peer can't stall the
+// response past that.
+//
+// Single-node mode (Cluster() == nil) and forwarded requests fall through to
+// the local handler unchanged so callers and tests see identical behavior to
+// the pre-cluster wire format.
+func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Cluster-Forwarded") == "1" {
+		h.listSandboxes(w, r)
+		return
+	}
+	if h.deps.Service == nil {
+		h.listSandboxes(w, r)
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		h.listSandboxes(w, r)
+		return
+	}
+
+	selfID := c.SelfNodeID()
+	peers := make([]cluster.Member, 0)
+	for _, m := range c.Members() {
+		if !m.Alive || m.NodeID == "" || m.NodeID == selfID || m.APIURL == "" {
+			continue
+		}
+		peers = append(peers, m)
+	}
+
+	local, err := h.deps.Service.ListSandboxes(r.Context())
+	if err != nil {
+		h.deps.Logger.Warn("cluster list: local list failed", "error", err)
+		local = nil
+	}
+
+	type peerResult struct {
+		nodeID    string
+		sandboxes []*models.Sandbox
+		err       error
+	}
+	results := make(chan peerResult, len(peers))
+	auth := r.Header.Get("Authorization")
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	for _, peer := range peers {
+		peer := peer
+		go func() {
+			endpoint := strings.TrimRight(peer.APIURL, "/") + "/v1/sandboxes"
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+			if err != nil {
+				results <- peerResult{nodeID: peer.NodeID, err: err}
+				return
+			}
+			req.Header.Set("X-Cluster-Forwarded", "1")
+			if auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				results <- peerResult{nodeID: peer.NodeID, err: err}
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+				results <- peerResult{nodeID: peer.NodeID, err: errors.New(strings.TrimSpace(string(body)))}
+				return
+			}
+			var sbs []*models.Sandbox
+			if err := json.NewDecoder(resp.Body).Decode(&sbs); err != nil {
+				results <- peerResult{nodeID: peer.NodeID, err: err}
+				return
+			}
+			results <- peerResult{nodeID: peer.NodeID, sandboxes: sbs}
+		}()
+	}
+
+	merged := make([]*models.Sandbox, 0, len(local))
+	seen := make(map[string]struct{}, len(local))
+	for _, sb := range local {
+		if sb == nil {
+			continue
+		}
+		seen[sb.ID] = struct{}{}
+		merged = append(merged, sb)
+	}
+	for i := 0; i < len(peers); i++ {
+		res := <-results
+		if res.err != nil {
+			h.deps.Logger.Warn("cluster list: peer query failed", "peer", res.nodeID, "error", res.err)
+			continue
+		}
+		for _, sb := range res.sandboxes {
+			if sb == nil {
+				continue
+			}
+			// Dedupe: a stopped sandbox may still appear in its previous
+			// owner's local store briefly after a failover, while the new
+			// owner already lists the recreated one under the same ID. Local
+			// wins because it's the freshest read for this node.
+			if _, dup := seen[sb.ID]; dup {
+				continue
+			}
+			seen[sb.ID] = struct{}{}
+			merged = append(merged, sb)
+		}
+	}
+
+	apihttp.WriteJSON(w, http.StatusOK, merged)
 }
 
 // clusterDestroyWrap runs the local destroy then deletes the placement
@@ -327,16 +449,19 @@ func (h *handlers) replicateRemoveExposedPort(ctx context.Context, id string, po
 }
 
 // capacityRequestFromCreate maps the wire CreateSandboxRequest into a
-// capacity.Request used for placement scoring. Defaults match the admission
-// floor so unspecified requests still produce a stable, comparable score.
+// capacity.Request used for placement scoring. Defaults track normalizeCreateRequest
+// (via models.DefaultCPU / DefaultMemoryMB) so the score we use to pick the
+// owner matches the reservation that will actually be charged once the local
+// create runs — otherwise a request gets placed on a host that admission then
+// rejects.
 func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
 	cpu := req.CPU
 	mem := req.MemoryMB
 	if cpu <= 0 {
-		cpu = 0.5
+		cpu = models.DefaultCPU
 	}
 	if mem <= 0 {
-		mem = 256
+		mem = models.DefaultMemoryMB
 	}
 	return capacity.Request{CPU: cpu, MemoryMB: mem}
 }

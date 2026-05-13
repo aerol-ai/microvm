@@ -219,6 +219,18 @@ type UpdateLifecycleRequest struct {
 	Lifecycle
 }
 
+// DefaultCPU, DefaultMemoryMB, DefaultDiskGB are the values normalizeCreateRequest
+// substitutes when the caller leaves them at zero. Exported so any code path that
+// has to reason about an un-normalized CreateSandboxRequest (placement scoring on
+// the way IN, failover-recreate target selection on the way OUT) uses the same
+// numbers — drift here causes placement to score against ghost capacity that
+// doesn't match the eventual admission reservation.
+const (
+	DefaultCPU      float64 = 1
+	DefaultMemoryMB int     = 1024
+	DefaultDiskGB   int     = 10
+)
+
 type CreateSandboxRequest struct {
 	Image string `json:"image"`
 	// CPU is the number of CPU cores to allocate. Fractional values are

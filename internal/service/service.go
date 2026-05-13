@@ -1571,13 +1571,13 @@ func (s *Service) StartReconcileLoop(ctx context.Context) {
 
 func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandboxRequest {
 	if req.CPU <= 0 {
-		req.CPU = 1
+		req.CPU = models.DefaultCPU
 	}
 	if req.MemoryMB <= 0 {
-		req.MemoryMB = 1024
+		req.MemoryMB = models.DefaultMemoryMB
 	}
 	if req.DiskGB <= 0 {
-		req.DiskGB = 10
+		req.DiskGB = models.DefaultDiskGB
 	}
 	if req.OSUser == "" {
 		req.OSUser = "root"

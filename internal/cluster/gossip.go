@@ -215,11 +215,20 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 	}
 }
 
-// members returns peer state, including self.
+// members returns peer state, including self. Self's metadata is sourced from
+// the local delegate (under its own mutex) rather than from the *memberlist.Node
+// pointer returned by ml.Members(): that pointer aliases internal state whose
+// Meta field is rewritten by memberlist.aliveNode every time our refresh loop
+// calls UpdateNode, which races with members() reads. memberlist exposes no
+// safe accessor for self's Meta, so we substitute self ourselves.
 func (g *gossipNode) members() []Member {
 	all := g.ml.Members()
 	out := make([]Member, 0, len(all))
 	for _, n := range all {
+		if n.Name == g.delegate.nodeID {
+			out = append(out, g.selfMember())
+			continue
+		}
 		m := Member{NodeID: n.Name, Alive: n.State == memberlist.StateAlive}
 		if n.Meta != nil {
 			var meta nodeMeta
@@ -235,6 +244,23 @@ func (g *gossipNode) members() []Member {
 		out = append(out, m)
 	}
 	return out
+}
+
+// selfMember snapshots the local node's advertised state from the delegate.
+// Always reports Alive=true — self can't observe itself dead, and any caller
+// asking "are we still in the cluster" should be using a different signal
+// (raft leadership / gossip peer count).
+func (g *gossipNode) selfMember() Member {
+	g.delegate.mu.RLock()
+	meta := g.delegate.selfMeta
+	g.delegate.mu.RUnlock()
+	return Member{
+		NodeID:   meta.NodeID,
+		APIURL:   meta.APIURL,
+		RaftAddr: meta.RaftAddr,
+		Alive:    true,
+		Capacity: meta.Capacity,
+	}
 }
 
 // peerByNodeID looks up a member's API URL by node ID. Returns "" if unknown.
