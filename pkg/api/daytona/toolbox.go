@@ -42,7 +42,7 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := strings.TrimPrefix(r.PathValue("path"), "/")
+	path := normalizeToolboxPath(r.PathValue("path"))
 	switch {
 	case r.Method == http.MethodGet && path == "":
 		h.forwardToolbox(w, r, sandboxID, "/")
@@ -81,6 +81,17 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 	default:
 		apihttp.WriteError(w, http.StatusNotImplemented, "daytona toolbox route not implemented")
 	}
+}
+
+func normalizeToolboxPath(path string) string {
+	trimmed := strings.Trim(strings.TrimSpace(path), "/")
+	if trimmed == "toolbox" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "toolbox/") {
+		return strings.TrimPrefix(trimmed, "toolbox/")
+	}
+	return trimmed
 }
 
 func (h *handlers) executeCommand(w http.ResponseWriter, r *http.Request, sandboxID string) {
