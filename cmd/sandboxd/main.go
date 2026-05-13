@@ -241,10 +241,30 @@ func localSandboxStates(ctx context.Context, svc *service.Service, logger *slog.
 		if sb == nil || sb.ID == "" {
 			continue
 		}
+		spec := specFromSandbox(svc, sb, logger)
+		// Seal credentials and redact the spec BEFORE handing it to the
+		// cluster — the cluster layer never sees plaintext registry passwords.
+		// On seal failure we still ship the placement (without secrets) so
+		// the cluster knows about the sandbox; the next failover-recreate
+		// will be unable to pull a private image, which the recreator logs
+		// loudly, but losing replication entirely would be worse.
+		var sealed []byte
+		if spec != nil {
+			s, err := svc.SealClusterSecrets(*spec)
+			if err != nil {
+				logger.Warn("cluster: seal secrets at boot replay failed; placement will ship without sealed bag",
+					"sandbox_id", sb.ID, "err", err)
+			} else {
+				sealed = s
+				redacted := service.RedactClusterSecrets(*spec)
+				spec = &redacted
+			}
+		}
 		out = append(out, cluster.LocalSandboxState{
-			ID:           sb.ID,
-			Spec:         specFromSandbox(svc, sb, logger),
-			ExposedPorts: portsFromSandbox(sb),
+			ID:            sb.ID,
+			Spec:          spec,
+			SealedSecrets: sealed,
+			ExposedPorts:  portsFromSandbox(sb),
 		})
 	}
 	return out, nil

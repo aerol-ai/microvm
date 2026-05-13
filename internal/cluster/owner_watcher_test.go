@@ -18,18 +18,19 @@ type recordingRecreator struct {
 }
 
 type recordedRecreate struct {
-	spec  models.CreateSandboxRequest
-	ports map[int]string
+	spec   models.CreateSandboxRequest
+	sealed []byte
+	ports  map[int]string
 }
 
 func newRecordingRecreator() *recordingRecreator {
 	return &recordingRecreator{calls: make(map[string]recordedRecreate)}
 }
 
-func (r *recordingRecreator) RecreateSandbox(_ context.Context, id string, spec models.CreateSandboxRequest, ports map[int]string) error {
+func (r *recordingRecreator) RecreateSandbox(_ context.Context, id string, spec models.CreateSandboxRequest, sealed []byte, ports map[int]string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls[id] = recordedRecreate{spec: spec, ports: ports}
+	r.calls[id] = recordedRecreate{spec: spec, sealed: sealed, ports: ports}
 	return r.err
 }
 

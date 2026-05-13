@@ -36,13 +36,14 @@ func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 	return PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}, nil
 }
 
-func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
+func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	return nil
 }
-func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
+func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	return nil
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
+func (n *Noop) SealedSecretsOf(sandboxID string) []byte              { return nil }
 func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error {
 	return nil
 }

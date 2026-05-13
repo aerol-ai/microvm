@@ -27,17 +27,27 @@ const (
 // command is the wire format for one raft log entry. Spec is non-nil for
 // opPlace (records the original creation request alongside the owner pointer)
 // and opUpsertSpec (records mutations like resize/lifecycle that must survive
-// failover). Port/Protocol carry one (port, protocol) tuple for opAddExposedPort
-// and opRemoveExposedPort — replicated as intent-only so the new owner picks a
-// fresh host port from its own pool.
+// failover). Spec MUST be redacted of plaintext credentials before encoding —
+// SealedSecrets carries the matching encrypted bag. Port/Protocol carry one
+// (port, protocol) tuple for opAddExposedPort and opRemoveExposedPort —
+// replicated as intent-only so the new owner picks a fresh host port from
+// its own pool.
+//
+// SealedSecrets follows the same preserve-on-nil rule as Spec at the FSM
+// level: an opPlace or opUpsertSpec that omits SealedSecrets does NOT erase
+// a previously-replicated bag. That lets resize/lifecycle write-throughs
+// (which never touch credentials) leave the sealed payload alone, and lets
+// boot-time replays that have a spec but lost track of the sealed bytes
+// avoid clobbering the original.
 type command struct {
-	Op          opCode                       `json:"op"`
-	SandboxID   string                       `json:"sandbox_id"`
-	OwnerNodeID string                       `json:"owner_node_id,omitempty"`
-	OwnerAPIURL string                       `json:"owner_api_url,omitempty"`
-	Spec        *models.CreateSandboxRequest `json:"spec,omitempty"`
-	Port        int                          `json:"port,omitempty"`
-	Protocol    string                       `json:"protocol,omitempty"`
+	Op            opCode                       `json:"op"`
+	SandboxID     string                       `json:"sandbox_id"`
+	OwnerNodeID   string                       `json:"owner_node_id,omitempty"`
+	OwnerAPIURL   string                       `json:"owner_api_url,omitempty"`
+	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SealedSecrets []byte                       `json:"sealed_secrets,omitempty"`
+	Port          int                          `json:"port,omitempty"`
+	Protocol      string                       `json:"protocol,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -86,7 +96,7 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		// CreateSandbox, so an idempotent retry that omits the spec must not
 		// erase a previously-recorded spec.
 		existing, exists := f.placements[cmd.SandboxID]
-		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil {
+		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && cmd.SealedSecrets == nil {
 			return nil
 		}
 		created := now
@@ -99,6 +109,12 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			// later opPlace that omits the payload.
 			spec = existing.Spec
 		}
+		// Same preservation rule as Spec: a partial replay must not erase the
+		// sealed credential bag the original create stored.
+		sealed := cmd.SealedSecrets
+		if sealed == nil && exists {
+			sealed = existing.SealedSecrets
+		}
 		var ports map[int]string
 		if exists {
 			// Same preservation rule as Spec: opPlace is the "owner + spec"
@@ -107,14 +123,15 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			ports = existing.ExposedPorts
 		}
 		f.placements[cmd.SandboxID] = Placement{
-			SandboxID:    cmd.SandboxID,
-			OwnerNodeID:  cmd.OwnerNodeID,
-			OwnerAPIURL:  cmd.OwnerAPIURL,
-			Version:      f.version,
-			CreatedUnix:  created,
-			UpdatedUnix:  now,
-			Spec:         spec,
-			ExposedPorts: ports,
+			SandboxID:     cmd.SandboxID,
+			OwnerNodeID:   cmd.OwnerNodeID,
+			OwnerAPIURL:   cmd.OwnerAPIURL,
+			Version:       f.version,
+			CreatedUnix:   created,
+			UpdatedUnix:   now,
+			Spec:          spec,
+			SealedSecrets: sealed,
+			ExposedPorts:  ports,
 		}
 		return nil
 	case opDelete:
@@ -141,10 +158,19 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			// failed locally if the sandbox truly doesn't exist.
 			return nil
 		}
-		if cmd.Spec == nil {
+		if cmd.Spec == nil && cmd.SealedSecrets == nil {
 			return nil
 		}
-		existing.Spec = cmd.Spec
+		if cmd.Spec != nil {
+			existing.Spec = cmd.Spec
+		}
+		// Replace the sealed bag only when the caller supplied one. Resize /
+		// lifecycle write-throughs leave it nil, preserving the original
+		// secrets — the only call sites that ship a fresh bag are create
+		// (opPlace, not here) and an explicit credential rotation.
+		if cmd.SealedSecrets != nil {
+			existing.SealedSecrets = cmd.SealedSecrets
+		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing

@@ -209,15 +209,27 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // poll doesn't re-issue ExposePort or emit a misleading "recreated" log on
 // every tick — the actual recreate path only runs on a true failover.
 //
+// sealedSecrets is the encrypted credential bag that the previous owner
+// stripped from spec before replicating it; we re-merge it here via
+// UnsealClusterSecrets so the recreated container can pull from the same
+// private registry / mount the same external storage. A decrypt failure is
+// fatal to this attempt but non-fatal globally — the watcher's retry loop
+// (now with reassign-after-K-failures) will eventually move the placement
+// to a node whose key matches.
+//
 // Port replay is best-effort: a failure on one port is logged and the others
 // still try. A transient failure (caddy not ready, L4 app still bootstrapping)
 // self-heals on the next tick — ExposePort is idempotent at the service layer
 // so a partial replay leaves the system in a consistent state.
-func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, exposedPorts map[int]string) error {
+func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]string) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		return nil
 	}
-	if _, err := s.CreateSandboxWithID(ctx, spec, id); err != nil {
+	merged, err := s.UnsealClusterSecrets(spec, sealedSecrets)
+	if err != nil {
+		return fmt.Errorf("recreate %s: %w", id, err)
+	}
+	if _, err := s.CreateSandboxWithID(ctx, merged, id); err != nil {
 		return err
 	}
 	for port, protocol := range exposedPorts {

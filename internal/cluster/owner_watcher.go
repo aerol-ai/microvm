@@ -99,7 +99,14 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 				ports[k] = v
 			}
 		}
-		if err := r.RecreateSandbox(ctx, id, spec, ports); err != nil {
+		// Pass the sealed credential bag through unchanged — only the service
+		// holds the cipher and is allowed to peek inside.
+		var sealed []byte
+		if len(p.SealedSecrets) > 0 {
+			sealed = make([]byte, len(p.SealedSecrets))
+			copy(sealed, p.SealedSecrets)
+		}
+		if err := r.RecreateSandbox(ctx, id, spec, sealed, ports); err != nil {
 			fails := c.recreateFailures.record(id)
 			c.logger.Warn("cluster: recreate owned sandbox failed",
 				"sandbox_id", id, "consecutive_failures", fails, "err", err)

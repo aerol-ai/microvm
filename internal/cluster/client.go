@@ -221,31 +221,57 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 // applyCommand transparently forwards to the current leader if we're a
 // follower. Passing spec=nil preserves a previously-recorded spec — see
 // fsm.go opPlace handling.
-func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
+//
+// spec MUST be redacted before being passed in; sealedSecrets is the opaque
+// encrypted bag the caller produces via service.SealClusterSecrets. Passing
+// sealedSecrets=nil preserves a previously-recorded bag.
+func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	cmd := command{
-		Op:          opPlace,
-		SandboxID:   sandboxID,
-		OwnerNodeID: c.nodeID,
-		OwnerAPIURL: c.apiURL,
-		Spec:        spec,
+		Op:            opPlace,
+		SandboxID:     sandboxID,
+		OwnerNodeID:   c.nodeID,
+		OwnerAPIURL:   c.apiURL,
+		Spec:          spec,
+		SealedSecrets: sealedSecrets,
 	}
 	return c.applyCommand(ctx, cmd)
 }
 
 // UpsertSpec replicates a sandbox spec mutation (resize, lifecycle change)
-// without changing ownership. Idempotent; nil spec is a no-op. Safe to call
-// from any node — applyCommand forwards to the leader as needed.
-func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error {
-	if spec == nil {
+// without changing ownership. Idempotent; nil spec + nil sealedSecrets is a
+// no-op. Safe to call from any node — applyCommand forwards to the leader as
+// needed.
+//
+// spec MUST be redacted; sealedSecrets=nil preserves the previously
+// replicated bag (resize/lifecycle never change credentials).
+func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+	if spec == nil && sealedSecrets == nil {
 		return nil
 	}
-	cmd := command{Op: opUpsertSpec, SandboxID: sandboxID, Spec: spec}
+	cmd := command{Op: opUpsertSpec, SandboxID: sandboxID, Spec: spec, SealedSecrets: sealedSecrets}
 	return c.applyCommand(ctx, cmd)
 }
 
+// SealedSecretsOf returns a copy of the sealed credential bag paired with
+// SpecOf's spec. Returns nil when there's no placement, no sealed bag, or
+// the placement pre-dates secrets sealing. Caller-mutation is safe (the
+// returned slice is a fresh copy).
+func (c *Cluster) SealedSecretsOf(sandboxID string) []byte {
+	p, ok := c.fsm.get(sandboxID)
+	if !ok || len(p.SealedSecrets) == 0 {
+		return nil
+	}
+	out := make([]byte, len(p.SealedSecrets))
+	copy(out, p.SealedSecrets)
+	return out
+}
+
 // SpecOf returns a deep-copy of the replicated spec for sandboxID, or nil if
-// none is recorded. Callers may safely mutate the returned struct (it shares
-// no memory with the FSM).
+// none is recorded. The returned spec is REDACTED — registry passwords and
+// mount credentials are stripped at write time. Use SealedSecretsOf to
+// retrieve the matching sealed bag and service.UnsealClusterSecrets to merge
+// credentials back in. Callers may safely mutate the returned struct (it
+// shares no memory with the FSM).
 func (c *Cluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 	p, ok := c.fsm.get(sandboxID)
 	if !ok || p.Spec == nil {
@@ -351,14 +377,17 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			// Either no placement exists or another node thinks they own this
 			// sandbox (unlikely but possible after a split-brain recovery). In
 			// both cases we (re)claim — this node has the sandbox locally so
-			// it IS the owner. Pass spec so the placement is born recoverable.
-			if err := c.RecordPlacement(ctx, st.ID, st.Spec); err != nil && firstErr == nil {
+			// it IS the owner. Pass spec + sealed secrets so the placement is
+			// born recoverable.
+			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		} else if needsSpecBackfill {
 			// Existing placement, no spec yet — attach one so future failover
-			// can recreate this pre-cluster sandbox.
-			if err := c.UpsertSpec(ctx, st.ID, st.Spec); err != nil && firstErr == nil {
+			// can recreate this pre-cluster sandbox. Pass sealed secrets too
+			// so the failover doesn't lose the user's private-registry creds
+			// the moment the spec is backfilled.
+			if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

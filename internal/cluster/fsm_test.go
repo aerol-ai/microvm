@@ -286,3 +286,78 @@ func TestFSMSnapshotRestoreRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestFSMPreservesSealedSecrets covers the preserve-on-nil semantics for the
+// sealed-secrets bag: write-through paths that don't touch credentials (resize,
+// lifecycle, idempotent retries) must not erase the bag a previous opPlace
+// stored. Without this, a single opUpsertSpec replay would silently drop the
+// only copy of the registry password / mount creds the new owner needs at
+// failover.
+func TestFSMPreservesSealedSecrets(t *testing.T) {
+	fsm := newPlacementFSM()
+	sealed := []byte("ciphertext-blob-v1")
+
+	// 1. Initial opPlace stores spec + sealed bag.
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
+		SealedSecrets: sealed,
+	})
+	if got := fsm.Apply(&raft.Log{Data: place}); got != nil {
+		t.Fatalf("opPlace: %v", got)
+	}
+	p, _ := fsm.get("sb1")
+	if !bytes.Equal(p.SealedSecrets, sealed) {
+		t.Fatalf("opPlace did not store SealedSecrets: %x", p.SealedSecrets)
+	}
+
+	// 2. opUpsertSpec with a NEW spec but nil SealedSecrets must keep the
+	// existing bag — resize/lifecycle replication takes this code path.
+	upsert, _ := encodeCommand(command{
+		Op: opUpsertSpec, SandboxID: "sb1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2, MemoryMB: 512},
+	})
+	if got := fsm.Apply(&raft.Log{Data: upsert}); got != nil {
+		t.Fatalf("opUpsertSpec: %v", got)
+	}
+	p, _ = fsm.get("sb1")
+	if p.Spec == nil || p.Spec.CPU != 2 {
+		t.Fatalf("opUpsertSpec didn't update spec: %+v", p.Spec)
+	}
+	if !bytes.Equal(p.SealedSecrets, sealed) {
+		t.Fatalf("opUpsertSpec erased SealedSecrets: got %x, want %x", p.SealedSecrets, sealed)
+	}
+
+	// 3. Idempotent opPlace retry (no Spec, no SealedSecrets) must keep both.
+	retry, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a",
+	})
+	if got := fsm.Apply(&raft.Log{Data: retry}); got != nil {
+		t.Fatalf("opPlace retry: %v", got)
+	}
+	p, _ = fsm.get("sb1")
+	if !bytes.Equal(p.SealedSecrets, sealed) {
+		t.Fatalf("idempotent opPlace erased SealedSecrets: %x", p.SealedSecrets)
+	}
+	if p.Spec == nil || p.Spec.CPU != 2 {
+		t.Fatalf("idempotent opPlace erased spec: %+v", p.Spec)
+	}
+
+	// 4. opUpsertSpec with a NEW sealed bag but nil Spec must rotate the bag
+	// while keeping the spec — used if we ever rotate creds without touching
+	// resources.
+	rotated := []byte("ciphertext-blob-v2")
+	upsertSealed, _ := encodeCommand(command{
+		Op: opUpsertSpec, SandboxID: "sb1", SealedSecrets: rotated,
+	})
+	if got := fsm.Apply(&raft.Log{Data: upsertSealed}); got != nil {
+		t.Fatalf("opUpsertSpec sealed-only: %v", got)
+	}
+	p, _ = fsm.get("sb1")
+	if !bytes.Equal(p.SealedSecrets, rotated) {
+		t.Fatalf("opUpsertSpec didn't rotate SealedSecrets: %x", p.SealedSecrets)
+	}
+	if p.Spec == nil || p.Spec.CPU != 2 {
+		t.Fatalf("sealed-only upsert erased spec: %+v", p.Spec)
+	}
+}

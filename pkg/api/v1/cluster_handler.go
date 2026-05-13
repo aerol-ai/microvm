@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -131,9 +132,25 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	// Replicate the original spec alongside the placement pointer so a future
-	// owner can recreate this sandbox if the current owner dies.
-	specCopy := req
-	if err := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &specCopy); err != nil {
+	// owner can recreate this sandbox if the current owner dies. Secrets
+	// (registry password, mount creds) are sealed into a separate encrypted
+	// bag and the spec is redacted before going on the wire — the raft log
+	// must NOT carry plaintext credentials.
+	sealed, err := h.deps.Service.SealClusterSecrets(req)
+	if err != nil {
+		h.deps.Logger.Error("cluster: seal secrets failed; rolling back create",
+			"sandbox_id", resp.Sandbox.ID, "err", err)
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
+			h.deps.Logger.Error("cluster: rollback destroy failed",
+				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
+		}
+		rbCancel()
+		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: seal secrets: "+err.Error())
+		return
+	}
+	redacted := service.RedactClusterSecrets(req)
+	if err := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, sealed); err != nil {
 		h.deps.Logger.Error("cluster: RecordPlacement failed; rolling back create",
 			"sandbox_id", resp.Sandbox.ID, "err", err)
 		// Use a fresh context — the request context may already be cancelled
@@ -406,7 +423,11 @@ func (h *handlers) replicateSpecPatch(ctx context.Context, id string, patch func
 	patch(spec)
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.UpsertSpec(commitCtx, id, spec); err != nil {
+	// Pass nil for sealedSecrets — resize / lifecycle never touch credentials,
+	// so preserving the existing sealed bag is correct (and required: re-sealing
+	// here would silently drop the bag because spec is already redacted, so
+	// SealClusterSecrets would return nil-nil and overwrite the original).
+	if err := c.UpsertSpec(commitCtx, id, spec, nil); err != nil {
 		h.deps.Logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
 			"sandbox_id", id, "err", err)
 	}

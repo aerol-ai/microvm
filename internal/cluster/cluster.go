@@ -56,19 +56,28 @@ var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned
 // after its previous owner died (see owner_watcher.go). Spec is a pointer so
 // older snapshots written before spec replication still decode cleanly.
 //
+// SealedSecrets carries the encrypted credential bag (registry password,
+// per-mount credentials) that was stripped from Spec before replication.
+// The cluster never decrypts it — the service layer (which holds the
+// pkg/secrets cipher) re-merges credentials into Spec on recreate. The
+// payload is sealed by service.SealClusterSecrets / opened by
+// service.UnsealClusterSecrets; the schema is the latter's responsibility,
+// not the cluster's. Empty when the original create had no credentials.
+//
 // ExposedPorts is the replicated set of port→protocol intents; the host port
 // and public URL are deliberately not replicated because they're allocated
 // per-host. The new owner re-runs ExposePort for each entry after recreate so
 // caddy/L4 routes get rebuilt with whatever host port the new node picks.
 type Placement struct {
-	SandboxID    string                       `json:"sandbox_id"`
-	OwnerNodeID  string                       `json:"owner_node_id"`
-	OwnerAPIURL  string                       `json:"owner_api_url"`
-	Version      uint64                       `json:"version"`
-	CreatedUnix  int64                        `json:"created_unix"`
-	UpdatedUnix  int64                        `json:"updated_unix"`
-	Spec         *models.CreateSandboxRequest `json:"spec,omitempty"`
-	ExposedPorts map[int]string               `json:"exposed_ports,omitempty"`
+	SandboxID     string                       `json:"sandbox_id"`
+	OwnerNodeID   string                       `json:"owner_node_id"`
+	OwnerAPIURL   string                       `json:"owner_api_url"`
+	Version       uint64                       `json:"version"`
+	CreatedUnix   int64                        `json:"created_unix"`
+	UpdatedUnix   int64                        `json:"updated_unix"`
+	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SealedSecrets []byte                       `json:"sealed_secrets,omitempty"`
+	ExposedPorts  map[int]string               `json:"exposed_ports,omitempty"`
 }
 
 // Member is a snapshot of a peer's gossiped state.
@@ -86,10 +95,18 @@ type Member struct {
 // this, sandboxes that pre-date cluster mode (or pre-date the spec/ports
 // replication features) would never gain a replicated spec until their next
 // mutating call.
+//
+// Spec MUST be redacted (no plaintext registry password / mount credentials)
+// before being handed to AssertOwnership; SealedSecrets carries the encrypted
+// bag that the new owner re-merges on recreate. cmd/sandboxd takes care of
+// this via service.SealClusterSecrets + RedactClusterSecrets so the cluster
+// layer never sees plaintext. SealedSecrets may be empty when the sandbox
+// has no secrets to ship.
 type LocalSandboxState struct {
-	ID           string
-	Spec         *models.CreateSandboxRequest
-	ExposedPorts map[int]string
+	ID            string
+	Spec          *models.CreateSandboxRequest
+	SealedSecrets []byte
+	ExposedPorts  map[int]string
 }
 
 // PlacementTarget is returned by SelectPlacement.
@@ -122,8 +139,15 @@ type OwnerInfo struct {
 // Implementations MUST be idempotent: the watcher polls and may invoke
 // RecreateSandbox multiple times for the same id while a previous attempt is
 // still in flight or after an unexpected restart.
+//
+// sealedSecrets is the opaque encrypted bag that was stripped from the spec
+// before replication (see Placement.SealedSecrets). The implementation is
+// expected to decrypt and re-merge it back into spec before instantiating
+// the container — without this step, recreated sandboxes would lose access
+// to the user's private registry / mount credentials. May be empty when
+// the original create supplied no credentials.
 type SandboxRecreator interface {
-	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, exposedPorts map[int]string) error
+	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]string) error
 }
 
 // Client is the surface the rest of the daemon (Service, API handlers)
@@ -149,19 +173,38 @@ type Client interface {
 	// passing spec=nil preserves any spec that was previously replicated for
 	// this id (so a boot-time replay can't erase a richer record written by
 	// the original CreateSandbox call).
-	RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error
+	//
+	// spec MUST be redacted (no plaintext credentials) before being passed in;
+	// sealedSecrets is the opaque encrypted credential bag produced by the
+	// service layer. Passing sealedSecrets=nil preserves any sealed bag
+	// previously replicated for this id (mirrors the spec-preservation rule —
+	// a boot-time replay that has the spec but not the secrets can't erase the
+	// secrets the original CreateSandbox stored).
+	RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error
 
 	// UpsertSpec replaces the replicated spec for sandboxID without touching
 	// ownership. Mutating handlers (resize, lifecycle) call this after a
 	// successful local mutation so the FSM stays current — otherwise a
 	// failover-recreated sandbox would revert to its create-time shape.
-	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest) error
+	//
+	// spec MUST be redacted. sealedSecrets=nil preserves the previously
+	// replicated bag — resize/lifecycle never touch credentials, so passing
+	// nil is the right choice for those callers; the "real" secrets are only
+	// re-shipped when the user re-runs create or rotates them explicitly.
+	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error
 
 	// SpecOf returns the most-recently-replicated CreateSandboxRequest for
 	// sandboxID, or nil if no spec is recorded (pre-cluster sandbox, or no
-	// placement). Callers use this as the read half of a read-modify-write
-	// pattern when patching a single field via UpsertSpec.
+	// placement). The returned spec is REDACTED — no plaintext secrets. Use
+	// SealedSecretsOf to retrieve the matching sealed bag if you need to
+	// reconstruct the full spec for a recreate.
 	SpecOf(sandboxID string) *models.CreateSandboxRequest
+
+	// SealedSecretsOf returns the sealed credential bag that was paired with
+	// SpecOf's spec when the placement was last written. Empty when the
+	// sandbox was created without any private-registry / mount credentials,
+	// or when the placement pre-dates the secret-sealing work.
+	SealedSecretsOf(sandboxID string) []byte
 
 	// AddExposedPort records intent that sandboxID has port exposed under
 	// protocol. Replicated as intent only — the new owner allocates its own
