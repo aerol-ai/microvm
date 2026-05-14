@@ -1463,6 +1463,88 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 	}
 }
 
+// StartBuiltImageGC launches the periodic janitor that removes locally-built
+// images (BuiltImageNamespace, i.e. "aerolvm-build/*") that are no longer
+// referenced by any active sandbox AND were created more than the configured
+// TTL ago. Without this, two failure modes leak images forever:
+//
+//   - POST /v2/images/build called standalone (no follow-up CreateSandbox).
+//   - Build succeeded, CreateSandbox failed AND the daytona facade's inline
+//     rollback couldn't reach the daemon (e.g. server-side panic, dropped
+//     connection between build success and rollback call).
+//
+// The TTL keeps the janitor from racing the dominant build+create flow: an
+// image built moments ago must clear ImageBuildGCTTL before it's eligible,
+// so a transient network hiccup between build and create can't have the
+// janitor yanking an image the client is about to consume.
+//
+// No-op if ImageBuildGCEnabled is false or ImageBuildGCInterval <= 0.
+func (s *Service) StartBuiltImageGC(ctx context.Context) {
+	if !s.cfg.ImageBuildGCEnabled {
+		return
+	}
+	interval := s.cfg.ImageBuildGCInterval
+	if interval <= 0 {
+		return
+	}
+	if s.events == nil {
+		s.logger.Warn("built-image GC disabled: docker events client is nil")
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				s.runBuiltImageGC(sweepCtx, s.events.ListBuiltImages)
+				cancel()
+			}
+		}
+	}()
+}
+
+// builtImageListFn is the indirection runBuiltImageGC takes so tests can
+// supply a synthetic image list without standing up a Docker daemon. The
+// only production caller is StartBuiltImageGC, which always passes
+// s.events.ListBuiltImages.
+type builtImageListFn func(ctx context.Context) ([]docker.BuiltImage, error)
+
+// runBuiltImageGC is one pass of the built-image janitor. Idempotent: every
+// removal decision is gated by an indexed Store.HasActiveImageRef check, so
+// a sandbox created between list-time and remove-time is protected (the
+// store sees its row before we ask). Failures are logged, not returned —
+// the janitor must not block on a bad image; the next tick will retry.
+func (s *Service) runBuiltImageGC(ctx context.Context, list builtImageListFn) {
+	images, err := list(ctx)
+	if err != nil {
+		s.logger.Warn("built-image gc list failed", "error", err)
+		return
+	}
+	cutoff := time.Now().UTC().Add(-s.cfg.ImageBuildGCTTL)
+	for _, img := range images {
+		if img.CreatedAt.After(cutoff) {
+			continue
+		}
+		referenced, err := s.store.HasActiveImageRef(ctx, img.Tag)
+		if err != nil {
+			s.logger.Warn("built-image gc ref check failed", "tag", img.Tag, "error", err)
+			continue
+		}
+		if referenced {
+			continue
+		}
+		if err := s.docker.RemoveImage(ctx, img.Tag); err != nil {
+			s.logger.Warn("built-image gc remove failed", "tag", img.Tag, "error", err)
+			continue
+		}
+		s.logger.Info("audit built image gc removed", "tag", img.Tag, "created_at", img.CreatedAt)
+	}
+}
+
 func (s *Service) StartReconcileLoop(ctx context.Context) {
 	interval := s.cfg.ReconcileInterval
 	if interval <= 0 {

@@ -232,3 +232,56 @@ func (c *Client) ImageExists(ctx context.Context, imageRef string) (bool, error)
 	}
 	return false, err
 }
+
+// BuiltImage is the slice of Docker's image-list payload that the built-image
+// janitor needs: one of the locally-built image's RepoTags (always in the
+// BuiltImageNamespace) plus when the daemon reported it was created. Multiple
+// RepoTags per image are possible if the same content was tagged twice; we
+// surface each tag as its own BuiltImage so the GC decision is per-tag.
+type BuiltImage struct {
+	// Tag is one of the image's RepoTags, qualified (e.g.
+	// "aerolvm-build/abc123:latest").
+	Tag string
+	// CreatedAt is the daemon-reported creation time, UTC.
+	CreatedAt time.Time
+}
+
+// ListBuiltImages returns every locally-built image (tags in
+// BuiltImageNamespace) the daemon currently holds. The janitor uses this
+// to find candidates for unreferenced-and-old removal.
+//
+// We filter server-side by reference so the API call only returns matching
+// images — much cheaper than pulling the whole image list and filtering
+// client-side on a daemon that may hold hundreds of base images.
+func (c *Client) ListBuiltImages(ctx context.Context) ([]BuiltImage, error) {
+	filters, err := json.Marshal(map[string][]string{
+		"reference": {BuiltImageNamespace + "/*"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal filters: %w", err)
+	}
+	query := url.Values{}
+	query.Set("filters", string(filters))
+
+	var payload []struct {
+		RepoTags []string `json:"RepoTags"`
+		Created  int64    `json:"Created"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/images/json", query, nil, nil, &payload); err != nil {
+		return nil, fmt.Errorf("list built images: %w", err)
+	}
+
+	out := make([]BuiltImage, 0, len(payload))
+	for _, entry := range payload {
+		created := time.Unix(entry.Created, 0).UTC()
+		for _, tag := range entry.RepoTags {
+			if !strings.HasPrefix(tag, BuiltImageNamespace+"/") {
+				// Docker's reference filter is glob-y; defensively skip anything
+				// outside our namespace so an aliased tag can't get GC'd.
+				continue
+			}
+			out = append(out, BuiltImage{Tag: tag, CreatedAt: created})
+		}
+	}
+	return out, nil
+}

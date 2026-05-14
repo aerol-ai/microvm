@@ -135,6 +135,7 @@ func main() {
 	}
 	svc.StartLifecycleSweep(ctx)
 	svc.StartEventMonitor(ctx)
+	svc.StartBuiltImageGC(ctx)
 
 	if cfg.EnableSSHGateway {
 		gw, err := sshgateway.New(logger, sshgateway.Config{

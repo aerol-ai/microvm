@@ -129,6 +129,28 @@ type Config struct {
 	ImageBuildRegistry         string
 	ImageBuildRegistryUsername string
 	ImageBuildRegistryPassword string
+
+	// ImageBuildGCEnabled toggles the periodic janitor that sweeps
+	// locally-built images (BuiltImageNamespace, i.e. "aerolvm-build/*")
+	// that are no longer referenced by any active sandbox AND were created
+	// more than ImageBuildGCTTL ago. Without this, images produced by
+	// standalone POST /v2/images/build calls or by builds whose followup
+	// CreateSandbox failed accumulate forever — service.maybeRemoveImage
+	// only runs on sandbox destroy and so can't see images that never had
+	// a sandbox row.
+	ImageBuildGCEnabled bool
+	// ImageBuildGCInterval is how often the janitor ticker fires. Default
+	// 10m: cheap enough (one filtered /images/json call + one indexed store
+	// lookup per match) that running it more often would only matter if
+	// builds were churning faster than the TTL — which would itself be a
+	// signal something is wrong upstream.
+	ImageBuildGCInterval time.Duration
+	// ImageBuildGCTTL is the minimum age a built image must reach before
+	// it becomes eligible for removal. Default 1h: comfortably longer than
+	// any reasonable retry/network-blip between build and create, so a
+	// transient hiccup doesn't have the janitor yanking an image a client
+	// is about to use.
+	ImageBuildGCTTL time.Duration
 }
 
 func Load() (Config, error) {
@@ -191,6 +213,9 @@ func Load() (Config, error) {
 		ImageBuildRegistry:         strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY")),
 		ImageBuildRegistryUsername: strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY_USERNAME")),
 		ImageBuildRegistryPassword: strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY_PASSWORD")),
+		ImageBuildGCEnabled:        getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:       getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:            getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
 	}
 
 	if cfg.PATToken == "" {
