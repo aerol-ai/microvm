@@ -11,12 +11,15 @@ import (
 )
 
 // ImageBuilder is the slice of pkg/docker.Client v1 needs to compile an
-// Image-builder graph into a content-addressed local image tag. Declared as
-// an interface so the test harness can stub it without standing up a real
-// Docker daemon. Same shape as the daytona facade's analogue.
+// Image-builder graph into a content-addressed local image tag, and
+// optionally push the result to a remote registry. Declared as an
+// interface so the test harness can stub it without standing up a real
+// Docker daemon. PushImage is v1-only — the Daytona facade interface
+// deliberately omits it to keep its surface aligned with upstream Daytona.
 type ImageBuilder interface {
 	BuildImage(ctx context.Context, req docker.BuildImageRequest) error
 	ImageExists(ctx context.Context, imageRef string) (bool, error)
+	PushImage(ctx context.Context, req docker.PushImageRequest) (string, error)
 }
 
 // BuildConfig mirrors the operator-configured image-build knobs.

@@ -24,6 +24,9 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
+import ai.aerol.microvm.model.BuildImageOptions;
+import ai.aerol.microvm.model.BuildImagePushOptions;
+import ai.aerol.microvm.model.BuildImageResult;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.ExecExitInfo;
@@ -127,11 +130,40 @@ public class MicroVMClient {
     }
 
     public String buildImage(Image image) {
+        return buildImage(image, null).image;
+    }
+
+    /**
+     * Build an Image and optionally push the result to a remote registry.
+     * When {@code options.push} is set, push credentials are forwarded to the
+     * daemon as a one-shot {@code X-Registry-Auth} header on the underlying
+     * push call and are never persisted server-side.
+     */
+    public BuildImageResult buildImage(Image image, BuildImageOptions options) {
         if (image == null) {
             throw new MicroVMException("image is required");
         }
+        BuildImageRequest body = new BuildImageRequest(image.getDockerfile());
+        if (options != null && options.push != null) {
+            BuildImagePushOptions push = options.push;
+            String registry = push.registry == null ? "" : push.registry.trim();
+            if (registry.isEmpty()) {
+                throw new MicroVMException("push.registry is required when push is set");
+            }
+            if (push.username == null || push.username.isEmpty()
+                || push.password == null || push.password.isEmpty()) {
+                throw new MicroVMException("push.username and push.password are required when push is set");
+            }
+            BuildImagePushSpec spec = new BuildImagePushSpec();
+            spec.registry = registry;
+            spec.tag = isNullOrEmpty(push.tag) ? null : push.tag.trim();
+            spec.server = isNullOrEmpty(push.server) ? null : push.server.trim();
+            spec.username = push.username;
+            spec.password = push.password;
+            body.push = spec;
+        }
         String path = versioned("/images/build");
-        HttpResponse<byte[]> response = sendJsonRequest("POST", path, new BuildImageRequest(image.getDockerfile()));
+        HttpResponse<byte[]> response = sendJsonRequest("POST", path, body);
         if (response.statusCode() == 404) {
             throw new MicroVMException(
                 "this daemon does not support Image builds (POST " + path
@@ -140,7 +172,15 @@ public class MicroVMClient {
         }
         ensureSuccess(response);
         BuildImageResponse payload = JsonSupport.read(response.body(), BuildImageResponse.class);
-        return payload == null || payload.image == null ? "" : payload.image;
+        if (payload == null) {
+            return new BuildImageResult("", null);
+        }
+        String pushed = isNullOrEmpty(payload.pushed) ? null : payload.pushed;
+        return new BuildImageResult(payload.image == null ? "" : payload.image, pushed);
+    }
+
+    private static boolean isNullOrEmpty(String s) {
+        return s == null || s.isEmpty();
     }
 
     public List<Sandbox> list() {
@@ -272,14 +312,24 @@ public class MicroVMClient {
 
     static class BuildImageRequest {
         public final String dockerfileContent;
+        public BuildImagePushSpec push;
 
         BuildImageRequest(String dockerfileContent) {
             this.dockerfileContent = dockerfileContent;
         }
     }
 
+    static class BuildImagePushSpec {
+        public String registry;
+        public String tag;
+        public String server;
+        public String username;
+        public String password;
+    }
+
     static class BuildImageResponse {
         public String image;
+        public String pushed;
     }
 
     public void reconcile() {

@@ -6,6 +6,33 @@ export interface RegistryAuth {
   password: string;
 }
 
+/**
+ * Per-request push directive for `MicroVM.buildImage`. Credentials are
+ * forwarded to the daemon as a one-shot `X-Registry-Auth` header on the
+ * push call and are never persisted.
+ */
+export interface BuildImagePushOptions {
+  /** Destination repository, e.g. "ghcr.io/my-org/my-image". */
+  registry: string;
+  /** Destination tag. Defaults to "latest" on the daemon when omitted. */
+  tag?: string;
+  /** Registry serveraddress, e.g. "ghcr.io". Sent inside X-Registry-Auth. */
+  server?: string;
+  username: string;
+  password: string;
+}
+
+export interface BuildImageOptions {
+  push?: BuildImagePushOptions;
+}
+
+export interface BuildImageResult {
+  /** Local content-addressed tag (always returned). */
+  image: string;
+  /** Pushed reference, e.g. "ghcr.io/my-org/my-image:v1.2.3". */
+  pushed?: string;
+}
+
 export type MountType = "s3" | "nfs" | "sshfs" | "rclone";
 
 export interface MountSpec {

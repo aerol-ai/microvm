@@ -16,6 +16,26 @@ class RegistryAuth(TypedDict, total=False):
     password: str
 
 
+class BuildImagePushOptions(TypedDict, total=False):
+    """Per-request push directive for :meth:`Client.build_image_with_push`.
+
+    Credentials are forwarded to the daemon as a one-shot ``X-Registry-Auth``
+    header on the underlying push call and are never persisted server-side.
+    """
+
+    registry: str  # required: e.g. "ghcr.io/my-org/my-image"
+    tag: str       # optional: defaults to "latest" on the daemon
+    server: str    # optional: serveraddress in X-Registry-Auth
+    username: str  # required
+    password: str  # required
+
+
+@dataclass(frozen=True)
+class BuildImageResult:
+    image: str
+    pushed: Optional[str] = None
+
+
 class MountSpec(TypedDict, total=False):
     type: MountType
     target: str

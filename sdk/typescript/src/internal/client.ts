@@ -4,6 +4,8 @@ import { PATH_PREFIX as V1_PATH_PREFIX } from "./api/v1/paths.js";
 import { Image } from "../Image.js";
 import type {
   BinaryLike,
+  BuildImageOptions,
+  BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
   ExecExitInfo,
@@ -236,17 +238,42 @@ export class APIClient {
    * caller to pass a string image instead, rather than the generic "request
    * failed with status 404" the JSON decoder would otherwise produce.
    */
-  async buildImage(image: Image): Promise<string> {
+  async buildImage(image: Image, options?: BuildImageOptions): Promise<BuildImageResult> {
+    const body: {
+      dockerfile_content: string;
+      push?: {
+        registry: string;
+        tag?: string;
+        server?: string;
+        username: string;
+        password: string;
+      };
+    } = { dockerfile_content: image.dockerfile };
+    if (options?.push) {
+      const p = options.push;
+      if (!p.registry) {
+        throw new Error("buildImage: push.registry is required when push is set");
+      }
+      if (!p.username || !p.password) {
+        throw new Error("buildImage: push.username and push.password are required when push is set");
+      }
+      body.push = {
+        registry: p.registry,
+        tag: p.tag,
+        server: p.server,
+        username: p.username,
+        password: p.password,
+      };
+    }
     const response = await this.request(
       "POST",
       "/v1/images/build",
       {
-        body: JSON.stringify({ dockerfile_content: image.dockerfile }),
+        body: JSON.stringify(body),
         headers: { "Content-Type": "application/json" },
       },
     );
     if (response.status === 404) {
-      // Drain the body so the connection can be reused.
       await response.text().catch(() => undefined);
       throw new Error(
         "this daemon does not support Image builds (POST /v1/images/build is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
@@ -255,8 +282,8 @@ export class APIClient {
     if (!response.ok) {
       throw await decodeError(response);
     }
-    const payload = (await response.json()) as { image: string };
-    return payload.image;
+    const payload = (await response.json()) as { image: string; pushed?: string };
+    return { image: payload.image, pushed: payload.pushed };
   }
 
   private async resolveImage(options: CreateOptions): Promise<CreateOptions & { image: string }> {
@@ -266,8 +293,8 @@ export class APIClient {
     if (!(options.image instanceof Image)) {
       throw new TypeError("CreateOptions.image must be a string or Image");
     }
-    const tag = await this.buildImage(options.image);
-    return { ...options, image: tag };
+    const result = await this.buildImage(options.image);
+    return { ...options, image: result.image };
   }
 
   async list(): Promise<SandboxResource[]> {

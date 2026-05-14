@@ -623,6 +623,46 @@ test("internal client create with Image builds first then creates", async () => 
   assert.deepEqual(seenRequests[1].body, { image: "aerolvm-build/abc123:latest" });
 });
 
+test("internal client buildImage forwards push options and returns pushed ref", async () => {
+  const seenBodies: any[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seenBodies.push(await req.json());
+      return jsonResponse({ image: "aerolvm-build/abc123:latest", pushed: "ghcr.io/x/y:v1" });
+    },
+  });
+
+  const result = await client.buildImage(Image.base("alpine"), {
+    push: { registry: "ghcr.io/x/y", tag: "v1", server: "ghcr.io", username: "u", password: "p" },
+  });
+  assert.equal(result.image, "aerolvm-build/abc123:latest");
+  assert.equal(result.pushed, "ghcr.io/x/y:v1");
+  assert.deepEqual(seenBodies[0].push, {
+    registry: "ghcr.io/x/y",
+    tag: "v1",
+    server: "ghcr.io",
+    username: "u",
+    password: "p",
+  });
+});
+
+test("internal client buildImage rejects push without credentials", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ image: "x" }),
+  });
+  await assert.rejects(
+    client.buildImage(Image.base("alpine"), {
+      push: { registry: "ghcr.io/x/y", username: "", password: "p" },
+    }),
+    /push.username and push.password are required/,
+  );
+});
+
 test("internal client buildImage maps 404 to actionable error", async () => {
   const client = new APIClient({
     baseURL: "https://api.example.com",

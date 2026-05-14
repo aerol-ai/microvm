@@ -219,6 +219,138 @@ func BuildTagFor(dockerfile string, contextHashes []string) string {
 	return BuiltImageNamespace + "/" + digest + ":latest"
 }
 
+// PushImageRequest is the input to (*Client).PushImage. SourceTag is the
+// local image (typically an aerolvm-build/<sha>:latest tag returned by
+// BuildImage). DestRef is the fully-qualified destination, e.g.
+// "ghcr.io/my-org/my-image:v1.2.3"; if no ":tag" is present, "latest" is
+// used. Auth is request-scoped credentials — they are sent to the daemon
+// as a one-shot X-Registry-Auth header and never persisted.
+type PushImageRequest struct {
+	SourceTag string
+	DestRef   string
+	Auth      models.RegistryAuth
+	OnLog     func(line string)
+}
+
+// PushImage tags SourceTag as DestRef and pushes the result to the
+// destination registry. Returns the canonical "repo:tag" that was pushed.
+//
+// Credentials are passed through per-call via X-Registry-Auth; nothing is
+// written to the daemon's auth config and nothing is logged. The local
+// SourceTag is preserved after a successful push so a follow-up sandbox
+// create still hits the local fast path.
+func (c *Client) PushImage(ctx context.Context, req PushImageRequest) (string, error) {
+	src := strings.TrimSpace(req.SourceTag)
+	dest := strings.TrimSpace(req.DestRef)
+	if src == "" {
+		return "", errors.New("push image: source tag is required")
+	}
+	if dest == "" {
+		return "", errors.New("push image: dest ref is required")
+	}
+	if req.Auth.Username == "" || req.Auth.Password == "" {
+		return "", errors.New("push image: auth username and password are required")
+	}
+	repo, tag := splitDestRef(dest)
+	if repo == "" {
+		return "", fmt.Errorf("push image: dest ref %q is missing a repository", dest)
+	}
+	if err := c.tagImage(ctx, src, repo, tag); err != nil {
+		return "", err
+	}
+
+	encoded, err := json.Marshal(map[string]string{
+		"username":      req.Auth.Username,
+		"password":      req.Auth.Password,
+		"serveraddress": req.Auth.Server,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal push registry auth: %w", err)
+	}
+	authHeader := base64.StdEncoding.EncodeToString(encoded)
+
+	query := url.Values{}
+	query.Set("tag", tag)
+	target := "http://docker/images/" + url.PathEscape(repo) + "/push?" + query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
+	if err != nil {
+		return "", fmt.Errorf("push image: %w", err)
+	}
+	request.Header.Set("X-Registry-Auth", authHeader)
+
+	response, err := c.streamClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("push image: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode >= 400 {
+		data, _ := io.ReadAll(response.Body)
+		return "", fmt.Errorf("docker API POST /images/%s/push failed with status %d: %s",
+			repo, response.StatusCode, strings.TrimSpace(string(data)))
+	}
+	if err := decodePushStream(response.Body, req.OnLog); err != nil {
+		return "", err
+	}
+	return repo + ":" + tag, nil
+}
+
+// splitDestRef splits "host[:port]/repo:tag" into (repo, tag). Tag defaults
+// to "latest" when missing. The colon search is anchored after the last
+// slash so a registry "host:port" prefix isn't mistaken for the tag.
+func splitDestRef(ref string) (repo, tag string) {
+	slash := strings.LastIndex(ref, "/")
+	tail := ref
+	prefix := ""
+	if slash >= 0 {
+		prefix = ref[:slash+1]
+		tail = ref[slash+1:]
+	}
+	if colon := strings.LastIndex(tail, ":"); colon >= 0 {
+		return prefix + tail[:colon], tail[colon+1:]
+	}
+	return ref, "latest"
+}
+
+func (c *Client) tagImage(ctx context.Context, sourceRef, repo, tag string) error {
+	query := url.Values{}
+	query.Set("repo", repo)
+	query.Set("tag", tag)
+	if err := c.doJSON(ctx, http.MethodPost,
+		"/images/"+url.PathEscape(sourceRef)+"/tag", query, nil, nil, nil); err != nil {
+		return fmt.Errorf("tag image %s as %s:%s: %w", sourceRef, repo, tag, err)
+	}
+	return nil
+}
+
+func decodePushStream(body io.Reader, onLog func(line string)) error {
+	decoder := json.NewDecoder(body)
+	for {
+		var msg struct {
+			Status      string `json:"status"`
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&msg); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("decode push stream: %w", err)
+		}
+		if msg.ErrorDetail.Message != "" {
+			return fmt.Errorf("push image: %s", msg.ErrorDetail.Message)
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("push image: %s", msg.Error)
+		}
+		if onLog != nil && msg.Status != "" {
+			onLog(msg.Status)
+		}
+	}
+}
+
 // ImageExists reports whether the named image already exists in the local
 // daemon. Used by the daytona facade to short-circuit redundant builds.
 func (c *Client) ImageExists(ctx context.Context, imageRef string) (bool, error) {

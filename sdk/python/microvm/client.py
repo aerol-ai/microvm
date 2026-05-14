@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
 from .types import (
+    BuildImagePushOptions,
+    BuildImageResult,
     CreateOptions,
     CreateSessionOptions,
     ExecExitInfo,
@@ -404,19 +406,59 @@ class MicroVM:
         return self._wrap_sandbox(sandbox)
 
     def build_image(self, image: Image) -> str:
+        result = self.build_image_with_push(image, push=None)
+        return result.image
+
+    def build_image_with_push(
+        self,
+        image: Image,
+        *,
+        push: Optional[BuildImagePushOptions] = None,
+    ) -> BuildImageResult:
+        """Build an Image and optionally push the result to a remote registry.
+
+        When ``push`` is ``None``, behavior matches :meth:`build_image`.
+        Push credentials are forwarded to the daemon as a one-shot
+        ``X-Registry-Auth`` header on the underlying push call and are never
+        persisted server-side.
+        """
         if not isinstance(image, Image):
             raise TypeError("build_image expects an Image instance")
+        body: Dict[str, Any] = {"dockerfile_content": image.dockerfile}
+        if push is not None:
+            registry = str(push.get("registry", "")).strip()
+            username = str(push.get("username", ""))
+            password = str(push.get("password", ""))
+            if not registry:
+                raise ValueError("push.registry is required when push is set")
+            if not username or not password:
+                raise ValueError("push.username and push.password are required when push is set")
+            push_body: Dict[str, Any] = {
+                "registry": registry,
+                "username": username,
+                "password": password,
+            }
+            tag = str(push.get("tag", "")).strip()
+            if tag:
+                push_body["tag"] = tag
+            server = str(push.get("server", "")).strip()
+            if server:
+                push_body["server"] = server
+            body["push"] = push_body
+
         path = self._versioned("/images/build")
         try:
-            payload = self._do_json("POST", path, {"dockerfile_content": image.dockerfile})
+            payload = self._do_json("POST", path, body)
         except MicroVMHTTPError as exc:
             if exc.status_code == 404:
                 raise MicroVMError(
                     f'this daemon does not support Image builds (POST {path} is not registered) — pass a string image reference (e.g. "ubuntu:22.04") instead, or upgrade the daemon'
                 ) from exc
             raise
-        value = _first_of(payload, "image")
-        return str(value or "")
+        image_tag = str(_first_of(payload, "image") or "")
+        pushed_value = _first_of(payload, "pushed")
+        pushed: Optional[str] = str(pushed_value) if pushed_value else None
+        return BuildImageResult(image=image_tag, pushed=pushed)
 
     def list(self) -> List[Sandbox]:
         sandboxes = self._do_json("GET", self._versioned("/sandboxes"), None)

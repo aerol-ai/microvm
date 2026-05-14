@@ -27,7 +27,7 @@ import (
 type Server struct {
 	logger   *slog.Logger
 	service  *service.Service
-	builder  daytona.ImageBuilder
+	builder  *docker.Client
 	build    daytona.BuildConfig
 	patToken string
 	mux      *http.ServeMux
