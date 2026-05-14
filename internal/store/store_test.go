@@ -472,6 +472,73 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "snapshot_roundtrip_by_name",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				snapshot := &models.SandboxSnapshot{
+					Name:            "snapshots/demo:v1",
+					Image:           "snapshots/demo:v1",
+					ImageID:         "sha256:snap-1",
+					SourceSandboxID: "sb-source",
+					CreatedAt:       time.Now().UTC().Round(0),
+				}
+				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				if err != nil {
+					t.Fatalf("GetSnapshot() error = %v", err)
+				}
+				if !reflect.DeepEqual(got, snapshot) {
+					t.Fatalf("snapshot = %+v, want %+v", got, snapshot)
+				}
+			},
+		},
+		{
+			name: "snapshot_name_conflict_returns_error",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				first := &models.SandboxSnapshot{Name: "snapshots/shared:v1", Image: "snapshots/shared:v1", SourceSandboxID: "sb-one", CreatedAt: time.Now().UTC()}
+				second := &models.SandboxSnapshot{Name: "snapshots/shared:v1", Image: "snapshots/shared:v1", SourceSandboxID: "sb-two", CreatedAt: time.Now().UTC()}
+				if err := st.CreateSnapshot(ctx, first); err != nil {
+					t.Fatalf("first CreateSnapshot() error = %v", err)
+				}
+				if err := st.CreateSnapshot(ctx, second); !errors.Is(err, ErrSnapshotNameConflict) {
+					t.Fatalf("expected ErrSnapshotNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			name: "snapshot_survives_source_sandbox_delete",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-snapshot-source")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				snapshot := &models.SandboxSnapshot{
+					Name:            "snapshots/preserved:v1",
+					Image:           "snapshots/preserved:v1",
+					ImageID:         "sha256:snap-preserved",
+					SourceSandboxID: sandbox.ID,
+					CreatedAt:       time.Now().UTC(),
+				}
+				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if err := st.Delete(ctx, sandbox.ID); err != nil {
+					t.Fatalf("Delete() error = %v", err)
+				}
+				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				if err != nil {
+					t.Fatalf("GetSnapshot() after delete error = %v", err)
+				}
+				if got.SourceSandboxID != sandbox.ID || got.Image != snapshot.Image {
+					t.Fatalf("unexpected snapshot after delete: %+v", got)
+				}
+			},
+		},
+		{
 			name: "try_reserve_host_port_distinguishes_pk_collision_from_host_port_collision",
 			run: func(t *testing.T) {
 				st := newTestStore(t)

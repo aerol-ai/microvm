@@ -27,20 +27,24 @@ func TestRegisterRoutesAllUseV1Prefix(t *testing.T) {
 	// probe with HEAD to a small set of known v1 paths and assert each
 	// resolves (i.e. is not the 404 NotFoundHandler). A path mismatch would
 	// indicate someone moved a route off /v1/.
-	probes := []string{
-		"/v1/capacity",
-		"/v1/sandboxes",
-		"/v1/sandboxes/abc",
-		"/v1/sandboxes/abc/sessions",
-		"/v1/sandboxes/abc/toolbox/foo",
+	probes := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/v1/capacity"},
+		{method: http.MethodGet, path: "/v1/sandboxes"},
+		{method: http.MethodGet, path: "/v1/sandboxes/abc"},
+		{method: http.MethodPost, path: "/v1/sandboxes/abc/snapshot"},
+		{method: http.MethodGet, path: "/v1/sandboxes/abc/sessions"},
+		{method: http.MethodGet, path: "/v1/sandboxes/abc/toolbox/foo"},
 	}
-	for _, p := range probes {
-		req, _ := http.NewRequest(http.MethodGet, p, nil)
+	for _, probe := range probes {
+		req, _ := http.NewRequest(probe.method, probe.path, nil)
 		_, pattern := mux.Handler(req)
 		// Pattern can be "GET /v1/foo" (method-scoped) or just "/v1/foo".
 		// Either way it must contain PathPrefix as a path component.
 		if pattern == "" || !strings.Contains(pattern, apiv1.PathPrefix+"/") {
-			t.Errorf("path %q resolved to pattern %q, expected one containing %q", p, pattern, apiv1.PathPrefix)
+			t.Errorf("path %q resolved to pattern %q, expected one containing %q", probe.path, pattern, apiv1.PathPrefix)
 		}
 	}
 }

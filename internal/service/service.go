@@ -58,8 +58,9 @@ type Service struct {
 	// best-effort (caddy may not be reachable yet on a cold start), so the
 	// expose path retries under l4Mu when the latch is still false. atomic
 	// load gives a lock-free fast path on the steady-state hot path.
-	l4Mu    sync.Mutex
-	l4Ready atomic.Bool
+	l4Mu       sync.Mutex
+	l4Ready    atomic.Bool
+	snapshotMu sync.Mutex
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -484,6 +485,57 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	s.maybeRemoveImage(ctx, sandbox.Image)
 	return nil
+}
+
+// CreateSnapshot commits the sandbox container into a reusable local image.
+// Idempotency is by snapshot name: repeated requests for the same sandbox +
+// name return the stored snapshot metadata, while a different sandbox trying
+// to claim the same name is rejected with a conflict.
+func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest) (*models.SandboxSnapshot, error) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return nil, errors.New("snapshot name is required")
+	}
+
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+
+	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
+		if existing.SourceSandboxID == sandboxID {
+			return existing, nil
+		}
+		return nil, store.ErrSnapshotNameConflict
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+
+	sandbox, err := s.store.Get(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+
+	imageID, err := s.docker.CreateSnapshot(ctx, sandboxContainerRef(sandbox), name)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot := &models.SandboxSnapshot{
+		Name:            name,
+		Image:           name,
+		ImageID:         imageID,
+		SourceSandboxID: sandboxID,
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
+		if errors.Is(err, store.ErrSnapshotNameConflict) {
+			existing, getErr := s.store.GetSnapshot(ctx, name)
+			if getErr == nil && existing.SourceSandboxID == sandboxID {
+				return existing, nil
+			}
+		}
+		return nil, err
+	}
+	return snapshot, nil
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {

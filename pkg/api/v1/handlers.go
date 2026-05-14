@@ -81,6 +81,20 @@ func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 
+func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req models.CreateSandboxSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	response, err := h.deps.Service.CreateSnapshot(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusCreated, response)
+}
+
 func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
 	if err := h.deps.Service.DestroySandbox(r.Context(), r.PathValue("id")); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)

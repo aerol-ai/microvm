@@ -42,6 +42,10 @@ type Runtime interface {
 	// have a sandbox record.
 	Destroy(ctx context.Context, sandbox *models.Sandbox) error
 
+	// CreateSnapshot commits a managed container into a reusable local image
+	// reference and returns the resulting image ID.
+	CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error)
+
 	// Resize updates CPU/memory caps on a running container. DiskGB is not
 	// resizable on a live container; resize-up at create time is honored
 	// per-runtime.

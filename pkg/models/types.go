@@ -295,6 +295,24 @@ type CreateSandboxResponse struct {
 	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
 }
 
+// CreateSandboxSnapshotRequest creates a reusable local image snapshot from an
+// existing sandbox container. Name is the image reference callers can later
+// pass back into CreateSandboxRequest.Image.
+type CreateSandboxSnapshotRequest struct {
+	Name string `json:"name"`
+}
+
+// SandboxSnapshot is the persisted metadata for a committed sandbox image.
+// Image is the reusable image reference; ImageID is the content-addressed
+// Docker image ID returned by the runtime after the commit succeeds.
+type SandboxSnapshot struct {
+	Name            string    `json:"name"`
+	Image           string    `json:"image"`
+	ImageID         string    `json:"image_id,omitempty"`
+	SourceSandboxID string    `json:"source_sandbox_id"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
 // ExposePortRequest is the optional JSON body for POST /v1/sandboxes/{id}/ports/{port}.
 // Empty body or empty Protocol falls back to "http" — the historical default —
 // so old SDK callers keep working unchanged.
@@ -315,13 +333,13 @@ type ExposePortResponse struct {
 }
 
 type ExposedPort struct {
-	SandboxID string    `json:"sandbox_id"`
-	Port      int       `json:"port"`
+	SandboxID string `json:"sandbox_id"`
+	Port      int    `json:"port"`
 	// Protocol is one of "http" (default — Caddy HTTP reverse proxy), "tcp"
 	// (caddy-l4 listener bound to HostPort, raw TCP forward to the container),
 	// or "tls" (caddy-l4 SNI route on the shared TLS listener). Pre-migration
 	// rows carry "http" via the column default.
-	Protocol  string    `json:"protocol"`
+	Protocol string `json:"protocol"`
 	// HostPort is the parent-host TCP listener allocated for protocol="tcp"
 	// from the configured pool (default [22000, 23000]). Zero for http/tls
 	// modes, which don't reserve a per-exposure host port.
