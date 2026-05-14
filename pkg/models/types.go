@@ -254,6 +254,16 @@ type CreateSandboxRequest struct {
 	// is not supported with the gVisor runtime — the API returns an error if
 	// both GPUs and runtime="gvisor" are set.
 	GPUs *GPURequest `json:"gpus,omitempty"`
+	// NetworkBytesInLimit caps lifetime ingress bytes for the sandbox. Zero
+	// means unlimited. When the cumulative counter crosses the limit, the
+	// reconcile loop installs an ingress DROP rule. The "we already paid for
+	// the bytes you see in the meter" caveat applies — host-side ingress is
+	// counted after the NIC has accepted the packet.
+	NetworkBytesInLimit int64 `json:"network_bytes_in_limit,omitempty"`
+	// NetworkBytesOutLimit caps lifetime egress bytes. Zero means unlimited.
+	// Crossing the limit installs an egress DROP rule via the same primitive
+	// NetworkBlockAll uses.
+	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
 }
 
 type ResizeSandboxRequest struct {
@@ -301,6 +311,48 @@ type Sandbox struct {
 	// GPUs is the GPU configuration this sandbox was created with. Nil means
 	// no GPU was requested.
 	GPUs *GPURequest `json:"gpus,omitempty"`
+	// NetworkBytesIn / NetworkBytesOut are cumulative byte counters
+	// maintained by the netstats poller. They survive container restarts —
+	// a new veth resets in-memory baseline math but the persisted total is
+	// preserved.
+	NetworkBytesIn  int64 `json:"network_bytes_in"`
+	NetworkBytesOut int64 `json:"network_bytes_out"`
+	// NetworkBytesInLimit / NetworkBytesOutLimit are the caps the sandbox was
+	// created or patched with. Zero = unlimited.
+	NetworkBytesInLimit  int64 `json:"network_bytes_in_limit"`
+	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit"`
+	// NetworkQuotaExceeded reflects whether either lifetime byte counter has
+	// crossed its limit. The reconcile loop installs DROP rules when this is
+	// true; clearing requires raising the limit (or zeroing it for unlimited).
+	NetworkQuotaExceeded bool `json:"network_quota_exceeded"`
+	// NetworkQuotaExceededAt is the wall-clock time the limit was first
+	// observed crossed. Nil while under quota.
+	NetworkQuotaExceededAt *time.Time `json:"network_quota_exceeded_at,omitempty"`
+}
+
+// NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.
+// BytesInLimit / BytesOutLimit zero means unlimited.
+type NetworkUsage struct {
+	SandboxID       string     `json:"sandbox_id"`
+	BytesIn         int64      `json:"bytes_in"`
+	BytesOut        int64      `json:"bytes_out"`
+	BytesInLimit    int64      `json:"bytes_in_limit"`
+	BytesOutLimit   int64      `json:"bytes_out_limit"`
+	QuotaExceeded   bool       `json:"quota_exceeded"`
+	QuotaExceededAt *time.Time `json:"quota_exceeded_at,omitempty"`
+	// LastSampledAt is omitted until the netstats poller has produced at
+	// least one sample. Pointer + omitempty so we don't serialize the zero
+	// time as "0001-01-01T00:00:00Z" before the first tick.
+	LastSampledAt *time.Time `json:"last_sampled_at,omitempty"`
+}
+
+// UpdateNetworkLimitsRequest is the body for PATCH /v1/sandboxes/{id}/network/limits.
+// Each field is a pointer so the handler can distinguish "leave alone" (nil)
+// from "set to unlimited" (pointer to zero). Negative values are rejected at
+// the service layer.
+type UpdateNetworkLimitsRequest struct {
+	NetworkBytesInLimit  *int64 `json:"network_bytes_in_limit,omitempty"`
+	NetworkBytesOutLimit *int64 `json:"network_bytes_out_limit,omitempty"`
 }
 
 // CreateSandboxResponse is what the API returns from POST /v1/sandboxes.

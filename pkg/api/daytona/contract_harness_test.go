@@ -162,8 +162,11 @@ func (f *fakeDaytonaContractRuntime) PushAllowedPorts(_ context.Context, contain
 	return nil
 }
 
-func (f *fakeDaytonaContractRuntime) ClearNetworkRules(string) error    { return nil }
-func (f *fakeDaytonaContractRuntime) ApplyNetworkBlockAll(string) error { return nil }
+func (f *fakeDaytonaContractRuntime) ClearNetworkRules(string) error        { return nil }
+func (f *fakeDaytonaContractRuntime) ApplyNetworkBlockAll(string) error     { return nil }
+func (f *fakeDaytonaContractRuntime) ApplyNetworkBlockIngress(string) error { return nil }
+func (f *fakeDaytonaContractRuntime) ClearNetworkBlockIngress(string) error { return nil }
+func (f *fakeDaytonaContractRuntime) ClearNetworkBlockEgress(string) error  { return nil }
 
 func (f *fakeDaytonaContractRuntime) seedSandbox(sandbox *models.Sandbox) {
 	if sandbox == nil {

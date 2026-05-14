@@ -40,6 +40,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(http.HandlerFunc(h.exposePort)))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(http.HandlerFunc(h.unexposePort)))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(http.HandlerFunc(h.listMounts)))
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(http.HandlerFunc(h.getNetworkUsage)))
+	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(http.HandlerFunc(h.updateNetworkLimits)))
 
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...

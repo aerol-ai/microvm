@@ -1,0 +1,199 @@
+---
+title: Network Usage
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Every sandbox has a per-direction byte counter and an optional cap. You can set the cap at create time, read live counters, and raise or lift the cap while the sandbox is running. When a cap is hit, the platform installs an iptables drop on the sandbox's container IP — the container keeps running, but its network goes dark until the cap is raised.
+
+This is the model AerolVM uses for billing-style network quotas and for shutting down a sandbox that has started behaving badly without killing it outright.
+
+## How it works
+
+- Counters are sampled from `/proc/<pid>/net/dev` at a fixed interval and persisted to the sandbox row. They are cumulative across container restarts.
+- `bytes_in` is ingress (rx, traffic delivered to the container). `bytes_out` is egress (tx, traffic sent from the container).
+- A cap of `0` means unlimited. This is the default and matches the historical behaviour.
+- When `bytes_in >= bytes_in_limit` (and the limit is non-zero), the platform installs an ingress drop. The same applies to egress. `quota_exceeded` flips to `true` and `quota_exceeded_at` is set.
+- Raising the cap above current usage clears the drop on the next reconcile pass, or immediately when you call `setNetworkLimits` with a higher limit.
+
+## Create a sandbox with limits
+
+Caps are optional fields on the create request. Either or both can be set; omit a field (or pass `0`) to leave it unlimited.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      networkBytesInLimit:  1 * 1024 * 1024 * 1024, // 1 GiB ingress
+      networkBytesOutLimit: 5 * 1024 * 1024 * 1024, // 5 GiB egress
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'networkBytesInLimit':  1 * 1024 * 1024 * 1024,
+        'networkBytesOutLimit': 5 * 1024 * 1024 * 1024,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:                "ubuntu:22.04",
+        NetworkBytesInLimit:  1 << 30,
+        NetworkBytesOutLimit: 5 << 30,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        network_bytes_in_limit:  Some(1 << 30),
+        network_bytes_out_limit: Some(5 << 30),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.CreateOptions;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setNetworkBytesInLimit(1L << 30)
+            .setNetworkBytesOutLimit(5L << 30)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Read current usage
+
+`getNetworkUsage` returns the latest cumulative counters, the active caps, and whether the quota has been exceeded.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const usage = await sandbox.getNetworkUsage()
+    console.log(usage.bytesIn, usage.bytesOut, usage.quotaExceeded)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    usage = sandbox.get_network_usage()
+    print(usage['bytesIn'], usage['bytesOut'], usage['quotaExceeded'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    usage, err := sandbox.GetNetworkUsage(ctx)
+    if err != nil {
+        return err
+    }
+    fmt.Println(usage.BytesIn, usage.BytesOut, usage.QuotaExceeded)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let usage = sandbox.get_network_usage()?;
+    println!("{} {} {}", usage.bytes_in, usage.bytes_out, usage.quota_exceeded);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.NetworkUsage;
+
+    NetworkUsage usage = sandbox.getNetworkUsage();
+    System.out.println(usage.bytesIn + " " + usage.bytesOut + " " + usage.quotaExceeded);
+    ```
+  </TabItem>
+</Tabs>
+
+The response shape:
+
+| Field | Meaning |
+|---|---|
+| `bytes_in` / `bytes_out` | Cumulative ingress / egress in bytes since the sandbox was created. |
+| `bytes_in_limit` / `bytes_out_limit` | Active cap. `0` means unlimited. |
+| `quota_exceeded` | `true` if either direction has hit its cap. The drop rule is installed while this is true. |
+| `quota_exceeded_at` | RFC 3339 timestamp of when the quota was first hit. Cleared when the cap is raised. |
+| `last_sampled_at` | RFC 3339 timestamp of the last counter sample. **Absent until the netstats poller has produced at least one sample** — typically up to one poll interval after a sandbox starts. |
+
+## Raise or lift the limits at runtime
+
+`setNetworkLimits` is a PATCH — only the fields you set are changed. Pass `0` to lift a cap (back to unlimited), or a higher number to raise it. Omit a field to leave it alone.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Raise the egress cap to 20 GiB; leave ingress alone.
+    const usage = await sandbox.setNetworkLimits({
+      networkBytesOutLimit: 20 * 1024 * 1024 * 1024,
+    })
+
+    // Lift the ingress cap entirely (0 = unlimited).
+    await sandbox.setNetworkLimits({ networkBytesInLimit: 0 })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    usage = sandbox.set_network_limits({
+        'networkBytesOutLimit': 20 * 1024 * 1024 * 1024,
+    })
+
+    sandbox.set_network_limits({'networkBytesInLimit': 0})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    out := int64(20) << 30
+    usage, err := sandbox.SetNetworkLimits(ctx, sdktypes.SetNetworkLimitsOptions{
+        NetworkBytesOutLimit: &out,
+    })
+    if err != nil {
+        return err
+    }
+
+    zero := int64(0)
+    if _, err := sandbox.SetNetworkLimits(ctx, sdktypes.SetNetworkLimitsOptions{
+        NetworkBytesInLimit: &zero,
+    }); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let usage = sandbox.set_network_limits(SetNetworkLimitsOptions {
+        network_bytes_out_limit: Some(20 << 30),
+        ..Default::default()
+    })?;
+
+    sandbox.set_network_limits(SetNetworkLimitsOptions {
+        network_bytes_in_limit: Some(0),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.NetworkUsage;
+    import ai.aerol.microvm.model.SetNetworkLimitsOptions;
+
+    NetworkUsage usage = sandbox.setNetworkLimits(
+        new SetNetworkLimitsOptions().setNetworkBytesOutLimit(20L << 30)
+    );
+
+    sandbox.setNetworkLimits(
+        new SetNetworkLimitsOptions().setNetworkBytesInLimit(0L)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+When the new cap is above current usage, the per-IP drop is removed immediately and traffic flows again. When the new cap is still below usage, the drop stays in place until usage falls back under the limit (which only happens when you raise it further or destroy the sandbox).

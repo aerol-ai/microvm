@@ -65,8 +65,11 @@ func (f *fakeSnapshotRuntime) RemoveImage(_ context.Context, imageRef string) er
 func (f *fakeSnapshotRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	panic("unexpected PushAllowedPorts")
 }
-func (f *fakeSnapshotRuntime) ClearNetworkRules(string) error    { return nil }
-func (f *fakeSnapshotRuntime) ApplyNetworkBlockAll(string) error { return nil }
+func (f *fakeSnapshotRuntime) ClearNetworkRules(string) error        { return nil }
+func (f *fakeSnapshotRuntime) ApplyNetworkBlockAll(string) error     { return nil }
+func (f *fakeSnapshotRuntime) ApplyNetworkBlockIngress(string) error { return nil }
+func (f *fakeSnapshotRuntime) ClearNetworkBlockIngress(string) error { return nil }
+func (f *fakeSnapshotRuntime) ClearNetworkBlockEgress(string) error  { return nil }
 
 func TestCreateSnapshotIdempotentByName(t *testing.T) {
 	ctx := context.Background()

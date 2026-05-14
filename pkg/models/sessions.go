@@ -7,10 +7,10 @@ import "time"
 type SessionStatus string
 
 const (
-	SessionStatusRunning  SessionStatus = "running"
-	SessionStatusExited   SessionStatus = "exited"
-	SessionStatusKilled   SessionStatus = "killed"
-	SessionStatusFailed   SessionStatus = "failed" // could not start
+	SessionStatusRunning SessionStatus = "running"
+	SessionStatusExited  SessionStatus = "exited"
+	SessionStatusKilled  SessionStatus = "killed"
+	SessionStatusFailed  SessionStatus = "failed" // could not start
 )
 
 // CreateSessionRequest is the body of POST /sessions on toolboxd (and the
@@ -43,8 +43,8 @@ type Session struct {
 	StartedAt  time.Time     `json:"started_at"`
 	ExitedAt   time.Time     `json:"exited_at,omitempty"`
 	Recording  bool          `json:"recording"`
-	Bytes      int64         `json:"bytes"`     // total stdout+stderr bytes produced
-	Attached   int           `json:"attached"`  // current number of attached clients
+	Bytes      int64         `json:"bytes"`    // total stdout+stderr bytes produced
+	Attached   int           `json:"attached"` // current number of attached clients
 }
 
 // SessionList is the GET /sessions response shape.

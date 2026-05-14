@@ -114,6 +114,21 @@ func (c *Client) Mounts(ctx context.Context, id string) ([]sdktypes.MountSpecRed
 	return c.inner.Mounts(ctx, id)
 }
 
+// GetNetworkUsage returns current cumulative ingress/egress byte counters and
+// the configured per-direction caps for a sandbox. A `*Limit` of zero means
+// unlimited.
+func (c *Client) GetNetworkUsage(ctx context.Context, id string) (sdktypes.NetworkUsage, error) {
+	return c.inner.GetNetworkUsage(ctx, id)
+}
+
+// SetNetworkLimits raises or lifts the per-direction byte caps. Leave a field
+// nil to keep the current value; pass a pointer to zero to set "unlimited".
+// Raising a cap above current usage clears the per-IP iptables block on the
+// next reconcile pass (or immediately if it's already over the new cap).
+func (c *Client) SetNetworkLimits(ctx context.Context, id string, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
+	return c.inner.SetNetworkLimits(ctx, id, opts)
+}
+
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	item, err := c.inner.Start(ctx, id)
 	if err != nil {
@@ -274,6 +289,14 @@ func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions
 	}
 	s.Sandbox = item.Sandbox
 	return nil
+}
+
+func (s *Sandbox) GetNetworkUsage(ctx context.Context) (sdktypes.NetworkUsage, error) {
+	return s.client.GetNetworkUsage(ctx, s.ID)
+}
+
+func (s *Sandbox) SetNetworkLimits(ctx context.Context, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
+	return s.client.SetNetworkLimits(ctx, s.ID, opts)
 }
 
 func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle sdktypes.Lifecycle) error {

@@ -80,4 +80,23 @@ type Runtime interface {
 	// cycles (which clear it on the stop event) and after host-side state
 	// loss (iptables flush, daemon restart that rebuilds chains).
 	ApplyNetworkBlockAll(containerIP string) error
+
+	// ApplyNetworkBlockIngress installs the per-IP ingress DROP rule. Used
+	// by the network-quota enforcer when net_bytes_in_limit is crossed.
+	// Idempotent at the netrules layer. Distinct from the egress block so
+	// quota enforcement composes with NetworkBlockAll independently on each
+	// direction.
+	ApplyNetworkBlockIngress(containerIP string) error
+
+	// ClearNetworkBlockIngress removes the per-IP ingress DROP rule. The
+	// caller is responsible for not racing this against quota state — the
+	// service layer only clears when limits are raised above current usage.
+	ClearNetworkBlockIngress(containerIP string) error
+
+	// ClearNetworkBlockEgress removes the per-IP egress DROP rule. Symmetric
+	// to ApplyNetworkBlockAll for callers that need to walk back a quota-
+	// driven block without also undoing NetworkBlockAll. Today the underlying
+	// rule is shared, so the service must consult NetworkBlockAll before
+	// invoking this on a quota-clear path.
+	ClearNetworkBlockEgress(containerIP string) error
 }

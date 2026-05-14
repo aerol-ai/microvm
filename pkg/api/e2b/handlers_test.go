@@ -534,6 +534,9 @@ func (f *fakeE2BRuntime) RemoveImage(_ context.Context, imageRef string) error {
 func (f *fakeE2BRuntime) PushAllowedPorts(context.Context, string, string, []int) error { return nil }
 func (f *fakeE2BRuntime) ClearNetworkRules(string) error                                { return nil }
 func (f *fakeE2BRuntime) ApplyNetworkBlockAll(string) error                             { return nil }
+func (f *fakeE2BRuntime) ApplyNetworkBlockIngress(string) error                         { return nil }
+func (f *fakeE2BRuntime) ClearNetworkBlockIngress(string) error                         { return nil }
+func (f *fakeE2BRuntime) ClearNetworkBlockEgress(string) error                          { return nil }
 
 func (f *fakeE2BRuntime) lookup(containerRef string) (*models.SandboxRuntimeState, bool) {
 	if state, ok := f.states[containerRef]; ok {

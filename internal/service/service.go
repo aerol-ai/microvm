@@ -24,6 +24,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -61,6 +62,16 @@ type Service struct {
 	l4Mu       sync.Mutex
 	l4Ready    atomic.Bool
 	snapshotMu sync.Mutex
+
+	// netstatsReady latches the lazy bootstrap of the per-sandbox network
+	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
+	// hot side, single-flight Mutex on the cold-start side. The poller is
+	// kicked off either at daemon boot (best-effort) or on the first request
+	// that needs network usage data — whichever happens first.
+	netstatsMu       sync.Mutex
+	netstatsReady    atomic.Bool
+	netstatsPoller   *netstats.Poller
+	netstatsLastTick atomic.Int64 // unix nanos; last successful tick for /usage staleness reporting
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -127,6 +138,12 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	// Mirror SetNetworkLimits: enforcement uses `limit > 0`, so a negative
+	// value would silently behave as unlimited and bypass the quota.
+	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
+		return nil, errors.New("network byte limits must be >= 0")
+	}
+
 	sealedMounts, err := s.sealMounts(req.Mounts)
 	if err != nil {
 		return nil, err
@@ -187,30 +204,32 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	now := time.Now().UTC()
 	sandbox := &models.Sandbox{
-		ID:               state.SandboxID,
-		Image:            req.Image,
-		Status:           state.Status,
-		PublicURL:        s.caddy.SandboxPublicURL(state.SandboxID),
-		ContainerID:      state.ContainerID,
-		ContainerIP:      state.ContainerIP,
-		CPU:              req.CPU,
-		MemoryMB:         req.MemoryMB,
-		DiskGB:           req.DiskGB,
-		OSUser:           req.OSUser,
-		Env:              req.Env,
-		NetworkBlockAll:  req.NetworkBlockAll,
-		ToolboxEnabled:   true,
-		ToolboxToken:     toolboxToken,
-		SSHPublicKey:     authorizedKey,
-		Name:             strings.TrimSpace(req.Name),
-		Tags:             req.Tags,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		LastActiveAt:     now,
-		ContainerCommand: req.ContainerCommand,
-		Lifecycle:        lifecycle,
-		Runtime:          chosenRuntime,
-		GPUs:             req.GPUs,
+		ID:                   state.SandboxID,
+		Image:                req.Image,
+		Status:               state.Status,
+		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		ContainerID:          state.ContainerID,
+		ContainerIP:          state.ContainerIP,
+		CPU:                  req.CPU,
+		MemoryMB:             req.MemoryMB,
+		DiskGB:               req.DiskGB,
+		OSUser:               req.OSUser,
+		Env:                  req.Env,
+		NetworkBlockAll:      req.NetworkBlockAll,
+		ToolboxEnabled:       true,
+		ToolboxToken:         toolboxToken,
+		SSHPublicKey:         authorizedKey,
+		Name:                 strings.TrimSpace(req.Name),
+		Tags:                 req.Tags,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		LastActiveAt:         now,
+		ContainerCommand:     req.ContainerCommand,
+		Lifecycle:            lifecycle,
+		Runtime:              chosenRuntime,
+		GPUs:                 req.GPUs,
+		NetworkBytesInLimit:  req.NetworkBytesInLimit,
+		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
@@ -1170,6 +1189,17 @@ func (s *Service) Reconcile(ctx context.Context) error {
 						"error", err,
 					)
 				}
+			}
+			// Heal quota-driven blocks. The flag is the source of truth for
+			// "we previously decided to block"; re-evaluate against the
+			// current cumulative counters so a quota raised over the wire
+			// while sandboxd was down clears as part of the same pass.
+			if sandbox.NetworkQuotaExceeded ||
+				(sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit) ||
+				(sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit) {
+				overIn := sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
+				overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
+				s.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
 			}
 			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 				return err

@@ -137,10 +137,10 @@ type fakeChannel struct {
 	stderr io.Writer
 }
 
-func (f fakeChannel) Read(p []byte) (int, error)              { return 0, io.EOF }
-func (f fakeChannel) Write(p []byte) (int, error)             { return f.stdout.Write(p) }
-func (f fakeChannel) Close() error                            { return nil }
-func (f fakeChannel) CloseWrite() error                       { return nil }
+func (f fakeChannel) Read(p []byte) (int, error)  { return 0, io.EOF }
+func (f fakeChannel) Write(p []byte) (int, error) { return f.stdout.Write(p) }
+func (f fakeChannel) Close() error                { return nil }
+func (f fakeChannel) CloseWrite() error           { return nil }
 func (f fakeChannel) SendRequest(string, bool, []byte) (bool, error) {
 	return false, nil
 }
@@ -148,5 +148,5 @@ func (f fakeChannel) Stderr() io.ReadWriter { return stderrAdapter{w: f.stderr} 
 
 type stderrAdapter struct{ w io.Writer }
 
-func (s stderrAdapter) Read([]byte) (int, error)  { return 0, io.EOF }
+func (s stderrAdapter) Read([]byte) (int, error)    { return 0, io.EOF }
 func (s stderrAdapter) Write(p []byte) (int, error) { return s.w.Write(p) }

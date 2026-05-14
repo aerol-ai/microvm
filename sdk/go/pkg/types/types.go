@@ -62,6 +62,9 @@ const (
 	RuntimeKata   = models.RuntimeKata
 )
 
+type NetworkUsage = models.NetworkUsage
+type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
+
 type GPURequest = models.GPURequest
 type GPUVendor = models.GPUVendor
 

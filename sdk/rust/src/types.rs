@@ -94,6 +94,17 @@ pub struct CreateOptions {
     pub os_user: Option<String>,
     #[serde(rename = "network_block_all", skip_serializing_if = "Option::is_none")]
     pub network_block_all: Option<bool>,
+    /// Cap on bytes the sandbox may receive before its ingress is dropped via
+    /// per-IP iptables rule. `0` (or omit) means unlimited. Limits can be
+    /// raised or lifted at runtime via [`Client::set_network_limits`].
+    #[serde(rename = "network_bytes_in_limit", skip_serializing_if = "Option::is_none")]
+    pub network_bytes_in_limit: Option<i64>,
+    /// Cap on bytes the sandbox may send before its egress is dropped. `0`
+    /// (or omit) means unlimited. The block reuses the same iptables row as
+    /// `network_block_all`; clearing the quota does not lift an operator-set
+    /// blanket egress block.
+    #[serde(rename = "network_bytes_out_limit", skip_serializing_if = "Option::is_none")]
+    pub network_bytes_out_limit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<RegistryAuth>,
     #[serde(rename = "container_command", skip_serializing_if = "Option::is_none")]
@@ -388,4 +399,44 @@ pub struct Session {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SessionList {
     pub sessions: Vec<Session>,
+}
+
+/// Per-sandbox network byte counters and the configured caps that drive the
+/// quota enforcer. `bytes_in` is traffic the container received (ingress);
+/// `bytes_out` is traffic the container sent (egress). A `*_limit` of `0`
+/// means unlimited. `quota_exceeded` flips true the first time the meter
+/// crosses either configured cap and stays true until the operator raises
+/// the limit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkUsage {
+    #[serde(rename = "sandbox_id")]
+    pub sandbox_id: String,
+    #[serde(rename = "bytes_in")]
+    pub bytes_in: i64,
+    #[serde(rename = "bytes_out")]
+    pub bytes_out: i64,
+    #[serde(rename = "bytes_in_limit")]
+    pub bytes_in_limit: i64,
+    #[serde(rename = "bytes_out_limit")]
+    pub bytes_out_limit: i64,
+    #[serde(rename = "quota_exceeded")]
+    pub quota_exceeded: bool,
+    #[serde(rename = "quota_exceeded_at", skip_serializing_if = "Option::is_none")]
+    pub quota_exceeded_at: Option<String>,
+    /// Absent (`None`) until the netstats poller has produced at least one
+    /// sample. `default` lets us deserialize a server response that omits the
+    /// field entirely (pre-first-tick) rather than failing.
+    #[serde(rename = "last_sampled_at", default, skip_serializing_if = "Option::is_none")]
+    pub last_sampled_at: Option<String>,
+}
+
+/// Patch body for [`Client::set_network_limits`]. Each field is `Option`-wrapped
+/// so an unset key serializes as missing (server reads as "leave alone");
+/// `Some(0)` means unlimited.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SetNetworkLimitsOptions {
+    #[serde(rename = "network_bytes_in_limit", skip_serializing_if = "Option::is_none")]
+    pub network_bytes_in_limit: Option<i64>,
+    #[serde(rename = "network_bytes_out_limit", skip_serializing_if = "Option::is_none")]
+    pub network_bytes_out_limit: Option<i64>,
 }

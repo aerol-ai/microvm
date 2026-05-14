@@ -77,6 +77,11 @@ class CreateOptions(TypedDict, total=False):
     env: Dict[str, str]
     osUser: str
     networkBlockAll: bool
+    # Caps on network bytes the sandbox may receive (in) / send (out) before
+    # per-IP iptables block fires. 0 (default) means unlimited; both can be
+    # raised or lifted at runtime via set_network_limits.
+    networkBytesInLimit: int
+    networkBytesOutLimit: int
     registry: RegistryAuth
     containerCommand: List[str]
     mounts: List[MountSpec]
@@ -239,6 +244,24 @@ class SandboxData(TypedDict, total=False):
     runtime: Literal["", "docker", "gvisor", "kata"]
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
+
+
+class NetworkUsage(TypedDict, total=False):
+    sandboxID: str
+    bytesIn: int
+    bytesOut: int
+    bytesInLimit: int
+    bytesOutLimit: int
+    quotaExceeded: bool
+    quotaExceededAt: str
+    # Absent until the netstats poller has produced at least one sample.
+    lastSampledAt: str
+
+
+class SetNetworkLimitsOptions(TypedDict, total=False):
+    # Omit a key to leave that direction unchanged. 0 means unlimited.
+    networkBytesInLimit: int
+    networkBytesOutLimit: int
 
 
 class HealthStatus(TypedDict):
