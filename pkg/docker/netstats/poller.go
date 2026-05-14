@@ -120,7 +120,17 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 
 	samples := make([]Sample, 0, len(targets))
 	for _, t := range targets {
-		if t.SandboxID == "" || t.ContainerRef == "" {
+		if t.SandboxID == "" {
+			continue
+		}
+		// Per the SandboxLister contract, an empty ContainerRef means "not
+		// running this tick" — same semantics as a failed PID lookup or
+		// ErrNotRunning below. Drop the baseline so the next tick (when the
+		// container is up and the ref reappears) re-baselines from the new
+		// PID instead of diffing against a stale one. Without this, baselines
+		// for sandboxes stuck in not-yet-running states would accumulate.
+		if t.ContainerRef == "" {
+			p.dropBaseline(t.SandboxID)
 			continue
 		}
 

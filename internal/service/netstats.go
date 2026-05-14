@@ -54,7 +54,17 @@ func (s *Service) EnsureNetstatsReady(ctx context.Context) error {
 
 // GetNetworkUsage returns the current cumulative byte counters and
 // configured limits for a sandbox. Callers handle ErrNotFound translation.
+//
+// Best-effort lazy bootstrap of the netstats poller: if boot's
+// EnsureNetstatsReady failed (cold-start race against the docker daemon, etc.)
+// this call retries it under the same single-flight latch. Failure is logged
+// and swallowed — the caller still gets back whatever counters the store has,
+// and the next call will retry again.
 func (s *Service) GetNetworkUsage(ctx context.Context, id string) (*models.NetworkUsage, error) {
+	if err := s.EnsureNetstatsReady(ctx); err != nil {
+		s.logger.Warn("netstats lazy bootstrap failed; counters may be stale",
+			"sandbox_id", id, "error", err)
+	}
 	sandbox, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -87,6 +97,16 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 	if bytesInLimit < 0 || bytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
+	// Stronger lazy-bootstrap case than GetNetworkUsage: setting a limit
+	// implies the operator wants enforcement to start. If the poller is
+	// down, "limit set, never enforced" is silent failure of a security
+	// control. Best-effort still — the limit is persisted either way and
+	// reconcile will re-evaluate; this just shortens the window before the
+	// poller starts feeding the quota check.
+	if err := s.EnsureNetstatsReady(ctx); err != nil {
+		s.logger.Warn("netstats lazy bootstrap failed; quota enforcement may be delayed",
+			"sandbox_id", id, "error", err)
+	}
 	if err := s.store.SetNetworkLimits(ctx, id, bytesInLimit, bytesOutLimit); err != nil {
 		return nil, err
 	}
@@ -107,34 +127,44 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 // both sides — called from the poller sink, the SetNetworkLimits path, and
 // the reconcile re-heal path.
 func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sandbox, overIn, overOut bool) {
-	if sandbox == nil || sandbox.ContainerIP == "" {
+	if sandbox == nil {
 		return
 	}
 
-	// Egress: only clear when NetworkBlockAll is also off. NetworkBlockAll
-	// owns the same DOCKER-USER row, so ApplyNetworkBlockAll is the right
-	// shared installer for the quota path too.
-	if overOut {
-		if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
-			s.logger.Warn("apply quota egress block failed",
-				"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+	// iptables reconciliation needs an IP to install rules against. A
+	// sandbox in a state with no ContainerIP (stopped, between create and
+	// runtime ready, etc.) has nothing to firewall — Start / reconcile
+	// reapplies quota state via this same function once an IP exists.
+	// Store-flag reconciliation below is intentionally NOT gated on the IP:
+	// without that, a sandbox stopped while over-quota would have its
+	// `quota_exceeded` flag stuck true even after the operator raises the
+	// limit and the over-quota condition no longer holds.
+	if sandbox.ContainerIP != "" {
+		// Egress: only clear when NetworkBlockAll is also off. NetworkBlockAll
+		// owns the same DOCKER-USER row, so ApplyNetworkBlockAll is the right
+		// shared installer for the quota path too.
+		if overOut {
+			if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+				s.logger.Warn("apply quota egress block failed",
+					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			}
+		} else if !sandbox.NetworkBlockAll {
+			if err := s.docker.ClearNetworkBlockEgress(sandbox.ContainerIP); err != nil {
+				s.logger.Warn("clear quota egress block failed",
+					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			}
 		}
-	} else if !sandbox.NetworkBlockAll {
-		if err := s.docker.ClearNetworkBlockEgress(sandbox.ContainerIP); err != nil {
-			s.logger.Warn("clear quota egress block failed",
-				"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
-		}
-	}
 
-	if overIn {
-		if err := s.docker.ApplyNetworkBlockIngress(sandbox.ContainerIP); err != nil {
-			s.logger.Warn("apply quota ingress block failed",
-				"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
-		}
-	} else {
-		if err := s.docker.ClearNetworkBlockIngress(sandbox.ContainerIP); err != nil {
-			s.logger.Warn("clear quota ingress block failed",
-				"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+		if overIn {
+			if err := s.docker.ApplyNetworkBlockIngress(sandbox.ContainerIP); err != nil {
+				s.logger.Warn("apply quota ingress block failed",
+					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			}
+		} else {
+			if err := s.docker.ClearNetworkBlockIngress(sandbox.ContainerIP); err != nil {
+				s.logger.Warn("clear quota ingress block failed",
+					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			}
 		}
 	}
 
