@@ -92,7 +92,7 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 }
 
 // versioned builds an API path with the active version's prefix prepended.
-// Use this for every versioned call so v2 (when it lands) can be selected
+// Use this for every versioned call so a future wire version can be selected
 // via ClientOptions.APIVersion without touching call sites.
 func (c *Client) versioned(suffix string) string {
 	return c.versionPrefix + suffix

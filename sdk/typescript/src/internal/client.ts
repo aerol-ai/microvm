@@ -35,15 +35,15 @@ type FetchLike = typeof fetch;
  * Wire version of the v1-style sandbox endpoints (`/v1/sandboxes`, etc.) this
  * client speaks. The SDK and the server version independently — bumping the
  * SDK package does not move the wire version. Today only "v1" exists; future
- * breaking changes to the sandbox endpoints will land in "v2".
+ * breaking changes to the sandbox endpoints will land in a new version
+ * prefix.
  *
- * Note: the `/v2/images/build` endpoint used by {@link Image}-shaped image
- * inputs is NOT a v2 sandbox API — it's a separate post-freeze capability
- * mounted under the v2 prefix because v1 is soft-frozen. It is called
- * unconditionally when an Image is supplied to {@link APIClient.create},
- * regardless of `apiVersion`. Daemons older than the image-build feature
- * return 404; the SDK turns that into a clear "daemon does not support
- * image builds" error so the user can switch to a string image.
+ * The `/v1/images/build` endpoint used by {@link Image}-shaped image inputs
+ * is called unconditionally when an Image is supplied to
+ * {@link APIClient.create}, regardless of `apiVersion`. Daemons older than
+ * the image-build feature return 404; the SDK turns that into a clear
+ * "daemon does not support image builds" error so the user can switch to a
+ * string image.
  */
 export type APIVersion = "v1";
 
@@ -212,7 +212,7 @@ export class APIClient {
   /**
    * Build a versioned API path. Pass the suffix beginning with "/" (e.g.
    * "/sandboxes") and the active version's prefix is prepended. Use this for
-   * every versioned API call so v2 (when it lands) can be selected by the
+   * every versioned API call so a future wire version can be selected by the
    * apiVersion option without touching call sites.
    */
   private versioned(suffix: string): string {
@@ -227,7 +227,7 @@ export class APIClient {
 
   /**
    * Compile a fluent {@link Image} into a content-addressed image tag by
-   * POSTing its Dockerfile to `/v2/images/build`. The daemon caches by
+   * POSTing its Dockerfile to `/v1/images/build`. The daemon caches by
    * content hash, so repeated calls with the same Dockerfile are a no-op.
    * String images are passed through unchanged.
    *
@@ -239,7 +239,7 @@ export class APIClient {
   async buildImage(image: Image): Promise<string> {
     const response = await this.request(
       "POST",
-      "/v2/images/build",
+      "/v1/images/build",
       {
         body: JSON.stringify({ dockerfile_content: image.dockerfile }),
         headers: { "Content-Type": "application/json" },
@@ -249,7 +249,7 @@ export class APIClient {
       // Drain the body so the connection can be reused.
       await response.text().catch(() => undefined);
       throw new Error(
-        "this daemon does not support Image builds (POST /v2/images/build is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
+        "this daemon does not support Image builds (POST /v1/images/build is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
       );
     }
     if (!response.ok) {

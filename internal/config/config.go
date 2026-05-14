@@ -134,7 +134,7 @@ type Config struct {
 	// locally-built images (BuiltImageNamespace, i.e. "aerolvm-build/*")
 	// that are no longer referenced by any active sandbox AND were created
 	// more than ImageBuildGCTTL ago. Without this, images produced by
-	// standalone POST /v2/images/build calls or by builds whose followup
+	// standalone POST /v1/images/build calls or by builds whose followup
 	// CreateSandbox failed accumulate forever — service.maybeRemoveImage
 	// only runs on sandbox destroy and so can't see images that never had
 	// a sandbox row.

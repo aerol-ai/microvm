@@ -76,7 +76,7 @@ export interface CreateOptions {
    * The base image for this sandbox. A bare image reference (e.g.
    * `"ubuntu:22.04"`) is pulled by the daemon as-is. An {@link Image} builder
    * is compiled to a Dockerfile and sent to the daemon's
-   * `POST /v2/images/build` endpoint; the resulting content-addressed tag is
+   * `POST /v1/images/build` endpoint; the resulting content-addressed tag is
    * used for the sandbox. The daemon must have an image builder configured
    * (every official deployment does); otherwise the build call returns 503.
    */

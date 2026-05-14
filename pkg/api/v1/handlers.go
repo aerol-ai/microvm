@@ -12,7 +12,7 @@ import (
 // handlers carries Deps so each handler method has access to the service,
 // logger, and shared response helpers without threading them through every
 // signature. Handlers are intentionally thin — wire decode → service call →
-// wire encode — so the v1/v2 boundary stays at this layer.
+// wire encode — so the version boundary stays at this layer.
 type handlers struct {
 	deps Deps
 }

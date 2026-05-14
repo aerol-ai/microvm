@@ -39,8 +39,8 @@ STREAM_PREFIX_STDOUT = 0x01
 STREAM_PREFIX_STDERR = 0x02
 
 # Wire versions of the sandbox daemon API this SDK can call. Today only "v1"
-# exists; "v2" will be added when a wire-level breaking change ships on the
-# server. The SDK package version and the API wire version evolve
+# exists; a new wire version will be added when a breaking change ships on
+# the server. The SDK package version and the API wire version evolve
 # independently — bumping this SDK does not move the wire version.
 _DEFAULT_API_VERSION = "v1"
 _PATH_PREFIXES: Dict[str, str] = {
@@ -385,8 +385,8 @@ class MicroVM:
     def _versioned(self, suffix: str) -> str:
         """Build a versioned API path. Pass the suffix beginning with "/" (e.g.
         ``"/sandboxes"``) and the active version's prefix is prepended. Use
-        this for every versioned call so v2 (when it lands) is selected by the
-        ``api_version`` option without touching call sites.
+        this for every versioned call so a future wire version is selected by
+        the ``api_version`` option without touching call sites.
         """
         return f"{self._version_prefix}{suffix}"
 

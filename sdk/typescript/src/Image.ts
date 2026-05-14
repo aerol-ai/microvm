@@ -2,7 +2,7 @@
  * Image is a fluent Dockerfile builder. The shape mirrors the Daytona SDK's
  * Image API so examples port across by changing the import. The output is a
  * Dockerfile string accessible via `.dockerfile` — the SDK ships it to
- * `POST /v2/images/build` when an Image is passed to `MicroVM.create`.
+ * `POST /v1/images/build` when an Image is passed to `MicroVM.create`.
  *
  * Caller-side context (COPY/ADD from local files) needs the
  * SB_IMAGE_BUILD_CONTEXT_ENABLED operator flag on the daemon. Without that,

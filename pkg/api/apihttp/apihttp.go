@@ -1,6 +1,6 @@
 // Package apihttp holds HTTP helpers shared by every version of the public
-// API (pkg/api/v1, pkg/api/v2, ...). It is intentionally a leaf package with
-// no dependencies on pkg/api so version subpackages can import it without
+// API (pkg/api/v1, ...). It is intentionally a leaf package with no
+// dependencies on pkg/api so version subpackages can import it without
 // creating an import cycle through the top-level router.
 package apihttp
 

@@ -601,7 +601,7 @@ test("internal client create with Image builds first then creates", async () => 
       const req = new Request(input, init);
       const body = req.method === "POST" ? await req.json().catch(() => undefined) : undefined;
       seenRequests.push({ url: req.url, method: req.method, body });
-      if (req.url.endsWith("/v2/images/build")) {
+      if (req.url.endsWith("/v1/images/build")) {
         return jsonResponse({ image: "aerolvm-build/abc123:latest" });
       }
       return jsonResponse(apiSandbox("sb-from-image", { image: "aerolvm-build/abc123:latest" }));
@@ -614,7 +614,7 @@ test("internal client create with Image builds first then creates", async () => 
   assert.equal(sandbox.id, "sb-from-image");
   assert.equal(seenRequests.length, 2);
   assert.equal(seenRequests[0].method, "POST");
-  assert.ok(seenRequests[0].url.endsWith("/v2/images/build"));
+  assert.ok(seenRequests[0].url.endsWith("/v1/images/build"));
   assert.deepEqual(seenRequests[0].body, {
     dockerfile_content:
       "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n",

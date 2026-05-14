@@ -1,15 +1,34 @@
 package v1
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/docker"
 )
+
+// ImageBuilder is the slice of pkg/docker.Client v1 needs to compile an
+// Image-builder graph into a content-addressed local image tag. Declared as
+// an interface so the test harness can stub it without standing up a real
+// Docker daemon. Same shape as the daytona facade's analogue.
+type ImageBuilder interface {
+	BuildImage(ctx context.Context, req docker.BuildImageRequest) error
+	ImageExists(ctx context.Context, imageRef string) (bool, error)
+}
+
+// BuildConfig mirrors the operator-configured image-build knobs.
+type BuildConfig struct {
+	ContextEnabled bool
+	Timeout        time.Duration
+	Registry       string
+}
 
 // Deps holds the shared dependencies a version package needs from the
 // top-level pkg/api router. Keeping these explicit (rather than reaching into
-// pkg/api globals) is what lets pkg/api/v2 coexist later without coupling.
+// pkg/api globals) lets future version packages coexist without coupling.
 type Deps struct {
 	Service *service.Service
 	Logger  *slog.Logger
@@ -17,6 +36,9 @@ type Deps struct {
 	// pkg/api so all versions share one auth contract; the version package
 	// only decides which routes need it.
 	Auth func(http.Handler) http.Handler
+	// Builder is optional. When nil, POST /v1/images/build responds 503.
+	Builder ImageBuilder
+	Build   BuildConfig
 }
 
 // RegisterRoutes mounts every v1 route onto mux. Paths are written with the
@@ -27,6 +49,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 
 	mux.Handle("GET "+PathPrefix+"/capacity", d.Auth(http.HandlerFunc(h.capacity)))
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Auth(http.HandlerFunc(h.reconcile)))
+	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.buildImage)))
 
 	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.createSandbox)))
 	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.listSandboxes)))

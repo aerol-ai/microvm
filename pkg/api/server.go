@@ -1,15 +1,15 @@
 // Package api wires the top-level HTTP server. It is intentionally thin —
-// per-version routing lives in subpackages (pkg/api/v1, pkg/api/v2, ...) and
-// shared HTTP helpers live in pkg/api/apihttp. This file's job is:
+// per-version routing lives in subpackages (pkg/api/v1, ...) and shared HTTP
+// helpers live in pkg/api/apihttp. This file's job is:
 //
 //  1. construct the *Server with its dependencies,
 //  2. mount unversioned routes (/health),
 //  3. delegate /v1/... (and any future version) to that version's
 //     RegisterRoutes function.
 //
-// To add v2: create pkg/api/v2 mirroring pkg/api/v1, then add a single
-// v2.RegisterRoutes(...) call below. The two versions coexist on the same
-// mux without modifying v1.
+// To add a new version: create pkg/api/vN mirroring pkg/api/v1, then add a
+// single vN.RegisterRoutes(...) call below. Versions coexist on the same
+// mux without modifying each other.
 package api
 
 import (
@@ -21,7 +21,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
-	apiv2 "github.com/aerol-ai/microvm/pkg/api/v2"
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
@@ -76,14 +75,8 @@ func (s *Server) routes() {
 		Service: s.service,
 		Logger:  s.logger,
 		Auth:    s.requireAuth,
-	})
-
-	apiv2.RegisterRoutes(s.mux, apiv2.Deps{
-		Service: s.service,
-		Logger:  s.logger,
-		Auth:    s.requireAuth,
 		Builder: s.builder,
-		Build:   apiv2.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout, Registry: s.build.Registry},
+		Build:   apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout, Registry: s.build.Registry},
 	})
 }
 

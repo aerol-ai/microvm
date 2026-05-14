@@ -1,4 +1,4 @@
-package v2
+package v1
 
 import (
 	"context"
@@ -13,15 +13,14 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
+// buildContextWithTimeout returns a child context with the configured build
+// timeout. A timeout of zero falls back to plain cancel — the parent's
+// deadline (if any) still applies.
 func buildContextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return context.WithCancel(parent)
 	}
 	return context.WithTimeout(parent, timeout)
-}
-
-type handlers struct {
-	deps Deps
 }
 
 type buildImageRequest struct {
@@ -76,7 +75,7 @@ func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 		DockerfileContent: dockerfile,
 		OnLog: func(line string) {
 			if logger != nil {
-				logger.Debug("v2 image build", "tag", tag, "line", line)
+				logger.Debug("v1 image build", "tag", tag, "line", line)
 			}
 		},
 	})

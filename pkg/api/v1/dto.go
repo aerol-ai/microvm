@@ -6,7 +6,7 @@
 //
 // Versioning rules (soft freeze, see pr-review.md):
 //   - Behavioral changes to v1 wire bodies, status codes, or paths are
-//     forbidden once shipped. Add a new version package (pkg/api/v2) instead.
+//     forbidden once shipped. Add a new version package (pkg/api/vN) instead.
 //   - Bug and security fixes that preserve wire compatibility are allowed.
 //
 // The service layer (internal/service) stays version-agnostic. v1 handlers
@@ -20,6 +20,6 @@ const PathPrefix = "/v1"
 
 // Wire DTOs are currently shared with internal/service via pkg/models. As the
 // surface evolves, v1-owned request/response types should move into this file
-// so v2 can diverge without touching v1. Today this file intentionally holds
-// only the path constant; the boundary is enforced by package-locality of
-// handlers, not by separate types.
+// so future versions can diverge without touching v1. Today this file
+// intentionally holds only the path constant; the boundary is enforced by
+// package-locality of handlers, not by separate types.

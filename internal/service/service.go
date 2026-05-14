@@ -1468,7 +1468,7 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 // referenced by any active sandbox AND were created more than the configured
 // TTL ago. Without this, two failure modes leak images forever:
 //
-//   - POST /v2/images/build called standalone (no follow-up CreateSandbox).
+//   - POST /v1/images/build called standalone (no follow-up CreateSandbox).
 //   - Build succeeded, CreateSandbox failed AND the daytona facade's inline
 //     rollback couldn't reach the daemon (e.g. server-side panic, dropped
 //     connection between build success and rollback call).

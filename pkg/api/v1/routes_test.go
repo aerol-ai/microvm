@@ -10,8 +10,9 @@ import (
 
 // TestRegisterRoutesPrefix is a smoke test that every v1 route registered on
 // the mux begins with PathPrefix. It exists to catch the regression where a
-// future maintainer copies the v1 file as a starting point for v2 but forgets
-// to update PathPrefix — the route would then accidentally collide on /v1/...
+// future maintainer copies the v1 file as a starting point for a new version
+// but forgets to update PathPrefix — the route would then accidentally
+// collide on /v1/...
 //
 // The test does not exercise handler behavior; pkg/api integration tests
 // cover that.

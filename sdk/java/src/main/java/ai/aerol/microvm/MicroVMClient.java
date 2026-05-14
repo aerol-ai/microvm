@@ -97,8 +97,8 @@ public class MicroVMClient {
     /**
      * Build a versioned API path. Pass the suffix beginning with "/" (e.g.
      * {@code "/sandboxes"}); the active version's prefix is prepended. Use
-     * this for every versioned call so v2 (when it lands) can be selected via
-     * {@link MicroVMConfig#apiVersion} without touching call sites.
+     * this for every versioned call so a future wire version can be selected
+     * via {@link MicroVMConfig#apiVersion} without touching call sites.
      */
     private String versioned(String suffix) {
         return versionPrefix + suffix;

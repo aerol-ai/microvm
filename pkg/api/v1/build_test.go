@@ -1,4 +1,4 @@
-package v2
+package v1
 
 import (
 	"context"
@@ -50,7 +50,7 @@ func TestBuildImageReturnsContentAddressedTag(t *testing.T) {
 
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v2/images/build", strings.NewReader(string(body))))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
@@ -76,7 +76,7 @@ func TestBuildImageCacheHitSkipsBuild(t *testing.T) {
 
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v2/images/build", strings.NewReader(string(body))))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d", rr.Code)
@@ -90,7 +90,7 @@ func TestBuildImageRejectsEmptyDockerfile(t *testing.T) {
 	mux := newTestMux(&fakeImageBuilder{}, BuildConfig{})
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "   "})
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v2/images/build", strings.NewReader(string(body))))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rr.Code)
 	}
@@ -103,7 +103,7 @@ func TestBuildImageRejectsContextHashesWithoutFlag(t *testing.T) {
 		ContextHashes:     []string{"deadbeef"},
 	})
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v2/images/build", strings.NewReader(string(body))))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
 	}
@@ -116,7 +116,7 @@ func TestBuildImageRejectsMissingBuilder(t *testing.T) {
 	mux := newTestMux(nil, BuildConfig{})
 	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine"})
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v2/images/build", strings.NewReader(string(body))))
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rr.Code)
 	}
