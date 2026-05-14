@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
 )
 
 // extractBearerToken returns the caller's bearer token from either:
@@ -46,6 +47,17 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		apihttp.WriteError(w, http.StatusUnauthorized, "unauthorized")
+	})
+}
+
+func (s *Server) requireE2BAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiKey := strings.TrimSpace(r.Header.Get("X-API-KEY"))
+		if apiKey == s.patToken || extractBearerToken(r) == s.patToken {
+			next.ServeHTTP(w, r)
+			return
+		}
+		apie2b.WriteError(w, http.StatusUnauthorized, "Unauthorized, please check your credentials.")
 	})
 }
 

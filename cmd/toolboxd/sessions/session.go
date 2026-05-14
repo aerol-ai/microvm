@@ -108,6 +108,15 @@ func (s *Session) ID() string { return s.id }
 // Name returns the human-friendly session name.
 func (s *Session) Name() string { return s.name }
 
+// PID returns the OS process identifier for the session, or 0 when the
+// session has not started successfully.
+func (s *Session) PID() int {
+	if s == nil || s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
 // IsPTY reports whether the session was started in PTY mode.
 func (s *Session) IsPTY() bool { return s.pty }
 

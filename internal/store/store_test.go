@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +18,6 @@ import (
 func TestStoreCases(t *testing.T) {
 	ctx := context.Background()
 
-	// 25 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -468,6 +469,262 @@ func TestStoreCases(t *testing.T) {
 				}
 				if _, err := st.ResolveDaytonaSandboxID(ctx, "cascade-name"); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound from ResolveDaytonaSandboxID(), got %v", err)
+				}
+			},
+		},
+		{
+			name: "e2b_sandbox_metadata_roundtrip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-e2b")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				allowInternet := false
+				allowPublic := true
+				createdAt := time.Now().UTC().Add(-time.Minute)
+				meta := models.E2BSandboxMetadata{
+					SandboxID:           sandbox.ID,
+					TemplateID:          "base",
+					TemplateAlias:       "base",
+					Metadata:            map[string]string{"team": "sdk"},
+					TimeoutSeconds:      45,
+					OnTimeout:           "pause",
+					AutoResume:          true,
+					Secure:              true,
+					AllowInternetAccess: &allowInternet,
+					NetworkAllowOut:     []string{"10.0.0.0/24"},
+					NetworkDenyOut:      []string{"0.0.0.0/0"},
+					AllowPublicTraffic:  &allowPublic,
+					MaskRequestHost:     "sandbox.example.com",
+					CreatedAt:           createdAt,
+				}
+				if err := st.UpsertE2BSandboxMetadata(ctx, meta); err != nil {
+					t.Fatalf("UpsertE2BSandboxMetadata() error = %v", err)
+				}
+
+				got, err := st.GetE2BSandboxMetadata(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("GetE2BSandboxMetadata() error = %v", err)
+				}
+				if got.TemplateID != meta.TemplateID || got.TemplateAlias != meta.TemplateAlias || got.TimeoutSeconds != meta.TimeoutSeconds || got.OnTimeout != meta.OnTimeout || got.MaskRequestHost != meta.MaskRequestHost {
+					t.Fatalf("unexpected e2b metadata: %+v", got)
+				}
+				if !reflect.DeepEqual(got.Metadata, meta.Metadata) {
+					t.Fatalf("Metadata = %+v, want %+v", got.Metadata, meta.Metadata)
+				}
+				if !reflect.DeepEqual(got.NetworkAllowOut, meta.NetworkAllowOut) {
+					t.Fatalf("NetworkAllowOut = %+v, want %+v", got.NetworkAllowOut, meta.NetworkAllowOut)
+				}
+				if !reflect.DeepEqual(got.NetworkDenyOut, meta.NetworkDenyOut) {
+					t.Fatalf("NetworkDenyOut = %+v, want %+v", got.NetworkDenyOut, meta.NetworkDenyOut)
+				}
+				if got.AllowInternetAccess == nil || *got.AllowInternetAccess != allowInternet {
+					t.Fatalf("AllowInternetAccess = %+v, want %v", got.AllowInternetAccess, allowInternet)
+				}
+				if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic != allowPublic {
+					t.Fatalf("AllowPublicTraffic = %+v, want %v", got.AllowPublicTraffic, allowPublic)
+				}
+				items, err := st.ListE2BSandboxMetadata(ctx)
+				if err != nil {
+					t.Fatalf("ListE2BSandboxMetadata() error = %v", err)
+				}
+				if listed, ok := items[sandbox.ID]; !ok || listed.TemplateID != meta.TemplateID {
+					t.Fatalf("expected listed e2b metadata for %q, got %+v", sandbox.ID, items)
+				}
+			},
+		},
+		{
+			name: "e2b_snapshot_metadata_roundtrip_and_delete",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				meta := models.E2BSnapshotMetadata{
+					SnapshotID:      "snapshot-name:default",
+					SnapshotName:    "snapshot-name",
+					Names:           []string{"snapshot-name:default"},
+					SourceSandboxID: "sb-1",
+					CreatedAt:       time.Now().UTC(),
+				}
+				if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
+					Name:            meta.SnapshotName,
+					Image:           meta.SnapshotName,
+					ImageID:         "sha256:e2b-snapshot",
+					SourceSandboxID: meta.SourceSandboxID,
+					CreatedAt:       meta.CreatedAt,
+				}); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if err := st.UpsertE2BSnapshot(ctx, meta); err != nil {
+					t.Fatalf("UpsertE2BSnapshot() error = %v", err)
+				}
+
+				got, err := st.GetE2BSnapshot(ctx, meta.SnapshotID)
+				if err != nil {
+					t.Fatalf("GetE2BSnapshot() error = %v", err)
+				}
+				if got.SnapshotName != meta.SnapshotName || got.SourceSandboxID != meta.SourceSandboxID {
+					t.Fatalf("unexpected e2b snapshot metadata: %+v", got)
+				}
+				if !reflect.DeepEqual(got.Names, meta.Names) {
+					t.Fatalf("Names = %+v, want %+v", got.Names, meta.Names)
+				}
+				items, err := st.ListE2BSnapshots(ctx)
+				if err != nil {
+					t.Fatalf("ListE2BSnapshots() error = %v", err)
+				}
+				if listed, ok := items[meta.SnapshotID]; !ok || listed.SnapshotName != meta.SnapshotName {
+					t.Fatalf("expected listed snapshot metadata for %q, got %+v", meta.SnapshotID, items)
+				}
+				if err := st.DeleteE2BSnapshot(ctx, meta.SnapshotID); err != nil {
+					t.Fatalf("DeleteE2BSnapshot() error = %v", err)
+				}
+				if _, err := st.GetE2BSnapshot(ctx, meta.SnapshotID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+			},
+		},
+		{
+			name: "e2b_snapshot_metadata_cascades_with_native_snapshot_delete",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				meta := models.E2BSnapshotMetadata{
+					SnapshotID:      "snapshot-cascade:default",
+					SnapshotName:    "snapshot-cascade",
+					Names:           []string{"snapshot-cascade:default"},
+					SourceSandboxID: "sb-cascade",
+					CreatedAt:       time.Now().UTC(),
+				}
+				if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
+					Name:            meta.SnapshotName,
+					Image:           meta.SnapshotName,
+					ImageID:         "sha256:e2b-cascade",
+					SourceSandboxID: meta.SourceSandboxID,
+					CreatedAt:       meta.CreatedAt,
+				}); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if err := st.UpsertE2BSnapshot(ctx, meta); err != nil {
+					t.Fatalf("UpsertE2BSnapshot() error = %v", err)
+				}
+				if err := st.DeleteSnapshot(ctx, meta.SnapshotName); err != nil {
+					t.Fatalf("DeleteSnapshot() error = %v", err)
+				}
+				if _, err := st.GetE2BSnapshot(ctx, meta.SnapshotID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected E2B snapshot metadata cascade delete, got %v", err)
+				}
+			},
+		},
+		{
+			name: "e2b_create_request_claim_complete_and_reclaim",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC().Round(0)
+				fingerprint := "fp:test"
+
+				record, acquired, err := st.ClaimE2BCreateRequest(ctx, fingerprint, now, 30*time.Second)
+				if err != nil {
+					t.Fatalf("first ClaimE2BCreateRequest() error = %v", err)
+				}
+				if !acquired {
+					t.Fatal("expected first claim to acquire reservation")
+				}
+				if record.State != models.E2BCreateRequestStatePending {
+					t.Fatalf("record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending)
+				}
+
+				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(5*time.Second), 30*time.Second)
+				if err != nil {
+					t.Fatalf("second ClaimE2BCreateRequest() error = %v", err)
+				}
+				if acquired {
+					t.Fatal("expected second claim to observe pending reservation")
+				}
+				if record.State != models.E2BCreateRequestStatePending {
+					t.Fatalf("pending record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending)
+				}
+
+				if err := st.CompleteE2BCreateRequest(ctx, fingerprint, "sb-e2b-claim", now.Add(8*time.Second), 15*time.Second); err != nil {
+					t.Fatalf("CompleteE2BCreateRequest() error = %v", err)
+				}
+
+				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(10*time.Second), 30*time.Second)
+				if err != nil {
+					t.Fatalf("ready ClaimE2BCreateRequest() error = %v", err)
+				}
+				if acquired {
+					t.Fatal("expected ready claim to replay existing sandbox")
+				}
+				if record.State != models.E2BCreateRequestStateReady || record.SandboxID != "sb-e2b-claim" {
+					t.Fatalf("unexpected ready record: %+v", record)
+				}
+
+				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(40*time.Second), 30*time.Second)
+				if err != nil {
+					t.Fatalf("stale ready ClaimE2BCreateRequest() error = %v", err)
+				}
+				if !acquired {
+					t.Fatal("expected stale ready record to be reclaimed")
+				}
+				if record.State != models.E2BCreateRequestStatePending || record.SandboxID != "" {
+					t.Fatalf("unexpected reclaimed record: %+v", record)
+				}
+
+				if err := st.DeleteE2BCreateRequest(ctx, fingerprint); err != nil {
+					t.Fatalf("DeleteE2BCreateRequest() error = %v", err)
+				}
+				if _, err := st.GetE2BCreateRequest(ctx, fingerprint); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+			},
+		},
+		{
+			name: "e2b_create_request_concurrent_claims_share_pending_record",
+			run: func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state.db")
+				const contenders = 6
+				stores := make([]*Store, 0, contenders)
+				for i := 0; i < contenders; i++ {
+					st, err := Open(path)
+					if err != nil {
+						t.Fatalf("Open(%d) error = %v", i, err)
+					}
+					defer st.Close()
+					stores = append(stores, st)
+				}
+
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				var mu sync.Mutex
+				var errs []error
+				acquiredCount := 0
+				for _, st := range stores {
+					wg.Add(1)
+					go func(st *Store) {
+						defer wg.Done()
+						<-start
+						record, acquired, err := st.ClaimE2BCreateRequest(ctx, "fp:concurrent", time.Now().UTC(), time.Minute)
+						mu.Lock()
+						defer mu.Unlock()
+						if err != nil {
+							errs = append(errs, err)
+							return
+						}
+						if record.State != models.E2BCreateRequestStatePending {
+							errs = append(errs, fmt.Errorf("record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending))
+							return
+						}
+						if acquired {
+							acquiredCount++
+						}
+					}(st)
+				}
+				close(start)
+				wg.Wait()
+				if len(errs) > 0 {
+					t.Fatalf("concurrent ClaimE2BCreateRequest() errors = %v", errs)
+				}
+				if acquiredCount != 1 {
+					t.Fatalf("acquired claims = %d, want 1", acquiredCount)
 				}
 			},
 		},

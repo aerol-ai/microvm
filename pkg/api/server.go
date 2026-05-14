@@ -18,6 +18,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
+	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 )
 
@@ -54,6 +55,12 @@ func (s *Server) routes() {
 		Service: s.service,
 		Logger:  s.logger,
 		Auth:    s.requireAuth,
+	})
+
+	e2b.RegisterRoutes(s.mux, e2b.Deps{
+		Service: s.service,
+		Logger:  s.logger,
+		Auth:    s.requireE2BAuth,
 	})
 
 	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
