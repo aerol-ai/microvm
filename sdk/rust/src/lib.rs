@@ -25,11 +25,11 @@ pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::ExposePortResponseWire;
 pub use types::{
-    CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
-    ExposeProtocol, ExposeResult, ExposedPort, HealthStatus, Lifecycle, MountSpec,
-    MountSpecRedacted, MountType, NetworkUsage, RegistryAuth, ResizeOptions,
-    Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus,
-    SetNetworkLimitsOptions, UpdateLifecycleOptions,
+    BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions,
+    CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, ExposeProtocol,
+    ExposeResult, ExposedPort, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType,
+    NetworkUsage, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session,
+    SessionList, SessionStatus, SetNetworkLimitsOptions, UpdateLifecycleOptions,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -490,19 +490,71 @@ impl Client {
     }
 
     pub fn build_image(&self, image: &Image) -> Result<String, Error> {
+        Ok(self
+            .build_image_with_options(image, &BuildImageOptions::default())?
+            .image)
+    }
+
+    /// Build an `Image` and optionally push the result to a remote registry.
+    /// Push credentials are forwarded to the daemon as a one-shot
+    /// `X-Registry-Auth` header on the underlying push call and are never
+    /// persisted server-side.
+    pub fn build_image_with_options(
+        &self,
+        image: &Image,
+        options: &BuildImageOptions,
+    ) -> Result<BuildImageResult, Error> {
         #[derive(Serialize)]
         struct BuildImageRequest<'a> {
             dockerfile_content: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            push: Option<BuildImagePushBody<'a>>,
+        }
+
+        #[derive(Serialize)]
+        struct BuildImagePushBody<'a> {
+            registry: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tag: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            server: Option<&'a str>,
+            username: &'a str,
+            password: &'a str,
         }
 
         #[derive(serde::Deserialize)]
         struct BuildImageResponse {
             image: String,
+            #[serde(default)]
+            pushed: Option<String>,
         }
 
         if let Some(message) = image.validation_error() {
             return Err(Error::Api(message.to_string()));
         }
+
+        let push_body = if let Some(push) = options.push.as_ref() {
+            let registry = push.registry.trim();
+            if registry.is_empty() {
+                return Err(Error::Api(
+                    "push.registry is required when push is set".to_string(),
+                ));
+            }
+            if push.username.is_empty() || push.password.is_empty() {
+                return Err(Error::Api(
+                    "push.username and push.password are required when push is set".to_string(),
+                ));
+            }
+            Some(BuildImagePushBody {
+                registry,
+                tag: push.tag.as_deref().filter(|s| !s.is_empty()),
+                server: push.server.as_deref().filter(|s| !s.is_empty()),
+                username: push.username.as_str(),
+                password: push.password.as_str(),
+            })
+        } else {
+            None
+        };
 
         let path = format!("{}/images/build", self.version_prefix());
         let response = self
@@ -511,6 +563,7 @@ impl Client {
             .bearer_auth(&self.pat_token)
             .json(&BuildImageRequest {
                 dockerfile_content: image.dockerfile(),
+                push: push_body,
             })
             .send()?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -522,7 +575,10 @@ impl Client {
         }
         let response = self.handle_response(response)?;
         let payload: BuildImageResponse = response.json().map_err(Error::Reqwest)?;
-        Ok(payload.image)
+        Ok(BuildImageResult {
+            image: payload.image,
+            pushed: payload.pushed.filter(|s| !s.is_empty()),
+        })
     }
 
     pub fn create_with_image(
