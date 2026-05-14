@@ -37,6 +37,7 @@ import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 import ai.aerol.microvm.model.MountSpecRedacted;
 import ai.aerol.microvm.model.SandboxData;
+import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 
@@ -131,6 +132,43 @@ class MicroVMClientTest {
             Map<String, Object> lifecycle = castMap(payload.get("lifecycle"));
             assertEquals(3_600_000_000_000L, ((Number) lifecycle.get("stop_if_idle_for")).longValue());
             assertEquals(86_400_000_000_000L, ((Number) lifecycle.get("destroy_at_age")).longValue());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createSnapshotMapsRequestAndResponseShapes() throws Exception {
+        List<Map<String, Object>> requestBodies = new ArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod());
+            assertEquals("/v1/sandboxes/sb-1/snapshot", exchange.getRequestURI().getPath());
+            Map<String, Object> request = castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class));
+            requestBodies.add(request);
+            String name = String.valueOf(request.get("name"));
+            writeJson(exchange, 200, mapOf(
+                "name", name,
+                "image", name,
+                "image_id", "sha256:snap-1",
+                "source_sandbox_id", "sb-1",
+                "created_at", "2026-05-14T10:00:00Z"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            SandboxSnapshot snapshot = client.createSnapshot("sb-1", "snapshots/demo:v1");
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+            SandboxSnapshot sandboxSnapshot = sandbox.createSnapshot("snapshots/from-sandbox:v1");
+
+            assertEquals(2, requestBodies.size());
+            assertEquals("snapshots/demo:v1", requestBodies.get(0).get("name"));
+            assertEquals("snapshots/from-sandbox:v1", requestBodies.get(1).get("name"));
+            assertEquals("snapshots/demo:v1", snapshot.name);
+            assertEquals("sha256:snap-1", snapshot.imageId);
+            assertEquals("sb-1", snapshot.sourceSandboxId);
+            assertEquals("snapshots/from-sandbox:v1", sandboxSnapshot.name);
         } finally {
             server.stop(0);
         }

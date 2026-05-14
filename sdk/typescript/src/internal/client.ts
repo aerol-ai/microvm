@@ -20,6 +20,7 @@ import type {
   MountSpecRedacted,
   ResizeOptions,
   Sandbox,
+  SandboxSnapshot,
   Session,
   SessionAttachHandle,
   SessionAttachOptions,
@@ -101,6 +102,14 @@ interface ApiSandbox {
 
 interface ApiCreateSandboxResponse extends ApiSandbox {
   ssh_private_key?: string;
+}
+
+interface ApiSandboxSnapshot {
+  name: string;
+  image: string;
+  image_id?: string;
+  source_sandbox_id: string;
+  created_at: string;
 }
 
 interface ApiSession {
@@ -212,6 +221,11 @@ export class APIClient {
     const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/stop`);
     return this.wrap(response);
   }
+
+	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
+		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, { name });
+		return fromApiSandboxSnapshot(response);
+	}
 
   async destroy(id: string): Promise<void> {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}`);
@@ -477,6 +491,10 @@ export class SandboxResource implements Sandbox {
     await this.client.unexposePort(this.id, port);
   }
 
+	async createSnapshot(name: string): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(this.id, name);
+	}
+
   async start(): Promise<this> {
     const updated = await this.client.start(this.id);
     this.apply(updated.toJSON());
@@ -611,6 +629,16 @@ function fromApiCreateSandboxResponse(response: ApiCreateSandboxResponse): Sandb
   return {
     ...fromApiSandbox(response),
     sshPrivateKey: response.ssh_private_key,
+  };
+}
+
+function fromApiSandboxSnapshot(snapshot: ApiSandboxSnapshot): SandboxSnapshot {
+  return {
+    name: snapshot.name,
+    image: snapshot.image,
+    imageID: snapshot.image_id,
+    sourceSandboxID: snapshot.source_sandbox_id,
+    createdAt: snapshot.created_at,
   };
 }
 

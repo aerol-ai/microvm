@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
@@ -109,6 +110,44 @@ func TestNewClientCases(t *testing.T) {
 				_, err = sandbox.ExecStream(ctx, sdktypes.ExecStreamOptions{})
 				if err == nil || !strings.Contains(err.Error(), "command is required") {
 					t.Fatalf("unexpected error: %v", err)
+				}
+			},
+		},
+		{
+			name: "client_create_snapshot_maps_response",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPost || r.URL.Path != "/v1/sandboxes/sb-structured/snapshot" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					var payload models.CreateSandboxSnapshotRequest
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatalf("Decode() error = %v", err)
+					}
+					if payload.Name != "snapshots/demo:v1" {
+						t.Fatalf("payload.Name = %q, want snapshots/demo:v1", payload.Name)
+					}
+					_ = json.NewEncoder(w).Encode(models.SandboxSnapshot{
+						Name:            payload.Name,
+						Image:           payload.Name,
+						ImageID:         "sha256:snap-1",
+						SourceSandboxID: "sb-structured",
+						CreatedAt:       time.Now().UTC(),
+					})
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "config-pat", APIUrl: server.URL})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig() error = %v", err)
+				}
+
+				snapshot, err := client.CreateSnapshot(ctx, "sb-structured", "snapshots/demo:v1")
+				if err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if snapshot.Name != "snapshots/demo:v1" || snapshot.ImageID != "sha256:snap-1" {
+					t.Fatalf("unexpected snapshot: %+v", snapshot)
 				}
 			},
 		},

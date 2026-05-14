@@ -59,6 +59,32 @@ test("internal client create maps request and response", async () => {
   });
 });
 
+test("internal client createSnapshot maps request and response", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        name: "snapshots/demo:v1",
+        image: "snapshots/demo:v1",
+        image_id: "sha256:snap-1",
+        source_sandbox_id: "sb-create",
+        created_at: "2026-05-14T10:00:00Z",
+      });
+    },
+  });
+
+  const snapshot = await client.createSnapshot("sb-create", "snapshots/demo:v1");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "POST");
+  assert.deepEqual(await seenRequest.json(), { name: "snapshots/demo:v1" });
+  assert.equal(snapshot.name, "snapshots/demo:v1");
+  assert.equal(snapshot.imageID, "sha256:snap-1");
+  assert.equal(snapshot.sourceSandboxID, "sb-create");
+});
+
 test("internal client updateLifecycle sends flat request body", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({
@@ -146,6 +172,28 @@ test("sandbox resource methods refresh and resize data", async () => {
     stopIfIdleFor: 7_200_000_000_000,
     destroyIfIdleFor: 14_400_000_000_000,
   });
+});
+
+test("sandbox resource createSnapshot delegates to client", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "POST" && request.url.endsWith("/snapshot")) {
+        return jsonResponse({
+          name: "snapshots/resource:v1",
+          image: "snapshots/resource:v1",
+          source_sandbox_id: "sb-resource",
+          created_at: "2026-05-14T10:00:00Z",
+        });
+      }
+      return jsonResponse(apiSandbox("sb-resource"));
+    },
+  });
+
+  const sandbox = await client.get("sb-resource");
+  const snapshot = await sandbox.createSnapshot("snapshots/resource:v1");
+  assert.equal(snapshot.sourceSandboxID, "sb-resource");
 });
 
 test("internal client decodes API errors", async () => {

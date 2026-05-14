@@ -28,6 +28,7 @@ from .types import (
     MountSpecRedacted,
     ResizeOptions,
     SandboxData,
+    SandboxSnapshot,
     Session,
     SessionAttachOptions,
 )
@@ -325,6 +326,9 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
+    def create_snapshot(self, name: str) -> SandboxSnapshot:
+        return self._client.create_snapshot(self.id, name)
+
     def destroy(self) -> None:
         self._client.destroy(self.id)
 
@@ -397,6 +401,10 @@ class MicroVM:
     def stop(self, sandbox_id: str) -> Sandbox:
         sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None)
         return self._wrap_sandbox(sandbox)
+
+    def create_snapshot(self, sandbox_id: str, name: str) -> SandboxSnapshot:
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", {"name": name})
+        return _from_api_sandbox_snapshot(response)
 
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
@@ -732,6 +740,19 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
         "publicURL": str(_first_of(port, "public_url", "publicURL") or ""),
         "createdAt": str(_first_of(port, "created_at", "createdAt") or ""),
     }
+
+
+def _from_api_sandbox_snapshot(snapshot: Dict[str, Any]) -> SandboxSnapshot:
+    result: SandboxSnapshot = {
+        "name": str(_first_of(snapshot, "name") or ""),
+        "image": str(_first_of(snapshot, "image") or ""),
+        "sourceSandboxID": str(_first_of(snapshot, "source_sandbox_id", "sourceSandboxID") or ""),
+        "createdAt": str(_first_of(snapshot, "created_at", "createdAt") or ""),
+    }
+    image_id = _first_of(snapshot, "image_id", "imageID")
+    if image_id not in (None, ""):
+        result["imageID"] = str(image_id)
+    return result
 
 
 def _from_api_expose_port_response(response: Dict[str, Any]) -> ExposeResult:

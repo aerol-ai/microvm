@@ -16,4 +16,5 @@ These are the first-party AerolVM SDKs that are shipped directly from this repos
 |---|---|
 | Native API target | AerolVM SDKs target the native `/v1` API, not the `/daytona` compatibility facade. |
 | Language parity | The repo ships five first-party AerolVM SDK languages today: Go, Java, Python, Rust, and TypeScript. |
+| Native snapshot creation | Supported across all five first-party SDKs via `POST /v1/sandboxes/{id}/snapshot`. |
 | Compatibility mode | Daytona compatibility is additive and does not replace or modify the native AerolVM SDKs. |

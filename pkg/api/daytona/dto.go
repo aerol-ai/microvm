@@ -32,6 +32,10 @@ type resizeSandboxRequest struct {
 	Disk   *int32 `json:"disk,omitempty"`
 }
 
+type createSandboxSnapshotRequest struct {
+	Name string `json:"name"`
+}
+
 type sandboxResponse struct {
 	ID                  string            `json:"id"`
 	OrganizationID      string            `json:"organizationId"`

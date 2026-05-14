@@ -17,7 +17,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
-pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, ExposeOptions, ExposeProtocol, ExposeResult, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, Session, SessionList, SessionStatus, UpdateLifecycleOptions};
+pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, ExposeOptions, ExposeProtocol, ExposeResult, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus, UpdateLifecycleOptions};
 pub use types::CreateSandboxResponse;
 use types::ExposePortResponseWire;
 
@@ -371,6 +371,10 @@ impl Sandbox {
         Ok(self)
     }
 
+    pub fn create_snapshot(&self, name: &str) -> Result<SandboxSnapshot, Error> {
+        self.client.create_snapshot(&self.data.id, name)
+    }
+
     pub fn destroy(self) -> Result<(), Error> {
         self.client.destroy(&self.data.id)
     }
@@ -449,6 +453,19 @@ impl Client {
     pub fn stop(&self, id: &str) -> Result<Sandbox, Error> {
         let raw = self.do_json::<(), SandboxData>(Method::POST, &format!("{}/sandboxes/{}/stop", self.version_prefix(), id), None)?;
         Ok(Sandbox::new(self.clone(), raw))
+    }
+
+    pub fn create_snapshot(&self, id: &str, name: &str) -> Result<SandboxSnapshot, Error> {
+        #[derive(Serialize)]
+        struct CreateSnapshotRequest<'a> {
+            name: &'a str,
+        }
+
+        self.do_json::<CreateSnapshotRequest<'_>, SandboxSnapshot>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/snapshot", self.version_prefix(), id),
+            Some(&CreateSnapshotRequest { name }),
+        )
     }
 
     pub fn destroy(&self, id: &str) -> Result<(), Error> {
@@ -1225,6 +1242,32 @@ mod tests {
             stop_at_age: 0,
             destroy_at_age: 172800000000000,
         });
+    }
+
+    #[test]
+    fn create_snapshot_sends_name_and_maps_response() {
+        let body = serde_json::json!({
+            "name": "snapshots/demo:v1",
+            "image": "snapshots/demo:v1",
+            "image_id": "sha256:snap-1",
+            "source_sandbox_id": "sb-1",
+            "created_at": "2026-05-14T10:00:00Z"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let snapshot = client
+            .create_snapshot("sb-1", "snapshots/demo:v1")
+            .expect("create snapshot should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+
+        assert!(request.starts_with("POST /v1/sandboxes/sb-1/snapshot HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(body, serde_json::json!({"name": "snapshots/demo:v1"}));
+        assert_eq!(snapshot.name, "snapshots/demo:v1");
+        assert_eq!(snapshot.image_id.as_deref(), Some("sha256:snap-1"));
+        assert_eq!(snapshot.source_sandbox_id, "sb-1");
     }
 
     #[test]

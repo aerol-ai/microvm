@@ -241,6 +241,32 @@ func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
 }
 
+func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req createSandboxSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	if _, err := h.deps.Service.CreateSnapshot(r.Context(), sandboxID, models.CreateSandboxSnapshotRequest{Name: req.Name}); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
 func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
 	if err != nil {

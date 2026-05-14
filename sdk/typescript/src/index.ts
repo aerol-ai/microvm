@@ -20,6 +20,7 @@ export type {
   RegistryAuth,
   ResizeOptions,
   Sandbox as SandboxData,
+  SandboxSnapshot,
   SandboxStatus,
   Session,
   SessionAttachHandle,

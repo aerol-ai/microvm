@@ -38,6 +38,7 @@ import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpecRedacted;
 import ai.aerol.microvm.model.ResizeOptions;
 import ai.aerol.microvm.model.SandboxData;
+import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 
@@ -133,6 +134,10 @@ public class MicroVMClient {
         return wrap(doJson("POST", sandboxPath(sandboxId) + "/stop", null, SandboxData.class));
     }
 
+    public SandboxSnapshot createSnapshot(String sandboxId, String name) {
+        return doJson("POST", sandboxPath(sandboxId) + "/snapshot", new CreateSnapshotRequest(name), SandboxSnapshot.class);
+    }
+
     public void destroy(String sandboxId) {
         doNoContent("DELETE", sandboxPath(sandboxId), null);
     }
@@ -217,6 +222,14 @@ public class MicroVMClient {
 
         ExposePortRequest(String protocol) {
             this.protocol = protocol;
+        }
+    }
+
+    static class CreateSnapshotRequest {
+        public final String name;
+
+        CreateSnapshotRequest(String name) {
+            this.name = name;
         }
     }
 

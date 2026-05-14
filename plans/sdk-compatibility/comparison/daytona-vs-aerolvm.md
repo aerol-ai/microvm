@@ -9,6 +9,7 @@ This is the short side-by-side view. The detailed route tables live under `../da
 | Official Daytona high-level SDKs | N/A | Partial | Go, Java, Python, Ruby, and TypeScript can only use the implemented `/daytona` subset. |
 | Sandbox lifecycle | Supported | Supported | Create, list, get, start, stop, destroy, resize all exist in the current facade. |
 | Persistent Daytona names and labels | N/A | Supported | Stored as compatibility metadata so lookup survives restarts. |
+| Snapshot creation | Supported | Partial | Native AerolVM SDKs expose sandbox snapshot creation directly. Daytona compatibility supports only create-from-sandbox, not the broader snapshot catalog. |
 | Daytona auto-stop and auto-delete | N/A | Supported | Mapped to native AerolVM lifecycle timers. |
 | Daytona auto-archive | N/A | Partial | Metadata is stored, but there is no real archive behavior. |
 | Toolbox exec | Supported | Supported | One-shot command execution works on both sides. |

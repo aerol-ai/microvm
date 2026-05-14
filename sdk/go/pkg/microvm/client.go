@@ -130,6 +130,10 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 	return wrapSandbox(c, item), nil
 }
 
+func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (sdktypes.SandboxSnapshot, error) {
+	return c.inner.CreateSnapshot(ctx, id, name)
+}
+
 func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.inner.Destroy(ctx, id)
 }
@@ -235,6 +239,10 @@ func (s *Sandbox) ExposePort(ctx context.Context, port int, opts ...ExposeOption
 
 func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 	return s.client.inner.UnexposePort(ctx, s.ID, port)
+}
+
+func (s *Sandbox) CreateSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {
+	return s.client.CreateSnapshot(ctx, s.ID, name)
 }
 
 func (s *Sandbox) Start(ctx context.Context) error {

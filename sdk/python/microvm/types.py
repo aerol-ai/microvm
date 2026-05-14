@@ -182,6 +182,14 @@ class ExposedPort(TypedDict, total=False):
     createdAt: str
 
 
+class SandboxSnapshot(TypedDict, total=False):
+    name: str
+    image: str
+    imageID: str
+    sourceSandboxID: str
+    createdAt: str
+
+
 # Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP
 # reverse proxy; "tcp" and "tls" map to caddy-l4 surfaces.
 ExposeProtocol = Literal["http", "tcp", "tls"]
