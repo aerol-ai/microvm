@@ -1,5 +1,7 @@
 # Daytona and E2B Compatibility Facade Plan
 
+Note: the E2B portion of this document is now historical context. The active E2B implementation plan lives in `plans/sdk-compatibility/e2b/facade-plan.md`.
+
 ## Objective
 
 Make AerolVM consumable by external sandbox SDKs without changing AerolVM's own SDKs, starting with Daytona and then E2B.

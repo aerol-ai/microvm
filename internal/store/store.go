@@ -101,6 +101,32 @@ func Open(path string) (*Store, error) {
 			updated_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		`CREATE TABLE IF NOT EXISTS e2b_sandboxes (
+			sandbox_id TEXT PRIMARY KEY,
+			template_id TEXT NOT NULL DEFAULT '',
+			template_alias TEXT NOT NULL DEFAULT '',
+			metadata_json TEXT NOT NULL DEFAULT '{}',
+			timeout_seconds INTEGER NOT NULL DEFAULT 0,
+			on_timeout TEXT NOT NULL DEFAULT 'kill',
+			auto_resume INTEGER NOT NULL DEFAULT 0,
+			secure INTEGER NOT NULL DEFAULT 1,
+			allow_internet_access INTEGER,
+			network_allow_out_json TEXT NOT NULL DEFAULT '[]',
+			network_deny_out_json TEXT NOT NULL DEFAULT '[]',
+			allow_public_traffic INTEGER,
+			mask_request_host TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
+		`CREATE TABLE IF NOT EXISTS e2b_snapshots (
+			snapshot_id TEXT PRIMARY KEY,
+			snapshot_name TEXT NOT NULL,
+			names_json TEXT NOT NULL DEFAULT '[]',
+			source_sandbox_id TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -116,6 +142,7 @@ func Open(path string) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
+		`CREATE INDEX IF NOT EXISTS idx_e2b_snapshots_source_sandbox_id ON e2b_snapshots(source_sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
 	}
 
@@ -586,6 +613,201 @@ func (s *Store) GetDaytonaMetadata(ctx context.Context, sandboxID string) (*mode
 	return meta, nil
 }
 
+func (s *Store) UpsertE2BSandboxMetadata(ctx context.Context, meta models.E2BSandboxMetadata) error {
+	metadataJSON, err := marshalJSON(meta.Metadata, "{}")
+	if err != nil {
+		return fmt.Errorf("marshal e2b metadata: %w", err)
+	}
+	allowOutJSON, err := marshalJSON(meta.NetworkAllowOut, "[]")
+	if err != nil {
+		return fmt.Errorf("marshal e2b allowOut: %w", err)
+	}
+	denyOutJSON, err := marshalJSON(meta.NetworkDenyOut, "[]")
+	if err != nil {
+		return fmt.Errorf("marshal e2b denyOut: %w", err)
+	}
+	now := time.Now().UTC()
+	createdAt := meta.CreatedAt.UTC()
+	if meta.CreatedAt.IsZero() {
+		createdAt = now
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO e2b_sandboxes (
+			sandbox_id, template_id, template_alias, metadata_json, timeout_seconds,
+			on_timeout, auto_resume, secure, allow_internet_access,
+			network_allow_out_json, network_deny_out_json, allow_public_traffic,
+			mask_request_host, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			template_id = excluded.template_id,
+			template_alias = excluded.template_alias,
+			metadata_json = excluded.metadata_json,
+			timeout_seconds = excluded.timeout_seconds,
+			on_timeout = excluded.on_timeout,
+			auto_resume = excluded.auto_resume,
+			secure = excluded.secure,
+			allow_internet_access = excluded.allow_internet_access,
+			network_allow_out_json = excluded.network_allow_out_json,
+			network_deny_out_json = excluded.network_deny_out_json,
+			allow_public_traffic = excluded.allow_public_traffic,
+			mask_request_host = excluded.mask_request_host,
+			updated_at = excluded.updated_at
+	`,
+		strings.TrimSpace(meta.SandboxID),
+		strings.TrimSpace(meta.TemplateID),
+		strings.TrimSpace(meta.TemplateAlias),
+		metadataJSON,
+		meta.TimeoutSeconds,
+		firstNonEmptyString(strings.TrimSpace(meta.OnTimeout), "kill"),
+		boolToInt(meta.AutoResume),
+		boolToInt(meta.Secure),
+		nullableBool(meta.AllowInternetAccess),
+		allowOutJSON,
+		denyOutJSON,
+		nullableBool(meta.AllowPublicTraffic),
+		strings.TrimSpace(meta.MaskRequestHost),
+		createdAt,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert e2b sandbox metadata: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetE2BSandboxMetadata(ctx context.Context, sandboxID string) (*models.E2BSandboxMetadata, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, template_id, template_alias, metadata_json, timeout_seconds,
+			on_timeout, auto_resume, secure, allow_internet_access,
+			network_allow_out_json, network_deny_out_json, allow_public_traffic,
+			mask_request_host, created_at, updated_at
+		FROM e2b_sandboxes
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	meta, err := scanE2BSandboxMetadata(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get e2b sandbox metadata: %w", err)
+	}
+	return meta, nil
+}
+
+func (s *Store) ListE2BSandboxMetadata(ctx context.Context) (map[string]models.E2BSandboxMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, template_id, template_alias, metadata_json, timeout_seconds,
+			on_timeout, auto_resume, secure, allow_internet_access,
+			network_allow_out_json, network_deny_out_json, allow_public_traffic,
+			mask_request_host, created_at, updated_at
+		FROM e2b_sandboxes
+		ORDER BY sandbox_id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list e2b sandbox metadata: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.E2BSandboxMetadata{}
+	for rows.Next() {
+		meta, err := scanE2BSandboxMetadata(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan e2b sandbox metadata: %w", err)
+		}
+		items[meta.SandboxID] = *meta
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate e2b sandbox metadata: %w", err)
+	}
+	return items, nil
+}
+
+func (s *Store) UpsertE2BSnapshot(ctx context.Context, meta models.E2BSnapshotMetadata) error {
+	namesJSON, err := marshalJSON(meta.Names, "[]")
+	if err != nil {
+		return fmt.Errorf("marshal e2b snapshot names: %w", err)
+	}
+	now := time.Now().UTC()
+	createdAt := meta.CreatedAt.UTC()
+	if meta.CreatedAt.IsZero() {
+		createdAt = now
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO e2b_snapshots (
+			snapshot_id, snapshot_name, names_json, source_sandbox_id, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(snapshot_id) DO UPDATE SET
+			snapshot_name = excluded.snapshot_name,
+			names_json = excluded.names_json,
+			source_sandbox_id = excluded.source_sandbox_id,
+			updated_at = excluded.updated_at
+	`,
+		strings.TrimSpace(meta.SnapshotID),
+		strings.TrimSpace(meta.SnapshotName),
+		namesJSON,
+		strings.TrimSpace(meta.SourceSandboxID),
+		createdAt,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert e2b snapshot metadata: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetE2BSnapshot(ctx context.Context, snapshotID string) (*models.E2BSnapshotMetadata, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT snapshot_id, snapshot_name, names_json, source_sandbox_id, created_at, updated_at
+		FROM e2b_snapshots
+		WHERE snapshot_id = ?
+	`, strings.TrimSpace(snapshotID))
+	meta, err := scanE2BSnapshotMetadata(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get e2b snapshot metadata: %w", err)
+	}
+	return meta, nil
+}
+
+func (s *Store) ListE2BSnapshots(ctx context.Context) (map[string]models.E2BSnapshotMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT snapshot_id, snapshot_name, names_json, source_sandbox_id, created_at, updated_at
+		FROM e2b_snapshots
+		ORDER BY created_at DESC, snapshot_id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list e2b snapshot metadata: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.E2BSnapshotMetadata{}
+	for rows.Next() {
+		meta, err := scanE2BSnapshotMetadata(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan e2b snapshot metadata: %w", err)
+		}
+		items[meta.SnapshotID] = *meta
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate e2b snapshot metadata: %w", err)
+	}
+	return items, nil
+}
+
+func (s *Store) DeleteE2BSnapshot(ctx context.Context, snapshotID string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM e2b_snapshots WHERE snapshot_id = ?`, strings.TrimSpace(snapshotID))
+	if err != nil {
+		return fmt.Errorf("delete e2b snapshot metadata: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at)
@@ -1000,6 +1222,95 @@ func scanDaytonaMetadata(scanner interface {
 	return &meta, nil
 }
 
+func scanE2BSandboxMetadata(scanner interface {
+	Scan(dest ...any) error
+}) (*models.E2BSandboxMetadata, error) {
+	var meta models.E2BSandboxMetadata
+	var metadataJSON string
+	var allowOutJSON string
+	var denyOutJSON string
+	var autoResume int
+	var secure int
+	var allowInternetAccess sql.NullInt64
+	var allowPublicTraffic sql.NullInt64
+	err := scanner.Scan(
+		&meta.SandboxID,
+		&meta.TemplateID,
+		&meta.TemplateAlias,
+		&metadataJSON,
+		&meta.TimeoutSeconds,
+		&meta.OnTimeout,
+		&autoResume,
+		&secure,
+		&allowInternetAccess,
+		&allowOutJSON,
+		&denyOutJSON,
+		&allowPublicTraffic,
+		&meta.MaskRequestHost,
+		&meta.CreatedAt,
+		&meta.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if metadataJSON != "" {
+		if err := json.Unmarshal([]byte(metadataJSON), &meta.Metadata); err != nil {
+			return nil, fmt.Errorf("decode e2b metadata: %w", err)
+		}
+	}
+	if meta.Metadata == nil {
+		meta.Metadata = map[string]string{}
+	}
+	if allowOutJSON != "" {
+		if err := json.Unmarshal([]byte(allowOutJSON), &meta.NetworkAllowOut); err != nil {
+			return nil, fmt.Errorf("decode e2b allowOut: %w", err)
+		}
+	}
+	if meta.NetworkAllowOut == nil {
+		meta.NetworkAllowOut = []string{}
+	}
+	if denyOutJSON != "" {
+		if err := json.Unmarshal([]byte(denyOutJSON), &meta.NetworkDenyOut); err != nil {
+			return nil, fmt.Errorf("decode e2b denyOut: %w", err)
+		}
+	}
+	if meta.NetworkDenyOut == nil {
+		meta.NetworkDenyOut = []string{}
+	}
+	meta.AutoResume = autoResume != 0
+	meta.Secure = secure != 0
+	meta.AllowInternetAccess = nullableBoolPtr(allowInternetAccess)
+	meta.AllowPublicTraffic = nullableBoolPtr(allowPublicTraffic)
+	return &meta, nil
+}
+
+func scanE2BSnapshotMetadata(scanner interface {
+	Scan(dest ...any) error
+}) (*models.E2BSnapshotMetadata, error) {
+	var meta models.E2BSnapshotMetadata
+	var namesJSON string
+	err := scanner.Scan(
+		&meta.SnapshotID,
+		&meta.SnapshotName,
+		&namesJSON,
+		&meta.SourceSandboxID,
+		&meta.CreatedAt,
+		&meta.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if namesJSON != "" {
+		if err := json.Unmarshal([]byte(namesJSON), &meta.Names); err != nil {
+			return nil, fmt.Errorf("decode e2b snapshot names: %w", err)
+		}
+	}
+	if meta.Names == nil {
+		meta.Names = []string{}
+	}
+	return &meta, nil
+}
+
 func scanSnapshot(scanner interface {
 	Scan(dest ...any) error
 }) (*models.SandboxSnapshot, error) {
@@ -1061,6 +1372,34 @@ func nullableFloat32Ptr(value sql.NullFloat64) *float32 {
 	}
 	v := float32(value.Float64)
 	return &v
+}
+
+func nullableBool(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	if *value {
+		return 1
+	}
+	return 0
+}
+
+func nullableBoolPtr(value sql.NullInt64) *bool {
+	if !value.Valid {
+		return nil
+	}
+	v := value.Int64 != 0
+	return &v
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func isSQLiteUniqueConstraint(err error) bool {

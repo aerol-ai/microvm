@@ -1,6 +1,6 @@
 # SDK Compatibility Matrix
 
-This folder tracks the current AerolVM versus Daytona SDK compatibility state.
+This folder tracks the current AerolVM versus external SDK compatibility state.
 
 It is intentionally split into folders so the language-level view and the endpoint-level view stay separate:
 
@@ -8,6 +8,7 @@ It is intentionally split into folders so the language-level view and the endpoi
 |---|---|
 | `aerolvm/` | Native AerolVM SDK inventory and support status. |
 | `daytona/` | Daytona SDK language inventory plus detailed `/daytona` facade support tables. |
+| `e2b/` | E2B compatibility planning and, later, support tables for the `/e2b` facade. |
 | `comparison/` | High-level side-by-side summary of native AerolVM SDKs versus Daytona compatibility. |
 
 ## Status Legend
@@ -26,6 +27,7 @@ It is intentionally split into folders so the language-level view and the endpoi
 | `daytona/sdk-language-matrix.md` | Official Daytona SDK families and how they map onto the AerolVM `/daytona` facade. |
 | `daytona/control-plane-matrix.md` | Daytona control-plane routes and feature fields supported by AerolVM. |
 | `daytona/toolbox-matrix.md` | Daytona toolbox routes and feature families supported by AerolVM. |
+| `e2b/facade-plan.md` | Concrete plan for exposing the E2B Python SDK contract through a new `/e2b` compatibility facade. |
 | `comparison/daytona-vs-aerolvm.md` | Short side-by-side view of native AerolVM SDKs versus Daytona compatibility mode. |
 
-All tables reflect the current implementation in the repository as of 2026-05-13.
+All tables reflect the current implementation in the repository as of 2026-05-14.

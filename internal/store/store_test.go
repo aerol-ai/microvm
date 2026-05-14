@@ -472,6 +472,108 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "e2b_sandbox_metadata_roundtrip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-e2b")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				allowInternet := false
+				allowPublic := true
+				createdAt := time.Now().UTC().Add(-time.Minute)
+				meta := models.E2BSandboxMetadata{
+					SandboxID:           sandbox.ID,
+					TemplateID:          "base",
+					TemplateAlias:       "base",
+					Metadata:            map[string]string{"team": "sdk"},
+					TimeoutSeconds:      45,
+					OnTimeout:           "pause",
+					AutoResume:          true,
+					Secure:              true,
+					AllowInternetAccess: &allowInternet,
+					NetworkAllowOut:     []string{"10.0.0.0/24"},
+					NetworkDenyOut:      []string{"0.0.0.0/0"},
+					AllowPublicTraffic:  &allowPublic,
+					MaskRequestHost:     "sandbox.example.com",
+					CreatedAt:           createdAt,
+				}
+				if err := st.UpsertE2BSandboxMetadata(ctx, meta); err != nil {
+					t.Fatalf("UpsertE2BSandboxMetadata() error = %v", err)
+				}
+
+				got, err := st.GetE2BSandboxMetadata(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("GetE2BSandboxMetadata() error = %v", err)
+				}
+				if got.TemplateID != meta.TemplateID || got.TemplateAlias != meta.TemplateAlias || got.TimeoutSeconds != meta.TimeoutSeconds || got.OnTimeout != meta.OnTimeout || got.MaskRequestHost != meta.MaskRequestHost {
+					t.Fatalf("unexpected e2b metadata: %+v", got)
+				}
+				if !reflect.DeepEqual(got.Metadata, meta.Metadata) {
+					t.Fatalf("Metadata = %+v, want %+v", got.Metadata, meta.Metadata)
+				}
+				if !reflect.DeepEqual(got.NetworkAllowOut, meta.NetworkAllowOut) {
+					t.Fatalf("NetworkAllowOut = %+v, want %+v", got.NetworkAllowOut, meta.NetworkAllowOut)
+				}
+				if !reflect.DeepEqual(got.NetworkDenyOut, meta.NetworkDenyOut) {
+					t.Fatalf("NetworkDenyOut = %+v, want %+v", got.NetworkDenyOut, meta.NetworkDenyOut)
+				}
+				if got.AllowInternetAccess == nil || *got.AllowInternetAccess != allowInternet {
+					t.Fatalf("AllowInternetAccess = %+v, want %v", got.AllowInternetAccess, allowInternet)
+				}
+				if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic != allowPublic {
+					t.Fatalf("AllowPublicTraffic = %+v, want %v", got.AllowPublicTraffic, allowPublic)
+				}
+				items, err := st.ListE2BSandboxMetadata(ctx)
+				if err != nil {
+					t.Fatalf("ListE2BSandboxMetadata() error = %v", err)
+				}
+				if listed, ok := items[sandbox.ID]; !ok || listed.TemplateID != meta.TemplateID {
+					t.Fatalf("expected listed e2b metadata for %q, got %+v", sandbox.ID, items)
+				}
+			},
+		},
+		{
+			name: "e2b_snapshot_metadata_roundtrip_and_delete",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				meta := models.E2BSnapshotMetadata{
+					SnapshotID:      "snapshot-name:default",
+					SnapshotName:    "snapshot-name",
+					Names:           []string{"snapshot-name:default"},
+					SourceSandboxID: "sb-1",
+					CreatedAt:       time.Now().UTC(),
+				}
+				if err := st.UpsertE2BSnapshot(ctx, meta); err != nil {
+					t.Fatalf("UpsertE2BSnapshot() error = %v", err)
+				}
+
+				got, err := st.GetE2BSnapshot(ctx, meta.SnapshotID)
+				if err != nil {
+					t.Fatalf("GetE2BSnapshot() error = %v", err)
+				}
+				if got.SnapshotName != meta.SnapshotName || got.SourceSandboxID != meta.SourceSandboxID {
+					t.Fatalf("unexpected e2b snapshot metadata: %+v", got)
+				}
+				if !reflect.DeepEqual(got.Names, meta.Names) {
+					t.Fatalf("Names = %+v, want %+v", got.Names, meta.Names)
+				}
+				items, err := st.ListE2BSnapshots(ctx)
+				if err != nil {
+					t.Fatalf("ListE2BSnapshots() error = %v", err)
+				}
+				if listed, ok := items[meta.SnapshotID]; !ok || listed.SnapshotName != meta.SnapshotName {
+					t.Fatalf("expected listed snapshot metadata for %q, got %+v", meta.SnapshotID, items)
+				}
+				if err := st.DeleteE2BSnapshot(ctx, meta.SnapshotID); err != nil {
+					t.Fatalf("DeleteE2BSnapshot() error = %v", err)
+				}
+				if _, err := st.GetE2BSnapshot(ctx, meta.SnapshotID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+			},
+		},
+		{
 			name: "snapshot_roundtrip_by_name",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
