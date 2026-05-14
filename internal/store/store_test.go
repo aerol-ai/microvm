@@ -373,315 +373,383 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			// The Daytona facade lives outside this package, so this test
+			// exercises the generic primitives it relies on with a
+			// Daytona-shaped payload — name on the native row,
+			// labels in tags_json, and the facade-private scraps
+			// (snapshot, target, allow-list) inside sandbox_compat_state.
 			name: "daytona_metadata_roundtrip_and_resolve_by_name",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
 				sandbox := sampleSandbox("sb-daytona")
+				sandbox.Name = "workspace-alpha"
+				sandbox.OSUser = "ubuntu"
+				sandbox.Tags = map[string]string{"team": "sdk"}
+				sandbox.Lifecycle = models.Lifecycle{StopIfIdleFor: 15 * time.Minute}
 				if err := st.Create(ctx, sandbox); err != nil {
 					t.Fatalf("Create() error = %v", err)
 				}
-				autoStop := float32(15)
-				autoArchive := float32(60)
-				meta := models.DaytonaSandboxMetadata{
-					SandboxID:                  sandbox.ID,
-					Name:                       "workspace-alpha",
-					Snapshot:                   "snapshot-123",
-					User:                       "ubuntu",
-					Labels:                     map[string]string{"team": "sdk"},
-					Target:                     "default",
-					NetworkAllowList:           "10.0.0.0/24",
-					AutoStopIntervalMinutes:    &autoStop,
-					AutoArchiveIntervalMinutes: &autoArchive,
-				}
-				if err := st.UpsertDaytonaMetadata(ctx, meta); err != nil {
-					t.Fatalf("UpsertDaytonaMetadata() error = %v", err)
+				blob := `{"snapshot":"snapshot-123","target":"default","network_allow_list":"10.0.0.0/24","auto_archive_interval_minutes":60}`
+				if err := st.UpsertCompatState(ctx, sandbox.ID, models.FacadeDaytona, blob); err != nil {
+					t.Fatalf("UpsertCompatState() error = %v", err)
 				}
 
-				got, err := st.GetDaytonaMetadata(ctx, sandbox.ID)
+				got, err := st.GetCompatState(ctx, sandbox.ID, models.FacadeDaytona)
 				if err != nil {
-					t.Fatalf("GetDaytonaMetadata() error = %v", err)
+					t.Fatalf("GetCompatState() error = %v", err)
 				}
-				if got.Name != meta.Name || got.Snapshot != meta.Snapshot || got.User != meta.User || got.Target != meta.Target || got.NetworkAllowList != meta.NetworkAllowList {
-					t.Fatalf("unexpected metadata: %+v", got)
+				if got.StateJSON != blob {
+					t.Fatalf("StateJSON = %q, want %q", got.StateJSON, blob)
 				}
-				if !reflect.DeepEqual(got.Labels, meta.Labels) {
-					t.Fatalf("labels = %+v, want %+v", got.Labels, meta.Labels)
+				native, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
 				}
-				if got.AutoStopIntervalMinutes == nil || *got.AutoStopIntervalMinutes != autoStop {
-					t.Fatalf("AutoStopIntervalMinutes = %+v, want %v", got.AutoStopIntervalMinutes, autoStop)
+				if native.Name != "workspace-alpha" || native.OSUser != "ubuntu" {
+					t.Fatalf("unexpected native fields: %+v", native)
 				}
-				if got.AutoArchiveIntervalMinutes == nil || *got.AutoArchiveIntervalMinutes != autoArchive {
-					t.Fatalf("AutoArchiveIntervalMinutes = %+v, want %v", got.AutoArchiveIntervalMinutes, autoArchive)
+				if !reflect.DeepEqual(native.Tags, map[string]string{"team": "sdk"}) {
+					t.Fatalf("Tags = %+v, want team=sdk", native.Tags)
+				}
+				if native.Lifecycle.StopIfIdleFor != 15*time.Minute {
+					t.Fatalf("StopIfIdleFor = %v, want 15m", native.Lifecycle.StopIfIdleFor)
 				}
 
-				resolved, err := st.ResolveDaytonaSandboxID(ctx, meta.Name)
+				resolved, err := st.ResolveSandboxIDByName(ctx, "workspace-alpha")
 				if err != nil {
-					t.Fatalf("ResolveDaytonaSandboxID() error = %v", err)
+					t.Fatalf("ResolveSandboxIDByName() error = %v", err)
 				}
 				if resolved != sandbox.ID {
 					t.Fatalf("resolved sandbox id = %q, want %q", resolved, sandbox.ID)
 				}
 
-				items, err := st.ListDaytonaMetadata(ctx)
+				items, err := st.ListCompatState(ctx, models.FacadeDaytona)
 				if err != nil {
-					t.Fatalf("ListDaytonaMetadata() error = %v", err)
+					t.Fatalf("ListCompatState() error = %v", err)
 				}
-				if listed, ok := items[sandbox.ID]; !ok || listed.Name != meta.Name {
-					t.Fatalf("expected listed metadata for %q, got %+v", sandbox.ID, items)
+				if listed, ok := items[sandbox.ID]; !ok || listed.StateJSON != blob {
+					t.Fatalf("expected listed compat state for %q, got %+v", sandbox.ID, items)
 				}
 			},
 		},
 		{
+			// Same Daytona-shape coverage: two sandboxes that try to claim
+			// the same `name` must collide on the partial unique index now
+			// that name lives natively, not on a per-facade table.
 			name: "daytona_metadata_name_conflict_returns_error",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
 				first := sampleSandbox("sb-daytona-first")
+				first.Name = "shared-name"
 				second := sampleSandbox("sb-daytona-second")
-				for _, sandbox := range []*models.Sandbox{first, second} {
-					if err := st.Create(ctx, sandbox); err != nil {
-						t.Fatalf("Create(%s) error = %v", sandbox.ID, err)
-					}
+				second.Name = "shared-name"
+				if err := st.Create(ctx, first); err != nil {
+					t.Fatalf("Create(first) error = %v", err)
 				}
-				if err := st.UpsertDaytonaMetadata(ctx, models.DaytonaSandboxMetadata{SandboxID: first.ID, Name: "shared-name"}); err != nil {
-					t.Fatalf("first UpsertDaytonaMetadata() error = %v", err)
-				}
-				if err := st.UpsertDaytonaMetadata(ctx, models.DaytonaSandboxMetadata{SandboxID: second.ID, Name: "shared-name"}); !errors.Is(err, ErrDaytonaNameConflict) {
-					t.Fatalf("expected ErrDaytonaNameConflict, got %v", err)
+				if err := st.Create(ctx, second); !errors.Is(err, ErrSandboxNameConflict) {
+					t.Fatalf("expected ErrSandboxNameConflict, got %v", err)
 				}
 			},
 		},
 		{
+			// IDs and names share one lookup namespace. If a name can equal
+			// another sandbox's id, resolve-by-id wins forever and the named
+			// sandbox is shadowed. The store rejects that ambiguity directly.
+			name: "sandbox_name_cannot_match_existing_id",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				existing := sampleSandbox("claimed-name")
+				existing.Name = "unrelated"
+				if err := st.Create(ctx, existing); err != nil {
+					t.Fatalf("Create(existing) error = %v", err)
+				}
+
+				candidate := sampleSandbox("sb-name-vs-id")
+				candidate.Name = "claimed-name"
+				if err := st.Create(ctx, candidate); !errors.Is(err, ErrSandboxNameConflict) {
+					t.Fatalf("expected ErrSandboxNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			// The inverse matters too for callers that supply their own IDs:
+			// a new sandbox id must not steal an existing sandbox's name.
+			name: "sandbox_id_cannot_match_existing_name",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				existing := sampleSandbox("sb-existing-name-owner")
+				existing.Name = "reserved-lookup"
+				if err := st.Create(ctx, existing); err != nil {
+					t.Fatalf("Create(existing) error = %v", err)
+				}
+
+				candidate := sampleSandbox("reserved-lookup")
+				if err := st.Create(ctx, candidate); !errors.Is(err, ErrSandboxNameConflict) {
+					t.Fatalf("expected ErrSandboxNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			name: "upsert_name_cannot_match_existing_id",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				existing := sampleSandbox("upsert-claimed-name")
+				if err := st.Create(ctx, existing); err != nil {
+					t.Fatalf("Create(existing) error = %v", err)
+				}
+
+				candidate := sampleSandbox("sb-upsert-name-vs-id")
+				candidate.Name = "upsert-claimed-name"
+				if err := st.Upsert(ctx, candidate); !errors.Is(err, ErrSandboxNameConflict) {
+					t.Fatalf("expected ErrSandboxNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			// FK CASCADE on sandbox_compat_state means deleting the native
+			// sandbox row drops the Daytona compat blob too. ResolveSandboxIDByName
+			// then misses because the unique-name index lives on the native
+			// row that just went away.
 			name: "delete_sandbox_cascades_daytona_metadata",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
 				sandbox := sampleSandbox("sb-daytona-cascade")
+				sandbox.Name = "cascade-name"
 				if err := st.Create(ctx, sandbox); err != nil {
 					t.Fatalf("Create() error = %v", err)
 				}
-				if err := st.UpsertDaytonaMetadata(ctx, models.DaytonaSandboxMetadata{SandboxID: sandbox.ID, Name: "cascade-name"}); err != nil {
-					t.Fatalf("UpsertDaytonaMetadata() error = %v", err)
+				if err := st.UpsertCompatState(ctx, sandbox.ID, models.FacadeDaytona, `{"target":"default"}`); err != nil {
+					t.Fatalf("UpsertCompatState() error = %v", err)
 				}
 				if err := st.Delete(ctx, sandbox.ID); err != nil {
 					t.Fatalf("Delete() error = %v", err)
 				}
-				if _, err := st.GetDaytonaMetadata(ctx, sandbox.ID); !errors.Is(err, ErrNotFound) {
+				if _, err := st.GetCompatState(ctx, sandbox.ID, models.FacadeDaytona); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
 				}
-				if _, err := st.ResolveDaytonaSandboxID(ctx, "cascade-name"); !errors.Is(err, ErrNotFound) {
-					t.Fatalf("expected ErrNotFound from ResolveDaytonaSandboxID(), got %v", err)
+				if _, err := st.ResolveSandboxIDByName(ctx, "cascade-name"); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound from ResolveSandboxIDByName(), got %v", err)
 				}
 			},
 		},
 		{
+			// E2B-shape coverage: native fields (tags_json, NetworkBlockAll,
+			// Lifecycle) carry what AerolVM has equivalents for; the rest
+			// (template_id, secure, on_timeout, mask_request_host, etc.)
+			// rides inside the facade's compat blob — same partition the
+			// E2B handlers use at runtime.
 			name: "e2b_sandbox_metadata_roundtrip",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
 				sandbox := sampleSandbox("sb-e2b")
+				sandbox.Tags = map[string]string{"team": "sdk"}
+				sandbox.NetworkBlockAll = true
+				sandbox.Lifecycle = models.Lifecycle{StopAtAge: 45 * time.Second}
 				if err := st.Create(ctx, sandbox); err != nil {
 					t.Fatalf("Create() error = %v", err)
 				}
-				allowInternet := false
-				allowPublic := true
-				createdAt := time.Now().UTC().Add(-time.Minute)
-				meta := models.E2BSandboxMetadata{
-					SandboxID:           sandbox.ID,
-					TemplateID:          "base",
-					TemplateAlias:       "base",
-					Metadata:            map[string]string{"team": "sdk"},
-					TimeoutSeconds:      45,
-					OnTimeout:           "pause",
-					AutoResume:          true,
-					Secure:              true,
-					AllowInternetAccess: &allowInternet,
-					NetworkAllowOut:     []string{"10.0.0.0/24"},
-					NetworkDenyOut:      []string{"0.0.0.0/0"},
-					AllowPublicTraffic:  &allowPublic,
-					MaskRequestHost:     "sandbox.example.com",
-					CreatedAt:           createdAt,
-				}
-				if err := st.UpsertE2BSandboxMetadata(ctx, meta); err != nil {
-					t.Fatalf("UpsertE2BSandboxMetadata() error = %v", err)
+				blob := `{"template_id":"base","template_alias":"base","on_timeout":"pause","auto_resume":true,"secure":true,"network_allow_out":["10.0.0.0/24"],"network_deny_out":["0.0.0.0/0"],"allow_public_traffic":true,"mask_request_host":"sandbox.example.com"}`
+				if err := st.UpsertCompatState(ctx, sandbox.ID, models.FacadeE2B, blob); err != nil {
+					t.Fatalf("UpsertCompatState() error = %v", err)
 				}
 
-				got, err := st.GetE2BSandboxMetadata(ctx, sandbox.ID)
+				got, err := st.GetCompatState(ctx, sandbox.ID, models.FacadeE2B)
 				if err != nil {
-					t.Fatalf("GetE2BSandboxMetadata() error = %v", err)
+					t.Fatalf("GetCompatState() error = %v", err)
 				}
-				if got.TemplateID != meta.TemplateID || got.TemplateAlias != meta.TemplateAlias || got.TimeoutSeconds != meta.TimeoutSeconds || got.OnTimeout != meta.OnTimeout || got.MaskRequestHost != meta.MaskRequestHost {
-					t.Fatalf("unexpected e2b metadata: %+v", got)
+				if got.StateJSON != blob {
+					t.Fatalf("StateJSON = %q, want %q", got.StateJSON, blob)
 				}
-				if !reflect.DeepEqual(got.Metadata, meta.Metadata) {
-					t.Fatalf("Metadata = %+v, want %+v", got.Metadata, meta.Metadata)
-				}
-				if !reflect.DeepEqual(got.NetworkAllowOut, meta.NetworkAllowOut) {
-					t.Fatalf("NetworkAllowOut = %+v, want %+v", got.NetworkAllowOut, meta.NetworkAllowOut)
-				}
-				if !reflect.DeepEqual(got.NetworkDenyOut, meta.NetworkDenyOut) {
-					t.Fatalf("NetworkDenyOut = %+v, want %+v", got.NetworkDenyOut, meta.NetworkDenyOut)
-				}
-				if got.AllowInternetAccess == nil || *got.AllowInternetAccess != allowInternet {
-					t.Fatalf("AllowInternetAccess = %+v, want %v", got.AllowInternetAccess, allowInternet)
-				}
-				if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic != allowPublic {
-					t.Fatalf("AllowPublicTraffic = %+v, want %v", got.AllowPublicTraffic, allowPublic)
-				}
-				items, err := st.ListE2BSandboxMetadata(ctx)
+				native, err := st.Get(ctx, sandbox.ID)
 				if err != nil {
-					t.Fatalf("ListE2BSandboxMetadata() error = %v", err)
+					t.Fatalf("Get() error = %v", err)
 				}
-				if listed, ok := items[sandbox.ID]; !ok || listed.TemplateID != meta.TemplateID {
-					t.Fatalf("expected listed e2b metadata for %q, got %+v", sandbox.ID, items)
+				if !reflect.DeepEqual(native.Tags, map[string]string{"team": "sdk"}) {
+					t.Fatalf("Tags = %+v, want team=sdk", native.Tags)
+				}
+				if !native.NetworkBlockAll {
+					t.Fatal("expected NetworkBlockAll=true")
+				}
+				if native.Lifecycle.StopAtAge != 45*time.Second {
+					t.Fatalf("Lifecycle.StopAtAge = %v, want 45s", native.Lifecycle.StopAtAge)
+				}
+				items, err := st.ListCompatState(ctx, models.FacadeE2B)
+				if err != nil {
+					t.Fatalf("ListCompatState() error = %v", err)
+				}
+				if listed, ok := items[sandbox.ID]; !ok || listed.StateJSON != blob {
+					t.Fatalf("expected listed e2b compat state for %q, got %+v", sandbox.ID, items)
 				}
 			},
 		},
 		{
+			// E2B's snapshot tokens are facade-shaped aliases for native
+			// sandbox_snapshots rows. The generic snapshot_aliases table
+			// holds the mapping; the native row is authoritative.
 			name: "e2b_snapshot_metadata_roundtrip_and_delete",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
-				meta := models.E2BSnapshotMetadata{
-					SnapshotID:      "snapshot-name:default",
-					SnapshotName:    "snapshot-name",
-					Names:           []string{"snapshot-name:default"},
-					SourceSandboxID: "sb-1",
-					CreatedAt:       time.Now().UTC(),
-				}
+				createdAt := time.Now().UTC()
+				snapshotName := "snapshot-name"
+				aliasID := "snapshot-name:default"
 				if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
-					Name:            meta.SnapshotName,
-					Image:           meta.SnapshotName,
+					Name:            snapshotName,
+					Image:           snapshotName,
 					ImageID:         "sha256:e2b-snapshot",
-					SourceSandboxID: meta.SourceSandboxID,
-					CreatedAt:       meta.CreatedAt,
+					SourceSandboxID: "sb-1",
+					CreatedAt:       createdAt,
 				}); err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
 				}
-				if err := st.UpsertE2BSnapshot(ctx, meta); err != nil {
-					t.Fatalf("UpsertE2BSnapshot() error = %v", err)
+				alias := models.SnapshotAlias{
+					Alias:        aliasID,
+					SnapshotName: snapshotName,
+					Facade:       models.FacadeE2B,
+					ExtraNames:   []string{aliasID},
+					CreatedAt:    createdAt,
+				}
+				if err := st.UpsertSnapshotAlias(ctx, alias); err != nil {
+					t.Fatalf("UpsertSnapshotAlias() error = %v", err)
 				}
 
-				got, err := st.GetE2BSnapshot(ctx, meta.SnapshotID)
+				got, err := st.GetSnapshotAlias(ctx, aliasID)
 				if err != nil {
-					t.Fatalf("GetE2BSnapshot() error = %v", err)
+					t.Fatalf("GetSnapshotAlias() error = %v", err)
 				}
-				if got.SnapshotName != meta.SnapshotName || got.SourceSandboxID != meta.SourceSandboxID {
-					t.Fatalf("unexpected e2b snapshot metadata: %+v", got)
+				if got.SnapshotName != snapshotName || got.Facade != models.FacadeE2B {
+					t.Fatalf("unexpected snapshot alias: %+v", got)
 				}
-				if !reflect.DeepEqual(got.Names, meta.Names) {
-					t.Fatalf("Names = %+v, want %+v", got.Names, meta.Names)
+				if !reflect.DeepEqual(got.ExtraNames, []string{aliasID}) {
+					t.Fatalf("ExtraNames = %+v, want %+v", got.ExtraNames, []string{aliasID})
 				}
-				items, err := st.ListE2BSnapshots(ctx)
+				items, err := st.ListSnapshotAliases(ctx, models.FacadeE2B)
 				if err != nil {
-					t.Fatalf("ListE2BSnapshots() error = %v", err)
+					t.Fatalf("ListSnapshotAliases() error = %v", err)
 				}
-				if listed, ok := items[meta.SnapshotID]; !ok || listed.SnapshotName != meta.SnapshotName {
-					t.Fatalf("expected listed snapshot metadata for %q, got %+v", meta.SnapshotID, items)
+				if listed, ok := items[aliasID]; !ok || listed.SnapshotName != snapshotName {
+					t.Fatalf("expected listed alias for %q, got %+v", aliasID, items)
 				}
-				if err := st.DeleteE2BSnapshot(ctx, meta.SnapshotID); err != nil {
-					t.Fatalf("DeleteE2BSnapshot() error = %v", err)
+				if err := st.DeleteSnapshotAlias(ctx, aliasID); err != nil {
+					t.Fatalf("DeleteSnapshotAlias() error = %v", err)
 				}
-				if _, err := st.GetE2BSnapshot(ctx, meta.SnapshotID); !errors.Is(err, ErrNotFound) {
+				if _, err := st.GetSnapshotAlias(ctx, aliasID); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
 				}
 			},
 		},
 		{
+			// Deleting the native snapshot row must cascade through to
+			// snapshot_aliases — same parity the old per-facade table
+			// promised, now enforced by the FK on snapshot_aliases.
 			name: "e2b_snapshot_metadata_cascades_with_native_snapshot_delete",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
-				meta := models.E2BSnapshotMetadata{
-					SnapshotID:      "snapshot-cascade:default",
-					SnapshotName:    "snapshot-cascade",
-					Names:           []string{"snapshot-cascade:default"},
-					SourceSandboxID: "sb-cascade",
-					CreatedAt:       time.Now().UTC(),
-				}
+				createdAt := time.Now().UTC()
+				snapshotName := "snapshot-cascade"
+				aliasID := "snapshot-cascade:default"
 				if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
-					Name:            meta.SnapshotName,
-					Image:           meta.SnapshotName,
+					Name:            snapshotName,
+					Image:           snapshotName,
 					ImageID:         "sha256:e2b-cascade",
-					SourceSandboxID: meta.SourceSandboxID,
-					CreatedAt:       meta.CreatedAt,
+					SourceSandboxID: "sb-cascade",
+					CreatedAt:       createdAt,
 				}); err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
 				}
-				if err := st.UpsertE2BSnapshot(ctx, meta); err != nil {
-					t.Fatalf("UpsertE2BSnapshot() error = %v", err)
+				if err := st.UpsertSnapshotAlias(ctx, models.SnapshotAlias{
+					Alias:        aliasID,
+					SnapshotName: snapshotName,
+					Facade:       models.FacadeE2B,
+					ExtraNames:   []string{aliasID},
+					CreatedAt:    createdAt,
+				}); err != nil {
+					t.Fatalf("UpsertSnapshotAlias() error = %v", err)
 				}
-				if err := st.DeleteSnapshot(ctx, meta.SnapshotName); err != nil {
+				if err := st.DeleteSnapshot(ctx, snapshotName); err != nil {
 					t.Fatalf("DeleteSnapshot() error = %v", err)
 				}
-				if _, err := st.GetE2BSnapshot(ctx, meta.SnapshotID); !errors.Is(err, ErrNotFound) {
-					t.Fatalf("expected E2B snapshot metadata cascade delete, got %v", err)
+				if _, err := st.GetSnapshotAlias(ctx, aliasID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected snapshot alias cascade delete, got %v", err)
 				}
 			},
 		},
 		{
+			// Same end-to-end shape the E2B create handler relies on,
+			// expressed against the generic primitive: claim → observe
+			// pending → complete → replay ready → stale-reclaim → delete.
+			// The only thing E2B-specific here is the scope string.
 			name: "e2b_create_request_claim_complete_and_reclaim",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
 				now := time.Now().UTC().Round(0)
+				const scope = "e2b.create"
 				fingerprint := "fp:test"
 
-				record, acquired, err := st.ClaimE2BCreateRequest(ctx, fingerprint, now, 30*time.Second)
+				record, acquired, err := st.ClaimIdempotentRequest(ctx, scope, fingerprint, now, 30*time.Second)
 				if err != nil {
-					t.Fatalf("first ClaimE2BCreateRequest() error = %v", err)
+					t.Fatalf("first ClaimIdempotentRequest() error = %v", err)
 				}
 				if !acquired {
 					t.Fatal("expected first claim to acquire reservation")
 				}
-				if record.State != models.E2BCreateRequestStatePending {
-					t.Fatalf("record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending)
+				if record.State != models.RequestStatePending {
+					t.Fatalf("record.State = %q, want %q", record.State, models.RequestStatePending)
 				}
 
-				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(5*time.Second), 30*time.Second)
+				record, acquired, err = st.ClaimIdempotentRequest(ctx, scope, fingerprint, now.Add(5*time.Second), 30*time.Second)
 				if err != nil {
-					t.Fatalf("second ClaimE2BCreateRequest() error = %v", err)
+					t.Fatalf("second ClaimIdempotentRequest() error = %v", err)
 				}
 				if acquired {
 					t.Fatal("expected second claim to observe pending reservation")
 				}
-				if record.State != models.E2BCreateRequestStatePending {
-					t.Fatalf("pending record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending)
+				if record.State != models.RequestStatePending {
+					t.Fatalf("pending record.State = %q, want %q", record.State, models.RequestStatePending)
 				}
 
-				if err := st.CompleteE2BCreateRequest(ctx, fingerprint, "sb-e2b-claim", now.Add(8*time.Second), 15*time.Second); err != nil {
-					t.Fatalf("CompleteE2BCreateRequest() error = %v", err)
+				if err := st.CompleteIdempotentRequest(ctx, scope, fingerprint, "sb-e2b-claim", now.Add(8*time.Second), 15*time.Second); err != nil {
+					t.Fatalf("CompleteIdempotentRequest() error = %v", err)
 				}
 
-				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(10*time.Second), 30*time.Second)
+				record, acquired, err = st.ClaimIdempotentRequest(ctx, scope, fingerprint, now.Add(10*time.Second), 30*time.Second)
 				if err != nil {
-					t.Fatalf("ready ClaimE2BCreateRequest() error = %v", err)
+					t.Fatalf("ready ClaimIdempotentRequest() error = %v", err)
 				}
 				if acquired {
 					t.Fatal("expected ready claim to replay existing sandbox")
 				}
-				if record.State != models.E2BCreateRequestStateReady || record.SandboxID != "sb-e2b-claim" {
+				if record.State != models.RequestStateReady || record.TargetID != "sb-e2b-claim" {
 					t.Fatalf("unexpected ready record: %+v", record)
 				}
 
-				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(40*time.Second), 30*time.Second)
+				record, acquired, err = st.ClaimIdempotentRequest(ctx, scope, fingerprint, now.Add(40*time.Second), 30*time.Second)
 				if err != nil {
-					t.Fatalf("stale ready ClaimE2BCreateRequest() error = %v", err)
+					t.Fatalf("stale ready ClaimIdempotentRequest() error = %v", err)
 				}
 				if !acquired {
 					t.Fatal("expected stale ready record to be reclaimed")
 				}
-				if record.State != models.E2BCreateRequestStatePending || record.SandboxID != "" {
+				if record.State != models.RequestStatePending || record.TargetID != "" {
 					t.Fatalf("unexpected reclaimed record: %+v", record)
 				}
 
-				if err := st.DeleteE2BCreateRequest(ctx, fingerprint); err != nil {
-					t.Fatalf("DeleteE2BCreateRequest() error = %v", err)
+				if err := st.DeleteIdempotentRequest(ctx, scope, fingerprint); err != nil {
+					t.Fatalf("DeleteIdempotentRequest() error = %v", err)
 				}
-				if _, err := st.GetE2BCreateRequest(ctx, fingerprint); !errors.Is(err, ErrNotFound) {
+				if _, err := st.GetIdempotentRequest(ctx, scope, fingerprint); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
 				}
 			},
 		},
 		{
+			// Concurrent dedupe regression for the E2B create path: many
+			// processes racing to insert the same (scope, fingerprint) row
+			// must converge on exactly one acquired claim.
 			name: "e2b_create_request_concurrent_claims_share_pending_record",
 			run: func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "state.db")
 				const contenders = 6
+				const scope = "e2b.create"
 				stores := make([]*Store, 0, contenders)
 				for i := 0; i < contenders; i++ {
 					st, err := Open(path)
@@ -702,15 +770,15 @@ func TestStoreCases(t *testing.T) {
 					go func(st *Store) {
 						defer wg.Done()
 						<-start
-						record, acquired, err := st.ClaimE2BCreateRequest(ctx, "fp:concurrent", time.Now().UTC(), time.Minute)
+						record, acquired, err := st.ClaimIdempotentRequest(ctx, scope, "fp:concurrent", time.Now().UTC(), time.Minute)
 						mu.Lock()
 						defer mu.Unlock()
 						if err != nil {
 							errs = append(errs, err)
 							return
 						}
-						if record.State != models.E2BCreateRequestStatePending {
-							errs = append(errs, fmt.Errorf("record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending))
+						if record.State != models.RequestStatePending {
+							errs = append(errs, fmt.Errorf("record.State = %q, want %q", record.State, models.RequestStatePending))
 							return
 						}
 						if acquired {
@@ -721,7 +789,7 @@ func TestStoreCases(t *testing.T) {
 				close(start)
 				wg.Wait()
 				if len(errs) > 0 {
-					t.Fatalf("concurrent ClaimE2BCreateRequest() errors = %v", errs)
+					t.Fatalf("concurrent ClaimIdempotentRequest() errors = %v", errs)
 				}
 				if acquiredCount != 1 {
 					t.Fatalf("acquired claims = %d, want 1", acquiredCount)
@@ -1109,10 +1177,31 @@ func TestStoreHelperCases(t *testing.T) {
 	})
 
 	t.Run("scan_sandbox_invalid_env_json_returns_error", func(t *testing.T) {
+		now := time.Now()
 		row := sqlRowStub{values: []any{
-			"sb-bad", "image", models.SandboxStatusStarted, "https://example.com", "container", "10.0.0.1",
-			float64(1), 1024, 10, "root", "{bad json", 0, 1, "", "", "", "[]", time.Now(), time.Now(), time.Now(),
-			int64(0), int64(0), int64(0), int64(0), "", "",
+			"sb-bad",                    // id
+			"image",                     // image
+			models.SandboxStatusStarted, // status
+			"https://example.com",       // public_url
+			"container",                 // container_id
+			"10.0.0.1",                  // container_ip
+			float64(1),                  // cpu
+			1024,                        // memory_mb
+			10,                          // disk_gb
+			"root",                      // os_user
+			"{bad json",                 // env_json — triggers the failure
+			0,                           // network_blocked
+			1,                           // toolbox_enabled
+			"",                          // toolbox_token
+			"",                          // ssh_public_key
+			"",                          // last_error
+			"[]",                        // container_command_json
+			"",                          // name
+			"{}",                        // tags_json
+			now, now, now,               // created_at, updated_at, last_active_at
+			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
+			"", // runtime
+			"", // gpus_json
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

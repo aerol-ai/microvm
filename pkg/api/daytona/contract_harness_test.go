@@ -2,6 +2,7 @@ package daytona
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -418,8 +419,20 @@ func (e *daytonaContractEnv) seedSandbox(seed contractSandboxSeed) *models.Sandb
 		exposedPorts[i].SandboxID = id
 	}
 
+	// Daytona's Name and Labels live on the native sandbox row now —
+	// the facade derives them on read. Auto-stop / auto-delete intervals
+	// likewise round-trip through Lifecycle.
+	lifecycle := seed.Lifecycle
+	if seed.AutoStopInterval != nil && *seed.AutoStopInterval > 0 && lifecycle.StopIfIdleFor == 0 {
+		lifecycle.StopIfIdleFor = time.Duration(float64(*seed.AutoStopInterval) * float64(time.Minute))
+	}
+	if seed.AutoDeleteInterval != nil && *seed.AutoDeleteInterval > 0 && lifecycle.DestroyIfIdleFor == 0 {
+		lifecycle.DestroyIfIdleFor = time.Duration(float64(*seed.AutoDeleteInterval) * float64(time.Minute))
+	}
+
 	sandbox := &models.Sandbox{
 		ID:               id,
+		Name:             name,
 		Image:            image,
 		Status:           status,
 		PublicURL:        publicURL,
@@ -430,6 +443,7 @@ func (e *daytonaContractEnv) seedSandbox(seed contractSandboxSeed) *models.Sandb
 		DiskGB:           firstNonZeroInt(seed.DiskGB, 10),
 		OSUser:           osUser,
 		Env:              maps.Clone(seed.Env),
+		Tags:             maps.Clone(seed.Labels),
 		NetworkBlockAll:  seed.NetworkBlockAll,
 		ToolboxEnabled:   toolboxEnabled,
 		ToolboxToken:     toolboxToken,
@@ -440,31 +454,47 @@ func (e *daytonaContractEnv) seedSandbox(seed contractSandboxSeed) *models.Sandb
 		LastActiveAt:     lastActiveAt,
 		LastError:        seed.LastError,
 		ContainerCommand: slices.Clone(seed.ContainerCommand),
-		Lifecycle:        seed.Lifecycle,
+		Lifecycle:        lifecycle,
 		Runtime:          runtimeName,
 	}
 	if err := e.store.Upsert(e.ctx, sandbox); err != nil {
 		e.t.Fatalf("store.Upsert(%s) error = %v", sandbox.ID, err)
 	}
 
-	meta := models.DaytonaSandboxMetadata{
-		SandboxID:                  sandbox.ID,
-		Name:                       name,
-		Snapshot:                   seed.Snapshot,
-		User:                       osUser,
-		Labels:                     maps.Clone(seed.Labels),
-		Target:                     seed.Target,
-		NetworkAllowList:           seed.NetworkAllowList,
-		AutoStopIntervalMinutes:    cloneContractFloat32Ptr(seed.AutoStopInterval),
-		AutoArchiveIntervalMinutes: cloneContractFloat32Ptr(seed.AutoArchiveInterval),
-		AutoDeleteIntervalMinutes:  cloneContractFloat32Ptr(seed.AutoDeleteInterval),
+	// Persist the Daytona-private fields (snapshot, target, allow-list,
+	// auto-archive interval) into sandbox_compat_state — the same path
+	// the live facade write code uses.
+	stateBlob, err := sandboxMetaToState(sandboxMeta{
+		Snapshot:            emptyStringToPtr(seed.Snapshot),
+		Target:              seed.Target,
+		NetworkAllowList:    emptyStringToPtr(seed.NetworkAllowList),
+		AutoArchiveInterval: cloneContractFloat32Ptr(seed.AutoArchiveInterval),
+	})
+	if err != nil {
+		e.t.Fatalf("sandboxMetaToState(%s) error = %v", sandbox.ID, err)
 	}
-	if err := e.service.UpsertDaytonaMetadata(e.ctx, meta); err != nil {
-		e.t.Fatalf("service.UpsertDaytonaMetadata(%s) error = %v", sandbox.ID, err)
+	if err := e.service.UpsertCompatState(e.ctx, sandbox.ID, models.FacadeDaytona, stateBlob); err != nil {
+		e.t.Fatalf("service.UpsertCompatState(%s) error = %v", sandbox.ID, err)
 	}
 
 	e.runtime.seedSandbox(sandbox)
 	return sandbox
+}
+
+// loadDaytonaMeta is the test-side equivalent of the old GetDaytonaMetadata
+// helper: read the native sandbox row plus its Daytona compat blob and
+// combine them through the facade's own meta builder, so contract tests
+// keep asserting against the same in-memory shape they did before.
+func (e *daytonaContractEnv) loadDaytonaMeta(sandboxID string) (sandboxMeta, error) {
+	sandbox, err := e.store.Get(e.ctx, sandboxID)
+	if err != nil {
+		return sandboxMeta{}, err
+	}
+	state, err := e.service.GetCompatState(e.ctx, sandboxID, models.FacadeDaytona)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return sandboxMeta{}, err
+	}
+	return sandboxMetaFromState(state, sandbox)
 }
 
 func (e *daytonaContractEnv) seedSnapshot(seed contractSnapshotSeed) *models.SandboxSnapshot {

@@ -353,53 +353,68 @@ request_idempotency(                     -- NEW (replaces e2b_create_requests)
 
 Seven tables, none named after a third-party product.
 
-## Migration plan
+## Development-stage schema policy
 
-The data lives in the dev DB only; AerolVM is self-hosted, so we control
-the upgrade. Migrations should be idempotent and additive in one release,
-destructive in a follow-up.
+AerolVM is not in production yet. Existing local SQLite data is development
+state, not customer data, so this consolidation does **not** need a
+production-safe two-phase migration or backfill.
 
-### Phase A — additive (one release)
+Accepted policy for this change:
 
-1. `ALTER TABLE sandboxes ADD COLUMN name TEXT NOT NULL DEFAULT '';`
-2. `CREATE UNIQUE INDEX idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`
-3. `ALTER TABLE sandboxes ADD COLUMN tags_json TEXT NOT NULL DEFAULT '{}';`
-4. Create `sandbox_compat_state`, `snapshot_aliases`, and
+1. Fresh schema creation is enough for this patch.
+2. Old local DBs that contain `daytona_sandboxes`, `e2b_sandboxes`,
+   `e2b_snapshots`, or `e2b_create_requests` may be deleted/reset.
+3. No one-shot backfill from provider-named tables is required.
+4. No dual-write period to old and new tables is required.
+5. The plan must still keep the architecture honest: no table names should
+   contain `daytona` or `e2b`; those names belong at the facade/test layer.
+
+If this changes before launch, the previously considered production-safe
+path would be:
+
+1. Add `sandboxes.name` and `sandboxes.tags_json` with `ALTER TABLE`.
+2. Create `sandbox_compat_state`, `snapshot_aliases`, and
    `request_idempotency`.
-5. Backfill from existing tables (one-shot at startup, idempotent):
-   - `sandboxes.name` ← `daytona_sandboxes.name`
-   - `sandboxes.tags_json` ← `daytona_sandboxes.labels_json` (and merge
-     with `e2b_sandboxes.metadata_json` for sandboxes that have both)
-   - `sandbox_compat_state` rows derived from leftover Daytona/E2B columns
-   - `snapshot_aliases` rows from `e2b_snapshots`
-   - `request_idempotency` rows from `e2b_create_requests` with
-     `scope = 'e2b.create'`
-6. Switch reads in `pkg/api/daytona` and `pkg/api/e2b` to the new
-   tables. Writes go to both old and new until Phase B.
-7. Keep `/v1` unchanged. Internally everyone reads from `sandboxes` +
-   the new generic tables.
+3. Backfill from the old provider-named tables.
+4. Switch reads and writes to the generic schema.
+5. Drop the old provider-named tables in a later release.
 
-### Phase B — destructive (next release)
+That path is intentionally out of scope while the product is still in
+development.
 
-1. Stop writing to `daytona_sandboxes`, `e2b_sandboxes`, `e2b_snapshots`,
-   `e2b_create_requests`.
-2. `DROP TABLE daytona_sandboxes;`
-3. `DROP TABLE e2b_sandboxes;`
-4. `DROP TABLE e2b_snapshots;`
-5. `DROP TABLE e2b_create_requests;`
-6. Delete the old store helpers (`UpsertDaytonaMetadata`,
-   `GetDaytonaMetadata`, …, `DeleteE2BSnapshot`,
-   `ClaimE2BCreateRequest`, `CompleteE2BCreateRequest`,
-   `GetE2BCreateRequest`, `DeleteE2BCreateRequest`).
-7. Rename `ResolveDaytonaSandboxID` → `ResolveSandboxIDByName` (now in
-   the native service surface, not a Daytona-named helper).
-8. Rename the idempotency service methods to drop the `E2B` prefix
-   (`ClaimRequest`, `CompleteRequest`, `GetRequest`, `DeleteRequest`)
-   and take a `scope` argument.
+## Implementation review status
 
-Splitting it in two releases keeps the dev DB safe across a downgrade and
-lets us run tests against the new path while the old path is still
-authoritative.
+The current implementation direction is correct:
+
+- `daytona_sandboxes` and `e2b_sandboxes` are replaced by
+  `sandbox_compat_state`.
+- `e2b_snapshots` is replaced by `snapshot_aliases`.
+- `e2b_create_requests` is replaced by `request_idempotency` with
+  `scope = "e2b.create"`.
+- Daytona/E2B compatibility tests are preserved and retargeted at the new
+  facade builders rather than removed.
+- Provider-specific model structs in `pkg/models/daytona.go` and
+  `pkg/models/e2b.go` are removed from the shared model layer.
+
+Resolved in the current implementation:
+
+1. **Daytona name collision with sandbox IDs.** The store now rejects
+   cross-namespace ambiguity between `sandboxes.id` and non-empty
+   `sandboxes.name`, so a Daytona name cannot be shadowed by an unrelated
+   sandbox ID.
+
+Remaining fixes before this implementation should be considered complete:
+
+1. **E2B `allowInternetAccess` round-trip.** Since this field is now derived
+   from `sandboxes.network_block_all`, derive both sides explicitly:
+   `false` when `NetworkBlockAll` is true and `true` when it is false.
+   If the API should omit `true`, call that out as an intentional facade
+   behavior change and keep a compatibility test around it.
+2. **Native `/v1` exposure decision.** Adding `name` and `tags` to
+   `models.Sandbox` / `models.CreateSandboxRequest` means `/v1` accepts and
+   returns them because v1 currently uses shared models as DTOs. During
+   development this may be acceptable, but it should be an explicit decision.
+   If `/v1` must remain frozen, introduce v1-owned DTOs before merging.
 
 ## Files that change
 
@@ -410,17 +425,15 @@ authoritative.
   `request_idempotency` claim/complete/reclaim cycle (port the existing
   `e2b_create_request_claim_complete_and_reclaim` test to the generic
   scope keying).
-- `internal/service/daytona.go` — collapse to wrappers around
-  `sandbox_compat_state`.
-- `internal/service/e2b.go` — same, plus rename
-  `Claim/Complete/Get/DeleteE2BCreateRequest` to scope-aware generic
-  methods.
-- `pkg/models/daytona.go`, `pkg/models/e2b.go` — keep the structs for
-  facade-internal use, but they no longer have a 1:1 column mapping;
-  the facade serializes them into `state_json`.
-- `pkg/models/e2b.go` — `E2BCreateRequestRecord` becomes a generic
-  `IdempotentRequestRecord` (or stays E2B-named but is just an alias
-  over the generic record; either is fine).
+- `internal/service/daytona.go`, `internal/service/e2b.go` — remove the
+  provider-specific service wrappers.
+- `internal/service/facade_state.go` — add the generic wrappers around
+  compat state, snapshot aliases, name resolution, tags, and request
+  idempotency.
+- `pkg/models/daytona.go`, `pkg/models/e2b.go` — remove provider-specific
+  persistence structs from the shared model layer.
+- `pkg/models/types.go` — add generic `SandboxCompatState`,
+  `SnapshotAlias`, and `IdempotentRequestRecord` types.
 - `pkg/models/types.go` — add `Name` and `Tags` to `Sandbox` and
   `CreateSandboxRequest`. SDKs follow when ready.
 - `pkg/api/daytona/handlers.go`, `pkg/api/e2b/handlers.go` — read derived
@@ -445,20 +458,19 @@ These pieces of the recent E2B work do not need to change:
   `pkg/api/e2b/handlers.go` `createSandbox` — semantics are right;
   only the underlying store call changes.
 
-## Open questions before coding
+## Decisions and follow-ups
 
-1. Do we want `name` exposed in `/v1` now, or only stored and reserved
-   for SDK plumbing later? Recommendation: store it now, expose in `/v1`
-   when SDKs catch up. The schema change is the irreversible part.
-2. Do we want `tags`/`labels` exposed in `/v1` now? Same answer.
-3. For `e2b_snapshots`, the current schema lets one native snapshot have
-   one E2B ID. Do we ever expect to expose the same snapshot under
-   multiple facades simultaneously? If yes, `snapshot_aliases` keyed on
-   `alias` is correct. If no, a per-snapshot JSON column would suffice
-   and is even simpler.
-4. Are we willing to do the two-phase migration, or do we want to drop
-   the old tables in the same release? Self-hosted means we can usually
-   afford the one-shot — but two phases makes test/rollback trivial.
+1. **Migration/backfill:** decided. No production migration is needed before
+   launch; local dev DB reset is acceptable.
+2. **`/v1` name/tags exposure:** still needs an explicit product decision.
+   If accepted during development, keep the shared model fields. If not,
+   split v1 DTOs away from `models.Sandbox` and `models.CreateSandboxRequest`.
+3. **E2B snapshot alias shape:** accepted. `snapshot_aliases` keyed by alias
+   supports one native snapshot being exposed under multiple facade-shaped
+   IDs later without another schema change.
+4. **Daytona/E2B compatibility tests:** must stay. These tests are the drift
+   detector for facade parity and should be adjusted to the generic storage
+   internals, not removed.
 
 ## Why this is a real cleanup, not just churn
 

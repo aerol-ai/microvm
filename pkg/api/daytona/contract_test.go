@@ -55,9 +55,9 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 					Execute()
 				mustGeneratedSandboxSuccess(t, resp, httpResp, err)
 
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, resp.GetId())
+				meta, err := env.loadDaytonaMeta(resp.GetId())
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", resp.GetId(), err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", resp.GetId(), err)
 				}
 				if resp.GetName() != "named-generated" {
 					t.Fatalf("resp.Name = %q, want %q", resp.GetName(), "named-generated")
@@ -68,6 +68,20 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if meta.Name != "named-generated" || meta.User != "coder" {
 					t.Fatalf("stored metadata = %+v", meta)
 				}
+			},
+		},
+		{
+			name: "create_rejects_name_matching_existing_sandbox_id",
+			run: func(t *testing.T, env *daytonaContractEnv) {
+				env.seedSandbox(contractSandboxSeed{ID: "sb-shadow-owner", Name: "unrelated-shadow-owner"})
+
+				req := newGeneratedCreateRequest("ubuntu:22.04")
+				req.SetName("sb-shadow-owner")
+				_, httpResp, err := env.api.SandboxAPI.CreateSandbox(env.ctx).
+					CreateSandbox(*req).
+					Execute()
+
+				assertGeneratedAPIErrorStatus(t, httpResp, err, http.StatusConflict)
 			},
 		},
 		{
@@ -82,9 +96,9 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 					Execute()
 				mustGeneratedSandboxSuccess(t, resp, httpResp, err)
 
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, resp.GetId())
+				meta, err := env.loadDaytonaMeta(resp.GetId())
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", resp.GetId(), err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", resp.GetId(), err)
 				}
 				if resp.GetTarget() != "us-east-1" {
 					t.Fatalf("resp.Target = %q, want %q", resp.GetTarget(), "us-east-1")
@@ -114,15 +128,15 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("store.Get(%s) error = %v", resp.GetId(), err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, resp.GetId())
+				meta, err := env.loadDaytonaMeta(resp.GetId())
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", resp.GetId(), err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", resp.GetId(), err)
 				}
 				if stored.Image != "base-snapshot" {
 					t.Fatalf("stored.Image = %q, want %q", stored.Image, "base-snapshot")
 				}
-				if meta.Snapshot != "base-snapshot" {
-					t.Fatalf("stored snapshot metadata = %q, want %q", meta.Snapshot, "base-snapshot")
+				if valueOrEmpty(meta.Snapshot) != "base-snapshot" {
+					t.Fatalf("stored snapshot metadata = %q, want %q", valueOrEmpty(meta.Snapshot), "base-snapshot")
 				}
 				if resp.GetSnapshot() != "base-snapshot" {
 					t.Fatalf("resp.Snapshot = %q, want %q", resp.GetSnapshot(), "base-snapshot")
@@ -145,9 +159,9 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("store.Get(%s) error = %v", resp.GetId(), err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, resp.GetId())
+				meta, err := env.loadDaytonaMeta(resp.GetId())
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", resp.GetId(), err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", resp.GetId(), err)
 				}
 				if stored.Lifecycle.StopIfIdleFor != 5*time.Minute {
 					t.Fatalf("stored.StopIfIdleFor = %v, want %v", stored.Lifecycle.StopIfIdleFor, 5*time.Minute)
@@ -155,8 +169,8 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if stored.Lifecycle.DestroyIfIdleFor != 15*time.Minute {
 					t.Fatalf("stored.DestroyIfIdleFor = %v, want %v", stored.Lifecycle.DestroyIfIdleFor, 15*time.Minute)
 				}
-				if meta.AutoArchiveIntervalMinutes == nil || *meta.AutoArchiveIntervalMinutes != 30 {
-					t.Fatalf("stored.AutoArchiveIntervalMinutes = %+v, want 30", meta.AutoArchiveIntervalMinutes)
+				if meta.AutoArchiveInterval == nil || *meta.AutoArchiveInterval != 30 {
+					t.Fatalf("stored.AutoArchiveIntervalMinutes = %+v, want 30", meta.AutoArchiveInterval)
 				}
 				if resp.AutoStopInterval == nil || *resp.AutoStopInterval != 5 {
 					t.Fatalf("resp.AutoStopInterval = %+v, want 5", resp.AutoStopInterval)
@@ -400,9 +414,9 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if httpResp == nil || httpResp.StatusCode != http.StatusOK {
 					t.Fatalf("ReplaceLabels(%s) status = %+v", seed.ID, httpResp)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, seed.ID)
+				meta, err := env.loadDaytonaMeta(seed.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", seed.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", seed.ID, err)
 				}
 				if resp.GetLabels()["team"] != "backend" || meta.Labels["team"] != "backend" {
 					t.Fatalf("labels not updated: resp=%+v meta=%+v", resp.GetLabels(), meta.Labels)
@@ -424,9 +438,9 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if httpResp == nil || httpResp.StatusCode != http.StatusOK {
 					t.Fatalf("ReplaceLabels(%s) status = %+v", sandboxName, httpResp)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, seed.ID)
+				meta, err := env.loadDaytonaMeta(seed.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", seed.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", seed.ID, err)
 				}
 				if resp.GetLabels()["component"] != "gateway" || meta.Labels["component"] != "gateway" {
 					t.Fatalf("labels not updated: resp=%+v meta=%+v", resp.GetLabels(), meta.Labels)
@@ -445,15 +459,15 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("store.Get(%s) error = %v", seed.ID, err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, seed.ID)
+				meta, err := env.loadDaytonaMeta(seed.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", seed.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", seed.ID, err)
 				}
 				if stored.Lifecycle.StopIfIdleFor != 12*time.Minute {
 					t.Fatalf("stored.StopIfIdleFor = %v, want %v", stored.Lifecycle.StopIfIdleFor, 12*time.Minute)
 				}
-				if meta.AutoStopIntervalMinutes == nil || *meta.AutoStopIntervalMinutes != 12 {
-					t.Fatalf("stored.AutoStopIntervalMinutes = %+v, want 12", meta.AutoStopIntervalMinutes)
+				if meta.AutoStopInterval == nil || *meta.AutoStopInterval != 12 {
+					t.Fatalf("stored.AutoStopIntervalMinutes = %+v, want 12", meta.AutoStopInterval)
 				}
 				if resp.AutoStopInterval == nil || *resp.AutoStopInterval != 12 {
 					t.Fatalf("resp.AutoStopInterval = %+v, want 12", resp.AutoStopInterval)
@@ -477,15 +491,15 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("store.Get(%s) error = %v", seed.ID, err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, seed.ID)
+				meta, err := env.loadDaytonaMeta(seed.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", seed.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", seed.ID, err)
 				}
 				if stored.Lifecycle.StopIfIdleFor != 0 {
 					t.Fatalf("stored.StopIfIdleFor = %v, want 0", stored.Lifecycle.StopIfIdleFor)
 				}
-				if meta.AutoStopIntervalMinutes != nil || resp.AutoStopInterval != nil {
-					t.Fatalf("auto-stop interval not cleared: meta=%+v resp=%+v", meta.AutoStopIntervalMinutes, resp.AutoStopInterval)
+				if meta.AutoStopInterval != nil || resp.AutoStopInterval != nil {
+					t.Fatalf("auto-stop interval not cleared: meta=%+v resp=%+v", meta.AutoStopInterval, resp.AutoStopInterval)
 				}
 			},
 		},
@@ -501,15 +515,15 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("store.Get(%s) error = %v", seed.ID, err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, seed.ID)
+				meta, err := env.loadDaytonaMeta(seed.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", seed.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", seed.ID, err)
 				}
 				if stored.Lifecycle.DestroyIfIdleFor != 25*time.Minute {
 					t.Fatalf("stored.DestroyIfIdleFor = %v, want %v", stored.Lifecycle.DestroyIfIdleFor, 25*time.Minute)
 				}
-				if meta.AutoDeleteIntervalMinutes == nil || *meta.AutoDeleteIntervalMinutes != 25 {
-					t.Fatalf("stored.AutoDeleteIntervalMinutes = %+v, want 25", meta.AutoDeleteIntervalMinutes)
+				if meta.AutoDeleteInterval == nil || *meta.AutoDeleteInterval != 25 {
+					t.Fatalf("stored.AutoDeleteIntervalMinutes = %+v, want 25", meta.AutoDeleteInterval)
 				}
 				if resp.AutoDeleteInterval == nil || *resp.AutoDeleteInterval != 25 {
 					t.Fatalf("resp.AutoDeleteInterval = %+v, want 25", resp.AutoDeleteInterval)
@@ -524,12 +538,12 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				resp, httpResp, err := env.api.SandboxAPI.SetAutoArchiveInterval(env.ctx, seed.ID, 45).Execute()
 				mustGeneratedSandboxSuccess(t, resp, httpResp, err)
 
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, seed.ID)
+				meta, err := env.loadDaytonaMeta(seed.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", seed.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", seed.ID, err)
 				}
-				if meta.AutoArchiveIntervalMinutes == nil || *meta.AutoArchiveIntervalMinutes != 45 {
-					t.Fatalf("stored.AutoArchiveIntervalMinutes = %+v, want 45", meta.AutoArchiveIntervalMinutes)
+				if meta.AutoArchiveInterval == nil || *meta.AutoArchiveInterval != 45 {
+					t.Fatalf("stored.AutoArchiveIntervalMinutes = %+v, want 45", meta.AutoArchiveInterval)
 				}
 				if resp.AutoArchiveInterval == nil || *resp.AutoArchiveInterval != 45 {
 					t.Fatalf("resp.AutoArchiveInterval = %+v, want 45", resp.AutoArchiveInterval)
@@ -957,9 +971,9 @@ func TestDaytonaSDKContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("store.Get(%s) error = %v", sandbox.ID, err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, sandbox.ID)
+				meta, err := env.loadDaytonaMeta(sandbox.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", sandbox.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", sandbox.ID, err)
 				}
 				if stored.Image != "python:3.12" || stored.MemoryMB != 4096 || stored.DiskGB != 20 {
 					t.Fatalf("unexpected stored sandbox: %+v", stored)
@@ -985,11 +999,11 @@ func TestDaytonaSDKContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("store.Get(%s) error = %v", sandbox.ID, err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, sandbox.ID)
+				meta, err := env.loadDaytonaMeta(sandbox.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", sandbox.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", sandbox.ID, err)
 				}
-				if stored.Image != "sdk-base-snapshot" || meta.Snapshot != "sdk-base-snapshot" {
+				if stored.Image != "sdk-base-snapshot" || valueOrEmpty(meta.Snapshot) != "sdk-base-snapshot" {
 					t.Fatalf("snapshot contract not preserved: stored=%+v meta=%+v", stored, meta)
 				}
 			},
@@ -1141,9 +1155,9 @@ func TestDaytonaSDKContracts(t *testing.T) {
 				if err := sandbox.SetLabels(env.ctx, map[string]string{"component": "sdk"}); err != nil {
 					t.Fatalf("sandbox.SetLabels() error = %v", err)
 				}
-				meta, err := env.service.GetDaytonaMetadata(env.ctx, seed.ID)
+				meta, err := env.loadDaytonaMeta(seed.ID)
 				if err != nil {
-					t.Fatalf("service.GetDaytonaMetadata(%s) error = %v", seed.ID, err)
+					t.Fatalf("loadDaytonaMeta(%s) error = %v", seed.ID, err)
 				}
 				if meta.Labels["component"] != "sdk" {
 					t.Fatalf("stored labels = %+v", meta.Labels)

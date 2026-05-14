@@ -59,13 +59,13 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cleanupReservation := func() {
-		if err := h.deps.Service.DeleteE2BCreateRequest(r.Context(), fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
+		if err := h.deps.Service.DeleteIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
 			h.deps.Logger.Warn("e2b create reservation cleanup failed", "fingerprint", fingerprint, "error", err)
 		}
 	}
 
 	for {
-		record, acquired, err := h.deps.Service.ClaimE2BCreateRequest(r.Context(), fingerprint, time.Now().UTC(), e2bCreatePendingTTL)
+		record, acquired, err := h.deps.Service.ClaimIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint, time.Now().UTC(), e2bCreatePendingTTL)
 		if err != nil {
 			writeStoreAwareError(h.deps.Logger, w, err)
 			return
@@ -74,7 +74,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		if record.State == models.E2BCreateRequestStateReady {
+		if record.State == models.RequestStateReady {
 			sandbox, storedMeta, replayed, err := h.loadReplayableCreateResult(r.Context(), record)
 			if err != nil {
 				writeStoreAwareError(h.deps.Logger, w, err)
@@ -116,7 +116,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.deps.Service.CompleteE2BCreateRequest(r.Context(), fingerprint, response.ID, time.Now().UTC(), e2bCreateReplayWindow); err != nil {
+	if err := h.deps.Service.CompleteIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint, response.ID, time.Now().UTC(), e2bCreateReplayWindow); err != nil {
 		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
 			h.deps.Logger.Warn("e2b create idempotency rollback failed", "sandbox_id", response.ID, "error", destroyErr)
 		}
@@ -150,7 +150,7 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stored, err := h.deps.Service.ListE2BSandboxMetadata(r.Context())
+	stored, err := h.deps.Service.ListCompatState(r.Context(), models.FacadeE2B)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -161,7 +161,16 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		if sandbox == nil {
 			continue
 		}
-		meta := sandboxMetaFromStored(storedSandboxMeta(stored, sandbox.ID), sandbox)
+		var statePtr *models.SandboxCompatState
+		if s, ok := stored[sandbox.ID]; ok {
+			copied := s
+			statePtr = &copied
+		}
+		meta, err := sandboxMetaFromState(statePtr, sandbox)
+		if err != nil {
+			writeStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
 		state := mapSandboxState(sandbox.Status)
 		if len(stateFilter) > 0 {
 			if _, ok := stateFilter[state]; !ok {
@@ -376,11 +385,11 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		SnapshotID: snapshotIDFromName(snapshot.Name),
 		Names:      []string{canonicalSnapshotName(snapshot.Name)},
 	}
-	if err := h.deps.Service.UpsertE2BSnapshot(r.Context(), models.E2BSnapshotMetadata{
-		SnapshotID:      resp.SnapshotID,
-		SnapshotName:    snapshot.Name,
-		Names:           resp.Names,
-		SourceSandboxID: sandbox.ID,
+	if err := h.deps.Service.UpsertSnapshotAlias(r.Context(), models.SnapshotAlias{
+		Alias:        resp.SnapshotID,
+		SnapshotName: snapshot.Name,
+		Facade:       models.FacadeE2B,
+		ExtraNames:   resp.Names,
 	}); err != nil {
 		if createdSnapshot {
 			if deleteErr := h.deps.Service.DeleteSnapshot(r.Context(), snapshot.Name); deleteErr != nil && h.deps.Logger != nil {
@@ -406,10 +415,15 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	stored, err := h.deps.Service.ListE2BSnapshots(r.Context())
+	aliases, err := h.deps.Service.ListSnapshotAliases(r.Context(), models.FacadeE2B)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
+	}
+	// Index aliases by native snapshot name for the per-snapshot join below.
+	aliasesByName := make(map[string]models.SnapshotAlias, len(aliases))
+	for _, alias := range aliases {
+		aliasesByName[strings.TrimSpace(alias.SnapshotName)] = alias
 	}
 
 	type snapshotRow struct {
@@ -421,30 +435,24 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		if snapshot == nil {
 			continue
 		}
-		meta, ok := stored[snapshotIDFromName(snapshot.Name)]
-		if sandboxFilter != "" {
-			sourceSandboxID := snapshot.SourceSandboxID
-			if ok && strings.TrimSpace(meta.SourceSandboxID) != "" {
-				sourceSandboxID = strings.TrimSpace(meta.SourceSandboxID)
-			}
-			if sourceSandboxID != sandboxFilter {
-				continue
-			}
+		if sandboxFilter != "" && snapshot.SourceSandboxID != sandboxFilter {
+			continue
 		}
+		alias, ok := aliasesByName[strings.TrimSpace(snapshot.Name)]
 		response := snapshotInfoResponse{
 			SnapshotID: snapshotIDFromName(snapshot.Name),
 			Names:      []string{canonicalSnapshotName(snapshot.Name)},
 		}
 		createdAt := snapshot.CreatedAt
 		if ok {
-			if strings.TrimSpace(meta.SnapshotID) != "" {
-				response.SnapshotID = strings.TrimSpace(meta.SnapshotID)
+			if strings.TrimSpace(alias.Alias) != "" {
+				response.SnapshotID = strings.TrimSpace(alias.Alias)
 			}
-			if len(meta.Names) > 0 {
-				response.Names = cloneStringSlice(meta.Names)
+			if len(alias.ExtraNames) > 0 {
+				response.Names = cloneStringSlice(alias.ExtraNames)
 			}
-			if !meta.CreatedAt.IsZero() {
-				createdAt = meta.CreatedAt
+			if !alias.CreatedAt.IsZero() {
+				createdAt = alias.CreatedAt
 			}
 		}
 		rows = append(rows, snapshotRow{response: response, createdAt: createdAt})
@@ -492,8 +500,12 @@ func (h *handlers) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// The FK cascade on snapshot_aliases.snapshot_name → sandbox_snapshots.name
+	// already removed the alias when DeleteSnapshot ran. We still delete by
+	// alias explicitly to absorb the case where the caller addressed the
+	// snapshot by its native name and the alias has a different identifier.
 	if storedID != "" {
-		if err := h.deps.Service.DeleteE2BSnapshot(r.Context(), storedID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		if err := h.deps.Service.DeleteSnapshotAlias(r.Context(), storedID); err != nil && !errors.Is(err, store.ErrNotFound) {
 			writeStoreAwareError(h.deps.Logger, w, err)
 			return
 		}
@@ -587,6 +599,10 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		Env:             envVars,
 		NetworkBlockAll: networkBlockAll,
 		Lifecycle:       lifecyclePtr(timeoutSeconds, onTimeout),
+		// E2B's metadata is the same shape as Daytona's labels — write it
+		// into the native tags column so it round-trips through any API
+		// surface, not just /e2b.
+		Tags: cloneStringMap(metadata),
 	}
 	meta := sandboxMeta{
 		TemplateID:          templateID,
@@ -606,8 +622,8 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 }
 
 func (h *handlers) resolveTemplate(ctx context.Context, templateID string) (string, string, error) {
-	if snapshotMeta, err := h.deps.Service.GetE2BSnapshot(ctx, templateID); err == nil {
-		return strings.TrimSpace(snapshotMeta.SnapshotName), "", nil
+	if alias, err := h.deps.Service.GetSnapshotAlias(ctx, templateID); err == nil {
+		return strings.TrimSpace(alias.SnapshotName), "", nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return "", "", err
 	}
@@ -640,31 +656,35 @@ func (h *handlers) loadSandboxMeta(ctx context.Context, sandbox *models.Sandbox)
 	if sandbox == nil {
 		return defaultSandboxMeta(nil), nil
 	}
-	stored, err := h.deps.Service.GetE2BSandboxMetadata(ctx, sandbox.ID)
+	stored, err := h.deps.Service.GetCompatState(ctx, sandbox.ID, models.FacadeE2B)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return defaultSandboxMeta(sandbox), nil
 		}
 		return sandboxMeta{}, err
 	}
-	return sandboxMetaFromStored(stored, sandbox), nil
+	return sandboxMetaFromState(stored, sandbox)
 }
 
 func (h *handlers) persistSandboxMeta(ctx context.Context, sandboxID string, meta sandboxMeta) error {
 	if h.deps.Service == nil {
 		return nil
 	}
-	return h.deps.Service.UpsertE2BSandboxMetadata(ctx, sandboxMetaToStored(sandboxID, meta))
+	stateJSON, err := sandboxMetaToState(meta)
+	if err != nil {
+		return err
+	}
+	return h.deps.Service.UpsertCompatState(ctx, sandboxID, models.FacadeE2B, stateJSON)
 }
 
-func (h *handlers) loadReplayableCreateResult(ctx context.Context, record *models.E2BCreateRequestRecord) (*models.Sandbox, sandboxMeta, bool, error) {
-	if record == nil || strings.TrimSpace(record.SandboxID) == "" {
+func (h *handlers) loadReplayableCreateResult(ctx context.Context, record *models.IdempotentRequestRecord) (*models.Sandbox, sandboxMeta, bool, error) {
+	if record == nil || strings.TrimSpace(record.TargetID) == "" {
 		return nil, sandboxMeta{}, false, nil
 	}
-	sandbox, err := h.deps.Service.GetSandbox(ctx, record.SandboxID)
+	sandbox, err := h.deps.Service.GetSandbox(ctx, record.TargetID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			if deleteErr := h.deps.Service.DeleteE2BCreateRequest(ctx, record.Fingerprint); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
+			if deleteErr := h.deps.Service.DeleteIdempotentRequest(ctx, record.Scope, record.Fingerprint); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
 				return nil, sandboxMeta{}, false, deleteErr
 			}
 			return nil, sandboxMeta{}, false, nil
@@ -689,7 +709,7 @@ func (h *handlers) waitForCreateReplay(ctx context.Context, fingerprint string) 
 			return nil, sandboxMeta{}, false, serviceUnavailable("An identical sandbox create is already in progress; retry shortly.")
 		}
 
-		record, err := h.deps.Service.GetE2BCreateRequest(ctx, fingerprint)
+		record, err := h.deps.Service.GetIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return nil, sandboxMeta{}, false, nil
@@ -697,16 +717,16 @@ func (h *handlers) waitForCreateReplay(ctx context.Context, fingerprint string) 
 			return nil, sandboxMeta{}, false, err
 		}
 
-		if record.State == models.E2BCreateRequestStateReady {
+		if record.State == models.RequestStateReady {
 			if record.ReplayUntil.IsZero() || !record.ReplayUntil.After(now) {
-				if err := h.deps.Service.DeleteE2BCreateRequest(ctx, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) {
+				if err := h.deps.Service.DeleteIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) {
 					return nil, sandboxMeta{}, false, err
 				}
 				return nil, sandboxMeta{}, false, nil
 			}
 			return h.loadReplayableCreateResult(ctx, record)
 		}
-		if record.State != models.E2BCreateRequestStatePending || !record.LockedUntil.After(now) {
+		if record.State != models.RequestStatePending || !record.LockedUntil.After(now) {
 			return nil, sandboxMeta{}, false, nil
 		}
 
@@ -728,8 +748,8 @@ func (h *handlers) waitForCreateReplay(ctx context.Context, fingerprint string) 
 }
 
 func (h *handlers) resolveSnapshotDeleteTarget(ctx context.Context, snapshotID string) (string, string, error) {
-	if stored, err := h.deps.Service.GetE2BSnapshot(ctx, snapshotID); err == nil {
-		return strings.TrimSpace(stored.SnapshotName), strings.TrimSpace(stored.SnapshotID), nil
+	if alias, err := h.deps.Service.GetSnapshotAlias(ctx, snapshotID); err == nil {
+		return strings.TrimSpace(alias.SnapshotName), strings.TrimSpace(alias.Alias), nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return "", "", err
 	}
@@ -1099,11 +1119,3 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func storedSandboxMeta(items map[string]models.E2BSandboxMetadata, sandboxID string) *models.E2BSandboxMetadata {
-	meta, ok := items[sandboxID]
-	if !ok {
-		return nil
-	}
-	copy := meta
-	return &copy
-}

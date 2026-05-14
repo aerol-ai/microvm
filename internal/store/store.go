@@ -50,6 +50,11 @@ func Open(path string) (*Store, error) {
 	stmts := []string{
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA foreign_keys = ON;`,
+		// sandboxes is the canonical per-sandbox row. name and tags_json are
+		// native first-class fields used by every facade — they are NOT
+		// Daytona- or E2B-specific. Lifecycle is stored as four INTEGER
+		// nanosecond fields (matches Go's time.Duration shape), gpus_json
+		// is a JSON blob to absorb future GPU options without schema churn.
 		`CREATE TABLE IF NOT EXISTS sandboxes (
 			id TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -68,6 +73,14 @@ func Open(path string) (*Store, error) {
 			ssh_public_key TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '',
 			container_command_json TEXT NOT NULL DEFAULT '[]',
+			name TEXT NOT NULL DEFAULT '',
+			tags_json TEXT NOT NULL DEFAULT '{}',
+			stop_if_idle_for_ns INTEGER NOT NULL DEFAULT 0,
+			destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0,
+			stop_at_age_ns INTEGER NOT NULL DEFAULT 0,
+			destroy_at_age_ns INTEGER NOT NULL DEFAULT 0,
+			runtime TEXT NOT NULL DEFAULT '',
+			gpus_json TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			last_active_at DATETIME NOT NULL
@@ -75,6 +88,8 @@ func Open(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS exposed_ports (
 			sandbox_id TEXT NOT NULL,
 			port INTEGER NOT NULL,
+			protocol TEXT NOT NULL DEFAULT 'http',
+			host_port INTEGER NOT NULL DEFAULT 0,
 			public_url TEXT NOT NULL,
 			created_at DATETIME NOT NULL,
 			PRIMARY KEY (sandbox_id, port),
@@ -86,63 +101,56 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
-		`CREATE TABLE IF NOT EXISTS daytona_sandboxes (
-			sandbox_id TEXT PRIMARY KEY,
-			name TEXT NOT NULL UNIQUE,
-			snapshot TEXT NOT NULL DEFAULT '',
-			user_name TEXT NOT NULL DEFAULT '',
-			labels_json TEXT NOT NULL DEFAULT '{}',
-			target TEXT NOT NULL DEFAULT '',
-			network_allow_list TEXT NOT NULL DEFAULT '',
-			auto_stop_interval_minutes REAL,
-			auto_archive_interval_minutes REAL,
-			auto_delete_interval_minutes REAL,
-			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL,
-			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
-		);`,
-		`CREATE TABLE IF NOT EXISTS e2b_sandboxes (
-			sandbox_id TEXT PRIMARY KEY,
-			template_id TEXT NOT NULL DEFAULT '',
-			template_alias TEXT NOT NULL DEFAULT '',
-			metadata_json TEXT NOT NULL DEFAULT '{}',
-			timeout_seconds INTEGER NOT NULL DEFAULT 0,
-			on_timeout TEXT NOT NULL DEFAULT 'kill',
-			auto_resume INTEGER NOT NULL DEFAULT 0,
-			secure INTEGER NOT NULL DEFAULT 1,
-			allow_internet_access INTEGER,
-			network_allow_out_json TEXT NOT NULL DEFAULT '[]',
-			network_deny_out_json TEXT NOT NULL DEFAULT '[]',
-			allow_public_traffic INTEGER,
-			mask_request_host TEXT NOT NULL DEFAULT '',
-			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL,
-			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
-		);`,
-		`CREATE TABLE IF NOT EXISTS e2b_snapshots (
-			snapshot_id TEXT PRIMARY KEY,
-			snapshot_name TEXT NOT NULL UNIQUE,
-			names_json TEXT NOT NULL DEFAULT '[]',
-			source_sandbox_id TEXT NOT NULL DEFAULT '',
-			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL,
-			FOREIGN KEY (snapshot_name) REFERENCES sandbox_snapshots(name) ON DELETE CASCADE
-		);`,
-		`CREATE TABLE IF NOT EXISTS e2b_create_requests (
-			fingerprint TEXT PRIMARY KEY,
-			sandbox_id TEXT NOT NULL DEFAULT '',
-			state TEXT NOT NULL DEFAULT 'pending',
-			locked_until DATETIME NOT NULL,
-			replay_until DATETIME,
-			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL
-		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
 			image_id TEXT NOT NULL DEFAULT '',
 			source_sandbox_id TEXT NOT NULL,
 			created_at DATETIME NOT NULL
+		);`,
+		// sandbox_compat_state holds opaque facade-private state that has
+		// no native meaning. One row per (sandbox, facade). state_json is
+		// owned by the facade — the store does not interpret it. FK cascade
+		// guarantees facade state is removed when the sandbox is destroyed.
+		`CREATE TABLE IF NOT EXISTS sandbox_compat_state (
+			sandbox_id TEXT NOT NULL,
+			facade TEXT NOT NULL,
+			state_json TEXT NOT NULL DEFAULT '{}',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, facade),
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
+		// snapshot_aliases lets a native sandbox_snapshots row be addressed
+		// by facade-shaped alternate identifiers (e.g. E2B's base64 token).
+		// FK cascade fixes the orphan-row bug where /v1/snapshots delete
+		// would leave a facade alias dangling.
+		`CREATE TABLE IF NOT EXISTS snapshot_aliases (
+			alias TEXT PRIMARY KEY,
+			snapshot_name TEXT NOT NULL,
+			facade TEXT NOT NULL,
+			extra_names_json TEXT NOT NULL DEFAULT '[]',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			FOREIGN KEY (snapshot_name) REFERENCES sandbox_snapshots(name) ON DELETE CASCADE
+		);`,
+		// request_idempotency is the generic claim/replay primitive for
+		// caller-retry dedupe. scope is a caller-defined namespace string
+		// ("e2b.create" today; "daytona.create" or "v1.create" later) so
+		// the same fingerprint hash can be reused across facades without
+		// colliding. The state machine is: pending → ready, with
+		// locked_until bounding the in-flight wait and replay_until
+		// bounding the replay window after success.
+		`CREATE TABLE IF NOT EXISTS request_idempotency (
+			scope TEXT NOT NULL,
+			fingerprint TEXT NOT NULL,
+			target_id TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL DEFAULT 'pending',
+			locked_until DATETIME NOT NULL,
+			replay_until DATETIME,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (scope, fingerprint)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
@@ -152,9 +160,15 @@ func Open(path string) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
-		`CREATE INDEX IF NOT EXISTS idx_e2b_create_requests_replay_until ON e2b_create_requests(replay_until);`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_e2b_snapshots_snapshot_name ON e2b_snapshots(snapshot_name);`,
-		`CREATE INDEX IF NOT EXISTS idx_e2b_snapshots_source_sandbox_id ON e2b_snapshots(source_sandbox_id);`,
+		// Partial unique index on sandboxes.name. The default '' is allowed
+		// many times (for sandboxes created without a name); any non-empty
+		// name is unique across the table. Daytona depends on this for
+		// name-based lookup; everyone else benefits from collision-free
+		// names by default.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
+		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
 	}
 
@@ -162,42 +176,6 @@ func Open(path string) (*Store, error) {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("run schema statement: %w", err)
-		}
-	}
-
-	// Migrations for older DBs that pre-date columns above. Idempotent.
-	// Lifecycle fields are stored as INTEGER nanoseconds — same shape Go
-	// uses for time.Duration internally, so no parsing on read and no
-	// format ambiguity. Zero means "disabled" for that axis.
-	migrations := []string{
-		`ALTER TABLE sandboxes ADD COLUMN toolbox_token TEXT NOT NULL DEFAULT '';`,
-		`ALTER TABLE sandboxes ADD COLUMN ssh_public_key TEXT NOT NULL DEFAULT '';`,
-		`ALTER TABLE sandboxes ADD COLUMN stop_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
-		`ALTER TABLE sandboxes ADD COLUMN destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
-		`ALTER TABLE sandboxes ADD COLUMN stop_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
-		`ALTER TABLE sandboxes ADD COLUMN destroy_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
-		// Per-sandbox OCI runtime selector (runc / runsc). Pre-migration rows
-		// get '' and resolve to the host default at start time; new sandboxes
-		// always store the resolved value so the choice cannot drift across
-		// host restarts.
-		`ALTER TABLE sandboxes ADD COLUMN runtime TEXT NOT NULL DEFAULT '';`,
-		// GPU configuration as a JSON blob. Empty string means no GPU was
-		// requested. Stored as JSON to avoid schema churn as GPU options grow.
-		`ALTER TABLE sandboxes ADD COLUMN gpus_json TEXT NOT NULL DEFAULT '';`,
-		// Protocol of an exposed port: "http" (Caddy HTTP reverse proxy,
-		// historical behavior), "tcp" (caddy-l4 listener at host_port), or
-		// "tls" (caddy-l4 SNI route on the shared TLS listener).
-		`ALTER TABLE exposed_ports ADD COLUMN protocol TEXT NOT NULL DEFAULT 'http';`,
-		// Parent-host TCP port reserved for protocol="tcp" exposures from the
-		// configured pool. Zero for http/tls. The partial unique index below
-		// rejects two reservations on the same host_port without preventing
-		// many rows at the default 0.
-		`ALTER TABLE exposed_ports ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0;`,
-	}
-	for _, stmt := range migrations {
-		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-			db.Close()
-			return nil, fmt.Errorf("run migration: %w", err)
 		}
 	}
 
@@ -259,15 +237,22 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	tagsJSON, err := marshalJSON(sandbox.Tags, "{}")
+	if err != nil {
+		return err
+	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -286,6 +271,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
+		strings.TrimSpace(sandbox.Name),
+		tagsJSON,
 		sandbox.CreatedAt.UTC(),
 		sandbox.UpdatedAt.UTC(),
 		sandbox.LastActiveAt.UTC(),
@@ -297,6 +284,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		gpusJSON,
 	)
 	if err != nil {
+		if isSandboxNameConflict(err, sandbox.Name) {
+			return ErrSandboxNameConflict
+		}
 		return fmt.Errorf("insert sandbox: %w", err)
 	}
 	return nil
@@ -315,15 +305,22 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	tagsJSON, err := marshalJSON(sandbox.Tags, "{}")
+	if err != nil {
+		return err
+	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -341,6 +338,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			ssh_public_key = excluded.ssh_public_key,
 			last_error = excluded.last_error,
 			container_command_json = excluded.container_command_json,
+			name = excluded.name,
+			tags_json = excluded.tags_json,
 			updated_at = excluded.updated_at,
 			last_active_at = excluded.last_active_at,
 			stop_if_idle_for_ns = excluded.stop_if_idle_for_ns,
@@ -367,6 +366,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
+		strings.TrimSpace(sandbox.Name),
+		tagsJSON,
 		sandbox.CreatedAt.UTC(),
 		sandbox.UpdatedAt.UTC(),
 		sandbox.LastActiveAt.UTC(),
@@ -378,6 +379,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		gpusJSON,
 	)
 	if err != nil {
+		if isSandboxNameConflict(err, sandbox.Name) {
+			return ErrSandboxNameConflict
+		}
 		return fmt.Errorf("upsert sandbox: %w", err)
 	}
 	return nil
@@ -387,7 +391,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json
 		FROM sandboxes
@@ -415,7 +419,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json
 		FROM sandboxes
@@ -515,6 +519,30 @@ func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, erro
 	return true, nil
 }
 
+// UpdateTags replaces sandboxes.tags_json on the row matching id and bumps
+// updated_at. Used by facades that want to mutate the native tags field
+// without round-tripping the entire sandbox struct through Upsert. Returns
+// ErrNotFound if no row matches.
+func (s *Store) UpdateTags(ctx context.Context, id string, tags map[string]string) error {
+	tagsJSON, err := marshalJSON(tags, "{}")
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET tags_json = ?, updated_at = ?
+		WHERE id = ?
+	`, tagsJSON, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update sandbox tags: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // UpdateLifecycle replaces the four lifecycle timer fields on a sandbox row
 // and bumps updated_at. Other fields are untouched. Returns ErrNotFound if
 // no row matches id. The caller must validate the Lifecycle first; the
@@ -558,260 +586,245 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Store) UpsertDaytonaMetadata(ctx context.Context, meta models.DaytonaSandboxMetadata) error {
-	labelsJSON, err := marshalJSON(meta.Labels, "{}")
-	if err != nil {
-		return fmt.Errorf("marshal daytona labels: %w", err)
-	}
-	name := strings.TrimSpace(meta.Name)
-	if name == "" {
-		name = strings.TrimSpace(meta.SandboxID)
-	}
-	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO daytona_sandboxes (
-			sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,
-			auto_stop_interval_minutes, auto_archive_interval_minutes, auto_delete_interval_minutes,
-			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET
-			name = excluded.name,
-			snapshot = excluded.snapshot,
-			user_name = excluded.user_name,
-			labels_json = excluded.labels_json,
-			target = excluded.target,
-			network_allow_list = excluded.network_allow_list,
-			auto_stop_interval_minutes = excluded.auto_stop_interval_minutes,
-			auto_archive_interval_minutes = excluded.auto_archive_interval_minutes,
-			auto_delete_interval_minutes = excluded.auto_delete_interval_minutes,
-			updated_at = excluded.updated_at
-	`,
-		strings.TrimSpace(meta.SandboxID),
-		name,
-		strings.TrimSpace(meta.Snapshot),
-		strings.TrimSpace(meta.User),
-		labelsJSON,
-		strings.TrimSpace(meta.Target),
-		strings.TrimSpace(meta.NetworkAllowList),
-		nullableFloat32(meta.AutoStopIntervalMinutes),
-		nullableFloat32(meta.AutoArchiveIntervalMinutes),
-		nullableFloat32(meta.AutoDeleteIntervalMinutes),
-		now,
-		now,
-	)
-	if err != nil {
-		if isSQLiteUniqueConstraint(err) {
-			return ErrDaytonaNameConflict
+// ensureSandboxLookupNameAvailable keeps the user-facing sandbox lookup
+// namespace unambiguous. Handlers resolve by id first and name second, so a
+// name that equals another sandbox's id would otherwise be permanently
+// shadowed. The inverse is also rejected for caller-supplied ids.
+func (s *Store) ensureSandboxLookupNameAvailable(ctx context.Context, id, name string) error {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if name != "" {
+		var existingID string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sandboxes
+			WHERE id = ? AND id <> ?
+			LIMIT 1
+		`, name, id).Scan(&existingID)
+		if err == nil {
+			return ErrSandboxNameConflict
 		}
-		return fmt.Errorf("upsert daytona metadata: %w", err)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check sandbox name against ids: %w", err)
+		}
+	}
+	if id != "" {
+		var existingID string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sandboxes
+			WHERE name = ? AND id <> ?
+			LIMIT 1
+		`, id, id).Scan(&existingID)
+		if err == nil {
+			return ErrSandboxNameConflict
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check sandbox id against names: %w", err)
+		}
 	}
 	return nil
 }
 
-func (s *Store) GetDaytonaMetadata(ctx context.Context, sandboxID string) (*models.DaytonaSandboxMetadata, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,
-			auto_stop_interval_minutes, auto_archive_interval_minutes, auto_delete_interval_minutes
-		FROM daytona_sandboxes
-		WHERE sandbox_id = ?
-	`, sandboxID)
-	meta, err := scanDaytonaMetadata(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("get daytona metadata: %w", err)
+// UpsertCompatState writes the facade-private state blob for (sandboxID,
+// facade). stateJSON is opaque to the store — each facade defines its own
+// schema inside it. created_at is preserved on update so list ordering
+// stays stable.
+func (s *Store) UpsertCompatState(ctx context.Context, sandboxID, facade, stateJSON string) error {
+	if strings.TrimSpace(sandboxID) == "" {
+		return fmt.Errorf("upsert compat state: sandbox_id is required")
 	}
-	return meta, nil
-}
-
-func (s *Store) UpsertE2BSandboxMetadata(ctx context.Context, meta models.E2BSandboxMetadata) error {
-	metadataJSON, err := marshalJSON(meta.Metadata, "{}")
-	if err != nil {
-		return fmt.Errorf("marshal e2b metadata: %w", err)
+	if strings.TrimSpace(facade) == "" {
+		return fmt.Errorf("upsert compat state: facade is required")
 	}
-	allowOutJSON, err := marshalJSON(meta.NetworkAllowOut, "[]")
-	if err != nil {
-		return fmt.Errorf("marshal e2b allowOut: %w", err)
-	}
-	denyOutJSON, err := marshalJSON(meta.NetworkDenyOut, "[]")
-	if err != nil {
-		return fmt.Errorf("marshal e2b denyOut: %w", err)
+	body := strings.TrimSpace(stateJSON)
+	if body == "" {
+		body = "{}"
 	}
 	now := time.Now().UTC()
-	createdAt := meta.CreatedAt.UTC()
-	if meta.CreatedAt.IsZero() {
-		createdAt = now
-	}
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO e2b_sandboxes (
-			sandbox_id, template_id, template_alias, metadata_json, timeout_seconds,
-			on_timeout, auto_resume, secure, allow_internet_access,
-			network_allow_out_json, network_deny_out_json, allow_public_traffic,
-			mask_request_host, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET
-			template_id = excluded.template_id,
-			template_alias = excluded.template_alias,
-			metadata_json = excluded.metadata_json,
-			timeout_seconds = excluded.timeout_seconds,
-			on_timeout = excluded.on_timeout,
-			auto_resume = excluded.auto_resume,
-			secure = excluded.secure,
-			allow_internet_access = excluded.allow_internet_access,
-			network_allow_out_json = excluded.network_allow_out_json,
-			network_deny_out_json = excluded.network_deny_out_json,
-			allow_public_traffic = excluded.allow_public_traffic,
-			mask_request_host = excluded.mask_request_host,
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sandbox_compat_state (sandbox_id, facade, state_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, facade) DO UPDATE SET
+			state_json = excluded.state_json,
 			updated_at = excluded.updated_at
-	`,
-		strings.TrimSpace(meta.SandboxID),
-		strings.TrimSpace(meta.TemplateID),
-		strings.TrimSpace(meta.TemplateAlias),
-		metadataJSON,
-		meta.TimeoutSeconds,
-		firstNonEmptyString(strings.TrimSpace(meta.OnTimeout), "kill"),
-		boolToInt(meta.AutoResume),
-		boolToInt(meta.Secure),
-		nullableBool(meta.AllowInternetAccess),
-		allowOutJSON,
-		denyOutJSON,
-		nullableBool(meta.AllowPublicTraffic),
-		strings.TrimSpace(meta.MaskRequestHost),
-		createdAt,
-		now,
-	)
+	`, strings.TrimSpace(sandboxID), strings.TrimSpace(facade), body, now, now)
 	if err != nil {
-		return fmt.Errorf("upsert e2b sandbox metadata: %w", err)
+		return fmt.Errorf("upsert compat state: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) GetE2BSandboxMetadata(ctx context.Context, sandboxID string) (*models.E2BSandboxMetadata, error) {
+// GetCompatState returns the state blob for (sandboxID, facade), or
+// ErrNotFound when no row exists. Callers unmarshal state_json themselves.
+func (s *Store) GetCompatState(ctx context.Context, sandboxID, facade string) (*models.SandboxCompatState, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id, template_id, template_alias, metadata_json, timeout_seconds,
-			on_timeout, auto_resume, secure, allow_internet_access,
-			network_allow_out_json, network_deny_out_json, allow_public_traffic,
-			mask_request_host, created_at, updated_at
-		FROM e2b_sandboxes
-		WHERE sandbox_id = ?
-	`, sandboxID)
-	meta, err := scanE2BSandboxMetadata(row)
+		SELECT sandbox_id, facade, state_json, created_at, updated_at
+		FROM sandbox_compat_state
+		WHERE sandbox_id = ? AND facade = ?
+	`, strings.TrimSpace(sandboxID), strings.TrimSpace(facade))
+	state, err := scanCompatState(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("get e2b sandbox metadata: %w", err)
+		return nil, fmt.Errorf("get compat state: %w", err)
 	}
-	return meta, nil
+	return state, nil
 }
 
-func (s *Store) ListE2BSandboxMetadata(ctx context.Context) (map[string]models.E2BSandboxMetadata, error) {
+// ListCompatState returns every row for the given facade keyed by
+// sandbox_id. Empty result is map of length zero, not nil — callers can
+// always index into it.
+func (s *Store) ListCompatState(ctx context.Context, facade string) (map[string]models.SandboxCompatState, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, template_id, template_alias, metadata_json, timeout_seconds,
-			on_timeout, auto_resume, secure, allow_internet_access,
-			network_allow_out_json, network_deny_out_json, allow_public_traffic,
-			mask_request_host, created_at, updated_at
-		FROM e2b_sandboxes
+		SELECT sandbox_id, facade, state_json, created_at, updated_at
+		FROM sandbox_compat_state
+		WHERE facade = ?
 		ORDER BY sandbox_id ASC
-	`)
+	`, strings.TrimSpace(facade))
 	if err != nil {
-		return nil, fmt.Errorf("list e2b sandbox metadata: %w", err)
+		return nil, fmt.Errorf("list compat state: %w", err)
 	}
 	defer rows.Close()
 
-	items := map[string]models.E2BSandboxMetadata{}
+	items := map[string]models.SandboxCompatState{}
 	for rows.Next() {
-		meta, err := scanE2BSandboxMetadata(rows)
+		state, err := scanCompatState(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan e2b sandbox metadata: %w", err)
+			return nil, fmt.Errorf("scan compat state: %w", err)
 		}
-		items[meta.SandboxID] = *meta
+		items[state.SandboxID] = *state
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate e2b sandbox metadata: %w", err)
+		return nil, fmt.Errorf("iterate compat state: %w", err)
 	}
 	return items, nil
 }
 
-func (s *Store) UpsertE2BSnapshot(ctx context.Context, meta models.E2BSnapshotMetadata) error {
-	namesJSON, err := marshalJSON(meta.Names, "[]")
+// ResolveSandboxIDByName returns the sandbox ID owning the given name, or
+// ErrNotFound if no row matches. Empty input is rejected so an accidental
+// "" lookup does not match a no-name sandbox via the partial unique
+// index's escape hatch.
+func (s *Store) ResolveSandboxIDByName(ctx context.Context, name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE name = ?`, trimmed)
+	var sandboxID string
+	if err := row.Scan(&sandboxID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("resolve sandbox id by name: %w", err)
+	}
+	return sandboxID, nil
+}
+
+// UpsertSnapshotAlias maps a facade-shaped alternate identifier onto a
+// native sandbox_snapshots row. created_at is preserved on update.
+func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAlias) error {
+	if strings.TrimSpace(alias.Alias) == "" {
+		return fmt.Errorf("upsert snapshot alias: alias is required")
+	}
+	if strings.TrimSpace(alias.SnapshotName) == "" {
+		return fmt.Errorf("upsert snapshot alias: snapshot_name is required")
+	}
+	extraNamesJSON, err := marshalJSON(alias.ExtraNames, "[]")
 	if err != nil {
-		return fmt.Errorf("marshal e2b snapshot names: %w", err)
+		return fmt.Errorf("marshal snapshot alias names: %w", err)
 	}
 	now := time.Now().UTC()
-	createdAt := meta.CreatedAt.UTC()
-	if meta.CreatedAt.IsZero() {
+	createdAt := alias.CreatedAt.UTC()
+	if alias.CreatedAt.IsZero() {
 		createdAt = now
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO e2b_snapshots (
-			snapshot_id, snapshot_name, names_json, source_sandbox_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(snapshot_id) DO UPDATE SET
+		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(alias) DO UPDATE SET
 			snapshot_name = excluded.snapshot_name,
-			names_json = excluded.names_json,
-			source_sandbox_id = excluded.source_sandbox_id,
+			facade = excluded.facade,
+			extra_names_json = excluded.extra_names_json,
 			updated_at = excluded.updated_at
 	`,
-		strings.TrimSpace(meta.SnapshotID),
-		strings.TrimSpace(meta.SnapshotName),
-		namesJSON,
-		strings.TrimSpace(meta.SourceSandboxID),
+		strings.TrimSpace(alias.Alias),
+		strings.TrimSpace(alias.SnapshotName),
+		strings.TrimSpace(alias.Facade),
+		extraNamesJSON,
 		createdAt,
 		now,
 	)
 	if err != nil {
-		return fmt.Errorf("upsert e2b snapshot metadata: %w", err)
+		return fmt.Errorf("upsert snapshot alias: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) GetE2BSnapshot(ctx context.Context, snapshotID string) (*models.E2BSnapshotMetadata, error) {
+// GetSnapshotAlias returns the alias row, or ErrNotFound if the alias
+// does not exist.
+func (s *Store) GetSnapshotAlias(ctx context.Context, alias string) (*models.SnapshotAlias, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT snapshot_id, snapshot_name, names_json, source_sandbox_id, created_at, updated_at
-		FROM e2b_snapshots
-		WHERE snapshot_id = ?
-	`, strings.TrimSpace(snapshotID))
-	meta, err := scanE2BSnapshotMetadata(row)
+		SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+		FROM snapshot_aliases
+		WHERE alias = ?
+	`, strings.TrimSpace(alias))
+	got, err := scanSnapshotAlias(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("get e2b snapshot metadata: %w", err)
+		return nil, fmt.Errorf("get snapshot alias: %w", err)
 	}
-	return meta, nil
+	return got, nil
 }
 
-func (s *Store) ListE2BSnapshots(ctx context.Context) (map[string]models.E2BSnapshotMetadata, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT snapshot_id, snapshot_name, names_json, source_sandbox_id, created_at, updated_at
-		FROM e2b_snapshots
-		ORDER BY created_at DESC, snapshot_id ASC
-	`)
+// ListSnapshotAliases returns all alias rows for the given facade keyed
+// by alias. Pass empty facade to fetch every alias regardless of facade.
+func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[string]models.SnapshotAlias, error) {
+	var rows *sql.Rows
+	var err error
+	trimmed := strings.TrimSpace(facade)
+	if trimmed == "" {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			FROM snapshot_aliases
+			ORDER BY created_at DESC, alias ASC
+		`)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			FROM snapshot_aliases
+			WHERE facade = ?
+			ORDER BY created_at DESC, alias ASC
+		`, trimmed)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("list e2b snapshot metadata: %w", err)
+		return nil, fmt.Errorf("list snapshot aliases: %w", err)
 	}
 	defer rows.Close()
 
-	items := map[string]models.E2BSnapshotMetadata{}
+	items := map[string]models.SnapshotAlias{}
 	for rows.Next() {
-		meta, err := scanE2BSnapshotMetadata(rows)
+		alias, err := scanSnapshotAlias(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan e2b snapshot metadata: %w", err)
+			return nil, fmt.Errorf("scan snapshot alias: %w", err)
 		}
-		items[meta.SnapshotID] = *meta
+		items[alias.Alias] = *alias
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate e2b snapshot metadata: %w", err)
+		return nil, fmt.Errorf("iterate snapshot aliases: %w", err)
 	}
 	return items, nil
 }
 
-func (s *Store) DeleteE2BSnapshot(ctx context.Context, snapshotID string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM e2b_snapshots WHERE snapshot_id = ?`, strings.TrimSpace(snapshotID))
+// DeleteSnapshotAlias removes the alias row. FK cascade also drops the
+// row when its underlying sandbox_snapshots row is deleted, so explicit
+// deletes are only needed when the facade wants to forget an alias
+// without removing the native snapshot.
+func (s *Store) DeleteSnapshotAlias(ctx context.Context, alias string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM snapshot_aliases WHERE alias = ?`, strings.TrimSpace(alias))
 	if err != nil {
-		return fmt.Errorf("delete e2b snapshot metadata: %w", err)
+		return fmt.Errorf("delete snapshot alias: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -820,112 +833,139 @@ func (s *Store) DeleteE2BSnapshot(ctx context.Context, snapshotID string) error 
 	return nil
 }
 
-func (s *Store) ClaimE2BCreateRequest(ctx context.Context, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.E2BCreateRequestRecord, bool, error) {
-	trimmed := strings.TrimSpace(fingerprint)
-	if trimmed == "" {
-		return nil, false, fmt.Errorf("claim e2b create request: fingerprint is required")
+// ClaimIdempotentRequest is the generic claim/replay primitive for
+// caller-retry dedupe. scope is a facade-defined namespace string
+// ("e2b.create" today; "daytona.create" or "v1.create" later) so the
+// same fingerprint can be reused across facades without colliding.
+//
+// Three outcomes per call:
+//  1. INSERTed a fresh pending row → acquired=true, caller owns the work.
+//  2. Found a Ready row whose ReplayUntil has not expired → acquired=false,
+//     caller replays the TargetID instead of running the work again.
+//  3. Found a Pending row whose LockedUntil has not expired → acquired=false,
+//     caller waits.
+//
+// Stale Pending or Ready rows past their TTLs are reclaimed as a fresh
+// Pending row (acquired=true), so a crashed claimer cannot block future
+// retries indefinitely.
+func (s *Store) ClaimIdempotentRequest(ctx context.Context, scope, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.IdempotentRequestRecord, bool, error) {
+	scope = strings.TrimSpace(scope)
+	fingerprint = strings.TrimSpace(fingerprint)
+	if scope == "" {
+		return nil, false, fmt.Errorf("claim idempotent request: scope is required")
+	}
+	if fingerprint == "" {
+		return nil, false, fmt.Errorf("claim idempotent request: fingerprint is required")
 	}
 	now = now.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, false, fmt.Errorf("claim e2b create request: begin tx: %w", err)
+		return nil, false, fmt.Errorf("claim idempotent request: begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	record := &models.E2BCreateRequestRecord{
-		Fingerprint: trimmed,
-		State:       models.E2BCreateRequestStatePending,
+	record := &models.IdempotentRequestRecord{
+		Scope:       scope,
+		Fingerprint: fingerprint,
+		State:       models.RequestStatePending,
 		LockedUntil: now.Add(pendingTTL),
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO e2b_create_requests (fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(fingerprint) DO NOTHING
-	`, record.Fingerprint, "", record.State, record.LockedUntil, nil, record.CreatedAt, record.UpdatedAt)
+		INSERT INTO request_idempotency (scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(scope, fingerprint) DO NOTHING
+	`, record.Scope, record.Fingerprint, "", record.State, record.LockedUntil, nil, record.CreatedAt, record.UpdatedAt)
 	if err != nil {
-		return nil, false, fmt.Errorf("claim e2b create request: insert: %w", err)
+		return nil, false, fmt.Errorf("claim idempotent request: insert: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return nil, false, fmt.Errorf("claim e2b create request: inspect insert: %w", err)
+		return nil, false, fmt.Errorf("claim idempotent request: inspect insert: %w", err)
 	}
 	if inserted > 0 {
 		if err := tx.Commit(); err != nil {
-			return nil, false, fmt.Errorf("claim e2b create request: commit insert: %w", err)
+			return nil, false, fmt.Errorf("claim idempotent request: commit insert: %w", err)
 		}
 		return record, true, nil
 	}
 
-	record, err = scanE2BCreateRequestRecord(tx.QueryRowContext(ctx, `
-		SELECT fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at
-		FROM e2b_create_requests
-		WHERE fingerprint = ?
-	`, trimmed))
+	record, err = scanIdempotentRequestRecord(tx.QueryRowContext(ctx, `
+		SELECT scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at
+		FROM request_idempotency
+		WHERE scope = ? AND fingerprint = ?
+	`, scope, fingerprint))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, false, fmt.Errorf("claim e2b create request: missing row after insert conflict")
+			return nil, false, fmt.Errorf("claim idempotent request: missing row after insert conflict")
 		}
-		return nil, false, fmt.Errorf("claim e2b create request: query: %w", err)
+		return nil, false, fmt.Errorf("claim idempotent request: query: %w", err)
 	}
 
-	if record.State == models.E2BCreateRequestStateReady && !record.ReplayUntil.IsZero() && record.ReplayUntil.After(now) && strings.TrimSpace(record.SandboxID) != "" {
+	if record.State == models.RequestStateReady && !record.ReplayUntil.IsZero() && record.ReplayUntil.After(now) && strings.TrimSpace(record.TargetID) != "" {
 		if err := tx.Commit(); err != nil {
-			return nil, false, fmt.Errorf("claim e2b create request: commit ready: %w", err)
+			return nil, false, fmt.Errorf("claim idempotent request: commit ready: %w", err)
 		}
 		return record, false, nil
 	}
-	if record.State == models.E2BCreateRequestStatePending && record.LockedUntil.After(now) {
+	if record.State == models.RequestStatePending && record.LockedUntil.After(now) {
 		if err := tx.Commit(); err != nil {
-			return nil, false, fmt.Errorf("claim e2b create request: commit pending: %w", err)
+			return nil, false, fmt.Errorf("claim idempotent request: commit pending: %w", err)
 		}
 		return record, false, nil
 	}
 
-	record.SandboxID = ""
-	record.State = models.E2BCreateRequestStatePending
+	record.TargetID = ""
+	record.State = models.RequestStatePending
 	record.LockedUntil = now.Add(pendingTTL)
 	record.ReplayUntil = time.Time{}
 	record.UpdatedAt = now
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE e2b_create_requests
-		SET sandbox_id = '', state = ?, locked_until = ?, replay_until = NULL, updated_at = ?
-		WHERE fingerprint = ?
-	`, record.State, record.LockedUntil, record.UpdatedAt, record.Fingerprint); err != nil {
-		return nil, false, fmt.Errorf("claim e2b create request: refresh: %w", err)
+		UPDATE request_idempotency
+		SET target_id = '', state = ?, locked_until = ?, replay_until = NULL, updated_at = ?
+		WHERE scope = ? AND fingerprint = ?
+	`, record.State, record.LockedUntil, record.UpdatedAt, record.Scope, record.Fingerprint); err != nil {
+		return nil, false, fmt.Errorf("claim idempotent request: refresh: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, false, fmt.Errorf("claim e2b create request: commit refresh: %w", err)
+		return nil, false, fmt.Errorf("claim idempotent request: commit refresh: %w", err)
 	}
 	return record, true, nil
 }
 
-func (s *Store) GetE2BCreateRequest(ctx context.Context, fingerprint string) (*models.E2BCreateRequestRecord, error) {
+// GetIdempotentRequest returns the row for (scope, fingerprint), or
+// ErrNotFound when no row exists.
+func (s *Store) GetIdempotentRequest(ctx context.Context, scope, fingerprint string) (*models.IdempotentRequestRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at
-		FROM e2b_create_requests
-		WHERE fingerprint = ?
-	`, strings.TrimSpace(fingerprint))
-	record, err := scanE2BCreateRequestRecord(row)
+		SELECT scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at
+		FROM request_idempotency
+		WHERE scope = ? AND fingerprint = ?
+	`, strings.TrimSpace(scope), strings.TrimSpace(fingerprint))
+	record, err := scanIdempotentRequestRecord(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("get e2b create request: %w", err)
+		return nil, fmt.Errorf("get idempotent request: %w", err)
 	}
 	return record, nil
 }
 
-func (s *Store) CompleteE2BCreateRequest(ctx context.Context, fingerprint, sandboxID string, now time.Time, replayTTL time.Duration) error {
+// CompleteIdempotentRequest moves a Pending row to Ready, recording the
+// target ID the work produced and extending the lock-and-replay window
+// out to replayTTL from now. Returns ErrNotFound if no row matched —
+// indicating either a programming error or a too-aggressive cleanup that
+// removed the row mid-flight.
+func (s *Store) CompleteIdempotentRequest(ctx context.Context, scope, fingerprint, targetID string, now time.Time, replayTTL time.Duration) error {
 	now = now.UTC()
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE e2b_create_requests
-		SET sandbox_id = ?, state = ?, locked_until = ?, replay_until = ?, updated_at = ?
-		WHERE fingerprint = ?
-	`, strings.TrimSpace(sandboxID), models.E2BCreateRequestStateReady, now, now.Add(replayTTL), now, strings.TrimSpace(fingerprint))
+		UPDATE request_idempotency
+		SET target_id = ?, state = ?, locked_until = ?, replay_until = ?, updated_at = ?
+		WHERE scope = ? AND fingerprint = ?
+	`, strings.TrimSpace(targetID), models.RequestStateReady, now, now.Add(replayTTL), now, strings.TrimSpace(scope), strings.TrimSpace(fingerprint))
 	if err != nil {
-		return fmt.Errorf("complete e2b create request: %w", err)
+		return fmt.Errorf("complete idempotent request: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -934,10 +974,13 @@ func (s *Store) CompleteE2BCreateRequest(ctx context.Context, fingerprint, sandb
 	return nil
 }
 
-func (s *Store) DeleteE2BCreateRequest(ctx context.Context, fingerprint string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM e2b_create_requests WHERE fingerprint = ?`, strings.TrimSpace(fingerprint))
+// DeleteIdempotentRequest drops the row outright. Used by failure paths
+// where the in-flight write rolled back and the next retry should run
+// the work again from scratch instead of waiting for LockedUntil.
+func (s *Store) DeleteIdempotentRequest(ctx context.Context, scope, fingerprint string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM request_idempotency WHERE scope = ? AND fingerprint = ?`, strings.TrimSpace(scope), strings.TrimSpace(fingerprint))
 	if err != nil {
-		return fmt.Errorf("delete e2b create request: %w", err)
+		return fmt.Errorf("delete idempotent request: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -1017,44 +1060,6 @@ func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
 		return ErrNotFound
 	}
 	return nil
-}
-
-func (s *Store) ListDaytonaMetadata(ctx context.Context) (map[string]models.DaytonaSandboxMetadata, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,
-			auto_stop_interval_minutes, auto_archive_interval_minutes, auto_delete_interval_minutes
-		FROM daytona_sandboxes
-		ORDER BY sandbox_id ASC
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("list daytona metadata: %w", err)
-	}
-	defer rows.Close()
-
-	items := map[string]models.DaytonaSandboxMetadata{}
-	for rows.Next() {
-		meta, err := scanDaytonaMetadata(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan daytona metadata: %w", err)
-		}
-		items[meta.SandboxID] = *meta
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate daytona metadata: %w", err)
-	}
-	return items, nil
-}
-
-func (s *Store) ResolveDaytonaSandboxID(ctx context.Context, name string) (string, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT sandbox_id FROM daytona_sandboxes WHERE name = ?`, strings.TrimSpace(name))
-	var sandboxID string
-	if err := row.Scan(&sandboxID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", ErrNotFound
-		}
-		return "", fmt.Errorf("resolve daytona sandbox id: %w", err)
-	}
-	return sandboxID, nil
 }
 
 func (s *Store) UpdateStatus(ctx context.Context, id string, status models.SandboxStatus, lastError string) error {
@@ -1258,6 +1263,7 @@ func scanSandbox(scanner interface {
 	var networkBlocked int
 	var toolboxEnabled int
 	var commandJSON string
+	var tagsJSON string
 	var gpusJSON string
 	var stopIfIdleNs, destroyIfIdleNs, stopAtAgeNs, destroyAtAgeNs int64
 
@@ -1279,6 +1285,8 @@ func scanSandbox(scanner interface {
 		&sandbox.SSHPublicKey,
 		&sandbox.LastError,
 		&commandJSON,
+		&sandbox.Name,
+		&tagsJSON,
 		&sandbox.CreatedAt,
 		&sandbox.UpdatedAt,
 		&sandbox.LastActiveAt,
@@ -1303,6 +1311,11 @@ func scanSandbox(scanner interface {
 			return nil, fmt.Errorf("decode container command: %w", err)
 		}
 	}
+	if tagsJSON != "" {
+		if err := json.Unmarshal([]byte(tagsJSON), &sandbox.Tags); err != nil {
+			return nil, fmt.Errorf("decode sandbox tags: %w", err)
+		}
+	}
 	if gpusJSON != "" {
 		var gpu models.GPURequest
 		if err := json.Unmarshal([]byte(gpusJSON), &gpu); err != nil {
@@ -1323,140 +1336,63 @@ func scanSandbox(scanner interface {
 	return &sandbox, nil
 }
 
-func scanDaytonaMetadata(scanner interface {
+func scanCompatState(scanner interface {
 	Scan(dest ...any) error
-}) (*models.DaytonaSandboxMetadata, error) {
-	var meta models.DaytonaSandboxMetadata
-	var labelsJSON string
-	var autoStop sql.NullFloat64
-	var autoArchive sql.NullFloat64
-	var autoDelete sql.NullFloat64
+}) (*models.SandboxCompatState, error) {
+	var state models.SandboxCompatState
 	err := scanner.Scan(
-		&meta.SandboxID,
-		&meta.Name,
-		&meta.Snapshot,
-		&meta.User,
-		&labelsJSON,
-		&meta.Target,
-		&meta.NetworkAllowList,
-		&autoStop,
-		&autoArchive,
-		&autoDelete,
+		&state.SandboxID,
+		&state.Facade,
+		&state.StateJSON,
+		&state.CreatedAt,
+		&state.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if labelsJSON != "" {
-		if err := json.Unmarshal([]byte(labelsJSON), &meta.Labels); err != nil {
-			return nil, fmt.Errorf("decode daytona labels: %w", err)
-		}
-	}
-	if meta.Labels == nil {
-		meta.Labels = map[string]string{}
-	}
-	meta.AutoStopIntervalMinutes = nullableFloat32Ptr(autoStop)
-	meta.AutoArchiveIntervalMinutes = nullableFloat32Ptr(autoArchive)
-	meta.AutoDeleteIntervalMinutes = nullableFloat32Ptr(autoDelete)
-	return &meta, nil
+	state.CreatedAt = state.CreatedAt.UTC()
+	state.UpdatedAt = state.UpdatedAt.UTC()
+	return &state, nil
 }
 
-func scanE2BSandboxMetadata(scanner interface {
+func scanSnapshotAlias(scanner interface {
 	Scan(dest ...any) error
-}) (*models.E2BSandboxMetadata, error) {
-	var meta models.E2BSandboxMetadata
-	var metadataJSON string
-	var allowOutJSON string
-	var denyOutJSON string
-	var autoResume int
-	var secure int
-	var allowInternetAccess sql.NullInt64
-	var allowPublicTraffic sql.NullInt64
+}) (*models.SnapshotAlias, error) {
+	var alias models.SnapshotAlias
+	var extraNamesJSON string
 	err := scanner.Scan(
-		&meta.SandboxID,
-		&meta.TemplateID,
-		&meta.TemplateAlias,
-		&metadataJSON,
-		&meta.TimeoutSeconds,
-		&meta.OnTimeout,
-		&autoResume,
-		&secure,
-		&allowInternetAccess,
-		&allowOutJSON,
-		&denyOutJSON,
-		&allowPublicTraffic,
-		&meta.MaskRequestHost,
-		&meta.CreatedAt,
-		&meta.UpdatedAt,
+		&alias.Alias,
+		&alias.SnapshotName,
+		&alias.Facade,
+		&extraNamesJSON,
+		&alias.CreatedAt,
+		&alias.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if metadataJSON != "" {
-		if err := json.Unmarshal([]byte(metadataJSON), &meta.Metadata); err != nil {
-			return nil, fmt.Errorf("decode e2b metadata: %w", err)
+	if extraNamesJSON != "" {
+		if err := json.Unmarshal([]byte(extraNamesJSON), &alias.ExtraNames); err != nil {
+			return nil, fmt.Errorf("decode snapshot alias extra names: %w", err)
 		}
 	}
-	if meta.Metadata == nil {
-		meta.Metadata = map[string]string{}
+	if alias.ExtraNames == nil {
+		alias.ExtraNames = []string{}
 	}
-	if allowOutJSON != "" {
-		if err := json.Unmarshal([]byte(allowOutJSON), &meta.NetworkAllowOut); err != nil {
-			return nil, fmt.Errorf("decode e2b allowOut: %w", err)
-		}
-	}
-	if meta.NetworkAllowOut == nil {
-		meta.NetworkAllowOut = []string{}
-	}
-	if denyOutJSON != "" {
-		if err := json.Unmarshal([]byte(denyOutJSON), &meta.NetworkDenyOut); err != nil {
-			return nil, fmt.Errorf("decode e2b denyOut: %w", err)
-		}
-	}
-	if meta.NetworkDenyOut == nil {
-		meta.NetworkDenyOut = []string{}
-	}
-	meta.AutoResume = autoResume != 0
-	meta.Secure = secure != 0
-	meta.AllowInternetAccess = nullableBoolPtr(allowInternetAccess)
-	meta.AllowPublicTraffic = nullableBoolPtr(allowPublicTraffic)
-	return &meta, nil
+	alias.CreatedAt = alias.CreatedAt.UTC()
+	alias.UpdatedAt = alias.UpdatedAt.UTC()
+	return &alias, nil
 }
 
-func scanE2BSnapshotMetadata(scanner interface {
+func scanIdempotentRequestRecord(scanner interface {
 	Scan(dest ...any) error
-}) (*models.E2BSnapshotMetadata, error) {
-	var meta models.E2BSnapshotMetadata
-	var namesJSON string
-	err := scanner.Scan(
-		&meta.SnapshotID,
-		&meta.SnapshotName,
-		&namesJSON,
-		&meta.SourceSandboxID,
-		&meta.CreatedAt,
-		&meta.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if namesJSON != "" {
-		if err := json.Unmarshal([]byte(namesJSON), &meta.Names); err != nil {
-			return nil, fmt.Errorf("decode e2b snapshot names: %w", err)
-		}
-	}
-	if meta.Names == nil {
-		meta.Names = []string{}
-	}
-	return &meta, nil
-}
-
-func scanE2BCreateRequestRecord(scanner interface {
-	Scan(dest ...any) error
-}) (*models.E2BCreateRequestRecord, error) {
-	var record models.E2BCreateRequestRecord
+}) (*models.IdempotentRequestRecord, error) {
+	var record models.IdempotentRequestRecord
 	var replayUntil sql.NullTime
 	err := scanner.Scan(
+		&record.Scope,
 		&record.Fingerprint,
-		&record.SandboxID,
+		&record.TargetID,
 		&record.State,
 		&record.LockedUntil,
 		&replayUntil,
@@ -1523,49 +1459,6 @@ func boolToInt(value bool) int {
 	return 0
 }
 
-func nullableFloat32(value *float32) any {
-	if value == nil {
-		return nil
-	}
-	return float64(*value)
-}
-
-func nullableFloat32Ptr(value sql.NullFloat64) *float32 {
-	if !value.Valid {
-		return nil
-	}
-	v := float32(value.Float64)
-	return &v
-}
-
-func nullableBool(value *bool) any {
-	if value == nil {
-		return nil
-	}
-	if *value {
-		return 1
-	}
-	return 0
-}
-
-func nullableBoolPtr(value sql.NullInt64) *bool {
-	if !value.Valid {
-		return nil
-	}
-	v := value.Int64 != 0
-	return &v
-}
-
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		trimmed := strings.TrimSpace(value)
-		if trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
-
 func isSQLiteUniqueConstraint(err error) bool {
 	var sqliteErr sqlite3.Error
 	if !errors.As(err, &sqliteErr) {
@@ -1574,9 +1467,20 @@ func isSQLiteUniqueConstraint(err error) bool {
 	return sqliteErr.Code == sqlite3.ErrConstraint && (sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique || sqliteErr.ExtendedCode == sqlite3.ErrConstraintPrimaryKey)
 }
 
+func isSandboxNameConflict(err error, name string) bool {
+	if strings.Contains(err.Error(), ErrSandboxNameConflict.Error()) {
+		return true
+	}
+	return strings.TrimSpace(name) != "" && isSQLiteUniqueConstraint(err)
+}
+
 var ErrNotFound = errors.New("sandbox not found")
 
-var ErrDaytonaNameConflict = errors.New("daytona sandbox name already in use")
+// ErrSandboxNameConflict is returned by Create/Upsert when the sandbox's
+// name collides with an existing row's name or id. Names are unique across
+// the sandboxes table; empty names skip the name uniqueness check but ids
+// still cannot collide with existing non-empty names.
+var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
 

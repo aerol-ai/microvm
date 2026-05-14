@@ -37,24 +37,6 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestedName := trimmedString(req.Name)
-	if requestedName != "" {
-		if _, err := h.deps.Service.GetSandbox(r.Context(), requestedName); err == nil {
-			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
-			return
-		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
-			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
-		if _, err := h.deps.Service.ResolveDaytonaSandboxID(r.Context(), requestedName); err == nil {
-			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
-			return
-		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
-			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
-	}
-
 	serviceReq, err := h.translateCreateSandboxRequest(req)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
@@ -63,27 +45,26 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	response, err := h.deps.Service.CreateSandbox(r.Context(), serviceReq)
 	if err != nil {
+		// Native uniqueness constraint on sandboxes.name surfaces as
+		// ErrSandboxNameConflict — translate to Daytona's wire-shape
+		// 409 message before falling through to the generic mapper.
+		if errors.Is(err, store.ErrSandboxNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
+			return
+		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
-	meta := sandboxMeta{
-		Name:                requestedName,
-		Snapshot:            nonEmptyStringPtr(req.Snapshot),
-		User:                firstNonEmpty(trimmedString(req.User), response.OSUser),
-		Labels:              cloneStringMap(mapValue(req.Labels)),
+	meta := sandboxMetaFromNative(&response.Sandbox, compatBlob{
+		Snapshot:            strings.TrimSpace(valueOrEmpty(req.Snapshot)),
 		Target:              trimmedString(req.Target),
-		AutoStopInterval:    int32MinutesPtr(req.AutoStopInterval),
-		AutoArchiveInterval: int32MinutesPtr(req.AutoArchiveInterval),
-		AutoDeleteInterval:  int32MinutesPtr(req.AutoDeleteInterval),
-	}
+		NetworkAllowList:    strings.TrimSpace(valueOrEmpty(req.NetworkAllowList)),
+		AutoArchiveInterval: float32(int32Value(req.AutoArchiveInterval, 0)),
+	})
 	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
 		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
-			h.deps.Logger.Warn("daytona metadata conflict cleanup failed", "sandbox_id", response.ID, "error", destroyErr)
-		}
-		if errors.Is(err, store.ErrDaytonaNameConflict) {
-			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
-			return
+			h.deps.Logger.Warn("daytona metadata persist cleanup failed", "sandbox_id", response.ID, "error", destroyErr)
 		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -383,7 +364,7 @@ func (h *handlers) previewURL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) replaceLabels(w http.ResponseWriter, r *http.Request) {
-	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -393,17 +374,10 @@ func (h *handlers) replaceLabels(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
-	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	meta.Labels = cloneStringMap(req.Labels)
-	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
-		if errors.Is(err, store.ErrDaytonaNameConflict) {
-			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
-			return
-		}
+	// Labels are stored natively on sandboxes.tags_json — no compat-state
+	// write is needed for this endpoint. The compat blob never carried
+	// label data after the consolidation; only echo-back fields remain.
+	if err := h.deps.Service.UpdateTags(r.Context(), sandboxID, cloneStringMap(req.Labels)); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -441,10 +415,6 @@ func (h *handlers) setAutoArchiveInterval(w http.ResponseWriter, r *http.Request
 	}
 	meta.AutoArchiveInterval = intervalPtr
 	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
-		if errors.Is(err, store.ErrDaytonaNameConflict) {
-			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
-			return
-		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -486,21 +456,12 @@ func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, s
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	// Auto-stop / auto-delete intervals are derived from Lifecycle on
+	// read, so the UpdateLifecycle call above is the only persistence
+	// step. Load meta against the updated sandbox so the response
+	// reflects the new interval.
+	meta, err := h.loadSandboxMeta(r.Context(), updated)
 	if err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	if stop {
-		meta.AutoStopInterval = intervalPtr
-	} else {
-		meta.AutoDeleteInterval = intervalPtr
-	}
-	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
-		if errors.Is(err, store.ErrDaytonaNameConflict) {
-			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
-			return
-		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -516,7 +477,7 @@ func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, "", err
 	}
-	resolved, err := h.deps.Service.ResolveDaytonaSandboxID(ctx, trimmed)
+	resolved, err := h.deps.Service.ResolveSandboxIDByName(ctx, trimmed)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, "", err
 	}
@@ -530,13 +491,14 @@ func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models
 	return sandbox, sandbox.ID, nil
 }
 
-func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbox, metadata map[string]sandboxMeta, filters listFilters) []sandboxResponse {
+func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbox, metadata map[string]compatBlob, filters listFilters) []sandboxResponse {
 	items := make([]sandboxResponse, 0, len(sandboxes))
 	for _, sandbox := range sandboxes {
 		if sandbox == nil {
 			continue
 		}
-		item := h.toSandboxResponse(r, sandbox, metadata[sandbox.ID])
+		meta := sandboxMetaFromNative(sandbox, metadata[sandbox.ID])
+		item := h.toSandboxResponse(r, sandbox, meta)
 		if filters.ID != "" && !strings.Contains(item.ID, filters.ID) {
 			continue
 		}
@@ -601,32 +563,45 @@ func (h *handlers) filteredSnapshots(r *http.Request, snapshots []*models.Sandbo
 }
 
 func (h *handlers) persistSandboxMeta(ctx context.Context, sandboxID string, meta sandboxMeta) error {
-	return h.deps.Service.UpsertDaytonaMetadata(ctx, sandboxMetaToStored(sandboxID, meta))
+	stateJSON, err := sandboxMetaToState(meta)
+	if err != nil {
+		return err
+	}
+	return h.deps.Service.UpsertCompatState(ctx, sandboxID, models.FacadeDaytona, stateJSON)
 }
 
 func (h *handlers) loadSandboxMeta(ctx context.Context, sandbox *models.Sandbox) (sandboxMeta, error) {
 	if sandbox == nil {
 		return sandboxMeta{Labels: map[string]string{}}, nil
 	}
-	stored, err := h.deps.Service.GetDaytonaMetadata(ctx, sandbox.ID)
+	stored, err := h.deps.Service.GetCompatState(ctx, sandbox.ID, models.FacadeDaytona)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return defaultSandboxMeta(sandbox), nil
 		}
 		return sandboxMeta{}, err
 	}
-	return sandboxMetaFromStored(stored, sandbox), nil
+	return sandboxMetaFromState(stored, sandbox)
 }
 
-func (h *handlers) listSandboxMeta(ctx context.Context) (map[string]sandboxMeta, error) {
-	stored, err := h.deps.Service.ListDaytonaMetadata(ctx)
+// listSandboxMeta returns a sandbox-id keyed map of the persisted compat
+// blobs for the Daytona facade. Sandboxes with no compat row are absent
+// from the map; their native fields still shape the response via the
+// zero-valued blob the map default returns at lookup time.
+func (h *handlers) listSandboxMeta(ctx context.Context) (map[string]compatBlob, error) {
+	stored, err := h.deps.Service.ListCompatState(ctx, models.FacadeDaytona)
 	if err != nil {
 		return nil, err
 	}
-	items := make(map[string]sandboxMeta, len(stored))
-	for sandboxID, meta := range stored {
-		copied := meta
-		items[sandboxID] = sandboxMetaFromStored(&copied, nil)
+	items := make(map[string]compatBlob, len(stored))
+	for sandboxID, state := range stored {
+		var blob compatBlob
+		if strings.TrimSpace(state.StateJSON) != "" {
+			if err := json.Unmarshal([]byte(state.StateJSON), &blob); err != nil {
+				return nil, err
+			}
+		}
+		items[sandboxID] = blob
 	}
 	return items, nil
 }
@@ -800,6 +775,8 @@ func (h *handlers) translateCreateSandboxRequest(req createSandboxRequest) (mode
 		Env:             cloneStringMap(mapValue(req.Env)),
 		OSUser:          trimmedString(req.User),
 		NetworkBlockAll: boolValue(req.NetworkBlockAll),
+		Name:            trimmedString(req.Name),
+		Tags:            cloneStringMap(mapValue(req.Labels)),
 	}
 	if !lifecycle.IsZero() {
 		serviceReq.Lifecycle = &lifecycle

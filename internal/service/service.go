@@ -202,6 +202,8 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		ToolboxEnabled:   true,
 		ToolboxToken:     toolboxToken,
 		SSHPublicKey:     authorizedKey,
+		Name:             strings.TrimSpace(req.Name),
+		Tags:             req.Tags,
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		LastActiveAt:     now,

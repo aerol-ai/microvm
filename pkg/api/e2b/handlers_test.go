@@ -56,9 +56,9 @@ func TestE2BSandboxFlow(t *testing.T) {
 		t.Fatal("create response missing envdAccessToken for secure sandbox")
 	}
 
-	storedMeta, err := st.GetE2BSandboxMetadata(ctx, created.SandboxID)
+	storedMeta, err := loadE2BSandboxMeta(ctx, st, created.SandboxID)
 	if err != nil {
-		t.Fatalf("GetE2BSandboxMetadata() error = %v", err)
+		t.Fatalf("loadE2BSandboxMeta() error = %v", err)
 	}
 	if storedMeta.OnTimeout != "pause" || !storedMeta.AutoResume {
 		t.Fatalf("unexpected stored lifecycle metadata: %+v", storedMeta)
@@ -138,9 +138,9 @@ func TestE2BSandboxFlow(t *testing.T) {
 	if timeoutResp.Code != http.StatusNoContent {
 		t.Fatalf("timeout status = %d, want %d; body=%s", timeoutResp.Code, http.StatusNoContent, timeoutResp.Body.String())
 	}
-	storedMeta, err = st.GetE2BSandboxMetadata(ctx, created.SandboxID)
+	storedMeta, err = loadE2BSandboxMeta(ctx, st, created.SandboxID)
 	if err != nil {
-		t.Fatalf("GetE2BSandboxMetadata() after timeout error = %v", err)
+		t.Fatalf("loadE2BSandboxMeta() after timeout error = %v", err)
 	}
 	if storedMeta.TimeoutSeconds != 30 {
 		t.Fatalf("storedMeta.TimeoutSeconds = %d, want %d", storedMeta.TimeoutSeconds, 30)
@@ -183,9 +183,25 @@ func TestE2BSandboxFlow(t *testing.T) {
 	if deleteResp.Code != http.StatusNoContent {
 		t.Fatalf("delete snapshot status = %d, want %d; body=%s", deleteResp.Code, http.StatusNoContent, deleteResp.Body.String())
 	}
-	if _, err := st.GetE2BSnapshot(ctx, snapshot.SnapshotID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("expected E2B snapshot metadata to be deleted, got %v", err)
+	if _, err := st.GetSnapshotAlias(ctx, snapshot.SnapshotID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected E2B snapshot alias to be deleted, got %v", err)
 	}
+}
+
+// loadE2BSandboxMeta is the test-side equivalent of the old per-facade
+// GetE2BSandboxMetadata: read the native sandbox row plus its E2B compat
+// blob and combine them through the facade's own meta builder, so contract
+// assertions stay against the same in-memory shape they did before.
+func loadE2BSandboxMeta(ctx context.Context, st *store.Store, sandboxID string) (sandboxMeta, error) {
+	sandbox, err := st.Get(ctx, sandboxID)
+	if err != nil {
+		return sandboxMeta{}, err
+	}
+	state, err := st.GetCompatState(ctx, sandboxID, models.FacadeE2B)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return sandboxMeta{}, err
+	}
+	return sandboxMetaFromState(state, sandbox)
 }
 
 func TestCreateSandboxRejectsUnsupportedNetworkAllowOut(t *testing.T) {
@@ -269,13 +285,13 @@ func TestWaitForCreateReplayIgnoresExpiredReadyRecord(t *testing.T) {
 	if err := st.Create(ctx, sandbox); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if _, acquired, err := st.ClaimE2BCreateRequest(ctx, fingerprint, now, time.Second); err != nil {
-		t.Fatalf("ClaimE2BCreateRequest() error = %v", err)
+	if _, acquired, err := st.ClaimIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint, now, time.Second); err != nil {
+		t.Fatalf("ClaimIdempotentRequest() error = %v", err)
 	} else if !acquired {
 		t.Fatal("expected initial create request claim to acquire")
 	}
-	if err := st.CompleteE2BCreateRequest(ctx, fingerprint, sandbox.ID, now, time.Second); err != nil {
-		t.Fatalf("CompleteE2BCreateRequest() error = %v", err)
+	if err := st.CompleteIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint, sandbox.ID, now, time.Second); err != nil {
+		t.Fatalf("CompleteIdempotentRequest() error = %v", err)
 	}
 
 	h := newHandlers(Deps{Service: svc, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
@@ -286,7 +302,7 @@ func TestWaitForCreateReplayIgnoresExpiredReadyRecord(t *testing.T) {
 	if replayed {
 		t.Fatal("expected expired ready record not to replay")
 	}
-	if _, err := st.GetE2BCreateRequest(ctx, fingerprint); !errors.Is(err, store.ErrNotFound) {
+	if _, err := st.GetIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected expired ready record to be cleared, got %v", err)
 	}
 }
