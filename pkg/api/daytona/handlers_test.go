@@ -21,12 +21,32 @@ import (
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
+// newMountsManagerForTest constructs a real *mounts.Manager rooted in t.TempDir.
+// Required by tests that exercise the full createSandbox path through
+// service.CreateSandbox — that function unconditionally calls into the
+// mount manager even when no mounts are declared on the request.
+func newMountsManagerForTest(t *testing.T) *mounts.Manager {
+	t.Helper()
+	mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
+		RootDir:     filepath.Join(t.TempDir(), "mounts"),
+		CredDir:     filepath.Join(t.TempDir(), "cred"),
+		WaitTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("mounts.New: %v", err)
+	}
+	t.Cleanup(mgr.Close)
+	return mgr
+}
+
 // fakeImageBuilder is the daytona.ImageBuilder stub used by tests that need
 // to assert build-path behavior without a real Docker daemon.
 type fakeImageBuilder struct {
-	exists   map[string]bool
-	builds   []docker.BuildImageRequest
-	buildErr error
+	exists    map[string]bool
+	builds    []docker.BuildImageRequest
+	buildErr  error
+	removed   []string
+	removeErr error
 }
 
 func (f *fakeImageBuilder) ImageExists(_ context.Context, ref string) (bool, error) {
@@ -45,6 +65,14 @@ func (f *fakeImageBuilder) BuildImage(_ context.Context, req docker.BuildImageRe
 	return nil
 }
 
+func (f *fakeImageBuilder) RemoveImage(_ context.Context, ref string) error {
+	f.removed = append(f.removed, ref)
+	if f.exists != nil {
+		delete(f.exists, ref)
+	}
+	return f.removeErr
+}
+
 func TestTranslateCreateSandboxRequestAcceptsDaytonaGoImageFixture(t *testing.T) {
 	fixture := []byte(`{
 		"public": false,
@@ -59,12 +87,15 @@ func TestTranslateCreateSandboxRequestAcceptsDaytonaGoImageFixture(t *testing.T)
 	}
 
 	h := newHandlers(Deps{})
-	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
+	translated, builtTag, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
 	}
 	if translated.Image != "alpine" {
 		t.Fatalf("translated.Image = %q, want %q", translated.Image, "alpine")
+	}
+	if builtTag != "" {
+		t.Fatalf("builtTag = %q, want empty (no fresh build for single-line FROM)", builtTag)
 	}
 	if translated.NetworkBlockAll {
 		t.Fatal("translated.NetworkBlockAll unexpectedly true")
@@ -95,13 +126,16 @@ func TestTranslateCreateSandboxRequestBuildsMultiLineDockerfile(t *testing.T) {
 
 	builder := &fakeImageBuilder{}
 	h := newHandlers(Deps{Builder: builder})
-	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
+	translated, builtTag, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
 	}
 	wantTag := docker.BuildTagFor(dockerfile, nil)
 	if translated.Image != wantTag {
 		t.Fatalf("translated.Image = %q, want %q", translated.Image, wantTag)
+	}
+	if builtTag != wantTag {
+		t.Fatalf("builtTag = %q, want %q (fresh build should be signaled)", builtTag, wantTag)
 	}
 	if len(builder.builds) != 1 {
 		t.Fatalf("expected 1 build call, got %d", len(builder.builds))
@@ -127,7 +161,7 @@ func TestTranslateCreateSandboxRequestRejectsMultiLineWithoutBuilder(t *testing.
 	}
 
 	h := newHandlers(Deps{}) // No Builder.
-	_, err := h.translateCreateSandboxRequest(context.Background(), req)
+	_, _, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected error when builder is nil")
 	}
@@ -145,7 +179,7 @@ func TestTranslateCreateSandboxRequestRejectsContextHashesWithoutFlag(t *testing
 	}
 
 	h := newHandlers(Deps{Builder: &fakeImageBuilder{}})
-	_, err := h.translateCreateSandboxRequest(context.Background(), req)
+	_, _, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected error when contextHashes set but flag disabled")
 	}
@@ -164,12 +198,15 @@ func TestTranslateCreateSandboxRequestCacheHitSkipsBuild(t *testing.T) {
 	}
 
 	h := newHandlers(Deps{Builder: builder})
-	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
+	translated, builtTag, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
 	}
 	if translated.Image != wantTag {
 		t.Fatalf("Image = %q, want %q", translated.Image, wantTag)
+	}
+	if builtTag != "" {
+		t.Fatalf("builtTag = %q, want empty (cache hit must not signal fresh build)", builtTag)
 	}
 	if len(builder.builds) != 0 {
 		t.Fatalf("expected zero build calls on cache hit, got %d", len(builder.builds))
@@ -188,7 +225,7 @@ func TestTranslateCreateSandboxRequestPreservesIdleLifecycleFields(t *testing.T)
 	}
 
 	h := newHandlers(Deps{})
-	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
+	translated, _, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
 	}
@@ -206,6 +243,94 @@ func TestTranslateCreateSandboxRequestPreservesIdleLifecycleFields(t *testing.T)
 	}
 	if translated.Lifecycle.DestroyIfIdleFor != 15*time.Minute {
 		t.Fatalf("DestroyIfIdleFor = %v, want 15m", translated.Lifecycle.DestroyIfIdleFor)
+	}
+}
+
+// TestCreateSandboxRollsBackFreshlyBuiltImageOnServiceFailure: a multi-line
+// Dockerfile triggers a fresh image build inside the daytona handler. If
+// service.CreateSandbox then errors, there is no sandbox row to drive the
+// normal reference-counted GC — the freshly-built image would leak. The
+// handler is expected to call Builder.RemoveImage(builtTag) on the failure
+// path. (Cache hits and bare-reference images must NOT trigger a rollback;
+// those are tested elsewhere via builtTag == "" in resolveBuildInfo.)
+func TestCreateSandboxRollsBackFreshlyBuiltImageOnServiceFailure(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rt := &fakeDaytonaSnapshotRuntime{createErr: errors.New("simulated docker failure")}
+	svc := service.New(config.Config{}, logger, st, rt, nil, nil, nil, newMountsManagerForTest(t), nil)
+
+	builder := &fakeImageBuilder{}
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Service: svc,
+		Logger:  logger,
+		Builder: builder,
+		Auth:    func(next http.Handler) http.Handler { return next },
+	})
+
+	dockerfile := "FROM alpine\nRUN echo rollback"
+	body := strings.NewReader(`{"buildInfo":{"dockerfileContent":"FROM alpine\nRUN echo rollback"}}`)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequestWithContext(ctx, http.MethodPost, "/daytona/sandbox", body))
+
+	if rr.Code < 400 {
+		t.Fatalf("expected non-2xx response, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+	wantTag := docker.BuildTagFor(dockerfile, nil)
+	if len(builder.builds) != 1 || builder.builds[0].Tag != wantTag {
+		t.Fatalf("expected one build for tag %q, got builds=%+v", wantTag, builder.builds)
+	}
+	if len(builder.removed) != 1 || builder.removed[0] != wantTag {
+		t.Fatalf("expected rollback RemoveImage(%q), got %+v", wantTag, builder.removed)
+	}
+}
+
+// TestCreateSandboxNoRollbackOnCacheHit: when resolveBuildInfo returns an
+// existing cached image (no fresh build), a downstream service failure must
+// NOT trigger RemoveImage — the cached image is presumed shared with other
+// users and removing it would break unrelated requests.
+func TestCreateSandboxNoRollbackOnCacheHit(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rt := &fakeDaytonaSnapshotRuntime{createErr: errors.New("simulated docker failure")}
+	svc := service.New(config.Config{}, logger, st, rt, nil, nil, nil, newMountsManagerForTest(t), nil)
+
+	dockerfile := "FROM alpine\nRUN echo cached"
+	cachedTag := docker.BuildTagFor(dockerfile, nil)
+	builder := &fakeImageBuilder{exists: map[string]bool{cachedTag: true}}
+
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Service: svc,
+		Logger:  logger,
+		Builder: builder,
+		Auth:    func(next http.Handler) http.Handler { return next },
+	})
+
+	body := strings.NewReader(`{"buildInfo":{"dockerfileContent":"FROM alpine\nRUN echo cached"}}`)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequestWithContext(ctx, http.MethodPost, "/daytona/sandbox", body))
+
+	if rr.Code < 400 {
+		t.Fatalf("expected non-2xx response, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(builder.builds) != 0 {
+		t.Fatalf("expected zero builds on cache hit, got %+v", builder.builds)
+	}
+	if len(builder.removed) != 0 {
+		t.Fatalf("expected NO rollback on cache hit, got removed=%+v", builder.removed)
 	}
 }
 
@@ -368,9 +493,16 @@ type fakeDaytonaSnapshotRuntime struct {
 	removeHits  int
 	lastRemoved string
 	removeErr   error
+	// createErr, when set, makes Create return that error instead of
+	// panicking. Used by tests that exercise the createSandbox failure path
+	// (e.g. image-rollback assertions) without standing up a real container.
+	createErr error
 }
 
 func (f *fakeDaytonaSnapshotRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
 	panic("unexpected Create")
 }
 

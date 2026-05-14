@@ -21,6 +21,7 @@ const (
 type ImageBuilder interface {
 	BuildImage(ctx context.Context, req docker.BuildImageRequest) error
 	ImageExists(ctx context.Context, imageRef string) (bool, error)
+	RemoveImage(ctx context.Context, imageRef string) error
 }
 
 // BuildConfig surfaces the operator-configured image-build knobs through to

@@ -233,8 +233,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
-	if err := c.pullImage(ctx, req.Image, req.Registry); err != nil {
-		return nil, err
+	// Images tagged in the local build namespace are produced by BuildImage and
+	// only exist on this daemon — they have no registry to pull from, and an
+	// attempted pull would 401/404 against Docker Hub (which is where the
+	// daemon resolves bare names with no registry prefix). Skip the pull and
+	// let inspectImage assert existence below.
+	if !strings.HasPrefix(req.Image, BuiltImageNamespace+"/") {
+		if err := c.pullImage(ctx, req.Image, req.Registry); err != nil {
+			return nil, err
+		}
 	}
 
 	imageInspect, err := c.inspectImage(ctx, req.Image)

@@ -623,6 +623,20 @@ test("internal client create with Image builds first then creates", async () => 
   assert.deepEqual(seenRequests[1].body, { image: "aerolvm-build/abc123:latest" });
 });
 
+test("internal client buildImage maps 404 to actionable error", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () =>
+      new Response("404 page not found\n", { status: 404, headers: { "content-type": "text/plain" } }),
+  });
+
+  await assert.rejects(
+    client.buildImage(Image.base("alpine")),
+    (err: Error) => /does not support Image builds/.test(err.message) && /string image reference/.test(err.message),
+  );
+});
+
 test("internal client create with bare image string skips build call", async () => {
   const seenURLs: string[] = [];
   const client = new APIClient({

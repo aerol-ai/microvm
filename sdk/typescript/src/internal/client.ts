@@ -32,10 +32,18 @@ import type {
 type FetchLike = typeof fetch;
 
 /**
- * Wire version of the sandbox daemon API this client speaks. The SDK and the
- * server version independently — bumping the SDK package does not move the
- * wire version. Today only "v1" exists; "v2" will be added when a wire-level
- * breaking change is needed on the server.
+ * Wire version of the v1-style sandbox endpoints (`/v1/sandboxes`, etc.) this
+ * client speaks. The SDK and the server version independently — bumping the
+ * SDK package does not move the wire version. Today only "v1" exists; future
+ * breaking changes to the sandbox endpoints will land in "v2".
+ *
+ * Note: the `/v2/images/build` endpoint used by {@link Image}-shaped image
+ * inputs is NOT a v2 sandbox API — it's a separate post-freeze capability
+ * mounted under the v2 prefix because v1 is soft-frozen. It is called
+ * unconditionally when an Image is supplied to {@link APIClient.create},
+ * regardless of `apiVersion`. Daemons older than the image-build feature
+ * return 404; the SDK turns that into a clear "daemon does not support
+ * image builds" error so the user can switch to a string image.
  */
 export type APIVersion = "v1";
 
@@ -222,14 +230,33 @@ export class APIClient {
    * POSTing its Dockerfile to `/v2/images/build`. The daemon caches by
    * content hash, so repeated calls with the same Dockerfile are a no-op.
    * String images are passed through unchanged.
+   *
+   * Daemons predating the image-build feature do not register the route and
+   * return 404; this method translates that into a clear error telling the
+   * caller to pass a string image instead, rather than the generic "request
+   * failed with status 404" the JSON decoder would otherwise produce.
    */
   async buildImage(image: Image): Promise<string> {
-    const response = await this.doJSON<{ image: string }>(
+    const response = await this.request(
       "POST",
       "/v2/images/build",
-      { dockerfile_content: image.dockerfile },
+      {
+        body: JSON.stringify({ dockerfile_content: image.dockerfile }),
+        headers: { "Content-Type": "application/json" },
+      },
     );
-    return response.image;
+    if (response.status === 404) {
+      // Drain the body so the connection can be reused.
+      await response.text().catch(() => undefined);
+      throw new Error(
+        "this daemon does not support Image builds (POST /v2/images/build is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
+      );
+    }
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+    const payload = (await response.json()) as { image: string };
+    return payload.image;
   }
 
   private async resolveImage(options: CreateOptions): Promise<CreateOptions & { image: string }> {

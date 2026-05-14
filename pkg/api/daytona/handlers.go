@@ -38,7 +38,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serviceReq, err := h.translateCreateSandboxRequest(r.Context(), req)
+	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(r.Context(), req)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -46,6 +46,19 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	response, err := h.deps.Service.CreateSandbox(r.Context(), serviceReq)
 	if err != nil {
+		// If we built the image in this request and the create failed, the
+		// image is now orphaned: no sandbox row references it, so the normal
+		// reference-counted GC (service.maybeRemoveImage on destroy) will
+		// never see it. Roll it back here so a build storm of failed creates
+		// doesn't fill the daemon's image store.
+		//
+		// Use context.Background so cancellation of r.Context() (e.g. client
+		// disconnect on the failure response) doesn't skip the cleanup.
+		if freshlyBuiltImage != "" && h.deps.Builder != nil {
+			if rmErr := h.deps.Builder.RemoveImage(context.Background(), freshlyBuiltImage); rmErr != nil && h.deps.Logger != nil {
+				h.deps.Logger.Warn("daytona image rollback failed", "tag", freshlyBuiltImage, "error", rmErr)
+			}
+		}
 		// Native uniqueness constraint on sandboxes.name surfaces as
 		// ErrSandboxNameConflict — translate to Daytona's wire-shape
 		// 409 message before falling through to the generic mapper.
@@ -744,15 +757,22 @@ func (h *handlers) toolboxProxyBaseURL(r *http.Request) string {
 	return requestBaseURL(r) + ToolboxPrefix
 }
 
-func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req createSandboxRequest) (models.CreateSandboxRequest, error) {
+// translateCreateSandboxRequest converts the Daytona-shaped payload into the
+// native CreateSandboxRequest. The second return value is the image tag of a
+// fresh build performed during this call (empty when the image came from a
+// snapshot, a bare reference, or the build cache). Callers use it to roll
+// back the image if the subsequent CreateSandbox fails — that's the only
+// path that can orphan a built image, since the normal reference-counted
+// GC (service.maybeRemoveImage) needs a sandbox row to fire.
+func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req createSandboxRequest) (models.CreateSandboxRequest, string, error) {
 	if req.NetworkAllowList != nil && strings.TrimSpace(*req.NetworkAllowList) != "" {
-		return models.CreateSandboxRequest{}, errors.New("networkAllowList is not supported by the Daytona facade")
+		return models.CreateSandboxRequest{}, "", errors.New("networkAllowList is not supported by the Daytona facade")
 	}
 	if req.Gpu != nil && *req.Gpu > 0 {
-		return models.CreateSandboxRequest{}, errors.New("gpu allocation is not supported by the Daytona facade")
+		return models.CreateSandboxRequest{}, "", errors.New("gpu allocation is not supported by the Daytona facade")
 	}
 	if len(req.Volumes) > 0 {
-		return models.CreateSandboxRequest{}, errors.New("volumes are not supported by the Daytona facade")
+		return models.CreateSandboxRequest{}, "", errors.New("volumes are not supported by the Daytona facade")
 	}
 
 	lifecycle := models.Lifecycle{}
@@ -763,9 +783,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		lifecycle.DestroyIfIdleFor = durationFromMinutes(float32(*req.AutoDeleteInterval))
 	}
 
-	image, err := h.createImage(ctx, req)
+	image, freshlyBuilt, err := h.createImage(ctx, req)
 	if err != nil {
-		return models.CreateSandboxRequest{}, err
+		return models.CreateSandboxRequest{}, "", err
 	}
 
 	serviceReq := models.CreateSandboxRequest{
@@ -782,20 +802,20 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if !lifecycle.IsZero() {
 		serviceReq.Lifecycle = &lifecycle
 	}
-	return serviceReq, nil
+	return serviceReq, freshlyBuilt, nil
 }
 
-func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (string, error) {
+func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (string, string, error) {
 	if snapshot := strings.TrimSpace(valueOrEmpty(req.Snapshot)); snapshot != "" {
-		return snapshot, nil
+		return snapshot, "", nil
 	}
 	if req.BuildInfo != nil {
 		return h.resolveBuildInfo(ctx, req.BuildInfo)
 	}
 	if configured := strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")); configured != "" {
-		return configured, nil
+		return configured, "", nil
 	}
-	return "ubuntu:22.04", nil
+	return "ubuntu:22.04", "", nil
 }
 
 // resolveBuildInfo turns a Daytona-shaped buildInfo payload into a runnable
@@ -814,34 +834,39 @@ func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (s
 //     a hash-resolved context tar is supplied to BuildImage (today that
 //     resolver is not wired — the flag returns "not yet implemented" so the
 //     contract is honored at the type level without misleading users).
-func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest) (string, error) {
+// resolveBuildInfo returns (imageTag, freshlyBuiltTag, error). freshlyBuiltTag
+// is non-empty only when this call actually invoked BuildImage and produced
+// a new image (cache hits return the tag in the first slot only). Callers
+// use freshlyBuiltTag to roll back the image if the downstream sandbox
+// create fails — see createSandbox.
+func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest) (string, string, error) {
 	dockerfile := strings.TrimSpace(valueOrEmpty(info.DockerfileContent))
 	if dockerfile == "" {
-		return "", errors.New("buildInfo is only supported when dockerfileContent is present")
+		return "", "", errors.New("buildInfo is only supported when dockerfileContent is present")
 	}
 	if base, ok := singleLineFromImage(dockerfile); ok && len(info.ContextHashes) == 0 {
-		return base, nil
+		return base, "", nil
 	}
 	if len(info.ContextHashes) > 0 {
 		if !h.deps.Build.ContextEnabled {
-			return "", errors.New("buildInfo.contextHashes requires operator-side context upload support (set SB_IMAGE_BUILD_CONTEXT_ENABLED=true on the daemon)")
+			return "", "", errors.New("buildInfo.contextHashes requires operator-side context upload support (set SB_IMAGE_BUILD_CONTEXT_ENABLED=true on the daemon)")
 		}
 		// Context-resolver wiring is a separate piece of work (needs an
 		// object store + registry push). Fail loud so callers don't think
 		// their COPY/ADD steps silently no-op.
-		return "", errors.New("buildInfo.contextHashes is enabled but no context resolver is configured on this daemon")
+		return "", "", errors.New("buildInfo.contextHashes is enabled but no context resolver is configured on this daemon")
 	}
 	if h.deps.Builder == nil {
-		return "", errors.New("multi-line buildInfo Dockerfiles require an image builder; daemon was started without one")
+		return "", "", errors.New("multi-line buildInfo Dockerfiles require an image builder; daemon was started without one")
 	}
 
 	tag := docker.BuildTagFor(dockerfile, info.ContextHashes)
 	exists, err := h.deps.Builder.ImageExists(ctx, tag)
 	if err != nil {
-		return "", fmt.Errorf("check built image cache: %w", err)
+		return "", "", fmt.Errorf("check built image cache: %w", err)
 	}
 	if exists {
-		return tag, nil
+		return tag, "", nil
 	}
 
 	buildCtx, cancel := buildContextWithTimeout(ctx, h.deps.Build.Timeout)
@@ -857,9 +882,9 @@ func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest)
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("build image: %w", err)
+		return "", "", fmt.Errorf("build image: %w", err)
 	}
-	return tag, nil
+	return tag, tag, nil
 }
 
 // singleLineFromImage detects the legacy `FROM <image>` shape and returns

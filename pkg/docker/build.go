@@ -16,8 +16,20 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// buildGroup deduplicates concurrent BuildImage calls that share a tag.
+// Two requests landing simultaneously for the same content-addressed tag
+// would otherwise both upload the tar context and ask the daemon to build —
+// Docker's layer cache makes the second build fast, but the tar upload and
+// daemon-side serialization still costs work. With singleflight, the second
+// (and Nth) caller waits for the first build's result and returns the same
+// error/success. The key is the tag because that's content-addressed: the
+// same tag means the same dockerfile bytes (see BuildTagFor).
+var buildGroup singleflight.Group
 
 // BuiltImageNamespace is the local image-name prefix every Daytona-facade
 // build is tagged with. Keeping every built image under a single namespace
@@ -50,6 +62,13 @@ func (c *Client) BuildImage(ctx context.Context, req BuildImageRequest) error {
 	if tag == "" {
 		return errors.New("build image: tag is required")
 	}
+	_, err, _ := buildGroup.Do(tag, func() (any, error) {
+		return nil, c.buildImageLocked(ctx, tag, req)
+	})
+	return err
+}
+
+func (c *Client) buildImageLocked(ctx context.Context, tag string, req BuildImageRequest) error {
 	dockerfile := strings.TrimRight(req.DockerfileContent, "\n") + "\n"
 	if strings.TrimSpace(dockerfile) == "" {
 		return errors.New("build image: dockerfile content is required")
