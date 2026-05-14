@@ -426,7 +426,9 @@ func (c *Client) Stop(ctx context.Context, containerRef string) error {
 
 func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox != nil {
-		_ = c.networkRules.ClearBlockAllEgress(sandbox.ContainerIP)
+		// Clear both directions: a stale ingress DROP would re-attach to whoever
+		// next gets this IP from Docker's IPAM pool.
+		_ = c.ClearNetworkRules(sandbox.ContainerIP)
 	}
 	if sandbox == nil {
 		return nil

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/coreos/go-iptables/iptables"
 )
@@ -11,6 +12,12 @@ import (
 type Manager struct {
 	enabled bool
 	ipt     *iptables.IPTables
+	// mu serializes Block/Clear pairs. iptables Exists+Insert is not atomic,
+	// and the poller, reconcile, SetNetworkLimits, and Destroy paths can all
+	// drive the same IP concurrently. Without this lock, two callers can both
+	// pass Exists and both Insert, leaving a duplicate that a single Delete
+	// in Clear* won't fully remove.
+	mu sync.Mutex
 }
 
 func New(enabled bool) (*Manager, error) {
@@ -44,6 +51,8 @@ func (m *Manager) BlockAllEgress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	exists, err := m.ipt.Exists("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP")
 	if err != nil {
@@ -64,13 +73,21 @@ func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	err := m.ipt.Delete("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP")
-	if err != nil && !strings.Contains(err.Error(), "No chain/target/match") {
+	// Loop in case a prior race left a duplicate row — Delete only removes
+	// one match per call. Stop on the first "no such rule" return.
+	for {
+		err := m.ipt.Delete("filter", "DOCKER-USER", "-s", containerIP, "-j", "DROP")
+		if err == nil {
+			continue
+		}
+		if strings.Contains(err.Error(), "No chain/target/match") {
+			return nil
+		}
 		return fmt.Errorf("delete egress rule: %w", err)
 	}
-
-	return nil
 }
 
 // BlockAllIngress installs a DROP rule for traffic destined for containerIP,
@@ -84,6 +101,8 @@ func (m *Manager) BlockAllIngress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	exists, err := m.ipt.Exists("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP")
 	if err != nil {
@@ -104,11 +123,17 @@ func (m *Manager) ClearBlockAllIngress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	err := m.ipt.Delete("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP")
-	if err != nil && !strings.Contains(err.Error(), "No chain/target/match") {
+	for {
+		err := m.ipt.Delete("filter", "DOCKER-USER", "-d", containerIP, "-j", "DROP")
+		if err == nil {
+			continue
+		}
+		if strings.Contains(err.Error(), "No chain/target/match") {
+			return nil
+		}
 		return fmt.Errorf("delete ingress rule: %w", err)
 	}
-
-	return nil
 }

@@ -138,6 +138,12 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	// Mirror SetNetworkLimits: enforcement uses `limit > 0`, so a negative
+	// value would silently behave as unlimited and bypass the quota.
+	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
+		return nil, errors.New("network byte limits must be >= 0")
+	}
+
 	sealedMounts, err := s.sealMounts(req.Mounts)
 	if err != nil {
 		return nil, err
