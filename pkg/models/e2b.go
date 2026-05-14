@@ -32,3 +32,21 @@ type E2BSnapshotMetadata struct {
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
+
+const (
+	E2BCreateRequestStatePending = "pending"
+	E2BCreateRequestStateReady   = "ready"
+)
+
+// E2BCreateRequestRecord tracks create-path idempotency for the /e2b facade.
+// Fingerprint keys are short-lived for body-hash-based dedupe and may be
+// longer-lived when an explicit Idempotency-Key is supplied.
+type E2BCreateRequestRecord struct {
+	Fingerprint string
+	SandboxID   string
+	State       string
+	LockedUntil time.Time
+	ReplayUntil time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}

@@ -30,6 +30,10 @@ func conflict(message string) error {
 	return requestError{status: http.StatusConflict, message: message}
 }
 
+func serviceUnavailable(message string) error {
+	return requestError{status: http.StatusServiceUnavailable, message: message}
+}
+
 func notImplemented(message string) error {
 	return requestError{status: http.StatusNotImplemented, message: message}
 }

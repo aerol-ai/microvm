@@ -39,6 +39,7 @@ type server struct {
 
 	sessions *sessions.Manager
 	daytona  *daytonaCompat
+	envd     *envdCompat
 }
 
 func (s *server) setAllowedPorts(ports []int) {
@@ -70,6 +71,7 @@ func main() {
 		port:         envInt("SB_TOOLBOX_PORT", 2280),
 		allowedPorts: map[int]struct{}{},
 		daytona:      newDaytonaCompat(),
+		envd:         newEnvdCompat(),
 	}
 	// Evict the token from the process env table so child processes spawned
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
@@ -192,6 +194,13 @@ func (s *server) routes() http.Handler {
 			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
 		case strings.HasPrefix(r.URL.Path, "/proxy/"):
 			s.handleProxy(w, r)
+		case strings.HasPrefix(r.URL.Path, "/envd/"):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			if !s.handleEnvdRoute(w, r) {
+				writeEnvdError(w, http.StatusNotFound, "not found")
+			}
 		case r.Method == http.MethodPost && r.URL.Path == "/process/execute":
 			if !s.requireAuth(w, r) {
 				return
@@ -290,6 +299,9 @@ func normalizeSandboxPath(path, sandboxID string) string {
 	if path == "" {
 		return "/"
 	}
+	if path == envdPrefix || strings.HasPrefix(path, envdPrefix+"/") {
+		return path
+	}
 
 	if sandboxID != "" {
 		prefix := "/" + sandboxID
@@ -347,6 +359,8 @@ func isKnownToolboxPath(path string) bool {
 	case strings.HasPrefix(path, "/git/"):
 		return true
 	case strings.HasPrefix(path, "/proxy/"):
+		return true
+	case strings.HasPrefix(path, "/envd/"):
 		return true
 	case path == "/sessions" || strings.HasPrefix(path, "/sessions/"):
 		return true

@@ -51,9 +51,56 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	fingerprint, err := createRequestFingerprint(req.TemplateID, serviceReq, meta)
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	cleanupReservation := func() {
+		if err := h.deps.Service.DeleteE2BCreateRequest(r.Context(), fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
+			h.deps.Logger.Warn("e2b create reservation cleanup failed", "fingerprint", fingerprint, "error", err)
+		}
+	}
+
+	for {
+		record, acquired, err := h.deps.Service.ClaimE2BCreateRequest(r.Context(), fingerprint, time.Now().UTC(), e2bCreatePendingTTL)
+		if err != nil {
+			writeStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+		if acquired {
+			break
+		}
+
+		if record.State == models.E2BCreateRequestStateReady {
+			sandbox, storedMeta, replayed, err := h.loadReplayableCreateResult(r.Context(), record)
+			if err != nil {
+				writeStoreAwareError(h.deps.Logger, w, err)
+				return
+			}
+			if replayed {
+				writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, sandbox, storedMeta))
+				return
+			}
+			continue
+		}
+
+		sandbox, storedMeta, replayed, err := h.waitForCreateReplay(r.Context(), fingerprint)
+		if err != nil {
+			if !writeKnownError(w, err) {
+				writeStoreAwareError(h.deps.Logger, w, err)
+			}
+			return
+		}
+		if replayed {
+			writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, sandbox, storedMeta))
+			return
+		}
+	}
 
 	response, err := h.deps.Service.CreateSandbox(r.Context(), serviceReq)
 	if err != nil {
+		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -62,16 +109,20 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
 			h.deps.Logger.Warn("e2b metadata rollback failed", "sandbox_id", response.ID, "error", destroyErr)
 		}
+		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
-	storedMeta, err := h.loadSandboxMeta(r.Context(), &response.Sandbox)
-	if err != nil {
+	if err := h.deps.Service.CompleteE2BCreateRequest(r.Context(), fingerprint, response.ID, time.Now().UTC(), e2bCreateReplayWindow); err != nil {
+		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
+			h.deps.Logger.Warn("e2b create idempotency rollback failed", "sandbox_id", response.ID, "error", destroyErr)
+		}
+		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, storedMeta))
+	writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -593,6 +644,70 @@ func (h *handlers) persistSandboxMeta(ctx context.Context, sandboxID string, met
 		return nil
 	}
 	return h.deps.Service.UpsertE2BSandboxMetadata(ctx, sandboxMetaToStored(sandboxID, meta))
+}
+
+func (h *handlers) loadReplayableCreateResult(ctx context.Context, record *models.E2BCreateRequestRecord) (*models.Sandbox, sandboxMeta, bool, error) {
+	if record == nil || strings.TrimSpace(record.SandboxID) == "" {
+		return nil, sandboxMeta{}, false, nil
+	}
+	sandbox, err := h.deps.Service.GetSandbox(ctx, record.SandboxID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			if deleteErr := h.deps.Service.DeleteE2BCreateRequest(ctx, record.Fingerprint); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
+				return nil, sandboxMeta{}, false, deleteErr
+			}
+			return nil, sandboxMeta{}, false, nil
+		}
+		return nil, sandboxMeta{}, false, err
+	}
+	meta, err := h.loadSandboxMeta(ctx, sandbox)
+	if err != nil {
+		return nil, sandboxMeta{}, false, err
+	}
+	return sandbox, meta, true, nil
+}
+
+func (h *handlers) waitForCreateReplay(ctx context.Context, fingerprint string) (*models.Sandbox, sandboxMeta, bool, error) {
+	deadline := time.Now().UTC().Add(e2bCreateWaitTimeout)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, sandboxMeta{}, false, err
+		}
+		now := time.Now().UTC()
+		if !now.Before(deadline) {
+			return nil, sandboxMeta{}, false, serviceUnavailable("An identical sandbox create is already in progress; retry shortly.")
+		}
+
+		record, err := h.deps.Service.GetE2BCreateRequest(ctx, fingerprint)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, sandboxMeta{}, false, nil
+			}
+			return nil, sandboxMeta{}, false, err
+		}
+
+		if record.State == models.E2BCreateRequestStateReady {
+			return h.loadReplayableCreateResult(ctx, record)
+		}
+		if record.State != models.E2BCreateRequestStatePending || !record.LockedUntil.After(now) {
+			return nil, sandboxMeta{}, false, nil
+		}
+
+		waitFor := e2bCreatePollInterval
+		if remaining := time.Until(deadline); remaining > 0 && remaining < waitFor {
+			waitFor = remaining
+		}
+		if remaining := time.Until(record.LockedUntil); remaining > 0 && remaining < waitFor {
+			waitFor = remaining
+		}
+		timer := time.NewTimer(waitFor)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, sandboxMeta{}, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (h *handlers) resolveSnapshotDeleteTarget(ctx context.Context, snapshotID string) (string, string, error) {

@@ -6,6 +6,13 @@ Make AerolVM consumable by the unmodified E2B Python SDK without changing AerolV
 
 This plan replaces the earlier placeholder E2B discovery section in `plans/daytona-e2b-compatibility-facades.md` with a concrete target based on the local E2B SDK checkout.
 
+## Current Status
+
+- Control-plane MVP under `/e2b` is implemented.
+- Runtime MVP under `/e2b/runtime` is implemented and proxies into toolboxd's internal `/envd` compatibility surface.
+- Create idempotency is implemented with a persisted request-fingerprint table and bounded replay window.
+- A real Python smoke harness against `e2b==2.21.0` is implemented and passes against the local SDK checkout.
+
 ## Constraints
 
 - Do not modify `sdk/python` in this repository.
@@ -32,9 +39,17 @@ That means the implementation must define explicit retry behavior for:
 - `POST /e2b/sandboxes/{id}/snapshots`
 - `DELETE /e2b/templates/{id}`
 
-The main unresolved design point is create idempotency. Before coding starts, the facade needs a deterministic retry story for `POST /e2b/sandboxes`. If the upstream request shape does not include a natural stable key, the facade will need a persisted request fingerprint or another explicit compatibility key instead of best-effort duplicate creation.
+The implemented create strategy uses a canonical request fingerprint persisted in `e2b_create_requests`.
 
-The upstream create body makes this stricter than it first appears: it has `templateID`, timeout and lifecycle inputs, metadata, env vars, network options, secure mode, and volume mounts, but it does not carry a caller-supplied sandbox name, alias, or request ID that can be reused as an obvious idempotency key.
+The fingerprint is built from the normalized create semantics, not the raw JSON body text. It covers the effective template ID, timeout and lifecycle settings, metadata, env vars, secure mode, and supported network fields. This keeps semantically identical retries stable even when JSON field order differs.
+
+The replay behavior is intentionally bounded so legitimate duplicate launches are still allowed:
+
+- first identical request claims the fingerprint and writes a pending row with a 2 minute lock TTL
+- concurrent identical requests wait up to 30 seconds for that pending create to finish instead of launching a duplicate sandbox
+- once the create succeeds, the row moves to `ready` and replays the same sandbox for a 10 second replay window
+- after the replay window expires, the same request is allowed to create a new sandbox again
+- if native sandbox creation or metadata persistence fails, the reservation is deleted and any newly created sandbox is rolled back
 
 Minimum expected behavior:
 
@@ -274,6 +289,14 @@ The runtime proxy should:
 - forward the request path and body to toolboxd
 - preserve E2B runtime headers that toolboxd needs, especially `X-Access-Token`, `E2b-Sandbox-Id`, `E2b-Sandbox-Port`, and `Authorization`
 
+The implemented gateway rewrites `/e2b/runtime/...` into toolboxd's internal `/envd/...` namespace. This keeps the E2B envd contract separate from Daytona's existing `/files` and `/process` semantics.
+
+The implemented header flow is:
+
+- validate `X-Access-Token` against the sandbox's stored toolbox token when the sandbox is secure
+- preserve inbound `Authorization: Basic ...` as `X-E2B-User-Authorization` for toolbox-side user impersonation compatibility
+- inject `Authorization: Bearer <toolbox token>` on the hop from the public gateway to toolboxd
+
 ### Metadata storage
 
 Follow the Daytona pattern instead of stuffing compatibility-only fields into the native sandbox model.
@@ -392,16 +415,16 @@ Implement these under `/e2b`:
 
 | Route | Status | Mapping |
 |---|---|---|
-| `POST /e2b/sandboxes` | MVP | create sandbox via template resolver + metadata persistence |
-| `GET /e2b/sandboxes` | MVP | native list + E2B response shaping + metadata filter support |
-| `GET /e2b/sandboxes/{id}` | MVP | native get + E2B response shaping |
-| `DELETE /e2b/sandboxes/{id}` | MVP | native destroy |
-| `POST /e2b/sandboxes/{id}/connect` | MVP | native start or no-op + timeout extension |
-| `POST /e2b/sandboxes/{id}/pause` | MVP | native stop |
-| `POST /e2b/sandboxes/{id}/timeout` | MVP | lifecycle update |
-| `POST /e2b/sandboxes/{id}/snapshots` | MVP | native snapshot create |
-| `GET /e2b/snapshots` | MVP | native snapshot list, with optional facade filter shaping |
-| `DELETE /e2b/templates/{id}` | MVP | native snapshot delete by id or mapped name |
+| `POST /e2b/sandboxes` | Implemented | create sandbox via template resolver + metadata persistence + persisted idempotent replay |
+| `GET /e2b/sandboxes` | Implemented | native list + E2B response shaping + metadata filter support |
+| `GET /e2b/sandboxes/{id}` | Implemented | native get + E2B response shaping |
+| `DELETE /e2b/sandboxes/{id}` | Implemented | native destroy |
+| `POST /e2b/sandboxes/{id}/connect` | Implemented | native start or no-op + timeout extension |
+| `POST /e2b/sandboxes/{id}/pause` | Implemented | native stop |
+| `POST /e2b/sandboxes/{id}/timeout` | Implemented | lifecycle update |
+| `POST /e2b/sandboxes/{id}/snapshots` | Implemented | native snapshot create |
+| `GET /e2b/snapshots` | Implemented | native snapshot list, with optional facade filter shaping |
+| `DELETE /e2b/templates/{id}` | Implemented | native snapshot delete by id or mapped name |
 
 The goal of phase one is to make create, connect, pause, timeout, kill, and snapshot workflows usable from the Python SDK.
 
@@ -413,26 +436,27 @@ Recommended runtime scope:
 
 | Capability | Status | Notes |
 |---|---|---|
-| `GET /health` | MVP | simple sandbox liveness |
-| `GET /files`, `POST /files` | MVP | read and write file contents |
-| `filesystem.Stat` | MVP | map to file info helper |
-| `filesystem.MakeDir` | MVP | add directory creation |
-| `filesystem.Move` | MVP | reuse move helper |
-| `filesystem.ListDir` | MVP | list entries with mode, owner, size, timestamps |
-| `filesystem.Remove` | MVP | add remove helper |
-| `process.List` | MVP | list running process handles |
-| `process.Start` | MVP | run command or PTY |
-| `process.Connect` | MVP | reconnect to running process |
-| `process.Update` | MVP | PTY resize |
-| `process.SendInput` | MVP | stdin and PTY input |
-| `process.SendSignal` | MVP | signal process |
-| `process.CloseStdin` | MVP | EOF stdin without killing process |
+| `GET /health` | Implemented | simple sandbox liveness |
+| `GET /files`, `POST /files` | Implemented | read and write file contents |
+| `filesystem.Stat` | Implemented | map to file info helper |
+| `filesystem.MakeDir` | Implemented | add directory creation |
+| `filesystem.Move` | Implemented | reuse move helper |
+| `filesystem.ListDir` | Implemented | list entries with mode, owner, size, timestamps |
+| `filesystem.Remove` | Implemented | add remove helper |
+| `process.List` | Implemented | list running process handles |
+| `process.Start` | Implemented | run command or PTY |
+| `process.Connect` | Implemented | reconnect to running process |
+| `process.Update` | Implemented | PTY resize |
+| `process.SendInput` | Implemented | stdin and PTY input |
+| `process.SendSignal` | Implemented | signal process |
+| `process.CloseStdin` | Implemented | EOF stdin without killing process |
 
 Implementation note:
 
-- Using `connectrpc.com/connect` for the runtime handlers is the most direct fit to the upstream Python client.
-- The current repo does not expose Connect RPC today, so this will be a new dependency and handler family.
-- Under the hood, process operations should reuse or extend the existing session machinery instead of inventing a third process model.
+- The implemented runtime surface uses manual Connect JSON encoding and decoding instead of adding a new Connect dependency.
+- The internal toolbox namespace is `/envd`, not `/files` or `/process`, to avoid collisions with Daytona compatibility routes.
+- Under the hood, process operations reuse the existing session machinery instead of inventing a third process model.
+- Watcher APIs remain explicit 501 responses in this phase.
 
 ### Phase 3: Ingress compatibility
 
@@ -478,10 +502,8 @@ Do not fake these as successful with incomplete semantics.
 
 These should be resolved before implementation starts, or answered in the first implementation PR description.
 
-1. What is the exact idempotency key for `POST /e2b/sandboxes` when the same request is retried concurrently?
-2. Should secure=false omit `envdAccessToken` entirely from create, connect, get, and list responses, or should the facade always return the toolbox-backed token for simplicity?
-3. For named snapshots, do we preserve the user-supplied snapshot name directly as the native snapshot name, or store a separate facade alias while keeping native snapshot names collision-free?
-4. Should phase-one runtime MVP stop at process and filesystem primitives, with all watcher APIs returning explicit 501, or is there a narrower subset the user already knows they need?
+1. For named snapshots, do we preserve the user-supplied snapshot name directly as the native snapshot name, or store a separate facade alias while keeping native snapshot names collision-free?
+2. When phase-three ingress work starts, do we want to preserve `secure=false` as a fully tokenless runtime mode, or should later browser-facing flows still issue a traffic-scoped token for consistency?
 
 ## Testing Plan
 
@@ -516,6 +538,12 @@ Add `cmd/toolboxd` tests for:
 ### Python contract harness
 
 Add a focused smoke harness that runs against the real upstream Python SDK `e2b==2.21.0`.
+
+Implemented harness shape:
+
+- `scripts/e2b_sdk_smoke.py` exercises create, runtime health, file read and write, file list, commands, pause, reconnect, snapshot create, snapshot list, snapshot delete, and sandbox delete
+- `pkg/api/e2b/contract_test.go` builds a temporary `toolboxd`, starts an in-process `/e2b` API server, creates a temporary Python virtualenv, installs either `SB_E2B_PYTHON_SDK_PATH` or `SB_E2B_PYTHON_SDK_SPEC` into it, and runs the smoke script
+- the smoke test is opt-in via `SB_E2B_PYTHON_SMOKE=1` so normal `go test ./...` stays fast and hermetic
 
 Do not try to run the entire upstream test suite first. Start with a pinned subset that matches our delivery phases:
 

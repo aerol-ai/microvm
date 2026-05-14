@@ -127,6 +127,15 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS e2b_create_requests (
+			fingerprint TEXT PRIMARY KEY,
+			sandbox_id TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL DEFAULT 'pending',
+			locked_until DATETIME NOT NULL,
+			replay_until DATETIME,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -142,6 +151,7 @@ func Open(path string) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
+		`CREATE INDEX IF NOT EXISTS idx_e2b_create_requests_replay_until ON e2b_create_requests(replay_until);`,
 		`CREATE INDEX IF NOT EXISTS idx_e2b_snapshots_source_sandbox_id ON e2b_snapshots(source_sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
 	}
@@ -808,6 +818,122 @@ func (s *Store) DeleteE2BSnapshot(ctx context.Context, snapshotID string) error 
 	return nil
 }
 
+func (s *Store) ClaimE2BCreateRequest(ctx context.Context, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.E2BCreateRequestRecord, bool, error) {
+	trimmed := strings.TrimSpace(fingerprint)
+	if trimmed == "" {
+		return nil, false, fmt.Errorf("claim e2b create request: fingerprint is required")
+	}
+	now = now.UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("claim e2b create request: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	record, err := scanE2BCreateRequestRecord(tx.QueryRowContext(ctx, `
+		SELECT fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at
+		FROM e2b_create_requests
+		WHERE fingerprint = ?
+	`, trimmed))
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, false, fmt.Errorf("claim e2b create request: query: %w", err)
+		}
+		record = &models.E2BCreateRequestRecord{
+			Fingerprint: trimmed,
+			State:       models.E2BCreateRequestStatePending,
+			LockedUntil: now.Add(pendingTTL),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO e2b_create_requests (fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, record.Fingerprint, "", record.State, record.LockedUntil, nil, record.CreatedAt, record.UpdatedAt); err != nil {
+			return nil, false, fmt.Errorf("claim e2b create request: insert: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("claim e2b create request: commit insert: %w", err)
+		}
+		return record, true, nil
+	}
+
+	if record.State == models.E2BCreateRequestStateReady && !record.ReplayUntil.IsZero() && record.ReplayUntil.After(now) && strings.TrimSpace(record.SandboxID) != "" {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("claim e2b create request: commit ready: %w", err)
+		}
+		return record, false, nil
+	}
+	if record.State == models.E2BCreateRequestStatePending && record.LockedUntil.After(now) {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("claim e2b create request: commit pending: %w", err)
+		}
+		return record, false, nil
+	}
+
+	record.SandboxID = ""
+	record.State = models.E2BCreateRequestStatePending
+	record.LockedUntil = now.Add(pendingTTL)
+	record.ReplayUntil = time.Time{}
+	record.UpdatedAt = now
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE e2b_create_requests
+		SET sandbox_id = '', state = ?, locked_until = ?, replay_until = NULL, updated_at = ?
+		WHERE fingerprint = ?
+	`, record.State, record.LockedUntil, record.UpdatedAt, record.Fingerprint); err != nil {
+		return nil, false, fmt.Errorf("claim e2b create request: refresh: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("claim e2b create request: commit refresh: %w", err)
+	}
+	return record, true, nil
+}
+
+func (s *Store) GetE2BCreateRequest(ctx context.Context, fingerprint string) (*models.E2BCreateRequestRecord, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at
+		FROM e2b_create_requests
+		WHERE fingerprint = ?
+	`, strings.TrimSpace(fingerprint))
+	record, err := scanE2BCreateRequestRecord(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get e2b create request: %w", err)
+	}
+	return record, nil
+}
+
+func (s *Store) CompleteE2BCreateRequest(ctx context.Context, fingerprint, sandboxID string, now time.Time, replayTTL time.Duration) error {
+	now = now.UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE e2b_create_requests
+		SET sandbox_id = ?, state = ?, locked_until = ?, replay_until = ?, updated_at = ?
+		WHERE fingerprint = ?
+	`, strings.TrimSpace(sandboxID), models.E2BCreateRequestStateReady, now, now.Add(replayTTL), now, strings.TrimSpace(fingerprint))
+	if err != nil {
+		return fmt.Errorf("complete e2b create request: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteE2BCreateRequest(ctx context.Context, fingerprint string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM e2b_create_requests WHERE fingerprint = ?`, strings.TrimSpace(fingerprint))
+	if err != nil {
+		return fmt.Errorf("delete e2b create request: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at)
@@ -1309,6 +1435,32 @@ func scanE2BSnapshotMetadata(scanner interface {
 		meta.Names = []string{}
 	}
 	return &meta, nil
+}
+
+func scanE2BCreateRequestRecord(scanner interface {
+	Scan(dest ...any) error
+}) (*models.E2BCreateRequestRecord, error) {
+	var record models.E2BCreateRequestRecord
+	var replayUntil sql.NullTime
+	err := scanner.Scan(
+		&record.Fingerprint,
+		&record.SandboxID,
+		&record.State,
+		&record.LockedUntil,
+		&replayUntil,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if replayUntil.Valid {
+		record.ReplayUntil = replayUntil.Time.UTC()
+	}
+	record.LockedUntil = record.LockedUntil.UTC()
+	record.CreatedAt = record.CreatedAt.UTC()
+	record.UpdatedAt = record.UpdatedAt.UTC()
+	return &record, nil
 }
 
 func scanSnapshot(scanner interface {

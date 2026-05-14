@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -32,4 +33,20 @@ func (s *Service) ListE2BSnapshots(ctx context.Context) (map[string]models.E2BSn
 
 func (s *Service) DeleteE2BSnapshot(ctx context.Context, snapshotID string) error {
 	return s.store.DeleteE2BSnapshot(ctx, snapshotID)
+}
+
+func (s *Service) ClaimE2BCreateRequest(ctx context.Context, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.E2BCreateRequestRecord, bool, error) {
+	return s.store.ClaimE2BCreateRequest(ctx, fingerprint, now, pendingTTL)
+}
+
+func (s *Service) GetE2BCreateRequest(ctx context.Context, fingerprint string) (*models.E2BCreateRequestRecord, error) {
+	return s.store.GetE2BCreateRequest(ctx, fingerprint)
+}
+
+func (s *Service) CompleteE2BCreateRequest(ctx context.Context, fingerprint, sandboxID string, now time.Time, replayTTL time.Duration) error {
+	return s.store.CompleteE2BCreateRequest(ctx, fingerprint, sandboxID, now, replayTTL)
+}
+
+func (s *Service) DeleteE2BCreateRequest(ctx context.Context, fingerprint string) error {
+	return s.store.DeleteE2BCreateRequest(ctx, fingerprint)
 }

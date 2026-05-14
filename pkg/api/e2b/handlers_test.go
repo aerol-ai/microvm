@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -202,12 +205,116 @@ func TestCreateSandboxRejectsUnsupportedNetworkAllowOut(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxIdempotentReplay(t *testing.T) {
+	runtime := newFakeE2BRuntime()
+	_, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: 2280})
+
+	body := `{"templateID":"base","metadata":{"team":"sdk"},"timeout":120}`
+	firstReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(body))
+	firstResp := httptest.NewRecorder()
+	handler.ServeHTTP(firstResp, firstReq)
+	if firstResp.Code != http.StatusCreated {
+		t.Fatalf("first create status = %d, want %d; body=%s", firstResp.Code, http.StatusCreated, firstResp.Body.String())
+	}
+	var first sandboxResponse
+	if err := json.NewDecoder(firstResp.Body).Decode(&first); err != nil {
+		t.Fatalf("decode first create response error = %v", err)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(body))
+	secondResp := httptest.NewRecorder()
+	handler.ServeHTTP(secondResp, secondReq)
+	if secondResp.Code != http.StatusCreated {
+		t.Fatalf("second create status = %d, want %d; body=%s", secondResp.Code, http.StatusCreated, secondResp.Body.String())
+	}
+	var second sandboxResponse
+	if err := json.NewDecoder(secondResp.Body).Decode(&second); err != nil {
+		t.Fatalf("decode second create response error = %v", err)
+	}
+	if second.SandboxID != first.SandboxID {
+		t.Fatalf("second SandboxID = %q, want %q", second.SandboxID, first.SandboxID)
+	}
+	runtime.mu.Lock()
+	createHits := runtime.createHits
+	runtime.mu.Unlock()
+	if createHits != 1 {
+		t.Fatalf("runtime create hits = %d, want 1", createHits)
+	}
+}
+
+func TestRuntimeProxyRewritesToEnvdToolboxSurface(t *testing.T) {
+	toolboxRequests := make(chan *http.Request, 1)
+	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolboxRequests <- r.Clone(r.Context())
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	}))
+	defer toolboxServer.Close()
+
+	parsedURL, err := neturl.Parse(toolboxServer.URL)
+	if err != nil {
+		t.Fatalf("parse toolbox url error = %v", err)
+	}
+	host, portText, err := net.SplitHostPort(parsedURL.Host)
+	if err != nil {
+		t.Fatalf("split toolbox host error = %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse toolbox port error = %v", err)
+	}
+
+	runtime := newFakeE2BRuntime()
+	runtime.containerIP = host
+	_, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: port})
+
+	createReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","secure":true}`))
+	createResp := httptest.NewRecorder()
+	handler.ServeHTTP(createResp, createReq)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d; body=%s", createResp.Code, http.StatusCreated, createResp.Body.String())
+	}
+	var created sandboxResponse
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response error = %v", err)
+	}
+
+	runtimeReq := httptest.NewRequest(http.MethodGet, "/e2b/runtime/health", nil)
+	runtimeReq.Header.Set("E2b-Sandbox-Id", created.SandboxID)
+	runtimeReq.Header.Set("X-Access-Token", created.EnvdAccessToken)
+	runtimeReq.Header.Set("Authorization", "Basic dXNlcjo=")
+	runtimeResp := httptest.NewRecorder()
+	handler.ServeHTTP(runtimeResp, runtimeReq)
+	if runtimeResp.Code != http.StatusOK {
+		t.Fatalf("runtime status = %d, want %d; body=%s", runtimeResp.Code, http.StatusOK, runtimeResp.Body.String())
+	}
+
+	select {
+	case forwarded := <-toolboxRequests:
+		if forwarded.URL.Path != "/envd/health" {
+			t.Fatalf("forwarded path = %q, want %q", forwarded.URL.Path, "/envd/health")
+		}
+		if forwarded.Header.Get("Authorization") == "" || !strings.HasPrefix(forwarded.Header.Get("Authorization"), "Bearer ") {
+			t.Fatalf("forwarded Authorization = %q, want Bearer token", forwarded.Header.Get("Authorization"))
+		}
+		if forwarded.Header.Get("X-E2B-User-Authorization") != "Basic dXNlcjo=" {
+			t.Fatalf("forwarded X-E2B-User-Authorization = %q", forwarded.Header.Get("X-E2B-User-Authorization"))
+		}
+		if forwarded.Header.Get("X-E2B-Sandbox-Id") != created.SandboxID {
+			t.Fatalf("forwarded X-E2B-Sandbox-Id = %q, want %q", forwarded.Header.Get("X-E2B-Sandbox-Id"), created.SandboxID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected toolbox request to be forwarded")
+	}
+}
+
 type fakeE2BRuntime struct {
 	mu            sync.Mutex
 	states        map[string]*models.SandboxRuntimeState
 	removedImages []string
 	imageSeq      int
 	ipSeq         int
+	createHits    int
+	containerIP   string
 }
 
 func newFakeE2BRuntime() *fakeE2BRuntime {
@@ -221,10 +328,15 @@ func (f *fakeE2BRuntime) Create(_ context.Context, _ models.CreateSandboxRequest
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ipSeq++
+	f.createHits++
+	containerIP := f.containerIP
+	if containerIP == "" {
+		containerIP = fmt.Sprintf("10.42.0.%d", f.ipSeq)
+	}
 	state := &models.SandboxRuntimeState{
 		SandboxID:   sandboxID,
 		ContainerID: "ctr-" + sandboxID,
-		ContainerIP: fmt.Sprintf("10.42.0.%d", f.ipSeq),
+		ContainerIP: containerIP,
 		Status:      models.SandboxStatusStarted,
 	}
 	f.states[sandboxID] = cloneRuntimeState(state)
@@ -334,6 +446,10 @@ func sanitizeSnapshotID(value string) string {
 }
 
 func newE2BHandlerTestEnv(t *testing.T) (*service.Service, *store.Store, http.Handler) {
+	return newE2BHandlerTestEnvWithRuntime(t, newFakeE2BRuntime(), config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: 2280})
+}
+
+func newE2BHandlerTestEnvWithRuntime(t *testing.T, runtime *fakeE2BRuntime, cfg config.Config) (*service.Service, *store.Store, http.Handler) {
 	t.Helper()
 	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"base":"ubuntu:22.04"}`)
 
@@ -360,8 +476,6 @@ func newE2BHandlerTestEnv(t *testing.T) (*service.Service, *store.Store, http.Ha
 		t.Fatalf("secrets.NewCipher() error = %v", err)
 	}
 
-	runtime := newFakeE2BRuntime()
-	cfg := config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: 2280}
 	svc := service.New(cfg, logger, st, runtime, nil, caddy.New(cfg), cipher, mountManager, nil)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{

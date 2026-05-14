@@ -574,6 +574,69 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "e2b_create_request_claim_complete_and_reclaim",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC().Round(0)
+				fingerprint := "fp:test"
+
+				record, acquired, err := st.ClaimE2BCreateRequest(ctx, fingerprint, now, 30*time.Second)
+				if err != nil {
+					t.Fatalf("first ClaimE2BCreateRequest() error = %v", err)
+				}
+				if !acquired {
+					t.Fatal("expected first claim to acquire reservation")
+				}
+				if record.State != models.E2BCreateRequestStatePending {
+					t.Fatalf("record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending)
+				}
+
+				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(5*time.Second), 30*time.Second)
+				if err != nil {
+					t.Fatalf("second ClaimE2BCreateRequest() error = %v", err)
+				}
+				if acquired {
+					t.Fatal("expected second claim to observe pending reservation")
+				}
+				if record.State != models.E2BCreateRequestStatePending {
+					t.Fatalf("pending record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending)
+				}
+
+				if err := st.CompleteE2BCreateRequest(ctx, fingerprint, "sb-e2b-claim", now.Add(8*time.Second), 15*time.Second); err != nil {
+					t.Fatalf("CompleteE2BCreateRequest() error = %v", err)
+				}
+
+				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(10*time.Second), 30*time.Second)
+				if err != nil {
+					t.Fatalf("ready ClaimE2BCreateRequest() error = %v", err)
+				}
+				if acquired {
+					t.Fatal("expected ready claim to replay existing sandbox")
+				}
+				if record.State != models.E2BCreateRequestStateReady || record.SandboxID != "sb-e2b-claim" {
+					t.Fatalf("unexpected ready record: %+v", record)
+				}
+
+				record, acquired, err = st.ClaimE2BCreateRequest(ctx, fingerprint, now.Add(40*time.Second), 30*time.Second)
+				if err != nil {
+					t.Fatalf("stale ready ClaimE2BCreateRequest() error = %v", err)
+				}
+				if !acquired {
+					t.Fatal("expected stale ready record to be reclaimed")
+				}
+				if record.State != models.E2BCreateRequestStatePending || record.SandboxID != "" {
+					t.Fatalf("unexpected reclaimed record: %+v", record)
+				}
+
+				if err := st.DeleteE2BCreateRequest(ctx, fingerprint); err != nil {
+					t.Fatalf("DeleteE2BCreateRequest() error = %v", err)
+				}
+				if _, err := st.GetE2BCreateRequest(ctx, fingerprint); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+			},
+		},
+		{
 			name: "snapshot_roundtrip_by_name",
 			run: func(t *testing.T) {
 				st := newTestStore(t)

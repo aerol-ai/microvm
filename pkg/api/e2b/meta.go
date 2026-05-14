@@ -1,8 +1,12 @@
 package e2b
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,6 +18,10 @@ const (
 	defaultEnvdVersion    = "0.1.0"
 	defaultSandboxTimeout = 300
 	snapshotIDPrefix      = "snapshot_"
+	e2bCreatePendingTTL   = 2 * time.Minute
+	e2bCreateWaitTimeout  = 30 * time.Second
+	e2bCreateReplayWindow = 10 * time.Second
+	e2bCreatePollInterval = 250 * time.Millisecond
 )
 
 type sandboxMeta struct {
@@ -185,4 +193,50 @@ func snapshotNameFromID(snapshotID string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+type createFingerprintPayload struct {
+	TemplateID          string            `json:"templateID"`
+	Metadata            map[string]string `json:"metadata,omitempty"`
+	EnvVars             map[string]string `json:"envVars,omitempty"`
+	TimeoutSeconds      int               `json:"timeoutSeconds"`
+	OnTimeout           string            `json:"onTimeout"`
+	AutoResume          bool              `json:"autoResume"`
+	Secure              bool              `json:"secure"`
+	AllowInternetAccess bool              `json:"allowInternetAccess"`
+	NetworkBlockAll     bool              `json:"networkBlockAll"`
+	NetworkAllowOut     []string          `json:"networkAllowOut,omitempty"`
+	NetworkDenyOut      []string          `json:"networkDenyOut,omitempty"`
+	AllowPublicTraffic  bool              `json:"allowPublicTraffic"`
+	MaskRequestHost     string            `json:"maskRequestHost,omitempty"`
+}
+
+func createRequestFingerprint(templateID string, serviceReq models.CreateSandboxRequest, meta sandboxMeta) (string, error) {
+	payload := createFingerprintPayload{
+		TemplateID:          strings.TrimSpace(templateID),
+		Metadata:            cloneStringMap(meta.Metadata),
+		EnvVars:             cloneStringMap(serviceReq.Env),
+		TimeoutSeconds:      meta.TimeoutSeconds,
+		OnTimeout:           strings.TrimSpace(meta.OnTimeout),
+		AutoResume:          meta.AutoResume,
+		Secure:              meta.Secure,
+		AllowInternetAccess: !serviceReq.NetworkBlockAll,
+		NetworkBlockAll:     serviceReq.NetworkBlockAll,
+		NetworkAllowOut:     sortedStringSlice(meta.NetworkAllowOut),
+		NetworkDenyOut:      sortedStringSlice(meta.NetworkDenyOut),
+		AllowPublicTraffic:  meta.AllowPublicTraffic == nil || *meta.AllowPublicTraffic,
+		MaskRequestHost:     strings.TrimSpace(meta.MaskRequestHost),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return "fingerprint:" + hex.EncodeToString(sum[:]), nil
+}
+
+func sortedStringSlice(values []string) []string {
+	cloned := cloneStringSlice(values)
+	sort.Strings(cloned)
+	return cloned
 }
