@@ -47,19 +47,24 @@ func (f *fakeCapacityRuntime) Inspect(_ context.Context, ref string) (*models.Sa
 func (f *fakeCapacityRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
+func (f *fakeCapacityRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
+	return "", nil
+}
 func (f *fakeCapacityRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
-func (f *fakeCapacityRuntime) Stop(context.Context, string) error  { return nil }
+func (f *fakeCapacityRuntime) Stop(context.Context, string) error             { return nil }
 func (f *fakeCapacityRuntime) Destroy(context.Context, *models.Sandbox) error { return nil }
 func (f *fakeCapacityRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	return nil
 }
-func (f *fakeCapacityRuntime) Ping(context.Context) error                                  { return nil }
-func (f *fakeCapacityRuntime) RemoveImage(context.Context, string) error                   { return nil }
-func (f *fakeCapacityRuntime) PushAllowedPorts(context.Context, string, string, []int) error { return nil }
-func (f *fakeCapacityRuntime) ClearNetworkRules(string) error                              { return nil }
-func (f *fakeCapacityRuntime) ApplyNetworkBlockAll(string) error                           { return nil }
+func (f *fakeCapacityRuntime) Ping(context.Context) error                { return nil }
+func (f *fakeCapacityRuntime) RemoveImage(context.Context, string) error { return nil }
+func (f *fakeCapacityRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
+	return nil
+}
+func (f *fakeCapacityRuntime) ClearNetworkRules(string) error    { return nil }
+func (f *fakeCapacityRuntime) ApplyNetworkBlockAll(string) error { return nil }
 
 func newCapacityHarness(t *testing.T, managed, inspect map[string]*models.SandboxRuntimeState) (*Service, *capacity.Admitter, *store.Store) {
 	t.Helper()

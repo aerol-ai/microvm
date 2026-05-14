@@ -11,6 +11,7 @@ import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.ResizeOptions;
 import ai.aerol.microvm.model.SandboxData;
+import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 
@@ -114,6 +115,10 @@ public class Sandbox extends SandboxData {
     public Sandbox stop() {
         apply(client.stop(id));
         return this;
+    }
+
+    public SandboxSnapshot createSnapshot(String name) {
+        return client.createSnapshot(id, name);
     }
 
     public void destroy() {

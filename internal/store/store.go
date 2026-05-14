@@ -101,6 +101,13 @@ func Open(path string) (*Store, error) {
 			updated_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
+			name TEXT PRIMARY KEY,
+			image TEXT NOT NULL,
+			image_id TEXT NOT NULL DEFAULT '',
+			source_sandbox_id TEXT NOT NULL,
+			created_at DATETIME NOT NULL
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
 		// idx_sandboxes_image powers HasActiveImageRef so image GC stays
@@ -109,6 +116,7 @@ func Open(path string) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
 	}
 
 	for _, stmt := range stmts {
@@ -578,6 +586,79 @@ func (s *Store) GetDaytonaMetadata(ctx context.Context, sandboxID string) (*mode
 	return meta, nil
 }
 
+func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`,
+		strings.TrimSpace(snapshot.Name),
+		strings.TrimSpace(snapshot.Image),
+		strings.TrimSpace(snapshot.ImageID),
+		strings.TrimSpace(snapshot.SourceSandboxID),
+		snapshot.CreatedAt.UTC(),
+	)
+	if err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			return ErrSnapshotNameConflict
+		}
+		return fmt.Errorf("create snapshot: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at
+		FROM sandbox_snapshots
+		WHERE name = ?
+	`, strings.TrimSpace(name))
+	snapshot, err := scanSnapshot(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at
+		FROM sandbox_snapshots
+		ORDER BY created_at DESC, name ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.SandboxSnapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot: %w", err)
+		}
+		items = append(items, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshots: %w", err)
+	}
+	return items, nil
+}
+
+func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_snapshots WHERE name = ?`, strings.TrimSpace(name))
+	if err != nil {
+		return fmt.Errorf("delete snapshot: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) ListDaytonaMetadata(ctx context.Context) (map[string]models.DaytonaSandboxMetadata, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,
@@ -919,6 +1000,23 @@ func scanDaytonaMetadata(scanner interface {
 	return &meta, nil
 }
 
+func scanSnapshot(scanner interface {
+	Scan(dest ...any) error
+}) (*models.SandboxSnapshot, error) {
+	var snapshot models.SandboxSnapshot
+	err := scanner.Scan(
+		&snapshot.Name,
+		&snapshot.Image,
+		&snapshot.ImageID,
+		&snapshot.SourceSandboxID,
+		&snapshot.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
 func marshalJSON(value any, fallback string) (string, error) {
 	if value == nil {
 		return fallback, nil
@@ -976,6 +1074,8 @@ func isSQLiteUniqueConstraint(err error) bool {
 var ErrNotFound = errors.New("sandbox not found")
 
 var ErrDaytonaNameConflict = errors.New("daytona sandbox name already in use")
+
+var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
 
 // PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
 // to the store layer; encryption / decryption happens in the service layer.

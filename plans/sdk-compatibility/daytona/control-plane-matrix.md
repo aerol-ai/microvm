@@ -13,6 +13,10 @@ These tables describe the current `/daytona` control-plane compatibility surface
 | `DELETE /daytona/sandbox/{idOrName}` | Supported | Maps onto native sandbox destroy | Supports lookup by Daytona name or AerolVM sandbox ID. |
 | `POST /daytona/sandbox/{idOrName}/start` | Supported | Maps onto native sandbox start | Native lifecycle operation. |
 | `POST /daytona/sandbox/{idOrName}/stop` | Supported | Maps onto native sandbox stop | Native lifecycle operation. |
+| `POST /daytona/sandbox/{idOrName}/snapshot` | Partial | Calls native snapshot create, returns a Daytona-shaped sandbox response | Create-from-sandbox works. The returned snapshot must still live within AerolVM's simpler native snapshot model. |
+| `GET /daytona/snapshots` | Partial | Maps onto native snapshot store with facade filtering, sorting, and pagination | Supports `page`, `limit`, `name`, `sort`, and `order` over persisted AerolVM snapshots. |
+| `GET /daytona/snapshots/{id}` | Partial | Resolves by AerolVM snapshot name or image ID and returns a Daytona-shaped snapshot DTO | Compatibility `id` is backed by the native snapshot image ID when present. |
+| `DELETE /daytona/snapshots/{id}` | Partial | Removes the native snapshot image and deletes persisted metadata | Supports deletion by AerolVM snapshot name or image ID. |
 | `POST /daytona/sandbox/{idOrName}/resize` | Supported | Maps onto native sandbox resize | Native resource resize operation. |
 | `GET /daytona/sandbox/{id}/toolbox-proxy-url` | Supported | Returns AerolVM Daytona toolbox facade base | Used by Daytona SDKs to reach toolbox routes. |
 | `GET /daytona/sandbox/{idOrName}/ports/{port}/preview-url` | Supported | Calls native port exposure | Returns Daytona-shaped preview URL response. |
@@ -35,7 +39,7 @@ These tables describe the current `/daytona` control-plane compatibility surface
 | `autoStopInterval` | Supported | Mapped to AerolVM idle-stop lifecycle. |
 | `autoDeleteInterval` | Supported | Mapped to AerolVM idle-destroy lifecycle. |
 | `autoArchiveInterval` | Partial | Stored as metadata only. No archive runtime behavior exists. |
-| `snapshot` | Partial | Accepted only as an image fallback/input alias, not as a true Daytona snapshot lifecycle. |
+| `snapshot` | Partial | Accepted as an image fallback/input alias. Together with the snapshot-create route, local snapshot image refs can be reused for later creates, but full Daytona snapshot management semantics do not exist. |
 | `target` | Partial | Stored as metadata only. No AerolVM scheduling or region semantics exist. |
 | `public=true` or omitted | Supported | Facade assumes public sandbox routing. |
 | `public=false` | Partial | Accepted for compatibility, but AerolVM still treats the sandbox as public in the current Daytona facade. |
@@ -49,7 +53,7 @@ These tables describe the current `/daytona` control-plane compatibility surface
 
 | Daytona area | Status | Gap |
 |---|---|---|
-| Snapshot lifecycle APIs | Unsupported | No Daytona snapshot create/list/restore management surface exists in AerolVM. |
+| Snapshot lifecycle APIs | Partial | Create, list, get, and delete are available, but activate/deactivate, snapshot build APIs, build logs, and other Daytona snapshot-management behaviors are still absent. |
 | Build/image pipeline APIs | Unsupported | AerolVM create is image-based; no Daytona-style build flow is exposed. |
 | Archive lifecycle | Unsupported beyond metadata | `autoarchive` is stored, but real archive behavior is not implemented. |
 | Dynamic network allowlist management | Unsupported | No separate Daytona-shaped update API is exposed. |

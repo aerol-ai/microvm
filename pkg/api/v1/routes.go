@@ -33,6 +33,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", d.Auth(http.HandlerFunc(h.getSandbox)))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/start", d.Auth(http.HandlerFunc(h.startSandbox)))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/stop", d.Auth(http.HandlerFunc(h.stopSandbox)))
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Auth(http.HandlerFunc(h.createSnapshot)))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Auth(http.HandlerFunc(h.destroySandbox)))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Auth(http.HandlerFunc(h.resizeSandbox)))
 	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Auth(http.HandlerFunc(h.updateLifecycle)))

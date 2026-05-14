@@ -45,6 +45,9 @@ func (f *fakeReconcileRuntime) RemoveImage(_ context.Context, _ string) error {
 func (f *fakeReconcileRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Create on reconcile destroyed path")
 }
+func (f *fakeReconcileRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
+	panic("unexpected CreateSnapshot on reconcile destroyed path")
+}
 func (f *fakeReconcileRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Start on reconcile destroyed path")
 }

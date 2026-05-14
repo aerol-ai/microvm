@@ -38,6 +38,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
+	if errors.Is(err, store.ErrSnapshotNameConflict) {
+		WriteError(w, http.StatusConflict, "snapshot name already in use")
+		return
+	}
 	// Capacity rejections are 503 with a Retry-After hint so well-behaved
 	// clients (and load balancers) back off instead of treating it as a
 	// permanent 4xx. The error string already carries human-readable

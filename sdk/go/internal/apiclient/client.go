@@ -40,6 +40,7 @@ type ExecRequest = models.ExecRequest
 type ExecResult = models.ExecResult
 type ExposedPort = models.ExposedPort
 type ExposeResult = models.ExposePortResponse
+type SandboxSnapshot = models.SandboxSnapshot
 type HealthStatus = models.HealthStatus
 
 type Client struct {
@@ -145,6 +146,12 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 		return nil, err
 	}
 	return c.wrap(response), nil
+}
+
+func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (SandboxSnapshot, error) {
+	var response models.SandboxSnapshot
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/snapshot", models.CreateSandboxSnapshotRequest{Name: name}, &response)
+	return response, err
 }
 
 func (c *Client) Destroy(ctx context.Context, id string) error {

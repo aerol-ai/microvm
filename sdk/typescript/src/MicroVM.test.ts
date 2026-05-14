@@ -135,6 +135,38 @@ test("MicroVM updateLifecycle returns wrapped sandboxes", async () => {
   });
 });
 
+test("MicroVM createSnapshot returns snapshot metadata", async () => {
+  const seen: Array<{ method: string; url: string; body: unknown }> = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const bodyText = request.method === "GET" || request.method === "DELETE" ? undefined : await request.text();
+      seen.push({
+        method: request.method,
+        url: request.url,
+        body: bodyText ? JSON.parse(bodyText) : undefined,
+      });
+      return new Response(JSON.stringify({
+        name: "snapshots/demo:v1",
+        image: "snapshots/demo:v1",
+        image_id: "sha256:snap-1",
+        source_sandbox_id: "sb-demo",
+        created_at: "2026-05-14T10:00:00Z",
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const snapshot = await sdk.createSnapshot("sb-demo", "snapshots/demo:v1");
+  assert.deepEqual(seen[0]?.body, { name: "snapshots/demo:v1" });
+  assert.equal(snapshot.imageID, "sha256:snap-1");
+  assert.equal(snapshot.sourceSandboxID, "sb-demo");
+});
+
 test("MicroVM create serializes mounts and mounts endpoint returns redacted specs", async () => {
   const seen: Array<{ method: string; url: string; body: unknown }> = [];
   const sdk = new MicroVM({

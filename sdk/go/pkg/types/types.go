@@ -14,6 +14,7 @@ type ExposedPort = models.ExposedPort
 // and HostPort are populated only when Protocol == ExposeProtocolTCP — for
 // HTTP and TLS exposures the dialable URL is in URL alone.
 type ExposeResult = models.ExposePortResponse
+type SandboxSnapshot = models.SandboxSnapshot
 
 // ExposeProtocol selects the wire surface an exposure publishes through.
 type ExposeProtocol string
@@ -31,6 +32,7 @@ const (
 	// SB_L4_TLS_LISTEN set.
 	ExposeProtocolTLS ExposeProtocol = "tls"
 )
+
 type HealthStatus = models.HealthStatus
 type Sandbox = models.Sandbox
 type MountSpec = models.MountSpec

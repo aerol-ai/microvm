@@ -281,6 +281,18 @@ pub struct CreateSandboxResponse {
     pub ssh_private_key: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SandboxSnapshot {
+    pub name: String,
+    pub image: String,
+    #[serde(rename = "image_id", skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
+    #[serde(rename = "source_sandbox_id")]
+    pub source_sandbox_id: String,
+    #[serde(rename = "created_at")]
+    pub created_at: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HealthStatus {
     pub status: String,

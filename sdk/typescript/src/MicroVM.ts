@@ -10,6 +10,7 @@ import type {
   MountSpecRedacted,
   ResizeOptions,
   Sandbox as SandboxData,
+  SandboxSnapshot,
   Session,
   SessionAttachHandle,
   SessionAttachOptions,
@@ -81,6 +82,10 @@ export class MicroVM {
     const sandbox = await this.client.stop(id);
     return this.wrap(sandbox.toJSON());
   }
+
+	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(id, name);
+	}
 
   async destroy(id: string): Promise<void> {
     await this.client.destroy(id);

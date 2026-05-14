@@ -157,6 +157,14 @@ export interface ExposePortOptions {
   protocol?: ExposeProtocol;
 }
 
+export interface SandboxSnapshot {
+  name: string;
+  image: string;
+  imageID?: string;
+  sourceSandboxID: string;
+  createdAt: string;
+}
+
 /**
  * Discriminated result from `exposePort`. Branch on `protocol` to access the
  * fields that are meaningful for the chosen wire protocol — only the raw-TCP

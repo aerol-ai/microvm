@@ -92,6 +92,59 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
 }
 
+func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
+	filters, page, limit, err := parseSnapshotListFilters(r)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	snapshots, err := h.deps.Service.ListSnapshots(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	items := h.filteredSnapshots(r, snapshots, filters)
+	total := len(items)
+	start := int((page - 1) * limit)
+	if start > total {
+		start = total
+	}
+	end := start + int(limit)
+	if end > total {
+		end = total
+	}
+	totalPages := float32(0)
+	if total > 0 {
+		totalPages = float32((total + int(limit) - 1) / int(limit))
+	}
+
+	apihttp.WriteJSON(w, http.StatusOK, paginatedSnapshotsResponse{
+		Items:      items[start:end],
+		Total:      float32(total),
+		Page:       page,
+		TotalPages: totalPages,
+	})
+}
+
+func (h *handlers) getSnapshot(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := h.deps.Service.GetSnapshot(r.Context(), r.PathValue("id"))
+	if err != nil {
+		h.writeSnapshotError(w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSnapshotResponse(r, snapshot))
+}
+
+func (h *handlers) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	if err := h.deps.Service.DeleteSnapshot(r.Context(), r.PathValue("id")); err != nil {
+		h.writeSnapshotError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
 	if err != nil {
@@ -233,6 +286,32 @@ func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
+func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req createSandboxSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	if _, err := h.deps.Service.CreateSnapshot(r.Context(), sandboxID, models.CreateSandboxSnapshotRequest{Name: req.Name}); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
 	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
@@ -492,6 +571,35 @@ func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbo
 	return items
 }
 
+func (h *handlers) filteredSnapshots(r *http.Request, snapshots []*models.SandboxSnapshot, filters snapshotListFilters) []snapshotResponse {
+	items := make([]snapshotResponse, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot == nil {
+			continue
+		}
+		item := h.toSnapshotResponse(r, snapshot)
+		if filters.Name != "" && !strings.Contains(strings.ToLower(item.Name), strings.ToLower(filters.Name)) {
+			continue
+		}
+		items = append(items, item)
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		left, right := snapshotSortKey(items[i], filters.Sort), snapshotSortKey(items[j], filters.Sort)
+		if left == right {
+			if filters.Order == "asc" {
+				return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+			}
+			return strings.ToLower(items[i].Name) > strings.ToLower(items[j].Name)
+		}
+		if filters.Order == "asc" {
+			return left < right
+		}
+		return left > right
+	})
+	return items
+}
+
 func (h *handlers) persistSandboxMeta(ctx context.Context, sandboxID string, meta sandboxMeta) error {
 	return h.deps.Service.UpsertDaytonaMetadata(ctx, sandboxMetaToStored(sandboxID, meta))
 }
@@ -554,6 +662,41 @@ func parseListFilters(r *http.Request) (listFilters, error) {
 	return filters, nil
 }
 
+func parseSnapshotListFilters(r *http.Request) (snapshotListFilters, float32, float32, error) {
+	page, err := parsePositiveFloatQuery(r, "page", 1)
+	if err != nil {
+		return snapshotListFilters{}, 0, 0, err
+	}
+	limit, err := parsePositiveFloatQuery(r, "limit", 100)
+	if err != nil {
+		return snapshotListFilters{}, 0, 0, err
+	}
+	if limit > 200 {
+		return snapshotListFilters{}, 0, 0, errors.New("limit must be less than or equal to 200")
+	}
+
+	filters := snapshotListFilters{
+		Name:  strings.TrimSpace(r.URL.Query().Get("name")),
+		Sort:  strings.TrimSpace(r.URL.Query().Get("sort")),
+		Order: strings.TrimSpace(r.URL.Query().Get("order")),
+	}
+	if filters.Sort == "" {
+		filters.Sort = "lastUsedAt"
+	}
+	switch filters.Sort {
+	case "name", "state", "lastUsedAt", "createdAt":
+	default:
+		return snapshotListFilters{}, 0, 0, errors.New("sort must be one of: name, state, lastUsedAt, createdAt")
+	}
+	if filters.Order == "" {
+		filters.Order = "desc"
+	}
+	if filters.Order != "asc" && filters.Order != "desc" {
+		return snapshotListFilters{}, 0, 0, errors.New("order must be one of: asc, desc")
+	}
+	return filters, page, limit, nil
+}
+
 func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, meta sandboxMeta) sandboxResponse {
 	name := firstNonEmpty(meta.Name, sandbox.ID)
 	user := firstNonEmpty(meta.User, sandbox.OSUser)
@@ -592,6 +735,32 @@ func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, m
 		UpdatedAt:           timePtr(sandbox.UpdatedAt),
 		LastActivityAt:      timePtr(sandbox.LastActiveAt),
 		ToolboxProxyURL:     h.toolboxProxyBaseURL(r),
+	}
+}
+
+func (h *handlers) toSnapshotResponse(r *http.Request, snapshot *models.SandboxSnapshot) snapshotResponse {
+	createdAt := snapshot.CreatedAt.UTC().Format(time.RFC3339)
+	organizationID := strings.TrimSpace(r.Header.Get("X-Daytona-Organization-ID"))
+	imageName := nonEmptyStringPtr(&snapshot.Image)
+	id := firstNonEmpty(strings.TrimSpace(snapshot.ImageID), snapshot.Name)
+	return snapshotResponse{
+		ID:             id,
+		OrganizationID: nonEmptyStringPtr(&organizationID),
+		General:        false,
+		Name:           snapshot.Name,
+		ImageName:      imageName,
+		State:          "active",
+		Size:           nil,
+		Entrypoint:     []string{},
+		CPU:            0,
+		GPU:            0,
+		Mem:            0,
+		Disk:           0,
+		ErrorReason:    nil,
+		CreatedAt:      createdAt,
+		UpdatedAt:      createdAt,
+		LastUsedAt:     nil,
+		Ref:            cloneStringPtr(imageName),
 	}
 }
 
@@ -720,6 +889,30 @@ func mapSandboxState(status models.SandboxStatus) string {
 	default:
 		return "unknown"
 	}
+}
+
+func snapshotSortKey(item snapshotResponse, sortBy string) string {
+	switch sortBy {
+	case "name":
+		return strings.ToLower(item.Name)
+	case "state":
+		return strings.ToLower(item.State)
+	case "createdAt":
+		return item.CreatedAt
+	default:
+		if item.LastUsedAt != nil && *item.LastUsedAt != "" {
+			return *item.LastUsedAt
+		}
+		return item.CreatedAt
+	}
+}
+
+func (h *handlers) writeSnapshotError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		apihttp.WriteError(w, http.StatusNotFound, "snapshot not found")
+		return
+	}
+	apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 }
 
 func requestBaseURL(r *http.Request) string {

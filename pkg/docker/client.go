@@ -387,6 +387,27 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return c.removeContainer(ctx, containerRef, true)
 }
 
+func (c *Client) CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error) {
+	repo, tag, err := splitSnapshotImageRef(imageRef)
+	if err != nil {
+		return "", err
+	}
+	query := url.Values{}
+	query.Set("container", strings.TrimSpace(containerRef))
+	query.Set("repo", repo)
+	if tag != "" {
+		query.Set("tag", tag)
+	}
+
+	var response struct {
+		ID string `json:"Id"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, "/commit", query, nil, nil, &response); err != nil {
+		return "", fmt.Errorf("commit snapshot: %w", err)
+	}
+	return strings.TrimSpace(response.ID), nil
+}
+
 func (c *Client) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
 	if c.resourceLimitsOff {
 		return nil
@@ -729,6 +750,27 @@ type containerInspect struct {
 type containerSummary struct {
 	ID     string            `json:"Id"`
 	Labels map[string]string `json:"Labels"`
+}
+
+func splitSnapshotImageRef(imageRef string) (repo, tag string, err error) {
+	trimmed := strings.TrimSpace(imageRef)
+	if trimmed == "" {
+		return "", "", errors.New("snapshot name is required")
+	}
+	if strings.Contains(trimmed, "@") {
+		return "", "", errors.New("snapshot name must not include a digest")
+	}
+	lastSlash := strings.LastIndex(trimmed, "/")
+	lastColon := strings.LastIndex(trimmed, ":")
+	if lastColon > lastSlash {
+		repo = trimmed[:lastColon]
+		tag = trimmed[lastColon+1:]
+		if strings.TrimSpace(repo) == "" || strings.TrimSpace(tag) == "" {
+			return "", "", errors.New("snapshot name must be a valid image reference")
+		}
+		return repo, tag, nil
+	}
+	return trimmed, "", nil
 }
 
 func queryValues(values map[string]string) url.Values {

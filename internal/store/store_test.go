@@ -16,7 +16,7 @@ import (
 func TestStoreCases(t *testing.T) {
 	ctx := context.Background()
 
-	// 24 cases
+	// 25 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -468,6 +468,124 @@ func TestStoreCases(t *testing.T) {
 				}
 				if _, err := st.ResolveDaytonaSandboxID(ctx, "cascade-name"); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound from ResolveDaytonaSandboxID(), got %v", err)
+				}
+			},
+		},
+		{
+			name: "snapshot_roundtrip_by_name",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				snapshot := &models.SandboxSnapshot{
+					Name:            "snapshots/demo:v1",
+					Image:           "snapshots/demo:v1",
+					ImageID:         "sha256:snap-1",
+					SourceSandboxID: "sb-source",
+					CreatedAt:       time.Now().UTC().Round(0),
+				}
+				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				if err != nil {
+					t.Fatalf("GetSnapshot() error = %v", err)
+				}
+				if !reflect.DeepEqual(got, snapshot) {
+					t.Fatalf("snapshot = %+v, want %+v", got, snapshot)
+				}
+			},
+		},
+		{
+			name: "snapshot_name_conflict_returns_error",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				first := &models.SandboxSnapshot{Name: "snapshots/shared:v1", Image: "snapshots/shared:v1", SourceSandboxID: "sb-one", CreatedAt: time.Now().UTC()}
+				second := &models.SandboxSnapshot{Name: "snapshots/shared:v1", Image: "snapshots/shared:v1", SourceSandboxID: "sb-two", CreatedAt: time.Now().UTC()}
+				if err := st.CreateSnapshot(ctx, first); err != nil {
+					t.Fatalf("first CreateSnapshot() error = %v", err)
+				}
+				if err := st.CreateSnapshot(ctx, second); !errors.Is(err, ErrSnapshotNameConflict) {
+					t.Fatalf("expected ErrSnapshotNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			name: "snapshot_survives_source_sandbox_delete",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-snapshot-source")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				snapshot := &models.SandboxSnapshot{
+					Name:            "snapshots/preserved:v1",
+					Image:           "snapshots/preserved:v1",
+					ImageID:         "sha256:snap-preserved",
+					SourceSandboxID: sandbox.ID,
+					CreatedAt:       time.Now().UTC(),
+				}
+				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if err := st.Delete(ctx, sandbox.ID); err != nil {
+					t.Fatalf("Delete() error = %v", err)
+				}
+				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				if err != nil {
+					t.Fatalf("GetSnapshot() after delete error = %v", err)
+				}
+				if got.SourceSandboxID != sandbox.ID || got.Image != snapshot.Image {
+					t.Fatalf("unexpected snapshot after delete: %+v", got)
+				}
+			},
+		},
+		{
+			name: "list_and_delete_snapshots",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				older := &models.SandboxSnapshot{
+					Name:            "alpha",
+					Image:           "snapshots/alpha:v1",
+					ImageID:         "sha256:alpha",
+					SourceSandboxID: "sb-alpha",
+					CreatedAt:       time.Now().UTC().Add(-time.Hour).Round(0),
+				}
+				newer := &models.SandboxSnapshot{
+					Name:            "beta",
+					Image:           "snapshots/beta:v1",
+					ImageID:         "sha256:beta",
+					SourceSandboxID: "sb-beta",
+					CreatedAt:       time.Now().UTC().Round(0),
+				}
+				if err := st.CreateSnapshot(ctx, older); err != nil {
+					t.Fatalf("CreateSnapshot(older) error = %v", err)
+				}
+				if err := st.CreateSnapshot(ctx, newer); err != nil {
+					t.Fatalf("CreateSnapshot(newer) error = %v", err)
+				}
+
+				items, err := st.ListSnapshots(ctx)
+				if err != nil {
+					t.Fatalf("ListSnapshots() error = %v", err)
+				}
+				if len(items) != 2 {
+					t.Fatalf("len(ListSnapshots()) = %d, want 2", len(items))
+				}
+				if items[0].Name != newer.Name || items[1].Name != older.Name {
+					t.Fatalf("unexpected snapshot order: %+v", items)
+				}
+
+				if err := st.DeleteSnapshot(ctx, newer.Name); err != nil {
+					t.Fatalf("DeleteSnapshot() error = %v", err)
+				}
+				if _, err := st.GetSnapshot(ctx, newer.Name); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+				remaining, err := st.GetSnapshot(ctx, older.Name)
+				if err != nil {
+					t.Fatalf("GetSnapshot(older) error = %v", err)
+				}
+				if !reflect.DeepEqual(remaining, older) {
+					t.Fatalf("remaining snapshot = %+v, want %+v", remaining, older)
 				}
 			},
 		},

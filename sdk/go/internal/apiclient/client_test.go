@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -78,6 +79,43 @@ func TestTransportClientCases(t *testing.T) {
 				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
 				if err := client.UploadFile(ctx, "sb-upload", "/workspace/file.txt", []byte("hello")); err != nil {
 					t.Fatalf("UploadFile() error = %v", err)
+				}
+			},
+		},
+		{
+			name: "create_snapshot_sends_name_and_maps_response",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPost || r.URL.Path != "/v1/sandboxes/sb-snap/snapshot" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					if r.Header.Get("Authorization") != "Bearer pat-token" {
+						t.Fatalf("unexpected authorization: %q", r.Header.Get("Authorization"))
+					}
+					var payload models.CreateSandboxSnapshotRequest
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatalf("Decode() error = %v", err)
+					}
+					if payload.Name != "snapshots/demo:v1" {
+						t.Fatalf("payload.Name = %q, want snapshots/demo:v1", payload.Name)
+					}
+					_ = json.NewEncoder(w).Encode(models.SandboxSnapshot{
+						Name:            "snapshots/demo:v1",
+						Image:           "snapshots/demo:v1",
+						ImageID:         "sha256:snap-1",
+						SourceSandboxID: "sb-snap",
+						CreatedAt:       time.Now().UTC(),
+					})
+				}))
+				defer server.Close()
+
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				snapshot, err := client.CreateSnapshot(ctx, "sb-snap", "snapshots/demo:v1")
+				if err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if snapshot.Name != "snapshots/demo:v1" || snapshot.SourceSandboxID != "sb-snap" {
+					t.Fatalf("unexpected snapshot: %+v", snapshot)
 				}
 			},
 		},

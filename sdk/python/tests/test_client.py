@@ -52,6 +52,14 @@ class RecordingMicroVM(MicroVM):
                 "last_active_at": "2026-05-07T10:30:00Z",
                 "lifecycle": payload,
             }
+        if method == "POST" and path == "/v1/sandboxes/sb-1/snapshot":
+            return {
+                "name": payload.get("name", "snapshots/default:v1"),
+                "image": payload.get("name", "snapshots/default:v1"),
+                "image_id": "sha256:snap-1",
+                "source_sandbox_id": "sb-1",
+                "created_at": "2026-05-14T10:00:00Z",
+            }
         if method == "GET" and path == "/v1/sandboxes/sb-1/mounts":
             return {
                 "mounts": [
@@ -303,6 +311,24 @@ class ClientTests(unittest.TestCase):
                 "destroyIfIdleFor": 14_400_000_000_000,
             },
         )
+
+    def test_create_snapshot_maps_request_and_response_shapes(self):
+        client = RecordingMicroVM()
+        snapshot = client.create_snapshot("sb-1", "snapshots/demo:v1")
+        sandbox = client.create({"image": "ubuntu:22.04"})
+        sandbox_snapshot = sandbox.create_snapshot("snapshots/from-sandbox:v1")
+
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/sandboxes/sb-1/snapshot",
+                {"name": "snapshots/demo:v1"},
+            ),
+        )
+        self.assertEqual(snapshot["imageID"], "sha256:snap-1")
+        self.assertEqual(snapshot["sourceSandboxID"], "sb-1")
+        self.assertEqual(sandbox_snapshot["name"], "snapshots/from-sandbox:v1")
 
     def test_exec_and_health_map_api_shapes(self):
         client = RecordingMicroVM()

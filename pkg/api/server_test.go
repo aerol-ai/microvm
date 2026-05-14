@@ -42,6 +42,20 @@ func TestRequireAuthCases(t *testing.T) {
 			body:          "not-json",
 			wantStatus:    http.StatusBadRequest,
 		},
+		{
+			name:          "daytona_snapshot_route_shares_auth_contract",
+			path:          "/daytona/sandbox/sb-1/snapshot",
+			authorization: "Bearer pat-token",
+			body:          "not-json",
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "v1_snapshot_route_shares_auth_contract",
+			path:          "/v1/sandboxes/sb-1/snapshot",
+			authorization: "Bearer pat-token",
+			body:          "not-json",
+			wantStatus:    http.StatusBadRequest,
+		},
 	}
 
 	for _, tc := range tests {
