@@ -116,6 +116,33 @@ public class MicroVMClient {
         return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class));
     }
 
+    public Sandbox create(Image image) {
+        return create(image, new CreateOptions());
+    }
+
+    public Sandbox create(Image image, CreateOptions options) {
+        CreateOptions resolved = copyCreateOptions(options);
+        resolved.setImage(buildImage(image));
+        return create(resolved);
+    }
+
+    public String buildImage(Image image) {
+        if (image == null) {
+            throw new MicroVMException("image is required");
+        }
+        String path = versioned("/images/build");
+        HttpResponse<byte[]> response = sendJsonRequest("POST", path, new BuildImageRequest(image.getDockerfile()));
+        if (response.statusCode() == 404) {
+            throw new MicroVMException(
+                "this daemon does not support Image builds (POST " + path
+                    + " is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon"
+            );
+        }
+        ensureSuccess(response);
+        BuildImageResponse payload = JsonSupport.read(response.body(), BuildImageResponse.class);
+        return payload == null || payload.image == null ? "" : payload.image;
+    }
+
     public List<Sandbox> list() {
         SandboxData[] response = doJson("GET", versioned("/sandboxes"), null, SandboxData[].class);
         if (response == null) {
@@ -241,6 +268,18 @@ public class MicroVMClient {
         CreateSnapshotRequest(String name) {
             this.name = name;
         }
+    }
+
+    static class BuildImageRequest {
+        public final String dockerfileContent;
+
+        BuildImageRequest(String dockerfileContent) {
+            this.dockerfileContent = dockerfileContent;
+        }
+    }
+
+    static class BuildImageResponse {
+        public String image;
     }
 
     public void reconcile() {
@@ -441,6 +480,29 @@ public class MicroVMClient {
 
     private Sandbox wrap(SandboxData data) {
         return new Sandbox(this, data);
+    }
+
+    private CreateOptions copyCreateOptions(CreateOptions source) {
+        CreateOptions copy = new CreateOptions();
+        if (source == null) {
+            return copy;
+        }
+        copy.image = source.image;
+        copy.cpu = source.cpu;
+        copy.memoryMb = source.memoryMb;
+        copy.diskGb = source.diskGb;
+        copy.env = source.env;
+        copy.osUser = source.osUser;
+        copy.networkBlockAll = source.networkBlockAll;
+        copy.networkBytesInLimit = source.networkBytesInLimit;
+        copy.networkBytesOutLimit = source.networkBytesOutLimit;
+        copy.registry = source.registry;
+        copy.containerCommand = source.containerCommand;
+        copy.mounts = source.mounts;
+        copy.lifecycle = source.lifecycle;
+        copy.runtime = source.runtime;
+        copy.gpus = source.gpus;
+        return copy;
     }
 
     private <T> T doJson(String method, String path, Object payload, Class<T> responseType) {

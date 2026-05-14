@@ -87,6 +87,31 @@ func (c *Client) Create(ctx context.Context, opts sdktypes.CreateSandboxOptions)
 	return wrapped, nil
 }
 
+// BuildImage compiles an Image builder into a content-addressed image tag via
+// POST /v1/images/build. Older daemons that do not register the route return a
+// tailored error telling the caller to fall back to a plain string image.
+func (c *Client) BuildImage(ctx context.Context, image *Image) (string, error) {
+	if image == nil {
+		return "", errors.New("image is nil")
+	}
+	if err := image.Err(); err != nil {
+		return "", err
+	}
+	return c.inner.BuildImage(ctx, image.Dockerfile())
+}
+
+// CreateWithImage builds an Image to a content-addressed tag, then creates the
+// sandbox using the resolved string image. This keeps CreateSandboxOptions
+// source-compatible with the server's request model.
+func (c *Client) CreateWithImage(ctx context.Context, image *Image, opts sdktypes.CreateSandboxOptions) (*Sandbox, error) {
+	tag, err := c.BuildImage(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	opts.Image = tag
+	return c.Create(ctx, opts)
+}
+
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
 	items, err := c.inner.List(ctx)
 	if err != nil {

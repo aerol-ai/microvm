@@ -81,6 +81,88 @@ func TestNewClientCases(t *testing.T) {
 			},
 		},
 		{
+			name: "create_with_image_builds_then_creates",
+			run: func(t *testing.T) {
+				var buildPayload struct {
+					DockerfileContent string `json:"dockerfile_content"`
+				}
+				var createPayload models.CreateSandboxRequest
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/v1/images/build":
+						if r.Method != http.MethodPost {
+							t.Fatalf("unexpected build request: %s %s", r.Method, r.URL.Path)
+						}
+						if err := json.NewDecoder(r.Body).Decode(&buildPayload); err != nil {
+							t.Fatalf("Decode(build) error = %v", err)
+						}
+						_ = json.NewEncoder(w).Encode(map[string]string{"image": "aerolvm-build/abc123:latest"})
+					case "/v1/sandboxes":
+						if r.Method != http.MethodPost {
+							t.Fatalf("unexpected create request: %s %s", r.Method, r.URL.Path)
+						}
+						if err := json.NewDecoder(r.Body).Decode(&createPayload); err != nil {
+							t.Fatalf("Decode(create) error = %v", err)
+						}
+						_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+							Sandbox: models.Sandbox{ID: "sb-from-image", Image: createPayload.Image, Status: models.SandboxStatusStarted},
+						})
+					default:
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+					PATToken: "config-pat",
+					APIUrl:   server.URL,
+				})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig() error = %v", err)
+				}
+
+				image := BaseImage("ubuntu:22.04").RunCommands("apt-get update", "apt-get install -y curl")
+				sandbox, err := client.CreateWithImage(ctx, image, sdktypes.CreateSandboxOptions{})
+				if err != nil {
+					t.Fatalf("CreateWithImage() error = %v", err)
+				}
+
+				if sandbox.ID != "sb-from-image" {
+					t.Fatalf("unexpected sandbox: %+v", sandbox)
+				}
+				if buildPayload.DockerfileContent != "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n" {
+					t.Fatalf("unexpected build payload: %+v", buildPayload)
+				}
+				if createPayload.Image != "aerolvm-build/abc123:latest" {
+					t.Fatalf("unexpected create payload image: %+v", createPayload)
+				}
+			},
+		},
+		{
+			name: "build_image_maps_404_to_actionable_error",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/plain")
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte("404 page not found\n"))
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+					PATToken: "config-pat",
+					APIUrl:   server.URL,
+				})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig() error = %v", err)
+				}
+
+				_, err = client.BuildImage(ctx, BaseImage("alpine"))
+				if err == nil || !strings.Contains(err.Error(), "does not support Image builds") || !strings.Contains(err.Error(), "string image reference") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			},
+		},
+		{
 			name: "new_client_requires_pat_token",
 			run: func(t *testing.T) {
 				t.Setenv("SB_PAT_TOKEN", "")

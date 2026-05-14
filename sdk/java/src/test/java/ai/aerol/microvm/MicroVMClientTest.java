@@ -45,6 +45,75 @@ import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 
 class MicroVMClientTest {
     @Test
+    void createWithImageBuildsThenCreatesSandbox() throws Exception {
+        AtomicReference<Map<String, Object>> buildPayload = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> createPayload = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("POST".equals(method) && "/v1/images/build".equals(path)) {
+                buildPayload.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("image", "aerolvm-build/abc123:latest"));
+                return;
+            }
+            if ("POST".equals(method) && "/v1/sandboxes".equals(path)) {
+                createPayload.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "id", "sb-from-image",
+                    "image", "aerolvm-build/abc123:latest",
+                    "status", "started",
+                    "public_url", "https://sb-from-image.example.com",
+                    "cpu", 2,
+                    "memory_mb", 2048,
+                    "disk_gb", 20,
+                    "os_user", "root",
+                    "network_block_all", false,
+                    "toolbox_enabled", true,
+                    "exposed_ports", List.of(),
+                    "created_at", "2026-05-07T10:00:00Z",
+                    "updated_at", "2026-05-07T10:00:00Z",
+                    "last_active_at", "2026-05-07T10:00:00Z"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = client.create(
+                Image.base("ubuntu:22.04").runCommands("apt-get update", "apt-get install -y curl"),
+                new CreateOptions()
+            );
+
+            assertEquals(
+                mapOf("dockerfile_content", "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n"),
+                buildPayload.get()
+            );
+            assertEquals("aerolvm-build/abc123:latest", createPayload.get().get("image"));
+            assertEquals("sb-from-image", sandbox.id);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void buildImageMaps404ToActionableError() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            writeResponse(exchange, 404, "text/plain", "404 page not found\n".getBytes(StandardCharsets.UTF_8));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException error = assertThrows(MicroVMException.class, () -> client.buildImage(Image.base("alpine")));
+            assertTrue(error.getMessage().contains("does not support Image builds"));
+            assertTrue(error.getMessage().contains("string image reference"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void newClientUsesEnvironmentConfig() throws Exception {
         AtomicReference<String> authorization = new AtomicReference<>();
         HttpServer server = startServer(exchange -> {

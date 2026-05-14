@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Optional, TypedDict
+from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, TypedDict, Union
+
+if TYPE_CHECKING:
+    from .image import Image
 
 
 MountType = Literal["s3", "nfs", "sshfs", "rclone"]
@@ -69,7 +72,7 @@ class GPUOptions(TypedDict, total=False):
 
 
 class CreateOptions(TypedDict, total=False):
-    image: str
+    image: Union[str, "Image"]
     # cpu accepts fractional cores: 0.5 = half a core, 1.5 = one and a half.
     cpu: float
     memoryMB: int

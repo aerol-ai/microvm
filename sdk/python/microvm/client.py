@@ -13,6 +13,7 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
+from .image import Image
 from .types import (
     CreateOptions,
     CreateSessionOptions,
@@ -59,6 +60,12 @@ def _read_env(name: str) -> Optional[str]:
 
 class MicroVMError(Exception):
     pass
+
+
+class MicroVMHTTPError(MicroVMError):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ExecStreamHandle:
@@ -391,8 +398,25 @@ class MicroVM:
         return f"{self._version_prefix}{suffix}"
 
     def create(self, options: CreateOptions) -> Sandbox:
-        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(options))
+        resolved_options = dict(options)
+        resolved_options["image"] = self._resolve_image(_first_of(options, "image"))
+        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
         return self._wrap_sandbox(sandbox)
+
+    def build_image(self, image: Image) -> str:
+        if not isinstance(image, Image):
+            raise TypeError("build_image expects an Image instance")
+        path = self._versioned("/images/build")
+        try:
+            payload = self._do_json("POST", path, {"dockerfile_content": image.dockerfile})
+        except MicroVMHTTPError as exc:
+            if exc.status_code == 404:
+                raise MicroVMError(
+                    f'this daemon does not support Image builds (POST {path} is not registered) — pass a string image reference (e.g. "ubuntu:22.04") instead, or upgrade the daemon'
+                ) from exc
+            raise
+        value = _first_of(payload, "image")
+        return str(value or "")
 
     def list(self) -> List[Sandbox]:
         sandboxes = self._do_json("GET", self._versioned("/sandboxes"), None)
@@ -548,6 +572,13 @@ class MicroVM:
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
+    def _resolve_image(self, image: Any) -> str:
+        if isinstance(image, Image):
+            return self.build_image(image)
+        if isinstance(image, str) and image.strip() != "":
+            return image
+        raise TypeError("CreateOptions.image must be a non-empty string or Image")
+
     def _wrap_sandbox(self, response: Dict[str, Any]) -> Sandbox:
         return Sandbox(self, _from_api_sandbox(response))
 
@@ -567,9 +598,9 @@ class MicroVM:
             payload = exc.read()
             try:
                 data = json.loads(payload.decode("utf-8"))
-                raise MicroVMError(str(data.get("error", exc.reason))) from exc
+                raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
             except (ValueError, TypeError):
-                raise MicroVMError(exc.reason) from exc
+                raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
         body = None

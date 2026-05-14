@@ -112,6 +112,55 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, stri
 	return c.wrap(response.Sandbox), response.SSHPrivateKey, nil
 }
 
+func (c *Client) BuildImage(ctx context.Context, dockerfile string) (string, error) {
+	type buildImageRequest struct {
+		DockerfileContent string `json:"dockerfile_content"`
+	}
+	type buildImageResponse struct {
+		Image string `json:"image"`
+	}
+
+	if strings.TrimSpace(dockerfile) == "" {
+		return "", errors.New("dockerfile_content is required")
+	}
+
+	encoded, err := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
+	if err != nil {
+		return "", err
+	}
+
+	path := c.versioned("/images/build")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(encoded))
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.addAuth(request)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, response.Body)
+		return "", fmt.Errorf(
+			"this daemon does not support Image builds (POST %s is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
+			path,
+		)
+	}
+	if response.StatusCode >= 400 {
+		return "", decodeError(response)
+	}
+
+	var payload buildImageResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	return payload.Image, nil
+}
+
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
 	var response []models.Sandbox
 	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes", nil, &response); err != nil {
