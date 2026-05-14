@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -1200,8 +1201,12 @@ func TestStoreHelperCases(t *testing.T) {
 			"{}",                        // tags_json
 			now, now, now,               // created_at, updated_at, last_active_at
 			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
-			"", // runtime
-			"", // gpus_json
+			"",                 // runtime
+			"",                 // gpus_json
+			int64(0), int64(0), // net_bytes_in, net_bytes_out
+			int64(0), int64(0), // net_bytes_in_limit, net_bytes_out_limit
+			0,              // net_quota_exceeded
+			sql.NullTime{}, // net_quota_exceeded_at
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

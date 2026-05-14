@@ -148,15 +148,15 @@ func TestGCZombieCaddyEntries(t *testing.T) {
 	fake.l4TLSRouteIDs["sandbox-abc-port-6379-tls"] = struct{}{}
 
 	// Zombies that must be deleted.
-	fake.httpRouteIDs["sandbox-ded"] = struct{}{}                       // destroyed sandbox
-	fake.httpRouteIDs["sandbox-ghost-port-8080"] = struct{}{}           // sandbox row no longer in DB
-	fake.l4TCPServerIDs["tcp-port-39999"] = struct{}{}                  // host port reservation lost
-	fake.l4TLSRouteIDs["sandbox-ded-port-6379-tls"] = struct{}{}        // destroyed sandbox's TLS route
-	fake.l4TLSRouteIDs["sandbox-ghost-port-1234-tls"] = struct{}{}      // unrelated TLS route
+	fake.httpRouteIDs["sandbox-ded"] = struct{}{}                  // destroyed sandbox
+	fake.httpRouteIDs["sandbox-ghost-port-8080"] = struct{}{}      // sandbox row no longer in DB
+	fake.l4TCPServerIDs["tcp-port-39999"] = struct{}{}             // host port reservation lost
+	fake.l4TLSRouteIDs["sandbox-ded-port-6379-tls"] = struct{}{}   // destroyed sandbox's TLS route
+	fake.l4TLSRouteIDs["sandbox-ghost-port-1234-tls"] = struct{}{} // unrelated TLS route
 
 	// Non-matching prefixes — must not be touched.
-	fake.httpRouteIDs["unrelated-route"] = struct{}{}                   // no "sandbox-" prefix
-	fake.l4TCPServerIDs["operator-managed-server"] = struct{}{}         // no "tcp-port-" prefix
+	fake.httpRouteIDs["unrelated-route"] = struct{}{}           // no "sandbox-" prefix
+	fake.l4TCPServerIDs["operator-managed-server"] = struct{}{} // no "tcp-port-" prefix
 
 	server := httptest.NewServer(fake.handler(t))
 	t.Cleanup(server.Close)

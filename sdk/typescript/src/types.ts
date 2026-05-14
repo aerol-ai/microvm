@@ -78,6 +78,19 @@ export interface CreateOptions {
   env?: Record<string, string>;
   osUser?: string;
   networkBlockAll?: boolean;
+  /**
+   * Cap on bytes the sandbox may receive from outside the container before its
+   * ingress is dropped via per-IP iptables rule. `0` (default) is unlimited.
+   * Limits can be raised or lifted at runtime via `setNetworkLimits`.
+   */
+  networkBytesInLimit?: number;
+  /**
+   * Cap on bytes the sandbox may send to outside the container before its
+   * egress is dropped. `0` (default) is unlimited. The block reuses the same
+   * iptables row as `networkBlockAll`; clearing the quota does not lift an
+   * operator-set blanket egress block.
+   */
+  networkBytesOutLimit?: number;
   registry?: RegistryAuth;
   containerCommand?: string[];
   mounts?: MountSpec[];
@@ -206,6 +219,30 @@ export interface Sandbox {
   runtime: "" | "docker" | "gvisor" | "kata";
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
+}
+
+/**
+ * Per-sandbox network byte counters and the configured caps that drive the
+ * quota enforcer. `bytesIn` is traffic the container received (ingress);
+ * `bytesOut` is traffic the container sent (egress). A `*Limit` of `0` means
+ * unlimited. `quotaExceeded` flips true the first time the meter crosses
+ * either configured cap and stays true until the operator raises the limit.
+ */
+export interface NetworkUsage {
+  sandboxID: string;
+  bytesIn: number;
+  bytesOut: number;
+  bytesInLimit: number;
+  bytesOutLimit: number;
+  quotaExceeded: boolean;
+  quotaExceededAt?: string;
+  lastSampledAt: string;
+}
+
+export interface SetNetworkLimitsOptions {
+  /** Omit (undefined) to leave unchanged. `0` means unlimited. */
+  networkBytesInLimit?: number;
+  networkBytesOutLimit?: number;
 }
 
 export interface ExecRequest {

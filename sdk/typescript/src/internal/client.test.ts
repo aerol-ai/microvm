@@ -500,6 +500,73 @@ test("internal client create defaults runtime to '' when sandboxd omits the fiel
   assert.equal(sandbox.runtime, "");
 });
 
+test("internal client getNetworkUsage maps response shape", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        sandbox_id: "sb-net",
+        bytes_in: 1024,
+        bytes_out: 2048,
+        bytes_in_limit: 4096,
+        bytes_out_limit: 0,
+        quota_exceeded: false,
+        quota_exceeded_at: null,
+        last_sampled_at: "2026-05-15T10:00:00Z",
+      });
+    },
+  });
+
+  const usage = await client.getNetworkUsage("sb-net");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-net/network/usage"));
+  assert.deepEqual(usage, {
+    sandboxID: "sb-net",
+    bytesIn: 1024,
+    bytesOut: 2048,
+    bytesInLimit: 4096,
+    bytesOutLimit: 0,
+    quotaExceeded: false,
+    quotaExceededAt: undefined,
+    lastSampledAt: "2026-05-15T10:00:00Z",
+  });
+});
+
+test("internal client setNetworkLimits sends PATCH with provided fields only", async () => {
+  let seenRequest: Request | undefined;
+  let seenBody: unknown;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      seenBody = await seenRequest.clone().json();
+      return jsonResponse({
+        sandbox_id: "sb-net",
+        bytes_in: 0,
+        bytes_out: 0,
+        bytes_in_limit: 4096,
+        bytes_out_limit: 0,
+        quota_exceeded: false,
+        quota_exceeded_at: null,
+        last_sampled_at: "2026-05-15T10:01:00Z",
+      });
+    },
+  });
+
+  const usage = await client.setNetworkLimits("sb-net", { networkBytesInLimit: 4096 });
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "PATCH");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-net/network/limits"));
+  // Unset egress limit must be omitted entirely so the server reads "leave alone".
+  assert.deepEqual(seenBody, { network_bytes_in_limit: 4096 });
+  assert.equal(usage.bytesInLimit, 4096);
+});
+
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,

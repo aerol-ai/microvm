@@ -19,6 +19,8 @@ fn main() {
             env: None,
             os_user: None,
             network_block_all: None,
+            network_bytes_in_limit: None,
+            network_bytes_out_limit: None,
             registry: None,
             container_command: None,
             mounts: None,

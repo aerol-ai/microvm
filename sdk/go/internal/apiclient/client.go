@@ -193,6 +193,22 @@ func (c *Client) Mounts(ctx context.Context, id string) ([]models.MountSpecRedac
 	return response.Mounts, nil
 }
 
+func (c *Client) GetNetworkUsage(ctx context.Context, id string) (models.NetworkUsage, error) {
+	var response models.NetworkUsage
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/network/usage", nil, &response); err != nil {
+		return models.NetworkUsage{}, err
+	}
+	return response, nil
+}
+
+func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models.UpdateNetworkLimitsRequest) (models.NetworkUsage, error) {
+	var response models.NetworkUsage
+	if err := c.doJSON(ctx, http.MethodPatch, c.versionPrefix+"/sandboxes/"+id+"/network/limits", request, &response); err != nil {
+		return models.NetworkUsage{}, err
+	}
+	return response, nil
+}
+
 func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (ExecResult, error) {
 	var response ExecResult
 	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/toolbox/process/execute", request, &response)

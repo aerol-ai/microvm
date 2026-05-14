@@ -36,11 +36,13 @@ import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpecRedacted;
+import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.ResizeOptions;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
+import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
@@ -156,6 +158,14 @@ public class MicroVMClient {
             return Collections.emptyList();
         }
         return response.mounts;
+    }
+
+    public NetworkUsage getNetworkUsage(String sandboxId) {
+        return doJson("GET", sandboxPath(sandboxId) + "/network/usage", null, NetworkUsage.class);
+    }
+
+    public NetworkUsage setNetworkLimits(String sandboxId, SetNetworkLimitsOptions options) {
+        return doJson("PATCH", sandboxPath(sandboxId) + "/network/limits", options, NetworkUsage.class);
     }
 
     public ExecResult exec(String sandboxId, ExecRequest request) {

@@ -81,6 +81,12 @@ func Open(path string) (*Store, error) {
 			destroy_at_age_ns INTEGER NOT NULL DEFAULT 0,
 			runtime TEXT NOT NULL DEFAULT '',
 			gpus_json TEXT NOT NULL DEFAULT '',
+			net_bytes_in INTEGER NOT NULL DEFAULT 0,
+			net_bytes_out INTEGER NOT NULL DEFAULT 0,
+			net_bytes_in_limit INTEGER NOT NULL DEFAULT 0,
+			net_bytes_out_limit INTEGER NOT NULL DEFAULT 0,
+			net_quota_exceeded INTEGER NOT NULL DEFAULT 0,
+			net_quota_exceeded_at DATETIME,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			last_active_at DATETIME NOT NULL
@@ -179,6 +185,26 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
+	// Additive migrations for sandboxes columns introduced after the original
+	// schema landed. Each ALTER TABLE is run unconditionally; SQLite returns
+	// "duplicate column name" when the column already exists, which we
+	// swallow so cold installs (where CREATE TABLE above already includes
+	// the column) and warm upgrades (where the column is new) both succeed.
+	migrations := []string{
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in_limit INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out_limit INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_quota_exceeded INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_quota_exceeded_at DATETIME;`,
+	}
+	for _, stmt := range migrations {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
+		}
+	}
+
 	// Partial unique index on host_port (only enforced when host_port > 0).
 	// This is the load-bearing primitive of the random-first allocator: two
 	// concurrent ExposePort calls race to INSERT a host_port row, and only
@@ -251,8 +277,10 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -282,6 +310,12 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
 		gpusJSON,
+		sandbox.NetworkBytesIn,
+		sandbox.NetworkBytesOut,
+		sandbox.NetworkBytesInLimit,
+		sandbox.NetworkBytesOutLimit,
+		boolToInt(sandbox.NetworkQuotaExceeded),
+		nullableTime(sandbox.NetworkQuotaExceededAt),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -319,8 +353,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -347,7 +383,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			stop_at_age_ns = excluded.stop_at_age_ns,
 			destroy_at_age_ns = excluded.destroy_at_age_ns,
 			runtime = excluded.runtime,
-			gpus_json = excluded.gpus_json
+			gpus_json = excluded.gpus_json,
+			net_bytes_in_limit = excluded.net_bytes_in_limit,
+			net_bytes_out_limit = excluded.net_bytes_out_limit
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -377,6 +415,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
 		gpusJSON,
+		sandbox.NetworkBytesIn,
+		sandbox.NetworkBytesOut,
+		sandbox.NetworkBytesInLimit,
+		sandbox.NetworkBytesOutLimit,
+		boolToInt(sandbox.NetworkQuotaExceeded),
+		nullableTime(sandbox.NetworkQuotaExceededAt),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -393,7 +437,9 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -421,7 +467,9 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -566,6 +614,101 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 	)
 	if err != nil {
 		return fmt.Errorf("update sandbox lifecycle: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateSandboxNetCounters bumps the cumulative ingress/egress counters by
+// the given deltas. Both values are non-negative byte counts measured since
+// the last sample. Concurrent calls are serialized by SQLite's single
+// writer, and the UPDATE is atomic so a failed sample never partially
+// applies. Returns ErrNotFound if the sandbox row was deleted between the
+// poller's snapshot and this write — the netstats poller treats that as a
+// cleanup signal and drops the in-memory baseline.
+func (s *Store) UpdateSandboxNetCounters(ctx context.Context, id string, deltaIn, deltaOut int64) error {
+	if deltaIn < 0 || deltaOut < 0 {
+		return fmt.Errorf("net counter deltas must be non-negative (in=%d out=%d)", deltaIn, deltaOut)
+	}
+	if deltaIn == 0 && deltaOut == 0 {
+		return nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_bytes_in = net_bytes_in + ?,
+		    net_bytes_out = net_bytes_out + ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, deltaIn, deltaOut, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update sandbox net counters: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetNetworkLimits replaces the per-sandbox network byte caps. Zero means
+// unlimited; negative values are rejected. The handler validates first so
+// the store does not re-validate. Returns ErrNotFound if no row matches id.
+func (s *Store) SetNetworkLimits(ctx context.Context, id string, bytesInLimit, bytesOutLimit int64) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_bytes_in_limit = ?,
+		    net_bytes_out_limit = ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, bytesInLimit, bytesOutLimit, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set sandbox net limits: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkNetworkQuotaExceeded flips the flag on. detectedAt records when the
+// crossover was first observed so the API can surface it to the SDK. Calls
+// when already-exceeded preserve the original detectedAt — the trigger time
+// is the interesting one, not the most recent re-observation.
+func (s *Store) MarkNetworkQuotaExceeded(ctx context.Context, id string, detectedAt time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_quota_exceeded = 1,
+		    net_quota_exceeded_at = COALESCE(net_quota_exceeded_at, ?),
+		    updated_at = ?
+		WHERE id = ?
+	`, detectedAt.UTC(), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("mark sandbox network quota exceeded: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearNetworkQuotaExceeded resets the flag and the detection timestamp.
+// Used when an operator raises the limit (or sets it to unlimited) and the
+// counter is no longer over the new ceiling.
+func (s *Store) ClearNetworkQuotaExceeded(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_quota_exceeded = 0,
+		    net_quota_exceeded_at = NULL,
+		    updated_at = ?
+		WHERE id = ?
+	`, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("clear sandbox network quota exceeded: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -1266,6 +1409,8 @@ func scanSandbox(scanner interface {
 	var tagsJSON string
 	var gpusJSON string
 	var stopIfIdleNs, destroyIfIdleNs, stopAtAgeNs, destroyAtAgeNs int64
+	var netQuotaExceeded int
+	var netQuotaExceededAt sql.NullTime
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -1296,9 +1441,20 @@ func scanSandbox(scanner interface {
 		&destroyAtAgeNs,
 		&sandbox.Runtime,
 		&gpusJSON,
+		&sandbox.NetworkBytesIn,
+		&sandbox.NetworkBytesOut,
+		&sandbox.NetworkBytesInLimit,
+		&sandbox.NetworkBytesOutLimit,
+		&netQuotaExceeded,
+		&netQuotaExceededAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
+	if netQuotaExceededAt.Valid {
+		t := netQuotaExceededAt.Time.UTC()
+		sandbox.NetworkQuotaExceededAt = &t
 	}
 
 	if envJSON != "" {
@@ -1450,6 +1606,17 @@ func marshalGPUs(g *models.GPURequest) (string, error) {
 		return "", fmt.Errorf("marshal gpus: %w", err)
 	}
 	return string(encoded), nil
+}
+
+// nullableTime maps a *time.Time to a sql.NullTime so a nil pointer becomes
+// NULL on disk. Used by columns where "absent" is a meaningful state distinct
+// from the zero time (e.g. net_quota_exceeded_at — sandboxes under quota
+// have NULL, not 0001-01-01).
+func nullableTime(t *time.Time) sql.NullTime {
+	if t == nil || t.IsZero() {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: t.UTC(), Valid: true}
 }
 
 func boolToInt(value bool) int {

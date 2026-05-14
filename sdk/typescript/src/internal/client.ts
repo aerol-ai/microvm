@@ -18,6 +18,8 @@ import type {
   Lifecycle,
   MountSpec,
   MountSpecRedacted,
+  NetworkUsage,
+  SetNetworkLimitsOptions,
   ResizeOptions,
   Sandbox,
   SandboxSnapshot,
@@ -169,6 +171,17 @@ interface ApiMountSpecRedacted {
 
 interface ApiMountList {
   mounts: ApiMountSpecRedacted[];
+}
+
+interface ApiNetworkUsage {
+  sandbox_id: string;
+  bytes_in: number;
+  bytes_out: number;
+  bytes_in_limit: number;
+  bytes_out_limit: number;
+  quota_exceeded: boolean;
+  quota_exceeded_at?: string;
+  last_sampled_at: string;
 }
 
 export class APIClient {
@@ -349,6 +362,20 @@ export class APIClient {
     return response.mounts.map(fromApiMountSpecRedacted);
   }
 
+  async getNetworkUsage(id: string): Promise<NetworkUsage> {
+    const response = await this.doJSON<ApiNetworkUsage>("GET", `${this.versionPrefix}/sandboxes/${id}/network/usage`);
+    return fromApiNetworkUsage(response);
+  }
+
+  async setNetworkLimits(id: string, options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
+    const response = await this.doJSON<ApiNetworkUsage>(
+      "PATCH",
+      `${this.versionPrefix}/sandboxes/${id}/network/limits`,
+      toApiSetNetworkLimitsOptions(options),
+    );
+    return fromApiNetworkUsage(response);
+  }
+
   private wrap(sandbox: ApiSandbox): SandboxResource {
     return new SandboxResource(this, fromApiSandbox(sandbox));
   }
@@ -523,6 +550,14 @@ export class SandboxResource implements Sandbox {
     return this;
   }
 
+  async getNetworkUsage(): Promise<NetworkUsage> {
+    return this.client.getNetworkUsage(this.id);
+  }
+
+  async setNetworkLimits(options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
+    return this.client.setNetworkLimits(this.id, options);
+  }
+
   toJSON(): Sandbox {
     return cloneSandbox(this);
   }
@@ -541,6 +576,8 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     env: options.env,
     os_user: options.osUser,
     network_block_all: options.networkBlockAll,
+    network_bytes_in_limit: options.networkBytesInLimit,
+    network_bytes_out_limit: options.networkBytesOutLimit,
     registry: options.registry,
     container_command: options.containerCommand,
     mounts: options.mounts?.map(toApiMountSpec),
@@ -725,6 +762,26 @@ function fromApiMountSpecRedacted(mount: ApiMountSpecRedacted): MountSpecRedacte
     options: mount.options,
     readOnly: mount.read_only ?? false,
     hasCredentials: mount.has_credentials,
+  };
+}
+
+function fromApiNetworkUsage(usage: ApiNetworkUsage): NetworkUsage {
+  return {
+    sandboxID: usage.sandbox_id,
+    bytesIn: usage.bytes_in,
+    bytesOut: usage.bytes_out,
+    bytesInLimit: usage.bytes_in_limit,
+    bytesOutLimit: usage.bytes_out_limit,
+    quotaExceeded: usage.quota_exceeded,
+    quotaExceededAt: usage.quota_exceeded_at ?? undefined,
+    lastSampledAt: usage.last_sampled_at,
+  };
+}
+
+function toApiSetNetworkLimitsOptions(options: SetNetworkLimitsOptions): Record<string, unknown> {
+  return {
+    network_bytes_in_limit: options.networkBytesInLimit,
+    network_bytes_out_limit: options.networkBytesOutLimit,
   };
 }
 

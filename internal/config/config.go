@@ -52,6 +52,7 @@ type Config struct {
 	DockerRuntimeWaitTimeout    time.Duration
 	ToolboxWaitTimeout          time.Duration
 	ReconcileInterval           time.Duration
+	NetstatsPollInterval        time.Duration
 	UploadMaxBytes              int64
 
 	// Admission control. Admission is purely resource-math: CPU/memory
@@ -147,6 +148,7 @@ func Load() (Config, error) {
 		DockerRuntimeWaitTimeout:    getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
 		ToolboxWaitTimeout:          getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
 		ReconcileInterval:           getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
+		NetstatsPollInterval:        getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:              int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),

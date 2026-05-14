@@ -164,9 +164,11 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 
 // parseSSHUser splits the SSH username into (sandbox_id, mode, name).
 // Forms:
-//   "<id>"           → mode="session", name="default"
-//   "<id>+<name>"    → mode="session", name=<name>
-//   "<id>+exec"      → mode="exec" (legacy one-shot via docker exec)
+//
+//	"<id>"           → mode="session", name="default"
+//	"<id>+<name>"    → mode="session", name=<name>
+//	"<id>+exec"      → mode="exec" (legacy one-shot via docker exec)
+//
 // Returns ok=false if the input is empty.
 func parseSSHUser(raw string) (sandboxID, mode, name string, ok bool) {
 	raw = strings.TrimSpace(raw)

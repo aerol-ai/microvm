@@ -119,6 +119,12 @@ func main() {
 	if err := svc.EnsureLayer4Ready(ctx); err != nil {
 		logger.Warn("failed to ensure caddy layer4 app at startup; will retry on first L4 exposure", "error", err)
 	}
+	// Bootstrap the netstats poller at boot so the first /network/usage call
+	// doesn't pay for it. Best-effort by design — failure here just means
+	// counters stay at zero until the next attempt at lazy bootstrap.
+	if err := svc.EnsureNetstatsReady(ctx); err != nil {
+		logger.Warn("failed to start netstats poller at startup", "error", err)
+	}
 	svc.ReplayReservations(ctx)
 
 	if cfg.AutoReconcile {

@@ -36,10 +36,12 @@ import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 import ai.aerol.microvm.model.MountSpecRedacted;
+import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
+import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 
 class MicroVMClientTest {
     @Test
@@ -301,6 +303,62 @@ class MicroVMClientTest {
             assertEquals(99, session.bytes);
             assertArrayEquals("session log".getBytes(StandardCharsets.UTF_8), log);
             assertArrayEquals("{\"version\":2}".getBytes(StandardCharsets.UTF_8), recording);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void networkUsageAndLimitsMapApiShapes() throws Exception {
+        AtomicReference<Map<String, Object>> patchBody = new AtomicReference<>();
+        AtomicReference<String> patchMethod = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("GET".equals(method) && "/v1/sandboxes/sb-1/network/usage".equals(path)) {
+                writeJson(exchange, 200, mapOf(
+                    "sandbox_id", "sb-1",
+                    "bytes_in", 1024,
+                    "bytes_out", 2048,
+                    "bytes_in_limit", 1048576,
+                    "bytes_out_limit", 0,
+                    "quota_exceeded", false,
+                    "last_sampled_at", "2026-05-15T10:00:00Z"
+                ));
+                return;
+            }
+            if ("PATCH".equals(method) && "/v1/sandboxes/sb-1/network/limits".equals(path)) {
+                patchMethod.set(method);
+                patchBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "sandbox_id", "sb-1",
+                    "bytes_in", 0,
+                    "bytes_out", 0,
+                    "bytes_in_limit", 4096,
+                    "bytes_out_limit", 0,
+                    "quota_exceeded", false,
+                    "last_sampled_at", "2026-05-15T10:00:00Z"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            NetworkUsage usage = client.getNetworkUsage("sb-1");
+            assertEquals("sb-1", usage.sandboxId);
+            assertEquals(1024, usage.bytesIn);
+            assertEquals(0, usage.bytesOutLimit);
+
+            NetworkUsage updated = client.setNetworkLimits(
+                "sb-1",
+                new SetNetworkLimitsOptions().setNetworkBytesInLimit(4096L)
+            );
+            assertEquals(4096, updated.bytesInLimit);
+            assertEquals("PATCH", patchMethod.get());
+            assertEquals(4096, ((Number) patchBody.get().get("network_bytes_in_limit")).longValue());
+            assertEquals(1, patchBody.get().size(), "unset fields should not be serialized");
         } finally {
             server.stop(0);
         }

@@ -26,11 +26,13 @@ from .types import (
     Lifecycle,
     MountSpec,
     MountSpecRedacted,
+    NetworkUsage,
     ResizeOptions,
     SandboxData,
     SandboxSnapshot,
     Session,
     SessionAttachOptions,
+    SetNetworkLimitsOptions,
 )
 
 STREAM_PREFIX_STDOUT = 0x01
@@ -342,6 +344,12 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
+    def get_network_usage(self) -> NetworkUsage:
+        return self._client.get_network_usage(self.id)
+
+    def set_network_limits(self, options: SetNetworkLimitsOptions) -> NetworkUsage:
+        return self._client.set_network_limits(self.id, options)
+
     @property
     def id(self) -> str:
         return str(self._data.get("id", ""))
@@ -429,6 +437,15 @@ class MicroVM:
         if not isinstance(mounts, list):
             return []
         return [_from_api_mount_spec_redacted(item) for item in mounts]
+
+    def get_network_usage(self, sandbox_id: str) -> NetworkUsage:
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)
+        return _from_api_network_usage(payload)
+
+    def set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions) -> NetworkUsage:
+        body = _to_api_set_network_limits_options(options)
+        payload = self._do_json("PATCH", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/limits", body)
+        return _from_api_network_usage(payload)
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
@@ -656,6 +673,8 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "env": _first_of(options, "env"),
             "os_user": _first_of(options, "osUser", "os_user"),
             "network_block_all": _first_of(options, "networkBlockAll", "network_block_all"),
+            "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
+            "network_bytes_out_limit": _first_of(options, "networkBytesOutLimit", "network_bytes_out_limit"),
             "registry": _first_of(options, "registry"),
             "container_command": _first_of(options, "containerCommand", "container_command"),
             "mounts": [_to_api_mount_spec(item) for item in (_first_of(options, "mounts") or [])],
@@ -784,6 +803,32 @@ def _to_api_mount_spec(mount: MountSpec) -> Dict[str, Any]:
             "read_only": _first_of(mount, "readOnly", "read_only"),
         }
     )
+
+
+def _to_api_set_network_limits_options(options: SetNetworkLimitsOptions) -> Dict[str, Any]:
+    # Omitted keys mean "leave unchanged" on the server. 0 means unlimited.
+    return _compact(
+        {
+            "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
+            "network_bytes_out_limit": _first_of(options, "networkBytesOutLimit", "network_bytes_out_limit"),
+        }
+    )
+
+
+def _from_api_network_usage(payload: Dict[str, Any]) -> NetworkUsage:
+    result: NetworkUsage = {
+        "sandboxID": str(_first_of(payload, "sandbox_id", "sandboxID") or ""),
+        "bytesIn": int(_first_of(payload, "bytes_in", "bytesIn") or 0),
+        "bytesOut": int(_first_of(payload, "bytes_out", "bytesOut") or 0),
+        "bytesInLimit": int(_first_of(payload, "bytes_in_limit", "bytesInLimit") or 0),
+        "bytesOutLimit": int(_first_of(payload, "bytes_out_limit", "bytesOutLimit") or 0),
+        "quotaExceeded": bool(_first_of(payload, "quota_exceeded", "quotaExceeded") or False),
+        "lastSampledAt": str(_first_of(payload, "last_sampled_at", "lastSampledAt") or ""),
+    }
+    quota_exceeded_at = _first_of(payload, "quota_exceeded_at", "quotaExceededAt")
+    if quota_exceeded_at not in (None, ""):
+        result["quotaExceededAt"] = str(quota_exceeded_at)
+    return result
 
 
 def _from_api_mount_spec_redacted(mount: Dict[str, Any]) -> MountSpecRedacted:

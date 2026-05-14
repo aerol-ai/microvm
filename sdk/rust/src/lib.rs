@@ -17,7 +17,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
-pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, ExposeOptions, ExposeProtocol, ExposeResult, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus, UpdateLifecycleOptions};
+pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, ExposeOptions, ExposeProtocol, ExposeResult, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus, SetNetworkLimitsOptions, UpdateLifecycleOptions};
 pub use types::CreateSandboxResponse;
 use types::ExposePortResponseWire;
 
@@ -390,6 +390,14 @@ impl Sandbox {
         self.data = updated.data;
         Ok(self)
     }
+
+    pub fn get_network_usage(&self) -> Result<NetworkUsage, Error> {
+        self.client.get_network_usage(&self.data.id)
+    }
+
+    pub fn set_network_limits(&self, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
+        self.client.set_network_limits(&self.data.id, opts)
+    }
 }
 
 impl Client {
@@ -498,6 +506,14 @@ impl Client {
 
         let raw = self.do_json::<(), MountList>(Method::GET, &format!("{}/sandboxes/{}/mounts", self.version_prefix(), id), None)?;
         Ok(raw.mounts)
+    }
+
+    pub fn get_network_usage(&self, id: &str) -> Result<NetworkUsage, Error> {
+        self.do_json::<(), NetworkUsage>(Method::GET, &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), id), None)
+    }
+
+    pub fn set_network_limits(&self, id: &str, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
+        self.do_json::<SetNetworkLimitsOptions, NetworkUsage>(Method::PATCH, &format!("{}/sandboxes/{}/network/limits", self.version_prefix(), id), Some(&opts))
     }
 
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
@@ -1073,6 +1089,8 @@ mod tests {
             env: None,
             os_user: None,
             network_block_all: None,
+            network_bytes_in_limit: None,
+            network_bytes_out_limit: None,
             registry: None,
             container_command: None,
             mounts: None,
@@ -1303,6 +1321,62 @@ mod tests {
                 has_credentials: true,
             }]
         );
+    }
+
+    #[test]
+    fn get_network_usage_maps_response_shape() {
+        let body = serde_json::json!({
+            "sandbox_id": "sb-1",
+            "bytes_in": 1024,
+            "bytes_out": 2048,
+            "bytes_in_limit": 1048576,
+            "bytes_out_limit": 0,
+            "quota_exceeded": false,
+            "last_sampled_at": "2026-05-15T10:00:00Z"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let usage = client.get_network_usage("sb-1").expect("get_network_usage should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/network/usage HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(usage.bytes_in, 1024);
+        assert_eq!(usage.bytes_out_limit, 0);
+        assert!(!usage.quota_exceeded);
+    }
+
+    #[test]
+    fn set_network_limits_sends_patch_with_provided_fields_only() {
+        let body = serde_json::json!({
+            "sandbox_id": "sb-1",
+            "bytes_in": 0,
+            "bytes_out": 0,
+            "bytes_in_limit": 4096,
+            "bytes_out_limit": 0,
+            "quota_exceeded": false,
+            "last_sampled_at": "2026-05-15T10:00:00Z"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let usage = client
+            .set_network_limits(
+                "sb-1",
+                SetNetworkLimitsOptions {
+                    network_bytes_in_limit: Some(4096),
+                    network_bytes_out_limit: None,
+                },
+            )
+            .expect("set_network_limits should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+
+        assert!(request.starts_with("PATCH /v1/sandboxes/sb-1/network/limits HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(body, serde_json::json!({"network_bytes_in_limit": 4096}));
+        assert_eq!(usage.bytes_in_limit, 4096);
     }
 
     #[test]

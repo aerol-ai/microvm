@@ -60,6 +60,27 @@ class RecordingMicroVM(MicroVM):
                 "source_sandbox_id": "sb-1",
                 "created_at": "2026-05-14T10:00:00Z",
             }
+        if method == "GET" and path == "/v1/sandboxes/sb-1/network/usage":
+            return {
+                "sandbox_id": "sb-1",
+                "bytes_in": 1024,
+                "bytes_out": 2048,
+                "bytes_in_limit": 1048576,
+                "bytes_out_limit": 0,
+                "quota_exceeded": False,
+                "last_sampled_at": "2026-05-15T10:00:00Z",
+            }
+        if method == "PATCH" and path == "/v1/sandboxes/sb-1/network/limits":
+            return {
+                "sandbox_id": "sb-1",
+                "bytes_in": 1024,
+                "bytes_out": 2048,
+                "bytes_in_limit": payload.get("network_bytes_in_limit", 0) if payload else 0,
+                "bytes_out_limit": payload.get("network_bytes_out_limit", 0) if payload else 0,
+                "quota_exceeded": False,
+                "quota_exceeded_at": "2026-05-15T09:00:00Z",
+                "last_sampled_at": "2026-05-15T10:00:00Z",
+            }
         if method == "GET" and path == "/v1/sandboxes/sb-1/mounts":
             return {
                 "mounts": [
@@ -368,6 +389,65 @@ class ClientTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_create_with_network_byte_limits_maps_snake_case_fields(self):
+        client = RecordingMicroVM()
+        client.create(
+            {
+                "image": "ubuntu:22.04",
+                "networkBytesInLimit": 1048576,
+                "networkBytesOutLimit": 524288,
+            }
+        )
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/sandboxes",
+                {
+                    "image": "ubuntu:22.04",
+                    "network_bytes_in_limit": 1048576,
+                    "network_bytes_out_limit": 524288,
+                    "mounts": [],
+                },
+            ),
+        )
+
+    def test_get_network_usage_maps_response_shape(self):
+        client = RecordingMicroVM()
+
+        usage = client.get_network_usage("sb-1")
+
+        self.assertEqual(client.calls[0], ("GET", "/v1/sandboxes/sb-1/network/usage", None))
+        self.assertEqual(
+            usage,
+            {
+                "sandboxID": "sb-1",
+                "bytesIn": 1024,
+                "bytesOut": 2048,
+                "bytesInLimit": 1048576,
+                "bytesOutLimit": 0,
+                "quotaExceeded": False,
+                "lastSampledAt": "2026-05-15T10:00:00Z",
+            },
+        )
+
+    def test_set_network_limits_sends_patch_and_returns_usage(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        usage = sandbox.set_network_limits({"networkBytesInLimit": 2097152})
+
+        self.assertEqual(
+            client.calls[1],
+            (
+                "PATCH",
+                "/v1/sandboxes/sb-1/network/limits",
+                {"network_bytes_in_limit": 2097152},
+            ),
+        )
+        self.assertEqual(usage["bytesInLimit"], 2097152)
+        self.assertEqual(usage["quotaExceededAt"], "2026-05-15T09:00:00Z")
 
     def test_exec_stream_sends_handshake_and_control_frames(self):
         stdout_chunks = []

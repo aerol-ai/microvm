@@ -138,6 +138,70 @@ func TestTransportClientCases(t *testing.T) {
 			},
 		},
 		{
+			name: "get_network_usage_returns_counters_and_limits",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet || r.URL.Path != "/v1/sandboxes/sb-net/network/usage" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					_ = json.NewEncoder(w).Encode(models.NetworkUsage{
+						SandboxID:     "sb-net",
+						BytesIn:       1024,
+						BytesOut:      2048,
+						BytesInLimit:  1 << 20,
+						BytesOutLimit: 0,
+						QuotaExceeded: false,
+						LastSampledAt: time.Now().UTC(),
+					})
+				}))
+				defer server.Close()
+
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				usage, err := client.GetNetworkUsage(ctx, "sb-net")
+				if err != nil {
+					t.Fatalf("GetNetworkUsage() error = %v", err)
+				}
+				if usage.BytesIn != 1024 || usage.BytesOutLimit != 0 || usage.QuotaExceeded {
+					t.Fatalf("unexpected usage: %+v", usage)
+				}
+			},
+		},
+		{
+			name: "set_network_limits_sends_patch_with_pointer_fields",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPatch || r.URL.Path != "/v1/sandboxes/sb-net/network/limits" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					var payload models.UpdateNetworkLimitsRequest
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatalf("Decode() error = %v", err)
+					}
+					if payload.NetworkBytesInLimit == nil || *payload.NetworkBytesInLimit != 4096 {
+						t.Fatalf("unexpected NetworkBytesInLimit: %+v", payload.NetworkBytesInLimit)
+					}
+					if payload.NetworkBytesOutLimit != nil {
+						t.Fatalf("expected NetworkBytesOutLimit nil; got %+v", payload.NetworkBytesOutLimit)
+					}
+					_ = json.NewEncoder(w).Encode(models.NetworkUsage{
+						SandboxID:    "sb-net",
+						BytesInLimit: 4096,
+					})
+				}))
+				defer server.Close()
+
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				inLimit := int64(4096)
+				usage, err := client.SetNetworkLimits(ctx, "sb-net", models.UpdateNetworkLimitsRequest{NetworkBytesInLimit: &inLimit})
+				if err != nil {
+					t.Fatalf("SetNetworkLimits() error = %v", err)
+				}
+				if usage.BytesInLimit != 4096 {
+					t.Fatalf("unexpected usage: %+v", usage)
+				}
+			},
+		},
+		{
 			name: "json_error_payload_is_decoded",
 			run: func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
