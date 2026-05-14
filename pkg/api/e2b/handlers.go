@@ -362,12 +362,7 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	h.snapshotMu.Lock()
 	defer h.snapshotMu.Unlock()
 
-	existedBefore, err := h.snapshotExistsForSandbox(r.Context(), snapshotName, sandbox.ID)
-	if err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	snapshot, err := h.deps.Service.CreateSnapshot(r.Context(), sandbox.ID, models.CreateSandboxSnapshotRequest{Name: snapshotName})
+	snapshot, createdSnapshot, err := h.deps.Service.CreateSnapshotWithOwnership(r.Context(), sandbox.ID, models.CreateSandboxSnapshotRequest{Name: snapshotName})
 	if err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
 			WriteError(w, http.StatusConflict, "Snapshot name already in use")
@@ -387,7 +382,7 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		Names:           resp.Names,
 		SourceSandboxID: sandbox.ID,
 	}); err != nil {
-		if !existedBefore {
+		if createdSnapshot {
 			if deleteErr := h.deps.Service.DeleteSnapshot(r.Context(), snapshot.Name); deleteErr != nil && h.deps.Logger != nil {
 				h.deps.Logger.Warn("e2b snapshot metadata rollback failed", "snapshot_name", snapshot.Name, "error", deleteErr)
 			}
@@ -703,6 +698,12 @@ func (h *handlers) waitForCreateReplay(ctx context.Context, fingerprint string) 
 		}
 
 		if record.State == models.E2BCreateRequestStateReady {
+			if record.ReplayUntil.IsZero() || !record.ReplayUntil.After(now) {
+				if err := h.deps.Service.DeleteE2BCreateRequest(ctx, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) {
+					return nil, sandboxMeta{}, false, err
+				}
+				return nil, sandboxMeta{}, false, nil
+			}
 			return h.loadReplayableCreateResult(ctx, record)
 		}
 		if record.State != models.E2BCreateRequestStatePending || !record.LockedUntil.After(now) {
@@ -724,17 +725,6 @@ func (h *handlers) waitForCreateReplay(ctx context.Context, fingerprint string) 
 		case <-timer.C:
 		}
 	}
-}
-
-func (h *handlers) snapshotExistsForSandbox(ctx context.Context, snapshotName, sandboxID string) (bool, error) {
-	snapshot, err := h.deps.Service.GetSnapshot(ctx, snapshotName)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return false, nil
-		}
-		return false, err
-	}
-	return snapshot.SourceSandboxID == sandboxID, nil
 }
 
 func (h *handlers) resolveSnapshotDeleteTarget(ctx context.Context, snapshotID string) (string, string, error) {

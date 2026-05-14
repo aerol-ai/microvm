@@ -242,6 +242,55 @@ func TestCreateSandboxIdempotentReplay(t *testing.T) {
 	}
 }
 
+func TestWaitForCreateReplayIgnoresExpiredReadyRecord(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newE2BHandlerTestEnv(t)
+	now := time.Now().UTC().Add(-time.Minute).Round(0)
+	fingerprint := "fp:expired-ready"
+	sandbox := &models.Sandbox{
+		ID:               "sb-expired-ready",
+		Image:            "ubuntu:22.04",
+		Status:           models.SandboxStatusStarted,
+		PublicURL:        "https://sb-expired-ready.example.com",
+		ContainerID:      "container-sb-expired-ready",
+		ContainerIP:      "10.0.0.10",
+		CPU:              2,
+		MemoryMB:         2048,
+		DiskGB:           20,
+		OSUser:           "root",
+		Env:              map[string]string{},
+		ToolboxEnabled:   true,
+		ContainerCommand: []string{"bash"},
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActiveAt:     now,
+		Runtime:          models.RuntimeGvisor,
+	}
+	if err := st.Create(ctx, sandbox); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, acquired, err := st.ClaimE2BCreateRequest(ctx, fingerprint, now, time.Second); err != nil {
+		t.Fatalf("ClaimE2BCreateRequest() error = %v", err)
+	} else if !acquired {
+		t.Fatal("expected initial create request claim to acquire")
+	}
+	if err := st.CompleteE2BCreateRequest(ctx, fingerprint, sandbox.ID, now, time.Second); err != nil {
+		t.Fatalf("CompleteE2BCreateRequest() error = %v", err)
+	}
+
+	h := newHandlers(Deps{Service: svc, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	_, _, replayed, err := h.waitForCreateReplay(ctx, fingerprint)
+	if err != nil {
+		t.Fatalf("waitForCreateReplay() error = %v", err)
+	}
+	if replayed {
+		t.Fatal("expected expired ready record not to replay")
+	}
+	if _, err := st.GetE2BCreateRequest(ctx, fingerprint); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected expired ready record to be cleared, got %v", err)
+	}
+}
+
 func TestCreateSnapshotWithoutNameIsIdempotent(t *testing.T) {
 	runtime := newFakeE2BRuntime()
 	_, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: 2280})

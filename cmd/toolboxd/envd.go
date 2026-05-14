@@ -25,6 +25,7 @@ import (
 const (
 	envdPrefix               = "/envd"
 	connectEnvelopeHeaderLen = 5
+	connectJSONMaxPayloadLen = 4 * 1024 * 1024
 	connectFlagEndStream     = 0x02
 	connectFlagCompressed    = 0x01
 	envdFileTypeFile         = "FILE_TYPE_FILE"
@@ -1119,23 +1120,29 @@ func uniqueEnvdSessionName(tag string) string {
 }
 
 func readConnectJSONRequest(r *http.Request, dst any) error {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
+	header := make([]byte, connectEnvelopeHeaderLen)
+	if _, err := io.ReadFull(r.Body, header); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return errors.New("invalid connect request envelope")
+		}
 		return err
 	}
-	if len(body) < connectEnvelopeHeaderLen {
-		return errors.New("invalid connect request envelope")
-	}
-	flags := body[0]
+	flags := header[0]
 	if flags&connectFlagCompressed != 0 {
 		return errors.New("compressed connect requests are not supported")
 	}
-	size := binary.BigEndian.Uint32(body[1:connectEnvelopeHeaderLen])
-	end := connectEnvelopeHeaderLen + int(size)
-	if end > len(body) {
-		return errors.New("truncated connect request envelope")
+	size := binary.BigEndian.Uint32(header[1:connectEnvelopeHeaderLen])
+	if size > connectJSONMaxPayloadLen {
+		return fmt.Errorf("connect request envelope exceeds %d bytes", connectJSONMaxPayloadLen)
 	}
-	if err := json.Unmarshal(body[connectEnvelopeHeaderLen:end], dst); err != nil {
+	payload := make([]byte, int(size))
+	if _, err := io.ReadFull(r.Body, payload); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return errors.New("truncated connect request envelope")
+		}
+		return err
+	}
+	if err := json.Unmarshal(payload, dst); err != nil {
 		return err
 	}
 	return nil

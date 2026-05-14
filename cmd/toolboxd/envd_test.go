@@ -227,6 +227,18 @@ func encodeConnectEnvelopeForTest(payload []byte) []byte {
 	return append(header, payload...)
 }
 
+func TestReadConnectJSONRequestRejectsOversizedEnvelope(t *testing.T) {
+	header := make([]byte, connectEnvelopeHeaderLen)
+	binary.BigEndian.PutUint32(header[1:], uint32(connectJSONMaxPayloadLen+1))
+	req := httptest.NewRequest(http.MethodPost, envdPrefix+"/processes/start", bytes.NewReader(header))
+
+	var dst envdStartRequest
+	err := readConnectJSONRequest(req, &dst)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("readConnectJSONRequest() error = %v, want oversized envelope error", err)
+	}
+}
+
 func basicUserHeaderForTest(username string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"))
 }

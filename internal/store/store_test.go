@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +18,6 @@ import (
 func TestStoreCases(t *testing.T) {
 	ctx := context.Background()
 
-	// 25 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -544,6 +545,15 @@ func TestStoreCases(t *testing.T) {
 					SourceSandboxID: "sb-1",
 					CreatedAt:       time.Now().UTC(),
 				}
+				if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
+					Name:            meta.SnapshotName,
+					Image:           meta.SnapshotName,
+					ImageID:         "sha256:e2b-snapshot",
+					SourceSandboxID: meta.SourceSandboxID,
+					CreatedAt:       meta.CreatedAt,
+				}); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
 				if err := st.UpsertE2BSnapshot(ctx, meta); err != nil {
 					t.Fatalf("UpsertE2BSnapshot() error = %v", err)
 				}
@@ -570,6 +580,37 @@ func TestStoreCases(t *testing.T) {
 				}
 				if _, err := st.GetE2BSnapshot(ctx, meta.SnapshotID); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+			},
+		},
+		{
+			name: "e2b_snapshot_metadata_cascades_with_native_snapshot_delete",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				meta := models.E2BSnapshotMetadata{
+					SnapshotID:      "snapshot-cascade:default",
+					SnapshotName:    "snapshot-cascade",
+					Names:           []string{"snapshot-cascade:default"},
+					SourceSandboxID: "sb-cascade",
+					CreatedAt:       time.Now().UTC(),
+				}
+				if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
+					Name:            meta.SnapshotName,
+					Image:           meta.SnapshotName,
+					ImageID:         "sha256:e2b-cascade",
+					SourceSandboxID: meta.SourceSandboxID,
+					CreatedAt:       meta.CreatedAt,
+				}); err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if err := st.UpsertE2BSnapshot(ctx, meta); err != nil {
+					t.Fatalf("UpsertE2BSnapshot() error = %v", err)
+				}
+				if err := st.DeleteSnapshot(ctx, meta.SnapshotName); err != nil {
+					t.Fatalf("DeleteSnapshot() error = %v", err)
+				}
+				if _, err := st.GetE2BSnapshot(ctx, meta.SnapshotID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected E2B snapshot metadata cascade delete, got %v", err)
 				}
 			},
 		},
@@ -633,6 +674,57 @@ func TestStoreCases(t *testing.T) {
 				}
 				if _, err := st.GetE2BCreateRequest(ctx, fingerprint); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+			},
+		},
+		{
+			name: "e2b_create_request_concurrent_claims_share_pending_record",
+			run: func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state.db")
+				const contenders = 6
+				stores := make([]*Store, 0, contenders)
+				for i := 0; i < contenders; i++ {
+					st, err := Open(path)
+					if err != nil {
+						t.Fatalf("Open(%d) error = %v", i, err)
+					}
+					defer st.Close()
+					stores = append(stores, st)
+				}
+
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				var mu sync.Mutex
+				var errs []error
+				acquiredCount := 0
+				for _, st := range stores {
+					wg.Add(1)
+					go func(st *Store) {
+						defer wg.Done()
+						<-start
+						record, acquired, err := st.ClaimE2BCreateRequest(ctx, "fp:concurrent", time.Now().UTC(), time.Minute)
+						mu.Lock()
+						defer mu.Unlock()
+						if err != nil {
+							errs = append(errs, err)
+							return
+						}
+						if record.State != models.E2BCreateRequestStatePending {
+							errs = append(errs, fmt.Errorf("record.State = %q, want %q", record.State, models.E2BCreateRequestStatePending))
+							return
+						}
+						if acquired {
+							acquiredCount++
+						}
+					}(st)
+				}
+				close(start)
+				wg.Wait()
+				if len(errs) > 0 {
+					t.Fatalf("concurrent ClaimE2BCreateRequest() errors = %v", errs)
+				}
+				if acquiredCount != 1 {
+					t.Fatalf("acquired claims = %d, want 1", acquiredCount)
 				}
 			},
 		},

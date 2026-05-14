@@ -121,11 +121,12 @@ func Open(path string) (*Store, error) {
 		);`,
 		`CREATE TABLE IF NOT EXISTS e2b_snapshots (
 			snapshot_id TEXT PRIMARY KEY,
-			snapshot_name TEXT NOT NULL,
+			snapshot_name TEXT NOT NULL UNIQUE,
 			names_json TEXT NOT NULL DEFAULT '[]',
 			source_sandbox_id TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL
+			updated_at DATETIME NOT NULL,
+			FOREIGN KEY (snapshot_name) REFERENCES sandbox_snapshots(name) ON DELETE CASCADE
 		);`,
 		`CREATE TABLE IF NOT EXISTS e2b_create_requests (
 			fingerprint TEXT PRIMARY KEY,
@@ -152,6 +153,7 @@ func Open(path string) (*Store, error) {
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
 		`CREATE INDEX IF NOT EXISTS idx_e2b_create_requests_replay_until ON e2b_create_requests(replay_until);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_e2b_snapshots_snapshot_name ON e2b_snapshots(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_e2b_snapshots_source_sandbox_id ON e2b_snapshots(source_sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
 	}
@@ -830,32 +832,42 @@ func (s *Store) ClaimE2BCreateRequest(ctx context.Context, fingerprint string, n
 	}
 	defer tx.Rollback()
 
-	record, err := scanE2BCreateRequestRecord(tx.QueryRowContext(ctx, `
+	record := &models.E2BCreateRequestRecord{
+		Fingerprint: trimmed,
+		State:       models.E2BCreateRequestStatePending,
+		LockedUntil: now.Add(pendingTTL),
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO e2b_create_requests (fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(fingerprint) DO NOTHING
+	`, record.Fingerprint, "", record.State, record.LockedUntil, nil, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return nil, false, fmt.Errorf("claim e2b create request: insert: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("claim e2b create request: inspect insert: %w", err)
+	}
+	if inserted > 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("claim e2b create request: commit insert: %w", err)
+		}
+		return record, true, nil
+	}
+
+	record, err = scanE2BCreateRequestRecord(tx.QueryRowContext(ctx, `
 		SELECT fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at
 		FROM e2b_create_requests
 		WHERE fingerprint = ?
 	`, trimmed))
 	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, false, fmt.Errorf("claim e2b create request: query: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, fmt.Errorf("claim e2b create request: missing row after insert conflict")
 		}
-		record = &models.E2BCreateRequestRecord{
-			Fingerprint: trimmed,
-			State:       models.E2BCreateRequestStatePending,
-			LockedUntil: now.Add(pendingTTL),
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO e2b_create_requests (fingerprint, sandbox_id, state, locked_until, replay_until, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, record.Fingerprint, "", record.State, record.LockedUntil, nil, record.CreatedAt, record.UpdatedAt); err != nil {
-			return nil, false, fmt.Errorf("claim e2b create request: insert: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, false, fmt.Errorf("claim e2b create request: commit insert: %w", err)
-		}
-		return record, true, nil
+		return nil, false, fmt.Errorf("claim e2b create request: query: %w", err)
 	}
 
 	if record.State == models.E2BCreateRequestStateReady && !record.ReplayUntil.IsZero() && record.ReplayUntil.After(now) && strings.TrimSpace(record.SandboxID) != "" {

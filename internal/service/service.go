@@ -492,9 +492,17 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 // name return the stored snapshot metadata, while a different sandbox trying
 // to claim the same name is rejected with a conflict.
 func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest) (*models.SandboxSnapshot, error) {
+	snapshot, _, err := s.CreateSnapshotWithOwnership(ctx, sandboxID, req)
+	return snapshot, err
+}
+
+// CreateSnapshotWithOwnership commits a sandbox image and reports whether this
+// call created the native snapshot row. Callers that add companion metadata can
+// use the flag to avoid rolling back a snapshot that already existed.
+func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest) (*models.SandboxSnapshot, bool, error) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
-		return nil, errors.New("snapshot name is required")
+		return nil, false, errors.New("snapshot name is required")
 	}
 
 	s.snapshotMu.Lock()
@@ -502,21 +510,21 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 
 	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
 		if existing.SourceSandboxID == sandboxID {
-			return existing, nil
+			return existing, false, nil
 		}
-		return nil, store.ErrSnapshotNameConflict
+		return nil, false, store.ErrSnapshotNameConflict
 	} else if !errors.Is(err, store.ErrNotFound) {
-		return nil, err
+		return nil, false, err
 	}
 
 	sandbox, err := s.store.Get(ctx, sandboxID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	imageID, err := s.docker.CreateSnapshot(ctx, sandboxContainerRef(sandbox), name)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	snapshot := &models.SandboxSnapshot{
@@ -530,12 +538,12 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
 			existing, getErr := s.store.GetSnapshot(ctx, name)
 			if getErr == nil && existing.SourceSandboxID == sandboxID {
-				return existing, nil
+				return existing, false, nil
 			}
 		}
-		return nil, err
+		return nil, false, err
 	}
-	return snapshot, nil
+	return snapshot, true, nil
 }
 
 func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.SandboxSnapshot, error) {

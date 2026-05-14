@@ -142,10 +142,16 @@ func waitForHTTP(t *testing.T, endpoint string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			t.Fatalf("timed out waiting for %s", endpoint)
 		}
-		resp, err := http.Get(endpoint)
+		attemptTimeout := 2 * time.Second
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+		client := http.Client{Timeout: attemptTimeout}
+		resp, err := client.Get(endpoint)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode < 500 {
