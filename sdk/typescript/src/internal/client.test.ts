@@ -28,7 +28,12 @@ test("internal client create maps request and response", async () => {
     patToken: "pat-token",
     fetch: async (input, init) => {
       seenRequest = new Request(input, init);
-      return jsonResponse(apiSandbox("sb-create"));
+      return jsonResponse(apiSandbox("sb-create", {
+        lifecycle: {
+          stop_if_idle_for: 3_600_000_000_000,
+          destroy_at_age: 86_400_000_000_000,
+        },
+      }));
     },
   });
 
