@@ -180,7 +180,7 @@ interface ApiNetworkUsage {
   bytes_in_limit: number;
   bytes_out_limit: number;
   quota_exceeded: boolean;
-  quota_exceeded_at?: string;
+  quota_exceeded_at?: string | null;
   last_sampled_at: string;
 }
 
