@@ -452,6 +452,60 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			// IDs and names share one lookup namespace. If a name can equal
+			// another sandbox's id, resolve-by-id wins forever and the named
+			// sandbox is shadowed. The store rejects that ambiguity directly.
+			name: "sandbox_name_cannot_match_existing_id",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				existing := sampleSandbox("claimed-name")
+				existing.Name = "unrelated"
+				if err := st.Create(ctx, existing); err != nil {
+					t.Fatalf("Create(existing) error = %v", err)
+				}
+
+				candidate := sampleSandbox("sb-name-vs-id")
+				candidate.Name = "claimed-name"
+				if err := st.Create(ctx, candidate); !errors.Is(err, ErrSandboxNameConflict) {
+					t.Fatalf("expected ErrSandboxNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			// The inverse matters too for callers that supply their own IDs:
+			// a new sandbox id must not steal an existing sandbox's name.
+			name: "sandbox_id_cannot_match_existing_name",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				existing := sampleSandbox("sb-existing-name-owner")
+				existing.Name = "reserved-lookup"
+				if err := st.Create(ctx, existing); err != nil {
+					t.Fatalf("Create(existing) error = %v", err)
+				}
+
+				candidate := sampleSandbox("reserved-lookup")
+				if err := st.Create(ctx, candidate); !errors.Is(err, ErrSandboxNameConflict) {
+					t.Fatalf("expected ErrSandboxNameConflict, got %v", err)
+				}
+			},
+		},
+		{
+			name: "upsert_name_cannot_match_existing_id",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				existing := sampleSandbox("upsert-claimed-name")
+				if err := st.Create(ctx, existing); err != nil {
+					t.Fatalf("Create(existing) error = %v", err)
+				}
+
+				candidate := sampleSandbox("sb-upsert-name-vs-id")
+				candidate.Name = "upsert-claimed-name"
+				if err := st.Upsert(ctx, candidate); !errors.Is(err, ErrSandboxNameConflict) {
+					t.Fatalf("expected ErrSandboxNameConflict, got %v", err)
+				}
+			},
+		},
+		{
 			// FK CASCADE on sandbox_compat_state means deleting the native
 			// sandbox row drops the Daytona compat blob too. ResolveSandboxIDByName
 			// then misses because the unique-name index lives on the native
@@ -1125,29 +1179,29 @@ func TestStoreHelperCases(t *testing.T) {
 	t.Run("scan_sandbox_invalid_env_json_returns_error", func(t *testing.T) {
 		now := time.Now()
 		row := sqlRowStub{values: []any{
-			"sb-bad",                       // id
-			"image",                        // image
-			models.SandboxStatusStarted,    // status
-			"https://example.com",          // public_url
-			"container",                    // container_id
-			"10.0.0.1",                     // container_ip
-			float64(1),                     // cpu
-			1024,                           // memory_mb
-			10,                             // disk_gb
-			"root",                         // os_user
-			"{bad json",                    // env_json — triggers the failure
-			0,                              // network_blocked
-			1,                              // toolbox_enabled
-			"",                             // toolbox_token
-			"",                             // ssh_public_key
-			"",                             // last_error
-			"[]",                           // container_command_json
-			"",                             // name
-			"{}",                           // tags_json
-			now, now, now,                  // created_at, updated_at, last_active_at
+			"sb-bad",                    // id
+			"image",                     // image
+			models.SandboxStatusStarted, // status
+			"https://example.com",       // public_url
+			"container",                 // container_id
+			"10.0.0.1",                  // container_ip
+			float64(1),                  // cpu
+			1024,                        // memory_mb
+			10,                          // disk_gb
+			"root",                      // os_user
+			"{bad json",                 // env_json — triggers the failure
+			0,                           // network_blocked
+			1,                           // toolbox_enabled
+			"",                          // toolbox_token
+			"",                          // ssh_public_key
+			"",                          // last_error
+			"[]",                        // container_command_json
+			"",                          // name
+			"{}",                        // tags_json
+			now, now, now,               // created_at, updated_at, last_active_at
 			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
-			"",                             // runtime
-			"",                             // gpus_json
+			"", // runtime
+			"", // gpus_json
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

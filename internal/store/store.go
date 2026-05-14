@@ -241,6 +241,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
@@ -281,7 +284,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		gpusJSON,
 	)
 	if err != nil {
-		if isSQLiteUniqueConstraint(err) && strings.TrimSpace(sandbox.Name) != "" {
+		if isSandboxNameConflict(err, sandbox.Name) {
 			return ErrSandboxNameConflict
 		}
 		return fmt.Errorf("insert sandbox: %w", err)
@@ -304,6 +307,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	}
 	tagsJSON, err := marshalJSON(sandbox.Tags, "{}")
 	if err != nil {
+		return err
+	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
 		return err
 	}
 
@@ -373,7 +379,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		gpusJSON,
 	)
 	if err != nil {
-		if isSQLiteUniqueConstraint(err) && strings.TrimSpace(sandbox.Name) != "" {
+		if isSandboxNameConflict(err, sandbox.Name) {
 			return ErrSandboxNameConflict
 		}
 		return fmt.Errorf("upsert sandbox: %w", err)
@@ -576,6 +582,44 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// ensureSandboxLookupNameAvailable keeps the user-facing sandbox lookup
+// namespace unambiguous. Handlers resolve by id first and name second, so a
+// name that equals another sandbox's id would otherwise be permanently
+// shadowed. The inverse is also rejected for caller-supplied ids.
+func (s *Store) ensureSandboxLookupNameAvailable(ctx context.Context, id, name string) error {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if name != "" {
+		var existingID string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sandboxes
+			WHERE id = ? AND id <> ?
+			LIMIT 1
+		`, name, id).Scan(&existingID)
+		if err == nil {
+			return ErrSandboxNameConflict
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check sandbox name against ids: %w", err)
+		}
+	}
+	if id != "" {
+		var existingID string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sandboxes
+			WHERE name = ? AND id <> ?
+			LIMIT 1
+		`, id, id).Scan(&existingID)
+		if err == nil {
+			return ErrSandboxNameConflict
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check sandbox id against names: %w", err)
+		}
 	}
 	return nil
 }
@@ -1423,12 +1467,19 @@ func isSQLiteUniqueConstraint(err error) bool {
 	return sqliteErr.Code == sqlite3.ErrConstraint && (sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique || sqliteErr.ExtendedCode == sqlite3.ErrConstraintPrimaryKey)
 }
 
+func isSandboxNameConflict(err error, name string) bool {
+	if strings.Contains(err.Error(), ErrSandboxNameConflict.Error()) {
+		return true
+	}
+	return strings.TrimSpace(name) != "" && isSQLiteUniqueConstraint(err)
+}
+
 var ErrNotFound = errors.New("sandbox not found")
 
 // ErrSandboxNameConflict is returned by Create/Upsert when the sandbox's
-// name collides with an existing row. Names are unique across the
-// sandboxes table; empty names skip the uniqueness check via the partial
-// unique index.
+// name collides with an existing row's name or id. Names are unique across
+// the sandboxes table; empty names skip the name uniqueness check but ids
+// still cannot collide with existing non-empty names.
 var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")

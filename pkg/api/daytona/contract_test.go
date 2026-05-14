@@ -71,6 +71,20 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 			},
 		},
 		{
+			name: "create_rejects_name_matching_existing_sandbox_id",
+			run: func(t *testing.T, env *daytonaContractEnv) {
+				env.seedSandbox(contractSandboxSeed{ID: "sb-shadow-owner", Name: "unrelated-shadow-owner"})
+
+				req := newGeneratedCreateRequest("ubuntu:22.04")
+				req.SetName("sb-shadow-owner")
+				_, httpResp, err := env.api.SandboxAPI.CreateSandbox(env.ctx).
+					CreateSandbox(*req).
+					Execute()
+
+				assertGeneratedAPIErrorStatus(t, httpResp, err, http.StatusConflict)
+			},
+		},
+		{
 			name: "create_with_labels_and_target",
 			run: func(t *testing.T, env *daytonaContractEnv) {
 				req := newGeneratedCreateRequest("python:3.12")

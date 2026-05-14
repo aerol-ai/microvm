@@ -396,19 +396,21 @@ The current implementation direction is correct:
 - Provider-specific model structs in `pkg/models/daytona.go` and
   `pkg/models/e2b.go` are removed from the shared model layer.
 
+Resolved in the current implementation:
+
+1. **Daytona name collision with sandbox IDs.** The store now rejects
+   cross-namespace ambiguity between `sandboxes.id` and non-empty
+   `sandboxes.name`, so a Daytona name cannot be shadowed by an unrelated
+   sandbox ID.
+
 Remaining fixes before this implementation should be considered complete:
 
-1. **Daytona name collision with sandbox IDs.** Moving names to
-   `sandboxes.name` removes the old Daytona-only name table, but the create
-   path must still reject a requested Daytona name that equals any existing
-   sandbox ID. Otherwise `resolveSandbox` resolves by ID first and a named
-   Daytona sandbox can be shadowed by an unrelated native sandbox.
-2. **E2B `allowInternetAccess` round-trip.** Since this field is now derived
+1. **E2B `allowInternetAccess` round-trip.** Since this field is now derived
    from `sandboxes.network_block_all`, derive both sides explicitly:
    `false` when `NetworkBlockAll` is true and `true` when it is false.
    If the API should omit `true`, call that out as an intentional facade
    behavior change and keep a compatibility test around it.
-3. **Native `/v1` exposure decision.** Adding `name` and `tags` to
+2. **Native `/v1` exposure decision.** Adding `name` and `tags` to
    `models.Sandbox` / `models.CreateSandboxRequest` means `/v1` accepts and
    returns them because v1 currently uses shared models as DTOs. During
    development this may be acceptable, but it should be an explicit decision.
