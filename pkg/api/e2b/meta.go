@@ -22,8 +22,18 @@ const (
 	e2bCreateWaitTimeout  = 30 * time.Second
 	e2bCreateReplayWindow = 10 * time.Second
 	e2bCreatePollInterval = 250 * time.Millisecond
+	// idempotencyScopeCreate is the scope string the generic
+	// request_idempotency table uses to namespace E2B create
+	// fingerprints. Pick a stable string — changing it would
+	// disconnect in-flight retries from their original claims.
+	idempotencyScopeCreate = "e2b.create"
 )
 
+// sandboxMeta is the in-memory shape the handlers use. Some fields are
+// derived from the native sandbox row (Metadata ← sandbox.Tags, the two
+// timeout fields ← sandbox.Lifecycle, AllowInternetAccess ← inverse of
+// sandbox.NetworkBlockAll); the rest are facade-private echo-back state
+// stored opaquely in sandbox_compat_state.state_json.
 type sandboxMeta struct {
 	TemplateID          string
 	TemplateAlias       string
@@ -39,71 +49,105 @@ type sandboxMeta struct {
 	MaskRequestHost     string
 }
 
+// compatBlob is the persisted JSON shape inside sandbox_compat_state.state_json
+// for the E2B facade. Only fields that have no native AerolVM equivalent
+// live here — Metadata, the timeout, and the internet-access flag are
+// derived from the native sandbox row on read.
+type compatBlob struct {
+	TemplateID         string   `json:"template_id,omitempty"`
+	TemplateAlias      string   `json:"template_alias,omitempty"`
+	OnTimeout          string   `json:"on_timeout,omitempty"`
+	AutoResume         bool     `json:"auto_resume,omitempty"`
+	Secure             bool     `json:"secure,omitempty"`
+	NetworkAllowOut    []string `json:"network_allow_out,omitempty"`
+	NetworkDenyOut     []string `json:"network_deny_out,omitempty"`
+	AllowPublicTraffic *bool    `json:"allow_public_traffic,omitempty"`
+	MaskRequestHost    string   `json:"mask_request_host,omitempty"`
+}
+
 func defaultSandboxMeta(sandbox *models.Sandbox) sandboxMeta {
+	return sandboxMetaFromNative(sandbox, compatBlob{Secure: true, OnTimeout: "kill"})
+}
+
+// sandboxMetaFromNative builds the in-memory meta by combining a native
+// sandbox row with the facade-private compat blob. Used on every read
+// path so the response shape is consistent whether or not a compat row
+// exists.
+func sandboxMetaFromNative(sandbox *models.Sandbox, blob compatBlob) sandboxMeta {
 	meta := sandboxMeta{
-		Metadata:        map[string]string{},
-		OnTimeout:       "kill",
-		Secure:          true,
-		NetworkAllowOut: []string{},
-		NetworkDenyOut:  []string{},
+		TemplateID:         strings.TrimSpace(blob.TemplateID),
+		TemplateAlias:      strings.TrimSpace(blob.TemplateAlias),
+		Metadata:           map[string]string{},
+		OnTimeout:          firstNonEmpty(blob.OnTimeout, "kill"),
+		AutoResume:         blob.AutoResume,
+		Secure:             blob.Secure,
+		NetworkAllowOut:    cloneStringSlice(blob.NetworkAllowOut),
+		NetworkDenyOut:     cloneStringSlice(blob.NetworkDenyOut),
+		AllowPublicTraffic: cloneBoolPtr(blob.AllowPublicTraffic),
+		MaskRequestHost:    strings.TrimSpace(blob.MaskRequestHost),
 	}
-	if sandbox == nil {
-		return meta
+	if meta.NetworkAllowOut == nil {
+		meta.NetworkAllowOut = []string{}
 	}
-	meta.TemplateID = strings.TrimSpace(sandbox.Image)
-	if sandbox.NetworkBlockAll {
-		allowInternet := false
-		meta.AllowInternetAccess = &allowInternet
+	if meta.NetworkDenyOut == nil {
+		meta.NetworkDenyOut = []string{}
 	}
-	if timeoutSeconds, onTimeout := deriveTimeoutConfig(sandbox); timeoutSeconds > 0 {
-		meta.TimeoutSeconds = timeoutSeconds
-		meta.OnTimeout = onTimeout
+	if sandbox != nil {
+		if meta.TemplateID == "" {
+			meta.TemplateID = strings.TrimSpace(sandbox.Image)
+		}
+		meta.Metadata = cloneStringMap(sandbox.Tags)
+		if meta.Metadata == nil {
+			meta.Metadata = map[string]string{}
+		}
+		if sandbox.NetworkBlockAll {
+			allow := false
+			meta.AllowInternetAccess = &allow
+		}
+		if timeoutSeconds, onTimeout := deriveTimeoutConfig(sandbox); timeoutSeconds > 0 {
+			meta.TimeoutSeconds = timeoutSeconds
+			if meta.OnTimeout == "" || meta.OnTimeout == "kill" {
+				meta.OnTimeout = onTimeout
+			}
+		}
 	}
 	return meta
 }
 
-func sandboxMetaFromStored(stored *models.E2BSandboxMetadata, sandbox *models.Sandbox) sandboxMeta {
-	meta := defaultSandboxMeta(sandbox)
-	if stored == nil {
-		return meta
+// sandboxMetaFromState unmarshals the compat blob and merges it with the
+// sandbox row.
+func sandboxMetaFromState(state *models.SandboxCompatState, sandbox *models.Sandbox) (sandboxMeta, error) {
+	if state == nil || strings.TrimSpace(state.StateJSON) == "" {
+		return sandboxMetaFromNative(sandbox, compatBlob{Secure: true, OnTimeout: "kill"}), nil
 	}
-	if trimmed := strings.TrimSpace(stored.TemplateID); trimmed != "" {
-		meta.TemplateID = trimmed
+	var blob compatBlob
+	if err := json.Unmarshal([]byte(state.StateJSON), &blob); err != nil {
+		return sandboxMeta{}, err
 	}
-	meta.TemplateAlias = strings.TrimSpace(stored.TemplateAlias)
-	meta.Metadata = cloneStringMap(stored.Metadata)
-	if stored.TimeoutSeconds > 0 {
-		meta.TimeoutSeconds = stored.TimeoutSeconds
-	}
-	if trimmed := strings.TrimSpace(stored.OnTimeout); trimmed != "" {
-		meta.OnTimeout = trimmed
-	}
-	meta.AutoResume = stored.AutoResume
-	meta.Secure = stored.Secure
-	meta.AllowInternetAccess = cloneBoolPtr(stored.AllowInternetAccess)
-	meta.NetworkAllowOut = cloneStringSlice(stored.NetworkAllowOut)
-	meta.NetworkDenyOut = cloneStringSlice(stored.NetworkDenyOut)
-	meta.AllowPublicTraffic = cloneBoolPtr(stored.AllowPublicTraffic)
-	meta.MaskRequestHost = strings.TrimSpace(stored.MaskRequestHost)
-	return meta
+	return sandboxMetaFromNative(sandbox, blob), nil
 }
 
-func sandboxMetaToStored(sandboxID string, meta sandboxMeta) models.E2BSandboxMetadata {
-	return models.E2BSandboxMetadata{
-		SandboxID:           strings.TrimSpace(sandboxID),
-		TemplateID:          strings.TrimSpace(meta.TemplateID),
-		TemplateAlias:       strings.TrimSpace(meta.TemplateAlias),
-		Metadata:            cloneStringMap(meta.Metadata),
-		TimeoutSeconds:      meta.TimeoutSeconds,
-		OnTimeout:           strings.TrimSpace(meta.OnTimeout),
-		AutoResume:          meta.AutoResume,
-		Secure:              meta.Secure,
-		AllowInternetAccess: cloneBoolPtr(meta.AllowInternetAccess),
-		NetworkAllowOut:     cloneStringSlice(meta.NetworkAllowOut),
-		NetworkDenyOut:      cloneStringSlice(meta.NetworkDenyOut),
-		AllowPublicTraffic:  cloneBoolPtr(meta.AllowPublicTraffic),
-		MaskRequestHost:     strings.TrimSpace(meta.MaskRequestHost),
+// sandboxMetaToState marshals just the facade-private bits into a JSON
+// string suitable for sandbox_compat_state.state_json. Native bits
+// (Metadata, TimeoutSeconds, AllowInternetAccess) are written through
+// the native sandbox row by CreateSandbox / UpdateLifecycle.
+func sandboxMetaToState(meta sandboxMeta) (string, error) {
+	blob := compatBlob{
+		TemplateID:         strings.TrimSpace(meta.TemplateID),
+		TemplateAlias:      strings.TrimSpace(meta.TemplateAlias),
+		OnTimeout:          firstNonEmpty(strings.TrimSpace(meta.OnTimeout), "kill"),
+		AutoResume:         meta.AutoResume,
+		Secure:             meta.Secure,
+		NetworkAllowOut:    cloneStringSlice(meta.NetworkAllowOut),
+		NetworkDenyOut:     cloneStringSlice(meta.NetworkDenyOut),
+		AllowPublicTraffic: cloneBoolPtr(meta.AllowPublicTraffic),
+		MaskRequestHost:    strings.TrimSpace(meta.MaskRequestHost),
 	}
+	encoded, err := json.Marshal(blob)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func deriveTimeoutConfig(sandbox *models.Sandbox) (int, string) {

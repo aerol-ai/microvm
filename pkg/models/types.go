@@ -234,6 +234,16 @@ type CreateSandboxRequest struct {
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Mounts           []MountSpec       `json:"mounts,omitempty"`
 	Lifecycle        *Lifecycle        `json:"lifecycle,omitempty"`
+	// Name is an optional human-readable identifier. When set, it must be
+	// unique across all sandboxes — the store enforces this with a partial
+	// unique index. Empty means no name; the sandbox can only be referenced
+	// by ID. The Daytona facade requires names; the native /v1 API and other
+	// facades may set or omit it.
+	Name string `json:"name,omitempty"`
+	// Tags is an optional free-form key/value map associated with the
+	// sandbox. Used by facades that expose label-style metadata (Daytona
+	// labels, E2B metadata).
+	Tags map[string]string `json:"tags,omitempty"`
 	// Runtime selects the container runtime for this sandbox. Empty falls back
 	// to the host default (SB_CONTAINER_RUNTIME). Allowed values: "docker"
 	// (standard runc-backed Docker runtime, default), "gvisor" (runsc-backed
@@ -275,6 +285,14 @@ type Sandbox struct {
 	LastError        string            `json:"last_error,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle         `json:"lifecycle"`
+	// Name is the optional unique identifier set at create time. Empty when
+	// the sandbox was created without one (the common path on /v1 today).
+	Name string `json:"name,omitempty"`
+	// Tags is the optional key/value bag set at create time. Facades use it
+	// for label-style metadata (Daytona labels, E2B metadata) but the field
+	// is facade-agnostic — anything that wants attribute-tagged sandboxes
+	// can write here.
+	Tags map[string]string `json:"tags,omitempty"`
 	// Runtime is the container runtime this sandbox uses (one of "docker",
 	// "gvisor", or "kata"). Pre-migration rows carry "" and resolve to the
 	// host default at start time; new sandboxes always store the resolved
@@ -397,4 +415,62 @@ type ExecResult struct {
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+// Facade names used by sandbox_compat_state, snapshot_aliases, and
+// request_idempotency. The string is the only thing persisted, so renaming
+// a facade later would require a one-shot UPDATE.
+const (
+	FacadeDaytona = "daytona"
+	FacadeE2B     = "e2b"
+)
+
+// SandboxCompatState carries facade-private state that has no native
+// meaning on its own — opaque wire-shape sugar like Daytona's `target` or
+// E2B's `template_id`. The store treats StateJSON as a byte string;
+// facades own the schema inside it.
+type SandboxCompatState struct {
+	SandboxID string
+	Facade    string
+	StateJSON string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// SnapshotAlias maps a facade-shaped alternate identifier (e.g. E2B's
+// base64-encoded `snapshot_*` token) onto a native sandbox_snapshots.name.
+// ExtraNames carries additional facade-visible names that point at the
+// same native snapshot.
+type SnapshotAlias struct {
+	Alias        string
+	SnapshotName string
+	Facade       string
+	ExtraNames   []string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// Idempotent-request states for request_idempotency.state. Pending means
+// a write is in flight and holds the row's lock; Ready means the write
+// completed and retries within ReplayUntil should replay TargetID instead
+// of running again.
+const (
+	RequestStatePending = "pending"
+	RequestStateReady   = "ready"
+)
+
+// IdempotentRequestRecord is the row shape for request_idempotency. Scope
+// is a facade-defined namespace string (e.g. "e2b.create") so the same
+// fingerprint hash can be reused across facades without collision. The
+// generic store helpers stay facade-agnostic — only the scope string says
+// which caller owns the row.
+type IdempotentRequestRecord struct {
+	Scope       string
+	Fingerprint string
+	TargetID    string
+	State       string
+	LockedUntil time.Time
+	ReplayUntil time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }

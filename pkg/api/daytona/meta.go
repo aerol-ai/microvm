@@ -1,6 +1,7 @@
 package daytona
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -9,6 +10,10 @@ import (
 
 var errNameConflict = errors.New("daytona sandbox name already in use")
 
+// sandboxMeta is the in-memory shape the handlers manipulate. Some fields
+// (Name, User, Labels, AutoStopInterval, AutoDeleteInterval) are derived
+// from the native sandbox row at read time; the rest are facade-private
+// echo-back state stored in sandbox_compat_state.state_json.
 type sandboxMeta struct {
 	Name                string
 	Snapshot            *string
@@ -21,52 +26,79 @@ type sandboxMeta struct {
 	AutoDeleteInterval  *float32
 }
 
+// compatBlob is the persisted JSON shape inside sandbox_compat_state.state_json
+// for the Daytona facade. Only fields that have no native AerolVM equivalent
+// live here — Name, Labels, User, and the auto-stop/destroy intervals are
+// derived from the sandbox row instead. AutoArchiveInterval has no native
+// equivalent (AerolVM has no archive concept) so it is stored opaquely.
+type compatBlob struct {
+	Snapshot            string  `json:"snapshot,omitempty"`
+	Target              string  `json:"target,omitempty"`
+	NetworkAllowList    string  `json:"network_allow_list,omitempty"`
+	AutoArchiveInterval float32 `json:"auto_archive_interval_minutes,omitempty"`
+}
+
 func defaultSandboxMeta(sandbox *models.Sandbox) sandboxMeta {
 	if sandbox == nil {
 		return sandboxMeta{Labels: map[string]string{}}
 	}
-	return sandboxMeta{
-		Name:   sandbox.ID,
-		User:   sandbox.OSUser,
-		Labels: map[string]string{},
-	}
+	return sandboxMetaFromNative(sandbox, compatBlob{})
 }
 
-func sandboxMetaFromStored(meta *models.DaytonaSandboxMetadata, sandbox *models.Sandbox) sandboxMeta {
-	if meta == nil {
-		return defaultSandboxMeta(sandbox)
+// sandboxMetaFromNative builds a sandboxMeta from the native sandbox row
+// plus the optional Daytona-private blob. Used by both the meta-present
+// and meta-absent code paths so derived fields are computed in one place.
+func sandboxMetaFromNative(sandbox *models.Sandbox, blob compatBlob) sandboxMeta {
+	meta := sandboxMeta{
+		Name:                firstNonEmpty(strings.TrimSpace(sandbox.Name), sandbox.ID),
+		Snapshot:            emptyStringToPtr(blob.Snapshot),
+		User:                strings.TrimSpace(sandbox.OSUser),
+		Labels:              cloneStringMap(sandbox.Tags),
+		Target:              strings.TrimSpace(blob.Target),
+		NetworkAllowList:    emptyStringToPtr(blob.NetworkAllowList),
+		AutoStopInterval:    durationMinutesPtr(sandbox.Lifecycle.StopIfIdleFor),
+		AutoArchiveInterval: nonZeroFloatPtr(blob.AutoArchiveInterval),
+		AutoDeleteInterval:  durationMinutesPtr(sandbox.Lifecycle.DestroyIfIdleFor),
 	}
-	fallback := defaultSandboxMeta(sandbox)
-	return sandboxMeta{
-		Name:                firstNonEmpty(strings.TrimSpace(meta.Name), fallback.Name),
-		Snapshot:            emptyStringToPtr(meta.Snapshot),
-		User:                firstNonEmpty(strings.TrimSpace(meta.User), fallback.User),
-		Labels:              cloneStringMap(meta.Labels),
+	if meta.Labels == nil {
+		meta.Labels = map[string]string{}
+	}
+	return meta
+}
+
+// sandboxMetaFromState rebuilds a sandboxMeta by unmarshalling the
+// compat blob and combining it with the native sandbox row. nil sandbox
+// would be a programming error — handlers always have one in hand.
+func sandboxMetaFromState(state *models.SandboxCompatState, sandbox *models.Sandbox) (sandboxMeta, error) {
+	if sandbox == nil {
+		return sandboxMeta{Labels: map[string]string{}}, nil
+	}
+	if state == nil || strings.TrimSpace(state.StateJSON) == "" {
+		return sandboxMetaFromNative(sandbox, compatBlob{}), nil
+	}
+	var blob compatBlob
+	if err := json.Unmarshal([]byte(state.StateJSON), &blob); err != nil {
+		return sandboxMeta{}, err
+	}
+	return sandboxMetaFromNative(sandbox, blob), nil
+}
+
+// sandboxMetaToState marshals just the facade-private bits into a JSON
+// string suitable for sandbox_compat_state.state_json. Native fields
+// (Name, Labels, User, lifecycle intervals) are written through the
+// native sandbox row instead.
+func sandboxMetaToState(meta sandboxMeta) (string, error) {
+	blob := compatBlob{
+		Snapshot:            strings.TrimSpace(valueOrEmpty(meta.Snapshot)),
 		Target:              strings.TrimSpace(meta.Target),
-		NetworkAllowList:    emptyStringToPtr(meta.NetworkAllowList),
-		AutoStopInterval:    cloneFloat32Ptr(meta.AutoStopIntervalMinutes),
-		AutoArchiveInterval: cloneFloat32Ptr(meta.AutoArchiveIntervalMinutes),
-		AutoDeleteInterval:  cloneFloat32Ptr(meta.AutoDeleteIntervalMinutes),
+		NetworkAllowList:    strings.TrimSpace(valueOrEmpty(meta.NetworkAllowList)),
+		AutoArchiveInterval: float32Value(meta.AutoArchiveInterval),
 	}
-}
-
-func sandboxMetaToStored(sandboxID string, meta sandboxMeta) models.DaytonaSandboxMetadata {
-	name := strings.TrimSpace(meta.Name)
-	if name == "" {
-		name = strings.TrimSpace(sandboxID)
+	encoded, err := json.Marshal(blob)
+	if err != nil {
+		return "", err
 	}
-	return models.DaytonaSandboxMetadata{
-		SandboxID:                  strings.TrimSpace(sandboxID),
-		Name:                       name,
-		Snapshot:                   strings.TrimSpace(valueOrEmpty(meta.Snapshot)),
-		User:                       strings.TrimSpace(meta.User),
-		Labels:                     cloneStringMap(meta.Labels),
-		Target:                     strings.TrimSpace(meta.Target),
-		NetworkAllowList:           strings.TrimSpace(valueOrEmpty(meta.NetworkAllowList)),
-		AutoStopIntervalMinutes:    cloneFloat32Ptr(meta.AutoStopInterval),
-		AutoArchiveIntervalMinutes: cloneFloat32Ptr(meta.AutoArchiveInterval),
-		AutoDeleteIntervalMinutes:  cloneFloat32Ptr(meta.AutoDeleteInterval),
-	}
+	return string(encoded), nil
 }
 
 func cloneMeta(meta sandboxMeta) sandboxMeta {
@@ -116,4 +148,21 @@ func cloneFloat32Ptr(value *float32) *float32 {
 	}
 	v := *value
 	return &v
+}
+
+// durationMinutesPtr is defined in handlers.go.
+
+func nonZeroFloatPtr(value float32) *float32 {
+	if value <= 0 {
+		return nil
+	}
+	v := value
+	return &v
+}
+
+func float32Value(value *float32) float32 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
