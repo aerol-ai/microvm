@@ -100,10 +100,8 @@ func sandboxMetaFromNative(sandbox *models.Sandbox, blob compatBlob) sandboxMeta
 		if meta.Metadata == nil {
 			meta.Metadata = map[string]string{}
 		}
-		if sandbox.NetworkBlockAll {
-			allow := false
-			meta.AllowInternetAccess = &allow
-		}
+		allow := !sandbox.NetworkBlockAll
+		meta.AllowInternetAccess = &allow
 		if timeoutSeconds, onTimeout := deriveTimeoutConfig(sandbox); timeoutSeconds > 0 {
 			meta.TimeoutSeconds = timeoutSeconds
 			if meta.OnTimeout == "" || meta.OnTimeout == "kill" {
