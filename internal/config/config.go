@@ -107,6 +107,28 @@ type Config struct {
 	// Required when L4TLSListen is non-empty; ignored otherwise. Default is
 	// "127.0.0.1:8443" to match install.sh's relocated HTTPS listener.
 	L4TLSFallback string
+
+	// ImageBuildContextEnabled flips on the Daytona/aerovm SDK's
+	// `contextHashes` upload path — image builds whose context includes
+	// caller-supplied local files (COPY/ADD). Off by default because the
+	// resolution path needs an object-store + registry combo to push the
+	// resulting layered image somewhere the docker daemon can pull from
+	// on the next sandbox start. With this disabled, builds that only RUN
+	// commands (no caller-side context) still work — they execute against
+	// a tar containing just the Dockerfile.
+	ImageBuildContextEnabled bool
+	// ImageBuildTimeout caps a single `docker build` call from the daytona
+	// facade. Build time is opaque (depends on the Dockerfile) so the
+	// default is generous; we bound it only to keep a runaway build from
+	// permanently parking a sandbox-create HTTP handler.
+	ImageBuildTimeout time.Duration
+	// ImageBuildRegistry is the registry root (e.g. "ghcr.io/aerol-ai")
+	// that built images are pushed to when ImageBuildContextEnabled is true.
+	// Per project contract, registry credentials are server-configured —
+	// they are NOT taken from the create-sandbox request.
+	ImageBuildRegistry         string
+	ImageBuildRegistryUsername string
+	ImageBuildRegistryPassword string
 }
 
 func Load() (Config, error) {
@@ -163,6 +185,12 @@ func Load() (Config, error) {
 		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 23000),
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
+
+		ImageBuildContextEnabled:   getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:          getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildRegistry:         strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY")),
+		ImageBuildRegistryUsername: strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY_USERNAME")),
+		ImageBuildRegistryPassword: strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY_PASSWORD")),
 	}
 
 	if cfg.PATToken == "" {

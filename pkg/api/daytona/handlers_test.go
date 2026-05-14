@@ -9,15 +9,41 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
+
+// fakeImageBuilder is the daytona.ImageBuilder stub used by tests that need
+// to assert build-path behavior without a real Docker daemon.
+type fakeImageBuilder struct {
+	exists   map[string]bool
+	builds   []docker.BuildImageRequest
+	buildErr error
+}
+
+func (f *fakeImageBuilder) ImageExists(_ context.Context, ref string) (bool, error) {
+	return f.exists[ref], nil
+}
+
+func (f *fakeImageBuilder) BuildImage(_ context.Context, req docker.BuildImageRequest) error {
+	f.builds = append(f.builds, req)
+	if f.buildErr != nil {
+		return f.buildErr
+	}
+	if f.exists == nil {
+		f.exists = map[string]bool{}
+	}
+	f.exists[req.Tag] = true
+	return nil
+}
 
 func TestTranslateCreateSandboxRequestAcceptsDaytonaGoImageFixture(t *testing.T) {
 	fixture := []byte(`{
@@ -33,7 +59,7 @@ func TestTranslateCreateSandboxRequestAcceptsDaytonaGoImageFixture(t *testing.T)
 	}
 
 	h := newHandlers(Deps{})
-	translated, err := h.translateCreateSandboxRequest(req)
+	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
 	}
@@ -54,7 +80,8 @@ func TestTranslateCreateSandboxRequestAcceptsDaytonaGoImageFixture(t *testing.T)
 	}
 }
 
-func TestTranslateCreateSandboxRequestRejectsComplexBuildInfo(t *testing.T) {
+func TestTranslateCreateSandboxRequestBuildsMultiLineDockerfile(t *testing.T) {
+	dockerfile := "FROM alpine\nRUN echo hello"
 	fixture := []byte(`{
 		"buildInfo": {
 			"dockerfileContent": "FROM alpine\nRUN echo hello"
@@ -66,13 +93,86 @@ func TestTranslateCreateSandboxRequestRejectsComplexBuildInfo(t *testing.T) {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
 
-	h := newHandlers(Deps{})
-	_, err := h.translateCreateSandboxRequest(req)
-	if err == nil {
-		t.Fatal("expected translateCreateSandboxRequest() error for complex buildInfo")
+	builder := &fakeImageBuilder{}
+	h := newHandlers(Deps{Builder: builder})
+	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
 	}
-	if got := err.Error(); got != "buildInfo is only supported for simple single-line Dockerfiles of the form `FROM <image>`" {
-		t.Fatalf("error = %q", got)
+	wantTag := docker.BuildTagFor(dockerfile, nil)
+	if translated.Image != wantTag {
+		t.Fatalf("translated.Image = %q, want %q", translated.Image, wantTag)
+	}
+	if len(builder.builds) != 1 {
+		t.Fatalf("expected 1 build call, got %d", len(builder.builds))
+	}
+	if got := builder.builds[0].Tag; got != wantTag {
+		t.Fatalf("build tag = %q, want %q", got, wantTag)
+	}
+	if !strings.Contains(builder.builds[0].DockerfileContent, "RUN echo hello") {
+		t.Fatalf("build dockerfile missing RUN step: %q", builder.builds[0].DockerfileContent)
+	}
+}
+
+func TestTranslateCreateSandboxRequestRejectsMultiLineWithoutBuilder(t *testing.T) {
+	fixture := []byte(`{
+		"buildInfo": {
+			"dockerfileContent": "FROM alpine\nRUN echo hello"
+		}
+	}`)
+
+	var req createSandboxRequest
+	if err := json.Unmarshal(fixture, &req); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	h := newHandlers(Deps{}) // No Builder.
+	_, err := h.translateCreateSandboxRequest(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error when builder is nil")
+	}
+	if !strings.Contains(err.Error(), "image builder") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTranslateCreateSandboxRequestRejectsContextHashesWithoutFlag(t *testing.T) {
+	req := createSandboxRequest{
+		BuildInfo: &buildInfoRequest{
+			DockerfileContent: stringPtr("FROM alpine\nCOPY app /app"),
+			ContextHashes:     []string{"deadbeef"},
+		},
+	}
+
+	h := newHandlers(Deps{Builder: &fakeImageBuilder{}})
+	_, err := h.translateCreateSandboxRequest(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error when contextHashes set but flag disabled")
+	}
+	if !strings.Contains(err.Error(), "SB_IMAGE_BUILD_CONTEXT_ENABLED") {
+		t.Fatalf("error should point at flag: %v", err)
+	}
+}
+
+func TestTranslateCreateSandboxRequestCacheHitSkipsBuild(t *testing.T) {
+	dockerfile := "FROM alpine\nRUN echo hello"
+	wantTag := docker.BuildTagFor(dockerfile, nil)
+	builder := &fakeImageBuilder{exists: map[string]bool{wantTag: true}}
+
+	req := createSandboxRequest{
+		BuildInfo: &buildInfoRequest{DockerfileContent: stringPtr(dockerfile)},
+	}
+
+	h := newHandlers(Deps{Builder: builder})
+	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
+	}
+	if translated.Image != wantTag {
+		t.Fatalf("Image = %q, want %q", translated.Image, wantTag)
+	}
+	if len(builder.builds) != 0 {
+		t.Fatalf("expected zero build calls on cache hit, got %d", len(builder.builds))
 	}
 }
 
@@ -88,7 +188,7 @@ func TestTranslateCreateSandboxRequestPreservesIdleLifecycleFields(t *testing.T)
 	}
 
 	h := newHandlers(Deps{})
-	translated, err := h.translateCreateSandboxRequest(req)
+	translated, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
 	}

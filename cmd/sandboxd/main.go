@@ -153,7 +153,7 @@ func main() {
 		}()
 	}
 
-	server := api.NewServer(logger, svc, cfg.PATToken)
+	server := api.NewServer(logger, svc, dockerClient, cfg, cfg.PATToken)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
 		Handler:           server.Handler(),

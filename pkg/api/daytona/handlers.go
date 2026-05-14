@@ -15,6 +15,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -37,7 +38,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serviceReq, err := h.translateCreateSandboxRequest(req)
+	serviceReq, err := h.translateCreateSandboxRequest(r.Context(), req)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -743,7 +744,7 @@ func (h *handlers) toolboxProxyBaseURL(r *http.Request) string {
 	return requestBaseURL(r) + ToolboxPrefix
 }
 
-func (h *handlers) translateCreateSandboxRequest(req createSandboxRequest) (models.CreateSandboxRequest, error) {
+func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req createSandboxRequest) (models.CreateSandboxRequest, error) {
 	if req.NetworkAllowList != nil && strings.TrimSpace(*req.NetworkAllowList) != "" {
 		return models.CreateSandboxRequest{}, errors.New("networkAllowList is not supported by the Daytona facade")
 	}
@@ -762,7 +763,7 @@ func (h *handlers) translateCreateSandboxRequest(req createSandboxRequest) (mode
 		lifecycle.DestroyIfIdleFor = durationFromMinutes(float32(*req.AutoDeleteInterval))
 	}
 
-	image, err := h.createImage(req)
+	image, err := h.createImage(ctx, req)
 	if err != nil {
 		return models.CreateSandboxRequest{}, err
 	}
@@ -784,14 +785,12 @@ func (h *handlers) translateCreateSandboxRequest(req createSandboxRequest) (mode
 	return serviceReq, nil
 }
 
-func (h *handlers) createImage(req createSandboxRequest) (string, error) {
+func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (string, error) {
 	if snapshot := strings.TrimSpace(valueOrEmpty(req.Snapshot)); snapshot != "" {
 		return snapshot, nil
 	}
-	if buildImage, err := buildInfoBaseImage(req.BuildInfo); err != nil {
-		return "", err
-	} else if buildImage != "" {
-		return buildImage, nil
+	if req.BuildInfo != nil {
+		return h.resolveBuildInfo(ctx, req.BuildInfo)
 	}
 	if configured := strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")); configured != "" {
 		return configured, nil
@@ -799,14 +798,73 @@ func (h *handlers) createImage(req createSandboxRequest) (string, error) {
 	return "ubuntu:22.04", nil
 }
 
-func buildInfoBaseImage(info *buildInfoRequest) (string, error) {
-	if info == nil {
-		return "", nil
-	}
+// resolveBuildInfo turns a Daytona-shaped buildInfo payload into a runnable
+// local image reference. Three cases:
+//
+//  1. Single-line `FROM <image>` Dockerfile, no context  → return the bare
+//     image string; the runtime layer will `docker pull` it as usual. This
+//     preserves the legacy fast path for callers (Daytona SDK with a string
+//     image) that don't need a real build.
+//  2. Multi-line Dockerfile, no context                  → build locally with
+//     docker.Client.BuildImage; tag is content-addressed for idempotent
+//     retries.
+//  3. Any payload with contextHashes                     → gated behind the
+//     SB_IMAGE_BUILD_CONTEXT_ENABLED operator flag. With the flag off, we
+//     return a clear error pointing operators at the flag. With the flag on,
+//     a hash-resolved context tar is supplied to BuildImage (today that
+//     resolver is not wired — the flag returns "not yet implemented" so the
+//     contract is honored at the type level without misleading users).
+func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest) (string, error) {
 	dockerfile := strings.TrimSpace(valueOrEmpty(info.DockerfileContent))
 	if dockerfile == "" {
 		return "", errors.New("buildInfo is only supported when dockerfileContent is present")
 	}
+	if base, ok := singleLineFromImage(dockerfile); ok && len(info.ContextHashes) == 0 {
+		return base, nil
+	}
+	if len(info.ContextHashes) > 0 {
+		if !h.deps.Build.ContextEnabled {
+			return "", errors.New("buildInfo.contextHashes requires operator-side context upload support (set SB_IMAGE_BUILD_CONTEXT_ENABLED=true on the daemon)")
+		}
+		// Context-resolver wiring is a separate piece of work (needs an
+		// object store + registry push). Fail loud so callers don't think
+		// their COPY/ADD steps silently no-op.
+		return "", errors.New("buildInfo.contextHashes is enabled but no context resolver is configured on this daemon")
+	}
+	if h.deps.Builder == nil {
+		return "", errors.New("multi-line buildInfo Dockerfiles require an image builder; daemon was started without one")
+	}
+
+	tag := docker.BuildTagFor(dockerfile, info.ContextHashes)
+	exists, err := h.deps.Builder.ImageExists(ctx, tag)
+	if err != nil {
+		return "", fmt.Errorf("check built image cache: %w", err)
+	}
+	if exists {
+		return tag, nil
+	}
+
+	buildCtx, cancel := buildContextWithTimeout(ctx, h.deps.Build.Timeout)
+	defer cancel()
+	logger := h.deps.Logger
+	err = h.deps.Builder.BuildImage(buildCtx, docker.BuildImageRequest{
+		Tag:               tag,
+		DockerfileContent: dockerfile,
+		OnLog: func(line string) {
+			if logger != nil {
+				logger.Debug("daytona build", "tag", tag, "line", line)
+			}
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("build image: %w", err)
+	}
+	return tag, nil
+}
+
+// singleLineFromImage detects the legacy `FROM <image>` shape and returns
+// the base image when matched. Comments and blank lines are ignored.
+func singleLineFromImage(dockerfile string) (string, bool) {
 	lines := make([]string, 0, 4)
 	for _, line := range strings.Split(dockerfile, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -816,16 +874,23 @@ func buildInfoBaseImage(info *buildInfoRequest) (string, error) {
 		lines = append(lines, trimmed)
 	}
 	if len(lines) != 1 {
-		return "", errors.New("buildInfo is only supported for simple single-line Dockerfiles of the form `FROM <image>`")
+		return "", false
 	}
 	parts := strings.Fields(lines[0])
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "FROM") {
-		return "", fmt.Errorf("buildInfo dockerfileContent %q is unsupported; expected `FROM <image>`", lines[0])
+		return "", false
 	}
 	if strings.TrimSpace(parts[1]) == "" {
-		return "", errors.New("buildInfo dockerfileContent must include a base image")
+		return "", false
 	}
-	return parts[1], nil
+	return parts[1], true
+}
+
+func buildContextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 func parsePositiveFloatQuery(r *http.Request, key string, fallback float32) (float32, error) {

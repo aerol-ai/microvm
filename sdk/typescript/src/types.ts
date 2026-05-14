@@ -69,8 +69,18 @@ export interface GPUOptions {
   deviceIDs?: string[];
 }
 
+import type { Image } from "./Image.js";
+
 export interface CreateOptions {
-  image: string;
+  /**
+   * The base image for this sandbox. A bare image reference (e.g.
+   * `"ubuntu:22.04"`) is pulled by the daemon as-is. An {@link Image} builder
+   * is compiled to a Dockerfile and sent to the daemon's
+   * `POST /v2/images/build` endpoint; the resulting content-addressed tag is
+   * used for the sandbox. The daemon must have an image builder configured
+   * (every official deployment does); otherwise the build call returns 503.
+   */
+  image: string | Image;
   /** Number of CPU cores to allocate. Fractional values are supported (e.g. 0.5 = half a core). */
   cpu?: number;
   memoryMB?: number;

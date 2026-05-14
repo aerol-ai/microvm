@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { APIClient, SandboxResource } from "./client.js";
+import { Image } from "../Image.js";
 import type { Sandbox } from "../types.js";
 
 test("internal client uses config object and auth header", async () => {
@@ -589,6 +590,54 @@ test("internal client setNetworkLimits sends PATCH with provided fields only", a
   // Unset egress limit must be omitted entirely so the server reads "leave alone".
   assert.deepEqual(seenBody, { network_bytes_in_limit: 4096 });
   assert.equal(usage.bytesInLimit, 4096);
+});
+
+test("internal client create with Image builds first then creates", async () => {
+  const seenRequests: { url: string; method: string; body: unknown }[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      const body = req.method === "POST" ? await req.json().catch(() => undefined) : undefined;
+      seenRequests.push({ url: req.url, method: req.method, body });
+      if (req.url.endsWith("/v2/images/build")) {
+        return jsonResponse({ image: "aerolvm-build/abc123:latest" });
+      }
+      return jsonResponse(apiSandbox("sb-from-image", { image: "aerolvm-build/abc123:latest" }));
+    },
+  });
+
+  const image = Image.base("ubuntu:22.04").runCommands("apt-get update", "apt-get install -y curl");
+  const sandbox = await client.create({ image });
+
+  assert.equal(sandbox.id, "sb-from-image");
+  assert.equal(seenRequests.length, 2);
+  assert.equal(seenRequests[0].method, "POST");
+  assert.ok(seenRequests[0].url.endsWith("/v2/images/build"));
+  assert.deepEqual(seenRequests[0].body, {
+    dockerfile_content:
+      "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n",
+  });
+  assert.ok(seenRequests[1].url.endsWith("/v1/sandboxes"));
+  assert.deepEqual(seenRequests[1].body, { image: "aerolvm-build/abc123:latest" });
+});
+
+test("internal client create with bare image string skips build call", async () => {
+  const seenURLs: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seenURLs.push(req.url);
+      return jsonResponse(apiSandbox("sb-string"));
+    },
+  });
+
+  await client.create({ image: "ubuntu:22.04" });
+  assert.equal(seenURLs.length, 1);
+  assert.ok(seenURLs[0].endsWith("/v1/sandboxes"));
 });
 
 function jsonResponse(value: unknown, status = 200): Response {

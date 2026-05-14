@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 
 import { PATH_PREFIX as V1_PATH_PREFIX } from "./api/v1/paths.js";
+import { Image } from "../Image.js";
 import type {
   BinaryLike,
   CreateOptions,
@@ -211,8 +212,35 @@ export class APIClient {
   }
 
   async create(options: CreateOptions): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(options));
+    const resolved = await this.resolveImage(options);
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved));
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
+  }
+
+  /**
+   * Compile a fluent {@link Image} into a content-addressed image tag by
+   * POSTing its Dockerfile to `/v2/images/build`. The daemon caches by
+   * content hash, so repeated calls with the same Dockerfile are a no-op.
+   * String images are passed through unchanged.
+   */
+  async buildImage(image: Image): Promise<string> {
+    const response = await this.doJSON<{ image: string }>(
+      "POST",
+      "/v2/images/build",
+      { dockerfile_content: image.dockerfile },
+    );
+    return response.image;
+  }
+
+  private async resolveImage(options: CreateOptions): Promise<CreateOptions & { image: string }> {
+    if (typeof options.image === "string") {
+      return options as CreateOptions & { image: string };
+    }
+    if (!(options.image instanceof Image)) {
+      throw new TypeError("CreateOptions.image must be a string or Image");
+    }
+    const tag = await this.buildImage(options.image);
+    return { ...options, image: tag };
   }
 
   async list(): Promise<SandboxResource[]> {

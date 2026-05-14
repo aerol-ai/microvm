@@ -1,7 +1,8 @@
 package daytona
 
 type buildInfoRequest struct {
-	DockerfileContent *string `json:"dockerfileContent,omitempty"`
+	DockerfileContent *string  `json:"dockerfileContent,omitempty"`
+	ContextHashes     []string `json:"contextHashes,omitempty"`
 }
 
 type createSandboxRequest struct {

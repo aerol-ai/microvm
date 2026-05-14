@@ -16,23 +16,30 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
+	apiv2 "github.com/aerol-ai/microvm/pkg/api/v2"
+	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
 type Server struct {
 	logger   *slog.Logger
 	service  *service.Service
+	builder  daytona.ImageBuilder
+	build    daytona.BuildConfig
 	patToken string
 	mux      *http.ServeMux
 }
 
-func NewServer(logger *slog.Logger, service *service.Service, patToken string) *Server {
+func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, cfg config.Config, patToken string) *Server {
 	s := &Server{
 		logger:   logger,
 		service:  service,
+		builder:  dockerClient,
+		build:    daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout, Registry: cfg.ImageBuildRegistry},
 		patToken: patToken,
 		mux:      http.NewServeMux(),
 	}
@@ -55,6 +62,8 @@ func (s *Server) routes() {
 		Service: s.service,
 		Logger:  s.logger,
 		Auth:    s.requireAuth,
+		Builder: s.builder,
+		Build:   s.build,
 	})
 
 	e2b.RegisterRoutes(s.mux, e2b.Deps{
@@ -67,6 +76,14 @@ func (s *Server) routes() {
 		Service: s.service,
 		Logger:  s.logger,
 		Auth:    s.requireAuth,
+	})
+
+	apiv2.RegisterRoutes(s.mux, apiv2.Deps{
+		Service: s.service,
+		Logger:  s.logger,
+		Auth:    s.requireAuth,
+		Builder: s.builder,
+		Build:   apiv2.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout, Registry: s.build.Registry},
 	})
 }
 

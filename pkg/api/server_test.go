@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 func TestRequireAuthCases(t *testing.T) {
@@ -86,7 +88,7 @@ func TestRequireAuthCases(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "pat-token")
+			server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, config.Config{}, "pat-token")
 			request := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
 			if tc.authorization != "" {
 				request.Header.Set("Authorization", tc.authorization)

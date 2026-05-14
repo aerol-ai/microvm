@@ -1,5 +1,6 @@
 export { MicroVM } from "./MicroVM.js";
 export { Sandbox } from "./Sandbox.js";
+export { Image } from "./Image.js";
 export type { MicroVMConfig } from "./MicroVM.js";
 export type {
   BinaryLike,
