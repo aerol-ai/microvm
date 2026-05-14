@@ -622,6 +622,43 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 	return snapshot, nil
 }
 
+func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at
+		FROM sandbox_snapshots
+		ORDER BY created_at DESC, name ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.SandboxSnapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot: %w", err)
+		}
+		items = append(items, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshots: %w", err)
+	}
+	return items, nil
+}
+
+func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_snapshots WHERE name = ?`, strings.TrimSpace(name))
+	if err != nil {
+		return fmt.Errorf("delete snapshot: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) ListDaytonaMetadata(ctx context.Context) (map[string]models.DaytonaSandboxMetadata, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT sandbox_id, name, snapshot, user_name, labels_json, target, network_allow_list,

@@ -25,6 +25,9 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	h := newHandlers(d)
 
 	mux.Handle("POST "+PathPrefix+"/sandbox", d.Auth(http.HandlerFunc(h.createSandbox)))
+	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
+	mux.Handle("GET "+PathPrefix+"/snapshots/{id}", d.Auth(http.HandlerFunc(h.getSnapshot)))
+	mux.Handle("DELETE "+PathPrefix+"/snapshots/{id}", d.Auth(http.HandlerFunc(h.deleteSnapshot)))
 	mux.Handle("GET "+PathPrefix+"/sandbox", d.Auth(http.HandlerFunc(h.listSandboxes)))
 	mux.Handle("GET "+PathPrefix+"/sandbox/paginated", d.Auth(http.HandlerFunc(h.listSandboxesPaginated)))
 	mux.Handle("GET "+PathPrefix+"/sandbox/{idOrName}", d.Auth(http.HandlerFunc(h.getSandbox)))

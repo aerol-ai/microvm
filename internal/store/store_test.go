@@ -16,7 +16,7 @@ import (
 func TestStoreCases(t *testing.T) {
 	ctx := context.Background()
 
-	// 24 cases
+	// 25 cases
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -535,6 +535,57 @@ func TestStoreCases(t *testing.T) {
 				}
 				if got.SourceSandboxID != sandbox.ID || got.Image != snapshot.Image {
 					t.Fatalf("unexpected snapshot after delete: %+v", got)
+				}
+			},
+		},
+		{
+			name: "list_and_delete_snapshots",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				older := &models.SandboxSnapshot{
+					Name:            "alpha",
+					Image:           "snapshots/alpha:v1",
+					ImageID:         "sha256:alpha",
+					SourceSandboxID: "sb-alpha",
+					CreatedAt:       time.Now().UTC().Add(-time.Hour).Round(0),
+				}
+				newer := &models.SandboxSnapshot{
+					Name:            "beta",
+					Image:           "snapshots/beta:v1",
+					ImageID:         "sha256:beta",
+					SourceSandboxID: "sb-beta",
+					CreatedAt:       time.Now().UTC().Round(0),
+				}
+				if err := st.CreateSnapshot(ctx, older); err != nil {
+					t.Fatalf("CreateSnapshot(older) error = %v", err)
+				}
+				if err := st.CreateSnapshot(ctx, newer); err != nil {
+					t.Fatalf("CreateSnapshot(newer) error = %v", err)
+				}
+
+				items, err := st.ListSnapshots(ctx)
+				if err != nil {
+					t.Fatalf("ListSnapshots() error = %v", err)
+				}
+				if len(items) != 2 {
+					t.Fatalf("len(ListSnapshots()) = %d, want 2", len(items))
+				}
+				if items[0].Name != newer.Name || items[1].Name != older.Name {
+					t.Fatalf("unexpected snapshot order: %+v", items)
+				}
+
+				if err := st.DeleteSnapshot(ctx, newer.Name); err != nil {
+					t.Fatalf("DeleteSnapshot() error = %v", err)
+				}
+				if _, err := st.GetSnapshot(ctx, newer.Name); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound after delete, got %v", err)
+				}
+				remaining, err := st.GetSnapshot(ctx, older.Name)
+				if err != nil {
+					t.Fatalf("GetSnapshot(older) error = %v", err)
+				}
+				if !reflect.DeepEqual(remaining, older) {
+					t.Fatalf("remaining snapshot = %+v, want %+v", remaining, older)
 				}
 			},
 		},

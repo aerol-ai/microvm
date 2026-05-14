@@ -15,11 +15,14 @@ import (
 )
 
 type fakeSnapshotRuntime struct {
-	imageID string
-	hits    int
-	lastRef string
-	lastImg string
-	err     error
+	imageID     string
+	hits        int
+	lastRef     string
+	lastImg     string
+	err         error
+	removeHits  int
+	lastRemoved string
+	removeErr   error
 }
 
 func (f *fakeSnapshotRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
@@ -51,8 +54,13 @@ func (f *fakeSnapshotRuntime) ListManaged(context.Context) (map[string]*models.S
 	panic("unexpected ListManaged")
 }
 func (f *fakeSnapshotRuntime) Ping(context.Context) error { panic("unexpected Ping") }
-func (f *fakeSnapshotRuntime) RemoveImage(context.Context, string) error {
-	panic("unexpected RemoveImage")
+func (f *fakeSnapshotRuntime) RemoveImage(_ context.Context, imageRef string) error {
+	f.removeHits++
+	f.lastRemoved = imageRef
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	return nil
 }
 func (f *fakeSnapshotRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	panic("unexpected PushAllowedPorts")
@@ -152,5 +160,42 @@ func TestCreateSnapshotConflictsAcrossSandboxes(t *testing.T) {
 	}
 	if rt.hits != 1 {
 		t.Fatalf("CreateSnapshot runtime hits = %d, want 1", rt.hits)
+	}
+}
+
+func TestDeleteSnapshotRemovesImageAndStoreEntry(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	snapshot := &models.SandboxSnapshot{
+		Name:            "demo-snapshot",
+		Image:           "snapshots/demo:v1",
+		ImageID:         "sha256:demo-snapshot",
+		SourceSandboxID: "sb-source",
+		CreatedAt:       time.Now().UTC().Round(0),
+	}
+	if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+		t.Fatalf("CreateSnapshot() error = %v", err)
+	}
+
+	rt := &fakeSnapshotRuntime{}
+	svc := &Service{store: st, docker: rt, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	if err := svc.DeleteSnapshot(ctx, snapshot.ImageID); err != nil {
+		t.Fatalf("DeleteSnapshot() error = %v", err)
+	}
+	if rt.removeHits != 1 {
+		t.Fatalf("RemoveImage hits = %d, want 1", rt.removeHits)
+	}
+	if rt.lastRemoved != snapshot.Image {
+		t.Fatalf("RemoveImage ref = %q, want %q", rt.lastRemoved, snapshot.Image)
+	}
+	if _, err := st.GetSnapshot(ctx, snapshot.Name); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after delete, got %v", err)
 	}
 }

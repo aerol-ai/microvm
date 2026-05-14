@@ -26,4 +26,4 @@ Daytona compatibility in AerolVM is HTTP-surface based. That means support is pr
 | Are any Daytona SDK languages fully supported end-to-end? | No. The current status is partial across the board because the AerolVM facade implements only part of the Daytona contract. |
 | Are any Daytona SDK languages uniquely unsupported? | No language is singled out. The limitation is the shared HTTP compatibility surface, not the client language. |
 | What determines success with a Daytona SDK today? | Whether the code path uses only the supported `/daytona` control-plane and toolbox routes listed in the detailed matrices. |
-| Does Daytona snapshot creation work against AerolVM now? | Partially. `POST /daytona/sandbox/{idOrName}/snapshot` is implemented, but the wider Daytona snapshot catalog APIs are still absent. |
+| Does Daytona snapshot support work against AerolVM now? | Partially. `POST /daytona/sandbox/{idOrName}/snapshot` plus snapshot list/get/delete are implemented, but activate/deactivate, build logs, and fuller Daytona snapshot-management semantics are still absent. |

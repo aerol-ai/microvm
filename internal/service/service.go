@@ -538,6 +538,52 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 	return snapshot, nil
 }
 
+func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.SandboxSnapshot, error) {
+	needle := strings.TrimSpace(idOrName)
+	if needle == "" {
+		return nil, store.ErrNotFound
+	}
+	snapshot, err := s.store.GetSnapshot(ctx, needle)
+	if err == nil {
+		return snapshot, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	snapshots, err := s.store.ListSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, snapshot := range snapshots {
+		if snapshot != nil && strings.TrimSpace(snapshot.ImageID) == needle {
+			return snapshot, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+func (s *Service) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
+	return s.store.ListSnapshots(ctx)
+}
+
+func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
+	if strings.TrimSpace(idOrName) == "" {
+		return store.ErrNotFound
+	}
+
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+
+	snapshot, err := s.GetSnapshot(ctx, idOrName)
+	if err != nil {
+		return err
+	}
+	if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
+		return err
+	}
+	return s.store.DeleteSnapshot(ctx, snapshot.Name)
+}
+
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
 	sandbox, err := s.store.Get(ctx, id)
 	if err != nil {

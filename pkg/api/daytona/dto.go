@@ -36,6 +36,34 @@ type createSandboxSnapshotRequest struct {
 	Name string `json:"name"`
 }
 
+type snapshotResponse struct {
+	ID             string   `json:"id"`
+	OrganizationID *string  `json:"organizationId,omitempty"`
+	General        bool     `json:"general"`
+	Name           string   `json:"name"`
+	ImageName      *string  `json:"imageName,omitempty"`
+	State          string   `json:"state"`
+	Size           *float32 `json:"size"`
+	Entrypoint     []string `json:"entrypoint"`
+	CPU            float32  `json:"cpu"`
+	GPU            float32  `json:"gpu"`
+	Mem            float32  `json:"mem"`
+	Disk           float32  `json:"disk"`
+	ErrorReason    *string  `json:"errorReason"`
+	CreatedAt      string   `json:"createdAt"`
+	UpdatedAt      string   `json:"updatedAt"`
+	LastUsedAt     *string  `json:"lastUsedAt"`
+	Ref            *string  `json:"ref,omitempty"`
+	RegionIDs      []string `json:"regionIds,omitempty"`
+}
+
+type paginatedSnapshotsResponse struct {
+	Items      []snapshotResponse `json:"items"`
+	Total      float32            `json:"total"`
+	Page       float32            `json:"page"`
+	TotalPages float32            `json:"totalPages"`
+}
+
 type sandboxResponse struct {
 	ID                  string            `json:"id"`
 	OrganizationID      string            `json:"organizationId"`
@@ -109,4 +137,10 @@ type listFilters struct {
 	Name   string
 	Labels map[string]string
 	States map[string]struct{}
+}
+
+type snapshotListFilters struct {
+	Name  string
+	Sort  string
+	Order string
 }
