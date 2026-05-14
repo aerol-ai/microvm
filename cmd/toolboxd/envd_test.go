@@ -176,6 +176,23 @@ func TestEnvdProcessStartStreamsConnectJSON(t *testing.T) {
 	}
 }
 
+func TestEnvdRejectsUnsupportedRequestedUser(t *testing.T) {
+	srv := newEnvdTestServer(t)
+	handler := srv.routes()
+
+	req := httptest.NewRequest(http.MethodGet, envdPrefix+"/files?path=/tmp/missing", nil)
+	req.Header.Set("Authorization", "Bearer toolbox-token")
+	req.Header.Set("X-E2B-User-Authorization", basicUserHeaderForTest("aerolvm-unsupported-user"))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusNotImplemented, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "aerolvm-unsupported-user") {
+		t.Fatalf("body = %q, want unsupported user message", resp.Body.String())
+	}
+}
+
 type decodedConnectEnvelope struct {
 	Flags   byte
 	Payload []byte
@@ -208,6 +225,10 @@ func encodeConnectEnvelopeForTest(payload []byte) []byte {
 	header := make([]byte, connectEnvelopeHeaderLen)
 	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
 	return append(header, payload...)
+}
+
+func basicUserHeaderForTest(username string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"))
 }
 
 func decodeConnectEnvelopesForTest(t *testing.T, body []byte) []decodedConnectEnvelope {

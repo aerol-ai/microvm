@@ -342,6 +342,10 @@ func cloneEnvdStringMap(values map[string]string) map[string]string {
 }
 
 func (s *server) handleEnvdRoute(w http.ResponseWriter, r *http.Request) bool {
+	if !validateEnvdRequestedUser(w, r) {
+		return true
+	}
+
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == envdPrefix+"/health":
 		s.handleEnvdHealth(w, r)
@@ -387,6 +391,71 @@ func (s *server) handleEnvdRoute(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+func validateEnvdRequestedUser(w http.ResponseWriter, r *http.Request) bool {
+	username, err := requestedEnvdUsername(r)
+	if err != nil {
+		writeEnvdError(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	if username == "" || isSupportedEnvdUser(username) {
+		return true
+	}
+	writeEnvdError(w, http.StatusNotImplemented, fmt.Sprintf("envd user %q is not supported", username))
+	return false
+}
+
+func requestedEnvdUsername(r *http.Request) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+	username := strings.TrimSpace(r.URL.Query().Get("username"))
+	if basic := strings.TrimSpace(r.Header.Get("X-E2B-User-Authorization")); basic != "" {
+		basicUsername, err := parseEnvdBasicUsername(basic)
+		if err != nil {
+			return "", err
+		}
+		if username != "" && basicUsername != "" && username != basicUsername {
+			return "", errors.New("conflicting envd users")
+		}
+		if username == "" {
+			username = basicUsername
+		}
+	}
+	return username, nil
+}
+
+func parseEnvdBasicUsername(header string) (string, error) {
+	const prefix = "Basic "
+	if !strings.HasPrefix(header, prefix) {
+		return "", errors.New("invalid envd user authorization")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(header, prefix)))
+	if err != nil {
+		return "", errors.New("invalid envd user authorization")
+	}
+	username, _, ok := strings.Cut(string(decoded), ":")
+	if !ok {
+		return "", errors.New("invalid envd user authorization")
+	}
+	return strings.TrimSpace(username), nil
+}
+
+func isSupportedEnvdUser(username string) bool {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return true
+	}
+	if username == "root" {
+		return os.Geteuid() == 0
+	}
+	for _, current := range []string{os.Getenv("USER"), os.Getenv("LOGNAME")} {
+		if current != "" && username == current {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) handleEnvdHealth(w http.ResponseWriter, r *http.Request) {

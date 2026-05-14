@@ -242,6 +242,57 @@ func TestCreateSandboxIdempotentReplay(t *testing.T) {
 	}
 }
 
+func TestCreateSnapshotWithoutNameIsIdempotent(t *testing.T) {
+	runtime := newFakeE2BRuntime()
+	_, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: 2280})
+
+	createReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base"}`))
+	createResp := httptest.NewRecorder()
+	handler.ServeHTTP(createResp, createReq)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d; body=%s", createResp.Code, http.StatusCreated, createResp.Body.String())
+	}
+	var created sandboxResponse
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response error = %v", err)
+	}
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes/"+created.SandboxID+"/snapshots", strings.NewReader(`{}`))
+	firstResp := httptest.NewRecorder()
+	handler.ServeHTTP(firstResp, firstReq)
+	if firstResp.Code != http.StatusCreated {
+		t.Fatalf("first snapshot status = %d, want %d; body=%s", firstResp.Code, http.StatusCreated, firstResp.Body.String())
+	}
+	var first snapshotInfoResponse
+	if err := json.NewDecoder(firstResp.Body).Decode(&first); err != nil {
+		t.Fatalf("decode first snapshot response error = %v", err)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes/"+created.SandboxID+"/snapshots", strings.NewReader(`{}`))
+	secondResp := httptest.NewRecorder()
+	handler.ServeHTTP(secondResp, secondReq)
+	if secondResp.Code != http.StatusCreated {
+		t.Fatalf("second snapshot status = %d, want %d; body=%s", secondResp.Code, http.StatusCreated, secondResp.Body.String())
+	}
+	var second snapshotInfoResponse
+	if err := json.NewDecoder(secondResp.Body).Decode(&second); err != nil {
+		t.Fatalf("decode second snapshot response error = %v", err)
+	}
+	if second.SnapshotID != first.SnapshotID {
+		t.Fatalf("second SnapshotID = %q, want %q", second.SnapshotID, first.SnapshotID)
+	}
+	if len(second.Names) != 1 || second.Names[0] != defaultSnapshotName(created.SandboxID) {
+		t.Fatalf("second.Names = %+v, want [%q]", second.Names, defaultSnapshotName(created.SandboxID))
+	}
+
+	runtime.mu.Lock()
+	imageSeq := runtime.imageSeq
+	runtime.mu.Unlock()
+	if imageSeq != 1 {
+		t.Fatalf("runtime snapshot creates = %d, want 1", imageSeq)
+	}
+}
+
 func TestRuntimeProxyRewritesToEnvdToolboxSurface(t *testing.T) {
 	toolboxRequests := make(chan *http.Request, 1)
 	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

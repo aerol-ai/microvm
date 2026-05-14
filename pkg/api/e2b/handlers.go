@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
@@ -26,6 +27,7 @@ type handlers struct {
 	clientID       string
 	defaultDomain  *string
 	defaultEnvdVer string
+	snapshotMu     sync.Mutex
 }
 
 func newHandlers(d Deps) *handlers {
@@ -354,7 +356,16 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	snapshotName := canonicalSnapshotName(req.Name)
 	if snapshotName == "" {
-		snapshotName = canonicalSnapshotName(fmt.Sprintf("%s-%d", sandbox.ID, time.Now().UTC().UnixNano()))
+		snapshotName = defaultSnapshotName(sandbox.ID)
+	}
+
+	h.snapshotMu.Lock()
+	defer h.snapshotMu.Unlock()
+
+	existedBefore, err := h.snapshotExistsForSandbox(r.Context(), snapshotName, sandbox.ID)
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
 	}
 	snapshot, err := h.deps.Service.CreateSnapshot(r.Context(), sandbox.ID, models.CreateSandboxSnapshotRequest{Name: snapshotName})
 	if err != nil {
@@ -376,6 +387,11 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		Names:           resp.Names,
 		SourceSandboxID: sandbox.ID,
 	}); err != nil {
+		if !existedBefore {
+			if deleteErr := h.deps.Service.DeleteSnapshot(r.Context(), snapshot.Name); deleteErr != nil && h.deps.Logger != nil {
+				h.deps.Logger.Warn("e2b snapshot metadata rollback failed", "snapshot_name", snapshot.Name, "error", deleteErr)
+			}
+		}
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -708,6 +724,17 @@ func (h *handlers) waitForCreateReplay(ctx context.Context, fingerprint string) 
 		case <-timer.C:
 		}
 	}
+}
+
+func (h *handlers) snapshotExistsForSandbox(ctx context.Context, snapshotName, sandboxID string) (bool, error) {
+	snapshot, err := h.deps.Service.GetSnapshot(ctx, snapshotName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return snapshot.SourceSandboxID == sandboxID, nil
 }
 
 func (h *handlers) resolveSnapshotDeleteTarget(ctx context.Context, snapshotID string) (string, string, error) {

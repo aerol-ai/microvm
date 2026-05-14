@@ -15,7 +15,7 @@ import (
 
 const (
 	defaultClientID       = "aerolvm"
-	defaultEnvdVersion    = "0.1.0"
+	defaultEnvdVersion    = "0.4.0"
 	defaultSandboxTimeout = 300
 	snapshotIDPrefix      = "snapshot_"
 	e2bCreatePendingTTL   = 2 * time.Minute
@@ -169,6 +169,10 @@ func canonicalSnapshotName(name string) string {
 		return trimmed
 	}
 	return trimmed + ":default"
+}
+
+func defaultSnapshotName(sandboxID string) string {
+	return canonicalSnapshotName("e2b/" + strings.TrimSpace(sandboxID))
 }
 
 func snapshotIDFromName(name string) string {

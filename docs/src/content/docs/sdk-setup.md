@@ -49,6 +49,31 @@ print(sandbox['public_url'])
 sandbox.destroy()
 ```
 
+## E2B Python SDK Compatibility
+
+AerolVM also exposes a compatibility facade for the unmodified E2B Python SDK. Point both the E2B control plane and runtime plane at the AerolVM `/e2b` routes:
+
+```bash
+pip install e2b
+
+export E2B_API_URL=https://sandbox.example.com/e2b
+export E2B_SANDBOX_URL=https://sandbox.example.com/e2b/runtime
+export E2B_API_KEY="$SB_PAT_TOKEN"
+```
+
+```py
+from e2b import Sandbox
+
+sandbox = Sandbox.create(template="base")
+result = sandbox.commands.run("python --version")
+print(result.stdout)
+sandbox.kill()
+```
+
+`E2B_SANDBOX_URL` is required for this compatibility mode. Without it, the E2B SDK builds runtime URLs like `https://49983-<sandbox>.<domain>`, which are not the path-based AerolVM runtime gateway.
+
+This facade supports the core create, list, connect, pause, kill, file, command, and snapshot flows. E2B template builds, volumes, traffic access tokens, metrics, logs, and E2B-style public host routing are not part of this first compatibility surface.
+
 ## Go
 
 ```bash
