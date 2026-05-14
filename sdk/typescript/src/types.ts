@@ -236,7 +236,8 @@ export interface NetworkUsage {
   bytesOutLimit: number;
   quotaExceeded: boolean;
   quotaExceededAt?: string;
-  lastSampledAt: string;
+  /** Absent until the netstats poller has produced at least one sample. */
+  lastSampledAt?: string;
 }
 
 export interface SetNetworkLimitsOptions {

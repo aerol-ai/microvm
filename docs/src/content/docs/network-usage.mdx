@@ -122,7 +122,7 @@ The response shape:
 | `bytes_in_limit` / `bytes_out_limit` | Active cap. `0` means unlimited. |
 | `quota_exceeded` | `true` if either direction has hit its cap. The drop rule is installed while this is true. |
 | `quota_exceeded_at` | RFC 3339 timestamp of when the quota was first hit. Cleared when the cap is raised. |
-| `last_sampled_at` | RFC 3339 timestamp of the last counter sample. |
+| `last_sampled_at` | RFC 3339 timestamp of the last counter sample. **Absent until the netstats poller has produced at least one sample** — typically up to one poll interval after a sandbox starts. |
 
 ## Raise or lift the limits at runtime
 

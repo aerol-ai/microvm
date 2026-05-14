@@ -254,6 +254,7 @@ class NetworkUsage(TypedDict, total=False):
     bytesOutLimit: int
     quotaExceeded: bool
     quotaExceededAt: str
+    # Absent until the netstats poller has produced at least one sample.
     lastSampledAt: str
 
 

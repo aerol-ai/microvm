@@ -423,8 +423,11 @@ pub struct NetworkUsage {
     pub quota_exceeded: bool,
     #[serde(rename = "quota_exceeded_at", skip_serializing_if = "Option::is_none")]
     pub quota_exceeded_at: Option<String>,
-    #[serde(rename = "last_sampled_at")]
-    pub last_sampled_at: String,
+    /// Absent (`None`) until the netstats poller has produced at least one
+    /// sample. `default` lets us deserialize a server response that omits the
+    /// field entirely (pre-first-tick) rather than failing.
+    #[serde(rename = "last_sampled_at", default, skip_serializing_if = "Option::is_none")]
+    pub last_sampled_at: Option<String>,
 }
 
 /// Patch body for [`Client::set_network_limits`]. Each field is `Option`-wrapped

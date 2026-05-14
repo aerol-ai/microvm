@@ -823,11 +823,13 @@ def _from_api_network_usage(payload: Dict[str, Any]) -> NetworkUsage:
         "bytesInLimit": int(_first_of(payload, "bytes_in_limit", "bytesInLimit") or 0),
         "bytesOutLimit": int(_first_of(payload, "bytes_out_limit", "bytesOutLimit") or 0),
         "quotaExceeded": bool(_first_of(payload, "quota_exceeded", "quotaExceeded") or False),
-        "lastSampledAt": str(_first_of(payload, "last_sampled_at", "lastSampledAt") or ""),
     }
     quota_exceeded_at = _first_of(payload, "quota_exceeded_at", "quotaExceededAt")
     if quota_exceeded_at not in (None, ""):
         result["quotaExceededAt"] = str(quota_exceeded_at)
+    last_sampled_at = _first_of(payload, "last_sampled_at", "lastSampledAt")
+    if last_sampled_at not in (None, ""):
+        result["lastSampledAt"] = str(last_sampled_at)
     return result
 
 

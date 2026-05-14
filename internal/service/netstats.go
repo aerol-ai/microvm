@@ -79,7 +79,8 @@ func (s *Service) GetNetworkUsage(ctx context.Context, id string) (*models.Netwo
 		QuotaExceededAt: sandbox.NetworkQuotaExceededAt,
 	}
 	if last := s.netstatsLastTick.Load(); last > 0 {
-		usage.LastSampledAt = time.Unix(0, last).UTC()
+		t := time.Unix(0, last).UTC()
+		usage.LastSampledAt = &t
 	}
 	return usage, nil
 }

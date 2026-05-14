@@ -17,6 +17,7 @@ public class NetworkUsage {
     public boolean quotaExceeded;
     @JsonProperty("quota_exceeded_at")
     public String quotaExceededAt;
+    /** Null until the netstats poller has produced at least one sample. */
     @JsonProperty("last_sampled_at")
     public String lastSampledAt;
 }

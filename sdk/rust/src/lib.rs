@@ -1348,6 +1348,24 @@ mod tests {
     }
 
     #[test]
+    fn get_network_usage_handles_absent_last_sampled_at() {
+        let body = serde_json::json!({
+            "sandbox_id": "sb-fresh",
+            "bytes_in": 0,
+            "bytes_out": 0,
+            "bytes_in_limit": 0,
+            "bytes_out_limit": 0,
+            "quota_exceeded": false
+        })
+        .to_string();
+        let (url, _rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let usage = client.get_network_usage("sb-fresh").expect("get_network_usage should succeed");
+        assert_eq!(usage.last_sampled_at, None);
+    }
+
+    #[test]
     fn set_network_limits_sends_patch_with_provided_fields_only() {
         let body = serde_json::json!({
             "sandbox_id": "sb-1",

@@ -541,6 +541,25 @@ test("internal client getNetworkUsage maps response shape", async () => {
   });
 });
 
+test("internal client getNetworkUsage handles absent last_sampled_at (pre-first-tick)", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () =>
+      jsonResponse({
+        sandbox_id: "sb-fresh",
+        bytes_in: 0,
+        bytes_out: 0,
+        bytes_in_limit: 0,
+        bytes_out_limit: 0,
+        quota_exceeded: false,
+      }),
+  });
+
+  const usage = await client.getNetworkUsage("sb-fresh");
+  assert.equal(usage.lastSampledAt, undefined);
+});
+
 test("internal client setNetworkLimits sends PATCH with provided fields only", async () => {
   let seenRequest: Request | undefined;
   let seenBody: unknown;

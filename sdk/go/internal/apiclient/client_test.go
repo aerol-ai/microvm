@@ -144,6 +144,7 @@ func TestTransportClientCases(t *testing.T) {
 					if r.Method != http.MethodGet || r.URL.Path != "/v1/sandboxes/sb-net/network/usage" {
 						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 					}
+					sampled := time.Now().UTC()
 					_ = json.NewEncoder(w).Encode(models.NetworkUsage{
 						SandboxID:     "sb-net",
 						BytesIn:       1024,
@@ -151,7 +152,7 @@ func TestTransportClientCases(t *testing.T) {
 						BytesInLimit:  1 << 20,
 						BytesOutLimit: 0,
 						QuotaExceeded: false,
-						LastSampledAt: time.Now().UTC(),
+						LastSampledAt: &sampled,
 					})
 				}))
 				defer server.Close()

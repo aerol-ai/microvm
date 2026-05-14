@@ -181,7 +181,7 @@ interface ApiNetworkUsage {
   bytes_out_limit: number;
   quota_exceeded: boolean;
   quota_exceeded_at?: string | null;
-  last_sampled_at: string;
+  last_sampled_at?: string | null;
 }
 
 export class APIClient {
@@ -774,7 +774,7 @@ function fromApiNetworkUsage(usage: ApiNetworkUsage): NetworkUsage {
     bytesOutLimit: usage.bytes_out_limit,
     quotaExceeded: usage.quota_exceeded,
     quotaExceededAt: usage.quota_exceeded_at ?? undefined,
-    lastSampledAt: usage.last_sampled_at,
+    lastSampledAt: usage.last_sampled_at ?? undefined,
   };
 }
 

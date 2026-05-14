@@ -340,7 +340,10 @@ type NetworkUsage struct {
 	BytesOutLimit   int64      `json:"bytes_out_limit"`
 	QuotaExceeded   bool       `json:"quota_exceeded"`
 	QuotaExceededAt *time.Time `json:"quota_exceeded_at,omitempty"`
-	LastSampledAt   time.Time  `json:"last_sampled_at"`
+	// LastSampledAt is omitted until the netstats poller has produced at
+	// least one sample. Pointer + omitempty so we don't serialize the zero
+	// time as "0001-01-01T00:00:00Z" before the first tick.
+	LastSampledAt *time.Time `json:"last_sampled_at,omitempty"`
 }
 
 // UpdateNetworkLimitsRequest is the body for PATCH /v1/sandboxes/{id}/network/limits.
