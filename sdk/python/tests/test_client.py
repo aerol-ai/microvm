@@ -63,6 +63,20 @@ class RecordingMicroVM(MicroVM):
                 "source_sandbox_id": "sb-1",
                 "created_at": "2026-05-14T10:00:00Z",
             }
+        if method == "POST" and path == "/v1/snapshots":
+            return {
+                "name": payload.get("name", "snapshots/default:v1"),
+                "image": payload.get("image") or "snapshots/built:resolved",
+                "image_id": "sha256:snap-2",
+                "source_sandbox_id": "",
+                "created_at": "2026-05-15T10:00:00Z",
+                "entrypoint": payload.get("entrypoint") or [],
+                "region_id": payload.get("region_id", ""),
+                "cpu": payload.get("cpu", 0),
+                "gpu": payload.get("gpu", 0),
+                "memory_mb": payload.get("memory_mb", 0),
+                "disk_gb": payload.get("disk_gb", 0),
+            }
         if method == "GET" and path == "/v1/sandboxes/sb-1/network/usage":
             return {
                 "sandbox_id": "sb-1",
@@ -450,6 +464,78 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(snapshot["imageID"], "sha256:snap-1")
         self.assertEqual(snapshot["sourceSandboxID"], "sb-1")
         self.assertEqual(sandbox_snapshot["name"], "snapshots/from-sandbox:v1")
+
+    def test_register_snapshot_maps_request_and_response_shapes(self):
+        client = RecordingMicroVM()
+
+        snapshot = client.register_snapshot(
+            {
+                "name": "py-base",
+                "image": "python:3.12-slim",
+                "regionID": "us",
+                "cpu": 2,
+                "gpu": 1,
+                "memoryMB": 4096,
+                "diskGB": 10,
+            }
+        )
+
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/snapshots",
+                {
+                    "name": "py-base",
+                    "image": "python:3.12-slim",
+                    "region_id": "us",
+                    "cpu": 2,
+                    "gpu": 1,
+                    "memory_mb": 4096,
+                    "disk_gb": 10,
+                },
+            ),
+        )
+        self.assertEqual(snapshot["imageID"], "sha256:snap-2")
+        self.assertEqual(snapshot["regionID"], "us")
+        self.assertEqual(snapshot["cpu"], 2.0)
+        self.assertEqual(snapshot["gpu"], 1.0)
+        self.assertEqual(snapshot["memoryMB"], 4096)
+        self.assertEqual(snapshot["diskGB"], 10)
+
+    def test_register_snapshot_from_image_uses_dockerfile_content(self):
+        client = RecordingMicroVM()
+
+        snapshot = client.register_snapshot_from_image(
+            "built",
+            Image.base("debian:bookworm-slim").run_commands("apt-get update"),
+            {"entrypoint": ["/bin/sh", "-c", "echo hi"]},
+        )
+
+        method, path, payload = client.calls[0]
+        self.assertEqual((method, path), ("POST", "/v1/snapshots"))
+        self.assertEqual(payload["name"], "built")
+        self.assertNotIn("image", payload)
+        self.assertIn("dockerfile_content", payload)
+        self.assertIn("FROM debian:bookworm-slim", payload["dockerfile_content"])
+        self.assertIn("RUN apt-get update", payload["dockerfile_content"])
+        self.assertEqual(payload["entrypoint"], ["/bin/sh", "-c", "echo hi"])
+        self.assertEqual(snapshot["image"], "snapshots/built:resolved")
+        self.assertEqual(snapshot["entrypoint"], ["/bin/sh", "-c", "echo hi"])
+
+    def test_register_snapshot_validates_input_before_sending(self):
+        client = RecordingMicroVM()
+
+        with self.assertRaisesRegex(client_module.MicroVMError, "name is required"):
+            client.register_snapshot({"image": "alpine"})
+
+        with self.assertRaisesRegex(client_module.MicroVMError, "image or dockerfile_content is required"):
+            client.register_snapshot({"name": "x"})
+
+        with self.assertRaisesRegex(client_module.MicroVMError, "mutually exclusive"):
+            client.register_snapshot({"name": "x", "image": "alpine", "dockerfileContent": "FROM busybox"})
+
+        self.assertEqual(client.calls, [])
 
     def test_exec_and_health_map_api_shapes(self):
         client = RecordingMicroVM()

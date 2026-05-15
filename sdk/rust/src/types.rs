@@ -48,6 +48,27 @@ pub struct BuildImageResult {
     pub pushed: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RegisterSnapshotOptions {
+    /// Human-readable identifier other callers use in create-time snapshot references.
+    pub name: String,
+    /// Pre-built registry image reference. Mutually exclusive with `dockerfile_content`.
+    pub image: Option<String>,
+    /// Literal Dockerfile the daemon will build. Mutually exclusive with `image`.
+    pub dockerfile_content: Option<String>,
+    /// Uploaded build-context hashes for future COPY/ADD resolution.
+    pub context_hashes: Vec<String>,
+    /// Optional command override persisted on the snapshot row.
+    pub entrypoint: Vec<String>,
+    /// Region hint persisted for read-back.
+    pub region_id: Option<String>,
+    /// Resource hints surfaced back on the snapshot row.
+    pub cpu: Option<f64>,
+    pub gpu: Option<f64>,
+    pub memory_mb: Option<u32>,
+    pub disk_gb: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MountSpec {
     #[serde(rename = "type")]
@@ -320,7 +341,7 @@ pub struct CreateSandboxResponse {
     pub ssh_private_key: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SandboxSnapshot {
     pub name: String,
     pub image: String,
@@ -330,6 +351,18 @@ pub struct SandboxSnapshot {
     pub source_sandbox_id: String,
     #[serde(rename = "created_at")]
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entrypoint: Vec<String>,
+    #[serde(rename = "region_id", skip_serializing_if = "Option::is_none")]
+    pub region_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<f64>,
+    #[serde(rename = "memory_mb", skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u32>,
+    #[serde(rename = "disk_gb", skip_serializing_if = "Option::is_none")]
+    pub disk_gb: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

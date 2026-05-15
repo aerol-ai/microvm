@@ -49,7 +49,7 @@ public final class Image {
         return this;
     }
 
-    /** A list argument is joined with && so the commands share one layer. */
+    /** A list argument is joined with {@code &&} so the commands share one layer. */
     public Image runCommands(List<String> commands) {
         String joined = commands.stream()
             .map(Image::trimToNull)

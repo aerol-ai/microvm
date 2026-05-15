@@ -21,6 +21,7 @@ export type {
   MountSpec,
   MountSpecRedacted,
   MountType,
+  RegisterSnapshotOptions,
   RegistryAuth,
   ResizeOptions,
   Sandbox as SandboxData,

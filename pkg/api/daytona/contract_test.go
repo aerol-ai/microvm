@@ -132,8 +132,12 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("loadDaytonaMeta(%s) error = %v", resp.GetId(), err)
 				}
-				if stored.Image != "base-snapshot" {
-					t.Fatalf("stored.Image = %q, want %q", stored.Image, "base-snapshot")
+				// Daytona's snapshot field is a snapshot *name*, not an image ref.
+				// The facade looks the name up in the snapshot store and uses the
+				// row's Image as the runtime image; the snapshot name itself is
+				// preserved in the per-sandbox compat metadata for read-back.
+				if stored.Image != "snapshots/base:v1" {
+					t.Fatalf("stored.Image = %q, want %q (resolved from snapshot row)", stored.Image, "snapshots/base:v1")
 				}
 				if valueOrEmpty(meta.Snapshot) != "base-snapshot" {
 					t.Fatalf("stored snapshot metadata = %q, want %q", valueOrEmpty(meta.Snapshot), "base-snapshot")
@@ -1003,7 +1007,9 @@ func TestDaytonaSDKContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("loadDaytonaMeta(%s) error = %v", sandbox.ID, err)
 				}
-				if stored.Image != "sdk-base-snapshot" || valueOrEmpty(meta.Snapshot) != "sdk-base-snapshot" {
+				// stored.Image is the resolved image from the snapshot row;
+				// the meta.Snapshot field preserves the caller-supplied name.
+				if stored.Image != "snapshots/sdk-base:v1" || valueOrEmpty(meta.Snapshot) != "sdk-base-snapshot" {
 					t.Fatalf("snapshot contract not preserved: stored=%+v meta=%+v", stored, meta)
 				}
 			},

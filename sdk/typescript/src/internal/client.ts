@@ -22,6 +22,7 @@ import type {
   MountSpec,
   MountSpecRedacted,
   NetworkUsage,
+  RegisterSnapshotOptions,
   SetNetworkLimitsOptions,
   ResizeOptions,
   Sandbox,
@@ -123,6 +124,12 @@ interface ApiSandboxSnapshot {
   image_id?: string;
   source_sandbox_id: string;
   created_at: string;
+  entrypoint?: string[];
+  region_id?: string;
+  cpu?: number;
+  gpu?: number;
+  memory_mb?: number;
+  disk_gb?: number;
 }
 
 interface ApiSession {
@@ -321,6 +328,47 @@ export class APIClient {
 		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, { name });
 		return fromApiSandboxSnapshot(response);
 	}
+
+  async registerSnapshot(options: RegisterSnapshotOptions): Promise<SandboxSnapshot> {
+    const name = options.name.trim();
+    if (name === "") {
+      throw new Error("name is required");
+    }
+
+    const image = options.image?.trim() ?? "";
+    const dockerfileContent = options.dockerfileContent?.trim() ?? "";
+    if (image === "" && dockerfileContent === "") {
+      throw new Error("image or dockerfile_content is required");
+    }
+    if (image !== "" && dockerfileContent !== "") {
+      throw new Error("image and dockerfile_content are mutually exclusive");
+    }
+
+    const response = await this.doJSON<ApiSandboxSnapshot>(
+      "POST",
+      this.versioned("/snapshots"),
+      toApiRegisterSnapshotOptions({
+        ...options,
+        name,
+        image: image || undefined,
+        dockerfileContent: dockerfileContent || undefined,
+        regionID: options.regionID?.trim() || undefined,
+      }),
+    );
+    return fromApiSandboxSnapshot(response);
+  }
+
+  async registerSnapshotFromImage(
+    name: string,
+    image: Image,
+    options: Omit<RegisterSnapshotOptions, "name" | "image" | "dockerfileContent"> = {},
+  ): Promise<SandboxSnapshot> {
+    return this.registerSnapshot({
+      ...options,
+      name,
+      dockerfileContent: image.dockerfile,
+    });
+  }
 
   async destroy(id: string): Promise<void> {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}`);
@@ -668,6 +716,21 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
   };
 }
 
+function toApiRegisterSnapshotOptions(options: RegisterSnapshotOptions): Record<string, unknown> {
+  return {
+    name: options.name,
+    image: options.image,
+    dockerfile_content: options.dockerfileContent,
+    context_hashes: options.contextHashes,
+    entrypoint: options.entrypoint,
+    region_id: options.regionID,
+    cpu: options.cpu,
+    gpu: options.gpu,
+    memory_mb: options.memoryMB,
+    disk_gb: options.diskGB,
+  };
+}
+
 function toApiResizeOptions(options: ResizeOptions): Record<string, unknown> {
   return {
     cpu: options.cpu,
@@ -758,6 +821,12 @@ function fromApiSandboxSnapshot(snapshot: ApiSandboxSnapshot): SandboxSnapshot {
     imageID: snapshot.image_id,
     sourceSandboxID: snapshot.source_sandbox_id,
     createdAt: snapshot.created_at,
+    entrypoint: snapshot.entrypoint,
+    regionID: snapshot.region_id,
+    cpu: snapshot.cpu,
+    gpu: snapshot.gpu,
+    memoryMB: snapshot.memory_mb,
+    diskGB: snapshot.disk_gb,
   };
 }
 

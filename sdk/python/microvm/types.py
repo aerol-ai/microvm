@@ -36,6 +36,19 @@ class BuildImageResult:
     pushed: Optional[str] = None
 
 
+class RegisterSnapshotOptions(TypedDict, total=False):
+    name: str
+    image: str
+    dockerfileContent: str
+    contextHashes: List[str]
+    entrypoint: List[str]
+    regionID: str
+    cpu: float
+    gpu: float
+    memoryMB: int
+    diskGB: int
+
+
 class MountSpec(TypedDict, total=False):
     type: MountType
     target: str
@@ -216,6 +229,12 @@ class SandboxSnapshot(TypedDict, total=False):
     imageID: str
     sourceSandboxID: str
     createdAt: str
+    entrypoint: List[str]
+    regionID: str
+    cpu: float
+    gpu: float
+    memoryMB: int
+    diskGB: int
 
 
 # Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP

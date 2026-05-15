@@ -19,11 +19,24 @@ type fakeImageBuilder struct {
 	pushErr    error
 	refreshes  []string
 	refreshErr error
+	removes    []string
+	removeErr  error
 }
 
 func (f *fakeImageBuilder) RefreshTag(_ context.Context, ref string) error {
 	f.refreshes = append(f.refreshes, ref)
 	return f.refreshErr
+}
+
+func (f *fakeImageBuilder) RemoveImage(_ context.Context, ref string) error {
+	f.removes = append(f.removes, ref)
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	if f.exists != nil {
+		delete(f.exists, ref)
+	}
+	return nil
 }
 
 func (f *fakeImageBuilder) ImageExists(_ context.Context, ref string) (bool, error) {

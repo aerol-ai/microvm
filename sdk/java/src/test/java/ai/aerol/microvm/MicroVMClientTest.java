@@ -37,6 +37,7 @@ import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 import ai.aerol.microvm.model.MountSpecRedacted;
 import ai.aerol.microvm.model.NetworkUsage;
+import ai.aerol.microvm.model.RegisterSnapshotOptions;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
@@ -331,6 +332,126 @@ class MicroVMClientTest {
             assertEquals("sha256:snap-1", snapshot.imageId);
             assertEquals("sb-1", snapshot.sourceSandboxId);
             assertEquals("snapshots/from-sandbox:v1", sandboxSnapshot.name);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void registerSnapshotMapsRequestAndResponseShapes() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod());
+            assertEquals("/v1/snapshots", exchange.getRequestURI().getPath());
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 201, mapOf(
+                "name", "py-base",
+                "image", "python:3.12-slim",
+                "image_id", "sha256:snap-2",
+                "source_sandbox_id", "",
+                "created_at", "2026-05-15T10:00:00Z",
+                "region_id", "us",
+                "cpu", 2.0,
+                "gpu", 1.0,
+                "memory_mb", 4096,
+                "disk_gb", 10
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            SandboxSnapshot snapshot = client.registerSnapshot(
+                new RegisterSnapshotOptions()
+                    .setName("py-base")
+                    .setImage("python:3.12-slim")
+                    .setRegionId("us")
+                    .setCpu(2.0)
+                    .setGpu(1.0)
+                    .setMemoryMb(4096)
+                    .setDiskGb(10)
+            );
+
+            Map<String, Object> payload = requestBody.get();
+            assertEquals("py-base", payload.get("name"));
+            assertEquals("python:3.12-slim", payload.get("image"));
+            assertEquals("us", payload.get("region_id"));
+            assertEquals(2.0, ((Number) payload.get("cpu")).doubleValue());
+            assertEquals(1.0, ((Number) payload.get("gpu")).doubleValue());
+            assertEquals(4096, ((Number) payload.get("memory_mb")).intValue());
+            assertEquals(10, ((Number) payload.get("disk_gb")).intValue());
+            assertEquals("sha256:snap-2", snapshot.imageId);
+            assertEquals("us", snapshot.regionId);
+            assertEquals(2.0, snapshot.cpu);
+            assertEquals(1.0, snapshot.gpu);
+            assertEquals(4096, snapshot.memoryMb);
+            assertEquals(10, snapshot.diskGb);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void registerSnapshotFromImageSendsDockerfilePath() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod());
+            assertEquals("/v1/snapshots", exchange.getRequestURI().getPath());
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 201, mapOf(
+                "name", "built",
+                "image", "snapshots/built:resolved",
+                "image_id", "sha256:snap-3",
+                "source_sandbox_id", "",
+                "created_at", "2026-05-15T10:00:00Z",
+                "entrypoint", List.of("/bin/sh", "-c", "echo hi")
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            SandboxSnapshot snapshot = client.registerSnapshotFromImage(
+                "built",
+                Image.base("debian:bookworm-slim").runCommands("apt-get update"),
+                new RegisterSnapshotOptions().setEntrypoint(List.of("/bin/sh", "-c", "echo hi"))
+            );
+
+            Map<String, Object> payload = requestBody.get();
+            assertEquals("built", payload.get("name"));
+            assertTrue(payload.containsKey("dockerfile_content"));
+            assertTrue(String.valueOf(payload.get("dockerfile_content")).contains("FROM debian:bookworm-slim"));
+            assertTrue(String.valueOf(payload.get("dockerfile_content")).contains("RUN apt-get update"));
+            assertEquals(false, payload.containsKey("image"));
+            assertEquals(List.of("/bin/sh", "-c", "echo hi"), payload.get("entrypoint"));
+            assertEquals("snapshots/built:resolved", snapshot.image);
+            assertEquals(List.of("/bin/sh", "-c", "echo hi"), snapshot.entrypoint);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void registerSnapshotValidatesInputBeforeSending() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            throw new AssertionError("validation should fail before the request fires; got " + exchange.getRequestMethod() + " " + exchange.getRequestURI());
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+
+            MicroVMException missingName = assertThrows(MicroVMException.class, () -> client.registerSnapshot(
+                new RegisterSnapshotOptions().setImage("alpine")
+            ));
+            assertTrue(missingName.getMessage().contains("name is required"));
+
+            MicroVMException missingPayload = assertThrows(MicroVMException.class, () -> client.registerSnapshot(
+                new RegisterSnapshotOptions().setName("x")
+            ));
+            assertTrue(missingPayload.getMessage().contains("image or dockerfile_content is required"));
+
+            MicroVMException bothSet = assertThrows(MicroVMException.class, () -> client.registerSnapshot(
+                new RegisterSnapshotOptions().setName("x").setImage("alpine").setDockerfileContent("FROM busybox")
+            ));
+            assertTrue(bothSet.getMessage().contains("mutually exclusive"));
         } finally {
             server.stop(0);
         }

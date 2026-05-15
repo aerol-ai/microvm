@@ -24,6 +24,10 @@ type ImageBuilder interface {
 	// janitor doesn't GC a tag that was just handed out from the build
 	// cache. Called on the ImageExists==true short-circuit path.
 	RefreshTag(ctx context.Context, fullRef string) error
+	// RemoveImage rolls back a freshly built tag when the downstream
+	// snapshot-register call fails — otherwise the layer leaks because no
+	// snapshot row points at it for the built-image janitor to clean up.
+	RemoveImage(ctx context.Context, imageRef string) error
 }
 
 // BuildConfig mirrors the operator-configured image-build knobs.
@@ -86,6 +90,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
+	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...

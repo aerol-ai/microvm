@@ -202,6 +202,47 @@ func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (sdktypes.
 	return c.inner.CreateSnapshot(ctx, id, name)
 }
 
+// RegisterSnapshot persists a named snapshot pointing at either a pre-built
+// image (opts.Image) or a Dockerfile the daemon will build (opts.Dockerfile
+// — typically obtained from Image.Dockerfile()). The returned snapshot's
+// Image field reflects the resolved registry reference (for the build path
+// this is the daemon's content-addressed tag).
+//
+// Once registered, callers can reference the snapshot by name in
+// CreateSandboxOptions.Snapshot — the server resolves it to the image at
+// create time.
+func (c *Client) RegisterSnapshot(ctx context.Context, opts sdktypes.RegisterSnapshotOptions) (sdktypes.SandboxSnapshot, error) {
+	return c.inner.RegisterSnapshot(ctx, apiclient.RegisterSnapshotOptions{
+		Name:              opts.Name,
+		Image:             opts.Image,
+		DockerfileContent: opts.DockerfileContent,
+		ContextHashes:     opts.ContextHashes,
+		Entrypoint:        opts.Entrypoint,
+		RegionID:          opts.RegionID,
+		CPU:               opts.CPU,
+		GPU:               opts.GPU,
+		MemoryMB:          opts.MemoryMB,
+		DiskGB:            opts.DiskGB,
+	})
+}
+
+// RegisterSnapshotFromImage compiles an Image-builder graph and registers
+// the resulting Dockerfile as a named snapshot. Convenience wrapper around
+// RegisterSnapshot that mirrors CreateWithImage's ergonomics — pass an
+// *Image instead of remembering to call Image.Dockerfile() yourself.
+func (c *Client) RegisterSnapshotFromImage(ctx context.Context, name string, image *Image, opts sdktypes.RegisterSnapshotOptions) (sdktypes.SandboxSnapshot, error) {
+	if image == nil {
+		return sdktypes.SandboxSnapshot{}, errors.New("image is nil")
+	}
+	if err := image.Err(); err != nil {
+		return sdktypes.SandboxSnapshot{}, err
+	}
+	opts.Name = name
+	opts.Image = ""
+	opts.DockerfileContent = image.Dockerfile()
+	return c.RegisterSnapshot(ctx, opts)
+}
+
 func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.inner.Destroy(ctx, id)
 }

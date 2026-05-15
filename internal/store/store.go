@@ -112,7 +112,13 @@ func Open(path string) (*Store, error) {
 			image TEXT NOT NULL,
 			image_id TEXT NOT NULL DEFAULT '',
 			source_sandbox_id TEXT NOT NULL,
-			created_at DATETIME NOT NULL
+			created_at DATETIME NOT NULL,
+			entrypoint_json TEXT NOT NULL DEFAULT '[]',
+			region_id TEXT NOT NULL DEFAULT '',
+			cpu REAL NOT NULL DEFAULT 0,
+			memory_mb INTEGER NOT NULL DEFAULT 0,
+			disk_gb INTEGER NOT NULL DEFAULT 0,
+			gpu REAL NOT NULL DEFAULT 0
 		);`,
 		// sandbox_compat_state holds opaque facade-private state that has
 		// no native meaning. One row per (sandbox, facade). state_json is
@@ -226,6 +232,15 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out_limit INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_quota_exceeded INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_quota_exceeded_at DATETIME;`,
+		// Snapshot-from-image columns. Pre-existing rows (committed from a
+		// running sandbox) get zero values, which scanSnapshot decodes as
+		// "no extra metadata" — preserving the legacy shape.
+		`ALTER TABLE sandbox_snapshots ADD COLUMN entrypoint_json TEXT NOT NULL DEFAULT '[]';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN region_id TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN cpu REAL NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN disk_gb INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN gpu REAL NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -1178,15 +1193,26 @@ func (s *Store) DeleteIdempotentRequest(ctx context.Context, scope, fingerprint 
 }
 
 func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at)
-		VALUES (?, ?, ?, ?, ?)
+	entrypointJSON, err := marshalJSON(snapshot.Entrypoint, "[]")
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		strings.TrimSpace(snapshot.Name),
 		strings.TrimSpace(snapshot.Image),
 		strings.TrimSpace(snapshot.ImageID),
 		strings.TrimSpace(snapshot.SourceSandboxID),
 		snapshot.CreatedAt.UTC(),
+		entrypointJSON,
+		strings.TrimSpace(snapshot.RegionID),
+		snapshot.CPU,
+		snapshot.MemoryMB,
+		snapshot.DiskGB,
+		snapshot.GPU,
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -1199,7 +1225,8 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 
 func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT name, image, image_id, source_sandbox_id, created_at
+		SELECT name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu
 		FROM sandbox_snapshots
 		WHERE name = ?
 	`, strings.TrimSpace(name))
@@ -1215,7 +1242,8 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 
 func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT name, image, image_id, source_sandbox_id, created_at
+		SELECT name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu
 		FROM sandbox_snapshots
 		ORDER BY created_at DESC, name ASC
 	`)
@@ -1619,15 +1647,27 @@ func scanSnapshot(scanner interface {
 	Scan(dest ...any) error
 }) (*models.SandboxSnapshot, error) {
 	var snapshot models.SandboxSnapshot
+	var entrypointJSON string
 	err := scanner.Scan(
 		&snapshot.Name,
 		&snapshot.Image,
 		&snapshot.ImageID,
 		&snapshot.SourceSandboxID,
 		&snapshot.CreatedAt,
+		&entrypointJSON,
+		&snapshot.RegionID,
+		&snapshot.CPU,
+		&snapshot.MemoryMB,
+		&snapshot.DiskGB,
+		&snapshot.GPU,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if entrypointJSON != "" && entrypointJSON != "[]" {
+		if err := json.Unmarshal([]byte(entrypointJSON), &snapshot.Entrypoint); err != nil {
+			return nil, fmt.Errorf("decode snapshot entrypoint: %w", err)
+		}
 	}
 	return &snapshot, nil
 }

@@ -30,6 +30,7 @@ from .types import (
     MountSpec,
     MountSpecRedacted,
     NetworkUsage,
+    RegisterSnapshotOptions,
     ResizeOptions,
     SandboxData,
     SandboxSnapshot,
@@ -480,6 +481,47 @@ class MicroVM:
         response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", {"name": name})
         return _from_api_sandbox_snapshot(response)
 
+    def register_snapshot(self, options: RegisterSnapshotOptions) -> SandboxSnapshot:
+        name = str(_first_of(options, "name") or "").strip()
+        if name == "":
+            raise MicroVMError("name is required")
+
+        image = str(_first_of(options, "image") or "").strip()
+        dockerfile_content = str(_first_of(options, "dockerfileContent", "dockerfile_content") or "").strip()
+        if image == "" and dockerfile_content == "":
+            raise MicroVMError("image or dockerfile_content is required")
+        if image != "" and dockerfile_content != "":
+            raise MicroVMError("image and dockerfile_content are mutually exclusive")
+
+        response = self._do_json(
+            "POST",
+            self._versioned("/snapshots"),
+            _to_api_register_snapshot_options(
+                {
+                    **options,
+                    "name": name,
+                    "image": image or None,
+                    "dockerfileContent": dockerfile_content or None,
+                    "regionID": str(_first_of(options, "regionID", "region_id") or "").strip() or None,
+                }
+            ),
+        )
+        return _from_api_sandbox_snapshot(response)
+
+    def register_snapshot_from_image(
+        self,
+        name: str,
+        image: Image,
+        options: Optional[RegisterSnapshotOptions] = None,
+    ) -> SandboxSnapshot:
+        if not isinstance(image, Image):
+            raise TypeError("register_snapshot_from_image expects an Image instance")
+        resolved_options: RegisterSnapshotOptions = dict(options or {})
+        resolved_options["name"] = name
+        resolved_options.pop("image", None)
+        resolved_options["dockerfileContent"] = image.dockerfile
+        return self.register_snapshot(resolved_options)
+
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
 
@@ -756,6 +798,23 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
     )
 
 
+def _to_api_register_snapshot_options(options: RegisterSnapshotOptions) -> Dict[str, Any]:
+    return _compact(
+        {
+            "name": _first_of(options, "name"),
+            "image": _first_of(options, "image"),
+            "dockerfile_content": _first_of(options, "dockerfileContent", "dockerfile_content"),
+            "context_hashes": _first_of(options, "contextHashes", "context_hashes"),
+            "entrypoint": _first_of(options, "entrypoint"),
+            "region_id": _first_of(options, "regionID", "region_id"),
+            "cpu": _first_of(options, "cpu"),
+            "gpu": _first_of(options, "gpu"),
+            "memory_mb": _first_of(options, "memoryMB", "memory_mb"),
+            "disk_gb": _first_of(options, "diskGB", "disk_gb"),
+        }
+    )
+
+
 def _to_api_resize_options(options: ResizeOptions) -> Dict[str, Any]:
     return _compact(
         {
@@ -844,6 +903,24 @@ def _from_api_sandbox_snapshot(snapshot: Dict[str, Any]) -> SandboxSnapshot:
     image_id = _first_of(snapshot, "image_id", "imageID")
     if image_id not in (None, ""):
         result["imageID"] = str(image_id)
+    entrypoint = _first_of(snapshot, "entrypoint")
+    if isinstance(entrypoint, list):
+        result["entrypoint"] = [str(item) for item in entrypoint]
+    region_id = _first_of(snapshot, "region_id", "regionID")
+    if region_id not in (None, ""):
+        result["regionID"] = str(region_id)
+    cpu = _first_of(snapshot, "cpu")
+    if cpu is not None:
+        result["cpu"] = float(cpu)
+    gpu = _first_of(snapshot, "gpu")
+    if gpu is not None:
+        result["gpu"] = float(gpu)
+    memory_mb = _first_of(snapshot, "memory_mb", "memoryMB")
+    if memory_mb is not None:
+        result["memoryMB"] = int(memory_mb)
+    disk_gb = _first_of(snapshot, "disk_gb", "diskGB")
+    if disk_gb is not None:
+        result["diskGB"] = int(disk_gb)
     return result
 
 

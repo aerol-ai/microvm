@@ -54,6 +54,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	h := newHandlers(d)
 
 	mux.Handle("POST "+PathPrefix+"/sandbox", d.Auth(http.HandlerFunc(h.createSandbox)))
+	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.createSnapshotFromImage)))
 	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
 	mux.Handle("GET "+PathPrefix+"/snapshots/{id}", d.Auth(http.HandlerFunc(h.getSnapshot)))
 	mux.Handle("DELETE "+PathPrefix+"/snapshots/{id}", d.Auth(http.HandlerFunc(h.deleteSnapshot)))
@@ -74,4 +75,14 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 
 	mux.Handle(ToolboxPrefix+"/{id}", d.Auth(http.HandlerFunc(h.toolbox)))
 	mux.Handle(ToolboxPrefix+"/{id}/{path...}", d.Auth(http.HandlerFunc(h.toolbox)))
+
+	// Volumes — the Daytona SDK probes these five routes when callers use
+	// daytona.volume.{list,get,create,delete}. The facade has no volume
+	// backend yet; respond with 405 so clients see a clear "recognized but
+	// not implemented" signal rather than a 404 they'd retry through.
+	mux.Handle("GET "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(volumesNotSupported)))
+	mux.Handle("POST "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(volumesNotSupported)))
+	mux.Handle("GET "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(volumesNotSupported)))
+	mux.Handle("DELETE "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(volumesNotSupported)))
+	mux.Handle("GET "+PathPrefix+"/volumes/by-name/{name}", d.Auth(http.HandlerFunc(volumesNotSupported)))
 }
