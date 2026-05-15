@@ -13,7 +13,10 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
+from .image import Image
 from .types import (
+    BuildImagePushOptions,
+    BuildImageResult,
     CreateOptions,
     CreateSessionOptions,
     ExecExitInfo,
@@ -39,8 +42,8 @@ STREAM_PREFIX_STDOUT = 0x01
 STREAM_PREFIX_STDERR = 0x02
 
 # Wire versions of the sandbox daemon API this SDK can call. Today only "v1"
-# exists; "v2" will be added when a wire-level breaking change ships on the
-# server. The SDK package version and the API wire version evolve
+# exists; a new wire version will be added when a breaking change ships on
+# the server. The SDK package version and the API wire version evolve
 # independently — bumping this SDK does not move the wire version.
 _DEFAULT_API_VERSION = "v1"
 _PATH_PREFIXES: Dict[str, str] = {
@@ -59,6 +62,12 @@ def _read_env(name: str) -> Optional[str]:
 
 class MicroVMError(Exception):
     pass
+
+
+class MicroVMHTTPError(MicroVMError):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ExecStreamHandle:
@@ -385,14 +394,71 @@ class MicroVM:
     def _versioned(self, suffix: str) -> str:
         """Build a versioned API path. Pass the suffix beginning with "/" (e.g.
         ``"/sandboxes"``) and the active version's prefix is prepended. Use
-        this for every versioned call so v2 (when it lands) is selected by the
-        ``api_version`` option without touching call sites.
+        this for every versioned call so a future wire version is selected by
+        the ``api_version`` option without touching call sites.
         """
         return f"{self._version_prefix}{suffix}"
 
     def create(self, options: CreateOptions) -> Sandbox:
-        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(options))
+        resolved_options = dict(options)
+        resolved_options["image"] = self._resolve_image(_first_of(options, "image"))
+        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
         return self._wrap_sandbox(sandbox)
+
+    def build_image(self, image: Image) -> str:
+        result = self.build_image_with_push(image, push=None)
+        return result.image
+
+    def build_image_with_push(
+        self,
+        image: Image,
+        *,
+        push: Optional[BuildImagePushOptions] = None,
+    ) -> BuildImageResult:
+        """Build an Image and optionally push the result to a remote registry.
+
+        When ``push`` is ``None``, behavior matches :meth:`build_image`.
+        Push credentials are forwarded to the daemon as a one-shot
+        ``X-Registry-Auth`` header on the underlying push call and are never
+        persisted server-side.
+        """
+        if not isinstance(image, Image):
+            raise TypeError("build_image expects an Image instance")
+        body: Dict[str, Any] = {"dockerfile_content": image.dockerfile}
+        if push is not None:
+            registry = str(push.get("registry", "")).strip()
+            username = str(push.get("username", ""))
+            password = str(push.get("password", ""))
+            if not registry:
+                raise ValueError("push.registry is required when push is set")
+            if not username or not password:
+                raise ValueError("push.username and push.password are required when push is set")
+            push_body: Dict[str, Any] = {
+                "registry": registry,
+                "username": username,
+                "password": password,
+            }
+            tag = str(push.get("tag", "")).strip()
+            if tag:
+                push_body["tag"] = tag
+            server = str(push.get("server", "")).strip()
+            if server:
+                push_body["server"] = server
+            body["push"] = push_body
+
+        path = self._versioned("/images/build")
+        try:
+            payload = self._do_json("POST", path, body)
+        except MicroVMHTTPError as exc:
+            if exc.status_code == 404:
+                raise MicroVMError(
+                    f'this daemon does not support Image builds (POST {path} is not registered) — pass a string image reference (e.g. "ubuntu:22.04") instead, or upgrade the daemon'
+                ) from exc
+            raise
+        image_tag = str(_first_of(payload, "image") or "")
+        pushed_value = _first_of(payload, "pushed")
+        pushed: Optional[str] = str(pushed_value) if pushed_value else None
+        return BuildImageResult(image=image_tag, pushed=pushed)
 
     def list(self) -> List[Sandbox]:
         sandboxes = self._do_json("GET", self._versioned("/sandboxes"), None)
@@ -548,6 +614,13 @@ class MicroVM:
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
+    def _resolve_image(self, image: Any) -> str:
+        if isinstance(image, Image):
+            return self.build_image(image)
+        if isinstance(image, str) and image.strip() != "":
+            return image
+        raise TypeError("CreateOptions.image must be a non-empty string or Image")
+
     def _wrap_sandbox(self, response: Dict[str, Any]) -> Sandbox:
         return Sandbox(self, _from_api_sandbox(response))
 
@@ -567,9 +640,9 @@ class MicroVM:
             payload = exc.read()
             try:
                 data = json.loads(payload.decode("utf-8"))
-                raise MicroVMError(str(data.get("error", exc.reason))) from exc
+                raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
             except (ValueError, TypeError):
-                raise MicroVMError(exc.reason) from exc
+                raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
         body = None

@@ -60,20 +60,8 @@ If you change who holds a PAT (sub-accounts, hosted offering, external CI), this
 
 **Reviewer asks:** does this PR widen what a PAT holder can pass into a host-side mount command? If yes, is it still safe under the "PAT == operator" assumption, and is the assumption still accurate?
 
-## 6. API versioning (v1 soft freeze)
 
-The HTTP API is split into version subpackages: every `/v1/...` route is owned by `pkg/api/v1`, and SDK call sites build URLs through a `versioned()` helper / `apiVersion` option (see each SDK's `internal/api/v1/` module). The split exists so v1 and v2 can coexist on the same daemon and so SDK consumers can pin a wire version independently of the SDK package version.
-
-To preserve that property, v1 is **soft-frozen**:
-
-- **No behavioral changes** to v1 wire bodies, status codes, header semantics, or path shapes once shipped. Adding a new field to a v1 response, changing an error status, or renaming a path counts as a behavioral change. Land those in a new version package (`pkg/api/v2/...`) instead.
-- **Bug and security fixes that preserve wire compatibility are allowed** — clarifying an error message, fixing a 500 that should have been a 4xx for invalid input the server already rejected, plugging a panic.
-- **No version-leakage into `internal/`.** The service layer (`internal/service`) stays version-agnostic; v1 handlers translate v1 DTOs ↔ `models.*`. If you find yourself wanting `if version == "v1"` in `internal/`, stop and put the branch in the handler instead.
-- SDK changes follow the same rule per-SDK: do not alter what an `apiVersion: "v1"` client sends or how it deserializes a v1 response. Add capabilities by introducing a `v2` transport.
-
-**Reviewer asks:** does this PR change anything a `/v1` client (server-side or SDK-side) can observe? If yes, does it belong in v2 instead?
-
-## 7. TCP host-port pool & L4 bootstrap
+## 6. TCP host-port pool & L4 bootstrap
 
 These two areas are particularly fragile and have produced live incidents (PR #16):
 

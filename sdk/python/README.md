@@ -55,6 +55,22 @@ sandbox.update_lifecycle(
 print(sandbox.lifecycle)
 ```
 
+## Build Images
+
+```python
+from microvm import Image, MicroVM
+
+client = MicroVM(pat_token="${SB_PAT_TOKEN}", api_url="https://sandbox.example.com")
+image = Image.base("ubuntu:22.04").run_commands("apt-get update", "apt-get install -y curl")
+
+# create() accepts an Image directly
+sandbox = client.create({"image": image})
+
+# or build it explicitly and reuse the content-addressed tag
+tag = client.build_image(image)
+print(tag)
+```
+
 ## Example
 
 ```bash

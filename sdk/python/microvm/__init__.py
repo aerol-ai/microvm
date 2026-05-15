@@ -1,4 +1,19 @@
 from .client import MicroVM
-from .types import ExposeProtocol, ExposeResult, SandboxSnapshot
+from .image import Image
+from .types import (
+    BuildImagePushOptions,
+    BuildImageResult,
+    ExposeProtocol,
+    ExposeResult,
+    SandboxSnapshot,
+)
 
-__all__ = ["MicroVM", "ExposeProtocol", "ExposeResult", "SandboxSnapshot"]
+__all__ = [
+    "BuildImagePushOptions",
+    "BuildImageResult",
+    "Image",
+    "MicroVM",
+    "ExposeProtocol",
+    "ExposeResult",
+    "SandboxSnapshot",
+]

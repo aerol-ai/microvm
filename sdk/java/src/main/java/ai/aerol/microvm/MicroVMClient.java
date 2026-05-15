@@ -24,6 +24,9 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
+import ai.aerol.microvm.model.BuildImageOptions;
+import ai.aerol.microvm.model.BuildImagePushOptions;
+import ai.aerol.microvm.model.BuildImageResult;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.ExecExitInfo;
@@ -97,8 +100,8 @@ public class MicroVMClient {
     /**
      * Build a versioned API path. Pass the suffix beginning with "/" (e.g.
      * {@code "/sandboxes"}); the active version's prefix is prepended. Use
-     * this for every versioned call so v2 (when it lands) can be selected via
-     * {@link MicroVMConfig#apiVersion} without touching call sites.
+     * this for every versioned call so a future wire version can be selected
+     * via {@link MicroVMConfig#apiVersion} without touching call sites.
      */
     private String versioned(String suffix) {
         return versionPrefix + suffix;
@@ -114,6 +117,75 @@ public class MicroVMClient {
 
     public Sandbox create(CreateOptions options) {
         return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class));
+    }
+
+    /**
+     * Build {@code image} and create a sandbox from the resulting tag with
+     * default options. Distinct method name (vs {@code create(...)} overloads)
+     * so a {@code null} argument can't pick this path by accident.
+     */
+    public Sandbox createWithImage(Image image) {
+        return createWithImage(image, new CreateOptions());
+    }
+
+    public Sandbox createWithImage(Image image, CreateOptions options) {
+        CreateOptions resolved = copyCreateOptions(options);
+        resolved.setImage(buildImage(image));
+        return create(resolved);
+    }
+
+    public String buildImage(Image image) {
+        return buildImage(image, null).image;
+    }
+
+    /**
+     * Build an Image and optionally push the result to a remote registry.
+     * When {@code options.push} is set, push credentials are forwarded to the
+     * daemon as a one-shot {@code X-Registry-Auth} header on the underlying
+     * push call and are never persisted server-side.
+     */
+    public BuildImageResult buildImage(Image image, BuildImageOptions options) {
+        if (image == null) {
+            throw new MicroVMException("image is required");
+        }
+        BuildImageRequest body = new BuildImageRequest(image.getDockerfile());
+        if (options != null && options.push != null) {
+            BuildImagePushOptions push = options.push;
+            String registry = push.registry == null ? "" : push.registry.trim();
+            if (registry.isEmpty()) {
+                throw new MicroVMException("push.registry is required when push is set");
+            }
+            if (push.username == null || push.username.isEmpty()
+                || push.password == null || push.password.isEmpty()) {
+                throw new MicroVMException("push.username and push.password are required when push is set");
+            }
+            BuildImagePushSpec spec = new BuildImagePushSpec();
+            spec.registry = registry;
+            spec.tag = isNullOrEmpty(push.tag) ? null : push.tag.trim();
+            spec.server = isNullOrEmpty(push.server) ? null : push.server.trim();
+            spec.username = push.username;
+            spec.password = push.password;
+            body.push = spec;
+        }
+        String path = versioned("/images/build");
+        HttpResponse<byte[]> response = sendJsonRequest("POST", path, body);
+        if (response.statusCode() == 404) {
+            throw new MicroVMException(
+                "this daemon does not support Image builds (POST " + path
+                    + " is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon"
+            );
+        }
+        ensureSuccess(response);
+        BuildImageResponse payload = JsonSupport.read(response.body(), BuildImageResponse.class);
+        if (payload == null) {
+            return new BuildImageResult("", null);
+        }
+        String pushed = isNullOrEmpty(payload.pushed) ? null : payload.pushed;
+        return new BuildImageResult(payload.image == null ? "" : payload.image, pushed);
+    }
+
+    private static boolean isNullOrEmpty(String s) {
+        return s == null || s.isEmpty();
     }
 
     public List<Sandbox> list() {
@@ -241,6 +313,28 @@ public class MicroVMClient {
         CreateSnapshotRequest(String name) {
             this.name = name;
         }
+    }
+
+    static class BuildImageRequest {
+        public final String dockerfileContent;
+        public BuildImagePushSpec push;
+
+        BuildImageRequest(String dockerfileContent) {
+            this.dockerfileContent = dockerfileContent;
+        }
+    }
+
+    static class BuildImagePushSpec {
+        public String registry;
+        public String tag;
+        public String server;
+        public String username;
+        public String password;
+    }
+
+    static class BuildImageResponse {
+        public String image;
+        public String pushed;
     }
 
     public void reconcile() {
@@ -441,6 +535,29 @@ public class MicroVMClient {
 
     private Sandbox wrap(SandboxData data) {
         return new Sandbox(this, data);
+    }
+
+    private CreateOptions copyCreateOptions(CreateOptions source) {
+        CreateOptions copy = new CreateOptions();
+        if (source == null) {
+            return copy;
+        }
+        copy.image = source.image;
+        copy.cpu = source.cpu;
+        copy.memoryMb = source.memoryMb;
+        copy.diskGb = source.diskGb;
+        copy.env = source.env;
+        copy.osUser = source.osUser;
+        copy.networkBlockAll = source.networkBlockAll;
+        copy.networkBytesInLimit = source.networkBytesInLimit;
+        copy.networkBytesOutLimit = source.networkBytesOutLimit;
+        copy.registry = source.registry;
+        copy.containerCommand = source.containerCommand;
+        copy.mounts = source.mounts;
+        copy.lifecycle = source.lifecycle;
+        copy.runtime = source.runtime;
+        copy.gpus = source.gpus;
+        return copy;
     }
 
     private <T> T doJson(String method, String path, Object payload, Class<T> responseType) {

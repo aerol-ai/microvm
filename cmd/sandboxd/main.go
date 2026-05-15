@@ -135,6 +135,7 @@ func main() {
 	}
 	svc.StartLifecycleSweep(ctx)
 	svc.StartEventMonitor(ctx)
+	svc.StartBuiltImageGC(ctx)
 
 	if cfg.EnableSSHGateway {
 		gw, err := sshgateway.New(logger, sshgateway.Config{
@@ -153,7 +154,7 @@ func main() {
 		}()
 	}
 
-	server := api.NewServer(logger, svc, cfg.PATToken)
+	server := api.NewServer(logger, svc, dockerClient, cfg, cfg.PATToken)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
 		Handler:           server.Handler(),

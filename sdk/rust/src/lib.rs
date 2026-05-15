@@ -1,3 +1,4 @@
+mod image;
 mod types;
 
 use std::fmt;
@@ -6,7 +7,10 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::blocking::{multipart::{Form, Part}, Client as HttpClient};
+use reqwest::blocking::{
+    multipart::{Form, Part},
+    Client as HttpClient,
+};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -17,9 +21,16 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
-pub use types::{CreateOptions, CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposedPort, ExposeOptions, ExposeProtocol, ExposeResult, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus, SetNetworkLimitsOptions, UpdateLifecycleOptions};
+pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::ExposePortResponseWire;
+pub use types::{
+    BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions,
+    CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, ExposeProtocol,
+    ExposeResult, ExposedPort, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType,
+    NetworkUsage, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session,
+    SessionList, SessionStatus, SetNetworkLimitsOptions, UpdateLifecycleOptions,
+};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
@@ -68,7 +79,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Reqwest(err) => write!(f, "HTTP error: {}", err),
-            Error::MissingToken => write!(f, "PAT token is required. Set SB_PAT_TOKEN or pass pat_token."),
+            Error::MissingToken => write!(
+                f,
+                "PAT token is required. Set SB_PAT_TOKEN or pass pat_token."
+            ),
             Error::Api(message) => write!(f, "API error: {}", message),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
@@ -215,7 +229,9 @@ impl ExecStreamHandle {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Error> {
-        self.send_text(serde_json::json!({ "type": "resize", "cols": cols, "rows": rows }).to_string())
+        self.send_text(
+            serde_json::json!({ "type": "resize", "cols": cols, "rows": rows }).to_string(),
+        )
     }
 
     pub fn signal(&self, name: &str) -> Result<(), Error> {
@@ -249,7 +265,9 @@ impl SessionAttachHandle {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Error> {
-        self.send_text(serde_json::json!({ "type": "resize", "cols": cols, "rows": rows }).to_string())
+        self.send_text(
+            serde_json::json!({ "type": "resize", "cols": cols, "rows": rows }).to_string(),
+        )
     }
 
     pub fn signal(&self, name: &str) -> Result<(), Error> {
@@ -280,7 +298,11 @@ impl Sandbox {
         }
     }
 
-    fn new_with_ssh_private_key(client: Client, data: SandboxData, ssh_private_key: Option<String>) -> Self {
+    fn new_with_ssh_private_key(
+        client: Client,
+        data: SandboxData,
+        ssh_private_key: Option<String>,
+    ) -> Self {
         Sandbox {
             client,
             data,
@@ -319,11 +341,13 @@ impl Sandbox {
     }
 
     pub fn signal_session(&self, session_id: &str, signal: &str) -> Result<(), Error> {
-        self.client.signal_session(&self.data.id, session_id, signal)
+        self.client
+            .signal_session(&self.data.id, session_id, signal)
     }
 
     pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), Error> {
-        self.client.resize_session(&self.data.id, session_id, cols, rows)
+        self.client
+            .resize_session(&self.data.id, session_id, cols, rows)
     }
 
     pub fn session_log(&self, session_id: &str) -> Result<Vec<u8>, Error> {
@@ -334,8 +358,13 @@ impl Sandbox {
         self.client.session_recording(&self.data.id, session_id)
     }
 
-    pub fn attach_session(&self, session_id: &str, options: SessionAttachOptions) -> Result<SessionAttachHandle, Error> {
-        self.client.attach_session(&self.data.id, session_id, options)
+    pub fn attach_session(
+        &self,
+        session_id: &str,
+        options: SessionAttachOptions,
+    ) -> Result<SessionAttachHandle, Error> {
+        self.client
+            .attach_session(&self.data.id, session_id, options)
     }
 
     pub fn upload_file(&self, target_path: &str, data: Vec<u8>) -> Result<(), Error> {
@@ -416,13 +445,22 @@ impl Client {
         let token = pat_token
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
-            .or_else(|| std::env::var("SB_PAT_TOKEN").ok().filter(|value| !value.trim().is_empty()));
+            .or_else(|| {
+                std::env::var("SB_PAT_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
 
         let pat_token = token.ok_or(Error::MissingToken)?;
         let api_url = api_url
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().trim_end_matches('/').to_string())
-            .or_else(|| std::env::var("SB_API_URL").ok().filter(|value| !value.trim().is_empty()).map(|value| value.trim().trim_end_matches('/').to_string()))
+            .or_else(|| {
+                std::env::var("SB_API_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| value.trim().trim_end_matches('/').to_string())
+            })
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
         Ok(Client {
@@ -439,27 +477,155 @@ impl Client {
     }
 
     pub fn create(&self, opts: CreateOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(Method::POST, &format!("{}/sandboxes", self.version_prefix()), Some(&opts))?;
-        Ok(Sandbox::new_with_ssh_private_key(self.clone(), raw.sandbox, raw.ssh_private_key))
+        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(
+            Method::POST,
+            &format!("{}/sandboxes", self.version_prefix()),
+            Some(&opts),
+        )?;
+        Ok(Sandbox::new_with_ssh_private_key(
+            self.clone(),
+            raw.sandbox,
+            raw.ssh_private_key,
+        ))
+    }
+
+    pub fn build_image(&self, image: &Image) -> Result<String, Error> {
+        Ok(self
+            .build_image_with_options(image, &BuildImageOptions::default())?
+            .image)
+    }
+
+    /// Build an `Image` and optionally push the result to a remote registry.
+    /// Push credentials are forwarded to the daemon as a one-shot
+    /// `X-Registry-Auth` header on the underlying push call and are never
+    /// persisted server-side.
+    pub fn build_image_with_options(
+        &self,
+        image: &Image,
+        options: &BuildImageOptions,
+    ) -> Result<BuildImageResult, Error> {
+        #[derive(Serialize)]
+        struct BuildImageRequest<'a> {
+            dockerfile_content: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            push: Option<BuildImagePushBody<'a>>,
+        }
+
+        #[derive(Serialize)]
+        struct BuildImagePushBody<'a> {
+            registry: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tag: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            server: Option<&'a str>,
+            username: &'a str,
+            password: &'a str,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct BuildImageResponse {
+            image: String,
+            #[serde(default)]
+            pushed: Option<String>,
+        }
+
+        if let Some(message) = image.validation_error() {
+            return Err(Error::Api(message.to_string()));
+        }
+
+        let push_body = if let Some(push) = options.push.as_ref() {
+            let registry = push.registry.trim();
+            if registry.is_empty() {
+                return Err(Error::Api(
+                    "push.registry is required when push is set".to_string(),
+                ));
+            }
+            if push.username.is_empty() || push.password.is_empty() {
+                return Err(Error::Api(
+                    "push.username and push.password are required when push is set".to_string(),
+                ));
+            }
+            Some(BuildImagePushBody {
+                registry,
+                tag: push.tag.as_deref().filter(|s| !s.is_empty()),
+                server: push.server.as_deref().filter(|s| !s.is_empty()),
+                username: push.username.as_str(),
+                password: push.password.as_str(),
+            })
+        } else {
+            None
+        };
+
+        let path = format!("{}/images/build", self.version_prefix());
+        let response = self
+            .inner
+            .request(Method::POST, self.full_url(&path))
+            .bearer_auth(&self.pat_token)
+            .json(&BuildImageRequest {
+                dockerfile_content: image.dockerfile(),
+                push: push_body,
+            })
+            .send()?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let _ = response.text();
+            return Err(Error::Api(format!(
+                "this daemon does not support Image builds (POST {} is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
+                path,
+            )));
+        }
+        let response = self.handle_response(response)?;
+        let payload: BuildImageResponse = response.json().map_err(Error::Reqwest)?;
+        Ok(BuildImageResult {
+            image: payload.image,
+            pushed: payload.pushed.filter(|s| !s.is_empty()),
+        })
+    }
+
+    pub fn create_with_image(
+        &self,
+        image: &Image,
+        mut opts: CreateOptions,
+    ) -> Result<Sandbox, Error> {
+        opts.image = self.build_image(image)?;
+        self.create(opts)
     }
 
     pub fn list(&self) -> Result<Vec<Sandbox>, Error> {
-        let raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &format!("{}/sandboxes", self.version_prefix()), None)?;
-        Ok(raw.into_iter().map(|item| Sandbox::new(self.clone(), item)).collect())
+        let raw = self.do_json::<(), Vec<SandboxData>>(
+            Method::GET,
+            &format!("{}/sandboxes", self.version_prefix()),
+            None,
+        )?;
+        Ok(raw
+            .into_iter()
+            .map(|item| Sandbox::new(self.clone(), item))
+            .collect())
     }
 
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(Method::GET, &format!("{}/sandboxes/{}", self.version_prefix(), id), None)?;
+        let raw = self.do_json::<(), SandboxData>(
+            Method::GET,
+            &format!("{}/sandboxes/{}", self.version_prefix(), id),
+            None,
+        )?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn start(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(Method::POST, &format!("{}/sandboxes/{}/start", self.version_prefix(), id), None)?;
+        let raw = self.do_json::<(), SandboxData>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/start", self.version_prefix(), id),
+            None,
+        )?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn stop(&self, id: &str) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<(), SandboxData>(Method::POST, &format!("{}/sandboxes/{}/stop", self.version_prefix(), id), None)?;
+        let raw = self.do_json::<(), SandboxData>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/stop", self.version_prefix(), id),
+            None,
+        )?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
@@ -477,21 +643,38 @@ impl Client {
     }
 
     pub fn destroy(&self, id: &str) -> Result<(), Error> {
-        self.do_json::<(), ()>(Method::DELETE, &format!("{}/sandboxes/{}", self.version_prefix(), id), None)
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!("{}/sandboxes/{}", self.version_prefix(), id),
+            None,
+        )
     }
 
     pub fn resize(&self, id: &str, opts: ResizeOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<ResizeOptions, SandboxData>(Method::POST, &format!("{}/sandboxes/{}/resize", self.version_prefix(), id), Some(&opts))?;
+        let raw = self.do_json::<ResizeOptions, SandboxData>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/resize", self.version_prefix(), id),
+            Some(&opts),
+        )?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn update_lifecycle(&self, id: &str, lifecycle: Lifecycle) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<Lifecycle, SandboxData>(Method::PUT, &format!("{}/sandboxes/{}/lifecycle", self.version_prefix(), id), Some(&lifecycle))?;
+        let raw = self.do_json::<Lifecycle, SandboxData>(
+            Method::PUT,
+            &format!("{}/sandboxes/{}/lifecycle", self.version_prefix(), id),
+            Some(&lifecycle),
+        )?;
         Ok(Sandbox::new(self.clone(), raw))
     }
 
     pub fn reconcile(&self) -> Result<(), Error> {
-        self.do_json::<(), serde_json::Value>(Method::POST, &format!("{}/admin/reconcile", self.version_prefix()), None).map(|_| ())
+        self.do_json::<(), serde_json::Value>(
+            Method::POST,
+            &format!("{}/admin/reconcile", self.version_prefix()),
+            None,
+        )
+        .map(|_| ())
     }
 
     pub fn health(&self) -> Result<HealthStatus, Error> {
@@ -504,78 +687,165 @@ impl Client {
             mounts: Vec<MountSpecRedacted>,
         }
 
-        let raw = self.do_json::<(), MountList>(Method::GET, &format!("{}/sandboxes/{}/mounts", self.version_prefix(), id), None)?;
+        let raw = self.do_json::<(), MountList>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/mounts", self.version_prefix(), id),
+            None,
+        )?;
         Ok(raw.mounts)
     }
 
     pub fn get_network_usage(&self, id: &str) -> Result<NetworkUsage, Error> {
-        self.do_json::<(), NetworkUsage>(Method::GET, &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), id), None)
+        self.do_json::<(), NetworkUsage>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), id),
+            None,
+        )
     }
 
-    pub fn set_network_limits(&self, id: &str, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
-        self.do_json::<SetNetworkLimitsOptions, NetworkUsage>(Method::PATCH, &format!("{}/sandboxes/{}/network/limits", self.version_prefix(), id), Some(&opts))
+    pub fn set_network_limits(
+        &self,
+        id: &str,
+        opts: SetNetworkLimitsOptions,
+    ) -> Result<NetworkUsage, Error> {
+        self.do_json::<SetNetworkLimitsOptions, NetworkUsage>(
+            Method::PATCH,
+            &format!("{}/sandboxes/{}/network/limits", self.version_prefix(), id),
+            Some(&opts),
+        )
     }
 
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.do_json::<ExecRequest, ExecResult>(Method::POST, &format!("{}/sandboxes/{}/toolbox/process/execute", self.version_prefix(), id), Some(&request))
+        self.do_json::<ExecRequest, ExecResult>(
+            Method::POST,
+            &format!(
+                "{}/sandboxes/{}/toolbox/process/execute",
+                self.version_prefix(),
+                id
+            ),
+            Some(&request),
+        )
     }
 
     pub fn create_session(&self, id: &str, opts: CreateSessionOptions) -> Result<Session, Error> {
-        self.do_json::<CreateSessionOptions, Session>(Method::POST, &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id), Some(&opts))
+        self.do_json::<CreateSessionOptions, Session>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id),
+            Some(&opts),
+        )
     }
 
     pub fn list_sessions(&self, id: &str) -> Result<Vec<Session>, Error> {
-        let raw = self.do_json::<(), SessionList>(Method::GET, &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id), None)?;
+        let raw = self.do_json::<(), SessionList>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id),
+            None,
+        )?;
         Ok(raw.sessions)
     }
 
     pub fn get_session(&self, id: &str, session_id: &str) -> Result<Session, Error> {
-        self.do_json::<(), Session>(Method::GET, &format!("{}/sandboxes/{}/sessions/{}", self.version_prefix(), id, session_id), None)
+        self.do_json::<(), Session>(
+            Method::GET,
+            &format!(
+                "{}/sandboxes/{}/sessions/{}",
+                self.version_prefix(),
+                id,
+                session_id
+            ),
+            None,
+        )
     }
 
     pub fn delete_session(&self, id: &str, session_id: &str) -> Result<(), Error> {
-        self.do_json::<(), ()>(Method::DELETE, &format!("{}/sandboxes/{}/sessions/{}", self.version_prefix(), id, session_id), None)
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!(
+                "{}/sandboxes/{}/sessions/{}",
+                self.version_prefix(),
+                id,
+                session_id
+            ),
+            None,
+        )
     }
 
     pub fn signal_session(&self, id: &str, session_id: &str, signal: &str) -> Result<(), Error> {
         self.do_json::<SessionSignalRequest, ()>(
             Method::POST,
-            &format!("{}/sandboxes/{}/sessions/{}/signal", self.version_prefix(), id, session_id),
+            &format!(
+                "{}/sandboxes/{}/sessions/{}/signal",
+                self.version_prefix(),
+                id,
+                session_id
+            ),
             Some(&SessionSignalRequest {
                 signal: signal.to_string(),
             }),
         )
     }
 
-    pub fn resize_session(&self, id: &str, session_id: &str, cols: u16, rows: u16) -> Result<(), Error> {
+    pub fn resize_session(
+        &self,
+        id: &str,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), Error> {
         self.do_json::<SessionResizeRequest, ()>(
             Method::POST,
-            &format!("{}/sandboxes/{}/sessions/{}/resize", self.version_prefix(), id, session_id),
+            &format!(
+                "{}/sandboxes/{}/sessions/{}/resize",
+                self.version_prefix(),
+                id,
+                session_id
+            ),
             Some(&SessionResizeRequest { cols, rows }),
         )
     }
 
     pub fn session_log(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!("{}/sandboxes/{}/sessions/{}/log", self.version_prefix(), id, session_id));
+        let url = self.full_url(&format!(
+            "{}/sandboxes/{}/sessions/{}/log",
+            self.version_prefix(),
+            id,
+            session_id
+        ));
         let response = self
             .inner
             .request(Method::GET, &url)
             .bearer_auth(&self.pat_token)
             .send()?;
-        self.handle_response(response)?.bytes().map_err(Error::Reqwest).map(|bytes| bytes.to_vec())
+        self.handle_response(response)?
+            .bytes()
+            .map_err(Error::Reqwest)
+            .map(|bytes| bytes.to_vec())
     }
 
     pub fn session_recording(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!("{}/sandboxes/{}/sessions/{}/recording", self.version_prefix(), id, session_id));
+        let url = self.full_url(&format!(
+            "{}/sandboxes/{}/sessions/{}/recording",
+            self.version_prefix(),
+            id,
+            session_id
+        ));
         let response = self
             .inner
             .request(Method::GET, &url)
             .bearer_auth(&self.pat_token)
             .send()?;
-        self.handle_response(response)?.bytes().map_err(Error::Reqwest).map(|bytes| bytes.to_vec())
+        self.handle_response(response)?
+            .bytes()
+            .map_err(Error::Reqwest)
+            .map(|bytes| bytes.to_vec())
     }
 
-    pub fn attach_session(&self, id: &str, session_id: &str, options: SessionAttachOptions) -> Result<SessionAttachHandle, Error> {
+    pub fn attach_session(
+        &self,
+        id: &str,
+        session_id: &str,
+        options: SessionAttachOptions,
+    ) -> Result<SessionAttachHandle, Error> {
         let (control_tx, control_rx) = unbounded_channel();
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
@@ -587,16 +857,31 @@ impl Client {
         thread::spawn(move || {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
-                Ok(runtime) => runtime.block_on(run_session_attach(api_url, api_version, pat_token, sandbox_id, session_id, options, control_rx)),
+                Ok(runtime) => runtime.block_on(run_session_attach(
+                    api_url,
+                    api_version,
+                    pat_token,
+                    sandbox_id,
+                    session_id,
+                    options,
+                    control_rx,
+                )),
                 Err(err) => Err(Error::Runtime(err)),
             };
             let _ = done_tx.send(result);
         });
 
-        Ok(SessionAttachHandle { control_tx, done_rx })
+        Ok(SessionAttachHandle {
+            control_tx,
+            done_rx,
+        })
     }
 
-    pub fn exec_stream(&self, id: &str, options: ExecStreamOptions) -> Result<ExecStreamHandle, Error> {
+    pub fn exec_stream(
+        &self,
+        id: &str,
+        options: ExecStreamOptions,
+    ) -> Result<ExecStreamHandle, Error> {
         if options.command.trim().is_empty() {
             return Err(Error::Api("command is required".to_string()));
         }
@@ -611,13 +896,23 @@ impl Client {
         thread::spawn(move || {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
-                Ok(runtime) => runtime.block_on(run_exec_stream(api_url, api_version, pat_token, sandbox_id, options, control_rx)),
+                Ok(runtime) => runtime.block_on(run_exec_stream(
+                    api_url,
+                    api_version,
+                    pat_token,
+                    sandbox_id,
+                    options,
+                    control_rx,
+                )),
                 Err(err) => Err(Error::Runtime(err)),
             };
             let _ = done_tx.send(result);
         });
 
-        Ok(ExecStreamHandle { control_tx, done_rx })
+        Ok(ExecStreamHandle {
+            control_tx,
+            done_rx,
+        })
     }
 
     pub fn upload_file(&self, id: &str, target_path: &str, data: Vec<u8>) -> Result<(), Error> {
@@ -630,20 +925,40 @@ impl Client {
             .text("path", target_path.to_string())
             .part("file", Part::bytes(data).file_name(file_name.to_string()));
 
-        self.do_multipart(&format!("{}/sandboxes/{}/toolbox/files/upload", self.version_prefix(), id), form)
+        self.do_multipart(
+            &format!(
+                "{}/sandboxes/{}/toolbox/files/upload",
+                self.version_prefix(),
+                id
+            ),
+            form,
+        )
     }
 
     pub fn download_file(&self, id: &str, target_path: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!("{}/sandboxes/{}/toolbox/files/download?path={}", self.version_prefix(), id, urlencoding::encode(target_path)));
+        let url = self.full_url(&format!(
+            "{}/sandboxes/{}/toolbox/files/download?path={}",
+            self.version_prefix(),
+            id,
+            urlencoding::encode(target_path)
+        ));
         let response = self
             .inner
             .request(Method::GET, &url)
             .bearer_auth(&self.pat_token)
             .send()?;
-        self.handle_response(response)?.bytes().map_err(Error::Reqwest).map(|bytes| bytes.to_vec())
+        self.handle_response(response)?
+            .bytes()
+            .map_err(Error::Reqwest)
+            .map(|bytes| bytes.to_vec())
     }
 
-    pub fn expose_port(&self, id: &str, port: u16, options: ExposeOptions) -> Result<ExposeResult, Error> {
+    pub fn expose_port(
+        &self,
+        id: &str,
+        port: u16,
+        options: ExposeOptions,
+    ) -> Result<ExposeResult, Error> {
         let protocol_str = match options.protocol {
             ExposeProtocol::Http => "http",
             ExposeProtocol::Tcp => "tcp",
@@ -665,23 +980,39 @@ impl Client {
                 host: wire.host.unwrap_or_default(),
                 host_port: wire.host_port.unwrap_or(0),
             }),
-            "tls" => Ok(ExposeResult::Tls { url: wire.public_url }),
-            "http" | "" => Ok(ExposeResult::Http { url: wire.public_url }),
+            "tls" => Ok(ExposeResult::Tls {
+                url: wire.public_url,
+            }),
+            "http" | "" => Ok(ExposeResult::Http {
+                url: wire.public_url,
+            }),
             other => Err(Error::Api(format!("unknown expose protocol: {}", other))),
         }
     }
 
     pub fn unexpose_port(&self, id: &str, port: u16) -> Result<(), Error> {
-        self.do_json::<(), ()>(Method::DELETE, &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port), None)
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
+            None,
+        )
     }
 
     fn full_url(&self, path: &str) -> String {
         format!("{}{}", self.api_url, path)
     }
 
-    fn do_json<T: Serialize, U: DeserializeOwned>(&self, method: Method, path: &str, payload: Option<&T>) -> Result<U, Error> {
+    fn do_json<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+    ) -> Result<U, Error> {
         let url = self.full_url(path);
-        let builder = self.inner.request(method, &url).bearer_auth(&self.pat_token);
+        let builder = self
+            .inner
+            .request(method, &url)
+            .bearer_auth(&self.pat_token);
         let builder = if let Some(body) = payload {
             builder.json(body)
         } else {
@@ -707,7 +1038,10 @@ impl Client {
         self.handle_response(response).map(|_| ())
     }
 
-    fn handle_response(&self, response: reqwest::blocking::Response) -> Result<reqwest::blocking::Response, Error> {
+    fn handle_response(
+        &self,
+        response: reqwest::blocking::Response,
+    ) -> Result<reqwest::blocking::Response, Error> {
         if response.status().is_success() {
             Ok(response)
         } else {
@@ -731,7 +1065,14 @@ async fn run_exec_stream(
     options: ExecStreamOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<ExecExitInfo, Error> {
-    let ws_url = websocket_url(&api_url, &format!("{}/sandboxes/{}/toolbox/process/exec/stream", api_version.path_prefix(), urlencoding::encode(&sandbox_id)))?;
+    let ws_url = websocket_url(
+        &api_url,
+        &format!(
+            "{}/sandboxes/{}/toolbox/process/exec/stream",
+            api_version.path_prefix(),
+            urlencoding::encode(&sandbox_id)
+        ),
+    )?;
     let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
     request.headers_mut().insert(
         http::header::AUTHORIZATION,
@@ -752,7 +1093,9 @@ async fn run_exec_stream(
         cols: options.cols,
         rows: options.rows,
     };
-    write.send(Message::Text(serde_json::to_string(&start)?.into())).await?;
+    write
+        .send(Message::Text(serde_json::to_string(&start)?.into()))
+        .await?;
 
     loop {
         tokio::select! {
@@ -922,7 +1265,10 @@ fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
             let body_str = String::from_utf8_lossy(&body);
             let trimmed = body_str.trim();
             if trimmed.is_empty() {
-                Error::Api(format!("{} websocket handshake failed: status={}", label, status))
+                Error::Api(format!(
+                    "{} websocket handshake failed: status={}",
+                    label, status
+                ))
             } else {
                 Error::Api(format!(
                     "{} websocket handshake failed: status={}, body={:?}",
@@ -985,8 +1331,64 @@ mod tests {
                 content_type,
                 body.len(),
             );
-            stream.write_all(response.as_bytes()).expect("response should write");
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should write");
             stream.write_all(&body).expect("response body should write");
+        });
+
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn spawn_create_with_image_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let request = read_http_request(&mut stream);
+                request_tx
+                    .send(request.clone())
+                    .expect("request should be sent");
+
+                let body = if request.starts_with("POST /v1/images/build HTTP/1.1\r\n") {
+                    serde_json::json!({ "image": "aerolvm-build/abc123:latest" })
+                        .to_string()
+                        .into_bytes()
+                } else if request.starts_with("POST /v1/sandboxes HTTP/1.1\r\n") {
+                    serde_json::json!({
+                        "id": "sb-from-image",
+                        "image": "aerolvm-build/abc123:latest",
+                        "status": "started",
+                        "public_url": "https://sb-from-image.example.com",
+                        "cpu": 2,
+                        "memory_mb": 2048,
+                        "disk_gb": 20,
+                        "os_user": "root",
+                        "network_block_all": false,
+                        "toolbox_enabled": true,
+                        "exposed_ports": [],
+                        "created_at": "2026-05-07T10:00:00Z",
+                        "updated_at": "2026-05-07T10:00:00Z",
+                        "last_active_at": "2026-05-07T10:00:00Z"
+                    })
+                    .to_string()
+                    .into_bytes()
+                } else {
+                    panic!("unexpected request: {}", request);
+                };
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should write");
+                stream.write_all(&body).expect("response body should write");
+            }
         });
 
         (format!("http://{}", addr), request_rx)
@@ -995,13 +1397,19 @@ mod tests {
     fn spawn_session_attach_server() -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
-        listener.set_nonblocking(true).expect("listener should be non-blocking");
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be non-blocking");
         let (control_tx, control_rx) = std::sync::mpsc::channel();
 
         thread::spawn(move || {
-            let runtime = Builder::new_current_thread().enable_all().build().expect("runtime should build");
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
             runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener should build");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("tokio listener should build");
                 let (stream, _) = listener.accept().await.expect("server should accept");
                 let ws_stream = accept_async(stream).await.expect("websocket should accept");
                 let (mut write, mut read) = ws_stream.split();
@@ -1009,10 +1417,14 @@ mod tests {
                 for _ in 0..4 {
                     match read.next().await {
                         Some(Ok(Message::Text(text))) => {
-                            control_tx.send(text.to_string()).expect("text control should send");
+                            control_tx
+                                .send(text.to_string())
+                                .expect("text control should send");
                         }
                         Some(Ok(Message::Binary(payload))) => {
-                            control_tx.send(format!("binary:{}", String::from_utf8_lossy(&payload))).expect("binary control should send");
+                            control_tx
+                                .send(format!("binary:{}", String::from_utf8_lossy(&payload)))
+                                .expect("binary control should send");
                         }
                         Some(Ok(_)) => {}
                         Some(Err(err)) => panic!("websocket read failed: {}", err),
@@ -1021,11 +1433,19 @@ mod tests {
                 }
 
                 write
-                    .send(Message::Binary([vec![STREAM_PREFIX_STDOUT], b"hello".to_vec()].concat().into()))
+                    .send(Message::Binary(
+                        [vec![STREAM_PREFIX_STDOUT], b"hello".to_vec()]
+                            .concat()
+                            .into(),
+                    ))
                     .await
                     .expect("stdout frame should send");
                 write
-                    .send(Message::Binary([vec![STREAM_PREFIX_STDERR], b"warn".to_vec()].concat().into()))
+                    .send(Message::Binary(
+                        [vec![STREAM_PREFIX_STDERR], b"warn".to_vec()]
+                            .concat()
+                            .into(),
+                    ))
                     .await
                     .expect("stderr frame should send");
                 write
@@ -1118,8 +1538,15 @@ mod tests {
 
     #[test]
     fn websocket_url_switches_schemes() {
-        let ws = websocket_url("https://sandbox.example.com", "/v1/sandboxes/sb/toolbox/process/exec/stream").expect("ws url");
-        assert_eq!(ws, "wss://sandbox.example.com/v1/sandboxes/sb/toolbox/process/exec/stream");
+        let ws = websocket_url(
+            "https://sandbox.example.com",
+            "/v1/sandboxes/sb/toolbox/process/exec/stream",
+        )
+        .expect("ws url");
+        assert_eq!(
+            ws,
+            "wss://sandbox.example.com/v1/sandboxes/sb/toolbox/process/exec/stream"
+        );
     }
 
     #[test]
@@ -1146,14 +1573,219 @@ mod tests {
         let (url, request_rx) = spawn_json_server(body);
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
-        let sandbox = client.create(minimal_create_options()).expect("create should succeed");
+        let sandbox = client
+            .create(minimal_create_options())
+            .expect("create should succeed");
         let request = request_rx.recv().expect("request should be captured");
         let request_lower = request.to_ascii_lowercase();
 
-        assert!(request.starts_with("POST /v1/sandboxes HTTP/1.1\r\n"), "unexpected request: {}", request);
-        assert!(request_lower.contains("authorization: bearer pat-token"), "missing bearer auth: {}", request);
-        assert_eq!(sandbox.data.ssh_public_key.as_deref(), Some("ssh-ed25519 AAAA sandbox"));
+        assert!(
+            request.starts_with("POST /v1/sandboxes HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(
+            request_lower.contains("authorization: bearer pat-token"),
+            "missing bearer auth: {}",
+            request
+        );
+        assert_eq!(
+            sandbox.data.ssh_public_key.as_deref(),
+            Some("ssh-ed25519 AAAA sandbox")
+        );
         assert_eq!(sandbox.ssh_private_key.as_deref(), Some("PRIVATE"));
+    }
+
+    #[test]
+    fn image_builder_emits_expected_dockerfile() {
+        let image = Image::base("alpine")
+            .run_command("apk add curl")
+            .run_command_group(["apk add bash", "echo ready"])
+            .env([("FOO", "bar"), ("PATH", "/opt/bin:/usr/bin")])
+            .workdir("/app")
+            .user("nobody")
+            .expose(8080)
+            .entrypoint(["/bin/sh", "-c"])
+            .cmd(["echo", "hi"]);
+
+        assert_eq!(
+            image.dockerfile(),
+            "FROM alpine\nRUN apk add curl\nRUN apk add bash && echo ready\nENV FOO=bar PATH=/opt/bin:/usr/bin\nWORKDIR /app\nUSER nobody\nEXPOSE 8080\nENTRYPOINT [\"/bin/sh\",\"-c\"]\nCMD [\"echo\",\"hi\"]\n"
+        );
+    }
+
+    #[test]
+    fn image_builder_tracks_invalid_inputs() {
+        assert!(Image::base("   ").validation_error().is_some());
+        assert!(Image::from_dockerfile("   ").validation_error().is_some());
+        assert!(Image::base("alpine")
+            .workdir(" ")
+            .validation_error()
+            .is_some());
+        assert!(Image::base("alpine").user(" ").validation_error().is_some());
+        assert!(Image::base("alpine").expose(0).validation_error().is_some());
+        assert!(Image::base("alpine")
+            .expose(70_000)
+            .validation_error()
+            .is_some());
+    }
+
+    #[test]
+    fn create_with_image_builds_then_creates() {
+        let (url, request_rx) = spawn_create_with_image_server();
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .create_with_image(
+                &Image::base("ubuntu:22.04")
+                    .run_commands(["apt-get update", "apt-get install -y curl"]),
+                minimal_create_options(),
+            )
+            .expect("create_with_image should succeed");
+
+        let build_request = request_rx.recv().expect("build request should be captured");
+        let create_request = request_rx
+            .recv()
+            .expect("create request should be captured");
+
+        assert!(
+            build_request.starts_with("POST /v1/images/build HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            build_request
+        );
+        assert_eq!(
+            request_json_body(&build_request),
+            serde_json::json!({
+                "dockerfile_content": "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n"
+            })
+        );
+        assert_eq!(
+            request_json_body(&create_request),
+            serde_json::json!({
+                "image": "aerolvm-build/abc123:latest"
+            })
+        );
+        assert_eq!(sandbox.data.id, "sb-from-image");
+    }
+
+    #[test]
+    fn build_image_with_options_forwards_push_directive() {
+        let (url, request_rx) = spawn_json_server(
+            serde_json::json!({
+                "image": "aerolvm-build/abc123:latest",
+                "pushed": "ghcr.io/x/y:v1"
+            })
+            .to_string(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+
+        let result = client
+            .build_image_with_options(
+                &Image::base("alpine"),
+                &BuildImageOptions {
+                    push: Some(BuildImagePushOptions {
+                        registry: "ghcr.io/x/y".to_string(),
+                        tag: Some("v1".to_string()),
+                        server: Some("ghcr.io".to_string()),
+                        username: "u".to_string(),
+                        password: "p".to_string(),
+                    }),
+                },
+            )
+            .expect("build_image_with_options should succeed");
+
+        assert_eq!(result.image, "aerolvm-build/abc123:latest");
+        assert_eq!(result.pushed.as_deref(), Some("ghcr.io/x/y:v1"));
+
+        let request = request_rx.recv().expect("request should be received");
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({
+                "dockerfile_content": "FROM alpine\n",
+                "push": {
+                    "registry": "ghcr.io/x/y",
+                    "tag": "v1",
+                    "server": "ghcr.io",
+                    "username": "u",
+                    "password": "p"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn build_image_with_options_rejects_missing_credentials() {
+        // Validation must happen client-side: no listener — if any HTTP call
+        // leaks, reqwest will surface a connect error and the asserts on the
+        // returned Validation message will fail.
+        let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token"))
+            .expect("client should build");
+
+        let cases: &[(BuildImagePushOptions, &str)] = &[
+            (
+                BuildImagePushOptions {
+                    registry: String::new(),
+                    tag: None,
+                    server: None,
+                    username: "u".to_string(),
+                    password: "p".to_string(),
+                },
+                "registry",
+            ),
+            (
+                BuildImagePushOptions {
+                    registry: "ghcr.io/x/y".to_string(),
+                    tag: None,
+                    server: None,
+                    username: String::new(),
+                    password: "p".to_string(),
+                },
+                "username",
+            ),
+            (
+                BuildImagePushOptions {
+                    registry: "ghcr.io/x/y".to_string(),
+                    tag: None,
+                    server: None,
+                    username: "u".to_string(),
+                    password: String::new(),
+                },
+                "password",
+            ),
+        ];
+
+        for (push, want_substr) in cases {
+            let err = client
+                .build_image_with_options(
+                    &Image::base("alpine"),
+                    &BuildImageOptions {
+                        push: Some(push.clone()),
+                    },
+                )
+                .expect_err("must reject missing credentials");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(want_substr),
+                "expected error containing {want_substr:?}, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_image_maps_404_to_actionable_error() {
+        let (url, _request_rx) = spawn_response_server(
+            "404 Not Found",
+            "text/plain",
+            b"404 page not found\n".to_vec(),
+        );
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client
+            .build_image(&Image::base("alpine"))
+            .expect_err("build_image should fail");
+
+        assert!(err.to_string().contains("does not support Image builds"));
+        assert!(err.to_string().contains("string image reference"));
     }
 
     #[test]
@@ -1195,19 +1827,25 @@ mod tests {
         let request = request_rx.recv().expect("request should be captured");
         let body = request_json_body(&request);
 
-        assert_eq!(body, serde_json::json!({
-            "image": "ubuntu:22.04",
-            "lifecycle": {
-                "stop_if_idle_for": 3600000000000u64,
-                "destroy_at_age": 86400000000000u64
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "image": "ubuntu:22.04",
+                "lifecycle": {
+                    "stop_if_idle_for": 3600000000000u64,
+                    "destroy_at_age": 86400000000000u64
+                }
+            })
+        );
+        assert_eq!(
+            sandbox.data.lifecycle,
+            Lifecycle {
+                stop_if_idle_for: 3600000000000,
+                destroy_if_idle_for: 0,
+                stop_at_age: 0,
+                destroy_at_age: 86400000000000,
             }
-        }));
-        assert_eq!(sandbox.data.lifecycle, Lifecycle {
-            stop_if_idle_for: 3600000000000,
-            destroy_if_idle_for: 0,
-            stop_at_age: 0,
-            destroy_at_age: 86400000000000,
-        });
+        );
     }
 
     #[test]
@@ -1249,17 +1887,27 @@ mod tests {
         let request = request_rx.recv().expect("request should be captured");
         let body = request_json_body(&request);
 
-        assert!(request.starts_with("PUT /v1/sandboxes/sb-lifecycle-update/lifecycle HTTP/1.1\r\n"), "unexpected request: {}", request);
-        assert_eq!(body, serde_json::json!({
-            "stop_if_idle_for": 7200000000000u64,
-            "destroy_at_age": 172800000000000u64
-        }));
-        assert_eq!(sandbox.data.lifecycle, Lifecycle {
-            stop_if_idle_for: 7200000000000,
-            destroy_if_idle_for: 0,
-            stop_at_age: 0,
-            destroy_at_age: 172800000000000,
-        });
+        assert!(
+            request.starts_with("PUT /v1/sandboxes/sb-lifecycle-update/lifecycle HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "stop_if_idle_for": 7200000000000u64,
+                "destroy_at_age": 172800000000000u64
+            })
+        );
+        assert_eq!(
+            sandbox.data.lifecycle,
+            Lifecycle {
+                stop_if_idle_for: 7200000000000,
+                destroy_if_idle_for: 0,
+                stop_at_age: 0,
+                destroy_at_age: 172800000000000,
+            }
+        );
     }
 
     #[test]
@@ -1281,7 +1929,11 @@ mod tests {
         let request = request_rx.recv().expect("request should be captured");
         let body = request_json_body(&request);
 
-        assert!(request.starts_with("POST /v1/sandboxes/sb-1/snapshot HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/snapshot HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
         assert_eq!(body, serde_json::json!({"name": "snapshots/demo:v1"}));
         assert_eq!(snapshot.name, "snapshots/demo:v1");
         assert_eq!(snapshot.image_id.as_deref(), Some("sha256:snap-1"));
@@ -1309,14 +1961,21 @@ mod tests {
         let mounts = client.mounts("sb-1").expect("mounts should succeed");
         let request = request_rx.recv().expect("request should be captured");
 
-        assert!(request.starts_with("GET /v1/sandboxes/sb-1/mounts HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(
+            request.starts_with("GET /v1/sandboxes/sb-1/mounts HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
         assert_eq!(
             mounts,
             vec![MountSpecRedacted {
                 mount_type: MountType::S3,
                 target: "/workspace".to_string(),
                 source: "s3://bucket/prefix".to_string(),
-                options: Some(std::collections::HashMap::from([(String::from("region"), String::from("us-east-1"))])),
+                options: Some(std::collections::HashMap::from([(
+                    String::from("region"),
+                    String::from("us-east-1")
+                )])),
                 read_only: true,
                 has_credentials: true,
             }]
@@ -1338,10 +1997,16 @@ mod tests {
         let (url, request_rx) = spawn_json_server(body);
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
-        let usage = client.get_network_usage("sb-1").expect("get_network_usage should succeed");
+        let usage = client
+            .get_network_usage("sb-1")
+            .expect("get_network_usage should succeed");
         let request = request_rx.recv().expect("request should be captured");
 
-        assert!(request.starts_with("GET /v1/sandboxes/sb-1/network/usage HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(
+            request.starts_with("GET /v1/sandboxes/sb-1/network/usage HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
         assert_eq!(usage.bytes_in, 1024);
         assert_eq!(usage.bytes_out_limit, 0);
         assert!(!usage.quota_exceeded);
@@ -1361,7 +2026,9 @@ mod tests {
         let (url, _rx) = spawn_json_server(body);
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
-        let usage = client.get_network_usage("sb-fresh").expect("get_network_usage should succeed");
+        let usage = client
+            .get_network_usage("sb-fresh")
+            .expect("get_network_usage should succeed");
         assert_eq!(usage.last_sampled_at, None);
     }
 
@@ -1392,7 +2059,11 @@ mod tests {
         let request = request_rx.recv().expect("request should be captured");
         let body = request_json_body(&request);
 
-        assert!(request.starts_with("PATCH /v1/sandboxes/sb-1/network/limits HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(
+            request.starts_with("PATCH /v1/sandboxes/sb-1/network/limits HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
         assert_eq!(body, serde_json::json!({"network_bytes_in_limit": 4096}));
         assert_eq!(usage.bytes_in_limit, 4096);
     }
@@ -1453,12 +2124,31 @@ mod tests {
         let request = request_rx.recv().expect("request should be captured");
         let request_lower = request.to_ascii_lowercase();
 
-        assert!(request.starts_with("POST /v1/sandboxes/sb-1/sessions HTTP/1.1\r\n"), "unexpected request: {}", request);
-        assert!(request_lower.contains("authorization: bearer pat-token"), "missing bearer auth: {}", request);
-        assert!(request.contains("\"command\":\"bash\""), "missing command: {}", request);
-        assert!(request.contains("\"workdir\":\"/workspace\""), "missing workdir: {}", request);
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/sessions HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(
+            request_lower.contains("authorization: bearer pat-token"),
+            "missing bearer auth: {}",
+            request
+        );
+        assert!(
+            request.contains("\"command\":\"bash\""),
+            "missing command: {}",
+            request
+        );
+        assert!(
+            request.contains("\"workdir\":\"/workspace\""),
+            "missing workdir: {}",
+            request
+        );
         assert_eq!(session.status, SessionStatus::Running);
-        assert_eq!(session.argv, vec!["sh".to_string(), "-c".to_string(), "bash".to_string()]);
+        assert_eq!(
+            session.argv,
+            vec!["sh".to_string(), "-c".to_string(), "bash".to_string()]
+        );
     }
 
     #[test]
@@ -1484,7 +2174,9 @@ mod tests {
         let (url, _request_rx) = spawn_json_server(body);
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
-        let sessions = client.list_sessions("sb-1").expect("list sessions should succeed");
+        let sessions = client
+            .list_sessions("sb-1")
+            .expect("list sessions should succeed");
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "default");
@@ -1493,21 +2185,31 @@ mod tests {
 
     #[test]
     fn delete_session_accepts_no_content() {
-        let (url, request_rx) = spawn_response_server("204 No Content", "application/json", Vec::new());
+        let (url, request_rx) =
+            spawn_response_server("204 No Content", "application/json", Vec::new());
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
-        client.delete_session("sb-1", "ses-1").expect("delete session should succeed");
+        client
+            .delete_session("sb-1", "ses-1")
+            .expect("delete session should succeed");
         let request = request_rx.recv().expect("request should be captured");
 
-        assert!(request.starts_with("DELETE /v1/sandboxes/sb-1/sessions/ses-1 HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(
+            request.starts_with("DELETE /v1/sandboxes/sb-1/sessions/ses-1 HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
     }
 
     #[test]
     fn session_log_returns_bytes() {
-        let (url, _request_rx) = spawn_response_server("200 OK", "text/plain", b"session log".to_vec());
+        let (url, _request_rx) =
+            spawn_response_server("200 OK", "text/plain", b"session log".to_vec());
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
-        let body = client.session_log("sb-1", "ses-1").expect("session log should succeed");
+        let body = client
+            .session_log("sb-1", "ses-1")
+            .expect("session log should succeed");
 
         assert_eq!(body, b"session log".to_vec());
     }
@@ -1533,35 +2235,73 @@ mod tests {
                 SessionAttachOptions {
                     cols: Some(120),
                     rows: Some(40),
-                    on_stdout: Some(Arc::new(move |chunk| stdout_capture.lock().expect("stdout lock").push(chunk))),
-                    on_stderr: Some(Arc::new(move |chunk| stderr_capture.lock().expect("stderr lock").push(chunk))),
-                    on_error: Some(Arc::new(move |message| error_capture.lock().expect("error lock").push(message))),
-                    on_exit: Some(Arc::new(move |info| exit_capture.lock().expect("exit lock").push(info))),
+                    on_stdout: Some(Arc::new(move |chunk| {
+                        stdout_capture.lock().expect("stdout lock").push(chunk)
+                    })),
+                    on_stderr: Some(Arc::new(move |chunk| {
+                        stderr_capture.lock().expect("stderr lock").push(chunk)
+                    })),
+                    on_error: Some(Arc::new(move |message| {
+                        error_capture.lock().expect("error lock").push(message)
+                    })),
+                    on_exit: Some(Arc::new(move |info| {
+                        exit_capture.lock().expect("exit lock").push(info)
+                    })),
                 },
             )
             .expect("attach session should succeed");
 
-        handle.write_string("pwd\n").expect("stdin write should succeed");
+        handle
+            .write_string("pwd\n")
+            .expect("stdin write should succeed");
         handle.resize(100, 30).expect("resize should succeed");
         handle.signal("INT").expect("signal should succeed");
         let result = handle.wait().expect("attach should exit cleanly");
 
-        assert_eq!(result, ExecExitInfo { code: 0, signal: Some("TERM".to_string()) });
-        assert_eq!(stdout_chunks.lock().expect("stdout lock").clone(), vec![b"hello".to_vec()]);
-        assert_eq!(stderr_chunks.lock().expect("stderr lock").clone(), vec![b"warn".to_vec()]);
-        assert!(error_messages.lock().expect("error lock").is_empty());
-        assert_eq!(exits.lock().expect("exit lock").clone(), vec![ExecExitInfo { code: 0, signal: Some("TERM".to_string()) }]);
         assert_eq!(
-            serde_json::from_str::<Value>(&control_rx.recv().expect("initial resize should be captured")).expect("initial resize should parse"),
+            result,
+            ExecExitInfo {
+                code: 0,
+                signal: Some("TERM".to_string())
+            }
+        );
+        assert_eq!(
+            stdout_chunks.lock().expect("stdout lock").clone(),
+            vec![b"hello".to_vec()]
+        );
+        assert_eq!(
+            stderr_chunks.lock().expect("stderr lock").clone(),
+            vec![b"warn".to_vec()]
+        );
+        assert!(error_messages.lock().expect("error lock").is_empty());
+        assert_eq!(
+            exits.lock().expect("exit lock").clone(),
+            vec![ExecExitInfo {
+                code: 0,
+                signal: Some("TERM".to_string())
+            }]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &control_rx
+                    .recv()
+                    .expect("initial resize should be captured")
+            )
+            .expect("initial resize should parse"),
             serde_json::json!({ "type": "resize", "cols": 120, "rows": 40 })
         );
-        assert_eq!(control_rx.recv().expect("stdin should be captured"), "binary:pwd\n");
         assert_eq!(
-            serde_json::from_str::<Value>(&control_rx.recv().expect("resize should be captured")).expect("resize should parse"),
+            control_rx.recv().expect("stdin should be captured"),
+            "binary:pwd\n"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&control_rx.recv().expect("resize should be captured"))
+                .expect("resize should parse"),
             serde_json::json!({ "type": "resize", "cols": 100, "rows": 30 })
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&control_rx.recv().expect("signal should be captured")).expect("signal should parse"),
+            serde_json::from_str::<Value>(&control_rx.recv().expect("signal should be captured"))
+                .expect("signal should parse"),
             serde_json::json!({ "type": "signal", "signal": "INT" })
         );
     }

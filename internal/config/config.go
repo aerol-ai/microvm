@@ -107,6 +107,50 @@ type Config struct {
 	// Required when L4TLSListen is non-empty; ignored otherwise. Default is
 	// "127.0.0.1:8443" to match install.sh's relocated HTTPS listener.
 	L4TLSFallback string
+
+	// ImageBuildContextEnabled is the operator opt-in for the contextHashes
+	// upload path — image builds whose context includes caller-supplied
+	// local files (COPY/ADD). Off by default because the resolution path
+	// needs an object-store + registry combo to push the resulting layered
+	// image somewhere the docker daemon can pull from on the next sandbox
+	// start. With this disabled, builds that only RUN commands (no
+	// caller-side context) still work — they execute against a tar
+	// containing just the Dockerfile.
+	//
+	// NOTE: enabling this is necessary but not sufficient. The context
+	// resolver itself is not yet wired, so requests with contextHashes will
+	// still return HTTP 501 even when this flag is true. The flag exists
+	// so operators can explicitly opt in to that codepath as soon as the
+	// resolver lands, without a daemon redeploy.
+	ImageBuildContextEnabled bool
+	// ImageBuildTimeout caps a single `docker build` (or `docker push`)
+	// call from any image-build path: the native POST /v1/images/build
+	// handler and the Daytona facade's createSandbox build-on-create flow.
+	// Build time is opaque (depends on the Dockerfile) so the default is
+	// generous; we bound it only to keep a runaway build from permanently
+	// parking the HTTP handler.
+	ImageBuildTimeout time.Duration
+	// ImageBuildGCEnabled toggles the periodic janitor that sweeps
+	// locally-built images (BuiltImageNamespace, i.e. "aerolvm-build/*")
+	// that are no longer referenced by any active sandbox AND were created
+	// more than ImageBuildGCTTL ago. Without this, images produced by
+	// standalone POST /v1/images/build calls or by builds whose followup
+	// CreateSandbox failed accumulate forever — service.maybeRemoveImage
+	// only runs on sandbox destroy and so can't see images that never had
+	// a sandbox row.
+	ImageBuildGCEnabled bool
+	// ImageBuildGCInterval is how often the janitor ticker fires. Default
+	// 10m: cheap enough (one filtered /images/json call + one indexed store
+	// lookup per match) that running it more often would only matter if
+	// builds were churning faster than the TTL — which would itself be a
+	// signal something is wrong upstream.
+	ImageBuildGCInterval time.Duration
+	// ImageBuildGCTTL is the minimum age a built image must reach before
+	// it becomes eligible for removal. Default 1h: comfortably longer than
+	// any reasonable retry/network-blip between build and create, so a
+	// transient hiccup doesn't have the janitor yanking an image a client
+	// is about to use.
+	ImageBuildGCTTL time.Duration
 }
 
 func Load() (Config, error) {
@@ -163,6 +207,12 @@ func Load() (Config, error) {
 		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 23000),
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
+
+		ImageBuildContextEnabled: getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:        getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:      getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:     getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:          getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
 	}
 
 	if cfg.PATToken == "" {

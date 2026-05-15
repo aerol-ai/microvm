@@ -65,6 +65,36 @@ const (
 type NetworkUsage = models.NetworkUsage
 type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
 
+// BuildImagePushOptions describes the per-request push directive for
+// Client.BuildImageWithOptions. Credentials are forwarded to the daemon
+// as a one-shot X-Registry-Auth header on the push call and are never
+// persisted.
+type BuildImagePushOptions struct {
+	// Registry is the destination repository, e.g. "ghcr.io/my-org/my-image".
+	Registry string
+	// Tag is the destination tag. The daemon defaults to "latest" when empty.
+	Tag string
+	// Server is the registry serveraddress, e.g. "ghcr.io". Sent inside
+	// X-Registry-Auth.
+	Server   string
+	Username string
+	Password string
+}
+
+// BuildImageOptions are optional knobs for Client.BuildImageWithOptions.
+type BuildImageOptions struct {
+	Push *BuildImagePushOptions
+}
+
+// BuildImageResult is the response from Client.BuildImageWithOptions.
+type BuildImageResult struct {
+	// Image is the local content-addressed tag (always returned).
+	Image string
+	// Pushed is the pushed reference (e.g. "ghcr.io/x/y:v1") when push was
+	// requested, otherwise empty.
+	Pushed string
+}
+
 type GPURequest = models.GPURequest
 type GPUVendor = models.GPUVendor
 

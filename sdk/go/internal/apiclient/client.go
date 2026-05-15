@@ -92,7 +92,7 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 }
 
 // versioned builds an API path with the active version's prefix prepended.
-// Use this for every versioned call so v2 (when it lands) can be selected
+// Use this for every versioned call so a future wire version can be selected
 // via ClientOptions.APIVersion without touching call sites.
 func (c *Client) versioned(suffix string) string {
 	return c.versionPrefix + suffix
@@ -110,6 +110,108 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, stri
 		return nil, "", err
 	}
 	return c.wrap(response.Sandbox), response.SSHPrivateKey, nil
+}
+
+// BuildImagePushSpec is the wire shape of the per-request push directive
+// sent to /v1/images/build. Mirrors the v1 server DTO; credentials are
+// forwarded to the daemon as a one-shot X-Registry-Auth header on the
+// underlying push call and are never persisted on the server.
+type BuildImagePushSpec struct {
+	Registry string
+	Tag      string
+	Server   string
+	Username string
+	Password string
+}
+
+// BuildImageResult holds the response of BuildImageWithPush.
+type BuildImageResult struct {
+	Image  string
+	Pushed string
+}
+
+func (c *Client) BuildImage(ctx context.Context, dockerfile string) (string, error) {
+	res, err := c.BuildImageWithPush(ctx, dockerfile, nil)
+	if err != nil {
+		return "", err
+	}
+	return res.Image, nil
+}
+
+// BuildImageWithPush is the variant that exposes the optional per-request
+// push directive. When push is nil, behavior matches BuildImage.
+func (c *Client) BuildImageWithPush(ctx context.Context, dockerfile string, push *BuildImagePushSpec) (BuildImageResult, error) {
+	type buildImagePushBody struct {
+		Registry string `json:"registry"`
+		Tag      string `json:"tag,omitempty"`
+		Server   string `json:"server,omitempty"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	type buildImageRequest struct {
+		DockerfileContent string              `json:"dockerfile_content"`
+		Push              *buildImagePushBody `json:"push,omitempty"`
+	}
+	type buildImageResponse struct {
+		Image  string `json:"image"`
+		Pushed string `json:"pushed,omitempty"`
+	}
+
+	if strings.TrimSpace(dockerfile) == "" {
+		return BuildImageResult{}, errors.New("dockerfile_content is required")
+	}
+	body := buildImageRequest{DockerfileContent: dockerfile}
+	if push != nil {
+		if strings.TrimSpace(push.Registry) == "" {
+			return BuildImageResult{}, errors.New("push.registry is required when push is set")
+		}
+		if push.Username == "" || push.Password == "" {
+			return BuildImageResult{}, errors.New("push.username and push.password are required when push is set")
+		}
+		body.Push = &buildImagePushBody{
+			Registry: push.Registry,
+			Tag:      push.Tag,
+			Server:   push.Server,
+			Username: push.Username,
+			Password: push.Password,
+		}
+	}
+
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return BuildImageResult{}, err
+	}
+
+	path := c.versioned("/images/build")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(encoded))
+	if err != nil {
+		return BuildImageResult{}, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.addAuth(request)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return BuildImageResult{}, err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, response.Body)
+		return BuildImageResult{}, fmt.Errorf(
+			"this daemon does not support Image builds (POST %s is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
+			path,
+		)
+	}
+	if response.StatusCode >= 400 {
+		return BuildImageResult{}, decodeError(response)
+	}
+
+	var payload buildImageResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return BuildImageResult{}, err
+	}
+	return BuildImageResult{Image: payload.Image, Pushed: payload.Pushed}, nil
 }
 
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {

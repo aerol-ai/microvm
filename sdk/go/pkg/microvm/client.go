@@ -87,6 +87,59 @@ func (c *Client) Create(ctx context.Context, opts sdktypes.CreateSandboxOptions)
 	return wrapped, nil
 }
 
+// BuildImage compiles an Image builder into a content-addressed image tag via
+// POST /v1/images/build. Older daemons that do not register the route return a
+// tailored error telling the caller to fall back to a plain string image.
+func (c *Client) BuildImage(ctx context.Context, image *Image) (string, error) {
+	if image == nil {
+		return "", errors.New("image is nil")
+	}
+	if err := image.Err(); err != nil {
+		return "", err
+	}
+	return c.inner.BuildImage(ctx, image.Dockerfile())
+}
+
+// BuildImageWithOptions builds an Image and optionally pushes the result to a
+// remote registry. Push credentials are forwarded to the daemon as a one-shot
+// X-Registry-Auth header and never persisted server-side. Returns the local
+// content-addressed tag and (when push was requested) the pushed reference.
+func (c *Client) BuildImageWithOptions(ctx context.Context, image *Image, opts sdktypes.BuildImageOptions) (sdktypes.BuildImageResult, error) {
+	if image == nil {
+		return sdktypes.BuildImageResult{}, errors.New("image is nil")
+	}
+	if err := image.Err(); err != nil {
+		return sdktypes.BuildImageResult{}, err
+	}
+	var push *apiclient.BuildImagePushSpec
+	if opts.Push != nil {
+		push = &apiclient.BuildImagePushSpec{
+			Registry: opts.Push.Registry,
+			Tag:      opts.Push.Tag,
+			Server:   opts.Push.Server,
+			Username: opts.Push.Username,
+			Password: opts.Push.Password,
+		}
+	}
+	res, err := c.inner.BuildImageWithPush(ctx, image.Dockerfile(), push)
+	if err != nil {
+		return sdktypes.BuildImageResult{}, err
+	}
+	return sdktypes.BuildImageResult{Image: res.Image, Pushed: res.Pushed}, nil
+}
+
+// CreateWithImage builds an Image to a content-addressed tag, then creates the
+// sandbox using the resolved string image. This keeps CreateSandboxOptions
+// source-compatible with the server's request model.
+func (c *Client) CreateWithImage(ctx context.Context, image *Image, opts sdktypes.CreateSandboxOptions) (*Sandbox, error) {
+	tag, err := c.BuildImage(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	opts.Image = tag
+	return c.Create(ctx, opts)
+}
+
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
 	items, err := c.inner.List(ctx)
 	if err != nil {

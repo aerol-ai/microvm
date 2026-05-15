@@ -73,6 +73,21 @@ sandbox.updateLifecycle(
 );
 ```
 
+## Build Images
+
+```java
+import ai.aerol.microvm.Image;
+
+Image image = Image.base("ubuntu:22.04")
+  .runCommands("apt-get update", "apt-get install -y curl");
+
+String tag = client.buildImage(image);
+Sandbox sandbox = client.create(
+  new CreateOptions()
+    .setImage(tag)
+);
+```
+
 ## Streaming Exec
 
 ```java

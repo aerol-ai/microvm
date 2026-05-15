@@ -48,6 +48,35 @@ sandbox.update_lifecycle(Lifecycle {
 })?;
 ```
 
+## Build Images
+
+```rust
+use aerolvm_sdk::{Client, CreateOptions, Image};
+
+let image = Image::base("ubuntu:22.04")
+    .run_commands(["apt-get update", "apt-get install -y curl"]);
+let tag = client.build_image(&image)?;
+
+let sandbox = client.create(CreateOptions {
+	image: tag,
+	cpu: None,
+	memory_mb: None,
+	disk_gb: None,
+	env: None,
+	os_user: None,
+	network_block_all: None,
+	network_bytes_in_limit: None,
+	network_bytes_out_limit: None,
+	registry: None,
+	container_command: None,
+	mounts: None,
+	lifecycle: None,
+	runtime: None,
+	gpus: None,
+})?;
+println!("sandbox = {}", sandbox.data.id);
+```
+
 ## Example
 
 ```bash

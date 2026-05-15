@@ -1,8 +1,11 @@
 import { basename } from "node:path";
 
 import { PATH_PREFIX as V1_PATH_PREFIX } from "./api/v1/paths.js";
+import { Image } from "../Image.js";
 import type {
   BinaryLike,
+  BuildImageOptions,
+  BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
   ExecExitInfo,
@@ -31,10 +34,18 @@ import type {
 type FetchLike = typeof fetch;
 
 /**
- * Wire version of the sandbox daemon API this client speaks. The SDK and the
- * server version independently — bumping the SDK package does not move the
- * wire version. Today only "v1" exists; "v2" will be added when a wire-level
- * breaking change is needed on the server.
+ * Wire version of the v1-style sandbox endpoints (`/v1/sandboxes`, etc.) this
+ * client speaks. The SDK and the server version independently — bumping the
+ * SDK package does not move the wire version. Today only "v1" exists; future
+ * breaking changes to the sandbox endpoints will land in a new version
+ * prefix.
+ *
+ * The `/v1/images/build` endpoint used by {@link Image}-shaped image inputs
+ * is called unconditionally when an Image is supplied to
+ * {@link APIClient.create}, regardless of `apiVersion`. Daemons older than
+ * the image-build feature return 404; the SDK turns that into a clear
+ * "daemon does not support image builds" error so the user can switch to a
+ * string image.
  */
 export type APIVersion = "v1";
 
@@ -203,7 +214,7 @@ export class APIClient {
   /**
    * Build a versioned API path. Pass the suffix beginning with "/" (e.g.
    * "/sandboxes") and the active version's prefix is prepended. Use this for
-   * every versioned API call so v2 (when it lands) can be selected by the
+   * every versioned API call so a future wire version can be selected by the
    * apiVersion option without touching call sites.
    */
   private versioned(suffix: string): string {
@@ -211,8 +222,79 @@ export class APIClient {
   }
 
   async create(options: CreateOptions): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(options));
+    const resolved = await this.resolveImage(options);
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved));
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
+  }
+
+  /**
+   * Compile a fluent {@link Image} into a content-addressed image tag by
+   * POSTing its Dockerfile to `/v1/images/build`. The daemon caches by
+   * content hash, so repeated calls with the same Dockerfile are a no-op.
+   * String images are passed through unchanged.
+   *
+   * Daemons predating the image-build feature do not register the route and
+   * return 404; this method translates that into a clear error telling the
+   * caller to pass a string image instead, rather than the generic "request
+   * failed with status 404" the JSON decoder would otherwise produce.
+   */
+  async buildImage(image: Image, options?: BuildImageOptions): Promise<BuildImageResult> {
+    const body: {
+      dockerfile_content: string;
+      push?: {
+        registry: string;
+        tag?: string;
+        server?: string;
+        username: string;
+        password: string;
+      };
+    } = { dockerfile_content: image.dockerfile };
+    if (options?.push) {
+      const p = options.push;
+      if (!p.registry) {
+        throw new Error("buildImage: push.registry is required when push is set");
+      }
+      if (!p.username || !p.password) {
+        throw new Error("buildImage: push.username and push.password are required when push is set");
+      }
+      body.push = {
+        registry: p.registry,
+        tag: p.tag,
+        server: p.server,
+        username: p.username,
+        password: p.password,
+      };
+    }
+    const response = await this.request(
+      "POST",
+      "/v1/images/build",
+      {
+        body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+    if (response.status === 404) {
+      await response.text().catch(() => undefined);
+      throw new Error(
+        "this daemon does not support Image builds (POST /v1/images/build is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
+      );
+    }
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+    const payload = (await response.json()) as { image: string; pushed?: string };
+    return { image: payload.image, pushed: payload.pushed };
+  }
+
+  private async resolveImage(options: CreateOptions): Promise<CreateOptions & { image: string }> {
+    if (typeof options.image === "string") {
+      return options as CreateOptions & { image: string };
+    }
+    if (!(options.image instanceof Image)) {
+      throw new TypeError("CreateOptions.image must be a string or Image");
+    }
+    const result = await this.buildImage(options.image);
+    return { ...options, image: result.image };
   }
 
   async list(): Promise<SandboxResource[]> {

@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from microvm import Image
 from microvm import client as client_module
 from microvm.client import MicroVM
 
@@ -13,6 +14,8 @@ class RecordingMicroVM(MicroVM):
 
     def _do_json(self, method, path, payload):  # type: ignore[override]
         self.calls.append((method, path, payload))
+        if method == "POST" and path == "/v1/images/build":
+            return {"image": "aerolvm-build/abc123:latest"}
         if method == "POST" and path == "/v1/sandboxes":
             return {
                 "id": "sb-1",
@@ -211,6 +214,103 @@ class FakeWebSocketModule:
 
 
 class ClientTests(unittest.TestCase):
+    def test_create_with_image_builds_before_create(self):
+        client = RecordingMicroVM()
+
+        sandbox = client.create(
+            {
+                "image": Image.base("ubuntu:22.04").run_commands("apt-get update", "apt-get install -y curl"),
+            }
+        )
+
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/images/build",
+                {
+                    "dockerfile_content": "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n",
+                },
+            ),
+        )
+        self.assertEqual(client.calls[1][0], "POST")
+        self.assertEqual(client.calls[1][1], "/v1/sandboxes")
+        self.assertEqual(client.calls[1][2]["image"], "aerolvm-build/abc123:latest")
+        self.assertEqual(sandbox.id, "sb-1")
+
+    def test_build_image_with_push_forwards_push_options(self):
+        class PushRecordingMicroVM(RecordingMicroVM):
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                self.calls.append((method, path, payload))
+                if method == "POST" and path == "/v1/images/build":
+                    return {
+                        "image": "aerolvm-build/abc123:latest",
+                        "pushed": "ghcr.io/x/y:v1",
+                    }
+                return super()._do_json(method, path, payload)
+
+        client = PushRecordingMicroVM()
+        result = client.build_image_with_push(
+            Image.base("alpine"),
+            push={
+                "registry": "ghcr.io/x/y",
+                "tag": "v1",
+                "server": "ghcr.io",
+                "username": "u",
+                "password": "p",
+            },
+        )
+
+        self.assertEqual(result.image, "aerolvm-build/abc123:latest")
+        self.assertEqual(result.pushed, "ghcr.io/x/y:v1")
+        self.assertEqual(
+            client.calls[-1],
+            (
+                "POST",
+                "/v1/images/build",
+                {
+                    "dockerfile_content": "FROM alpine\n",
+                    "push": {
+                        "registry": "ghcr.io/x/y",
+                        "username": "u",
+                        "password": "p",
+                        "tag": "v1",
+                        "server": "ghcr.io",
+                    },
+                },
+            ),
+        )
+
+    def test_build_image_with_push_rejects_missing_credentials(self):
+        client = RecordingMicroVM()
+        with self.assertRaisesRegex(ValueError, "push.registry is required"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"username": "u", "password": "p"},
+            )
+        with self.assertRaisesRegex(ValueError, r"push\.username and push\.password"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"registry": "ghcr.io/x/y", "password": "p"},
+            )
+        with self.assertRaisesRegex(ValueError, r"push\.username and push\.password"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"registry": "ghcr.io/x/y", "username": "u"},
+            )
+
+    def test_build_image_maps_404_to_actionable_error(self):
+        class NotFoundBuildMicroVM(RecordingMicroVM):
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                if method == "POST" and path == "/v1/images/build":
+                    raise client_module.MicroVMHTTPError(404, "Not Found")
+                return super()._do_json(method, path, payload)
+
+        client = NotFoundBuildMicroVM()
+
+        with self.assertRaisesRegex(client_module.MicroVMError, "does not support Image builds"):
+            client.build_image(Image.base("alpine"))
+
     def test_create_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         sandbox = client.create(

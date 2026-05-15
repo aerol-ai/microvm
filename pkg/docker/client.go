@@ -233,13 +233,24 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
-	if err := c.pullImage(ctx, req.Image, req.Registry); err != nil {
-		return nil, err
-	}
-
+	// Locally-built images (BuildImage tags them with content-addressed
+	// names that don't exist on any registry) must skip the pull, otherwise
+	// the daemon would 401/404 trying to fetch them from Docker Hub. We
+	// can't decide that purely from the name though — a real registry image
+	// could legitimately use a name in BuiltImageNamespace. Inspect first;
+	// if the image is already local, the pull is unnecessary regardless of
+	// where it came from. If the inspect fails (image missing) we fall
+	// through to a normal pull attempt and let that surface the registry
+	// error.
 	imageInspect, err := c.inspectImage(ctx, req.Image)
 	if err != nil {
-		return nil, fmt.Errorf("inspect image: %w", err)
+		if pullErr := c.pullImage(ctx, req.Image, req.Registry); pullErr != nil {
+			return nil, pullErr
+		}
+		imageInspect, err = c.inspectImage(ctx, req.Image)
+		if err != nil {
+			return nil, fmt.Errorf("inspect image: %w", err)
+		}
 	}
 
 	workingDir := strings.TrimSpace(imageInspect.Config.WorkingDir)
@@ -784,6 +795,13 @@ type imageInspect struct {
 		Entrypoint []string `json:"Entrypoint"`
 		Cmd        []string `json:"Cmd"`
 	} `json:"Config"`
+	Metadata struct {
+		// LastTagTime is updated by the daemon every time the image is
+		// (re)tagged. We use it as the "freshness" signal for built-image GC
+		// because a content-cache-hit build returns an image whose Created
+		// timestamp may be days old — but the tag was just written.
+		LastTagTime time.Time `json:"LastTagTime"`
+	} `json:"Metadata"`
 }
 
 type containerInspect struct {

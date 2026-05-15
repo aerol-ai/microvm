@@ -37,10 +37,7 @@ PR description is **not** acceptable on these axes):
 4. **Failure-path consistency.** Multi-step writes touching both caddy and the
    store must have a documented rollback rule. Don't lean on reconcile as
    routine cleanup.
-5. **`/v1` is soft-frozen.** No behavioral changes to v1 wire bodies, status
-   codes, or paths. New capabilities go in `pkg/api/v2`. No
-   `if version == "v1"` in `internal/`.
-6. **TCP host-port pool & L4 bootstrap are fragile.** Any change to
+5. **TCP host-port pool & L4 bootstrap are fragile.** Any change to
    `TryReserveHostPort`, the `host_port` partial unique index, `allocateHostPort`,
    `EnsureLayer4`, `EnsureLayer4Ready`, or the `l4Ready` latch needs a
    regression test (see `store_test.go` / `layer4_bootstrap_test.go`) AND a PR
@@ -67,10 +64,10 @@ internal/
 pkg/
   api/           HTTP server entrypoint (server.go) + middleware + auth.
     apihttp/     Shared helpers (WriteJSON, WriteError, WriteStoreAwareError).
-    v1/          Soft-frozen v1 routes. routes.go is the single grep target
-                 for "what does v1 expose?". handlers.go is thin: decode →
+    v1/          v1 routes. routes.go is the single grep target for
+                 "what does v1 expose?". handlers.go is thin: decode →
                  service call → encode.
-    v2/          Empty — where future breaking changes land.
+    v2/          Reserved for future breaking changes; not in active use.
     daytona/     Daytona-SDK compatibility facade (/daytona/...).
   caddy/         Caddy admin API client (L7 routes + L4 routes for TCP).
   capacity/      Host capacity detection + admission control (Admitter).

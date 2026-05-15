@@ -20,6 +20,34 @@ pub struct RegistryAuth {
     pub password: String,
 }
 
+/// Per-request push directive for `Client::build_image_with_options`.
+/// Credentials are forwarded to the daemon as a one-shot `X-Registry-Auth`
+/// header on the underlying push call and are never persisted server-side.
+#[derive(Debug, Clone, Default)]
+pub struct BuildImagePushOptions {
+    /// Destination repository, e.g. `"ghcr.io/my-org/my-image"`.
+    pub registry: String,
+    /// Destination tag. The daemon defaults to `"latest"` when empty.
+    pub tag: Option<String>,
+    /// Registry serveraddress, e.g. `"ghcr.io"`. Sent inside `X-Registry-Auth`.
+    pub server: Option<String>,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BuildImageOptions {
+    pub push: Option<BuildImagePushOptions>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildImageResult {
+    /// Local content-addressed tag (always returned).
+    pub image: String,
+    /// Pushed reference (e.g. `"ghcr.io/x/y:v1"`) when push was requested.
+    pub pushed: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MountSpec {
     #[serde(rename = "type")]

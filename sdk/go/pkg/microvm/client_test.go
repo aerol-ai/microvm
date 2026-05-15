@@ -81,6 +81,88 @@ func TestNewClientCases(t *testing.T) {
 			},
 		},
 		{
+			name: "create_with_image_builds_then_creates",
+			run: func(t *testing.T) {
+				var buildPayload struct {
+					DockerfileContent string `json:"dockerfile_content"`
+				}
+				var createPayload models.CreateSandboxRequest
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/v1/images/build":
+						if r.Method != http.MethodPost {
+							t.Fatalf("unexpected build request: %s %s", r.Method, r.URL.Path)
+						}
+						if err := json.NewDecoder(r.Body).Decode(&buildPayload); err != nil {
+							t.Fatalf("Decode(build) error = %v", err)
+						}
+						_ = json.NewEncoder(w).Encode(map[string]string{"image": "aerolvm-build/abc123:latest"})
+					case "/v1/sandboxes":
+						if r.Method != http.MethodPost {
+							t.Fatalf("unexpected create request: %s %s", r.Method, r.URL.Path)
+						}
+						if err := json.NewDecoder(r.Body).Decode(&createPayload); err != nil {
+							t.Fatalf("Decode(create) error = %v", err)
+						}
+						_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+							Sandbox: models.Sandbox{ID: "sb-from-image", Image: createPayload.Image, Status: models.SandboxStatusStarted},
+						})
+					default:
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+					PATToken: "config-pat",
+					APIUrl:   server.URL,
+				})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig() error = %v", err)
+				}
+
+				image := BaseImage("ubuntu:22.04").RunCommands("apt-get update", "apt-get install -y curl")
+				sandbox, err := client.CreateWithImage(ctx, image, sdktypes.CreateSandboxOptions{})
+				if err != nil {
+					t.Fatalf("CreateWithImage() error = %v", err)
+				}
+
+				if sandbox.ID != "sb-from-image" {
+					t.Fatalf("unexpected sandbox: %+v", sandbox)
+				}
+				if buildPayload.DockerfileContent != "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n" {
+					t.Fatalf("unexpected build payload: %+v", buildPayload)
+				}
+				if createPayload.Image != "aerolvm-build/abc123:latest" {
+					t.Fatalf("unexpected create payload image: %+v", createPayload)
+				}
+			},
+		},
+		{
+			name: "build_image_maps_404_to_actionable_error",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/plain")
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte("404 page not found\n"))
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+					PATToken: "config-pat",
+					APIUrl:   server.URL,
+				})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig() error = %v", err)
+				}
+
+				_, err = client.BuildImage(ctx, BaseImage("alpine"))
+				if err == nil || !strings.Contains(err.Error(), "does not support Image builds") || !strings.Contains(err.Error(), "string image reference") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			},
+		},
+		{
 			name: "new_client_requires_pat_token",
 			run: func(t *testing.T) {
 				t.Setenv("SB_PAT_TOKEN", "")
@@ -148,6 +230,100 @@ func TestNewClientCases(t *testing.T) {
 				}
 				if snapshot.Name != "snapshots/demo:v1" || snapshot.ImageID != "sha256:snap-1" {
 					t.Fatalf("unexpected snapshot: %+v", snapshot)
+				}
+			},
+		},
+		{
+			name: "build_image_with_options_forwards_push_directive",
+			run: func(t *testing.T) {
+				var seenBody struct {
+					DockerfileContent string `json:"dockerfile_content"`
+					Push              *struct {
+						Registry string `json:"registry"`
+						Tag      string `json:"tag"`
+						Server   string `json:"server"`
+						Username string `json:"username"`
+						Password string `json:"password"`
+					} `json:"push"`
+				}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPost || r.URL.Path != "/v1/images/build" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
+						t.Fatalf("decode: %v", err)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]string{
+						"image":  "aerolvm-build/abc123:latest",
+						"pushed": "ghcr.io/x/y:v1",
+					})
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+					PATToken: "config-pat",
+					APIUrl:   server.URL,
+				})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig: %v", err)
+				}
+
+				result, err := client.BuildImageWithOptions(ctx, BaseImage("alpine"), sdktypes.BuildImageOptions{
+					Push: &sdktypes.BuildImagePushOptions{
+						Registry: "ghcr.io/x/y",
+						Tag:      "v1",
+						Server:   "ghcr.io",
+						Username: "u",
+						Password: "p",
+					},
+				})
+				if err != nil {
+					t.Fatalf("BuildImageWithOptions: %v", err)
+				}
+				if result.Image != "aerolvm-build/abc123:latest" || result.Pushed != "ghcr.io/x/y:v1" {
+					t.Fatalf("unexpected result: %+v", result)
+				}
+				if seenBody.Push == nil ||
+					seenBody.Push.Registry != "ghcr.io/x/y" ||
+					seenBody.Push.Tag != "v1" ||
+					seenBody.Push.Server != "ghcr.io" ||
+					seenBody.Push.Username != "u" ||
+					seenBody.Push.Password != "p" {
+					t.Fatalf("unexpected push body: %+v", seenBody.Push)
+				}
+			},
+		},
+		{
+			name: "build_image_with_options_rejects_missing_credentials",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					t.Fatalf("must not call daemon: %s %s", r.Method, r.URL.Path)
+				}))
+				defer server.Close()
+
+				client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+					PATToken: "config-pat",
+					APIUrl:   server.URL,
+				})
+				if err != nil {
+					t.Fatalf("NewClientWithConfig: %v", err)
+				}
+				cases := []struct {
+					name string
+					push sdktypes.BuildImagePushOptions
+					want string
+				}{
+					{name: "missing_registry", push: sdktypes.BuildImagePushOptions{Username: "u", Password: "p"}, want: "registry"},
+					{name: "missing_username", push: sdktypes.BuildImagePushOptions{Registry: "ghcr.io/x/y", Password: "p"}, want: "username"},
+					{name: "missing_password", push: sdktypes.BuildImagePushOptions{Registry: "ghcr.io/x/y", Username: "u"}, want: "password"},
+				}
+				for _, tc := range cases {
+					t.Run(tc.name, func(t *testing.T) {
+						_, err := client.BuildImageWithOptions(ctx, BaseImage("alpine"), sdktypes.BuildImageOptions{Push: &tc.push})
+						if err == nil || !strings.Contains(err.Error(), tc.want) {
+							t.Fatalf("expected error containing %q, got %v", tc.want, err)
+						}
+					})
 				}
 			},
 		},
