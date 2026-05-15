@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httputil"
 	"net/textproto"
 	"net/url"
 	"path/filepath"
@@ -56,8 +57,19 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 		h.workDir(w, r, sandboxID)
 	case r.Method == http.MethodPost && path == "process/execute":
 		h.executeCommand(w, r, sandboxID)
-	case path == "process/session" || strings.HasPrefix(path, "process/session/"):
+	case r.Method == http.MethodPost && path == "process/code-run":
 		h.forwardToolbox(w, r, sandboxID, "/"+path)
+	case path == "process/session" || strings.HasPrefix(path, "process/session/"):
+		// Session log/PTY streams upgrade to WebSocket — use the reverse-proxy
+		// path so the Upgrade handshake passes through. Plain-HTTP session
+		// requests ride the same proxy without harm.
+		h.proxyToolbox(w, r, sandboxID, "/"+path)
+	case strings.HasPrefix(path, "process/interpreter/"):
+		// /process/interpreter/execute is a WebSocket stream; the context
+		// endpoints are plain HTTP. ReverseProxy handles both.
+		h.proxyToolbox(w, r, sandboxID, "/"+path)
+	case strings.HasPrefix(path, "process/pty/"):
+		h.proxyToolbox(w, r, sandboxID, "/"+path)
 	case r.Method == http.MethodGet && path == "files":
 		h.forwardToolbox(w, r, sandboxID, "/files")
 	case r.Method == http.MethodGet && path == "files/info":
@@ -319,6 +331,42 @@ func (h *handlers) runToolboxCommand(ctx context.Context, sandboxID string, req 
 		return nil, &toolboxHTTPError{StatusCode: statusCode, Message: http.StatusText(statusCode)}
 	}
 	return &result, nil
+}
+
+// proxyToolbox forwards via httputil.ReverseProxy, which transparently
+// negotiates Upgrade: websocket handshakes — unlike forwardToolbox, which
+// reads the body fully through httpClient.Do and breaks WS streams.
+func (h *handlers) proxyToolbox(w http.ResponseWriter, r *http.Request, sandboxID, path string) {
+	endpoint, err := h.deps.Service.ToolboxTarget(r.Context(), sandboxID)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	target, err := url.Parse(endpoint.URL)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, "invalid toolbox target")
+		return
+	}
+
+	toolboxToken := endpoint.Token
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.URL.Path = path
+			pr.Out.URL.RawPath = ""
+			pr.Out.Host = target.Host
+			if toolboxToken != "" {
+				pr.Out.Header.Set("Authorization", "Bearer "+toolboxToken)
+			}
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			if h.deps.Logger != nil {
+				h.deps.Logger.Warn("daytona toolbox proxy failed", "error", err, "path", path)
+			}
+			apihttp.WriteError(w, http.StatusBadGateway, "toolbox unavailable")
+		},
+	}
+	proxy.ServeHTTP(w, r)
 }
 
 func (h *handlers) forwardToolbox(w http.ResponseWriter, r *http.Request, sandboxID, path string) {
