@@ -27,8 +27,13 @@ type nodeMeta struct {
 	// https://10.0.0.5:7002). Set only when the node was started with cluster
 	// TLS material — peers receiving an empty value know to fall back to the
 	// public APIURL with PAT-only auth.
-	InternalURL string            `json:"internal_url,omitempty"`
-	Capacity    capacity.Snapshot `json:"capacity"`
+	InternalURL string `json:"internal_url,omitempty"`
+	// Role is the gossiped SB_NODE_ROLE — the leader's voter-promotion code
+	// uses this to decline to AddVoter a peer that announced itself as
+	// worker/ingress. Empty (older builds) is treated as "mixed" to preserve
+	// rolling-upgrade compatibility.
+	Role     string            `json:"role,omitempty"`
+	Capacity capacity.Snapshot `json:"capacity"`
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
@@ -43,9 +48,10 @@ type gossipDelegate struct {
 	dataPlaneHost string
 	raftAddr      string
 	internalURL   string
+	role          string
 }
 
-func newGossipDelegate(nodeID, apiURL, dataPlaneHost, raftAddr, internalURL string, admitter *capacity.Admitter) *gossipDelegate {
+func newGossipDelegate(nodeID, apiURL, dataPlaneHost, raftAddr, internalURL, role string, admitter *capacity.Admitter) *gossipDelegate {
 	d := &gossipDelegate{
 		admitter:      admitter,
 		nodeID:        nodeID,
@@ -53,6 +59,7 @@ func newGossipDelegate(nodeID, apiURL, dataPlaneHost, raftAddr, internalURL stri
 		dataPlaneHost: dataPlaneHost,
 		raftAddr:      raftAddr,
 		internalURL:   internalURL,
+		role:          role,
 	}
 	d.refreshMeta()
 	return d
@@ -66,12 +73,12 @@ func (d *gossipDelegate) refreshMeta() {
 	if d.admitter != nil {
 		snap = d.admitter.Snapshot()
 	}
-	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Capacity: snap}
+	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, Capacity: snap}
 	enc, err := json.Marshal(meta)
 	if err != nil {
 		// JSON of a capacity.Snapshot can't fail; if it does, fall back to a
 		// minimal blob so peers still know we're here.
-		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, InternalURL: d.internalURL})
+		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, InternalURL: d.internalURL, Role: d.role})
 		enc = minimal
 	}
 	d.mu.Lock()
@@ -119,6 +126,7 @@ type gossipSetupConfig struct {
 	DataPlaneHost  string
 	RaftAddr       string
 	InternalURL    string
+	Role           string
 	BootstrapPeers []string
 	GossipInterval time.Duration
 	// SecretKey enables AES gossip encryption + authentication when non-nil.
@@ -150,7 +158,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		mlCfg.AdvertisePort = aport
 	}
 
-	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, admitter)
+	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, admitter)
 	mlCfg.Delegate = delegate
 	if cfg.Events != nil {
 		mlCfg.Events = cfg.Events
@@ -252,6 +260,7 @@ func (g *gossipNode) members() []Member {
 				m.DataPlaneHost = meta.DataPlaneHost
 				m.RaftAddr = meta.RaftAddr
 				m.InternalURL = meta.InternalURL
+				m.Role = meta.Role
 				m.Capacity = meta.Capacity
 			}
 		}
@@ -274,6 +283,7 @@ func (g *gossipNode) selfMember() Member {
 		DataPlaneHost: meta.DataPlaneHost,
 		RaftAddr:      meta.RaftAddr,
 		InternalURL:   meta.InternalURL,
+		Role:          meta.Role,
 		Alive:         true,
 		Capacity:      meta.Capacity,
 	}

@@ -37,6 +37,9 @@ func TestLoadCases(t *testing.T) {
 			"SB_HTTP_CLIENT_TIMEOUT",
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
 			"SB_DATA_PLANE_ADVERTISE_HOST",
+			"SB_NODE_ROLE",
+			"SB_ENABLE_CLUSTER",
+			"SB_CLUSTER_BOOTSTRAP",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -86,6 +89,12 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.ClusterMaxAutoVoters != 5 {
 					t.Fatalf("expected default ClusterMaxAutoVoters=5, got %d", cfg.ClusterMaxAutoVoters)
+				}
+				if cfg.NodeRole != NodeRoleMixed {
+					t.Fatalf("expected default NodeRole=%q, got %q", NodeRoleMixed, cfg.NodeRole)
+				}
+				if !cfg.IsServer() || !cfg.IsWorker() || !cfg.IsIngress() {
+					t.Fatalf("expected mixed default to return true for all role predicates: %+v", cfg)
 				}
 			},
 		},
@@ -303,6 +312,155 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 		if cfg.DataPlaneAdvertiseHost != "10.0.0.7" {
 			t.Fatalf("DataPlaneAdvertiseHost = %q", cfg.DataPlaneAdvertiseHost)
+		}
+	})
+}
+
+func TestNodeRoleCases(t *testing.T) {
+	// Helper: a known-good cluster-mode env so role-specific cases don't
+	// trip the credential/gossip/peer invariants. Each subtest tweaks only
+	// what it's testing.
+	setClusterDefaults := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "true")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_API_ADVERTISE_URL", "http://10.0.0.5:21212")
+		t.Setenv("SB_NODE_ROLE", "")
+	}
+
+	t.Run("default_is_mixed_in_single_node_mode", func(t *testing.T) {
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "")
+		t.Setenv("SB_NODE_ROLE", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != NodeRoleMixed {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, NodeRoleMixed)
+		}
+	})
+
+	t.Run("accepts_each_known_role", func(t *testing.T) {
+		for _, role := range []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed} {
+			t.Run(role, func(t *testing.T) {
+				setClusterDefaults(t)
+				t.Setenv("SB_NODE_ROLE", role)
+				// Worker/ingress can't bootstrap; flip to a peer join for those.
+				if role == NodeRoleWorker || role == NodeRoleIngress {
+					t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+					t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+				}
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("role=%q Load() error = %v", role, err)
+				}
+				if cfg.NodeRole != role {
+					t.Fatalf("role=%q parsed as %q", role, cfg.NodeRole)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects_unknown_role", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "controller")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_NODE_ROLE") {
+			t.Fatalf("expected SB_NODE_ROLE error, got %v", err)
+		}
+	})
+
+	t.Run("lowercases_input", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "Worker")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != NodeRoleWorker {
+			t.Fatalf("expected lowercase normalization, got %q", cfg.NodeRole)
+		}
+	})
+
+	t.Run("non_default_role_requires_cluster_mode", func(t *testing.T) {
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "")
+		t.Setenv("SB_NODE_ROLE", "worker")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_ENABLE_CLUSTER") {
+			t.Fatalf("expected SB_ENABLE_CLUSTER requirement error, got %v", err)
+		}
+	})
+
+	t.Run("worker_cannot_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_BOOTSTRAP") {
+			t.Fatalf("expected bootstrap-incompatible error, got %v", err)
+		}
+	})
+
+	t.Run("ingress_cannot_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_BOOTSTRAP") {
+			t.Fatalf("expected bootstrap-incompatible error, got %v", err)
+		}
+	})
+
+	t.Run("ingress_advertise_host_default_falls_back_to_public_host", func(t *testing.T) {
+		c := Config{PublicHost: "203.0.113.10"}
+		if got := c.EffectivePublicHost(); got != "203.0.113.10" {
+			t.Fatalf("EffectivePublicHost fallback = %q, want PublicHost", got)
+		}
+	})
+
+	t.Run("ingress_advertise_host_overrides_public_host", func(t *testing.T) {
+		c := Config{PublicHost: "10.0.0.5", IngressAdvertiseHost: "ingress.example.com"}
+		if got := c.EffectivePublicHost(); got != "ingress.example.com" {
+			t.Fatalf("EffectivePublicHost override = %q, want ingress.example.com", got)
+		}
+	})
+
+	t.Run("ingress_advertise_host_is_normalized_from_env", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_INGRESS_ADVERTISE_HOST", "https://ingress.example.com:443")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.IngressAdvertiseHost != "ingress.example.com" {
+			t.Fatalf("IngressAdvertiseHost = %q, want host-only normalization", cfg.IngressAdvertiseHost)
+		}
+	})
+
+	t.Run("helpers_match_role", func(t *testing.T) {
+		cases := []struct {
+			role                            string
+			wantServer, wantWorker, wantIng bool
+		}{
+			{NodeRoleMixed, true, true, true},
+			{NodeRoleServer, true, false, false},
+			{NodeRoleWorker, false, true, false},
+			{NodeRoleIngress, false, false, true},
+		}
+		for _, tc := range cases {
+			c := Config{NodeRole: tc.role}
+			if c.IsServer() != tc.wantServer || c.IsWorker() != tc.wantWorker || c.IsIngress() != tc.wantIng {
+				t.Fatalf("role=%q: IsServer=%v IsWorker=%v IsIngress=%v (want %v %v %v)",
+					tc.role, c.IsServer(), c.IsWorker(), c.IsIngress(),
+					tc.wantServer, tc.wantWorker, tc.wantIng)
+			}
 		}
 	})
 }

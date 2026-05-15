@@ -16,6 +16,23 @@ import (
 
 const defaultToolboxPort = 2280
 
+// NodeRole values for SB_NODE_ROLE. The role partitions which components a
+// cluster-mode daemon runs (Raft voter promotion, sandbox worker work, public
+// ingress reconciler). Default is NodeRoleMixed — every node runs every
+// component, matching pre-role behavior bit-for-bit. The split exists so a
+// 200-worker cluster doesn't have 200 Raft voters and 200 nodes each holding
+// a 10K-route public ingress table; see plans/data-plane-load-balancer.md.
+const (
+	NodeRoleServer  = "server"
+	NodeRoleWorker  = "worker"
+	NodeRoleIngress = "ingress"
+	NodeRoleMixed   = "mixed"
+)
+
+func validNodeRoles() []string {
+	return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed}
+}
+
 type Config struct {
 	PATToken            string
 	APIHost             string
@@ -117,7 +134,13 @@ type Config struct {
 	// sandbox is owned by exactly one node; the owner's local SQLite remains
 	// the source of truth for sandbox state. Hot-path traffic (toolbox,
 	// sessions, port forwards) is transparently reverse-proxied to the owner.
-	EnableCluster       bool
+	EnableCluster bool
+	// NodeRole partitions cluster-mode components across this daemon. Values
+	// are one of NodeRoleServer / NodeRoleWorker / NodeRoleIngress /
+	// NodeRoleMixed. Default NodeRoleMixed preserves pre-role behavior
+	// (every component runs on every node). SB_NODE_ROLE. Ignored when
+	// EnableCluster=false — single-node mode is implicitly "mixed".
+	NodeRole            string
 	NodeID              string
 	RaftBindAddr        string
 	RaftAdvertiseAddr   string
@@ -133,7 +156,21 @@ type Config struct {
 	// SelfAPIAdvertiseURL: many deployments put API traffic behind a shared
 	// load balancer or API-only DNS name that must not be used as the
 	// owner-data-plane target. SB_DATA_PLANE_ADVERTISE_HOST.
-	DataPlaneAdvertiseHost        string
+	DataPlaneAdvertiseHost string
+	// IngressAdvertiseHost is the *public* host the SDK and end users hit for
+	// sandbox URLs in cluster mode. It is separate from PublicHost (which is
+	// the local node's bind-or-NAT address) and from DataPlaneAdvertiseHost
+	// (which is the peer-internal LAN address other nodes use). When set, the
+	// Caddy client uses it as the hostname in composed sandbox URLs; when
+	// empty, it falls back to PublicHost so single-node mode is unchanged.
+	//
+	// Operators point this at whatever the cluster's data-plane LB endpoint
+	// is — a wildcard DNS record fronting the ingress nodes, a cloud NLB, a
+	// MetalLB/BGP VIP, or DNS round-robin across ingress nodes. The build
+	// itself does not run any load balancer; that's a deployment decision.
+	// See plans/data-plane-load-balancer.md.
+	// SB_INGRESS_ADVERTISE_HOST.
+	IngressAdvertiseHost          string
 	ClusterRaftCommitTimeout      time.Duration
 	ClusterCapacityGossipInterval time.Duration
 	// ClusterMaxAutoVoters caps gossip-driven Raft voter promotion. Additional
@@ -290,6 +327,7 @@ func Load() (Config, error) {
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
 
 		EnableCluster:                 getEnvBool("SB_ENABLE_CLUSTER", false),
+		NodeRole:                      strings.ToLower(strings.TrimSpace(os.Getenv("SB_NODE_ROLE"))),
 		NodeID:                        strings.TrimSpace(os.Getenv("SB_NODE_ID")),
 		RaftBindAddr:                  getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
 		RaftAdvertiseAddr:             strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
@@ -300,6 +338,7 @@ func Load() (Config, error) {
 		ClusterBootstrap:              getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
 		SelfAPIAdvertiseURL:           strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		DataPlaneAdvertiseHost:        normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
+		IngressAdvertiseHost:          normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
 		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:          getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
@@ -359,6 +398,23 @@ func Load() (Config, error) {
 		return Config{}, errors.New("SB_L4_TLS_FALLBACK must be set when SB_L4_TLS_LISTEN is set (caddy-l4 needs a target for non-sandbox SNI)")
 	}
 
+	// NodeRole defaults to "mixed" and must be one of the known values when
+	// set. The role only changes daemon behavior in cluster mode; in
+	// single-node mode it stays at "mixed" implicitly (and an explicit
+	// non-default value would be a misconfiguration, not a silent override).
+	if cfg.NodeRole == "" {
+		cfg.NodeRole = NodeRoleMixed
+	}
+	switch cfg.NodeRole {
+	case NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed:
+		// ok
+	default:
+		return Config{}, fmt.Errorf("invalid SB_NODE_ROLE=%q (allowed: %s)", cfg.NodeRole, strings.Join(validNodeRoles(), ", "))
+	}
+	if cfg.NodeRole != NodeRoleMixed && !cfg.EnableCluster {
+		return Config{}, fmt.Errorf("SB_NODE_ROLE=%q requires SB_ENABLE_CLUSTER=true (single-node mode is implicitly %q)", cfg.NodeRole, NodeRoleMixed)
+	}
+
 	// Cluster-mode invariants. Single-node mode (EnableCluster=false) skips
 	// all of this — defaults are non-load-bearing in that case.
 	if cfg.EnableCluster {
@@ -389,6 +445,13 @@ func Load() (Config, error) {
 		}
 		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
 			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
+		}
+		// Worker and ingress nodes never seed a fresh Raft cluster — only
+		// server/mixed roles do. Catching this at boot avoids a confusing
+		// half-bootstrapped cluster where a non-voter tried to be the
+		// first voter.
+		if cfg.ClusterBootstrap && (cfg.NodeRole == NodeRoleWorker || cfg.NodeRole == NodeRoleIngress) {
+			return Config{}, fmt.Errorf("SB_CLUSTER_BOOTSTRAP=true is incompatible with SB_NODE_ROLE=%q (only %q or %q may bootstrap a cluster)", cfg.NodeRole, NodeRoleServer, NodeRoleMixed)
 		}
 		// Gossip auth gates voter auto-promotion. Without it, any reachable peer
 		// can join the raft configuration. Refusing at boot is the safest default
@@ -439,6 +502,41 @@ func (c Config) ListenAddr() string {
 
 func (c Config) DomainMode() bool {
 	return c.Domain != ""
+}
+
+// IsServer reports whether this daemon should run server-only responsibilities
+// (Raft voter promotion, FSM ownership). Mixed nodes return true for all three
+// IsServer/IsWorker/IsIngress predicates so single-node and small-cluster
+// deployments keep their current behavior.
+func (c Config) IsServer() bool {
+	return c.NodeRole == NodeRoleServer || c.NodeRole == NodeRoleMixed
+}
+
+// IsWorker reports whether this daemon owns sandboxes locally (Docker,
+// lifecycle sweep, image GC, reservation replay). Pure ingress/server nodes
+// return false.
+func (c Config) IsWorker() bool {
+	return c.NodeRole == NodeRoleWorker || c.NodeRole == NodeRoleMixed
+}
+
+// IsIngress reports whether this daemon installs owner-aware Caddy routes for
+// remote sandboxes. Pure server/worker nodes return false; the public ingress
+// fan-out is concentrated on dedicated ingress nodes (or every mixed node).
+func (c Config) IsIngress() bool {
+	return c.NodeRole == NodeRoleIngress || c.NodeRole == NodeRoleMixed
+}
+
+// EffectivePublicHost returns the hostname or IP that should appear in
+// SDK-facing sandbox URLs. In cluster mode, operators set
+// SB_INGRESS_ADVERTISE_HOST to whatever fronts the ingress tier (cloud NLB,
+// MetalLB VIP, wildcard DNS, etc.); single-node mode and clusters that
+// haven't configured an ingress host fall back to PublicHost, matching the
+// pre-cluster behavior.
+func (c Config) EffectivePublicHost() string {
+	if c.IngressAdvertiseHost != "" {
+		return c.IngressAdvertiseHost
+	}
+	return c.PublicHost
 }
 
 func (c Config) IdleTimeout() time.Duration {

@@ -84,6 +84,13 @@ type Service struct {
 	cluster      cluster.Client
 	clusterMu    sync.Mutex
 	clusterReady atomic.Bool
+
+	// ingressLastHash is the hash of the placement view that the last
+	// successful cluster-ingress reconcile installed. The reconciler hashes
+	// the next view and skips work when unchanged — this is the cheap idle
+	// path that keeps a 10K-placement steady state from hammering Caddy's
+	// admin API every 5 seconds. Set to 0 on error so the next tick retries.
+	ingressLastHash atomic.Uint64
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -2071,6 +2078,18 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	}
 	placements := c.Placements()
 
+	// Idle-skip: hash the relevant slice of the placement view. If nothing
+	// changed since the last successful reconcile, return without touching
+	// Caddy admin. At 10K placements this drops a 2K-route-write tick to a
+	// single hash() and a few atomic loads. The hash key includes
+	// Version, so any FSM-level placement change forces a recompute.
+	start := time.Now()
+	viewHash, routeCounts, maxVersion := hashPlacementView(self, placements)
+	if viewHash == s.ingressLastHash.Load() && viewHash != 0 {
+		recordIngressReconcile(reconcileSkipped, time.Since(start), routeCounts, maxVersion)
+		return nil
+	}
+
 	var firstErr error
 	needL4 := s.cfg.Domain != ""
 	if !needL4 {
@@ -2158,6 +2177,15 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	}
 	if err := s.gcClusterIngressRoutes(ctx); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	// Stash the hash only on full success — partial failures must retry next
+	// tick rather than wedging the idle-skip on a stale view.
+	if firstErr == nil {
+		s.ingressLastHash.Store(viewHash)
+		recordIngressReconcile(reconcileApplied, time.Since(start), routeCounts, maxVersion)
+	} else {
+		s.ingressLastHash.Store(0)
+		recordIngressReconcile(reconcileErrored, time.Since(start), routeCounts, maxVersion)
 	}
 	return firstErr
 }

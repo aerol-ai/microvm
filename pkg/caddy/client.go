@@ -28,10 +28,15 @@ type Client struct {
 
 func New(cfg config.Config) *Client {
 	return &Client{
-		baseURL:       strings.TrimRight(cfg.CaddyAdminURL, "/"),
-		serverID:      cfg.CaddyServerID,
-		domain:        cfg.Domain,
-		publicHost:    cfg.PublicHost,
+		baseURL:  strings.TrimRight(cfg.CaddyAdminURL, "/"),
+		serverID: cfg.CaddyServerID,
+		domain:   cfg.Domain,
+		// In cluster mode an operator points SB_INGRESS_ADVERTISE_HOST at
+		// whatever fronts the ingress tier (cloud NLB, MetalLB VIP, wildcard
+		// DNS RR, etc.) so SDK-returned URLs resolve there rather than at
+		// this specific node. EffectivePublicHost falls back to PublicHost so
+		// single-node and pre-cluster deployments stay byte-identical.
+		publicHost:    cfg.EffectivePublicHost(),
 		enabled:       cfg.EnableCaddy,
 		l4TLSListen:   cfg.L4TLSListen,
 		l4TLSFallback: cfg.L4TLSFallback,

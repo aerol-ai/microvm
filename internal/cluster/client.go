@@ -202,6 +202,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		DataPlaneHost:  cfg.DataPlaneAdvertiseHost,
 		RaftAddr:       raftAdvertise,
 		InternalURL:    c.internalURL,
+		Role:           cfg.NodeRole,
 		BootstrapPeers: cfg.BootstrapPeers,
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,

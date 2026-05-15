@@ -27,6 +27,8 @@ INTERNAL_ADVERTISE_URL=""
 NO_TLS="false"
 FORCE="false"
 MAX_AUTO_VOTERS="5"
+NODE_ROLE=""
+INGRESS_ADVERTISE_HOST=""
 
 usage() {
 	cat <<'EOF'
@@ -83,6 +85,16 @@ Optional:
   --no-tls                      Skip TLS. Cluster-internal channels ride over
                                 the public API URL with PAT-only auth. ONLY
                                 safe on a fully isolated network.
+  --role <role>                 SB_NODE_ROLE for this daemon. One of server,
+                                worker, ingress, mixed. Default mixed.
+                                worker and ingress nodes never become raft
+                                voters even after gossip join — use these on
+                                joiners that should not weigh on quorum.
+  --ingress-advertise-host <h>  SB_INGRESS_ADVERTISE_HOST — the public host
+                                in SDK-returned sandbox URLs. Defaults to
+                                empty (URLs use SB_PUBLIC_HOST or SB_DOMAIN).
+                                Required when running a dedicated ingress
+                                tier so SDK URLs resolve there.
   --force                       Allow re-join even if the raft data dir
                                 already exists (DESTROYS local raft state).
   --help                        Show this help.
@@ -112,6 +124,8 @@ while [[ $# -gt 0 ]]; do
 		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
 		--internal-advertise) INTERNAL_ADVERTISE_URL="$2"; shift 2 ;;
 		--max-auto-voters)    MAX_AUTO_VOTERS="$2"; shift 2 ;;
+		--role)               NODE_ROLE="$2"; shift 2 ;;
+		--ingress-advertise-host) INGRESS_ADVERTISE_HOST="$2"; shift 2 ;;
 		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
@@ -123,6 +137,14 @@ if [[ $EUID -ne 0 ]]; then
 	echo "cluster-join.sh must run as root" >&2
 	exit 1
 fi
+
+case "$NODE_ROLE" in
+	""|server|worker|ingress|mixed) ;;
+	*)
+		echo "Unknown --role=$NODE_ROLE (allowed: server, worker, ingress, mixed)" >&2
+		exit 1
+		;;
+esac
 
 if [[ -z "$GOSSIP_SECRET_KEY" || -z "$PEERS" ]]; then
 	echo "--gossip-key and --peers are required" >&2
@@ -366,6 +388,12 @@ SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
 SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
+	if [[ -n "$NODE_ROLE" ]]; then
+		echo "SB_NODE_ROLE=$NODE_ROLE"
+	fi
+	if [[ -n "$INGRESS_ADVERTISE_HOST" ]]; then
+		echo "SB_INGRESS_ADVERTISE_HOST=$INGRESS_ADVERTISE_HOST"
+	fi
 	if [[ "$TLS_GENERATED" == "true" ]]; then
 		cat <<EOF
 SB_CLUSTER_TLS_DIR=$TLS_DIR

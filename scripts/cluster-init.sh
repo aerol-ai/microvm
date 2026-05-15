@@ -32,6 +32,8 @@ CRED_KEY_PATH=""
 CRED_BUNDLE_OUT=""
 FORCE="false"
 MAX_AUTO_VOTERS="5"
+NODE_ROLE=""
+INGRESS_ADVERTISE_HOST=""
 
 usage() {
 	cat <<'EOF'
@@ -84,6 +86,19 @@ Options:
   --max-auto-voters <n>         Max Raft voters auto-promoted from gossip.
                                 Additional nodes become non-voters. Default 5.
                                 Set 0 for the old unlimited behavior.
+  --role <role>                 SB_NODE_ROLE for this daemon. One of
+                                server, worker, ingress, mixed. Default mixed
+                                (every component on every node — fine for
+                                small clusters; use server/worker/ingress to
+                                split components at 10+ nodes). The bootstrap
+                                node must be server or mixed; worker/ingress
+                                refuse to bootstrap a fresh cluster.
+  --ingress-advertise-host <h>  SB_INGRESS_ADVERTISE_HOST — the public host
+                                in SDK-returned sandbox URLs. Defaults to
+                                empty (URLs use SB_PUBLIC_HOST or
+                                SB_DOMAIN). Set this to your wildcard-DNS
+                                ingress endpoint when running a dedicated
+                                ingress tier.
   --no-tls                      Skip TLS generation. Cluster-internal channels
                                 ride over the public API URL with PAT-only auth.
                                 ONLY safe on a fully isolated private network.
@@ -115,6 +130,8 @@ while [[ $# -gt 0 ]]; do
 		--credential-key-path) CRED_KEY_PATH="$2"; shift 2 ;;
 		--cred-bundle-out)    CRED_BUNDLE_OUT="$2"; shift 2 ;;
 		--max-auto-voters)    MAX_AUTO_VOTERS="$2"; shift 2 ;;
+		--role)               NODE_ROLE="$2"; shift 2 ;;
+		--ingress-advertise-host) INGRESS_ADVERTISE_HOST="$2"; shift 2 ;;
 		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
@@ -126,6 +143,21 @@ if [[ $EUID -ne 0 ]]; then
 	echo "cluster-init.sh must run as root" >&2
 	exit 1
 fi
+
+# Validate --role early. cluster-init bootstraps raft, so the role must be one
+# that participates in raft voting (server or mixed). Worker/ingress nodes are
+# joiners — they use cluster-join.sh, not this script.
+case "$NODE_ROLE" in
+	""|server|mixed) ;;
+	worker|ingress)
+		echo "cluster-init.sh cannot bootstrap with --role=$NODE_ROLE (use cluster-join.sh on a worker/ingress node, or pick server/mixed here)" >&2
+		exit 1
+		;;
+	*)
+		echo "Unknown --role=$NODE_ROLE (allowed: server, worker, ingress, mixed)" >&2
+		exit 1
+		;;
+esac
 
 if [[ ! -f /etc/sandboxd/sandboxd.env ]]; then
 	echo "Missing /etc/sandboxd/sandboxd.env — run install.sh first" >&2
@@ -381,6 +413,12 @@ SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
 SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
+	if [[ -n "$NODE_ROLE" ]]; then
+		echo "SB_NODE_ROLE=$NODE_ROLE"
+	fi
+	if [[ -n "$INGRESS_ADVERTISE_HOST" ]]; then
+		echo "SB_INGRESS_ADVERTISE_HOST=$INGRESS_ADVERTISE_HOST"
+	fi
 	if [[ "$TLS_GENERATED" == "true" ]]; then
 		cat <<EOF
 SB_CLUSTER_TLS_DIR=$TLS_DIR

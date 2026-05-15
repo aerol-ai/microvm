@@ -107,9 +107,12 @@ type Member struct {
 	// leader-forward applies. Empty when the peer is running without
 	// SB_CLUSTER_TLS_DIR — the forwarder falls back to APIURL with PAT-only
 	// auth in that case.
-	InternalURL string            `json:"internal_url,omitempty"`
-	Alive       bool              `json:"alive"`
-	Capacity    capacity.Snapshot `json:"capacity"`
+	InternalURL string `json:"internal_url,omitempty"`
+	// Role is the peer's gossiped SB_NODE_ROLE. Empty for older builds that
+	// pre-date the field; callers treat empty as the legacy "mixed" default.
+	Role     string            `json:"role,omitempty"`
+	Alive    bool              `json:"alive"`
+	Capacity capacity.Snapshot `json:"capacity"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.

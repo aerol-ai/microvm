@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 )
@@ -52,6 +53,13 @@ func (d *voterAutoJoinDelegate) NotifyUpdate(*memberlist.Node) {}
 // members as non-voters so they keep a replicated FSM without increasing
 // quorum size. Idempotent and leader-gated. Failures are logged at warn — the
 // periodic reconcile loop will retry.
+//
+// Role-aware policy: a peer that gossiped SB_NODE_ROLE=worker or =ingress is
+// always added as a non-voter, regardless of the voter cap. Without this gate
+// a 200-worker cluster grows 200 raft voters even with the cap set high, and
+// stage-2 §02 (B4) treats that as a release blocker. Empty role (older builds
+// without the field) is treated as "mixed" so rolling upgrades don't strand
+// pre-existing voters.
 func (c *Cluster) handleMemberJoin(nodeID string) {
 	if nodeID == "" || nodeID == c.nodeID {
 		return
@@ -64,16 +72,21 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 		// Metadata hasn't propagated yet. The reconcile loop will catch this.
 		return
 	}
+	nonVoterByRole := c.peerForcedNonVoter(nodeID)
 
 	if srv, ok := c.configuredServer(nodeID); ok {
 		if srv.Suffrage == raft.Voter {
 			if string(srv.Address) == raftAddr {
 				return
 			}
+			if nonVoterByRole {
+				c.addMemberAsNonvoter(nodeID, raftAddr)
+				return
+			}
 			c.addMemberAsVoter(nodeID, raftAddr)
 			return
 		}
-		if c.voterCapReached() {
+		if nonVoterByRole || c.voterCapReached() {
 			if string(srv.Address) == raftAddr {
 				return
 			}
@@ -84,11 +97,40 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 		return
 	}
 
-	if c.voterCapReached() {
+	if nonVoterByRole || c.voterCapReached() {
 		c.addMemberAsNonvoter(nodeID, raftAddr)
 		return
 	}
 	c.addMemberAsVoter(nodeID, raftAddr)
+}
+
+// peerForcedNonVoter returns true when the joining peer gossiped a role that
+// must never become a raft voter (worker or ingress). Empty / unknown roles
+// are treated as voter-eligible so older builds (and the default "mixed"
+// role) keep their pre-role-split behavior.
+func (c *Cluster) peerForcedNonVoter(nodeID string) bool {
+	if c.gossip == nil {
+		return false
+	}
+	for _, m := range c.gossip.members() {
+		if m.NodeID == nodeID {
+			return isForcedNonVoterRole(m.Role)
+		}
+	}
+	return false
+}
+
+// isForcedNonVoterRole reports whether a gossiped SB_NODE_ROLE must never be
+// promoted to raft voter. Worker and ingress nodes hold a replicated FSM as
+// non-voters; server and mixed (and any unknown future role) stay
+// voter-eligible.
+func isForcedNonVoterRole(role string) bool {
+	switch role {
+	case config.NodeRoleWorker, config.NodeRoleIngress:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Cluster) addMemberAsVoter(nodeID, raftAddr string) {

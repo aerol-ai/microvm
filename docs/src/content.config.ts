@@ -53,6 +53,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/cluster-ingress',
+        label: 'Cluster Ingress',
+        description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
+      },
+      {
+        type: 'link',
         href: '/sdk-setup',
         label: 'SDK Setup',
         description: 'Connect an SDK to your AerolVM server.',

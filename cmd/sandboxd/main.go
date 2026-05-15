@@ -140,6 +140,7 @@ func main() {
 		logger.Info("cluster mode enabled",
 			"node_id", clusterClient.SelfNodeID(),
 			"api_url", clusterClient.SelfAPIURL(),
+			"node_role", cfg.NodeRole,
 			"raft_bind", cfg.RaftBindAddr,
 			"gossip_bind", cfg.GossipBindAddr,
 			"bootstrap", cfg.ClusterBootstrap,
@@ -152,40 +153,63 @@ func main() {
 	// up, in which case the next ExposePort(tcp|tls) will retry under the
 	// service's single-flight latch. Logging rather than exiting keeps the
 	// daemon serving HTTP exposures even when L4 is misconfigured.
-	if err := svc.EnsureLayer4Ready(ctx); err != nil {
-		logger.Warn("failed to ensure caddy layer4 app at startup; will retry on first L4 exposure", "error", err)
+	//
+	// Ingress nodes run caddy-l4 for SNI passthrough and raw TCP ingress;
+	// worker/mixed nodes run it as the L4 termination side of the owner-local
+	// path. Pure server nodes never serve sandbox traffic, so the L4 listener
+	// would be wasted bind() syscalls.
+	if cfg.IsWorker() || cfg.IsIngress() {
+		if err := svc.EnsureLayer4Ready(ctx); err != nil {
+			logger.Warn("failed to ensure caddy layer4 app at startup; will retry on first L4 exposure", "error", err)
+		}
 	}
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means
 	// counters stay at zero until the next attempt at lazy bootstrap.
-	if err := svc.EnsureNetstatsReady(ctx); err != nil {
-		logger.Warn("failed to start netstats poller at startup", "error", err)
+	// Worker-only: pure ingress/server nodes own no sandboxes, so per-sandbox
+	// netstats numbers would always be zero.
+	if cfg.IsWorker() {
+		if err := svc.EnsureNetstatsReady(ctx); err != nil {
+			logger.Warn("failed to start netstats poller at startup", "error", err)
+		}
+		svc.ReplayReservations(ctx)
 	}
-	svc.ReplayReservations(ctx)
 
 	// Cluster ownership replay. After local reservations are restored, tell
 	// the cluster which sandboxes this node owns so the FSM stays consistent
 	// across restarts. Best-effort: a missing leader on cold start is logged
-	// and recovered by the next reconcile or the next mutating call.
+	// and recovered by the next reconcile or the next mutating call. Only
+	// worker (and mixed) nodes can own sandboxes — pure server/ingress nodes
+	// have nothing to assert.
 	if cfg.EnableCluster {
-		states, err := localSandboxStates(ctx, svc, logger)
-		if err != nil {
-			logger.Warn("cluster: could not list local sandbox states for ownership replay", "error", err)
-		} else if err := svc.Cluster().AssertOwnership(ctx, states); err != nil {
-			logger.Warn("cluster: AssertOwnership returned error at boot; reconcile will retry", "error", err)
+		if cfg.IsWorker() {
+			states, err := localSandboxStates(ctx, svc, logger)
+			if err != nil {
+				logger.Warn("cluster: could not list local sandbox states for ownership replay", "error", err)
+			} else if err := svc.Cluster().AssertOwnership(ctx, states); err != nil {
+				logger.Warn("cluster: AssertOwnership returned error at boot; reconcile will retry", "error", err)
+			}
 		}
-		svc.StartClusterIngressReconcile(ctx)
+		if cfg.IsIngress() {
+			svc.StartClusterIngressReconcile(ctx)
+		}
 	}
 
-	if cfg.AutoReconcile {
-		if err := svc.Reconcile(ctx); err != nil {
-			logger.Warn("initial reconcile failed", "error", err)
+	// AutoReconcile / lifecycle sweep / event monitor / built-image GC are all
+	// worker-side concerns — they reach into Docker, sandbox rows, and
+	// per-container caddy routes. Pure server/ingress nodes have neither
+	// docker nor sandbox state to reconcile.
+	if cfg.IsWorker() {
+		if cfg.AutoReconcile {
+			if err := svc.Reconcile(ctx); err != nil {
+				logger.Warn("initial reconcile failed", "error", err)
+			}
+			svc.StartReconcileLoop(ctx)
 		}
-		svc.StartReconcileLoop(ctx)
+		svc.StartLifecycleSweep(ctx)
+		svc.StartEventMonitor(ctx)
+		svc.StartBuiltImageGC(ctx)
 	}
-	svc.StartLifecycleSweep(ctx)
-	svc.StartEventMonitor(ctx)
-	svc.StartBuiltImageGC(ctx)
 
 	if cfg.EnableSSHGateway {
 		gw, err := sshgateway.New(logger, sshgateway.Config{
