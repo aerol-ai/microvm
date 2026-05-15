@@ -22,9 +22,9 @@ marketed as robust or Kubernetes-comparable.
 - Wrong-owner route misses are zero after convergence.
 - During failover, ingress returns explicit "placement in flux" behavior rather
   than random 404/unmatched-SNI fallback.
-- Raw TCP behavior is explicitly one of:
-  - stable through ingress with global L4 allocation; or
-  - direct-to-owner and documented as changing on failover.
+- Raw TCP is stable through ingress with global L4 allocation metadata.
+- Preferred host-port replay on failover either succeeds or enters an explicit,
+  observable parked state.
 - UDP is explicitly unsupported until implemented.
 
 ### Control-plane roles
@@ -127,11 +127,10 @@ Before release, remove contradictions:
 Recommended labels:
 
 - **Experimental cluster mode:** current PR after fixing create-forwarding and
-  docs, but before server/worker split and ingress.
+  docs, before server/worker split and before data-plane hardening.
 - **SDK-only cluster beta:** server/worker split done; API paths robust; data
   plane documented as not stable.
 - **Network-capable cluster beta:** owner-aware HTTP/TLS ingress done; raw TCP
-  either explicitly direct-owner or globally routed.
+  globally routed; route convergence, metrics, and Caddy churn tests pass.
 - **Production cluster:** release gates above pass at 200 x 50 with runbooks and
   metrics.
-

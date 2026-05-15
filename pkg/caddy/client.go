@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -155,6 +157,32 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 	return c.upsertRoute(ctx, routeID, route)
 }
 
+// UpsertSandboxRouteToPeer installs the IP/path-mode ingress route for a
+// sandbox owned by another node. Domain-mode clusters use caddy-l4 SNI
+// pass-through instead, because the local HTTPS app sits behind the :443
+// layer4 mux and remote proxying would require dynamic upstream TLS SNI.
+func (c *Client) UpsertSandboxRouteToPeer(ctx context.Context, id, peerHost string) error {
+	if !c.enabled || c.domain != "" {
+		return nil
+	}
+	routeID := sandboxRouteID(id)
+	route := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{{"path": []string{
+			fmt.Sprintf("/%s", id),
+			fmt.Sprintf("/%s/*", id),
+		}}},
+		"handle": []map[string]any{{
+			"handler": "reverse_proxy",
+			"upstreams": []map[string]string{{
+				"dial": net.JoinHostPort(peerHost, "80"),
+			}},
+		}},
+		"terminal": true,
+	}
+	return c.upsertRoute(ctx, routeID, route)
+}
+
 func (c *Client) DeleteSandboxRoute(ctx context.Context, id string) error {
 	if !c.enabled {
 		return nil
@@ -180,6 +208,31 @@ func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, po
 		"terminal": true,
 	}
 
+	return c.upsertRoute(ctx, routeID, route)
+}
+
+// UpsertPortRouteToPeer installs the IP/path-mode per-port route for a
+// sandbox owned by another node. In domain mode this is handled by SNI
+// pass-through routes in the layer4 mux.
+func (c *Client) UpsertPortRouteToPeer(ctx context.Context, id string, port int, peerHost string) error {
+	if !c.enabled || c.domain != "" {
+		return nil
+	}
+	routeID := portRouteID(id, port)
+	route := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{{"path": []string{
+			fmt.Sprintf("/%s/proxy/%d", id, port),
+			fmt.Sprintf("/%s/proxy/%d/*", id, port),
+		}}},
+		"handle": []map[string]any{{
+			"handler": "reverse_proxy",
+			"upstreams": []map[string]string{{
+				"dial": net.JoinHostPort(peerHost, "80"),
+			}},
+		}},
+		"terminal": true,
+	}
 	return c.upsertRoute(ctx, routeID, route)
 }
 
@@ -340,6 +393,22 @@ func tlsRouteID(id string, port int) string {
 	return fmt.Sprintf("sandbox-%s-port-%d-tls", id, port)
 }
 
+func ingressSandboxSNIRouteID(id string) string {
+	return fmt.Sprintf("sandbox-%s-ingress-sni", id)
+}
+
+func ingressPortSNIRouteID(id string, port int) string {
+	return fmt.Sprintf("sandbox-%s-port-%d-ingress-sni", id, port)
+}
+
+func IngressSandboxSNIRouteID(id string) string {
+	return ingressSandboxSNIRouteID(id)
+}
+
+func IngressPortSNIRouteID(id string, port int) string {
+	return ingressPortSNIRouteID(id, port)
+}
+
 // EnsureLayer4 idempotently bootstraps the layer4 app and (when tlsListen is
 // non-empty) the shared SNI-mux server. Safe to call on every sandboxd start
 // — the admin API treats a no-op POST as 200 and a PATCH on a missing key as
@@ -465,6 +534,44 @@ func (c *Client) UpsertTCPRoute(ctx context.Context, id, containerIP string, por
 	return nil
 }
 
+// UpsertTCPProxyRoute creates a raw-TCP ingress server bound to hostPort that
+// forwards to another node's hostPort. This is the non-owner half of stable
+// cluster TCP exposure: every node can accept tcp://cluster-host:hostPort, but
+// only the owner forwards from hostPort to the container.
+func (c *Client) UpsertTCPProxyRoute(ctx context.Context, id string, port, hostPort int, peerHost string, peerPort int) error {
+	if !c.enabled {
+		return nil
+	}
+	if hostPort <= 0 || peerPort <= 0 {
+		return errors.New("host port must be positive")
+	}
+	server := map[string]any{
+		"listen": []string{fmt.Sprintf(":%d", hostPort)},
+		"routes": []any{
+			map[string]any{
+				"@id": tcpRouteID(id, port),
+				"handle": []map[string]any{{
+					"handler":   "proxy",
+					"upstreams": []map[string]any{{"dial": []string{net.JoinHostPort(peerHost, strconv.Itoa(peerPort))}}},
+				}},
+			},
+		},
+	}
+	body, err := json.Marshal(server)
+	if err != nil {
+		return fmt.Errorf("marshal tcp proxy server: %w", err)
+	}
+	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, tcpServerID(hostPort))
+	status, err := c.sendJSON(ctx, http.MethodPut, target, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("upsert tcp proxy server failed: %d", status)
+	}
+	return nil
+}
+
 // DeleteTCPRoute removes the layer4 server holding hostPort. 404 is treated
 // as success — the desired post-condition is "not present", and it isn't.
 func (c *Client) DeleteTCPRoute(ctx context.Context, hostPort int) error {
@@ -553,6 +660,53 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 	}
 	if status >= 400 {
 		return fmt.Errorf("insert tls sni route failed: %d", status)
+	}
+	return nil
+}
+
+// UpsertSNIPassthroughRoute publishes a layer4 SNI route that does not
+// terminate TLS. Non-owner ingress nodes use this to forward domain-mode
+// sandbox hosts to the owner node's :443 mux, preserving the original ClientHello
+// and letting the owner perform the normal local routing.
+func (c *Client) UpsertSNIPassthroughRoute(ctx context.Context, routeID, sniHost, peerHost string, peerPort int) error {
+	if !c.enabled {
+		return nil
+	}
+	if routeID == "" || sniHost == "" || peerHost == "" || peerPort <= 0 {
+		return errors.New("route id, sni host, peer host, and peer port are required")
+	}
+	route := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{{
+			"tls": map[string]any{"sni": []string{sniHost}},
+		}},
+		"handle": []map[string]any{{
+			"handler":   "proxy",
+			"upstreams": []map[string]any{{"dial": []string{net.JoinHostPort(peerHost, strconv.Itoa(peerPort))}}},
+		}},
+	}
+	body, err := json.Marshal(route)
+	if err != nil {
+		return fmt.Errorf("marshal sni passthrough route: %w", err)
+	}
+	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
+	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
+	if err != nil {
+		return err
+	}
+	if status < 400 {
+		return nil
+	}
+	if status != http.StatusNotFound {
+		return fmt.Errorf("patch sni passthrough route failed: %d", status)
+	}
+	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
+	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("insert sni passthrough route failed: %d", status)
 	}
 	return nil
 }

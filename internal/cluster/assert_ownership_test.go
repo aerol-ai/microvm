@@ -25,9 +25,12 @@ func TestAssertOwnershipBackfillsFreshPlacement(t *testing.T) {
 
 	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512}
 	local := []LocalSandboxState{{
-		ID:           "sb-fresh",
-		Spec:         spec,
-		ExposedPorts: map[int]string{80: "http", 5432: "tcp"},
+		ID:   "sb-fresh",
+		Spec: spec,
+		ExposedPorts: map[int]ExposedPortRoute{
+			80:   {Protocol: "http"},
+			5432: {Protocol: "tcp", HostPort: 22432},
+		},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
 		t.Fatalf("AssertOwnership: %v", err)
@@ -74,7 +77,7 @@ func TestAssertOwnershipBackfillsMissingSpec(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-legacy",
 		Spec:         spec,
-		ExposedPorts: map[int]string{443: "tls"},
+		ExposedPorts: map[int]ExposedPortRoute{443: {Protocol: "tls"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
 		t.Fatalf("AssertOwnership: %v", err)
@@ -141,7 +144,7 @@ func TestAssertOwnershipDoesNotReclaimForeignOwnedPlacement(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-failover",
 		Spec:         staleLocalSpec,
-		ExposedPorts: map[int]string{9999: "tcp"},
+		ExposedPorts: map[int]ExposedPortRoute{9999: {Protocol: "tcp", HostPort: 22999}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
 		t.Fatalf("AssertOwnership: %v", err)
@@ -183,7 +186,7 @@ func TestAssertOwnershipIsIdempotent(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-twice",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
-		ExposedPorts: map[int]string{8080: "http"},
+		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
 		t.Fatalf("first AssertOwnership: %v", err)

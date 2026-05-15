@@ -14,7 +14,8 @@ import (
 // changes go through the leader's log.
 //
 // Phase 2 behavior:
-//   - NotifyJoin: AddVoter on the leader (this file).
+//   - NotifyJoin: AddVoter on the leader until the configured voter cap is
+//     reached, then AddNonvoter for additional nodes (this file).
 //   - NotifyLeave: arms a grace timer; on expiry the leader orphans the
 //     dead node's placements and RemoveServer's it from the raft config
 //     (see dead_owner.go).
@@ -191,7 +192,8 @@ func (c *Cluster) startVoterReconcileLoop() {
 }
 
 // reconcileVoters scans gossip members and ensures every alive node with a
-// known RaftAddr is a raft voter. No-op when self is not the leader.
+// known RaftAddr is present in the raft configuration. No-op when self is not
+// the leader.
 func (c *Cluster) reconcileVoters() {
 	if c.raft == nil || c.raft.raft.State() != raft.Leader {
 		return

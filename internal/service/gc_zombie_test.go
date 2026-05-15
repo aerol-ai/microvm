@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -29,6 +31,15 @@ type gcCaddyFake struct {
 	httpRouteIDs   map[string]struct{}
 	l4TCPServerIDs map[string]struct{}
 	l4TLSRouteIDs  map[string]struct{}
+}
+
+type stubIngressCluster struct {
+	*cluster.Noop
+	placements []cluster.Placement
+}
+
+func (s *stubIngressCluster) Placements() []cluster.Placement {
+	return s.placements
 }
 
 func newGCCaddyFake() *gcCaddyFake {
@@ -185,6 +196,103 @@ func TestGCZombieCaddyEntries(t *testing.T) {
 	wantTLS := []string{"sandbox-abc-port-6379-tls"}
 	if got := fake.keys(fake.l4TLSRouteIDs); !equalSorted(got, wantTLS) {
 		t.Fatalf("tls routes after gc: got %v, want %v", got, wantTLS)
+	}
+}
+
+func TestGCZombieCaddyEntriesKeepsRemoteClusterIngressRoutes(t *testing.T) {
+	fake := newGCCaddyFake()
+	fake.httpRouteIDs["sandbox-remote"] = struct{}{}
+	fake.httpRouteIDs["sandbox-remote-port-3000"] = struct{}{}
+	fake.httpRouteIDs["sandbox-remote-port-4000"] = struct{}{} // stale exposure
+	fake.l4TCPServerIDs["tcp-port-22432"] = struct{}{}
+	fake.l4TCPServerIDs["tcp-port-22433"] = struct{}{} // stale exposure
+	fake.httpRouteIDs["unrelated-route"] = struct{}{}
+
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+
+	caddyClient := caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 5 * time.Second,
+	})
+	svc := &Service{
+		cfg:    config.Config{EnableCluster: true},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy:  caddyClient,
+	}
+	svc.AttachCluster(&stubIngressCluster{
+		Noop: cluster.NewNoop("self", "http://self"),
+		placements: []cluster.Placement{{
+			SandboxID:   "remote",
+			OwnerNodeID: "other",
+			OwnerAPIURL: "http://10.0.0.9:21212",
+			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+				3000: {Protocol: models.ExposedPortProtocolHTTP},
+				5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 22432},
+			},
+		}},
+	})
+
+	svc.gcZombieCaddyEntries(context.Background(), nil)
+
+	wantHTTP := []string{"sandbox-remote", "sandbox-remote-port-3000", "unrelated-route"}
+	if got := fake.keys(fake.httpRouteIDs); !equalSorted(got, wantHTTP) {
+		t.Fatalf("http routes after gc: got %v, want %v", got, wantHTTP)
+	}
+	wantTCP := []string{"tcp-port-22432"}
+	if got := fake.keys(fake.l4TCPServerIDs); !equalSorted(got, wantTCP) {
+		t.Fatalf("tcp servers after gc: got %v, want %v", got, wantTCP)
+	}
+}
+
+func TestReconcileClusterIngressGCsRoutesWhenPlacementGone(t *testing.T) {
+	fake := newGCCaddyFake()
+	fake.httpRouteIDs["sandbox-gone"] = struct{}{}
+	fake.httpRouteIDs["sandbox-gone-port-3000"] = struct{}{}
+	fake.l4TCPServerIDs["tcp-port-22432"] = struct{}{}
+	fake.l4TLSRouteIDs["sandbox-gone-ingress-sni"] = struct{}{}
+	fake.httpRouteIDs["unrelated-route"] = struct{}{}
+
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+
+	st, err := store.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	caddyClient := caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 5 * time.Second,
+	})
+	svc := &Service{
+		cfg:    config.Config{EnableCluster: true},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:  st,
+		caddy:  caddyClient,
+	}
+	svc.AttachCluster(&stubIngressCluster{
+		Noop:       cluster.NewNoop("self", "http://self"),
+		placements: nil,
+	})
+
+	if err := svc.ReconcileClusterIngress(context.Background()); err != nil {
+		t.Fatalf("ReconcileClusterIngress: %v", err)
+	}
+	wantHTTP := []string{"unrelated-route"}
+	if got := fake.keys(fake.httpRouteIDs); !equalSorted(got, wantHTTP) {
+		t.Fatalf("http routes after reconcile: got %v, want %v", got, wantHTTP)
+	}
+	if got := fake.keys(fake.l4TCPServerIDs); len(got) != 0 {
+		t.Fatalf("tcp servers after reconcile: got %v, want empty", got)
+	}
+	if got := fake.keys(fake.l4TLSRouteIDs); len(got) != 0 {
+		t.Fatalf("tls routes after reconcile: got %v, want empty", got)
 	}
 }
 

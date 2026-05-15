@@ -92,13 +92,7 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 			continue
 		}
 		spec := *p.Spec
-		var ports map[int]string
-		if len(p.ExposedPorts) > 0 {
-			ports = make(map[int]string, len(p.ExposedPorts))
-			for k, v := range p.ExposedPorts {
-				ports[k] = v
-			}
-		}
+		ports := exposedPortRoutesForPlacement(p)
 		// Pass the sealed credential bag through unchanged — only the service
 		// holds the cipher and is allowed to peek inside.
 		var sealed []byte

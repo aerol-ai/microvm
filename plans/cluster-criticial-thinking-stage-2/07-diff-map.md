@@ -15,7 +15,8 @@ Files:
 
 Changes:
 
-- Add target-locked forwarding for `POST /v1/sandboxes`.
+- Add target-locked forwarding for `POST /v1/sandboxes`. Implemented in this
+  branch.
 - Better: add reservation-first create and an internal create-local endpoint.
 - Forwarded create must not run fresh random placement.
 - Add tests for:
@@ -58,7 +59,8 @@ Files:
 
 Changes:
 
-- Deep-copy FSM snapshot values.
+- Deep-copy FSM snapshot values. Implemented in this branch for placement specs,
+  sealed secrets, legacy exposed ports, and route metadata.
 - Persist or derive durable revision from Raft log index.
 - Add full placement list endpoint with revision.
 - Add watch/long-poll endpoint:
@@ -78,9 +80,11 @@ Files:
 
 Changes:
 
-- Add `sandboxd --mode ingress` or equivalent env.
-- Ingress watches placement/route map.
+- First-slice implementation in this branch: every node reconciles remote
+  placement/route metadata into Caddy/caddy-l4.
 - Caddy/caddy-l4 routes SNI/hostnames to owner workers.
+- Production follow-up: add `sandboxd --mode ingress` or equivalent role/env.
+- Production follow-up: ingress watches placement/route map instead of polling.
 - Batch route updates.
 - Expose route lag and route miss metrics.
 - Update install docs to put public wildcard DNS on ingress, not all workers.
@@ -106,8 +110,10 @@ If raw TCP remains direct-to-owner:
 
 If raw TCP must be cluster-stable:
 
-- add cluster-wide ingress port reservations;
-- add route map `ingress_port -> owner_host:owner_port`;
+- add cluster-wide ingress port reservations; first-slice uniqueness is now
+  enforced in the placement FSM;
+- add route map `ingress_port -> owner_host:owner_port`; first-slice route
+  metadata is now replicated in `ExposedPortRoutes`;
 - update `ExposePortResponse` to return ingress endpoint;
 - update failover replay to preserve the ingress endpoint when possible.
 
@@ -212,4 +218,3 @@ Changes:
 - State raw TCP and UDP semantics.
 - Replace "sandboxes survive node failure" with "placement/spec can recreate,
   but runtime state is lost" unless the product intentionally wants recreate.
-

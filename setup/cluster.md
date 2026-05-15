@@ -164,7 +164,11 @@ new node runs cluster-join.sh
 joins gossip ring (authenticated by SB_GOSSIP_SECRET_KEY)
         │
         ▼
-seed's leader auto-promotes it to a raft voter
+seed's leader adds it to raft
+        │
+        ├─ as voter until SB_CLUSTER_MAX_AUTO_VOTERS is reached
+        │
+        └─ as non-voter after the cap
         │
         ▼
 raft replays the FSM log: this node now has the full placement map
@@ -394,13 +398,14 @@ sudo journalctl -u sandboxd -f
 You want to see lines like:
 
 ```
-cluster: voter promoted node_id=node-b
-cluster: voter promoted node_id=node-c
+cluster: auto-promoted member to raft voter node_id=node-b
+cluster: added member as raft non-voter because voter cap is reached node_id=node-f
 cluster gossip joined peers ...
 ```
 
-The seed leader auto-promotes new joiners to raft voters once gossip
-membership is confirmed (typically within seconds).
+The seed leader auto-promotes new joiners to raft voters until
+`SB_CLUSTER_MAX_AUTO_VOTERS` is reached. Additional joiners are added as raft
+non-voters so they receive the placement log without increasing quorum.
 
 ### Step 6 — Verify the cluster
 
@@ -446,13 +451,18 @@ but every node's advertised API URL must be reachable by its peers.**
 
 ### Path 2 — Sandbox URLs (`<id>.sandbox.example.com`, `<id>-<port>.sandbox.example.com`)
 
-Each sandbox container lives on exactly **one** node. Only that node's Caddy
-holds a route for `<id>.sandbox.example.com` → local container IP. **The
-cluster does not proxy sandbox-URL traffic between nodes today.** If the TCP
-connection lands on a node that isn't the owner, Caddy on that node has no
-matching route and returns a 404 / unmatched-SNI fallback.
+Each sandbox container lives on exactly **one** owner node, but every node runs
+an ingress reconciler. Non-owner nodes install Caddy/caddy-l4 routes from the
+cluster placement map and forward public traffic to the owner:
 
-Your DNS / LB layer has to put each sandbox-URL connection on the right node.
+- domain-mode HTTP sandbox URLs use caddy-l4 SNI pass-through to the owner;
+- IP/path-mode HTTP routes reverse-proxy to the owner's Caddy `:80`;
+- raw TCP routes bind the same `host_port` on each node and proxy to the
+  owner's `host_port`;
+- TLS-SNI port routes pass through to the owner's `:443` mux.
+
+That means the public LB no longer needs to know the owner for each sandbox.
+It only needs to send traffic to a healthy sandboxd node.
 
 ### Address you give to clients
 
@@ -479,20 +489,12 @@ the wildcard cert.
 
 For the **API path**, this works trivially — any backend forwards the call.
 
-For the **sandbox URL path**, this works **only when the LB happens to land
-the connection on the owner**. With pure round-robin across N nodes, ~1/N of
-sandbox-URL requests reach the right node and the rest 404. To make it
-reliable you need one of:
+For the **sandbox URL path**, this also works: if the LB lands on a non-owner,
+that node's ingress route forwards the connection to the owner. Route
+convergence is controlled by the sandboxd cluster-ingress reconcile loop, so a
+fresh expose or failover can briefly return 404/502 until the next reconcile.
 
-- An LB that can dynamically steer per SNI to the owner backend (Envoy with
-  an SDS feed from the cluster's owner endpoint, or a custom HAProxy
-  config-rewriter). Not built into AerolVM today.
-- A small router process in front (e.g. another `sandboxd` running with
-  `SB_ENABLE_CADDY=true` but no sandboxes — it would still 404 because no
-  cross-node sandbox routes exist; this option is not viable today).
-- One of the alternate topologies below.
-
-### Topology B — Per-sandbox DNS (works for sandbox URLs but operational overhead)
+### Topology B — Per-sandbox DNS (not recommended unless you need direct owner routing)
 
 On each sandbox create, write a per-sandbox A record pointing at the owner:
 
@@ -500,11 +502,11 @@ On each sandbox create, write a per-sandbox A record pointing at the owner:
 A   <sandbox-id>.sandbox.example.com  →  <owner-node-IP>
 ```
 
-On failover, update the record to point at the new owner. Pros: every
-request reaches the owner directly. Cons: Cloudflare TTL lag during failover
-(typically ≥60s of downtime), Cloudflare API rate limits at high create
-churn, one DNS record per sandbox. **Not implemented in `sandboxd` today** —
-you'd have to wire it up via a webhook on placement changes.
+On failover, update the record to point at the new owner. This bypasses the
+any-node ingress layer, but it adds Cloudflare TTL lag during failover
+(typically ≥60s), Cloudflare API rate limits at high create churn, and one DNS
+record per sandbox. Prefer Topology A unless your environment forbids
+node-to-node ingress forwarding.
 
 ### Topology C — DNS round-robin (NOT RECOMMENDED) — **6 records**
 
@@ -517,21 +519,17 @@ A   *.sandbox.example.com  →  <node-b-IP>
 A   *.sandbox.example.com  →  <node-c-IP>
 ```
 
-Same hit-the-wrong-owner problem as Topology A, plus no health checking
-(dead nodes still answer DNS). **API works** (every backend can forward).
-**Sandbox URLs partially work** (1/N hit rate). Use only for testing.
+DNS round-robin now works functionally because any live node can route to the
+owner, but it has no health checking: dead nodes still answer DNS until clients
+retry another A record. Use only for testing or tiny private deployments.
 
 ### Practical recommendation
 
 | Your usage | Use this |
 |---|---|
-| Mostly SDK calls (exec, file, port-forward) — sandbox URLs rare or none | Topology A. Sandbox URL hit-rate is acceptable; SDK path is perfect. |
-| Public sandbox URLs are core to the product | Single-node today, OR build Topology B integration. |
-| Mixed | Topology A + accept retries on sandbox URL failures, OR build B. |
-
-The "any-node can serve any sandbox URL" property does **not** exist today
-for the public HTTPS data plane. It exists for the API only. Plan
-accordingly.
+| Production cluster with public URLs | Topology A: health-checked TCP/TLS pass-through LB in front of all nodes. |
+| Small private test cluster | Topology C is acceptable if client retries tolerate dead DNS answers. |
+| Environment that forbids node-to-node ingress forwarding | Topology B, with the operational cost of per-sandbox DNS updates. |
 
 ---
 
@@ -889,23 +887,15 @@ through API forwarding.
 | Path | Status with this setup |
 |---|---|
 | SDK calls (`/v1/sandboxes/...`, exec, file copy, port-forward) | **Fully working.** Land on any node, internally forwarded to owner. |
-| Public sandbox URLs (`<id>.sandbox.example.com`) | **Round-robin: ~1/3 hit rate on a 3-node NLB.** Connection lands on a non-owner → 404. |
+| Public sandbox URLs (`<id>.sandbox.example.com`) | **Working.** NLB can land on any live node; non-owners SNI-pass-through to the owner. |
+| Raw TCP exposures (`tcp://sandbox.example.com:<host-port>`) | **Working after route convergence.** Each node binds the replicated host port and proxies to the owner. |
 | Failover (kill an EC2) | **Working.** After `SB_DEAD_OWNER_GRACE`, sandboxes reassign; new owner unseals creds with the shared key from the bundle. |
 | TLS issuance/renewal | **Working per node.** Three independent DNS-01 renewal loops, well under LE quota. |
 
-If your product depends on `<id>.sandbox.example.com` URLs being reliably
-reachable (not just SDK calls), you have three choices today:
-
-1. **Stay single-node** until you implement smarter ingress.
-2. **Per-sandbox DNS** (Topology B): write a record per sandbox pointing at
-   the owner; update on failover. Requires custom integration.
-3. **Build SNI-aware ingress**: replace the NLB with Envoy or HAProxy
-   driven by a control loop that polls `/v1/cluster/members` + placements
-   and rewrites the SNI→backend map. This is the "real" fix and is on the
-   roadmap.
-
-This isn't documented elsewhere because it's the architectural seam most
-operators don't notice until they ship public sandbox URLs in production.
+The important operational check is route convergence. On each node, sandboxd
+reconciles cluster ingress routes every few seconds from the raft placement
+snapshot. During failover or immediately after exposing a port, expect a short
+window where a non-owner backend can return 404/502 before it refreshes.
 
 ---
 
@@ -926,7 +916,8 @@ Re-running `install.sh` later does not overwrite the cluster overlay.
 
 Run `cluster-join.sh` on the new host with any reachable peer. The script
 takes the same gossip key + TLS bundle as the original joiners. The leader
-auto-promotes it to a voter.
+adds it as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached; after that,
+it is added as a non-voter.
 
 > **Tip:** keep voter count odd. Add nodes in pairs: 3 → 5 → 7. A 4-node
 > cluster has the same fault tolerance as a 3-node one but a higher quorum
@@ -1114,8 +1105,10 @@ A healthy cluster reports:
 - A non-empty `Leader` from `GET /v1/cluster/leader`.
 - All expected node IDs in `GET /v1/cluster/members` with `alive: true`.
 - No repeated `cluster: AssertOwnership skipped, no leader yet` warnings.
-- `cluster: voter promoted` log lines when joiners come online — silence
-  here means the auto-voter loop isn't seeing the joiner.
+- `cluster: auto-promoted member to raft voter` or `cluster: added member as
+  raft non-voter because voter cap is reached` log lines when joiners come
+  online — silence here means the raft membership loop isn't seeing the
+  joiner.
 
 Set up monitoring on `GET /v1/cluster/leader` returning empty for more than
 30 seconds — that's the earliest signal of a brewing quorum problem.

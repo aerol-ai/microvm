@@ -174,6 +174,7 @@ func main() {
 		} else if err := svc.Cluster().AssertOwnership(ctx, states); err != nil {
 			logger.Warn("cluster: AssertOwnership returned error at boot; reconcile will retry", "error", err)
 		}
+		svc.StartClusterIngressReconcile(ctx)
 	}
 
 	if cfg.AutoReconcile {
@@ -315,19 +316,23 @@ func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logg
 	return spec
 }
 
-// portsFromSandbox extracts the (containerPort, protocol) intents the sandbox
-// currently has exposed. Host ports and public URLs are deliberately dropped
-// because they're per-host concerns the new owner re-derives.
-func portsFromSandbox(sb *models.Sandbox) map[int]string {
+// portsFromSandbox extracts the routing intents the sandbox currently has
+// exposed. Raw TCP includes HostPort so cluster ingress can keep a stable
+// public port across owner-aware routers and failover recreates when possible.
+func portsFromSandbox(sb *models.Sandbox) map[int]cluster.ExposedPortRoute {
 	if sb == nil || len(sb.ExposedPorts) == 0 {
 		return nil
 	}
-	out := make(map[int]string, len(sb.ExposedPorts))
+	out := make(map[int]cluster.ExposedPortRoute, len(sb.ExposedPorts))
 	for _, p := range sb.ExposedPorts {
 		if p.Port <= 0 {
 			continue
 		}
-		out[p.Port] = p.Protocol
+		out[p.Port] = cluster.ExposedPortRoute{
+			Protocol:  p.Protocol,
+			HostPort:  p.HostPort,
+			PublicURL: p.PublicURL,
+		}
 	}
 	return out
 }

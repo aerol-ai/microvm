@@ -84,6 +84,14 @@ next-quarter hardening. It is a release blocker.
 Per-node URLs can be a compatibility escape hatch, but they are not a load
 balancer. They also do not solve stable raw TCP exposure through one public VIP.
 
+Implementation note: this branch now adds an owner-aware ingress reconciler on
+each node, plus replicated raw TCP host-port metadata. That removes the original
+1/N public URL failure mode. The remaining criticism is that the route map is
+poll-reconciled from the local FSM and lacks the production traits a dedicated
+ingress control plane would need: watch revisions, batching, route-lag metrics,
+health-driven backend removal, and load-tested Caddy admin behavior at 10K
+routes.
+
 ### 3. It critiques Raft voter count but does not make a storage decision
 
 The plan recommends a server/worker split but does not force a decision between:
@@ -117,6 +125,13 @@ stable through the cluster ingress:
 If raw TCP stays direct-to-owner, the product documentation must say that. If it
 must be load-balanced through one endpoint, the control plane needs a
 cluster-wide L4 port allocator and an ingress `port -> owner:hostPort` map.
+
+Implementation note: this branch chose the cluster-stable TCP path. The Raft
+placement now records `HostPort` for TCP routes, the FSM rejects duplicate TCP
+host-port reservations across placements, each node binds the same host port,
+and non-owners proxy to the owner. That is the right product direction. It
+still needs scale and failure testing around local port conflicts, route
+convergence after ownership changes, and route garbage collection during churn.
 
 ### 5. It treats placement as mostly CPU/memory, but the API is richer
 
@@ -155,10 +170,10 @@ as the release critique.
 
 The release bar should be:
 
-- P0: fix create routing determinism;
-- P0: stop every runner from becoming a voter;
-- P0: ship owner-aware ingress, or explicitly mark cluster mode as SDK-only;
+- P0: keep the target-locked create fix and move toward reservation-before-create;
+- P0: keep the voter cap and design a real server/worker role split;
+- P0: harden the owner-aware ingress implementation with watch semantics,
+  metrics, and scale tests;
 - P0: define exactly which network protocols are cluster-stable;
 - P0: make placement correct for the API fields already exposed;
 - P0: add measurable scale and chaos gates.
-

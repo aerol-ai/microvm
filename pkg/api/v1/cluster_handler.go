@@ -470,16 +470,16 @@ func (h *handlers) replicateSpecPatch(ctx context.Context, id string, patch func
 // itself is idempotent on the recreated owner so a missed write-through
 // degrades gracefully — the user keeps the local route, just not the
 // cluster-replicated intent.
-func (h *handlers) replicateAddExposedPort(ctx context.Context, id string, port int, protocol string) {
+func (h *handlers) replicateAddExposedPort(ctx context.Context, id string, port int, route cluster.ExposedPortRoute) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
 		return
 	}
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.AddExposedPort(commitCtx, id, port, protocol); err != nil {
+	if err := c.AddExposedPort(commitCtx, id, port, route); err != nil {
 		h.deps.Logger.Warn("cluster: AddExposedPort write-through failed; FSM port intent stale until next mutation",
-			"sandbox_id", id, "port", port, "protocol", protocol, "err", err)
+			"sandbox_id", id, "port", port, "protocol", route.Protocol, "host_port", route.HostPort, "err", err)
 	}
 }
 

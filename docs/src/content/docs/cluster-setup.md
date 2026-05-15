@@ -65,24 +65,35 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-
     --peers <seed-gossip-host>:7001
 ```
 
-`--peers` accepts a comma-separated list - one reachable peer is enough; the new node discovers the rest through gossip. The seed's leader auto-promotes the new node to a Raft voter once the gossip join lands (typically within seconds).
+`--peers` accepts a comma-separated list - one reachable peer is enough; the new node discovers the rest through gossip. The seed's leader auto-promotes new nodes to Raft voters until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached; later nodes are added as Raft non-voters so they receive the placement log without increasing quorum.
 
 `--force` is available for re-joining after a local raft state wipe; it deletes `/var/lib/sandboxd/raft` before starting.
 
 ## Verify
 
-Tail the seed node's daemon log to confirm new joiners arrive and get auto-promoted to raft voters:
+Tail the seed node's daemon log to confirm new joiners arrive and are added to the Raft configuration:
 
 ```bash
 sudo journalctl -u sandboxd -f
 ```
 
-Lines like `cluster: voter promoted node_id=...` and `cluster gossip joined peers ...` indicate a healthy join. Once the cluster is up, two HTTP endpoints expose membership for monitoring tools - they are operator-facing observability surfaces, not part of the SDK API:
+Lines like `cluster: auto-promoted member to raft voter`, `cluster: added member as raft non-voter because voter cap is reached`, and `cluster gossip joined peers ...` indicate a healthy join. Once the cluster is up, two HTTP endpoints expose membership for monitoring tools - they are operator-facing observability surfaces, not part of the SDK API:
 
 - `GET /v1/cluster/members` - one entry per alive node with its capacity snapshot.
 - `GET /v1/cluster/leader` - current Raft leader.
 
 Both require the same `Authorization: Bearer $SB_PAT_TOKEN` header as the rest of the API. From the SDK perspective, sandbox creation is identical to single-node mode: a request to any node returns a sandbox owned by whichever node has the most headroom, and subsequent calls are transparently forwarded.
+
+## Public ingress behavior
+
+Cluster mode publishes sandbox traffic through owner-aware ingress. The public load balancer can send API, sandbox URL, exposed HTTP/TLS, or raw TCP traffic to any live node:
+
+- API requests are forwarded by the Go control plane when the receiving node is not the owner.
+- Domain-mode sandbox URLs and exposed HTTP/TLS port hosts are SNI-routed to the owner.
+- IP/path-mode sandbox URLs are reverse-proxied to the owner's Caddy listener.
+- Raw TCP exposures replicate their `hostPort`; every node binds that port and proxies to the owner.
+
+Route changes are reconciled from the Raft placement map every few seconds. Immediately after exposing a port or after owner failover, a non-owner backend can briefly return 404/502 until its ingress routes refresh. For a stable public surface, set `SB_DOMAIN` or `SB_PUBLIC_HOST` to the shared load-balancer hostname, not a per-node address.
 
 ## What the cluster scripts write
 
@@ -222,6 +233,6 @@ A healthy cluster reports:
 - A non-empty `Leader` from `GET /v1/cluster/leader`.
 - All expected node IDs in `GET /v1/cluster/members` with `alive: true`.
 - No repeated `cluster: AssertOwnership skipped, no leader yet` warnings in `journalctl -u sandboxd`.
-- `cluster: voter promoted` log lines when joiners come online — silence here means the auto-voter loop isn't seeing the joiner.
+- `cluster: auto-promoted member to raft voter` or `cluster: added member as raft non-voter because voter cap is reached` log lines when joiners come online - silence here means the raft membership loop is not seeing the joiner.
 
 Set up monitoring on `GET /v1/cluster/leader` returning empty for more than 30 seconds: that's the earliest signal of a brewing quorum problem.

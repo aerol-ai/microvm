@@ -20,14 +20,14 @@ type recordingRecreator struct {
 type recordedRecreate struct {
 	spec   models.CreateSandboxRequest
 	sealed []byte
-	ports  map[int]string
+	ports  map[int]ExposedPortRoute
 }
 
 func newRecordingRecreator() *recordingRecreator {
 	return &recordingRecreator{calls: make(map[string]recordedRecreate)}
 }
 
-func (r *recordingRecreator) RecreateSandbox(_ context.Context, id string, spec models.CreateSandboxRequest, sealed []byte, ports map[int]string) error {
+func (r *recordingRecreator) RecreateSandbox(_ context.Context, id string, spec models.CreateSandboxRequest, sealed []byte, ports map[int]ExposedPortRoute) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls[id] = recordedRecreate{spec: spec, sealed: sealed, ports: ports}
@@ -119,8 +119,8 @@ func TestOwnerWatcherReplaysExposedPorts(t *testing.T) {
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply opPlace: %v", err)
 	}
-	for port, proto := range map[int]string{5432: "tcp", 8080: "http"} {
-		add := command{Op: opAddExposedPort, SandboxID: "sb-with-ports", Port: port, Protocol: proto}
+	for port, route := range map[int]ExposedPortRoute{5432: {Protocol: "tcp", HostPort: 22432}, 8080: {Protocol: "http"}} {
+		add := command{Op: opAddExposedPort, SandboxID: "sb-with-ports", Port: port, Protocol: route.Protocol, HostPort: route.HostPort}
 		payload, _ = encodeCommand(add)
 		if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 			t.Fatalf("raft Apply opAddExposedPort: %v", err)
@@ -132,12 +132,12 @@ func TestOwnerWatcherReplaysExposedPorts(t *testing.T) {
 	if !ok {
 		t.Fatal("recreator was not invoked for sb-with-ports")
 	}
-	if got.ports[5432] != "tcp" || got.ports[8080] != "http" {
+	if got.ports[5432].Protocol != "tcp" || got.ports[5432].HostPort != 22432 || got.ports[8080].Protocol != "http" {
 		t.Fatalf("recreator received wrong ports: %+v", got.ports)
 	}
 	// Mutating the recreator's copy must not bleed back into the FSM — the
 	// watcher is supposed to deep-copy before handing the map over.
-	got.ports[9999] = "tcp"
+	got.ports[9999] = ExposedPortRoute{Protocol: "tcp"}
 	stored, ok := c.fsm.get("sb-with-ports")
 	if !ok {
 		t.Fatal("placement disappeared from fsm")

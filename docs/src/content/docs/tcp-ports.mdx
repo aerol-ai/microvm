@@ -108,6 +108,8 @@ The host firewall must permit inbound traffic on that range. The installer print
 
 The `host_port` reservation is persisted alongside the exposure row. After a sandboxd restart, the periodic reconcile re-publishes the layer4 server pointing at the (possibly new) container IP, and the same host port stays bound - clients with cached connection strings keep working.
 
+In cluster mode, the selected host port is also replicated in the placement route map. Non-owner nodes bind the same public host port and proxy to the current owner, so `tcp://<cluster-host>:<host-port>` remains the intended stable endpoint after route convergence. If a failover owner cannot bind the replicated host port because something local already owns it, the exposure needs operator attention rather than silently changing to a different port.
+
 ## TLS-SNI multiplexing
 
 `exposePort(port, { protocol: "tls" })` reuses one shared listener (default `:443`), terminates TLS at the edge using Caddy's wildcard certificate, and forwards plaintext bytes to the container. The result has `url` in `tls://<id>-<port>.<domain>:<l4-port>` form.

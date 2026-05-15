@@ -2,7 +2,8 @@
 
 This page is intentionally concrete. It compares the stage-1 plan to the code
 in PR #58 and lists issues that should block a "cluster mode is production
-ready" release.
+ready" release. Some items now have first-slice fixes in this branch; those are
+called out explicitly instead of being treated as still absent.
 
 ## B1. Forwarded create requests can reschedule and fail
 
@@ -10,6 +11,9 @@ ready" release.
 
 - `pkg/api/v1/cluster_handler.go:81-122`
 - `internal/cluster/forward.go:75-96`
+
+**Current branch status:** first-slice fixed with target-locked create
+forwarding.
 
 `clusterCreateWrap` chooses a target and forwards the original request when the
 target is not self. The receiver then runs `clusterCreateWrap` again and calls
@@ -34,7 +38,7 @@ Use one of these patterns:
   intended owner, then the selected owner consumes it.
 
 The reservation-first path is the best long-term fix. The target-locked path is
-the smallest hotfix.
+the smallest hotfix and is what this branch now implements.
 
 ## B2. Create documentation disagrees with implementation
 
@@ -118,30 +122,51 @@ Short-term safety patch if roles cannot land immediately:
 
 Do not ship "add every runner as voter" as the default cluster story.
 
-## B5. Public sandbox URLs are still 1/N reliable
+## B5. Public sandbox URLs need owner-aware ingress
 
 **Where:**
 
-- `setup/cluster.md:431-518`
-- `setup/cluster.md:871-889`
+- `internal/service/service.go`
+- `pkg/caddy/client.go`
+- `internal/cluster/fsm.go`
+- `setup/cluster.md`
 
-The setup doc honestly describes the gap: only the owner has the Caddy route for
-`<id>.sandbox.example.com`. A round-robin LB has no owner mapping.
+**Current branch status:** first-slice fixed for functional routing.
+
+The original PR gap was severe: only the owner had the Caddy route for
+`<id>.sandbox.example.com`, so a round-robin LB had no owner mapping.
 
 At 200 runners, a random backend hits the owner roughly 0.5% of the time.
 
-**Required fix:**
+This branch now adds an ingress reconciler on every node. Non-owners install
+routes from the replicated placement map:
 
-Ship an owner-aware ingress tier or explicitly label cluster mode as SDK-only.
-Because this task asks for a load balancer, ingress is a release blocker.
+- domain-mode HTTP and TLS/SNI use caddy-l4 SNI pass-through to the owner;
+- IP/path-mode HTTP reverse-proxies to the owner's Caddy listener;
+- expected remote routes are added to zombie-GC's keep set.
 
-## B6. Raw TCP is not covered by the load-balancer plan
+That removes the 1/N hit-rate blocker for normal operation.
+
+**Remaining release work:**
+
+- replace polling with a watch/revision model or prove the polling interval is
+  acceptable at 200 x 50;
+- add metrics for route lag, Caddy admin latency, and route misses;
+- test Caddy route churn and config size at 10K sandboxes;
+- define explicit failover responses during the convergence window.
+
+## B6. Raw TCP needs a stable cluster route map
 
 **Where:**
 
 - `pkg/models/types.go:435-445`
 - `internal/service/service.go:960-1073`
 - `internal/service/service.go:1113-1152`
+- `internal/cluster/fsm.go`
+- `pkg/caddy/client.go`
+
+**Current branch status:** first-slice fixed with replicated TCP host-port
+routes.
 
 Raw TCP exposures return an owner-local `Host` and `HostPort`. This is reliable
 only when the client dials the exact owner endpoint returned by the API. It is
@@ -149,15 +174,20 @@ not stable behind a shared cluster load balancer.
 
 HTTP/TLS can route by hostname/SNI. Raw TCP cannot.
 
-**Required fix if raw TCP must be cluster-stable:**
+This branch implements the cluster-stable path:
 
-- allocate a cluster-wide ingress port from Raft/etcd;
-- install `ingressVIP:port -> ownerIP:hostPort` in the ingress tier;
-- update mapping on failover;
-- document that the TCP endpoint is stable only after ingress convergence.
+- the placement FSM records TCP `HostPort`;
+- the FSM rejects duplicate TCP host-port usage across placements;
+- non-owner nodes bind the same host port and proxy to the owner host port;
+- failover replay attempts to preserve the same host port on the new owner.
 
-If that is not in scope, the docs must say raw TCP remains direct-to-owner and
-changes on failover.
+**Remaining release work:**
+
+- prove there are no local port conflicts on large mixed clusters;
+- decide whether failed preferred-host-port replay should park the exposure or
+  allocate a replacement endpoint;
+- expose clear status when the TCP ingress route has not converged;
+- add scale tests for high-port listener count and Caddy admin latency.
 
 ## B7. UDP is not supported
 
@@ -190,6 +220,9 @@ we rely on snapshots under churn.
 
 Deep-copy `Placement.Spec`, `Placement.SealedSecrets`, and `Placement.ExposedPorts`
 when taking FSM snapshots and when returning placement snapshots to watchers.
+
+**Current branch status:** first-slice fixed, including
+`ExposedPortRoutes`.
 
 ## B9. FSM version is not a durable watch revision
 
@@ -290,4 +323,3 @@ registers:
 Implement the endpoint or remove it from the docs. For Kubernetes-grade
 operability, an explicit remove/drain/promote API is useful, but it must exist
 before it is documented.
-

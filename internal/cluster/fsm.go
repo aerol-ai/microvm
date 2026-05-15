@@ -48,6 +48,8 @@ type command struct {
 	SealedSecrets []byte                       `json:"sealed_secrets,omitempty"`
 	Port          int                          `json:"port,omitempty"`
 	Protocol      string                       `json:"protocol,omitempty"`
+	HostPort      int                          `json:"host_port,omitempty"`
+	PublicURL     string                       `json:"public_url,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -116,22 +118,25 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			sealed = existing.SealedSecrets
 		}
 		var ports map[int]string
+		var portRoutes map[int]ExposedPortRoute
 		if exists {
 			// Same preservation rule as Spec: opPlace is the "owner + spec"
 			// write and must not erase the port intents accumulated by
 			// opAddExposedPort calls between creates.
 			ports = existing.ExposedPorts
+			portRoutes = existing.ExposedPortRoutes
 		}
 		f.placements[cmd.SandboxID] = Placement{
-			SandboxID:     cmd.SandboxID,
-			OwnerNodeID:   cmd.OwnerNodeID,
-			OwnerAPIURL:   cmd.OwnerAPIURL,
-			Version:       f.version,
-			CreatedUnix:   created,
-			UpdatedUnix:   now,
-			Spec:          spec,
-			SealedSecrets: sealed,
-			ExposedPorts:  ports,
+			SandboxID:         cmd.SandboxID,
+			OwnerNodeID:       cmd.OwnerNodeID,
+			OwnerAPIURL:       cmd.OwnerAPIURL,
+			Version:           f.version,
+			CreatedUnix:       created,
+			UpdatedUnix:       now,
+			Spec:              spec,
+			SealedSecrets:     sealed,
+			ExposedPorts:      ports,
+			ExposedPortRoutes: portRoutes,
 		}
 		return nil
 	case opDelete:
@@ -180,17 +185,30 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		if !exists || cmd.Port <= 0 {
 			return nil
 		}
+		route := ExposedPortRoute{
+			Protocol:  cmd.Protocol,
+			HostPort:  cmd.HostPort,
+			PublicURL: cmd.PublicURL,
+		}
+		if route.Protocol == "" {
+			route.Protocol = existing.ExposedPorts[cmd.Port]
+		}
+		if err := f.validateHostPortAvailableLocked(cmd.SandboxID, cmd.Port, route); err != nil {
+			return err
+		}
 		if existing.ExposedPorts == nil {
 			existing.ExposedPorts = make(map[int]string)
 		}
-		// Same-protocol re-add is a no-op; protocol upgrade overwrites (the
-		// service layer rejects mid-flight protocol changes via the
-		// "unexpose first" guard, so this branch only fires on legitimate
-		// updates that already succeeded locally).
-		if existing.ExposedPorts[cmd.Port] == cmd.Protocol {
+		if existing.ExposedPortRoutes == nil {
+			existing.ExposedPortRoutes = make(map[int]ExposedPortRoute)
+		}
+		// Same-route re-add is a no-op; protocol/host-port updates overwrite
+		// only after the service layer has accepted the local mutation.
+		if existing.ExposedPorts[cmd.Port] == route.Protocol && existing.ExposedPortRoutes[cmd.Port] == route {
 			return nil
 		}
-		existing.ExposedPorts[cmd.Port] = cmd.Protocol
+		existing.ExposedPorts[cmd.Port] = route.Protocol
+		existing.ExposedPortRoutes[cmd.Port] = route
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
@@ -207,6 +225,10 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		if len(existing.ExposedPorts) == 0 {
 			existing.ExposedPorts = nil
 		}
+		delete(existing.ExposedPortRoutes, cmd.Port)
+		if len(existing.ExposedPortRoutes) == 0 {
+			existing.ExposedPortRoutes = nil
+		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
@@ -214,6 +236,23 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 	default:
 		return fmt.Errorf("placementFSM: unknown op %d", cmd.Op)
 	}
+}
+
+func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port int, route ExposedPortRoute) error {
+	if route.Protocol != models.ExposedPortProtocolTCP || route.HostPort <= 0 {
+		return nil
+	}
+	for otherSandboxID, placement := range f.placements {
+		for otherPort, otherRoute := range exposedPortRoutesForPlacement(placement) {
+			if otherSandboxID == sandboxID && otherPort == port {
+				continue
+			}
+			if otherRoute.Protocol == models.ExposedPortProtocolTCP && otherRoute.HostPort == route.HostPort {
+				return fmt.Errorf("placementFSM: tcp host port %d already reserved by %s:%d", route.HostPort, otherSandboxID, otherPort)
+			}
+		}
+	}
+	return nil
 }
 
 // get returns the placement for id, or zero-value + false if absent.
@@ -302,6 +341,13 @@ func clonePlacement(p Placement) Placement {
 			ports[k] = v
 		}
 		p.ExposedPorts = ports
+	}
+	if len(p.ExposedPortRoutes) > 0 {
+		routes := make(map[int]ExposedPortRoute, len(p.ExposedPortRoutes))
+		for k, v := range p.ExposedPortRoutes {
+			routes[k] = v
+		}
+		p.ExposedPortRoutes = routes
 	}
 	return p
 }

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -161,7 +162,11 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 	// Replicate the canonical protocol the service settled on (not the raw
 	// request value) so a future failover-recreate uses the same protocol the
 	// user is seeing.
-	h.replicateAddExposedPort(r.Context(), id, port, resp.Protocol)
+	h.replicateAddExposedPort(r.Context(), id, port, cluster.ExposedPortRoute{
+		Protocol:  resp.Protocol,
+		HostPort:  resp.HostPort,
+		PublicURL: resp.PublicURL,
+	})
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 

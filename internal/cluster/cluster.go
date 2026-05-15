@@ -64,27 +64,37 @@ var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned
 // service.UnsealClusterSecrets; the schema is the latter's responsibility,
 // not the cluster's. Empty when the original create had no credentials.
 //
-// ExposedPorts is the replicated set of port→protocol intents; the host port
-// and public URL are deliberately not replicated because they're allocated
-// per-host. The new owner re-runs ExposePort for each entry after recreate so
-// caddy/L4 routes get rebuilt with whatever host port the new node picks.
+// ExposedPortRoute is the replicated routing intent for one exposed sandbox
+// port. Protocol drives which Caddy surface is used. HostPort is populated for
+// raw TCP so every node can bind/proxy the same cluster-wide port.
+type ExposedPortRoute struct {
+	Protocol  string `json:"protocol"`
+	HostPort  int    `json:"host_port,omitempty"`
+	PublicURL string `json:"public_url,omitempty"`
+}
+
+// ExposedPorts is the legacy replicated set of port→protocol intents. Newer
+// code also fills ExposedPortRoutes with HostPort/PublicURL metadata so remote
+// ingress nodes can install owner-aware data-plane routes. Both fields are kept
+// so older snapshots still restore cleanly.
 type Placement struct {
-	SandboxID     string                       `json:"sandbox_id"`
-	OwnerNodeID   string                       `json:"owner_node_id"`
-	OwnerAPIURL   string                       `json:"owner_api_url"`
-	Version       uint64                       `json:"version"`
-	CreatedUnix   int64                        `json:"created_unix"`
-	UpdatedUnix   int64                        `json:"updated_unix"`
-	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SealedSecrets []byte                       `json:"sealed_secrets,omitempty"`
-	ExposedPorts  map[int]string               `json:"exposed_ports,omitempty"`
+	SandboxID         string                       `json:"sandbox_id"`
+	OwnerNodeID       string                       `json:"owner_node_id"`
+	OwnerAPIURL       string                       `json:"owner_api_url"`
+	Version           uint64                       `json:"version"`
+	CreatedUnix       int64                        `json:"created_unix"`
+	UpdatedUnix       int64                        `json:"updated_unix"`
+	Spec              *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SealedSecrets     []byte                       `json:"sealed_secrets,omitempty"`
+	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
+	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
 }
 
 // Member is a snapshot of a peer's gossiped state.
 type Member struct {
-	NodeID   string            `json:"node_id"`
-	APIURL   string            `json:"api_url"`
-	RaftAddr string            `json:"raft_addr,omitempty"`
+	NodeID   string `json:"node_id"`
+	APIURL   string `json:"api_url"`
+	RaftAddr string `json:"raft_addr,omitempty"`
 	// InternalURL is the cluster-internal mTLS endpoint used for raft
 	// leader-forward applies. Empty when the peer is running without
 	// SB_CLUSTER_TLS_DIR — the forwarder falls back to APIURL with PAT-only
@@ -111,7 +121,7 @@ type LocalSandboxState struct {
 	ID            string
 	Spec          *models.CreateSandboxRequest
 	SealedSecrets []byte
-	ExposedPorts  map[int]string
+	ExposedPorts  map[int]ExposedPortRoute
 }
 
 // PlacementTarget is returned by SelectPlacement.
@@ -134,12 +144,11 @@ type OwnerInfo struct {
 // no corresponding local sandbox — typically because the previous owner died
 // and the dead-owner reconciler reassigned the placement here.
 //
-// exposedPorts carries the replicated port→protocol intents the previous
-// owner had recorded; the implementation is expected to re-issue ExposePort
-// for each entry after the create succeeds. The host port is not replicated
-// because each node allocates from its own pool — the public URL may differ
-// after failover for "tcp" exposures (HTTP/TLS-SNI URLs are stable because
-// they're derived from id+port+domain).
+// exposedPorts carries the replicated port routing intents the previous owner
+// had recorded; the implementation is expected to re-issue ExposePort for each
+// entry after the create succeeds. Raw TCP entries include the original
+// HostPort so the recreated owner can preserve the public endpoint when the
+// port is available on the new node.
 //
 // Implementations MUST be idempotent: the watcher polls and may invoke
 // RecreateSandbox multiple times for the same id while a previous attempt is
@@ -152,7 +161,7 @@ type OwnerInfo struct {
 // to the user's private registry / mount credentials. May be empty when
 // the original create supplied no credentials.
 type SandboxRecreator interface {
-	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]string) error
+	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]ExposedPortRoute) error
 }
 
 // Client is the surface the rest of the daemon (Service, API handlers)
@@ -211,18 +220,17 @@ type Client interface {
 	// or when the placement pre-dates the secret-sealing work.
 	SealedSecretsOf(sandboxID string) []byte
 
-	// AddExposedPort records intent that sandboxID has port exposed under
-	// protocol. Replicated as intent only — the new owner allocates its own
-	// host port on recreate. Idempotent (same port+protocol is a no-op).
-	AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error
+	// AddExposedPort records intent that sandboxID has port exposed. Raw TCP
+	// routes include HostPort so every ingress node can bind/proxy the same
+	// cluster-wide endpoint. Idempotent when the route metadata is unchanged.
+	AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error
 
 	// RemoveExposedPort drops a port intent from the placement. Idempotent.
 	RemoveExposedPort(ctx context.Context, sandboxID string, port int) error
 
-	// ExposedPortsOf returns a copy of the replicated port→protocol map for
-	// sandboxID, or nil if none. Used by the recreator to replay exposures
-	// after a failover.
-	ExposedPortsOf(sandboxID string) map[int]string
+	// ExposedPortsOf returns a copy of the replicated port route map for
+	// sandboxID, or nil if none. Used by the recreator and ingress reconciler.
+	ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute
 
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error
@@ -246,6 +254,10 @@ type Client interface {
 
 	// Members returns a snapshot of all known cluster members.
 	Members() []Member
+
+	// Placements returns the local FSM's placement snapshot. Used by each node
+	// to reconcile owner-aware public ingress routes.
+	Placements() []Placement
 
 	// Leader returns the node ID of the current Raft leader, empty if none.
 	Leader() string

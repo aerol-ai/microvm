@@ -44,11 +44,11 @@ func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.Cr
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
 func (n *Noop) SealedSecretsOf(sandboxID string) []byte              { return nil }
-func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error {
+func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error {
 	return nil
 }
 func (n *Noop) RemoveExposedPort(ctx context.Context, sandboxID string, port int) error { return nil }
-func (n *Noop) ExposedPortsOf(sandboxID string) map[int]string                          { return nil }
+func (n *Noop) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute                { return nil }
 func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error             { return nil }
 func (n *Noop) ApplyEncoded(ctx context.Context, payload []byte) error                  { return nil }
 
@@ -63,6 +63,8 @@ func (n *Noop) ForwardHTTP(peerAPIURL string, w http.ResponseWriter, r *http.Req
 func (n *Noop) Members() []Member {
 	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}
 }
+
+func (n *Noop) Placements() []Placement { return nil }
 
 func (n *Noop) Leader() string { return n.nodeID }
 

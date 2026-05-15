@@ -362,13 +362,20 @@ func (c *Cluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 	return &cp
 }
 
-// AddExposedPort replicates a port-exposure intent. Idempotent (same
-// port+protocol is a no-op at the FSM layer). Safe to call from any node.
-func (c *Cluster) AddExposedPort(ctx context.Context, sandboxID string, port int, protocol string) error {
+// AddExposedPort replicates a port-exposure intent. Idempotent when the route
+// metadata is unchanged. Safe to call from any node.
+func (c *Cluster) AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error {
 	if port <= 0 {
 		return nil
 	}
-	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, Port: port, Protocol: protocol}
+	cmd := command{
+		Op:        opAddExposedPort,
+		SandboxID: sandboxID,
+		Port:      port,
+		Protocol:  route.Protocol,
+		HostPort:  route.HostPort,
+		PublicURL: route.PublicURL,
+	}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -381,18 +388,14 @@ func (c *Cluster) RemoveExposedPort(ctx context.Context, sandboxID string, port 
 	return c.applyCommand(ctx, cmd)
 }
 
-// ExposedPortsOf returns a copy of the replicated port→protocol map. Returns
-// nil if no placement exists or no ports are recorded.
-func (c *Cluster) ExposedPortsOf(sandboxID string) map[int]string {
+// ExposedPortsOf returns a copy of the replicated port route map. Returns nil
+// if no placement exists or no ports are recorded.
+func (c *Cluster) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute {
 	p, ok := c.fsm.get(sandboxID)
-	if !ok || len(p.ExposedPorts) == 0 {
+	if !ok {
 		return nil
 	}
-	out := make(map[int]string, len(p.ExposedPorts))
-	for k, v := range p.ExposedPorts {
-		out[k] = v
-	}
-	return out
+	return exposedPortRoutesForPlacement(p)
 }
 
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
@@ -463,8 +466,8 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				firstErr = err
 			}
 			// Replay port intents so the FSM matches local truth.
-			for port, protocol := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, protocol); err != nil && firstErr == nil {
+			for port, route := range st.ExposedPorts {
+				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -478,8 +481,8 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 					firstErr = err
 				}
 			}
-			for port, protocol := range st.ExposedPorts {
-				if err := c.AddExposedPort(ctx, st.ID, port, protocol); err != nil && firstErr == nil {
+			for port, route := range st.ExposedPorts {
+				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -641,6 +644,15 @@ func (c *Cluster) waitForLeader(ctx context.Context, max time.Duration) error {
 
 // Members returns gossip-known members (self included).
 func (c *Cluster) Members() []Member { return c.gossip.members() }
+
+func (c *Cluster) Placements() []Placement {
+	snap := c.fsm.snapshot()
+	out := make([]Placement, 0, len(snap))
+	for _, p := range snap {
+		out = append(out, p)
+	}
+	return out
+}
 
 // Leader returns the node ID of the current raft leader. Empty if no leader.
 func (c *Cluster) Leader() string {

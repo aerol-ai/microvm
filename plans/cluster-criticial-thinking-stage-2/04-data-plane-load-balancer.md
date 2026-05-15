@@ -7,14 +7,14 @@ to support cluster networking.
 
 ## Traffic planes
 
-| Plane | Current status | Release-grade requirement |
-|---|---|---|
-| SDK/API calls to `/v1/...` | Conceptually owner-forwarded, but create has a blocker | Any node/API frontend can accept; zero wrong-owner writes. |
-| Sandbox HTTP URL | Owner-local Caddy route only | Stable through owner-aware ingress. |
-| Exposed HTTP port URL | Owner-local Caddy route only | Stable through owner-aware ingress. |
-| Exposed TLS/SNI port URL | Owner-local caddy-l4 SNI route only | Stable through owner-aware SNI ingress. |
-| Raw TCP exposure | Direct owner `host:port` | Either explicitly direct-owner, or stable via global ingress port map. |
-| UDP exposure | Not supported | Do not document until designed. |
+| Plane | Original PR status | Current branch status | Release-grade requirement |
+|---|---|---|---|
+| SDK/API calls to `/v1/...` | Conceptually owner-forwarded, but create has a blocker | Target-locked create forwarding is implemented. | Any node/API frontend can accept; zero wrong-owner writes. |
+| Sandbox HTTP URL | Owner-local Caddy route only | Non-owners reconcile owner-aware routes. | Stable through owner-aware ingress with measured convergence. |
+| Exposed HTTP port URL | Owner-local Caddy route only | Non-owners reconcile owner-aware routes. | Stable through owner-aware ingress with measured convergence. |
+| Exposed TLS/SNI port URL | Owner-local caddy-l4 SNI route only | Non-owners pass SNI through to the owner mux. | Stable through owner-aware SNI ingress with measured convergence. |
+| Raw TCP exposure | Direct owner `host:port` | TCP host port is replicated and bound/proxied on every node. | Stable via global ingress port map with conflict handling and SLOs. |
+| UDP exposure | Not supported | Not supported. | Do not document until designed. |
 
 ## Required load-balancer shape
 
@@ -30,9 +30,15 @@ public DNS
 The ingress tier watches the placement/route map from the control plane and
 routes by hostname/SNI for HTTP/TLS.
 
-Workers do not hold routes for every sandbox in the cluster. They hold only
-local routes. This prevents the "10K sandboxes x 200 workers" Caddy config
-explosion.
+For a production line, workers should not all hold routes for every sandbox in
+the cluster. They should hold local routes, and a small ingress tier should hold
+the public route map. This prevents the "10K sandboxes x 200 workers" Caddy
+config explosion.
+
+This branch intentionally takes a smaller product step: every node runs an
+ingress reconciler and can accept public traffic. That is acceptable for a
+cluster beta and removes the 1/N correctness gap, but it must be load-tested
+before it becomes the production topology.
 
 ## Envoy, HAProxy, or sandboxd-ingress
 
@@ -116,23 +122,31 @@ TCP endpoint, the control plane needs a global L4 model:
 ingress.example.com:31042 -> node-17:22491 -> sandbox container:5432
 ```
 
-That implies:
+The branch now implements the core of this model:
 
-- cluster-wide ingress port pool;
-- Raft/etcd-backed allocation;
-- route map watched by ingress;
+- cluster-wide TCP host-port uniqueness is checked by the placement FSM;
+- `ExposePort` records TCP `HostPort` in Raft;
+- every node can bind the same `hostPort` and proxy to the owner;
+- failover replay tries to preserve the same `hostPort`.
+
+The production version still implies:
+
+- a clearly defined cluster-wide ingress port pool;
+- Raft/etcd-backed allocation with durable revisions;
+- route map watched by ingress rather than only polled;
 - health checks and retry/failover behavior;
-- response schema that returns the ingress endpoint, not owner public IP;
-- migration behavior when the owner dies and the new owner gets a different
-  local host port.
+- response schema that clearly returns the ingress endpoint;
+- migration behavior when the owner dies and the preferred host port is not
+  available on the new owner.
 
-If this is too much for the release, say so explicitly:
+If the product ever backs away from this scope, say so explicitly:
 
 > HTTP/TLS sandbox URLs are stable through cluster ingress. Raw TCP endpoints
 > are direct-to-owner and must be re-fetched after failover.
 
 That is an acceptable product line. What is not acceptable is implying raw TCP
-is load-balanced when it is owner-local.
+is load-balanced when it is owner-local. This branch now chooses the stronger
+cluster-stable TCP line, so the release gates need to prove it under churn.
 
 ## Per-node URLs are not enough
 
@@ -166,8 +180,9 @@ For TCP if supported through ingress:
 - no duplicate ingress port allocations;
 - route update after failover is bounded;
 - clients can distinguish "sandbox gone" from "route not converged."
+- local host-port conflicts on failover are surfaced clearly and do not loop
+  forever without operator visibility.
 
 For UDP:
 
 - explicitly unsupported until a design lands.
-

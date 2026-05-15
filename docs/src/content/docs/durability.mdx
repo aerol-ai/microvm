@@ -19,8 +19,8 @@ This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder 
 | Idle lifecycle policy | N/A | Restored on `Start` | Restored from replicated spec |
 | Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Re-exposed on the new owner from replicated intent |
 | Caddy routes | Removed | Restored on `Start` | Re-created on the new owner when ports are re-exposed |
-| Host port number | N/A | Same host, same port | New host, new port allocated from the new owner's pool |
-| Public URL | Removed | Restored on `Start` | Re-issued — the host and host port change |
+| Host port number | N/A | Same host, same port | TCP host ports are replayed from replicated route metadata when available |
+| Public URL | Removed | Restored on `Start` | HTTP/TLS URLs stay derived from the sandbox ID; TCP URLs stay stable when the replicated host port can be rebound |
 
 ## Make workspace state durable
 
@@ -129,7 +129,7 @@ Anything written under `/workspace` outlives the container. Anything written els
 
 ## Cluster-mode failover
 
-When `SB_ENABLE_CLUSTER=true`, the cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle) and every exposed-port intent (port + protocol) into a Raft log. If the owner node leaves the cluster and stays gone past the dead-owner grace period, the leader reassigns every placement that carries a spec to a live node. The new owner detects the reassignment within a few seconds, recreates the sandbox locally with the original ID, and re-runs `ExposePort` for each replicated port intent.
+When `SB_ENABLE_CLUSTER=true`, the cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle) and every exposed-port route intent into a Raft log. HTTP/TLS routes record their public URL metadata; raw TCP routes also record the selected `hostPort` so the cluster ingress can keep a stable endpoint. If the owner node leaves the cluster and stays gone past the dead-owner grace period, the leader reassigns every placement that carries a spec to a live node. The new owner detects the reassignment within a few seconds, recreates the sandbox locally with the original ID, and re-runs `ExposePort` for each replicated route intent.
 
 The recreated sandbox is a **fresh container** with the same identity:
 
@@ -137,7 +137,7 @@ The recreated sandbox is a **fresh container** with the same identity:
 - Same image, env, resource limits, mounts, lifecycle policy.
 - Mounted volumes attach to the same external sources, so workspace state under mount targets is intact.
 - Container writable layer is empty - any in-container files outside mounts are lost.
-- Same set of exposed ports - re-issued automatically on the new owner. The host port and public URL change because they're allocated from the new owner's pool, so clients that hard-coded the old URL must re-fetch it from `GetSandbox`.
+- Same set of exposed ports - re-issued automatically on the new owner. HTTP/TLS URLs stay stable because they are derived from the sandbox ID and domain. Raw TCP keeps the same host port when the new owner can bind the replicated port; if that local port is already occupied, the exposure must be retried or inspected by the operator.
 
 If you ever need to re-expose a port manually (for example, the original `ExposePort` call landed during a network partition and was dropped), the API is idempotent:
 
@@ -187,7 +187,7 @@ Cluster traffic uses two transports:
 - **Gossip** (`SB_GOSSIP_BIND_ADDR`, default `:7001`) — SWIM membership and capacity dissemination.
 - **Raft** (`SB_RAFT_BIND_ADDR`, default `:7000`) — placement-map consensus.
 
-When a node successfully joins gossip, it is automatically promoted to a Raft voter. **Anyone who can reach these ports can join the cluster and influence consensus.** Run them on a private network the operator controls (VPC peering, WireGuard mesh, dedicated cluster subnet); never expose them to the public internet.
+When a node successfully joins gossip, it is added to the Raft configuration as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached, then as a non-voter. **Anyone who can reach these ports can still join the cluster and influence placement replication.** Run them on a private network the operator controls (VPC peering, WireGuard mesh, dedicated cluster subnet); never expose them to the public internet.
 
 To authenticate gossip and reject foreign joiners, set `SB_GOSSIP_SECRET_KEY` to a base64-encoded 16, 24, or 32-byte key (AES-128/192/256-GCM). The same key must be configured on every node in the cluster.
 
@@ -204,7 +204,7 @@ When `SB_GOSSIP_SECRET_KEY` is unset, the daemon logs a warning at boot. Raft it
 ## Limitations
 
 - **Pre-cluster sandboxes are backfilled at boot.** Sandboxes created before the cluster was enabled, or before spec replication shipped, get their spec, exposed-port intents, and registry credentials written into the Raft log on the next daemon start under cluster mode. Registry credentials persisted before the encrypted column existed are absent from the row and won't be backfilled — those sandboxes rely on the new owner already having the image cached, or a fresh `Create` to re-seed credentials.
-- **Public URLs change on failover.** Host ports come from each node's local pool, so the URL surface re-derives on the new owner. Always look up the current URL via `GetSandbox` rather than caching the one from the original create.
+- **Ingress has a convergence window.** Public HTTP/TLS URLs and raw TCP host ports are replicated through the cluster route map, but non-owner ingress routes refresh periodically. Immediately after failover or a new exposure, a backend can briefly return 404/502 until it has reconciled.
 - **Writable-layer state is not replicated.** Treat anything outside a mount as cache. If you need it after a crash, write it to a mount.
 - **Single-node deployments inherit the same model.** A host crash loses the writable layer just as a failover does. Mount external storage for anything that must survive.
 
@@ -213,6 +213,6 @@ When `SB_GOSSIP_SECRET_KEY` is unset, the daemon logs a warning at boot. Raft it
 1. Pick the directory your workload writes durable state to (often a project root, a database data dir, or a model cache).
 2. Declare it as a mount target at `Create` time.
 3. Treat everything else inside the container as scratch.
-4. In cluster mode, re-fetch the public URL from `GetSandbox` after a failover - the sandbox ID and exposed ports survive, but the host and host port change.
+4. In cluster mode, tolerate a short ingress convergence window after failover - the sandbox ID and exposed port routes survive, but the recreated container is fresh.
 
 This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable.
