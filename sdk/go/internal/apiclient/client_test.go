@@ -224,3 +224,132 @@ func TestTransportClientCases(t *testing.T) {
 		t.Run(tc.name, tc.run)
 	}
 }
+
+// TestRegisterSnapshotSendsImagePath verifies the image-only happy path:
+// fields land on the wire under their snake_case names, the URL targets
+// /v1/snapshots, and the daemon's response is round-tripped back to the
+// caller. Splitting this off the big TestTransportClientCases table keeps
+// the per-field assertions readable.
+func TestRegisterSnapshotSendsImagePath(t *testing.T) {
+	ctx := context.Background()
+	var seen map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/snapshots" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer pat" {
+			t.Fatalf("unexpected authorization: %q", r.Header.Get("Authorization"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(models.SandboxSnapshot{
+			Name:     "py-base",
+			Image:    "python:3.12-slim",
+			RegionID: "us",
+			CPU:      2,
+			MemoryMB: 4096,
+			DiskGB:   10,
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	snap, err := client.RegisterSnapshot(ctx, RegisterSnapshotOptions{
+		Name:     "py-base",
+		Image:    "python:3.12-slim",
+		RegionID: "us",
+		CPU:      2,
+		MemoryMB: 4096,
+		DiskGB:   10,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSnapshot: %v", err)
+	}
+	if snap.Name != "py-base" || snap.Image != "python:3.12-slim" {
+		t.Fatalf("unexpected snapshot: %+v", snap)
+	}
+	if seen["image"] != "python:3.12-slim" || seen["region_id"] != "us" {
+		t.Fatalf("payload missing fields: %+v", seen)
+	}
+	// dockerfile_content omitempty — must NOT be in the payload when Image is set.
+	if _, present := seen["dockerfile_content"]; present {
+		t.Errorf("dockerfile_content should not be sent when Image is set: %+v", seen)
+	}
+}
+
+// TestRegisterSnapshotSendsDockerfilePath verifies the build-info wire
+// shape — the payload uses dockerfile_content, image is omitted, and the
+// daemon's resolved tag flows back to the caller.
+func TestRegisterSnapshotSendsDockerfilePath(t *testing.T) {
+	ctx := context.Background()
+	var seen map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(models.SandboxSnapshot{
+			Name:  "built",
+			Image: "snapshots/built:abcd1234",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	snap, err := client.RegisterSnapshot(ctx, RegisterSnapshotOptions{
+		Name:              "built",
+		DockerfileContent: "FROM debian:bookworm-slim\nRUN apt-get update",
+		Entrypoint:        []string{"/bin/sh", "-c", "echo hi"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterSnapshot: %v", err)
+	}
+	if snap.Image != "snapshots/built:abcd1234" {
+		t.Fatalf("Image = %q, want resolved build tag", snap.Image)
+	}
+	if seen["dockerfile_content"] == nil || seen["dockerfile_content"] == "" {
+		t.Errorf("dockerfile_content missing: %+v", seen)
+	}
+	if _, present := seen["image"]; present {
+		t.Errorf("image must be omitted on dockerfile path: %+v", seen)
+	}
+	ep, _ := seen["entrypoint"].([]any)
+	if len(ep) != 3 {
+		t.Errorf("entrypoint = %+v, want 3 elements", seen["entrypoint"])
+	}
+}
+
+// TestRegisterSnapshotClientValidation pins the validation we do client-
+// side before issuing the request. Catching these locally avoids a network
+// round-trip and gives a more direct error message.
+func TestRegisterSnapshotClientValidation(t *testing.T) {
+	ctx := context.Background()
+	// Server intentionally panics — these calls must never reach it.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("validation should fail before the request fires; got %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, ClientOptions{HTTPClient: server.Client()})
+
+	cases := []struct {
+		name string
+		opts RegisterSnapshotOptions
+		want string
+	}{
+		{"missing name", RegisterSnapshotOptions{Image: "alpine"}, "name is required"},
+		{"missing both", RegisterSnapshotOptions{Name: "x"}, "image or dockerfile_content"},
+		{"both set", RegisterSnapshotOptions{Name: "x", Image: "alpine", DockerfileContent: "FROM busybox"}, "mutually exclusive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.RegisterSnapshot(ctx, tc.opts)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}

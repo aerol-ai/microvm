@@ -256,6 +256,70 @@ func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (SandboxSn
 	return response, err
 }
 
+// RegisterSnapshotOptions is the wire shape for Client.RegisterSnapshot.
+// Exactly one of Image (a pre-built registry reference) or DockerfileContent
+// (build inputs the daemon compiles via Image-builder) must be set.
+type RegisterSnapshotOptions struct {
+	Name              string
+	Image             string
+	DockerfileContent string
+	ContextHashes     []string
+	Entrypoint        []string
+	RegionID          string
+	CPU               float64
+	GPU               float64
+	MemoryMB          int
+	DiskGB            int
+}
+
+// RegisterSnapshot persists a named snapshot pointing at either a caller-
+// supplied image reference or a Dockerfile the daemon will build. Mirrors
+// POST /v1/snapshots; returns the stored row so callers can read back the
+// resolved image (which differs from the request when DockerfileContent is
+// set — the daemon returns the content-addressed build tag).
+func (c *Client) RegisterSnapshot(ctx context.Context, opts RegisterSnapshotOptions) (SandboxSnapshot, error) {
+	type registerSnapshotRequest struct {
+		Name              string   `json:"name"`
+		Image             string   `json:"image,omitempty"`
+		DockerfileContent string   `json:"dockerfile_content,omitempty"`
+		ContextHashes     []string `json:"context_hashes,omitempty"`
+		Entrypoint        []string `json:"entrypoint,omitempty"`
+		RegionID          string   `json:"region_id,omitempty"`
+		CPU               float64  `json:"cpu,omitempty"`
+		GPU               float64  `json:"gpu,omitempty"`
+		MemoryMB          int      `json:"memory_mb,omitempty"`
+		DiskGB            int      `json:"disk_gb,omitempty"`
+	}
+
+	if strings.TrimSpace(opts.Name) == "" {
+		return SandboxSnapshot{}, errors.New("name is required")
+	}
+	image := strings.TrimSpace(opts.Image)
+	dockerfile := strings.TrimSpace(opts.DockerfileContent)
+	switch {
+	case image == "" && dockerfile == "":
+		return SandboxSnapshot{}, errors.New("image or dockerfile_content is required")
+	case image != "" && dockerfile != "":
+		return SandboxSnapshot{}, errors.New("image and dockerfile_content are mutually exclusive")
+	}
+
+	body := registerSnapshotRequest{
+		Name:              opts.Name,
+		Image:             image,
+		DockerfileContent: dockerfile,
+		ContextHashes:     opts.ContextHashes,
+		Entrypoint:        opts.Entrypoint,
+		RegionID:          strings.TrimSpace(opts.RegionID),
+		CPU:               opts.CPU,
+		GPU:               opts.GPU,
+		MemoryMB:          opts.MemoryMB,
+		DiskGB:            opts.DiskGB,
+	}
+	var response models.SandboxSnapshot
+	err := c.doJSON(ctx, http.MethodPost, c.versioned("/snapshots"), body, &response)
+	return response, err
+}
+
 func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+id, nil, nil)
 }

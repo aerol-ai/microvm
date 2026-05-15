@@ -33,6 +33,26 @@ export interface BuildImageResult {
   pushed?: string;
 }
 
+export interface RegisterSnapshotOptions {
+  /** Human-readable identifier other callers use in `CreateOptions.snapshot`. */
+  name: string;
+  /** Pre-built registry reference. Mutually exclusive with `dockerfileContent`. */
+  image?: string;
+  /** Literal Dockerfile the daemon will build. Mutually exclusive with `image`. */
+  dockerfileContent?: string;
+  /** Uploaded build-context hashes for future COPY/ADD resolution. */
+  contextHashes?: string[];
+  /** Optional command override persisted on the snapshot row. */
+  entrypoint?: string[];
+  /** Region hint persisted for read-back. */
+  regionID?: string;
+  /** Resource hints surfaced back on the snapshot row. */
+  cpu?: number;
+  gpu?: number;
+  memoryMB?: number;
+  diskGB?: number;
+}
+
 export type MountType = "s3" | "nfs" | "sshfs" | "rclone";
 
 export interface MountSpec {
@@ -213,6 +233,12 @@ export interface SandboxSnapshot {
   imageID?: string;
   sourceSandboxID: string;
   createdAt: string;
+  entrypoint?: string[];
+  regionID?: string;
+  cpu?: number;
+  gpu?: number;
+  memoryMB?: number;
+  diskGB?: number;
 }
 
 /**

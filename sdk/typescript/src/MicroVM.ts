@@ -11,6 +11,7 @@ import type {
   HealthStatus,
   Lifecycle,
   MountSpecRedacted,
+  RegisterSnapshotOptions,
   ResizeOptions,
   Sandbox as SandboxData,
   SandboxSnapshot,
@@ -89,6 +90,18 @@ export class MicroVM {
 	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
 		return this.client.createSnapshot(id, name);
 	}
+
+  async registerSnapshot(options: RegisterSnapshotOptions): Promise<SandboxSnapshot> {
+    return this.client.registerSnapshot(options);
+  }
+
+  async registerSnapshotFromImage(
+    name: string,
+    image: Image,
+    options: Omit<RegisterSnapshotOptions, "name" | "image" | "dockerfileContent"> = {},
+  ): Promise<SandboxSnapshot> {
+    return this.client.registerSnapshotFromImage(name, image, options);
+  }
 
   async destroy(id: string): Promise<void> {
     await this.client.destroy(id);

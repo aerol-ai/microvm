@@ -91,6 +91,105 @@ test("internal client createSnapshot maps request and response", async () => {
   assert.equal(snapshot.sourceSandboxID, "sb-create");
 });
 
+test("internal client registerSnapshot maps image path and response", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        name: "py-base",
+        image: "python:3.12-slim",
+        source_sandbox_id: "",
+        created_at: "2026-05-15T10:00:00Z",
+        region_id: "us",
+        cpu: 2,
+        gpu: 1,
+        memory_mb: 4096,
+        disk_gb: 10,
+      }, 201);
+    },
+  });
+
+  const snapshot = await client.registerSnapshot({
+    name: "py-base",
+    image: "python:3.12-slim",
+    regionID: "us",
+    cpu: 2,
+    gpu: 1,
+    memoryMB: 4096,
+    diskGB: 10,
+  });
+
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "POST");
+  assert.equal(seenRequest.url, "https://api.example.com/v1/snapshots");
+  assert.deepEqual(await seenRequest.json(), {
+    name: "py-base",
+    image: "python:3.12-slim",
+    region_id: "us",
+    cpu: 2,
+    gpu: 1,
+    memory_mb: 4096,
+    disk_gb: 10,
+  });
+  assert.equal(snapshot.regionID, "us");
+  assert.equal(snapshot.cpu, 2);
+  assert.equal(snapshot.gpu, 1);
+  assert.equal(snapshot.memoryMB, 4096);
+  assert.equal(snapshot.diskGB, 10);
+});
+
+test("internal client registerSnapshotFromImage sends dockerfile path", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        name: "built",
+        image: "snapshots/built:resolved",
+        source_sandbox_id: "",
+        created_at: "2026-05-15T10:00:00Z",
+        entrypoint: ["/bin/sh", "-c", "echo hi"],
+      }, 201);
+    },
+  });
+
+  const snapshot = await client.registerSnapshotFromImage(
+    "built",
+    Image.base("debian:bookworm-slim").runCommands("apt-get update"),
+    { entrypoint: ["/bin/sh", "-c", "echo hi"] },
+  );
+
+  assert.ok(seenRequest);
+  const payload = await seenRequest.json() as Record<string, unknown>;
+  assert.equal(payload.name, "built");
+  assert.match(String(payload.dockerfile_content), /FROM debian:bookworm-slim/);
+  assert.match(String(payload.dockerfile_content), /RUN apt-get update/);
+  assert.equal("image" in payload, false);
+  assert.deepEqual(payload.entrypoint, ["/bin/sh", "-c", "echo hi"]);
+  assert.deepEqual(snapshot.entrypoint, ["/bin/sh", "-c", "echo hi"]);
+});
+
+test("internal client registerSnapshot validates input before sending", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    fetch: async () => {
+      throw new Error("should not send request");
+    },
+  });
+
+  await assert.rejects(() => client.registerSnapshot({ name: "", image: "alpine" }), /name is required/);
+  await assert.rejects(() => client.registerSnapshot({ name: "x" }), /image or dockerfile_content is required/);
+  await assert.rejects(
+    () => client.registerSnapshot({ name: "x", image: "alpine", dockerfileContent: "FROM busybox" }),
+    /image and dockerfile_content are mutually exclusive/,
+  );
+});
+
 test("internal client updateLifecycle sends flat request body", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({
