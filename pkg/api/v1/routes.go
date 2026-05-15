@@ -24,6 +24,10 @@ type ImageBuilder interface {
 	// janitor doesn't GC a tag that was just handed out from the build
 	// cache. Called on the ImageExists==true short-circuit path.
 	RefreshTag(ctx context.Context, fullRef string) error
+	// RemoveImage rolls back a freshly built tag when the downstream
+	// snapshot-register call fails — otherwise the layer leaks because no
+	// snapshot row points at it for the built-image janitor to clean up.
+	RemoveImage(ctx context.Context, imageRef string) error
 }
 
 // BuildConfig mirrors the operator-configured image-build knobs.
@@ -56,6 +60,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/capacity", d.Auth(http.HandlerFunc(h.capacity)))
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Auth(http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.buildImage)))
+
+	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.createSandbox)))
 	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.listSandboxes)))
