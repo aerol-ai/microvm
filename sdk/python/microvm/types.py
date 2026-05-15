@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Optional, TypedDict
+from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, TypedDict, Union
+
+if TYPE_CHECKING:
+    from .image import Image
 
 
 MountType = Literal["s3", "nfs", "sshfs", "rclone"]
@@ -11,6 +14,26 @@ class RegistryAuth(TypedDict, total=False):
     server: str
     username: str
     password: str
+
+
+class BuildImagePushOptions(TypedDict, total=False):
+    """Per-request push directive for :meth:`MicroVM.build_image_with_push`.
+
+    Credentials are forwarded to the daemon as a one-shot ``X-Registry-Auth``
+    header on the underlying push call and are never persisted server-side.
+    """
+
+    registry: str  # required: e.g. "ghcr.io/my-org/my-image"
+    tag: str       # optional: defaults to "latest" on the daemon
+    server: str    # optional: serveraddress in X-Registry-Auth
+    username: str  # required
+    password: str  # required
+
+
+@dataclass(frozen=True)
+class BuildImageResult:
+    image: str
+    pushed: Optional[str] = None
 
 
 class MountSpec(TypedDict, total=False):
@@ -69,7 +92,7 @@ class GPUOptions(TypedDict, total=False):
 
 
 class CreateOptions(TypedDict, total=False):
-    image: str
+    image: Union[str, "Image"]
     # cpu accepts fractional cores: 0.5 = half a core, 1.5 = one and a half.
     cpu: float
     memoryMB: int
@@ -77,6 +100,11 @@ class CreateOptions(TypedDict, total=False):
     env: Dict[str, str]
     osUser: str
     networkBlockAll: bool
+    # Caps on network bytes the sandbox may receive (in) / send (out) before
+    # per-IP iptables block fires. 0 (default) means unlimited; both can be
+    # raised or lifted at runtime via set_network_limits.
+    networkBytesInLimit: int
+    networkBytesOutLimit: int
     registry: RegistryAuth
     containerCommand: List[str]
     mounts: List[MountSpec]
@@ -182,6 +210,14 @@ class ExposedPort(TypedDict, total=False):
     createdAt: str
 
 
+class SandboxSnapshot(TypedDict, total=False):
+    name: str
+    image: str
+    imageID: str
+    sourceSandboxID: str
+    createdAt: str
+
+
 # Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP
 # reverse proxy; "tcp" and "tls" map to caddy-l4 surfaces.
 ExposeProtocol = Literal["http", "tcp", "tls"]
@@ -231,6 +267,24 @@ class SandboxData(TypedDict, total=False):
     runtime: Literal["", "docker", "gvisor", "kata"]
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
+
+
+class NetworkUsage(TypedDict, total=False):
+    sandboxID: str
+    bytesIn: int
+    bytesOut: int
+    bytesInLimit: int
+    bytesOutLimit: int
+    quotaExceeded: bool
+    quotaExceededAt: str
+    # Absent until the netstats poller has produced at least one sample.
+    lastSampledAt: str
+
+
+class SetNetworkLimitsOptions(TypedDict, total=False):
+    # Omit a key to leave that direction unchanged. 0 means unlimited.
+    networkBytesInLimit: int
+    networkBytesOutLimit: int
 
 
 class HealthStatus(TypedDict):

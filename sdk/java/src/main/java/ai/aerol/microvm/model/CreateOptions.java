@@ -17,6 +17,10 @@ public class CreateOptions {
     public Map<String, String> env;
     public String osUser;
     public Boolean networkBlockAll;
+    @JsonProperty("network_bytes_in_limit")
+    public Long networkBytesInLimit;
+    @JsonProperty("network_bytes_out_limit")
+    public Long networkBytesOutLimit;
     public RegistryAuth registry;
     public List<String> containerCommand;
     public List<MountSpec> mounts;
@@ -57,6 +61,16 @@ public class CreateOptions {
 
     public CreateOptions setNetworkBlockAll(Boolean networkBlockAll) {
         this.networkBlockAll = networkBlockAll;
+        return this;
+    }
+
+    public CreateOptions setNetworkBytesInLimit(Long networkBytesInLimit) {
+        this.networkBytesInLimit = networkBytesInLimit;
+        return this;
+    }
+
+    public CreateOptions setNetworkBytesOutLimit(Long networkBytesOutLimit) {
+        this.networkBytesOutLimit = networkBytesOutLimit;
         return this;
     }
 

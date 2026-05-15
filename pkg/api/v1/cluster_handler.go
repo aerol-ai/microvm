@@ -34,6 +34,10 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 			local.ServeHTTP(w, r)
 			return
 		}
+		if h.deps.Service == nil {
+			local.ServeHTTP(w, r)
+			return
+		}
 		c := h.deps.Service.Cluster()
 		if c == nil {
 			local.ServeHTTP(w, r)

@@ -87,6 +87,59 @@ func (c *Client) Create(ctx context.Context, opts sdktypes.CreateSandboxOptions)
 	return wrapped, nil
 }
 
+// BuildImage compiles an Image builder into a content-addressed image tag via
+// POST /v1/images/build. Older daemons that do not register the route return a
+// tailored error telling the caller to fall back to a plain string image.
+func (c *Client) BuildImage(ctx context.Context, image *Image) (string, error) {
+	if image == nil {
+		return "", errors.New("image is nil")
+	}
+	if err := image.Err(); err != nil {
+		return "", err
+	}
+	return c.inner.BuildImage(ctx, image.Dockerfile())
+}
+
+// BuildImageWithOptions builds an Image and optionally pushes the result to a
+// remote registry. Push credentials are forwarded to the daemon as a one-shot
+// X-Registry-Auth header and never persisted server-side. Returns the local
+// content-addressed tag and (when push was requested) the pushed reference.
+func (c *Client) BuildImageWithOptions(ctx context.Context, image *Image, opts sdktypes.BuildImageOptions) (sdktypes.BuildImageResult, error) {
+	if image == nil {
+		return sdktypes.BuildImageResult{}, errors.New("image is nil")
+	}
+	if err := image.Err(); err != nil {
+		return sdktypes.BuildImageResult{}, err
+	}
+	var push *apiclient.BuildImagePushSpec
+	if opts.Push != nil {
+		push = &apiclient.BuildImagePushSpec{
+			Registry: opts.Push.Registry,
+			Tag:      opts.Push.Tag,
+			Server:   opts.Push.Server,
+			Username: opts.Push.Username,
+			Password: opts.Push.Password,
+		}
+	}
+	res, err := c.inner.BuildImageWithPush(ctx, image.Dockerfile(), push)
+	if err != nil {
+		return sdktypes.BuildImageResult{}, err
+	}
+	return sdktypes.BuildImageResult{Image: res.Image, Pushed: res.Pushed}, nil
+}
+
+// CreateWithImage builds an Image to a content-addressed tag, then creates the
+// sandbox using the resolved string image. This keeps CreateSandboxOptions
+// source-compatible with the server's request model.
+func (c *Client) CreateWithImage(ctx context.Context, image *Image, opts sdktypes.CreateSandboxOptions) (*Sandbox, error) {
+	tag, err := c.BuildImage(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	opts.Image = tag
+	return c.Create(ctx, opts)
+}
+
 func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
 	items, err := c.inner.List(ctx)
 	if err != nil {
@@ -114,6 +167,21 @@ func (c *Client) Mounts(ctx context.Context, id string) ([]sdktypes.MountSpecRed
 	return c.inner.Mounts(ctx, id)
 }
 
+// GetNetworkUsage returns current cumulative ingress/egress byte counters and
+// the configured per-direction caps for a sandbox. A `*Limit` of zero means
+// unlimited.
+func (c *Client) GetNetworkUsage(ctx context.Context, id string) (sdktypes.NetworkUsage, error) {
+	return c.inner.GetNetworkUsage(ctx, id)
+}
+
+// SetNetworkLimits raises or lifts the per-direction byte caps. Leave a field
+// nil to keep the current value; pass a pointer to zero to set "unlimited".
+// Raising a cap above current usage clears the per-IP iptables block on the
+// next reconcile pass (or immediately if it's already over the new cap).
+func (c *Client) SetNetworkLimits(ctx context.Context, id string, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
+	return c.inner.SetNetworkLimits(ctx, id, opts)
+}
+
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	item, err := c.inner.Start(ctx, id)
 	if err != nil {
@@ -128,6 +196,10 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 		return nil, err
 	}
 	return wrapSandbox(c, item), nil
+}
+
+func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (sdktypes.SandboxSnapshot, error) {
+	return c.inner.CreateSnapshot(ctx, id, name)
 }
 
 func (c *Client) Destroy(ctx context.Context, id string) error {
@@ -237,6 +309,10 @@ func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 	return s.client.inner.UnexposePort(ctx, s.ID, port)
 }
 
+func (s *Sandbox) CreateSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {
+	return s.client.CreateSnapshot(ctx, s.ID, name)
+}
+
 func (s *Sandbox) Start(ctx context.Context) error {
 	item, err := s.client.Start(ctx, s.ID)
 	if err != nil {
@@ -266,6 +342,14 @@ func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions
 	}
 	s.Sandbox = item.Sandbox
 	return nil
+}
+
+func (s *Sandbox) GetNetworkUsage(ctx context.Context) (sdktypes.NetworkUsage, error) {
+	return s.client.GetNetworkUsage(ctx, s.ID)
+}
+
+func (s *Sandbox) SetNetworkLimits(ctx context.Context, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
+	return s.client.SetNetworkLimits(ctx, s.ID, opts)
 }
 
 func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle sdktypes.Lifecycle) error {

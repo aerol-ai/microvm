@@ -95,4 +95,3 @@ func TestRedactStripsCredentials(t *testing.T) {
 		t.Errorf("Options lost: %v", r.Options)
 	}
 }
-

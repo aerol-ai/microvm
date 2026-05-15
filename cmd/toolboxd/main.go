@@ -38,6 +38,8 @@ type server struct {
 	allowedPorts map[int]struct{}
 
 	sessions *sessions.Manager
+	daytona  *daytonaCompat
+	envd     *envdCompat
 }
 
 func (s *server) setAllowedPorts(ports []int) {
@@ -68,6 +70,8 @@ func main() {
 		authToken:    strings.TrimSpace(os.Getenv("SB_TOOLBOX_TOKEN")),
 		port:         envInt("SB_TOOLBOX_PORT", 2280),
 		allowedPorts: map[int]struct{}{},
+		daytona:      newDaytonaCompat(),
+		envd:         newEnvdCompat(),
 	}
 	// Evict the token from the process env table so child processes spawned
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
@@ -190,11 +194,25 @@ func (s *server) routes() http.Handler {
 			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
 		case strings.HasPrefix(r.URL.Path, "/proxy/"):
 			s.handleProxy(w, r)
+		case strings.HasPrefix(r.URL.Path, "/envd/"):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			if !s.handleEnvdRoute(w, r) {
+				writeEnvdError(w, http.StatusNotFound, "not found")
+			}
 		case r.Method == http.MethodPost && r.URL.Path == "/process/execute":
 			if !s.requireAuth(w, r) {
 				return
 			}
 			s.handleExec(w, r)
+		case strings.HasPrefix(r.URL.Path, "/process/session"):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			if !s.handleDaytonaProcessRoute(w, r) {
+				writeError(w, http.StatusNotFound, "not found")
+			}
 		case r.Method == http.MethodPost && r.URL.Path == "/files/upload":
 			if !s.requireAuth(w, r) {
 				return
@@ -205,6 +223,38 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleDownload(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/files":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaListFiles(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/files/info":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaFileInfo(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/move":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaMoveFile(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/files/search":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaSearchFiles(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/files/find":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaFindInFiles(w, r)
+		case strings.HasPrefix(r.URL.Path, "/git/"):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			if !s.handleDaytonaGitRoute(w, r) {
+				writeError(w, http.StatusNotFound, "not found")
+			}
 		case r.Method == http.MethodPost && r.URL.Path == "/admin/allowed-ports":
 			if !s.requireAuth(w, r) {
 				return
@@ -248,6 +298,9 @@ func normalizeSandboxID(hostname string) string {
 func normalizeSandboxPath(path, sandboxID string) string {
 	if path == "" {
 		return "/"
+	}
+	if path == envdPrefix || strings.HasPrefix(path, envdPrefix+"/") {
+		return path
 	}
 
 	if sandboxID != "" {
@@ -299,9 +352,15 @@ func isKnownToolboxPath(path string) bool {
 		return true
 	case strings.HasPrefix(path, "/process/"):
 		return true
+	case path == "/files":
+		return true
 	case strings.HasPrefix(path, "/files/"):
 		return true
+	case strings.HasPrefix(path, "/git/"):
+		return true
 	case strings.HasPrefix(path, "/proxy/"):
+		return true
+	case strings.HasPrefix(path, "/envd/"):
 		return true
 	case path == "/sessions" || strings.HasPrefix(path, "/sessions/"):
 		return true

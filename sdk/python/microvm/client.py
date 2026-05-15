@@ -13,7 +13,10 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
+from .image import Image
 from .types import (
+    BuildImagePushOptions,
+    BuildImageResult,
     CreateOptions,
     CreateSessionOptions,
     ExecExitInfo,
@@ -26,18 +29,21 @@ from .types import (
     Lifecycle,
     MountSpec,
     MountSpecRedacted,
+    NetworkUsage,
     ResizeOptions,
     SandboxData,
+    SandboxSnapshot,
     Session,
     SessionAttachOptions,
+    SetNetworkLimitsOptions,
 )
 
 STREAM_PREFIX_STDOUT = 0x01
 STREAM_PREFIX_STDERR = 0x02
 
 # Wire versions of the sandbox daemon API this SDK can call. Today only "v1"
-# exists; "v2" will be added when a wire-level breaking change ships on the
-# server. The SDK package version and the API wire version evolve
+# exists; a new wire version will be added when a breaking change ships on
+# the server. The SDK package version and the API wire version evolve
 # independently — bumping this SDK does not move the wire version.
 _DEFAULT_API_VERSION = "v1"
 _PATH_PREFIXES: Dict[str, str] = {
@@ -56,6 +62,12 @@ def _read_env(name: str) -> Optional[str]:
 
 class MicroVMError(Exception):
     pass
+
+
+class MicroVMHTTPError(MicroVMError):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ExecStreamHandle:
@@ -325,6 +337,9 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
+    def create_snapshot(self, name: str) -> SandboxSnapshot:
+        return self._client.create_snapshot(self.id, name)
+
     def destroy(self) -> None:
         self._client.destroy(self.id)
 
@@ -337,6 +352,12 @@ class Sandbox:
         updated = self._client.update_lifecycle(self.id, lifecycle)
         self._data = updated.to_dict()
         return self
+
+    def get_network_usage(self) -> NetworkUsage:
+        return self._client.get_network_usage(self.id)
+
+    def set_network_limits(self, options: SetNetworkLimitsOptions) -> NetworkUsage:
+        return self._client.set_network_limits(self.id, options)
 
     @property
     def id(self) -> str:
@@ -373,14 +394,71 @@ class MicroVM:
     def _versioned(self, suffix: str) -> str:
         """Build a versioned API path. Pass the suffix beginning with "/" (e.g.
         ``"/sandboxes"``) and the active version's prefix is prepended. Use
-        this for every versioned call so v2 (when it lands) is selected by the
-        ``api_version`` option without touching call sites.
+        this for every versioned call so a future wire version is selected by
+        the ``api_version`` option without touching call sites.
         """
         return f"{self._version_prefix}{suffix}"
 
     def create(self, options: CreateOptions) -> Sandbox:
-        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(options))
+        resolved_options = dict(options)
+        resolved_options["image"] = self._resolve_image(_first_of(options, "image"))
+        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
         return self._wrap_sandbox(sandbox)
+
+    def build_image(self, image: Image) -> str:
+        result = self.build_image_with_push(image, push=None)
+        return result.image
+
+    def build_image_with_push(
+        self,
+        image: Image,
+        *,
+        push: Optional[BuildImagePushOptions] = None,
+    ) -> BuildImageResult:
+        """Build an Image and optionally push the result to a remote registry.
+
+        When ``push`` is ``None``, behavior matches :meth:`build_image`.
+        Push credentials are forwarded to the daemon as a one-shot
+        ``X-Registry-Auth`` header on the underlying push call and are never
+        persisted server-side.
+        """
+        if not isinstance(image, Image):
+            raise TypeError("build_image expects an Image instance")
+        body: Dict[str, Any] = {"dockerfile_content": image.dockerfile}
+        if push is not None:
+            registry = str(push.get("registry", "")).strip()
+            username = str(push.get("username", ""))
+            password = str(push.get("password", ""))
+            if not registry:
+                raise ValueError("push.registry is required when push is set")
+            if not username or not password:
+                raise ValueError("push.username and push.password are required when push is set")
+            push_body: Dict[str, Any] = {
+                "registry": registry,
+                "username": username,
+                "password": password,
+            }
+            tag = str(push.get("tag", "")).strip()
+            if tag:
+                push_body["tag"] = tag
+            server = str(push.get("server", "")).strip()
+            if server:
+                push_body["server"] = server
+            body["push"] = push_body
+
+        path = self._versioned("/images/build")
+        try:
+            payload = self._do_json("POST", path, body)
+        except MicroVMHTTPError as exc:
+            if exc.status_code == 404:
+                raise MicroVMError(
+                    f'this daemon does not support Image builds (POST {path} is not registered) — pass a string image reference (e.g. "ubuntu:22.04") instead, or upgrade the daemon'
+                ) from exc
+            raise
+        image_tag = str(_first_of(payload, "image") or "")
+        pushed_value = _first_of(payload, "pushed")
+        pushed: Optional[str] = str(pushed_value) if pushed_value else None
+        return BuildImageResult(image=image_tag, pushed=pushed)
 
     def list(self) -> List[Sandbox]:
         sandboxes = self._do_json("GET", self._versioned("/sandboxes"), None)
@@ -397,6 +475,10 @@ class MicroVM:
     def stop(self, sandbox_id: str) -> Sandbox:
         sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None)
         return self._wrap_sandbox(sandbox)
+
+    def create_snapshot(self, sandbox_id: str, name: str) -> SandboxSnapshot:
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", {"name": name})
+        return _from_api_sandbox_snapshot(response)
 
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
@@ -421,6 +503,15 @@ class MicroVM:
         if not isinstance(mounts, list):
             return []
         return [_from_api_mount_spec_redacted(item) for item in mounts]
+
+    def get_network_usage(self, sandbox_id: str) -> NetworkUsage:
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)
+        return _from_api_network_usage(payload)
+
+    def set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions) -> NetworkUsage:
+        body = _to_api_set_network_limits_options(options)
+        payload = self._do_json("PATCH", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/limits", body)
+        return _from_api_network_usage(payload)
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
@@ -523,6 +614,13 @@ class MicroVM:
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
+    def _resolve_image(self, image: Any) -> str:
+        if isinstance(image, Image):
+            return self.build_image(image)
+        if isinstance(image, str) and image.strip() != "":
+            return image
+        raise TypeError("CreateOptions.image must be a non-empty string or Image")
+
     def _wrap_sandbox(self, response: Dict[str, Any]) -> Sandbox:
         return Sandbox(self, _from_api_sandbox(response))
 
@@ -542,9 +640,9 @@ class MicroVM:
             payload = exc.read()
             try:
                 data = json.loads(payload.decode("utf-8"))
-                raise MicroVMError(str(data.get("error", exc.reason))) from exc
+                raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
             except (ValueError, TypeError):
-                raise MicroVMError(exc.reason) from exc
+                raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
         body = None
@@ -648,6 +746,8 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "env": _first_of(options, "env"),
             "os_user": _first_of(options, "osUser", "os_user"),
             "network_block_all": _first_of(options, "networkBlockAll", "network_block_all"),
+            "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
+            "network_bytes_out_limit": _first_of(options, "networkBytesOutLimit", "network_bytes_out_limit"),
             "registry": _first_of(options, "registry"),
             "container_command": _first_of(options, "containerCommand", "container_command"),
             "mounts": [_to_api_mount_spec(item) for item in (_first_of(options, "mounts") or [])],
@@ -734,6 +834,19 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _from_api_sandbox_snapshot(snapshot: Dict[str, Any]) -> SandboxSnapshot:
+    result: SandboxSnapshot = {
+        "name": str(_first_of(snapshot, "name") or ""),
+        "image": str(_first_of(snapshot, "image") or ""),
+        "sourceSandboxID": str(_first_of(snapshot, "source_sandbox_id", "sourceSandboxID") or ""),
+        "createdAt": str(_first_of(snapshot, "created_at", "createdAt") or ""),
+    }
+    image_id = _first_of(snapshot, "image_id", "imageID")
+    if image_id not in (None, ""):
+        result["imageID"] = str(image_id)
+    return result
+
+
 def _from_api_expose_port_response(response: Dict[str, Any]) -> ExposeResult:
     protocol_raw = str(_first_of(response, "protocol") or "http")
     if protocol_raw not in ("http", "tcp", "tls"):
@@ -763,6 +876,34 @@ def _to_api_mount_spec(mount: MountSpec) -> Dict[str, Any]:
             "read_only": _first_of(mount, "readOnly", "read_only"),
         }
     )
+
+
+def _to_api_set_network_limits_options(options: SetNetworkLimitsOptions) -> Dict[str, Any]:
+    # Omitted keys mean "leave unchanged" on the server. 0 means unlimited.
+    return _compact(
+        {
+            "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
+            "network_bytes_out_limit": _first_of(options, "networkBytesOutLimit", "network_bytes_out_limit"),
+        }
+    )
+
+
+def _from_api_network_usage(payload: Dict[str, Any]) -> NetworkUsage:
+    result: NetworkUsage = {
+        "sandboxID": str(_first_of(payload, "sandbox_id", "sandboxID") or ""),
+        "bytesIn": int(_first_of(payload, "bytes_in", "bytesIn") or 0),
+        "bytesOut": int(_first_of(payload, "bytes_out", "bytesOut") or 0),
+        "bytesInLimit": int(_first_of(payload, "bytes_in_limit", "bytesInLimit") or 0),
+        "bytesOutLimit": int(_first_of(payload, "bytes_out_limit", "bytesOutLimit") or 0),
+        "quotaExceeded": bool(_first_of(payload, "quota_exceeded", "quotaExceeded") or False),
+    }
+    quota_exceeded_at = _first_of(payload, "quota_exceeded_at", "quotaExceededAt")
+    if quota_exceeded_at not in (None, ""):
+        result["quotaExceededAt"] = str(quota_exceeded_at)
+    last_sampled_at = _first_of(payload, "last_sampled_at", "lastSampledAt")
+    if last_sampled_at not in (None, ""):
+        result["lastSampledAt"] = str(last_sampled_at)
+    return result
 
 
 def _from_api_mount_spec_redacted(mount: Dict[str, Any]) -> MountSpecRedacted:

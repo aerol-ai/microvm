@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 type Store struct {
@@ -50,6 +50,11 @@ func Open(path string) (*Store, error) {
 	stmts := []string{
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA foreign_keys = ON;`,
+		// sandboxes is the canonical per-sandbox row. name and tags_json are
+		// native first-class fields used by every facade — they are NOT
+		// Daytona- or E2B-specific. Lifecycle is stored as four INTEGER
+		// nanosecond fields (matches Go's time.Duration shape), gpus_json
+		// is a JSON blob to absorb future GPU options without schema churn.
 		`CREATE TABLE IF NOT EXISTS sandboxes (
 			id TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -68,6 +73,20 @@ func Open(path string) (*Store, error) {
 			ssh_public_key TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '',
 			container_command_json TEXT NOT NULL DEFAULT '[]',
+			name TEXT NOT NULL DEFAULT '',
+			tags_json TEXT NOT NULL DEFAULT '{}',
+			stop_if_idle_for_ns INTEGER NOT NULL DEFAULT 0,
+			destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0,
+			stop_at_age_ns INTEGER NOT NULL DEFAULT 0,
+			destroy_at_age_ns INTEGER NOT NULL DEFAULT 0,
+			runtime TEXT NOT NULL DEFAULT '',
+			gpus_json TEXT NOT NULL DEFAULT '',
+			net_bytes_in INTEGER NOT NULL DEFAULT 0,
+			net_bytes_out INTEGER NOT NULL DEFAULT 0,
+			net_bytes_in_limit INTEGER NOT NULL DEFAULT 0,
+			net_bytes_out_limit INTEGER NOT NULL DEFAULT 0,
+			net_quota_exceeded INTEGER NOT NULL DEFAULT 0,
+			net_quota_exceeded_at DATETIME,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			last_active_at DATETIME NOT NULL
@@ -75,6 +94,8 @@ func Open(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS exposed_ports (
 			sandbox_id TEXT NOT NULL,
 			port INTEGER NOT NULL,
+			protocol TEXT NOT NULL DEFAULT 'http',
+			host_port INTEGER NOT NULL DEFAULT 0,
 			public_url TEXT NOT NULL,
 			created_at DATETIME NOT NULL,
 			PRIMARY KEY (sandbox_id, port),
@@ -86,6 +107,57 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
+			name TEXT PRIMARY KEY,
+			image TEXT NOT NULL,
+			image_id TEXT NOT NULL DEFAULT '',
+			source_sandbox_id TEXT NOT NULL,
+			created_at DATETIME NOT NULL
+		);`,
+		// sandbox_compat_state holds opaque facade-private state that has
+		// no native meaning. One row per (sandbox, facade). state_json is
+		// owned by the facade — the store does not interpret it. FK cascade
+		// guarantees facade state is removed when the sandbox is destroyed.
+		`CREATE TABLE IF NOT EXISTS sandbox_compat_state (
+			sandbox_id TEXT NOT NULL,
+			facade TEXT NOT NULL,
+			state_json TEXT NOT NULL DEFAULT '{}',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, facade),
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
+		// snapshot_aliases lets a native sandbox_snapshots row be addressed
+		// by facade-shaped alternate identifiers (e.g. E2B's base64 token).
+		// FK cascade fixes the orphan-row bug where /v1/snapshots delete
+		// would leave a facade alias dangling.
+		`CREATE TABLE IF NOT EXISTS snapshot_aliases (
+			alias TEXT PRIMARY KEY,
+			snapshot_name TEXT NOT NULL,
+			facade TEXT NOT NULL,
+			extra_names_json TEXT NOT NULL DEFAULT '[]',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			FOREIGN KEY (snapshot_name) REFERENCES sandbox_snapshots(name) ON DELETE CASCADE
+		);`,
+		// request_idempotency is the generic claim/replay primitive for
+		// caller-retry dedupe. scope is a caller-defined namespace string
+		// ("e2b.create" today; "daytona.create" or "v1.create" later) so
+		// the same fingerprint hash can be reused across facades without
+		// colliding. The state machine is: pending → ready, with
+		// locked_until bounding the in-flight wait and replay_until
+		// bounding the replay window after success.
+		`CREATE TABLE IF NOT EXISTS request_idempotency (
+			scope TEXT NOT NULL,
+			fingerprint TEXT NOT NULL,
+			target_id TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL DEFAULT 'pending',
+			locked_until DATETIME NOT NULL,
+			replay_until DATETIME,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (scope, fingerprint)
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
 		// idx_sandboxes_image powers HasActiveImageRef so image GC stays
@@ -94,6 +166,16 @@ func Open(path string) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
+		// Partial unique index on sandboxes.name. The default '' is allowed
+		// many times (for sandboxes created without a name); any non-empty
+		// name is unique across the table. Daytona depends on this for
+		// name-based lookup; everyone else benefits from collision-free
+		// names by default.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
+		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
 	}
 
 	for _, stmt := range stmts {
@@ -103,10 +185,11 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	// Migrations for older DBs that pre-date columns above. Idempotent.
-	// Lifecycle fields are stored as INTEGER nanoseconds — same shape Go
-	// uses for time.Duration internally, so no parsing on read and no
-	// format ambiguity. Zero means "disabled" for that axis.
+	// Additive migrations for sandboxes columns introduced after the original
+	// schema landed. Each ALTER TABLE is run unconditionally; SQLite returns
+	// "duplicate column name" when the column already exists, which we
+	// swallow so cold installs (where CREATE TABLE above already includes
+	// the column) and warm upgrades (where the column is new) both succeed.
 	migrations := []string{
 		`ALTER TABLE sandboxes ADD COLUMN toolbox_token TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN ssh_public_key TEXT NOT NULL DEFAULT '';`,
@@ -137,11 +220,17 @@ func Open(path string) (*Store, error) {
 		// rejects two reservations on the same host_port without preventing
 		// many rows at the default 0.
 		`ALTER TABLE exposed_ports ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in_limit INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out_limit INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_quota_exceeded INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN net_quota_exceeded_at DATETIME;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			db.Close()
-			return nil, fmt.Errorf("run migration: %w", err)
+			return nil, fmt.Errorf("apply schema migration %q: %w", stmt, err)
 		}
 	}
 
@@ -203,15 +292,25 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	tagsJSON, err := marshalJSON(sandbox.Tags, "{}")
+	if err != nil {
+		return err
+	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json, registry_auth_sealed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -230,6 +329,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
+		strings.TrimSpace(sandbox.Name),
+		tagsJSON,
 		sandbox.CreatedAt.UTC(),
 		sandbox.UpdatedAt.UTC(),
 		sandbox.LastActiveAt.UTC(),
@@ -239,9 +340,18 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
 		gpusJSON,
+		sandbox.NetworkBytesIn,
+		sandbox.NetworkBytesOut,
+		sandbox.NetworkBytesInLimit,
+		sandbox.NetworkBytesOutLimit,
+		boolToInt(sandbox.NetworkQuotaExceeded),
+		nullableTime(sandbox.NetworkQuotaExceededAt),
 		nullableBlob(sandbox.RegistryAuthSealed),
 	)
 	if err != nil {
+		if isSandboxNameConflict(err, sandbox.Name) {
+			return ErrSandboxNameConflict
+		}
 		return fmt.Errorf("insert sandbox: %w", err)
 	}
 	return nil
@@ -269,15 +379,25 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	if err != nil {
 		return err
 	}
+	tagsJSON, err := marshalJSON(sandbox.Tags, "{}")
+	if err != nil {
+		return err
+	}
+	if err := s.ensureSandboxLookupNameAvailable(ctx, sandbox.ID, sandbox.Name); err != nil {
+		return err
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json, registry_auth_sealed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -295,6 +415,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			ssh_public_key = excluded.ssh_public_key,
 			last_error = excluded.last_error,
 			container_command_json = excluded.container_command_json,
+			name = excluded.name,
+			tags_json = excluded.tags_json,
 			updated_at = excluded.updated_at,
 			last_active_at = excluded.last_active_at,
 			stop_if_idle_for_ns = excluded.stop_if_idle_for_ns,
@@ -303,6 +425,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			destroy_at_age_ns = excluded.destroy_at_age_ns,
 			runtime = excluded.runtime,
 			gpus_json = excluded.gpus_json,
+			net_bytes_in_limit = excluded.net_bytes_in_limit,
+			net_bytes_out_limit = excluded.net_bytes_out_limit,
 			registry_auth_sealed = excluded.registry_auth_sealed
 	`,
 		sandbox.ID,
@@ -322,6 +446,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.SSHPublicKey,
 		sandbox.LastError,
 		commandJSON,
+		strings.TrimSpace(sandbox.Name),
+		tagsJSON,
 		sandbox.CreatedAt.UTC(),
 		sandbox.UpdatedAt.UTC(),
 		sandbox.LastActiveAt.UTC(),
@@ -331,9 +457,18 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyAtAge),
 		sandbox.Runtime,
 		gpusJSON,
+		sandbox.NetworkBytesIn,
+		sandbox.NetworkBytesOut,
+		sandbox.NetworkBytesInLimit,
+		sandbox.NetworkBytesOutLimit,
+		boolToInt(sandbox.NetworkQuotaExceeded),
+		nullableTime(sandbox.NetworkQuotaExceededAt),
 		nullableBlob(sandbox.RegistryAuthSealed),
 	)
 	if err != nil {
+		if isSandboxNameConflict(err, sandbox.Name) {
+			return ErrSandboxNameConflict
+		}
 		return fmt.Errorf("upsert sandbox: %w", err)
 	}
 	return nil
@@ -343,9 +478,12 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json, registry_auth_sealed
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -371,9 +509,12 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
-			last_error, container_command_json, created_at, updated_at, last_active_at,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
-			runtime, gpus_json, registry_auth_sealed
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -471,6 +612,30 @@ func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, erro
 	return true, nil
 }
 
+// UpdateTags replaces sandboxes.tags_json on the row matching id and bumps
+// updated_at. Used by facades that want to mutate the native tags field
+// without round-tripping the entire sandbox struct through Upsert. Returns
+// ErrNotFound if no row matches.
+func (s *Store) UpdateTags(ctx context.Context, id string, tags map[string]string) error {
+	tagsJSON, err := marshalJSON(tags, "{}")
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET tags_json = ?, updated_at = ?
+		WHERE id = ?
+	`, tagsJSON, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update sandbox tags: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // UpdateLifecycle replaces the four lifecycle timer fields on a sandbox row
 // and bumps updated_at. Other fields are untouched. Returns ErrNotFound if
 // no row matches id. The caller must validate the Lifecycle first; the
@@ -502,10 +667,581 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 	return nil
 }
 
+// UpdateSandboxNetCounters bumps the cumulative ingress/egress counters by
+// the given deltas. Both values are non-negative byte counts measured since
+// the last sample. Concurrent calls are serialized by SQLite's single
+// writer, and the UPDATE is atomic so a failed sample never partially
+// applies. Returns ErrNotFound if the sandbox row was deleted between the
+// poller's snapshot and this write — the netstats poller treats that as a
+// cleanup signal and drops the in-memory baseline.
+func (s *Store) UpdateSandboxNetCounters(ctx context.Context, id string, deltaIn, deltaOut int64) error {
+	if deltaIn < 0 || deltaOut < 0 {
+		return fmt.Errorf("net counter deltas must be non-negative (in=%d out=%d)", deltaIn, deltaOut)
+	}
+	if deltaIn == 0 && deltaOut == 0 {
+		return nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_bytes_in = net_bytes_in + ?,
+		    net_bytes_out = net_bytes_out + ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, deltaIn, deltaOut, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update sandbox net counters: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetNetworkLimits replaces the per-sandbox network byte caps. Zero means
+// unlimited; negative values are rejected. The handler validates first so
+// the store does not re-validate. Returns ErrNotFound if no row matches id.
+func (s *Store) SetNetworkLimits(ctx context.Context, id string, bytesInLimit, bytesOutLimit int64) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_bytes_in_limit = ?,
+		    net_bytes_out_limit = ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, bytesInLimit, bytesOutLimit, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set sandbox net limits: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkNetworkQuotaExceeded flips the flag on. detectedAt records when the
+// crossover was first observed so the API can surface it to the SDK. Calls
+// when already-exceeded preserve the original detectedAt — the trigger time
+// is the interesting one, not the most recent re-observation.
+func (s *Store) MarkNetworkQuotaExceeded(ctx context.Context, id string, detectedAt time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_quota_exceeded = 1,
+		    net_quota_exceeded_at = COALESCE(net_quota_exceeded_at, ?),
+		    updated_at = ?
+		WHERE id = ?
+	`, detectedAt.UTC(), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("mark sandbox network quota exceeded: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearNetworkQuotaExceeded resets the flag and the detection timestamp.
+// Used when an operator raises the limit (or sets it to unlimited) and the
+// counter is no longer over the new ceiling.
+func (s *Store) ClearNetworkQuotaExceeded(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET net_quota_exceeded = 0,
+		    net_quota_exceeded_at = NULL,
+		    updated_at = ?
+		WHERE id = ?
+	`, time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("clear sandbox network quota exceeded: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) Delete(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete sandbox: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ensureSandboxLookupNameAvailable keeps the user-facing sandbox lookup
+// namespace unambiguous. Handlers resolve by id first and name second, so a
+// name that equals another sandbox's id would otherwise be permanently
+// shadowed. The inverse is also rejected for caller-supplied ids.
+func (s *Store) ensureSandboxLookupNameAvailable(ctx context.Context, id, name string) error {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if name != "" {
+		var existingID string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sandboxes
+			WHERE id = ? AND id <> ?
+			LIMIT 1
+		`, name, id).Scan(&existingID)
+		if err == nil {
+			return ErrSandboxNameConflict
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check sandbox name against ids: %w", err)
+		}
+	}
+	if id != "" {
+		var existingID string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sandboxes
+			WHERE name = ? AND id <> ?
+			LIMIT 1
+		`, id, id).Scan(&existingID)
+		if err == nil {
+			return ErrSandboxNameConflict
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check sandbox id against names: %w", err)
+		}
+	}
+	return nil
+}
+
+// UpsertCompatState writes the facade-private state blob for (sandboxID,
+// facade). stateJSON is opaque to the store — each facade defines its own
+// schema inside it. created_at is preserved on update so list ordering
+// stays stable.
+func (s *Store) UpsertCompatState(ctx context.Context, sandboxID, facade, stateJSON string) error {
+	if strings.TrimSpace(sandboxID) == "" {
+		return fmt.Errorf("upsert compat state: sandbox_id is required")
+	}
+	if strings.TrimSpace(facade) == "" {
+		return fmt.Errorf("upsert compat state: facade is required")
+	}
+	body := strings.TrimSpace(stateJSON)
+	if body == "" {
+		body = "{}"
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sandbox_compat_state (sandbox_id, facade, state_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, facade) DO UPDATE SET
+			state_json = excluded.state_json,
+			updated_at = excluded.updated_at
+	`, strings.TrimSpace(sandboxID), strings.TrimSpace(facade), body, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert compat state: %w", err)
+	}
+	return nil
+}
+
+// GetCompatState returns the state blob for (sandboxID, facade), or
+// ErrNotFound when no row exists. Callers unmarshal state_json themselves.
+func (s *Store) GetCompatState(ctx context.Context, sandboxID, facade string) (*models.SandboxCompatState, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, facade, state_json, created_at, updated_at
+		FROM sandbox_compat_state
+		WHERE sandbox_id = ? AND facade = ?
+	`, strings.TrimSpace(sandboxID), strings.TrimSpace(facade))
+	state, err := scanCompatState(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get compat state: %w", err)
+	}
+	return state, nil
+}
+
+// ListCompatState returns every row for the given facade keyed by
+// sandbox_id. Empty result is map of length zero, not nil — callers can
+// always index into it.
+func (s *Store) ListCompatState(ctx context.Context, facade string) (map[string]models.SandboxCompatState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, facade, state_json, created_at, updated_at
+		FROM sandbox_compat_state
+		WHERE facade = ?
+		ORDER BY sandbox_id ASC
+	`, strings.TrimSpace(facade))
+	if err != nil {
+		return nil, fmt.Errorf("list compat state: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.SandboxCompatState{}
+	for rows.Next() {
+		state, err := scanCompatState(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan compat state: %w", err)
+		}
+		items[state.SandboxID] = *state
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate compat state: %w", err)
+	}
+	return items, nil
+}
+
+// ResolveSandboxIDByName returns the sandbox ID owning the given name, or
+// ErrNotFound if no row matches. Empty input is rejected so an accidental
+// "" lookup does not match a no-name sandbox via the partial unique
+// index's escape hatch.
+func (s *Store) ResolveSandboxIDByName(ctx context.Context, name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE name = ?`, trimmed)
+	var sandboxID string
+	if err := row.Scan(&sandboxID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("resolve sandbox id by name: %w", err)
+	}
+	return sandboxID, nil
+}
+
+// UpsertSnapshotAlias maps a facade-shaped alternate identifier onto a
+// native sandbox_snapshots row. created_at is preserved on update.
+func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAlias) error {
+	if strings.TrimSpace(alias.Alias) == "" {
+		return fmt.Errorf("upsert snapshot alias: alias is required")
+	}
+	if strings.TrimSpace(alias.SnapshotName) == "" {
+		return fmt.Errorf("upsert snapshot alias: snapshot_name is required")
+	}
+	extraNamesJSON, err := marshalJSON(alias.ExtraNames, "[]")
+	if err != nil {
+		return fmt.Errorf("marshal snapshot alias names: %w", err)
+	}
+	now := time.Now().UTC()
+	createdAt := alias.CreatedAt.UTC()
+	if alias.CreatedAt.IsZero() {
+		createdAt = now
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(alias) DO UPDATE SET
+			snapshot_name = excluded.snapshot_name,
+			facade = excluded.facade,
+			extra_names_json = excluded.extra_names_json,
+			updated_at = excluded.updated_at
+	`,
+		strings.TrimSpace(alias.Alias),
+		strings.TrimSpace(alias.SnapshotName),
+		strings.TrimSpace(alias.Facade),
+		extraNamesJSON,
+		createdAt,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert snapshot alias: %w", err)
+	}
+	return nil
+}
+
+// GetSnapshotAlias returns the alias row, or ErrNotFound if the alias
+// does not exist.
+func (s *Store) GetSnapshotAlias(ctx context.Context, alias string) (*models.SnapshotAlias, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+		FROM snapshot_aliases
+		WHERE alias = ?
+	`, strings.TrimSpace(alias))
+	got, err := scanSnapshotAlias(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get snapshot alias: %w", err)
+	}
+	return got, nil
+}
+
+// ListSnapshotAliases returns all alias rows for the given facade keyed
+// by alias. Pass empty facade to fetch every alias regardless of facade.
+func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[string]models.SnapshotAlias, error) {
+	var rows *sql.Rows
+	var err error
+	trimmed := strings.TrimSpace(facade)
+	if trimmed == "" {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			FROM snapshot_aliases
+			ORDER BY created_at DESC, alias ASC
+		`)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			FROM snapshot_aliases
+			WHERE facade = ?
+			ORDER BY created_at DESC, alias ASC
+		`, trimmed)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list snapshot aliases: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.SnapshotAlias{}
+	for rows.Next() {
+		alias, err := scanSnapshotAlias(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot alias: %w", err)
+		}
+		items[alias.Alias] = *alias
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshot aliases: %w", err)
+	}
+	return items, nil
+}
+
+// DeleteSnapshotAlias removes the alias row. FK cascade also drops the
+// row when its underlying sandbox_snapshots row is deleted, so explicit
+// deletes are only needed when the facade wants to forget an alias
+// without removing the native snapshot.
+func (s *Store) DeleteSnapshotAlias(ctx context.Context, alias string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM snapshot_aliases WHERE alias = ?`, strings.TrimSpace(alias))
+	if err != nil {
+		return fmt.Errorf("delete snapshot alias: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClaimIdempotentRequest is the generic claim/replay primitive for
+// caller-retry dedupe. scope is a facade-defined namespace string
+// ("e2b.create" today; "daytona.create" or "v1.create" later) so the
+// same fingerprint can be reused across facades without colliding.
+//
+// Three outcomes per call:
+//  1. INSERTed a fresh pending row → acquired=true, caller owns the work.
+//  2. Found a Ready row whose ReplayUntil has not expired → acquired=false,
+//     caller replays the TargetID instead of running the work again.
+//  3. Found a Pending row whose LockedUntil has not expired → acquired=false,
+//     caller waits.
+//
+// Stale Pending or Ready rows past their TTLs are reclaimed as a fresh
+// Pending row (acquired=true), so a crashed claimer cannot block future
+// retries indefinitely.
+func (s *Store) ClaimIdempotentRequest(ctx context.Context, scope, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.IdempotentRequestRecord, bool, error) {
+	scope = strings.TrimSpace(scope)
+	fingerprint = strings.TrimSpace(fingerprint)
+	if scope == "" {
+		return nil, false, fmt.Errorf("claim idempotent request: scope is required")
+	}
+	if fingerprint == "" {
+		return nil, false, fmt.Errorf("claim idempotent request: fingerprint is required")
+	}
+	now = now.UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("claim idempotent request: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	record := &models.IdempotentRequestRecord{
+		Scope:       scope,
+		Fingerprint: fingerprint,
+		State:       models.RequestStatePending,
+		LockedUntil: now.Add(pendingTTL),
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO request_idempotency (scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(scope, fingerprint) DO NOTHING
+	`, record.Scope, record.Fingerprint, "", record.State, record.LockedUntil, nil, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return nil, false, fmt.Errorf("claim idempotent request: insert: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("claim idempotent request: inspect insert: %w", err)
+	}
+	if inserted > 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("claim idempotent request: commit insert: %w", err)
+		}
+		return record, true, nil
+	}
+
+	record, err = scanIdempotentRequestRecord(tx.QueryRowContext(ctx, `
+		SELECT scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at
+		FROM request_idempotency
+		WHERE scope = ? AND fingerprint = ?
+	`, scope, fingerprint))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, fmt.Errorf("claim idempotent request: missing row after insert conflict")
+		}
+		return nil, false, fmt.Errorf("claim idempotent request: query: %w", err)
+	}
+
+	if record.State == models.RequestStateReady && !record.ReplayUntil.IsZero() && record.ReplayUntil.After(now) && strings.TrimSpace(record.TargetID) != "" {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("claim idempotent request: commit ready: %w", err)
+		}
+		return record, false, nil
+	}
+	if record.State == models.RequestStatePending && record.LockedUntil.After(now) {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("claim idempotent request: commit pending: %w", err)
+		}
+		return record, false, nil
+	}
+
+	record.TargetID = ""
+	record.State = models.RequestStatePending
+	record.LockedUntil = now.Add(pendingTTL)
+	record.ReplayUntil = time.Time{}
+	record.UpdatedAt = now
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE request_idempotency
+		SET target_id = '', state = ?, locked_until = ?, replay_until = NULL, updated_at = ?
+		WHERE scope = ? AND fingerprint = ?
+	`, record.State, record.LockedUntil, record.UpdatedAt, record.Scope, record.Fingerprint); err != nil {
+		return nil, false, fmt.Errorf("claim idempotent request: refresh: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("claim idempotent request: commit refresh: %w", err)
+	}
+	return record, true, nil
+}
+
+// GetIdempotentRequest returns the row for (scope, fingerprint), or
+// ErrNotFound when no row exists.
+func (s *Store) GetIdempotentRequest(ctx context.Context, scope, fingerprint string) (*models.IdempotentRequestRecord, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at
+		FROM request_idempotency
+		WHERE scope = ? AND fingerprint = ?
+	`, strings.TrimSpace(scope), strings.TrimSpace(fingerprint))
+	record, err := scanIdempotentRequestRecord(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get idempotent request: %w", err)
+	}
+	return record, nil
+}
+
+// CompleteIdempotentRequest moves a Pending row to Ready, recording the
+// target ID the work produced and extending the lock-and-replay window
+// out to replayTTL from now. Returns ErrNotFound if no row matched —
+// indicating either a programming error or a too-aggressive cleanup that
+// removed the row mid-flight.
+func (s *Store) CompleteIdempotentRequest(ctx context.Context, scope, fingerprint, targetID string, now time.Time, replayTTL time.Duration) error {
+	now = now.UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE request_idempotency
+		SET target_id = ?, state = ?, locked_until = ?, replay_until = ?, updated_at = ?
+		WHERE scope = ? AND fingerprint = ?
+	`, strings.TrimSpace(targetID), models.RequestStateReady, now, now.Add(replayTTL), now, strings.TrimSpace(scope), strings.TrimSpace(fingerprint))
+	if err != nil {
+		return fmt.Errorf("complete idempotent request: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteIdempotentRequest drops the row outright. Used by failure paths
+// where the in-flight write rolled back and the next retry should run
+// the work again from scratch instead of waiting for LockedUntil.
+func (s *Store) DeleteIdempotentRequest(ctx context.Context, scope, fingerprint string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM request_idempotency WHERE scope = ? AND fingerprint = ?`, strings.TrimSpace(scope), strings.TrimSpace(fingerprint))
+	if err != nil {
+		return fmt.Errorf("delete idempotent request: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`,
+		strings.TrimSpace(snapshot.Name),
+		strings.TrimSpace(snapshot.Image),
+		strings.TrimSpace(snapshot.ImageID),
+		strings.TrimSpace(snapshot.SourceSandboxID),
+		snapshot.CreatedAt.UTC(),
+	)
+	if err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			return ErrSnapshotNameConflict
+		}
+		return fmt.Errorf("create snapshot: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at
+		FROM sandbox_snapshots
+		WHERE name = ?
+	`, strings.TrimSpace(name))
+	snapshot, err := scanSnapshot(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at
+		FROM sandbox_snapshots
+		ORDER BY created_at DESC, name ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.SandboxSnapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot: %w", err)
+		}
+		items = append(items, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshots: %w", err)
+	}
+	return items, nil
+}
+
+func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_snapshots WHERE name = ?`, strings.TrimSpace(name))
+	if err != nil {
+		return fmt.Errorf("delete snapshot: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -715,8 +1451,12 @@ func scanSandbox(scanner interface {
 	var networkBlocked int
 	var toolboxEnabled int
 	var commandJSON string
+	var tagsJSON string
 	var gpusJSON string
 	var stopIfIdleNs, destroyIfIdleNs, stopAtAgeNs, destroyAtAgeNs int64
+	var netQuotaExceeded int
+	var netQuotaExceededAt sql.NullTime
+	var registryAuthSealed []byte
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -736,6 +1476,8 @@ func scanSandbox(scanner interface {
 		&sandbox.SSHPublicKey,
 		&sandbox.LastError,
 		&commandJSON,
+		&sandbox.Name,
+		&tagsJSON,
 		&sandbox.CreatedAt,
 		&sandbox.UpdatedAt,
 		&sandbox.LastActiveAt,
@@ -745,11 +1487,23 @@ func scanSandbox(scanner interface {
 		&destroyAtAgeNs,
 		&sandbox.Runtime,
 		&gpusJSON,
-		&sandbox.RegistryAuthSealed,
+		&sandbox.NetworkBytesIn,
+		&sandbox.NetworkBytesOut,
+		&sandbox.NetworkBytesInLimit,
+		&sandbox.NetworkBytesOutLimit,
+		&netQuotaExceeded,
+		&netQuotaExceededAt,
+		&registryAuthSealed,
 	)
 	if err != nil {
 		return nil, err
 	}
+	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
+	if netQuotaExceededAt.Valid {
+		t := netQuotaExceededAt.Time.UTC()
+		sandbox.NetworkQuotaExceededAt = &t
+	}
+	sandbox.RegistryAuthSealed = nullableBlob(registryAuthSealed)
 
 	if envJSON != "" {
 		if err := json.Unmarshal([]byte(envJSON), &sandbox.Env); err != nil {
@@ -759,6 +1513,11 @@ func scanSandbox(scanner interface {
 	if commandJSON != "" {
 		if err := json.Unmarshal([]byte(commandJSON), &sandbox.ContainerCommand); err != nil {
 			return nil, fmt.Errorf("decode container command: %w", err)
+		}
+	}
+	if tagsJSON != "" {
+		if err := json.Unmarshal([]byte(tagsJSON), &sandbox.Tags); err != nil {
+			return nil, fmt.Errorf("decode sandbox tags: %w", err)
 		}
 	}
 	if gpusJSON != "" {
@@ -779,6 +1538,98 @@ func scanSandbox(scanner interface {
 	}
 
 	return &sandbox, nil
+}
+
+func scanCompatState(scanner interface {
+	Scan(dest ...any) error
+}) (*models.SandboxCompatState, error) {
+	var state models.SandboxCompatState
+	err := scanner.Scan(
+		&state.SandboxID,
+		&state.Facade,
+		&state.StateJSON,
+		&state.CreatedAt,
+		&state.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	state.CreatedAt = state.CreatedAt.UTC()
+	state.UpdatedAt = state.UpdatedAt.UTC()
+	return &state, nil
+}
+
+func scanSnapshotAlias(scanner interface {
+	Scan(dest ...any) error
+}) (*models.SnapshotAlias, error) {
+	var alias models.SnapshotAlias
+	var extraNamesJSON string
+	err := scanner.Scan(
+		&alias.Alias,
+		&alias.SnapshotName,
+		&alias.Facade,
+		&extraNamesJSON,
+		&alias.CreatedAt,
+		&alias.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if extraNamesJSON != "" {
+		if err := json.Unmarshal([]byte(extraNamesJSON), &alias.ExtraNames); err != nil {
+			return nil, fmt.Errorf("decode snapshot alias extra names: %w", err)
+		}
+	}
+	if alias.ExtraNames == nil {
+		alias.ExtraNames = []string{}
+	}
+	alias.CreatedAt = alias.CreatedAt.UTC()
+	alias.UpdatedAt = alias.UpdatedAt.UTC()
+	return &alias, nil
+}
+
+func scanIdempotentRequestRecord(scanner interface {
+	Scan(dest ...any) error
+}) (*models.IdempotentRequestRecord, error) {
+	var record models.IdempotentRequestRecord
+	var replayUntil sql.NullTime
+	err := scanner.Scan(
+		&record.Scope,
+		&record.Fingerprint,
+		&record.TargetID,
+		&record.State,
+		&record.LockedUntil,
+		&replayUntil,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if replayUntil.Valid {
+		record.ReplayUntil = replayUntil.Time.UTC()
+	}
+	record.LockedUntil = record.LockedUntil.UTC()
+	record.CreatedAt = record.CreatedAt.UTC()
+	record.UpdatedAt = record.UpdatedAt.UTC()
+	return &record, nil
+}
+
+func scanSnapshot(scanner interface {
+	Scan(dest ...any) error
+}) (*models.SandboxSnapshot, error) {
+	var snapshot models.SandboxSnapshot
+	err := scanner.Scan(
+		&snapshot.Name,
+		&snapshot.Image,
+		&snapshot.ImageID,
+		&snapshot.SourceSandboxID,
+		&snapshot.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
 }
 
 func marshalJSON(value any, fallback string) (string, error) {
@@ -805,6 +1656,17 @@ func marshalGPUs(g *models.GPURequest) (string, error) {
 	return string(encoded), nil
 }
 
+// nullableTime maps a *time.Time to a sql.NullTime so a nil pointer becomes
+// NULL on disk. Used by columns where "absent" is a meaningful state distinct
+// from the zero time (e.g. net_quota_exceeded_at — sandboxes under quota
+// have NULL, not 0001-01-01).
+func nullableTime(t *time.Time) sql.NullTime {
+	if t == nil || t.IsZero() {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: t.UTC(), Valid: true}
+}
+
 func boolToInt(value bool) int {
 	if value {
 		return 1
@@ -812,7 +1674,30 @@ func boolToInt(value bool) int {
 	return 0
 }
 
+func isSQLiteUniqueConstraint(err error) bool {
+	var sqliteErr sqlite3.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code == sqlite3.ErrConstraint && (sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique || sqliteErr.ExtendedCode == sqlite3.ErrConstraintPrimaryKey)
+}
+
+func isSandboxNameConflict(err error, name string) bool {
+	if strings.Contains(err.Error(), ErrSandboxNameConflict.Error()) {
+		return true
+	}
+	return strings.TrimSpace(name) != "" && isSQLiteUniqueConstraint(err)
+}
+
 var ErrNotFound = errors.New("sandbox not found")
+
+// ErrSandboxNameConflict is returned by Create/Upsert when the sandbox's
+// name collides with an existing row's name or id. Names are unique across
+// the sandboxes table; empty names skip the name uniqueness check but ids
+// still cannot collide with existing non-empty names.
+var ErrSandboxNameConflict = errors.New("sandbox name already in use")
+
+var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
 
 // PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
 // to the store layer; encryption / decryption happens in the service layer.

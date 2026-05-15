@@ -1,6 +1,6 @@
 {
   "name": "@aerol-ai/aerolvm-sdk",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": false,
   "type": "module",
   "main": "./dist/index.js",
@@ -18,7 +18,7 @@
     "example:create:src": "npx tsx src/examples/createSandbox.ts",
     "example:delete": "npm run build && node dist/examples/deleteSandbox.js",
     "example:delete:src": "npx tsx src/examples/deleteSandbox.ts",
-    "test": "tsc -p tsconfig.test.json --outDir dist-test && node --test dist-test/*.test.js"
+    "test": "tsc -p tsconfig.test.json --outDir dist-test && node --test dist-test/*.test.js dist-test/internal/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^25.6.2",

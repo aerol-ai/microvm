@@ -36,11 +36,174 @@ import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 import ai.aerol.microvm.model.MountSpecRedacted;
+import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.SandboxData;
+import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
+import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 
 class MicroVMClientTest {
+    @Test
+    void createWithImageBuildsThenCreatesSandbox() throws Exception {
+        AtomicReference<Map<String, Object>> buildPayload = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> createPayload = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("POST".equals(method) && "/v1/images/build".equals(path)) {
+                buildPayload.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("image", "aerolvm-build/abc123:latest"));
+                return;
+            }
+            if ("POST".equals(method) && "/v1/sandboxes".equals(path)) {
+                createPayload.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "id", "sb-from-image",
+                    "image", "aerolvm-build/abc123:latest",
+                    "status", "started",
+                    "public_url", "https://sb-from-image.example.com",
+                    "cpu", 2,
+                    "memory_mb", 2048,
+                    "disk_gb", 20,
+                    "os_user", "root",
+                    "network_block_all", false,
+                    "toolbox_enabled", true,
+                    "exposed_ports", List.of(),
+                    "created_at", "2026-05-07T10:00:00Z",
+                    "updated_at", "2026-05-07T10:00:00Z",
+                    "last_active_at", "2026-05-07T10:00:00Z"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = client.createWithImage(
+                Image.base("ubuntu:22.04").runCommands("apt-get update", "apt-get install -y curl"),
+                new CreateOptions()
+            );
+
+            assertEquals(
+                mapOf("dockerfile_content", "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n"),
+                buildPayload.get()
+            );
+            assertEquals("aerolvm-build/abc123:latest", createPayload.get().get("image"));
+            assertEquals("sb-from-image", sandbox.id);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void buildImageMaps404ToActionableError() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            writeResponse(exchange, 404, "text/plain", "404 page not found\n".getBytes(StandardCharsets.UTF_8));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException error = assertThrows(MicroVMException.class, () -> client.buildImage(Image.base("alpine")));
+            assertTrue(error.getMessage().contains("does not support Image builds"));
+            assertTrue(error.getMessage().contains("string image reference"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void buildImageWithPushForwardsPushOptionsAndReturnsPushedRef() throws Exception {
+        AtomicReference<Map<String, Object>> seenBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("POST".equals(method) && "/v1/images/build".equals(path)) {
+                seenBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "image", "aerolvm-build/abc123:latest",
+                    "pushed", "ghcr.io/x/y:v1"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            ai.aerol.microvm.model.BuildImageResult result = client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setRegistry("ghcr.io/x/y")
+                        .setTag("v1")
+                        .setServer("ghcr.io")
+                        .setUsername("u")
+                        .setPassword("p")
+                )
+            );
+
+            assertEquals("aerolvm-build/abc123:latest", result.image);
+            assertEquals("ghcr.io/x/y:v1", result.pushed);
+
+            Map<String, Object> body = seenBody.get();
+            assertEquals("FROM alpine\n", body.get("dockerfile_content"));
+            Map<?, ?> push = (Map<?, ?>) body.get("push");
+            assertNotNull(push);
+            assertEquals("ghcr.io/x/y", push.get("registry"));
+            assertEquals("v1", push.get("tag"));
+            assertEquals("ghcr.io", push.get("server"));
+            assertEquals("u", push.get("username"));
+            assertEquals("p", push.get("password"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void buildImageWithPushRejectsMissingCredentialsClientSide() throws Exception {
+        // No HTTP server: validation must throw before any wire call. If a
+        // request leaks out, the HttpClient will fail with a connect error
+        // and the test will surface that instead of the expected message.
+        HttpServer server = startServer(exchange -> {
+            throw new AssertionError("must not call daemon: " + exchange.getRequestURI());
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+
+            MicroVMException missingRegistry = assertThrows(MicroVMException.class, () -> client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setUsername("u").setPassword("p")
+                )
+            ));
+            assertTrue(missingRegistry.getMessage().contains("registry"));
+
+            MicroVMException missingUser = assertThrows(MicroVMException.class, () -> client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setRegistry("ghcr.io/x/y").setPassword("p")
+                )
+            ));
+            assertTrue(missingUser.getMessage().contains("username"));
+
+            MicroVMException missingPass = assertThrows(MicroVMException.class, () -> client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setRegistry("ghcr.io/x/y").setUsername("u")
+                )
+            ));
+            assertTrue(missingPass.getMessage().contains("password"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void newClientUsesEnvironmentConfig() throws Exception {
         AtomicReference<String> authorization = new AtomicReference<>();
@@ -131,6 +294,43 @@ class MicroVMClientTest {
             Map<String, Object> lifecycle = castMap(payload.get("lifecycle"));
             assertEquals(3_600_000_000_000L, ((Number) lifecycle.get("stop_if_idle_for")).longValue());
             assertEquals(86_400_000_000_000L, ((Number) lifecycle.get("destroy_at_age")).longValue());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createSnapshotMapsRequestAndResponseShapes() throws Exception {
+        List<Map<String, Object>> requestBodies = new ArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod());
+            assertEquals("/v1/sandboxes/sb-1/snapshot", exchange.getRequestURI().getPath());
+            Map<String, Object> request = castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class));
+            requestBodies.add(request);
+            String name = String.valueOf(request.get("name"));
+            writeJson(exchange, 200, mapOf(
+                "name", name,
+                "image", name,
+                "image_id", "sha256:snap-1",
+                "source_sandbox_id", "sb-1",
+                "created_at", "2026-05-14T10:00:00Z"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            SandboxSnapshot snapshot = client.createSnapshot("sb-1", "snapshots/demo:v1");
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+            SandboxSnapshot sandboxSnapshot = sandbox.createSnapshot("snapshots/from-sandbox:v1");
+
+            assertEquals(2, requestBodies.size());
+            assertEquals("snapshots/demo:v1", requestBodies.get(0).get("name"));
+            assertEquals("snapshots/from-sandbox:v1", requestBodies.get(1).get("name"));
+            assertEquals("snapshots/demo:v1", snapshot.name);
+            assertEquals("sha256:snap-1", snapshot.imageId);
+            assertEquals("sb-1", snapshot.sourceSandboxId);
+            assertEquals("snapshots/from-sandbox:v1", sandboxSnapshot.name);
         } finally {
             server.stop(0);
         }
@@ -263,6 +463,62 @@ class MicroVMClientTest {
             assertEquals(99, session.bytes);
             assertArrayEquals("session log".getBytes(StandardCharsets.UTF_8), log);
             assertArrayEquals("{\"version\":2}".getBytes(StandardCharsets.UTF_8), recording);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void networkUsageAndLimitsMapApiShapes() throws Exception {
+        AtomicReference<Map<String, Object>> patchBody = new AtomicReference<>();
+        AtomicReference<String> patchMethod = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("GET".equals(method) && "/v1/sandboxes/sb-1/network/usage".equals(path)) {
+                writeJson(exchange, 200, mapOf(
+                    "sandbox_id", "sb-1",
+                    "bytes_in", 1024,
+                    "bytes_out", 2048,
+                    "bytes_in_limit", 1048576,
+                    "bytes_out_limit", 0,
+                    "quota_exceeded", false,
+                    "last_sampled_at", "2026-05-15T10:00:00Z"
+                ));
+                return;
+            }
+            if ("PATCH".equals(method) && "/v1/sandboxes/sb-1/network/limits".equals(path)) {
+                patchMethod.set(method);
+                patchBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "sandbox_id", "sb-1",
+                    "bytes_in", 0,
+                    "bytes_out", 0,
+                    "bytes_in_limit", 4096,
+                    "bytes_out_limit", 0,
+                    "quota_exceeded", false,
+                    "last_sampled_at", "2026-05-15T10:00:00Z"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            NetworkUsage usage = client.getNetworkUsage("sb-1");
+            assertEquals("sb-1", usage.sandboxId);
+            assertEquals(1024, usage.bytesIn);
+            assertEquals(0, usage.bytesOutLimit);
+
+            NetworkUsage updated = client.setNetworkLimits(
+                "sb-1",
+                new SetNetworkLimitsOptions().setNetworkBytesInLimit(4096L)
+            );
+            assertEquals(4096, updated.bytesInLimit);
+            assertEquals("PATCH", patchMethod.get());
+            assertEquals(4096, ((Number) patchBody.get().get("network_bytes_in_limit")).longValue());
+            assertEquals(1, patchBody.get().size(), "unset fields should not be serialized");
         } finally {
             server.stop(0);
         }

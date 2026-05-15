@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from microvm import Image
 from microvm import client as client_module
 from microvm.client import MicroVM
 
@@ -13,6 +14,8 @@ class RecordingMicroVM(MicroVM):
 
     def _do_json(self, method, path, payload):  # type: ignore[override]
         self.calls.append((method, path, payload))
+        if method == "POST" and path == "/v1/images/build":
+            return {"image": "aerolvm-build/abc123:latest"}
         if method == "POST" and path == "/v1/sandboxes":
             return {
                 "id": "sb-1",
@@ -51,6 +54,35 @@ class RecordingMicroVM(MicroVM):
                 "updated_at": "2026-05-07T11:00:00Z",
                 "last_active_at": "2026-05-07T10:30:00Z",
                 "lifecycle": payload,
+            }
+        if method == "POST" and path == "/v1/sandboxes/sb-1/snapshot":
+            return {
+                "name": payload.get("name", "snapshots/default:v1"),
+                "image": payload.get("name", "snapshots/default:v1"),
+                "image_id": "sha256:snap-1",
+                "source_sandbox_id": "sb-1",
+                "created_at": "2026-05-14T10:00:00Z",
+            }
+        if method == "GET" and path == "/v1/sandboxes/sb-1/network/usage":
+            return {
+                "sandbox_id": "sb-1",
+                "bytes_in": 1024,
+                "bytes_out": 2048,
+                "bytes_in_limit": 1048576,
+                "bytes_out_limit": 0,
+                "quota_exceeded": False,
+                "last_sampled_at": "2026-05-15T10:00:00Z",
+            }
+        if method == "PATCH" and path == "/v1/sandboxes/sb-1/network/limits":
+            return {
+                "sandbox_id": "sb-1",
+                "bytes_in": 1024,
+                "bytes_out": 2048,
+                "bytes_in_limit": payload.get("network_bytes_in_limit", 0) if payload else 0,
+                "bytes_out_limit": payload.get("network_bytes_out_limit", 0) if payload else 0,
+                "quota_exceeded": False,
+                "quota_exceeded_at": "2026-05-15T09:00:00Z",
+                "last_sampled_at": "2026-05-15T10:00:00Z",
             }
         if method == "GET" and path == "/v1/sandboxes/sb-1/mounts":
             return {
@@ -182,6 +214,103 @@ class FakeWebSocketModule:
 
 
 class ClientTests(unittest.TestCase):
+    def test_create_with_image_builds_before_create(self):
+        client = RecordingMicroVM()
+
+        sandbox = client.create(
+            {
+                "image": Image.base("ubuntu:22.04").run_commands("apt-get update", "apt-get install -y curl"),
+            }
+        )
+
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/images/build",
+                {
+                    "dockerfile_content": "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n",
+                },
+            ),
+        )
+        self.assertEqual(client.calls[1][0], "POST")
+        self.assertEqual(client.calls[1][1], "/v1/sandboxes")
+        self.assertEqual(client.calls[1][2]["image"], "aerolvm-build/abc123:latest")
+        self.assertEqual(sandbox.id, "sb-1")
+
+    def test_build_image_with_push_forwards_push_options(self):
+        class PushRecordingMicroVM(RecordingMicroVM):
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                self.calls.append((method, path, payload))
+                if method == "POST" and path == "/v1/images/build":
+                    return {
+                        "image": "aerolvm-build/abc123:latest",
+                        "pushed": "ghcr.io/x/y:v1",
+                    }
+                return super()._do_json(method, path, payload)
+
+        client = PushRecordingMicroVM()
+        result = client.build_image_with_push(
+            Image.base("alpine"),
+            push={
+                "registry": "ghcr.io/x/y",
+                "tag": "v1",
+                "server": "ghcr.io",
+                "username": "u",
+                "password": "p",
+            },
+        )
+
+        self.assertEqual(result.image, "aerolvm-build/abc123:latest")
+        self.assertEqual(result.pushed, "ghcr.io/x/y:v1")
+        self.assertEqual(
+            client.calls[-1],
+            (
+                "POST",
+                "/v1/images/build",
+                {
+                    "dockerfile_content": "FROM alpine\n",
+                    "push": {
+                        "registry": "ghcr.io/x/y",
+                        "username": "u",
+                        "password": "p",
+                        "tag": "v1",
+                        "server": "ghcr.io",
+                    },
+                },
+            ),
+        )
+
+    def test_build_image_with_push_rejects_missing_credentials(self):
+        client = RecordingMicroVM()
+        with self.assertRaisesRegex(ValueError, "push.registry is required"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"username": "u", "password": "p"},
+            )
+        with self.assertRaisesRegex(ValueError, r"push\.username and push\.password"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"registry": "ghcr.io/x/y", "password": "p"},
+            )
+        with self.assertRaisesRegex(ValueError, r"push\.username and push\.password"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"registry": "ghcr.io/x/y", "username": "u"},
+            )
+
+    def test_build_image_maps_404_to_actionable_error(self):
+        class NotFoundBuildMicroVM(RecordingMicroVM):
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                if method == "POST" and path == "/v1/images/build":
+                    raise client_module.MicroVMHTTPError(404, "Not Found")
+                return super()._do_json(method, path, payload)
+
+        client = NotFoundBuildMicroVM()
+
+        with self.assertRaisesRegex(client_module.MicroVMError, "does not support Image builds"):
+            client.build_image(Image.base("alpine"))
+
     def test_create_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         sandbox = client.create(
@@ -304,6 +433,24 @@ class ClientTests(unittest.TestCase):
             },
         )
 
+    def test_create_snapshot_maps_request_and_response_shapes(self):
+        client = RecordingMicroVM()
+        snapshot = client.create_snapshot("sb-1", "snapshots/demo:v1")
+        sandbox = client.create({"image": "ubuntu:22.04"})
+        sandbox_snapshot = sandbox.create_snapshot("snapshots/from-sandbox:v1")
+
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/sandboxes/sb-1/snapshot",
+                {"name": "snapshots/demo:v1"},
+            ),
+        )
+        self.assertEqual(snapshot["imageID"], "sha256:snap-1")
+        self.assertEqual(snapshot["sourceSandboxID"], "sb-1")
+        self.assertEqual(sandbox_snapshot["name"], "snapshots/from-sandbox:v1")
+
     def test_exec_and_health_map_api_shapes(self):
         client = RecordingMicroVM()
 
@@ -342,6 +489,65 @@ class ClientTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_create_with_network_byte_limits_maps_snake_case_fields(self):
+        client = RecordingMicroVM()
+        client.create(
+            {
+                "image": "ubuntu:22.04",
+                "networkBytesInLimit": 1048576,
+                "networkBytesOutLimit": 524288,
+            }
+        )
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/sandboxes",
+                {
+                    "image": "ubuntu:22.04",
+                    "network_bytes_in_limit": 1048576,
+                    "network_bytes_out_limit": 524288,
+                    "mounts": [],
+                },
+            ),
+        )
+
+    def test_get_network_usage_maps_response_shape(self):
+        client = RecordingMicroVM()
+
+        usage = client.get_network_usage("sb-1")
+
+        self.assertEqual(client.calls[0], ("GET", "/v1/sandboxes/sb-1/network/usage", None))
+        self.assertEqual(
+            usage,
+            {
+                "sandboxID": "sb-1",
+                "bytesIn": 1024,
+                "bytesOut": 2048,
+                "bytesInLimit": 1048576,
+                "bytesOutLimit": 0,
+                "quotaExceeded": False,
+                "lastSampledAt": "2026-05-15T10:00:00Z",
+            },
+        )
+
+    def test_set_network_limits_sends_patch_and_returns_usage(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        usage = sandbox.set_network_limits({"networkBytesInLimit": 2097152})
+
+        self.assertEqual(
+            client.calls[1],
+            (
+                "PATCH",
+                "/v1/sandboxes/sb-1/network/limits",
+                {"network_bytes_in_limit": 2097152},
+            ),
+        )
+        self.assertEqual(usage["bytesInLimit"], 2097152)
+        self.assertEqual(usage["quotaExceededAt"], "2026-05-15T09:00:00Z")
 
     def test_exec_stream_sends_handshake_and_control_frames(self):
         stdout_chunks = []

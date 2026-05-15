@@ -98,11 +98,16 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 // ClearNetworkRules releases any per-IP network rules previously attached to a
 // sandbox. Used by the event-driven path when a container exits or is destroyed
 // out-of-band, since Destroy() handles this for us during normal teardown.
+// Clears both egress (NetworkBlockAll / quota egress) and ingress (quota
+// ingress) rules — once the IP is gone there is nothing left to firewall on.
 func (c *Client) ClearNetworkRules(containerIP string) error {
 	if containerIP == "" {
 		return nil
 	}
-	return c.networkRules.ClearBlockAllEgress(containerIP)
+	if err := c.networkRules.ClearBlockAllEgress(containerIP); err != nil {
+		return err
+	}
+	return c.networkRules.ClearBlockAllIngress(containerIP)
 }
 
 // ApplyNetworkBlockAll installs the per-IP egress DROP rule. Idempotent —
@@ -115,6 +120,52 @@ func (c *Client) ApplyNetworkBlockAll(containerIP string) error {
 		return nil
 	}
 	return c.networkRules.BlockAllEgress(containerIP)
+}
+
+// ContainerPID returns the host PID of a running container's init process.
+// The PID is the entry point into the container's network namespace —
+// /proc/<pid>/net/dev is per-netns, so the netstats poller reads byte
+// counters straight from there with no nsenter / veth-iflink dance. Returns
+// 0 when the container is not running (Docker reports Pid:0 in that case).
+func (c *Client) ContainerPID(ctx context.Context, containerRef string) (int, error) {
+	inspect, err := c.inspectContainer(ctx, containerRef)
+	if err != nil {
+		return 0, err
+	}
+	if inspect.State == nil {
+		return 0, nil
+	}
+	return inspect.State.Pid, nil
+}
+
+// ApplyNetworkBlockIngress installs the per-IP ingress DROP rule used by the
+// network-quota enforcer when net_bytes_in_limit is crossed. Idempotent.
+func (c *Client) ApplyNetworkBlockIngress(containerIP string) error {
+	if containerIP == "" {
+		return nil
+	}
+	return c.networkRules.BlockAllIngress(containerIP)
+}
+
+// ClearNetworkBlockIngress removes the per-IP ingress DROP rule. Service layer
+// only calls this when the inbound limit is raised above current usage.
+func (c *Client) ClearNetworkBlockIngress(containerIP string) error {
+	if containerIP == "" {
+		return nil
+	}
+	return c.networkRules.ClearBlockAllIngress(containerIP)
+}
+
+// ClearNetworkBlockEgress removes the per-IP egress DROP rule. Symmetric to
+// ApplyNetworkBlockAll. The underlying rule is shared with NetworkBlockAll, so
+// the service must consult sandbox.NetworkBlockAll before invoking this on a
+// quota-clear path — otherwise it would silently undo the operator's egress
+// block.
+func (c *Client) ClearNetworkBlockEgress(containerIP string) error {
+	if containerIP == "" {
+		return nil
+	}
+	return c.networkRules.ClearBlockAllEgress(containerIP)
 }
 
 func (c *Client) Ping(ctx context.Context) error {
@@ -182,13 +233,24 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
-	if err := c.pullImage(ctx, req.Image, req.Registry); err != nil {
-		return nil, err
-	}
-
+	// Locally-built images (BuildImage tags them with content-addressed
+	// names that don't exist on any registry) must skip the pull, otherwise
+	// the daemon would 401/404 trying to fetch them from Docker Hub. We
+	// can't decide that purely from the name though — a real registry image
+	// could legitimately use a name in BuiltImageNamespace. Inspect first;
+	// if the image is already local, the pull is unnecessary regardless of
+	// where it came from. If the inspect fails (image missing) we fall
+	// through to a normal pull attempt and let that surface the registry
+	// error.
 	imageInspect, err := c.inspectImage(ctx, req.Image)
 	if err != nil {
-		return nil, fmt.Errorf("inspect image: %w", err)
+		if pullErr := c.pullImage(ctx, req.Image, req.Registry); pullErr != nil {
+			return nil, pullErr
+		}
+		imageInspect, err = c.inspectImage(ctx, req.Image)
+		if err != nil {
+			return nil, fmt.Errorf("inspect image: %w", err)
+		}
 	}
 
 	workingDir := strings.TrimSpace(imageInspect.Config.WorkingDir)
@@ -375,7 +437,9 @@ func (c *Client) Stop(ctx context.Context, containerRef string) error {
 
 func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox != nil {
-		_ = c.networkRules.ClearBlockAllEgress(sandbox.ContainerIP)
+		// Clear both directions: a stale ingress DROP would re-attach to whoever
+		// next gets this IP from Docker's IPAM pool.
+		_ = c.ClearNetworkRules(sandbox.ContainerIP)
 	}
 	if sandbox == nil {
 		return nil
@@ -385,6 +449,27 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return errors.New("sandbox container ID is not available")
 	}
 	return c.removeContainer(ctx, containerRef, true)
+}
+
+func (c *Client) CreateSnapshot(ctx context.Context, containerRef, imageRef string) (string, error) {
+	repo, tag, err := splitSnapshotImageRef(imageRef)
+	if err != nil {
+		return "", err
+	}
+	query := url.Values{}
+	query.Set("container", strings.TrimSpace(containerRef))
+	query.Set("repo", repo)
+	if tag != "" {
+		query.Set("tag", tag)
+	}
+
+	var response struct {
+		ID string `json:"Id"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, "/commit", query, nil, nil, &response); err != nil {
+		return "", fmt.Errorf("commit snapshot: %w", err)
+	}
+	return strings.TrimSpace(response.ID), nil
 }
 
 func (c *Client) Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error {
@@ -710,6 +795,13 @@ type imageInspect struct {
 		Entrypoint []string `json:"Entrypoint"`
 		Cmd        []string `json:"Cmd"`
 	} `json:"Config"`
+	Metadata struct {
+		// LastTagTime is updated by the daemon every time the image is
+		// (re)tagged. We use it as the "freshness" signal for built-image GC
+		// because a content-cache-hit build returns an image whose Created
+		// timestamp may be days old — but the tag was just written.
+		LastTagTime time.Time `json:"LastTagTime"`
+	} `json:"Metadata"`
 }
 
 type containerInspect struct {
@@ -718,6 +810,7 @@ type containerInspect struct {
 	State *struct {
 		Running bool   `json:"Running"`
 		Status  string `json:"Status"`
+		Pid     int    `json:"Pid"`
 	} `json:"State"`
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -729,6 +822,27 @@ type containerInspect struct {
 type containerSummary struct {
 	ID     string            `json:"Id"`
 	Labels map[string]string `json:"Labels"`
+}
+
+func splitSnapshotImageRef(imageRef string) (repo, tag string, err error) {
+	trimmed := strings.TrimSpace(imageRef)
+	if trimmed == "" {
+		return "", "", errors.New("snapshot name is required")
+	}
+	if strings.Contains(trimmed, "@") {
+		return "", "", errors.New("snapshot name must not include a digest")
+	}
+	lastSlash := strings.LastIndex(trimmed, "/")
+	lastColon := strings.LastIndex(trimmed, ":")
+	if lastColon > lastSlash {
+		repo = trimmed[:lastColon]
+		tag = trimmed[lastColon+1:]
+		if strings.TrimSpace(repo) == "" || strings.TrimSpace(tag) == "" {
+			return "", "", errors.New("snapshot name must be a valid image reference")
+		}
+		return repo, tag, nil
+	}
+	return trimmed, "", nil
 }
 
 func queryValues(values map[string]string) url.Values {

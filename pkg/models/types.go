@@ -246,6 +246,16 @@ type CreateSandboxRequest struct {
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Mounts           []MountSpec       `json:"mounts,omitempty"`
 	Lifecycle        *Lifecycle        `json:"lifecycle,omitempty"`
+	// Name is an optional human-readable identifier. When set, it must be
+	// unique across all sandboxes — the store enforces this with a partial
+	// unique index. Empty means no name; the sandbox can only be referenced
+	// by ID. The Daytona facade requires names; the native /v1 API and other
+	// facades may set or omit it.
+	Name string `json:"name,omitempty"`
+	// Tags is an optional free-form key/value map associated with the
+	// sandbox. Used by facades that expose label-style metadata (Daytona
+	// labels, E2B metadata).
+	Tags map[string]string `json:"tags,omitempty"`
 	// Runtime selects the container runtime for this sandbox. Empty falls back
 	// to the host default (SB_CONTAINER_RUNTIME). Allowed values: "docker"
 	// (standard runc-backed Docker runtime, default), "gvisor" (runsc-backed
@@ -256,6 +266,16 @@ type CreateSandboxRequest struct {
 	// is not supported with the gVisor runtime — the API returns an error if
 	// both GPUs and runtime="gvisor" are set.
 	GPUs *GPURequest `json:"gpus,omitempty"`
+	// NetworkBytesInLimit caps lifetime ingress bytes for the sandbox. Zero
+	// means unlimited. When the cumulative counter crosses the limit, the
+	// reconcile loop installs an ingress DROP rule. The "we already paid for
+	// the bytes you see in the meter" caveat applies — host-side ingress is
+	// counted after the NIC has accepted the packet.
+	NetworkBytesInLimit int64 `json:"network_bytes_in_limit,omitempty"`
+	// NetworkBytesOutLimit caps lifetime egress bytes. Zero means unlimited.
+	// Crossing the limit installs an egress DROP rule via the same primitive
+	// NetworkBlockAll uses.
+	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
 }
 
 type ResizeSandboxRequest struct {
@@ -287,6 +307,14 @@ type Sandbox struct {
 	LastError        string            `json:"last_error,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle         `json:"lifecycle"`
+	// Name is the optional unique identifier set at create time. Empty when
+	// the sandbox was created without one (the common path on /v1 today).
+	Name string `json:"name,omitempty"`
+	// Tags is the optional key/value bag set at create time. Facades use it
+	// for label-style metadata (Daytona labels, E2B metadata) but the field
+	// is facade-agnostic — anything that wants attribute-tagged sandboxes
+	// can write here.
+	Tags map[string]string `json:"tags,omitempty"`
 	// Runtime is the container runtime this sandbox uses (one of "docker",
 	// "gvisor", or "kata"). Pre-migration rows carry "" and resolve to the
 	// host default at start time; new sandboxes always store the resolved
@@ -301,6 +329,48 @@ type Sandbox struct {
 	// the credentials back to the new owner's docker pull. Never serialized
 	// over the API — it is internal store ↔ service plumbing.
 	RegistryAuthSealed []byte `json:"-"`
+	// NetworkBytesIn / NetworkBytesOut are cumulative byte counters
+	// maintained by the netstats poller. They survive container restarts —
+	// a new veth resets in-memory baseline math but the persisted total is
+	// preserved.
+	NetworkBytesIn  int64 `json:"network_bytes_in"`
+	NetworkBytesOut int64 `json:"network_bytes_out"`
+	// NetworkBytesInLimit / NetworkBytesOutLimit are the caps the sandbox was
+	// created or patched with. Zero = unlimited.
+	NetworkBytesInLimit  int64 `json:"network_bytes_in_limit"`
+	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit"`
+	// NetworkQuotaExceeded reflects whether either lifetime byte counter has
+	// crossed its limit. The reconcile loop installs DROP rules when this is
+	// true; clearing requires raising the limit (or zeroing it for unlimited).
+	NetworkQuotaExceeded bool `json:"network_quota_exceeded"`
+	// NetworkQuotaExceededAt is the wall-clock time the limit was first
+	// observed crossed. Nil while under quota.
+	NetworkQuotaExceededAt *time.Time `json:"network_quota_exceeded_at,omitempty"`
+}
+
+// NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.
+// BytesInLimit / BytesOutLimit zero means unlimited.
+type NetworkUsage struct {
+	SandboxID       string     `json:"sandbox_id"`
+	BytesIn         int64      `json:"bytes_in"`
+	BytesOut        int64      `json:"bytes_out"`
+	BytesInLimit    int64      `json:"bytes_in_limit"`
+	BytesOutLimit   int64      `json:"bytes_out_limit"`
+	QuotaExceeded   bool       `json:"quota_exceeded"`
+	QuotaExceededAt *time.Time `json:"quota_exceeded_at,omitempty"`
+	// LastSampledAt is omitted until the netstats poller has produced at
+	// least one sample. Pointer + omitempty so we don't serialize the zero
+	// time as "0001-01-01T00:00:00Z" before the first tick.
+	LastSampledAt *time.Time `json:"last_sampled_at,omitempty"`
+}
+
+// UpdateNetworkLimitsRequest is the body for PATCH /v1/sandboxes/{id}/network/limits.
+// Each field is a pointer so the handler can distinguish "leave alone" (nil)
+// from "set to unlimited" (pointer to zero). Negative values are rejected at
+// the service layer.
+type UpdateNetworkLimitsRequest struct {
+	NetworkBytesInLimit  *int64 `json:"network_bytes_in_limit,omitempty"`
+	NetworkBytesOutLimit *int64 `json:"network_bytes_out_limit,omitempty"`
 }
 
 // CreateSandboxResponse is what the API returns from POST /v1/sandboxes.
@@ -311,6 +381,24 @@ type Sandbox struct {
 type CreateSandboxResponse struct {
 	Sandbox
 	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
+}
+
+// CreateSandboxSnapshotRequest creates a reusable local image snapshot from an
+// existing sandbox container. Name is the image reference callers can later
+// pass back into CreateSandboxRequest.Image.
+type CreateSandboxSnapshotRequest struct {
+	Name string `json:"name"`
+}
+
+// SandboxSnapshot is the persisted metadata for a committed sandbox image.
+// Image is the reusable image reference; ImageID is the content-addressed
+// Docker image ID returned by the runtime after the commit succeeds.
+type SandboxSnapshot struct {
+	Name            string    `json:"name"`
+	Image           string    `json:"image"`
+	ImageID         string    `json:"image_id,omitempty"`
+	SourceSandboxID string    `json:"source_sandbox_id"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // ExposePortRequest is the optional JSON body for POST /v1/sandboxes/{id}/ports/{port}.
@@ -333,13 +421,13 @@ type ExposePortResponse struct {
 }
 
 type ExposedPort struct {
-	SandboxID string    `json:"sandbox_id"`
-	Port      int       `json:"port"`
+	SandboxID string `json:"sandbox_id"`
+	Port      int    `json:"port"`
 	// Protocol is one of "http" (default — Caddy HTTP reverse proxy), "tcp"
 	// (caddy-l4 listener bound to HostPort, raw TCP forward to the container),
 	// or "tls" (caddy-l4 SNI route on the shared TLS listener). Pre-migration
 	// rows carry "http" via the column default.
-	Protocol  string    `json:"protocol"`
+	Protocol string `json:"protocol"`
 	// HostPort is the parent-host TCP listener allocated for protocol="tcp"
 	// from the configured pool (default [22000, 23000]). Zero for http/tls
 	// modes, which don't reserve a per-exposure host port.
@@ -397,4 +485,62 @@ type ExecResult struct {
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+// Facade names used by sandbox_compat_state, snapshot_aliases, and
+// request_idempotency. The string is the only thing persisted, so renaming
+// a facade later would require a one-shot UPDATE.
+const (
+	FacadeDaytona = "daytona"
+	FacadeE2B     = "e2b"
+)
+
+// SandboxCompatState carries facade-private state that has no native
+// meaning on its own — opaque wire-shape sugar like Daytona's `target` or
+// E2B's `template_id`. The store treats StateJSON as a byte string;
+// facades own the schema inside it.
+type SandboxCompatState struct {
+	SandboxID string
+	Facade    string
+	StateJSON string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// SnapshotAlias maps a facade-shaped alternate identifier (e.g. E2B's
+// base64-encoded `snapshot_*` token) onto a native sandbox_snapshots.name.
+// ExtraNames carries additional facade-visible names that point at the
+// same native snapshot.
+type SnapshotAlias struct {
+	Alias        string
+	SnapshotName string
+	Facade       string
+	ExtraNames   []string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// Idempotent-request states for request_idempotency.state. Pending means
+// a write is in flight and holds the row's lock; Ready means the write
+// completed and retries within ReplayUntil should replay TargetID instead
+// of running again.
+const (
+	RequestStatePending = "pending"
+	RequestStateReady   = "ready"
+)
+
+// IdempotentRequestRecord is the row shape for request_idempotency. Scope
+// is a facade-defined namespace string (e.g. "e2b.create") so the same
+// fingerprint hash can be reused across facades without collision. The
+// generic store helpers stay facade-agnostic — only the scope string says
+// which caller owns the row.
+type IdempotentRequestRecord struct {
+	Scope       string
+	Fingerprint string
+	TargetID    string
+	State       string
+	LockedUntil time.Time
+	ReplayUntil time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }

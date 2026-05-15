@@ -1,8 +1,11 @@
 import { basename } from "node:path";
 
 import { PATH_PREFIX as V1_PATH_PREFIX } from "./api/v1/paths.js";
+import { Image } from "../Image.js";
 import type {
   BinaryLike,
+  BuildImageOptions,
+  BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
   ExecExitInfo,
@@ -18,8 +21,11 @@ import type {
   Lifecycle,
   MountSpec,
   MountSpecRedacted,
+  NetworkUsage,
+  SetNetworkLimitsOptions,
   ResizeOptions,
   Sandbox,
+  SandboxSnapshot,
   Session,
   SessionAttachHandle,
   SessionAttachOptions,
@@ -28,10 +34,18 @@ import type {
 type FetchLike = typeof fetch;
 
 /**
- * Wire version of the sandbox daemon API this client speaks. The SDK and the
- * server version independently — bumping the SDK package does not move the
- * wire version. Today only "v1" exists; "v2" will be added when a wire-level
- * breaking change is needed on the server.
+ * Wire version of the v1-style sandbox endpoints (`/v1/sandboxes`, etc.) this
+ * client speaks. The SDK and the server version independently — bumping the
+ * SDK package does not move the wire version. Today only "v1" exists; future
+ * breaking changes to the sandbox endpoints will land in a new version
+ * prefix.
+ *
+ * The `/v1/images/build` endpoint used by {@link Image}-shaped image inputs
+ * is called unconditionally when an Image is supplied to
+ * {@link APIClient.create}, regardless of `apiVersion`. Daemons older than
+ * the image-build feature return 404; the SDK turns that into a clear
+ * "daemon does not support image builds" error so the user can switch to a
+ * string image.
  */
 export type APIVersion = "v1";
 
@@ -103,6 +117,14 @@ interface ApiCreateSandboxResponse extends ApiSandbox {
   ssh_private_key?: string;
 }
 
+interface ApiSandboxSnapshot {
+  name: string;
+  image: string;
+  image_id?: string;
+  source_sandbox_id: string;
+  created_at: string;
+}
+
 interface ApiSession {
   id: string;
   name: string;
@@ -162,6 +184,17 @@ interface ApiMountList {
   mounts: ApiMountSpecRedacted[];
 }
 
+interface ApiNetworkUsage {
+  sandbox_id: string;
+  bytes_in: number;
+  bytes_out: number;
+  bytes_in_limit: number;
+  bytes_out_limit: number;
+  quota_exceeded: boolean;
+  quota_exceeded_at?: string | null;
+  last_sampled_at?: string | null;
+}
+
 export class APIClient {
   readonly baseURL: string;
   readonly apiVersion: APIVersion;
@@ -181,7 +214,7 @@ export class APIClient {
   /**
    * Build a versioned API path. Pass the suffix beginning with "/" (e.g.
    * "/sandboxes") and the active version's prefix is prepended. Use this for
-   * every versioned API call so v2 (when it lands) can be selected by the
+   * every versioned API call so a future wire version can be selected by the
    * apiVersion option without touching call sites.
    */
   private versioned(suffix: string): string {
@@ -189,8 +222,79 @@ export class APIClient {
   }
 
   async create(options: CreateOptions): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(options));
+    const resolved = await this.resolveImage(options);
+    const response = await this.doJSON<ApiCreateSandboxResponse>("POST", this.versioned("/sandboxes"), toApiCreateOptions(resolved));
     return new SandboxResource(this, fromApiCreateSandboxResponse(response));
+  }
+
+  /**
+   * Compile a fluent {@link Image} into a content-addressed image tag by
+   * POSTing its Dockerfile to `/v1/images/build`. The daemon caches by
+   * content hash, so repeated calls with the same Dockerfile are a no-op.
+   * String images are passed through unchanged.
+   *
+   * Daemons predating the image-build feature do not register the route and
+   * return 404; this method translates that into a clear error telling the
+   * caller to pass a string image instead, rather than the generic "request
+   * failed with status 404" the JSON decoder would otherwise produce.
+   */
+  async buildImage(image: Image, options?: BuildImageOptions): Promise<BuildImageResult> {
+    const body: {
+      dockerfile_content: string;
+      push?: {
+        registry: string;
+        tag?: string;
+        server?: string;
+        username: string;
+        password: string;
+      };
+    } = { dockerfile_content: image.dockerfile };
+    if (options?.push) {
+      const p = options.push;
+      if (!p.registry) {
+        throw new Error("buildImage: push.registry is required when push is set");
+      }
+      if (!p.username || !p.password) {
+        throw new Error("buildImage: push.username and push.password are required when push is set");
+      }
+      body.push = {
+        registry: p.registry,
+        tag: p.tag,
+        server: p.server,
+        username: p.username,
+        password: p.password,
+      };
+    }
+    const response = await this.request(
+      "POST",
+      "/v1/images/build",
+      {
+        body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+    if (response.status === 404) {
+      await response.text().catch(() => undefined);
+      throw new Error(
+        "this daemon does not support Image builds (POST /v1/images/build is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
+      );
+    }
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+    const payload = (await response.json()) as { image: string; pushed?: string };
+    return { image: payload.image, pushed: payload.pushed };
+  }
+
+  private async resolveImage(options: CreateOptions): Promise<CreateOptions & { image: string }> {
+    if (typeof options.image === "string") {
+      return options as CreateOptions & { image: string };
+    }
+    if (!(options.image instanceof Image)) {
+      throw new TypeError("CreateOptions.image must be a string or Image");
+    }
+    const result = await this.buildImage(options.image);
+    return { ...options, image: result.image };
   }
 
   async list(): Promise<SandboxResource[]> {
@@ -212,6 +316,11 @@ export class APIClient {
     const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/stop`);
     return this.wrap(response);
   }
+
+	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
+		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, { name });
+		return fromApiSandboxSnapshot(response);
+	}
 
   async destroy(id: string): Promise<void> {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}`);
@@ -333,6 +442,20 @@ export class APIClient {
   async mounts(id: string): Promise<MountSpecRedacted[]> {
     const response = await this.doJSON<ApiMountList>("GET", `${this.versionPrefix}/sandboxes/${id}/mounts`);
     return response.mounts.map(fromApiMountSpecRedacted);
+  }
+
+  async getNetworkUsage(id: string): Promise<NetworkUsage> {
+    const response = await this.doJSON<ApiNetworkUsage>("GET", `${this.versionPrefix}/sandboxes/${id}/network/usage`);
+    return fromApiNetworkUsage(response);
+  }
+
+  async setNetworkLimits(id: string, options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
+    const response = await this.doJSON<ApiNetworkUsage>(
+      "PATCH",
+      `${this.versionPrefix}/sandboxes/${id}/network/limits`,
+      toApiSetNetworkLimitsOptions(options),
+    );
+    return fromApiNetworkUsage(response);
   }
 
   private wrap(sandbox: ApiSandbox): SandboxResource {
@@ -477,6 +600,10 @@ export class SandboxResource implements Sandbox {
     await this.client.unexposePort(this.id, port);
   }
 
+	async createSnapshot(name: string): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(this.id, name);
+	}
+
   async start(): Promise<this> {
     const updated = await this.client.start(this.id);
     this.apply(updated.toJSON());
@@ -505,6 +632,14 @@ export class SandboxResource implements Sandbox {
     return this;
   }
 
+  async getNetworkUsage(): Promise<NetworkUsage> {
+    return this.client.getNetworkUsage(this.id);
+  }
+
+  async setNetworkLimits(options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
+    return this.client.setNetworkLimits(this.id, options);
+  }
+
   toJSON(): Sandbox {
     return cloneSandbox(this);
   }
@@ -523,6 +658,8 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     env: options.env,
     os_user: options.osUser,
     network_block_all: options.networkBlockAll,
+    network_bytes_in_limit: options.networkBytesInLimit,
+    network_bytes_out_limit: options.networkBytesOutLimit,
     registry: options.registry,
     container_command: options.containerCommand,
     mounts: options.mounts?.map(toApiMountSpec),
@@ -614,6 +751,16 @@ function fromApiCreateSandboxResponse(response: ApiCreateSandboxResponse): Sandb
   };
 }
 
+function fromApiSandboxSnapshot(snapshot: ApiSandboxSnapshot): SandboxSnapshot {
+  return {
+    name: snapshot.name,
+    image: snapshot.image,
+    imageID: snapshot.image_id,
+    sourceSandboxID: snapshot.source_sandbox_id,
+    createdAt: snapshot.created_at,
+  };
+}
+
 function fromApiSession(session: ApiSession): Session {
   return {
     id: session.id,
@@ -697,6 +844,26 @@ function fromApiMountSpecRedacted(mount: ApiMountSpecRedacted): MountSpecRedacte
     options: mount.options,
     readOnly: mount.read_only ?? false,
     hasCredentials: mount.has_credentials,
+  };
+}
+
+function fromApiNetworkUsage(usage: ApiNetworkUsage): NetworkUsage {
+  return {
+    sandboxID: usage.sandbox_id,
+    bytesIn: usage.bytes_in,
+    bytesOut: usage.bytes_out,
+    bytesInLimit: usage.bytes_in_limit,
+    bytesOutLimit: usage.bytes_out_limit,
+    quotaExceeded: usage.quota_exceeded,
+    quotaExceededAt: usage.quota_exceeded_at ?? undefined,
+    lastSampledAt: usage.last_sampled_at ?? undefined,
+  };
+}
+
+function toApiSetNetworkLimitsOptions(options: SetNetworkLimitsOptions): Record<string, unknown> {
+  return {
+    network_bytes_in_limit: options.networkBytesInLimit,
+    network_bytes_out_limit: options.networkBytesOutLimit,
   };
 }
 

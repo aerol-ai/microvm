@@ -12,7 +12,7 @@ import (
 // handlers carries Deps so each handler method has access to the service,
 // logger, and shared response helpers without threading them through every
 // signature. Handlers are intentionally thin — wire decode → service call →
-// wire encode — so the v1/v2 boundary stays at this layer.
+// wire encode — so the version boundary stays at this layer.
 type handlers struct {
 	deps Deps
 }
@@ -79,6 +79,20 @@ func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
+}
+
+func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req models.CreateSandboxSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	response, err := h.deps.Service.CreateSnapshot(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusCreated, response)
 }
 
 func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
@@ -181,4 +195,44 @@ func (h *handlers) listMounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"mounts": mounts})
+}
+
+func (h *handlers) getNetworkUsage(w http.ResponseWriter, r *http.Request) {
+	usage, err := h.deps.Service.GetNetworkUsage(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, usage)
+}
+
+func (h *handlers) updateNetworkLimits(w http.ResponseWriter, r *http.Request) {
+	var req models.UpdateNetworkLimitsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	id := r.PathValue("id")
+	// Pointer-nil ⇒ "leave alone"; pointer-to-zero ⇒ "set to unlimited".
+	// Read the existing limits when only one direction is supplied so the
+	// other direction round-trips unchanged.
+	current, err := h.deps.Service.GetNetworkUsage(r.Context(), id)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	in := current.BytesInLimit
+	if req.NetworkBytesInLimit != nil {
+		in = *req.NetworkBytesInLimit
+	}
+	out := current.BytesOutLimit
+	if req.NetworkBytesOutLimit != nil {
+		out = *req.NetworkBytesOutLimit
+	}
+	usage, err := h.deps.Service.SetNetworkLimits(r.Context(), id, in, out)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, usage)
 }

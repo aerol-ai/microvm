@@ -25,6 +25,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -59,8 +60,19 @@ type Service struct {
 	// best-effort (caddy may not be reachable yet on a cold start), so the
 	// expose path retries under l4Mu when the latch is still false. atomic
 	// load gives a lock-free fast path on the steady-state hot path.
-	l4Mu    sync.Mutex
-	l4Ready atomic.Bool
+	l4Mu       sync.Mutex
+	l4Ready    atomic.Bool
+	snapshotMu sync.Mutex
+
+	// netstatsReady latches the lazy bootstrap of the per-sandbox network
+	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
+	// hot side, single-flight Mutex on the cold-start side. The poller is
+	// kicked off either at daemon boot (best-effort) or on the first request
+	// that needs network usage data — whichever happens first.
+	netstatsMu       sync.Mutex
+	netstatsReady    atomic.Bool
+	netstatsPoller   *netstats.Poller
+	netstatsLastTick atomic.Int64 // unix nanos; last successful tick for /usage staleness reporting
 
 	// cluster is the cluster.Client used by the API layer for owner lookup
 	// and cross-node forwarding. Defaults to a Noop in single-node mode so
@@ -293,6 +305,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	// Mirror SetNetworkLimits: enforcement uses `limit > 0`, so a negative
+	// value would silently behave as unlimited and bypass the quota.
+	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
+		return nil, errors.New("network byte limits must be >= 0")
+	}
+
 	sealedMounts, err := s.sealMounts(req.Mounts)
 	if err != nil {
 		return nil, err
@@ -372,29 +390,33 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	now := time.Now().UTC()
 	sandbox := &models.Sandbox{
-		ID:                 state.SandboxID,
-		Image:              req.Image,
-		Status:             state.Status,
-		PublicURL:          s.caddy.SandboxPublicURL(state.SandboxID),
-		ContainerID:        state.ContainerID,
-		ContainerIP:        state.ContainerIP,
-		CPU:                req.CPU,
-		MemoryMB:           req.MemoryMB,
-		DiskGB:             req.DiskGB,
-		OSUser:             req.OSUser,
-		Env:                req.Env,
-		NetworkBlockAll:    req.NetworkBlockAll,
-		ToolboxEnabled:     true,
-		ToolboxToken:       toolboxToken,
-		SSHPublicKey:       authorizedKey,
-		CreatedAt:          now,
-		UpdatedAt:          now,
-		LastActiveAt:       now,
-		ContainerCommand:   req.ContainerCommand,
-		Lifecycle:          lifecycle,
-		Runtime:            chosenRuntime,
-		GPUs:               req.GPUs,
-		RegistryAuthSealed: sealedRegistry,
+		ID:                   state.SandboxID,
+		Image:                req.Image,
+		Status:               state.Status,
+		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		ContainerID:          state.ContainerID,
+		ContainerIP:          state.ContainerIP,
+		CPU:                  req.CPU,
+		MemoryMB:             req.MemoryMB,
+		DiskGB:               req.DiskGB,
+		OSUser:               req.OSUser,
+		Env:                  req.Env,
+		NetworkBlockAll:      req.NetworkBlockAll,
+		ToolboxEnabled:       true,
+		ToolboxToken:         toolboxToken,
+		SSHPublicKey:         authorizedKey,
+		Name:                 strings.TrimSpace(req.Name),
+		Tags:                 req.Tags,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		LastActiveAt:         now,
+		ContainerCommand:     req.ContainerCommand,
+		Lifecycle:            lifecycle,
+		Runtime:              chosenRuntime,
+		GPUs:                 req.GPUs,
+		RegistryAuthSealed:   sealedRegistry,
+		NetworkBytesInLimit:  req.NetworkBytesInLimit,
+		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
@@ -709,6 +731,111 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	s.maybeRemoveImage(ctx, sandbox.Image)
 	return nil
+}
+
+// CreateSnapshot commits the sandbox container into a reusable local image.
+// Idempotency is by snapshot name: repeated requests for the same sandbox +
+// name return the stored snapshot metadata, while a different sandbox trying
+// to claim the same name is rejected with a conflict.
+func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest) (*models.SandboxSnapshot, error) {
+	snapshot, _, err := s.CreateSnapshotWithOwnership(ctx, sandboxID, req)
+	return snapshot, err
+}
+
+// CreateSnapshotWithOwnership commits a sandbox image and reports whether this
+// call created the native snapshot row. Callers that add companion metadata can
+// use the flag to avoid rolling back a snapshot that already existed.
+func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest) (*models.SandboxSnapshot, bool, error) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return nil, false, errors.New("snapshot name is required")
+	}
+
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+
+	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
+		if existing.SourceSandboxID == sandboxID {
+			return existing, false, nil
+		}
+		return nil, false, store.ErrSnapshotNameConflict
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, false, err
+	}
+
+	sandbox, err := s.store.Get(ctx, sandboxID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	imageID, err := s.docker.CreateSnapshot(ctx, sandboxContainerRef(sandbox), name)
+	if err != nil {
+		return nil, false, err
+	}
+
+	snapshot := &models.SandboxSnapshot{
+		Name:            name,
+		Image:           name,
+		ImageID:         imageID,
+		SourceSandboxID: sandboxID,
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
+		if errors.Is(err, store.ErrSnapshotNameConflict) {
+			existing, getErr := s.store.GetSnapshot(ctx, name)
+			if getErr == nil && existing.SourceSandboxID == sandboxID {
+				return existing, false, nil
+			}
+		}
+		return nil, false, err
+	}
+	return snapshot, true, nil
+}
+
+func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.SandboxSnapshot, error) {
+	needle := strings.TrimSpace(idOrName)
+	if needle == "" {
+		return nil, store.ErrNotFound
+	}
+	snapshot, err := s.store.GetSnapshot(ctx, needle)
+	if err == nil {
+		return snapshot, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	snapshots, err := s.store.ListSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, snapshot := range snapshots {
+		if snapshot != nil && strings.TrimSpace(snapshot.ImageID) == needle {
+			return snapshot, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+func (s *Service) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
+	return s.store.ListSnapshots(ctx)
+}
+
+func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
+	if strings.TrimSpace(idOrName) == "" {
+		return store.ErrNotFound
+	}
+
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+
+	snapshot, err := s.GetSnapshot(ctx, idOrName)
+	if err != nil {
+		return err
+	}
+	if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
+		return err
+	}
+	return s.store.DeleteSnapshot(ctx, snapshot.Name)
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
@@ -1296,6 +1423,17 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					)
 				}
 			}
+			// Heal quota-driven blocks. The flag is the source of truth for
+			// "we previously decided to block"; re-evaluate against the
+			// current cumulative counters so a quota raised over the wire
+			// while sandboxd was down clears as part of the same pass.
+			if sandbox.NetworkQuotaExceeded ||
+				(sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit) ||
+				(sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit) {
+				overIn := sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
+				overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
+				s.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
+			}
 			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
 				return err
 			}
@@ -1555,6 +1693,88 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 			continue
 		}
 		s.logger.Info("audit zombie tls route removed", "route_id", id)
+	}
+}
+
+// StartBuiltImageGC launches the periodic janitor that removes locally-built
+// images (BuiltImageNamespace, i.e. "aerolvm-build/*") that are no longer
+// referenced by any active sandbox AND were created more than the configured
+// TTL ago. Without this, two failure modes leak images forever:
+//
+//   - POST /v1/images/build called standalone (no follow-up CreateSandbox).
+//   - Build succeeded, CreateSandbox failed AND the daytona facade's inline
+//     rollback couldn't reach the daemon (e.g. server-side panic, dropped
+//     connection between build success and rollback call).
+//
+// The TTL keeps the janitor from racing the dominant build+create flow: an
+// image built moments ago must clear ImageBuildGCTTL before it's eligible,
+// so a transient network hiccup between build and create can't have the
+// janitor yanking an image the client is about to consume.
+//
+// No-op if ImageBuildGCEnabled is false or ImageBuildGCInterval <= 0.
+func (s *Service) StartBuiltImageGC(ctx context.Context) {
+	if !s.cfg.ImageBuildGCEnabled {
+		return
+	}
+	interval := s.cfg.ImageBuildGCInterval
+	if interval <= 0 {
+		return
+	}
+	if s.events == nil {
+		s.logger.Warn("built-image GC disabled: docker events client is nil")
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				s.runBuiltImageGC(sweepCtx, s.events.ListBuiltImages)
+				cancel()
+			}
+		}
+	}()
+}
+
+// builtImageListFn is the indirection runBuiltImageGC takes so tests can
+// supply a synthetic image list without standing up a Docker daemon. The
+// only production caller is StartBuiltImageGC, which always passes
+// s.events.ListBuiltImages.
+type builtImageListFn func(ctx context.Context) ([]docker.BuiltImage, error)
+
+// runBuiltImageGC is one pass of the built-image janitor. Idempotent: every
+// removal decision is gated by an indexed Store.HasActiveImageRef check, so
+// a sandbox created between list-time and remove-time is protected (the
+// store sees its row before we ask). Failures are logged, not returned —
+// the janitor must not block on a bad image; the next tick will retry.
+func (s *Service) runBuiltImageGC(ctx context.Context, list builtImageListFn) {
+	images, err := list(ctx)
+	if err != nil {
+		s.logger.Warn("built-image gc list failed", "error", err)
+		return
+	}
+	cutoff := time.Now().UTC().Add(-s.cfg.ImageBuildGCTTL)
+	for _, img := range images {
+		if img.LastTagTime.After(cutoff) {
+			continue
+		}
+		referenced, err := s.store.HasActiveImageRef(ctx, img.Tag)
+		if err != nil {
+			s.logger.Warn("built-image gc ref check failed", "tag", img.Tag, "error", err)
+			continue
+		}
+		if referenced {
+			continue
+		}
+		if err := s.docker.RemoveImage(ctx, img.Tag); err != nil {
+			s.logger.Warn("built-image gc remove failed", "tag", img.Tag, "error", err)
+			continue
+		}
+		s.logger.Info("audit built image gc removed", "tag", img.Tag, "last_tag_time", img.LastTagTime)
 	}
 }
 

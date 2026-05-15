@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -82,6 +83,43 @@ func TestTransportClientCases(t *testing.T) {
 			},
 		},
 		{
+			name: "create_snapshot_sends_name_and_maps_response",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPost || r.URL.Path != "/v1/sandboxes/sb-snap/snapshot" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					if r.Header.Get("Authorization") != "Bearer pat-token" {
+						t.Fatalf("unexpected authorization: %q", r.Header.Get("Authorization"))
+					}
+					var payload models.CreateSandboxSnapshotRequest
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatalf("Decode() error = %v", err)
+					}
+					if payload.Name != "snapshots/demo:v1" {
+						t.Fatalf("payload.Name = %q, want snapshots/demo:v1", payload.Name)
+					}
+					_ = json.NewEncoder(w).Encode(models.SandboxSnapshot{
+						Name:            "snapshots/demo:v1",
+						Image:           "snapshots/demo:v1",
+						ImageID:         "sha256:snap-1",
+						SourceSandboxID: "sb-snap",
+						CreatedAt:       time.Now().UTC(),
+					})
+				}))
+				defer server.Close()
+
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				snapshot, err := client.CreateSnapshot(ctx, "sb-snap", "snapshots/demo:v1")
+				if err != nil {
+					t.Fatalf("CreateSnapshot() error = %v", err)
+				}
+				if snapshot.Name != "snapshots/demo:v1" || snapshot.SourceSandboxID != "sb-snap" {
+					t.Fatalf("unexpected snapshot: %+v", snapshot)
+				}
+			},
+		},
+		{
 			name: "health_maps_response",
 			run: func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +134,71 @@ func TestTransportClientCases(t *testing.T) {
 				}
 				if health.Status != "ok" || health.Sandboxes != 2 {
 					t.Fatalf("unexpected health: %+v", health)
+				}
+			},
+		},
+		{
+			name: "get_network_usage_returns_counters_and_limits",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet || r.URL.Path != "/v1/sandboxes/sb-net/network/usage" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					sampled := time.Now().UTC()
+					_ = json.NewEncoder(w).Encode(models.NetworkUsage{
+						SandboxID:     "sb-net",
+						BytesIn:       1024,
+						BytesOut:      2048,
+						BytesInLimit:  1 << 20,
+						BytesOutLimit: 0,
+						QuotaExceeded: false,
+						LastSampledAt: &sampled,
+					})
+				}))
+				defer server.Close()
+
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				usage, err := client.GetNetworkUsage(ctx, "sb-net")
+				if err != nil {
+					t.Fatalf("GetNetworkUsage() error = %v", err)
+				}
+				if usage.BytesIn != 1024 || usage.BytesOutLimit != 0 || usage.QuotaExceeded {
+					t.Fatalf("unexpected usage: %+v", usage)
+				}
+			},
+		},
+		{
+			name: "set_network_limits_sends_patch_with_pointer_fields",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPatch || r.URL.Path != "/v1/sandboxes/sb-net/network/limits" {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					}
+					var payload models.UpdateNetworkLimitsRequest
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatalf("Decode() error = %v", err)
+					}
+					if payload.NetworkBytesInLimit == nil || *payload.NetworkBytesInLimit != 4096 {
+						t.Fatalf("unexpected NetworkBytesInLimit: %+v", payload.NetworkBytesInLimit)
+					}
+					if payload.NetworkBytesOutLimit != nil {
+						t.Fatalf("expected NetworkBytesOutLimit nil; got %+v", payload.NetworkBytesOutLimit)
+					}
+					_ = json.NewEncoder(w).Encode(models.NetworkUsage{
+						SandboxID:    "sb-net",
+						BytesInLimit: 4096,
+					})
+				}))
+				defer server.Close()
+
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				inLimit := int64(4096)
+				usage, err := client.SetNetworkLimits(ctx, "sb-net", models.UpdateNetworkLimitsRequest{NetworkBytesInLimit: &inLimit})
+				if err != nil {
+					t.Fatalf("SetNetworkLimits() error = %v", err)
+				}
+				if usage.BytesInLimit != 4096 {
+					t.Fatalf("unexpected usage: %+v", usage)
 				}
 			},
 		},

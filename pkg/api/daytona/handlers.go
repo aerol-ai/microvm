@@ -1,0 +1,1137 @@
+package daytona
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/models"
+)
+
+type handlers struct {
+	deps       Deps
+	httpClient *http.Client
+}
+
+func newHandlers(d Deps) *handlers {
+	return &handlers{
+		deps:       d,
+		httpClient: &http.Client{},
+	}
+}
+
+func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
+	var req createSandboxRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(r.Context(), req)
+	if err != nil {
+		// Image-build failures are operational, not user-input errors:
+		// reporting them as 400 would mislead retry/alerting (a transient
+		// daemon hiccup looks identical to bad client input). Distinguish
+		// timeouts (504) and build/registry failures (502) from validation
+		// errors that fail before BuildImage is reached (400).
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
+		case errors.Is(err, errBuildOperational):
+			apihttp.WriteError(w, http.StatusBadGateway, err.Error())
+		default:
+			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+
+	response, err := h.deps.Service.CreateSandbox(r.Context(), serviceReq)
+	if err != nil {
+		// If we built the image in this request and the create failed, the
+		// image is now orphaned: no sandbox row references it, so the normal
+		// reference-counted GC (service.maybeRemoveImage on destroy) will
+		// never see it. Roll it back here so a build storm of failed creates
+		// doesn't fill the daemon's image store.
+		//
+		// Use context.Background so cancellation of r.Context() (e.g. client
+		// disconnect on the failure response) doesn't skip the cleanup.
+		if freshlyBuiltImage != "" && h.deps.Builder != nil {
+			if rmErr := h.deps.Builder.RemoveImage(context.Background(), freshlyBuiltImage); rmErr != nil && h.deps.Logger != nil {
+				h.deps.Logger.Warn("daytona image rollback failed", "tag", freshlyBuiltImage, "error", rmErr)
+			}
+		}
+		// Native uniqueness constraint on sandboxes.name surfaces as
+		// ErrSandboxNameConflict — translate to Daytona's wire-shape
+		// 409 message before falling through to the generic mapper.
+		if errors.Is(err, store.ErrSandboxNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	meta := sandboxMetaFromNative(&response.Sandbox, compatBlob{
+		Snapshot:            strings.TrimSpace(valueOrEmpty(req.Snapshot)),
+		Target:              trimmedString(req.Target),
+		NetworkAllowList:    strings.TrimSpace(valueOrEmpty(req.NetworkAllowList)),
+		AutoArchiveInterval: float32(int32Value(req.AutoArchiveInterval, 0)),
+	})
+	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
+		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
+			h.deps.Logger.Warn("daytona metadata persist cleanup failed", "sandbox_id", response.ID, "error", destroyErr)
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	apihttp.WriteJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
+}
+
+func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
+	filters, page, limit, err := parseSnapshotListFilters(r)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	snapshots, err := h.deps.Service.ListSnapshots(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	items := h.filteredSnapshots(r, snapshots, filters)
+	total := len(items)
+	start := int((page - 1) * limit)
+	if start > total {
+		start = total
+	}
+	end := start + int(limit)
+	if end > total {
+		end = total
+	}
+	totalPages := float32(0)
+	if total > 0 {
+		totalPages = float32((total + int(limit) - 1) / int(limit))
+	}
+
+	apihttp.WriteJSON(w, http.StatusOK, paginatedSnapshotsResponse{
+		Items:      items[start:end],
+		Total:      float32(total),
+		Page:       page,
+		TotalPages: totalPages,
+	})
+}
+
+func (h *handlers) getSnapshot(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := h.deps.Service.GetSnapshot(r.Context(), r.PathValue("id"))
+	if err != nil {
+		h.writeSnapshotError(w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSnapshotResponse(r, snapshot))
+}
+
+func (h *handlers) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	if err := h.deps.Service.DeleteSnapshot(r.Context(), r.PathValue("id")); err != nil {
+		h.writeSnapshotError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	filters, err := parseListFilters(r)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	metadata, err := h.listSandboxMeta(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	apihttp.WriteJSON(w, http.StatusOK, items)
+}
+
+func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	filters, err := parseListFilters(r)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	metadata, err := h.listSandboxMeta(r.Context())
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	page, err := parsePositiveFloatQuery(r, "page", 1)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit, err := parsePositiveFloatQuery(r, "limit", 100)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	items := h.filteredSandboxes(r, sandboxes, metadata, filters)
+	total := len(items)
+	start := int((page - 1) * limit)
+	if start > total {
+		start = total
+	}
+	end := start + int(limit)
+	if end > total {
+		end = total
+	}
+	totalPages := float32(0)
+	if total > 0 {
+		totalPages = float32((total + int(limit) - 1) / int(limit))
+	}
+
+	apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{
+		Items:      items[start:end],
+		Total:      float32(total),
+		Page:       page,
+		TotalPages: totalPages,
+	})
+}
+
+func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
+	sandbox, _, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
+func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
+	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if err := h.deps.Service.DestroySandbox(r.Context(), sandboxID); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	snapshot := *sandbox
+	snapshot.Status = models.SandboxStatusDestroyed
+	now := time.Now().UTC()
+	snapshot.UpdatedAt = now
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, &snapshot, meta))
+}
+
+func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	sandbox, err := h.deps.Service.StartSandbox(r.Context(), sandboxID)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
+func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	sandbox, err := h.deps.Service.StopSandbox(r.Context(), sandboxID)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
+func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req createSandboxSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	if _, err := h.deps.Service.CreateSnapshot(r.Context(), sandboxID, models.CreateSandboxSnapshotRequest{Name: req.Name}); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
+func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	var req resizeSandboxRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	sandbox, err := h.deps.Service.ResizeSandbox(r.Context(), sandboxID, models.ResizeSandboxRequest{
+		CPU:      float64(int32Value(req.Cpu, 0)),
+		MemoryMB: int(int32Value(req.Memory, 0)) * 1024,
+		DiskGB:   int(int32Value(req.Disk, 0)),
+	})
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
+func (h *handlers) toolboxProxyURL(w http.ResponseWriter, r *http.Request) {
+	_, _, err := h.resolveSandbox(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, toolboxProxyURLResponse{URL: h.toolboxProxyBaseURL(r)})
+}
+
+func (h *handlers) previewURL(w http.ResponseWriter, r *http.Request) {
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	port, err := strconv.Atoi(r.PathValue("port"))
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid port")
+		return
+	}
+	preview, err := h.deps.Service.ExposePort(r.Context(), sandboxID, port, models.ExposedPortProtocolHTTP)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, portPreviewURLResponse{
+		SandboxID: sandboxID,
+		URL:       preview.PublicURL,
+		Token:     "",
+	})
+}
+
+func (h *handlers) replaceLabels(w http.ResponseWriter, r *http.Request) {
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	var req sandboxLabelsResponse
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	// Labels are stored natively on sandboxes.tags_json — no compat-state
+	// write is needed for this endpoint. The compat blob never carried
+	// label data after the consolidation; only echo-back fields remain.
+	if err := h.deps.Service.UpdateTags(r.Context(), sandboxID, cloneStringMap(req.Labels)); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, sandboxLabelsResponse{Labels: cloneStringMap(req.Labels)})
+}
+
+func (h *handlers) setAutoStopInterval(w http.ResponseWriter, r *http.Request) {
+	h.updateIdleLifecycle(w, r, true)
+}
+
+func (h *handlers) setAutoDeleteInterval(w http.ResponseWriter, r *http.Request) {
+	h.updateIdleLifecycle(w, r, false)
+}
+
+func (h *handlers) setAutoArchiveInterval(w http.ResponseWriter, r *http.Request) {
+	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	interval, err := parseFloat32Path(r, "interval")
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid interval")
+		return
+	}
+	intervalPtr, err := intervalMetadataPtr(interval)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta.AutoArchiveInterval = intervalPtr
+	if err := h.persistSandboxMeta(r.Context(), sandboxID, meta); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+}
+
+func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, stop bool) {
+	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	interval, err := parseFloat32Path(r, "interval")
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid interval")
+		return
+	}
+	intervalPtr, err := intervalMetadataPtr(interval)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	lifecycle := sandbox.Lifecycle
+	if stop {
+		if intervalPtr == nil {
+			lifecycle.StopIfIdleFor = 0
+		} else {
+			lifecycle.StopIfIdleFor = durationFromMinutes(interval)
+		}
+	} else {
+		if intervalPtr == nil {
+			lifecycle.DestroyIfIdleFor = 0
+		} else {
+			lifecycle.DestroyIfIdleFor = durationFromMinutes(interval)
+		}
+	}
+	updated, err := h.deps.Service.UpdateLifecycle(r.Context(), sandboxID, lifecycle)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	// Auto-stop / auto-delete intervals are derived from Lifecycle on
+	// read, so the UpdateLifecycle call above is the only persistence
+	// step. Load meta against the updated sandbox so the response
+	// reflects the new interval.
+	meta, err := h.loadSandboxMeta(r.Context(), updated)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
+}
+
+func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models.Sandbox, string, error) {
+	trimmed := strings.TrimSpace(idOrName)
+	sandbox, err := h.deps.Service.GetSandbox(ctx, trimmed)
+	if err == nil {
+		return sandbox, sandbox.ID, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return nil, "", err
+	}
+	resolved, err := h.deps.Service.ResolveSandboxIDByName(ctx, trimmed)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, "", err
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	sandbox, err = h.deps.Service.GetSandbox(ctx, resolved)
+	if err != nil {
+		return nil, "", err
+	}
+	return sandbox, sandbox.ID, nil
+}
+
+func (h *handlers) filteredSandboxes(r *http.Request, sandboxes []*models.Sandbox, metadata map[string]compatBlob, filters listFilters) []sandboxResponse {
+	items := make([]sandboxResponse, 0, len(sandboxes))
+	for _, sandbox := range sandboxes {
+		if sandbox == nil {
+			continue
+		}
+		meta := sandboxMetaFromNative(sandbox, metadata[sandbox.ID])
+		item := h.toSandboxResponse(r, sandbox, meta)
+		if filters.ID != "" && !strings.Contains(item.ID, filters.ID) {
+			continue
+		}
+		if filters.Name != "" && !strings.Contains(strings.ToLower(item.Name), strings.ToLower(filters.Name)) {
+			continue
+		}
+		if len(filters.Labels) > 0 && !labelsMatch(item.Labels, filters.Labels) {
+			continue
+		}
+		if len(filters.States) > 0 {
+			state := ""
+			if item.State != nil {
+				state = *item.State
+			}
+			if _, ok := filters.States[state]; !ok {
+				continue
+			}
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		left := ""
+		right := ""
+		if items[i].CreatedAt != nil {
+			left = *items[i].CreatedAt
+		}
+		if items[j].CreatedAt != nil {
+			right = *items[j].CreatedAt
+		}
+		return left > right
+	})
+	return items
+}
+
+func (h *handlers) filteredSnapshots(r *http.Request, snapshots []*models.SandboxSnapshot, filters snapshotListFilters) []snapshotResponse {
+	items := make([]snapshotResponse, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot == nil {
+			continue
+		}
+		item := h.toSnapshotResponse(r, snapshot)
+		if filters.Name != "" && !strings.Contains(strings.ToLower(item.Name), strings.ToLower(filters.Name)) {
+			continue
+		}
+		items = append(items, item)
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		left, right := snapshotSortKey(items[i], filters.Sort), snapshotSortKey(items[j], filters.Sort)
+		if left == right {
+			if filters.Order == "asc" {
+				return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+			}
+			return strings.ToLower(items[i].Name) > strings.ToLower(items[j].Name)
+		}
+		if filters.Order == "asc" {
+			return left < right
+		}
+		return left > right
+	})
+	return items
+}
+
+func (h *handlers) persistSandboxMeta(ctx context.Context, sandboxID string, meta sandboxMeta) error {
+	stateJSON, err := sandboxMetaToState(meta)
+	if err != nil {
+		return err
+	}
+	return h.deps.Service.UpsertCompatState(ctx, sandboxID, models.FacadeDaytona, stateJSON)
+}
+
+func (h *handlers) loadSandboxMeta(ctx context.Context, sandbox *models.Sandbox) (sandboxMeta, error) {
+	if sandbox == nil {
+		return sandboxMeta{Labels: map[string]string{}}, nil
+	}
+	stored, err := h.deps.Service.GetCompatState(ctx, sandbox.ID, models.FacadeDaytona)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return defaultSandboxMeta(sandbox), nil
+		}
+		return sandboxMeta{}, err
+	}
+	return sandboxMetaFromState(stored, sandbox)
+}
+
+// listSandboxMeta returns a sandbox-id keyed map of the persisted compat
+// blobs for the Daytona facade. Sandboxes with no compat row are absent
+// from the map; their native fields still shape the response via the
+// zero-valued blob the map default returns at lookup time.
+func (h *handlers) listSandboxMeta(ctx context.Context) (map[string]compatBlob, error) {
+	stored, err := h.deps.Service.ListCompatState(ctx, models.FacadeDaytona)
+	if err != nil {
+		return nil, err
+	}
+	items := make(map[string]compatBlob, len(stored))
+	for sandboxID, state := range stored {
+		var blob compatBlob
+		if strings.TrimSpace(state.StateJSON) != "" {
+			if err := json.Unmarshal([]byte(state.StateJSON), &blob); err != nil {
+				return nil, err
+			}
+		}
+		items[sandboxID] = blob
+	}
+	return items, nil
+}
+
+func labelsMatch(labels map[string]string, wanted map[string]string) bool {
+	for key, value := range wanted {
+		if labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func parseListFilters(r *http.Request) (listFilters, error) {
+	filters := listFilters{
+		ID:   strings.TrimSpace(r.URL.Query().Get("id")),
+		Name: strings.TrimSpace(r.URL.Query().Get("name")),
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("labels")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &filters.Labels); err != nil {
+			return listFilters{}, errors.New("labels must be a JSON object")
+		}
+	}
+	if states := r.URL.Query()["states"]; len(states) > 0 {
+		filters.States = make(map[string]struct{}, len(states))
+		for _, state := range states {
+			trimmed := strings.TrimSpace(state)
+			if trimmed != "" {
+				filters.States[trimmed] = struct{}{}
+			}
+		}
+	}
+	return filters, nil
+}
+
+func parseSnapshotListFilters(r *http.Request) (snapshotListFilters, float32, float32, error) {
+	page, err := parsePositiveFloatQuery(r, "page", 1)
+	if err != nil {
+		return snapshotListFilters{}, 0, 0, err
+	}
+	limit, err := parsePositiveFloatQuery(r, "limit", 100)
+	if err != nil {
+		return snapshotListFilters{}, 0, 0, err
+	}
+	if limit > 200 {
+		return snapshotListFilters{}, 0, 0, errors.New("limit must be less than or equal to 200")
+	}
+
+	filters := snapshotListFilters{
+		Name:  strings.TrimSpace(r.URL.Query().Get("name")),
+		Sort:  strings.TrimSpace(r.URL.Query().Get("sort")),
+		Order: strings.TrimSpace(r.URL.Query().Get("order")),
+	}
+	if filters.Sort == "" {
+		filters.Sort = "lastUsedAt"
+	}
+	switch filters.Sort {
+	case "name", "state", "lastUsedAt", "createdAt":
+	default:
+		return snapshotListFilters{}, 0, 0, errors.New("sort must be one of: name, state, lastUsedAt, createdAt")
+	}
+	if filters.Order == "" {
+		filters.Order = "desc"
+	}
+	if filters.Order != "asc" && filters.Order != "desc" {
+		return snapshotListFilters{}, 0, 0, errors.New("order must be one of: asc, desc")
+	}
+	return filters, page, limit, nil
+}
+
+func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, meta sandboxMeta) sandboxResponse {
+	name := firstNonEmpty(meta.Name, sandbox.ID)
+	user := firstNonEmpty(meta.User, sandbox.OSUser)
+	labels := cloneStringMap(meta.Labels)
+	state := stringPtr(mapSandboxState(sandbox.Status))
+	var errorReason *string
+	if strings.TrimSpace(sandbox.LastError) != "" {
+		errorReason = stringPtr(strings.TrimSpace(sandbox.LastError))
+	}
+	gpu := float32(0)
+	if sandbox.GPUs != nil && sandbox.GPUs.Count != 0 {
+		gpu = float32(sandbox.GPUs.Count)
+	}
+	return sandboxResponse{
+		ID:                  sandbox.ID,
+		OrganizationID:      strings.TrimSpace(r.Header.Get("X-Daytona-Organization-ID")),
+		Name:                name,
+		Snapshot:            cloneStringPtr(meta.Snapshot),
+		User:                user,
+		Env:                 cloneStringMap(sandbox.Env),
+		Labels:              labels,
+		Public:              true,
+		NetworkBlockAll:     sandbox.NetworkBlockAll,
+		NetworkAllowList:    cloneStringPtr(meta.NetworkAllowList),
+		Target:              meta.Target,
+		CPU:                 float32(sandbox.CPU),
+		GPU:                 gpu,
+		Memory:              float32(sandbox.MemoryMB) / 1024,
+		Disk:                float32(sandbox.DiskGB),
+		State:               state,
+		ErrorReason:         errorReason,
+		AutoStopInterval:    firstFloat32Ptr(meta.AutoStopInterval, durationMinutesPtr(sandbox.Lifecycle.StopIfIdleFor)),
+		AutoArchiveInterval: cloneFloat32Ptr(meta.AutoArchiveInterval),
+		AutoDeleteInterval:  firstFloat32Ptr(meta.AutoDeleteInterval, durationMinutesPtr(sandbox.Lifecycle.DestroyIfIdleFor)),
+		CreatedAt:           timePtr(sandbox.CreatedAt),
+		UpdatedAt:           timePtr(sandbox.UpdatedAt),
+		LastActivityAt:      timePtr(sandbox.LastActiveAt),
+		ToolboxProxyURL:     h.toolboxProxyBaseURL(r),
+	}
+}
+
+func (h *handlers) toSnapshotResponse(r *http.Request, snapshot *models.SandboxSnapshot) snapshotResponse {
+	createdAt := snapshot.CreatedAt.UTC().Format(time.RFC3339)
+	organizationID := strings.TrimSpace(r.Header.Get("X-Daytona-Organization-ID"))
+	imageName := nonEmptyStringPtr(&snapshot.Image)
+	id := firstNonEmpty(strings.TrimSpace(snapshot.ImageID), snapshot.Name)
+	return snapshotResponse{
+		ID:             id,
+		OrganizationID: nonEmptyStringPtr(&organizationID),
+		General:        false,
+		Name:           snapshot.Name,
+		ImageName:      imageName,
+		State:          "active",
+		Size:           nil,
+		Entrypoint:     []string{},
+		CPU:            0,
+		GPU:            0,
+		Mem:            0,
+		Disk:           0,
+		ErrorReason:    nil,
+		CreatedAt:      createdAt,
+		UpdatedAt:      createdAt,
+		LastUsedAt:     nil,
+		Ref:            cloneStringPtr(imageName),
+	}
+}
+
+func (h *handlers) toolboxProxyBaseURL(r *http.Request) string {
+	return requestBaseURL(r) + ToolboxPrefix
+}
+
+// translateCreateSandboxRequest converts the Daytona-shaped payload into the
+// native CreateSandboxRequest. The second return value is the image tag of a
+// fresh build performed during this call (empty when the image came from a
+// snapshot, a bare reference, or the build cache). Callers use it to roll
+// back the image if the subsequent CreateSandbox fails — that's the only
+// path that can orphan a built image, since the normal reference-counted
+// GC (service.maybeRemoveImage) needs a sandbox row to fire.
+func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req createSandboxRequest) (models.CreateSandboxRequest, string, error) {
+	if req.NetworkAllowList != nil && strings.TrimSpace(*req.NetworkAllowList) != "" {
+		return models.CreateSandboxRequest{}, "", errors.New("networkAllowList is not supported by the Daytona facade")
+	}
+	if req.Gpu != nil && *req.Gpu > 0 {
+		return models.CreateSandboxRequest{}, "", errors.New("gpu allocation is not supported by the Daytona facade")
+	}
+	if len(req.Volumes) > 0 {
+		return models.CreateSandboxRequest{}, "", errors.New("volumes are not supported by the Daytona facade")
+	}
+
+	lifecycle := models.Lifecycle{}
+	if req.AutoStopInterval != nil && *req.AutoStopInterval > 0 {
+		lifecycle.StopIfIdleFor = durationFromMinutes(float32(*req.AutoStopInterval))
+	}
+	if req.AutoDeleteInterval != nil && *req.AutoDeleteInterval > 0 {
+		lifecycle.DestroyIfIdleFor = durationFromMinutes(float32(*req.AutoDeleteInterval))
+	}
+
+	image, freshlyBuilt, err := h.createImage(ctx, req)
+	if err != nil {
+		return models.CreateSandboxRequest{}, "", err
+	}
+
+	serviceReq := models.CreateSandboxRequest{
+		Image:           image,
+		CPU:             float64(int32Value(req.Cpu, 0)),
+		MemoryMB:        int(int32Value(req.Memory, 0)) * 1024,
+		DiskGB:          int(int32Value(req.Disk, 0)),
+		Env:             cloneStringMap(mapValue(req.Env)),
+		OSUser:          trimmedString(req.User),
+		NetworkBlockAll: boolValue(req.NetworkBlockAll),
+		Name:            trimmedString(req.Name),
+		Tags:            cloneStringMap(mapValue(req.Labels)),
+	}
+	if !lifecycle.IsZero() {
+		serviceReq.Lifecycle = &lifecycle
+	}
+	return serviceReq, freshlyBuilt, nil
+}
+
+func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (string, string, error) {
+	if snapshot := strings.TrimSpace(valueOrEmpty(req.Snapshot)); snapshot != "" {
+		return snapshot, "", nil
+	}
+	if req.BuildInfo != nil {
+		return h.resolveBuildInfo(ctx, req.BuildInfo)
+	}
+	if configured := strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")); configured != "" {
+		return configured, "", nil
+	}
+	return "ubuntu:22.04", "", nil
+}
+
+// resolveBuildInfo turns a Daytona-shaped buildInfo payload into a runnable
+// local image reference. Three cases:
+//
+//  1. Single-line `FROM <image>` Dockerfile, no context  → return the bare
+//     image string; the runtime layer will `docker pull` it as usual. This
+//     preserves the legacy fast path for callers (Daytona SDK with a string
+//     image) that don't need a real build.
+//  2. Multi-line Dockerfile, no context                  → build locally with
+//     docker.Client.BuildImage; tag is content-addressed for idempotent
+//     retries.
+//  3. Any payload with contextHashes                     → gated behind the
+//     SB_IMAGE_BUILD_CONTEXT_ENABLED operator flag. With the flag off, we
+//     return a clear error pointing operators at the flag. With the flag on,
+//     a hash-resolved context tar is supplied to BuildImage (today that
+//     resolver is not wired — the flag returns "not yet implemented" so the
+//     contract is honored at the type level without misleading users).
+// resolveBuildInfo returns (imageTag, freshlyBuiltTag, error). freshlyBuiltTag
+// is non-empty only when this call actually invoked BuildImage and produced
+// a new image (cache hits return the tag in the first slot only). Callers
+// use freshlyBuiltTag to roll back the image if the downstream sandbox
+// create fails — see createSandbox.
+func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest) (string, string, error) {
+	dockerfile := strings.TrimSpace(valueOrEmpty(info.DockerfileContent))
+	if dockerfile == "" {
+		return "", "", errors.New("buildInfo is only supported when dockerfileContent is present")
+	}
+	if base, ok := singleLineFromImage(dockerfile); ok && len(info.ContextHashes) == 0 {
+		return base, "", nil
+	}
+	if len(info.ContextHashes) > 0 {
+		if !h.deps.Build.ContextEnabled {
+			return "", "", errors.New("buildInfo.contextHashes requires operator-side context upload support (set SB_IMAGE_BUILD_CONTEXT_ENABLED=true on the daemon)")
+		}
+		// Context-resolver wiring is a separate piece of work (needs an
+		// object store + registry push). Fail loud so callers don't think
+		// their COPY/ADD steps silently no-op.
+		return "", "", errors.New("buildInfo.contextHashes is enabled but no context resolver is configured on this daemon")
+	}
+	if h.deps.Builder == nil {
+		return "", "", errors.New("multi-line buildInfo Dockerfiles require an image builder; daemon was started without one")
+	}
+
+	tag := docker.BuildTagFor(dockerfile, info.ContextHashes)
+	exists, err := h.deps.Builder.ImageExists(ctx, tag)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: check built image cache: %v", errBuildOperational, err)
+	}
+	if exists {
+		// Bump LastTagTime so the built-image janitor doesn't GC a tag we
+		// just handed back to the caller. Best-effort: a refresh failure
+		// only narrows the GC window for this tag, so we log and continue.
+		if rtErr := h.deps.Builder.RefreshTag(ctx, tag); rtErr != nil && h.deps.Logger != nil {
+			h.deps.Logger.Warn("daytona build cache refresh-tag failed", "tag", tag, "error", rtErr)
+		}
+		return tag, "", nil
+	}
+
+	buildCtx, cancel := buildContextWithTimeout(ctx, h.deps.Build.Timeout)
+	defer cancel()
+	logger := h.deps.Logger
+	err = h.deps.Builder.BuildImage(buildCtx, docker.BuildImageRequest{
+		Tag:               tag,
+		DockerfileContent: dockerfile,
+		OnLog: func(line string) {
+			if logger != nil {
+				logger.Debug("daytona build", "tag", tag, "line", line)
+			}
+		},
+	})
+	if err != nil {
+		// Surface DeadlineExceeded and the build-operational marker so the
+		// caller can return 504 / 502 instead of 400. Wrap with both: %w
+		// only chains one error, so emit a fmt.Errorf that errors.Is sees
+		// errBuildOperational; if the underlying err is DeadlineExceeded,
+		// the caller's first switch arm catches that via the chain.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", "", fmt.Errorf("build image timed out: %w", err)
+		}
+		return "", "", fmt.Errorf("%w: build image: %v", errBuildOperational, err)
+	}
+	return tag, tag, nil
+}
+
+// errBuildOperational marks errors that originate from the local Docker
+// daemon (build, image inspect) rather than from caller validation. The
+// daytona createSandbox handler maps it to HTTP 502 so that retries and
+// alerting can distinguish "daemon is sad" from "client sent garbage".
+var errBuildOperational = errors.New("build operational error")
+
+// singleLineFromImage detects the legacy `FROM <image>` shape and returns
+// the base image when matched. Comments and blank lines are ignored.
+func singleLineFromImage(dockerfile string) (string, bool) {
+	lines := make([]string, 0, 4)
+	for _, line := range strings.Split(dockerfile, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		lines = append(lines, trimmed)
+	}
+	if len(lines) != 1 {
+		return "", false
+	}
+	parts := strings.Fields(lines[0])
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "FROM") {
+		return "", false
+	}
+	if strings.TrimSpace(parts[1]) == "" {
+		return "", false
+	}
+	return parts[1], true
+}
+
+func buildContextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func parsePositiveFloatQuery(r *http.Request, key string, fallback float32) (float32, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseFloat(raw, 32)
+	if err != nil || value <= 0 {
+		return 0, errors.New(key + " must be a positive number")
+	}
+	return float32(value), nil
+}
+
+func parseFloat32Path(r *http.Request, name string) (float32, error) {
+	value, err := strconv.ParseFloat(strings.TrimSpace(r.PathValue(name)), 32)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, errors.New(name + " must be finite")
+	}
+	return float32(value), nil
+}
+
+func mapSandboxState(status models.SandboxStatus) string {
+	switch status {
+	case models.SandboxStatusCreating:
+		return "creating"
+	case models.SandboxStatusStarted:
+		return "started"
+	case models.SandboxStatusStopped:
+		return "stopped"
+	case models.SandboxStatusDestroyed:
+		return "destroyed"
+	case models.SandboxStatusError:
+		return "error"
+	default:
+		return "unknown"
+	}
+}
+
+func snapshotSortKey(item snapshotResponse, sortBy string) string {
+	switch sortBy {
+	case "name":
+		return strings.ToLower(item.Name)
+	case "state":
+		return strings.ToLower(item.State)
+	case "createdAt":
+		return item.CreatedAt
+	default:
+		if item.LastUsedAt != nil && *item.LastUsedAt != "" {
+			return *item.LastUsedAt
+		}
+		return item.CreatedAt
+	}
+}
+
+func (h *handlers) writeSnapshotError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		apihttp.WriteError(w, http.StatusNotFound, "snapshot not found")
+		return
+	}
+	apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+}
+
+func requestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		scheme = strings.Split(forwarded, ",")[0]
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
+}
+
+func durationFromMinutes(value float32) time.Duration {
+	if value <= 0 {
+		return 0
+	}
+	return time.Duration(float64(value) * float64(time.Minute))
+}
+
+func durationMinutesPtr(value time.Duration) *float32 {
+	if value <= 0 {
+		return nil
+	}
+	v := float32(float64(value) / float64(time.Minute))
+	return &v
+}
+
+func timePtr(value time.Time) *string {
+	if value.IsZero() {
+		return nil
+	}
+	v := value.UTC().Format(time.RFC3339)
+	return &v
+}
+
+func int32MinutesPtr(value *int32) *float32 {
+	if value == nil {
+		return nil
+	}
+	if *value <= 0 {
+		return nil
+	}
+	v := float32(*value)
+	return &v
+}
+
+func int32Value(value *int32, fallback int32) int32 {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+
+func boolValue(value *bool) bool {
+	return value != nil && *value
+}
+
+func mapValue(value *map[string]string) map[string]string {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func trimmedString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
+func nonEmptyStringPtr(value *string) *string {
+	trimmed := trimmedString(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func float32Ptr(value float32) *float32 {
+	return &value
+}
+
+func intervalMetadataPtr(value float32) (*float32, error) {
+	if value < 0 {
+		return nil, errors.New("interval must be non-negative")
+	}
+	if value == 0 {
+		return nil, nil
+	}
+	return float32Ptr(value), nil
+}
+
+func firstFloat32Ptr(primary *float32, fallback *float32) *float32 {
+	if primary != nil {
+		return cloneFloat32Ptr(primary)
+	}
+	return cloneFloat32Ptr(fallback)
+}

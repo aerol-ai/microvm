@@ -1,6 +1,6 @@
 // Package apihttp holds HTTP helpers shared by every version of the public
-// API (pkg/api/v1, pkg/api/v2, ...). It is intentionally a leaf package with
-// no dependencies on pkg/api so version subpackages can import it without
+// API (pkg/api/v1, ...). It is intentionally a leaf package with no
+// dependencies on pkg/api so version subpackages can import it without
 // creating an import cycle through the top-level router.
 package apihttp
 
@@ -36,6 +36,10 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		WriteError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	if errors.Is(err, store.ErrSnapshotNameConflict) {
+		WriteError(w, http.StatusConflict, "snapshot name already in use")
 		return
 	}
 	// Capacity rejections are 503 with a Retry-After hint so well-behaved

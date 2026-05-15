@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { APIClient, SandboxResource } from "./client.js";
+import { Image } from "../Image.js";
 import type { Sandbox } from "../types.js";
 
 test("internal client uses config object and auth header", async () => {
@@ -28,7 +29,12 @@ test("internal client create maps request and response", async () => {
     patToken: "pat-token",
     fetch: async (input, init) => {
       seenRequest = new Request(input, init);
-      return jsonResponse(apiSandbox("sb-create"));
+      return jsonResponse(apiSandbox("sb-create", {
+        lifecycle: {
+          stop_if_idle_for: 3_600_000_000_000,
+          destroy_at_age: 86_400_000_000_000,
+        },
+      }));
     },
   });
 
@@ -57,6 +63,32 @@ test("internal client create maps request and response", async () => {
     stopIfIdleFor: 3_600_000_000_000,
     destroyAtAge: 86_400_000_000_000,
   });
+});
+
+test("internal client createSnapshot maps request and response", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        name: "snapshots/demo:v1",
+        image: "snapshots/demo:v1",
+        image_id: "sha256:snap-1",
+        source_sandbox_id: "sb-create",
+        created_at: "2026-05-14T10:00:00Z",
+      });
+    },
+  });
+
+  const snapshot = await client.createSnapshot("sb-create", "snapshots/demo:v1");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "POST");
+  assert.deepEqual(await seenRequest.json(), { name: "snapshots/demo:v1" });
+  assert.equal(snapshot.name, "snapshots/demo:v1");
+  assert.equal(snapshot.imageID, "sha256:snap-1");
+  assert.equal(snapshot.sourceSandboxID, "sb-create");
 });
 
 test("internal client updateLifecycle sends flat request body", async () => {
@@ -146,6 +178,28 @@ test("sandbox resource methods refresh and resize data", async () => {
     stopIfIdleFor: 7_200_000_000_000,
     destroyIfIdleFor: 14_400_000_000_000,
   });
+});
+
+test("sandbox resource createSnapshot delegates to client", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "POST" && request.url.endsWith("/snapshot")) {
+        return jsonResponse({
+          name: "snapshots/resource:v1",
+          image: "snapshots/resource:v1",
+          source_sandbox_id: "sb-resource",
+          created_at: "2026-05-14T10:00:00Z",
+        });
+      }
+      return jsonResponse(apiSandbox("sb-resource"));
+    },
+  });
+
+  const sandbox = await client.get("sb-resource");
+  const snapshot = await sandbox.createSnapshot("snapshots/resource:v1");
+  assert.equal(snapshot.sourceSandboxID, "sb-resource");
 });
 
 test("internal client decodes API errors", async () => {
@@ -450,6 +504,194 @@ test("internal client create defaults runtime to '' when sandboxd omits the fiel
   });
   const sandbox = await client.create({ image: "ubuntu:22.04" });
   assert.equal(sandbox.runtime, "");
+});
+
+test("internal client getNetworkUsage maps response shape", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        sandbox_id: "sb-net",
+        bytes_in: 1024,
+        bytes_out: 2048,
+        bytes_in_limit: 4096,
+        bytes_out_limit: 0,
+        quota_exceeded: false,
+        quota_exceeded_at: null,
+        last_sampled_at: "2026-05-15T10:00:00Z",
+      });
+    },
+  });
+
+  const usage = await client.getNetworkUsage("sb-net");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-net/network/usage"));
+  assert.deepEqual(usage, {
+    sandboxID: "sb-net",
+    bytesIn: 1024,
+    bytesOut: 2048,
+    bytesInLimit: 4096,
+    bytesOutLimit: 0,
+    quotaExceeded: false,
+    quotaExceededAt: undefined,
+    lastSampledAt: "2026-05-15T10:00:00Z",
+  });
+});
+
+test("internal client getNetworkUsage handles absent last_sampled_at (pre-first-tick)", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () =>
+      jsonResponse({
+        sandbox_id: "sb-fresh",
+        bytes_in: 0,
+        bytes_out: 0,
+        bytes_in_limit: 0,
+        bytes_out_limit: 0,
+        quota_exceeded: false,
+      }),
+  });
+
+  const usage = await client.getNetworkUsage("sb-fresh");
+  assert.equal(usage.lastSampledAt, undefined);
+});
+
+test("internal client setNetworkLimits sends PATCH with provided fields only", async () => {
+  let seenRequest: Request | undefined;
+  let seenBody: unknown;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      seenBody = await seenRequest.clone().json();
+      return jsonResponse({
+        sandbox_id: "sb-net",
+        bytes_in: 0,
+        bytes_out: 0,
+        bytes_in_limit: 4096,
+        bytes_out_limit: 0,
+        quota_exceeded: false,
+        quota_exceeded_at: null,
+        last_sampled_at: "2026-05-15T10:01:00Z",
+      });
+    },
+  });
+
+  const usage = await client.setNetworkLimits("sb-net", { networkBytesInLimit: 4096 });
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "PATCH");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-net/network/limits"));
+  // Unset egress limit must be omitted entirely so the server reads "leave alone".
+  assert.deepEqual(seenBody, { network_bytes_in_limit: 4096 });
+  assert.equal(usage.bytesInLimit, 4096);
+});
+
+test("internal client create with Image builds first then creates", async () => {
+  const seenRequests: { url: string; method: string; body: unknown }[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      const body = req.method === "POST" ? await req.json().catch(() => undefined) : undefined;
+      seenRequests.push({ url: req.url, method: req.method, body });
+      if (req.url.endsWith("/v1/images/build")) {
+        return jsonResponse({ image: "aerolvm-build/abc123:latest" });
+      }
+      return jsonResponse(apiSandbox("sb-from-image", { image: "aerolvm-build/abc123:latest" }));
+    },
+  });
+
+  const image = Image.base("ubuntu:22.04").runCommands("apt-get update", "apt-get install -y curl");
+  const sandbox = await client.create({ image });
+
+  assert.equal(sandbox.id, "sb-from-image");
+  assert.equal(seenRequests.length, 2);
+  assert.equal(seenRequests[0].method, "POST");
+  assert.ok(seenRequests[0].url.endsWith("/v1/images/build"));
+  assert.deepEqual(seenRequests[0].body, {
+    dockerfile_content:
+      "FROM ubuntu:22.04\nRUN apt-get update\nRUN apt-get install -y curl\n",
+  });
+  assert.ok(seenRequests[1].url.endsWith("/v1/sandboxes"));
+  assert.deepEqual(seenRequests[1].body, { image: "aerolvm-build/abc123:latest" });
+});
+
+test("internal client buildImage forwards push options and returns pushed ref", async () => {
+  const seenBodies: any[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seenBodies.push(await req.json());
+      return jsonResponse({ image: "aerolvm-build/abc123:latest", pushed: "ghcr.io/x/y:v1" });
+    },
+  });
+
+  const result = await client.buildImage(Image.base("alpine"), {
+    push: { registry: "ghcr.io/x/y", tag: "v1", server: "ghcr.io", username: "u", password: "p" },
+  });
+  assert.equal(result.image, "aerolvm-build/abc123:latest");
+  assert.equal(result.pushed, "ghcr.io/x/y:v1");
+  assert.deepEqual(seenBodies[0].push, {
+    registry: "ghcr.io/x/y",
+    tag: "v1",
+    server: "ghcr.io",
+    username: "u",
+    password: "p",
+  });
+});
+
+test("internal client buildImage rejects push without credentials", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ image: "x" }),
+  });
+  await assert.rejects(
+    client.buildImage(Image.base("alpine"), {
+      push: { registry: "ghcr.io/x/y", username: "", password: "p" },
+    }),
+    /push.username and push.password are required/,
+  );
+});
+
+test("internal client buildImage maps 404 to actionable error", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () =>
+      new Response("404 page not found\n", { status: 404, headers: { "content-type": "text/plain" } }),
+  });
+
+  await assert.rejects(
+    client.buildImage(Image.base("alpine")),
+    (err: Error) => /does not support Image builds/.test(err.message) && /string image reference/.test(err.message),
+  );
+});
+
+test("internal client create with bare image string skips build call", async () => {
+  const seenURLs: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seenURLs.push(req.url);
+      return jsonResponse(apiSandbox("sb-string"));
+    },
+  });
+
+  await client.create({ image: "ubuntu:22.04" });
+  assert.equal(seenURLs.length, 1);
+  assert.ok(seenURLs[0].endsWith("/v1/sandboxes"));
 });
 
 function jsonResponse(value: unknown, status = 200): Response {

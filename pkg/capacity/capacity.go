@@ -68,19 +68,19 @@ type Request struct {
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
 // /capacity response.
 type Snapshot struct {
-	HostCPUCores      int      `json:"host_cpu_cores"`
-	HostMemoryTotalMB int      `json:"host_memory_total_mb"`
-	ReservedCPU       float64  `json:"reserved_cpu"`
-	ReservedMemoryMB  int      `json:"reserved_memory_mb"`
-	LiveMemoryFreeMB  int      `json:"live_memory_free_mb"`
-	SandboxesActive   int      `json:"sandboxes_active"`
-	CanAdmit          bool     `json:"can_admit"`
-	Reasons           []string `json:"reasons,omitempty"`
-	CPUReservationRatio       float64 `json:"cpu_reservation_ratio"`
-	MemoryReservationRatio    float64 `json:"memory_reservation_ratio"`
-	MemoryFloorRatio          float64 `json:"memory_floor_ratio"`
-	CPUOverProvisionFactor    float64 `json:"cpu_overprovision_factor"`
-	MemoryOverProvisionFactor float64 `json:"memory_overprovision_factor"`
+	HostCPUCores              int      `json:"host_cpu_cores"`
+	HostMemoryTotalMB         int      `json:"host_memory_total_mb"`
+	ReservedCPU               float64  `json:"reserved_cpu"`
+	ReservedMemoryMB          int      `json:"reserved_memory_mb"`
+	LiveMemoryFreeMB          int      `json:"live_memory_free_mb"`
+	SandboxesActive           int      `json:"sandboxes_active"`
+	CanAdmit                  bool     `json:"can_admit"`
+	Reasons                   []string `json:"reasons,omitempty"`
+	CPUReservationRatio       float64  `json:"cpu_reservation_ratio"`
+	MemoryReservationRatio    float64  `json:"memory_reservation_ratio"`
+	MemoryFloorRatio          float64  `json:"memory_floor_ratio"`
+	CPUOverProvisionFactor    float64  `json:"cpu_overprovision_factor"`
+	MemoryOverProvisionFactor float64  `json:"memory_overprovision_factor"`
 	// MemoryFloorMB is the absolute floor derived from MemoryFloorRatio and
 	// host memory, exposed for operators reading /capacity.
 	MemoryFloorMB int `json:"memory_floor_mb"`

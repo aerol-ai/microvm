@@ -199,6 +199,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/network-usage',
+        label: 'Network Usage & Quotas',
+        description: 'Per-sandbox ingress / egress byte counters with optional caps that drop traffic when exceeded.',
+      },
+      {
+        type: 'link',
         href: '/port-allowlist',
         label: 'Port Allowlist',
         description: 'Require explicit exposure before public traffic reaches a sandbox port.',

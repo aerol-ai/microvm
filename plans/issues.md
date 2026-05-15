@@ -79,120 +79,114 @@ window reliably; opportunistic and accidental traffic mostly will not.
 
 ---
 
-## 2. Failover-recreate loses in-container runtime state
+## 2. Network usage poller drops bytes on the first observation
 
 ### Symptom
 
-When the owning node dies hard and the dead-owner reconciler reassigns a sandbox to a new
-owner, the new owner re-materializes the sandbox from the **replicated spec** — image, env,
-command, resources, mounts, exposed ports, sealed credentials. Anything the original
-container produced *after* boot is gone.
+`pkg/docker/netstats/poller.go:167-173` (`diffAndUpdate`) treats the first sample for a
+new `(sandbox, PID)` pair as a baseline-only event and emits a zero delta. The current
+`/proc/<pid>/net/dev` reading is stored, the next tick's delta is computed against it,
+and only that next tick contributes to the persisted counter.
 
-### What's lost on failover
-
-- **Process tree** — long-running scripts, dev servers, agent processes. The new container
-  boots from the image entrypoint as if it were brand new.
-- **Filesystem writes outside mounts** — `apt install`, files in `/tmp`, `/home`, the
-  workdir. The image's writable layer is local to the dead host.
-- **In-flight sessions** — exec sessions, attached shells, established port forwards drop.
-  Clients must reconnect.
-- **Toolbox uploads** not yet flushed to a mount.
-- **Host-local mount data** — silently gone. The mount path doesn't exist on the new owner.
-  Worst case because the user may not realize until they go looking.
-
-### What survives
-
-- Spec (image, env, command, resources, mounts) — replicated via raft FSM.
-- Sealed credentials — re-merged on recreate by the service layer.
-- Sandbox ID and HTTP/TLS-SNI URLs (stable; derived from id+port+domain).
-- Exposed port intents (replayed; raw TCP exposures get a new host port — public TCP URL
-  changes).
-- Network-backed mount data (NFS, S3FS, anything not host-local).
+For a freshly created sandbox at the default 10s poll interval, that means up to ~10s of
+traffic between container start and the first poll, plus another full interval before
+enforcement sees a non-zero delta. A workload that bursts hard at startup (large image
+pull inside the container, an exfil-on-startup script, an aggressive `wget`) can move
+tens of GB before the quota check ever fires.
 
 ### Affected code
 
-- `internal/cluster/cluster.go:55-95` — `Placement` carries Spec + SealedSecrets +
-  ExposedPorts; explicitly does NOT carry runtime state.
-- `internal/cluster/owner_watcher.go` — invokes `SandboxRecreator.RecreateSandbox` on the
-  new owner; the recreator boots from the spec only.
-- `internal/cluster/cluster.go:131-156` — `SandboxRecreator` interface; documents that the
-  new owner re-runs `ExposePort` for each replicated intent but cannot recover writable-layer
-  state.
+- `pkg/docker/netstats/poller.go:163-179` — `diffAndUpdate` baseline rule.
+- `pkg/docker/netstats/poller.go:41-46` — comment documenting the design intent.
+- `internal/service/netstats.go:186-227` — `HandleSamples` is the only callback path,
+  so any byte not surfaced here never gets metered or quota-checked.
 
-### Trigger frequency
+### Why deferred
 
-Only when the owning node goes down hard (process crash + dead-owner reconciler reassigns
-after the ~30s `SB_DEAD_OWNER_GRACE` window). Graceful restarts on the same node do NOT
-trigger recreate — the local store + container resume in place.
+The current behaviour is intentional: it makes the poller restart-safe. After a
+container restart (new PID) or a daemon restart (poller forgets baselines), `/proc`
+counters reset to small numbers, and treating the first read as "delta from zero" would
+spuriously credit terabytes against the quota.
 
-Blast radius per failover: "fraction of sandboxes owned by the dead node" × "how stateful
-those sandboxes are."
+A correct fix has to *distinguish* the two cases:
 
-### Severity by workload pattern
+- **Fresh container, first observation ever:** counters start at 0 inside the new netns,
+  so the first reading IS the actual usage from 0 — credit it.
+- **Daemon restart, container already had traffic:** stored cumulative is non-zero,
+  in-PID counters are mid-run — must baseline.
 
-| Pattern | Impact |
-|---|---|
-| Stateless CI runner, ephemeral test sandbox | Negligible — recreate from spec is the whole job. |
-| Long-running dev env with `npm install` / modified files | High — user loses all in-container work. |
-| Agent with active session | Session drops mid-task; agent must reconnect. |
-| Anything writing to host-local mounts | **Silent data loss** — path is empty on the new node. |
+This needs persistent baselines, not just in-memory ones, and a slightly subtler diff
+rule. Worth doing right rather than racing a one-line patch.
 
-### Industry baseline
+### Proposed fix shape
 
-This is the same failover model as Kubernetes pods, ECS tasks, and Nomad allocations:
-recreate from spec, lose runtime state. The alternatives (CRIU live migration, periodic
-checkpointing) are operationally heavy and have their own failure modes.
+- Persist `(last_observed_pid, last_observed_bytes_in, last_observed_bytes_out)` on the
+  sandbox row alongside the existing cumulative counters.
+- On poll:
+  - If the persisted PID is 0 / unset → fresh sandbox, no prior reading. Credit the
+    full current reading as the delta and store the snapshot.
+  - If the persisted PID matches the current PID → normal delta, store snapshot.
+  - If PIDs differ → container restart, baseline only (current behaviour).
+- Re-hydrate in-memory `baselines` map at `EnsureNetstatsReady` from the persisted row
+  so a daemon restart doesn't lose state.
+- Optional: tighten the default `NetstatsPollInterval` for the first ~minute of a
+  sandbox's life (a "warm-up" sub-poller) to bound the first-observation gap. Costs
+  extra `/proc` reads per new sandbox, no impact at steady state.
 
-### Decision: document, do not fix
+### Severity
 
-The semantics are acceptable for v1. We expose them user-facing rather than engineer
-around them. If a workload needs durable runtime state across host failure, the answer is
-network-backed mounts, not in-container persistence.
+Medium. Most workloads don't move tens of GB in their first 20 seconds, but billing
+accuracy and abuse-prevention quotas both rely on this counter being honest. Currently
+a known sub-quota leak exists at the start of every sandbox's life.
 
-### Proposed follow-ups (when revisited)
+### Test plan
 
-- **Cheap (do first):** user-facing docs page on failover semantics — what survives, what
-  doesn't, how to design workloads that tolerate it. Add a `host_local_mount` warning at
-  create time when cluster mode is on.
-- **Medium:** mount-type advisory in the SDK / API: surface a warning when a sandbox in
-  cluster mode uses a host-local mount.
-- **Heavy (not planned):** CRIU-based checkpoint/restore, or runtime-native snapshot for
-  gVisor/Kata. Deferred indefinitely; revisit only if a paying user blocks on it.
+- Unit test for `diffAndUpdate` (or its persistent successor): asserts the
+  fresh-container case produces a non-zero delta on first observation, while the
+  PID-change case still baselines.
+- Restart test: create a sandbox, kill the daemon, restart, observe that the first
+  post-restart sample baselines (does not credit cumulative counter to zero).
 
 ---
 
-## 3. AssertOwnership clobbered FSM on failover-recovery (FIXED)
+## 3. Netstats poller scans the whole sandbox table every tick
 
 ### Symptom
 
-Boot-time `AssertOwnership` treated *any* existing placement not owned by self
-as something this node should reclaim — including placements that already pointed
-to a live new owner after a failover-recreate. In the failover-recovery path:
+`internal/service/netstats.go:159-181` (`netstatsServiceLister.NetstatsTargets`) calls
+`store.List(ctx)` on every poll. `Store.List` loads every sandbox row, runs
+`attachPortsBulk` (which scans all `exposed_ports`), and filters in Go. The poller only
+needs `(id, container_id WHERE status='started')`.
 
-1. Node A owned sandbox X. A died hard.
-2. Dead-owner reconciler reassigned X to node B after `SB_DEAD_OWNER_GRACE`;
-   B recreated X locally from the replicated spec.
-3. A came back online with the stale local row still in its store.
-4. A's `AssertOwnership` saw `OwnerNodeID=B != self` and called
-   `RecordPlacement(self)`, overwriting B's ownership in the FSM.
-5. B's `reconcileStaleOwnership` then destroyed B's freshly-recreated
-   container (FSM said B no longer owned it). User state silently lost.
+At small scale this is invisible. As historical / running rows grow, every tick walks
+more rows through the same single-writer SQLite connection that serves API traffic.
 
-### Fix
+### Affected code
 
-`internal/cluster/client.go:AssertOwnership` now uses a three-way decision
-with the FSM as the source of truth for ownership:
+- `internal/service/netstats.go:159-181` — caller.
+- `internal/store/store.go` — `List` is the only available query; no filtered variant.
 
-- **No FSM placement**: claim ownership, ship spec + ports + sealed secrets.
-- **FSM owner == self**: backfill missing spec/secrets, replay port intents.
-- **FSM owner != self**: log loudly and leave the FSM untouched. The local
-  row gets cleaned up by `service.reconcileStaleOwnership` on its next pass
-  (which also runs at boot via `Reconcile`).
+### Why deferred
 
-Pinned by `TestAssertOwnershipDoesNotReclaimForeignOwnedPlacement` in
-`internal/cluster/assert_ownership_test.go` — the test seeds a foreign-owned
-placement, calls `AssertOwnership` with a divergent local row + ports, and
-asserts the FSM owner / spec / ports / version are all unchanged.
+It's premature optimization until a host genuinely carries hundreds-to-thousands of
+running sandboxes. The poller already runs at a low cadence (default 10s) and the work
+isn't on a request-serving path. The fix is mechanical, but it adds a new store method
+that needs its own tests, and shipping it with no measured pressure isn't worth the
+diff cost.
+
+### Proposed fix shape
+
+- Add `Store.ListNetstatsTargets(ctx) ([]struct{ ID, ContainerID string }, error)` that
+  runs a single `SELECT id, container_id FROM sandboxes WHERE status = ?` (no port
+  attach, no full row hydration).
+- Switch `netstatsServiceLister.NetstatsTargets` to call it.
+- Add a regression test in `store_test.go` that verifies status filtering and that no
+  port-attach side query runs (could assert via query counter or simply scope the
+  fixture).
+
+### Severity
+
+Low until measured. Re-evaluate when single-host sandbox counts move into the hundreds.
 
 ---
 

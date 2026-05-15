@@ -6,6 +6,33 @@ export interface RegistryAuth {
   password: string;
 }
 
+/**
+ * Per-request push directive for `MicroVM.buildImage`. Credentials are
+ * forwarded to the daemon as a one-shot `X-Registry-Auth` header on the
+ * push call and are never persisted.
+ */
+export interface BuildImagePushOptions {
+  /** Destination repository, e.g. "ghcr.io/my-org/my-image". */
+  registry: string;
+  /** Destination tag. Defaults to "latest" on the daemon when omitted. */
+  tag?: string;
+  /** Registry serveraddress, e.g. "ghcr.io". Sent inside X-Registry-Auth. */
+  server?: string;
+  username: string;
+  password: string;
+}
+
+export interface BuildImageOptions {
+  push?: BuildImagePushOptions;
+}
+
+export interface BuildImageResult {
+  /** Local content-addressed tag (always returned). */
+  image: string;
+  /** Pushed reference, e.g. "ghcr.io/my-org/my-image:v1.2.3". */
+  pushed?: string;
+}
+
 export type MountType = "s3" | "nfs" | "sshfs" | "rclone";
 
 export interface MountSpec {
@@ -69,8 +96,18 @@ export interface GPUOptions {
   deviceIDs?: string[];
 }
 
+import type { Image } from "./Image.js";
+
 export interface CreateOptions {
-  image: string;
+  /**
+   * The base image for this sandbox. A bare image reference (e.g.
+   * `"ubuntu:22.04"`) is pulled by the daemon as-is. An {@link Image} builder
+   * is compiled to a Dockerfile and sent to the daemon's
+   * `POST /v1/images/build` endpoint; the resulting content-addressed tag is
+   * used for the sandbox. The daemon must have an image builder configured
+   * (every official deployment does); otherwise the build call returns 503.
+   */
+  image: string | Image;
   /** Number of CPU cores to allocate. Fractional values are supported (e.g. 0.5 = half a core). */
   cpu?: number;
   memoryMB?: number;
@@ -78,6 +115,19 @@ export interface CreateOptions {
   env?: Record<string, string>;
   osUser?: string;
   networkBlockAll?: boolean;
+  /**
+   * Cap on bytes the sandbox may receive from outside the container before its
+   * ingress is dropped via per-IP iptables rule. `0` (default) is unlimited.
+   * Limits can be raised or lifted at runtime via `setNetworkLimits`.
+   */
+  networkBytesInLimit?: number;
+  /**
+   * Cap on bytes the sandbox may send to outside the container before its
+   * egress is dropped. `0` (default) is unlimited. The block reuses the same
+   * iptables row as `networkBlockAll`; clearing the quota does not lift an
+   * operator-set blanket egress block.
+   */
+  networkBytesOutLimit?: number;
   registry?: RegistryAuth;
   containerCommand?: string[];
   mounts?: MountSpec[];
@@ -157,6 +207,14 @@ export interface ExposePortOptions {
   protocol?: ExposeProtocol;
 }
 
+export interface SandboxSnapshot {
+  name: string;
+  image: string;
+  imageID?: string;
+  sourceSandboxID: string;
+  createdAt: string;
+}
+
 /**
  * Discriminated result from `exposePort`. Branch on `protocol` to access the
  * fields that are meaningful for the chosen wire protocol — only the raw-TCP
@@ -198,6 +256,31 @@ export interface Sandbox {
   runtime: "" | "docker" | "gvisor" | "kata";
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
+}
+
+/**
+ * Per-sandbox network byte counters and the configured caps that drive the
+ * quota enforcer. `bytesIn` is traffic the container received (ingress);
+ * `bytesOut` is traffic the container sent (egress). A `*Limit` of `0` means
+ * unlimited. `quotaExceeded` flips true the first time the meter crosses
+ * either configured cap and stays true until the operator raises the limit.
+ */
+export interface NetworkUsage {
+  sandboxID: string;
+  bytesIn: number;
+  bytesOut: number;
+  bytesInLimit: number;
+  bytesOutLimit: number;
+  quotaExceeded: boolean;
+  quotaExceededAt?: string;
+  /** Absent until the netstats poller has produced at least one sample. */
+  lastSampledAt?: string;
+}
+
+export interface SetNetworkLimitsOptions {
+  /** Omit (undefined) to leave unchanged. `0` means unlimited. */
+  networkBytesInLimit?: number;
+  networkBytesOutLimit?: number;
 }
 
 export interface ExecRequest {

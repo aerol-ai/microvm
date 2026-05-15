@@ -9,10 +9,13 @@ import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.ExposeOptions;
 import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.Lifecycle;
+import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.ResizeOptions;
 import ai.aerol.microvm.model.SandboxData;
+import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
+import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 
 public class Sandbox extends SandboxData {
     private final MicroVMClient client;
@@ -116,6 +119,10 @@ public class Sandbox extends SandboxData {
         return this;
     }
 
+    public SandboxSnapshot createSnapshot(String name) {
+        return client.createSnapshot(id, name);
+    }
+
     public void destroy() {
         client.destroy(id);
     }
@@ -128,6 +135,14 @@ public class Sandbox extends SandboxData {
     public Sandbox updateLifecycle(Lifecycle lifecycle) {
         apply(client.updateLifecycle(id, lifecycle));
         return this;
+    }
+
+    public NetworkUsage getNetworkUsage() {
+        return client.getNetworkUsage(id);
+    }
+
+    public NetworkUsage setNetworkLimits(SetNetworkLimitsOptions options) {
+        return client.setNetworkLimits(id, options);
     }
 
     private void apply(SandboxData data) {

@@ -1,6 +1,9 @@
 import { APIClient, type APIVersion } from "./internal/client.js";
 import { Sandbox } from "./Sandbox.js";
+import { Image } from "./Image.js";
 import type {
+  BuildImageOptions,
+  BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
   ExecStreamHandle,
@@ -10,6 +13,7 @@ import type {
   MountSpecRedacted,
   ResizeOptions,
   Sandbox as SandboxData,
+  SandboxSnapshot,
   Session,
   SessionAttachHandle,
   SessionAttachOptions,
@@ -82,6 +86,10 @@ export class MicroVM {
     return this.wrap(sandbox.toJSON());
   }
 
+	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
+		return this.client.createSnapshot(id, name);
+	}
+
   async destroy(id: string): Promise<void> {
     await this.client.destroy(id);
   }
@@ -98,6 +106,16 @@ export class MicroVM {
 
   async reconcile(): Promise<void> {
     await this.client.reconcile();
+  }
+
+  /**
+   * Build an {@link Image} on the daemon and optionally push the result to a
+   * remote registry. Push credentials are forwarded per request and never
+   * persisted by the daemon. Returns the local content-addressed tag and,
+   * when push was requested, the pushed reference.
+   */
+  async buildImage(image: Image, options?: BuildImageOptions): Promise<BuildImageResult> {
+    return this.client.buildImage(image, options);
   }
 
   async health(): Promise<HealthStatus> {

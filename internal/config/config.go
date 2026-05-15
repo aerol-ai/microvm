@@ -33,26 +33,27 @@ type Config struct {
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
-	Runtime string
-	AutoReconcile       bool
-	EnableCaddy         bool
-	EnableNetworkRules  bool
-	EnableEventMonitor  bool
-	EnableSSHGateway    bool
-	SSHListenAddr       string
-	SSHHostKeyPath      string
+	Runtime                     string
+	AutoReconcile               bool
+	EnableCaddy                 bool
+	EnableNetworkRules          bool
+	EnableEventMonitor          bool
+	EnableSSHGateway            bool
+	SSHListenAddr               string
+	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
 	CredentialEncryptionKeyPath string
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
-	LogLevel                 string
-	ShutdownTimeout          time.Duration
-	HTTPClientTimeout        time.Duration
-	DockerRuntimeWaitTimeout time.Duration
-	ToolboxWaitTimeout       time.Duration
-	ReconcileInterval        time.Duration
-	UploadMaxBytes           int64
+	LogLevel                    string
+	ShutdownTimeout             time.Duration
+	HTTPClientTimeout           time.Duration
+	DockerRuntimeWaitTimeout    time.Duration
+	ToolboxWaitTimeout          time.Duration
+	ReconcileInterval           time.Duration
+	NetstatsPollInterval        time.Duration
+	UploadMaxBytes              int64
 
 	// Admission control. Admission is purely resource-math: CPU/memory
 	// reservation ratios plus a live memory floor. There is no fixed sandbox
@@ -174,6 +175,49 @@ type Config struct {
 	// RPCs. Falls back to https://<derived-host>:<internal-port> when empty.
 	// Must be HTTPS — plaintext defeats the purpose. SB_CLUSTER_INTERNAL_ADVERTISE.
 	ClusterInternalAdvertiseURL string
+	// ImageBuildContextEnabled is the operator opt-in for the contextHashes
+	// upload path — image builds whose context includes caller-supplied
+	// local files (COPY/ADD). Off by default because the resolution path
+	// needs an object-store + registry combo to push the resulting layered
+	// image somewhere the docker daemon can pull from on the next sandbox
+	// start. With this disabled, builds that only RUN commands (no
+	// caller-side context) still work — they execute against a tar
+	// containing just the Dockerfile.
+	//
+	// NOTE: enabling this is necessary but not sufficient. The context
+	// resolver itself is not yet wired, so requests with contextHashes will
+	// still return HTTP 501 even when this flag is true. The flag exists
+	// so operators can explicitly opt in to that codepath as soon as the
+	// resolver lands, without a daemon redeploy.
+	ImageBuildContextEnabled bool
+	// ImageBuildTimeout caps a single `docker build` (or `docker push`)
+	// call from any image-build path: the native POST /v1/images/build
+	// handler and the Daytona facade's createSandbox build-on-create flow.
+	// Build time is opaque (depends on the Dockerfile) so the default is
+	// generous; we bound it only to keep a runaway build from permanently
+	// parking the HTTP handler.
+	ImageBuildTimeout time.Duration
+	// ImageBuildGCEnabled toggles the periodic janitor that sweeps
+	// locally-built images (BuiltImageNamespace, i.e. "aerolvm-build/*")
+	// that are no longer referenced by any active sandbox AND were created
+	// more than ImageBuildGCTTL ago. Without this, images produced by
+	// standalone POST /v1/images/build calls or by builds whose followup
+	// CreateSandbox failed accumulate forever — service.maybeRemoveImage
+	// only runs on sandbox destroy and so can't see images that never had
+	// a sandbox row.
+	ImageBuildGCEnabled bool
+	// ImageBuildGCInterval is how often the janitor ticker fires. Default
+	// 10m: cheap enough (one filtered /images/json call + one indexed store
+	// lookup per match) that running it more often would only matter if
+	// builds were churning faster than the TTL — which would itself be a
+	// signal something is wrong upstream.
+	ImageBuildGCInterval time.Duration
+	// ImageBuildGCTTL is the minimum age a built image must reach before
+	// it becomes eligible for removal. Default 1h: comfortably longer than
+	// any reasonable retry/network-blip between build and create, so a
+	// transient hiccup doesn't have the janitor yanking an image a client
+	// is about to use.
+	ImageBuildGCTTL time.Duration
 }
 
 func Load() (Config, error) {
@@ -181,41 +225,42 @@ func Load() (Config, error) {
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
 	cfg := Config{
-		PATToken:            strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
-		APIHost:             getEnv("SB_API_HOST", "0.0.0.0"),
-		APIPort:             getEnvInt("SB_API_PORT", 21212),
-		Domain:              normalizeHost(os.Getenv("SB_DOMAIN")),
-		PublicHost:          normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
-		CaddyAdminURL:       getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
-		CaddyServerID:       getEnv("SB_CADDY_SERVER_ID", "srv0"),
-		DBPath:              getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
-		DockerNetwork:       getEnv("SB_DOCKER_NETWORK", "bridge"),
-		ToolboxBinaryPath:   getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
-		ToolboxMountPath:    getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
-		ToolboxPort:         getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
-		IdleTimeoutMinutes:  getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
-		ContainerPrivileged: getEnvBool("SB_CONTAINER_PRIVILEGED", false),
-		ResourceLimitsOff:   getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
-		Runtime:             getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
-		AutoReconcile:       getEnvBool("SB_AUTO_RECONCILE", true),
-		EnableCaddy:         getEnvBool("SB_ENABLE_CADDY", true),
-		EnableNetworkRules:  getEnvBool("SB_ENABLE_NETWORK_RULES", true),
-		EnableEventMonitor:  getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
-		EnableSSHGateway:    getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
-		SSHListenAddr:       getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
-		SSHHostKeyPath:      getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
+		PATToken:                    strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
+		APIHost:                     getEnv("SB_API_HOST", "0.0.0.0"),
+		APIPort:                     getEnvInt("SB_API_PORT", 21212),
+		Domain:                      normalizeHost(os.Getenv("SB_DOMAIN")),
+		PublicHost:                  normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
+		CaddyAdminURL:               getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
+		CaddyServerID:               getEnv("SB_CADDY_SERVER_ID", "srv0"),
+		DBPath:                      getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
+		DockerNetwork:               getEnv("SB_DOCKER_NETWORK", "bridge"),
+		ToolboxBinaryPath:           getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
+		ToolboxMountPath:            getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
+		ToolboxPort:                 getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		IdleTimeoutMinutes:          getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		ContainerPrivileged:         getEnvBool("SB_CONTAINER_PRIVILEGED", false),
+		ResourceLimitsOff:           getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		Runtime:                     getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
+		AutoReconcile:               getEnvBool("SB_AUTO_RECONCILE", true),
+		EnableCaddy:                 getEnvBool("SB_ENABLE_CADDY", true),
+		EnableNetworkRules:          getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		EnableEventMonitor:          getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
+		EnableSSHGateway:            getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
+		SSHListenAddr:               getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
+		SSHHostKeyPath:              getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:     strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
 		CredentialEncryptionKeyPath: getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
 		MountsRootPath:              getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir: getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:            getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
-		LogLevel:            strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
-		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
-		HTTPClientTimeout:        getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 60*time.Second),
-		DockerRuntimeWaitTimeout: getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
-		ToolboxWaitTimeout:       getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
-		ReconcileInterval:        getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
-		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		LogLevel:                    strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
+		ShutdownTimeout:             getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
+		HTTPClientTimeout:           getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
+		DockerRuntimeWaitTimeout:    getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
+		ToolboxWaitTimeout:          getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
+		ReconcileInterval:           getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
+		NetstatsPollInterval:        getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
+		UploadMaxBytes:              int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
@@ -249,6 +294,11 @@ func Load() (Config, error) {
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
+		ImageBuildContextEnabled: getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:        getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:      getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:     getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:          getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
 	}
 
 	if cfg.PATToken == "" {
