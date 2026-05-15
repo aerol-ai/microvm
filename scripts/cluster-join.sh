@@ -25,6 +25,7 @@ INTERNAL_BIND_ADDR="0.0.0.0:7002"
 INTERNAL_ADVERTISE_URL=""
 NO_TLS="false"
 FORCE="false"
+MAX_AUTO_VOTERS="5"
 
 usage() {
 	cat <<'EOF'
@@ -69,6 +70,9 @@ Optional:
                                 Default: 0.0.0.0:7002
   --internal-advertise <url>    HTTPS URL peers dial for the internal channel.
                                 Default: derived from primary IP + internal-bind port.
+  --max-auto-voters <n>         Max Raft voters auto-promoted from gossip.
+                                Additional nodes become non-voters. Default 5.
+                                Set 0 for the old unlimited behavior.
   --no-tls                      Skip TLS. Cluster-internal channels ride over
                                 the public API URL with PAT-only auth. ONLY
                                 safe on a fully isolated network.
@@ -99,6 +103,7 @@ while [[ $# -gt 0 ]]; do
 		--credential-key-path) CRED_KEY_PATH="$2"; shift 2 ;;
 		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
 		--internal-advertise) INTERNAL_ADVERTISE_URL="$2"; shift 2 ;;
+		--max-auto-voters)    MAX_AUTO_VOTERS="$2"; shift 2 ;;
 		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
@@ -151,6 +156,19 @@ if [[ ! -f /etc/systemd/system/sandboxd.service ]]; then
 	exit 1
 fi
 
+if ! [[ "$MAX_AUTO_VOTERS" =~ ^[0-9]+$ ]]; then
+	echo "--max-auto-voters must be a non-negative integer" >&2
+	exit 1
+fi
+
+read_sandboxd_env_value() {
+	local key="$1"
+	if [[ ! -f /etc/sandboxd/sandboxd.env ]]; then
+		return 0
+	fi
+	awk -F= -v key="$key" '$1 == key { value = substr($0, length($1) + 2) } END { print value }' /etc/sandboxd/sandboxd.env
+}
+
 if [[ -d "$RAFT_DATA_DIR" ]] && [[ -n "$(ls -A "$RAFT_DATA_DIR" 2>/dev/null || true)" ]]; then
 	if [[ "$FORCE" != "true" ]]; then
 		echo "Refusing to join: $RAFT_DATA_DIR is not empty." >&2
@@ -171,7 +189,7 @@ case "$DECODED_LEN" in
 		;;
 esac
 
-SB_API_PORT_DEFAULT="$(grep -E '^SB_API_PORT=' /etc/sandboxd/sandboxd.env | tail -n1 | cut -d= -f2-)"
+SB_API_PORT_DEFAULT="$(read_sandboxd_env_value SB_API_PORT)"
 SB_API_PORT_DEFAULT="${SB_API_PORT_DEFAULT:-21212}"
 
 primary_ip() {
@@ -284,7 +302,7 @@ fi
 # the env var (highest precedence in pkg/secrets) carries the same value
 # regardless of file state.
 if [[ -z "$CRED_KEY_PATH" ]]; then
-	CRED_KEY_PATH="$(grep -E '^SB_CREDENTIAL_ENCRYPTION_KEY_PATH=' /etc/sandboxd/sandboxd.env | tail -n1 | cut -d= -f2-)"
+	CRED_KEY_PATH="$(read_sandboxd_env_value SB_CREDENTIAL_ENCRYPTION_KEY_PATH)"
 	CRED_KEY_PATH="${CRED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key}"
 fi
 
@@ -334,6 +352,7 @@ SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
 SB_BOOTSTRAP_PEERS=$PEERS
 SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
 SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
+SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
 	if [[ "$TLS_GENERATED" == "true" ]]; then
 		cat <<EOF

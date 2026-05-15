@@ -30,6 +30,7 @@ TLS_BUNDLE_OUT=""
 CRED_KEY_PATH=""
 CRED_BUNDLE_OUT=""
 FORCE="false"
+MAX_AUTO_VOTERS="5"
 
 usage() {
 	cat <<'EOF'
@@ -73,6 +74,9 @@ Options:
                                 credential encryption key) for distribution to
                                 joining nodes.
                                 Default: ./aerolvm-cred-bundle.tar.gz
+  --max-auto-voters <n>         Max Raft voters auto-promoted from gossip.
+                                Additional nodes become non-voters. Default 5.
+                                Set 0 for the old unlimited behavior.
   --no-tls                      Skip TLS generation. Cluster-internal channels
                                 ride over the public API URL with PAT-only auth.
                                 ONLY safe on a fully isolated private network.
@@ -102,6 +106,7 @@ while [[ $# -gt 0 ]]; do
 		--tls-bundle-out)     TLS_BUNDLE_OUT="$2"; shift 2 ;;
 		--credential-key-path) CRED_KEY_PATH="$2"; shift 2 ;;
 		--cred-bundle-out)    CRED_BUNDLE_OUT="$2"; shift 2 ;;
+		--max-auto-voters)    MAX_AUTO_VOTERS="$2"; shift 2 ;;
 		--no-tls)             NO_TLS="true"; shift ;;
 		--force)              FORCE="true"; shift ;;
 		--help)               usage; exit 0 ;;
@@ -123,6 +128,19 @@ if [[ ! -f /etc/systemd/system/sandboxd.service ]]; then
 	exit 1
 fi
 
+if ! [[ "$MAX_AUTO_VOTERS" =~ ^[0-9]+$ ]]; then
+	echo "--max-auto-voters must be a non-negative integer" >&2
+	exit 1
+fi
+
+read_sandboxd_env_value() {
+	local key="$1"
+	if [[ ! -f /etc/sandboxd/sandboxd.env ]]; then
+		return 0
+	fi
+	awk -F= -v key="$key" '$1 == key { value = substr($0, length($1) + 2) } END { print value }' /etc/sandboxd/sandboxd.env
+}
+
 # Refuse to clobber an existing raft data dir unless --force. Re-running this
 # script with stale on-disk state would silently fork the cluster.
 if [[ -d "$RAFT_DATA_DIR" ]] && [[ -n "$(ls -A "$RAFT_DATA_DIR" 2>/dev/null || true)" ]]; then
@@ -139,7 +157,7 @@ fi
 
 # Pull SB_API_PORT from the base env so the default API URL matches whatever
 # install.sh wrote (defaults to 21212 but a custom install can change it).
-SB_API_PORT_DEFAULT="$(grep -E '^SB_API_PORT=' /etc/sandboxd/sandboxd.env | tail -n1 | cut -d= -f2-)"
+SB_API_PORT_DEFAULT="$(read_sandboxd_env_value SB_API_PORT)"
 SB_API_PORT_DEFAULT="${SB_API_PORT_DEFAULT:-21212}"
 
 primary_ip() {
@@ -199,6 +217,38 @@ case "$DECODED_LEN" in
 		exit 1
 		;;
 esac
+
+# --- Credential encryption key --------------------------------------------
+# Sealed registry passwords and per-mount credentials replicated via raft are
+# decrypted with this key on the failover owner. Every node MUST share the
+# same value or recovered sandboxes lose access to private registries and
+# credentialed mounts. install.sh lazy-generates a per-node file by default;
+# we capture the seed's key (or generate one) and ship it to every joiner via
+# the bundle below.
+if [[ -z "$CRED_KEY_PATH" ]]; then
+	# Honor SB_CREDENTIAL_ENCRYPTION_KEY_PATH from sandboxd.env if the
+	# operator customized it; otherwise the daemon default.
+	CRED_KEY_PATH="$(read_sandboxd_env_value SB_CREDENTIAL_ENCRYPTION_KEY_PATH)"
+	CRED_KEY_PATH="${CRED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key}"
+fi
+
+if [[ ! -f "$CRED_KEY_PATH" ]]; then
+	mkdir -p "$(dirname "$CRED_KEY_PATH")"
+	if ! command -v openssl >/dev/null 2>&1; then
+		echo "openssl not found — required to generate the credential encryption key." >&2
+		echo "Install openssl, or pre-create $CRED_KEY_PATH (base64-encoded 32 bytes)." >&2
+		exit 1
+	fi
+	openssl rand -base64 32 > "$CRED_KEY_PATH"
+	chmod 0600 "$CRED_KEY_PATH"
+fi
+
+CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_PATH")"
+CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+if [[ "$CRED_DECODED_LEN" != "32" ]]; then
+	echo "Invalid credential key at $CRED_KEY_PATH: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
+	exit 1
+fi
 
 # --- Cluster TLS material (self-signed CA + per-node cert) -----------------
 # Generated once on the seed; the CA + CA key go into a tarball that the
@@ -300,38 +350,6 @@ if [[ -z "$INTERNAL_ADVERTISE_URL" ]] && [[ "$NO_TLS" != "true" ]]; then
 	INTERNAL_ADVERTISE_URL="https://${PRIMARY_IP}:${INTERNAL_PORT}"
 fi
 
-# --- Credential encryption key --------------------------------------------
-# Sealed registry passwords and per-mount credentials replicated via raft are
-# decrypted with this key on the failover owner. Every node MUST share the
-# same value or recovered sandboxes lose access to private registries and
-# credentialed mounts. install.sh lazy-generates a per-node file by default;
-# we capture the seed's key (or generate one) and ship it to every joiner via
-# the bundle below.
-if [[ -z "$CRED_KEY_PATH" ]]; then
-	# Honor SB_CREDENTIAL_ENCRYPTION_KEY_PATH from sandboxd.env if the
-	# operator customized it; otherwise the daemon default.
-	CRED_KEY_PATH="$(grep -E '^SB_CREDENTIAL_ENCRYPTION_KEY_PATH=' /etc/sandboxd/sandboxd.env | tail -n1 | cut -d= -f2-)"
-	CRED_KEY_PATH="${CRED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key}"
-fi
-
-if [[ ! -f "$CRED_KEY_PATH" ]]; then
-	mkdir -p "$(dirname "$CRED_KEY_PATH")"
-	if ! command -v openssl >/dev/null 2>&1; then
-		echo "openssl not found — required to generate the credential encryption key." >&2
-		echo "Install openssl, or pre-create $CRED_KEY_PATH (base64-encoded 32 bytes)." >&2
-		exit 1
-	fi
-	openssl rand -base64 32 > "$CRED_KEY_PATH"
-	chmod 0600 "$CRED_KEY_PATH"
-fi
-
-CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_PATH")"
-CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
-if [[ "$CRED_DECODED_LEN" != "32" ]]; then
-	echo "Invalid credential key at $CRED_KEY_PATH: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
-	exit 1
-fi
-
 mkdir -p /etc/sandboxd
 {
 	cat <<EOF
@@ -349,6 +367,7 @@ SB_GOSSIP_ADVERTISE_ADDR=$GOSSIP_ADVERTISE_ADDR
 SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
 SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
 SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
+SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
 	if [[ "$TLS_GENERATED" == "true" ]]; then
 		cat <<EOF

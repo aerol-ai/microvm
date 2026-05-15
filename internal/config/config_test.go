@@ -35,6 +35,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_LOG_LEVEL",
 			"SB_SHUTDOWN_TIMEOUT",
 			"SB_HTTP_CLIENT_TIMEOUT",
+			"SB_CLUSTER_MAX_AUTO_VOTERS",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -81,6 +82,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.Runtime != "docker" {
 					t.Fatalf("expected default Runtime=docker, got %q", cfg.Runtime)
+				}
+				if cfg.ClusterMaxAutoVoters != 5 {
+					t.Fatalf("expected default ClusterMaxAutoVoters=5, got %d", cfg.ClusterMaxAutoVoters)
 				}
 			},
 		},
@@ -155,6 +159,7 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_AUTO_RECONCILE", "false")
 				t.Setenv("SB_ENABLE_CADDY", "false")
 				t.Setenv("SB_ENABLE_NETWORK_RULES", "false")
+				t.Setenv("SB_CLUSTER_MAX_AUTO_VOTERS", "3")
 				t.Setenv("SB_LOG_LEVEL", "DEBUG")
 				t.Setenv("SB_SHUTDOWN_TIMEOUT", "25s")
 				t.Setenv("SB_HTTP_CLIENT_TIMEOUT", "12s")
@@ -173,6 +178,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.AutoReconcile || cfg.EnableCaddy || cfg.EnableNetworkRules {
 					t.Fatalf("expected disabled bool overrides: %+v", cfg)
+				}
+				if cfg.ClusterMaxAutoVoters != 3 {
+					t.Fatalf("expected ClusterMaxAutoVoters=3, got %d", cfg.ClusterMaxAutoVoters)
 				}
 				if cfg.LogLevel != "debug" || cfg.ShutdownTimeout != 25*time.Second || cfg.HTTPClientTimeout != 12*time.Second {
 					t.Fatalf("unexpected log/duration overrides: %+v", cfg)

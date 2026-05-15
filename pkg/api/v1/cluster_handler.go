@@ -17,6 +17,8 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
+const clusterCreateTargetHeader = "X-Cluster-Create-Target"
+
 // clusterForwardWrap returns a middleware that, for any request carrying a
 // {id} path value, looks up the placement and forwards to the owner if the
 // owner is not this node. When the owner is this node — or no placement
@@ -111,13 +113,36 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if targetNodeID := strings.TrimSpace(r.Header.Get(clusterCreateTargetHeader)); targetNodeID != "" {
+		if targetNodeID != c.SelfNodeID() {
+			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
+			return
+		}
+		h.createSandboxOnSelectedNode(w, r, req)
+		return
+	}
+
 	target, err := c.SelectPlacement(capacityRequestFromCreate(req))
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return
 	}
 	if !target.IsSelf {
+		r.Header.Set(clusterCreateTargetHeader, target.NodeID)
 		c.ForwardHTTP(target.APIURL, w, r)
+		return
+	}
+
+	h.createSandboxOnSelectedNode(w, r, req)
+}
+
+// createSandboxOnSelectedNode performs the local side effect once placement has
+// already selected this node. Cross-node forwarded creates enter here through
+// X-Cluster-Create-Target instead of re-running placement on the target.
+func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		h.createSandbox(w, r)
 		return
 	}
 

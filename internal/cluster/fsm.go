@@ -16,11 +16,11 @@ import (
 type opCode uint8
 
 const (
-	opPlace            opCode = 1
-	opDelete           opCode = 2
-	opReassign         opCode = 3
-	opUpsertSpec       opCode = 4 // overwrite Placement.Spec without touching ownership
-	opAddExposedPort   opCode = 5 // record one (port, protocol) intent
+	opPlace             opCode = 1
+	opDelete            opCode = 2
+	opReassign          opCode = 3
+	opUpsertSpec        opCode = 4 // overwrite Placement.Spec without touching ownership
+	opAddExposedPort    opCode = 5 // record one (port, protocol) intent
 	opRemoveExposedPort opCode = 6 // drop one port intent
 )
 
@@ -221,7 +221,10 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	p, ok := f.placements[id]
-	return p, ok
+	if !ok {
+		return Placement{}, false
+	}
+	return clonePlacement(p), true
 }
 
 // idsOwnedBy returns the sandbox IDs whose current owner is nodeID. Used by
@@ -244,7 +247,7 @@ func (f *placementFSM) snapshot() map[string]Placement {
 	defer f.mu.RUnlock()
 	out := make(map[string]Placement, len(f.placements))
 	for k, v := range f.placements {
-		out[k] = v
+		out[k] = clonePlacement(v)
 	}
 	return out
 }
@@ -287,3 +290,65 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 }
 
 func (s *fsmSnapshot) Release() {}
+
+func clonePlacement(p Placement) Placement {
+	p.Spec = cloneCreateSandboxRequest(p.Spec)
+	if len(p.SealedSecrets) > 0 {
+		p.SealedSecrets = append([]byte(nil), p.SealedSecrets...)
+	}
+	if len(p.ExposedPorts) > 0 {
+		ports := make(map[int]string, len(p.ExposedPorts))
+		for k, v := range p.ExposedPorts {
+			ports[k] = v
+		}
+		p.ExposedPorts = ports
+	}
+	return p
+}
+
+func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSandboxRequest {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Env = cloneStringMap(in.Env)
+	out.Tags = cloneStringMap(in.Tags)
+	if len(in.ContainerCommand) > 0 {
+		out.ContainerCommand = append([]string(nil), in.ContainerCommand...)
+	}
+	if len(in.Mounts) > 0 {
+		out.Mounts = make([]models.MountSpec, len(in.Mounts))
+		for i := range in.Mounts {
+			out.Mounts[i] = in.Mounts[i]
+			out.Mounts[i].Options = cloneStringMap(in.Mounts[i].Options)
+			out.Mounts[i].Credentials = cloneStringMap(in.Mounts[i].Credentials)
+		}
+	}
+	if in.Registry != nil {
+		registry := *in.Registry
+		out.Registry = &registry
+	}
+	if in.Lifecycle != nil {
+		lifecycle := *in.Lifecycle
+		out.Lifecycle = &lifecycle
+	}
+	if in.GPUs != nil {
+		gpus := *in.GPUs
+		if len(in.GPUs.DeviceIDs) > 0 {
+			gpus.DeviceIDs = append([]string(nil), in.GPUs.DeviceIDs...)
+		}
+		out.GPUs = &gpus
+	}
+	return &out
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}

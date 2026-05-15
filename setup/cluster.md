@@ -68,13 +68,16 @@ traces one request type from client to action.
 ### 1. Client creates a sandbox
 
 ```
-client ──► any node ──► (forwards to leader if not leader)
-                    │
-                    ▼
-                 [admission check: this node has capacity?]
+client ──► any API node
                     │
                     ▼
                  [pick best owner from gossip capacity table]
+                    │
+                    ▼
+                 [if owner != API node: forward create to owner]
+                    │
+                    ▼  (owner is pinned; target re-checks the pin)
+                 [owner creates the sandbox locally]
                     │
                     ▼
                  [seal registry/mount secrets with shared key]
@@ -82,14 +85,13 @@ client ──► any node ──► (forwards to leader if not leader)
                     ▼
                  [opPlace via raft: replicate placement+spec+sealed]
                     │
-                    ▼  (committed everywhere)
-                 [if owner == this node: docker run; else: forward create]
-                    │
                     ▼
                  returns sandbox handle to client
 ```
 
 Key invariants:
+- The first API node selects placement exactly once. A forwarded create carries
+  the selected owner ID, and a node rejects the request if it is not that owner.
 - Only the **leader** can apply raft entries. Followers forward writes.
 - Every node ends up with the same **redacted spec** + **sealed secrets**
   in its in-memory FSM. SealedSecrets are bytes — only the owner with the
@@ -97,6 +99,9 @@ Key invariants:
 - The owner's local SQLite is the source of truth for runtime state
   (container ID, port allocations, sessions). Raft only carries placement
   + intent.
+- Placement is committed after local runtime creation. If the raft commit fails,
+  the owner attempts to destroy the just-created sandbox so the cluster does
+  not keep an untracked runtime.
 
 ### 2. Client makes a hot-path call (exec, file copy, port-forward)
 
@@ -214,8 +219,13 @@ the loss of `(N-1)/2` voters before writes stop.
 - Always run an **odd number** of voters. Even counts only raise the quorum
   threshold without raising fault tolerance.
 - A 2-node cluster is a single point of failure with extra steps.
+- `SB_CLUSTER_MAX_AUTO_VOTERS` defaults to `5`. Once that many voters exist,
+  newly discovered nodes are added as raft **non-voters**: they receive the
+  placement log, can own sandboxes, and can forward writes to the leader, but
+  they do not enlarge quorum. This is the default safety guard for large runner
+  pools.
 - `SB_NODE_ID` must be **stable** across restarts. A node returning with a
-  new ID joins as a brand-new voter while the old voter sits in the
+  new ID joins as a brand-new raft server while the old server sits in the
   configuration as dead.
 
 ---
@@ -423,10 +433,16 @@ cluster — read this section before configuring DNS.
 
 ### Path 1 — API traffic (`sandbox.example.com/v1/...`)
 
-Lands on any node, gets reverse-proxied internally to the owner via mTLS on
-`:7002`. Routing is solved at the application layer
-(`internal/cluster.ForwardHTTP`). **You can put any LB or DNS scheme in
-front and the API will work.**
+Lands on any node. For sandbox-scoped requests, the application looks up the
+placement record and forwards the HTTP request to the owner's advertised API
+URL (`internal/cluster.ForwardHTTP`). Create requests are the special case:
+the receiving API node chooses the owner once, then forwards a target-pinned
+create to that owner.
+
+The mTLS listener on `:7002` is for cluster-internal control-plane traffic
+such as leader-forwarded raft applies. It is not the data path for API
+owner-forwarding. **You can put any LB or DNS scheme in front of the API path,
+but every node's advertised API URL must be reachable by its peers.**
 
 ### Path 2 — Sandbox URLs (`<id>.sandbox.example.com`, `<id>-<port>.sandbox.example.com`)
 
@@ -920,15 +936,11 @@ auto-promotes it to a voter.
 
 Stop the daemon on the node. The dead-owner reconciler runs after
 `SB_DEAD_OWNER_GRACE` (default 30s) and reassigns or orphans its
-placements. To permanently remove from the raft configuration:
-
-```bash
-# on the leader:
-curl -X DELETE -H "Authorization: Bearer $SB_PAT_TOKEN" \
-  http://127.0.0.1:21212/v1/cluster/members/<node-id>
-```
-
-(Or wait for the dead-owner reconciler to evict it.)
+placements. There is not currently a public API endpoint for explicit raft
+membership removal; do not rely on `DELETE /v1/cluster/members/<node-id>`.
+For now, treat permanent node removal as an operator action that must be
+validated against the current raft membership before the node's data directory
+is reused or discarded.
 
 ### Rolling restart
 
@@ -987,6 +999,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial. Auto-derived. |
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses. Empty on the seed. |
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
+| `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered nodes auto-promoted as raft voters. Default `5`; additional nodes become non-voters. Set `0` for unlimited. |
 | `SB_DEAD_OWNER_GRACE` | no | Wait before reassigning a dead node's placements. Default `30s`. |
 
 The daemon **refuses to boot** in cluster mode if either gossip or

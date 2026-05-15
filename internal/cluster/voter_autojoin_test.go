@@ -3,6 +3,8 @@ package cluster
 import (
 	"testing"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // TestVoterAutoJoinNoOpsWithoutCluster guards the nil-cluster path. Memberlist
@@ -44,4 +46,20 @@ func TestVoterAutoJoinPromotesFollower(t *testing.T) {
 	defer cleanupFollower()
 
 	waitForVoter(t, leader, "fol", 10*time.Second)
+}
+
+func TestVoterAutoJoinAddsNonvoterAfterCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires opening real raft/memberlist sockets")
+	}
+
+	leader, cleanupLeader := newTestCluster(t, "ldr-cap", true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+	leader.cfg.ClusterMaxAutoVoters = 1
+
+	_, cleanupFollower := newTestCluster(t, "nonvoter", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupFollower()
+
+	waitForServerSuffrage(t, leader, "nonvoter", raft.Nonvoter, 10*time.Second)
 }

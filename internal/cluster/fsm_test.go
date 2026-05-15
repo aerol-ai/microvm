@@ -243,7 +243,7 @@ type fakeSnapshotSink struct {
 	cancelled bool
 }
 
-func (f *fakeSnapshotSink) ID() string  { return "fake" }
+func (f *fakeSnapshotSink) ID() string    { return "fake" }
 func (f *fakeSnapshotSink) Cancel() error { f.cancelled = true; return nil }
 func (f *fakeSnapshotSink) Close() error  { return nil }
 
@@ -359,5 +359,69 @@ func TestFSMPreservesSealedSecrets(t *testing.T) {
 	}
 	if p.Spec == nil || p.Spec.CPU != 2 {
 		t.Fatalf("sealed-only upsert erased spec: %+v", p.Spec)
+	}
+}
+
+func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op:          opPlace,
+		SandboxID:   "sb1",
+		OwnerNodeID: "nodeA",
+		Spec: &models.CreateSandboxRequest{
+			Image: "alpine",
+			Env:   map[string]string{"A": "1"},
+			Mounts: []models.MountSpec{{
+				Target:      "/mnt/data",
+				Options:     map[string]string{"ro": "true"},
+				Credentials: map[string]string{"token": "secret"},
+			}},
+			Tags:             map[string]string{"team": "infra"},
+			ContainerCommand: []string{"sleep", "60"},
+			Registry:         &models.RegistryAuth{Server: "ghcr.io", Username: "u", Password: "p"},
+			Lifecycle:        &models.Lifecycle{StopAtAge: time.Minute},
+			GPUs:             &models.GPURequest{Vendor: models.GPUVendorNVIDIA, DeviceIDs: []string{"0"}},
+		},
+		SealedSecrets: []byte("sealed"),
+	})
+	fsm.Apply(&raft.Log{Data: place})
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 8080, Protocol: "http"})
+	fsm.Apply(&raft.Log{Data: add})
+
+	got, ok := fsm.get("sb1")
+	if !ok {
+		t.Fatal("missing placement")
+	}
+	got.Spec.Env["A"] = "mutated"
+	got.Spec.Mounts[0].Options["ro"] = "false"
+	got.Spec.Mounts[0].Credentials["token"] = "mutated"
+	got.Spec.Tags["team"] = "mutated"
+	got.Spec.ContainerCommand[0] = "rm"
+	got.Spec.Registry.Password = "mutated"
+	got.Spec.Lifecycle.StopAtAge = 2 * time.Minute
+	got.Spec.GPUs.DeviceIDs[0] = "1"
+	got.SealedSecrets[0] = 'X'
+	got.ExposedPorts[8080] = "tcp"
+
+	again, _ := fsm.get("sb1")
+	if again.Spec.Env["A"] != "1" ||
+		again.Spec.Mounts[0].Options["ro"] != "true" ||
+		again.Spec.Mounts[0].Credentials["token"] != "secret" ||
+		again.Spec.Tags["team"] != "infra" ||
+		again.Spec.ContainerCommand[0] != "sleep" ||
+		again.Spec.Registry.Password != "p" ||
+		again.Spec.Lifecycle.StopAtAge != time.Minute ||
+		again.Spec.GPUs.DeviceIDs[0] != "0" ||
+		string(again.SealedSecrets) != "sealed" ||
+		again.ExposedPorts[8080] != "http" {
+		t.Fatalf("mutating get() result changed FSM state: %+v", again)
+	}
+
+	snap := fsm.snapshot()
+	snap["sb1"].Spec.Env["A"] = "snap-mutated"
+	snap["sb1"].ExposedPorts[8080] = "tls"
+	afterSnap, _ := fsm.get("sb1")
+	if afterSnap.Spec.Env["A"] != "1" || afterSnap.ExposedPorts[8080] != "http" {
+		t.Fatalf("mutating snapshot() result changed FSM state: %+v", afterSnap)
 	}
 }

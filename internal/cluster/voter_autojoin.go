@@ -46,9 +46,11 @@ func (d *voterAutoJoinDelegate) NotifyLeave(n *memberlist.Node) {
 
 func (d *voterAutoJoinDelegate) NotifyUpdate(*memberlist.Node) {}
 
-// handleMemberJoin tries to add nodeID as a raft voter. Idempotent and
-// leader-gated. Failures are logged at warn — the periodic reconcile loop
-// will retry.
+// handleMemberJoin tries to add nodeID to the raft configuration. It promotes
+// members to voters until ClusterMaxAutoVoters is reached, then adds later
+// members as non-voters so they keep a replicated FSM without increasing
+// quorum size. Idempotent and leader-gated. Failures are logged at warn — the
+// periodic reconcile loop will retry.
 func (c *Cluster) handleMemberJoin(nodeID string) {
 	if nodeID == "" || nodeID == c.nodeID {
 		return
@@ -61,9 +63,34 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 		// Metadata hasn't propagated yet. The reconcile loop will catch this.
 		return
 	}
-	if c.alreadyVoter(nodeID, raftAddr) {
+
+	if srv, ok := c.configuredServer(nodeID); ok {
+		if srv.Suffrage == raft.Voter {
+			if string(srv.Address) == raftAddr {
+				return
+			}
+			c.addMemberAsVoter(nodeID, raftAddr)
+			return
+		}
+		if c.voterCapReached() {
+			if string(srv.Address) == raftAddr {
+				return
+			}
+			c.addMemberAsNonvoter(nodeID, raftAddr)
+			return
+		}
+		c.addMemberAsVoter(nodeID, raftAddr)
 		return
 	}
+
+	if c.voterCapReached() {
+		c.addMemberAsNonvoter(nodeID, raftAddr)
+		return
+	}
+	c.addMemberAsVoter(nodeID, raftAddr)
+}
+
+func (c *Cluster) addMemberAsVoter(nodeID, raftAddr string) {
 	f := c.raft.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, c.commitTimeout)
 	if err := f.Error(); err != nil {
 		c.logger.Warn("cluster: auto-AddVoter failed; will retry on next reconcile",
@@ -74,20 +101,55 @@ func (c *Cluster) handleMemberJoin(nodeID string) {
 		"node_id", nodeID, "raft_addr", raftAddr)
 }
 
-// alreadyVoter returns true if nodeID is in the current raft configuration at
-// raftAddr. We compare both ID and address so a re-bound peer with a new port
-// is re-added rather than silently skipped.
-func (c *Cluster) alreadyVoter(nodeID, raftAddr string) bool {
-	cfg := c.raft.raft.GetConfiguration()
-	if err := cfg.Error(); err != nil {
+func (c *Cluster) addMemberAsNonvoter(nodeID, raftAddr string) {
+	f := c.raft.raft.AddNonvoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, c.commitTimeout)
+	if err := f.Error(); err != nil {
+		c.logger.Warn("cluster: auto-AddNonvoter failed; will retry on next reconcile",
+			"node_id", nodeID, "raft_addr", raftAddr, "err", err)
+		return
+	}
+	c.logger.Info("cluster: added member as raft non-voter because voter cap is reached",
+		"node_id", nodeID, "raft_addr", raftAddr, "max_auto_voters", c.cfg.ClusterMaxAutoVoters)
+}
+
+func (c *Cluster) voterCapReached() bool {
+	max := c.cfg.ClusterMaxAutoVoters
+	if max <= 0 {
 		return false
 	}
+	count, ok := c.currentVoterCount()
+	if !ok {
+		// If we cannot read the configuration, avoid promoting another voter.
+		return true
+	}
+	return count >= max
+}
+
+func (c *Cluster) currentVoterCount() (int, bool) {
+	cfg := c.raft.raft.GetConfiguration()
+	if err := cfg.Error(); err != nil {
+		return 0, false
+	}
+	count := 0
 	for _, srv := range cfg.Configuration().Servers {
-		if string(srv.ID) == nodeID && string(srv.Address) == raftAddr {
-			return true
+		if srv.Suffrage == raft.Voter {
+			count++
 		}
 	}
-	return false
+	return count, true
+}
+
+func (c *Cluster) configuredServer(nodeID string) (raft.Server, bool) {
+	cfg := c.raft.raft.GetConfiguration()
+	if err := cfg.Error(); err != nil {
+		return raft.Server{}, false
+	}
+	for _, srv := range cfg.Configuration().Servers {
+		if string(srv.ID) == nodeID {
+			return srv, true
+		}
+	}
+	return raft.Server{}, false
 }
 
 // peerRaftAddr looks up the raft transport address advertised by nodeID via

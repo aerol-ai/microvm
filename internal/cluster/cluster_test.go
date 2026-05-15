@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/hashicorp/raft"
 )
 
 // TestClusterSingleNodeBootstrap is the smallest possible end-to-end test of
@@ -276,17 +277,22 @@ func waitForLeader(t *testing.T, c *Cluster, max time.Duration) {
 // as a voter (i.e. the auto-voter promotion has fired), or fails the test.
 func waitForVoter(t *testing.T, leader *Cluster, nodeID string, max time.Duration) {
 	t.Helper()
+	waitForServerSuffrage(t, leader, nodeID, raft.Voter, max)
+}
+
+func waitForServerSuffrage(t *testing.T, leader *Cluster, nodeID string, suffrage raft.ServerSuffrage, max time.Duration) {
+	t.Helper()
 	deadline := time.Now().Add(max)
 	for time.Now().Before(deadline) {
 		cfg := leader.raft.raft.GetConfiguration()
 		if cfg.Error() == nil {
 			for _, srv := range cfg.Configuration().Servers {
-				if string(srv.ID) == nodeID {
+				if string(srv.ID) == nodeID && srv.Suffrage == suffrage {
 					return
 				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("voter %q never appeared in leader config within %s", nodeID, max)
+	t.Fatalf("server %q never appeared in leader config with suffrage %v within %s", nodeID, suffrage, max)
 }

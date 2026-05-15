@@ -128,6 +128,7 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial for the internal channel (e.g. `https://10.0.0.5:7002`). Auto-derived from primary IP + internal-listen port when empty. Must be HTTPS. |
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses to join. Bootstrap node leaves this empty. |
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
+| `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Maximum gossip-discovered nodes auto-promoted as raft voters. Default `5`; additional nodes are added as raft non-voters so they receive the placement log without increasing quorum. Set `0` for the old unlimited behavior. |
 
 ### Cluster-internal TLS (recommended)
 
@@ -170,7 +171,8 @@ Raft requires a majority of voters to commit any write. With `N` voters, the clu
 
 - Always run an **odd number** of voters (1, 3, 5, 7). Even counts only raise the quorum threshold without raising fault tolerance.
 - Treat a 2-node cluster as a single point of failure with extra steps. If you only have two hosts, run single-node mode on the more-reliable one.
-- `SB_NODE_ID` must be **stable** across restarts. A node that comes back with a new ID joins as a brand-new voter while the old voter sits in the configuration as dead — eventually evicted by the dead-owner reconciler, but until then it counts toward quorum and inflates the failure budget.
+- `SB_CLUSTER_MAX_AUTO_VOTERS` defaults to `5`. After that cap, new runners join as raft non-voters: they can own sandboxes and forward writes, but they do not count toward quorum.
+- `SB_NODE_ID` must be **stable** across restarts. A node that comes back with a new ID joins as a brand-new raft server while the old server sits in the configuration as dead — eventually evicted by the dead-owner reconciler, but until then it may inflate replication work or quorum if it was a voter.
 
 ## Lost-quorum recovery
 
