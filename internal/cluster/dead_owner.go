@@ -10,6 +10,23 @@ import (
 	"github.com/hashicorp/raft"
 )
 
+// clusterRecreateOnFailoverEnabled is the product-policy gate for automatic
+// sandbox failover-recreate. When false (current policy), a dead owner's
+// placements are orphaned and clients see 410 Gone — sandboxes do not survive
+// node death.
+//
+// The reassign + recreate code paths in this file (pickRecreationTarget,
+// evictDeadOwner's spec-driven branch) and in owner_watcher.go
+// (recreateOwnedSandboxes, tryReassignStuckPlacement) are intentionally
+// preserved rather than deleted: spec/sealed-secret replication is cheap, the
+// failure-mode tests are still useful, and a future opt-in lifecycle policy
+// (e.g. Lifecycle.RecreateOnFailover) is expected to flip this gate.
+//
+// To re-enable: change to true here. Before exposing to users, decide whether
+// recreate should be opt-in per sandbox so it does not silently revive user
+// work that the operator intended to leave dead.
+const clusterRecreateOnFailoverEnabled = false
+
 // deadOwnerTracker holds per-node "first observed dead at" timestamps so the
 // reconciler can decide which nodes have outlasted the grace period.
 type deadOwnerTracker struct {
@@ -153,16 +170,21 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 	}
 }
 
-// evictDeadOwner reassigns every placement owned by nodeID to a live peer
-// (chosen by SelectPlacement using the replicated spec for capacity scoring),
-// then removes the dead node from the raft configuration. Placements with no
-// replicated spec fall back to orphan-marking (owner=""), since recreation is
-// impossible without a spec — a clear observability signal that operator
-// intervention is required.
+// evictDeadOwner orphans every placement owned by nodeID and removes the dead
+// node from the raft configuration. Orphan = OwnerNodeID set to "", so the API
+// surfaces ErrOrphaned (410 Gone) for any subsequent request against that
+// sandbox. This matches the product policy that sandboxes do not survive node
+// death (see clusterRecreateOnFailoverEnabled at the top of this file).
+//
+// When clusterRecreateOnFailoverEnabled flips to true, pickRecreationTarget
+// returns a live peer scored against the replicated spec and the placement is
+// reassigned (rather than orphaned) — the owner watcher on the new owner then
+// re-materializes the container. That code path is preserved here for the
+// future opt-in failover behavior.
 //
 // All steps are idempotent so a partial failure is safe to retry on the next
-// tick: a placement already reassigned to live node X gets opReassign'd to
-// X again as a no-op; RemoveServer is a no-op once the dead node is gone.
+// tick: a placement already orphaned stays orphaned, and RemoveServer is a
+// no-op once the dead node is gone.
 func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 	ids := c.fsm.idsOwnedBy(nodeID)
 	var reassigned, orphaned int
@@ -171,7 +193,13 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		if !ok {
 			continue
 		}
-		newOwnerID, newOwnerURL, newOwnerDataPlaneHost := c.pickRecreationTarget(p.Spec)
+		// Default to the orphan path. The reassign branch is gated off in
+		// product policy; keeping pickRecreationTarget callable preserves the
+		// future opt-in path and the existing tests that exercise it.
+		var newOwnerID, newOwnerURL, newOwnerDataPlaneHost string
+		if clusterRecreateOnFailoverEnabled {
+			newOwnerID, newOwnerURL, newOwnerDataPlaneHost = c.pickRecreationTarget(p.Spec)
+		}
 		cmd := command{
 			Op:                 opReassign,
 			SandboxID:          id,

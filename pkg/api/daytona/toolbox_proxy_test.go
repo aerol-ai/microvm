@@ -51,7 +51,7 @@ func (fakeToolboxRouteRuntime) Inspect(context.Context, string) (*models.Sandbox
 func (fakeToolboxRouteRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	return map[string]*models.SandboxRuntimeState{}, nil
 }
-func (fakeToolboxRouteRuntime) Ping(context.Context) error          { return nil }
+func (fakeToolboxRouteRuntime) Ping(context.Context) error                { return nil }
 func (fakeToolboxRouteRuntime) RemoveImage(context.Context, string) error { return nil }
 func (fakeToolboxRouteRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	return nil
@@ -485,4 +485,3 @@ func TestNormalizeToolboxPathInterpreter(t *testing.T) {
 		}
 	}
 }
-

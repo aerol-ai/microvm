@@ -225,7 +225,7 @@ If the lost voters are gone for good (disk loss, hardware destroyed) and waiting
    sudo rm -rf /var/lib/sandboxd/raft   # on each rejoining node
    sudo ./cluster-join.sh --gossip-key '<key>' --peers <recovered-node>:7001 --force
    ```
-5. Inspect placements via `GET /v1/cluster/members` and reconcile any sandboxes that were owned by permanently-lost nodes — their FSM placements remain but the dead-owner reconciler will reassign or orphan them on the next tick.
+5. Inspect placements via `GET /v1/cluster/members` and reconcile any sandboxes that were owned by permanently-lost nodes — under the current non-HA policy the dead-owner reconciler orphans them on the next tick (clients then see `410 Gone` and should issue a fresh `Create`).
 
 Document this procedure in your runbook before you need it. Do not improvise during an outage.
 

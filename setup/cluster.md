@@ -2,8 +2,11 @@
 
 Run AerolVM across multiple hosts behind one logical API. Clients call any
 node, raft coordinates placement, and traffic is transparently forwarded to
-whichever node owns each sandbox. Sandboxes survive node failure (with
-caveats — see [Failover semantics](#failover-semantics)).
+whichever node owns each sandbox. **Sandboxes themselves are not highly
+available** — if the owner node dies, the sandbox is gone (see
+[Failover semantics](#failover-semantics)). What survives a node failure is
+the cluster: the control plane stays available, other sandboxes keep running,
+and new placements continue to land on healthy nodes.
 
 When to pick this over [`single-node.md`](./single-node.md):
 
@@ -139,21 +142,23 @@ gossip on surviving nodes marks B "suspect" then "dead"
         │
         ▼
 leader runs the dead-owner reconciler:
-  - for each placement owned by B: try to reassign to a live node with capacity
-  - if no capacity anywhere: orphan it (placement deleted)
+  - for each placement owned by B: set owner = "" (orphan)
+  - RemoveServer B from the raft configuration
         │
         ▼
-new owner pulls the spec from its FSM
+subsequent API calls for any of B's sandboxes return 410 Gone
         │
         ▼
-new owner unseals registry/mount creds with the shared key
-        │   (THIS is why every node must hold the same key)
-        ▼
-new owner docker-runs the sandbox image
-        │
-        ▼
-sandbox is back on a different host with the same spec
+clients (or operators) issue a fresh create — placement picks
+a new owner from the live, healthy nodes
 ```
+
+**Sandboxes do not auto-recreate.** Spec, sealed credentials, and exposed-port
+metadata replicated via raft are *retained in the FSM* (and a future opt-in
+lifecycle policy may rematerialize them), but the current product policy is
+"a killed sandbox stays gone." The reassign + recreate code paths exist in
+`internal/cluster/{dead_owner,owner_watcher}.go` and `service.RecreateSandbox`
+but are gated off behind `clusterRecreateOnFailoverEnabled = false`.
 
 ### 4. A node joins for the first time
 
@@ -182,23 +187,33 @@ sandboxes and can accept new placements based on its capacity
 
 ## Failover semantics
 
-What does and does not survive a node failure.
+**The product policy is non-HA sandboxes.** When an owner node dies, every
+sandbox on it is gone. The cluster keeps running; the sandboxes do not.
 
-| State | Survives failover | Why |
+| State | Survives node failure | Why |
 |---|---|---|
-| Sandbox spec (image, env, mounts, runtime, registry config) | **Yes** | Replicated via raft. New owner recreates the container. |
-| Sealed registry/mount credentials | **Yes (only with shared key)** | Replicated as encrypted blobs. Decrypted by new owner using `SB_CREDENTIAL_ENCRYPTION_KEY`. |
-| Container filesystem | **No** | Lives only on the dead host. New owner starts a fresh container from the same image. |
-| Active exec sessions, port-forwards, SSH connections | **No** | Bound to the old container. Clients reconnect after failover. |
-| Sessions / recordings on disk | **No (without external storage)** | Live in the dead host's `/var/lib/`. Use external mounts to persist. |
-| TCP-port allocations | **Yes, when the new owner can bind the replicated host port** | The placement FSM stores the raw-TCP `host_port` and rejects duplicate cluster-wide reservations. Recreate retries failed replays and can reassign if a node cannot restore the route. |
-| Subdomain URL (`<id>.<domain>`) | **Yes** | The sandbox keeps its ID. DNS continues to resolve. |
+| Sandbox spec, sealed creds, port intents | **Retained in the FSM, not auto-recreated** | Replicated by raft so a future opt-in failover policy could rematerialize the sandbox. The current default does not. |
+| Sandbox runtime (container, filesystem, sessions, host ports, SSH) | **No** | Lives only on the dead host. There is no automatic replacement. |
+| Sandbox URL (`<id>.<domain>`) | **No** | The ID is gone from the live cluster — API returns 410 Gone. Clients should create a fresh sandbox and get a fresh ID. |
+| Sessions / recordings on disk | **No (without external storage)** | Live in the dead host's `/var/lib/`. Use external mounts if you need to retrieve them later. |
+| Cluster control plane (raft, placement of *other* sandboxes) | **Yes** | Quorum stays available as long as you keep `(N-1)/2` voters alive. Other sandboxes on healthy nodes continue to run. |
+| New placements after the failure | **Yes** | Capacity from the dead node leaves the gossip pool; new creates pick from the remaining healthy candidates. |
 
-Make workloads truly stateless across failover by:
-1. Keeping ephemeral state in the container only.
-2. Mounting durable state from external storage (S3, NFS, sshfs).
-3. Reconnecting sessions on disconnect (the SDK does this automatically for
-   exec and file streams).
+This is by design: a sandbox is treated as a session, not a service. To make a
+workload *survive* node failure, structure it on top of AerolVM rather than
+inside one sandbox:
+
+1. Keep durable state on external mounts (S3, NFS, sshfs) so a *new* sandbox
+   created by your application code can pick it up.
+2. Have your client code recreate the sandbox on `410 Gone` (the SDK exposes
+   this as a clear error class).
+3. Do not assume the sandbox URL, container ID, or host ports persist across
+   the owner's death.
+
+The reassign + recreate code paths exist behind a gate
+(`clusterRecreateOnFailoverEnabled` in `internal/cluster/dead_owner.go`). They
+are preserved for a future opt-in lifecycle policy and are not active in this
+release.
 
 See [Durability and Failover](https://docs.aerol.ai/durability) for the
 production runbook.
@@ -932,13 +947,18 @@ it is added as a non-voter.
 
 ### Removing a node
 
-Stop the daemon on the node. The dead-owner reconciler runs after
-`SB_DEAD_OWNER_GRACE` (default 30s) and reassigns or orphans its
-placements. There is not currently a public API endpoint for explicit raft
-membership removal; do not rely on `DELETE /v1/cluster/members/<node-id>`.
-For now, treat permanent node removal as an operator action that must be
-validated against the current raft membership before the node's data directory
-is reused or discarded.
+Stop the daemon on the node. After `SB_DEAD_OWNER_GRACE` (default 30s) the
+leader's dead-owner reconciler orphans every placement that node owned
+(`OwnerNodeID = ""` in the FSM — subsequent API calls for those sandboxes
+return `410 Gone`) and `RemoveServer`s the node from the raft configuration.
+Any sandboxes that were on it are gone for good under the current non-HA
+policy; clients should create fresh sandboxes.
+
+There is no public API endpoint for explicit raft membership removal yet —
+`DELETE /v1/cluster/members/<node-id>` is **not implemented** in this release.
+Treat permanent node removal as an operator action and validate against the
+current raft membership before the node's data directory is reused or
+discarded.
 
 ### Rolling restart
 

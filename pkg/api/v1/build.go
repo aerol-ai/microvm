@@ -25,8 +25,8 @@ func buildContextWithTimeout(parent context.Context, timeout time.Duration) (con
 }
 
 type buildImageRequest struct {
-	DockerfileContent string             `json:"dockerfile_content"`
-	ContextHashes     []string           `json:"context_hashes,omitempty"`
+	DockerfileContent string              `json:"dockerfile_content"`
+	ContextHashes     []string            `json:"context_hashes,omitempty"`
 	Push              *buildImagePushSpec `json:"push,omitempty"`
 }
 

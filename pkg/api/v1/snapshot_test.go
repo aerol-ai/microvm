@@ -365,7 +365,7 @@ func (noopRuntime) CreateSnapshot(context.Context, string, string) (string, erro
 func (noopRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Start")
 }
-func (noopRuntime) Stop(context.Context, string) error          { panic("unexpected Stop") }
+func (noopRuntime) Stop(context.Context, string) error             { panic("unexpected Stop") }
 func (noopRuntime) Destroy(context.Context, *models.Sandbox) error { panic("unexpected Destroy") }
 func (noopRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("unexpected Resize")
@@ -376,8 +376,8 @@ func (noopRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState
 func (noopRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	panic("unexpected ListManaged")
 }
-func (noopRuntime) Ping(context.Context) error                         { panic("unexpected Ping") }
-func (noopRuntime) RemoveImage(context.Context, string) error          { return nil }
+func (noopRuntime) Ping(context.Context) error                { panic("unexpected Ping") }
+func (noopRuntime) RemoveImage(context.Context, string) error { return nil }
 func (noopRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	panic("unexpected PushAllowedPorts")
 }

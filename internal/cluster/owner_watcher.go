@@ -29,8 +29,24 @@ const maxRecreateFailuresBeforeReassign = 5
 // the service layer. It runs on every node (not just the leader): each node
 // is responsible for materializing the sandboxes it owns. The loop is a no-op
 // until AttachRecreator wires in the service hook.
+//
+// Gated by clusterRecreateOnFailoverEnabled (see dead_owner.go). When the gate
+// is off (current product policy), the loop is never started so a placement
+// owned by self is never materialized into a container after failover —
+// dead_owner.evictDeadOwner orphans placements instead of reassigning them, so
+// no FSM row should ever name self as the owner without a matching local
+// sandbox under the current policy. The tracker and loop body remain intact so
+// the existing tests can drive recreateOwnedSandboxes directly, and so a
+// future opt-in flip of the gate re-enables failover without re-implementing
+// it.
 func (c *Cluster) startOwnerWatcher() {
 	c.recreateFailures = &recreateFailureTracker{counts: make(map[string]int)}
+	if !clusterRecreateOnFailoverEnabled {
+		// Product policy: sandboxes are not highly available. Do not start
+		// the recreate loop. Keep the tracker non-nil so callers (and tests
+		// that hit recreateOwnedSandboxes directly) don't deref nil.
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ownerWatcherStop = cancel
 	go func() {

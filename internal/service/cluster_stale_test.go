@@ -103,7 +103,6 @@ func TestReconcileStaleOwnershipKeepsLocalSandboxWhenSelfOwns(t *testing.T) {
 		},
 	}, nil)
 
-
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
 		ID:           sandboxID,

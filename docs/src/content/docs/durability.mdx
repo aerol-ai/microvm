@@ -4,23 +4,23 @@ title: Durability and Failover
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A sandbox's container is ephemeral. Files written into the container's writable layer (`/tmp`, the working directory, anywhere not on a mount) live only as long as the container itself. If the container is destroyed - by an explicit `Destroy`, by a host crash, or by an owner-node failover in cluster mode - that data is gone.
+A sandbox's container is ephemeral. Files written into the container's writable layer (`/tmp`, the working directory, anywhere not on a mount) live only as long as the container itself. If the container is destroyed - by an explicit `Destroy`, by a host crash, or by the loss of the owner node in cluster mode - that data is gone, **and the sandbox itself is gone too**: the current release does not auto-recreate a sandbox after the owner dies.
 
-This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle.
+This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle. Add cluster mode and *the sandbox* is also treated as cattle — a fresh `Create` is the way to recover.
 
 ## What survives, what does not
 
-| Asset | Single-node `Destroy` | Single-node host crash | Cluster-mode owner failover |
+| Asset | Single-node `Destroy` | Single-node host crash | Cluster-mode owner death |
 |---|---|---|---|
 | Container writable layer | Lost | Lost | Lost |
-| Mounted volumes (S3, NFS, SSHFS, rclone) | Survive (external) | Survive (external) | Survive (external) |
-| Sandbox ID | Reused on next `Create` | Preserved if record persisted | Preserved (recreated on new owner) |
-| Environment variables, image, resource limits | N/A | Restored on `Start` | Restored from replicated spec |
-| Idle lifecycle policy | N/A | Restored on `Start` | Restored from replicated spec |
-| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Re-exposed on the new owner from replicated intent |
-| Caddy routes | Removed | Restored on `Start` | Re-created on the new owner when ports are re-exposed |
-| Host port number | N/A | Same host, same port | TCP host ports are replayed from replicated route metadata when available |
-| Public URL | Removed | Restored on `Start` | HTTP/TLS URLs stay derived from the sandbox ID; TCP URLs stay stable when the replicated host port can be rebound |
+| Mounted volumes (S3, NFS, SSHFS, rclone) | Survive (external) | Survive (external) | Survive (external) — a *new* sandbox can re-mount them |
+| Sandbox ID | Reused on next `Create` | Preserved if record persisted | **Lost** — API returns `410 Gone`; create a new sandbox |
+| Environment variables, image, resource limits | N/A | Restored on `Start` | Lost (spec is replicated in the FSM but not rematerialized) |
+| Idle lifecycle policy | N/A | Restored on `Start` | Lost |
+| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Lost — the new sandbox declares its own |
+| Caddy routes | Removed | Restored on `Start` | Lost — ingress routes are torn down when the placement orphans |
+| Host port number | N/A | Same host, same port | Lost |
+| Public URL | Removed | Restored on `Start` | Lost — a new sandbox gets a new URL |
 
 ## Make workspace state durable
 
@@ -127,17 +127,17 @@ Mount external storage at the path you want to keep across container lifetimes. 
 
 Anything written under `/workspace` outlives the container. Anything written elsewhere does not. See [External Storage](/external-storage) for the full mount surface (S3, NFS, SSHFS, rclone).
 
-## Cluster-mode failover
+## Cluster-mode owner death
 
-When `SB_ENABLE_CLUSTER=true`, the cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle) and every exposed-port route intent into a Raft log. HTTP/TLS routes record their public URL metadata; raw TCP routes also record the selected `hostPort` so the cluster ingress can keep a stable endpoint. If the owner node leaves the cluster and stays gone past the dead-owner grace period, the leader reassigns every placement that carries a spec to a live node. The new owner detects the reassignment within a few seconds, recreates the sandbox locally with the original ID, and re-runs `ExposePort` for each replicated route intent.
+When `SB_ENABLE_CLUSTER=true` and a sandbox's owner node dies, the current product policy is:
 
-The recreated sandbox is a **fresh container** with the same identity:
+1. After `SB_DEAD_OWNER_GRACE` (default 30s) the cluster leader **orphans** every placement that the dead node owned (`OwnerNodeID = ""` in the replicated FSM) and removes the node from the raft configuration.
+2. Any further API call for one of those sandboxes returns `410 Gone`.
+3. The sandbox is not auto-recreated on a different node. Clients should issue a fresh `Create` to land a new sandbox on the surviving fleet.
 
-- Same sandbox ID - existing client references keep working.
-- Same image, env, resource limits, mounts, lifecycle policy.
-- Mounted volumes attach to the same external sources, so workspace state under mount targets is intact.
-- Container writable layer is empty - any in-container files outside mounts are lost.
-- Same set of exposed ports - re-issued automatically on the new owner. HTTP/TLS URLs stay stable because they are derived from the sandbox ID and domain. Raw TCP keeps the same host port when the new owner can bind the replicated port; if that local port is already occupied, the exposure must be retried or inspected by the operator.
+The cluster *does* still replicate each sandbox's create spec (image, env, resource limits, mounts, lifecycle), the sealed registry/mount credential bag, and every exposed-port route intent into the raft log. That replication is preserved deliberately so a future opt-in lifecycle policy can recover specific sandboxes; the auto-recreate code path is present in the codebase but gated off (`clusterRecreateOnFailoverEnabled` in `internal/cluster/dead_owner.go`).
+
+For now: design your application around the assumption that a sandbox is a session, not a service. Put durable state on a mount, and recreate the sandbox on top of that mount when the old one goes away.
 
 If you ever need to re-expose a port manually (for example, the original `ExposePort` call landed during a network partition and was dropped), the API is idempotent:
 
@@ -203,16 +203,16 @@ When `SB_GOSSIP_SECRET_KEY` is unset, the daemon logs a warning at boot. Raft it
 
 ## Limitations
 
-- **Pre-cluster sandboxes are backfilled at boot.** Sandboxes created before the cluster was enabled, or before spec replication shipped, get their spec, exposed-port intents, and registry credentials written into the Raft log on the next daemon start under cluster mode. Registry credentials persisted before the encrypted column existed are absent from the row and won't be backfilled — those sandboxes rely on the new owner already having the image cached, or a fresh `Create` to re-seed credentials.
-- **Ingress has a convergence window.** Public HTTP/TLS URLs and raw TCP host ports are replicated through the cluster route map, but non-owner ingress routes refresh periodically. Immediately after failover or a new exposure, a backend can briefly return 404/502 until it has reconciled.
+- **Sandboxes are not highly available.** Owner-node death orphans the placement; clients see `410 Gone` and must create a fresh sandbox. Spec, sealed creds, and port intents are still replicated through raft for a future opt-in failover policy, but no auto-recreate runs in this release.
+- **Ingress has a convergence window.** Public HTTP/TLS URLs and raw TCP host ports for *live* sandboxes are replicated through the cluster route map, but non-owner ingress routes refresh periodically. Immediately after a new `ExposePort` call, a backend can briefly return 404/502 until it has reconciled.
 - **Writable-layer state is not replicated.** Treat anything outside a mount as cache. If you need it after a crash, write it to a mount.
-- **Single-node deployments inherit the same model.** A host crash loses the writable layer just as a failover does. Mount external storage for anything that must survive.
+- **Single-node deployments inherit the same model.** A host crash loses the writable layer just as owner death does. Mount external storage for anything that must survive.
 
 ## Recommended pattern
 
 1. Pick the directory your workload writes durable state to (often a project root, a database data dir, or a model cache).
 2. Declare it as a mount target at `Create` time.
 3. Treat everything else inside the container as scratch.
-4. In cluster mode, tolerate a short ingress convergence window after failover - the sandbox ID and exposed port routes survive, but the recreated container is fresh.
+4. In cluster mode, design the client to call `Create` again on `410 Gone`. The mount keeps the durable state intact; a new sandbox picks up where the old one left off.
 
-This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable.
+This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable — and, in cluster mode, the sandbox itself is replaceable too.

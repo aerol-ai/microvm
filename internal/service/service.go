@@ -236,6 +236,13 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // Port replay tries every port but returns an error when any replay failed so
 // the owner watcher keeps retrying and can eventually reassign the placement.
 // ExposePort is idempotent, so a partial replay is safe to resume.
+//
+// Currently unreachable in production: cluster.startOwnerWatcher is gated off
+// by cluster.clusterRecreateOnFailoverEnabled (product policy: sandboxes are
+// not highly available; a dead owner's placements are orphaned). The method is
+// preserved here so a future opt-in failover flag can re-enable the watcher
+// without re-implementing recreate. Cluster-package tests still drive the
+// inner recreate paths through a mock recreator, not this implementation.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		return s.replayClusterExposedPorts(ctx, id, exposedPorts)

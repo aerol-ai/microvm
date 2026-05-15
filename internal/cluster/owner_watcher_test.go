@@ -153,7 +153,14 @@ func TestOwnerWatcherReplaysExposedPorts(t *testing.T) {
 // failover-recreation scenario expressed against a single-node test cluster
 // (the leader picks itself as the recreation target via SelectPlacement's
 // fallback-to-self).
+//
+// Skipped under the current product policy (clusterRecreateOnFailoverEnabled
+// is false): evictDeadOwner orphans the placement, so the watcher never sees
+// it as owned-by-self. Kept for the future opt-in flip.
 func TestEvictThenWatcherEndToEnd(t *testing.T) {
+	if !clusterRecreateOnFailoverEnabled {
+		t.Skip("failover recreate is gated off; flip clusterRecreateOnFailoverEnabled to exercise")
+	}
 	if testing.Short() {
 		t.Skip("integration test: requires real raft socket")
 	}

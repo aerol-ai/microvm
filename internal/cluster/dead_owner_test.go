@@ -115,7 +115,15 @@ func TestReconcileDeadOwnersRespectsGrace(t *testing.T) {
 // only candidate is self/leader) instead of being marked orphan. This is the
 // behaviour change behind auto-recreation — the owner watcher on the new
 // owner picks up from there.
+//
+// Skipped under the current product policy (clusterRecreateOnFailoverEnabled
+// is false): evictDeadOwner always orphans, regardless of spec. The test is
+// kept so the reassign path is still validated whenever the gate flips back
+// on.
 func TestEvictDeadOwnerReassignsWhenSpecExists(t *testing.T) {
+	if !clusterRecreateOnFailoverEnabled {
+		t.Skip("failover recreate is gated off; flip clusterRecreateOnFailoverEnabled to exercise")
+	}
 	if testing.Short() {
 		t.Skip("integration test: requires real raft socket")
 	}
@@ -157,4 +165,3 @@ func newTestClusterWithCfg(t *testing.T, nodeID string, bootstrap bool, gossipPe
 	}
 	return c, cleanup
 }
-
