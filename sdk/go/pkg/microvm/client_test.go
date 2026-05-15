@@ -333,3 +333,107 @@ func TestNewClientCases(t *testing.T) {
 		t.Run(tc.name, tc.run)
 	}
 }
+
+// TestRegisterSnapshotForwardsToWire verifies the public wrapper threads
+// through to /v1/snapshots with the right field names and surfaces the
+// daemon's stored row back to the caller.
+func TestRegisterSnapshotForwardsToWire(t *testing.T) {
+	ctx := context.Background()
+	var seen map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/snapshots" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(models.SandboxSnapshot{
+			Name:      "py-base",
+			Image:     "python:3.12-slim",
+			RegionID:  "us",
+			MemoryMB:  4096,
+			DiskGB:    10,
+			CreatedAt: time.Now().UTC(),
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		APIUrl:     server.URL,
+		PATToken:   "pat",
+		HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+
+	snap, err := client.RegisterSnapshot(ctx, sdktypes.RegisterSnapshotOptions{
+		Name:     "py-base",
+		Image:    "python:3.12-slim",
+		RegionID: "us",
+		MemoryMB: 4096,
+		DiskGB:   10,
+	})
+	if err != nil {
+		t.Fatalf("RegisterSnapshot: %v", err)
+	}
+	if snap.Name != "py-base" || snap.Image != "python:3.12-slim" {
+		t.Fatalf("unexpected snap: %+v", snap)
+	}
+	if seen["name"] != "py-base" || seen["image"] != "python:3.12-slim" {
+		t.Fatalf("payload missing fields: %+v", seen)
+	}
+}
+
+// TestRegisterSnapshotFromImageBuildsDockerfile verifies the convenience
+// wrapper that takes an *Image: it serializes to dockerfile_content under
+// the hood and forwards everything else from the options.
+func TestRegisterSnapshotFromImageBuildsDockerfile(t *testing.T) {
+	ctx := context.Background()
+	var seen map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(models.SandboxSnapshot{
+			Name:  "built",
+			Image: "snapshots/built:resolved",
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		APIUrl: server.URL, PATToken: "pat", HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+
+	img := BaseImage("debian:bookworm-slim").RunCommands("apt-get update")
+	snap, err := client.RegisterSnapshotFromImage(ctx, "built", img, sdktypes.RegisterSnapshotOptions{
+		Entrypoint: []string{"/bin/sh", "-c", "echo hi"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterSnapshotFromImage: %v", err)
+	}
+	if snap.Image != "snapshots/built:resolved" {
+		t.Fatalf("Image = %q, want resolved tag", snap.Image)
+	}
+	got, _ := seen["dockerfile_content"].(string)
+	if got == "" || !strings.Contains(got, "FROM debian:bookworm-slim") {
+		t.Errorf("dockerfile_content missing FROM: %q", got)
+	}
+	if !strings.Contains(got, "apt-get update") {
+		t.Errorf("dockerfile_content missing RUN body: %q", got)
+	}
+	if _, present := seen["image"]; present {
+		t.Errorf("image must be omitted on dockerfile path: %+v", seen)
+	}
+	if seen["name"] != "built" {
+		t.Errorf("name = %v, want built", seen["name"])
+	}
+}

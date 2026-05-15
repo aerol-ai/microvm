@@ -582,3 +582,18 @@ func newSnapshotHandlerTestEnv(t *testing.T) (*service.Service, *store.Store, *f
 func boolPtr(value bool) *bool {
 	return &value
 }
+
+func TestTranslateCreateSandboxRequestRejectsVolumesAsUnsupported(t *testing.T) {
+	req := createSandboxRequest{
+		Volumes: []map[string]any{{"volumeId": "vol-1", "mountPath": "/data"}},
+	}
+
+	h := newHandlers(Deps{})
+	_, _, err := h.translateCreateSandboxRequest(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error when volumes field is set")
+	}
+	if !errors.Is(err, errVolumesUnsupported) {
+		t.Fatalf("err = %v, want errVolumesUnsupported", err)
+	}
+}

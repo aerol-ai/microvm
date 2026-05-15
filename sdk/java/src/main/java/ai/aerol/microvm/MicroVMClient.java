@@ -40,6 +40,7 @@ import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpecRedacted;
 import ai.aerol.microvm.model.NetworkUsage;
+import ai.aerol.microvm.model.RegisterSnapshotOptions;
 import ai.aerol.microvm.model.ResizeOptions;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
@@ -210,6 +211,44 @@ public class MicroVMClient {
 
     public SandboxSnapshot createSnapshot(String sandboxId, String name) {
         return doJson("POST", sandboxPath(sandboxId) + "/snapshot", new CreateSnapshotRequest(name), SandboxSnapshot.class);
+    }
+
+    public SandboxSnapshot registerSnapshot(RegisterSnapshotOptions options) {
+        RegisterSnapshotOptions resolved = copyRegisterSnapshotOptions(options);
+        String name = trimToNull(resolved.name);
+        if (name == null) {
+            throw new MicroVMException("name is required");
+        }
+
+        String image = trimToNull(resolved.image);
+        String dockerfileContent = trimToNull(resolved.dockerfileContent);
+        if (image == null && dockerfileContent == null) {
+            throw new MicroVMException("image or dockerfile_content is required");
+        }
+        if (image != null && dockerfileContent != null) {
+            throw new MicroVMException("image and dockerfile_content are mutually exclusive");
+        }
+
+        resolved.name = name;
+        resolved.image = image;
+        resolved.dockerfileContent = dockerfileContent;
+        resolved.regionId = trimToNull(resolved.regionId);
+        return doJson("POST", versioned("/snapshots"), resolved, SandboxSnapshot.class);
+    }
+
+    public SandboxSnapshot registerSnapshotFromImage(String name, Image image) {
+        return registerSnapshotFromImage(name, image, new RegisterSnapshotOptions());
+    }
+
+    public SandboxSnapshot registerSnapshotFromImage(String name, Image image, RegisterSnapshotOptions options) {
+        if (image == null) {
+            throw new MicroVMException("image is required");
+        }
+        RegisterSnapshotOptions resolved = copyRegisterSnapshotOptions(options);
+        resolved.name = name;
+        resolved.image = null;
+        resolved.dockerfileContent = image.getDockerfile();
+        return registerSnapshot(resolved);
     }
 
     public void destroy(String sandboxId) {
@@ -557,6 +596,24 @@ public class MicroVMClient {
         copy.lifecycle = source.lifecycle;
         copy.runtime = source.runtime;
         copy.gpus = source.gpus;
+        return copy;
+    }
+
+    private RegisterSnapshotOptions copyRegisterSnapshotOptions(RegisterSnapshotOptions source) {
+        RegisterSnapshotOptions copy = new RegisterSnapshotOptions();
+        if (source == null) {
+            return copy;
+        }
+        copy.name = source.name;
+        copy.image = source.image;
+        copy.dockerfileContent = source.dockerfileContent;
+        copy.contextHashes = source.contextHashes;
+        copy.entrypoint = source.entrypoint;
+        copy.regionId = source.regionId;
+        copy.cpu = source.cpu;
+        copy.gpu = source.gpu;
+        copy.memoryMb = source.memoryMb;
+        copy.diskGb = source.diskGb;
         return copy;
     }
 

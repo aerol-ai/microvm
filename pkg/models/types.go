@@ -375,12 +375,36 @@ type CreateSandboxSnapshotRequest struct {
 // SandboxSnapshot is the persisted metadata for a committed sandbox image.
 // Image is the reusable image reference; ImageID is the content-addressed
 // Docker image ID returned by the runtime after the commit succeeds.
+//
+// Two creation paths populate this row:
+//
+//  1. Snapshot-of-a-running-sandbox (legacy) — SourceSandboxID is set,
+//     resource fields stay zero, the image is committed by the runtime.
+//  2. Snapshot-from-image (Daytona facade) — SourceSandboxID is empty,
+//     resource fields and Entrypoint reflect the caller's create payload,
+//     and Image is either the caller-supplied imageName or a freshly built
+//     tag from a buildInfo Dockerfile.
 type SandboxSnapshot struct {
 	Name            string    `json:"name"`
 	Image           string    `json:"image"`
 	ImageID         string    `json:"image_id,omitempty"`
 	SourceSandboxID string    `json:"source_sandbox_id"`
 	CreatedAt       time.Time `json:"created_at"`
+
+	// Entrypoint is the optional command override the caller wants the
+	// runtime to use when starting a sandbox from this snapshot.
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	// RegionID echoes the region the caller requested when creating the
+	// snapshot. The facade persists this verbatim for read-back; region
+	// routing itself is not yet wired through the daemon.
+	RegionID string `json:"region_id,omitempty"`
+	// CPU / MemoryMB / DiskGB / GPU mirror the resource hints the caller
+	// supplied on create — surfaced back to clients that poll the snapshot
+	// after creation.
+	CPU      float64 `json:"cpu,omitempty"`
+	MemoryMB int     `json:"memory_mb,omitempty"`
+	DiskGB   int     `json:"disk_gb,omitempty"`
+	GPU      float64 `json:"gpu,omitempty"`
 }
 
 // ExposePortRequest is the optional JSON body for POST /v1/sandboxes/{id}/ports/{port}.

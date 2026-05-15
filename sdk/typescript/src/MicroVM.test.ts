@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { Image } from "./Image.js";
 import { MicroVM } from "./MicroVM.js";
 import { Sandbox } from "./Sandbox.js";
 
@@ -165,6 +166,95 @@ test("MicroVM createSnapshot returns snapshot metadata", async () => {
   assert.deepEqual(seen[0]?.body, { name: "snapshots/demo:v1" });
   assert.equal(snapshot.imageID, "sha256:snap-1");
   assert.equal(snapshot.sourceSandboxID, "sb-demo");
+});
+
+test("MicroVM registerSnapshot returns persisted snapshot metadata", async () => {
+  const seen: Array<{ method: string; url: string; body: unknown }> = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const bodyText = request.method === "GET" || request.method === "DELETE" ? undefined : await request.text();
+      seen.push({
+        method: request.method,
+        url: request.url,
+        body: bodyText ? JSON.parse(bodyText) : undefined,
+      });
+      return new Response(JSON.stringify({
+        name: "py-base",
+        image: "python:3.12-slim",
+        source_sandbox_id: "",
+        created_at: "2026-05-15T10:00:00Z",
+        region_id: "us",
+        cpu: 2,
+        memory_mb: 4096,
+        disk_gb: 10,
+      }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const snapshot = await sdk.registerSnapshot({
+    name: "py-base",
+    image: "python:3.12-slim",
+    regionID: "us",
+    cpu: 2,
+    memoryMB: 4096,
+    diskGB: 10,
+  });
+
+  assert.deepEqual(seen[0]?.body, {
+    name: "py-base",
+    image: "python:3.12-slim",
+    region_id: "us",
+    cpu: 2,
+    memory_mb: 4096,
+    disk_gb: 10,
+  });
+  assert.equal(snapshot.regionID, "us");
+  assert.equal(snapshot.memoryMB, 4096);
+});
+
+test("MicroVM registerSnapshotFromImage sends dockerfile_content", async () => {
+  const seen: Array<{ method: string; url: string; body: unknown }> = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const bodyText = request.method === "GET" || request.method === "DELETE" ? undefined : await request.text();
+      seen.push({
+        method: request.method,
+        url: request.url,
+        body: bodyText ? JSON.parse(bodyText) : undefined,
+      });
+      return new Response(JSON.stringify({
+        name: "built",
+        image: "snapshots/built:resolved",
+        source_sandbox_id: "",
+        created_at: "2026-05-15T10:00:00Z",
+      }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const snapshot = await sdk.registerSnapshotFromImage(
+    "built",
+    Image.base("debian:bookworm-slim").runCommands("apt-get update"),
+    { entrypoint: ["/bin/sh", "-c", "echo hi"] },
+  );
+
+  const payload = seen[0]?.body as Record<string, unknown>;
+  assert.equal(payload?.name, "built");
+  assert.match(String(payload?.dockerfile_content), /FROM debian:bookworm-slim/);
+  assert.equal("image" in payload, false);
+  assert.deepEqual(payload?.entrypoint, ["/bin/sh", "-c", "echo hi"]);
+  assert.equal(snapshot.image, "snapshots/built:resolved");
 });
 
 test("MicroVM create serializes mounts and mounts endpoint returns redacted specs", async () => {

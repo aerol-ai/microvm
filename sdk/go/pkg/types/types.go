@@ -95,6 +95,42 @@ type BuildImageResult struct {
 	Pushed string
 }
 
+// RegisterSnapshotOptions is the input shape for Client.RegisterSnapshot.
+// Exactly one of Image (a pre-built registry reference) or
+// DockerfileContent (build inputs the daemon will compile) must be set.
+//
+// The remaining fields capture the resource hints the snapshot will report
+// when listed or used in CreateSandboxOptions.Snapshot.
+type RegisterSnapshotOptions struct {
+	// Name is the human-readable identifier other callers use to reference
+	// this snapshot in CreateSandboxOptions.Snapshot. Required.
+	Name string
+	// Image is a pre-built registry image reference (e.g. "python:3.12").
+	// Mutually exclusive with DockerfileContent.
+	Image string
+	// DockerfileContent is the literal Dockerfile the daemon will build.
+	// Mutually exclusive with Image. Use Image.Dockerfile() to obtain this
+	// from an Image-builder graph, or RegisterSnapshotFromImage to skip the
+	// indirection entirely.
+	DockerfileContent string
+	// ContextHashes references blobs uploaded ahead of time so COPY/ADD
+	// steps in DockerfileContent can resolve. Requires the daemon to have
+	// SB_IMAGE_BUILD_CONTEXT_ENABLED set; the resolver itself is not
+	// implemented yet, so non-empty values currently return 501.
+	ContextHashes []string
+	// Entrypoint overrides the image's entrypoint. Echoed back on the
+	// snapshot row so future sandbox-create calls inherit it.
+	Entrypoint []string
+	// RegionID pins the snapshot to a specific region for multi-region
+	// deployments. Persisted on the row but not yet used for routing.
+	RegionID string
+	// CPU, GPU, MemoryMB, DiskGB are resource hints surfaced to clients.
+	CPU      float64
+	GPU      float64
+	MemoryMB int
+	DiskGB   int
+}
+
 type GPURequest = models.GPURequest
 type GPUVendor = models.GPUVendor
 

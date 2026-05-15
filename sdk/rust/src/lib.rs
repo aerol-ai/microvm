@@ -28,8 +28,9 @@ pub use types::{
     BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions,
     CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, ExposeProtocol,
     ExposeResult, ExposedPort, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType,
-    NetworkUsage, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session,
-    SessionList, SessionStatus, SetNetworkLimitsOptions, UpdateLifecycleOptions,
+    NetworkUsage, RegisterSnapshotOptions, RegistryAuth, ResizeOptions, Sandbox as SandboxData,
+    SandboxSnapshot, Session, SessionList, SessionStatus, SetNetworkLimitsOptions,
+    UpdateLifecycleOptions,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -640,6 +641,103 @@ impl Client {
             &format!("{}/sandboxes/{}/snapshot", self.version_prefix(), id),
             Some(&CreateSnapshotRequest { name }),
         )
+    }
+
+    pub fn register_snapshot(&self, opts: RegisterSnapshotOptions) -> Result<SandboxSnapshot, Error> {
+        #[derive(Serialize)]
+        struct RegisterSnapshotRequest<'a> {
+            name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            image: Option<&'a str>,
+            #[serde(rename = "dockerfile_content", skip_serializing_if = "Option::is_none")]
+            dockerfile_content: Option<&'a str>,
+            #[serde(rename = "context_hashes", skip_serializing_if = "Option::is_none")]
+            context_hashes: Option<&'a [String]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            entrypoint: Option<&'a [String]>,
+            #[serde(rename = "region_id", skip_serializing_if = "Option::is_none")]
+            region_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cpu: Option<f64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            gpu: Option<f64>,
+            #[serde(rename = "memory_mb", skip_serializing_if = "Option::is_none")]
+            memory_mb: Option<u32>,
+            #[serde(rename = "disk_gb", skip_serializing_if = "Option::is_none")]
+            disk_gb: Option<u32>,
+        }
+
+        let name = opts.name.trim();
+        if name.is_empty() {
+            return Err(Error::Api("name is required".to_string()));
+        }
+
+        let image = opts
+            .image
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let dockerfile_content = opts
+            .dockerfile_content
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        match (&image, &dockerfile_content) {
+            (None, None) => {
+                return Err(Error::Api(
+                    "image or dockerfile_content is required".to_string(),
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::Api(
+                    "image and dockerfile_content are mutually exclusive".to_string(),
+                ))
+            }
+            _ => {}
+        }
+
+        let region_id = opts
+            .region_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        self.do_json::<RegisterSnapshotRequest<'_>, SandboxSnapshot>(
+            Method::POST,
+            &format!("{}/snapshots", self.version_prefix()),
+            Some(&RegisterSnapshotRequest {
+                name,
+                image: image.as_deref(),
+                dockerfile_content: dockerfile_content.as_deref(),
+                context_hashes: if opts.context_hashes.is_empty() {
+                    None
+                } else {
+                    Some(opts.context_hashes.as_slice())
+                },
+                entrypoint: if opts.entrypoint.is_empty() {
+                    None
+                } else {
+                    Some(opts.entrypoint.as_slice())
+                },
+                region_id: region_id.as_deref(),
+                cpu: opts.cpu,
+                gpu: opts.gpu,
+                memory_mb: opts.memory_mb,
+                disk_gb: opts.disk_gb,
+            }),
+        )
+    }
+
+    pub fn register_snapshot_from_image(
+        &self,
+        name: &str,
+        image: &Image,
+        mut opts: RegisterSnapshotOptions,
+    ) -> Result<SandboxSnapshot, Error> {
+        if let Some(message) = image.validation_error() {
+            return Err(Error::Api(message.to_string()));
+        }
+        opts.name = name.to_string();
+        opts.image = None;
+        opts.dockerfile_content = Some(image.dockerfile().to_string());
+        self.register_snapshot(opts)
     }
 
     pub fn destroy(&self, id: &str) -> Result<(), Error> {
@@ -1938,6 +2036,147 @@ mod tests {
         assert_eq!(snapshot.name, "snapshots/demo:v1");
         assert_eq!(snapshot.image_id.as_deref(), Some("sha256:snap-1"));
         assert_eq!(snapshot.source_sandbox_id, "sb-1");
+    }
+
+    #[test]
+    fn register_snapshot_sends_image_path_and_maps_response() {
+        let body = serde_json::json!({
+            "name": "py-base",
+            "image": "python:3.12-slim",
+            "image_id": "sha256:snap-2",
+            "source_sandbox_id": "",
+            "created_at": "2026-05-15T10:00:00Z",
+            "region_id": "us",
+            "cpu": 2.0,
+            "gpu": 1.0,
+            "memory_mb": 4096,
+            "disk_gb": 10
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let snapshot = client
+            .register_snapshot(RegisterSnapshotOptions {
+                name: "py-base".to_string(),
+                image: Some("python:3.12-slim".to_string()),
+                region_id: Some("us".to_string()),
+                cpu: Some(2.0),
+                gpu: Some(1.0),
+                memory_mb: Some(4096),
+                disk_gb: Some(10),
+                ..Default::default()
+            })
+            .expect("register snapshot should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+
+        assert!(
+            request.starts_with("POST /v1/snapshots HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "name": "py-base",
+                "image": "python:3.12-slim",
+                "region_id": "us",
+                "cpu": 2.0,
+                "gpu": 1.0,
+                "memory_mb": 4096,
+                "disk_gb": 10
+            })
+        );
+        assert_eq!(snapshot.image_id.as_deref(), Some("sha256:snap-2"));
+        assert_eq!(snapshot.region_id.as_deref(), Some("us"));
+        assert_eq!(snapshot.cpu, Some(2.0));
+        assert_eq!(snapshot.gpu, Some(1.0));
+        assert_eq!(snapshot.memory_mb, Some(4096));
+        assert_eq!(snapshot.disk_gb, Some(10));
+    }
+
+    #[test]
+    fn register_snapshot_from_image_sends_dockerfile_path() {
+        let body = serde_json::json!({
+            "name": "built",
+            "image": "snapshots/built:resolved",
+            "image_id": "sha256:snap-3",
+            "source_sandbox_id": "",
+            "created_at": "2026-05-15T10:00:00Z",
+            "entrypoint": ["/bin/sh", "-c", "echo hi"]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let snapshot = client
+            .register_snapshot_from_image(
+                "built",
+                &Image::base("debian:bookworm-slim").run_command("apt-get update"),
+                RegisterSnapshotOptions {
+                    entrypoint: vec!["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+                    ..Default::default()
+                },
+            )
+            .expect("register snapshot from image should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+
+        assert!(
+            request.starts_with("POST /v1/snapshots HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        let dockerfile = body
+            .get("dockerfile_content")
+            .and_then(|value| value.as_str())
+            .expect("dockerfile_content should be present");
+        assert!(dockerfile.contains("FROM debian:bookworm-slim"));
+        assert!(dockerfile.contains("RUN apt-get update"));
+        assert!(body.get("image").is_none());
+        assert_eq!(
+            body.get("entrypoint"),
+            Some(&serde_json::json!(["/bin/sh", "-c", "echo hi"]))
+        );
+        assert_eq!(snapshot.image, "snapshots/built:resolved");
+        assert_eq!(snapshot.entrypoint, vec!["/bin/sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn register_snapshot_validates_input_before_sending() {
+        let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token"))
+            .expect("client should build");
+
+        let missing_name = client
+            .register_snapshot(RegisterSnapshotOptions {
+                image: Some("alpine".to_string()),
+                ..Default::default()
+            })
+            .expect_err("missing name should fail");
+        assert!(missing_name.to_string().contains("name is required"));
+
+        let missing_payload = client
+            .register_snapshot(RegisterSnapshotOptions {
+                name: "x".to_string(),
+                ..Default::default()
+            })
+            .expect_err("missing image/dockerfile should fail");
+        assert!(
+            missing_payload
+                .to_string()
+                .contains("image or dockerfile_content is required")
+        );
+
+        let both_set = client
+            .register_snapshot(RegisterSnapshotOptions {
+                name: "x".to_string(),
+                image: Some("alpine".to_string()),
+                dockerfile_content: Some("FROM busybox".to_string()),
+                ..Default::default()
+            })
+            .expect_err("mutually exclusive fields should fail");
+        assert!(both_set.to_string().contains("mutually exclusive"));
     }
 
     #[test]
