@@ -243,7 +243,7 @@ type fakeSnapshotSink struct {
 	cancelled bool
 }
 
-func (f *fakeSnapshotSink) ID() string  { return "fake" }
+func (f *fakeSnapshotSink) ID() string    { return "fake" }
 func (f *fakeSnapshotSink) Cancel() error { f.cancelled = true; return nil }
 func (f *fakeSnapshotSink) Close() error  { return nil }
 

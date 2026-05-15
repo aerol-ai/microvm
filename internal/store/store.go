@@ -358,7 +358,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 }
 
 // nullableBlob normalizes a nil byte slice to an empty one so SQLite stores
-// X'' rather than NULL for the registry_auth_sealed column.
+// X” rather than NULL for the registry_auth_sealed column.
 func nullableBlob(b []byte) []byte {
 	if b == nil {
 		return []byte{}

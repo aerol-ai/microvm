@@ -115,17 +115,17 @@ type Config struct {
 	// sandbox is owned by exactly one node; the owner's local SQLite remains
 	// the source of truth for sandbox state. Hot-path traffic (toolbox,
 	// sessions, port forwards) is transparently reverse-proxied to the owner.
-	EnableCluster            bool
-	NodeID                   string
-	RaftBindAddr             string
-	RaftAdvertiseAddr        string
-	RaftDataDir              string
-	GossipBindAddr           string
-	GossipAdvertiseAddr      string
-	BootstrapPeers           []string
-	ClusterBootstrap         bool
-	SelfAPIAdvertiseURL      string
-	ClusterRaftCommitTimeout time.Duration
+	EnableCluster                 bool
+	NodeID                        string
+	RaftBindAddr                  string
+	RaftAdvertiseAddr             string
+	RaftDataDir                   string
+	GossipBindAddr                string
+	GossipAdvertiseAddr           string
+	BootstrapPeers                []string
+	ClusterBootstrap              bool
+	SelfAPIAdvertiseURL           string
+	ClusterRaftCommitTimeout      time.Duration
 	ClusterCapacityGossipInterval time.Duration
 	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
 	// a node dead before orphaning its placements and removing it from the
@@ -294,11 +294,11 @@ func Load() (Config, error) {
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
-		ImageBuildContextEnabled: getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
-		ImageBuildTimeout:        getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
-		ImageBuildGCEnabled:      getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
-		ImageBuildGCInterval:     getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:          getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageBuildContextEnabled:      getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:             getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:          getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:               getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
 	}
 
 	if cfg.PATToken == "" {

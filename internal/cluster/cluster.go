@@ -82,9 +82,9 @@ type Placement struct {
 
 // Member is a snapshot of a peer's gossiped state.
 type Member struct {
-	NodeID   string            `json:"node_id"`
-	APIURL   string            `json:"api_url"`
-	RaftAddr string            `json:"raft_addr,omitempty"`
+	NodeID   string `json:"node_id"`
+	APIURL   string `json:"api_url"`
+	RaftAddr string `json:"raft_addr,omitempty"`
 	// InternalURL is the cluster-internal mTLS endpoint used for raft
 	// leader-forward applies. Empty when the peer is running without
 	// SB_CLUSTER_TLS_DIR — the forwarder falls back to APIURL with PAT-only
