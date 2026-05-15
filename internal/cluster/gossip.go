@@ -19,9 +19,9 @@ import (
 // capacity.Snapshot grows past that, we'd need to switch to gossiped
 // user-events instead of node metadata.
 type nodeMeta struct {
-	NodeID   string `json:"node_id"`
-	APIURL   string `json:"api_url"`
-	RaftAddr string `json:"raft_addr,omitempty"`
+	NodeID   string            `json:"node_id"`
+	APIURL   string            `json:"api_url"`
+	RaftAddr string            `json:"raft_addr,omitempty"`
 	// InternalURL is this node's cluster-internal mTLS endpoint (e.g.
 	// https://10.0.0.5:7002). Set only when the node was started with cluster
 	// TLS material — peers receiving an empty value know to fall back to the
@@ -94,18 +94,18 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 
 // NotifyMsg, GetBroadcasts, LocalState, MergeRemoteState are required by the
 // Delegate interface but unused in Phase 1 — we rely on NodeMeta only.
-func (d *gossipDelegate) NotifyMsg([]byte)                {}
-func (d *gossipDelegate) GetBroadcasts(int, int) [][]byte { return nil }
-func (d *gossipDelegate) LocalState(bool) []byte          { return nil }
-func (d *gossipDelegate) MergeRemoteState([]byte, bool)   {}
+func (d *gossipDelegate) NotifyMsg([]byte)                 {}
+func (d *gossipDelegate) GetBroadcasts(int, int) [][]byte  { return nil }
+func (d *gossipDelegate) LocalState(bool) []byte           { return nil }
+func (d *gossipDelegate) MergeRemoteState([]byte, bool)    {}
 
 // gossipNode wraps memberlist + the delegate so Close can stop the refresh
 // loop alongside leaving the cluster.
 type gossipNode struct {
-	ml          *memberlist.Memberlist
-	delegate    *gossipDelegate
+	ml       *memberlist.Memberlist
+	delegate *gossipDelegate
 	stopRefresh context.CancelFunc
-	logger      *slog.Logger
+	logger   *slog.Logger
 }
 
 type gossipSetupConfig struct {

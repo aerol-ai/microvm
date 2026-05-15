@@ -172,7 +172,7 @@ func TestBuiltImageGCMixedRulesAppliedPerImage(t *testing.T) {
 
 	list := func(context.Context) ([]docker.BuiltImage, error) {
 		return []docker.BuiltImage{
-			{Tag: "aerolvm-build/old-orphan:latest", LastTagTime: old},     // remove
+			{Tag: "aerolvm-build/old-orphan:latest", LastTagTime: old},   // remove
 			{Tag: "aerolvm-build/fresh-orphan:latest", LastTagTime: fresh}, // skip (fresh)
 			{Tag: "aerolvm-build/inuse:latest", LastTagTime: old},          // skip (referenced)
 		}, nil

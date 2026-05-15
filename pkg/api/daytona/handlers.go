@@ -846,7 +846,6 @@ func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (s
 //     a hash-resolved context tar is supplied to BuildImage (today that
 //     resolver is not wired — the flag returns "not yet implemented" so the
 //     contract is honored at the type level without misleading users).
-//
 // resolveBuildInfo returns (imageTag, freshlyBuiltTag, error). freshlyBuiltTag
 // is non-empty only when this call actually invoked BuildImage and produced
 // a new image (cache hits return the tag in the first slot only). Callers

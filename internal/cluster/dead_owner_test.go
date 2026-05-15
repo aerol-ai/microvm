@@ -157,3 +157,4 @@ func newTestClusterWithCfg(t *testing.T, nodeID string, bootstrap bool, gossipPe
 	}
 	return c, cleanup
 }
+

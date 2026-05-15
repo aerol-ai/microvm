@@ -16,11 +16,11 @@ import (
 type opCode uint8
 
 const (
-	opPlace             opCode = 1
-	opDelete            opCode = 2
-	opReassign          opCode = 3
-	opUpsertSpec        opCode = 4 // overwrite Placement.Spec without touching ownership
-	opAddExposedPort    opCode = 5 // record one (port, protocol) intent
+	opPlace            opCode = 1
+	opDelete           opCode = 2
+	opReassign         opCode = 3
+	opUpsertSpec       opCode = 4 // overwrite Placement.Spec without touching ownership
+	opAddExposedPort   opCode = 5 // record one (port, protocol) intent
 	opRemoveExposedPort opCode = 6 // drop one port intent
 )
 
