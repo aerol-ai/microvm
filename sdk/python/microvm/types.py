@@ -17,7 +17,7 @@ class RegistryAuth(TypedDict, total=False):
 
 
 class BuildImagePushOptions(TypedDict, total=False):
-    """Per-request push directive for :meth:`Client.build_image_with_push`.
+    """Per-request push directive for :meth:`MicroVM.build_image_with_push`.
 
     Credentials are forwarded to the daemon as a one-shot ``X-Registry-Auth``
     header on the underlying push call and are never persisted server-side.

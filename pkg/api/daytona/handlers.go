@@ -40,7 +40,19 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(r.Context(), req)
 	if err != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		// Image-build failures are operational, not user-input errors:
+		// reporting them as 400 would mislead retry/alerting (a transient
+		// daemon hiccup looks identical to bad client input). Distinguish
+		// timeouts (504) and build/registry failures (502) from validation
+		// errors that fail before BuildImage is reached (400).
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
+		case errors.Is(err, errBuildOperational):
+			apihttp.WriteError(w, http.StatusBadGateway, err.Error())
+		default:
+			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		}
 		return
 	}
 
@@ -863,7 +875,7 @@ func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest)
 	tag := docker.BuildTagFor(dockerfile, info.ContextHashes)
 	exists, err := h.deps.Builder.ImageExists(ctx, tag)
 	if err != nil {
-		return "", "", fmt.Errorf("check built image cache: %w", err)
+		return "", "", fmt.Errorf("%w: check built image cache: %v", errBuildOperational, err)
 	}
 	if exists {
 		return tag, "", nil
@@ -882,10 +894,24 @@ func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest)
 		},
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("build image: %w", err)
+		// Surface DeadlineExceeded and the build-operational marker so the
+		// caller can return 504 / 502 instead of 400. Wrap with both: %w
+		// only chains one error, so emit a fmt.Errorf that errors.Is sees
+		// errBuildOperational; if the underlying err is DeadlineExceeded,
+		// the caller's first switch arm catches that via the chain.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", "", fmt.Errorf("build image timed out: %w", err)
+		}
+		return "", "", fmt.Errorf("%w: build image: %v", errBuildOperational, err)
 	}
 	return tag, tag, nil
 }
+
+// errBuildOperational marks errors that originate from the local Docker
+// daemon (build, image inspect) rather than from caller validation. The
+// daytona createSandbox handler maps it to HTTP 502 so that retries and
+// alerting can distinguish "daemon is sad" from "client sent garbage".
+var errBuildOperational = errors.New("build operational error")
 
 // singleLineFromImage detects the legacy `FROM <image>` shape and returns
 // the base image when matched. Comments and blank lines are ignored.

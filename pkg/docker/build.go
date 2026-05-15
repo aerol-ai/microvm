@@ -241,6 +241,18 @@ func (c *Client) PushImage(ctx context.Context, req PushImageRequest) (string, e
 	if err := c.tagImage(ctx, src, repo, tag); err != nil {
 		return "", err
 	}
+	// The push only needs the dest tag to exist for the duration of the
+	// push call; afterwards we untag so only the aerolvm-build/* tag still
+	// references the image content. This matters for GC: the built-image
+	// janitor lists tags under BuiltImageNamespace, and a stray repo:tag
+	// outside that namespace would keep the image alive forever even after
+	// the source build tag is swept. RemoveImage is benign on 404/409, so
+	// running it on both success and failure is safe.
+	defer func() {
+		if rmErr := c.RemoveImage(context.Background(), repo+":"+tag); rmErr != nil && c.logger != nil {
+			c.logger.Warn("untag pushed image failed", "ref", repo+":"+tag, "error", rmErr)
+		}
+	}()
 
 	encoded, err := json.Marshal(map[string]string{
 		"username":      req.Auth.Username,

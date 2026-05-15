@@ -108,19 +108,27 @@ type Config struct {
 	// "127.0.0.1:8443" to match install.sh's relocated HTTPS listener.
 	L4TLSFallback string
 
-	// ImageBuildContextEnabled flips on the Daytona/aerovm SDK's
-	// `contextHashes` upload path — image builds whose context includes
-	// caller-supplied local files (COPY/ADD). Off by default because the
-	// resolution path needs an object-store + registry combo to push the
-	// resulting layered image somewhere the docker daemon can pull from
-	// on the next sandbox start. With this disabled, builds that only RUN
-	// commands (no caller-side context) still work — they execute against
-	// a tar containing just the Dockerfile.
+	// ImageBuildContextEnabled is the operator opt-in for the contextHashes
+	// upload path — image builds whose context includes caller-supplied
+	// local files (COPY/ADD). Off by default because the resolution path
+	// needs an object-store + registry combo to push the resulting layered
+	// image somewhere the docker daemon can pull from on the next sandbox
+	// start. With this disabled, builds that only RUN commands (no
+	// caller-side context) still work — they execute against a tar
+	// containing just the Dockerfile.
+	//
+	// NOTE: enabling this is necessary but not sufficient. The context
+	// resolver itself is not yet wired, so requests with contextHashes will
+	// still return HTTP 501 even when this flag is true. The flag exists
+	// so operators can explicitly opt in to that codepath as soon as the
+	// resolver lands, without a daemon redeploy.
 	ImageBuildContextEnabled bool
-	// ImageBuildTimeout caps a single `docker build` call from the daytona
-	// facade. Build time is opaque (depends on the Dockerfile) so the
-	// default is generous; we bound it only to keep a runaway build from
-	// permanently parking a sandbox-create HTTP handler.
+	// ImageBuildTimeout caps a single `docker build` (or `docker push`)
+	// call from any image-build path: the native POST /v1/images/build
+	// handler and the Daytona facade's createSandbox build-on-create flow.
+	// Build time is opaque (depends on the Dockerfile) so the default is
+	// generous; we bound it only to keep a runaway build from permanently
+	// parking the HTTP handler.
 	ImageBuildTimeout time.Duration
 	// ImageBuildGCEnabled toggles the periodic janitor that sweeps
 	// locally-built images (BuiltImageNamespace, i.e. "aerolvm-build/*")
