@@ -42,6 +42,12 @@ var ErrNotLeader = errors.New("cluster: not raft leader")
 // they have just-created the sandbox and not yet committed its placement.
 var ErrUnknownSandbox = errors.New("cluster: unknown sandbox placement")
 
+// ErrHostPortReserved is returned when the FSM rejects a raw-TCP exposure
+// because another placement already owns the requested cluster-wide host port.
+// Callers can retry with another candidate instead of surfacing a random
+// expose failure to the user.
+var ErrHostPortReserved = errors.New("cluster: tcp host port already reserved")
+
 // ErrOrphaned is returned by OwnerOf when a placement exists but its owner has
 // been auto-evicted and the dead-owner reconciler has cleared the pointer
 // without yet selecting a new owner. With auto-recreation enabled this is a
@@ -78,23 +84,25 @@ type ExposedPortRoute struct {
 // ingress nodes can install owner-aware data-plane routes. Both fields are kept
 // so older snapshots still restore cleanly.
 type Placement struct {
-	SandboxID         string                       `json:"sandbox_id"`
-	OwnerNodeID       string                       `json:"owner_node_id"`
-	OwnerAPIURL       string                       `json:"owner_api_url"`
-	Version           uint64                       `json:"version"`
-	CreatedUnix       int64                        `json:"created_unix"`
-	UpdatedUnix       int64                        `json:"updated_unix"`
-	Spec              *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SealedSecrets     []byte                       `json:"sealed_secrets,omitempty"`
-	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
-	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	SandboxID          string                       `json:"sandbox_id"`
+	OwnerNodeID        string                       `json:"owner_node_id"`
+	OwnerAPIURL        string                       `json:"owner_api_url"`
+	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
+	Version            uint64                       `json:"version"`
+	CreatedUnix        int64                        `json:"created_unix"`
+	UpdatedUnix        int64                        `json:"updated_unix"`
+	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
+	ExposedPorts       map[int]string               `json:"exposed_ports,omitempty"`
+	ExposedPortRoutes  map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
 }
 
 // Member is a snapshot of a peer's gossiped state.
 type Member struct {
-	NodeID   string `json:"node_id"`
-	APIURL   string `json:"api_url"`
-	RaftAddr string `json:"raft_addr,omitempty"`
+	NodeID        string `json:"node_id"`
+	APIURL        string `json:"api_url"`
+	DataPlaneHost string `json:"data_plane_host,omitempty"`
+	RaftAddr      string `json:"raft_addr,omitempty"`
 	// InternalURL is the cluster-internal mTLS endpoint used for raft
 	// leader-forward applies. Empty when the peer is running without
 	// SB_CLUSTER_TLS_DIR — the forwarder falls back to APIURL with PAT-only
@@ -126,9 +134,10 @@ type LocalSandboxState struct {
 
 // PlacementTarget is returned by SelectPlacement.
 type PlacementTarget struct {
-	NodeID string
-	APIURL string
-	IsSelf bool
+	NodeID        string
+	APIURL        string
+	DataPlaneHost string
+	IsSelf        bool
 }
 
 // OwnerInfo is returned by OwnerOf.

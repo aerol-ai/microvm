@@ -40,16 +40,17 @@ const (
 // boot-time replays that have a spec but lost track of the sealed bytes
 // avoid clobbering the original.
 type command struct {
-	Op            opCode                       `json:"op"`
-	SandboxID     string                       `json:"sandbox_id"`
-	OwnerNodeID   string                       `json:"owner_node_id,omitempty"`
-	OwnerAPIURL   string                       `json:"owner_api_url,omitempty"`
-	Spec          *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SealedSecrets []byte                       `json:"sealed_secrets,omitempty"`
-	Port          int                          `json:"port,omitempty"`
-	Protocol      string                       `json:"protocol,omitempty"`
-	HostPort      int                          `json:"host_port,omitempty"`
-	PublicURL     string                       `json:"public_url,omitempty"`
+	Op                 opCode                       `json:"op"`
+	SandboxID          string                       `json:"sandbox_id"`
+	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
+	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
+	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
+	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
+	Port               int                          `json:"port,omitempty"`
+	Protocol           string                       `json:"protocol,omitempty"`
+	HostPort           int                          `json:"host_port,omitempty"`
+	PublicURL          string                       `json:"public_url,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -126,17 +127,22 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			ports = existing.ExposedPorts
 			portRoutes = existing.ExposedPortRoutes
 		}
+		dataPlaneHost := cmd.OwnerDataPlaneHost
+		if dataPlaneHost == "" && exists {
+			dataPlaneHost = existing.OwnerDataPlaneHost
+		}
 		f.placements[cmd.SandboxID] = Placement{
-			SandboxID:         cmd.SandboxID,
-			OwnerNodeID:       cmd.OwnerNodeID,
-			OwnerAPIURL:       cmd.OwnerAPIURL,
-			Version:           f.version,
-			CreatedUnix:       created,
-			UpdatedUnix:       now,
-			Spec:              spec,
-			SealedSecrets:     sealed,
-			ExposedPorts:      ports,
-			ExposedPortRoutes: portRoutes,
+			SandboxID:          cmd.SandboxID,
+			OwnerNodeID:        cmd.OwnerNodeID,
+			OwnerAPIURL:        cmd.OwnerAPIURL,
+			OwnerDataPlaneHost: dataPlaneHost,
+			Version:            f.version,
+			CreatedUnix:        created,
+			UpdatedUnix:        now,
+			Spec:               spec,
+			SealedSecrets:      sealed,
+			ExposedPorts:       ports,
+			ExposedPortRoutes:  portRoutes,
 		}
 		return nil
 	case opDelete:
@@ -151,6 +157,7 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		}
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
+		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
@@ -248,7 +255,7 @@ func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port in
 				continue
 			}
 			if otherRoute.Protocol == models.ExposedPortProtocolTCP && otherRoute.HostPort == route.HostPort {
-				return fmt.Errorf("placementFSM: tcp host port %d already reserved by %s:%d", route.HostPort, otherSandboxID, otherPort)
+				return fmt.Errorf("%w: %d reserved by %s:%d", ErrHostPortReserved, route.HostPort, otherSandboxID, otherPort)
 			}
 		}
 	}

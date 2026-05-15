@@ -22,10 +22,11 @@ import (
 
 // Cluster is the multi-node Client implementation. Construct with New.
 type Cluster struct {
-	cfg    config.Config
-	logger *slog.Logger
-	nodeID string
-	apiURL string
+	cfg           config.Config
+	logger        *slog.Logger
+	nodeID        string
+	apiURL        string
+	dataPlaneHost string
 
 	fsm    *placementFSM
 	raft   *raftNode
@@ -135,6 +136,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		logger:        logger,
 		nodeID:        nodeID,
 		apiURL:        cfg.SelfAPIAdvertiseURL,
+		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
 		fsm:           fsm,
 		raft:          rn,
 		patToken:      cfg.PATToken,
@@ -197,6 +199,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		BindAddr:       cfg.GossipBindAddr,
 		AdvertiseAddr:  cfg.GossipAdvertiseAddr,
 		APIURL:         cfg.SelfAPIAdvertiseURL,
+		DataPlaneHost:  cfg.DataPlaneAdvertiseHost,
 		RaftAddr:       raftAdvertise,
 		InternalURL:    c.internalURL,
 		BootstrapPeers: cfg.BootstrapPeers,
@@ -287,12 +290,13 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 // sealedSecrets=nil preserves a previously-recorded bag.
 func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	cmd := command{
-		Op:            opPlace,
-		SandboxID:     sandboxID,
-		OwnerNodeID:   c.nodeID,
-		OwnerAPIURL:   c.apiURL,
-		Spec:          spec,
-		SealedSecrets: sealedSecrets,
+		Op:                 opPlace,
+		SandboxID:          sandboxID,
+		OwnerNodeID:        c.nodeID,
+		OwnerAPIURL:        c.apiURL,
+		OwnerDataPlaneHost: c.dataPlaneHost,
+		Spec:               spec,
+		SealedSecrets:      sealedSecrets,
 	}
 	return c.applyCommand(ctx, cmd)
 }

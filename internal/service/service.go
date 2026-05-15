@@ -220,10 +220,10 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 }
 
 // RecreateSandbox satisfies cluster.SandboxRecreator. The cluster owner
-// watcher invokes this for any FSM placement that points to self. We
-// short-circuit when the sandbox already exists locally so the watcher's 5s
-// poll doesn't re-issue ExposePort or emit a misleading "recreated" log on
-// every tick — the actual recreate path only runs on a true failover.
+// watcher invokes this for any FSM placement that points to self. If the
+// sandbox already exists locally, we still replay the replicated port intents:
+// a previous recreate attempt may have created the container and then failed
+// while restoring Caddy/L4 ingress.
 //
 // sealedSecrets is the encrypted credential bag that the previous owner
 // stripped from spec before replicating it; we re-merge it here via
@@ -233,13 +233,12 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // (now with reassign-after-K-failures) will eventually move the placement
 // to a node whose key matches.
 //
-// Port replay is best-effort: a failure on one port is logged and the others
-// still try. A transient failure (caddy not ready, L4 app still bootstrapping)
-// self-heals on the next tick — ExposePort is idempotent at the service layer
-// so a partial replay leaves the system in a consistent state.
+// Port replay tries every port but returns an error when any replay failed so
+// the owner watcher keeps retrying and can eventually reassign the placement.
+// ExposePort is idempotent, so a partial replay is safe to resume.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
-		return nil
+		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
 	}
 	merged, err := s.UnsealClusterSecrets(spec, sealedSecrets)
 	if err != nil {
@@ -248,15 +247,26 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 	if _, err := s.CreateSandboxWithID(ctx, merged, id); err != nil {
 		return err
 	}
-	for port, route := range exposedPorts {
-		if _, err := s.exposePort(ctx, id, port, route.Protocol, route.HostPort); err != nil {
-			s.logger.Warn("cluster: re-expose after recreate failed; owner watcher will retry",
-				"sandbox_id", id, "port", port, "protocol", route.Protocol, "host_port", route.HostPort, "err", err)
-		}
+	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
+		return err
 	}
 	s.logger.Info("cluster: recreated sandbox after failover",
 		"sandbox_id", id, "replayed_ports", len(exposedPorts))
 	return nil
+}
+
+func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, exposedPorts map[int]cluster.ExposedPortRoute) error {
+	var firstErr error
+	for port, route := range exposedPorts {
+		if _, err := s.exposePort(ctx, id, port, route.Protocol, route.HostPort); err != nil {
+			s.logger.Warn("cluster: re-expose after recreate failed; owner watcher will retry",
+				"sandbox_id", id, "port", port, "protocol", route.Protocol, "host_port", route.HostPort, "err", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("replay exposed port %d: %w", port, err)
+			}
+		}
+	}
+	return firstErr
 }
 
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
@@ -980,6 +990,15 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 
 	now := time.Now().UTC()
 	existingBefore := findExposure(sandbox, port)
+	if existingBefore != nil {
+		existingProto := existingBefore.Protocol
+		if existingProto == "" {
+			existingProto = models.ExposedPortProtocolHTTP
+		}
+		if existingProto != canonicalProto {
+			return models.ExposePortResponse{}, fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existingProto)
+		}
+	}
 	switch canonicalProto {
 	case models.ExposedPortProtocolHTTP:
 		publicURL := s.caddy.PortPublicURL(id, port)
@@ -1020,9 +1039,6 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		// pool. A different protocol on the same (id, port) is rejected
 		// outright — the caller must unexpose first to switch protocols.
 		if existing := existingBefore; existing != nil {
-			if existing.Protocol != models.ExposedPortProtocolTCP {
-				return models.ExposePortResponse{}, fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existing.Protocol)
-			}
 			if existing.HostPort > 0 {
 				if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, existing.HostPort); err != nil {
 					return models.ExposePortResponse{}, err
@@ -1048,6 +1064,9 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			// installed by a concurrent caller and is not ours to delete.
 			if !reused {
 				_ = s.store.DeletePort(ctx, id, port)
+				if preferredHostPort == 0 {
+					_ = s.removeClusterExposedPort(ctx, id, port)
+				}
 			}
 			return models.ExposePortResponse{}, err
 		}
@@ -1055,6 +1074,9 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			_ = s.caddy.DeleteTCPRoute(ctx, hostPort)
 			if !reused {
 				_ = s.store.DeletePort(ctx, id, port)
+				if preferredHostPort == 0 {
+					_ = s.removeClusterExposedPort(ctx, id, port)
+				}
 			}
 			return models.ExposePortResponse{}, err
 		}
@@ -1130,13 +1152,16 @@ func (s *Service) EnsureLayer4Ready(ctx context.Context) error {
 	return nil
 }
 
-// allocateHostPort reserves a parent-host port for a raw-TCP exposure. The
-// random-first phase tries up to allocatorRandomAttempts candidates from the
-// configured pool — each attempt is one INSERT OR IGNORE protected by the
-// partial unique index on host_port, so concurrent allocators serialize at
-// the DB without a process-level lock. When randoms collide enough times we
-// fall back to a deterministic linear scan, which is the p99 path that
-// guarantees we exhaust the pool before giving up.
+// allocateHostPort reserves a parent-host port for a raw-TCP exposure. In
+// cluster mode it first reserves the candidate in the Raft placement FSM so
+// cross-node collisions are rejected before local Caddy state is changed. The
+// local SQLite reservation still runs afterward to catch per-node bind
+// conflicts and same-sandbox idempotent retries.
+//
+// The random-first phase tries up to allocatorRandomAttempts candidates from
+// the configured pool. When randoms collide enough times we fall back to a
+// deterministic linear scan, which guarantees we exhaust the pool before
+// giving up.
 //
 // Returns reused=true when a concurrent caller installed the (sandbox_id,
 // port) row first; the returned host_port and public URL come from that
@@ -1148,10 +1173,28 @@ func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, contai
 	}
 	span := s.cfg.L4PortRangeEnd - s.cfg.L4PortRangeStart + 1
 
-	tryCandidate := func(candidate int) (int, string, bool, bool, error) {
+	tryCandidate := func(candidate int, preserveClusterRouteOnLocalConflict bool) (int, string, bool, bool, error) {
 		candidateURL := s.caddy.TCPPublicEndpoint(candidate)
+		candidateRoute := cluster.ExposedPortRoute{
+			Protocol:  models.ExposedPortProtocolTCP,
+			HostPort:  candidate,
+			PublicURL: candidateURL,
+		}
+		clusterRecorded := false
+		if s.cfg.EnableCluster {
+			if err := s.recordClusterExposedPort(ctx, sandboxID, containerPort, candidateRoute); err != nil {
+				if errors.Is(err, cluster.ErrHostPortReserved) {
+					return 0, "", false, false, nil
+				}
+				return 0, "", false, false, err
+			}
+			clusterRecorded = true
+		}
 		result, err := s.store.TryReserveHostPort(ctx, sandboxID, containerPort, candidate, models.ExposedPortProtocolTCP, candidateURL, now)
 		if err != nil {
+			if clusterRecorded {
+				_ = s.removeClusterExposedPort(ctx, sandboxID, containerPort)
+			}
 			return 0, "", false, false, err
 		}
 		if result.Reserved {
@@ -1162,11 +1205,34 @@ func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, contai
 			// when protocols match; otherwise refuse (avoids the pool walk
 			// AND prevents silently leaking the prior route).
 			if result.Existing.Protocol != models.ExposedPortProtocolTCP {
+				if clusterRecorded {
+					route := cluster.ExposedPortRoute{
+						Protocol:  result.Existing.Protocol,
+						HostPort:  result.Existing.HostPort,
+						PublicURL: result.Existing.PublicURL,
+					}
+					if route.Protocol == "" {
+						route.Protocol = models.ExposedPortProtocolHTTP
+					}
+					_ = s.recordClusterExposedPort(ctx, sandboxID, containerPort, route)
+				}
 				return 0, "", false, false, fmt.Errorf("port %d already exposed as %s; unexpose it first", containerPort, result.Existing.Protocol)
 			}
 			if result.Existing.HostPort > 0 {
+				if clusterRecorded && result.Existing.HostPort != candidate {
+					if err := s.recordClusterExposedPort(ctx, sandboxID, containerPort, cluster.ExposedPortRoute{
+						Protocol:  models.ExposedPortProtocolTCP,
+						HostPort:  result.Existing.HostPort,
+						PublicURL: result.Existing.PublicURL,
+					}); err != nil {
+						return 0, "", false, false, err
+					}
+				}
 				return result.Existing.HostPort, result.Existing.PublicURL, true, true, nil
 			}
+		}
+		if clusterRecorded && !preserveClusterRouteOnLocalConflict {
+			_ = s.removeClusterExposedPort(ctx, sandboxID, containerPort)
 		}
 		return 0, "", false, false, nil
 	}
@@ -1175,19 +1241,19 @@ func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, contai
 		if preferredHostPort < s.cfg.L4PortRangeStart || preferredHostPort > s.cfg.L4PortRangeEnd {
 			return 0, "", false, fmt.Errorf("preferred host port %d is outside configured L4 range", preferredHostPort)
 		}
-		hp, url, r, done, terr := tryCandidate(preferredHostPort)
+		hp, url, r, done, terr := tryCandidate(preferredHostPort, true)
 		if terr != nil {
 			return 0, "", false, terr
 		}
 		if done {
 			return hp, url, r, nil
 		}
-		return 0, "", false, fmt.Errorf("preferred host port %d is already in use on this node", preferredHostPort)
+		return 0, "", false, fmt.Errorf("preferred host port %d is already reserved in the cluster or in use on this node", preferredHostPort)
 	}
 
 	for i := 0; i < allocatorRandomAttempts; i++ {
 		candidate := s.cfg.L4PortRangeStart + mathrand.Intn(span)
-		hp, url, r, done, terr := tryCandidate(candidate)
+		hp, url, r, done, terr := tryCandidate(candidate, false)
 		if terr != nil {
 			return 0, "", false, terr
 		}
@@ -1197,7 +1263,7 @@ func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, contai
 	}
 
 	for candidate := s.cfg.L4PortRangeStart; candidate <= s.cfg.L4PortRangeEnd; candidate++ {
-		hp, url, r, done, terr := tryCandidate(candidate)
+		hp, url, r, done, terr := tryCandidate(candidate, false)
 		if terr != nil {
 			return 0, "", false, terr
 		}
@@ -1217,6 +1283,19 @@ func (s *Service) recordClusterExposedPort(ctx context.Context, sandboxID string
 	defer cancel()
 	if err := c.AddExposedPort(commitCtx, sandboxID, port, route); err != nil {
 		return fmt.Errorf("cluster: record exposed port: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) removeClusterExposedPort(ctx context.Context, sandboxID string, port int) error {
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.RemoveExposedPort(commitCtx, sandboxID, port); err != nil {
+		return fmt.Errorf("cluster: remove exposed port: %w", err)
 	}
 	return nil
 }
@@ -2011,10 +2090,10 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 		if p.SandboxID == "" || p.OwnerNodeID == "" || p.OwnerNodeID == self {
 			continue
 		}
-		ownerHost := hostFromURL(p.OwnerAPIURL)
+		ownerHost := dataPlaneHostForPlacement(p)
 		if ownerHost == "" {
-			s.logger.Warn("cluster ingress: owner API URL missing or invalid; cannot route remote sandbox",
-				"sandbox_id", p.SandboxID, "owner", p.OwnerNodeID, "owner_api_url", p.OwnerAPIURL)
+			s.logger.Warn("cluster ingress: owner data-plane host missing or invalid; cannot route remote sandbox",
+				"sandbox_id", p.SandboxID, "owner", p.OwnerNodeID, "owner_api_url", p.OwnerAPIURL, "owner_data_plane_host", p.OwnerDataPlaneHost)
 			continue
 		}
 
@@ -2085,19 +2164,30 @@ func (s *Service) gcClusterIngressRoutes(ctx context.Context) error {
 	return nil
 }
 
+func dataPlaneHostForPlacement(p cluster.Placement) string {
+	if host := strings.TrimSpace(p.OwnerDataPlaneHost); host != "" {
+		return hostFromURL(host)
+	}
+	return hostFromURL(p.OwnerAPIURL)
+}
+
 func hostFromURL(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err == nil && u.Hostname() != "" {
 		return u.Hostname()
 	}
 	host := strings.TrimSpace(raw)
+	trimmed := strings.Trim(host, "[]")
+	if net.ParseIP(trimmed) != nil {
+		return trimmed
+	}
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		return strings.Trim(h, "[]")
 	}
-	if i := strings.LastIndex(host, ":"); i > -1 && !strings.Contains(host[i+1:], "/") {
+	if i := strings.LastIndex(host, ":"); i > -1 && !strings.Contains(host[i+1:], "/") && strings.Count(host, ":") == 1 {
 		return strings.Trim(host[:i], "[]")
 	}
-	return strings.Trim(host, "[]")
+	return trimmed
 }
 
 func l4ListenPort(listen string) int {

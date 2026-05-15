@@ -10,6 +10,7 @@ set -euo pipefail
 
 NODE_ID=""
 API_ADVERTISE_URL=""
+DATA_PLANE_ADVERTISE_HOST=""
 RAFT_BIND_ADDR="0.0.0.0:7000"
 RAFT_ADVERTISE_ADDR=""
 GOSSIP_BIND_ADDR="0.0.0.0:7001"
@@ -43,6 +44,12 @@ Optional:
   --node-id <id>                Stable node identity. Default: hostname.
   --api-advertise-url <url>     URL other nodes use to forward writes back
                                 to this node. Default: http://<primary-ip>:<api-port>.
+  --data-plane-advertise-host <host>
+                                Host/IP other nodes use for sandbox ingress
+                                (HTTP/SNI passthrough and raw TCP proxying).
+                                Default: <primary-ip>. Set this separately
+                                when API traffic uses a load balancer or
+                                API-only DNS name.
   --raft-bind <host:port>       Raft listen address. Default: 0.0.0.0:7000
   --raft-advertise <host:port>  Raft address peers connect to. Default: derived.
   --gossip-bind <host:port>     Gossip listen address. Default: 0.0.0.0:7001
@@ -91,6 +98,7 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--node-id)            NODE_ID="$2"; shift 2 ;;
 		--api-advertise-url)  API_ADVERTISE_URL="$2"; shift 2 ;;
+		--data-plane-advertise-host) DATA_PLANE_ADVERTISE_HOST="$2"; shift 2 ;;
 		--raft-bind)          RAFT_BIND_ADDR="$2"; shift 2 ;;
 		--raft-advertise)     RAFT_ADVERTISE_ADDR="$2"; shift 2 ;;
 		--gossip-bind)        GOSSIP_BIND_ADDR="$2"; shift 2 ;;
@@ -212,6 +220,9 @@ fi
 
 if [[ -z "$API_ADVERTISE_URL" ]]; then
 	API_ADVERTISE_URL="http://${PRIMARY_IP}:${SB_API_PORT_DEFAULT}"
+fi
+if [[ -z "$DATA_PLANE_ADVERTISE_HOST" ]]; then
+	DATA_PLANE_ADVERTISE_HOST="$PRIMARY_IP"
 fi
 
 derive_advertise() {
@@ -343,6 +354,7 @@ SB_ENABLE_CLUSTER=true
 SB_CLUSTER_BOOTSTRAP=false
 SB_NODE_ID=$NODE_ID
 SB_API_ADVERTISE_URL=$API_ADVERTISE_URL
+SB_DATA_PLANE_ADVERTISE_HOST=$DATA_PLANE_ADVERTISE_HOST
 SB_RAFT_BIND_ADDR=$RAFT_BIND_ADDR
 SB_RAFT_ADVERTISE_ADDR=$RAFT_ADVERTISE_ADDR
 SB_RAFT_DATA_DIR=$RAFT_DATA_DIR
@@ -378,6 +390,7 @@ cat <<EOF
 Joined cluster as node "$NODE_ID".
 
   API advertise URL: $API_ADVERTISE_URL
+  Data-plane host:   $DATA_PLANE_ADVERTISE_HOST
   Raft advertise:    $RAFT_ADVERTISE_ADDR
   Gossip advertise:  $GOSSIP_ADVERTISE_ADDR
   Bootstrap peers:   $PEERS

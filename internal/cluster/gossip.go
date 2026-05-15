@@ -19,9 +19,10 @@ import (
 // capacity.Snapshot grows past that, we'd need to switch to gossiped
 // user-events instead of node metadata.
 type nodeMeta struct {
-	NodeID   string            `json:"node_id"`
-	APIURL   string            `json:"api_url"`
-	RaftAddr string            `json:"raft_addr,omitempty"`
+	NodeID        string `json:"node_id"`
+	APIURL        string `json:"api_url"`
+	DataPlaneHost string `json:"data_plane_host,omitempty"`
+	RaftAddr      string `json:"raft_addr,omitempty"`
 	// InternalURL is this node's cluster-internal mTLS endpoint (e.g.
 	// https://10.0.0.5:7002). Set only when the node was started with cluster
 	// TLS material — peers receiving an empty value know to fall back to the
@@ -33,23 +34,25 @@ type nodeMeta struct {
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
 // node's metadata (which includes the capacity snapshot) and accept others'.
 type gossipDelegate struct {
-	mu          sync.RWMutex
-	selfMeta    nodeMeta
-	encoded     []byte
-	admitter    *capacity.Admitter
-	nodeID      string
-	apiURL      string
-	raftAddr    string
-	internalURL string
+	mu            sync.RWMutex
+	selfMeta      nodeMeta
+	encoded       []byte
+	admitter      *capacity.Admitter
+	nodeID        string
+	apiURL        string
+	dataPlaneHost string
+	raftAddr      string
+	internalURL   string
 }
 
-func newGossipDelegate(nodeID, apiURL, raftAddr, internalURL string, admitter *capacity.Admitter) *gossipDelegate {
+func newGossipDelegate(nodeID, apiURL, dataPlaneHost, raftAddr, internalURL string, admitter *capacity.Admitter) *gossipDelegate {
 	d := &gossipDelegate{
-		admitter:    admitter,
-		nodeID:      nodeID,
-		apiURL:      apiURL,
-		raftAddr:    raftAddr,
-		internalURL: internalURL,
+		admitter:      admitter,
+		nodeID:        nodeID,
+		apiURL:        apiURL,
+		dataPlaneHost: dataPlaneHost,
+		raftAddr:      raftAddr,
+		internalURL:   internalURL,
 	}
 	d.refreshMeta()
 	return d
@@ -63,12 +66,12 @@ func (d *gossipDelegate) refreshMeta() {
 	if d.admitter != nil {
 		snap = d.admitter.Snapshot()
 	}
-	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Capacity: snap}
+	meta := nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Capacity: snap}
 	enc, err := json.Marshal(meta)
 	if err != nil {
 		// JSON of a capacity.Snapshot can't fail; if it does, fall back to a
 		// minimal blob so peers still know we're here.
-		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, InternalURL: d.internalURL})
+		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, InternalURL: d.internalURL})
 		enc = minimal
 	}
 	d.mu.Lock()
@@ -83,7 +86,7 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 	if len(d.encoded) > limit {
 		// Truncated metadata is worse than minimal metadata (peers can't
 		// decode partial JSON). Fall back to ID+URL only.
-		fallback, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL})
+		fallback, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost})
 		if len(fallback) > limit {
 			return fallback[:limit]
 		}
@@ -94,18 +97,18 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 
 // NotifyMsg, GetBroadcasts, LocalState, MergeRemoteState are required by the
 // Delegate interface but unused in Phase 1 — we rely on NodeMeta only.
-func (d *gossipDelegate) NotifyMsg([]byte)                 {}
-func (d *gossipDelegate) GetBroadcasts(int, int) [][]byte  { return nil }
-func (d *gossipDelegate) LocalState(bool) []byte           { return nil }
-func (d *gossipDelegate) MergeRemoteState([]byte, bool)    {}
+func (d *gossipDelegate) NotifyMsg([]byte)                {}
+func (d *gossipDelegate) GetBroadcasts(int, int) [][]byte { return nil }
+func (d *gossipDelegate) LocalState(bool) []byte          { return nil }
+func (d *gossipDelegate) MergeRemoteState([]byte, bool)   {}
 
 // gossipNode wraps memberlist + the delegate so Close can stop the refresh
 // loop alongside leaving the cluster.
 type gossipNode struct {
-	ml       *memberlist.Memberlist
-	delegate *gossipDelegate
+	ml          *memberlist.Memberlist
+	delegate    *gossipDelegate
 	stopRefresh context.CancelFunc
-	logger   *slog.Logger
+	logger      *slog.Logger
 }
 
 type gossipSetupConfig struct {
@@ -113,6 +116,7 @@ type gossipSetupConfig struct {
 	BindAddr       string
 	AdvertiseAddr  string
 	APIURL         string
+	DataPlaneHost  string
 	RaftAddr       string
 	InternalURL    string
 	BootstrapPeers []string
@@ -146,7 +150,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		mlCfg.AdvertisePort = aport
 	}
 
-	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.RaftAddr, cfg.InternalURL, admitter)
+	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, admitter)
 	mlCfg.Delegate = delegate
 	if cfg.Events != nil {
 		mlCfg.Events = cfg.Events
@@ -245,6 +249,7 @@ func (g *gossipNode) members() []Member {
 					m.NodeID = meta.NodeID
 				}
 				m.APIURL = meta.APIURL
+				m.DataPlaneHost = meta.DataPlaneHost
 				m.RaftAddr = meta.RaftAddr
 				m.InternalURL = meta.InternalURL
 				m.Capacity = meta.Capacity
@@ -264,12 +269,13 @@ func (g *gossipNode) selfMember() Member {
 	meta := g.delegate.selfMeta
 	g.delegate.mu.RUnlock()
 	return Member{
-		NodeID:      meta.NodeID,
-		APIURL:      meta.APIURL,
-		RaftAddr:    meta.RaftAddr,
-		InternalURL: meta.InternalURL,
-		Alive:       true,
-		Capacity:    meta.Capacity,
+		NodeID:        meta.NodeID,
+		APIURL:        meta.APIURL,
+		DataPlaneHost: meta.DataPlaneHost,
+		RaftAddr:      meta.RaftAddr,
+		InternalURL:   meta.InternalURL,
+		Alive:         true,
+		Capacity:      meta.Capacity,
 	}
 }
 
@@ -278,6 +284,15 @@ func (g *gossipNode) peerAPIURL(nodeID string) string {
 	for _, m := range g.members() {
 		if m.NodeID == nodeID {
 			return m.APIURL
+		}
+	}
+	return ""
+}
+
+func (g *gossipNode) peerDataPlaneHost(nodeID string) string {
+	for _, m := range g.members() {
+		if m.NodeID == nodeID {
+			return m.DataPlaneHost
 		}
 	}
 	return ""

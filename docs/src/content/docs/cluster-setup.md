@@ -93,6 +93,8 @@ Cluster mode publishes sandbox traffic through owner-aware ingress. The public l
 - IP/path-mode sandbox URLs are reverse-proxied to the owner's Caddy listener.
 - Raw TCP exposures replicate their `hostPort`; every node binds that port and proxies to the owner.
 
+The owner target for sandbox data-plane traffic comes from `SB_DATA_PLANE_ADVERTISE_HOST`, not `SB_API_ADVERTISE_URL`. This matters when the API advertise URL is an API-only hostname, a shared load-balancer hostname, or an address that would loop back through the public LB. Keep `SB_API_ADVERTISE_URL` for peer API forwarding and set `SB_DATA_PLANE_ADVERTISE_HOST` to the node address peers can dial on Caddy/L4 ports.
+
 Route changes are reconciled from the Raft placement map every few seconds. Immediately after exposing a port or after owner failover, a non-owner backend can briefly return 404/502 until its ingress routes refresh. For a stable public surface, set `SB_DOMAIN` or `SB_PUBLIC_HOST` to the shared load-balancer hostname, not a per-node address.
 
 ## What the cluster scripts write
@@ -124,6 +126,7 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 | `SB_ENABLE_CLUSTER` | yes | Set to `true` to enable cluster mode. Default `false`. |
 | `SB_NODE_ID` | yes | Stable identifier for this node. |
 | `SB_API_ADVERTISE_URL` | yes | URL other nodes use to forward writes back to this node (e.g. `http://10.0.0.5:21212`). |
+| `SB_DATA_PLANE_ADVERTISE_HOST` | yes | Host/IP other nodes use to route sandbox data-plane traffic to this node's Caddy/L4 listeners. Defaults to the host in `SB_API_ADVERTISE_URL`; set explicitly when API traffic uses an API-only name or shared LB. |
 | `SB_RAFT_BIND_ADDR` | yes | Raft listen address. Default `0.0.0.0:7000`. |
 | `SB_RAFT_ADVERTISE_ADDR` | yes | Raft address peers connect to. Cannot be `0.0.0.0`. |
 | `SB_RAFT_DATA_DIR` | yes | On-disk raft state. Default `/var/lib/sandboxd/raft`. |

@@ -191,7 +191,7 @@ What does and does not survive a node failure.
 | Container filesystem | **No** | Lives only on the dead host. New owner starts a fresh container from the same image. |
 | Active exec sessions, port-forwards, SSH connections | **No** | Bound to the old container. Clients reconnect after failover. |
 | Sessions / recordings on disk | **No (without external storage)** | Live in the dead host's `/var/lib/`. Use external mounts to persist. |
-| TCP-port allocations | **Re-allocated** | New owner picks fresh host ports from its pool. URLs that include the port number change. |
+| TCP-port allocations | **Yes, when the new owner can bind the replicated host port** | The placement FSM stores the raw-TCP `host_port` and rejects duplicate cluster-wide reservations. Recreate retries failed replays and can reassign if a node cannot restore the route. |
 | Subdomain URL (`<id>.<domain>`) | **Yes** | The sandbox keeps its ID. DNS continues to resolve. |
 
 Make workloads truly stateless across failover by:
@@ -460,6 +460,13 @@ cluster placement map and forward public traffic to the owner:
 - raw TCP routes bind the same `host_port` on each node and proxy to the
   owner's `host_port`;
 - TLS-SNI port routes pass through to the owner's `:443` mux.
+
+The owner target for this data-plane forwarding is `SB_DATA_PLANE_ADVERTISE_HOST`.
+Do not rely on `SB_API_ADVERTISE_URL` unless it is also the host peers should
+dial on Caddy/L4 ports. If the API advertise URL is an API-only DNS name, a
+shared load balancer, or an address that can loop back through the public LB,
+set `SB_DATA_PLANE_ADVERTISE_HOST` to the node's peer-reachable data-plane IP
+or DNS name.
 
 That means the public LB no longer needs to know the owner for each sandbox.
 It only needs to send traffic to a healthy sandboxd node.
@@ -975,6 +982,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_ENABLE_CLUSTER` | yes | `true` to enable cluster mode. |
 | `SB_NODE_ID` | yes | Stable identity. Default: hostname. |
 | `SB_API_ADVERTISE_URL` | yes | URL other nodes use to forward writes back to this node. |
+| `SB_DATA_PLANE_ADVERTISE_HOST` | yes | Host/IP other nodes use for sandbox data-plane forwarding to this node's Caddy/L4 listeners. Defaults to the host in `SB_API_ADVERTISE_URL`; set explicitly when API traffic uses a shared LB or API-only hostname. |
 | `SB_RAFT_BIND_ADDR` | yes | Raft listen. Default `0.0.0.0:7000`. |
 | `SB_RAFT_ADVERTISE_ADDR` | yes | Raft address peers connect to. Cannot be `0.0.0.0`. |
 | `SB_RAFT_DATA_DIR` | yes | On-disk raft state. Default `/var/lib/sandboxd/raft`. |

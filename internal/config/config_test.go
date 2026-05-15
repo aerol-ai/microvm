@@ -36,6 +36,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_SHUTDOWN_TIMEOUT",
 			"SB_HTTP_CLIENT_TIMEOUT",
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
+			"SB_DATA_PLANE_ADVERTISE_HOST",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -233,6 +234,8 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		// Clear vars the test toggles per-case so previous cases don't leak.
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "")
 		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "")
+		t.Setenv("SB_API_ADVERTISE_URL", "")
+		t.Setenv("SB_DATA_PLANE_ADVERTISE_HOST", "")
 	}
 
 	t.Run("refuses_when_no_env_and_no_file", func(t *testing.T) {
@@ -271,6 +274,35 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
 		if _, err := Load(); err != nil {
 			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("derives_data_plane_host_from_api_advertise_url", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_API_ADVERTISE_URL", "http://10.0.0.5:21212")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.DataPlaneAdvertiseHost != "10.0.0.5" {
+			t.Fatalf("DataPlaneAdvertiseHost = %q", cfg.DataPlaneAdvertiseHost)
+		}
+	})
+
+	t.Run("accepts_explicit_data_plane_host", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_API_ADVERTISE_URL", "http://shared-api.internal:21212")
+		t.Setenv("SB_DATA_PLANE_ADVERTISE_HOST", "10.0.0.7")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.DataPlaneAdvertiseHost != "10.0.0.7" {
+			t.Fatalf("DataPlaneAdvertiseHost = %q", cfg.DataPlaneAdvertiseHost)
 		}
 	})
 }

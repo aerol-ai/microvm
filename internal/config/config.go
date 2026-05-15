@@ -3,6 +3,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -115,16 +117,23 @@ type Config struct {
 	// sandbox is owned by exactly one node; the owner's local SQLite remains
 	// the source of truth for sandbox state. Hot-path traffic (toolbox,
 	// sessions, port forwards) is transparently reverse-proxied to the owner.
-	EnableCluster                 bool
-	NodeID                        string
-	RaftBindAddr                  string
-	RaftAdvertiseAddr             string
-	RaftDataDir                   string
-	GossipBindAddr                string
-	GossipAdvertiseAddr           string
-	BootstrapPeers                []string
-	ClusterBootstrap              bool
-	SelfAPIAdvertiseURL           string
+	EnableCluster       bool
+	NodeID              string
+	RaftBindAddr        string
+	RaftAdvertiseAddr   string
+	RaftDataDir         string
+	GossipBindAddr      string
+	GossipAdvertiseAddr string
+	BootstrapPeers      []string
+	ClusterBootstrap    bool
+	SelfAPIAdvertiseURL string
+	// DataPlaneAdvertiseHost is the host/IP other nodes use for sandbox
+	// public ingress (HTTP/SNI passthrough and raw TCP proxying) when this
+	// node owns a sandbox. It is intentionally separate from
+	// SelfAPIAdvertiseURL: many deployments put API traffic behind a shared
+	// load balancer or API-only DNS name that must not be used as the
+	// owner-data-plane target. SB_DATA_PLANE_ADVERTISE_HOST.
+	DataPlaneAdvertiseHost        string
 	ClusterRaftCommitTimeout      time.Duration
 	ClusterCapacityGossipInterval time.Duration
 	// ClusterMaxAutoVoters caps gossip-driven Raft voter promotion. Additional
@@ -290,6 +299,7 @@ func Load() (Config, error) {
 		BootstrapPeers:                splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
 		ClusterBootstrap:              getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
 		SelfAPIAdvertiseURL:           strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
+		DataPlaneAdvertiseHost:        normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:          getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
@@ -367,6 +377,12 @@ func Load() (Config, error) {
 				host = "127.0.0.1"
 			}
 			cfg.SelfAPIAdvertiseURL = fmt.Sprintf("http://%s:%d", host, cfg.APIPort)
+		}
+		if cfg.DataPlaneAdvertiseHost == "" {
+			cfg.DataPlaneAdvertiseHost = normalizeAdvertiseHost(cfg.SelfAPIAdvertiseURL)
+		}
+		if cfg.DataPlaneAdvertiseHost == "" {
+			return Config{}, errors.New("SB_DATA_PLANE_ADVERTISE_HOST could not be derived; set it to the host/IP peers use for sandbox ingress")
 		}
 		if cfg.ClusterMaxAutoVoters < 0 {
 			return Config{}, errors.New("SB_CLUSTER_MAX_AUTO_VOTERS must be >= 0")
@@ -490,4 +506,25 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 
 func normalizeHost(value string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(value, "https://"), "http://"))
+}
+
+func normalizeAdvertiseHost(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if u, err := url.Parse(value); err == nil && u.Hostname() != "" {
+		return strings.Trim(u.Hostname(), "[]")
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	trimmed := strings.Trim(value, "[]")
+	if net.ParseIP(trimmed) != nil {
+		return trimmed
+	}
+	if i := strings.LastIndex(value, ":"); i > -1 && !strings.Contains(value[i+1:], "/") && strings.Count(value, ":") == 1 {
+		return strings.Trim(value[:i], "[]")
+	}
+	return trimmed
 }

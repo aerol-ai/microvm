@@ -171,8 +171,14 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		if !ok {
 			continue
 		}
-		newOwnerID, newOwnerURL := c.pickRecreationTarget(p.Spec)
-		cmd := command{Op: opReassign, SandboxID: id, OwnerNodeID: newOwnerID, OwnerAPIURL: newOwnerURL}
+		newOwnerID, newOwnerURL, newOwnerDataPlaneHost := c.pickRecreationTarget(p.Spec)
+		cmd := command{
+			Op:                 opReassign,
+			SandboxID:          id,
+			OwnerNodeID:        newOwnerID,
+			OwnerAPIURL:        newOwnerURL,
+			OwnerDataPlaneHost: newOwnerDataPlaneHost,
+		}
 		if err := c.applyCommand(ctx, cmd); err != nil {
 			c.logger.Warn("cluster: reassign placement failed; will retry next tick",
 				"sandbox_id", id, "dead_node", nodeID, "new_owner", newOwnerID, "err", err)
@@ -201,12 +207,12 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 }
 
 // pickRecreationTarget runs placement scoring against the replicated spec to
-// pick a live node for the recreated sandbox. Returns ("","") if spec is nil
-// (caller treats that as the orphan path) or if SelectPlacement errors out.
+// pick a live node for the recreated sandbox. Returns empty strings if spec is
+// nil (caller treats that as the orphan path) or if SelectPlacement errors out.
 // Self is a perfectly valid choice — the leader is a normal recreation target.
-func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeID, apiURL string) {
+func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeID, apiURL, dataPlaneHost string) {
 	if spec == nil {
-		return "", ""
+		return "", "", ""
 	}
 	req := capacity.Request{CPU: spec.CPU, MemoryMB: spec.MemoryMB}
 	if req.CPU <= 0 {
@@ -217,10 +223,10 @@ func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeI
 	}
 	target, err := c.SelectPlacement(req)
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	if target.IsSelf {
-		return c.nodeID, c.apiURL
+		return c.nodeID, c.apiURL, c.dataPlaneHost
 	}
-	return target.NodeID, target.APIURL
+	return target.NodeID, target.APIURL, target.DataPlaneHost
 }

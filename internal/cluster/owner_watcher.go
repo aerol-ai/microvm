@@ -126,7 +126,13 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 			"sandbox_id", id)
 		return
 	}
-	cmd := command{Op: opReassign, SandboxID: id, OwnerNodeID: target.NodeID, OwnerAPIURL: target.APIURL}
+	cmd := command{
+		Op:                 opReassign,
+		SandboxID:          id,
+		OwnerNodeID:        target.NodeID,
+		OwnerAPIURL:        target.APIURL,
+		OwnerDataPlaneHost: target.DataPlaneHost,
+	}
 	if err := c.applyCommand(ctx, cmd); err != nil {
 		c.logger.Warn("cluster: reassign stuck placement failed; will retry on next tick",
 			"sandbox_id", id, "target", target.NodeID, "err", err)
@@ -189,7 +195,7 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		return PlacementTarget{}, false
 	}
 	if best.NodeID == c.nodeID {
-		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, IsSelf: true}, true
+		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, true
 	}
-	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, IsSelf: false}, true
+	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, DataPlaneHost: best.DataPlaneHost, IsSelf: false}, true
 }

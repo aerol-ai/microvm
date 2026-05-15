@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -234,6 +235,30 @@ func TestFSMReassignPreservesPorts(t *testing.T) {
 	}
 	if got.ExposedPorts[5432] != "tcp" {
 		t.Fatalf("reassign erased ports; got %+v", got.ExposedPorts)
+	}
+}
+
+func TestFSMRejectsDuplicateTCPHostPortWithSentinel(t *testing.T) {
+	fsm := newPlacementFSM()
+	for _, id := range []string{"sb1", "sb2"} {
+		place, _ := encodeCommand(command{Op: opPlace, SandboxID: id, OwnerNodeID: "node-" + id})
+		fsm.Apply(&raft.Log{Data: place})
+	}
+	add1, _ := encodeCommand(command{
+		Op: opAddExposedPort, SandboxID: "sb1", Port: 5432,
+		Protocol: models.ExposedPortProtocolTCP, HostPort: 22432,
+	})
+	if got := fsm.Apply(&raft.Log{Data: add1}); got != nil {
+		t.Fatalf("first add returned %v, want nil", got)
+	}
+	add2, _ := encodeCommand(command{
+		Op: opAddExposedPort, SandboxID: "sb2", Port: 5432,
+		Protocol: models.ExposedPortProtocolTCP, HostPort: 22432,
+	})
+	got := fsm.Apply(&raft.Log{Data: add2})
+	err, ok := got.(error)
+	if !ok || !errors.Is(err, ErrHostPortReserved) {
+		t.Fatalf("duplicate host port error = %v, want ErrHostPortReserved", got)
 	}
 }
 
