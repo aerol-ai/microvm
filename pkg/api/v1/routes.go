@@ -20,6 +20,10 @@ type ImageBuilder interface {
 	BuildImage(ctx context.Context, req docker.BuildImageRequest) error
 	ImageExists(ctx context.Context, imageRef string) (bool, error)
 	PushImage(ctx context.Context, req docker.PushImageRequest) (string, error)
+	// RefreshTag bumps Docker's Metadata.LastTagTime so the built-image
+	// janitor doesn't GC a tag that was just handed out from the build
+	// cache. Called on the ImageExists==true short-circuit path.
+	RefreshTag(ctx context.Context, fullRef string) error
 }
 
 // BuildConfig mirrors the operator-configured image-build knobs.

@@ -119,11 +119,16 @@ public class MicroVMClient {
         return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class));
     }
 
-    public Sandbox create(Image image) {
-        return create(image, new CreateOptions());
+    /**
+     * Build {@code image} and create a sandbox from the resulting tag with
+     * default options. Distinct method name (vs {@code create(...)} overloads)
+     * so a {@code null} argument can't pick this path by accident.
+     */
+    public Sandbox createWithImage(Image image) {
+        return createWithImage(image, new CreateOptions());
     }
 
-    public Sandbox create(Image image, CreateOptions options) {
+    public Sandbox createWithImage(Image image, CreateOptions options) {
         CreateOptions resolved = copyCreateOptions(options);
         resolved.setImage(buildImage(image));
         return create(resolved);

@@ -81,7 +81,7 @@ class MicroVMClientTest {
 
         try {
             MicroVMClient client = clientFor(server);
-            Sandbox sandbox = client.create(
+            Sandbox sandbox = client.createWithImage(
                 Image.base("ubuntu:22.04").runCommands("apt-get update", "apt-get install -y curl"),
                 new CreateOptions()
             );
@@ -108,6 +108,97 @@ class MicroVMClientTest {
             MicroVMException error = assertThrows(MicroVMException.class, () -> client.buildImage(Image.base("alpine")));
             assertTrue(error.getMessage().contains("does not support Image builds"));
             assertTrue(error.getMessage().contains("string image reference"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void buildImageWithPushForwardsPushOptionsAndReturnsPushedRef() throws Exception {
+        AtomicReference<Map<String, Object>> seenBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("POST".equals(method) && "/v1/images/build".equals(path)) {
+                seenBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "image", "aerolvm-build/abc123:latest",
+                    "pushed", "ghcr.io/x/y:v1"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            ai.aerol.microvm.model.BuildImageResult result = client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setRegistry("ghcr.io/x/y")
+                        .setTag("v1")
+                        .setServer("ghcr.io")
+                        .setUsername("u")
+                        .setPassword("p")
+                )
+            );
+
+            assertEquals("aerolvm-build/abc123:latest", result.image);
+            assertEquals("ghcr.io/x/y:v1", result.pushed);
+
+            Map<String, Object> body = seenBody.get();
+            assertEquals("FROM alpine\n", body.get("dockerfile_content"));
+            Map<?, ?> push = (Map<?, ?>) body.get("push");
+            assertNotNull(push);
+            assertEquals("ghcr.io/x/y", push.get("registry"));
+            assertEquals("v1", push.get("tag"));
+            assertEquals("ghcr.io", push.get("server"));
+            assertEquals("u", push.get("username"));
+            assertEquals("p", push.get("password"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void buildImageWithPushRejectsMissingCredentialsClientSide() throws Exception {
+        // No HTTP server: validation must throw before any wire call. If a
+        // request leaks out, the HttpClient will fail with a connect error
+        // and the test will surface that instead of the expected message.
+        HttpServer server = startServer(exchange -> {
+            throw new AssertionError("must not call daemon: " + exchange.getRequestURI());
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+
+            MicroVMException missingRegistry = assertThrows(MicroVMException.class, () -> client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setUsername("u").setPassword("p")
+                )
+            ));
+            assertTrue(missingRegistry.getMessage().contains("registry"));
+
+            MicroVMException missingUser = assertThrows(MicroVMException.class, () -> client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setRegistry("ghcr.io/x/y").setPassword("p")
+                )
+            ));
+            assertTrue(missingUser.getMessage().contains("username"));
+
+            MicroVMException missingPass = assertThrows(MicroVMException.class, () -> client.buildImage(
+                Image.base("alpine"),
+                new ai.aerol.microvm.model.BuildImageOptions().setPush(
+                    new ai.aerol.microvm.model.BuildImagePushOptions()
+                        .setRegistry("ghcr.io/x/y").setUsername("u")
+                )
+            ));
+            assertTrue(missingPass.getMessage().contains("password"));
         } finally {
             server.stop(0);
         }

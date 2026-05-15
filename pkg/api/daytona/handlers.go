@@ -878,6 +878,12 @@ func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest)
 		return "", "", fmt.Errorf("%w: check built image cache: %v", errBuildOperational, err)
 	}
 	if exists {
+		// Bump LastTagTime so the built-image janitor doesn't GC a tag we
+		// just handed back to the caller. Best-effort: a refresh failure
+		// only narrows the GC window for this tag, so we log and continue.
+		if rtErr := h.deps.Builder.RefreshTag(ctx, tag); rtErr != nil && h.deps.Logger != nil {
+			h.deps.Logger.Warn("daytona build cache refresh-tag failed", "tag", tag, "error", rtErr)
+		}
 		return tag, "", nil
 	}
 

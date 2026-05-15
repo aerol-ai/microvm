@@ -12,11 +12,18 @@ import (
 )
 
 type fakeImageBuilder struct {
-	exists   map[string]bool
-	builds   []docker.BuildImageRequest
-	buildErr error
-	pushes   []docker.PushImageRequest
-	pushErr  error
+	exists     map[string]bool
+	builds     []docker.BuildImageRequest
+	buildErr   error
+	pushes     []docker.PushImageRequest
+	pushErr    error
+	refreshes  []string
+	refreshErr error
+}
+
+func (f *fakeImageBuilder) RefreshTag(_ context.Context, ref string) error {
+	f.refreshes = append(f.refreshes, ref)
+	return f.refreshErr
 }
 
 func (f *fakeImageBuilder) ImageExists(_ context.Context, ref string) (bool, error) {

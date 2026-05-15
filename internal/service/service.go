@@ -1526,7 +1526,7 @@ func (s *Service) runBuiltImageGC(ctx context.Context, list builtImageListFn) {
 	}
 	cutoff := time.Now().UTC().Add(-s.cfg.ImageBuildGCTTL)
 	for _, img := range images {
-		if img.CreatedAt.After(cutoff) {
+		if img.LastTagTime.After(cutoff) {
 			continue
 		}
 		referenced, err := s.store.HasActiveImageRef(ctx, img.Tag)
@@ -1541,7 +1541,7 @@ func (s *Service) runBuiltImageGC(ctx context.Context, list builtImageListFn) {
 			s.logger.Warn("built-image gc remove failed", "tag", img.Tag, "error", err)
 			continue
 		}
-		s.logger.Info("audit built image gc removed", "tag", img.Tag, "created_at", img.CreatedAt)
+		s.logger.Info("audit built image gc removed", "tag", img.Tag, "last_tag_time", img.LastTagTime)
 	}
 }
 

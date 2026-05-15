@@ -1669,6 +1669,109 @@ mod tests {
     }
 
     #[test]
+    fn build_image_with_options_forwards_push_directive() {
+        let (url, request_rx) = spawn_json_server(
+            serde_json::json!({
+                "image": "aerolvm-build/abc123:latest",
+                "pushed": "ghcr.io/x/y:v1"
+            })
+            .to_string(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+
+        let result = client
+            .build_image_with_options(
+                &Image::base("alpine"),
+                &BuildImageOptions {
+                    push: Some(BuildImagePushOptions {
+                        registry: "ghcr.io/x/y".to_string(),
+                        tag: Some("v1".to_string()),
+                        server: Some("ghcr.io".to_string()),
+                        username: "u".to_string(),
+                        password: "p".to_string(),
+                    }),
+                },
+            )
+            .expect("build_image_with_options should succeed");
+
+        assert_eq!(result.image, "aerolvm-build/abc123:latest");
+        assert_eq!(result.pushed.as_deref(), Some("ghcr.io/x/y:v1"));
+
+        let request = request_rx.recv().expect("request should be received");
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({
+                "dockerfile_content": "FROM alpine\n",
+                "push": {
+                    "registry": "ghcr.io/x/y",
+                    "tag": "v1",
+                    "server": "ghcr.io",
+                    "username": "u",
+                    "password": "p"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn build_image_with_options_rejects_missing_credentials() {
+        // Validation must happen client-side: no listener — if any HTTP call
+        // leaks, reqwest will surface a connect error and the asserts on the
+        // returned Validation message will fail.
+        let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token"))
+            .expect("client should build");
+
+        let cases: &[(BuildImagePushOptions, &str)] = &[
+            (
+                BuildImagePushOptions {
+                    registry: String::new(),
+                    tag: None,
+                    server: None,
+                    username: "u".to_string(),
+                    password: "p".to_string(),
+                },
+                "registry",
+            ),
+            (
+                BuildImagePushOptions {
+                    registry: "ghcr.io/x/y".to_string(),
+                    tag: None,
+                    server: None,
+                    username: String::new(),
+                    password: "p".to_string(),
+                },
+                "username",
+            ),
+            (
+                BuildImagePushOptions {
+                    registry: "ghcr.io/x/y".to_string(),
+                    tag: None,
+                    server: None,
+                    username: "u".to_string(),
+                    password: String::new(),
+                },
+                "password",
+            ),
+        ];
+
+        for (push, want_substr) in cases {
+            let err = client
+                .build_image_with_options(
+                    &Image::base("alpine"),
+                    &BuildImageOptions {
+                        push: Some(push.clone()),
+                    },
+                )
+                .expect_err("must reject missing credentials");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(want_substr),
+                "expected error containing {want_substr:?}, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
     fn build_image_maps_404_to_actionable_error() {
         let (url, _request_rx) = spawn_response_server(
             "404 Not Found",

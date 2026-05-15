@@ -22,6 +22,10 @@ type ImageBuilder interface {
 	BuildImage(ctx context.Context, req docker.BuildImageRequest) error
 	ImageExists(ctx context.Context, imageRef string) (bool, error)
 	RemoveImage(ctx context.Context, imageRef string) error
+	// RefreshTag bumps Docker's Metadata.LastTagTime so the built-image
+	// janitor doesn't GC a tag we just handed back from the cache. Called
+	// on the ImageExists==true short-circuit in resolveBuildInfo.
+	RefreshTag(ctx context.Context, fullRef string) error
 }
 
 // BuildConfig surfaces the operator-configured image-build knobs through to

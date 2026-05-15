@@ -21,15 +21,28 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// buildGroup deduplicates concurrent BuildImage calls that share a tag.
-// Two requests landing simultaneously for the same content-addressed tag
-// would otherwise both upload the tar context and ask the daemon to build —
-// Docker's layer cache makes the second build fast, but the tar upload and
-// daemon-side serialization still costs work. With singleflight, the second
-// (and Nth) caller waits for the first build's result and returns the same
-// error/success. The key is the tag because that's content-addressed: the
-// same tag means the same dockerfile bytes (see BuildTagFor).
+// buildGroup deduplicates concurrent BuildImage calls. Two requests landing
+// simultaneously for the same dockerfile+context would otherwise both upload
+// the tar and ask the daemon to build — Docker's layer cache makes the
+// second build fast, but the tar upload and daemon-side serialization still
+// costs work. With singleflight, the second (and Nth) caller waits for the
+// first build's result and returns the same error/success.
+//
+// The key is sha256(tag, dockerfile, contextTar). Tag alone is not safe: it
+// is caller-supplied (BuildImageRequest.Tag), and an external caller could
+// reuse a tag for different content. Hashing the inputs guarantees only
+// identical builds coalesce.
 var buildGroup singleflight.Group
+
+func buildGroupKey(tag, dockerfile string, contextTar []byte) string {
+	h := sha256.New()
+	h.Write([]byte(tag))
+	h.Write([]byte{0})
+	h.Write([]byte(dockerfile))
+	h.Write([]byte{0})
+	h.Write(contextTar)
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // BuiltImageNamespace is the local image-name prefix every Daytona-facade
 // build is tagged with. Keeping every built image under a single namespace
@@ -61,7 +74,8 @@ func (c *Client) BuildImage(ctx context.Context, req BuildImageRequest) error {
 	if tag == "" {
 		return errors.New("build image: tag is required")
 	}
-	_, err, _ := buildGroup.Do(tag, func() (any, error) {
+	key := buildGroupKey(tag, req.DockerfileContent, req.ContextTar)
+	_, err, _ := buildGroup.Do(key, func() (any, error) {
 		return nil, c.buildImageLocked(ctx, tag, req)
 	})
 	return err
@@ -115,24 +129,16 @@ func (c *Client) buildImageLocked(ctx context.Context, tag string, req BuildImag
 }
 
 // assembleBuildContext returns a tar containing the Dockerfile at the
-// archive root. If extra is non-nil, its entries are concatenated after the
-// Dockerfile — entries with the same name (in particular "Dockerfile") win
-// from the extra tar to allow callers to ship their own.
+// archive root, plus any extra entries the caller supplied.
 //
-// We don't try to merge or deduplicate beyond writing both streams: Docker's
-// build tar reader uses the last-write-wins semantics for duplicate entries,
-// which matches what we want.
+// When extra is non-nil we strip its trailing zero-block, append our own
+// Dockerfile entry, and re-close the tar. Docker's build tar reader uses
+// last-write-wins semantics for duplicate entries, so the explicit
+// DockerfileContent always overrides whatever Dockerfile (if any) the
+// caller's tar shipped — matching what BuildImageRequest.DockerfileContent
+// promises ("mandatory"). This is also why we tar the Dockerfile last
+// rather than first.
 func assembleBuildContext(dockerfile string, extra []byte) ([]byte, error) {
-	if len(extra) > 0 {
-		// When the caller supplied their own context, we trust it to include
-		// a Dockerfile (the build query string is hardcoded to dockerfile=
-		// "Dockerfile" — if it's missing, docker errors immediately with a
-		// clear "Cannot locate specified Dockerfile" message).
-		return extra, nil
-	}
-
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
 	body := []byte(dockerfile)
 	header := &tar.Header{
 		Name:    "Dockerfile",
@@ -140,6 +146,34 @@ func assembleBuildContext(dockerfile string, extra []byte) ([]byte, error) {
 		Size:    int64(len(body)),
 		ModTime: time.Unix(0, 0),
 	}
+
+	var buf bytes.Buffer
+	if len(extra) > 0 {
+		// A POSIX tar ends with two empty 512-byte records. Stripping them
+		// before appending lets the new tar.Writer.Close re-emit a single
+		// well-formed terminator. We only strip when the trailer is present;
+		// some callers may hand us a malformed/tarless byte slice, in which
+		// case we still concatenate (Docker will fail decoding either way,
+		// with a clearer error than ours).
+		const tarTrailerLen = 2 * 512
+		trimmed := extra
+		if len(trimmed) >= tarTrailerLen {
+			tail := trimmed[len(trimmed)-tarTrailerLen:]
+			allZero := true
+			for _, b := range tail {
+				if b != 0 {
+					allZero = false
+					break
+				}
+			}
+			if allZero {
+				trimmed = trimmed[:len(trimmed)-tarTrailerLen]
+			}
+		}
+		buf.Write(trimmed)
+	}
+
+	tw := tar.NewWriter(&buf)
 	if err := tw.WriteHeader(header); err != nil {
 		return nil, fmt.Errorf("write Dockerfile header: %w", err)
 	}
@@ -362,15 +396,20 @@ func (c *Client) ImageExists(ctx context.Context, imageRef string) (bool, error)
 
 // BuiltImage is the slice of Docker's image-list payload that the built-image
 // janitor needs: one of the locally-built image's RepoTags (always in the
-// BuiltImageNamespace) plus when the daemon reported it was created. Multiple
+// BuiltImageNamespace) plus when the daemon last (re)tagged it. Multiple
 // RepoTags per image are possible if the same content was tagged twice; we
 // surface each tag as its own BuiltImage so the GC decision is per-tag.
 type BuiltImage struct {
 	// Tag is one of the image's RepoTags, qualified (e.g.
 	// "aerolvm-build/abc123:latest").
 	Tag string
-	// CreatedAt is the daemon-reported creation time, UTC.
-	CreatedAt time.Time
+	// LastTagTime is when the daemon last (re)tagged the image, UTC. Used
+	// instead of Image.Created because content-addressed builds can hit the
+	// docker layer cache and return an image whose Created timestamp is
+	// arbitrarily old. The tag itself, in contrast, is fresh: every
+	// successful BuildImage with t=<tag> bumps LastTagTime to "now", and
+	// callers that only had a cache-hit explicitly call RefreshTag below.
+	LastTagTime time.Time
 }
 
 // ListBuiltImages returns every locally-built image (tags in
@@ -379,7 +418,9 @@ type BuiltImage struct {
 //
 // We filter server-side by reference so the API call only returns matching
 // images — much cheaper than pulling the whole image list and filtering
-// client-side on a daemon that may hold hundreds of base images.
+// client-side on a daemon that may hold hundreds of base images. Each
+// candidate is then individually inspected to read Metadata.LastTagTime,
+// which the cheaper /images/json list endpoint does not return.
 func (c *Client) ListBuiltImages(ctx context.Context) ([]BuiltImage, error) {
 	filters, err := json.Marshal(map[string][]string{
 		"reference": {BuiltImageNamespace + "/*"},
@@ -392,7 +433,6 @@ func (c *Client) ListBuiltImages(ctx context.Context) ([]BuiltImage, error) {
 
 	var payload []struct {
 		RepoTags []string `json:"RepoTags"`
-		Created  int64    `json:"Created"`
 	}
 	if err := c.doJSON(ctx, http.MethodGet, "/images/json", query, nil, nil, &payload); err != nil {
 		return nil, fmt.Errorf("list built images: %w", err)
@@ -400,15 +440,39 @@ func (c *Client) ListBuiltImages(ctx context.Context) ([]BuiltImage, error) {
 
 	out := make([]BuiltImage, 0, len(payload))
 	for _, entry := range payload {
-		created := time.Unix(entry.Created, 0).UTC()
 		for _, tag := range entry.RepoTags {
 			if !strings.HasPrefix(tag, BuiltImageNamespace+"/") {
 				// Docker's reference filter is glob-y; defensively skip anything
 				// outside our namespace so an aliased tag can't get GC'd.
 				continue
 			}
-			out = append(out, BuiltImage{Tag: tag, CreatedAt: created})
+			inspect, err := c.inspectImage(ctx, tag)
+			if err != nil {
+				// A tag that vanished between list and inspect is fine; the
+				// next sweep will see the new state. Skip rather than abort
+				// so one missing image doesn't stall the whole janitor.
+				if c.logger != nil {
+					c.logger.Debug("built-image gc inspect failed", "tag", tag, "error", err)
+				}
+				continue
+			}
+			out = append(out, BuiltImage{Tag: tag, LastTagTime: inspect.Metadata.LastTagTime.UTC()})
 		}
 	}
 	return out, nil
+}
+
+// RefreshTag re-applies an image's existing repo:tag, which causes the
+// daemon to bump Metadata.LastTagTime to "now". The built-image janitor
+// uses LastTagTime as the "this tag was used recently, don't GC it" signal,
+// so callers that hand out a cached tag (without running BuildImage) must
+// call this to keep the GC clock from running on a tag that's actively in
+// use. Idempotent and cheap — Docker treats re-tagging an existing tag as
+// a no-op aside from the metadata bump.
+func (c *Client) RefreshTag(ctx context.Context, fullRef string) error {
+	repo, tag := splitDestRef(fullRef)
+	if repo == "" {
+		return fmt.Errorf("refresh tag: %q is missing a repository", fullRef)
+	}
+	return c.tagImage(ctx, fullRef, repo, tag)
 }

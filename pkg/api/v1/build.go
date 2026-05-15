@@ -89,6 +89,14 @@ func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logger := h.deps.Logger
+	if exists {
+		// Bump LastTagTime so the built-image janitor doesn't GC a tag we
+		// just handed out from the cache. Best-effort: a refresh failure
+		// only narrows the GC window for this tag, so we log and continue.
+		if err := h.deps.Builder.RefreshTag(r.Context(), tag); err != nil && logger != nil {
+			logger.Warn("v1 image cache refresh-tag failed", "tag", tag, "error", err)
+		}
+	}
 	if !exists {
 		buildCtx, cancel := buildContextWithTimeout(r.Context(), h.deps.Build.Timeout)
 		err = h.deps.Builder.BuildImage(buildCtx, docker.BuildImageRequest{

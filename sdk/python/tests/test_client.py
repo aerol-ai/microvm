@@ -238,6 +238,67 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client.calls[1][2]["image"], "aerolvm-build/abc123:latest")
         self.assertEqual(sandbox.id, "sb-1")
 
+    def test_build_image_with_push_forwards_push_options(self):
+        class PushRecordingMicroVM(RecordingMicroVM):
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                self.calls.append((method, path, payload))
+                if method == "POST" and path == "/v1/images/build":
+                    return {
+                        "image": "aerolvm-build/abc123:latest",
+                        "pushed": "ghcr.io/x/y:v1",
+                    }
+                return super()._do_json(method, path, payload)
+
+        client = PushRecordingMicroVM()
+        result = client.build_image_with_push(
+            Image.base("alpine"),
+            push={
+                "registry": "ghcr.io/x/y",
+                "tag": "v1",
+                "server": "ghcr.io",
+                "username": "u",
+                "password": "p",
+            },
+        )
+
+        self.assertEqual(result.image, "aerolvm-build/abc123:latest")
+        self.assertEqual(result.pushed, "ghcr.io/x/y:v1")
+        self.assertEqual(
+            client.calls[-1],
+            (
+                "POST",
+                "/v1/images/build",
+                {
+                    "dockerfile_content": "FROM alpine\n",
+                    "push": {
+                        "registry": "ghcr.io/x/y",
+                        "username": "u",
+                        "password": "p",
+                        "tag": "v1",
+                        "server": "ghcr.io",
+                    },
+                },
+            ),
+        )
+
+    def test_build_image_with_push_rejects_missing_credentials(self):
+        client = RecordingMicroVM()
+        with self.assertRaisesRegex(ValueError, "push.registry is required"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"username": "u", "password": "p"},
+            )
+        with self.assertRaisesRegex(ValueError, r"push\.username and push\.password"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"registry": "ghcr.io/x/y", "password": "p"},
+            )
+        with self.assertRaisesRegex(ValueError, r"push\.username and push\.password"):
+            client.build_image_with_push(
+                Image.base("alpine"),
+                push={"registry": "ghcr.io/x/y", "username": "u"},
+            )
+
     def test_build_image_maps_404_to_actionable_error(self):
         class NotFoundBuildMicroVM(RecordingMicroVM):
             def _do_json(self, method, path, payload):  # type: ignore[override]

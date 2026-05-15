@@ -42,11 +42,18 @@ func newMountsManagerForTest(t *testing.T) *mounts.Manager {
 // fakeImageBuilder is the daytona.ImageBuilder stub used by tests that need
 // to assert build-path behavior without a real Docker daemon.
 type fakeImageBuilder struct {
-	exists    map[string]bool
-	builds    []docker.BuildImageRequest
-	buildErr  error
-	removed   []string
-	removeErr error
+	exists     map[string]bool
+	builds     []docker.BuildImageRequest
+	buildErr   error
+	removed    []string
+	removeErr  error
+	refreshes  []string
+	refreshErr error
+}
+
+func (f *fakeImageBuilder) RefreshTag(_ context.Context, ref string) error {
+	f.refreshes = append(f.refreshes, ref)
+	return f.refreshErr
 }
 
 func (f *fakeImageBuilder) ImageExists(_ context.Context, ref string) (bool, error) {

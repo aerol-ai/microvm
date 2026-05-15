@@ -96,7 +96,7 @@ func TestBuiltImageGCRemovesOldUnreferenced(t *testing.T) {
 	svc, _, removed := newBuiltImageGCHarness(t, time.Hour)
 	old := time.Now().UTC().Add(-2 * time.Hour)
 	list := func(context.Context) ([]docker.BuiltImage, error) {
-		return []docker.BuiltImage{{Tag: "aerolvm-build/old1:latest", CreatedAt: old}}, nil
+		return []docker.BuiltImage{{Tag: "aerolvm-build/old1:latest", LastTagTime: old}}, nil
 	}
 
 	svc.runBuiltImageGC(context.Background(), list)
@@ -110,7 +110,7 @@ func TestBuiltImageGCSkipsFreshImage(t *testing.T) {
 	svc, _, removed := newBuiltImageGCHarness(t, time.Hour)
 	fresh := time.Now().UTC().Add(-5 * time.Minute) // well within TTL
 	list := func(context.Context) ([]docker.BuiltImage, error) {
-		return []docker.BuiltImage{{Tag: "aerolvm-build/fresh:latest", CreatedAt: fresh}}, nil
+		return []docker.BuiltImage{{Tag: "aerolvm-build/fresh:latest", LastTagTime: fresh}}, nil
 	}
 
 	svc.runBuiltImageGC(context.Background(), list)
@@ -141,7 +141,7 @@ func TestBuiltImageGCSkipsReferencedImage(t *testing.T) {
 	}
 
 	list := func(context.Context) ([]docker.BuiltImage, error) {
-		return []docker.BuiltImage{{Tag: referencedTag, CreatedAt: old}}, nil
+		return []docker.BuiltImage{{Tag: referencedTag, LastTagTime: old}}, nil
 	}
 	svc.runBuiltImageGC(context.Background(), list)
 
@@ -172,9 +172,9 @@ func TestBuiltImageGCMixedRulesAppliedPerImage(t *testing.T) {
 
 	list := func(context.Context) ([]docker.BuiltImage, error) {
 		return []docker.BuiltImage{
-			{Tag: "aerolvm-build/old-orphan:latest", CreatedAt: old},   // remove
-			{Tag: "aerolvm-build/fresh-orphan:latest", CreatedAt: fresh}, // skip (fresh)
-			{Tag: "aerolvm-build/inuse:latest", CreatedAt: old},          // skip (referenced)
+			{Tag: "aerolvm-build/old-orphan:latest", LastTagTime: old},   // remove
+			{Tag: "aerolvm-build/fresh-orphan:latest", LastTagTime: fresh}, // skip (fresh)
+			{Tag: "aerolvm-build/inuse:latest", LastTagTime: old},          // skip (referenced)
 		}, nil
 	}
 	svc.runBuiltImageGC(context.Background(), list)
@@ -207,7 +207,7 @@ func TestBuiltImageGCRemovesAfterDestroyedReference(t *testing.T) {
 	}
 
 	list := func(context.Context) ([]docker.BuiltImage, error) {
-		return []docker.BuiltImage{{Tag: tag, CreatedAt: old}}, nil
+		return []docker.BuiltImage{{Tag: tag, LastTagTime: old}}, nil
 	}
 	svc.runBuiltImageGC(context.Background(), list)
 
