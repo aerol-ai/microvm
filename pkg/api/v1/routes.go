@@ -26,7 +26,6 @@ type ImageBuilder interface {
 type BuildConfig struct {
 	ContextEnabled bool
 	Timeout        time.Duration
-	Registry       string
 }
 
 // Deps holds the shared dependencies a version package needs from the

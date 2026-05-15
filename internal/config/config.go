@@ -122,14 +122,6 @@ type Config struct {
 	// default is generous; we bound it only to keep a runaway build from
 	// permanently parking a sandbox-create HTTP handler.
 	ImageBuildTimeout time.Duration
-	// ImageBuildRegistry is the registry root (e.g. "ghcr.io/aerol-ai")
-	// that built images are pushed to when ImageBuildContextEnabled is true.
-	// Per project contract, registry credentials are server-configured —
-	// they are NOT taken from the create-sandbox request.
-	ImageBuildRegistry         string
-	ImageBuildRegistryUsername string
-	ImageBuildRegistryPassword string
-
 	// ImageBuildGCEnabled toggles the periodic janitor that sweeps
 	// locally-built images (BuiltImageNamespace, i.e. "aerolvm-build/*")
 	// that are no longer referenced by any active sandbox AND were created
@@ -208,14 +200,11 @@ func Load() (Config, error) {
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
 
-		ImageBuildContextEnabled:   getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
-		ImageBuildTimeout:          getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
-		ImageBuildRegistry:         strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY")),
-		ImageBuildRegistryUsername: strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY_USERNAME")),
-		ImageBuildRegistryPassword: strings.TrimSpace(os.Getenv("SB_IMAGE_BUILD_REGISTRY_PASSWORD")),
-		ImageBuildGCEnabled:        getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
-		ImageBuildGCInterval:       getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:            getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageBuildContextEnabled: getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:        getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:      getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:     getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:          getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
 	}
 
 	if cfg.PATToken == "" {

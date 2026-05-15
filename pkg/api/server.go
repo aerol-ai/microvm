@@ -38,7 +38,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		logger:   logger,
 		service:  service,
 		builder:  dockerClient,
-		build:    daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout, Registry: cfg.ImageBuildRegistry},
+		build:    daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
 		patToken: patToken,
 		mux:      http.NewServeMux(),
 	}
@@ -76,7 +76,7 @@ func (s *Server) routes() {
 		Logger:  s.logger,
 		Auth:    s.requireAuth,
 		Builder: s.builder,
-		Build:   apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout, Registry: s.build.Registry},
+		Build:   apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
 	})
 }
 

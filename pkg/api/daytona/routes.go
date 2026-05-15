@@ -30,7 +30,6 @@ type ImageBuilder interface {
 type BuildConfig struct {
 	ContextEnabled bool
 	Timeout        time.Duration
-	Registry       string
 }
 
 // Deps are the shared dependencies the Daytona facade needs from the

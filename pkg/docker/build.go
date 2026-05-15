@@ -47,7 +47,6 @@ type BuildImageRequest struct {
 	Tag               string
 	DockerfileContent string
 	ContextTar        []byte
-	Registry          *models.RegistryAuth
 	OnLog             func(line string)
 }
 
@@ -81,22 +80,6 @@ func (c *Client) buildImageLocked(ctx context.Context, tag string, req BuildImag
 
 	headers := map[string]string{
 		"Content-Type": "application/x-tar",
-	}
-	if req.Registry != nil && req.Registry.Username != "" {
-		// Docker's /build endpoint accepts X-Registry-Config (a JSON map of
-		// server→auth) for pulls of FROM bases that need authentication.
-		auth := map[string]map[string]string{
-			req.Registry.Server: {
-				"username":      req.Registry.Username,
-				"password":      req.Registry.Password,
-				"serveraddress": req.Registry.Server,
-			},
-		}
-		encoded, marshalErr := json.Marshal(auth)
-		if marshalErr != nil {
-			return fmt.Errorf("marshal build registry auth: %w", marshalErr)
-		}
-		headers["X-Registry-Config"] = base64.URLEncoding.EncodeToString(encoded)
 	}
 
 	query := url.Values{}
