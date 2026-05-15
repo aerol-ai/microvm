@@ -50,6 +50,8 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 			apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
 		case errors.Is(err, errBuildOperational):
 			apihttp.WriteError(w, http.StatusBadGateway, err.Error())
+		case errors.Is(err, errVolumesUnsupported):
+			apihttp.WriteError(w, http.StatusMethodNotAllowed, err.Error())
 		default:
 			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		}
@@ -894,7 +896,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		return models.CreateSandboxRequest{}, "", errors.New("gpu allocation is not supported by the Daytona facade")
 	}
 	if len(req.Volumes) > 0 {
-		return models.CreateSandboxRequest{}, "", errors.New("volumes are not supported by the Daytona facade")
+		return models.CreateSandboxRequest{}, "", errVolumesUnsupported
 	}
 
 	lifecycle := models.Lifecycle{}
@@ -1043,6 +1045,21 @@ func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest)
 // daytona createSandbox handler maps it to HTTP 502 so that retries and
 // alerting can distinguish "daemon is sad" from "client sent garbage".
 var errBuildOperational = errors.New("build operational error")
+
+// errVolumesUnsupported flags requests that name persistent Daytona volumes.
+// The facade has no volume backend yet; the dedicated /volumes routes and
+// the volumes[] field on createSandbox both surface as HTTP 405 so SDK
+// clients see a single, consistent "not yet implemented" signal.
+var errVolumesUnsupported = errors.New(volumesUnsupportedMessage)
+
+const volumesUnsupportedMessage = "volumes are not supported by the Daytona facade; this will be supported in a future release"
+
+// volumesNotSupported is the shared handler for every /volumes endpoint the
+// Daytona SDK reaches for. Returning 405 (rather than 404) tells clients the
+// route is recognized but the operation isn't available yet.
+func volumesNotSupported(w http.ResponseWriter, _ *http.Request) {
+	apihttp.WriteError(w, http.StatusMethodNotAllowed, volumesUnsupportedMessage)
+}
 
 // singleLineFromImage detects the legacy `FROM <image>` shape and returns
 // the base image when matched. Comments and blank lines are ignored.
