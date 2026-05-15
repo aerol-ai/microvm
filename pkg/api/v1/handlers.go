@@ -95,14 +95,6 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusCreated, response)
 }
 
-func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
-	if err := h.deps.Service.DestroySandbox(r.Context(), r.PathValue("id")); err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 	var req models.ResizeSandboxRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

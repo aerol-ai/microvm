@@ -87,21 +87,6 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
 
-	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.createSandbox)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.listSandboxes)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", d.Auth(http.HandlerFunc(h.getSandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/start", d.Auth(http.HandlerFunc(h.startSandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/stop", d.Auth(http.HandlerFunc(h.stopSandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Auth(http.HandlerFunc(h.createSnapshot)))
-	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Auth(http.HandlerFunc(h.destroySandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Auth(http.HandlerFunc(h.resizeSandbox)))
-	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Auth(http.HandlerFunc(h.updateLifecycle)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(http.HandlerFunc(h.exposePort)))
-	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(http.HandlerFunc(h.unexposePort)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(http.HandlerFunc(h.listMounts)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(http.HandlerFunc(h.getNetworkUsage)))
-	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(http.HandlerFunc(h.updateNetworkLimits)))
-
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
 	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.Auth(wrap(http.HandlerFunc(h.sessionsProxy))))

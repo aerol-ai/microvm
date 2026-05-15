@@ -13,7 +13,6 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/mattn/go-sqlite3 v1.14.44
 	golang.org/x/crypto v0.51.0
 	golang.org/x/sync v0.20.0
@@ -54,13 +53,6 @@ require (
 	github.com/miekg/dns v1.1.68 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
-	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/daytonaio/daytona/libs/toolbox-api-client-go v0.175.0 // indirect
-	github.com/go-logr/logr v1.4.3 // indirect
-	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/google/uuid v1.6.0 // indirect
-	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0 // indirect
@@ -76,9 +68,6 @@ require (
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
