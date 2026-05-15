@@ -96,7 +96,7 @@ func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 			DockerfileContent: dockerfile,
 			OnLog: func(line string) {
 				if logger != nil {
-					logger.Debug("v1 image build", "tag", tag, "line", line)
+					logger.Debug("v1 image build output received", "tag", tag)
 				}
 			},
 		})
