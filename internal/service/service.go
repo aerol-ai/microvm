@@ -517,6 +517,49 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 	return snapshot, err
 }
 
+// RegisterSnapshot persists a snapshot row whose Image was resolved out-of-band
+// — either a pre-existing registry image the caller supplied by name, or a
+// freshly built local tag produced by the image builder (e.g. the daytona
+// facade's buildInfo path). It does NOT call docker.CreateSnapshot; the image
+// is assumed to already be runnable. Idempotency is by snapshot name; a
+// re-register with matching image is treated as a no-op so SDK retries don't
+// fail. A different image under the same name is a conflict.
+func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) (*models.SandboxSnapshot, error) {
+	if snapshot == nil {
+		return nil, errors.New("snapshot is required")
+	}
+	name := strings.TrimSpace(snapshot.Name)
+	if name == "" {
+		return nil, errors.New("snapshot name is required")
+	}
+	if strings.TrimSpace(snapshot.Image) == "" {
+		return nil, errors.New("snapshot image is required")
+	}
+
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+
+	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
+		// Retry semantics: same name + same image → echo back the existing
+		// row. Different image under the same name is a conflict.
+		if strings.TrimSpace(existing.Image) == strings.TrimSpace(snapshot.Image) {
+			return existing, nil
+		}
+		return nil, store.ErrSnapshotNameConflict
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+
+	if snapshot.CreatedAt.IsZero() {
+		snapshot.CreatedAt = time.Now().UTC()
+	}
+	snapshot.Name = name
+	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
 // CreateSnapshotWithOwnership commits a sandbox image and reports whether this
 // call created the native snapshot row. Callers that add companion metadata can
 // use the flag to avoid rolling back a snapshot that already existed.

@@ -152,6 +152,97 @@ func (h *handlers) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// createSnapshotFromImage handles POST /daytona/snapshots — the Daytona SDK's
+// snapshot.create({ name, imageName | buildInfo, resources, regionId }) call.
+//
+// Two image-resolution paths:
+//
+//  1. imageName: caller hands us a pre-built registry reference. We register
+//     the snapshot row pointing at that reference and trust the runtime's
+//     docker pull at sandbox-create time to fail loudly if the image
+//     doesn't exist.
+//  2. buildInfo: caller hands us a Dockerfile (and optionally contextHashes,
+//     which today require operator-side object-store wiring — gated by
+//     SB_IMAGE_BUILD_CONTEXT_ENABLED). The same resolveBuildInfo used by the
+//     create-sandbox path produces a local image tag we then register.
+//
+// The SDK polls the snapshot until state hits a terminal value; we return
+// state=active synchronously, so its poll loop exits on the first read.
+func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Request) {
+	var req createSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	imageName := strings.TrimSpace(valueOrEmpty(req.ImageName))
+	hasBuildInfo := req.BuildInfo != nil && strings.TrimSpace(valueOrEmpty(req.BuildInfo.DockerfileContent)) != ""
+	if imageName == "" && !hasBuildInfo {
+		apihttp.WriteError(w, http.StatusBadRequest, "imageName or buildInfo.dockerfileContent is required")
+		return
+	}
+	if imageName != "" && hasBuildInfo {
+		apihttp.WriteError(w, http.StatusBadRequest, "imageName and buildInfo are mutually exclusive")
+		return
+	}
+
+	var (
+		resolvedImage   string
+		freshlyBuiltTag string
+		err             error
+	)
+	if hasBuildInfo {
+		resolvedImage, freshlyBuiltTag, err = h.resolveBuildInfo(r.Context(), req.BuildInfo)
+		if err != nil {
+			// Mirror the createSandbox classification: timeouts and
+			// build/registry failures are operational (502/504); everything
+			// else is a 400 because it's a payload validation failure
+			// (e.g. contextHashes-without-flag).
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
+			case errors.Is(err, errBuildOperational):
+				apihttp.WriteError(w, http.StatusBadGateway, err.Error())
+			default:
+				apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+			}
+			return
+		}
+	} else {
+		resolvedImage = imageName
+	}
+
+	snapshot := &models.SandboxSnapshot{
+		Name:       req.Name,
+		Image:      resolvedImage,
+		Entrypoint: append([]string{}, req.Entrypoint...),
+		RegionID:   strings.TrimSpace(valueOrEmpty(req.RegionID)),
+		CPU:        float64(float32Value(req.CPU)),
+		GPU:        float64(float32Value(req.GPU)),
+		MemoryMB:   int(float32Value(req.Memory)) * 1024,
+		DiskGB:     int(float32Value(req.Disk)),
+	}
+	registered, err := h.deps.Service.RegisterSnapshot(r.Context(), snapshot)
+	if err != nil {
+		// We may have just freshly built a tag that's now orphaned (no
+		// snapshot row pointing to it). Roll it back so the built-image
+		// janitor doesn't leak the layer.
+		if freshlyBuiltTag != "" && h.deps.Builder != nil {
+			if rbErr := h.deps.Builder.RemoveImage(r.Context(), freshlyBuiltTag); rbErr != nil && h.deps.Logger != nil {
+				h.deps.Logger.Warn("daytona snapshot rollback failed", "tag", freshlyBuiltTag, "error", rbErr)
+			}
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+
+	apihttp.WriteJSON(w, http.StatusCreated, h.toSnapshotResponse(r, registered))
+}
+
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
 	if err != nil {
@@ -744,6 +835,24 @@ func (h *handlers) toSnapshotResponse(r *http.Request, snapshot *models.SandboxS
 	organizationID := strings.TrimSpace(r.Header.Get("X-Daytona-Organization-ID"))
 	imageName := nonEmptyStringPtr(&snapshot.Image)
 	id := firstNonEmpty(strings.TrimSpace(snapshot.ImageID), snapshot.Name)
+
+	entrypoint := snapshot.Entrypoint
+	if entrypoint == nil {
+		entrypoint = []string{}
+	}
+
+	var regionIDs []string
+	if region := strings.TrimSpace(snapshot.RegionID); region != "" {
+		regionIDs = []string{region}
+	}
+
+	// MemoryMB is stored on the model in MB; the Daytona API reports it
+	// in GB to match the create payload's units.
+	memGB := float32(0)
+	if snapshot.MemoryMB > 0 {
+		memGB = float32(snapshot.MemoryMB) / 1024
+	}
+
 	return snapshotResponse{
 		ID:             id,
 		OrganizationID: nonEmptyStringPtr(&organizationID),
@@ -752,16 +861,17 @@ func (h *handlers) toSnapshotResponse(r *http.Request, snapshot *models.SandboxS
 		ImageName:      imageName,
 		State:          "active",
 		Size:           nil,
-		Entrypoint:     []string{},
-		CPU:            0,
-		GPU:            0,
-		Mem:            0,
-		Disk:           0,
+		Entrypoint:     entrypoint,
+		CPU:            float32(snapshot.CPU),
+		GPU:            float32(snapshot.GPU),
+		Mem:            memGB,
+		Disk:           float32(snapshot.DiskGB),
 		ErrorReason:    nil,
 		CreatedAt:      createdAt,
 		UpdatedAt:      createdAt,
 		LastUsedAt:     nil,
 		Ref:            cloneStringPtr(imageName),
+		RegionIDs:      regionIDs,
 	}
 }
 
@@ -819,6 +929,21 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 
 func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (string, string, error) {
 	if snapshot := strings.TrimSpace(valueOrEmpty(req.Snapshot)); snapshot != "" {
+		// First check the snapshot store — the Daytona SDK's
+		// daytona.snapshot.create() + daytona.create({snapshot: name}) flow
+		// passes a snapshot *name*, which the facade resolves to the
+		// underlying image reference here. Fall back to treating the string
+		// as a direct image reference for backwards compatibility with
+		// callers that already pass a registry path (e.g. create-vm example).
+		if resolved, err := h.deps.Service.GetSnapshot(ctx, snapshot); err == nil {
+			image := strings.TrimSpace(resolved.Image)
+			if image == "" {
+				image = strings.TrimSpace(resolved.ImageID)
+			}
+			if image != "" {
+				return image, "", nil
+			}
+		}
 		return snapshot, "", nil
 	}
 	if req.BuildInfo != nil {

@@ -15,6 +15,23 @@ Done in this pass:
   `POST /files/permissions` whitelisted.
 - `/lsp/*` whitelisted as a prefix.
 - `/work-dir` accepted as alias for `/workdir` (SDK `InfoApi.getWorkDir`).
+- **`POST /daytona/snapshots`** — snapshot-from-image (the
+  `declarative-image` + `region` blocker). Two paths supported:
+  - `imageName`: pre-built registry image, registered as-is.
+  - `buildInfo.dockerfileContent`: Dockerfile run through the existing
+    `resolveBuildInfo` → `Builder.BuildImage` pipeline. Single-line `FROM`
+    short-circuits to the bare image without a build.
+- **Snapshot name → image lookup** wired into `createImage`. The Daytona
+  SDK passes a snapshot *name* on sandbox create; the facade now resolves
+  that name through the snapshot store and uses the row's image as the
+  runtime image. Unknown names still fall through as direct image refs
+  for backwards compat (the `create-vm` example pattern).
+- `SandboxSnapshot` model extended with `Entrypoint`, `RegionID`, `CPU`,
+  `GPU`, `MemoryMB`, `DiskGB` — surfaced back through `toSnapshotResponse`
+  so SDK polls see the resources/region the caller asked for.
+- `service.RegisterSnapshot` added — persists an image-backed snapshot
+  row, idempotent on (name + image), conflicts on different image under
+  same name.
 
 ## Per-example status
 
@@ -24,7 +41,7 @@ Done in this pass:
 | `auto-delete` | ✅ | `daytona.create`, `setAutoDeleteInterval` | All routes exist. |
 | `charts` | ✅ | `daytona.create` w/ image, `process.codeRun`, chart artifacts | Needs `code-run` fix (now in). Charts are returned in-band on the `codeRun` response — no separate route. |
 | `create-vm` | ✅ | `daytona.create({snapshot})`, `executeCommand` | Snapshot must already exist on the registry. |
-| `declarative-image` | ⚠️ | `daytona.snapshot.create({image, resources})` with `Image.debianSlim(...).pipInstall(...)` | **Big feature gap**: `POST /daytona/snapshots` is not routed. Facade has GET/DELETE for snapshots and `POST /sandbox/{id}/snapshot` (snapshot-of-running-sandbox), but no build-snapshot-from-Image path. |
+| `declarative-image` | ⚠️ (partial) | `daytona.snapshot.create({image, resources})` with `Image.debianSlim(...).pipInstall(...)` | `POST /daytona/snapshots` now exists. `imageName` and `buildInfo.dockerfileContent` paths work end-to-end. The example also uses `Image.addLocalFile(...)` which uploads context blobs via the Daytona object-storage API + sends `buildInfo.contextHashes` — that uploader endpoint and the daemon-side context resolver are still missing (see big-feature notes below). |
 | `exec-command` | ✅ | `codeRun`, `executeCommand`, sessions (sync + async logs), `codeInterpreter` | All small fixes in. CodeInterpreter requires a running toolbox daemon that implements `/process/interpreter/*` — proxy layer is now correct. |
 | `file-operations` | ✅ | `fs.listFiles`, `createFolder`, `uploadFiles`, `searchFiles`, `replaceInFiles`, `downloadFiles`, `downloadFile`, `uploadFileStream`, `downloadFileStream` | Whitelisted folder + replace this pass. |
 | `git-lsp` | ✅ | `git.clone`, `fs.findFiles`, `createLspServer`, `lsp.start/didOpen/documentSymbols/didClose/completions`, `fs.replaceInFiles` | `/lsp/*` prefix added. |
@@ -33,7 +50,7 @@ Done in this pass:
 | `pagination/sandbox` | ✅ | `daytona.list(labels, page, limit)` | `/sandbox/paginated` exists. |
 | `pagination/snapshot` | ✅ | `daytona.snapshot.list(page, limit)` | `GET /snapshots` exists. |
 | `pty` | ✅ | `createPty`, `sendInput`, `resizePtySession`, `kill`, `wait` (WS) | `process/pty/*` is now WS-capable; bare `process/pty` whitelisted. |
-| `region` | ⚠️ | `daytona.snapshot.create({regionId})` and `daytona.create({snapshot})` against the regional snapshot | Inherits the `declarative-image` gap. Once `POST /daytona/snapshots` exists, `regionId` needs to be persisted on the snapshot row. |
+| `region` | ✅ (single-region) | `daytona.snapshot.create({regionId})` and `daytona.create({snapshot})` against the regional snapshot | `regionId` is now persisted on the snapshot row and echoed back in the response (`regionIds: [...]`). The daemon does not yet route requests across regions, so the example creates and lists snapshots in both regions but a real multi-region deployment would still need region-aware backend routing. |
 | `volumes` | ❌ | `daytona.volume.get('name', create=true)`, `daytona.create({volumes:[{volumeId, mountPath, subpath}]})` | **Big feature gap**: volume management is intentionally rejected by the facade (`handlers.go:786`). Needs: `GET/POST/DELETE /daytona/volumes`, `GET /daytona/volumes/by-name/{name}`, plus `Volumes` wiring in `createSandbox` translation and mount-binding through `service.CreateSandbox`. |
 
 ## Big-feature gaps (deferred)
@@ -62,28 +79,36 @@ Backend needed:
 - Subpath support inside the mount manager (the SDK passes a `subpath`
   field per-volume binding for multi-tenant isolation).
 
-### 2. Build snapshot from Image
+### 2. Build snapshot from Image — partially done
 
 Affects: `declarative-image`, `region`.
 
-The Daytona SDK `snapshot.create({ name, image, resources, regionId })`
-posts to `POST /snapshots` with either an `imageName` (pre-built image) or
-a `buildInfo` payload (dockerfile content + context hashes the SDK uploaded
-to S3 separately). The facade currently only knows how to snapshot a
-running sandbox (`POST /sandbox/{id}/snapshot`).
+**Done:**
+- `POST /daytona/snapshots` handler — `imageName` and
+  `buildInfo.dockerfileContent` both supported.
+- Snapshot store extended with entrypoint / regionId / cpu / gpu /
+  memoryMB / diskGB.
+- Snapshot name → image lookup in `createImage` so
+  `daytona.create({snapshot: name})` correctly resolves.
+- Synchronous build, return `state=active` so SDK poll loop exits on the
+  first read (no build-logs-url endpoint needed for the no-onLogs case).
 
-To make `declarative-image` runnable end-to-end we need:
-- `POST /daytona/snapshots` handler.
-- For `imageName`: pull-or-tag-and-register flow — should reuse the same
-  image-build infrastructure the create-sandbox path uses
-  (`Deps.Builder.BuildImage` / `RefreshTag`).
-- For `buildInfo`: dockerfile build that pulls context blobs by hash from
-  the configured object store (`Daytona`'s `objectStorageApi`). This is
-  the harder half — needs object-store integration on the server.
-- `GET /snapshots/{id}/build-logs-url` — the SDK polls this when
-  `onLogs` is set to stream build progress. Could be backed by Docker's
-  build-log stream.
-- `regionId` persistence on the snapshot row.
+**Still missing:**
+- **`contextHashes` resolver.** Required by `Image.addLocalFile(...)` (used
+  by the `declarative-image` example). The SDK uploads context blobs to
+  Daytona's `objectStorageApi` and sends the hashes in `buildInfo`. We need:
+  - An object-storage facade endpoint the SDK can upload to (today returns
+    "not configured" — see `Daytona.js` `processImageContext`).
+  - A daemon-side resolver that fetches blobs by hash, assembles a build
+    context tar, and hands it to `Builder.BuildImage` (gated behind
+    `SB_IMAGE_BUILD_CONTEXT_ENABLED`; the resolver itself returns "not yet
+    implemented" today).
+- **`GET /snapshots/{id}/build-logs-url`** — only needed when the SDK
+  caller passes `onLogs: console.log` and the build runs asynchronously.
+  With the current synchronous-build approach + `state=active` on first
+  return, the SDK never enters its log-streaming branch.
+- **Multi-region routing.** `regionId` is persisted and echoed, but the
+  daemon doesn't yet route create/list operations across regions.
 
 ### 3. ComputerUse / `/computeruse/*`
 
