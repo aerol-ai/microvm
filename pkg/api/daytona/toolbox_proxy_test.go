@@ -90,7 +90,7 @@ func newToolboxProxyTestEnv(t *testing.T) *toolboxProxyTestEnv {
 
 	mux := http.NewServeMux()
 
-	// Plain-HTTP endpoints we expect to ride forwardToolbox.
+	// Plain-HTTP endpoints we expect to ride forwardToolbox / proxyToolbox.
 	mux.HandleFunc("/process/code-run", func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.Clone(r.Context())
 		w.Header().Set("Content-Type", "application/json")
@@ -101,6 +101,25 @@ func newToolboxProxyTestEnv(t *testing.T) *toolboxProxyTestEnv {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"ctx-1"}`)
 	})
+
+	// File-system endpoints exercised by the file-operations + volumes examples.
+	echoOK := func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Clone(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	}
+	mux.HandleFunc("/files", echoOK)
+	mux.HandleFunc("/files/folder", echoOK)
+	mux.HandleFunc("/files/replace", echoOK)
+	mux.HandleFunc("/files/permissions", echoOK)
+
+	// LSP endpoints exercised by the git-lsp example.
+	mux.HandleFunc("/lsp/start", echoOK)
+	mux.HandleFunc("/lsp/did-open", echoOK)
+	mux.HandleFunc("/lsp/document-symbols", echoOK)
+	mux.HandleFunc("/lsp/completions", echoOK)
+
+	// PTY bare endpoint (list/create).
+	mux.HandleFunc("/process/pty", echoOK)
 
 	// WebSocket endpoints we expect to ride proxyToolbox.
 	wsHandler := func(w http.ResponseWriter, r *http.Request) {
@@ -370,6 +389,82 @@ func TestToolboxProxyUnknownRouteStillReturns501(t *testing.T) {
 		t.Fatalf("unknown path leaked to toolbox: %s %s", got.Method, got.URL.Path)
 	case <-time.After(100 * time.Millisecond):
 		// expected: nothing reaches the toolbox
+	}
+}
+
+// TestToolboxProxyForwardedRoutes is the table-driven coverage for every
+// route added while making the daytona-examples runnable end-to-end.
+// Each row picks an example that exercises the route and asserts the
+// request reaches the fake toolbox with the right method + path. If a
+// future refactor drops one of these whitelist entries, the matching
+// row turns red and points straight at the regressing example.
+func TestToolboxProxyForwardedRoutes(t *testing.T) {
+	cases := []struct {
+		name       string
+		example    string // which example would break if this regressed
+		method     string
+		facadePath string // path appended after /toolbox/{id}
+		wantPath   string // path the fake toolbox should observe
+	}{
+		// file-operations + volumes
+		{"createFolder", "file-operations", http.MethodPost, "/files/folder?path=p&mode=755", "/files/folder"},
+		{"replaceInFiles", "file-operations", http.MethodPost, "/files/replace", "/files/replace"},
+		{"setFilePermissions", "file-operations", http.MethodPost, "/files/permissions?path=p", "/files/permissions"},
+		{"deleteFile", "file-operations", http.MethodDelete, "/files?path=p", "/files"},
+		// git-lsp
+		{"lspStart", "git-lsp", http.MethodPost, "/lsp/start", "/lsp/start"},
+		{"lspDidOpen", "git-lsp", http.MethodPost, "/lsp/did-open", "/lsp/did-open"},
+		{"lspDocumentSymbols", "git-lsp", http.MethodGet, "/lsp/document-symbols?pathToProject=p&file=f", "/lsp/document-symbols"},
+		{"lspCompletions", "git-lsp", http.MethodPost, "/lsp/completions", "/lsp/completions"},
+		// pty (bare path covers list + create)
+		{"createPty", "pty", http.MethodPost, "/process/pty", "/process/pty"},
+		{"listPty", "pty", http.MethodGet, "/process/pty", "/process/pty"},
+	}
+
+	env := newToolboxProxyTestEnv(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(tc.method,
+				env.facade.URL+ToolboxPrefix+"/"+env.sandboxID+tc.facadePath,
+				strings.NewReader(`{}`),
+			)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			// 501 means the route fell through to the default case —
+			// the example named in tc.example is the one that breaks.
+			if resp.StatusCode == http.StatusNotImplemented {
+				t.Fatalf("route returned 501 — would break example %q", tc.example)
+			}
+			// The fake toolbox returns 204 for the catch-all echo handler;
+			// individual mux-mounted handlers may return 200/204. Anything
+			// 2xx means we got past the facade. >=300 is a real error.
+			if resp.StatusCode >= http.StatusMultipleChoices {
+				t.Fatalf("status = %d, want 2xx", resp.StatusCode)
+			}
+
+			select {
+			case got := <-env.toolboxRequests:
+				if got.Method != tc.method {
+					t.Errorf("method = %q, want %q", got.Method, tc.method)
+				}
+				if got.URL.Path != tc.wantPath {
+					t.Errorf("path = %q, want %q", got.URL.Path, tc.wantPath)
+				}
+				if got.Header.Get("Authorization") != "Bearer tok-proxy" {
+					t.Errorf("Authorization = %q, want Bearer tok-proxy", got.Header.Get("Authorization"))
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("request never reached fake toolbox — example %q would hang", tc.example)
+			}
+		})
 	}
 }
 

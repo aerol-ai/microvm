@@ -53,7 +53,10 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 		h.forwardToolbox(w, r, sandboxID, "/version")
 	case r.Method == http.MethodGet && path == "user-home-dir":
 		h.userHomeDir(w, r, sandboxID)
-	case r.Method == http.MethodGet && path == "workdir":
+	case r.Method == http.MethodGet && (path == "workdir" || path == "work-dir"):
+		// The Daytona SDK's InfoApi.getWorkDir calls /work-dir (hyphenated);
+		// the legacy facade route was /workdir. Accept both so older clients
+		// keep working.
 		h.workDir(w, r, sandboxID)
 	case r.Method == http.MethodPost && path == "process/execute":
 		h.executeCommand(w, r, sandboxID)
@@ -68,10 +71,20 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 		// /process/interpreter/execute is a WebSocket stream; the context
 		// endpoints are plain HTTP. ReverseProxy handles both.
 		h.proxyToolbox(w, r, sandboxID, "/"+path)
-	case strings.HasPrefix(path, "process/pty/"):
+	case path == "process/pty" || strings.HasPrefix(path, "process/pty/"):
+		// /process/pty (bare) covers list/create; /process/pty/{id}/connect
+		// is the WebSocket stream.
 		h.proxyToolbox(w, r, sandboxID, "/"+path)
 	case r.Method == http.MethodGet && path == "files":
 		h.forwardToolbox(w, r, sandboxID, "/files")
+	case r.Method == http.MethodDelete && path == "files":
+		h.forwardToolbox(w, r, sandboxID, "/files")
+	case r.Method == http.MethodPost && path == "files/folder":
+		h.forwardToolbox(w, r, sandboxID, "/files/folder")
+	case r.Method == http.MethodPost && path == "files/replace":
+		h.forwardToolbox(w, r, sandboxID, "/files/replace")
+	case r.Method == http.MethodPost && path == "files/permissions":
+		h.forwardToolbox(w, r, sandboxID, "/files/permissions")
 	case r.Method == http.MethodGet && path == "files/info":
 		h.forwardToolbox(w, r, sandboxID, "/files/info")
 	case r.Method == http.MethodPost && path == "files/upload":
@@ -89,6 +102,11 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && path == "files/bulk-download":
 		h.bulkDownload(w, r, sandboxID)
 	case strings.HasPrefix(path, "git/"):
+		h.forwardToolbox(w, r, sandboxID, "/"+path)
+	case strings.HasPrefix(path, "lsp/"):
+		// Language-server endpoints are simple HTTP requests against the
+		// toolbox daemon — pass them through so sandbox.createLspServer()
+		// + lsp.start/didOpen/completions/etc. work end-to-end.
 		h.forwardToolbox(w, r, sandboxID, "/"+path)
 	default:
 		apihttp.WriteError(w, http.StatusNotImplemented, "daytona toolbox route not implemented")
