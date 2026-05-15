@@ -659,6 +659,16 @@ func (c *Cluster) Placements() []Placement {
 	return out
 }
 
+// PlacementVersion returns the FSM's monotonic apply counter — bumps on
+// every committed raft log entry. Used by the cluster-ingress reconciler's
+// fast-poll wake loop.
+func (c *Cluster) PlacementVersion() uint64 {
+	if c.fsm == nil {
+		return 0
+	}
+	return c.fsm.currentVersion()
+}
+
 // Leader returns the node ID of the current raft leader. Empty if no leader.
 func (c *Cluster) Leader() string {
 	_, id := c.raft.raft.LeaderWithID()

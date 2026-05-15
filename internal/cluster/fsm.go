@@ -287,6 +287,17 @@ func (f *placementFSM) idsOwnedBy(nodeID string) []string {
 	return out
 }
 
+// currentVersion returns the FSM's monotonic apply counter. The cluster
+// ingress reconciler reads it from a fast-poll loop to detect placement
+// changes within a fraction of the slow reconcile interval — without this,
+// the worst-case wait between an FSM apply and an ingress route update is
+// the full reconcile period.
+func (f *placementFSM) currentVersion() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.version
+}
+
 // snapshot copies the placement map for use by Snapshot().
 func (f *placementFSM) snapshot() map[string]Placement {
 	f.mu.RLock()

@@ -1903,7 +1903,19 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 	}
 	self := c.SelfNodeID()
 	for _, p := range c.Placements() {
-		if p.SandboxID == "" || p.OwnerNodeID == "" || p.OwnerNodeID == self {
+		if p.SandboxID == "" || p.OwnerNodeID == self {
+			continue
+		}
+		// Orphaned placement: the in-flux 503 routes are the expected
+		// state. Keep them; the live routes are intentionally absent.
+		if p.OwnerNodeID == "" {
+			expectedHTTP[caddy.InFluxSandboxRouteID(p.SandboxID)] = struct{}{}
+			for port, route := range cluster.ExposedPortRoutesForPlacement(p) {
+				if route.Protocol == models.ExposedPortProtocolTCP {
+					continue
+				}
+				expectedHTTP[caddy.InFluxPortRouteID(p.SandboxID, port)] = struct{}{}
+			}
 			continue
 		}
 		if s.cfg.Domain != "" {
@@ -2045,6 +2057,15 @@ func (s *Service) StartClusterIngressReconcile(ctx context.Context) {
 	if !s.cfg.EnableCluster || !s.caddy.Enabled() {
 		return
 	}
+	// Fast-wake channel: a separate goroutine polls the FSM's monotonic
+	// version every clusterIngressFastPollInterval and signals here on
+	// change. The reconcile loop selects between the slow timer and this
+	// channel, so a placement apply on the leader is reflected in ingress
+	// routes within ~500ms instead of the full 5s reconcile period. Buffer
+	// of 1 collapses bursts (multiple version bumps between reconciles
+	// trigger one wake, not N).
+	wake := make(chan struct{}, 1)
+	go s.runIngressVersionWatcher(ctx, wake)
 	go func() {
 		for {
 			reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -2059,9 +2080,47 @@ func (s *Service) StartClusterIngressReconcile(ctx context.Context) {
 				t.Stop()
 				return
 			case <-t.C:
+			case <-wake:
+				t.Stop()
 			}
 		}
 	}()
+}
+
+// clusterIngressFastPollInterval is the FSM-version poll cadence for the
+// fast-wake path. 500ms keeps the convergence window comfortably under the
+// stage-2 §06 SLO of 2s p95 placement-to-ingress without burning a goroutine
+// on the hot path. Reading FSM.currentVersion is a single atomic-protected
+// uint64 read; the cost is negligible.
+const clusterIngressFastPollInterval = 500 * time.Millisecond
+
+// runIngressVersionWatcher polls the cluster FSM version and signals wake
+// whenever it changes. Non-blocking send: if the reconciler is mid-tick or
+// already armed, drop the signal — one wake per idle period is enough.
+func (s *Service) runIngressVersionWatcher(ctx context.Context, wake chan<- struct{}) {
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	last := c.PlacementVersion()
+	t := time.NewTicker(clusterIngressFastPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			cur := s.Cluster().PlacementVersion()
+			if cur == last {
+				continue
+			}
+			last = cur
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		}
+	}
 }
 
 func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
@@ -2111,30 +2170,52 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 		}
 	}
 
+	// Collect all admin operations into a slice and run them through a
+	// bounded worker pool. Each op is one Caddy admin HTTP call; with a
+	// 10K-route view the sequential version did 10K serial RTTs to Caddy
+	// admin per tick. The pool caps in-flight calls so we don't drown
+	// Caddy's admin server but lets us amortize HTTP overhead across N
+	// sockets in parallel.
 	tlsPeerPort := l4ListenPort(s.cfg.L4TLSListen)
+	var ops []func(context.Context) error
 	for _, p := range placements {
-		if p.SandboxID == "" || p.OwnerNodeID == "" || p.OwnerNodeID == self {
+		if p.SandboxID == "" || p.OwnerNodeID == self {
 			continue
 		}
+
 		ownerHost := dataPlaneHostForPlacement(p)
-		if ownerHost == "" {
-			s.logger.Warn("cluster ingress: owner data-plane host missing or invalid; cannot route remote sandbox",
-				"sandbox_id", p.SandboxID, "owner", p.OwnerNodeID, "owner_api_url", p.OwnerAPIURL, "owner_data_plane_host", p.OwnerDataPlaneHost)
+		// In-flux: orphaned placement (dead owner) or owner data-plane host
+		// hasn't gossiped yet. Install an HTTP 503 route so clients get a
+		// clear Retry-After signal instead of the Caddy catch-all 404.
+		// Remove any live route that may still be installed from a prior
+		// healthy tick. The whole in-flux flow stays in one op so its
+		// internal ordering (delete-live-then-install-503) is preserved.
+		if p.OwnerNodeID == "" || ownerHost == "" {
+			ops = append(ops, func(ctx context.Context) error {
+				return s.applyInFluxRoute(ctx, p)
+			})
 			continue
 		}
+
+		// Healthy: install the live route(s) and drop any in-flux route
+		// left over from a previous orphan window. Independent ops; safe
+		// to run in parallel.
+		ops = append(ops, func(ctx context.Context) error {
+			return s.caddy.DeleteInFluxSandboxRoute(ctx, p.SandboxID)
+		})
 
 		if s.cfg.Domain != "" {
 			if tlsPeerPort <= 0 {
 				continue
 			}
 			sni := p.SandboxID + "." + s.cfg.Domain
-			if err := s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID), sni, ownerHost, tlsPeerPort); err != nil && firstErr == nil {
-				firstErr = err
-			}
+			ops = append(ops, func(ctx context.Context) error {
+				return s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID), sni, ownerHost, tlsPeerPort)
+			})
 		} else {
-			if err := s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost); err != nil && firstErr == nil {
-				firstErr = err
-			}
+			ops = append(ops, func(ctx context.Context) error {
+				return s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost)
+			})
 		}
 
 		for port, route := range cluster.ExposedPortRoutesForPlacement(p) {
@@ -2142,6 +2223,9 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 			if protocol == "" {
 				protocol = models.ExposedPortProtocolHTTP
 			}
+			ops = append(ops, func(ctx context.Context) error {
+				return s.caddy.DeleteInFluxPortRoute(ctx, p.SandboxID, port)
+			})
 			switch protocol {
 			case models.ExposedPortProtocolHTTP:
 				if s.cfg.Domain != "" {
@@ -2149,11 +2233,13 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 						continue
 					}
 					sni := fmt.Sprintf("%s-%d.%s", p.SandboxID, port, s.cfg.Domain)
-					if err := s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port), sni, ownerHost, tlsPeerPort); err != nil && firstErr == nil {
-						firstErr = err
-					}
-				} else if err := s.caddy.UpsertPortRouteToPeer(ctx, p.SandboxID, port, ownerHost); err != nil && firstErr == nil {
-					firstErr = err
+					ops = append(ops, func(ctx context.Context) error {
+						return s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port), sni, ownerHost, tlsPeerPort)
+					})
+				} else {
+					ops = append(ops, func(ctx context.Context) error {
+						return s.caddy.UpsertPortRouteToPeer(ctx, p.SandboxID, port, ownerHost)
+					})
 				}
 			case models.ExposedPortProtocolTCP:
 				if route.HostPort <= 0 {
@@ -2161,19 +2247,22 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 						"sandbox_id", p.SandboxID, "port", port, "owner", p.OwnerNodeID)
 					continue
 				}
-				if err := s.caddy.UpsertTCPProxyRoute(ctx, p.SandboxID, port, route.HostPort, ownerHost, route.HostPort); err != nil && firstErr == nil {
-					firstErr = err
-				}
+				ops = append(ops, func(ctx context.Context) error {
+					return s.caddy.UpsertTCPProxyRoute(ctx, p.SandboxID, port, route.HostPort, ownerHost, route.HostPort)
+				})
 			case models.ExposedPortProtocolTLS:
 				if s.cfg.Domain == "" || tlsPeerPort <= 0 {
 					continue
 				}
 				sni := fmt.Sprintf("%s-%d.%s", p.SandboxID, port, s.cfg.Domain)
-				if err := s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port), sni, ownerHost, tlsPeerPort); err != nil && firstErr == nil {
-					firstErr = err
-				}
+				ops = append(ops, func(ctx context.Context) error {
+					return s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port), sni, ownerHost, tlsPeerPort)
+				})
 			}
 		}
+	}
+	if err := runIngressOps(ctx, ops, clusterIngressMaxConcurrentWrites); err != nil {
+		firstErr = err
 	}
 	if err := s.gcClusterIngressRoutes(ctx); err != nil && firstErr == nil {
 		firstErr = err
@@ -2186,6 +2275,50 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	} else {
 		s.ingressLastHash.Store(0)
 		recordIngressReconcile(reconcileErrored, time.Since(start), routeCounts, maxVersion)
+	}
+	return firstErr
+}
+
+// applyInFluxRoute is the orphan / unresolvable-owner branch of the ingress
+// reconciler. It removes any live route for the sandbox (so traffic can't
+// keep flowing to a dead host) and installs the 503-with-Retry-After route
+// for the sandbox and each replicated exposed port. All four mutations are
+// best-effort and idempotent; we return the first error and let the caller
+// reset the idle-skip hash so the next tick retries.
+func (s *Service) applyInFluxRoute(ctx context.Context, p cluster.Placement) error {
+	var firstErr error
+	// Drop live HTTP / SNI routes (whichever mode wired them).
+	if s.cfg.Domain == "" {
+		if err := s.caddy.DeleteSandboxRoute(ctx, p.SandboxID); err != nil {
+			firstErr = err
+		}
+	} else {
+		if err := s.caddy.DeleteRouteByID(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID)); err != nil {
+			firstErr = err
+		}
+	}
+	if err := s.caddy.UpsertInFluxSandboxRoute(ctx, p.SandboxID); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// Per-port: same idea. We only mirror HTTP/TLS in-flux into Caddy; raw
+	// TCP exposures don't have a hostname the client can match against, so
+	// they fail at connect time rather than serving an in-flux response.
+	for port, route := range cluster.ExposedPortRoutesForPlacement(p) {
+		if route.Protocol == models.ExposedPortProtocolTCP {
+			continue
+		}
+		if s.cfg.Domain == "" {
+			if err := s.caddy.DeletePortRoute(ctx, p.SandboxID, port); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			if err := s.caddy.DeleteRouteByID(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port)); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if err := s.caddy.UpsertInFluxPortRoute(ctx, p.SandboxID, port); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	return firstErr
 }

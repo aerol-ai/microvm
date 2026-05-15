@@ -271,6 +271,13 @@ type Client interface {
 	// to reconcile owner-aware public ingress routes.
 	Placements() []Placement
 
+	// PlacementVersion is the FSM's monotonic apply counter — bumps on every
+	// raft log entry the FSM applied. The ingress reconciler polls this on a
+	// fast tick to wake immediately on placement changes instead of waiting
+	// out the full reconcile interval. Zero means "no version data" (Noop or
+	// fresh cluster); callers should treat 0→non-zero as a change too.
+	PlacementVersion() uint64
+
 	// Leader returns the node ID of the current Raft leader, empty if none.
 	Leader() string
 

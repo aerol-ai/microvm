@@ -248,6 +248,92 @@ func (c *Client) DeletePortRoute(ctx context.Context, id string, port int) error
 	return c.deleteRoute(ctx, portRouteID(id, port))
 }
 
+// UpsertInFluxSandboxRoute installs an HTTP route for the sandbox's public
+// hostname/path that responds with 503 Service Unavailable + Retry-After: 2.
+// Used by the cluster-ingress reconciler when a placement is orphaned or
+// when the owner's data-plane host hasn't gossiped yet — the alternative is
+// the Caddy fallback 404, which clients can't tell apart from "sandbox does
+// not exist". The route has its own @id namespace (suffix "-in-flux") so it
+// can coexist with a live route during transitions; the reconciler is
+// responsible for deleting the live route before installing the in-flux
+// route, and vice versa.
+//
+// In domain mode the L4 SNI mux falls through to the local HTTPS listener
+// for any SNI it doesn't recognize, so an HTTP route registered for the
+// sandbox hostname captures in-flux traffic without needing a separate L4
+// route.
+func (c *Client) UpsertInFluxSandboxRoute(ctx context.Context, id string) error {
+	if !c.enabled {
+		return nil
+	}
+	routeID := inFluxSandboxRouteID(id)
+	route := inFluxRoute(routeID, c.inFluxMatchSandbox(id))
+	return c.upsertRoute(ctx, routeID, route)
+}
+
+// UpsertInFluxPortRoute mirrors UpsertInFluxSandboxRoute for per-port URLs.
+func (c *Client) UpsertInFluxPortRoute(ctx context.Context, id string, port int) error {
+	if !c.enabled {
+		return nil
+	}
+	routeID := inFluxPortRouteID(id, port)
+	route := inFluxRoute(routeID, c.inFluxMatchPort(id, port))
+	return c.upsertRoute(ctx, routeID, route)
+}
+
+// DeleteInFluxSandboxRoute drops the in-flux 503 route once the live route
+// is back. 404 is treated as success.
+func (c *Client) DeleteInFluxSandboxRoute(ctx context.Context, id string) error {
+	if !c.enabled {
+		return nil
+	}
+	return c.deleteRoute(ctx, inFluxSandboxRouteID(id))
+}
+
+// DeleteInFluxPortRoute mirrors DeleteInFluxSandboxRoute for per-port URLs.
+func (c *Client) DeleteInFluxPortRoute(ctx context.Context, id string, port int) error {
+	if !c.enabled {
+		return nil
+	}
+	return c.deleteRoute(ctx, inFluxPortRouteID(id, port))
+}
+
+// inFluxRoute builds the static-503 handler used by both
+// UpsertInFlux*Route helpers.
+func inFluxRoute(routeID string, match []map[string]any) map[string]any {
+	return map[string]any{
+		"@id":   routeID,
+		"match": match,
+		"handle": []map[string]any{{
+			"handler":     "static_response",
+			"status_code": 503,
+			"headers": map[string][]string{
+				"Retry-After":  {"2"},
+				"Content-Type": {"text/plain; charset=utf-8"},
+			},
+			"body": "Sandbox placement in flux. Retry in a moment.\n",
+		}},
+		"terminal": true,
+	}
+}
+
+func (c *Client) inFluxMatchSandbox(id string) []map[string]any {
+	if c.domain != "" {
+		return []map[string]any{{"host": []string{fmt.Sprintf("%s.%s", id, c.domain)}}}
+	}
+	return []map[string]any{{"path": []string{fmt.Sprintf("/%s", id), fmt.Sprintf("/%s/*", id)}}}
+}
+
+func (c *Client) inFluxMatchPort(id string, port int) []map[string]any {
+	if c.domain != "" {
+		return []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}}
+	}
+	return []map[string]any{{"path": []string{
+		fmt.Sprintf("/%s/proxy/%d", id, port),
+		fmt.Sprintf("/%s/proxy/%d/*", id, port),
+	}}}
+}
+
 // upsertRoute writes one route by its @id without touching the rest of the
 // routes array. PATCH /id/<routeID> replaces the existing node in place; if
 // it doesn't exist yet (404), we insert it at index 0 of the server's routes
@@ -365,6 +451,18 @@ func sandboxRouteID(id string) string {
 func portRouteID(id string, port int) string {
 	return fmt.Sprintf("sandbox-%s-port-%d", id, port)
 }
+
+func inFluxSandboxRouteID(id string) string {
+	return "sandbox-" + id + "-in-flux"
+}
+
+func inFluxPortRouteID(id string, port int) string {
+	return fmt.Sprintf("sandbox-%s-port-%d-in-flux", id, port)
+}
+
+// IDs exposed for the zombie GC to add to its keep-set.
+func InFluxSandboxRouteID(id string) string        { return inFluxSandboxRouteID(id) }
+func InFluxPortRouteID(id string, port int) string { return inFluxPortRouteID(id, port) }
 
 // Layer4 admin API conventions.
 //

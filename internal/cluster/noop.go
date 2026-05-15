@@ -66,6 +66,10 @@ func (n *Noop) Members() []Member {
 
 func (n *Noop) Placements() []Placement { return nil }
 
+// PlacementVersion always returns 0 in single-node mode — there's no FSM and
+// no need to wake an ingress reconciler that isn't running.
+func (n *Noop) PlacementVersion() uint64 { return 0 }
+
 func (n *Noop) Leader() string { return n.nodeID }
 
 func (n *Noop) Close() error { return nil }

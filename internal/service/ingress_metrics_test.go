@@ -1,7 +1,11 @@
 package service
 
 import (
+	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -66,6 +70,54 @@ func TestHashPlacementViewIgnoresSelfOwned(t *testing.T) {
 	h2, _, _ := hashPlacementView("self", []cluster.Placement{mine, theirs})
 	if h1 != h2 {
 		t.Fatalf("self-owned placement leaked into hash: %x vs %x", h1, h2)
+	}
+}
+
+// TestRunIngressOpsRunsAllInParallel exercises the worker pool used by the
+// per-tick Caddy admin fan-out. With concurrency=4 and 8 ops that each sleep
+// 50ms, the wall-clock should be ~100ms (two batches), not ~400ms (serial).
+// This is the load-bearing claim behind dropping 10K-route reconcile time
+// from ~10s to ~1.5s under realistic admin latency.
+func TestRunIngressOpsRunsAllInParallel(t *testing.T) {
+	const n = 8
+	var ran atomic.Int32
+	ops := make([]func(context.Context) error, n)
+	for i := 0; i < n; i++ {
+		ops[i] = func(_ context.Context) error {
+			time.Sleep(50 * time.Millisecond)
+			ran.Add(1)
+			return nil
+		}
+	}
+	start := time.Now()
+	if err := runIngressOps(context.Background(), ops, 4); err != nil {
+		t.Fatalf("runIngressOps: %v", err)
+	}
+	elapsed := time.Since(start)
+	if got := ran.Load(); got != n {
+		t.Fatalf("ran=%d, want %d", got, n)
+	}
+	// Conservative bound: serial would be ~400ms; parallel-by-4 should
+	// finish well under 250ms even on a busy CI machine.
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("ops took %s; expected concurrency to bring it well under 250ms", elapsed)
+	}
+}
+
+// TestRunIngressOpsReturnsFirstError surfaces the first error from any op
+// while letting subsequent ops short-circuit. The reconciler uses the
+// returned error to invalidate the idle-skip hash so the next tick retries
+// the failed admin call.
+func TestRunIngressOpsReturnsFirstError(t *testing.T) {
+	want := errors.New("admin api 500")
+	ops := []func(context.Context) error{
+		func(_ context.Context) error { return nil },
+		func(_ context.Context) error { return want },
+		func(_ context.Context) error { return nil },
+	}
+	got := runIngressOps(context.Background(), ops, 2)
+	if !errors.Is(got, want) {
+		t.Fatalf("runIngressOps err = %v, want %v", got, want)
 	}
 }
 

@@ -12,7 +12,8 @@
 // SB_PAT_TOKEN set in the env. It does NOT bring up nodes or join them.
 //
 // Output: a CSV of (timestamp, op, duration_ms, status_code, route_lag_ms)
-// suitable for attaching to a release PR as the convergence artifact.
+// suitable for attaching to a release PR as the convergence artifact, plus
+// a per-op p50/p95/p99 summary printed to stderr at exit.
 //
 // Run:
 //
@@ -21,6 +22,7 @@
 //	    -ingress https://ingress.sandbox.example.com \
 //	    -pat "$SB_PAT_TOKEN" \
 //	    -rate 1 \
+//	    -concurrency 4 \
 //	    -duration 60m \
 //	    -out churn.csv
 //
@@ -49,7 +51,8 @@ var (
 	apiURL       = flag.String("api", "", "AerolVM API URL (e.g. https://api.sandbox.example.com)")
 	ingressURL   = flag.String("ingress", "", "AerolVM ingress URL for public sandbox traffic (defaults to -api)")
 	patToken     = flag.String("pat", "", "SB_PAT_TOKEN — defaults to the env var of the same name")
-	ratePerSec   = flag.Float64("rate", 1, "create+destroy operations per second")
+	ratePerSec   = flag.Float64("rate", 1, "create+destroy operations per second (driver tick rate)")
+	concurrency  = flag.Int("concurrency", 4, "max concurrent create+probe+destroy lifecycles in flight")
 	duration     = flag.Duration("duration", 5*time.Minute, "how long to run before exiting")
 	outPath      = flag.String("out", "ingress_churn.csv", "CSV path for results")
 	imageRef     = flag.String("image", "alpine:3.19", "image for created sandboxes")
@@ -90,6 +93,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "-pat or SB_PAT_TOKEN required")
 		os.Exit(2)
 	}
+	if *concurrency < 1 {
+		*concurrency = 1
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
@@ -103,6 +109,12 @@ func main() {
 	w := csv.NewWriter(out)
 	defer w.Flush()
 	_ = w.Write([]string{"timestamp", "op", "duration_ms", "status", "route_lag_ms", "sandbox_id"})
+
+	// Per-op latency series for the end-of-run summary. We keep them in
+	// memory; at the default 1 op/s × 60min that's ~3600 entries per op,
+	// trivial. Operators running multi-hour churn at high rates can pipe
+	// the CSV through awk if memory matters.
+	stats := newStatsRecorder()
 
 	samples := make(chan sample, 1024)
 	var wg sync.WaitGroup
@@ -118,8 +130,14 @@ func main() {
 				strconv.FormatFloat(float64(s.routeLag)/float64(time.Millisecond), 'f', 3, 64),
 				s.id,
 			})
+			stats.record(s)
 		}
 	}()
+
+	// Concurrency limiter: the rate-tick fires the next op only when the
+	// limiter has a free slot. Without this, a hung create + 10s probe
+	// timeout would pile up goroutines linearly with the run length.
+	slots := make(chan struct{}, *concurrency)
 
 	interval := time.Duration(float64(time.Second) / *ratePerSec)
 	if interval <= 0 {
@@ -133,10 +151,22 @@ func main() {
 		case <-ctx.Done():
 			close(samples)
 			wg.Wait()
+			stats.printSummary(os.Stderr)
 			fmt.Fprintf(os.Stderr, "done; results in %s\n", *outPath)
 			return
 		case <-tick.C:
-			go runOnce(samples)
+			select {
+			case slots <- struct{}{}:
+				go func() {
+					defer func() { <-slots }()
+					runOnce(samples)
+				}()
+			default:
+				// Backpressure: concurrency cap reached. Drop this tick
+				// rather than queue forever — print a heartbeat so the
+				// operator notices saturation.
+				stats.dropped.Add(1)
+			}
 		}
 	}
 }
@@ -210,9 +240,11 @@ func probeIngress(publicURL string) (int, time.Duration) {
 		last = resp.StatusCode
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		// 503 is the in-flux signal. Anything else (200, 404, 502) counts
-		// as ingress converged — the application inside the sandbox may
-		// itself be 404-ing while we wait for it to come up.
+		// 503 is the in-flux signal — the new explicit "placement in flux"
+		// response from the ingress reconciler. Anything else (200, 404,
+		// 502 reaching the owner) counts as ingress converged: the
+		// application inside the sandbox may itself be 404-ing while we
+		// wait for it to come up.
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			return resp.StatusCode, time.Since(start)
 		}

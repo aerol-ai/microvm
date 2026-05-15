@@ -1,15 +1,83 @@
 package service
 
 import (
+	"context"
 	"expvar"
 	"hash/fnv"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// clusterIngressMaxConcurrentWrites caps in-flight Caddy admin calls per
+// reconcile tick. Caddy's admin API is single-process; pushing too many
+// concurrent writes through it adds queueing latency without actually
+// shortening the wall clock. 8 keeps a 10K-route tick saturating the admin
+// HTTP pipeline without overrunning it.
+const clusterIngressMaxConcurrentWrites = 8
+
+// runIngressOps fans `ops` out across at most `concurrency` worker goroutines
+// and returns the first error any op produced. Cancellation is propagated
+// via ctx; remaining queued ops short-circuit once an error is recorded so
+// we don't pile up admin calls behind a known-failing reconcile.
+func runIngressOps(ctx context.Context, ops []func(context.Context) error, concurrency int) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	work := make(chan func(context.Context) error)
+	var (
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	worker := func() {
+		defer wg.Done()
+		for op := range work {
+			// Bail out early if a previous op already errored — saves us
+			// from posting 9999 admin calls behind a connection failure.
+			mu.Lock()
+			haveErr := firstErr != nil
+			mu.Unlock()
+			if haveErr {
+				continue
+			}
+			if err := op(ctx); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}
+	}
+	if concurrency > len(ops) {
+		concurrency = len(ops)
+	}
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go worker()
+	}
+	for _, op := range ops {
+		select {
+		case <-ctx.Done():
+			close(work)
+			wg.Wait()
+			return ctx.Err()
+		case work <- op:
+		}
+	}
+	close(work)
+	wg.Wait()
+	return firstErr
+}
 
 // expvar names exposed at /debug/vars by the standard library. Stage-2 §06
 // (release gates) calls out route-lag, Caddy admin latency, and route counts
