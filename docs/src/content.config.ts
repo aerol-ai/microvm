@@ -40,6 +40,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         description: 'Spin up a sandbox and run a command in under five minutes.',
       },
       {
+        type: 'link',
+        href: '/comparison',
+        label: 'AerolVM vs Daytona vs e2b',
+        description: 'How AerolVM compares to e2b and Daytona, and why we built it.',
+      },
+      {
         type: 'group',
         label: 'Server Setup',
         homePageHref: '/getting-started',
@@ -49,12 +55,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
             href: '/getting-started/local-setup',
             label: 'Local Setup',
             description: 'Run AerolVM directly on your Mac or Linux machine for local development.',
-          },
-          {
-            type: 'link',
-            href: '/comparison',
-            label: 'AerolVM vs Daytona vs e2b',
-            description: 'How AerolVM compares to e2b and Daytona, and why we built it.',
           },
           {
             type: 'link',

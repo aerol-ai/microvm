@@ -9,7 +9,7 @@ A side-by-side look at how AerolVM compares to the two most common alternatives 
 | | AerolVM | e2b | Daytona |
 |---|---|---|---|
 | **Hosting** | Self-hosted on your infra | Cloud (managed, no self-host) | Self-hosted |
-| **Set Up Complexity** | Easy | No self-host | Extremely Complex |
+| **Set Up Complexity** | Easy for Single Node | No self-host | Extremely Complex for Single Node |
 | **Can run locally** | ✅ | ✗ | ✗ |
 | **Open source** | ✅ | ✗ | ✅ |
 | **Primary use case** | AI agents + ephemeral CI | AI agent code execution | Developer workspaces |
@@ -33,6 +33,7 @@ A side-by-side look at how AerolVM compares to the two most common alternatives 
 | **Multi-tenant tagging** | ✅ Tag filtering with AND semantics for control-plane scoping | ✗ | ✗ |
 | **Port allowlist** | ✅ Explicit exposure required before public traffic reaches a port | ✗ | ✗ |
 | **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python, Ruby, Go, Java |
+| **SDK Types** | AerolVM, Daytona, E2b | E2b | Daytona |
 | **Pricing for 100 Concurrent Sandboxs 4GB RAM + 2VCPU + 16GB Disk per Month** | ~4000$ (Check the calculation below) | ~12000$ | ~12000$ |
 
 ***IMPORTANT: Note these Sandboxes are built on Shared Infra so even though you are being charged for 4GB + 2VCPU you might not be consuming the entire resources.***
