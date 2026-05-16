@@ -502,6 +502,32 @@ func (c *Cluster) CancelReservation(ctx context.Context, sandboxID string) error
 	return c.applyCommand(ctx, cmd)
 }
 
+// SetNodeDrainState marks nodeID as drained (drained=true) or restores it to
+// the SelectPlacement candidate pool (drained=false). Goes through raft so
+// every node — including the drained node itself — sees the new state on its
+// next placement decision. Idempotent.
+//
+// Drain is a no-op on existing placements: a drained node continues serving
+// the sandboxes it already owns. Combine with the dead-owner reconciler (kill
+// the process) to force ownership transfer, or use a separate evacuate command
+// (not implemented) to move work proactively.
+func (c *Cluster) SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error {
+	if nodeID == "" {
+		return fmt.Errorf("cluster: SetNodeDrainState requires non-empty nodeID")
+	}
+	cmd := command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained}
+	return c.applyCommand(ctx, cmd)
+}
+
+// IsNodeDrained reports the FSM's view of nodeID's drain state. Read from the
+// local FSM with no network hop.
+func (c *Cluster) IsNodeDrained(nodeID string) bool {
+	if c.fsm == nil {
+		return false
+	}
+	return c.fsm.isNodeDrained(nodeID)
+}
+
 // AssertOwnership reconciles local sandbox state against the cluster FSM at
 // boot. Used at boot. Idempotent. Best-effort: errors are logged but do not
 // abort boot — the next reconcile loop will retry.

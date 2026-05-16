@@ -27,6 +27,7 @@ const (
 	opRemoveExposedPort opCode = 6 // drop one port intent
 	opReserve           opCode = 7 // hold capacity + name for a chosen owner before docker
 	opCancelReserve     opCode = 8 // release a pending reservation (rollback or TTL GC)
+	opSetNodeDrainState opCode = 9 // operator-set "exclude from placement" mark for a node
 )
 
 // command is the wire format for one raft log entry. Spec is non-nil for
@@ -61,6 +62,11 @@ type command struct {
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
 	// transitioning State back to Placed.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+	// NodeID + Drained are populated by opSetNodeDrainState. NodeID is the
+	// target of the drain mark; Drained is the desired state (true = exclude
+	// from SelectPlacement, false = uncordon). All other ops leave them zero.
+	NodeID  string `json:"node_id,omitempty"`
+	Drained bool   `json:"drained,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -90,6 +96,14 @@ type placementFSM struct {
 	// placement write so the index can never lag the authoritative map; rebuilt
 	// from placements on Restore so older snapshots without an index still load.
 	nameIndex map[string]string
+	// drainedNodes holds the set of nodeIDs an operator has marked as
+	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
+	// gossip) so the state survives the drained node going away — operators
+	// drain a node precisely because they want to stop it, and a gossip-only
+	// flag would vanish at the same moment it mattered most. Empty map is the
+	// no-drains steady state; cleared rows are deleted so the map size tracks
+	// active drains, not historical ones.
+	drainedNodes map[string]bool
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -100,8 +114,9 @@ type placementFSM struct {
 
 func newPlacementFSM() *placementFSM {
 	return &placementFSM{
-		placements: make(map[string]Placement),
-		nameIndex:  make(map[string]string),
+		placements:   make(map[string]Placement),
+		nameIndex:    make(map[string]string),
+		drainedNodes: make(map[string]bool),
 	}
 }
 
@@ -387,6 +402,24 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
 		return nil
+	case opSetNodeDrainState:
+		// Drain marks live in the FSM so an operator-issued drain persists past
+		// the drained node going down — the very next moment after a drain the
+		// operator typically stops the process. Idempotent on both edges: a
+		// drain of an already-drained node is a no-op, and uncordon of a node
+		// that isn't drained drops nothing.
+		if cmd.NodeID == "" {
+			return fmt.Errorf("placementFSM: opSetNodeDrainState requires node_id")
+		}
+		if cmd.Drained {
+			if f.drainedNodes == nil {
+				f.drainedNodes = make(map[string]bool)
+			}
+			f.drainedNodes[cmd.NodeID] = true
+		} else {
+			delete(f.drainedNodes, cmd.NodeID)
+		}
+		return nil
 	default:
 		return fmt.Errorf("placementFSM: unknown op %d", cmd.Op)
 	}
@@ -536,23 +569,56 @@ func (f *placementFSM) snapshot() map[string]Placement {
 	return out
 }
 
+// isNodeDrained reports whether nodeID has been marked drained via
+// opSetNodeDrainState. SelectPlacement reads this to filter the candidate set;
+// callers outside placement scoring can use it for observability (e.g. the
+// members endpoint surfacing drain status).
+func (f *placementFSM) isNodeDrained(nodeID string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.drainedNodes[nodeID]
+}
+
+// drainedNodesSnapshot returns a copy of the drained node set. SelectPlacement
+// uses this once per call instead of N isNodeDrained reads to avoid taking the
+// FSM lock for every candidate.
+func (f *placementFSM) drainedNodesSnapshot() map[string]bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if len(f.drainedNodes) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(f.drainedNodes))
+	for k, v := range f.drainedNodes {
+		out[k] = v
+	}
+	return out
+}
+
 // fsmSnapshotPayload is the on-disk envelope for an FSM snapshot. Wrapping
 // the map in a struct lets the snapshot carry the FSM version alongside the
 // placement state — without this, version reset to 0 on every cold restart
 // (B9). Legacy snapshots (pre-envelope) decoded as a bare map[string]Placement;
 // Restore detects that shape and reconstructs the version from the highest
-// Placement.Version it sees.
+// Placement.Version it sees. DrainedNodes is an optional addition — older
+// snapshots that pre-date the field decode it as nil and the FSM treats that
+// as "no drains," matching the empty-map steady state.
 type fsmSnapshotPayload struct {
-	Version    uint64
-	Placements map[string]Placement
+	Version      uint64
+	Placements   map[string]Placement
+	DrainedNodes map[string]bool
 }
 
 // Snapshot returns a raft.FSMSnapshot capturing current placement state.
 func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	version := f.version
+	drained := make(map[string]bool, len(f.drainedNodes))
+	for k, v := range f.drainedNodes {
+		drained[k] = v
+	}
 	f.mu.RUnlock()
-	return &fsmSnapshot{version: version, placements: f.snapshot()}, nil
+	return &fsmSnapshot{version: version, placements: f.snapshot(), drainedNodes: drained}, nil
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -600,17 +666,27 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 			f.nameIndex[name] = id
 		}
 	}
+	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the
+	// add path can write without a nil-map panic. Active drains carried in
+	// the envelope are copied across verbatim; raft will apply any
+	// post-snapshot opSetNodeDrainState entries next to bring us current.
+	if payload.DrainedNodes == nil {
+		f.drainedNodes = make(map[string]bool)
+	} else {
+		f.drainedNodes = payload.DrainedNodes
+	}
 	return nil
 }
 
 type fsmSnapshot struct {
-	version    uint64
-	placements map[string]Placement
+	version      uint64
+	placements   map[string]Placement
+	drainedNodes map[string]bool
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	enc := gob.NewEncoder(sink)
-	if err := enc.Encode(fsmSnapshotPayload{Version: s.version, Placements: s.placements}); err != nil {
+	if err := enc.Encode(fsmSnapshotPayload{Version: s.version, Placements: s.placements, DrainedNodes: s.drainedNodes}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
 	}

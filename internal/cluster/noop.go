@@ -55,7 +55,11 @@ func (n *Noop) ReserveOnTarget(ctx context.Context, sandboxID string, target Pla
 	return nil
 }
 func (n *Noop) CancelReservation(ctx context.Context, sandboxID string) error { return nil }
-func (n *Noop) ApplyEncoded(ctx context.Context, payload []byte) error        { return nil }
+func (n *Noop) SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error {
+	return nil
+}
+func (n *Noop) IsNodeDrained(nodeID string) bool                       { return false }
+func (n *Noop) ApplyEncoded(ctx context.Context, payload []byte) error { return nil }
 
 func (n *Noop) AssertOwnership(ctx context.Context, local []LocalSandboxState) error { return nil }
 

@@ -325,6 +325,19 @@ type Client interface {
 	// / late successful promote can race harmlessly.
 	CancelReservation(ctx context.Context, sandboxID string) error
 
+	// SetNodeDrainState marks nodeID as drained (excluded from
+	// SelectPlacement) or restores it to the candidate pool. Idempotent on
+	// both edges. The mark lives in the FSM and survives the drained node
+	// going away — the operator's intent must outlast the process they're
+	// about to stop.
+	SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error
+
+	// IsNodeDrained reports whether nodeID is currently marked drained.
+	// Reads the local FSM (no network hop). Used by observability endpoints
+	// — placement scoring uses an internal accessor that takes one lock for
+	// the whole sweep.
+	IsNodeDrained(nodeID string) bool
+
 	// ApplyEncoded is the receiving end of leader-forwarded raft writes. The
 	// internal API endpoint pipes the request body through here on the leader
 	// so any owner-side mutating call (Record/Upsert/Add/Remove/Delete) made on

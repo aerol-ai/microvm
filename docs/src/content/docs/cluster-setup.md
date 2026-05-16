@@ -257,6 +257,66 @@ If the lost voters are gone for good (disk loss, hardware destroyed) and waiting
 
 Document this procedure in your runbook before you need it. Do not improvise during an outage.
 
+## Backup and restore
+
+The raft log under `SB_RAFT_DATA_DIR` (default `/var/lib/sandboxd/raft`) is the cluster's source of truth for **placement state only** — sandbox IDs, owner nodes, replicated specs, sealed credentials, and exposed-port intents. Per-node local state (the `state.db` SQLite file, Docker containers, Caddy config) is **not** in the backup.
+
+### What lives where
+
+| Path | Contents | Per-node or cluster-wide |
+|---|---|---|
+| `$SB_RAFT_DATA_DIR/raft-log.bolt` | Raft log (every committed `opPlace` / `opReserve` / etc.) | Cluster-wide; same content on every voter |
+| `$SB_RAFT_DATA_DIR/raft-stable.bolt` | Raft term + voted-for state | Per-node |
+| `$SB_RAFT_DATA_DIR/snapshots/` | Periodic FSM snapshots | Per-node, fungible with peers |
+| `$SB_DB_PATH` (default `/var/lib/sandboxd/state.db`) | Local sandbox rows, host-port allocations, snapshots ledger | Per-node only |
+| Docker volumes + images | Sandbox filesystems | Per-node only |
+
+A backup of the raft directory on one voter is sufficient to reconstruct the cluster's placement view; it is **not** sufficient to recover the actual sandbox containers, which only exist on the node that originally hosted them.
+
+### Take a backup
+
+The backup is a hot copy of the raft directory on any voter (leader or follower — every voter holds the full log). Quiesce raft writes for the duration of the copy if you want a transactionally clean snapshot; the BoltDB files survive `cp -a` while sandboxd is running but you may capture a partial entry that raft will replay on next boot.
+
+```bash
+# On any voter. Stop sandboxd for the cleanest copy:
+sudo systemctl stop sandboxd
+sudo tar -C /var/lib/sandboxd -czf /var/backups/sandboxd-raft-$(date +%F).tar.gz raft
+sudo systemctl start sandboxd
+
+# Or, hot copy (acceptable; raft replay reconciles a torn entry):
+sudo cp -a /var/lib/sandboxd/raft /var/backups/sandboxd-raft-$(date +%F)
+```
+
+Run this on at least one node per scheduled interval. The backup is small (KB–MB scale even on large fleets) so daily retention with weekly/monthly rollups is reasonable.
+
+### What gets lost vs preserved on restore
+
+A raft-only restore brings back **cluster intent** (which sandbox should be where, with which spec, and which ports). It does **not** bring back:
+
+- Local sandbox containers — Docker state on each node is independent. After a restore, the owner watcher on each node will try to re-materialize sandboxes whose placement points at it via the recreate hook (this requires the image still being pullable and the replicated spec being intact).
+- Local `state.db` rows — host-port allocations, snapshot ledger, per-sandbox network counters. These are rebuilt opportunistically as the recreate path runs.
+- **In-flight reservations** with `expires_unix` in the past at restore time — the leader's GC sweep will cancel them on the first tick. Reservations whose TTL hasn't elapsed yet are honored.
+
+If the original cluster had sandboxes whose owners are permanently gone (disk loss), the dead-owner reconciler orphans those placements on the next tick (~15s after grace expires) and clients see `410 Gone` on next access — same shape as the lost-quorum recovery flow.
+
+### Restore procedure
+
+1. Provision a fresh node (or wipe an existing one). Match the `SB_NODE_ID` of the node whose backup you're restoring.
+2. Stop sandboxd:
+   ```bash
+   sudo systemctl stop sandboxd
+   sudo rm -rf /var/lib/sandboxd/raft
+   ```
+3. Extract the backup:
+   ```bash
+   sudo tar -C /var/lib/sandboxd -xzf /var/backups/sandboxd-raft-YYYY-MM-DD.tar.gz
+   sudo chown -R sandboxd:sandboxd /var/lib/sandboxd/raft
+   ```
+4. If this is the only surviving voter, follow the **manual quorum recovery** steps above to seed `peers.json` so it bootstraps a single-node cluster from the restored log. Otherwise, restarting `sandboxd` will rejoin the existing cluster as a follower and the log will sync from peers.
+5. Verify with `GET /v1/cluster/leader` and `GET /v1/cluster/members`. The placement count should match what was in the backup; counts that don't match indicate a stale snapshot or a backup taken mid-replication.
+
+The restore does not reach into Docker or `state.db` — sandboxes that pre-dated the backup will only come back up if their original images and (where applicable) sealed credentials are still valid. Treat the backup as a recovery aid for accidental placement-state loss, not as a substitute for per-node disaster recovery.
+
 ## Verifying cluster health
 
 A healthy cluster reports:

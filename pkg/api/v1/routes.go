@@ -105,6 +105,12 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/cluster/members", d.Auth(http.HandlerFunc(h.clusterMembers)))
 	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.Auth(http.HandlerFunc(h.clusterLeader)))
 	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", d.Auth(http.HandlerFunc(h.clusterPlacement)))
+	// Drain / uncordon are operator admission controls — they don't move
+	// existing work, they just stop SelectPlacement from sending new sandboxes
+	// to the node. PATCH-style verbs would also fit but POST keeps the surface
+	// consistent with /admin/reconcile (also a leader-side write side effect).
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", d.Auth(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", d.Auth(http.HandlerFunc(h.clusterUncordonNode)))
 	// Internal endpoint: receives leader-forwarded raft commands from peer
 	// nodes that aren't the current leader. Auth-gated by the same PAT as
 	// every other route — see clusterInternalApply for the leadership-shift

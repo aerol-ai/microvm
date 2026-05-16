@@ -538,3 +538,172 @@ func TestClusterForwardWrapReturns503AndBumpsMissCounterOnUnresolvedOwner(t *tes
 		t.Fatalf("route-miss counter delta = %d, want 1", got)
 	}
 }
+
+// drainStubCluster captures SetNodeDrainState calls and lets a test seed the
+// IsNodeDrained answer + control the error returned (e.g. a not-leader
+// condition). *Noop fills in every other Client method so we only override
+// the drain surface the handler touches.
+type drainStubCluster struct {
+	*cluster.Noop
+	setCalls    []drainSetCall
+	setErr      error
+	drainedView map[string]bool
+}
+
+type drainSetCall struct {
+	nodeID  string
+	drained bool
+}
+
+func (c *drainStubCluster) SetNodeDrainState(_ context.Context, nodeID string, drained bool) error {
+	c.setCalls = append(c.setCalls, drainSetCall{nodeID, drained})
+	return c.setErr
+}
+
+func (c *drainStubCluster) IsNodeDrained(nodeID string) bool {
+	return c.drainedView[nodeID]
+}
+
+func (c *drainStubCluster) Members() []cluster.Member {
+	return []cluster.Member{
+		{NodeID: "node-a", APIURL: "http://node-a", Alive: true},
+		{NodeID: "node-b", APIURL: "http://node-b", Alive: true},
+	}
+}
+
+var _ cluster.Client = (*drainStubCluster)(nil)
+
+// drainTestHandler wires a drainStubCluster into a Service + handlers so the
+// drain/uncordon route handlers can be exercised end-to-end without a real
+// raft FSM. Returns both so individual tests can inspect the recorded calls.
+func drainTestHandler(t *testing.T, stub *drainStubCluster) *handlers {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(stub)
+	return &handlers{deps: Deps{Service: svc, Logger: logger}}
+}
+
+// TestClusterDrainNodeReturns204AndCallsSet pins the happy path: a drain
+// request flips the FSM and returns 204 with no body. Without this, a typo in
+// the handler-to-client call (e.g. inverted bool) would slip through.
+func TestClusterDrainNodeReturns204AndCallsSet(t *testing.T) {
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	h := drainTestHandler(t, stub)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/nodes/node-b/drain", nil)
+	req.SetPathValue("id", "node-b")
+	rr := httptest.NewRecorder()
+	h.clusterDrainNode(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d (body=%q)", rr.Code, http.StatusNoContent, rr.Body.String())
+	}
+	if len(stub.setCalls) != 1 || stub.setCalls[0].nodeID != "node-b" || !stub.setCalls[0].drained {
+		t.Fatalf("setCalls = %+v, want one (node-b, true)", stub.setCalls)
+	}
+}
+
+// TestClusterUncordonNodeReturns204AndCallsSet mirrors the drain test on the
+// reverse edge so a future refactor can't silently make uncordon a no-op.
+func TestClusterUncordonNodeReturns204AndCallsSet(t *testing.T) {
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	h := drainTestHandler(t, stub)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/nodes/node-b/uncordon", nil)
+	req.SetPathValue("id", "node-b")
+	rr := httptest.NewRecorder()
+	h.clusterUncordonNode(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d (body=%q)", rr.Code, http.StatusNoContent, rr.Body.String())
+	}
+	if len(stub.setCalls) != 1 || stub.setCalls[0].nodeID != "node-b" || stub.setCalls[0].drained {
+		t.Fatalf("setCalls = %+v, want one (node-b, false)", stub.setCalls)
+	}
+}
+
+// TestClusterDrainNodeReturns503OnNotLeader maps the cluster.ErrNotLeader
+// sentinel to a 503 so the operator's retry logic stays uniform with the
+// leader-forward path elsewhere — a generic 500 would mask a transient
+// leadership flip as a hard failure.
+func TestClusterDrainNodeReturns503OnNotLeader(t *testing.T) {
+	stub := &drainStubCluster{
+		Noop:   cluster.NewNoop("node-a", "http://node-a"),
+		setErr: cluster.ErrNotLeader,
+	}
+	h := drainTestHandler(t, stub)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/nodes/node-b/drain", nil)
+	req.SetPathValue("id", "node-b")
+	rr := httptest.NewRecorder()
+	h.clusterDrainNode(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// TestClusterDrainNodeRejectsEmptyID guards against a router-side bug that
+// stripped the {id} segment: the handler must 400 instead of forwarding an
+// empty drain to the FSM (which would itself reject it but with worse UX).
+func TestClusterDrainNodeRejectsEmptyID(t *testing.T) {
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	h := drainTestHandler(t, stub)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/nodes//drain", nil)
+	// SetPathValue intentionally NOT called — simulates an upstream routing bug.
+	rr := httptest.NewRecorder()
+	h.clusterDrainNode(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (body=%q)", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+	if len(stub.setCalls) != 0 {
+		t.Fatalf("setCalls = %+v, want zero — FSM must not see the empty drain", stub.setCalls)
+	}
+}
+
+// TestClusterMembersIncludesDrainedField asserts the observability surface:
+// a drained node shows up with drained=true on the members list so operators
+// can confirm the mark landed without a second round trip to a hypothetical
+// /drain-state endpoint.
+func TestClusterMembersIncludesDrainedField(t *testing.T) {
+	stub := &drainStubCluster{
+		Noop:        cluster.NewNoop("node-a", "http://node-a"),
+		drainedView: map[string]bool{"node-b": true},
+	}
+	h := drainTestHandler(t, stub)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/members", nil)
+	rr := httptest.NewRecorder()
+	h.clusterMembers(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	var body struct {
+		Members []struct {
+			NodeID  string `json:"node_id"`
+			Drained bool   `json:"drained,omitempty"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v body=%q", err, rr.Body.String())
+	}
+	found := false
+	for _, m := range body.Members {
+		if m.NodeID == "node-b" {
+			found = true
+			if !m.Drained {
+				t.Fatalf("node-b drained flag = false, want true (body=%q)", rr.Body.String())
+			}
+		}
+		if m.NodeID == "node-a" && m.Drained {
+			t.Fatalf("node-a should not appear drained (body=%q)", rr.Body.String())
+		}
+	}
+	if !found {
+		t.Fatalf("node-b missing from members list: %q", rr.Body.String())
+	}
+}

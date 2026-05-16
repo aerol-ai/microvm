@@ -12,8 +12,14 @@ called out explicitly instead of being treated as still absent.
 - `pkg/api/v1/cluster_handler.go:81-122`
 - `internal/cluster/forward.go:75-96`
 
-**Current branch status:** first-slice fixed with target-locked create
-forwarding.
+**Current branch status:** **Resolved** by reservation-first create.
+`X-Cluster-Create-Target` still locks the second hop (no second
+`SelectPlacement`), and the router now also writes an `opReserve` to raft
+before forwarding so two routers cannot both pass T's local admitter
+between gossip ticks. See `plans/reservation-first-create.md`.
+
+Historical context: an earlier first-slice fix used target-locked create
+forwarding only.
 
 `clusterCreateWrap` chooses a target and forwards the original request when the
 target is not self. The receiver then runs `clusterCreateWrap` again and calls
@@ -67,6 +73,12 @@ Either update docs to match the current code and document rollback risk, or
 change implementation to reservation/placement-before-create.
 
 For the requested robustness bar, use reservation-before-create.
+
+**Current branch status:** **Resolved.** Implementation switched to
+reservation-before-create (`opReserve` written by router A before forward,
+`opPlace` promotes on T's success). Docs in
+`docs/src/content/docs/cluster-setup.md` now describe the actual flow.
+See `plans/reservation-first-create.md`.
 
 ## B3. API forwarding is documented as mTLS, but owner forwarding uses APIURL
 

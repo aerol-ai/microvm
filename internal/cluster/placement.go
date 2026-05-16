@@ -63,6 +63,12 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 	// book it. The FSM serializes opReserve through raft, so the second
 	// SelectPlacement on the same leader sees the first reservation here.
 	pending := c.fsm.pendingReservationsByNode(time.Now().Unix())
+	// Drained nodes are excluded from the candidate set entirely. Cheaper and
+	// clearer than threading the flag through nodeFits — drain is a hard
+	// admission rule (operator says "don't put more work here"), not a
+	// soft-scoring penalty. Self can be drained too; that's the intended way
+	// to roll a node out of rotation without restarting it.
+	drained := c.fsm.drainedNodesSnapshot()
 	candidates := make([]Member, 0, len(all))
 	for _, m := range all {
 		if !m.Alive {
@@ -71,6 +77,9 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		// Only consider members that have advertised an APIURL — others may
 		// be partially-joined and forwarding to them would 502.
 		if m.APIURL == "" && m.NodeID != c.nodeID {
+			continue
+		}
+		if drained[m.NodeID] {
 			continue
 		}
 		if !nodeFits(m, req, pending[m.NodeID]) {

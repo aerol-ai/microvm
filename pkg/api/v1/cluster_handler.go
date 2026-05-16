@@ -482,6 +482,13 @@ func (h *handlers) clusterDestroyWrap(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// memberView extends cluster.Member with the FSM-derived drain bit so the
+// members endpoint can show drained nodes without a second API call.
+type memberView struct {
+	cluster.Member
+	Drained bool `json:"drained,omitempty"`
+}
+
 // clusterMembers returns the gossiped member list (observability only).
 func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
@@ -489,7 +496,12 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": []any{}})
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": c.Members()})
+	members := c.Members()
+	view := make([]memberView, 0, len(members))
+	for _, m := range members {
+		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID)})
+	}
+	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": view})
 }
 
 // clusterLeader returns the current Raft leader's node ID.
@@ -500,6 +512,47 @@ func (h *handlers) clusterLeader(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"leader": c.Leader()})
+}
+
+// clusterDrainNode marks {id} as drained so future SelectPlacement decisions
+// exclude it. Idempotent — calling against an already-drained node returns 204.
+// Existing placements on the drained node continue to serve traffic; drain is
+// an admission-only signal, not an eviction.
+//
+// Single-node mode returns 503 (no cluster to drain). Unknown node IDs are
+// accepted so an operator can pre-drain a node that hasn't gossiped yet — the
+// FSM stores the mark and any future join with that ID inherits it.
+func (h *handlers) clusterDrainNode(w http.ResponseWriter, r *http.Request) {
+	h.setNodeDrainState(w, r, true)
+}
+
+// clusterUncordonNode clears the drain mark for {id}. Idempotent.
+func (h *handlers) clusterUncordonNode(w http.ResponseWriter, r *http.Request) {
+	h.setNodeDrainState(w, r, false)
+}
+
+func (h *handlers) setNodeDrainState(w http.ResponseWriter, r *http.Request, drained bool) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "node id required")
+		return
+	}
+	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.SetNodeDrainState(commitCtx, id, drained); err != nil {
+		if errors.Is(err, cluster.ErrNotLeader) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+			return
+		}
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // clusterInternalApply receives an encoded raft command from a follower and
