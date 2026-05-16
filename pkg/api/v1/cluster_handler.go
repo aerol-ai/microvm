@@ -266,7 +266,6 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	peerQuery := r.URL.RawQuery
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	for _, peer := range peers {
-		peer := peer
 		go func() {
 			endpoint := strings.TrimRight(peer.APIURL, "/") + "/v1/sandboxes"
 			if peerQuery != "" {
