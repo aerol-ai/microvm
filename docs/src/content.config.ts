@@ -66,6 +66,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/cluster-setup-step-by-step',
+        label: 'Cluster Setup Step by Step',
+        description: 'Guided checklist for bootstrapping a 3-node or custom AerolVM cluster.',
+      },
+      {
+        type: 'link',
         href: '/cluster-ingress',
         label: 'Cluster Ingress',
         description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
