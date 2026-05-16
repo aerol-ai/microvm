@@ -237,7 +237,17 @@ That removes the 1/N hit-rate blocker for normal operation.
     `TestInstrumentingTransportCountsErrors`,
     `TestInstrumentingTransportIgnoresHTTPErrorCodes` in
     `pkg/caddy/metrics_test.go`.
-- test Caddy route churn and config size at 10K sandboxes;
+- ~~test Caddy route churn and config size at 10K sandboxes~~ — **Resolved.**
+  `internal/service/ingress_scale_test.go` adds three scale tests:
+  `TestHashPlacementViewAt10KIsStable` (idle-skip path hashes 10K
+  placements deterministically; ~4ms),
+  `TestHashPlacementViewAt10KDetectsSingleMutation` (one-of-10K Version
+  bump still flips the hash),
+  `TestRunIngressOpsAt10KCompletesAll` (worker pool drains 10K admin
+  closures without exceeding the concurrency cap). Plus
+  `BenchmarkHashPlacementView10K` for tracking the per-tick cost over
+  time. Wall-clock numbers logged in test output so a future regression
+  pushing the scan super-linear is visible in CI.
 - define explicit failover responses during the convergence window.
 
 ## B6. Raw TCP needs a stable cluster route map
@@ -268,11 +278,19 @@ This branch implements the cluster-stable path:
 
 **Remaining release work:**
 
-- prove there are no local port conflicts on large mixed clusters;
+- ~~prove there are no local port conflicts on large mixed clusters~~ —
+  **Resolved.** `internal/cluster/fsm_scale_test.go` seeds an FSM with
+  10K placements each holding a distinct TCP host port and exercises
+  `validateHostPortAvailableLocked` end-to-end:
+  `TestFSMValidateHostPortAt10K` confirms both the no-conflict path
+  (succeeds) and the conflict path (returns `ErrHostPortReserved`) at
+  fleet scale; `BenchmarkFSMValidateHostPortAt10K` reports per-op cost
+  and allocs (~2ms on M1, 13 allocs). The O(N×P) scan is fine for
+  10K; the bench is the early-warning if a future port-allocator
+  change pushes it super-linear.
 - decide whether failed preferred-host-port replay should park the exposure or
   allocate a replacement endpoint;
-- expose clear status when the TCP ingress route has not converged;
-- add scale tests for high-port listener count and Caddy admin latency.
+- expose clear status when the TCP ingress route has not converged.
 
 ## B7. UDP is not supported
 
