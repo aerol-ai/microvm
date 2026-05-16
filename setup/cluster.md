@@ -929,6 +929,28 @@ reconciles cluster ingress routes every few seconds from the raft placement
 snapshot. During failover or immediately after exposing a port, expect a short
 window where a non-owner backend can return 404/502 before it refreshes.
 
+#### Convergence-window response contract
+
+While the cluster's placement view and the node's installed routes are
+catching up, the daemon returns documented HTTP codes rather than letting the
+caller fall into a generic timeout. Treat these as the wire contract — SDKs
+and load-balancer health checks key off them:
+
+| Surface | Situation | Response |
+|---|---|---|
+| API control plane (`/v1/sandboxes/...`) | Placement still resolving on this node, owner's URL not yet gossiped | **503 Service Unavailable** with owner node-id in body; bumps `aerolvm_ingress_route_misses_total`. Retry. |
+| API control plane | Owner died and grace expired; placement orphaned | **410 Gone**. Stop retrying; issue a fresh `Create`. |
+| API control plane | Request forwarded to wrong node (stale placement view at sender) | **421 Misdirected Request**. Caller should re-resolve owner. |
+| Data plane HTTP/TLS (Caddy) | Route in flux on this node (placement seen, route not yet installed) | **503** with `Retry-After: 2` and body `Sandbox placement in flux. Retry in a moment.` |
+| Data plane raw TCP | Route in flux on this node | Connection refused. (No in-flux mirror — raw TCP has no hostname to match on, so the port simply isn't bound until the reconciler installs it.) |
+| Internal raft apply (`/v1/cluster/_apply`) | This node is not the leader | **503**, treat as retry signal. |
+
+Convergence is event-driven, not periodic: every committed FSM mutation wakes
+the local ingress reconciler via a cap=1 buffered channel
+(`cluster.SubscribePlacement`), so the in-flux window is typically sub-second
+under steady-state gossip and is bounded by the 5s reconcile-on-tick safety
+net.
+
 ---
 
 ## Operating the cluster

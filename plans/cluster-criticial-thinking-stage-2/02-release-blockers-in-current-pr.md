@@ -248,7 +248,32 @@ That removes the 1/N hit-rate blocker for normal operation.
   `BenchmarkHashPlacementView10K` for tracking the per-tick cost over
   time. Wall-clock numbers logged in test output so a future regression
   pushing the scan super-linear is visible in CI.
-- define explicit failover responses during the convergence window.
+- ~~define explicit failover responses during the convergence window~~ —
+  **Resolved.** The response contract is now explicit on both the wire and in
+  the operator docs:
+  - API control plane: `clusterForwardWrap` returns **410 Gone** on
+    `cluster.ErrOrphaned` (sandbox owner died), **503 Service Unavailable**
+    with the owner node-id in body when placement names a peer but gossip
+    hasn't surfaced any forwarding URL yet (bumps
+    `aerolvm_ingress_route_misses_total`), and **421 Misdirected Request**
+    when a forwarded create lands on the wrong target.
+    Pinned by `TestClusterForwardWrapReturns410OnOrphanedPlacement` and
+    `TestClusterForwardWrapReturns503AndBumpsMissCounterOnUnresolvedOwner` in
+    `pkg/api/v1/cluster_handler_test.go` so a future refactor cannot regress
+    the orphan signal back to a generic 5xx.
+  - Data plane HTTP/TLS: in-flux Caddy routes respond **503 with
+    `Retry-After: 2`** via a `static_response` handler (`pkg/caddy/client.go`
+    `UpsertInFluxSandboxRoute` / `UpsertInFluxPortRoute`); already pinned by
+    `pkg/caddy/in_flux_test.go`.
+  - Data plane raw TCP: no in-flux mirror (no hostname to match on) — the
+    port is simply unbound until the reconciler installs it; documented as
+    "connection refused".
+  - Convergence is event-driven via `cluster.SubscribePlacement` (cap=1
+    buffered channel woken on every FSM apply), so the window is typically
+    sub-second; the 5s reconcile-on-tick is the safety net, not the floor.
+  - Operator documentation: `setup/cluster.md` "Convergence-window response
+    contract" table makes the codes a published interface so SDKs and LB
+    health checks can rely on them.
 
 ## B6. Raw TCP needs a stable cluster route map
 
