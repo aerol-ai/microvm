@@ -109,7 +109,7 @@ same target (the second reservation lands strictly after the first in the
 raft log and is rejected if `T` no longer fits), and a target that dies
 between reservation and promote returns its capacity to the cluster
 automatically. The added cost is one extra raft round-trip per cross-node
-create — same-node creates collapse back to a single commit.
+create - same-node creates collapse back to a single commit.
 
 ## Public ingress behavior
 
@@ -164,7 +164,7 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 | `SB_CREDENTIAL_ENCRYPTION_KEY` | yes | Base64-encoded 32-byte key used to seal/unseal sandbox registry passwords and per-mount credentials replicated via raft. Same value on every node. `cluster-init.sh` captures or generates this on the seed; `cluster-join.sh` extracts it from the bundle and writes it here. |
 | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | no | Path the daemon falls back to when `SB_CREDENTIAL_ENCRYPTION_KEY` is empty. Default `/var/lib/sandboxd/credential_encryption.key`. The cluster scripts install the shared key here as a backup so re-running `install.sh` doesn't lazy-generate a divergent key file. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | no | Set to `true` to opt out of the shared-credential-key requirement. **Recovered sandboxes lose access to private registries and credentialed mounts after failover** without it. Default `false`. |
-| `SB_CLUSTER_TLS_DIR` | recommended | Directory holding the cluster CA + this node's keypair (`ca.crt`, `node.crt`, `node.key`). When set, raft replication and leader-forwarded applies require a peer cert chained to the cluster CA — possession of the PAT alone is no longer enough to forge an internal apply. `cluster-init.sh` / `cluster-join.sh` populate this automatically. |
+| `SB_CLUSTER_TLS_DIR` | recommended | Directory holding the cluster CA + this node's keypair (`ca.crt`, `node.crt`, `node.key`). When set, raft replication and leader-forwarded applies require a peer cert chained to the cluster CA - possession of the PAT alone is no longer enough to forge an internal apply. `cluster-init.sh` / `cluster-join.sh` populate this automatically. |
 | `SB_CLUSTER_INTERNAL_LISTEN` | no | Bind address for the cluster-internal mTLS listener (used for leader-forwarded raft applies). Default `0.0.0.0:7002`. Ignored when `SB_CLUSTER_TLS_DIR` is empty. |
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | no | HTTPS URL peers dial for the internal channel (e.g. `https://10.0.0.5:7002`). Auto-derived from primary IP + internal-listen port when empty. Must be HTTPS. |
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses to join. Bootstrap node leaves this empty. |
@@ -177,21 +177,21 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 
 - **Raft replication** rides over mTLS (`raft.NewNetworkTransportWithConfig` + a custom TLS `StreamLayer`). A peer that can't present a cert chained to the cluster CA fails handshake.
 - **Leader-forwarded raft applies** ride over a separate HTTPS listener on `SB_CLUSTER_INTERNAL_LISTEN` (default port 7002), bypassing the public API URL entirely. Same CA-pinned mTLS rules apply.
-- **Owner API forwarding** (cross-node sandbox API hops — `GET /v1/sandboxes/{id}`, mutating writes, port exposure, etc.) also rides the `:7002` mTLS listener: the listener serves the same `/v1/...` mux as the public port, so peers reverse-proxy owner traffic over the cert-pinned channel instead of the public `SB_API_ADVERTISE_URL`.
+- **Owner API forwarding** (cross-node sandbox API hops - `GET /v1/sandboxes/{id}`, mutating writes, port exposure, etc.) also rides the `:7002` mTLS listener: the listener serves the same `/v1/...` mux as the public port, so peers reverse-proxy owner traffic over the cert-pinned channel instead of the public `SB_API_ADVERTISE_URL`.
 - **Falls back gracefully**: a node without `SB_CLUSTER_TLS_DIR` still works (the daemon advertises no `internal_url` via gossip, and peers fall back to the public API URL with PAT-only auth for both raft applies and owner forwarding). Use `--no-tls` on `cluster-init.sh` / `cluster-join.sh` for ephemeral test setups on a fully private network.
 
-The CA bundle MUST be transferred over a secure channel (scp, vault) — anyone with the bundle can mint a node cert and join the cluster.
+The CA bundle MUST be transferred over a secure channel (scp, vault) - anyone with the bundle can mint a node cert and join the cluster.
 
 ### Credential encryption key (required)
 
-Sandbox registry passwords and per-mount credentials replicated via raft are stored as sealed blobs encrypted with `SB_CREDENTIAL_ENCRYPTION_KEY`. Every node must hold the same value, or sandboxes that fail over to a new owner cannot pull from their private registry or attach their credentialed mounts — the recovered owner decrypts with a different key and silently fails.
+Sandbox registry passwords and per-mount credentials replicated via raft are stored as sealed blobs encrypted with `SB_CREDENTIAL_ENCRYPTION_KEY`. Every node must hold the same value, or sandboxes that fail over to a new owner cannot pull from their private registry or attach their credentialed mounts - the recovered owner decrypts with a different key and silently fails.
 
 `cluster-init.sh` ships the key automatically:
 
 - In TLS mode (default), the key is added to `aerolvm-tls-bundle.tar.gz` alongside `ca.crt` + `ca.key`.
 - In `--no-tls` mode, the key is emitted as a standalone `aerolvm-cred-bundle.tar.gz` and `cluster-join.sh --cred-bundle <path>` is required.
 
-Both bundles MUST be transferred over a secure channel — anyone with the bundle can decrypt every sandbox's sealed credentials.
+Both bundles MUST be transferred over a secure channel - anyone with the bundle can decrypt every sandbox's sealed credentials.
 
 The daemon refuses to boot in cluster mode unless `SB_CREDENTIAL_ENCRYPTION_KEY` is set or a key file already exists at `SB_CREDENTIAL_ENCRYPTION_KEY_PATH`. The `--no-tls` opt-out for gossip is independent; credential sharing is required regardless of TLS. Set `SB_CLUSTER_INSECURE_CREDENTIALS=true` to bypass the check, only for ephemeral test setups that don't use sealed registry/mount creds.
 
@@ -214,7 +214,7 @@ Raft requires a majority of voters to commit any write. With `N` voters, the clu
 - Always run an **odd number** of voters (1, 3, 5, 7). Even counts only raise the quorum threshold without raising fault tolerance.
 - Treat a 2-node cluster as a single point of failure with extra steps. If you only have two hosts, run single-node mode on the more-reliable one.
 - `SB_CLUSTER_MAX_AUTO_VOTERS` defaults to `5`. After that cap, new runners join as raft non-voters: they can own sandboxes and forward writes, but they do not count toward quorum.
-- `SB_NODE_ID` must be **stable** across restarts. A node that comes back with a new ID joins as a brand-new raft server while the old server sits in the configuration as dead — eventually evicted by the dead-owner reconciler, but until then it may inflate replication work or quorum if it was a voter.
+- `SB_NODE_ID` must be **stable** across restarts. A node that comes back with a new ID joins as a brand-new raft server while the old server sits in the configuration as dead - eventually evicted by the dead-owner reconciler, but until then it may inflate replication work or quorum if it was a voter.
 
 ## Lost-quorum recovery
 
@@ -230,13 +230,13 @@ curl -s -H "Authorization: Bearer $SB_PAT_TOKEN" \
 
 A persistent empty `Leader` field with repeated election timeouts is the signature.
 
-### Option A — wait for the lost nodes to come back
+### Option A - wait for the lost nodes to come back
 
-If the lost voters' raft state on disk is intact, restarting them rejoins the existing configuration. No special procedure required. **Try this first** — it does not destroy any state.
+If the lost voters' raft state on disk is intact, restarting them rejoins the existing configuration. No special procedure required. **Try this first** - it does not destroy any state.
 
-### Option B — manual quorum recovery (last resort)
+### Option B - manual quorum recovery (last resort)
 
-If the lost voters are gone for good (disk loss, hardware destroyed) and waiting is not an option, you can rewrite the raft configuration on a surviving node so it bootstraps a fresh single-node cluster from its existing log. This is **destructive to durability guarantees** — any committed entry that the surviving node never replicated is lost.
+If the lost voters are gone for good (disk loss, hardware destroyed) and waiting is not an option, you can rewrite the raft configuration on a surviving node so it bootstraps a fresh single-node cluster from its existing log. This is **destructive to durability guarantees** - any committed entry that the surviving node never replicated is lost.
 
 1. Stop `sandboxd` on every surviving node.
 2. On the node with the most-recent raft log (highest `LastIndex` from `journalctl`), edit `/var/lib/sandboxd/raft/peers.json` to list only itself as a voter:
@@ -253,13 +253,13 @@ If the lost voters are gone for good (disk loss, hardware destroyed) and waiting
    sudo rm -rf /var/lib/sandboxd/raft   # on each rejoining node
    sudo ./cluster-join.sh --gossip-key '<key>' --peers <recovered-node>:7001 --force
    ```
-5. Inspect placements via `GET /v1/cluster/members` and reconcile any sandboxes that were owned by permanently-lost nodes — under the current non-HA policy the dead-owner reconciler orphans them on the next tick (clients then see `410 Gone` and should issue a fresh `Create`).
+5. Inspect placements via `GET /v1/cluster/members` and reconcile any sandboxes that were owned by permanently-lost nodes - under the current non-HA policy the dead-owner reconciler orphans them on the next tick (clients then see `410 Gone` and should issue a fresh `Create`).
 
 Document this procedure in your runbook before you need it. Do not improvise during an outage.
 
 ## Backup and restore
 
-The raft log under `SB_RAFT_DATA_DIR` (default `/var/lib/sandboxd/raft`) is the cluster's source of truth for **placement state only** — sandbox IDs, owner nodes, replicated specs, sealed credentials, and exposed-port intents. Per-node local state (the `state.db` SQLite file, Docker containers, Caddy config) is **not** in the backup.
+The raft log under `SB_RAFT_DATA_DIR` (default `/var/lib/sandboxd/raft`) is the cluster's source of truth for **placement state only** - sandbox IDs, owner nodes, replicated specs, sealed credentials, and exposed-port intents. Per-node local state (the `state.db` SQLite file, Docker containers, Caddy config) is **not** in the backup.
 
 ### What lives where
 
@@ -275,7 +275,7 @@ A backup of the raft directory on one voter is sufficient to reconstruct the clu
 
 ### Take a backup
 
-The backup is a hot copy of the raft directory on any voter (leader or follower — every voter holds the full log). Quiesce raft writes for the duration of the copy if you want a transactionally clean snapshot; the BoltDB files survive `cp -a` while sandboxd is running but you may capture a partial entry that raft will replay on next boot.
+The backup is a hot copy of the raft directory on any voter (leader or follower - every voter holds the full log). Quiesce raft writes for the duration of the copy if you want a transactionally clean snapshot; the BoltDB files survive `cp -a` while sandboxd is running but you may capture a partial entry that raft will replay on next boot.
 
 ```bash
 # On any voter. Stop sandboxd for the cleanest copy:
@@ -293,11 +293,11 @@ Run this on at least one node per scheduled interval. The backup is small (KB–
 
 A raft-only restore brings back **cluster intent** (which sandbox should be where, with which spec, and which ports). It does **not** bring back:
 
-- Local sandbox containers — Docker state on each node is independent. After a restore, the owner watcher on each node will try to re-materialize sandboxes whose placement points at it via the recreate hook (this requires the image still being pullable and the replicated spec being intact).
-- Local `state.db` rows — host-port allocations, snapshot ledger, per-sandbox network counters. These are rebuilt opportunistically as the recreate path runs.
-- **In-flight reservations** with `expires_unix` in the past at restore time — the leader's GC sweep will cancel them on the first tick. Reservations whose TTL hasn't elapsed yet are honored.
+- Local sandbox containers - Docker state on each node is independent. After a restore, the owner watcher on each node will try to re-materialize sandboxes whose placement points at it via the recreate hook (this requires the image still being pullable and the replicated spec being intact).
+- Local `state.db` rows - host-port allocations, snapshot ledger, per-sandbox network counters. These are rebuilt opportunistically as the recreate path runs.
+- **In-flight reservations** with `expires_unix` in the past at restore time - the leader's GC sweep will cancel them on the first tick. Reservations whose TTL hasn't elapsed yet are honored.
 
-If the original cluster had sandboxes whose owners are permanently gone (disk loss), the dead-owner reconciler orphans those placements on the next tick (~15s after grace expires) and clients see `410 Gone` on next access — same shape as the lost-quorum recovery flow.
+If the original cluster had sandboxes whose owners are permanently gone (disk loss), the dead-owner reconciler orphans those placements on the next tick (~15s after grace expires) and clients see `410 Gone` on next access - same shape as the lost-quorum recovery flow.
 
 ### Restore procedure
 
@@ -315,7 +315,7 @@ If the original cluster had sandboxes whose owners are permanently gone (disk lo
 4. If this is the only surviving voter, follow the **manual quorum recovery** steps above to seed `peers.json` so it bootstraps a single-node cluster from the restored log. Otherwise, restarting `sandboxd` will rejoin the existing cluster as a follower and the log will sync from peers.
 5. Verify with `GET /v1/cluster/leader` and `GET /v1/cluster/members`. The placement count should match what was in the backup; counts that don't match indicate a stale snapshot or a backup taken mid-replication.
 
-The restore does not reach into Docker or `state.db` — sandboxes that pre-dated the backup will only come back up if their original images and (where applicable) sealed credentials are still valid. Treat the backup as a recovery aid for accidental placement-state loss, not as a substitute for per-node disaster recovery.
+The restore does not reach into Docker or `state.db` - sandboxes that pre-dated the backup will only come back up if their original images and (where applicable) sealed credentials are still valid. Treat the backup as a recovery aid for accidental placement-state loss, not as a substitute for per-node disaster recovery.
 
 ## Verifying cluster health
 

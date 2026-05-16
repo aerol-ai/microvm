@@ -6,21 +6,21 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 A sandbox's container is ephemeral. Files written into the container's writable layer (`/tmp`, the working directory, anywhere not on a mount) live only as long as the container itself. If the container is destroyed - by an explicit `Destroy`, by a host crash, or by the loss of the owner node in cluster mode - that data is gone, **and the sandbox itself is gone too**: the current release does not auto-recreate a sandbox after the owner dies.
 
-This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle. Add cluster mode and *the sandbox* is also treated as cattle — a fresh `Create` is the way to recover.
+This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle. Add cluster mode and *the sandbox* is also treated as cattle - a fresh `Create` is the way to recover.
 
 ## What survives, what does not
 
 | Asset | Single-node `Destroy` | Single-node host crash | Cluster-mode owner death |
 |---|---|---|---|
 | Container writable layer | Lost | Lost | Lost |
-| Mounted volumes (S3, NFS, SSHFS, rclone) | Survive (external) | Survive (external) | Survive (external) — a *new* sandbox can re-mount them |
-| Sandbox ID | Reused on next `Create` | Preserved if record persisted | **Lost** — API returns `410 Gone`; create a new sandbox |
+| Mounted volumes (S3, NFS, SSHFS, rclone) | Survive (external) | Survive (external) | Survive (external) - a *new* sandbox can re-mount them |
+| Sandbox ID | Reused on next `Create` | Preserved if record persisted | **Lost** - API returns `410 Gone`; create a new sandbox |
 | Environment variables, image, resource limits | N/A | Restored on `Start` | Lost (spec is replicated in the FSM but not rematerialized) |
 | Idle lifecycle policy | N/A | Restored on `Start` | Lost |
-| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Lost — the new sandbox declares its own |
-| Caddy routes | Removed | Restored on `Start` | Lost — ingress routes are torn down when the placement orphans |
+| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Lost - the new sandbox declares its own |
+| Caddy routes | Removed | Restored on `Start` | Lost - ingress routes are torn down when the placement orphans |
 | Host port number | N/A | Same host, same port | Lost |
-| Public URL | Removed | Restored on `Start` | Lost — a new sandbox gets a new URL |
+| Public URL | Removed | Restored on `Start` | Lost - a new sandbox gets a new URL |
 
 ## Make workspace state durable
 
@@ -184,8 +184,8 @@ If you ever need to re-expose a port manually (for example, the original `Expose
 
 Cluster traffic uses two transports:
 
-- **Gossip** (`SB_GOSSIP_BIND_ADDR`, default `:7001`) — SWIM membership and capacity dissemination.
-- **Raft** (`SB_RAFT_BIND_ADDR`, default `:7000`) — placement-map consensus.
+- **Gossip** (`SB_GOSSIP_BIND_ADDR`, default `:7001`) - SWIM membership and capacity dissemination.
+- **Raft** (`SB_RAFT_BIND_ADDR`, default `:7000`) - placement-map consensus.
 
 When a node successfully joins gossip, it is added to the Raft configuration as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached, then as a non-voter. **Anyone who can reach these ports can still join the cluster and influence placement replication.** Run them on a private network the operator controls (VPC peering, WireGuard mesh, dedicated cluster subnet); never expose them to the public internet.
 
@@ -215,4 +215,4 @@ When `SB_GOSSIP_SECRET_KEY` is unset, the daemon logs a warning at boot. Raft it
 3. Treat everything else inside the container as scratch.
 4. In cluster mode, design the client to call `Create` again on `410 Gone`. The mount keeps the durable state intact; a new sandbox picks up where the old one left off.
 
-This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable — and, in cluster mode, the sandbox itself is replaceable too.
+This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable - and, in cluster mode, the sandbox itself is replaceable too.

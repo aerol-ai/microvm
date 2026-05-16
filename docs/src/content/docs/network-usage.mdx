@@ -4,7 +4,7 @@ title: Network Usage
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Every sandbox has a per-direction byte counter and an optional cap. You can set the cap at create time, read live counters, and raise or lift the cap while the sandbox is running. When a cap is hit, the platform installs an iptables drop on the sandbox's container IP — the container keeps running, but its network goes dark until the cap is raised.
+Every sandbox has a per-direction byte counter and an optional cap. You can set the cap at create time, read live counters, and raise or lift the cap while the sandbox is running. When a cap is hit, the platform installs an iptables drop on the sandbox's container IP - the container keeps running, but its network goes dark until the cap is raised.
 
 This is the model AerolVM uses for billing-style network quotas and for shutting down a sandbox that has started behaving badly without killing it outright.
 
@@ -122,11 +122,11 @@ The response shape:
 | `bytes_in_limit` / `bytes_out_limit` | Active cap. `0` means unlimited. |
 | `quota_exceeded` | `true` if either direction has hit its cap. The drop rule is installed while this is true. |
 | `quota_exceeded_at` | RFC 3339 timestamp of when the quota was first hit. Cleared when the cap is raised. |
-| `last_sampled_at` | RFC 3339 timestamp of the last counter sample. **Absent until the netstats poller has produced at least one sample** — typically up to one poll interval after a sandbox starts. |
+| `last_sampled_at` | RFC 3339 timestamp of the last counter sample. **Absent until the netstats poller has produced at least one sample** - typically up to one poll interval after a sandbox starts. |
 
 ## Raise or lift the limits at runtime
 
-`setNetworkLimits` is a PATCH — only the fields you set are changed. Pass `0` to lift a cap (back to unlimited), or a higher number to raise it. Omit a field to leave it alone.
+`setNetworkLimits` is a PATCH - only the fields you set are changed. Pass `0` to lift a cap (back to unlimited), or a higher number to raise it. Omit a field to leave it alone.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
