@@ -254,12 +254,6 @@ The daemon dispatches on the protocol stored on the `exposed_ports` row:
 
 In every case the row in `exposed_ports` is deleted and the toolbox port allowlist is refreshed so subsequent calls to `/proxy/<port>/` on the public sandbox URL are rejected immediately.
 
-### Why one method handles all three protocols
-
-`(sandbox_id, port)` is the unique key on the exposure table, so there is at most one row per pair regardless of protocol - the daemon already knows the protocol from the row, the HTTP verb is the same (`DELETE /v1/sandboxes/{id}/ports/{port}`), and code that's defensive about not knowing how a port was published just works.
-
-This mirrors `close(fd)` in POSIX: the system call is the same whether the descriptor is a TCP socket, a UNIX socket, or a pipe - the kernel knows which one it gave you.
-
 ### Switching protocols on a port
 
 `(sandbox_id, port)` allows only one row at a time, so re-exposing the same port under a different protocol fails fast with `port N already exposed as <proto>; unexpose it first`. Call `unexposePort(port)` and then re-`exposePort` with the new options.
