@@ -122,6 +122,27 @@ Short-term safety patch if roles cannot land immediately:
 
 Do not ship "add every runner as voter" as the default cluster story.
 
+**Current branch status:** **Resolved.** Both the role split and the
+voter cap landed.
+
+- `SB_NODE_ROLE=server|worker|ingress|mixed` is wired in
+  `internal/config/config.go` (validated, defaults to `mixed`,
+  rejects `worker`/`ingress` outside cluster mode, blocks
+  `SB_CLUSTER_BOOTSTRAP` on non-server roles).
+- The role is gossiped on `nodeMeta.Role`
+  (`internal/cluster/gossip.go`) so the leader sees it without an
+  extra round-trip.
+- `voter_autojoin.go` forces `worker` and `ingress` peers to raft
+  non-voters unconditionally (`peerForcedNonVoter` /
+  `isForcedNonVoterRole`). Empty/unknown roles fall through to the
+  legacy path so rolling upgrades don't strand pre-existing voters.
+- `SB_CLUSTER_MAX_AUTO_VOTERS` (default `5`) caps gossip-driven
+  voter promotion for `server`/`mixed` peers; everything beyond the
+  cap is added as a non-voter so the FSM still replicates without
+  growing quorum.
+- `voterCapReached` is fail-safe: if the raft configuration read
+  errors, we treat the cap as reached rather than promote blindly.
+
 ## B5. Public sandbox URLs need owner-aware ingress
 
 **Where:**
