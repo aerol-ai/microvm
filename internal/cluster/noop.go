@@ -54,11 +54,15 @@ func (n *Noop) ApplyEncoded(ctx context.Context, payload []byte) error          
 
 func (n *Noop) AssertOwnership(ctx context.Context, local []LocalSandboxState) error { return nil }
 
-func (n *Noop) ForwardHTTP(peerAPIURL string, w http.ResponseWriter, r *http.Request) {
+func (n *Noop) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request) {
 	// Should never be called in single-node mode (OwnerOf always reports
 	// IsSelf=true). If it is, surface the bug rather than silently 200.
 	http.Error(w, "cluster: forwarding requested in single-node mode", http.StatusInternalServerError)
 }
+
+// AttachInternalHandler is a no-op for single-node mode — there's no mTLS
+// listener to wire into, so nothing to do.
+func (n *Noop) AttachInternalHandler(h http.Handler) {}
 
 func (n *Noop) Members() []Member {
 	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}

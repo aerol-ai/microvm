@@ -27,11 +27,22 @@ func (c *createForwardCluster) SelectPlacement(capacity.Request) (cluster.Placem
 	return c.target, nil
 }
 
-func (c *createForwardCluster) ForwardHTTP(peerAPIURL string, w http.ResponseWriter, r *http.Request) {
-	c.forwardedPeer = peerAPIURL
+func (c *createForwardCluster) ForwardHTTP(target cluster.Endpoint, w http.ResponseWriter, r *http.Request) {
+	// Prefer the internal channel for assertion purposes (matches the
+	// production preference order) so tests that exercise the mTLS path can
+	// also use this stub. Fall back to APIURL when the test didn't populate
+	// an internal URL — keeps existing assertions that compare against the
+	// public APIURL unchanged.
+	if target.InternalURL != "" {
+		c.forwardedPeer = target.InternalURL
+	} else {
+		c.forwardedPeer = target.APIURL
+	}
 	c.forwardedTarget = r.Header.Get(clusterCreateTargetHeader)
 	w.WriteHeader(http.StatusAccepted)
 }
+
+func (c *createForwardCluster) AttachInternalHandler(h http.Handler) {}
 
 func TestClusterCreateWrapPinsForwardedCreateToSelectedTarget(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

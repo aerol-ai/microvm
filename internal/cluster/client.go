@@ -58,6 +58,15 @@ type Cluster struct {
 	// our node cert. Used to dial peers' InternalURL when both sides have
 	// TLS material. nil when tls is nil.
 	internalClient *http.Client
+	// publicProxies caches httputil.ReverseProxy instances keyed on peer
+	// APIURL (the legacy public-API path). Shared across forwarded requests
+	// so the underlying transport's connection pool isn't rebuilt per call.
+	publicProxies *proxyCache
+	// mtlsProxies caches httputil.ReverseProxy instances keyed on peer
+	// InternalURL. Each proxy rides an mTLS transport configured with the
+	// cluster CA + this node's cert. nil when tls is nil — owner forwarding
+	// then falls back to publicProxies + PAT auth.
+	mtlsProxies *proxyCache
 
 	commitTimeout time.Duration
 
@@ -144,6 +153,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
+		publicProxies: newProxyCache(defaultPublicTransport),
 	}
 
 	// Build the cluster-internal HTTPS client + listener when TLS is loaded.
@@ -151,17 +161,27 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// fail handshake in exactly one way (chain mismatch) regardless of which
 	// channel they hit.
 	if clusterTLS != nil {
-		c.internalClient = &http.Client{
-			Timeout: commitTimeout + 2*time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: clusterTLS.clientConfig(),
-				// Disable connection reuse across leader changes so a
-				// stale TLS session can't pin us to a former leader.
-				DisableKeepAlives: false,
-				MaxIdleConns:      4,
-				IdleConnTimeout:   30 * time.Second,
-			},
+		mtlsTransport := &http.Transport{
+			TLSClientConfig: clusterTLS.clientConfig(),
+			// Disable connection reuse across leader changes so a
+			// stale TLS session can't pin us to a former leader.
+			DisableKeepAlives: false,
+			MaxIdleConns:      4,
+			IdleConnTimeout:   30 * time.Second,
 		}
+		c.internalClient = &http.Client{
+			Timeout:   commitTimeout + 2*time.Second,
+			Transport: mtlsTransport,
+		}
+		// Owner API forwards (ReverseProxy) share the same TLS config but get
+		// a higher per-host idle pool — they're the steady-state hot path
+		// across cluster-internal hops, not the bursty raft leader-forward.
+		c.mtlsProxies = newProxyCache(&http.Transport{
+			TLSClientConfig:     clusterTLS.clientConfig(),
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		})
 		is, err := startInternalServer(cfg.ClusterInternalListenAddr, clusterTLS, c.ApplyEncoded, logger)
 		if err != nil {
 			_ = rn.Close()
@@ -273,11 +293,30 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 		// owner advertised its URL.
 		apiURL = c.gossip.peerAPIURL(p.OwnerNodeID)
 	}
+	// InternalURL is only on gossip (it isn't in the persisted Placement
+	// record — operators can toggle TLS without rewriting raft state). Empty
+	// for owners that run without SB_CLUSTER_TLS_DIR; the forwarder then
+	// falls back to apiURL + PAT.
+	internalURL := c.gossip.peerInternalURL(p.OwnerNodeID)
 	return OwnerInfo{
-		NodeID: p.OwnerNodeID,
-		APIURL: apiURL,
-		IsSelf: p.OwnerNodeID == c.nodeID,
+		NodeID:      p.OwnerNodeID,
+		APIURL:      apiURL,
+		InternalURL: internalURL,
+		IsSelf:      p.OwnerNodeID == c.nodeID,
 	}, nil
+}
+
+// AttachInternalHandler wires the public API mux into the cluster-internal
+// mTLS listener so peers can reverse-proxy owner API calls over the
+// cert-pinned channel. No-op when this node has no TLS material loaded
+// (SB_CLUSTER_TLS_DIR empty) — there's no listener to attach to. Called once
+// from cmd/sandboxd after the API server is constructed; the order avoids a
+// service→cluster→api construction cycle.
+func (c *Cluster) AttachInternalHandler(h http.Handler) {
+	if c.internalServer == nil {
+		return
+	}
+	c.internalServer.SetExtraHandler(h)
 }
 
 // RecordPlacement commits sandboxID -> self into the FSM via raft along with

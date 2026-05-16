@@ -239,6 +239,14 @@ func main() {
 	}
 
 	server := api.NewServer(logger, svc, dockerClient, cfg, cfg.PATToken)
+	// Mount the same API handler onto the cluster-internal mTLS listener so
+	// peers can reverse-proxy owner API calls over the cert-pinned channel
+	// (not just leader-forwarded raft applies). Noop and TLS-disabled
+	// Cluster instances drop the handler on the floor — the public path
+	// keeps working unchanged.
+	if cfg.EnableCluster {
+		svc.Cluster().AttachInternalHandler(server.Handler())
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
 		Handler:           server.Handler(),

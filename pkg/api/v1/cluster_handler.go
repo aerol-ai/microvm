@@ -66,11 +66,11 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 			local.ServeHTTP(w, r)
 			return
 		}
-		if owner.APIURL == "" {
-			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" API URL unknown")
+		if owner.APIURL == "" && owner.InternalURL == "" {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 			return
 		}
-		c.ForwardHTTP(owner.APIURL, w, r)
+		c.ForwardHTTP(cluster.Endpoint{InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
 }
 
@@ -129,7 +129,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	}
 	if !target.IsSelf {
 		r.Header.Set(clusterCreateTargetHeader, target.NodeID)
-		c.ForwardHTTP(target.APIURL, w, r)
+		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 		return
 	}
 

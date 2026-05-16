@@ -454,15 +454,25 @@ cluster — read this section before configuring DNS.
 ### Path 1 — API traffic (`sandbox.example.com/v1/...`)
 
 Lands on any node. For sandbox-scoped requests, the application looks up the
-placement record and forwards the HTTP request to the owner's advertised API
-URL (`internal/cluster.ForwardHTTP`). Create requests are the special case:
-the receiving API node chooses the owner once, then forwards a target-pinned
+placement record and reverse-proxies the HTTP request to the owner
+(`internal/cluster.ForwardHTTP`). Create requests are the special case: the
+receiving API node chooses the owner once, then forwards a target-pinned
 create to that owner.
 
-The mTLS listener on `:7002` is for cluster-internal control-plane traffic
-such as leader-forwarded raft applies. It is not the data path for API
-owner-forwarding. **You can put any LB or DNS scheme in front of the API path,
-but every node's advertised API URL must be reachable by its peers.**
+**Channel selection.** When both this node and the owner have TLS material
+(`SB_CLUSTER_TLS_DIR` set on both), the proxy rides the cluster-internal
+mTLS channel on `:7002` — the receiving node's mTLS listener serves the
+same `/v1/...` mux as its public port, so handlers run identically but the
+hop is cert-pinned end-to-end. The PAT bearer header is still forwarded
+(belt-and-braces), but possession of the PAT alone is no longer sufficient
+to forge a cross-node API hop. When either side has no TLS material, the
+proxy falls back to the public `SB_API_ADVERTISE_URL` with PAT-only auth so
+mixed rollouts (some nodes with TLS, some without) keep working.
+
+**You can put any LB or DNS scheme in front of the API path**, but every
+node's advertised API URL must still be reachable by its peers as the
+mixed-rollout fallback. The `:7002` mTLS port must be reachable between
+cluster members for the cert-pinned path to be used at all.
 
 ### Path 2 — Sandbox URLs (`<id>.sandbox.example.com`, `<id>-<port>.sandbox.example.com`)
 

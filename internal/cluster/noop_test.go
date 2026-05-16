@@ -62,7 +62,7 @@ func TestNoopAlwaysSelf(t *testing.T) {
 func TestNoopForwardHTTPSignals500(t *testing.T) {
 	n := NewNoop("s", "http://s")
 	w := newRecorder()
-	n.ForwardHTTP("http://nowhere", w, nil)
+	n.ForwardHTTP(Endpoint{APIURL: "http://nowhere"}, w, nil)
 	if w.code != 500 {
 		t.Fatalf("expected 500 from Noop.ForwardHTTP, got %d", w.code)
 	}

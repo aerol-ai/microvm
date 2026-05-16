@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,14 +20,26 @@ import (
 const InternalAPIPath = "/internal/apply"
 
 // internalServer is the mTLS HTTPS server that accepts leader-forwarded raft
-// applies from peer nodes. The server cert + the required client cert are
-// both verified against the cluster CA — possession of the PAT alone is no
-// longer enough to forge an internal apply, since the TLS handshake fails
-// before the request body is read.
+// applies AND owner-API forwards from peer nodes. The server cert + the
+// required client cert are both verified against the cluster CA — possession
+// of the PAT alone is no longer enough to forge an internal call, since the
+// TLS handshake fails before the request body is read.
+//
+// Two surfaces share this listener:
+//
+//   - POST /internal/apply: leader-forwarded raft applies (the apply handler).
+//   - everything else: delegated to the extra http.Handler installed via
+//     SetExtraHandler. cmd/sandboxd wires the public v1 mux there so peers can
+//     reverse-proxy owner API calls over the cert-pinned channel. Until the
+//     handler is attached the listener returns 503 — peers that forwarded
+//     to us mid-boot just retry on the public path.
 type internalServer struct {
 	srv      *http.Server
 	listener net.Listener
 	logger   *slog.Logger
+	// extra is loaded atomically so AttachInternalHandler is lock-free for
+	// the hot path (every incoming forward reads it once per request).
+	extra atomic.Pointer[http.Handler]
 }
 
 // startInternalServer binds bindAddr with the cluster mTLS config and spawns
@@ -36,6 +49,7 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 	if ct == nil {
 		return nil, errors.New("cluster internal server: TLS material required")
 	}
+	is := &internalServer{logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+InternalAPIPath, func(w http.ResponseWriter, r *http.Request) {
 		// The TLS handshake already verified the peer cert chains to the
@@ -58,6 +72,20 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	// Catch-all delegate: anything that isn't the raft-apply endpoint runs
+	// through the registered extra handler. We register on "/" so the ServeMux
+	// "longest prefix wins" rule still routes POST /internal/apply to the
+	// dedicated handler above.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		hp := is.extra.Load()
+		if hp == nil || *hp == nil {
+			// Boot-window: peer forwarded to us before AttachInternalHandler
+			// fired. Same 503 semantics the public path uses for "not ready".
+			http.Error(w, "cluster: internal API not yet attached", http.StatusServiceUnavailable)
+			return
+		}
+		(*hp).ServeHTTP(w, r)
+	})
 
 	tlsListener, err := tls.Listen("tcp", bindAddr, ct.serverConfig())
 	if err != nil {
@@ -68,7 +96,8 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	is := &internalServer{srv: srv, listener: tlsListener, logger: logger}
+	is.srv = srv
+	is.listener = tlsListener
 	go func() {
 		if err := srv.Serve(tlsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Warn("cluster internal server stopped", "error", err)
@@ -76,6 +105,20 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 	}()
 	logger.Info("cluster internal mTLS server listening", "addr", tlsListener.Addr().String())
 	return is, nil
+}
+
+// SetExtraHandler installs the http.Handler used for every non-/internal/apply
+// path. Safe to call concurrently with serving — the load is atomic. Pass nil
+// to detach (the listener then 503s every non-apply path again).
+func (s *internalServer) SetExtraHandler(h http.Handler) {
+	if s == nil {
+		return
+	}
+	if h == nil {
+		s.extra.Store(nil)
+		return
+	}
+	s.extra.Store(&h)
 }
 
 func (s *internalServer) Addr() string { return s.listener.Addr().String() }

@@ -149,14 +149,32 @@ type PlacementTarget struct {
 	NodeID        string
 	APIURL        string
 	DataPlaneHost string
-	IsSelf        bool
+	// InternalURL is the peer's cluster-internal mTLS URL (e.g. https://10.0.0.5:7002).
+	// Empty when the peer is running without SB_CLUSTER_TLS_DIR or hasn't yet
+	// gossiped its advertise URL. Cross-node create-forwarding uses this in
+	// preference to APIURL so the hop rides the cert-pinned channel.
+	InternalURL string
+	IsSelf      bool
 }
 
 // OwnerInfo is returned by OwnerOf.
 type OwnerInfo struct {
 	NodeID string
 	APIURL string
-	IsSelf bool
+	// InternalURL is the owner's cluster-internal mTLS URL. Empty when the
+	// owner has no TLS material (mixed/legacy cluster). Owner API forwarding
+	// uses this in preference to APIURL so the cross-node hop is cert-pinned.
+	InternalURL string
+	IsSelf      bool
+}
+
+// Endpoint pairs a peer's optional cluster-internal mTLS URL with its public
+// API URL. Passed to ForwardHTTP so the forwarder can transparently pick the
+// cert-pinned internal channel when both ends have TLS material, falling back
+// to the public APIURL (PAT-authenticated) otherwise.
+type Endpoint struct {
+	InternalURL string
+	APIURL      string
 }
 
 // SandboxRecreator is the cluster's escape hatch back into the service layer
@@ -269,9 +287,19 @@ type Client interface {
 	// boot. Idempotent.
 	AssertOwnership(ctx context.Context, local []LocalSandboxState) error
 
-	// ForwardHTTP reverse-proxies r to peerAPIURL, copying response back to w.
-	// Used by the API layer when OwnerOf != self.
-	ForwardHTTP(peerAPIURL string, w http.ResponseWriter, r *http.Request)
+	// ForwardHTTP reverse-proxies r to the given peer, copying response back to
+	// w. Used by the API layer when OwnerOf != self. When target.InternalURL is
+	// non-empty AND this node has its own TLS material loaded, the proxy rides
+	// the cert-pinned mTLS channel; otherwise it falls back to target.APIURL
+	// with PAT-only auth (the legacy public-API path).
+	ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request)
+
+	// AttachInternalHandler wires the API server's HTTP handler into the
+	// cluster-internal mTLS listener so peers can reverse-proxy owner API calls
+	// over the cert-pinned channel (not just leader-forwarded raft applies).
+	// No-op for Noop and for Cluster instances with SB_CLUSTER_TLS_DIR unset.
+	// Safe to call exactly once after construction; subsequent calls overwrite.
+	AttachInternalHandler(h http.Handler)
 
 	// Members returns a snapshot of all known cluster members.
 	Members() []Member

@@ -71,7 +71,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		candidates = append(candidates, m)
 	}
 
-	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}
+	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		return self, nil
 	}
@@ -90,6 +90,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		NodeID:        winner.NodeID,
 		APIURL:        winner.APIURL,
 		DataPlaneHost: winner.DataPlaneHost,
+		InternalURL:   winner.InternalURL,
 		IsSelf:        false,
 	}, nil
 }

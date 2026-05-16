@@ -150,7 +150,8 @@ These are written by `cluster-init.sh` / `cluster-join.sh`. Listed here for refe
 
 - **Raft replication** rides over mTLS (`raft.NewNetworkTransportWithConfig` + a custom TLS `StreamLayer`). A peer that can't present a cert chained to the cluster CA fails handshake.
 - **Leader-forwarded raft applies** ride over a separate HTTPS listener on `SB_CLUSTER_INTERNAL_LISTEN` (default port 7002), bypassing the public API URL entirely. Same CA-pinned mTLS rules apply.
-- **Falls back gracefully**: a node without `SB_CLUSTER_TLS_DIR` still works (the daemon advertises no `internal_url` via gossip, and peers fall back to the public API URL with PAT-only auth). Use `--no-tls` on `cluster-init.sh` / `cluster-join.sh` for ephemeral test setups on a fully private network.
+- **Owner API forwarding** (cross-node sandbox API hops — `GET /v1/sandboxes/{id}`, mutating writes, port exposure, etc.) also rides the `:7002` mTLS listener: the listener serves the same `/v1/...` mux as the public port, so peers reverse-proxy owner traffic over the cert-pinned channel instead of the public `SB_API_ADVERTISE_URL`.
+- **Falls back gracefully**: a node without `SB_CLUSTER_TLS_DIR` still works (the daemon advertises no `internal_url` via gossip, and peers fall back to the public API URL with PAT-only auth for both raft applies and owner forwarding). Use `--no-tls` on `cluster-init.sh` / `cluster-join.sh` for ephemeral test setups on a fully private network.
 
 The CA bundle MUST be transferred over a secure channel (scp, vault) — anyone with the bundle can mint a node cert and join the cluster.
 

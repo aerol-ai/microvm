@@ -96,6 +96,36 @@ Make one of these true:
 For release-grade cluster mode, prefer an internal owner-forward URL distinct
 from the public API URL.
 
+**Current branch status:** **Resolved.** Owner API forwarding now rides the
+cluster-internal mTLS channel when both peers have TLS material; the public
+APIURL+PAT path remains as a mixed-rollout fallback.
+
+- `OwnerInfo` / `PlacementTarget` carry an `InternalURL` populated from
+  gossip's `peerInternalURL` (`internal/cluster/cluster.go`,
+  `internal/cluster/client.go`, `internal/cluster/placement.go`).
+- `ForwardHTTP(target Endpoint, ...)` (was `ForwardHTTP(string, ...)`) picks
+  the channel: `mtlsProxies` keyed on `InternalURL` when this node has TLS
+  AND the peer advertised one; else `publicProxies` keyed on `APIURL`. Hard
+  network/TLS failures on the internal channel surface as 502 instead of
+  silently downgrading, so the cert-pinned promise holds
+  (`internal/cluster/forward.go`).
+- The mTLS listener now serves the public v1 mux on every non-`/internal/apply`
+  path via a lock-free `atomic.Pointer[http.Handler]` delegate. The handler
+  is attached from `cmd/sandboxd/main.go` after `api.NewServer` returns; until
+  then the listener 503s non-apply paths and peers fall back to the public
+  path (`internal/cluster/internal_server.go`,
+  `internal/cluster/client.go::AttachInternalHandler`, `cmd/sandboxd/main.go`).
+- Regression coverage: `TestForwardHTTPPrefersInternalURLWhenAvailable`,
+  `TestForwardHTTPFallsBackToAPIURLWithoutTLS`,
+  `TestForwardHTTPFallsBackToAPIURLWhenInternalEmpty`,
+  `TestForwardHTTPRejectsLoop`, `TestForwardHTTP503WhenNoUsableEndpoint`
+  (`internal/cluster/forward_test.go`).
+- **Known limitation:** `clusterListWrap`'s peer fan-out still constructs
+  manual `peer.APIURL`-based requests because the existing code parses the
+  JSON response (it's a fan-and-merge, not a reverse-proxy). Moving that
+  read path to mTLS is a separate, smaller piece of follow-up work; the
+  primary B3 concern (owner-scoped mutating forwards) is now cert-pinned.
+
 ## B4. Every joiner becomes a voter
 
 **Where:**
