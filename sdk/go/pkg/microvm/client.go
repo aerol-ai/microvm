@@ -140,8 +140,29 @@ func (c *Client) CreateWithImage(ctx context.Context, image *Image, opts sdktype
 	return c.Create(ctx, opts)
 }
 
-func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
-	items, err := c.inner.List(ctx)
+// ListOption customizes a List call. Build values with WithTags; the variadic
+// shape leaves room for future filters (e.g. status, lifecycle) without
+// breaking call sites.
+type ListOption func(*listOptions)
+
+type listOptions struct {
+	tags map[string]string
+}
+
+// WithTags filters the result to sandboxes whose Tags map contains every
+// supplied key/value pair (AND semantics on the server). Wire format is
+// `?tag.<key>=<value>`; the SDK percent-encodes keys and values for you. An
+// empty or nil map is a no-op — the call is identical to List(ctx).
+func WithTags(tags map[string]string) ListOption {
+	return func(o *listOptions) { o.tags = tags }
+}
+
+func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, error) {
+	var cfg listOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	items, err := c.inner.List(ctx, cfg.tags)
 	if err != nil {
 		return nil, err
 	}

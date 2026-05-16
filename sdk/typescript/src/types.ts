@@ -177,6 +177,16 @@ export interface ResizeOptions {
   diskGB?: number;
 }
 
+export interface ListOptions {
+  /**
+   * Filter the result to only sandboxes whose `tags` map contains every
+   * key/value pair given here (AND semantics on the server). Wire format is
+   * `?tag.<key>=<value>`; the SDK URL-encodes keys and values for you. Omit
+   * or pass an empty map to list every sandbox visible to the PAT.
+   */
+  tags?: Record<string, string>;
+}
+
 export interface CreateSessionOptions {
   name?: string;
   argv?: string[];

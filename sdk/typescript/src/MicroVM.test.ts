@@ -508,6 +508,67 @@ test("MicroVM requires a PAT token", () => {
   }, /PAT token is required/);
 });
 
+// Mirrors pkg/api/v1/list_filter_test.go: every supplied tag must land in the
+// query string verbatim under the `tag.` prefix the server's parseTagFilter
+// keys on. If this drifts (e.g. someone switches to `?tags[user_id]=...`), the
+// server silently returns the full list and breaks multi-tenant scoping.
+test("MicroVM.list forwards tag filters as ?tag.<k>=<v>", async () => {
+  let seenURL = "";
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      seenURL = new Request(input).url;
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await sdk.list({ tags: { user_id: "alice", project_id: "p1" } });
+  const url = new URL(seenURL);
+  assert.equal(url.pathname, "/v1/sandboxes");
+  assert.equal(url.searchParams.get("tag.user_id"), "alice");
+  assert.equal(url.searchParams.get("tag.project_id"), "p1");
+});
+
+// URL-encoding is delegated to encodeURIComponent in buildTagQuery; this pins
+// that both keys and values with reserved characters (=, &, spaces) survive
+// the round trip via the server's url.Values decode.
+test("MicroVM.list URL-encodes tag keys and values", async () => {
+  let seenURL = "";
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      seenURL = new Request(input).url;
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await sdk.list({ tags: { "user/id": "alice bob", "needs=encode": "v&v" } });
+  const url = new URL(seenURL);
+  assert.equal(url.searchParams.get("tag.user/id"), "alice bob");
+  assert.equal(url.searchParams.get("tag.needs=encode"), "v&v");
+});
+
+// Backward-compat: list() with no options and list({}) must produce the
+// pre-filter URL byte-for-byte so existing fixtures, request matchers, and
+// proxies don't see a stray "?".
+test("MicroVM.list omits the query string when no tags are supplied", async () => {
+  const urls: string[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      urls.push(new Request(input).url);
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await sdk.list();
+  await sdk.list({});
+  await sdk.list({ tags: {} });
+  for (const u of urls) {
+    assert.equal(u, "https://api.example.com/v1/sandboxes");
+  }
+});
+
 test("MicroVM health maps ssh gateway state", async () => {
   const sdk = new MicroVM({
     patToken: "pat-token",

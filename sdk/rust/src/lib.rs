@@ -592,11 +592,22 @@ impl Client {
     }
 
     pub fn list(&self) -> Result<Vec<Sandbox>, Error> {
-        let raw = self.do_json::<(), Vec<SandboxData>>(
-            Method::GET,
-            &format!("{}/sandboxes", self.version_prefix()),
-            None,
-        )?;
+        self.list_with_tags(&std::collections::HashMap::new())
+    }
+
+    /// Lists sandboxes filtered by tag. Every key/value pair in `tags` must
+    /// be present on a sandbox's `tags` map for it to be returned (AND
+    /// semantics on the server). Wire format is `?tag.<key>=<value>`; both
+    /// key and value are percent-encoded. Passing an empty map is identical
+    /// to calling [`Client::list`].
+    pub fn list_with_tags(
+        &self,
+        tags: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<Sandbox>, Error> {
+        let mut path = format!("{}/sandboxes", self.version_prefix());
+        path.push_str(&build_tag_query(tags));
+        let raw =
+            self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
         Ok(raw
             .into_iter()
             .map(|item| Sandbox::new(self.clone(), item))
@@ -1355,6 +1366,32 @@ async fn run_session_attach(
 // caller sees the actual status + body the server returned (e.g.
 // "status=502, body=\"toolbox unavailable\"") instead of just
 // "Http error: 502 Bad Gateway".
+// Renders the tag filter as the server's `?tag.<key>=<value>` wire format.
+// The `tag.` prefix is literal — parseTagFilter on the server inspects the
+// decoded query key — so only the user-supplied key and value get
+// percent-encoded. An empty map returns "" so the URL is byte-identical to
+// the pre-filter call (no stray trailing "?"). Map iteration order is
+// unspecified; the server treats every `tag.*` pair as an AND clause so the
+// emitted order does not affect the response.
+fn build_tag_query(tags: &std::collections::HashMap<String, String>) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("?");
+    let mut first = true;
+    for (key, value) in tags {
+        if !first {
+            out.push('&');
+        }
+        first = false;
+        out.push_str("tag.");
+        out.push_str(&urlencoding::encode(key));
+        out.push('=');
+        out.push_str(&urlencoding::encode(value));
+    }
+    out
+}
+
 fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
     match err {
         WebSocketError::Http(response) => {

@@ -437,3 +437,32 @@ func TestRegisterSnapshotFromImageBuildsDockerfile(t *testing.T) {
 		t.Errorf("name = %v, want built", seen["name"])
 	}
 }
+
+// TestListWithTagsOptionRendersWireFormat covers the public ListOption →
+// wire path: callers use microvm.WithTags(map[...]string{...}) and the
+// resulting request must carry `?tag.<k>=<v>` for each pair. Pairs with the
+// inner-transport test in apiclient/client_test.go; this one specifically
+// pins that the variadic option wiring doesn't silently drop the map.
+func TestListWithTagsOptionRendersWireFormat(t *testing.T) {
+	ctx := context.Background()
+	var seenURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenURL = r.URL.String()
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig() error = %v", err)
+	}
+	if _, err := client.List(ctx, WithTags(map[string]string{"user_id": "alice"})); err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if !strings.HasPrefix(seenURL, "/v1/sandboxes?") {
+		t.Fatalf("URL = %q, want /v1/sandboxes?... prefix", seenURL)
+	}
+	if !strings.Contains(seenURL, "tag.user_id=alice") {
+		t.Fatalf("URL = %q, missing tag.user_id=alice", seenURL)
+	}
+}
