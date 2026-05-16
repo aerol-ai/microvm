@@ -101,7 +101,46 @@ var (
 	// FSM's current max version is the route-lag signal stage-2 §06 asks
 	// for; an operator can scrape both and subtract.
 	ingressPlacementVersionMax = expvar.NewInt("aerolvm_ingress_placement_version_max")
+	// ingressRouteLagVersions is route-lag pre-computed for operators who
+	// don't want to subtract two gauges in their dashboard. Updated on every
+	// reconcile pass as max(0, FSM.PlacementVersion - last reconciled max).
+	// Lag of N means N placement-mutating raft applies have not yet been
+	// reflected in this node's ingress routes. Persistent non-zero lag means
+	// the reconciler is falling behind raft.
+	ingressRouteLagVersions = expvar.NewInt("aerolvm_ingress_route_lag_versions")
+	// ingressRouteMissesTotal increments when a cross-node API forward can't
+	// find a usable peer endpoint for the placement (no InternalURL AND no
+	// APIURL — the peer is announced but has no advertised forwarding URL
+	// yet, or the placement view is mid-rollover). A persistently growing
+	// counter under steady-state traffic means gossip→placement convergence
+	// is lagging or a peer is misconfigured. Distinct from
+	// reconcile_errors_total: those count Caddy admin failures, not
+	// API-routing failures.
+	ingressRouteMissesTotal = expvar.NewInt("aerolvm_ingress_route_misses_total")
 )
+
+// RecordRouteMiss bumps the route-miss counter from the API layer. Exported so
+// pkg/api/v1 can wire it in without exposing the expvar directly (keeps the
+// metric name owned by this package). Service has no logical role here — this
+// is a package-level counter the v1 wrap layer pokes when it observes the
+// no-usable-URL case.
+func RecordRouteMiss() {
+	ingressRouteMissesTotal.Add(1)
+}
+
+// SetIngressRouteLag is the post-tick hook the reconciler calls with the
+// FSM's current PlacementVersion. Lag is computed as
+// max(0, fsmVersion - ingressPlacementVersionMax). Computed here (not at
+// recordIngressReconcile) so callers that only have the FSM version can
+// still publish the lag without needing the reconciler's maxVersion.
+func SetIngressRouteLag(fsmVersion uint64) {
+	installed := ingressPlacementVersionMax.Value()
+	if fsmVersion == 0 || int64(fsmVersion) <= installed {
+		ingressRouteLagVersions.Set(0)
+		return
+	}
+	ingressRouteLagVersions.Set(int64(fsmVersion) - installed)
+}
 
 // recordIngressReconcile updates the expvar gauges after a reconcile pass.
 // Called from ReconcileClusterIngress whether the pass succeeded, failed, or

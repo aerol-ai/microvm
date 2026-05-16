@@ -208,7 +208,35 @@ That removes the 1/N hit-rate blocker for normal operation.
   `internal/cluster/fsm.go` (`subscribers`, `notifySubscribers`),
   `internal/cluster/client.go` (`SubscribePlacement`), and
   `internal/service/ingress_wake_test.go`.
-- add metrics for route lag, Caddy admin latency, and route misses;
+- ~~add metrics for route lag, Caddy admin latency, and route misses~~ —
+  **Resolved on this branch.** Exposed at `/debug/vars`:
+  - `aerolvm_ingress_route_lag_versions` — gauge updated on every reconcile as
+    `max(0, FSM.PlacementVersion - last-reconciled-version)`. Computed in
+    `service.SetIngressRouteLag` and called after every
+    `ReconcileClusterIngress` tick regardless of pass outcome
+    (`internal/service/ingress_metrics.go`, `internal/service/service.go`).
+  - `aerolvm_caddy_admin_calls_total` / `aerolvm_caddy_admin_errors_total` /
+    `aerolvm_caddy_admin_last_nanos` — transport-level wrapper on
+    `caddy.Client.httpClient.Transport` so every admin call is metric'd
+    uniformly without per-call-site drift; errors here are *transport*
+    failures (connection refused, DNS, timeout) so the counter is the
+    Caddy-down canary (HTTP 4xx/5xx come back via resp.StatusCode and the
+    caller classifies). `pkg/caddy/metrics.go`.
+  - `aerolvm_ingress_route_misses_total` — incremented from
+    `clusterForwardWrap` when placement says someone else owns the sandbox
+    but gossip hasn't surfaced any forwarding URL (mid-rollover or
+    misconfigured advertise URLs). Distinct from `reconcile_errors_total`
+    which tracks Caddy admin failures. `pkg/api/v1/cluster_handler.go`,
+    `internal/service/ingress_metrics.go`.
+  - Regression coverage: `TestSetIngressRouteLagZeroWhenInstalledAhead`,
+    `TestSetIngressRouteLagComputesDelta`,
+    `TestSetIngressRouteLagZeroWhenFSMVersionUnknown`,
+    `TestRecordRouteMissIncrements` in
+    `internal/service/ingress_metrics_b5_test.go`;
+    `TestInstrumentingTransportCountsCalls`,
+    `TestInstrumentingTransportCountsErrors`,
+    `TestInstrumentingTransportIgnoresHTTPErrorCodes` in
+    `pkg/caddy/metrics_test.go`.
 - test Caddy route churn and config size at 10K sandboxes;
 - define explicit failover responses during the convergence window.
 

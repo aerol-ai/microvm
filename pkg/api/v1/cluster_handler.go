@@ -67,6 +67,12 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 			return
 		}
 		if owner.APIURL == "" && owner.InternalURL == "" {
+			// Route miss: placement says someone else owns the sandbox, but
+			// gossip hasn't surfaced any forwarding URL yet (mid-rollover,
+			// peer mid-boot, or misconfigured advertise URLs). Bump the
+			// counter so operator dashboards see persistent gossip-convergence
+			// lag rather than just sporadic 503s.
+			service.RecordRouteMiss()
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 			return
 		}

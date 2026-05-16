@@ -40,7 +40,13 @@ func New(cfg config.Config) *Client {
 		enabled:       cfg.EnableCaddy,
 		l4TLSListen:   cfg.L4TLSListen,
 		l4TLSFallback: cfg.L4TLSFallback,
-		httpClient:    &http.Client{Timeout: cfg.HTTPClientTimeout},
+		// Every admin call rides this client, so the instrumenting transport
+		// (pkg/caddy/metrics.go) catches latency + error counters for all of
+		// them without per-call-site instrumentation drift.
+		httpClient: &http.Client{
+			Timeout:   cfg.HTTPClientTimeout,
+			Transport: wrapTransport(http.DefaultTransport),
+		},
 	}
 }
 

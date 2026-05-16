@@ -2271,6 +2271,11 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 		s.ingressLastHash.Store(0)
 		recordIngressReconcile(reconcileErrored, time.Since(start), routeCounts, maxVersion)
 	}
+	// Publish lag regardless of pass outcome: even a failed tick gives the
+	// operator the up-to-date "FSM is N versions ahead of installed routes"
+	// signal. PlacementVersion() is the FSM's current monotonic apply counter
+	// (raft log index); maxVersion is what this pass *would* have installed.
+	SetIngressRouteLag(c.PlacementVersion())
 	return firstErr
 }
 
