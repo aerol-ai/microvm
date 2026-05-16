@@ -40,10 +40,23 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         description: 'Spin up a sandbox and run a command in under five minutes.',
       },
       {
-        type: 'link',
-        href: '/getting-started',
+        type: 'group',
         label: 'Server Setup',
-        description: 'Install and configure AerolVM on a Linux host.',
+        homePageHref: '/getting-started',
+        entries: [
+          {
+            type: 'link',
+            href: '/getting-started/local-setup',
+            label: 'Local Setup',
+            description: 'Run AerolVM directly on your Mac or Linux machine for local development.',
+          },
+          {
+            type: 'link',
+            href: '/getting-started/single-node-setup',
+            label: 'Single-Node Setup',
+            description: 'Install AerolVM on one Linux host with domain, TLS, SSH, and optional GPU support.',
+          },
+        ],
       },
       {
         type: 'link',

@@ -5,6 +5,12 @@ const { sublist = [], nested = false } = Astro.props
 
 const isActive = entry =>
   entry.exact ? comparePaths(entry.href, Astro.url.pathname) : isActiveOrParentPath(entry.href, Astro.url.pathname)
+
+const isGroupActive = entry =>
+  entry.homePageHref ? isActiveOrParentPath(entry.homePageHref, Astro.url.pathname) : false
+
+const isGroupCurrent = entry =>
+  entry.homePageHref ? comparePaths(entry.homePageHref, Astro.url.pathname) : false
 ---
 
 <ul class:list={{ 'top-level': !nested, nested }}>
@@ -26,9 +32,25 @@ const isActive = entry =>
           ) : entry.type === 'group' ? (
             <div>
               <div class="group-label">
-                <span class="large">{entry.label}</span>
+                {
+                  entry.homePageHref ? (
+                    <a
+                      href={entry.homePageHref}
+                      aria-current={isGroupCurrent(entry)
+                        ? 'page'
+                        : undefined}
+                      class:list={{ 'group-link': true, active: isGroupActive(entry) }}
+                    >
+                      <span class="large">{entry.label}</span>
+                    </a>
+                  ) : (
+                    <span class="large">{entry.label}</span>
+                  )
+                }
               </div>
-              <Astro.self sublist={entry.entries} nested />
+              <div class="group-entries">
+                <Astro.self sublist={entry.entries} nested />
+              </div>
             </div>
           ) : null
         }
@@ -54,7 +76,7 @@ const isActive = entry =>
     line-height: 1;
     letter-spacing: 0em;
     text-transform: uppercase;
-    color: var(--primary-text-color);
+    color: inherit;
   }
 
   .group-label {
@@ -62,6 +84,26 @@ const isActive = entry =>
     align-items: center;
     justify-content: space-between;
     padding: 24px 0 8px 0;
+    color: var(--primary-text-color);
+  }
+
+  .group-link {
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+    color: inherit;
+    transition: color 0.2s ease;
+  }
+
+  .group-link:hover,
+  .group-link.active,
+  .group-link[aria-current='page'] {
+    color: var(--hover-color);
+  }
+
+  .group-entries {
+    padding-left: 0.875rem;
+    border-left: 1px solid var(--sl-color-hairline-light);
   }
 
   li > a {
