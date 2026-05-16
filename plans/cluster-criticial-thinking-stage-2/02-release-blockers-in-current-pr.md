@@ -228,6 +228,26 @@ The first-stage plan mentions UDP as future work, but the product narrative
 should not imply Kubernetes-like Service protocol coverage. If UDP matters, it
 is a separate design.
 
+**Current branch status:** **Resolved by explicit disclaim** (the
+cheap half of the original "design or disclaim" fork).
+
+- `pkg/models/types.go` (`ValidExposedPortProtocol`) rejects any
+  protocol outside `http`/`tcp`/`tls` and surfaces the allowed list
+  verbatim in the error, so an SDK user asking for `udp` gets a
+  clear `400` with the right hint instead of a silent fallback.
+- `docs/src/content/docs/cluster-ingress.mdx:132` calls UDP out by
+  name: *"UDP is not supported. caddy-l4 can carry TCP and TLS/SNI;
+  UDP exposure needs a separate design."* This is the narrative
+  carve-out the blocker required.
+- The only other repo mention of UDP is the SWIM gossip port
+  (`cluster-setup.md:25` — `7001/TCP+UDP`), which is internal
+  control-plane traffic, not user-exposed sandbox ports. No
+  ambiguity there.
+
+A real UDP exposure design (connection-less host-port pool,
+caddy-l4 UDP module, source-IP preservation, no SNI) is a separate
+feature, not a release blocker.
+
 ## B8. FSM snapshots shallow-copy mutable placement values
 
 **Where:**
@@ -267,6 +287,24 @@ watch revision.
 
 Use Raft log index as the watch revision or persist FSM version in snapshots.
 Ingress and worker watches need monotonic, durable revisions.
+
+**Current branch status:** **Resolved.** Did both halves the plan asked
+for:
+
+- `placementFSM.apply` now sets `f.version = log.Index`
+  (`internal/cluster/fsm.go`). Raft guarantees the index is strictly
+  monotonic and globally ordered, so it doubles as a durable watch
+  revision — leader and followers see the same number for the same
+  state, and it can never regress across restarts.
+- `Snapshot`/`Persist` encode an `fsmSnapshotPayload{Version,
+  Placements}` envelope instead of a bare map. `Restore` decodes the
+  envelope and falls back to the legacy bare-map shape (deriving the
+  version from the highest `Placement.Version`) so a snapshot taken
+  pre-fix still loads without regressing the revision.
+- Regression coverage: `TestFSMVersionTracksLogIndex`,
+  `TestFSMSnapshotPreservesVersion`,
+  `TestFSMRestoreLegacySnapshotRecoversVersion` in
+  `internal/cluster/fsm_test.go`.
 
 ## B10. Cluster-wide name uniqueness is not enforced
 
@@ -352,6 +390,14 @@ Move credential key derivation/generation before TLS bundle creation.
 This belongs in the release blocker list because the setup scripts are the
 first user experience of cluster mode.
 
+**Current branch status:** **Resolved.** The credential-key block
+(`scripts/cluster-init.sh:264-294`: derive `CRED_KEY_PATH` from
+sandboxd.env or default, generate if missing, validate the base64
+length) now runs before the TLS material section (line 296 onwards)
+and before the bundle stages it via `install -m 0600 "$CRED_KEY_PATH"
+"$TLS_DIR/credential_encryption.key"` at line 369. Running with the
+default empty `CRED_KEY_PATH` no longer trips `set -u`.
+
 ## B13. Docs reference a node-removal endpoint that is not registered
 
 **Where:**
@@ -372,3 +418,12 @@ registers:
 Implement the endpoint or remove it from the docs. For Kubernetes-grade
 operability, an explicit remove/drain/promote API is useful, but it must exist
 before it is documented.
+
+**Current branch status:** **Resolved by removing the false claim.**
+A grep across `docs/src/content/docs/` for `DELETE.*cluster/members`
+turns up nothing — the live `cluster-setup.md` only references `GET
+/v1/cluster/members` (lines 82, 228, 237), which is what
+`pkg/api/v1/routes.go:105` actually registers. The original
+`setup/cluster.md:919-931` block no longer exists; the docs and the
+route table now agree. A proper drain/remove/promote API is still
+useful for operability but is feature work, not a release blocker.

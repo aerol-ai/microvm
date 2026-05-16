@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
@@ -115,7 +116,14 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.version++
+	// Use the raft log index as the FSM version. Raft guarantees it is
+	// strictly monotonic and globally ordered across the cluster, so it
+	// doubles as a durable watch revision — survives snapshots (because the
+	// raft log carries it) and matches between leader/follower without any
+	// extra bookkeeping. The previous "f.version++" counter was per-process
+	// and reset to 0 on every cold restart, which broke watchers that
+	// expected a monotonic revision across restores (B9).
+	f.version = log.Index
 	now := time.Now().Unix()
 
 	switch cmd.Op {
@@ -413,9 +421,23 @@ func (f *placementFSM) snapshot() map[string]Placement {
 	return out
 }
 
+// fsmSnapshotPayload is the on-disk envelope for an FSM snapshot. Wrapping
+// the map in a struct lets the snapshot carry the FSM version alongside the
+// placement state — without this, version reset to 0 on every cold restart
+// (B9). Legacy snapshots (pre-envelope) decoded as a bare map[string]Placement;
+// Restore detects that shape and reconstructs the version from the highest
+// Placement.Version it sees.
+type fsmSnapshotPayload struct {
+	Version    uint64
+	Placements map[string]Placement
+}
+
 // Snapshot returns a raft.FSMSnapshot capturing current placement state.
 func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
-	return &fsmSnapshot{placements: f.snapshot()}, nil
+	f.mu.RLock()
+	version := f.version
+	f.mu.RUnlock()
+	return &fsmSnapshot{version: version, placements: f.snapshot()}, nil
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -423,22 +445,42 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 // resync.
 func (f *placementFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	dec := gob.NewDecoder(rc)
-	var loaded map[string]Placement
-	if err := dec.Decode(&loaded); err != nil {
-		return fmt.Errorf("placementFSM: restore: %w", err)
+	raw, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("placementFSM: restore read: %w", err)
+	}
+	var payload fsmSnapshotPayload
+	if decErr := gob.NewDecoder(bytes.NewReader(raw)).Decode(&payload); decErr != nil {
+		// Legacy on-disk format is the bare map. Fall back so a snapshot
+		// taken before the version envelope was added still loads.
+		var legacy map[string]Placement
+		if legacyErr := gob.NewDecoder(bytes.NewReader(raw)).Decode(&legacy); legacyErr != nil {
+			return fmt.Errorf("placementFSM: restore: %w", decErr)
+		}
+		payload.Placements = legacy
+		// No envelope version in the legacy snapshot — derive a non-zero
+		// lower bound from existing Placement.Version values so watchers
+		// don't see the revision regress. Raft will Apply any post-snapshot
+		// log entries next, which will overwrite f.version with log.Index
+		// (guaranteed strictly greater than the snapshot's index).
+		for _, p := range legacy {
+			if p.Version > payload.Version {
+				payload.Version = p.Version
+			}
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if loaded == nil {
-		loaded = make(map[string]Placement)
+	if payload.Placements == nil {
+		payload.Placements = make(map[string]Placement)
 	}
-	f.placements = loaded
+	f.placements = payload.Placements
+	f.version = payload.Version
 	// Rebuild nameIndex from placements. Snapshots don't carry the index
 	// (older snapshots predate it), and rebuilding keeps the FSM the single
 	// source of truth even after a cold restart.
-	f.nameIndex = make(map[string]string, len(loaded))
-	for id, p := range loaded {
+	f.nameIndex = make(map[string]string, len(payload.Placements))
+	for id, p := range payload.Placements {
 		if name := specName(p.Spec); name != "" {
 			f.nameIndex[name] = id
 		}
@@ -447,12 +489,13 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 }
 
 type fsmSnapshot struct {
+	version    uint64
 	placements map[string]Placement
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	enc := gob.NewEncoder(sink)
-	if err := enc.Encode(s.placements); err != nil {
+	if err := enc.Encode(fsmSnapshotPayload{Version: s.version, Placements: s.placements}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
 	}

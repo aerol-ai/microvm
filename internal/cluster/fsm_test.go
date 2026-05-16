@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"encoding/gob"
 	"errors"
 	"io"
 	"testing"
@@ -618,5 +619,83 @@ func TestFSMSubscribeCancel(t *testing.T) {
 	case <-wake:
 		t.Fatal("subscriber received wake after cancel")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestFSMVersionTracksLogIndex pins the B9 fix: f.version must follow the
+// raft log index, not a per-process counter. Without this, watchers see the
+// revision regress to 0 after every restart, and the same revision value can
+// refer to different states on different nodes.
+func TestFSMVersionTracksLogIndex(t *testing.T) {
+	fsm := newPlacementFSM()
+	for _, idx := range []uint64{10, 11, 17, 42} {
+		cmd, _ := encodeCommand(command{
+			Op: opPlace, SandboxID: "sb1", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
+			Spec: &models.CreateSandboxRequest{Image: "img", CPU: 1, MemoryMB: 64},
+		})
+		fsm.Apply(&raft.Log{Index: idx, Data: cmd})
+		if got := fsm.currentVersion(); got != idx {
+			t.Fatalf("after Apply(Index=%d) version = %d, want %d", idx, got, idx)
+		}
+		p, _ := fsm.get("sb1")
+		if p.Version != idx {
+			t.Fatalf("Placement.Version = %d, want log index %d", p.Version, idx)
+		}
+	}
+}
+
+// TestFSMSnapshotPreservesVersion pins that the version survives a
+// snapshot/restore round trip — the durable-revision half of B9. A fresh FSM
+// instance restored from the snapshot must report the original version so
+// watchers can pick up exactly where they left off.
+func TestFSMSnapshotPreservesVersion(t *testing.T) {
+	src := newPlacementFSM()
+	cmd, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "n1", OwnerAPIURL: "http://n1",
+		Spec: &models.CreateSandboxRequest{Image: "img", CPU: 1, MemoryMB: 64},
+	})
+	src.Apply(&raft.Log{Index: 99, Data: cmd})
+
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	dst := newPlacementFSM()
+	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got := dst.currentVersion(); got != 99 {
+		t.Fatalf("restored version = %d, want 99", got)
+	}
+}
+
+// TestFSMRestoreLegacySnapshotRecoversVersion exercises the bare-map fallback
+// in Restore: a snapshot written before the envelope existed must still load,
+// and its version must be derived from the highest Placement.Version so
+// watchers don't see a regression to 0.
+func TestFSMRestoreLegacySnapshotRecoversVersion(t *testing.T) {
+	legacy := map[string]Placement{
+		"sb1": {SandboxID: "sb1", OwnerNodeID: "n1", Version: 7},
+		"sb2": {SandboxID: "sb2", OwnerNodeID: "n2", Version: 42},
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(legacy); err != nil {
+		t.Fatalf("encode legacy: %v", err)
+	}
+
+	dst := newPlacementFSM()
+	if err := dst.Restore(io.NopCloser(&buf)); err != nil {
+		t.Fatalf("restore legacy: %v", err)
+	}
+	if got := dst.currentVersion(); got != 42 {
+		t.Fatalf("legacy restore version = %d, want max placement.Version 42", got)
+	}
+	if _, ok := dst.get("sb1"); !ok {
+		t.Fatal("sb1 missing after legacy restore")
 	}
 }
