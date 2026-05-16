@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"encoding/json"
 	"expvar"
 	"io"
 	"log/slog"
@@ -143,6 +144,176 @@ func readExpvarInt(t *testing.T, name string) int64 {
 		t.Fatalf("expvar %q value %q parse: %v", name, v.String(), err)
 	}
 	return got
+}
+
+// placementOfStubCluster lets a test populate both OwnerOf and PlacementOf so
+// the convergence-status branch of clusterPlacement can be driven without a
+// real FSM. *Noop already provides every other Client method.
+type placementOfStubCluster struct {
+	*cluster.Noop
+	owner     cluster.OwnerInfo
+	ownerErr  error
+	placement cluster.Placement
+	hasPlace  bool
+}
+
+func (c *placementOfStubCluster) OwnerOf(string) (cluster.OwnerInfo, error) {
+	return c.owner, c.ownerErr
+}
+
+func (c *placementOfStubCluster) PlacementOf(string) (cluster.Placement, bool) {
+	return c.placement, c.hasPlace
+}
+
+var _ cluster.Client = (*placementOfStubCluster)(nil)
+
+// decodePlacementResponse parses the /v1/cluster/placements/{id} body into the
+// fields the tests assert on. Tests use map[string]any rather than the
+// handler's internal struct so a future field-name change in the handler
+// would surface as a test failure rather than be silently re-tracked.
+func decodePlacementResponse(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode response: %v body=%q", err, string(body))
+	}
+	return got
+}
+
+// TestClusterPlacementConvergedWhenOwnerIsSelf pins the headline branch: when
+// the local node owns the sandbox, exposePort installed the Caddy route
+// synchronously, so the response MUST report converged=true regardless of
+// what the reconciler's installed-version high-water mark says. Without this,
+// a freshly-booted owner could read converged=false on its own sandbox while
+// the cluster-ingress reconciler is still catching up to FSM applies for
+// OTHER sandboxes — a confusing operator signal.
+func TestClusterPlacementConvergedWhenOwnerIsSelf(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fake := &placementOfStubCluster{
+		Noop:  cluster.NewNoop("node-a", "http://node-a"),
+		owner: cluster.OwnerInfo{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
+		placement: cluster.Placement{
+			SandboxID:   "sb-self",
+			OwnerNodeID: "node-a",
+			Version:     42,
+			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+				5432: {Protocol: "tcp", HostPort: 40123, PublicURL: "tcp://lb.example.com:40123"},
+			},
+		},
+		hasPlace: true,
+	}
+	svc.AttachCluster(fake)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/placements/sb-self", nil)
+	req.SetPathValue("id", "sb-self")
+	rr := httptest.NewRecorder()
+	h.clusterPlacement(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	got := decodePlacementResponse(t, rr.Body.Bytes())
+	if got["converged"] != true {
+		t.Fatalf("converged = %v, want true for owner-self", got["converged"])
+	}
+	if pv, ok := got["placement_version"].(float64); !ok || uint64(pv) != 42 {
+		t.Fatalf("placement_version = %v, want 42", got["placement_version"])
+	}
+	owner, _ := got["owner"].(map[string]any)
+	if owner == nil || owner["is_self"] != true || owner["node_id"] != "node-a" {
+		t.Fatalf("owner = %+v, want is_self=true node_id=node-a", owner)
+	}
+	ports, _ := got["exposed_ports"].(map[string]any)
+	if ports == nil || ports["5432"] == nil {
+		t.Fatalf("exposed_ports = %+v, want a 5432 entry", got["exposed_ports"])
+	}
+}
+
+// TestClusterPlacementNotConvergedWhenInstalledVersionTrailsPlacement pins the
+// B6 status-surface contract: a non-owner ingress node whose reconciler hasn't
+// installed routes up to the placement's Version MUST report converged=false.
+// Operators key off this to spot stuck reconcilers per-sandbox instead of
+// inferring from aerolvm_ingress_route_lag_versions alone (which is a node-
+// wide aggregate that can't pinpoint which sandbox is affected).
+func TestClusterPlacementNotConvergedWhenInstalledVersionTrailsPlacement(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fake := &placementOfStubCluster{
+		Noop:  cluster.NewNoop("node-a", "http://node-a"),
+		owner: cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
+		placement: cluster.Placement{
+			SandboxID:   "sb-lagging",
+			OwnerNodeID: "node-b",
+			OwnerAPIURL: "http://node-b:21212",
+			Version:     uint64(readExpvarInt(t, "aerolvm_ingress_placement_version_max")) + 1_000_000,
+		},
+		hasPlace: true,
+	}
+	svc.AttachCluster(fake)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/placements/sb-lagging", nil)
+	req.SetPathValue("id", "sb-lagging")
+	rr := httptest.NewRecorder()
+	h.clusterPlacement(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	got := decodePlacementResponse(t, rr.Body.Bytes())
+	if got["converged"] != false {
+		t.Fatalf("converged = %v, want false for trailing installed_version", got["converged"])
+	}
+	pv, _ := got["placement_version"].(float64)
+	niv, _ := got["node_installed_version"].(float64)
+	if uint64(pv) <= uint64(niv) {
+		t.Fatalf("placement_version (%v) must exceed node_installed_version (%v) for this test to be meaningful",
+			pv, niv)
+	}
+	owner, _ := got["owner"].(map[string]any)
+	if owner == nil || owner["is_self"] != false || owner["node_id"] != "node-b" {
+		t.Fatalf("owner = %+v, want is_self=false node_id=node-b", owner)
+	}
+}
+
+// TestClusterPlacementReturnsOrphanedFlag pins that the orphaned branch keeps
+// the same enriched envelope rather than the old ad-hoc {orphaned:true,...}
+// shape — operator scripts can always read `converged` / `exposed_ports` /
+// `placement_version` without special-casing orphaned vs live placements.
+func TestClusterPlacementReturnsOrphanedFlag(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fake := &placementOfStubCluster{
+		Noop:     cluster.NewNoop("node-a", "http://node-a"),
+		ownerErr: cluster.ErrOrphaned,
+		placement: cluster.Placement{
+			SandboxID:   "sb-orphan",
+			OwnerNodeID: "",
+			Version:     7,
+		},
+		hasPlace: true,
+	}
+	svc.AttachCluster(fake)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/placements/sb-orphan", nil)
+	req.SetPathValue("id", "sb-orphan")
+	rr := httptest.NewRecorder()
+	h.clusterPlacement(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	got := decodePlacementResponse(t, rr.Body.Bytes())
+	if got["orphaned"] != true {
+		t.Fatalf("orphaned = %v, want true", got["orphaned"])
+	}
+	owner, _ := got["owner"].(map[string]any)
+	if owner == nil || owner["node_id"] != "" || owner["is_self"] != false {
+		t.Fatalf("owner = %+v, want empty node_id for orphan", owner)
+	}
 }
 
 // TestClusterForwardWrapReturns410OnOrphanedPlacement pins the convergence-window

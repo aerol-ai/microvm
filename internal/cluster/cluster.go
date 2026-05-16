@@ -308,6 +308,13 @@ type Client interface {
 	// to reconcile owner-aware public ingress routes.
 	Placements() []Placement
 
+	// PlacementOf returns the full Placement record for sandboxID and true,
+	// or a zero Placement and false if no record exists. Operator/debug
+	// endpoints use this for convergence-status reads where the per-aspect
+	// getters (OwnerOf/ExposedPortsOf) would lose the placement.Version
+	// needed to compute "is this sandbox's route installed yet on this node".
+	PlacementOf(sandboxID string) (Placement, bool)
+
 	// PlacementVersion is the FSM's monotonic apply counter — bumps on every
 	// raft log entry the FSM applied. Exposed for metrics/observability and
 	// as a tie-breaker for tests; the ingress reconciler now uses

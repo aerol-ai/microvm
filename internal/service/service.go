@@ -40,6 +40,17 @@ import (
 // near-full, so this keeps p95 low without spinning forever in tight pools.
 const allocatorRandomAttempts = 16
 
+// ErrPreferredHostPortUnavailable is returned by exposePort when a TCP replay
+// supplied a specific preferredHostPort that's already reserved (cluster-wide
+// or on this node) and so cannot be re-bound. The allocator deliberately does
+// NOT silently fall through to a fresh random port: cluster-stable TCP
+// endpoints are the entire point of B6 — clients addressing host:40123 must
+// not be invisibly rerouted to host:55555 after a failover-recreate. Park is
+// the policy; the FSM record (with the original HostPort) stays intact and
+// the watcher / operator surfaces the parked state instead of mutating the
+// contract behind the client's back.
+var ErrPreferredHostPortUnavailable = errors.New("preferred host port unavailable on this node; exposure parked")
+
 const clusterIngressReconcileInterval = 5 * time.Second
 
 type Service struct {
@@ -1293,7 +1304,11 @@ func (s *Service) allocateHostPort(ctx context.Context, sandboxID string, contai
 		if done {
 			return hp, url, r, nil
 		}
-		return 0, "", false, fmt.Errorf("preferred host port %d is already reserved in the cluster or in use on this node", preferredHostPort)
+		// Park, don't reallocate. Falling through to the random-then-linear
+		// pool walk would mint a new public endpoint and silently break every
+		// client that had memorized the original host:port. See
+		// ErrPreferredHostPortUnavailable for the policy rationale.
+		return 0, "", false, fmt.Errorf("%w: %d", ErrPreferredHostPortUnavailable, preferredHostPort)
 	}
 
 	for i := 0; i < allocatorRandomAttempts; i++ {

@@ -313,9 +313,67 @@ This branch implements the cluster-stable path:
   and allocs (~2ms on M1, 13 allocs). The O(N×P) scan is fine for
   10K; the bench is the early-warning if a future port-allocator
   change pushes it super-linear.
-- decide whether failed preferred-host-port replay should park the exposure or
-  allocate a replacement endpoint;
-- expose clear status when the TCP ingress route has not converged.
+- ~~decide whether failed preferred-host-port replay should park the exposure or
+  allocate a replacement endpoint~~ — **Resolved (park).** Falling through to
+  the random/linear pool walk would silently swap the published `host:port`
+  out from under any client that memorized it — and the entire point of B6 is
+  cluster-stable TCP endpoints. The allocator now returns
+  `ErrPreferredHostPortUnavailable` (`internal/service/service.go`) when the
+  preferred port is reserved cluster-wide or in use locally; the FSM record
+  stays intact so the next reconcile pass (or an explicit operator action)
+  can re-bind the same endpoint once the conflict clears.
+  - Regression coverage:
+    `TestAllocateHostPortPreferredUnavailableParksInsteadOfReallocating`
+    (`internal/service/cluster_exposure_test.go`) pins the no-reallocate
+    contract — a wide port pool guarantees a regression that fell through
+    to the random allocator would bind some *other* port, which the test
+    asserts against. It also pins that the cluster reserver is queried
+    exactly once for the preferred candidate (no fallback retry storm).
+  - Documented in `setup/cluster.md` "Preferred host-port replay during
+    failover-recreate" so operators have an explicit remediation path
+    (drain the conflict, or re-create on a different node) rather than
+    inferring policy from the log line.
+  - Failover-recreate itself remains product-policy gated off
+    (`clusterRecreateOnFailoverEnabled = false` in
+    `internal/cluster/dead_owner.go`); this decision pins the contract for
+    when/if a future `Lifecycle.RecreateOnFailover` opt-in flips the gate.
+- ~~expose clear status when the TCP ingress route has not converged~~ —
+  **Resolved.** `GET /v1/cluster/placements/{id}` now returns the
+  per-sandbox convergence view fused from three FSM reads plus this node's
+  ingress reconciler progress:
+
+  ```json
+  {
+    "owner": {"node_id": "node-b", "api_url": "...", "is_self": false},
+    "orphaned": false,
+    "exposed_ports": {"5432": {"protocol":"tcp","host_port":40123,"public_url":"tcp://..."}},
+    "placement_version": 42,
+    "node_installed_version": 41,
+    "converged": false
+  }
+  ```
+
+  - `converged` is the headline signal: `true` when the owner is self
+    (exposePort installs Caddy synchronously) OR the reconciler has installed
+    routes for an FSM version ≥ this placement's Version. `false` means
+    client traffic via this node may hit `connection refused` (raw TCP) or
+    the 503-with-Retry-After in-flux response (HTTP/TLS) until the next
+    reconcile tick lands.
+  - Backed by a new `cluster.Client.PlacementOf(id) (Placement, bool)`
+    getter (deep-cloned via `f.get` so the caller can't alias live FSM
+    state) and `service.IngressInstalledVersion()` (reads the existing
+    `aerolvm_ingress_placement_version_max` expvar without exposing the
+    name across package boundaries).
+  - Regression coverage in `pkg/api/v1/cluster_handler_test.go`:
+    `TestClusterPlacementConvergedWhenOwnerIsSelf` (owner-self short-
+    circuit), `TestClusterPlacementNotConvergedWhenInstalledVersionTrailsPlacement`
+    (stale reconciler ⇒ converged=false), `TestClusterPlacementReturnsOrphanedFlag`
+    (orphaned branch still uses the enriched envelope rather than the old
+    ad-hoc shape so operator scripts don't special-case it).
+  - Documented in `setup/cluster.md` "Per-sandbox convergence status" with
+    the read/interpret/remediate flow; node-wide convergence still goes
+    through the `aerolvm_ingress_route_lag_versions` /
+    `aerolvm_ingress_route_misses_total` expvars on `/debug/vars`.
 
 ## B7. UDP is not supported
 

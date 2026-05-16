@@ -70,6 +70,10 @@ func (n *Noop) Members() []Member {
 
 func (n *Noop) Placements() []Placement { return nil }
 
+// PlacementOf has no record in single-node mode — there's no FSM. Returns
+// the zero Placement and false so callers fall back to the local sandbox row.
+func (n *Noop) PlacementOf(sandboxID string) (Placement, bool) { return Placement{}, false }
+
 // PlacementVersion always returns 0 in single-node mode — there's no FSM and
 // no need to wake an ingress reconciler that isn't running.
 func (n *Noop) PlacementVersion() uint64 { return 0 }

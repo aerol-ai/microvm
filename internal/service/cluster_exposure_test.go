@@ -158,6 +158,76 @@ func TestAllocateHostPortHonorsClusterReservationBeforeLocalStore(t *testing.T) 
 	}
 }
 
+// TestAllocateHostPortPreferredUnavailableParksInsteadOfReallocating pins B6's
+// park-don't-reallocate policy. When a TCP failover replay supplies a specific
+// preferredHostPort that's already reserved cluster-wide, the allocator MUST
+// surface ErrPreferredHostPortUnavailable and MUST NOT silently fall through
+// to a fresh random port — that would invisibly mutate the public endpoint
+// (host:port is the entire B6 contract) and break every client that memorized
+// it.
+func TestAllocateHostPortPreferredUnavailableParksInsteadOfReallocating(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	// Wide pool so a "fall through to random" regression would visibly bind
+	// some *other* port; with a one-port pool the test couldn't distinguish
+	// "parked" from "exhausted".
+	svc.cfg.L4PortRangeStart = 30000
+	svc.cfg.L4PortRangeEnd = 30999
+	const preferred = 30500
+	reserver := &hostPortReserveCluster{
+		Noop:     cluster.NewNoop("self", "http://self"),
+		reserved: map[int]bool{preferred: true},
+	}
+	svc.AttachCluster(reserver)
+
+	now := time.Now().UTC()
+	const sandboxID = "sb-park-not-reallocate"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:          sandboxID,
+		Image:       "postgres:16",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-park-not-reallocate",
+		ContainerIP: "10.0.0.23",
+		CPU:         1,
+		MemoryMB:    512,
+		Runtime:     models.RuntimeDocker,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	hp, _, _, err := svc.allocateHostPort(ctx, sandboxID, 5432, now, preferred)
+	if err == nil {
+		t.Fatalf("allocateHostPort returned host_port=%d with no error; replay reallocated instead of parking", hp)
+	}
+	if !errors.Is(err, ErrPreferredHostPortUnavailable) {
+		t.Fatalf("error = %v, want ErrPreferredHostPortUnavailable so callers can surface the parked state", err)
+	}
+	if hp != 0 {
+		t.Fatalf("host_port = %d, want 0 (parked, no rebind)", hp)
+	}
+	// The store must NOT carry a fresh reservation for sandboxID:5432; a
+	// regression that fell through to the random/linear allocator would have
+	// inserted some other host port here.
+	got, err := st.Get(ctx, sandboxID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if exposure := findExposure(got, 5432); exposure != nil {
+		t.Fatalf("local store reserved host_port=%d behind a park; allocator must not reallocate", exposure.HostPort)
+	}
+	if reserver.added[len(reserver.added)-1] != preferred {
+		t.Fatalf("allocator asked cluster for host_port=%d as its LAST attempt, want %d; a non-park path retried other ports",
+			reserver.added[len(reserver.added)-1], preferred)
+	}
+	if len(reserver.added) > 1 {
+		t.Fatalf("allocator asked cluster for %d candidates after a preferred-port reject; park policy must try exactly once: %v",
+			len(reserver.added), reserver.added)
+	}
+}
+
 func TestDataPlaneHostForPlacementPrefersDedicatedHost(t *testing.T) {
 	p := cluster.Placement{
 		OwnerAPIURL:        "http://shared-api-lb.internal:21212",

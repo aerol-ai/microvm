@@ -128,6 +128,21 @@ func RecordRouteMiss() {
 	ingressRouteMissesTotal.Add(1)
 }
 
+// IngressInstalledVersion returns the highest placement.Version this node's
+// ingress reconciler has finished installing routes for. The /v1/cluster/
+// placements/{id} convergence-status read compares this against the per-
+// placement Version to answer "has this node bound the cluster-stable TCP
+// route yet?" without reaching into Caddy state. Zero means the reconciler
+// has not yet run a successful pass (fresh boot) — treat as "not converged"
+// for any non-zero placement.Version.
+func IngressInstalledVersion() uint64 {
+	v := ingressPlacementVersionMax.Value()
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
+}
+
 // SetIngressRouteLag is the post-tick hook the reconciler calls with the
 // FSM's current PlacementVersion. Lag is computed as
 // max(0, fsmVersion - ingressPlacementVersionMax). Computed here (not at

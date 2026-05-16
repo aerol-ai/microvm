@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -416,31 +417,94 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// clusterPlacement returns the placement record for one sandbox.
+// placementOwner is the snake_case JSON view of cluster.OwnerInfo. We don't
+// rely on OwnerInfo's default marshaling here because its struct fields have
+// no json tags (PascalCase keys leak), and unifying the response shape lets
+// operators script against a single contract.
+type placementOwner struct {
+	NodeID      string `json:"node_id"`
+	APIURL      string `json:"api_url"`
+	InternalURL string `json:"internal_url,omitempty"`
+	IsSelf      bool   `json:"is_self"`
+}
+
+// placementResponse is the enriched /v1/cluster/placements/{id} payload. It
+// fuses three FSM reads (owner, exposed routes, placement.Version) with this
+// node's ingress reconciler progress so operators can answer "where should
+// this sandbox's traffic go, and is the local node ready to serve it?" in
+// one request. Converged is the headline signal: false means a TCP client
+// dialing the cluster-stable host port via this node may hit "connection
+// refused" until the next reconcile tick lands.
+type placementResponse struct {
+	Owner                placementOwner                   `json:"owner"`
+	Orphaned             bool                             `json:"orphaned"`
+	ExposedPorts         map[string]cluster.ExposedPortRoute `json:"exposed_ports,omitempty"`
+	PlacementVersion     uint64                           `json:"placement_version"`
+	NodeInstalledVersion uint64                           `json:"node_installed_version"`
+	Converged            bool                             `json:"converged"`
+}
+
+// clusterPlacement returns the placement record for one sandbox plus this
+// node's per-sandbox convergence status (B6: operators need to spot TCP
+// ingress that hasn't propagated to a given node without grepping logs).
+// Owner-side requests are trivially converged: exposePort installs the local
+// Caddy route synchronously. Non-owner ingress nodes compare the per-
+// placement Version against the reconciler's installed-version high-water
+// mark — a stale lag flags "client traffic via this node may miss the route".
 func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
 		apihttp.WriteError(w, http.StatusNotFound, "cluster not enabled")
 		return
 	}
-	owner, err := c.OwnerOf(r.PathValue("id"))
-	if err != nil {
-		if errors.Is(err, cluster.ErrUnknownSandbox) {
+	id := r.PathValue("id")
+	owner, ownerErr := c.OwnerOf(id)
+	if ownerErr != nil && !errors.Is(ownerErr, cluster.ErrOrphaned) {
+		if errors.Is(ownerErr, cluster.ErrUnknownSandbox) {
 			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 			return
 		}
-		if errors.Is(err, cluster.ErrOrphaned) {
-			apihttp.WriteJSON(w, http.StatusOK, map[string]any{
-				"orphaned": true,
-				"node_id":  "",
-				"api_url":  "",
-			})
-			return
-		}
-		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		apihttp.WriteError(w, http.StatusInternalServerError, ownerErr.Error())
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusOK, owner)
+
+	resp := placementResponse{
+		NodeInstalledVersion: service.IngressInstalledVersion(),
+	}
+	if errors.Is(ownerErr, cluster.ErrOrphaned) {
+		resp.Orphaned = true
+	} else {
+		resp.Owner = placementOwner{
+			NodeID:      owner.NodeID,
+			APIURL:      owner.APIURL,
+			InternalURL: owner.InternalURL,
+			IsSelf:      owner.IsSelf,
+		}
+	}
+
+	// PlacementOf returns the full record including per-placement Version and
+	// the replicated port routes. Use string keys for the map so operators
+	// reading JSON via jq don't trip over numeric-key quirks in some clients.
+	if placement, ok := c.PlacementOf(id); ok {
+		resp.PlacementVersion = placement.Version
+		if len(placement.ExposedPortRoutes) > 0 {
+			resp.ExposedPorts = make(map[string]cluster.ExposedPortRoute, len(placement.ExposedPortRoutes))
+			for port, route := range placement.ExposedPortRoutes {
+				resp.ExposedPorts[strconv.Itoa(port)] = route
+			}
+		}
+	}
+
+	// Convergence semantics: owner-self is always converged (exposePort
+	// installs Caddy synchronously on the owner path). For non-owner nodes,
+	// we're converged once the reconciler has installed routes for an FSM
+	// version >= this placement's Version. A zero PlacementVersion (no FSM
+	// record, e.g. mid-eviction or pre-cluster sandbox) collapses to "owner
+	// drives the answer" — there's nothing pending to install.
+	resp.Converged = resp.Owner.IsSelf || resp.PlacementVersion == 0 ||
+		resp.NodeInstalledVersion >= resp.PlacementVersion
+
+	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
 // replicateSpecPatch is the write-through used by mutating handlers (resize,

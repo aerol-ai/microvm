@@ -951,6 +951,59 @@ the local ingress reconciler via a cap=1 buffered channel
 under steady-state gossip and is bounded by the 5s reconcile-on-tick safety
 net.
 
+#### Per-sandbox convergence status
+
+For pinpoint debugging of "is this sandbox's route installed on this node yet",
+query `GET /v1/cluster/placements/<sandbox-id>` from the node in question:
+
+```json
+{
+  "owner": {"node_id": "node-b", "api_url": "http://node-b:21212", "is_self": false},
+  "orphaned": false,
+  "exposed_ports": {
+    "5432": {"protocol": "tcp", "host_port": 40123, "public_url": "tcp://lb.example.com:40123"}
+  },
+  "placement_version": 42,
+  "node_installed_version": 41,
+  "converged": false
+}
+```
+
+- `converged: true` — owner is this node (synchronous install) OR the
+  reconciler has applied routes for an FSM version ≥ `placement_version`.
+  Client traffic via this node will hit the route.
+- `converged: false` — the reconciler is still catching up; raw TCP dials may
+  see connection refused and HTTP/TLS sees the 503-with-Retry-After in-flux
+  response above. Recheck after the next 5s reconcile tick. If
+  `node_installed_version` does not catch up after multiple ticks, scrape
+  `/debug/vars` for `aerolvm_ingress_reconcile_errors_total` to find the
+  Caddy-side failure.
+
+For node-wide convergence (rather than per-sandbox), the gauges
+`aerolvm_ingress_route_lag_versions` and `aerolvm_ingress_route_misses_total`
+on each node's `/debug/vars` are the operator signals.
+
+#### Preferred host-port replay during failover-recreate
+
+When a placement re-lands on a new owner via the failover-recreate path (gated
+off by default — sandboxes are not HA under current product policy), the FSM
+carries the original TCP `host_port` so the new owner can re-bind it and
+preserve the public endpoint. If that host port is already reserved on the
+new owner (taken by an unrelated TCP exposure, or in use locally), the
+replay **parks** the exposure rather than silently allocating a different
+host port:
+
+- The FSM record (with the original `host_port`) stays intact.
+- The local re-bind fails with `ErrPreferredHostPortUnavailable`; the
+  per-sandbox convergence status above reports `converged: false`.
+- The allocator does **not** fall through to the random/linear pool walk —
+  silently switching `host:40123` → `host:55555` would break every client
+  that memorized the original endpoint, which is the whole point of the
+  cluster-stable TCP route map.
+
+Operator remediation: drain the conflicting exposure on the new owner, or
+restart the placement on a different node via an explicit re-create.
+
 ---
 
 ## Operating the cluster

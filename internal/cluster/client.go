@@ -698,6 +698,16 @@ func (c *Cluster) Placements() []Placement {
 	return out
 }
 
+// PlacementOf returns the FSM record for sandboxID. Goes through f.get so the
+// returned Placement is deep-cloned and safe to mutate without aliasing live
+// FSM state (same guarantee as Placements).
+func (c *Cluster) PlacementOf(sandboxID string) (Placement, bool) {
+	if c.fsm == nil {
+		return Placement{}, false
+	}
+	return c.fsm.get(sandboxID)
+}
+
 // PlacementVersion returns the FSM's monotonic apply counter — bumps on
 // every committed raft log entry. Exposed for metrics and as a tie-breaker
 // for tests; the ingress reconciler uses SubscribePlacement to wake on
