@@ -2426,6 +2426,14 @@ func generateToolboxToken() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+// GenerateSandboxID is the exported entry point for the cluster handler's
+// reservation-first create path: the router (Node A) needs to mint a sandbox
+// ID before opReserve so the chosen target (Node T) can accept the forward
+// with X-Cluster-Create-ID and run CreateSandboxWithID against the same
+// reservation. Routes through the package-private generateSandboxID so the
+// format stays in lockstep with the local create path.
+func GenerateSandboxID() (string, error) { return generateSandboxID() }
+
 // generateSandboxID returns a 16-hex-char sandbox identifier. It is used as
 // both the daemon's primary key for the sandbox and the Docker container's
 // name, so it must satisfy Docker's name restrictions ([a-zA-Z0-9_.-]).

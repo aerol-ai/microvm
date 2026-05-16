@@ -233,6 +233,58 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 	c.logger.Info("cluster: evicted dead node from raft config", "dead_node", nodeID)
 }
 
+// startReservationGCLoop spawns the periodic sweep that cancels expired
+// opReserve rows. Leader-gated for the same reason as the dead-owner loop:
+// CancelReservation routes through raft anyway, and ticking on every node
+// would just multiply leader-forwarded no-ops. 5s tick matches the dead-
+// owner loop; with the 120s reservation TTL the worst-case orphan window is
+// ~125s.
+func (c *Cluster) startReservationGCLoop() {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.reservationGCStop = cancel
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				c.reconcileReservations(ctx)
+			}
+		}
+	}()
+}
+
+// reconcileReservations cancels any reservation whose expiry has passed.
+// Cancel is best-effort + idempotent: a reservation that was promoted to
+// Placed between snapshot and Apply is left alone (opCancelReserve is a no-op
+// on placed rows), and a reservation already cancelled by the router's
+// rollback path is also a no-op. So a partial sweep on leader-flap re-runs
+// safely on the next tick.
+func (c *Cluster) reconcileReservations(ctx context.Context) {
+	if c.raft == nil || c.raft.raft.State() != raft.Leader {
+		return
+	}
+	now := time.Now().Unix()
+	snapshot := c.fsm.snapshot()
+	for id, p := range snapshot {
+		if p.State != PlacementStateReserved {
+			continue
+		}
+		if p.ExpiresUnix == 0 || now <= p.ExpiresUnix {
+			continue
+		}
+		if err := c.CancelReservation(ctx, id); err != nil {
+			c.logger.Warn("cluster: cancel expired reservation failed; will retry next tick",
+				"sandbox_id", id, "owner", p.OwnerNodeID, "err", err)
+			continue
+		}
+		c.logger.Info("cluster: cancelled expired reservation",
+			"sandbox_id", id, "owner", p.OwnerNodeID)
+	}
+}
+
 // pickRecreationTarget runs placement scoring against the replicated spec to
 // pick a live node for the recreated sandbox. Returns empty strings if spec is
 // nil (caller treats that as the orphan path) or if SelectPlacement errors out.

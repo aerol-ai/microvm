@@ -18,7 +18,19 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-const clusterCreateTargetHeader = "X-Cluster-Create-Target"
+const (
+	clusterCreateTargetHeader = "X-Cluster-Create-Target"
+	// clusterCreateIDHeader carries the sandbox ID minted by the router (Node A)
+	// before opReserve, so the receiving target (Node T) runs CreateSandboxWithID
+	// against the reserved row. Without this, T would mint its own ID and the
+	// reservation->placed transition would never match up.
+	clusterCreateIDHeader = "X-Cluster-Create-ID"
+
+	// clusterReservationTTL bounds how long a reservation can hold capacity
+	// before the leader's GC sweep cancels it. 120s covers slow GPU image
+	// pulls; the 5s GC tick makes the worst-case orphan window ~125s.
+	clusterReservationTTL = 120 * time.Second
+)
 
 // clusterForwardWrap returns a middleware that, for any request carrying a
 // {id} path value, looks up the placement and forwards to the owner if the
@@ -81,12 +93,22 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 	})
 }
 
-// clusterCreateWrap is the handler for POST /v1/sandboxes. It runs placement
-// before invoking the local createSandbox: if a peer wins, the request is
-// forwarded; if self wins, we run locally and then commit the placement
-// pointer to raft. On commit failure we attempt to roll back the local
-// create — better an aborted create than a sandbox the cluster doesn't know
-// about.
+// clusterCreateWrap is the handler for POST /v1/sandboxes. It implements the
+// reservation-first flow that resolves B1+B2:
+//
+//  1. parse body
+//  2. if forwarded (X-Cluster-Create-Target == self): run locally against the
+//     reservation the router already wrote. The forwarded path never re-runs
+//     SelectPlacement (B1 fix preserved).
+//  3. otherwise: SelectPlacement → if a peer wins, mint a sandbox ID, seal +
+//     redact secrets, write opReserve to raft (so the cluster has *intent*
+//     before any side effect — B2 fix), then forward. If self wins, fall
+//     through to the existing single-commit flow with no reservation.
+//
+// On forward we don't roll back the reservation when ForwardHTTP can't reach
+// the peer: ForwardHTTP doesn't return a transport error (it streams the proxy
+// response straight to w), and the leader's reservation-GC sweep reclaims the
+// row 120s later. This is the documented orphan window in plans/release-blockers.
 func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// Parse the body up front so an invalid JSON request fails fast with 400
 	// without consuming a placement slot — and so the test that passes a nil
@@ -125,7 +147,18 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return
 		}
-		h.createSandboxOnSelectedNode(w, r, req)
+		// Reservation-first: a forwarded create MUST carry the ID the router
+		// minted before opReserve, so CreateSandboxWithID + RecordPlacement
+		// promote run against the same row. A missing header means the request
+		// came from a stale router that pre-dates the reservation flow — fail
+		// fast rather than minting a fresh ID and silently de-syncing the FSM
+		// from the local sandbox.
+		sandboxID := strings.TrimSpace(r.Header.Get(clusterCreateIDHeader))
+		if sandboxID == "" {
+			apihttp.WriteError(w, http.StatusBadRequest, "cluster: forwarded create missing X-Cluster-Create-ID")
+			return
+		}
+		h.createSandboxOnSelectedNode(w, r, req, sandboxID)
 		return
 	}
 
@@ -134,79 +167,164 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return
 	}
-	if !target.IsSelf {
-		r.Header.Set(clusterCreateTargetHeader, target.NodeID)
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	if target.IsSelf {
+		// Self wins: no reservation needed. There's no network hop where
+		// intermediate state could be lost, so the existing single-commit
+		// flow (CreateSandbox → RecordPlacement) stays correct and avoids
+		// an extra raft round-trip on the local-create critical path.
+		h.createSandboxOnSelectedNode(w, r, req, "")
 		return
 	}
 
-	h.createSandboxOnSelectedNode(w, r, req)
+	// Cross-node create: write the reservation BEFORE forwarding so the
+	// cluster has intent the instant Node A loses ownership of the request.
+	// This fixes B2 (intent-before-side-effect) and prevents the multi-node
+	// admission race where two routers both pass T's local admitter before
+	// either's placement is replicated.
+	sandboxID, err := service.GenerateSandboxID()
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
+		return
+	}
+	sealed, err := h.deps.Service.SealClusterSecrets(req)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: seal secrets: "+err.Error())
+		return
+	}
+	redacted := service.RedactClusterSecrets(req)
+	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, sealed, clusterReservationTTL); err != nil {
+		// Name collision: deterministic 409 so clients can distinguish
+		// "pick a different name" from "cluster degraded, retry."
+		if errors.Is(err, cluster.ErrNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+			return
+		}
+		// Reservation conflict (existing placed or live reservation under
+		// the same ID owned by someone else) — extremely unlikely with a
+		// freshly-minted ID, but surface it cleanly so the client retries.
+		if errors.Is(err, cluster.ErrReservationConflict) {
+			apihttp.WriteError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
+			return
+		}
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
+		return
+	}
+
+	r.Header.Set(clusterCreateTargetHeader, target.NodeID)
+	r.Header.Set(clusterCreateIDHeader, sandboxID)
+	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 }
 
 // createSandboxOnSelectedNode performs the local side effect once placement has
-// already selected this node. Cross-node forwarded creates enter here through
-// X-Cluster-Create-Target instead of re-running placement on the target.
-func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest) {
+// already selected this node. Two entry points:
+//
+//   - reservationID == "": self won SelectPlacement on this node. No
+//     reservation was written; run the existing single-commit flow
+//     (CreateSandbox → seal/redact → RecordPlacement).
+//   - reservationID != "": cross-node forward. The router already wrote the
+//     reservation with our redacted spec + sealed secrets. Use
+//     CreateSandboxWithID against the reserved ID, then RecordPlacement with
+//     nil spec/sealed — opPlace inherits them from the reservation and
+//     transitions State=Reserved → Placed atomically.
+func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
 		h.createSandbox(w, r)
 		return
 	}
 
-	resp, err := h.deps.Service.CreateSandbox(r.Context(), req)
+	var (
+		resp *models.CreateSandboxResponse
+		err  error
+	)
+	if reservationID != "" {
+		resp, err = h.deps.Service.CreateSandboxWithID(r.Context(), req, reservationID)
+	} else {
+		resp, err = h.deps.Service.CreateSandbox(r.Context(), req)
+	}
 	if err != nil {
+		// Local create failed — release the reservation so the leader's GC
+		// doesn't have to wait 120s to free the headroom. Best-effort: if
+		// CancelReservation also fails, the GC will catch it.
+		if reservationID != "" {
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if cErr := c.CancelReservation(rbCtx, reservationID); cErr != nil {
+				h.deps.Logger.Warn("cluster: cancel reservation after local create failed",
+					"sandbox_id", reservationID, "err", cErr)
+			}
+			rbCancel()
+		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
-	// Raft commit on the response path. This is the only new latency on
-	// CreateSandbox — pr-review.md invariant 2 (CreateSandbox latency) is
-	// honored because the commit happens AFTER the local create returns,
-	// not before, so admission and create latency are unchanged. Single-node
-	// mode skips this branch entirely (cluster is Noop, RecordPlacement is a
-	// no-op).
+	// Raft commit on the response path. CreateSandbox latency is unchanged
+	// (the reserve commit happened on the router, before the body was
+	// forwarded — and is called out in the PR description per pr-review.md
+	// invariant 2). Single-node mode skips this branch entirely (cluster is
+	// Noop, RecordPlacement is a no-op).
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	// Replicate the original spec alongside the placement pointer so a future
-	// owner can recreate this sandbox if the current owner dies. Secrets
-	// (registry password, mount creds) are sealed into a separate encrypted
-	// bag and the spec is redacted before going on the wire — the raft log
-	// must NOT carry plaintext credentials.
-	sealed, err := h.deps.Service.SealClusterSecrets(req)
-	if err != nil {
-		h.deps.Logger.Error("cluster: seal secrets failed; rolling back create",
-			"sandbox_id", resp.Sandbox.ID, "err", err)
-		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
-			h.deps.Logger.Error("cluster: rollback destroy failed",
-				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
+
+	var promoteErr error
+	if reservationID != "" {
+		// Promote: opPlace inherits the redacted spec + sealed secrets from
+		// the reservation written by the router. Passing nil avoids re-
+		// shipping them on the wire and guarantees the FSM never sees a
+		// Placed row whose spec drifted from the reserved one.
+		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, nil, nil)
+	} else {
+		// Self-wins: no reservation existed. Replicate the original spec
+		// alongside the placement pointer so a future owner can recreate
+		// this sandbox if the current owner dies. The raft log must NOT
+		// carry plaintext credentials, so we seal + redact here.
+		sealed, sealErr := h.deps.Service.SealClusterSecrets(req)
+		if sealErr != nil {
+			h.deps.Logger.Error("cluster: seal secrets failed; rolling back create",
+				"sandbox_id", resp.Sandbox.ID, "err", sealErr)
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
+				h.deps.Logger.Error("cluster: rollback destroy failed",
+					"sandbox_id", resp.Sandbox.ID, "err", rbErr)
+			}
+			rbCancel()
+			apihttp.WriteError(w, http.StatusInternalServerError, "cluster: seal secrets: "+sealErr.Error())
+			return
 		}
-		rbCancel()
-		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: seal secrets: "+err.Error())
-		return
+		redacted := service.RedactClusterSecrets(req)
+		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, sealed)
 	}
-	redacted := service.RedactClusterSecrets(req)
-	if err := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, sealed); err != nil {
+
+	if promoteErr != nil {
 		h.deps.Logger.Error("cluster: RecordPlacement failed; rolling back create",
-			"sandbox_id", resp.Sandbox.ID, "err", err)
-		// Use a fresh context — the request context may already be cancelled
-		// by the time we get here, but we still want the rollback to run.
+			"sandbox_id", resp.Sandbox.ID, "err", promoteErr)
+		// Fresh context — the request context may already be cancelled by
+		// the time we get here, but we still want the rollback to run.
 		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
 			h.deps.Logger.Error("cluster: rollback destroy failed",
 				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
 		}
+		// Also cancel the reservation so it doesn't linger until TTL — only
+		// if we had one (self-wins path has no reservation to cancel, and
+		// CancelReservation on a missing row is a no-op anyway).
+		if reservationID != "" {
+			if cErr := c.CancelReservation(rbCtx, reservationID); cErr != nil {
+				h.deps.Logger.Warn("cluster: cancel reservation after promote failed",
+					"sandbox_id", reservationID, "err", cErr)
+			}
+		}
 		rbCancel()
-		// Cluster-wide name conflict surfaces as 409 so clients can
-		// distinguish "pick a different name" from "cluster degraded, retry"
-		// (503). Without this mapping, two concurrent same-name creates
-		// landing on different owners both look like transient placement
-		// failures and clients would back off pointlessly.
-		if errors.Is(err, cluster.ErrNameConflict) {
+		// Cluster-wide name conflict surfaces as 409. With reservation-first
+		// this should only fire on the self-wins path (the reserve step
+		// already validated name uniqueness for the forward path).
+		if errors.Is(promoteErr, cluster.ErrNameConflict) {
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return
 		}
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: placement commit failed: "+err.Error())
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: placement commit failed: "+promoteErr.Error())
 		return
 	}
 

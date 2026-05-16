@@ -24,10 +24,10 @@ func TestNodeFitsRespectsBudget(t *testing.T) {
 			ReservedMemoryMB:  7800,
 		},
 	}
-	if nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024}) {
+	if nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{}) {
 		t.Fatal("tight node should not fit a 1-core/1G request")
 	}
-	if !nodeFits(tight, capacity.Request{CPU: 0.1, MemoryMB: 100}) {
+	if !nodeFits(tight, capacity.Request{CPU: 0.1, MemoryMB: 100}, capacity.Request{}) {
 		t.Fatal("tight node should still fit a small request that fits in remaining budget")
 	}
 }
@@ -37,7 +37,7 @@ func TestNodeFitsRespectsBudget(t *testing.T) {
 // remote admitter than to skip a viable node).
 func TestNodeFitsUnknownCapacity(t *testing.T) {
 	unknown := Member{NodeID: "u", APIURL: "http://u", Alive: true}
-	if !nodeFits(unknown, capacity.Request{CPU: 1, MemoryMB: 1024}) {
+	if !nodeFits(unknown, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{}) {
 		t.Fatal("unknown-capacity node should be treated as candidate")
 	}
 }
@@ -56,7 +56,7 @@ func TestHeadroomScorePrefersEmptier(t *testing.T) {
 		ReservedCPU: 0.5, ReservedMemoryMB: 1000,
 	}}
 	req := capacity.Request{CPU: 0.5, MemoryMB: 500}
-	if headroomScore(full, req) >= headroomScore(empty, req) {
+	if headroomScore(full, req, capacity.Request{}) >= headroomScore(empty, req, capacity.Request{}) {
 		t.Fatal("emptier node should score higher")
 	}
 }
@@ -91,10 +91,10 @@ func TestNodeFitsRejectsDiskOverflow(t *testing.T) {
 			ReservedCPU: 1, ReservedMemoryMB: 1024, ReservedDiskGB: 95,
 		},
 	}
-	if nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 10}) {
+	if nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 10}, capacity.Request{}) {
 		t.Fatal("tight-disk node should not fit a 10 GB ask with only 5 GB free")
 	}
-	if !nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 5}) {
+	if !nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 5}, capacity.Request{}) {
 		t.Fatal("tight-disk node should still fit an exactly-sized ask")
 	}
 }
@@ -106,7 +106,7 @@ func TestNodeFitsRejectsGPULessHost(t *testing.T) {
 	gpuLess := Member{NodeID: "g0", APIURL: "http://g", Alive: true, Capacity: capacity.Snapshot{
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,
 	}}
-	if nodeFits(gpuLess, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"}) {
+	if nodeFits(gpuLess, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"}, capacity.Request{}) {
 		t.Fatal("GPU sandbox should be rejected from GPU-less host")
 	}
 }
@@ -117,10 +117,10 @@ func TestNodeFitsRejectsGPUVendorMismatch(t *testing.T) {
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,
 		GPUCount: 4, GPUVendor: "amd",
 	}}
-	if nodeFits(amd, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"}) {
+	if nodeFits(amd, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"}, capacity.Request{}) {
 		t.Fatal("NVIDIA request must not fit on AMD host")
 	}
-	if !nodeFits(amd, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "amd"}) {
+	if !nodeFits(amd, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "amd"}, capacity.Request{}) {
 		t.Fatal("matching vendor must fit")
 	}
 }
@@ -133,10 +133,10 @@ func TestNodeFitsRejectsUnsupportedRuntime(t *testing.T) {
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,
 		SupportedRuntimes: []string{"docker"},
 	}}
-	if nodeFits(dockerOnly, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"}) {
+	if nodeFits(dockerOnly, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"}, capacity.Request{}) {
 		t.Fatal("gvisor request must not fit on docker-only host")
 	}
-	if !nodeFits(dockerOnly, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "docker"}) {
+	if !nodeFits(dockerOnly, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "docker"}, capacity.Request{}) {
 		t.Fatal("docker request must fit on docker-only host")
 	}
 }
@@ -151,7 +151,7 @@ func TestNodeFitsLegacyEmptyRuntimesAllowsAny(t *testing.T) {
 		CPUBudget: 8, MemoryBudgetMB: 8000,
 		// SupportedRuntimes intentionally empty
 	}}
-	if !nodeFits(legacy, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"}) {
+	if !nodeFits(legacy, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"}, capacity.Request{}) {
 		t.Fatal("legacy (empty SupportedRuntimes) peer must accept any runtime")
 	}
 }
@@ -171,7 +171,7 @@ func TestHeadroomScoreIncludesDiskWhenReported(t *testing.T) {
 		ReservedCPU: 1, ReservedMemoryMB: 1024, ReservedDiskGB: 5,
 	}}
 	req := capacity.Request{CPU: 1, MemoryMB: 100, DiskGB: 5}
-	if headroomScore(full, req) >= headroomScore(empty, req) {
+	if headroomScore(full, req, capacity.Request{}) >= headroomScore(empty, req, capacity.Request{}) {
 		t.Fatal("disk-emptier node should score higher when both report disk")
 	}
 }
@@ -214,7 +214,7 @@ func TestCapacityRequestFromSpecGPUCountDefaults(t *testing.T) {
 // returns a neutral 0.5 score so it ties with peers that haven't reported.
 func TestHeadroomScoreSymmetricNeutral(t *testing.T) {
 	unknown := Member{}
-	score := headroomScore(unknown, capacity.Request{CPU: 1, MemoryMB: 1024})
+	score := headroomScore(unknown, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{})
 	if math.Abs(score-0.5) > 1e-9 {
 		t.Fatalf("expected neutral 0.5 score for unknown capacity, got %v", score)
 	}

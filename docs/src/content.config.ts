@@ -215,6 +215,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'Port Allowlist',
         description: 'Require explicit exposure before public traffic reaches a sandbox port.',
       },
+      {
+        type: 'link',
+        href: '/sandbox-tags',
+        label: 'Sandbox Tags',
+        description: 'Filter list responses by tag with AND semantics for multi-tenant control planes.',
+      },
     ],
   },
 ]

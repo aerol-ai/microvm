@@ -1,7 +1,9 @@
 package v1
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"io"
 	"log/slog"
@@ -10,11 +12,13 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type createForwardCluster struct {
@@ -22,12 +26,35 @@ type createForwardCluster struct {
 	target             cluster.PlacementTarget
 	forwardedPeer      string
 	forwardedTarget    string
+	forwardedCreateID  string
 	selectPlacementHit int
+
+	reserveErr      error
+	reserveCalls    []reserveCall
+	cancelCalls     []string
+}
+
+type reserveCall struct {
+	sandboxID string
+	target    cluster.PlacementTarget
+	redacted  *models.CreateSandboxRequest
+	sealed    []byte
+	ttl       time.Duration
 }
 
 func (c *createForwardCluster) SelectPlacement(capacity.Request) (cluster.PlacementTarget, error) {
 	c.selectPlacementHit++
 	return c.target, nil
+}
+
+func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, sealed []byte, ttl time.Duration) error {
+	c.reserveCalls = append(c.reserveCalls, reserveCall{sandboxID, target, redacted, sealed, ttl})
+	return c.reserveErr
+}
+
+func (c *createForwardCluster) CancelReservation(_ context.Context, sandboxID string) error {
+	c.cancelCalls = append(c.cancelCalls, sandboxID)
+	return nil
 }
 
 func (c *createForwardCluster) ForwardHTTP(target cluster.Endpoint, w http.ResponseWriter, r *http.Request) {
@@ -42,6 +69,7 @@ func (c *createForwardCluster) ForwardHTTP(target cluster.Endpoint, w http.Respo
 		c.forwardedPeer = target.APIURL
 	}
 	c.forwardedTarget = r.Header.Get(clusterCreateTargetHeader)
+	c.forwardedCreateID = r.Header.Get(clusterCreateIDHeader)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -72,6 +100,114 @@ func TestClusterCreateWrapPinsForwardedCreateToSelectedTarget(t *testing.T) {
 	}
 	if fakeCluster.selectPlacementHit != 1 {
 		t.Fatalf("SelectPlacement calls = %d, want 1", fakeCluster.selectPlacementHit)
+	}
+	if len(fakeCluster.reserveCalls) != 1 {
+		t.Fatalf("ReserveOnTarget calls = %d, want 1 — reservation MUST be written before forwarding (B2)", len(fakeCluster.reserveCalls))
+	}
+	rc := fakeCluster.reserveCalls[0]
+	if rc.sandboxID == "" {
+		t.Fatalf("ReserveOnTarget sandboxID empty; router must mint an ID before reserving")
+	}
+	if rc.target.NodeID != "node-b" {
+		t.Fatalf("ReserveOnTarget target = %q, want node-b", rc.target.NodeID)
+	}
+	if rc.ttl != clusterReservationTTL {
+		t.Fatalf("ReserveOnTarget ttl = %v, want %v", rc.ttl, clusterReservationTTL)
+	}
+	if fakeCluster.forwardedCreateID != rc.sandboxID {
+		t.Fatalf("X-Cluster-Create-ID = %q on forward, want %q (must match the reserved ID)", fakeCluster.forwardedCreateID, rc.sandboxID)
+	}
+	if len(fakeCluster.cancelCalls) != 0 {
+		t.Fatalf("CancelReservation called %d times on success; want 0", len(fakeCluster.cancelCalls))
+	}
+}
+
+// TestClusterCreateWrapReturns503WhenReserveFails pins that a generic
+// reservation failure (e.g. raft not-leader, commit timeout) surfaces as 503,
+// not 500, so SDK retry policies treat it as a transient cluster issue and try
+// a different node rather than giving up. The forward MUST be skipped because
+// the cluster has no intent record yet.
+func TestClusterCreateWrapReturns503WhenReserveFails(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:       cluster.NewNoop("node-a", "http://node-a"),
+		target:     cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
+		reserveErr: errors.New("raft commit timed out"),
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine"}`))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	if fakeCluster.forwardedPeer != "" {
+		t.Fatalf("ForwardHTTP fired with peer %q; must not forward when reservation failed", fakeCluster.forwardedPeer)
+	}
+}
+
+// TestClusterCreateWrapReturns409OnReservationNameConflict pins the name-
+// collision contract: the reservation step runs validateNameUniqueLocked
+// inside the FSM apply, so a duplicate name is rejected before any docker side
+// effect and the client gets a deterministic 409 to retry with a different
+// name (rather than the 503 used for "cluster degraded, retry as-is").
+func TestClusterCreateWrapReturns409OnReservationNameConflict(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:       cluster.NewNoop("node-a", "http://node-a"),
+		target:     cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
+		reserveErr: cluster.ErrNameConflict,
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine","name":"dupe"}`))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusConflict)
+	}
+	if fakeCluster.forwardedPeer != "" {
+		t.Fatalf("ForwardHTTP fired; must not forward on name conflict")
+	}
+}
+
+// TestClusterCreateWrapForwardedRequiresCreateIDHeader pins the contract that
+// a forwarded create MUST carry X-Cluster-Create-ID. Without it, the receiving
+// target would mint its own ID and the reservation→placed promotion would
+// silently desync the FSM from the local sandbox. The 400 fails the forwarder
+// fast (a stale router pre-dating the reservation flow) rather than producing
+// an orphan reservation that lingers for 120s.
+func TestClusterCreateWrapForwardedRequiresCreateIDHeader(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("node-a", "http://node-a"),
+		target: cluster.PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine"}`))
+	req.Header.Set(clusterCreateTargetHeader, "node-a")
+	// no clusterCreateIDHeader
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(rr.Body.String(), clusterCreateIDHeader) {
+		t.Fatalf("body = %q, want it to mention %s", rr.Body.String(), clusterCreateIDHeader)
+	}
+	if len(fakeCluster.reserveCalls) != 0 {
+		t.Fatalf("ReserveOnTarget called on a forwarded request; the router already reserved")
 	}
 }
 

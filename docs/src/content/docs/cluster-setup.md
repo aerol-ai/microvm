@@ -84,6 +84,33 @@ Lines like `cluster: auto-promoted member to raft voter`, `cluster: added member
 
 Both require the same `Authorization: Bearer $SB_PAT_TOKEN` header as the rest of the API. From the SDK perspective, sandbox creation is identical to single-node mode: a request to any node returns a sandbox owned by whichever node has the most headroom, and subsequent calls are transparently forwarded.
 
+## How sandbox create works in cluster mode
+
+When a create lands on a node (call it `A`):
+
+1. `A` runs placement scoring against the gossiped capacity snapshot, biased
+   by any pending reservations it knows about, and picks a target `T`. If
+   `A == T`, `A` runs the create locally and commits a placement to the raft
+   log on success.
+2. If `T` is a different node, `A` mints a sandbox ID, seals + redacts the
+   request secrets, and writes a **reservation** for `T` to the raft log
+   *before* forwarding. The reservation holds the requested capacity and the
+   sandbox name on `T` for 120 seconds.
+3. `A` forwards the request to `T` with `X-Cluster-Create-Target: T` (so the
+   second hop never re-runs placement scoring) and `X-Cluster-Create-ID`
+   (the reserved ID). `T` runs the local create against that ID, then
+   promotes the reservation to a placement on success.
+4. If `T` crashes mid-create or the local create fails, the leader's
+   reservation-GC sweep cancels the row within ~125s and the headroom
+   returns to the cluster.
+
+The user-visible effect: two concurrent creates can never double-book the
+same target (the second reservation lands strictly after the first in the
+raft log and is rejected if `T` no longer fits), and a target that dies
+between reservation and promote returns its capacity to the cluster
+automatically. The added cost is one extra raft round-trip per cross-node
+create — same-node creates collapse back to a single commit.
+
 ## Public ingress behavior
 
 Cluster mode publishes sandbox traffic through owner-aware ingress. The public load balancer can send API, sandbox URL, exposed HTTP/TLS, or raw TCP traffic to any live node:

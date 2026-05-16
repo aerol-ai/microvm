@@ -177,6 +177,7 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 	// gives a deterministic best-fit, which matters more for recovery than
 	// for steady-state placement spread.
 	all := c.gossip.members()
+	pending := c.fsm.pendingReservationsByNode(time.Now().Unix())
 	var best Member
 	bestScore := -1.0
 	found := false
@@ -190,10 +191,10 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		if m.APIURL == "" && m.NodeID != c.nodeID {
 			continue
 		}
-		if !nodeFits(m, req) {
+		if !nodeFits(m, req, pending[m.NodeID]) {
 			continue
 		}
-		s := headroomScore(m, req)
+		s := headroomScore(m, req, pending[m.NodeID])
 		if !found || s > bestScore {
 			best = m
 			bestScore = s

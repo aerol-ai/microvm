@@ -3,6 +3,7 @@ package cluster
 import (
 	"errors"
 	"math/rand"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -55,6 +56,13 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 // a peer is genuinely better.
 func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 	all := c.gossip.members()
+	// Subtract still-in-flight reservations (router wrote opReserve but the
+	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
+	// reflect them) from each peer's headroom. Without this, two creates that
+	// arrive between gossip ticks both pick the same "best" node and double-
+	// book it. The FSM serializes opReserve through raft, so the second
+	// SelectPlacement on the same leader sees the first reservation here.
+	pending := c.fsm.pendingReservationsByNode(time.Now().Unix())
 	candidates := make([]Member, 0, len(all))
 	for _, m := range all {
 		if !m.Alive {
@@ -65,7 +73,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		if m.APIURL == "" && m.NodeID != c.nodeID {
 			continue
 		}
-		if !nodeFits(m, req) {
+		if !nodeFits(m, req, pending[m.NodeID]) {
 			continue
 		}
 		candidates = append(candidates, m)
@@ -79,7 +87,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 	// Power-of-two-choices.
 	a, b := pickTwo(candidates)
 	winner := a
-	if !sameNode(a, b) && headroomScore(b, req) > headroomScore(a, req) {
+	if !sameNode(a, b) && headroomScore(b, req, pending[b.NodeID]) > headroomScore(a, req, pending[a.NodeID]) {
 		winner = b
 	}
 
@@ -97,8 +105,10 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 
 // nodeFits returns true if the member could plausibly accept req based on its
 // gossiped capacity snapshot. We use the budget numbers (post-overcommit)
-// because that's what the remote admitter will check.
-func nodeFits(m Member, req capacity.Request) bool {
+// because that's what the remote admitter will check. extraReserved is the sum
+// of in-flight reservations the cluster has against this node but the gossip
+// ledger doesn't yet reflect (zero value when none).
+func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bool {
 	cap := m.Capacity
 	// If the snapshot is zero-valued (no advertisement yet), treat as
 	// unknown-but-allowed: better to forward and let the remote admitter
@@ -106,13 +116,13 @@ func nodeFits(m Member, req capacity.Request) bool {
 	if cap.HostCPUCores == 0 && cap.HostMemoryTotalMB == 0 {
 		return true
 	}
-	if cap.CPUBudget > 0 && cap.ReservedCPU+req.CPU > cap.CPUBudget {
+	if cap.CPUBudget > 0 && cap.ReservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
 		return false
 	}
-	if cap.MemoryBudgetMB > 0 && cap.ReservedMemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
+	if cap.MemoryBudgetMB > 0 && cap.ReservedMemoryMB+extraReserved.MemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
 		return false
 	}
-	if cap.DiskBudgetGB > 0 && cap.ReservedDiskGB+req.DiskGB > cap.DiskBudgetGB {
+	if cap.DiskBudgetGB > 0 && cap.ReservedDiskGB+extraReserved.DiskGB+req.DiskGB > cap.DiskBudgetGB {
 		return false
 	}
 	// GPU and runtime are physical attributes — a peer that lacks them can
@@ -149,7 +159,7 @@ func nodeFits(m Member, req capacity.Request) bool {
 // full" along every axis the operator opted into. Disk only contributes when
 // the peer advertises a budget so single-axis (CPU/memory) clusters keep their
 // existing scoring behaviour.
-func headroomScore(m Member, req capacity.Request) float64 {
+func headroomScore(m Member, req capacity.Request, extraReserved capacity.Request) float64 {
 	cap := m.Capacity
 	if cap.HostCPUCores == 0 && cap.HostMemoryTotalMB == 0 {
 		// Unknown capacity — neutral score so it ties with peers that have
@@ -158,14 +168,14 @@ func headroomScore(m Member, req capacity.Request) float64 {
 	}
 	cpuScore := 1.0
 	if cap.CPUBudget > 0 {
-		cpuScore = (cap.CPUBudget - cap.ReservedCPU - req.CPU) / cap.CPUBudget
+		cpuScore = (cap.CPUBudget - cap.ReservedCPU - extraReserved.CPU - req.CPU) / cap.CPUBudget
 	}
 	memScore := 1.0
 	if cap.MemoryBudgetMB > 0 {
-		memScore = float64(cap.MemoryBudgetMB-cap.ReservedMemoryMB-req.MemoryMB) / float64(cap.MemoryBudgetMB)
+		memScore = float64(cap.MemoryBudgetMB-cap.ReservedMemoryMB-extraReserved.MemoryMB-req.MemoryMB) / float64(cap.MemoryBudgetMB)
 	}
 	if cap.DiskBudgetGB > 0 {
-		diskScore := float64(cap.DiskBudgetGB-cap.ReservedDiskGB-req.DiskGB) / float64(cap.DiskBudgetGB)
+		diskScore := float64(cap.DiskBudgetGB-cap.ReservedDiskGB-extraReserved.DiskGB-req.DiskGB) / float64(cap.DiskBudgetGB)
 		return (cpuScore + memScore + diskScore) / 3
 	}
 	return (cpuScore + memScore) / 2

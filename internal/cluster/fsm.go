@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
@@ -24,6 +25,8 @@ const (
 	opUpsertSpec        opCode = 4 // overwrite Placement.Spec without touching ownership
 	opAddExposedPort    opCode = 5 // record one (port, protocol) intent
 	opRemoveExposedPort opCode = 6 // drop one port intent
+	opReserve           opCode = 7 // hold capacity + name for a chosen owner before docker
+	opCancelReserve     opCode = 8 // release a pending reservation (rollback or TTL GC)
 )
 
 // command is the wire format for one raft log entry. Spec is non-nil for
@@ -53,6 +56,11 @@ type command struct {
 	Protocol           string                       `json:"protocol,omitempty"`
 	HostPort           int                          `json:"host_port,omitempty"`
 	PublicURL          string                       `json:"public_url,omitempty"`
+	// ExpiresUnix is set on opReserve to bound how long a reservation holds
+	// capacity before the leader GC sweep cancels it. Ignored by every other
+	// op; promotion via opPlace clears the reservation's expiry implicitly by
+	// transitioning State back to Placed.
+	ExpiresUnix int64 `json:"expires_unix,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -129,12 +137,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	switch cmd.Op {
 	case opPlace:
 		// Idempotency: re-placing the same id with the same owner AND the same
-		// spec payload is a no-op. If the spec changed, we still want the new
-		// spec to land — opPlace is the atomic "owner + spec" write used by
-		// CreateSandbox, so an idempotent retry that omits the spec must not
-		// erase a previously-recorded spec.
+		// spec payload is a no-op when the existing row is already a placement.
+		// A reservation-state row with the same owner still needs the State
+		// transition + UpdatedUnix bump even when Spec/SealedSecrets are nil
+		// (the reservation already holds them) — so we fall through to the
+		// write path below in that case.
 		existing, exists := f.placements[cmd.SandboxID]
-		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && cmd.SealedSecrets == nil {
+		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && cmd.SealedSecrets == nil && !existing.IsReserved() {
 			return nil
 		}
 		// Cluster-wide name uniqueness. Without this, two concurrent creates
@@ -194,8 +203,82 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			SealedSecrets:      sealed,
 			ExposedPorts:       ports,
 			ExposedPortRoutes:  portRoutes,
+			// opPlace is the promotion path for reservations: writing the
+			// empty State here transitions a Reserved row back to Placed.
+			// ExpiresUnix is cleared by the zero-value as well so the GC
+			// sweep ignores promoted rows.
+			State:       PlacementStatePlaced,
+			ExpiresUnix: 0,
 		}
 		f.claimNameLocked(cmd.SandboxID, specName(spec))
+		return nil
+	case opReserve:
+		// Reservations are the first-half of the two-step create: the router
+		// commits intent here, the chosen owner promotes via opPlace once the
+		// local create succeeds. The intent carries the redacted spec + sealed
+		// secrets so a TTL-expired-then-reclaimed reservation can be promoted
+		// by a future re-attempt without re-sealing, and so the FSM-side name
+		// uniqueness check has the Name to compare against.
+		if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
+			return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
+		}
+		existing, exists := f.placements[cmd.SandboxID]
+		if exists {
+			// Reject when the slot is already materialized — a router racing
+			// a completed sandbox should back off and let the caller see 409.
+			if !existing.IsReserved() {
+				return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+			}
+			// Re-reserve from the same owner before expiry is an idempotent
+			// retry — refresh the TTL and treat it as a no-op otherwise.
+			if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
+				existing.ExpiresUnix = cmd.ExpiresUnix
+				existing.Version = f.version
+				existing.UpdatedUnix = now
+				f.placements[cmd.SandboxID] = existing
+				return nil
+			}
+			// Expired reservations are eligible for overwrite by a fresh
+			// reservation (the GC sweep racing the new opReserve is harmless
+			// because the GC's opCancelReserve only fires for State==Reserved
+			// AND a different SandboxID is never reused for the same intent).
+			if now > existing.ExpiresUnix {
+				f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			} else {
+				// Live reservation held by a different owner — conflict.
+				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+			}
+		}
+		if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
+			return err
+		}
+		f.placements[cmd.SandboxID] = Placement{
+			SandboxID:          cmd.SandboxID,
+			OwnerNodeID:        cmd.OwnerNodeID,
+			OwnerAPIURL:        cmd.OwnerAPIURL,
+			OwnerDataPlaneHost: cmd.OwnerDataPlaneHost,
+			Version:            f.version,
+			CreatedUnix:        now,
+			UpdatedUnix:        now,
+			Spec:               cmd.Spec,
+			SealedSecrets:      cmd.SealedSecrets,
+			State:              PlacementStateReserved,
+			ExpiresUnix:        cmd.ExpiresUnix,
+		}
+		f.claimNameLocked(cmd.SandboxID, specName(cmd.Spec))
+		return nil
+	case opCancelReserve:
+		// Only cancel reservations — never delete a placed sandbox, even if a
+		// stale rollback attempt arrives after a successful promote. This is
+		// the safety property that lets the router fire CancelReservation
+		// freely on any failure without worrying about a racing successful
+		// promote.
+		existing, exists := f.placements[cmd.SandboxID]
+		if !exists || !existing.IsReserved() {
+			return nil
+		}
+		f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+		delete(f.placements, cmd.SandboxID)
 		return nil
 	case opDelete:
 		if existing, ok := f.placements[cmd.SandboxID]; ok {
@@ -408,6 +491,38 @@ func (f *placementFSM) currentVersion() uint64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.version
+}
+
+// pendingReservationsByNode sums the capacity demand of every live (not yet
+// expired) reservation, keyed by the owner node ID. SelectPlacement uses this
+// to subtract still-in-flight reservations from a peer's gossiped headroom so
+// two creates routed to the same node back-to-back can't both pass scoring
+// before the first reservation reaches the gossip ledger.
+//
+// The FSM is the source of truth here: it serializes every opReserve through
+// raft, so two routers racing the same target see the second reservation land
+// strictly after the first in the log — and the second create's
+// SelectPlacement will read the updated map.
+func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.Request {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]capacity.Request)
+	for _, p := range f.placements {
+		if p.State != PlacementStateReserved {
+			continue
+		}
+		if p.ExpiresUnix > 0 && now > p.ExpiresUnix {
+			continue
+		}
+		req := capacityRequestFromSpec(p.Spec)
+		cur := out[p.OwnerNodeID]
+		cur.CPU += req.CPU
+		cur.MemoryMB += req.MemoryMB
+		cur.DiskGB += req.DiskGB
+		cur.GPUs += req.GPUs
+		out[p.OwnerNodeID] = cur
+	}
+	return out
 }
 
 // snapshot copies the placement map for use by Snapshot().

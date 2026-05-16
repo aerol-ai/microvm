@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -66,6 +67,33 @@ var ErrNameConflict = errors.New("cluster: sandbox name already in use")
 // but the system is converging).
 var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned")
 
+// ErrCapacityExceeded is returned when an opReserve apply finds that the
+// chosen target no longer has headroom for the request once concurrent
+// in-flight reservations are added to its gossiped reserved totals. Routers
+// translate this to 503 so the client retries; the next SelectPlacement
+// will see the new reservation and pick a different node.
+var ErrCapacityExceeded = errors.New("cluster: target capacity exceeded after pending reservations")
+
+// ErrReservationConflict is returned when opReserve tries to reserve a
+// sandbox ID that already has a non-expired placement (placed or actively
+// reserved by a different owner). Indicates either a router racing a
+// completed sandbox or a router with a stale view.
+var ErrReservationConflict = errors.New("cluster: sandbox already placed or reserved")
+
+// PlacementState distinguishes a reservation (capacity held, no docker yet)
+// from a placement (sandbox materialized). Empty defaults to Placed so
+// pre-reservation snapshots restore correctly: every old row is a real
+// placement, never a pending reservation.
+type PlacementState string
+
+const (
+	PlacementStatePlaced   PlacementState = "" // empty = legacy/placed
+	PlacementStateReserved PlacementState = "reserved"
+)
+
+// IsReserved reports whether p is a reservation awaiting promotion.
+func (p Placement) IsReserved() bool { return p.State == PlacementStateReserved }
+
 // Placement is one row of the FSM's placement map. Spec is the replicated
 // sandbox creation request used by the new owner to re-materialize a sandbox
 // after its previous owner died (see owner_watcher.go). Spec is a pointer so
@@ -104,6 +132,14 @@ type Placement struct {
 	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
 	ExposedPorts       map[int]string               `json:"exposed_ports,omitempty"`
 	ExposedPortRoutes  map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	// State is empty for materialized placements (the historical schema) and
+	// PlacementStateReserved for capacity-only intents that have not yet been
+	// promoted by a successful local create. Reservations are eligible for
+	// TTL-driven GC; opPlace transitions a reservation back to empty.
+	State PlacementState `json:"state,omitempty"`
+	// ExpiresUnix is meaningful only when State == PlacementStateReserved;
+	// the leader GC sweep cancels rows whose ExpiresUnix < now.
+	ExpiresUnix int64 `json:"expires_unix,omitempty"`
 }
 
 // Member is a snapshot of a peer's gossiped state.
@@ -273,6 +309,21 @@ type Client interface {
 
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error
+
+	// ReserveOnTarget writes opReserve into the FSM holding capacity + name
+	// for target before the body is forwarded to it. The reservation carries
+	// the redacted spec + sealed secrets so the target's RecordPlacement
+	// promote step can run with nil Spec/SealedSecrets and inherit them
+	// atomically. ttl bounds how long the reservation can hold capacity if
+	// the target never promotes (the leader's GC sweep cancels expired rows
+	// at ~5s tick cadence). Spec MUST already be redacted — the raft log
+	// must NOT carry plaintext credentials.
+	ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, sealedSecrets []byte, ttl time.Duration) error
+
+	// CancelReservation drops a pending reservation from the FSM. No-op on
+	// missing or already-promoted (Placed) rows, so router rollback / TTL GC
+	// / late successful promote can race harmlessly.
+	CancelReservation(ctx context.Context, sandboxID string) error
 
 	// ApplyEncoded is the receiving end of leader-forwarded raft writes. The
 	// internal API endpoint pipes the request body through here on the leader

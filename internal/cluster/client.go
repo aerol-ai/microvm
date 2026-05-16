@@ -79,6 +79,11 @@ type Cluster struct {
 	deadOwners        *deadOwnerTracker
 	deadOwnerLoopStop context.CancelFunc
 
+	// reservationGCStop cancels the leader-only sweep that cancels expired
+	// opReserve rows. Followers run no loop because every CancelReservation
+	// has to land via raft anyway. See dead_owner.go for the loop body.
+	reservationGCStop context.CancelFunc
+
 	// recreator is the service-layer hook the owner watcher uses to bring up
 	// a sandbox the FSM says we own but the local store doesn't have. Set via
 	// AttachRecreator after construction (avoids a cluster→service import
@@ -247,6 +252,12 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// removes them from the raft configuration. Followers maintain the
 	// in-memory tracker (cheap) but never act.
 	c.startDeadOwnerLoop()
+
+	// Reservation GC: leader-only sweep that cancels opReserve rows whose
+	// 120s TTL has elapsed (target node never promoted via opPlace, e.g.
+	// crashed mid-create or the forward never landed). Without this, dead
+	// reservations leak headroom from SelectPlacement scoring forever.
+	c.startReservationGCLoop()
 
 	// Owner watcher: every node polls the FSM for placements pointing to self
 	// that have no local sandbox row, and re-materializes them via the
@@ -445,6 +456,49 @@ func (c *Cluster) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute {
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	cmd := command{Op: opDelete, SandboxID: sandboxID}
+	return c.applyCommand(ctx, cmd)
+}
+
+// ReserveOnTarget commits a capacity-and-name reservation for sandboxID
+// owned by target before any docker side effect runs. The router calls this
+// after SelectPlacement so the cluster has intent recorded the instant the
+// router forwards the body to target. ttl bounds how long the reservation
+// holds the slot before the leader GC sweep cancels it; pick large enough
+// to cover the slowest expected image pull on the target.
+//
+// redacted MUST be stripped of plaintext credentials (call
+// service.RedactClusterSecrets); sealedSecrets is the encrypted bag from
+// service.SealClusterSecrets. Both ride the reservation so a successful
+// promote via opPlace can inherit them without re-shipping the payload —
+// see fsm.go opPlace preserve-on-nil rules.
+//
+// Returns ErrReservationConflict when the slot is already placed or held
+// by a different owner; ErrNameConflict when redacted.Name is held
+// cluster-wide. Either should map to 4xx at the API surface; transport
+// errors stay 5xx (caller may retry).
+func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, sealedSecrets []byte, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("cluster: reservation ttl must be > 0")
+	}
+	cmd := command{
+		Op:                 opReserve,
+		SandboxID:          sandboxID,
+		OwnerNodeID:        target.NodeID,
+		OwnerAPIURL:        target.APIURL,
+		OwnerDataPlaneHost: target.DataPlaneHost,
+		Spec:               redacted,
+		SealedSecrets:      sealedSecrets,
+		ExpiresUnix:        time.Now().Add(ttl).Unix(),
+	}
+	return c.applyCommand(ctx, cmd)
+}
+
+// CancelReservation deletes a pending reservation for sandboxID. Safe to
+// call at any rollback point: opCancelReserve only fires when the row is
+// State == Reserved, so a stale cancel after a successful promote is a
+// no-op. Idempotent; calling on a never-reserved id is also a no-op.
+func (c *Cluster) CancelReservation(ctx context.Context, sandboxID string) error {
+	cmd := command{Op: opCancelReserve, SandboxID: sandboxID}
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -766,6 +820,9 @@ func (c *Cluster) Close() error {
 	}
 	if c.deadOwnerLoopStop != nil {
 		c.deadOwnerLoopStop()
+	}
+	if c.reservationGCStop != nil {
+		c.reservationGCStop()
 	}
 	if c.ownerWatcherStop != nil {
 		c.ownerWatcherStop()
