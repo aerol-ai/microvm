@@ -2581,4 +2581,75 @@ mod tests {
             serde_json::json!({ "type": "signal", "signal": "INT" })
         );
     }
+
+    // Mirrors pkg/api/v1/list_filter_test.go: list_with_tags must render every
+    // tag as `?tag.<k>=<v>`, which is the prefix the server's parseTagFilter
+    // keys on. The check is on the request line rather than parsed URL params
+    // because the test server captures the raw HTTP request.
+    #[test]
+    fn list_with_tags_renders_tag_prefix_on_wire() {
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("user_id".to_string(), "alice".to_string());
+        client
+            .list_with_tags(&tags)
+            .expect("list_with_tags should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("GET /v1/sandboxes?tag.user_id=alice HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+    }
+
+    // URL-encoding is delegated to urlencoding::encode in build_tag_query.
+    // This pins that both keys and values with reserved characters survive
+    // the round trip via the server's url.Values decode (which percent-
+    // decodes both sides before the `tag.` prefix check).
+    #[test]
+    fn list_with_tags_url_encodes_keys_and_values() {
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("user/id".to_string(), "alice bob".to_string());
+        client
+            .list_with_tags(&tags)
+            .expect("list_with_tags should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        // urlencoding crate encodes space as %20 (not '+'), slash as %2F.
+        assert!(
+            request.starts_with("GET /v1/sandboxes?tag.user%2Fid=alice%20bob HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+    }
+
+    // Backward-compat: list() and list_with_tags(&empty) must produce the
+    // pre-filter URL byte-for-byte — no stray trailing "?" — so fixtures and
+    // request matchers in downstream code keep working.
+    #[test]
+    fn list_without_tags_omits_query_string() {
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client.list().expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("GET /v1/sandboxes HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+
+        let (url2, request_rx2) = spawn_json_server("[]".to_string());
+        let client2 = Client::new(Some(&url2), Some("pat-token")).expect("client should build");
+        client2
+            .list_with_tags(&std::collections::HashMap::new())
+            .expect("list_with_tags should succeed");
+        let request2 = request_rx2.recv().expect("request should be captured");
+        assert!(
+            request2.starts_with("GET /v1/sandboxes HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request2
+        );
+    }
 }

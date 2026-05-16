@@ -1,0 +1,137 @@
+---
+title: Sandbox Tags
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Tags are a free-form `string → string` map stamped onto a sandbox at create time. They are returned on every sandbox payload and can be used to filter list responses with `AND` semantics. Tags are the recommended way for an external control plane to scope multi-tenant views of a shared AerolVM deployment - stamp a tenant ID at create time, filter on it at list time.
+
+Tags are stored on the sandbox record. They are not indexed, not unique, and not validated beyond key length. They do not affect scheduling, billing, or networking.
+
+## Stamp tags at create time
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      tags: {
+        tenant: 'acme',
+        environment: 'staging',
+      },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'tags': {
+            'tenant': 'acme',
+            'environment': 'staging',
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Tags: map[string]string{
+            "tenant":      "acme",
+            "environment": "staging",
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mut tags = std::collections::HashMap::new();
+    tags.insert("tenant".into(), "acme".into());
+    tags.insert("environment".into(), "staging".into());
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        tags: Some(tags),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    java.util.Map<String, String> tags = new java.util.HashMap<>();
+    tags.put("tenant", "acme");
+    tags.put("environment", "staging");
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setTags(tags)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## List sandboxes filtered by tag
+
+Every tag passed to the list call must match for a sandbox to be returned (`AND` semantics). An empty or omitted tag map returns every sandbox visible to the PAT - identical to the unfiltered call.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandboxes = await client.list({
+      tags: { tenant: 'acme', environment: 'staging' },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandboxes = client.list(tags={
+        'tenant': 'acme',
+        'environment': 'staging',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandboxes, err := client.List(ctx, microvm.WithTags(map[string]string{
+        "tenant":      "acme",
+        "environment": "staging",
+    }))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mut tags = std::collections::HashMap::new();
+    tags.insert("tenant".into(), "acme".into());
+    tags.insert("environment".into(), "staging".into());
+
+    let sandboxes = client.list_with_tags(&tags)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    java.util.Map<String, String> tags = new java.util.HashMap<>();
+    tags.put("tenant", "acme");
+    tags.put("environment", "staging");
+
+    java.util.List<Sandbox> sandboxes = client.list(tags);
+    ```
+  </TabItem>
+</Tabs>
+
+## Wire format
+
+The SDKs encode the filter as repeated query parameters of the form `?tag.<key>=<value>`. Keys and values are URL-encoded, so dots, slashes, and spaces are safe to use. The server reads every `tag.*` parameter, drops any with empty keys, and ANDs the rest together at the storage layer. Parameters that do not start with `tag.` are ignored, so the format is forward-compatible with future list-filter options.
+
+A request like `client.list({ tags: { tenant: 'acme', environment: 'staging' } })` produces:
+
+```
+GET /v1/sandboxes?tag.tenant=acme&tag.environment=staging
+```
+
+## Common patterns
+
+- **Multi-tenant control plane.** Stamp a `tenant` tag at create time; every list call from a tenant scope passes `{ tenant: '<id>' }`. The PAT continues to gate the underlying deployment; the tag scopes the view inside it.
+- **Environment slicing.** Combine `environment: 'staging' | 'production'` with a `service` tag to fetch the subset of sandboxes a deploy pipeline owns.
+- **Per-user scratch sandboxes.** Tag with `owner: '<email>'` to drive a "my sandboxes" view in an internal dashboard without a separate ownership column.
