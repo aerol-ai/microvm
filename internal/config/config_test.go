@@ -449,10 +449,23 @@ func TestNodeRoleCases(t *testing.T) {
 			role                            string
 			wantServer, wantWorker, wantIng bool
 		}{
+			// Legacy single-role truth table — bit-for-bit unchanged.
 			{NodeRoleMixed, true, true, true},
 			{NodeRoleServer, true, false, false},
 			{NodeRoleWorker, false, true, false},
 			{NodeRoleIngress, false, false, true},
+			// Hybrid combinations — caller may have already canonicalised via
+			// Load() or may be constructing the Config{} by hand in tests.
+			// Both forms must work, so include unsorted inputs too.
+			{"worker,ingress", false, true, true},
+			{"ingress,worker", false, true, true},
+			{"server,worker", true, true, false},
+			{"server,ingress", true, false, true},
+			{"server,worker,ingress", true, true, true},
+			// An empty NodeRole on a hand-built Config{} should degrade to
+			// mixed (every gate on) rather than silently turning all the
+			// startup work off.
+			{"", true, true, true},
 		}
 		for _, tc := range cases {
 			c := Config{NodeRole: tc.role}
@@ -461,6 +474,147 @@ func TestNodeRoleCases(t *testing.T) {
 					tc.role, c.IsServer(), c.IsWorker(), c.IsIngress(),
 					tc.wantServer, tc.wantWorker, tc.wantIng)
 			}
+		}
+	})
+
+	t.Run("accepts_hybrid_worker_ingress", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		// Canonical form is sorted, so "worker,ingress" becomes "ingress,worker".
+		if cfg.NodeRole != "ingress,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,worker")
+		}
+		if cfg.IsServer() || !cfg.IsWorker() || !cfg.IsIngress() {
+			t.Fatalf("IsServer=%v IsWorker=%v IsIngress=%v (want false/true/true)",
+				cfg.IsServer(), cfg.IsWorker(), cfg.IsIngress())
+		}
+	})
+
+	t.Run("accepts_hybrid_server_worker", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "server,worker")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "server,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "server,worker")
+		}
+		if !cfg.IsServer() || !cfg.IsWorker() || cfg.IsIngress() {
+			t.Fatalf("IsServer=%v IsWorker=%v IsIngress=%v (want true/true/false)",
+				cfg.IsServer(), cfg.IsWorker(), cfg.IsIngress())
+		}
+	})
+
+	t.Run("accepts_hybrid_server_ingress", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "server,ingress")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "ingress,server" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,server")
+		}
+		if !cfg.IsServer() || cfg.IsWorker() || !cfg.IsIngress() {
+			t.Fatalf("IsServer=%v IsWorker=%v IsIngress=%v (want true/false/true)",
+				cfg.IsServer(), cfg.IsWorker(), cfg.IsIngress())
+		}
+	})
+
+	t.Run("hybrid_dedupes_and_normalises_case", func(t *testing.T) {
+		setClusterDefaults(t)
+		// Mixed case + duplicate + extra whitespace: all should collapse to
+		// the canonical sorted form.
+		t.Setenv("SB_NODE_ROLE", "Worker,WORKER,ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "ingress,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,worker")
+		}
+	})
+
+	t.Run("hybrid_trims_whitespace", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "  worker , ingress  ")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "ingress,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,worker")
+		}
+	})
+
+	t.Run("rejects_mixed_combined_with_other", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "mixed,worker")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), NodeRoleMixed) {
+			t.Fatalf("expected error mentioning %q, got %v", NodeRoleMixed, err)
+		}
+	})
+
+	t.Run("rejects_hybrid_with_unknown_token", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,controller")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "controller") {
+			t.Fatalf("expected error naming bad token %q, got %v", "controller", err)
+		}
+	})
+
+	t.Run("rejects_empty_token", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,,ingress")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "empty token") {
+			t.Fatalf("expected empty-token error, got %v", err)
+		}
+	})
+
+	t.Run("hybrid_without_server_cannot_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_BOOTSTRAP") {
+			t.Fatalf("expected bootstrap-incompatible error, got %v", err)
+		}
+	})
+
+	t.Run("hybrid_with_server_can_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "server,worker")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.ClusterBootstrap {
+			t.Fatalf("expected ClusterBootstrap=true")
+		}
+	})
+
+	t.Run("hybrid_requires_cluster_mode", func(t *testing.T) {
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "")
+		t.Setenv("SB_NODE_ROLE", "worker,ingress")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_ENABLE_CLUSTER") {
+			t.Fatalf("expected SB_ENABLE_CLUSTER requirement error, got %v", err)
 		}
 	})
 }

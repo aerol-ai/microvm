@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +24,12 @@ const defaultToolboxPort = 2280
 // component, matching pre-role behavior bit-for-bit. The split exists so a
 // 200-worker cluster doesn't have 200 Raft voters and 200 nodes each holding
 // a 10K-route public ingress table; see plans/data-plane-load-balancer.md.
+//
+// SB_NODE_ROLE accepts either a single token or a comma-separated combination
+// of base roles, e.g. "worker,ingress" for a data-plane edge node or
+// "server,ingress" for a control + ingress node. NodeRoleMixed remains the
+// shorthand for "server,worker,ingress" and may not be combined with anything
+// else.
 const (
 	NodeRoleServer  = "server"
 	NodeRoleWorker  = "worker"
@@ -31,6 +39,58 @@ const (
 
 func validNodeRoles() []string {
 	return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed}
+}
+
+// parseNodeRoles splits raw on commas, lowercases and trims each segment,
+// dedupes, and validates each token against the whitelist. It returns the
+// sorted, deduped role set; an empty raw returns an empty slice (caller
+// substitutes the default). The mixed token may not appear alongside any
+// other role: it already means all three and combining it is almost always a
+// misconfiguration, so we surface it at boot.
+func parseNodeRoles(raw string) ([]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	parts := strings.Split(trimmed, ",")
+	seen := make(map[string]bool, len(parts))
+	roles := make([]string, 0, len(parts))
+	for _, p := range parts {
+		tok := strings.ToLower(strings.TrimSpace(p))
+		if tok == "" {
+			return nil, fmt.Errorf("invalid SB_NODE_ROLE=%q: empty token (check for stray commas)", raw)
+		}
+		switch tok {
+		case NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed:
+		default:
+			return nil, fmt.Errorf("invalid SB_NODE_ROLE token %q in %q (allowed: %s)", tok, raw, strings.Join(validNodeRoles(), ", "))
+		}
+		if seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		roles = append(roles, tok)
+	}
+	if seen[NodeRoleMixed] && len(roles) > 1 {
+		return nil, fmt.Errorf("invalid SB_NODE_ROLE=%q: %q is shorthand for %q+%q+%q and may not be combined with other roles",
+			raw, NodeRoleMixed, NodeRoleServer, NodeRoleWorker, NodeRoleIngress)
+	}
+	sort.Strings(roles)
+	return roles, nil
+}
+
+// canonicalNodeRole renders a parsed role set back to its canonical wire
+// form. Single tokens stay as-is (so "worker" stays "worker"). Multi-role
+// sets become comma-separated and sorted ("ingress,worker"). The empty input
+// is the caller's signal to apply the NodeRoleMixed default.
+func canonicalNodeRole(roles []string) string {
+	if len(roles) == 0 {
+		return ""
+	}
+	if len(roles) == 1 {
+		return roles[0]
+	}
+	return strings.Join(roles, ",")
 }
 
 type Config struct {
@@ -350,7 +410,7 @@ func Load() (Config, error) {
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
 
 		EnableCluster:                 getEnvBool("SB_ENABLE_CLUSTER", false),
-		NodeRole:                      strings.ToLower(strings.TrimSpace(os.Getenv("SB_NODE_ROLE"))),
+		NodeRole:                      os.Getenv("SB_NODE_ROLE"),
 		NodeID:                        strings.TrimSpace(os.Getenv("SB_NODE_ID")),
 		RaftBindAddr:                  getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
 		RaftAdvertiseAddr:             strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
@@ -425,14 +485,16 @@ func Load() (Config, error) {
 	// set. The role only changes daemon behavior in cluster mode; in
 	// single-node mode it stays at "mixed" implicitly (and an explicit
 	// non-default value would be a misconfiguration, not a silent override).
-	if cfg.NodeRole == "" {
-		cfg.NodeRole = NodeRoleMixed
+	// Hybrid combinations like "worker,ingress" are allowed; parseNodeRoles
+	// validates each token and rejects illegal combos.
+	parsedRoles, err := parseNodeRoles(cfg.NodeRole)
+	if err != nil {
+		return Config{}, err
 	}
-	switch cfg.NodeRole {
-	case NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed:
-		// ok
-	default:
-		return Config{}, fmt.Errorf("invalid SB_NODE_ROLE=%q (allowed: %s)", cfg.NodeRole, strings.Join(validNodeRoles(), ", "))
+	if len(parsedRoles) == 0 {
+		cfg.NodeRole = NodeRoleMixed
+	} else {
+		cfg.NodeRole = canonicalNodeRole(parsedRoles)
 	}
 	if cfg.NodeRole != NodeRoleMixed && !cfg.EnableCluster {
 		return Config{}, fmt.Errorf("SB_NODE_ROLE=%q requires SB_ENABLE_CLUSTER=true (single-node mode is implicitly %q)", cfg.NodeRole, NodeRoleMixed)
@@ -470,11 +532,12 @@ func Load() (Config, error) {
 			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
 		}
 		// Worker and ingress nodes never seed a fresh Raft cluster — only
-		// server/mixed roles do. Catching this at boot avoids a confusing
-		// half-bootstrapped cluster where a non-voter tried to be the
-		// first voter.
-		if cfg.ClusterBootstrap && (cfg.NodeRole == NodeRoleWorker || cfg.NodeRole == NodeRoleIngress) {
-			return Config{}, fmt.Errorf("SB_CLUSTER_BOOTSTRAP=true is incompatible with SB_NODE_ROLE=%q (only %q or %q may bootstrap a cluster)", cfg.NodeRole, NodeRoleServer, NodeRoleMixed)
+		// roles that include "server" (or the "mixed" shorthand) do. Catching
+		// this at boot avoids a confusing half-bootstrapped cluster where a
+		// non-voter tried to be the first voter. Hybrid combos like
+		// "server,worker" pass; "worker,ingress" is rejected here.
+		if cfg.ClusterBootstrap && !cfg.IsServer() {
+			return Config{}, fmt.Errorf("SB_CLUSTER_BOOTSTRAP=true is incompatible with SB_NODE_ROLE=%q (only roles containing %q, or the %q shorthand, may bootstrap a cluster)", cfg.NodeRole, NodeRoleServer, NodeRoleMixed)
 		}
 		// Gossip auth gates voter auto-promotion. Without it, any reachable peer
 		// can join the raft configuration. Refusing at boot is the safest default
@@ -527,27 +590,53 @@ func (c Config) DomainMode() bool {
 	return c.Domain != ""
 }
 
-// IsServer reports whether this daemon should run server-only responsibilities
-// (Raft voter promotion, FSM ownership). Mixed nodes return true for all three
-// IsServer/IsWorker/IsIngress predicates so single-node and small-cluster
-// deployments keep their current behavior.
-func (c Config) IsServer() bool {
-	return c.NodeRole == NodeRoleServer || c.NodeRole == NodeRoleMixed
+// Roles returns the base-role set this daemon should run. NodeRoleMixed
+// expands to [server, worker, ingress]; hybrid comma-separated values
+// ("worker,ingress") are split into their constituent base roles. The empty
+// string maps to mixed for safety (callers that reach here via the validated
+// config never see an empty string, but consumers that build a Config{} by
+// hand in tests get the same default Load() applies). The returned slice is
+// sorted and deduped.
+func (c Config) Roles() []string {
+	raw := c.NodeRole
+	if strings.TrimSpace(raw) == "" {
+		raw = NodeRoleMixed
+	}
+	roles, err := parseNodeRoles(raw)
+	if err != nil || len(roles) == 0 {
+		// A Config that didn't go through Load() may carry an invalid string;
+		// fall back to "mixed" so the predicates degrade to pre-role behavior
+		// rather than silently turning every gate off.
+		return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress}
+	}
+	if len(roles) == 1 && roles[0] == NodeRoleMixed {
+		return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress}
+	}
+	return roles
 }
+
+// hasRole reports whether the expanded role set contains target. Used by the
+// IsServer / IsWorker / IsIngress predicates so they share one parsing path
+// and treat "mixed", single roles, and hybrid combinations identically.
+func (c Config) hasRole(target string) bool {
+	return slices.Contains(c.Roles(), target)
+}
+
+// IsServer reports whether this daemon should run server-only responsibilities
+// (Raft voter promotion, FSM ownership). Mixed nodes and any hybrid that
+// includes "server" return true; pure worker, pure ingress, and the
+// worker+ingress combo return false.
+func (c Config) IsServer() bool { return c.hasRole(NodeRoleServer) }
 
 // IsWorker reports whether this daemon owns sandboxes locally (Docker,
 // lifecycle sweep, image GC, reservation replay). Pure ingress/server nodes
-// return false.
-func (c Config) IsWorker() bool {
-	return c.NodeRole == NodeRoleWorker || c.NodeRole == NodeRoleMixed
-}
+// return false; mixed and any hybrid that includes "worker" return true.
+func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
 
 // IsIngress reports whether this daemon installs owner-aware Caddy routes for
-// remote sandboxes. Pure server/worker nodes return false; the public ingress
-// fan-out is concentrated on dedicated ingress nodes (or every mixed node).
-func (c Config) IsIngress() bool {
-	return c.NodeRole == NodeRoleIngress || c.NodeRole == NodeRoleMixed
-}
+// remote sandboxes. Pure server/worker nodes return false; mixed and any
+// hybrid that includes "ingress" return true.
+func (c Config) IsIngress() bool { return c.hasRole(NodeRoleIngress) }
 
 // EffectivePublicHost returns the hostname or IP that should appear in
 // SDK-facing sandbox URLs. In cluster mode, operators set

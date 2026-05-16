@@ -87,12 +87,16 @@ Options:
                                 Additional nodes become non-voters. Default 5.
                                 Set 0 for the old unlimited behavior.
   --role <role>                 SB_NODE_ROLE for this daemon. One of
-                                server, worker, ingress, mixed. Default mixed
-                                (every component on every node — fine for
-                                small clusters; use server/worker/ingress to
-                                split components at 10+ nodes). The bootstrap
-                                node must be server or mixed; worker/ingress
-                                refuse to bootstrap a fresh cluster.
+                                server, worker, ingress, mixed — or a
+                                comma-separated combination of server / worker
+                                / ingress (e.g. "server,worker") for hybrid
+                                nodes. Default mixed (every component on every
+                                node — fine for small clusters; split at 10+
+                                nodes). "mixed" cannot be combined with other
+                                tokens. The bootstrap node's role set must
+                                contain "server" (or be "mixed"); pure worker
+                                / ingress / worker,ingress refuse to bootstrap
+                                a fresh cluster.
   --ingress-advertise-host <h>  SB_INGRESS_ADVERTISE_HOST — the public host
                                 in SDK-returned sandbox URLs. Defaults to
                                 empty (URLs use SB_PUBLIC_HOST or
@@ -144,20 +148,46 @@ if [[ $EUID -ne 0 ]]; then
 	exit 1
 fi
 
-# Validate --role early. cluster-init bootstraps raft, so the role must be one
-# that participates in raft voting (server or mixed). Worker/ingress nodes are
-# joiners — they use cluster-join.sh, not this script.
-case "$NODE_ROLE" in
-	""|server|mixed) ;;
-	worker|ingress)
-		echo "cluster-init.sh cannot bootstrap with --role=$NODE_ROLE (use cluster-join.sh on a worker/ingress node, or pick server/mixed here)" >&2
+# Validate --role early. cluster-init bootstraps raft, so the role set must
+# include "server" (or be the "mixed" shorthand). Pure worker / ingress /
+# worker,ingress nodes are joiners — they use cluster-join.sh, not this script.
+# Accepts a comma-separated combination (e.g. "server,worker"); "mixed" cannot
+# be combined with other tokens.
+validate_node_role() {
+	local raw="$1"
+	if [[ -z "$raw" ]]; then return 0; fi
+	local has_server="false" has_mixed="false" has_other="false" token_count=0
+	local IFS=','
+	# shellcheck disable=SC2206
+	local parts=($raw)
+	for raw_tok in "${parts[@]}"; do
+		local tok
+		tok="$(echo "$raw_tok" | tr '[:upper:]' '[:lower:]' | xargs)"
+		if [[ -z "$tok" ]]; then
+			echo "Invalid --role=$raw: empty token (check for stray or trailing commas)" >&2
+			exit 1
+		fi
+		case "$tok" in
+			server)  has_server="true" ;;
+			mixed)   has_mixed="true" ;;
+			worker|ingress) has_other="true" ;;
+			*)
+				echo "Unknown --role token '$tok' in '$raw' (allowed: server, worker, ingress, mixed)" >&2
+				exit 1
+				;;
+		esac
+		token_count=$((token_count + 1))
+	done
+	if [[ "$has_mixed" == "true" && "$token_count" -gt 1 ]]; then
+		echo "Invalid --role=$raw: 'mixed' is shorthand for server,worker,ingress and cannot be combined with other tokens" >&2
 		exit 1
-		;;
-	*)
-		echo "Unknown --role=$NODE_ROLE (allowed: server, worker, ingress, mixed)" >&2
+	fi
+	if [[ "$has_server" != "true" && "$has_mixed" != "true" ]]; then
+		echo "cluster-init.sh cannot bootstrap with --role=$raw (use cluster-join.sh for pure worker/ingress nodes, or include 'server' here)" >&2
 		exit 1
-		;;
-esac
+	fi
+}
+validate_node_role "$NODE_ROLE"
 
 if [[ ! -f /etc/sandboxd/sandboxd.env ]]; then
 	echo "Missing /etc/sandboxd/sandboxd.env — run install.sh first" >&2

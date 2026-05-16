@@ -5,7 +5,7 @@ description: Guided checklist for bootstrapping a 3-node or custom AerolVM clust
 
 A guided walkthrough that turns a fleet of single-node installs into an AerolVM
 cluster. Pick your topology, work through the checklist, and tick each step as
-you finish it — progress is remembered on this device.
+you finish it - progress is remembered on this device.
 
 For the full reference (every env var, quorum math, lost-quorum recovery,
 backup/restore) see [Cluster Setup](/cluster-setup).
@@ -26,7 +26,7 @@ backup/restore) see [Cluster Setup](/cluster-setup).
 - You have **3 Linux hosts** with low-latency private connectivity between them.
 - One host is designated the **seed**; the other two will join it.
 - All 3 nodes will run the **`mixed` role** (Raft voter + worker + ingress on
-  every node). This is the right default up to about 10 nodes — see
+  every node). This is the right default up to about 10 nodes - see
   [Cluster Ingress](/cluster-ingress) for when to split roles.
 - You have an SDK / operator PAT token chosen in advance; the same
   `SB_PAT_TOKEN` value will be used on every node.
@@ -36,7 +36,7 @@ backup/restore) see [Cluster Setup](/cluster-setup).
 <div class="cs-step" data-cs-step-id="three-1">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 1 — Install single-node AerolVM on all 3 hosts</span>
+    <span class="cs-step-title">Step 1 - Install single-node AerolVM on all 3 hosts</span>
   </label>
 <div class="cs-step-body">
 
@@ -57,16 +57,16 @@ this token, so every node must hold the same value.
 <div class="cs-step" data-cs-step-id="three-2">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 2 — Open the cluster-internal ports between the 3 nodes</span>
+    <span class="cs-step-title">Step 2 - Open the cluster-internal ports between the 3 nodes</span>
   </label>
 <div class="cs-step-body">
 
 Allow these ports **between the cluster nodes only**, never from the public
 internet:
 
-- `7000/TCP` — raft replication.
-- `7001/TCP` and `7001/UDP` — SWIM gossip.
-- `7002/TCP` — cluster-internal mTLS (raft applies + owner API forwarding).
+- `7000/TCP` - raft replication.
+- `7001/TCP` and `7001/UDP` - SWIM gossip.
+- `7002/TCP` - cluster-internal mTLS (raft applies + owner API forwarding).
 
 A typical UFW rule per node, allowing the other two nodes by IP:
 
@@ -82,7 +82,7 @@ sudo ufw allow from <other-node-ip> to any port 7002 proto tcp
 <div class="cs-step" data-cs-step-id="three-3">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 3 — Bootstrap the seed node</span>
+    <span class="cs-step-title">Step 3 - Bootstrap the seed node</span>
   </label>
 <div class="cs-step-body">
 
@@ -97,8 +97,8 @@ The script auto-generates a gossip key, writes
 `/etc/sandboxd/cluster.env` + a systemd drop-in, restarts `sandboxd`, and
 prints two artefacts you must keep:
 
-1. The **gossip key** — needed by every joining node, only printed once.
-2. The **TLS + credential bundle** at `aerolvm-tls-bundle.tar.gz` — holds the
+1. The **gossip key** - needed by every joining node, only printed once.
+2. The **TLS + credential bundle** at `aerolvm-tls-bundle.tar.gz` - holds the
    cluster CA and the shared credential-encryption key.
 
 </div>
@@ -107,11 +107,11 @@ prints two artefacts you must keep:
 <div class="cs-step" data-cs-step-id="three-4">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 4 — Copy the gossip key and bundle to the other 2 nodes</span>
+    <span class="cs-step-title">Step 4 - Copy the gossip key and bundle to the other 2 nodes</span>
   </label>
 <div class="cs-step-body">
 
-Transfer over a secure channel (`scp`, vault, etc.) — anyone with the bundle
+Transfer over a secure channel (`scp`, vault, etc.) - anyone with the bundle
 can mint a node cert and join the cluster, and anyone with the credential key
 can decrypt every sandbox's sealed credentials.
 
@@ -129,7 +129,7 @@ join script will ask for it.
 <div class="cs-step" data-cs-step-id="three-5">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 5 — Join nodes 2 and 3 to the cluster</span>
+    <span class="cs-step-title">Step 5 - Join nodes 2 and 3 to the cluster</span>
   </label>
 <div class="cs-step-body">
 
@@ -145,7 +145,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/cluster-
 
 The leader auto-promotes new members to raft voters until the voter cap
 (`SB_CLUSTER_MAX_AUTO_VOTERS`, default 5) is hit. With 3 nodes you'll end up
-with 3 voters — the recommended minimum for production.
+with 3 voters - the recommended minimum for production.
 
 </div>
 </div>
@@ -153,7 +153,7 @@ with 3 voters — the recommended minimum for production.
 <div class="cs-step" data-cs-step-id="three-6">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 6 — Verify cluster health</span>
+    <span class="cs-step-title">Step 6 - Verify cluster health</span>
   </label>
 <div class="cs-step-body">
 
@@ -190,25 +190,64 @@ Fill in the count of each role and click **Generate checklist**.
 
 <form id="cs-custom-form" class="cs-form">
   <label class="cs-field">
-    <span>Server (Raft voter) nodes</span>
+    <span>Server</span>
     <input name="servers" type="number" min="1" value="3" required />
   </label>
   <label class="cs-field">
-    <span>Worker nodes</span>
+    <span>Worker</span>
     <input name="workers" type="number" min="0" value="5" required />
   </label>
   <label class="cs-field">
-    <span>Ingress nodes</span>
+    <span>Ingress</span>
     <input name="ingress" type="number" min="0" value="2" required />
+  </label>
+  <label class="cs-field">
+    <span>Edge</span>
+    <input name="edge" type="number" min="0" value="0" required />
+  </label>
+  <label class="cs-field">
+    <span>Server + Worker</span>
+    <input name="serverWorker" type="number" min="0" value="0" required />
+  </label>
+  <label class="cs-field">
+    <span>Server + Ingress</span>
+    <input name="serverIngress" type="number" min="0" value="0" required />
   </label>
   <button type="submit" class="cs-generate">Generate checklist</button>
 </form>
+
+<aside class="cs-legend" aria-label="What each role does">
+  <dl>
+    <dt>Server</dt>
+    <dd>Votes in Raft. No sandboxes. No public traffic.</dd>
+    <dt>Worker</dt>
+    <dd>Owns sandboxes. Never votes.</dd>
+    <dt>Ingress</dt>
+    <dd>Holds public route table. Never votes, never owns sandboxes.</dd>
+    <dt>Edge <code>worker,ingress</code></dt>
+    <dd>Sandboxes + public ingress on one host. Non-voter.</dd>
+    <dt>Server + Worker <code>server,worker</code></dt>
+    <dd>Voter that also owns sandboxes.</dd>
+    <dt>Server + Ingress <code>server,ingress</code></dt>
+    <dd>Voter that also serves public traffic. No sandboxes.</dd>
+  </dl>
+  <p>
+    Leave the three hybrid counts at <code>0</code> for the classic three-tier
+    split. Every <code>server,*</code> hybrid still counts as a Raft voter for
+    the odd-voter / quorum math below - see
+    <a href="/cluster-ingress#hybrid-roles">Hybrid roles</a> for the full table.
+  </p>
+</aside>
 
 <div data-cs-custom-summary class="cs-summary" hidden>
   Building a cluster of <strong data-cs-ph="total">10</strong> nodes:
   <strong data-cs-ph="servers">3</strong> server,
   <strong data-cs-ph="workers">5</strong> worker,
-  <strong data-cs-ph="ingress">2</strong> ingress.
+  <strong data-cs-ph="ingress">2</strong> ingress,
+  <strong data-cs-ph="edge">0</strong> edge (<code>worker,ingress</code>),
+  <strong data-cs-ph="serverWorker">0</strong> <code>server,worker</code>,
+  <strong data-cs-ph="serverIngress">0</strong> <code>server,ingress</code>.
+  Total Raft voters: <strong data-cs-ph="voters">3</strong>.
   <span data-cs-warn class="cs-warn" hidden></span>
 </div>
 
@@ -217,23 +256,35 @@ Fill in the count of each role and click **Generate checklist**.
 <div class="cs-step" data-cs-step-id="custom-1">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 1 — Sanity-check the topology</span>
+    <span class="cs-step-title">Step 1 - Sanity-check the topology</span>
   </label>
 <div class="cs-step-body">
 
 You picked **<span data-cs-ph="servers">3</span> server**,
-**<span data-cs-ph="workers">5</span> worker**, and
-**<span data-cs-ph="ingress">2</span> ingress** nodes
-(<span data-cs-ph="total">10</span> total).
+**<span data-cs-ph="workers">5</span> worker**,
+**<span data-cs-ph="ingress">2</span> ingress**,
+**<span data-cs-ph="edge">0</span>** `worker,ingress`,
+**<span data-cs-ph="serverWorker">0</span>** `server,worker`,
+**<span data-cs-ph="serverIngress">0</span>** `server,ingress` nodes
+(<span data-cs-ph="total">10</span> total,
+**<span data-cs-ph="voters">3</span> Raft voters**).
 
 Recommended sanity rules:
 
-- Run an **odd** number of servers (3, 5, 7). Even counts raise the quorum
+- Run an **odd** number of Raft voters (3, 5, 7). The voter count is
+  `server + server,worker + server,ingress`. Even counts raise the quorum
   threshold without raising fault tolerance.
-- For production, use **at least 3 servers**. A single server is fine for
+- For production, use **at least 3 voters**. A single voter is fine for
   staging but any restart blocks writes briefly.
-- **At least 2 ingress** nodes if you want failover at the public edge.
-- Workers can scale freely — they join as raft non-voters.
+- Public traffic needs a landing pad: keep
+  **`ingress + edge + server,ingress` ≥ 1**, and ≥ 2 for failover. Any node
+  whose role set contains `ingress` holds the public route table.
+- Sandboxes run on nodes whose role set contains `worker`
+  (`worker`, `worker,ingress`, `server,worker`, `mixed`). Keep enough of
+  these to host your workload.
+- Workers and `worker,ingress` edge nodes are never Raft voters and can be
+  scaled freely. `server,*` hybrids ARE voters and count against
+  `SB_CLUSTER_MAX_AUTO_VOTERS` (default 5).
 
 </div>
 </div>
@@ -241,16 +292,20 @@ Recommended sanity rules:
 <div class="cs-step" data-cs-step-id="custom-2">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 2 — Pick the public ingress address</span>
+    <span class="cs-step-title">Step 2 - Pick the public ingress address</span>
   </label>
 <div class="cs-step-body">
 
-The <span data-cs-ph="ingress">2</span> ingress nodes will sit behind a single
-advertised hostname that the SDK and end users hit. Pick one of:
+Every node whose role set contains `ingress` holds the public route table -
+that's your <span data-cs-ph="ingress">2</span> pure ingress nodes plus
+<span data-cs-ph="edge">0</span> `worker,ingress` edge and
+<span data-cs-ph="serverIngress">0</span> `server,ingress` hybrids. They all
+sit behind one advertised hostname that the SDK and end users hit. Pick one
+of:
 
-- **DNS round-robin** — `A`/`AAAA` records pointing at every ingress IP.
-- **Cloud TCP LB** — AWS NLB, GCP TCP LB, Cloudflare Spectrum.
-- **MetalLB / BGP VIP** — bare-metal / on-prem.
+- **DNS round-robin** - `A`/`AAAA` records pointing at every ingress-holding IP.
+- **Cloud TCP LB** - AWS NLB, GCP TCP LB, Cloudflare Spectrum.
+- **MetalLB / BGP VIP** - bare-metal / on-prem.
 
 Decide the hostname now; you'll pass it as `--ingress-advertise-host` to the
 cluster scripts. See [Cluster Ingress](/cluster-ingress) for the trade-offs.
@@ -261,7 +316,7 @@ cluster scripts. See [Cluster Ingress](/cluster-ingress) for the trade-offs.
 <div class="cs-step" data-cs-step-id="custom-3">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 3 — Install single-node AerolVM on all <span data-cs-ph="total">10</span> hosts</span>
+    <span class="cs-step-title">Step 3 - Install single-node AerolVM on all <span data-cs-ph="total">10</span> hosts</span>
   </label>
 <div class="cs-step-body">
 
@@ -278,7 +333,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
 <div class="cs-step" data-cs-step-id="custom-4">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 4 — Open cluster ports between every pair of nodes</span>
+    <span class="cs-step-title">Step 4 - Open cluster ports between every pair of nodes</span>
   </label>
 <div class="cs-step-body">
 
@@ -293,7 +348,7 @@ cluster-private network only:
 <div class="cs-step" data-cs-step-id="custom-5">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 5 — Bootstrap the first server node</span>
+    <span class="cs-step-title">Step 5 - Bootstrap the first server node</span>
   </label>
 <div class="cs-step-body">
 
@@ -306,7 +361,7 @@ sudo ./cluster-init.sh \
     --gossip-key "$(openssl rand -base64 32)"
 ```
 
-Save the printed gossip key and the `aerolvm-tls-bundle.tar.gz` bundle — every
+Save the printed gossip key and the `aerolvm-tls-bundle.tar.gz` bundle - every
 other node needs both.
 
 </div>
@@ -315,7 +370,7 @@ other node needs both.
 <div class="cs-step" data-cs-step-id="custom-6">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 6 — Join the remaining <span data-cs-ph="serversMinusOne">2</span> server nodes</span>
+    <span class="cs-step-title">Step 6 - Join the remaining <span data-cs-ph="serversMinusOne">2</span> server nodes</span>
   </label>
 <div class="cs-step-body">
 
@@ -336,10 +391,61 @@ All <span data-cs-ph="servers">3</span> server nodes should now show in
 </div>
 </div>
 
-<div class="cs-step" data-cs-step-id="custom-7">
+<div class="cs-step" data-cs-step-id="custom-6b" data-cs-server-worker-only hidden>
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 7 — Join the <span data-cs-ph="workers">5</span> worker nodes</span>
+    <span class="cs-step-title">Step 6b - Join the <span data-cs-ph="serverWorker">0</span> <code>server,worker</code> hybrid nodes</span>
+  </label>
+<div class="cs-step-body">
+
+On each host that should both vote in Raft **and** own sandboxes:
+
+```bash
+sudo ./cluster-join.sh \
+    --role server,worker \
+    --ingress-advertise-host <hostname-from-step-2> \
+    --gossip-key '<key>' \
+    --peers '<seed-ip>:7001' \
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+```
+
+These nodes count against `SB_CLUSTER_MAX_AUTO_VOTERS` (default 5) - if your
+total voter count would exceed the cap, the extra nodes join as non-voters
+even though their role set includes `server`.
+
+</div>
+</div>
+
+<div class="cs-step" data-cs-step-id="custom-6c" data-cs-server-ingress-only hidden>
+  <label class="cs-step-head">
+    <input type="checkbox" data-cs-check />
+    <span class="cs-step-title">Step 6c - Join the <span data-cs-ph="serverIngress">0</span> <code>server,ingress</code> hybrid nodes</span>
+  </label>
+<div class="cs-step-body">
+
+On each host that should vote in Raft **and** serve public ingress (but never
+own sandboxes):
+
+```bash
+sudo ./cluster-join.sh \
+    --role server,ingress \
+    --ingress-advertise-host <hostname-from-step-2> \
+    --gossip-key '<key>' \
+    --peers '<seed-ip>:7001' \
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+```
+
+Add each of these nodes' public IPs to the same DNS / LB target as the pure
+ingress nodes from step 8 - they hold the cluster-wide public route table and
+can answer for any sandbox.
+
+</div>
+</div>
+
+<div class="cs-step" data-cs-step-id="custom-7" data-cs-worker-only>
+  <label class="cs-step-head">
+    <input type="checkbox" data-cs-check />
+    <span class="cs-step-title">Step 7 - Join the <span data-cs-ph="workers">5</span> worker nodes</span>
   </label>
 <div class="cs-step-body">
 
@@ -360,10 +466,10 @@ they don't count toward quorum, so scaling them out is cheap.
 </div>
 </div>
 
-<div class="cs-step" data-cs-step-id="custom-8">
+<div class="cs-step" data-cs-step-id="custom-8" data-cs-ingress-only>
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 8 — Join the <span data-cs-ph="ingress">2</span> ingress nodes</span>
+    <span class="cs-step-title">Step 8 - Join the <span data-cs-ph="ingress">2</span> ingress nodes</span>
   </label>
 <div class="cs-step-body">
 
@@ -379,7 +485,35 @@ sudo ./cluster-join.sh \
 ```
 
 Then point your DNS / cloud LB / MetalLB VIP from step 2 at these
-<span data-cs-ph="ingress">2</span> public IPs.
+<span data-cs-ph="ingress">2</span> public IPs (plus every edge IP from the
+next step, if any).
+
+</div>
+</div>
+
+<div class="cs-step" data-cs-step-id="custom-8b" data-cs-edge-only hidden>
+  <label class="cs-step-head">
+    <input type="checkbox" data-cs-check />
+    <span class="cs-step-title">Step 8b - Join the <span data-cs-ph="edge">0</span> edge (<code>worker,ingress</code>) nodes</span>
+  </label>
+<div class="cs-step-body">
+
+On each edge host. An edge node both owns sandboxes **and** terminates public
+ingress on the same machine, but it joins Raft as a non-voter - so you can
+scale these horizontally without touching quorum:
+
+```bash
+sudo ./cluster-join.sh \
+    --role worker,ingress \
+    --ingress-advertise-host <hostname-from-step-2> \
+    --gossip-key '<key>' \
+    --peers '<seed-ip>:7001' \
+    --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+```
+
+Add each edge node's public IP to the same DNS / LB target as the ingress
+nodes from step 8 - every edge node holds the full public route table and can
+answer for any sandbox in the cluster.
 
 </div>
 </div>
@@ -387,7 +521,7 @@ Then point your DNS / cloud LB / MetalLB VIP from step 2 at these
 <div class="cs-step" data-cs-step-id="custom-9">
   <label class="cs-step-head">
     <input type="checkbox" data-cs-check />
-    <span class="cs-step-title">Step 9 — Verify cluster health</span>
+    <span class="cs-step-title">Step 9 - Verify cluster health</span>
   </label>
 <div class="cs-step-body">
 
@@ -402,7 +536,7 @@ curl -s -H "Authorization: Bearer $SB_PAT_TOKEN" \
 
 You should see <span data-cs-ph="total">10</span> nodes with `alive: true`,
 each with its declared role, and a non-empty `Leader` (one of the
-<span data-cs-ph="servers">3</span> server nodes). Done — point an SDK at the
+<span data-cs-ph="servers">3</span> server nodes). Done - point an SDK at the
 ingress hostname and create your first cluster sandbox.
 
 </div>
@@ -460,7 +594,10 @@ ingress hostname and create your first cluster sandbox.
     border-radius: 0.5rem;
   }
   .cs-field { display: flex; flex-direction: column; gap: 0.25rem; }
-  .cs-field span { font-size: 0.875rem; color: var(--sl-color-text-accent, var(--sl-color-text)); }
+  .cs-field > span {
+    font-size: 0.875rem;
+    color: var(--sl-color-text-accent, var(--sl-color-text));
+  }
   .cs-field input {
     padding: 0.5rem 0.625rem;
     background: var(--sl-color-bg);
@@ -482,6 +619,65 @@ ingress hostname and create your first cluster sandbox.
     font-weight: 600;
   }
   .cs-generate:hover { filter: brightness(1.08); }
+
+  /* Legend block below the form. Starlight's prose rules set p/dl font-size
+     and big margins, so scope with aside.cs-legend and use !important on
+     font-size, line-height, and margin to keep this a compact form helper
+     rather than body prose. */
+  aside.cs-legend {
+    display: block;
+    margin: 0.5rem 0 1.25rem !important;
+    padding: 0.75rem 1rem;
+    font-size: 0.8rem !important;
+    line-height: 1.5 !important;
+    color: var(--sl-color-text);
+    background: var(--sl-color-bg-nav, var(--sl-color-bg));
+    border: 1px solid var(--sl-color-hairline, var(--sl-color-gray-5));
+    border-radius: 0.375rem;
+  }
+  aside.cs-legend dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: 0.75rem;
+    row-gap: 0.25rem;
+    margin: 0 0 0.5rem !important;
+    padding: 0;
+  }
+  aside.cs-legend dt {
+    font-weight: 600;
+    color: var(--sl-color-text-accent, var(--sl-color-text));
+    margin: 0 !important;
+    padding: 0;
+    white-space: nowrap;
+  }
+  aside.cs-legend dd {
+    margin: 0 !important;
+    padding: 0;
+    opacity: 0.85;
+  }
+  aside.cs-legend dt code,
+  aside.cs-legend dd code,
+  aside.cs-legend p code {
+    font-size: 0.92em;
+    padding: 0 0.25em;
+    font-weight: 400;
+  }
+  aside.cs-legend p {
+    font-size: inherit !important;
+    line-height: inherit !important;
+    margin: 0.5rem 0 0 !important;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--sl-color-hairline, var(--sl-color-gray-5));
+    opacity: 0.85;
+  }
+  aside.cs-legend a { color: var(--sl-color-accent, #3aa1ff); }
+  @media (max-width: 40rem) {
+    aside.cs-legend dl {
+      grid-template-columns: 1fr;
+      row-gap: 0.5rem;
+    }
+    aside.cs-legend dd { margin-bottom: 0.25rem !important; }
+  }
 
   .cs-summary {
     padding: 0.625rem 0.875rem;
@@ -627,21 +823,35 @@ ingress hostname and create your first cluster sandbox.
       }
     }
 
-    function buildWarning(servers, ingress) {
+    // Voters = anything whose role set contains "server": pure servers,
+    // server,worker and server,ingress hybrids. "mixed" doesn't appear in
+    // this form (it's the 3-node panel's job).
+    function buildWarning(v) {
       var msgs = [];
-      if (servers < 3) msgs.push('Only ' + servers + ' server: any restart blocks writes, any disk loss is total.');
-      else if (servers % 2 === 0) msgs.push(servers + ' is an even voter count — prefer 3, 5, or 7 (same fault tolerance, lower quorum).');
-      if (ingress < 1) msgs.push('0 ingress nodes: public traffic has nowhere to land. Add at least 1.');
+      var voters = v.servers + v.serverWorker + v.serverIngress;
+      var publicEdge = v.ingress + v.edge + v.serverIngress;
+      var sandboxHosts = v.workers + v.edge + v.serverWorker;
+      if (voters < 3) msgs.push('Only ' + voters + ' Raft voter(s) - any voter restart blocks writes briefly, and a single voter loss past quorum stalls writes entirely. Aim for 3.');
+      else if (voters % 2 === 0) msgs.push(voters + ' is an even voter count - prefer 3, 5, or 7 (same fault tolerance, lower quorum).');
+      if (publicEdge < 1) msgs.push('No ingress / edge / server,ingress node: public traffic has nowhere to land. Add at least 1.');
+      else if (publicEdge === 1) msgs.push('Only 1 public-ingress node: a single failure takes the endpoint offline. Add at least 1 more.');
+      if (sandboxHosts < 1) msgs.push('No worker / edge / server,worker node: nowhere to run sandboxes. Add at least 1.');
       return msgs.join(' ');
     }
 
-    function renderCustom(servers, workers, ingress) {
+    function renderCustom(v) {
+      var voters = v.servers + v.serverWorker + v.serverIngress;
+      var total = v.servers + v.workers + v.ingress + v.edge + v.serverWorker + v.serverIngress;
       var values = {
-        servers: servers,
-        workers: workers,
-        ingress: ingress,
-        total: servers + workers + ingress,
-        serversMinusOne: Math.max(0, servers - 1),
+        servers: v.servers,
+        workers: v.workers,
+        ingress: v.ingress,
+        edge: v.edge,
+        serverWorker: v.serverWorker,
+        serverIngress: v.serverIngress,
+        voters: voters,
+        total: total,
+        serversMinusOne: Math.max(0, v.servers - 1),
       };
       updatePlaceholders(values);
 
@@ -650,9 +860,27 @@ ingress hostname and create your first cluster sandbox.
       if (summary) summary.removeAttribute('hidden');
       if (steps) steps.removeAttribute('hidden');
 
+      // Each [data-cs-*-only] attribute gates one step on a per-count basis.
+      // Add a new one here when you add a new role count to the form.
+      var conditionalSteps = [
+        { attr: 'data-cs-worker-only',         count: v.workers },
+        { attr: 'data-cs-ingress-only',        count: v.ingress },
+        { attr: 'data-cs-edge-only',           count: v.edge },
+        { attr: 'data-cs-server-worker-only',  count: v.serverWorker },
+        { attr: 'data-cs-server-ingress-only', count: v.serverIngress },
+      ];
+      for (var i = 0; i < conditionalSteps.length; i++) {
+        var entry = conditionalSteps[i];
+        var els = document.querySelectorAll('[' + entry.attr + ']');
+        for (var j = 0; j < els.length; j++) {
+          if (entry.count > 0) els[j].removeAttribute('hidden');
+          else els[j].setAttribute('hidden', '');
+        }
+      }
+
       var warn = document.querySelector('[data-cs-warn]');
       if (warn) {
-        var msg = buildWarning(servers, ingress);
+        var msg = buildWarning(v);
         if (msg) { warn.textContent = msg; warn.removeAttribute('hidden'); }
         else { warn.setAttribute('hidden', ''); warn.textContent = ''; }
       }
@@ -664,6 +892,9 @@ ingress hostname and create your first cluster sandbox.
         servers: Math.max(1, parseInt(data.get('servers') || '0', 10) || 0),
         workers: Math.max(0, parseInt(data.get('workers') || '0', 10) || 0),
         ingress: Math.max(0, parseInt(data.get('ingress') || '0', 10) || 0),
+        edge: Math.max(0, parseInt(data.get('edge') || '0', 10) || 0),
+        serverWorker: Math.max(0, parseInt(data.get('serverWorker') || '0', 10) || 0),
+        serverIngress: Math.max(0, parseInt(data.get('serverIngress') || '0', 10) || 0),
       };
     }
 
@@ -672,14 +903,12 @@ ingress hostname and create your first cluster sandbox.
       if (!form) return;
       form.addEventListener('submit', function (event) {
         event.preventDefault();
-        var v = readForm(form);
-        renderCustom(v.servers, v.workers, v.ingress);
+        renderCustom(readForm(form));
       });
       form.addEventListener('input', function () {
         var steps = document.querySelector('[data-cs-steps="custom"]');
         if (steps && steps.hasAttribute('hidden')) return;
-        var v = readForm(form);
-        renderCustom(v.servers, v.workers, v.ingress);
+        renderCustom(readForm(form));
       });
     }
 

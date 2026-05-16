@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -121,16 +122,29 @@ func (c *Cluster) peerForcedNonVoter(nodeID string) bool {
 }
 
 // isForcedNonVoterRole reports whether a gossiped SB_NODE_ROLE must never be
-// promoted to raft voter. Worker and ingress nodes hold a replicated FSM as
-// non-voters; server and mixed (and any unknown future role) stay
-// voter-eligible.
+// promoted to raft voter. The gossip field can carry a single role
+// ("worker"), the legacy "mixed" shorthand, or a comma-separated hybrid
+// combination ("worker,ingress", "server,worker"). A peer is forced non-voter
+// iff its role set is non-empty, does not include "server", and is not
+// "mixed". Empty role (older builds that pre-date the field) and unknown
+// tokens (future roles we don't recognise yet) stay voter-eligible so a
+// rolling upgrade can't accidentally demote a legitimate server peer.
 func isForcedNonVoterRole(role string) bool {
-	switch role {
-	case config.NodeRoleWorker, config.NodeRoleIngress:
-		return true
-	default:
+	trimmed := strings.TrimSpace(role)
+	if trimmed == "" {
 		return false
 	}
+	hasKnown := false
+	for raw := range strings.SplitSeq(trimmed, ",") {
+		tok := strings.ToLower(strings.TrimSpace(raw))
+		switch tok {
+		case config.NodeRoleServer, config.NodeRoleMixed:
+			return false
+		case config.NodeRoleWorker, config.NodeRoleIngress:
+			hasKnown = true
+		}
+	}
+	return hasKnown
 }
 
 func (c *Cluster) addMemberAsVoter(nodeID, raftAddr string) {

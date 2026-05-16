@@ -131,6 +131,27 @@ func TestPeerForcedNonVoterPolicy(t *testing.T) {
 		// Unknown future role values: stay voter-eligible — better to
 		// over-include than to silently demote a legitimate server.
 		{"controller", false},
+		// Hybrid combinations gossiped by the new builds. The rule is:
+		// "server" or "mixed" anywhere in the role set means voter-eligible;
+		// anything else with at least one known worker/ingress token is a
+		// forced non-voter.
+		{"worker,ingress", true},
+		// Canonical form is sorted but isForcedNonVoterRole should not depend
+		// on order — the leader may receive either form during a rolling
+		// upgrade window or from a test harness that bypasses canonicalisation.
+		{"ingress,worker", true},
+		{"server,worker", false},
+		{"server,ingress", false},
+		// Explicit equivalent of "mixed" — server presence wins.
+		{"server,worker,ingress", false},
+		// Server alongside a future role we don't recognise yet should still
+		// stay voter-eligible (the server token short-circuits the loop).
+		{"server,controller", false},
+		// Whitespace/case must be tolerated since gossip is just a string
+		// pass-through; canonicalisation happens at config.Load() time on the
+		// sender but the receiver must not break if it ever sees a sloppy
+		// form (e.g. from a future schema migration).
+		{" Worker , Ingress ", true},
 	}
 	for _, tc := range cases {
 		got := isForcedNonVoterRole(tc.role)
@@ -138,4 +159,50 @@ func TestPeerForcedNonVoterPolicy(t *testing.T) {
 			t.Fatalf("role=%q forced-non-voter=%v want %v", tc.role, got, tc.want)
 		}
 	}
+}
+
+// TestRoleSplitHybridWorkerIngressJoinsAsNonVoter is the hybrid analogue of
+// TestRoleSplitWorkerJoinsAsNonVoter: a node that gossips role
+// "worker,ingress" (worker + ingress without server) must land in the raft
+// configuration as a non-voter even when the voter cap is high. This is the
+// load-bearing path for "edge" data-plane nodes that own sandboxes AND fan
+// out public ingress but must never sit in the raft quorum.
+func TestRoleSplitHybridWorkerIngressJoinsAsNonVoter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft/memberlist sockets")
+	}
+
+	leader, cleanupLeader := newTestClusterWithRole(t, "ldr-hyb-wi", config.NodeRoleServer, true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+	leader.cfg.ClusterMaxAutoVoters = 10
+
+	// Canonical form is sorted, matching what config.Load() produces. Either
+	// order would work at the gate (the helper is order-independent) but we
+	// publish the form an operator would actually deploy with.
+	_, cleanupEdge := newTestClusterWithRole(t, "edge", "ingress,worker", false,
+		[]string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupEdge()
+
+	waitForServerSuffrage(t, leader, "edge", raft.Nonvoter, 10*time.Second)
+}
+
+// TestRoleSplitHybridServerWorkerJoinsAsVoter mirrors
+// TestRoleSplitServerJoinsAsVoter for the "server,worker" hybrid — a node
+// that owns sandboxes locally *and* participates in raft. Voter eligibility
+// must follow the server presence rather than the worker presence.
+func TestRoleSplitHybridServerWorkerJoinsAsVoter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft/memberlist sockets")
+	}
+
+	leader, cleanupLeader := newTestClusterWithRole(t, "ldr-hyb-sw", config.NodeRoleServer, true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	_, cleanupSrvWk := newTestClusterWithRole(t, "srv-wk", "server,worker", false,
+		[]string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupSrvWk()
+
+	waitForVoter(t, leader, "srv-wk", 10*time.Second)
 }

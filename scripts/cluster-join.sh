@@ -86,10 +86,15 @@ Optional:
                                 the public API URL with PAT-only auth. ONLY
                                 safe on a fully isolated network.
   --role <role>                 SB_NODE_ROLE for this daemon. One of server,
-                                worker, ingress, mixed. Default mixed.
-                                worker and ingress nodes never become raft
-                                voters even after gossip join — use these on
-                                joiners that should not weigh on quorum.
+                                worker, ingress, mixed — or a comma-separated
+                                combination of server / worker / ingress (e.g.
+                                "worker,ingress" for a data-plane edge node
+                                that owns sandboxes AND fans out public
+                                ingress without joining the raft quorum).
+                                Default mixed. A role set without "server" /
+                                "mixed" never becomes a raft voter even after
+                                gossip join. "mixed" cannot be combined with
+                                other tokens.
   --ingress-advertise-host <h>  SB_INGRESS_ADVERTISE_HOST — the public host
                                 in SDK-returned sandbox URLs. Defaults to
                                 empty (URLs use SB_PUBLIC_HOST or SB_DOMAIN).
@@ -138,13 +143,40 @@ if [[ $EUID -ne 0 ]]; then
 	exit 1
 fi
 
-case "$NODE_ROLE" in
-	""|server|worker|ingress|mixed) ;;
-	*)
-		echo "Unknown --role=$NODE_ROLE (allowed: server, worker, ingress, mixed)" >&2
+# Accepts a single role or a comma-separated combination (e.g.
+# "worker,ingress"). "mixed" cannot be combined with other tokens. Unlike
+# cluster-init.sh there is no "must contain server" constraint — a joiner can
+# be any combination, including pure worker / ingress / worker,ingress.
+validate_node_role() {
+	local raw="$1"
+	if [[ -z "$raw" ]]; then return 0; fi
+	local has_mixed="false" token_count=0
+	local IFS=','
+	# shellcheck disable=SC2206
+	local parts=($raw)
+	for raw_tok in "${parts[@]}"; do
+		local tok
+		tok="$(echo "$raw_tok" | tr '[:upper:]' '[:lower:]' | xargs)"
+		if [[ -z "$tok" ]]; then
+			echo "Invalid --role=$raw: empty token (check for stray or trailing commas)" >&2
+			exit 1
+		fi
+		case "$tok" in
+			server|worker|ingress) ;;
+			mixed) has_mixed="true" ;;
+			*)
+				echo "Unknown --role token '$tok' in '$raw' (allowed: server, worker, ingress, mixed)" >&2
+				exit 1
+				;;
+		esac
+		token_count=$((token_count + 1))
+	done
+	if [[ "$has_mixed" == "true" && "$token_count" -gt 1 ]]; then
+		echo "Invalid --role=$raw: 'mixed' is shorthand for server,worker,ingress and cannot be combined with other tokens" >&2
 		exit 1
-		;;
-esac
+	fi
+}
+validate_node_role "$NODE_ROLE"
 
 if [[ -z "$GOSSIP_SECRET_KEY" || -z "$PEERS" ]]; then
 	echo "--gossip-key and --peers are required" >&2
