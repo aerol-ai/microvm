@@ -699,3 +699,127 @@ func TestFSMRestoreLegacySnapshotRecoversVersion(t *testing.T) {
 		t.Fatal("sb1 missing after legacy restore")
 	}
 }
+
+// TestFSMSnapshotIsolatedFromLaterApplies is the load-bearing B8 claim: an
+// fsmSnapshot returned by Snapshot() must encode the state at snapshot time
+// even when later Applies mutate the FSM before Persist runs. Raft can defer
+// Persist arbitrarily long, so without per-value deep-copy here a snapshot
+// would silently capture post-snapshot state for any reference-typed field
+// (Spec, SealedSecrets, ExposedPorts) — that would break log truncation
+// safety: replaying the truncated tail against the persisted snapshot would
+// double-apply mutations the snapshot already absorbed.
+func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
+	src := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op:          opPlace,
+		SandboxID:   "sb1",
+		OwnerNodeID: "nodeA",
+		Spec: &models.CreateSandboxRequest{
+			Image: "alpine:before",
+			Env:   map[string]string{"K": "before"},
+		},
+		SealedSecrets: []byte("sealed-before"),
+	})
+	src.Apply(&raft.Log{Data: place})
+
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// Mutate the FSM AFTER the snapshot is taken but BEFORE Persist runs.
+	// Both opUpsertSpec (replaces Spec/SealedSecrets pointers) and a fresh
+	// opPlace (new owner / version) must not leak into the persisted bytes.
+	upsert, _ := encodeCommand(command{
+		Op:        opUpsertSpec,
+		SandboxID: "sb1",
+		Spec: &models.CreateSandboxRequest{
+			Image: "alpine:after",
+			Env:   map[string]string{"K": "after"},
+		},
+		SealedSecrets: []byte("sealed-after"),
+	})
+	src.Apply(&raft.Log{Data: upsert})
+
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	dst := newPlacementFSM()
+	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, ok := dst.get("sb1")
+	if !ok {
+		t.Fatal("sb1 missing after restore")
+	}
+	if got.Spec == nil || got.Spec.Image != "alpine:before" {
+		t.Fatalf("snapshot leaked post-snapshot Spec mutation: image=%q", got.Spec.Image)
+	}
+	if got.Spec.Env["K"] != "before" {
+		t.Fatalf("snapshot leaked post-snapshot Env mutation: K=%q", got.Spec.Env["K"])
+	}
+	if string(got.SealedSecrets) != "sealed-before" {
+		t.Fatalf("snapshot leaked post-snapshot SealedSecrets mutation: %q", got.SealedSecrets)
+	}
+}
+
+// TestFSMSnapshotIsolatedFromExposedPortMutations pins the tricky half of B8:
+// opAddExposedPort and opRemoveExposedPort mutate Placement.ExposedPorts /
+// ExposedPortRoutes IN PLACE (the maps are reference types, and apply rewrites
+// keys on the same map then re-stores the Placement value). A naive snapshot
+// that copied the map header without cloning entries would let later port
+// mutations bleed into the persisted bytes. This test exercises that exact
+// path: snapshot, then add/remove ports, then persist, then assert the
+// snapshot's port set matches the pre-mutation state.
+func TestFSMSnapshotIsolatedFromExposedPortMutations(t *testing.T) {
+	src := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+	})
+	src.Apply(&raft.Log{Data: place})
+	add80, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 80, Protocol: "http"})
+	src.Apply(&raft.Log{Data: add80})
+
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// After the snapshot: add a NEW port and remove the original. If the
+	// snapshot aliased the live ExposedPorts map, both mutations would
+	// leak — the persisted state would show port 443 (added later) and
+	// miss port 80 (removed later).
+	add443, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 443, Protocol: "tls"})
+	src.Apply(&raft.Log{Data: add443})
+	rm80, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "sb1", Port: 80})
+	src.Apply(&raft.Log{Data: rm80})
+
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	dst := newPlacementFSM()
+	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, ok := dst.get("sb1")
+	if !ok {
+		t.Fatal("sb1 missing after restore")
+	}
+	if got.ExposedPorts[80] != "http" {
+		t.Fatalf("snapshot lost port 80: ExposedPorts=%v", got.ExposedPorts)
+	}
+	if _, present := got.ExposedPorts[443]; present {
+		t.Fatalf("snapshot leaked port 443 added after Snapshot(): ExposedPorts=%v", got.ExposedPorts)
+	}
+	if got.ExposedPortRoutes[80].Protocol != "http" {
+		t.Fatalf("snapshot lost ExposedPortRoutes[80]: %+v", got.ExposedPortRoutes)
+	}
+	if _, present := got.ExposedPortRoutes[443]; present {
+		t.Fatalf("snapshot leaked ExposedPortRoutes[443]: %+v", got.ExposedPortRoutes)
+	}
+}

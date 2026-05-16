@@ -326,8 +326,32 @@ we rely on snapshots under churn.
 Deep-copy `Placement.Spec`, `Placement.SealedSecrets`, and `Placement.ExposedPorts`
 when taking FSM snapshots and when returning placement snapshots to watchers.
 
-**Current branch status:** first-slice fixed, including
-`ExposedPortRoutes`.
+**Current branch status:** **Resolved.** The deep-copy plumbing was
+in place in the first slice; the audit pinned what was missing —
+regression coverage proving snapshots are isolated from later Applies.
+
+- `clonePlacement` (`internal/cluster/fsm.go`) deep-copies `Spec`
+  (via `cloneCreateSandboxRequest` — Env, Tags, ContainerCommand,
+  Mounts.Options/Credentials, Registry, Lifecycle, GPUs.DeviceIDs),
+  `SealedSecrets`, `ExposedPorts`, and `ExposedPortRoutes`. Every
+  external read path (`f.get`, `f.snapshot`, `c.SpecOf`,
+  `c.ExposedPortsOf`, `c.SealedSecretsOf`, `c.Placements`) flows
+  through it. `Snapshot()` calls `f.snapshot()` so the
+  `*fsmSnapshot` raft holds across the deferred `Persist()` is
+  independent of subsequent Applies.
+- `opAddExposedPort` and `opRemoveExposedPort` still mutate the
+  `ExposedPorts` / `ExposedPortRoutes` maps in place — that's the
+  steady-state hot path. Because `Snapshot()` deep-clones every
+  placement up front, the in-place mutation only affects the live
+  FSM and is invisible to the persisted snapshot.
+- New regression coverage: `TestFSMSnapshotIsolatedFromLaterApplies`
+  (verifies a post-snapshot `opUpsertSpec` does not leak Spec /
+  SealedSecrets into the persisted bytes) and
+  `TestFSMSnapshotIsolatedFromExposedPortMutations` (verifies
+  post-snapshot `opAddExposedPort` / `opRemoveExposedPort` do not
+  leak through the ExposedPorts maps). Both restore into a fresh
+  FSM and assert pre-snapshot state — proving raft log truncation
+  is safe even if Persist runs arbitrarily long after Snapshot.
 
 ## B9. FSM version is not a durable watch revision
 
