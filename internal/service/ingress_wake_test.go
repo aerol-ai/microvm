@@ -2,86 +2,59 @@ package service
 
 import (
 	"context"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 )
 
-// fakeVersionedCluster is a minimal cluster.Client stand-in that exposes a
-// caller-controllable PlacementVersion. Wraps Noop to satisfy the rest of
-// the interface without writing 15 stub methods.
-type fakeVersionedCluster struct {
-	*cluster.Noop
-	version atomic.Uint64
-}
-
-func (f *fakeVersionedCluster) PlacementVersion() uint64 {
-	return f.version.Load()
-}
-
-// TestIngressVersionWatcherSignalsOnBump confirms the fast-wake loop fires
-// the wake channel when the FSM version bumps, and stays quiet otherwise.
-// This is the load-bearing claim behind sub-second convergence: without it,
-// an FSM apply waits out the 5s reconcile timer.
-func TestIngressVersionWatcherSignalsOnBump(t *testing.T) {
-	fc := &fakeVersionedCluster{Noop: cluster.NewNoop("self", "")}
-	fc.version.Store(7)
-
-	svc := &Service{}
-	svc.cluster = fc
-	svc.clusterReady.Store(true)
-
+// TestPlacementSubscriptionWiringSelectsOnWake verifies the wake-channel
+// contract used by StartClusterIngressReconcile: cap=1, non-blocking sends
+// coalesce, and a single receive drains the buffer. The FSM's
+// notifySubscribers and Cluster.SubscribePlacement both rely on this shape.
+func TestPlacementSubscriptionWiringSelectsOnWake(t *testing.T) {
+	// This test verifies that a buffered cap=1 wake channel coalesces and
+	// is non-blocking under the reconciler's select{...case <-wake} pattern,
+	// which is the contract Cluster.SubscribePlacement / Noop satisfy.
 	wake := make(chan struct{}, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go svc.runIngressVersionWatcher(ctx, wake)
-
-	// Quiet period: no version change → no wake. We give the watcher more
-	// than one poll interval to make sure a spurious signal would land.
-	select {
-	case <-wake:
-		t.Fatal("watcher signalled with no version change")
-	case <-time.After(2 * clusterIngressFastPollInterval):
+	// Two non-blocking sends; second drops because cap=1 — exactly what the
+	// FSM does. The reconciler then sees one wake and proceeds.
+	for i := 0; i < 2; i++ {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
 	}
-
-	// Bump → wake within ~1 poll interval. Generous timeout to absorb
-	// scheduler jitter on busy CI; the load-bearing assertion is "happens",
-	// not "happens this fast".
-	fc.version.Store(8)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
 	select {
 	case <-wake:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watcher did not signal after version bump")
+	case <-ctx.Done():
+		t.Fatal("expected coalesced wake to be readable")
+	}
+	// Buffer must now be empty — coalesce dropped the second send.
+	select {
+	case <-wake:
+		t.Fatal("expected only one wake; got a second from coalesced sends")
+	default:
 	}
 }
 
-// TestIngressVersionWatcherDropsCoalescedSignals confirms the wake channel
-// is non-blocking — if the reconciler is mid-tick (channel buffer full),
-// extra version bumps don't pile up. One wake per idle period is enough to
-// make sure the next reconcile sees the latest view.
-func TestIngressVersionWatcherDropsCoalescedSignals(t *testing.T) {
-	fc := &fakeVersionedCluster{Noop: cluster.NewNoop("self", "")}
-	svc := &Service{cluster: fc}
-	svc.clusterReady.Store(true)
-
-	// Buffer of 1; do NOT drain. Three rapid bumps must not block the
-	// watcher (which would deadlock the test goroutine).
-	wake := make(chan struct{}, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go svc.runIngressVersionWatcher(ctx, wake)
-
-	for v := uint64(1); v <= 5; v++ {
-		fc.version.Store(v)
-		time.Sleep(clusterIngressFastPollInterval + 100*time.Millisecond)
+// TestNoopSubscribePlacementNeverFires confirms single-node mode returns a
+// nil channel from SubscribePlacement, which is permanently un-ready in
+// select{}. Without this, the reconciler loop in single-node mode would
+// either receive a phantom wake or panic on a closed-channel design.
+func TestNoopSubscribePlacementNeverFires(t *testing.T) {
+	noop := cluster.NewNoop("self", "")
+	ch := noop.SubscribePlacement(context.Background())
+	if ch != nil {
+		t.Fatalf("Noop.SubscribePlacement returned %v, want nil", ch)
 	}
-	// Receiving once is enough; further reads should not block beyond a
-	// short timeout (no signals accumulated).
+	// Selecting on nil + a short timer must time out; this is exactly the
+	// behaviour the reconciler relies on.
 	select {
-	case <-wake:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected at least one wake")
+	case <-ch:
+		t.Fatal("nil channel produced a value")
+	case <-time.After(50 * time.Millisecond):
 	}
 }

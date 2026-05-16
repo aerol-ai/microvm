@@ -450,3 +450,173 @@ func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
 		t.Fatalf("mutating snapshot() result changed FSM state: %+v", afterSnap)
 	}
 }
+
+// TestFSMRejectsDuplicateName confirms cluster-wide name uniqueness: two
+// opPlace commands carrying the same Name on different sandbox IDs make the
+// second one fail with ErrNameConflict. Without this check, two concurrent
+// creates landing on different owners would both succeed and any name-based
+// facade lookup would resolve ambiguously.
+func TestFSMRejectsDuplicateName(t *testing.T) {
+	fsm := newPlacementFSM()
+	specA := &models.CreateSandboxRequest{Name: "shared"}
+	specB := &models.CreateSandboxRequest{Name: "shared"}
+
+	payloadA, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: specA})
+	if got := fsm.Apply(&raft.Log{Data: payloadA}); got != nil {
+		t.Fatalf("first place failed: %v", got)
+	}
+	payloadB, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-b", OwnerNodeID: "node-2", Spec: specB})
+	got := fsm.Apply(&raft.Log{Data: payloadB})
+	err, _ := got.(error)
+	if err == nil || !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("second place returned %v, want ErrNameConflict", got)
+	}
+	// The first placement must remain untouched — a rejected apply mustn't
+	// leak partial state into the FSM.
+	if p, ok := fsm.get("sb-a"); !ok || p.OwnerNodeID != "node-1" {
+		t.Fatalf("first placement disturbed by rejected apply: %+v ok=%v", p, ok)
+	}
+	if _, ok := fsm.get("sb-b"); ok {
+		t.Fatal("rejected place left a placement behind for sb-b")
+	}
+}
+
+// TestFSMNameReleasedOnDelete confirms the nameIndex frees the slot when a
+// placement is deleted, so a follow-up create with the same name succeeds.
+func TestFSMNameReleasedOnDelete(t *testing.T) {
+	fsm := newPlacementFSM()
+	spec := &models.CreateSandboxRequest{Name: "freed"}
+	payload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: spec})
+	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+	delPayload, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb-a"})
+	if got := fsm.Apply(&raft.Log{Data: delPayload}); got != nil {
+		t.Fatalf("delete: %v", got)
+	}
+	// New sandbox with same name should now succeed.
+	rePayload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-b", OwnerNodeID: "node-2", Spec: &models.CreateSandboxRequest{Name: "freed"}})
+	if got := fsm.Apply(&raft.Log{Data: rePayload}); got != nil {
+		t.Fatalf("re-place after delete failed: %v", got)
+	}
+}
+
+// TestFSMSamePlacementSameNameIdempotent confirms repeating opPlace for the
+// same sandbox_id with the same name is not flagged as a name conflict.
+// Without this, the create-then-retry idempotency contract on RecordPlacement
+// would break the moment we add cluster-wide name validation.
+func TestFSMSamePlacementSameNameIdempotent(t *testing.T) {
+	fsm := newPlacementFSM()
+	spec := &models.CreateSandboxRequest{Name: "stable"}
+	payload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: spec})
+	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
+		t.Fatalf("first place: %v", got)
+	}
+	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
+		t.Fatalf("idempotent re-place rejected: %v", got)
+	}
+}
+
+// TestFSMRestoreRebuildsNameIndex confirms a snapshot restore reconstructs
+// the name→id map. Older snapshots predate the index, so a name conflict
+// after Restore would be missed without the rebuild.
+func TestFSMRestoreRebuildsNameIndex(t *testing.T) {
+	src := newPlacementFSM()
+	spec := &models.CreateSandboxRequest{Name: "preserved"}
+	payload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-1", Spec: spec})
+	if got := src.Apply(&raft.Log{Data: payload}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+
+	// Snapshot + restore into a fresh FSM.
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	dst := newPlacementFSM()
+	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	// A second sandbox with the same name should now collide on the
+	// restored index.
+	collidePayload, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-b", OwnerNodeID: "node-2", Spec: &models.CreateSandboxRequest{Name: "preserved"}})
+	got := dst.Apply(&raft.Log{Data: collidePayload})
+	err2, _ := got.(error)
+	if err2 == nil || !errors.Is(err2, ErrNameConflict) {
+		t.Fatalf("restored FSM did not enforce name uniqueness: got %v", got)
+	}
+}
+
+// TestFSMSubscribeFiresOnApply confirms that subscribers receive a wake
+// signal after every Apply. The ingress reconciler relies on this to
+// converge in <1s after a placement change instead of waiting out the
+// reconcile timer.
+func TestFSMSubscribeFiresOnApply(t *testing.T) {
+	fsm := newPlacementFSM()
+	wake := make(chan struct{}, 1)
+	cancel := fsm.subscribe(wake)
+	defer cancel()
+
+	cmd := command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA"}
+	payload, _ := encodeCommand(cmd)
+	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
+		t.Fatalf("apply: %v", got)
+	}
+	select {
+	case <-wake:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("subscriber did not receive wake after FSM apply")
+	}
+}
+
+// TestFSMSubscribeCoalesces confirms multiple applies between reads collapse
+// to one wake. notifySubscribers does non-blocking sends, so a slow
+// reconciler doesn't accumulate a backlog.
+func TestFSMSubscribeCoalesces(t *testing.T) {
+	fsm := newPlacementFSM()
+	wake := make(chan struct{}, 1)
+	cancel := fsm.subscribe(wake)
+	defer cancel()
+
+	for i := 0; i < 5; i++ {
+		cmd := command{Op: opDelete, SandboxID: "sb-x"}
+		payload, _ := encodeCommand(cmd)
+		fsm.Apply(&raft.Log{Data: payload})
+	}
+	// Drain the one available wake.
+	select {
+	case <-wake:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected at least one wake")
+	}
+	// No second wake should be readable; cap=1 dropped the rest.
+	select {
+	case <-wake:
+		t.Fatal("subscriber received more than one wake from coalesced applies")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestFSMSubscribeCancel deregisters a subscriber. After cancel, an apply
+// must not wake the channel.
+func TestFSMSubscribeCancel(t *testing.T) {
+	fsm := newPlacementFSM()
+	wake := make(chan struct{}, 1)
+	cancel := fsm.subscribe(wake)
+	cancel()
+
+	cmd := command{Op: opDelete, SandboxID: "sb-y"}
+	payload, _ := encodeCommand(cmd)
+	fsm.Apply(&raft.Log{Data: payload})
+
+	select {
+	case <-wake:
+		t.Fatal("subscriber received wake after cancel")
+	case <-time.After(50 * time.Millisecond):
+	}
+}

@@ -48,6 +48,15 @@ var ErrUnknownSandbox = errors.New("cluster: unknown sandbox placement")
 // expose failure to the user.
 var ErrHostPortReserved = errors.New("cluster: tcp host port already reserved")
 
+// ErrNameConflict is returned when the placement FSM rejects an opPlace /
+// opUpsertSpec because a different sandbox already owns the requested Name.
+// Sandbox names are unique cluster-wide; without this check, two concurrent
+// creates landing on different owners could each succeed locally and present
+// ambiguous name-based lookups to facades like Daytona that resolve sandboxes
+// by name. Callers handle this by rolling back the local create and surfacing
+// 409 Conflict to the user.
+var ErrNameConflict = errors.New("cluster: sandbox name already in use")
+
 // ErrOrphaned is returned by OwnerOf when a placement exists but its owner has
 // been auto-evicted and the dead-owner reconciler has cleared the pointer
 // without yet selecting a new owner. With auto-recreation enabled this is a
@@ -272,11 +281,27 @@ type Client interface {
 	Placements() []Placement
 
 	// PlacementVersion is the FSM's monotonic apply counter — bumps on every
-	// raft log entry the FSM applied. The ingress reconciler polls this on a
-	// fast tick to wake immediately on placement changes instead of waiting
-	// out the full reconcile interval. Zero means "no version data" (Noop or
-	// fresh cluster); callers should treat 0→non-zero as a change too.
+	// raft log entry the FSM applied. Exposed for metrics/observability and
+	// as a tie-breaker for tests; the ingress reconciler now uses
+	// SubscribePlacement to wake on apply rather than polling this counter.
+	// Zero means "no version data" (Noop or fresh cluster).
 	PlacementVersion() uint64
+
+	// SubscribePlacement returns a buffered (cap=1) channel that receives a
+	// signal after every FSM apply on this node. The channel is fed directly
+	// from FSM.Apply, so a leader-side commit reaches every node's
+	// subscribers as soon as raft delivers the log entry — no poll interval.
+	//
+	// Multiple applies between reads collapse into one wake (cap=1, drops on
+	// full). Cancel ctx (or the returned cancel func) to deregister; both
+	// are safe to call multiple times. Callers MUST tolerate spurious wakes —
+	// the channel says "something changed in the FSM," not "the placement
+	// you care about changed."
+	//
+	// In single-node mode (Noop) the returned channel never fires; this is
+	// safe to use in a select{} alongside a ticker because Go's select treats
+	// a never-firing nil channel as permanently un-ready, not an error.
+	SubscribePlacement(ctx context.Context) <-chan struct{}
 
 	// Leader returns the node ID of the current Raft leader, empty if none.
 	Leader() string

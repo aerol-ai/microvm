@@ -92,6 +92,24 @@ type Config struct {
 	MemoryOverProvisionFactor float64
 	HostCPUCoresOverride      int
 	HostMemoryMBOverride      int
+	// DiskReservationRatio gates total per-sandbox disk reservations against
+	// HostDiskGB. 0 disables disk admission entirely (legacy behaviour).
+	// HostDiskGB is operator-declared because robust auto-detection of the
+	// docker-data-root volume is filesystem-specific (overlay2, devicemapper,
+	// btrfs all report differently); we'd rather operators set the number
+	// they trust than guess wrong.
+	DiskReservationRatio float64
+	HostDiskGB           int
+	// HostGPUCount and HostGPUVendor describe the GPU inventory wired into
+	// Docker via nvidia-container-runtime / amdgpu / etc. Used by placement
+	// scheduling so a GPU sandbox is never forwarded to a GPU-less peer.
+	HostGPUCount  int
+	HostGPUVendor string
+	// HostSupportedRuntimes is a comma-separated SB_HOST_RUNTIMES list
+	// declaring which OCI runtimes this host has installed. Empty falls
+	// back to ["docker"] in capacity.New so existing single-runtime hosts
+	// don't need new env to keep accepting placements.
+	HostSupportedRuntimes []string
 
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
@@ -320,6 +338,11 @@ func Load() (Config, error) {
 		MemoryOverProvisionFactor: getEnvFloat("SB_MEMORY_OVERPROVISION_FACTOR", 10.0),
 		HostCPUCoresOverride:      getEnvInt("SB_HOST_CPU_CORES", 0),
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
+		DiskReservationRatio:      getEnvFloat("SB_DISK_RESERVATION_RATIO", 0),
+		HostDiskGB:                getEnvInt("SB_HOST_DISK_GB", 0),
+		HostGPUCount:              getEnvInt("SB_HOST_GPU_COUNT", 0),
+		HostGPUVendor:             strings.ToLower(strings.TrimSpace(os.Getenv("SB_HOST_GPU_VENDOR"))),
+		HostSupportedRuntimes:     splitAndTrim(os.Getenv("SB_HOST_RUNTIMES"), ","),
 
 		L4PortRangeStart: getEnvInt("SB_L4_PORT_RANGE_START", 22000),
 		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 23000),

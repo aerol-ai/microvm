@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -171,13 +170,7 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 	for _, id := range exclude {
 		excluded[id] = struct{}{}
 	}
-	req := capacity.Request{CPU: spec.CPU, MemoryMB: spec.MemoryMB}
-	if req.CPU <= 0 {
-		req.CPU = models.DefaultCPU
-	}
-	if req.MemoryMB <= 0 {
-		req.MemoryMB = models.DefaultMemoryMB
-	}
+	req := capacityRequestFromSpec(spec)
 	// Score every alive candidate that isn't excluded; pick the one with the
 	// highest headroom. We don't use power-of-two here because the candidate
 	// set is already filtered (and likely small after excludes) — full scan

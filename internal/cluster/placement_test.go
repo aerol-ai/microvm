@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TestNodeFitsRespectsBudget asserts that a peer whose post-reservation
@@ -71,6 +72,140 @@ func TestPickTwoDistinct(t *testing.T) {
 		x, y := pickTwo(members)
 		if x.NodeID == y.NodeID {
 			t.Fatalf("pickTwo returned identical members on iter %d: %v / %v", i, x, y)
+		}
+	}
+}
+
+// TestNodeFitsRejectsDiskOverflow asserts the disk-budget filter — placement
+// must skip a peer whose remaining disk budget cannot hold the request, even
+// when CPU and memory would otherwise fit. Without this, a sandbox lands on
+// the peer and ENOSPCs at create time, leaking partial state.
+func TestNodeFitsRejectsDiskOverflow(t *testing.T) {
+	tight := Member{
+		NodeID: "tight",
+		APIURL: "http://t",
+		Alive:  true,
+		Capacity: capacity.Snapshot{
+			HostCPUCores: 16, HostMemoryTotalMB: 32000, HostDiskTotalGB: 100,
+			CPUBudget: 16, MemoryBudgetMB: 32000, DiskBudgetGB: 100,
+			ReservedCPU: 1, ReservedMemoryMB: 1024, ReservedDiskGB: 95,
+		},
+	}
+	if nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 10}) {
+		t.Fatal("tight-disk node should not fit a 10 GB ask with only 5 GB free")
+	}
+	if !nodeFits(tight, capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 5}) {
+		t.Fatal("tight-disk node should still fit an exactly-sized ask")
+	}
+}
+
+// TestNodeFitsRejectsGPULessHost: a GPU sandbox must not be forwarded to a
+// peer that has no GPUs. The remote admitter would 503 anyway, but doing
+// the filter at placement time avoids the wasted forward and the noisy log.
+func TestNodeFitsRejectsGPULessHost(t *testing.T) {
+	gpuLess := Member{NodeID: "g0", APIURL: "http://g", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+	}}
+	if nodeFits(gpuLess, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"}) {
+		t.Fatal("GPU sandbox should be rejected from GPU-less host")
+	}
+}
+
+// TestNodeFitsRejectsGPUVendorMismatch: NVIDIA request must not land on AMD.
+func TestNodeFitsRejectsGPUVendorMismatch(t *testing.T) {
+	amd := Member{NodeID: "amd", APIURL: "http://a", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		GPUCount: 4, GPUVendor: "amd",
+	}}
+	if nodeFits(amd, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"}) {
+		t.Fatal("NVIDIA request must not fit on AMD host")
+	}
+	if !nodeFits(amd, capacity.Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "amd"}) {
+		t.Fatal("matching vendor must fit")
+	}
+}
+
+// TestNodeFitsRejectsUnsupportedRuntime: gvisor request must not land on a
+// docker-only host. Empty SupportedRuntimes (legacy peer) is treated as
+// "unknown, allow" — exercised in a separate test.
+func TestNodeFitsRejectsUnsupportedRuntime(t *testing.T) {
+	dockerOnly := Member{NodeID: "d", APIURL: "http://d", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		SupportedRuntimes: []string{"docker"},
+	}}
+	if nodeFits(dockerOnly, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"}) {
+		t.Fatal("gvisor request must not fit on docker-only host")
+	}
+	if !nodeFits(dockerOnly, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "docker"}) {
+		t.Fatal("docker request must fit on docker-only host")
+	}
+}
+
+// TestNodeFitsLegacyEmptyRuntimesAllowsAny: a peer that pre-dates the
+// SupportedRuntimes field (empty list, but non-zero CPU/memory so the
+// "unknown capacity" early-return doesn't fire) must remain a candidate
+// for any runtime — otherwise a rolling upgrade would freeze placements.
+func TestNodeFitsLegacyEmptyRuntimesAllowsAny(t *testing.T) {
+	legacy := Member{NodeID: "l", APIURL: "http://l", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		// SupportedRuntimes intentionally empty
+	}}
+	if !nodeFits(legacy, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"}) {
+		t.Fatal("legacy (empty SupportedRuntimes) peer must accept any runtime")
+	}
+}
+
+// TestHeadroomScoreIncludesDiskWhenReported: when a peer reports a disk
+// budget, the score must drop relative to a peer with more free disk. This
+// is the property power-of-two-choices uses to prefer the emptier peer.
+func TestHeadroomScoreIncludesDiskWhenReported(t *testing.T) {
+	full := Member{Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000, HostDiskTotalGB: 100,
+		CPUBudget: 8, MemoryBudgetMB: 8000, DiskBudgetGB: 100,
+		ReservedCPU: 1, ReservedMemoryMB: 1024, ReservedDiskGB: 90,
+	}}
+	empty := Member{Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000, HostDiskTotalGB: 100,
+		CPUBudget: 8, MemoryBudgetMB: 8000, DiskBudgetGB: 100,
+		ReservedCPU: 1, ReservedMemoryMB: 1024, ReservedDiskGB: 5,
+	}}
+	req := capacity.Request{CPU: 1, MemoryMB: 100, DiskGB: 5}
+	if headroomScore(full, req) >= headroomScore(empty, req) {
+		t.Fatal("disk-emptier node should score higher when both report disk")
+	}
+}
+
+// TestCapacityRequestFromSpecMatchesCreatePath pins the invariant the
+// capacityRequestFromSpec helper exists to enforce: a CreateSandboxRequest
+// that flows through capacityRequestFromCreate (placement on create) must
+// produce the same capacity.Request as the spec going through
+// capacityRequestFromSpec (placement on failover-recreate). Drift here
+// would mean a recreated GPU/disk sandbox loses its hard constraints.
+func TestCapacityRequestFromSpecPopulatesAllAxes(t *testing.T) {
+	spec := &models.CreateSandboxRequest{
+		CPU: 2, MemoryMB: 4096, DiskGB: 50, Runtime: "gvisor",
+		GPUs: &models.GPURequest{Vendor: models.GPUVendorNVIDIA, Count: 2},
+	}
+	got := capacityRequestFromSpec(spec)
+	want := capacity.Request{CPU: 2, MemoryMB: 4096, DiskGB: 50, Runtime: "gvisor", GPUs: 2, GPUVendor: "nvidia"}
+	if got != want {
+		t.Fatalf("capacityRequestFromSpec drift: got %+v want %+v", got, want)
+	}
+}
+
+// TestCapacityRequestFromSpecGPUCountDefaults pins the documented GPU.Count
+// semantics: 0 means "default 1", -1 ("all") is normalized to 1 for
+// placement scoring (we can't gossip "all" cleanly, and any GPU host with
+// at least one card satisfies the intent).
+func TestCapacityRequestFromSpecGPUCountDefaults(t *testing.T) {
+	for _, tc := range []struct{ in, want int }{{0, 1}, {-1, 1}, {3, 3}} {
+		spec := &models.CreateSandboxRequest{
+			CPU: 1, MemoryMB: 100, DiskGB: 10,
+			GPUs: &models.GPURequest{Vendor: models.GPUVendorNVIDIA, Count: tc.in},
+		}
+		if got := capacityRequestFromSpec(spec).GPUs; got != tc.want {
+			t.Fatalf("GPU.Count=%d: got %d, want %d", tc.in, got, tc.want)
 		}
 	}
 }

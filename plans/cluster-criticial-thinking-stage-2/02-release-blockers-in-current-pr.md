@@ -149,8 +149,14 @@ That removes the 1/N hit-rate blocker for normal operation.
 
 **Remaining release work:**
 
-- replace polling with a watch/revision model or prove the polling interval is
-  acceptable at 200 x 50;
+- ~~replace polling with a watch/revision model or prove the polling interval is
+  acceptable at 200 x 50~~ — **Resolved on this branch.** The 500ms FSM-version
+  poll is gone; `Cluster.SubscribePlacement` returns a buffered cap=1 channel
+  and `placementFSM.Apply` wakes subscribers on every committed mutation. Noop
+  returns nil so single-node mode select{}s harmlessly. See
+  `internal/cluster/fsm.go` (`subscribers`, `notifySubscribers`),
+  `internal/cluster/client.go` (`SubscribePlacement`), and
+  `internal/service/ingress_wake_test.go`.
 - add metrics for route lag, Caddy admin latency, and route misses;
 - test Caddy route churn and config size at 10K sandboxes;
 - define explicit failover responses during the convergence window.
@@ -262,6 +268,13 @@ Move name reservation into the cluster control plane:
 - reservation before create;
 - idempotent retry semantics for duplicate create requests.
 
+**Current branch status:** **Resolved.** `placementFSM` now maintains a
+`nameIndex` (`name -> sandbox_id`); `opPlace` and `opUpsertSpec` validate
+uniqueness before mutating state and return `ErrNameConflict` on collision
+(idempotent for the same sandbox_id). `Restore` rebuilds the index from
+placements. The cluster-create path in `pkg/api/v1/cluster_handler.go` maps
+`ErrNameConflict` to `409 Conflict` and rolls back the local create.
+
 ## B11. Placement ignores disk and GPU
 
 **Where:**
@@ -283,6 +296,21 @@ Add node resource inventory and scheduler filters for:
 - disk budget and disk pressure;
 - GPU inventory, type, count, and runtime compatibility;
 - runtime support labels (`docker`, `gvisor`, future `kata`).
+
+**Current branch status:** **Resolved (placement filter).**
+`capacity.{Snapshot,Request,HostInfo,Limits}` extended with disk
+(GB-granular, operator-declared `SB_HOST_DISK_GB` +
+`SB_DISK_RESERVATION_RATIO`), GPU inventory (`SB_HOST_GPU_COUNT` /
+`SB_HOST_GPU_VENDOR`), and `SB_HOST_RUNTIMES`. `placement.nodeFits`
+filters on disk budget, GPU count + vendor, and runtime support;
+`headroomScore` includes disk when reported. The local `Admitter`
+charges and rejects on the same axes so a forwarded create can't pass
+placement and then 503 on the receiving node. `capacityRequestFromSpec`
+and `capacityRequestFromCreate` populate the new fields from
+`models.CreateSandboxRequest` so failover-recreate inherits the same
+constraints. Auto-detection of disk and GPU inventory is deliberately
+out of scope (operator-declared) — overlay2/devicemapper/btrfs report
+disk differently and GPU enumeration is vendor-specific.
 
 ## B12. `cluster-init.sh` credential-key ordering is suspicious
 

@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
@@ -242,13 +241,7 @@ func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeI
 	if spec == nil {
 		return "", "", ""
 	}
-	req := capacity.Request{CPU: spec.CPU, MemoryMB: spec.MemoryMB}
-	if req.CPU <= 0 {
-		req.CPU = models.DefaultCPU
-	}
-	if req.MemoryMB <= 0 {
-		req.MemoryMB = models.DefaultMemoryMB
-	}
+	req := capacityRequestFromSpec(spec)
 	target, err := c.SelectPlacement(req)
 	if err != nil {
 		return "", "", ""

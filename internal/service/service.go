@@ -2057,15 +2057,15 @@ func (s *Service) StartClusterIngressReconcile(ctx context.Context) {
 	if !s.cfg.EnableCluster || !s.caddy.Enabled() {
 		return
 	}
-	// Fast-wake channel: a separate goroutine polls the FSM's monotonic
-	// version every clusterIngressFastPollInterval and signals here on
-	// change. The reconcile loop selects between the slow timer and this
-	// channel, so a placement apply on the leader is reflected in ingress
-	// routes within ~500ms instead of the full 5s reconcile period. Buffer
-	// of 1 collapses bursts (multiple version bumps between reconciles
-	// trigger one wake, not N).
-	wake := make(chan struct{}, 1)
-	go s.runIngressVersionWatcher(ctx, wake)
+	// Push-based wake: SubscribePlacement returns a channel the FSM signals
+	// directly from Apply, so a leader-side raft commit reaches every node's
+	// reconciler as soon as the log entry is delivered. No poll interval —
+	// the previous version-poll watcher imposed a 500ms floor on convergence
+	// and a constant background ticker; the push path eliminates both.
+	//
+	// In single-node mode (Noop) the channel is nil; selecting on nil is
+	// permanently un-ready, so the loop falls back to the slow timer.
+	wake := s.Cluster().SubscribePlacement(ctx)
 	go func() {
 		for {
 			reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -2085,42 +2085,6 @@ func (s *Service) StartClusterIngressReconcile(ctx context.Context) {
 			}
 		}
 	}()
-}
-
-// clusterIngressFastPollInterval is the FSM-version poll cadence for the
-// fast-wake path. 500ms keeps the convergence window comfortably under the
-// stage-2 §06 SLO of 2s p95 placement-to-ingress without burning a goroutine
-// on the hot path. Reading FSM.currentVersion is a single atomic-protected
-// uint64 read; the cost is negligible.
-const clusterIngressFastPollInterval = 500 * time.Millisecond
-
-// runIngressVersionWatcher polls the cluster FSM version and signals wake
-// whenever it changes. Non-blocking send: if the reconciler is mid-tick or
-// already armed, drop the signal — one wake per idle period is enough.
-func (s *Service) runIngressVersionWatcher(ctx context.Context, wake chan<- struct{}) {
-	c := s.Cluster()
-	if c == nil {
-		return
-	}
-	last := c.PlacementVersion()
-	t := time.NewTicker(clusterIngressFastPollInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			cur := s.Cluster().PlacementVersion()
-			if cur == last {
-				continue
-			}
-			last = cur
-			select {
-			case wake <- struct{}{}:
-			default:
-			}
-		}
-	}
 }
 
 func (s *Service) ReconcileClusterIngress(ctx context.Context) error {

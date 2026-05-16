@@ -660,13 +660,32 @@ func (c *Cluster) Placements() []Placement {
 }
 
 // PlacementVersion returns the FSM's monotonic apply counter — bumps on
-// every committed raft log entry. Used by the cluster-ingress reconciler's
-// fast-poll wake loop.
+// every committed raft log entry. Exposed for metrics and as a tie-breaker
+// for tests; the ingress reconciler uses SubscribePlacement to wake on
+// apply rather than polling this counter.
 func (c *Cluster) PlacementVersion() uint64 {
 	if c.fsm == nil {
 		return 0
 	}
 	return c.fsm.currentVersion()
+}
+
+// SubscribePlacement returns a buffered (cap=1) wake channel that fires after
+// every FSM apply on this node. Cancelling ctx removes the subscriber. See the
+// Client.SubscribePlacement contract for semantics.
+func (c *Cluster) SubscribePlacement(ctx context.Context) <-chan struct{} {
+	if c.fsm == nil {
+		return nil
+	}
+	ch := make(chan struct{}, 1)
+	cancel := c.fsm.subscribe(ch)
+	// Tie cleanup to the caller's context — when ctx fires, drop the
+	// subscriber so the FSM doesn't keep handing it signals forever.
+	go func() {
+		<-ctx.Done()
+		cancel()
+	}()
+	return ch
 }
 
 // Leader returns the node ID of the current raft leader. Empty if no leader.

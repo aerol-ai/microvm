@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,14 +74,40 @@ type placementFSM struct {
 	mu         sync.RWMutex
 	placements map[string]Placement
 	version    uint64
+	// nameIndex maps sandbox Name → SandboxID for cluster-wide name uniqueness.
+	// Empty names are NOT indexed (anonymous sandboxes don't conflict, matching
+	// the local SQLite partial unique index that allows many empty names but
+	// rejects duplicate non-empty names). Updated inside Apply alongside the
+	// placement write so the index can never lag the authoritative map; rebuilt
+	// from placements on Restore so older snapshots without an index still load.
+	nameIndex map[string]string
+
+	// subMu guards subscribers. Separate from mu so a slow subscriber accept
+	// can't block FSM reads — Apply takes mu briefly to write, releases it,
+	// then takes subMu to fan out.
+	subMu       sync.Mutex
+	subscribers []chan<- struct{}
 }
 
 func newPlacementFSM() *placementFSM {
-	return &placementFSM{placements: make(map[string]Placement)}
+	return &placementFSM{
+		placements: make(map[string]Placement),
+		nameIndex:  make(map[string]string),
+	}
 }
 
 // Apply is invoked by raft for every committed log entry on every node.
 func (f *placementFSM) Apply(log *raft.Log) interface{} {
+	res := f.apply(log)
+	// Notify subscribers AFTER releasing the FSM lock so the ingress
+	// reconciler (or any other watcher) can immediately re-read placements
+	// without contending with the next Apply. Non-blocking by design — see
+	// notifySubscribers.
+	f.notifySubscribers()
+	return res
+}
+
+func (f *placementFSM) apply(log *raft.Log) interface{} {
 	cmd, err := decodeCommand(log.Data)
 	if err != nil {
 		return fmt.Errorf("placementFSM: decode: %w", err)
@@ -101,6 +128,16 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		existing, exists := f.placements[cmd.SandboxID]
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && cmd.SealedSecrets == nil {
 			return nil
+		}
+		// Cluster-wide name uniqueness. Without this, two concurrent creates
+		// with the same Name landing on different owners would both succeed
+		// (each owner's local SQLite is a separate name namespace) and any
+		// name-based facade lookup (e.g. Daytona) would resolve ambiguously.
+		// Done before any state mutation so a conflict leaves the FSM
+		// untouched and the leader's apply path returns the sentinel for the
+		// API handler to roll back the local create.
+		if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
+			return err
 		}
 		created := now
 		if exists {
@@ -131,6 +168,12 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		if dataPlaneHost == "" && exists {
 			dataPlaneHost = existing.OwnerDataPlaneHost
 		}
+		// Drop the OLD name from the index before writing the new placement —
+		// otherwise a re-place with a renamed spec would leave a phantom
+		// nameIndex entry pointing at this sandbox under its previous name.
+		if exists {
+			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+		}
 		f.placements[cmd.SandboxID] = Placement{
 			SandboxID:          cmd.SandboxID,
 			OwnerNodeID:        cmd.OwnerNodeID,
@@ -144,8 +187,12 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			ExposedPorts:       ports,
 			ExposedPortRoutes:  portRoutes,
 		}
+		f.claimNameLocked(cmd.SandboxID, specName(spec))
 		return nil
 	case opDelete:
+		if existing, ok := f.placements[cmd.SandboxID]; ok {
+			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+		}
 		delete(f.placements, cmd.SandboxID)
 		return nil
 	case opReassign:
@@ -174,6 +221,15 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 			return nil
 		}
 		if cmd.Spec != nil {
+			oldName := specName(existing.Spec)
+			newName := specName(cmd.Spec)
+			if newName != oldName {
+				if err := f.validateNameUniqueLocked(cmd.SandboxID, newName); err != nil {
+					return err
+				}
+				f.releaseNameLocked(cmd.SandboxID, oldName)
+				f.claimNameLocked(cmd.SandboxID, newName)
+			}
 			existing.Spec = cmd.Spec
 		}
 		// Replace the sealed bag only when the caller supplied one. Resize /
@@ -242,6 +298,54 @@ func (f *placementFSM) Apply(log *raft.Log) interface{} {
 		return nil
 	default:
 		return fmt.Errorf("placementFSM: unknown op %d", cmd.Op)
+	}
+}
+
+// specName returns the trimmed Name field, or "" if spec is nil. Centralized
+// so the conflict-check, claim, and release paths all derive the index key
+// the same way — a mismatch would silently leak nameIndex entries.
+func specName(spec *models.CreateSandboxRequest) string {
+	if spec == nil {
+		return ""
+	}
+	return strings.TrimSpace(spec.Name)
+}
+
+// validateNameUniqueLocked checks that no other placement currently claims
+// name. Empty name is always allowed (anonymous sandboxes don't conflict);
+// matches the local SQLite partial-unique-index behavior.
+func (f *placementFSM) validateNameUniqueLocked(sandboxID, name string) error {
+	if name == "" {
+		return nil
+	}
+	if owner, ok := f.nameIndex[name]; ok && owner != sandboxID {
+		return fmt.Errorf("%w: %q is held by %s", ErrNameConflict, name, owner)
+	}
+	return nil
+}
+
+// claimNameLocked records sandboxID as the owner of name. Empty name is a
+// no-op — anonymous sandboxes don't enter the index.
+func (f *placementFSM) claimNameLocked(sandboxID, name string) {
+	if name == "" {
+		return
+	}
+	if f.nameIndex == nil {
+		f.nameIndex = make(map[string]string)
+	}
+	f.nameIndex[name] = sandboxID
+}
+
+// releaseNameLocked drops name from the index when sandboxID is the recorded
+// owner. The owner-check guards against a delete-then-place race in raft log
+// order: if the rename's claim already wrote the new owner, a stale release
+// for the old name could otherwise unmap the new placement.
+func (f *placementFSM) releaseNameLocked(sandboxID, name string) {
+	if name == "" {
+		return
+	}
+	if owner, ok := f.nameIndex[name]; ok && owner == sandboxID {
+		delete(f.nameIndex, name)
 	}
 }
 
@@ -330,6 +434,15 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 		loaded = make(map[string]Placement)
 	}
 	f.placements = loaded
+	// Rebuild nameIndex from placements. Snapshots don't carry the index
+	// (older snapshots predate it), and rebuilding keeps the FSM the single
+	// source of truth even after a cold restart.
+	f.nameIndex = make(map[string]string, len(loaded))
+	for id, p := range loaded {
+		if name := specName(p.Spec); name != "" {
+			f.nameIndex[name] = id
+		}
+	}
 	return nil
 }
 
@@ -404,6 +517,46 @@ func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSa
 		out.GPUs = &gpus
 	}
 	return &out
+}
+
+// subscribe registers ch to receive a non-blocking signal after every Apply.
+// The caller is expected to use a buffered channel of capacity 1 so a missed
+// signal collapses into the next one (the watcher only needs "something
+// changed", not the count of changes). Returns a cancel func that removes the
+// subscriber and is safe to call multiple times.
+func (f *placementFSM) subscribe(ch chan<- struct{}) (cancel func()) {
+	f.subMu.Lock()
+	f.subscribers = append(f.subscribers, ch)
+	f.subMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.subMu.Lock()
+			defer f.subMu.Unlock()
+			for i, c := range f.subscribers {
+				if c == ch {
+					f.subscribers = append(f.subscribers[:i], f.subscribers[i+1:]...)
+					return
+				}
+			}
+		})
+	}
+}
+
+// notifySubscribers fires every registered channel non-blocking. A subscriber
+// that's already armed (buffered slot full) drops the signal — exactly the
+// behaviour we want, because "more than one apply since last wake" is still
+// just "wake up and reconcile."
+func (f *placementFSM) notifySubscribers() {
+	f.subMu.Lock()
+	subs := f.subscribers
+	f.subMu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

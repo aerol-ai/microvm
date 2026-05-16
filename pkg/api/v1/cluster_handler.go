@@ -190,6 +190,15 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
 		}
 		rbCancel()
+		// Cluster-wide name conflict surfaces as 409 so clients can
+		// distinguish "pick a different name" from "cluster degraded, retry"
+		// (503). Without this mapping, two concurrent same-name creates
+		// landing on different owners both look like transient placement
+		// failures and clients would back off pointlessly.
+		if errors.Is(err, cluster.ErrNameConflict) {
+			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+			return
+		}
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: placement commit failed: "+err.Error())
 		return
 	}
@@ -507,11 +516,30 @@ func (h *handlers) replicateRemoveExposedPort(ctx context.Context, id string, po
 func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
 	cpu := req.CPU
 	mem := req.MemoryMB
+	disk := req.DiskGB
 	if cpu <= 0 {
 		cpu = models.DefaultCPU
 	}
 	if mem <= 0 {
 		mem = models.DefaultMemoryMB
 	}
-	return capacity.Request{CPU: cpu, MemoryMB: mem}
+	if disk <= 0 {
+		disk = models.DefaultDiskGB
+	}
+	out := capacity.Request{CPU: cpu, MemoryMB: mem, DiskGB: disk, Runtime: req.Runtime}
+	// GPUs == nil means "no GPU"; a non-nil GPURequest with Count <= 0 is
+	// the documented "default 1" path (see GPURequest.Count comment in
+	// pkg/models/types.go) and we mirror that here so placement scoring
+	// reserves at least one GPU. Count == -1 ("all") is also normalized
+	// to 1 for placement purposes — we can't gossip "all" cleanly, and
+	// any GPU host that has at least one card satisfies the intent.
+	if req.GPUs != nil {
+		want := req.GPUs.Count
+		if want <= 0 {
+			want = 1
+		}
+		out.GPUs = want
+		out.GPUVendor = string(req.GPUs.Vendor)
+	}
+	return out
 }

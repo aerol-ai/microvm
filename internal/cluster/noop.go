@@ -70,6 +70,12 @@ func (n *Noop) Placements() []Placement { return nil }
 // no need to wake an ingress reconciler that isn't running.
 func (n *Noop) PlacementVersion() uint64 { return 0 }
 
+// SubscribePlacement returns nil in single-node mode. Selecting on a nil
+// channel never proceeds, so an ingress reconciler that select{}s on this
+// channel + a slow ticker just behaves as if the cluster never has
+// placement events — which is exactly the truth.
+func (n *Noop) SubscribePlacement(ctx context.Context) <-chan struct{} { return nil }
+
 func (n *Noop) Leader() string { return n.nodeID }
 
 func (n *Noop) Close() error { return nil }

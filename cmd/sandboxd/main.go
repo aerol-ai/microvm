@@ -90,9 +90,14 @@ func main() {
 	if cfg.HostMemoryMBOverride > 0 {
 		host.MemoryTotalMB = cfg.HostMemoryMBOverride
 	}
+	host.DiskTotalGB = cfg.HostDiskGB
+	host.GPUCount = cfg.HostGPUCount
+	host.GPUVendor = cfg.HostGPUVendor
+	host.SupportedRuntimes = cfg.HostSupportedRuntimes
 	admitter := capacity.New(host, capacity.Limits{
 		CPUReservationRatio:       cfg.CPUReservationRatio,
 		MemoryReservationRatio:    cfg.MemoryReservationRatio,
+		DiskReservationRatio:      cfg.DiskReservationRatio,
 		MemoryFloorRatio:          cfg.MemoryFloorRatio,
 		CPUOverProvisionFactor:    cfg.CPUOverProvisionFactor,
 		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
@@ -100,8 +105,13 @@ func main() {
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
+		"host_disk_gb", host.DiskTotalGB,
+		"host_gpu_count", host.GPUCount,
+		"host_gpu_vendor", host.GPUVendor,
+		"host_supported_runtimes", host.SupportedRuntimes,
 		"cpu_reservation_ratio", cfg.CPUReservationRatio,
 		"memory_reservation_ratio", cfg.MemoryReservationRatio,
+		"disk_reservation_ratio", cfg.DiskReservationRatio,
 		"memory_floor_ratio", cfg.MemoryFloorRatio,
 		"cpu_overprovision_factor", cfg.CPUOverProvisionFactor,
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
