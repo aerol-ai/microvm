@@ -246,7 +246,7 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -269,7 +269,7 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return

@@ -607,8 +607,39 @@ func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, e
 	return s.store.Get(ctx, id)
 }
 
-func (s *Service) ListSandboxes(ctx context.Context) ([]*models.Sandbox, error) {
-	return s.store.List(ctx)
+// ListSandboxes returns sandboxes whose Tags match every entry in tagFilter.
+// A nil or empty filter returns every sandbox on this node. Filtering happens
+// in-memory after the store read because Tags is JSON-encoded; pushing the
+// filter into SQL via json_extract is a follow-up once row counts make the
+// extra hop worth it. The filter exists so an external control plane can ask
+// "give me the sandboxes belonging to user X" without round-tripping every
+// sandbox in the cluster (see plans/multi-tenancy-via-control-plane.md).
+func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string) ([]*models.Sandbox, error) {
+	sandboxes, err := s.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(tagFilter) == 0 {
+		return sandboxes, nil
+	}
+	filtered := sandboxes[:0]
+	for _, sb := range sandboxes {
+		if sandboxMatchesTags(sb, tagFilter) {
+			filtered = append(filtered, sb)
+		}
+	}
+	return filtered, nil
+}
+
+// sandboxMatchesTags returns true iff every key in want is present on sb.Tags
+// with the same value. An empty want matches everything (caller short-circuits).
+func sandboxMatchesTags(sb *models.Sandbox, want map[string]string) bool {
+	for k, v := range want {
+		if sb.Tags[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox, error) {

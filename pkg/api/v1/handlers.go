@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
@@ -46,13 +47,39 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), parseTagFilter(r))
 	if err != nil {
 		h.deps.Logger.Warn("list sandboxes failed", "error", err)
 		apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, sandboxes)
+}
+
+// parseTagFilter pulls every query parameter of the form `tag.<key>=<value>`
+// into a flat map. Multiple tag.* params AND together at the service layer.
+// Anything else in the query string is ignored. This is the read-path twin of
+// CreateSandboxRequest.Tags — an external control plane stamps tags at create
+// time and uses the same keys here to scope its list calls. See
+// plans/multi-tenancy-via-control-plane.md.
+func parseTagFilter(r *http.Request) map[string]string {
+	const prefix = "tag."
+	q := r.URL.Query()
+	var filter map[string]string
+	for key, values := range q {
+		if !strings.HasPrefix(key, prefix) || len(values) == 0 {
+			continue
+		}
+		name := key[len(prefix):]
+		if name == "" {
+			continue
+		}
+		if filter == nil {
+			filter = make(map[string]string, 2)
+		}
+		filter[name] = values[0]
+	}
+	return filter
 }
 
 func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {

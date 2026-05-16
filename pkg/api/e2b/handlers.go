@@ -128,7 +128,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return

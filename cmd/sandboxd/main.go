@@ -274,7 +274,7 @@ func main() {
 // the spec falls back to nil-Registry rather than aborting boot for the
 // whole fleet.
 func localSandboxStates(ctx context.Context, svc *service.Service, logger *slog.Logger) ([]cluster.LocalSandboxState, error) {
-	sandboxes, err := svc.ListSandboxes(ctx)
+	sandboxes, err := svc.ListSandboxes(ctx, nil)
 	if err != nil {
 		return nil, err
 	}

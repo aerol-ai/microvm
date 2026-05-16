@@ -246,7 +246,8 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		peers = append(peers, m)
 	}
 
-	local, err := h.deps.Service.ListSandboxes(r.Context())
+	tagFilter := parseTagFilter(r)
+	local, err := h.deps.Service.ListSandboxes(r.Context(), tagFilter)
 	if err != nil {
 		h.deps.Logger.Warn("cluster list: local list failed", "error", err)
 		local = nil
@@ -259,11 +260,18 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	}
 	results := make(chan peerResult, len(peers))
 	auth := r.Header.Get("Authorization")
+	// Forward the original query string to each peer so they apply the same
+	// tag filter locally — only matching rows traverse the network. Empty
+	// when the caller didn't pass any tag.* params.
+	peerQuery := r.URL.RawQuery
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	for _, peer := range peers {
 		peer := peer
 		go func() {
 			endpoint := strings.TrimRight(peer.APIURL, "/") + "/v1/sandboxes"
+			if peerQuery != "" {
+				endpoint += "?" + peerQuery
+			}
 			req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
 			if err != nil {
 				results <- peerResult{nodeID: peer.NodeID, err: err}
