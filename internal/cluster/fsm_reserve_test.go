@@ -61,6 +61,10 @@ func TestFSMReserveWritesReservedState(t *testing.T) {
 	if string(p.SealedSecrets) != "sealed-bag" {
 		t.Fatalf("SealedSecrets = %q, want sealed-bag", string(p.SealedSecrets))
 	}
+	pending := fsm.pendingReservationsByNode(time.Now().Unix())
+	if got := pending["B"]; got.CPU != 2 || got.MemoryMB != 1024 {
+		t.Fatalf("pending capacity for B = %+v, want CPU=2 MemoryMB=1024", got)
+	}
 }
 
 // TestFSMReserveIdempotentRefreshesExpiry pins the retry contract: a
@@ -256,7 +260,7 @@ func TestFSMSnapshotRoundTripPreservesReservedState(t *testing.T) {
 	expiry := time.Now().Add(120 * time.Second).Unix()
 	applyOp(t, src, command{
 		Op: opReserve, SandboxID: "sb-r", OwnerNodeID: "B",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "named-reservation"},
+		Spec:          &models.CreateSandboxRequest{Image: "alpine", Name: "named-reservation"},
 		SealedSecrets: []byte("sealed"),
 		ExpiresUnix:   expiry,
 	})
@@ -284,6 +288,10 @@ func TestFSMSnapshotRoundTripPreservesReservedState(t *testing.T) {
 	}
 	if got.ExpiresUnix != expiry {
 		t.Fatalf("ExpiresUnix after restore = %d, want %d", got.ExpiresUnix, expiry)
+	}
+	pending := dst.pendingReservationsByNode(time.Now().Unix())
+	if got := pending["B"]; got.CPU != models.DefaultCPU || got.MemoryMB != models.DefaultMemoryMB {
+		t.Fatalf("restored pending capacity for B = %+v, want default request from reserved spec", got)
 	}
 	if got.Spec == nil || got.Spec.Name != "named-reservation" {
 		t.Fatalf("Spec lost during restore: %+v", got.Spec)
@@ -330,5 +338,87 @@ func TestFSMPendingReservationsByNodeSumsAndExcludesExpired(t *testing.T) {
 	}
 	if _, present := got["other"]; present {
 		t.Fatalf("got entry for other unowned node: %+v", got)
+	}
+	if _, ok := fsm.pendingReservationClaims["sb3"]; ok {
+		t.Fatalf("expired reservation remains in pending index after read")
+	}
+}
+
+func TestFSMPendingReservationIndexReleasesOnStateTransitions(t *testing.T) {
+	fsm := newPlacementFSM()
+	expiry := time.Now().Add(60 * time.Second).Unix()
+
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 2}, ExpiresUnix: expiry})
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb2", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 1}, ExpiresUnix: expiry})
+	if got := fsm.pendingReservationsByNode(time.Now().Unix())["B"].CPU; got != 3 {
+		t.Fatalf("pending CPU after two reservations = %v, want 3", got)
+	}
+
+	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B"}); got != nil {
+		t.Fatalf("promote sb1: %v", got)
+	}
+	if got := fsm.pendingReservationsByNode(time.Now().Unix())["B"].CPU; got != 1 {
+		t.Fatalf("pending CPU after promote = %v, want only sb2=1", got)
+	}
+	if _, ok := fsm.pendingReservationClaims["sb1"]; ok {
+		t.Fatalf("promoted reservation sb1 still has a pending claim")
+	}
+
+	if got := applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb2"}); got != nil {
+		t.Fatalf("cancel sb2: %v", got)
+	}
+	if _, ok := fsm.pendingReservationsByNode(time.Now().Unix())["B"]; ok {
+		t.Fatalf("owner B still has pending capacity after cancel")
+	}
+
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb3", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 4}, ExpiresUnix: expiry})
+	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb3", OwnerNodeID: "C"}); got != nil {
+		t.Fatalf("reassign sb3: %v", got)
+	}
+	pending := fsm.pendingReservationsByNode(time.Now().Unix())
+	if _, ok := pending["B"]; ok {
+		t.Fatalf("old owner B still has pending capacity after reservation reassign: %+v", pending)
+	}
+	if got := pending["C"].CPU; got != 4 {
+		t.Fatalf("new owner C pending CPU = %v, want 4", got)
+	}
+	if got := applyOp(t, fsm, command{Op: opDelete, SandboxID: "sb3"}); got != nil {
+		t.Fatalf("delete sb3: %v", got)
+	}
+	if len(fsm.pendingReservationsByNode(time.Now().Unix())) != 0 {
+		t.Fatalf("pending capacity not empty after deleting last reservation: %+v", fsm.pendingReservationsByNode(time.Now().Unix()))
+	}
+}
+
+func TestFSMPendingReservationIndexRefreshesExpiryWithoutDoubleCounting(t *testing.T) {
+	fsm := newPlacementFSM()
+	now := time.Now()
+	first := now.Add(10 * time.Second).Unix()
+	later := now.Add(60 * time.Second).Unix()
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 2}, ExpiresUnix: first})
+	if got := applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", ExpiresUnix: later}); got != nil {
+		t.Fatalf("refresh reserve: %v", got)
+	}
+
+	beforeLater := fsm.pendingReservationsByNode(now.Add(20 * time.Second).Unix())
+	if got := beforeLater["B"].CPU; got != 2 {
+		t.Fatalf("pending CPU after stale expiry passed = %v, want 2 without double-counting", got)
+	}
+	afterLater := fsm.pendingReservationsByNode(now.Add(90 * time.Second).Unix())
+	if _, ok := afterLater["B"]; ok {
+		t.Fatalf("pending capacity remained after refreshed expiry elapsed: %+v", afterLater)
+	}
+}
+
+func TestFSMPendingReservationIndexUpdatesOnReservedSpecUpsert(t *testing.T) {
+	fsm := newPlacementFSM()
+	expiry := time.Now().Add(60 * time.Second).Unix()
+	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 512}, ExpiresUnix: expiry})
+	if got := applyOp(t, fsm, command{Op: opUpsertSpec, SandboxID: "sb1", Spec: &models.CreateSandboxRequest{CPU: 3, MemoryMB: 2048}}); got != nil {
+		t.Fatalf("upsert reserved spec: %v", got)
+	}
+	got := fsm.pendingReservationsByNode(time.Now().Unix())["B"]
+	if got.CPU != 3 || got.MemoryMB != 2048 {
+		t.Fatalf("pending after reserved spec upsert = %+v, want CPU=3 MemoryMB=2048", got)
 	}
 }

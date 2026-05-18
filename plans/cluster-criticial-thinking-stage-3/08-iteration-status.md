@@ -34,6 +34,11 @@ real production soak, not in the obvious unbounded hot paths.
   RPC.
 - Placement reads are shard-filterable, backed by a stable 16,384-shard index,
   and worker/ingress agents can query only their assigned shards.
+- Create placement no longer scans the full placement map to account for
+  in-flight reservations. The FSM maintains a per-reservation claim map,
+  per-owner pending capacity aggregate, and expiry heap; gossip member metadata
+  is decoded into an event-driven member index instead of being JSON-decoded on
+  every placement read.
 - Ingress route ownership is sharded across ingress-capable members. Reconcile
   builds desired route intents, applies only deltas, batches Caddy writes, and
   runs full Caddy snapshot GC as a sparse backstop rather than the normal path.
@@ -56,8 +61,9 @@ real production soak, not in the obvious unbounded hot paths.
   node, and legacy raw blobs remain readable for rolling upgrades.
 - Repeatable scale gates live behind `AEROLVM_SCALE_GATES=1` and can be run via
   `scripts/scale-gates.sh`; they cover 10k ingress-member shard assignment,
-  100k placement pagination/sharding, 100k raw-TCP host-port collision checks,
-  100k ingress delta churn, and failover/ingress storm behavior.
+  100k placement pagination/sharding, 100k placement plus pending-reservation
+  create accounting, 100k raw-TCP host-port collision checks, 100k ingress
+  delta churn, and failover/ingress storm behavior.
 
 ## Still Pending
 

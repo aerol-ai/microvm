@@ -82,3 +82,50 @@ func TestScaleGateHostPortIndexAt100K(t *testing.T) {
 		t.Fatal("duplicate host port at 100k placements succeeded")
 	}
 }
+
+func TestScaleGatePendingReservationIndexAt100KPlacements(t *testing.T) {
+	requireScaleGates(t)
+	fsm := newPlacementFSM()
+	const placements = 100_000
+	for i := 0; i < placements; i++ {
+		place, _ := encodeCommand(command{
+			Op:          opPlace,
+			SandboxID:   fmt.Sprintf("placed-%06d", i),
+			OwnerNodeID: fmt.Sprintf("node-%04d", i%10_000),
+			Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
+		})
+		if got := fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: place}); got != nil {
+			t.Fatalf("place %d: %v", i, got)
+		}
+	}
+
+	const reservations = 10_000
+	const owners = 100
+	expires := int64(4_102_444_800) // 2100-01-01
+	for i := 0; i < reservations; i++ {
+		reserve, _ := encodeCommand(command{
+			Op:          opReserve,
+			SandboxID:   fmt.Sprintf("reserved-%05d", i),
+			OwnerNodeID: fmt.Sprintf("node-%03d", i%owners),
+			Spec:        &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 128, DiskGB: 1},
+			ExpiresUnix: expires,
+		})
+		if got := fsm.Apply(&raft.Log{Index: uint64(placements + i + 1), Data: reserve}); got != nil {
+			t.Fatalf("reserve %d: %v", i, got)
+		}
+	}
+
+	if len(fsm.pendingReservationClaims) != reservations {
+		t.Fatalf("pending claims=%d, want %d", len(fsm.pendingReservationClaims), reservations)
+	}
+	pending := fsm.pendingReservationsByNode(expires - 1)
+	if len(pending) != owners {
+		t.Fatalf("pending owner buckets=%d, want %d", len(pending), owners)
+	}
+	if got := pending["node-000"].CPU; got != reservations/owners {
+		t.Fatalf("node-000 pending CPU=%v, want %d", got, reservations/owners)
+	}
+	if got := len(fsm.pendingReservationsByNode(expires + 1)); got != 0 {
+		t.Fatalf("expired pending owner buckets=%d, want 0", got)
+	}
+}

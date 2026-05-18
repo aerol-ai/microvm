@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"container/heap"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
@@ -108,6 +109,14 @@ type placementFSM struct {
 	// rejects collisions in O(1) under the FSM lock instead of scanning every
 	// placement at 100k-row scale.
 	hostPortIndex map[int]hostPortClaim
+	// pendingReservationClaims is the per-reservation ledger behind
+	// pendingReservationCapacity. SelectPlacement reads the aggregate instead
+	// of scanning every placement row on each create. Expiries are tracked in
+	// pendingReservationExpiries so stale reservations can be removed lazily in
+	// O(expired log reservations) without waiting for the leader GC sweep.
+	pendingReservationClaims   map[string]pendingReservationClaim
+	pendingReservationCapacity map[string]capacity.Request
+	pendingReservationExpiries pendingReservationExpiryHeap
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -129,13 +138,46 @@ type hostPortClaim struct {
 	Port      int
 }
 
+type pendingReservationClaim struct {
+	OwnerNodeID string
+	Request     capacity.Request
+	ExpiresUnix int64
+}
+
+type pendingReservationExpiry struct {
+	SandboxID   string
+	ExpiresUnix int64
+}
+
+type pendingReservationExpiryHeap []pendingReservationExpiry
+
+func (h pendingReservationExpiryHeap) Len() int { return len(h) }
+func (h pendingReservationExpiryHeap) Less(i, j int) bool {
+	return h[i].ExpiresUnix < h[j].ExpiresUnix
+}
+func (h pendingReservationExpiryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *pendingReservationExpiryHeap) Push(x any) {
+	*h = append(*h, x.(pendingReservationExpiry))
+}
+
+func (h *pendingReservationExpiryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
 func newPlacementFSM() *placementFSM {
 	return &placementFSM{
-		placements:    make(map[string]Placement),
-		nameIndex:     make(map[string]string),
-		shardIndex:    make(map[int]map[string]struct{}),
-		hostPortIndex: make(map[int]hostPortClaim),
-		drainedNodes:  make(map[string]bool),
+		placements:                 make(map[string]Placement),
+		nameIndex:                  make(map[string]string),
+		shardIndex:                 make(map[int]map[string]struct{}),
+		hostPortIndex:              make(map[int]hostPortClaim),
+		pendingReservationClaims:   make(map[string]pendingReservationClaim),
+		pendingReservationCapacity: make(map[string]capacity.Request),
+		drainedNodes:               make(map[string]bool),
 	}
 }
 
@@ -224,6 +266,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// nameIndex entry pointing at this sandbox under its previous name.
 		if exists {
 			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			if existing.IsReserved() {
+				f.releasePendingReservationLocked(cmd.SandboxID)
+			}
 		}
 		f.placements[cmd.SandboxID] = Placement{
 			SandboxID:          cmd.SandboxID,
@@ -271,6 +316,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				existing.Version = f.version
 				existing.UpdatedUnix = now
 				f.placements[cmd.SandboxID] = existing
+				f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 				return nil
 			}
 			// Expired reservations are eligible for overwrite by a fresh
@@ -278,6 +324,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// because the GC's opCancelReserve only fires for State==Reserved
 			// AND a different SandboxID is never reused for the same intent).
 			if now > existing.ExpiresUnix {
+				f.releasePendingReservationLocked(cmd.SandboxID)
 				f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
 				f.releaseShardLocked(cmd.SandboxID)
 			} else {
@@ -288,7 +335,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
 			return err
 		}
-		f.placements[cmd.SandboxID] = Placement{
+		p := Placement{
 			SandboxID:          cmd.SandboxID,
 			OwnerNodeID:        cmd.OwnerNodeID,
 			OwnerAPIURL:        cmd.OwnerAPIURL,
@@ -301,8 +348,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			State:              PlacementStateReserved,
 			ExpiresUnix:        cmd.ExpiresUnix,
 		}
+		f.placements[cmd.SandboxID] = p
 		f.claimNameLocked(cmd.SandboxID, specName(cmd.Spec))
 		f.claimShardLocked(cmd.SandboxID)
+		f.claimPendingReservationLocked(cmd.SandboxID, p)
 		return nil
 	case opCancelReserve:
 		// Only cancel reservations — never delete a placed sandbox, even if a
@@ -317,6 +366,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
 		f.releaseShardLocked(cmd.SandboxID)
 		f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
+		f.releasePendingReservationLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		return nil
 	case opDelete:
@@ -324,6 +374,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
 			f.releaseShardLocked(cmd.SandboxID)
 			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
+			if existing.IsReserved() {
+				f.releasePendingReservationLocked(cmd.SandboxID)
+			}
 		}
 		delete(f.placements, cmd.SandboxID)
 		return nil
@@ -334,12 +387,19 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// if a delete and a reassign race; delete wins).
 			return nil
 		}
+		wasReserved := existing.IsReserved()
+		if wasReserved {
+			f.releasePendingReservationLocked(cmd.SandboxID)
+		}
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
 		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
+		if wasReserved {
+			f.claimPendingReservationLocked(cmd.SandboxID, existing)
+		}
 		return nil
 	case opUpsertSpec:
 		existing, exists := f.placements[cmd.SandboxID]
@@ -371,9 +431,16 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if cmd.SealedSecrets != nil {
 			existing.SealedSecrets = cmd.SealedSecrets
 		}
+		wasReserved := existing.IsReserved()
+		if wasReserved {
+			f.releasePendingReservationLocked(cmd.SandboxID)
+		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
+		if wasReserved {
+			f.claimPendingReservationLocked(cmd.SandboxID, existing)
+		}
 		return nil
 	case opAddExposedPort:
 		existing, exists := f.placements[cmd.SandboxID]
@@ -579,6 +646,105 @@ func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port in
 	return nil
 }
 
+func (f *placementFSM) claimPendingReservationLocked(sandboxID string, p Placement) {
+	if sandboxID == "" || !p.IsReserved() {
+		return
+	}
+	if f.pendingReservationClaims == nil {
+		f.pendingReservationClaims = make(map[string]pendingReservationClaim)
+	}
+	if f.pendingReservationCapacity == nil {
+		f.pendingReservationCapacity = make(map[string]capacity.Request)
+	}
+	if old, ok := f.pendingReservationClaims[sandboxID]; ok {
+		f.subtractPendingCapacityLocked(old.OwnerNodeID, old.Request)
+	}
+	req := capacityRequestFromSpec(p.Spec)
+	claim := pendingReservationClaim{
+		OwnerNodeID: p.OwnerNodeID,
+		Request:     req,
+		ExpiresUnix: p.ExpiresUnix,
+	}
+	f.pendingReservationClaims[sandboxID] = claim
+	f.addPendingCapacityLocked(claim.OwnerNodeID, claim.Request)
+	if claim.ExpiresUnix > 0 {
+		heap.Push(&f.pendingReservationExpiries, pendingReservationExpiry{SandboxID: sandboxID, ExpiresUnix: claim.ExpiresUnix})
+	}
+}
+
+func (f *placementFSM) releasePendingReservationLocked(sandboxID string) {
+	if f.pendingReservationClaims == nil {
+		return
+	}
+	claim, ok := f.pendingReservationClaims[sandboxID]
+	if !ok {
+		return
+	}
+	f.subtractPendingCapacityLocked(claim.OwnerNodeID, claim.Request)
+	delete(f.pendingReservationClaims, sandboxID)
+}
+
+func (f *placementFSM) refreshPendingReservationExpiryLocked(sandboxID string, expiresUnix int64) {
+	if f.pendingReservationClaims == nil {
+		return
+	}
+	claim, ok := f.pendingReservationClaims[sandboxID]
+	if !ok {
+		return
+	}
+	claim.ExpiresUnix = expiresUnix
+	f.pendingReservationClaims[sandboxID] = claim
+	if expiresUnix > 0 {
+		heap.Push(&f.pendingReservationExpiries, pendingReservationExpiry{SandboxID: sandboxID, ExpiresUnix: expiresUnix})
+	}
+}
+
+func (f *placementFSM) pruneExpiredPendingReservationsLocked(now int64) {
+	if now <= 0 {
+		return
+	}
+	for len(f.pendingReservationExpiries) > 0 {
+		next := f.pendingReservationExpiries[0]
+		if next.ExpiresUnix <= 0 || now <= next.ExpiresUnix {
+			return
+		}
+		heap.Pop(&f.pendingReservationExpiries)
+		claim, ok := f.pendingReservationClaims[next.SandboxID]
+		if !ok || claim.ExpiresUnix != next.ExpiresUnix {
+			continue
+		}
+		f.releasePendingReservationLocked(next.SandboxID)
+	}
+}
+
+func (f *placementFSM) addPendingCapacityLocked(owner string, req capacity.Request) {
+	if owner == "" {
+		return
+	}
+	cur := f.pendingReservationCapacity[owner]
+	cur.CPU += req.CPU
+	cur.MemoryMB += req.MemoryMB
+	cur.DiskGB += req.DiskGB
+	cur.GPUs += req.GPUs
+	f.pendingReservationCapacity[owner] = cur
+}
+
+func (f *placementFSM) subtractPendingCapacityLocked(owner string, req capacity.Request) {
+	if owner == "" || f.pendingReservationCapacity == nil {
+		return
+	}
+	cur := f.pendingReservationCapacity[owner]
+	cur.CPU -= req.CPU
+	cur.MemoryMB -= req.MemoryMB
+	cur.DiskGB -= req.DiskGB
+	cur.GPUs -= req.GPUs
+	if cur.CPU == 0 && cur.MemoryMB == 0 && cur.DiskGB == 0 && cur.GPUs == 0 {
+		delete(f.pendingReservationCapacity, owner)
+		return
+	}
+	f.pendingReservationCapacity[owner] = cur
+}
+
 // get returns the placement for id, or zero-value + false if absent.
 func (f *placementFSM) get(id string) (Placement, bool) {
 	f.mu.RLock()
@@ -628,34 +794,25 @@ func (f *placementFSM) currentVersion() uint64 {
 	return f.version
 }
 
-// pendingReservationsByNode sums the capacity demand of every live (not yet
-// expired) reservation, keyed by the owner node ID. SelectPlacement uses this
-// to subtract still-in-flight reservations from a peer's gossiped headroom so
-// two creates routed to the same node back-to-back can't both pass scoring
-// before the first reservation reaches the gossip ledger.
+// pendingReservationsByNode returns the indexed capacity demand of every live
+// (not yet expired) reservation, keyed by the owner node ID. SelectPlacement
+// uses this to subtract still-in-flight reservations from a peer's gossiped
+// headroom so two creates routed to the same node back-to-back can't both pass
+// scoring before the first reservation reaches the gossip ledger.
 //
 // The FSM is the source of truth here: it serializes every opReserve through
 // raft, so two routers racing the same target see the second reservation land
 // strictly after the first in the log — and the second create's
-// SelectPlacement will read the updated map.
+// SelectPlacement will read the updated aggregate. Expired claims are pruned
+// lazily from the expiry heap, so this path does not scan the full placement
+// table at 100k-sandbox scale.
 func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.Request {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	out := make(map[string]capacity.Request)
-	for _, p := range f.placements {
-		if p.State != PlacementStateReserved {
-			continue
-		}
-		if p.ExpiresUnix > 0 && now > p.ExpiresUnix {
-			continue
-		}
-		req := capacityRequestFromSpec(p.Spec)
-		cur := out[p.OwnerNodeID]
-		cur.CPU += req.CPU
-		cur.MemoryMB += req.MemoryMB
-		cur.DiskGB += req.DiskGB
-		cur.GPUs += req.GPUs
-		out[p.OwnerNodeID] = cur
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pruneExpiredPendingReservationsLocked(now)
+	out := make(map[string]capacity.Request, len(f.pendingReservationCapacity))
+	for owner, req := range f.pendingReservationCapacity {
+		out[owner] = req
 	}
 	return out
 }
@@ -850,6 +1007,9 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 	f.nameIndex = make(map[string]string, len(payload.Placements))
 	f.shardIndex = make(map[int]map[string]struct{})
 	f.hostPortIndex = make(map[int]hostPortClaim)
+	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
+	f.pendingReservationCapacity = make(map[string]capacity.Request)
+	f.pendingReservationExpiries = nil
 	for id, p := range payload.Placements {
 		if name := specName(p.Spec); name != "" {
 			f.nameIndex[name] = id
@@ -857,6 +1017,9 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 		f.claimShardLocked(id)
 		for port, route := range exposedPortRoutesForPlacement(p) {
 			f.claimHostPortLocked(id, port, route)
+		}
+		if p.IsReserved() {
+			f.claimPendingReservationLocked(id, p)
 		}
 	}
 	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the

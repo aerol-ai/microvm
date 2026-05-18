@@ -114,8 +114,90 @@ func (d *gossipDelegate) MergeRemoteState([]byte, bool)   {}
 type gossipNode struct {
 	ml          *memberlist.Memberlist
 	delegate    *gossipDelegate
+	memberIndex *gossipMemberIndex
 	stopRefresh context.CancelFunc
 	logger      *slog.Logger
+}
+
+type gossipMemberIndex struct {
+	mu      sync.RWMutex
+	members map[string]Member
+}
+
+func newGossipMemberIndex() *gossipMemberIndex {
+	return &gossipMemberIndex{members: make(map[string]Member)}
+}
+
+func (i *gossipMemberIndex) upsert(m Member) {
+	if i == nil || m.NodeID == "" {
+		return
+	}
+	i.mu.Lock()
+	i.members[m.NodeID] = m
+	i.mu.Unlock()
+}
+
+func (i *gossipMemberIndex) replace(members []Member) {
+	if i == nil {
+		return
+	}
+	next := make(map[string]Member, len(members))
+	for _, m := range members {
+		if m.NodeID == "" {
+			continue
+		}
+		next[m.NodeID] = m
+	}
+	i.mu.Lock()
+	i.members = next
+	i.mu.Unlock()
+}
+
+func (i *gossipMemberIndex) snapshot() []Member {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make([]Member, 0, len(i.members))
+	for _, m := range i.members {
+		out = append(out, m)
+	}
+	return out
+}
+
+type indexedEventDelegate struct {
+	index *gossipMemberIndex
+	next  memberlist.EventDelegate
+}
+
+func (d *indexedEventDelegate) NotifyJoin(n *memberlist.Node) {
+	if d.index != nil && n != nil {
+		d.index.upsert(memberFromMemberlistNode(n))
+	}
+	if d.next != nil {
+		d.next.NotifyJoin(n)
+	}
+}
+
+func (d *indexedEventDelegate) NotifyLeave(n *memberlist.Node) {
+	if d.index != nil && n != nil {
+		m := memberFromMemberlistNode(n)
+		m.Alive = false
+		d.index.upsert(m)
+	}
+	if d.next != nil {
+		d.next.NotifyLeave(n)
+	}
+}
+
+func (d *indexedEventDelegate) NotifyUpdate(n *memberlist.Node) {
+	if d.index != nil && n != nil {
+		d.index.upsert(memberFromMemberlistNode(n))
+	}
+	if d.next != nil {
+		d.next.NotifyUpdate(n)
+	}
 }
 
 type gossipSetupConfig struct {
@@ -159,10 +241,9 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	}
 
 	delegate := newGossipDelegate(cfg.NodeID, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, admitter)
+	memberIndex := newGossipMemberIndex()
 	mlCfg.Delegate = delegate
-	if cfg.Events != nil {
-		mlCfg.Events = cfg.Events
-	}
+	mlCfg.Events = &indexedEventDelegate{index: memberIndex, next: cfg.Events}
 	if len(cfg.SecretKey) > 0 {
 		// memberlist accepts 16/24/32-byte keys for AES-128/192/256-GCM. Anything
 		// else is rejected at construction so we surface a clear error rather
@@ -204,9 +285,11 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	gn := &gossipNode{
 		ml:          ml,
 		delegate:    delegate,
+		memberIndex: memberIndex,
 		stopRefresh: cancel,
 		logger:      logger,
 	}
+	gn.refreshMemberIndex()
 	go gn.runRefreshLoop(refreshCtx, interval)
 	return gn, nil
 }
@@ -225,6 +308,7 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 			return
 		case <-t.C:
 			g.delegate.refreshMeta()
+			g.refreshMemberIndex()
 			// UpdateNode triggers memberlist's NodeMeta callback and queues
 			// the new blob for gossip dissemination. Bound the call so a
 			// stalled gossip layer doesn't block the refresh ticker.
@@ -242,6 +326,20 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 // calls UpdateNode, which races with members() reads. memberlist exposes no
 // safe accessor for self's Meta, so we substitute self ourselves.
 func (g *gossipNode) members() []Member {
+	if g.memberIndex != nil {
+		return g.memberIndex.snapshot()
+	}
+	return g.scanMembers()
+}
+
+func (g *gossipNode) refreshMemberIndex() {
+	if g.memberIndex == nil {
+		return
+	}
+	g.memberIndex.replace(g.scanMembers())
+}
+
+func (g *gossipNode) scanMembers() []Member {
 	all := g.ml.Members()
 	out := make([]Member, 0, len(all))
 	for _, n := range all {
@@ -249,24 +347,31 @@ func (g *gossipNode) members() []Member {
 			out = append(out, g.selfMember())
 			continue
 		}
-		m := Member{NodeID: n.Name, Alive: n.State == memberlist.StateAlive}
-		if n.Meta != nil {
-			var meta nodeMeta
-			if err := json.Unmarshal(n.Meta, &meta); err == nil {
-				if meta.NodeID != "" {
-					m.NodeID = meta.NodeID
-				}
-				m.APIURL = meta.APIURL
-				m.DataPlaneHost = meta.DataPlaneHost
-				m.RaftAddr = meta.RaftAddr
-				m.InternalURL = meta.InternalURL
-				m.Role = meta.Role
-				m.Capacity = meta.Capacity
-			}
-		}
-		out = append(out, m)
+		out = append(out, memberFromMemberlistNode(n))
 	}
 	return out
+}
+
+func memberFromMemberlistNode(n *memberlist.Node) Member {
+	if n == nil {
+		return Member{}
+	}
+	m := Member{NodeID: n.Name, Alive: n.State == memberlist.StateAlive}
+	if n.Meta != nil {
+		var meta nodeMeta
+		if err := json.Unmarshal(n.Meta, &meta); err == nil {
+			if meta.NodeID != "" {
+				m.NodeID = meta.NodeID
+			}
+			m.APIURL = meta.APIURL
+			m.DataPlaneHost = meta.DataPlaneHost
+			m.RaftAddr = meta.RaftAddr
+			m.InternalURL = meta.InternalURL
+			m.Role = meta.Role
+			m.Capacity = meta.Capacity
+		}
+	}
+	return m
 }
 
 // selfMember snapshots the local node's advertised state from the delegate.
