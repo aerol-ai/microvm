@@ -136,9 +136,15 @@ func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.replicateSpecPatch(r.Context(), id, func(s *models.CreateSandboxRequest) {
-		s.CPU = req.CPU
-		s.MemoryMB = req.MemoryMB
-		s.DiskGB = req.DiskGB
+		if req.CPU > 0 {
+			s.CPU = req.CPU
+		}
+		if req.MemoryMB > 0 {
+			s.MemoryMB = req.MemoryMB
+		}
+		if req.DiskGB > 0 {
+			s.DiskGB = req.DiskGB
+		}
 	})
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }

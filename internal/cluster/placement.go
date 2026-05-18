@@ -3,8 +3,10 @@ package cluster
 import (
 	"errors"
 	"math/rand"
+	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -74,6 +76,9 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		if !m.Alive {
 			continue
 		}
+		if !CanOwnSandboxRole(m.Role) {
+			continue
+		}
 		// Only consider members that have advertised an APIURL — others may
 		// be partially-joined and forwarding to them would 502.
 		if m.APIURL == "" && m.NodeID != c.nodeID {
@@ -90,7 +95,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
-		return self, nil
+		return PlacementTarget{}, ErrNoPlacementTarget
 	}
 
 	// Power-of-two-choices.
@@ -206,6 +211,23 @@ func pickTwo(c []Member) (Member, Member) {
 }
 
 func sameNode(a, b Member) bool { return a.NodeID == b.NodeID }
+
+// CanOwnSandboxRole reports whether a gossiped node role may own sandboxes.
+// Empty is treated as worker-capable for rolling upgrades from builds that
+// did not advertise role metadata.
+func CanOwnSandboxRole(role string) bool {
+	trimmed := strings.TrimSpace(role)
+	if trimmed == "" {
+		return true
+	}
+	for raw := range strings.SplitSeq(trimmed, ",") {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case config.NodeRoleWorker, config.NodeRoleMixed:
+			return true
+		}
+	}
+	return false
+}
 
 // SelectPlacement on Noop is in noop.go.
 

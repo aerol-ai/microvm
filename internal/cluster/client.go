@@ -317,6 +317,22 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	}, nil
 }
 
+// OwnerOfName resolves a replicated sandbox Name to its placement owner. This
+// is intentionally a local FSM read just like OwnerOf; the name index is
+// maintained inside the FSM apply path so it tracks the authoritative
+// placement map exactly.
+func (c *Cluster) OwnerOfName(name string) (string, OwnerInfo, error) {
+	sandboxID, ok := c.fsm.sandboxIDByName(name)
+	if !ok {
+		return "", OwnerInfo{}, ErrUnknownSandbox
+	}
+	owner, err := c.OwnerOf(sandboxID)
+	if err != nil {
+		return sandboxID, OwnerInfo{}, err
+	}
+	return sandboxID, owner, nil
+}
+
 // AttachInternalHandler wires the public API mux into the cluster-internal
 // mTLS listener so peers can reverse-proxy owner API calls over the
 // cert-pinned channel. No-op when this node has no TLS material loaded

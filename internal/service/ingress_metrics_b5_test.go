@@ -62,3 +62,13 @@ func TestRecordRouteMissIncrements(t *testing.T) {
 		t.Fatalf("route miss delta = %d, want 3", got)
 	}
 }
+
+func TestRecordIngressReconcileErrorDoesNotAdvanceInstalledVersion(t *testing.T) {
+	ingressPlacementVersionMax.Set(10)
+
+	recordIngressReconcile(reconcileErrored, 0, ingressRouteCounts{}, 99)
+
+	if got := ingressPlacementVersionMax.Value(); got != 10 {
+		t.Fatalf("installed version advanced on failed reconcile: got %d, want 10", got)
+	}
+}

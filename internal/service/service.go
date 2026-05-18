@@ -294,7 +294,53 @@ func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, expo
 	return firstErr
 }
 
+func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
+	return capacity.Request{
+		CPU:       req.CPU,
+		MemoryMB:  req.MemoryMB,
+		DiskGB:    req.DiskGB,
+		Runtime:   req.Runtime,
+		GPUs:      gpuCountForCapacity(req.GPUs),
+		GPUVendor: gpuVendorForCapacity(req.GPUs),
+	}
+}
+
+func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
+	if sandbox == nil {
+		return capacity.Request{}
+	}
+	return capacity.Request{
+		CPU:       sandbox.CPU,
+		MemoryMB:  sandbox.MemoryMB,
+		DiskGB:    sandbox.DiskGB,
+		Runtime:   sandbox.Runtime,
+		GPUs:      gpuCountForCapacity(sandbox.GPUs),
+		GPUVendor: gpuVendorForCapacity(sandbox.GPUs),
+	}
+}
+
+func gpuCountForCapacity(req *models.GPURequest) int {
+	if req == nil {
+		return 0
+	}
+	if req.Count <= 0 {
+		return 1
+	}
+	return req.Count
+}
+
+func gpuVendorForCapacity(req *models.GPURequest) string {
+	if req == nil {
+		return ""
+	}
+	return string(req.Vendor)
+}
+
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
+	if s.cfg.EnableCluster && !s.cfg.IsWorker() {
+		return nil, cluster.ErrNoPlacementTarget
+	}
+
 	req = normalizeCreateRequest(req)
 	if req.Image == "" {
 		return nil, errors.New("image is required")
@@ -384,10 +430,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// counts against the host budget. Reservation happens here; every failure
 	// path below must release it.
 	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacity.Request{
-			CPU:      req.CPU,
-			MemoryMB: req.MemoryMB,
-		}); err != nil {
+		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
 			return nil, err
 		}
 	}
@@ -665,10 +708,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	// already-running sandboxes computed against the same footprint succeed
 	// without double-counting. A failed admission must not mutate any state.
 	if s.admitter != nil {
-		if err := s.admitter.Admit(id, capacity.Request{
-			CPU:      sandbox.CPU,
-			MemoryMB: sandbox.MemoryMB,
-		}); err != nil {
+		if err := s.admitter.Admit(id, capacityRequestFromSandbox(sandbox)); err != nil {
 			return nil, err
 		}
 	}
@@ -962,16 +1002,18 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	// delta against the existing reservation, so a downsize will free budget
 	// and an upsize that exceeds the budget is rejected with no changes.
 	if s.admitter != nil {
-		newCPU := sandbox.CPU
-		newMem := sandbox.MemoryMB
+		next := capacityRequestFromSandbox(sandbox)
 		if req.CPU > 0 {
-			newCPU = req.CPU
+			next.CPU = req.CPU
 		}
 		if req.MemoryMB > 0 {
-			newMem = req.MemoryMB
+			next.MemoryMB = req.MemoryMB
 		}
-		if newCPU != sandbox.CPU || newMem != sandbox.MemoryMB {
-			if err := s.admitter.Admit(id, capacity.Request{CPU: newCPU, MemoryMB: newMem}); err != nil {
+		if req.DiskGB > 0 {
+			next.DiskGB = req.DiskGB
+		}
+		if next.CPU != sandbox.CPU || next.MemoryMB != sandbox.MemoryMB || next.DiskGB != sandbox.DiskGB {
+			if err := s.admitter.Admit(id, next); err != nil {
 				return nil, err
 			}
 		}
@@ -982,7 +1024,7 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 		// effect on the container, so accounting must reflect the unchanged
 		// footprint.
 		if s.admitter != nil {
-			s.admitter.Reserve(id, capacity.Request{CPU: sandbox.CPU, MemoryMB: sandbox.MemoryMB})
+			s.admitter.Reserve(id, capacityRequestFromSandbox(sandbox))
 		}
 		return nil, err
 	}
@@ -1551,10 +1593,7 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 		if sandbox.Status == models.SandboxStatusDestroyed || sandbox.Status == models.SandboxStatusStopped {
 			continue
 		}
-		s.admitter.Reserve(sandbox.ID, capacity.Request{
-			CPU:      sandbox.CPU,
-			MemoryMB: sandbox.MemoryMB,
-		})
+		s.admitter.Reserve(sandbox.ID, capacityRequestFromSandbox(sandbox))
 		replayed++
 	}
 	s.logger.Info("capacity reservations replayed", "count", replayed)
@@ -1642,10 +1681,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if s.admitter != nil {
 			switch state.Status {
 			case models.SandboxStatusStarted:
-				s.admitter.Reserve(sandbox.ID, capacity.Request{
-					CPU:      sandbox.CPU,
-					MemoryMB: sandbox.MemoryMB,
-				})
+				s.admitter.Reserve(sandbox.ID, capacityRequestFromSandbox(sandbox))
 			case models.SandboxStatusStopped:
 				s.admitter.Release(sandbox.ID)
 			}

@@ -12,6 +12,11 @@ multi-node prototype, but it is not a scalable cluster architecture yet. Several
 Stage 2 items marked as "resolved" are only resolved for small functional
 correctness, not for large-scale bounded behavior.
 
+Post-review implementation status is tracked in
+[`08-iteration-status.md`](./08-iteration-status.md). That file separates the
+capabilities fixed in this branch from the larger design work still required
+for 10,000-node / 100,000-sandbox scale.
+
 ## Stage-3 Verdict
 
 PR #58 should not be described as production-scalable for 10,000 nodes or
@@ -55,6 +60,7 @@ global and unbounded:
 | [`05-data-plane-and-ingress.md`](./05-data-plane-and-ingress.md) | Caddy route scale, SNI/raw TCP limits, convergence metrics, route churn, and public LB assumptions. |
 | [`06-failure-state-and-recovery.md`](./06-failure-state-and-recovery.md) | Node death, partitions, orphan semantics, stale ownership, local state cleanup, snapshots, and image/storage issues. |
 | [`07-release-plan.md`](./07-release-plan.md) | Concrete blockers, required redesigns, scale gates, and a staged path from small beta to 100k scale. |
+| [`08-iteration-status.md`](./08-iteration-status.md) | What this implementation pass fixed, what tests passed, and what capabilities remain pending. |
 
 ## Critical Distinction
 
@@ -69,4 +75,3 @@ For this review, a fix only counts as scalable when it is:
 - role-aware at the API and service layers, not only in docs;
 - observable with metrics that cannot claim success on partial failure;
 - validated with integration load, not just unit-level synthetic loops.
-

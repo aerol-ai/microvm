@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
@@ -76,6 +77,10 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 			message = message[:200]
 		}
 		WriteError(w, http.StatusServiceUnavailable, message)
+		return
+	}
+	if errors.Is(err, cluster.ErrNoPlacementTarget) {
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	if logger != nil {

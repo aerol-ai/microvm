@@ -501,6 +501,19 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 	return clonePlacement(p), true
 }
 
+// sandboxIDByName returns the sandbox ID currently claiming name in the
+// replicated name index.
+func (f *placementFSM) sandboxIDByName(name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	id, ok := f.nameIndex[name]
+	return id, ok
+}
+
 // idsOwnedBy returns the sandbox IDs whose current owner is nodeID. Used by
 // the dead-owner reconciler to enumerate orphan candidates.
 func (f *placementFSM) idsOwnedBy(nodeID string) []string {

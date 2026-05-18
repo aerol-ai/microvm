@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -56,6 +57,11 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	fingerprint, err := createRequestFingerprint(req.TemplateID, serviceReq, meta)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	deterministicID := sandboxIDFromFingerprint(fingerprint)
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, WriteError, clustercreate.PrepareOptions{PreferredSandboxID: deterministicID})
+	if !ok {
 		return
 	}
 	cleanupReservation := func() {
@@ -100,7 +106,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response, err := h.deps.Service.CreateSandbox(r.Context(), serviceReq)
+	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true})
 	if err != nil {
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
@@ -111,6 +117,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
 			h.deps.Logger.Warn("e2b metadata rollback failed", "sandbox_id", response.ID, "error", destroyErr)
 		}
+		clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -120,11 +127,20 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
 			h.deps.Logger.Warn("e2b create idempotency rollback failed", "sandbox_id", response.ID, "error", destroyErr)
 		}
+		clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
+}
+
+func sandboxIDFromFingerprint(fingerprint string) string {
+	hexPart := strings.TrimPrefix(strings.TrimSpace(fingerprint), "fingerprint:")
+	if len(hexPart) < 16 {
+		return ""
+	}
+	return "sb-" + hexPart[:16]
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +240,7 @@ func (h *handlers) deleteSandbox(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, r.PathValue("id"))
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -128,6 +128,34 @@ func TestFSMUpsertSpec(t *testing.T) {
 	}
 }
 
+func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "alpha"}})
+	fsm.Apply(&raft.Log{Data: place})
+
+	if got, ok := fsm.sandboxIDByName(" alpha "); !ok || got != "sb1" {
+		t.Fatalf("lookup alpha = (%q, %v), want (sb1, true)", got, ok)
+	}
+
+	rename, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "beta"}})
+	fsm.Apply(&raft.Log{Data: rename})
+
+	if got, ok := fsm.sandboxIDByName("alpha"); ok {
+		t.Fatalf("old name alpha still resolves to %q after rename", got)
+	}
+	if got, ok := fsm.sandboxIDByName("beta"); !ok || got != "sb1" {
+		t.Fatalf("lookup beta = (%q, %v), want (sb1, true)", got, ok)
+	}
+
+	deleteCmd, _ := encodeCommand(command{Op: opDelete, SandboxID: "sb1"})
+	fsm.Apply(&raft.Log{Data: deleteCmd})
+	if got, ok := fsm.sandboxIDByName("beta"); ok {
+		t.Fatalf("deleted name beta still resolves to %q", got)
+	}
+}
+
 // TestFSMReassignPreservesSpec asserts opReassign moves the owner but leaves
 // the replicated spec intact — that's what makes auto-recreation possible.
 func TestFSMReassignPreservesSpec(t *testing.T) {

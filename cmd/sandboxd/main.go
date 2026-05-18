@@ -221,7 +221,7 @@ func main() {
 		svc.StartBuiltImageGC(ctx)
 	}
 
-	if cfg.EnableSSHGateway {
+	if cfg.EnableSSHGateway && cfg.IsWorker() {
 		gw, err := sshgateway.New(logger, sshgateway.Config{
 			ListenAddr:  cfg.SSHListenAddr,
 			HostKeyPath: cfg.SSHHostKeyPath,

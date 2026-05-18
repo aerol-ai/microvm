@@ -15,6 +15,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -38,8 +39,24 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	placementReq, err := h.clusterPlacementRequest(req)
+	if err != nil {
+		switch {
+		case errors.Is(err, errVolumesUnsupported):
+			apihttp.WriteError(w, http.StatusMethodNotAllowed, err.Error())
+		default:
+			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteError, clustercreate.PrepareOptions{})
+	if !ok {
+		return
+	}
+
 	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(r.Context(), req)
 	if err != nil {
+		clustercreate.CancelReservationBestEffort(context.Background(), h.deps.Service, h.deps.Logger, decision.ReservationID)
 		// Image-build failures are operational, not user-input errors:
 		// reporting them as 400 would mislead retry/alerting (a transient
 		// daemon hiccup looks identical to bad client input). Distinguish
@@ -58,7 +75,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := h.deps.Service.CreateSandbox(r.Context(), serviceReq)
+	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true})
 	if err != nil {
 		// If we built the image in this request and the create failed, the
 		// image is now orphaned: no sandbox row references it, so the normal
@@ -94,11 +111,33 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		if destroyErr := h.deps.Service.DestroySandbox(r.Context(), response.ID); destroyErr != nil && h.deps.Logger != nil {
 			h.deps.Logger.Warn("daytona metadata persist cleanup failed", "sandbox_id", response.ID, "error", destroyErr)
 		}
+		clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
 	apihttp.WriteJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
+}
+
+func (h *handlers) clusterPlacementRequest(req createSandboxRequest) (models.CreateSandboxRequest, error) {
+	if req.NetworkAllowList != nil && strings.TrimSpace(*req.NetworkAllowList) != "" {
+		return models.CreateSandboxRequest{}, errors.New("networkAllowList is not supported by the Daytona facade")
+	}
+	if req.Gpu != nil && *req.Gpu > 0 {
+		return models.CreateSandboxRequest{}, errors.New("gpu allocation is not supported by the Daytona facade")
+	}
+	if len(req.Volumes) > 0 {
+		return models.CreateSandboxRequest{}, errVolumesUnsupported
+	}
+	return models.CreateSandboxRequest{
+		Image:           "daytona-create",
+		CPU:             float64(int32Value(req.Cpu, 0)),
+		MemoryMB:        int(int32Value(req.Memory, 0)) * 1024,
+		DiskGB:          int(int32Value(req.Disk, 0)),
+		Name:            trimmedString(req.Name),
+		Tags:            cloneStringMap(mapValue(req.Labels)),
+		NetworkBlockAll: boolValue(req.NetworkBlockAll),
+	}, nil
 }
 
 func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +388,7 @@ func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	clustercreate.DeletePlacementBestEffort(context.Background(), h.deps.Service, h.deps.Logger, sandboxID)
 	snapshot := *sandbox
 	snapshot.Status = models.SandboxStatusDestroyed
 	now := time.Now().UTC()

@@ -28,10 +28,11 @@ type createForwardCluster struct {
 	forwardedTarget    string
 	forwardedCreateID  string
 	selectPlacementHit int
+	selectErr          error
 
-	reserveErr      error
-	reserveCalls    []reserveCall
-	cancelCalls     []string
+	reserveErr   error
+	reserveCalls []reserveCall
+	cancelCalls  []string
 }
 
 type reserveCall struct {
@@ -44,6 +45,9 @@ type reserveCall struct {
 
 func (c *createForwardCluster) SelectPlacement(capacity.Request) (cluster.PlacementTarget, error) {
 	c.selectPlacementHit++
+	if c.selectErr != nil {
+		return cluster.PlacementTarget{}, c.selectErr
+	}
 	return c.target, nil
 }
 
@@ -178,6 +182,31 @@ func TestClusterCreateWrapReturns409OnReservationNameConflict(t *testing.T) {
 	}
 }
 
+func TestClusterCreateWrapReturns503WhenNoWorkerCanOwnSandbox(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:      cluster.NewNoop("node-a", "http://node-a"),
+		selectErr: cluster.ErrNoPlacementTarget,
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine"}`))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	if len(fakeCluster.reserveCalls) != 0 {
+		t.Fatalf("ReserveOnTarget calls = %d, want 0 when no worker target exists", len(fakeCluster.reserveCalls))
+	}
+	if fakeCluster.forwardedPeer != "" {
+		t.Fatalf("ForwardHTTP fired with peer %q; must not forward without a worker target", fakeCluster.forwardedPeer)
+	}
+}
+
 // TestClusterCreateWrapForwardedRequiresCreateIDHeader pins the contract that
 // a forwarded create MUST carry X-Cluster-Create-ID. Without it, the receiving
 // target would mint its own ID and the reservation→placed promotion would
@@ -241,10 +270,10 @@ var _ cluster.Client = (*createForwardCluster)(nil)
 // configured.
 type ownerOfStubCluster struct {
 	*cluster.Noop
-	owner          cluster.OwnerInfo
-	err            error
-	forwardCalled  bool
-	forwardedPeer  string
+	owner         cluster.OwnerInfo
+	err           error
+	forwardCalled bool
+	forwardedPeer string
 }
 
 func (c *ownerOfStubCluster) OwnerOf(string) (cluster.OwnerInfo, error) {

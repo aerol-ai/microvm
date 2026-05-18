@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -54,6 +55,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 			msg = msg[:200]
 		}
 		WriteError(w, http.StatusServiceUnavailable, msg)
+		return
+	}
+	if errors.Is(err, cluster.ErrNoPlacementTarget) {
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	// Surface only the top-level error message; underlying causes (Docker

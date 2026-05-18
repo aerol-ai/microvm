@@ -80,6 +80,11 @@ var ErrCapacityExceeded = errors.New("cluster: target capacity exceeded after pe
 // completed sandbox or a router with a stale view.
 var ErrReservationConflict = errors.New("cluster: sandbox already placed or reserved")
 
+// ErrNoPlacementTarget is returned when no alive worker-capable node can
+// accept a new sandbox. This is distinct from "self wins": a pure server or
+// ingress node must not silently fall back to local Docker ownership.
+var ErrNoPlacementTarget = errors.New("cluster: no worker placement target available")
+
 // PlacementState distinguishes a reservation (capacity held, no docker yet)
 // from a placement (sandbox materialized). Empty defaults to Placed so
 // pre-reservation snapshots restore correctly: every old row is a real
@@ -251,6 +256,12 @@ type Client interface {
 	// OwnerOf returns the node currently owning sandboxID, or
 	// ErrUnknownSandbox if no placement record exists.
 	OwnerOf(sandboxID string) (OwnerInfo, error)
+
+	// OwnerOfName resolves a cluster-wide sandbox name to its sandbox ID and
+	// current owner. Names are indexed from replicated specs and exist for
+	// facade APIs that accept either ID or name. Returns ErrUnknownSandbox if
+	// no placement record claims name.
+	OwnerOfName(name string) (string, OwnerInfo, error)
 
 	// SelectPlacement chooses a node to host a new sandbox with the given
 	// resource request. In single-node mode it always returns self.

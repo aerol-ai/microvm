@@ -42,6 +42,27 @@ func TestNodeFitsUnknownCapacity(t *testing.T) {
 	}
 }
 
+func TestCanOwnSandboxRole(t *testing.T) {
+	for _, tc := range []struct {
+		role string
+		want bool
+	}{
+		{"", true},
+		{"mixed", true},
+		{"worker", true},
+		{"ingress,worker", true},
+		{"server,worker", true},
+		{"server", false},
+		{"ingress", false},
+		{"server,ingress", false},
+		{"controller", false},
+	} {
+		if got := CanOwnSandboxRole(tc.role); got != tc.want {
+			t.Fatalf("role %q CanOwnSandboxRole = %v, want %v", tc.role, got, tc.want)
+		}
+	}
+}
+
 // TestHeadroomScorePrefersEmptier checks the scoring monotonicity that
 // power-of-two-choices relies on.
 func TestHeadroomScorePrefersEmptier(t *testing.T) {

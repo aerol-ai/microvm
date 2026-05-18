@@ -30,6 +30,9 @@ const (
 	// before the leader's GC sweep cancels it. 120s covers slow GPU image
 	// pulls; the 5s GC tick makes the worst-case orphan window ~125s.
 	clusterReservationTTL = 120 * time.Second
+
+	clusterListMaxFanoutPeers         = 256
+	clusterListMaxConcurrentPeerReads = 64
 )
 
 // clusterForwardWrap returns a middleware that, for any request carrying a
@@ -164,6 +167,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 
 	target, err := c.SelectPlacement(capacityRequestFromCreate(req))
 	if err != nil {
+		if errors.Is(err, cluster.ErrNoPlacementTarget) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return
 	}
@@ -368,7 +375,14 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		if !m.Alive || m.NodeID == "" || m.NodeID == selfID || m.APIURL == "" {
 			continue
 		}
+		if !clusterMemberCanOwnSandbox(m.Role) {
+			continue
+		}
 		peers = append(peers, m)
+	}
+	if len(peers) > clusterListMaxFanoutPeers {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster list fanout exceeds safe peer cap; query a scoped owner or use a paginated control-plane index")
+		return
 	}
 
 	tagFilter := parseTagFilter(r)
@@ -390,8 +404,12 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	// when the caller didn't pass any tag.* params.
 	peerQuery := r.URL.RawQuery
 	httpClient := &http.Client{Timeout: 5 * time.Second}
+	sem := make(chan struct{}, clusterListMaxConcurrentPeerReads)
 	for _, peer := range peers {
+		peer := peer
 		go func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			endpoint := strings.TrimRight(peer.APIURL, "/") + "/v1/sandboxes"
 			if peerQuery != "" {
 				endpoint += "?" + peerQuery
@@ -457,6 +475,10 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	apihttp.WriteJSON(w, http.StatusOK, merged)
+}
+
+func clusterMemberCanOwnSandbox(role string) bool {
+	return cluster.CanOwnSandboxRole(role)
 }
 
 // clusterDestroyWrap runs the local destroy then deletes the placement
@@ -607,12 +629,12 @@ type placementOwner struct {
 // dialing the cluster-stable host port via this node may hit "connection
 // refused" until the next reconcile tick lands.
 type placementResponse struct {
-	Owner                placementOwner                   `json:"owner"`
-	Orphaned             bool                             `json:"orphaned"`
+	Owner                placementOwner                      `json:"owner"`
+	Orphaned             bool                                `json:"orphaned"`
 	ExposedPorts         map[string]cluster.ExposedPortRoute `json:"exposed_ports,omitempty"`
-	PlacementVersion     uint64                           `json:"placement_version"`
-	NodeInstalledVersion uint64                           `json:"node_installed_version"`
-	Converged            bool                             `json:"converged"`
+	PlacementVersion     uint64                              `json:"placement_version"`
+	NodeInstalledVersion uint64                              `json:"node_installed_version"`
+	Converged            bool                                `json:"converged"`
 }
 
 // clusterPlacement returns the placement record for one sandbox plus this

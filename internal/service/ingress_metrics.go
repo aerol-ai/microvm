@@ -173,7 +173,7 @@ func recordIngressReconcile(outcome reconcileOutcome, elapsed time.Duration, cou
 	ingressRoutesTLS.Set(int64(counts.tls))
 	ingressRoutesTCP.Set(int64(counts.tcp))
 	ingressRoutesTotal.Set(int64(counts.http + counts.tls + counts.tcp))
-	if maxVersion > 0 && int64(maxVersion) > ingressPlacementVersionMax.Value() {
+	if outcome != reconcileErrored && maxVersion > 0 && int64(maxVersion) > ingressPlacementVersionMax.Value() {
 		ingressPlacementVersionMax.Set(int64(maxVersion))
 	}
 }
