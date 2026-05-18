@@ -221,16 +221,16 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		c.logger.Warn("cluster: handled placements after owner death",
 			"dead_node", nodeID, "reassigned", reassigned, "orphaned_no_spec", orphaned)
 	}
-	// RemoveServer is a no-op (returns nil) if the server isn't in the config,
-	// so we don't need to pre-check.
-	f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, c.commitTimeout)
-	if err := f.Error(); err != nil {
-		c.logger.Warn("cluster: RemoveServer failed; will retry next tick",
-			"dead_node", nodeID, "err", err)
-		return
+	if _, ok := c.configuredServer(nodeID); ok {
+		f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, c.commitTimeout)
+		if err := f.Error(); err != nil {
+			c.logger.Warn("cluster: RemoveServer failed; will retry next tick",
+				"dead_node", nodeID, "err", err)
+			return
+		}
 	}
 	c.deadOwners.clear(nodeID)
-	c.logger.Info("cluster: evicted dead node from raft config", "dead_node", nodeID)
+	c.logger.Info("cluster: evicted dead node from control plane", "dead_node", nodeID)
 }
 
 // startReservationGCLoop spawns the periodic sweep that cancels expired

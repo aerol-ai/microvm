@@ -3,6 +3,7 @@ package v1
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -608,6 +609,116 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) clusterInternalPlacement(w http.ResponseWriter, r *http.Request) {
+	h.writeInternalPlacement(w, strings.TrimSpace(r.PathValue("id")))
+}
+
+func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.PathValue("name"))
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid encoded sandbox name")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id, owner, err := c.OwnerOfName(string(decoded))
+	if err != nil {
+		if errors.Is(err, cluster.ErrUnknownSandbox) {
+			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+			return
+		}
+		if errors.Is(err, cluster.ErrOrphaned) {
+			if p, ok := c.PlacementOf(id); ok {
+				p.SealedSecrets = nil
+				apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Orphaned: true})
+				return
+			}
+		}
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	p, ok := c.PlacementOf(id)
+	if !ok {
+		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		return
+	}
+	p.SealedSecrets = nil
+	apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
+}
+
+func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	p, ok := c.PlacementOf(id)
+	if !ok {
+		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		return
+	}
+	p.SealedSecrets = nil
+	owner, err := c.OwnerOf(id)
+	if err != nil {
+		if errors.Is(err, cluster.ErrOrphaned) {
+			apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Orphaned: true})
+			return
+		}
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
+}
+
+func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	placements := c.Placements()
+	for i := range placements {
+		placements[i].SealedSecrets = nil
+	}
+	apihttp.WriteJSON(w, http.StatusOK, placements)
+}
+
+func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	var req cluster.SelectPlacementRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	target, err := c.SelectPlacement(req.Request)
+	if err != nil {
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
+}
+
+func (h *handlers) clusterInternalDrainState(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.DrainStateResponse{Drained: c.IsNodeDrained(strings.TrimSpace(r.PathValue("id")))})
 }
 
 // placementOwner is the snake_case JSON view of cluster.OwnerInfo. We don't

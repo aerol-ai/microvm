@@ -229,11 +229,29 @@ func CanOwnSandboxRole(role string) bool {
 	return false
 }
 
+// CanServeControlPlaneRole reports whether a gossiped node role may host the
+// authoritative Raft/FSM control plane. Empty is treated as server-capable for
+// rolling upgrades from builds that did not advertise role metadata.
+func CanServeControlPlaneRole(role string) bool {
+	trimmed := strings.TrimSpace(role)
+	if trimmed == "" {
+		return true
+	}
+	for raw := range strings.SplitSeq(trimmed, ",") {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case config.NodeRoleServer, config.NodeRoleMixed:
+			return true
+		}
+	}
+	return false
+}
+
 // SelectPlacement on Noop is in noop.go.
 
 // Sanity: the package-level SelectPlacement signature matches the Client interface.
 var _ = func() error {
 	var _ Client = (*Cluster)(nil)
+	var _ Client = (*Agent)(nil)
 	var _ Client = (*Noop)(nil)
 	return errors.New("type assertion only, never returned")
 }

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/hashicorp/raft"
 )
 
 // newTestClusterWithRoleAndGrace mirrors newTestClusterWithRole but lets the
@@ -81,16 +80,18 @@ func TestRoleSplitConvergenceOnWorkerDeath(t *testing.T) {
 	waitForLeader(t, server, 10*time.Second)
 	server.cfg.ClusterMaxAutoVoters = 10
 
-	worker, cleanupWorker := newTestClusterWithRoleAndGrace(t, "wkr-cv", config.NodeRoleWorker, false,
-		[]string{server.gossip.ml.LocalNode().Address()}, 200*time.Millisecond)
+	worker, cleanupWorkerRaw := newTestAgentWithRole(t, "wkr-cv", config.NodeRoleWorker,
+		[]string{server.gossip.ml.LocalNode().Address()})
+	var workerCloseOnce sync.Once
+	cleanupWorker := func() { workerCloseOnce.Do(cleanupWorkerRaw) }
 	// cleanupWorker is sync.Once-guarded so a deferred call after the
 	// explicit shutdown below is a no-op.
 	defer cleanupWorker()
 
-	// Wait until the worker shows up in the server's raft config as a
-	// non-voter — that's the precondition for the leader's dead-owner
-	// reconciler to act on it once we kill the worker.
-	waitForServerSuffrage(t, server, "wkr-cv", raft.Nonvoter, 10*time.Second)
+	// Wait until the worker shows up in gossip. Workers are no longer raft
+	// non-voters; dead-owner handling now relies on memberlist membership for
+	// non-server owners.
+	waitForGossipMember(t, server, "wkr-cv", 10*time.Second)
 
 	// Place a sandbox owned by the worker. We write directly to the FSM via
 	// raft so the test doesn't depend on the service-layer create path.

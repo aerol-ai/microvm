@@ -6,9 +6,13 @@
 //     Every node periodically advertises a capacity.Snapshot in its memberlist
 //     metadata; placement decisions read these advertised snapshots.
 //
-//   - Placement map: a small Raft FSM (hashicorp/raft) holds exactly one piece
-//     of state — sandbox_id -> owner_node_id. Mutations happen on the leader;
-//     reads are local on every node from the in-memory FSM.
+//   - Placement map: server-role nodes run a small Raft FSM (hashicorp/raft)
+//     holding sandbox_id -> owner_node_id plus replicated recovery metadata.
+//     Mutations happen on the leader; server reads are local from the FSM.
+//     Worker/ingress-only nodes run Agent instead: they gossip capacity and
+//     receive owner API forwards, but all placement reads/writes go to the
+//     server quorum over authenticated RPC. They do not store the FSM and do
+//     not join Raft as non-voters.
 //
 //   - Owner-sharded execution: once a sandbox is placed on node N, all of its
 //     state and lifecycle stays on N. The local SQLite store is unchanged.
@@ -19,8 +23,8 @@
 //     requests for sandbox X are forwarded to X's owner; CreateSandbox forwards
 //     to the placement target chosen by power-of-two-choices.
 //
-// Single-node mode (cfg.EnableCluster = false) returns a Noop implementation
-// from New so that all callsites can be unconditional.
+// Single-node mode (cfg.EnableCluster = false) uses Noop so that callsites can
+// stay unconditional.
 package cluster
 
 import (

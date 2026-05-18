@@ -98,11 +98,15 @@ type Cluster struct {
 	recreateFailures *recreateFailureTracker
 }
 
-// New constructs a Cluster for cfg.EnableCluster=true. Caller takes ownership
-// of Close. For cfg.EnableCluster=false call NewNoop instead.
+// New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
+// takes ownership of Close. For worker/ingress-only roles call NewAgent; for
+// cfg.EnableCluster=false call NewNoop.
 func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Cluster, error) {
 	if !cfg.EnableCluster {
 		return nil, errors.New("cluster.New: cfg.EnableCluster is false; use NewNoop")
+	}
+	if !cfg.IsServer() {
+		return nil, fmt.Errorf("cluster.New: SB_NODE_ROLE=%q is not a server role; use NewAgent for worker/ingress nodes", cfg.NodeRole)
 	}
 
 	nodeID := cfg.NodeID

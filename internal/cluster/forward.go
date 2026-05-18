@@ -101,17 +101,17 @@ func (c *Cluster) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Re
 		return
 	}
 	if c.mtlsProxies != nil && target.InternalURL != "" {
-		c.serveProxy(c.mtlsProxies, target.InternalURL, w, r)
+		serveProxy(c.mtlsProxies, target.InternalURL, w, r)
 		return
 	}
 	if target.APIURL == "" {
 		http.Error(w, "cluster: peer API URL unknown", http.StatusServiceUnavailable)
 		return
 	}
-	c.serveProxy(c.publicProxies, target.APIURL, w, r)
+	serveProxy(c.publicProxies, target.APIURL, w, r)
 }
 
-func (c *Cluster) serveProxy(cache *proxyCache, baseURL string, w http.ResponseWriter, r *http.Request) {
+func serveProxy(cache *proxyCache, baseURL string, w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		http.Error(w, "cluster: peer URL must include scheme", http.StatusBadGateway)
 		return

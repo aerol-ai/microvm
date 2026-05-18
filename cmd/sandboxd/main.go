@@ -124,13 +124,19 @@ func main() {
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
 
-	// Cluster startup. When SB_ENABLE_CLUSTER=true, this node joins (or
-	// bootstraps) the Raft+gossip cluster before any external state-touching
-	// bootstrap so subsequent calls (EnsureLayer4Ready, ReplayReservations)
-	// can use cluster-aware logic. When false, AttachCluster is a no-op past
-	// the Noop default that service.New already installed.
+	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
+	// nodes start a lightweight agent: gossip + owner-forward receiver +
+	// control-plane RPC, but no Raft transport and no placement FSM copy.
 	if cfg.EnableCluster {
-		clusterClient, err := cluster.New(cfg, logger, admitter)
+		var (
+			clusterClient cluster.Client
+			err           error
+		)
+		if cfg.IsServer() {
+			clusterClient, err = cluster.New(cfg, logger, admitter)
+		} else {
+			clusterClient, err = cluster.NewAgent(cfg, logger, admitter)
+		}
 		if err != nil {
 			logger.Error("failed to start cluster mode", "error", err)
 			os.Exit(1)
@@ -146,12 +152,16 @@ func main() {
 		// dead-owner eviction. Wired here (after both objects exist) to keep
 		// the cluster→service direction one-way through the SandboxRecreator
 		// interface, avoiding an import cycle.
-		clusterClient.AttachRecreator(svc)
+		if withRecreator, ok := clusterClient.(interface {
+			AttachRecreator(cluster.SandboxRecreator)
+		}); ok {
+			withRecreator.AttachRecreator(svc)
+		}
 		logger.Info("cluster mode enabled",
 			"node_id", clusterClient.SelfNodeID(),
 			"api_url", clusterClient.SelfAPIURL(),
 			"node_role", cfg.NodeRole,
-			"raft_bind", cfg.RaftBindAddr,
+			"control_plane_server", cfg.IsServer(),
 			"gossip_bind", cfg.GossipBindAddr,
 			"bootstrap", cfg.ClusterBootstrap,
 			"peers", cfg.BootstrapPeers,

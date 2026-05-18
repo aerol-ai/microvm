@@ -27,15 +27,16 @@ data-plane redesigns.
 - Ingress convergence metrics no longer advance the installed-version
   high-water mark after a failed reconcile.
 - SSH gateway startup is worker-role gated.
+- Worker/ingress-only nodes now run a lightweight cluster agent instead of
+  Raft/FSM: they gossip capacity, receive owner API forwards, and delegate
+  placement reads/writes to server-role nodes over authenticated control-plane
+  RPC.
 
 ## Still Pending
 
-- Worker nodes still instantiate the full cluster/Raft client surface. Scaling
-  to 10,000 workers needs a worker-client mode where only a small server quorum
-  participates in Raft/FSM storage.
 - The placement FSM is still a global map replicated to every participant. A
-  100,000-sandbox design needs bounded shards, leases, or an external indexed
-  control plane rather than full-map ownership state everywhere.
+  100,000-sandbox design still needs bounded shards, leases, or an external
+  indexed control plane rather than one full map on every server-role node.
 - Ingress reconciliation is still fundamentally full-route/full-map oriented.
   Large clusters need route sharding, delta updates, batching, and backpressure
   against the Caddy admin surface.

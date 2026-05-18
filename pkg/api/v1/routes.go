@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
@@ -115,5 +116,10 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// nodes that aren't the current leader. Auth-gated by the same PAT as
 	// every other route — see clusterInternalApply for the leadership-shift
 	// retry contract.
-	mux.Handle("POST "+PathPrefix+"/cluster/internal/apply", d.Auth(http.HandlerFunc(h.clusterInternalApply)))
+	mux.Handle("POST "+cluster.PublicInternalApplyPath, d.Auth(http.HandlerFunc(h.clusterInternalApply)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", d.Auth(http.HandlerFunc(h.clusterInternalPlacementByName)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacements)))
+	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
 }

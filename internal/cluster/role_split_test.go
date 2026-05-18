@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/hashicorp/raft"
 )
 
 // newTestClusterWithRole is newTestCluster but lets the caller set fields on
@@ -51,11 +50,38 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 	}
 }
 
-// TestRoleSplitWorkerJoinsAsNonVoter is the headline gate: a follower that
-// gossiped SB_NODE_ROLE=worker must land in the raft configuration as a
-// non-voter even when the voter cap is high enough to accept it as a voter.
-// This is what cuts 200 → 3 voters at scale.
-func TestRoleSplitWorkerJoinsAsNonVoter(t *testing.T) {
+func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
+	t.Helper()
+	gossipPort := pickFreeTCPPort(t)
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
+	cfg := config.Config{
+		EnableCluster:                 true,
+		NodeID:                        nodeID,
+		NodeRole:                      role,
+		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		BootstrapPeers:                gossipPeers,
+		SelfAPIAdvertiseURL:           apiURL,
+		ClusterRaftCommitTimeout:      2 * time.Second,
+		ClusterCapacityGossipInterval: time.Second,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a, err := NewAgent(cfg, logger, nil)
+	if err != nil {
+		t.Fatalf("cluster.NewAgent(%s, role=%s): %v", nodeID, role, err)
+	}
+	return a, func() {
+		if err := a.Close(); err != nil {
+			t.Logf("agent.Close(%s): %v", nodeID, err)
+		}
+	}
+}
+
+// TestRoleSplitWorkerDoesNotJoinRaft is the headline gate: a worker must not
+// start raft at all and therefore must not appear in the raft configuration as
+// either voter or non-voter. It still joins gossip so servers can see capacity
+// and route ownership to it.
+func TestRoleSplitWorkerDoesNotJoinRaft(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft/memberlist sockets")
 	}
@@ -66,17 +92,21 @@ func TestRoleSplitWorkerJoinsAsNonVoter(t *testing.T) {
 	// Cap is high — worker role itself must keep it out of voter status.
 	leader.cfg.ClusterMaxAutoVoters = 10
 
-	_, cleanupWorker := newTestClusterWithRole(t, "wkr", config.NodeRoleWorker, false,
+	worker, cleanupWorker := newTestAgentWithRole(t, "wkr", config.NodeRoleWorker,
 		[]string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupWorker()
 
-	waitForServerSuffrage(t, leader, "wkr", raft.Nonvoter, 10*time.Second)
+	waitForGossipMember(t, leader, "wkr", 10*time.Second)
+	if worker.gossip == nil {
+		t.Fatal("worker agent did not start gossip")
+	}
+	assertNotInRaftConfig(t, leader, "wkr")
 }
 
-// TestRoleSplitIngressJoinsAsNonVoter mirrors the worker case for the ingress
-// role: ingress nodes participate in gossip and receive placement updates but
-// must not vote in raft.
-func TestRoleSplitIngressJoinsAsNonVoter(t *testing.T) {
+// TestRoleSplitIngressDoesNotJoinRaft mirrors the worker case for ingress:
+// ingress nodes participate in gossip and poll control-plane state but must
+// not store the placement FSM as raft non-voters.
+func TestRoleSplitIngressDoesNotJoinRaft(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft/memberlist sockets")
 	}
@@ -86,11 +116,12 @@ func TestRoleSplitIngressJoinsAsNonVoter(t *testing.T) {
 	waitForLeader(t, leader, 10*time.Second)
 	leader.cfg.ClusterMaxAutoVoters = 10
 
-	_, cleanupIngress := newTestClusterWithRole(t, "ing", config.NodeRoleIngress, false,
+	_, cleanupIngress := newTestAgentWithRole(t, "ing", config.NodeRoleIngress,
 		[]string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupIngress()
 
-	waitForServerSuffrage(t, leader, "ing", raft.Nonvoter, 10*time.Second)
+	waitForGossipMember(t, leader, "ing", 10*time.Second)
+	assertNotInRaftConfig(t, leader, "ing")
 }
 
 // TestRoleSplitServerJoinsAsVoter verifies the inverse: a peer that gossiped
@@ -161,13 +192,10 @@ func TestPeerForcedNonVoterPolicy(t *testing.T) {
 	}
 }
 
-// TestRoleSplitHybridWorkerIngressJoinsAsNonVoter is the hybrid analogue of
-// TestRoleSplitWorkerJoinsAsNonVoter: a node that gossips role
-// "worker,ingress" (worker + ingress without server) must land in the raft
-// configuration as a non-voter even when the voter cap is high. This is the
-// load-bearing path for "edge" data-plane nodes that own sandboxes AND fan
-// out public ingress but must never sit in the raft quorum.
-func TestRoleSplitHybridWorkerIngressJoinsAsNonVoter(t *testing.T) {
+// TestRoleSplitHybridWorkerIngressDoesNotJoinRaft is the hybrid analogue of
+// TestRoleSplitWorkerDoesNotJoinRaft: an edge node that owns sandboxes and
+// fans out ingress still does not store the control-plane FSM.
+func TestRoleSplitHybridWorkerIngressDoesNotJoinRaft(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft/memberlist sockets")
 	}
@@ -180,11 +208,12 @@ func TestRoleSplitHybridWorkerIngressJoinsAsNonVoter(t *testing.T) {
 	// Canonical form is sorted, matching what config.Load() produces. Either
 	// order would work at the gate (the helper is order-independent) but we
 	// publish the form an operator would actually deploy with.
-	_, cleanupEdge := newTestClusterWithRole(t, "edge", "ingress,worker", false,
+	_, cleanupEdge := newTestAgentWithRole(t, "edge", "ingress,worker",
 		[]string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupEdge()
 
-	waitForServerSuffrage(t, leader, "edge", raft.Nonvoter, 10*time.Second)
+	waitForGossipMember(t, leader, "edge", 10*time.Second)
+	assertNotInRaftConfig(t, leader, "edge")
 }
 
 // TestRoleSplitHybridServerWorkerJoinsAsVoter mirrors
@@ -205,4 +234,32 @@ func TestRoleSplitHybridServerWorkerJoinsAsVoter(t *testing.T) {
 	defer cleanupSrvWk()
 
 	waitForVoter(t, leader, "srv-wk", 10*time.Second)
+}
+
+func waitForGossipMember(t *testing.T, observer *Cluster, nodeID string, max time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		for _, m := range observer.Members() {
+			if m.NodeID == nodeID && m.Alive {
+				if m.RaftAddr != "" {
+					t.Fatalf("agent %q gossiped raft address %q; worker/ingress agents must not expose raft", nodeID, m.RaftAddr)
+				}
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("member %q never appeared in gossip within %s", nodeID, max)
+}
+
+func assertNotInRaftConfig(t *testing.T, leader *Cluster, nodeID string) {
+	t.Helper()
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, ok := leader.configuredServer(nodeID); ok {
+			t.Fatalf("agent %q appeared in raft configuration; non-server nodes must not be voters or non-voters", nodeID)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
