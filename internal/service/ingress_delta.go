@@ -100,7 +100,6 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 			if tlsPeerPort > 0 {
 				routeID := caddy.IngressSandboxSNIRouteID(p.SandboxID)
 				sni := p.SandboxID + "." + s.cfg.Domain
-				pCopy := p
 				intents[ingressIntentKey(ingressSurfaceTLS, routeID)] = ingressRouteIntent{
 					key:         ingressIntentKey(ingressSurfaceTLS, routeID),
 					surface:     ingressSurfaceTLS,
@@ -113,7 +112,6 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 						return s.caddy.DeleteRouteByID(ctx, routeID)
 					},
 				}
-				_ = pCopy
 			}
 		} else {
 			routeID := "sandbox-" + p.SandboxID

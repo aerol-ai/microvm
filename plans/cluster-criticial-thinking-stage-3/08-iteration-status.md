@@ -1,9 +1,10 @@
 # Stage 3 Iteration Status
 
-This branch now fixes the highest-risk small-cluster correctness gaps found in
-the Stage 3 review. It does not make the architecture ready for 10,000 nodes or
-100,000 concurrent sandboxes; those targets still need bounded control-plane and
-data-plane redesigns.
+This branch now fixes the highest-risk Stage 3 control-plane and data-plane
+scalability gaps in addition to the small-cluster correctness issues from the
+first pass. The design is no longer "every worker runs Raft and every ingress
+installs every route"; remaining scale risk is now in operational rollout and
+real production soak, not in the obvious unbounded hot paths.
 
 ## Fixed In This Iteration
 
@@ -31,30 +32,35 @@ data-plane redesigns.
   Raft/FSM: they gossip capacity, receive owner API forwards, and delegate
   placement reads/writes to server-role nodes over authenticated control-plane
   RPC.
+- Placement reads are shard-filterable, backed by a stable 16,384-shard index,
+  and worker/ingress agents can query only their assigned shards.
+- Ingress route ownership is sharded across ingress-capable members. Reconcile
+  builds desired route intents, applies only deltas, batches Caddy writes, and
+  runs full Caddy snapshot GC as a sparse backstop rather than the normal path.
+- Cluster-wide sandbox enumeration now has a paginated control-plane index at
+  `/v1/cluster/sandbox-index`; when legacy peer fanout would exceed the safe
+  cap, `/v1/sandboxes` falls back to the index instead of failing closed.
+- Raw TCP exposure has an FSM host-port index, so cluster-wide host-port
+  collision checks are O(1) at 100k placements instead of scanning the global
+  placement map.
+- Image pull storms are single-flighted per image/auth tuple, and local-only
+  built/snapshot image refs fail fast on a new owner when the image is missing
+  instead of stampeding a registry path that cannot contain them.
+- Cluster secret blobs now use a v2 recipient envelope: the recipient set is
+  authenticated as AES-GCM AAD, new create paths seal to the selected owner
+  node, and legacy raw blobs remain readable for rolling upgrades.
+- Repeatable scale gates live behind `AEROLVM_SCALE_GATES=1` and can be run via
+  `scripts/scale-gates.sh`; they cover 10k ingress-member shard assignment,
+  100k placement pagination/sharding, 100k raw-TCP host-port collision checks,
+  100k ingress delta churn, and failover/ingress storm behavior.
 
 ## Still Pending
 
-- The placement FSM is still a global map replicated to every participant. A
-  100,000-sandbox design still needs bounded shards, leases, or an external
-  indexed control plane rather than one full map on every server-role node.
-- Ingress reconciliation is still fundamentally full-route/full-map oriented.
-  Large clusters need route sharding, delta updates, batching, and backpressure
-  against the Caddy admin surface.
-- List APIs are only bounded, not truly scalable. A 100,000-sandbox product
-  needs paginated global indexes and scoped queries rather than peer fanout.
-- Raw TCP exposure remains bounded by host-port space and per-ingress listener
-  scale. This needs quotas, allocation strategy, and likely a different data
-  plane for high-cardinality exposure.
-- Snapshot/image locality is not solved. Remote create/build forwarding helps,
-  but migration/failover still needs image distribution, cache warming, and
-  storage placement policy.
-- Secrets are still replicated in sealed form to cluster participants. Reducing
-  blast radius needs separate secret distribution/KMS policy and narrower
-  recipient sets.
-- The branch still lacks real scale gates: create storms, churn, 10k member
-  synthetic gossip, 100k placement snapshots, ingress route churn, failover,
-  and facade idempotency should all have repeatable load tests.
+- External KMS rewrap and image pre-distribution are still deployment-level
+  integrations. The code now has recipient envelopes, pull dedupe, and clear
+  local-only image failure semantics, but it does not ship a registry/cache
+  service or a KMS plugin in-process.
 
 ## Verification
 
-`go test ./...` passes after the iteration.
+`go test ./...` and `scripts/scale-gates.sh` pass after the iteration.

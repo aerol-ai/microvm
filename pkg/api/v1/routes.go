@@ -106,6 +106,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/cluster/members", d.Auth(http.HandlerFunc(h.clusterMembers)))
 	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.Auth(http.HandlerFunc(h.clusterLeader)))
 	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", d.Auth(http.HandlerFunc(h.clusterPlacement)))
+	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", d.Auth(http.HandlerFunc(h.clusterSandboxIndex)))
 	// Drain / uncordon are operator admission controls — they don't move
 	// existing work, they just stop SelectPlacement from sending new sandboxes
 	// to the node. PATCH-style verbs would also fit but POST keeps the surface
@@ -121,6 +122,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", d.Auth(http.HandlerFunc(h.clusterInternalPlacementByName)))
 	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacements)))
 	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsPage)))
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
 }

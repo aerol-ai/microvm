@@ -12,10 +12,7 @@ import (
 
 // fillFSMWithPlacements seeds an FSM with `n` placements, each owned by a
 // round-robin node and exposing one raw-TCP host port that's unique across
-// the set. Returns the FSM ready for further opAddExposedPort applies —
-// every subsequent TCP add will trigger the O(N×P) port-availability scan
-// in validateHostPortAvailableLocked, which is the scaling axis this file
-// pins.
+// the set. Returns the FSM ready for further opAddExposedPort applies.
 func fillFSMWithPlacements(t testing.TB, fsm *placementFSM, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
@@ -44,12 +41,11 @@ func fillFSMWithPlacements(t testing.TB, fsm *placementFSM, n int) {
 }
 
 // TestFSMValidateHostPortAt10K is the B6 scale claim for the FSM's port-
-// availability scan. With 10K placements each holding a distinct TCP host
+// availability index. With 10K placements each holding a distinct TCP host
 // port, an opAddExposedPort that doesn't conflict MUST succeed, and one that
 // reuses an existing host port MUST be rejected with ErrHostPortReserved.
-// The O(N×P) loop in validateHostPortAvailableLocked is exercised end to end;
-// regressions that walk every placement's spec / clone every routes map will
-// show up as ballooning wall clock here.
+// Regressions that reintroduce placement-map scans will show up as ballooning
+// wall clock here and in the benchmark.
 func TestFSMValidateHostPortAt10K(t *testing.T) {
 	if testing.Short() {
 		t.Skip("scale test skipped under -short")
@@ -109,12 +105,59 @@ func TestFSMValidateHostPortAt10K(t *testing.T) {
 		n, okElapsed, conflictElapsed)
 }
 
+func TestFSMHostPortIndexReleasesOnRemoveAndDelete(t *testing.T) {
+	fsm := newPlacementFSM()
+	for _, id := range []string{"owner", "next"} {
+		place, _ := encodeCommand(command{
+			Op:          opPlace,
+			SandboxID:   id,
+			OwnerNodeID: "node-a",
+			Spec:        &models.CreateSandboxRequest{Image: "img"},
+		})
+		if got := fsm.Apply(&raft.Log{Index: uint64(len(id)), Data: place}); got != nil {
+			t.Fatalf("place %s: %v", id, got)
+		}
+	}
+	add, _ := encodeCommand(command{
+		Op:        opAddExposedPort,
+		SandboxID: "owner",
+		Port:      5432,
+		Protocol:  models.ExposedPortProtocolTCP,
+		HostPort:  45432,
+	})
+	if got := fsm.Apply(&raft.Log{Index: 10, Data: add}); got != nil {
+		t.Fatalf("add owner tcp: %v", got)
+	}
+	dup, _ := encodeCommand(command{
+		Op:        opAddExposedPort,
+		SandboxID: "next",
+		Port:      5432,
+		Protocol:  models.ExposedPortProtocolTCP,
+		HostPort:  45432,
+	})
+	if got := fsm.Apply(&raft.Log{Index: 11, Data: dup}); !errors.Is(got.(error), ErrHostPortReserved) {
+		t.Fatalf("duplicate host port = %v, want ErrHostPortReserved", got)
+	}
+	remove, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "owner", Port: 5432})
+	if got := fsm.Apply(&raft.Log{Index: 12, Data: remove}); got != nil {
+		t.Fatalf("remove owner tcp: %v", got)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 13, Data: dup}); got != nil {
+		t.Fatalf("host port not released after remove: %v", got)
+	}
+	del, _ := encodeCommand(command{Op: opDelete, SandboxID: "next"})
+	if got := fsm.Apply(&raft.Log{Index: 14, Data: del}); got != nil {
+		t.Fatalf("delete next: %v", got)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 15, Data: add}); got != nil {
+		t.Fatalf("host port not released after delete: %v", got)
+	}
+}
+
 // BenchmarkFSMValidateHostPortAt10K measures the steady-state cost of one
 // opAddExposedPort against a 10K-placement FSM. Operators can track this to
-// notice if a future port-allocator change pushes the scan from "fine" to
-// "drowns the apply loop." Reports allocations because exposedPortRoutesForPlacement
-// allocates a new map per placement on each scan — a known hotspot if the
-// FSM grows beyond 10K rows.
+// notice if a future port-allocator change regresses the O(1) host-port index
+// back into an FSM-wide scan.
 func BenchmarkFSMValidateHostPortAt10K(b *testing.B) {
 	fsm := newPlacementFSM()
 	const n = 10_000

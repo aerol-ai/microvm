@@ -3,6 +3,8 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -21,18 +23,30 @@ type clusterSealedSecrets struct {
 	MountCreds map[string]map[string]string `json:"mount_creds,omitempty"`
 }
 
+type clusterSealedSecretsEnvelope struct {
+	Version    int      `json:"version"`
+	Recipients []string `json:"recipients,omitempty"`
+	Payload    []byte   `json:"payload"`
+}
+
 // SealClusterSecrets extracts the secret-bearing portions of req, marshals
 // them as JSON, and encrypts the result with the service cipher. The output
 // is opaque bytes safe to put in the raft log. Returns nil/nil when there
 // are no secrets to seal so the FSM column stays empty for sandboxes that
 // don't need it.
 //
-// Cluster mode requires operators to share the same SB_CREDENTIAL_ENCRYPTION_KEY
-// across nodes — without it, the receiving owner can't decrypt the bag and
-// the recreated sandbox loses access to its private registry / mount creds.
-// This is the same key already used for at-rest sealing in SQLite, so the
-// requirement is implicit rather than newly imposed.
+// The legacy method emits a wildcard-recipient v2 envelope for compatibility.
+// New cluster placement paths should prefer SealClusterSecretsForRecipient so
+// the encrypted payload is authenticated to the specific owner node ID.
 func (s *Service) SealClusterSecrets(req models.CreateSandboxRequest) ([]byte, error) {
+	return s.sealClusterSecrets(req, []string{"*"})
+}
+
+func (s *Service) SealClusterSecretsForRecipient(req models.CreateSandboxRequest, recipient string) ([]byte, error) {
+	return s.sealClusterSecrets(req, []string{recipient})
+}
+
+func (s *Service) sealClusterSecrets(req models.CreateSandboxRequest, recipients []string) ([]byte, error) {
 	var bag clusterSealedSecrets
 	if req.Registry != nil && req.Registry.Password != "" {
 		regCopy := *req.Registry
@@ -58,11 +72,16 @@ func (s *Service) SealClusterSecrets(req models.CreateSandboxRequest) ([]byte, e
 	if err != nil {
 		return nil, fmt.Errorf("marshal cluster secrets: %w", err)
 	}
-	sealed, err := s.cipher.Encrypt(plain)
+	recipients = normalizeClusterSecretRecipients(recipients)
+	sealed, err := s.cipher.EncryptWithAAD(plain, clusterSecretAAD(recipients))
 	if err != nil {
 		return nil, fmt.Errorf("encrypt cluster secrets: %w", err)
 	}
-	return sealed, nil
+	envelope, err := json.Marshal(clusterSealedSecretsEnvelope{Version: 2, Recipients: recipients, Payload: sealed})
+	if err != nil {
+		return nil, fmt.Errorf("marshal cluster secrets envelope: %w", err)
+	}
+	return envelope, nil
 }
 
 // RedactClusterSecrets returns a copy of req with credentials stripped — safe
@@ -118,10 +137,14 @@ func RedactClusterSecrets(req models.CreateSandboxRequest) models.CreateSandboxR
 // secret bits — so a future credential rotation that re-seals doesn't
 // stomp on whatever the latest replicated metadata is.
 func (s *Service) UnsealClusterSecrets(redacted models.CreateSandboxRequest, sealed []byte) (models.CreateSandboxRequest, error) {
+	return s.UnsealClusterSecretsForNode(redacted, sealed, "")
+}
+
+func (s *Service) UnsealClusterSecretsForNode(redacted models.CreateSandboxRequest, sealed []byte, nodeID string) (models.CreateSandboxRequest, error) {
 	if len(sealed) == 0 {
 		return redacted, nil
 	}
-	plain, err := s.cipher.Decrypt(sealed)
+	plain, err := s.openClusterSecretPayload(sealed, nodeID)
 	if err != nil {
 		return redacted, fmt.Errorf("decrypt cluster secrets: %w", err)
 	}
@@ -166,4 +189,53 @@ func (s *Service) UnsealClusterSecrets(redacted models.CreateSandboxRequest, sea
 		out.Mounts = ms
 	}
 	return out, nil
+}
+
+func (s *Service) openClusterSecretPayload(sealed []byte, nodeID string) ([]byte, error) {
+	var envelope clusterSealedSecretsEnvelope
+	if err := json.Unmarshal(sealed, &envelope); err == nil && envelope.Version == 2 && len(envelope.Payload) > 0 {
+		recipients := normalizeClusterSecretRecipients(envelope.Recipients)
+		if !clusterSecretRecipientAllowed(recipients, nodeID) {
+			return nil, fmt.Errorf("recipient %q is not allowed to open this cluster secret", nodeID)
+		}
+		return s.cipher.DecryptWithAAD(envelope.Payload, clusterSecretAAD(recipients))
+	}
+	// Legacy raw nonce||ciphertext blob. Kept for rolling upgrades and
+	// snapshots/raft logs written before v2 recipient envelopes existed.
+	return s.cipher.Decrypt(sealed)
+}
+
+func normalizeClusterSecretRecipients(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, r := range in {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if _, ok := seen[r]; ok {
+			continue
+		}
+		seen[r] = struct{}{}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		out = append(out, "*")
+	}
+	sort.Strings(out)
+	return out
+}
+
+func clusterSecretRecipientAllowed(recipients []string, nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	for _, r := range recipients {
+		if r == "*" || (nodeID != "" && r == nodeID) {
+			return true
+		}
+	}
+	return false
+}
+
+func clusterSecretAAD(recipients []string) []byte {
+	return []byte("aerolvm-cluster-secrets-v2\x00" + strings.Join(normalizeClusterSecretRecipients(recipients), "\x00"))
 }

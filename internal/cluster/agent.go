@@ -28,6 +28,7 @@ const (
 	PublicInternalPlacementByNamePath   = "/v1/cluster/internal/placement-by-name/"
 	PublicInternalPlacementsPath        = "/v1/cluster/internal/placements"
 	PublicInternalPlacementsQueryPath   = "/v1/cluster/internal/placements/query"
+	PublicInternalPlacementsPagePath    = "/v1/cluster/internal/placements/page"
 	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
 	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
 	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
@@ -451,6 +452,18 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	}
 	a.shardCache[placementShardFilterCacheKey(filter)] = clonePlacements(out)
 	a.cacheMu.Unlock()
+	return out
+}
+
+func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
+	req = req.Normalize()
+	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
+	defer cancel()
+	var out PlacementPageResponse
+	if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsPagePath, PublicInternalPlacementsPagePath, req, &out); err != nil {
+		a.logger.Warn("cluster agent: placement page lookup failed", "err", err, "limit", req.Limit, "page_token", req.PageToken)
+		return PlacementPageResponse{}
+	}
 	return out
 }
 

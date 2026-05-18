@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +103,11 @@ type placementFSM struct {
 	// The shard ID derives only from SandboxID, so ownership/spec/port changes
 	// update the placement row without touching this index.
 	shardIndex map[int]map[string]struct{}
+	// hostPortIndex maps a raw-TCP public host port to the placement exposure
+	// that owns it. This is the cluster-wide raw TCP capacity index: AddPort
+	// rejects collisions in O(1) under the FSM lock instead of scanning every
+	// placement at 100k-row scale.
+	hostPortIndex map[int]hostPortClaim
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -118,12 +124,18 @@ type placementFSM struct {
 	subscribers []chan<- struct{}
 }
 
+type hostPortClaim struct {
+	SandboxID string
+	Port      int
+}
+
 func newPlacementFSM() *placementFSM {
 	return &placementFSM{
-		placements:   make(map[string]Placement),
-		nameIndex:    make(map[string]string),
-		shardIndex:   make(map[int]map[string]struct{}),
-		drainedNodes: make(map[string]bool),
+		placements:    make(map[string]Placement),
+		nameIndex:     make(map[string]string),
+		shardIndex:    make(map[int]map[string]struct{}),
+		hostPortIndex: make(map[int]hostPortClaim),
+		drainedNodes:  make(map[string]bool),
 	}
 }
 
@@ -304,12 +316,14 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
 		f.releaseShardLocked(cmd.SandboxID)
+		f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 		delete(f.placements, cmd.SandboxID)
 		return nil
 	case opDelete:
 		if existing, ok := f.placements[cmd.SandboxID]; ok {
 			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
 			f.releaseShardLocked(cmd.SandboxID)
+			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 		}
 		delete(f.placements, cmd.SandboxID)
 		return nil
@@ -388,8 +402,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if existing.ExposedPorts[cmd.Port] == route.Protocol && existing.ExposedPortRoutes[cmd.Port] == route {
 			return nil
 		}
+		f.releaseHostPortLocked(cmd.SandboxID, cmd.Port, existing.ExposedPortRoutes[cmd.Port])
 		existing.ExposedPorts[cmd.Port] = route.Protocol
 		existing.ExposedPortRoutes[cmd.Port] = route
+		f.claimHostPortLocked(cmd.SandboxID, cmd.Port, route)
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
@@ -402,6 +418,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if _, present := existing.ExposedPorts[cmd.Port]; !present {
 			return nil
 		}
+		f.releaseHostPortLocked(cmd.SandboxID, cmd.Port, existing.ExposedPortRoutes[cmd.Port])
 		delete(existing.ExposedPorts, cmd.Port)
 		if len(existing.ExposedPorts) == 0 {
 			existing.ExposedPorts = nil
@@ -516,19 +533,48 @@ func (f *placementFSM) releaseShardLocked(sandboxID string) {
 	}
 }
 
+func (f *placementFSM) claimHostPortLocked(sandboxID string, port int, route ExposedPortRoute) {
+	if route.Protocol != models.ExposedPortProtocolTCP || route.HostPort <= 0 {
+		return
+	}
+	if f.hostPortIndex == nil {
+		f.hostPortIndex = make(map[int]hostPortClaim)
+	}
+	f.hostPortIndex[route.HostPort] = hostPortClaim{SandboxID: sandboxID, Port: port}
+}
+
+func (f *placementFSM) releaseHostPortLocked(sandboxID string, port int, route ExposedPortRoute) {
+	if route.Protocol != models.ExposedPortProtocolTCP || route.HostPort <= 0 || f.hostPortIndex == nil {
+		return
+	}
+	claim, ok := f.hostPortIndex[route.HostPort]
+	if ok && claim.SandboxID == sandboxID && claim.Port == port {
+		delete(f.hostPortIndex, route.HostPort)
+	}
+}
+
+func (f *placementFSM) releaseAllHostPortsLocked(sandboxID string, p Placement) {
+	for port, route := range exposedPortRoutesForPlacement(p) {
+		f.releaseHostPortLocked(sandboxID, port, route)
+	}
+}
+
 func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port int, route ExposedPortRoute) error {
 	if route.Protocol != models.ExposedPortProtocolTCP || route.HostPort <= 0 {
 		return nil
 	}
-	for otherSandboxID, placement := range f.placements {
-		for otherPort, otherRoute := range exposedPortRoutesForPlacement(placement) {
-			if otherSandboxID == sandboxID && otherPort == port {
-				continue
-			}
-			if otherRoute.Protocol == models.ExposedPortProtocolTCP && otherRoute.HostPort == route.HostPort {
-				return fmt.Errorf("%w: %d reserved by %s:%d", ErrHostPortReserved, route.HostPort, otherSandboxID, otherPort)
+	if f.hostPortIndex == nil {
+		f.hostPortIndex = make(map[int]hostPortClaim)
+		for id, placement := range f.placements {
+			for placementPort, placementRoute := range exposedPortRoutesForPlacement(placement) {
+				if placementRoute.Protocol == models.ExposedPortProtocolTCP && placementRoute.HostPort > 0 {
+					f.hostPortIndex[placementRoute.HostPort] = hostPortClaim{SandboxID: id, Port: placementPort}
+				}
 			}
 		}
+	}
+	if claim, ok := f.hostPortIndex[route.HostPort]; ok && (claim.SandboxID != sandboxID || claim.Port != port) {
+		return fmt.Errorf("%w: %d reserved by %s:%d", ErrHostPortReserved, route.HostPort, claim.SandboxID, claim.Port)
 	}
 	return nil
 }
@@ -667,6 +713,49 @@ func (f *placementFSM) placementsForShards(filter PlacementShardFilter) []Placem
 	return out
 }
 
+func (f *placementFSM) placementPage(req PlacementPageRequest) PlacementPageResponse {
+	req = req.Normalize()
+	shardFilter := req.ShardFilter.Normalize()
+	allShards := shardFilter.allShards()
+	wantShards := make(map[int]struct{}, len(shardFilter.Shards))
+	for _, shard := range shardFilter.Shards {
+		wantShards[shard] = struct{}{}
+	}
+
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	ids := make([]string, 0, len(f.placements))
+	for id := range f.placements {
+		if req.PageToken != "" && id <= req.PageToken {
+			continue
+		}
+		if !allShards {
+			shardCount := shardFilter.ShardCount
+			if shardCount <= 0 {
+				shardCount = DefaultPlacementShardCount
+			}
+			if _, ok := wantShards[PlacementShardForSandbox(id, shardCount)]; !ok {
+				continue
+			}
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) > req.Limit {
+		ids = ids[:req.Limit]
+	}
+	out := make([]Placement, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, clonePlacement(f.placements[id]))
+	}
+	next := ""
+	if len(ids) == req.Limit {
+		next = ids[len(ids)-1]
+	}
+	return PlacementPageResponse{Placements: out, NextPageToken: next}
+}
+
 // isNodeDrained reports whether nodeID has been marked drained via
 // opSetNodeDrainState. SelectPlacement reads this to filter the candidate set;
 // callers outside placement scoring can use it for observability (e.g. the
@@ -760,11 +849,15 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 	// source of truth even after a cold restart.
 	f.nameIndex = make(map[string]string, len(payload.Placements))
 	f.shardIndex = make(map[int]map[string]struct{})
+	f.hostPortIndex = make(map[int]hostPortClaim)
 	for id, p := range payload.Placements {
 		if name := specName(p.Spec); name != "" {
 			f.nameIndex[name] = id
 		}
 		f.claimShardLocked(id)
+		for port, route := range exposedPortRoutesForPlacement(p) {
+			f.claimHostPortLocked(id, port, route)
+		}
 	}
 	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the
 	// add path can write without a nil-map panic. Active drains carried in

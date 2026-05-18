@@ -800,6 +800,13 @@ func (c *Cluster) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	return c.fsm.placementsForShards(filter)
 }
 
+func (c *Cluster) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
+	if c.fsm == nil {
+		return PlacementPageResponse{}
+	}
+	return c.fsm.placementPage(req)
+}
+
 // PlacementOf returns the FSM record for sandboxID. Goes through f.get so the
 // returned Placement is deep-cloned and safe to mutate without aliasing live
 // FSM state (same guarantee as Placements).

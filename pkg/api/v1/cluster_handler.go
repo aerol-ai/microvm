@@ -194,7 +194,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
 		return
 	}
-	sealed, err := h.deps.Service.SealClusterSecrets(req)
+	sealed, err := h.deps.Service.SealClusterSecretsForRecipient(req, target.NodeID)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: seal secrets: "+err.Error())
 		return
@@ -288,7 +288,7 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		// alongside the placement pointer so a future owner can recreate
 		// this sandbox if the current owner dies. The raft log must NOT
 		// carry plaintext credentials, so we seal + redact here.
-		sealed, sealErr := h.deps.Service.SealClusterSecrets(req)
+		sealed, sealErr := h.deps.Service.SealClusterSecretsForRecipient(req, c.SelfNodeID())
 		if sealErr != nil {
 			h.deps.Logger.Error("cluster: seal secrets failed; rolling back create",
 				"sandbox_id", resp.Sandbox.ID, "err", sealErr)
@@ -382,7 +382,7 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		peers = append(peers, m)
 	}
 	if len(peers) > clusterListMaxFanoutPeers {
-		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster list fanout exceeds safe peer cap; query a scoped owner or use a paginated control-plane index")
+		h.writeClusterSandboxIndex(w, r)
 		return
 	}
 
@@ -480,6 +480,65 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 
 func clusterMemberCanOwnSandbox(role string) bool {
 	return cluster.CanOwnSandboxRole(role)
+}
+
+func parsePositiveIntQuery(r *http.Request, key string) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func parseRepeatedIntQuery(r *http.Request, key string) []int {
+	var out []int
+	for _, rawValue := range r.URL.Query()[key] {
+		for _, rawPart := range strings.Split(rawValue, ",") {
+			rawPart = strings.TrimSpace(rawPart)
+			if rawPart == "" {
+				continue
+			}
+			n, err := strconv.Atoi(rawPart)
+			if err != nil {
+				continue
+			}
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func (h *handlers) clusterSandboxIndex(w http.ResponseWriter, r *http.Request) {
+	h.writeClusterSandboxIndex(w, r)
+}
+
+func (h *handlers) writeClusterSandboxIndex(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	req := cluster.PlacementPageRequest{
+		Limit:     parsePositiveIntQuery(r, "limit"),
+		PageToken: strings.TrimSpace(r.URL.Query().Get("page_token")),
+		ShardFilter: cluster.PlacementShardFilter{
+			ShardCount: parsePositiveIntQuery(r, "shard_count"),
+			Shards:     parseRepeatedIntQuery(r, "shard"),
+		},
+	}
+	resp := c.PlacementPage(req)
+	for i := range resp.Placements {
+		resp.Placements[i].SealedSecrets = nil
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
 // clusterDestroyWrap runs the local destroy then deletes the placement
@@ -709,6 +768,24 @@ func (h *handlers) clusterInternalPlacementsQuery(w http.ResponseWriter, r *http
 		placements[i].SealedSecrets = nil
 	}
 	apihttp.WriteJSON(w, http.StatusOK, placements)
+}
+
+func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	var req cluster.PlacementPageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp := c.PlacementPage(req)
+	for i := range resp.Placements {
+		resp.Placements[i].SealedSecrets = nil
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
 func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http.Request) {

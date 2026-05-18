@@ -43,6 +43,10 @@ func NewCipher(keyB64, fallbackPath string) (*Cipher, error) {
 // Encrypt seals plaintext. Empty input is allowed and produces a non-empty
 // sealed blob (the nonce alone authenticates that no plaintext was sealed).
 func (c *Cipher) Encrypt(plain []byte) ([]byte, error) {
+	return c.EncryptWithAAD(plain, nil)
+}
+
+func (c *Cipher) EncryptWithAAD(plain []byte, aad []byte) ([]byte, error) {
 	if c == nil || c.gcm == nil {
 		return nil, errors.New("cipher not initialized")
 	}
@@ -50,13 +54,17 @@ func (c *Cipher) Encrypt(plain []byte) ([]byte, error) {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("nonce: %w", err)
 	}
-	sealed := c.gcm.Seal(nil, nonce, plain, nil)
+	sealed := c.gcm.Seal(nil, nonce, plain, aad)
 	return append(nonce, sealed...), nil
 }
 
 // Decrypt opens a sealed blob produced by Encrypt. Tampering, truncation, or
 // using a different key all return an error.
 func (c *Cipher) Decrypt(sealed []byte) ([]byte, error) {
+	return c.DecryptWithAAD(sealed, nil)
+}
+
+func (c *Cipher) DecryptWithAAD(sealed []byte, aad []byte) ([]byte, error) {
 	if c == nil || c.gcm == nil {
 		return nil, errors.New("cipher not initialized")
 	}
@@ -64,7 +72,7 @@ func (c *Cipher) Decrypt(sealed []byte) ([]byte, error) {
 		return nil, errors.New("sealed blob too short")
 	}
 	nonce, body := sealed[:c.gcm.NonceSize()], sealed[c.gcm.NonceSize():]
-	plain, err := c.gcm.Open(nil, nonce, body, nil)
+	plain, err := c.gcm.Open(nil, nonce, body, aad)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt: %w", err)
 	}

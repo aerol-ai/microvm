@@ -271,7 +271,11 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
 	}
-	merged, err := s.UnsealClusterSecrets(spec, sealedSecrets)
+	nodeID := ""
+	if c := s.Cluster(); c != nil {
+		nodeID = c.SelfNodeID()
+	}
+	merged, err := s.UnsealClusterSecretsForNode(spec, sealedSecrets, nodeID)
 	if err != nil {
 		return fmt.Errorf("recreate %s: %w", id, err)
 	}

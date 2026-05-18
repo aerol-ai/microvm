@@ -394,6 +394,12 @@ type Client interface {
 	// plane peer. Empty Shards means "all placements."
 	PlacementsForShards(filter PlacementShardFilter) []Placement
 
+	// PlacementPage returns a bounded global placement-index page sorted by
+	// sandbox ID. It is the scalable read path for operators/control planes
+	// that need to enumerate 100k sandboxes without asking every worker for
+	// its local DB.
+	PlacementPage(req PlacementPageRequest) PlacementPageResponse
+
 	// PlacementOf returns the full Placement record for sandboxID and true,
 	// or a zero Placement and false if no record exists. Operator/debug
 	// endpoints use this for convergence-status reads where the per-aspect

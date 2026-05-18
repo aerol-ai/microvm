@@ -36,10 +36,18 @@ type gcCaddyFake struct {
 type stubIngressCluster struct {
 	*cluster.Noop
 	placements []cluster.Placement
+	members    []cluster.Member
 }
 
 func (s *stubIngressCluster) Placements() []cluster.Placement {
 	return s.placements
+}
+
+func (s *stubIngressCluster) Members() []cluster.Member {
+	if len(s.members) > 0 {
+		return s.members
+	}
+	return s.Noop.Members()
 }
 
 func (s *stubIngressCluster) PlacementsForShards(filter cluster.PlacementShardFilter) []cluster.Placement {

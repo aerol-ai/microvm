@@ -114,6 +114,29 @@ func TestSealClusterSecretsEmpty(t *testing.T) {
 	}
 }
 
+func TestSealClusterSecretsRecipientBound(t *testing.T) {
+	s := &Service{cipher: newTestCipher(t)}
+	req := models.CreateSandboxRequest{
+		Image:    "private.example.com/app:latest",
+		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: "p"},
+	}
+	sealed, err := s.SealClusterSecretsForRecipient(req, "node-a")
+	if err != nil {
+		t.Fatalf("SealClusterSecretsForRecipient: %v", err)
+	}
+	redacted := RedactClusterSecrets(req)
+	if _, err := s.UnsealClusterSecretsForNode(redacted, sealed, "node-b"); err == nil {
+		t.Fatal("wrong recipient opened sealed cluster secrets")
+	}
+	merged, err := s.UnsealClusterSecretsForNode(redacted, sealed, "node-a")
+	if err != nil {
+		t.Fatalf("recipient failed to open sealed cluster secrets: %v", err)
+	}
+	if merged.Registry == nil || merged.Registry.Password != "p" {
+		t.Fatalf("recipient merge lost registry password: %+v", merged.Registry)
+	}
+}
+
 // UnsealClusterSecrets with empty input must be a passthrough — callers
 // shouldn't have to short-circuit themselves.
 func TestUnsealClusterSecretsEmpty(t *testing.T) {

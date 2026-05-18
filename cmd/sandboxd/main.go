@@ -310,7 +310,11 @@ func localSandboxStates(ctx context.Context, svc *service.Service, logger *slog.
 		// loudly, but losing replication entirely would be worse.
 		var sealed []byte
 		if spec != nil {
-			s, err := svc.SealClusterSecrets(*spec)
+			recipient := ""
+			if c := svc.Cluster(); c != nil {
+				recipient = c.SelfNodeID()
+			}
+			s, err := svc.SealClusterSecretsForRecipient(*spec, recipient)
 			if err != nil {
 				logger.Warn("cluster: seal secrets at boot replay failed; placement will ship without sealed bag",
 					"sandbox_id", sb.ID, "err", err)
