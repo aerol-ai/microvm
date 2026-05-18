@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ const (
 	PublicInternalPlacementPath         = "/v1/cluster/internal/placement/"
 	PublicInternalPlacementByNamePath   = "/v1/cluster/internal/placement-by-name/"
 	PublicInternalPlacementsPath        = "/v1/cluster/internal/placements"
+	PublicInternalPlacementsQueryPath   = "/v1/cluster/internal/placements/query"
 	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
 	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
 	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
@@ -78,6 +80,7 @@ type Agent struct {
 
 	cacheMu        sync.RWMutex
 	placementCache []Placement
+	shardCache     map[string][]Placement
 }
 
 func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Agent, error) {
@@ -422,15 +425,31 @@ func (a *Agent) Members() []Member {
 }
 
 func (a *Agent) Placements() []Placement {
+	return a.PlacementsForShards(PlacementShardFilter{})
+}
+
+func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
+	filter = filter.Normalize()
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
 	var out []Placement
-	if err := a.doControlPlaneJSON(ctx, http.MethodGet, PublicInternalPlacementsPath, PublicInternalPlacementsPath, nil, &out); err != nil {
-		a.logger.Warn("cluster agent: placements lookup failed; using cached placement view", "err", err)
-		return a.cachedPlacements()
+	if filter.allShards() {
+		if err := a.doControlPlaneJSON(ctx, http.MethodGet, PublicInternalPlacementsPath, PublicInternalPlacementsPath, nil, &out); err != nil {
+			a.logger.Warn("cluster agent: placements lookup failed; using cached placement view", "err", err)
+			return a.cachedPlacementsForShards(filter)
+		}
+	} else if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsQueryPath, PublicInternalPlacementsQueryPath, filter, &out); err != nil {
+		a.logger.Warn("cluster agent: shard placement lookup failed; using cached shard view", "err", err, "shards", len(filter.Shards))
+		return a.cachedPlacementsForShards(filter)
 	}
 	a.cacheMu.Lock()
-	a.placementCache = clonePlacements(out)
+	if filter.allShards() {
+		a.placementCache = clonePlacements(out)
+	}
+	if a.shardCache == nil {
+		a.shardCache = make(map[string][]Placement)
+	}
+	a.shardCache[placementShardFilterCacheKey(filter)] = clonePlacements(out)
 	a.cacheMu.Unlock()
 	return out
 }
@@ -612,9 +631,34 @@ func (a *Agent) controlPlaneMembers() []Member {
 }
 
 func (a *Agent) cachedPlacements() []Placement {
+	return a.cachedPlacementsForShards(PlacementShardFilter{})
+}
+
+func (a *Agent) cachedPlacementsForShards(filter PlacementShardFilter) []Placement {
+	filter = filter.Normalize()
 	a.cacheMu.RLock()
 	defer a.cacheMu.RUnlock()
+	if filter.allShards() {
+		return clonePlacements(a.placementCache)
+	}
+	if cached, ok := a.shardCache[placementShardFilterCacheKey(filter)]; ok {
+		return clonePlacements(cached)
+	}
 	return clonePlacements(a.placementCache)
+}
+
+func placementShardFilterCacheKey(filter PlacementShardFilter) string {
+	filter = filter.Normalize()
+	var b strings.Builder
+	b.WriteString(strconv.Itoa(filter.ShardCount))
+	b.WriteByte(':')
+	for i, shard := range filter.Shards {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.Itoa(shard))
+	}
+	return b.String()
 }
 
 type statusError struct {

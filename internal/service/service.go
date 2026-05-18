@@ -102,6 +102,12 @@ type Service struct {
 	// path that keeps a 10K-placement steady state from hammering Caddy's
 	// admin API every 5 seconds. Set to 0 on error so the next tick retries.
 	ingressLastHash atomic.Uint64
+	// ingressRouteCache is the last route-intent set successfully applied to
+	// local Caddy by ReconcileClusterIngress. The reconciler diffs against it
+	// so a one-sandbox placement mutation does not rewrite the full shard.
+	ingressRouteMu        sync.Mutex
+	ingressRouteCache     map[string]ingressRouteIntent
+	ingressLastFullGCUnix atomic.Int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -1984,7 +1990,7 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 		return
 	}
 	self := c.SelfNodeID()
-	for _, p := range c.Placements() {
+	for _, p := range c.PlacementsForShards(clusterIngressShardFilter(c, self)) {
 		if p.SandboxID == "" || p.OwnerNodeID == self {
 			continue
 		}
@@ -2181,7 +2187,8 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	if self == "" {
 		return nil
 	}
-	placements := c.Placements()
+	shardFilter := clusterIngressShardFilter(c, self)
+	placements := c.PlacementsForShards(shardFilter)
 
 	// Idle-skip: hash the relevant slice of the placement view. If nothing
 	// changed since the last successful reconcile, return without touching
@@ -2190,128 +2197,39 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	// Version, so any FSM-level placement change forces a recompute.
 	start := time.Now()
 	viewHash, routeCounts, maxVersion := hashPlacementView(self, placements)
-	if viewHash == s.ingressLastHash.Load() && viewHash != 0 {
+	runFullGC := s.shouldRunClusterIngressFullGC()
+	if viewHash == s.ingressLastHash.Load() && viewHash != 0 && !runFullGC {
 		recordIngressReconcile(reconcileSkipped, time.Since(start), routeCounts, maxVersion)
 		return nil
 	}
 
 	var firstErr error
-	needL4 := s.cfg.Domain != ""
-	if !needL4 {
-		for _, p := range placements {
-			for _, route := range cluster.ExposedPortRoutesForPlacement(p) {
-				if route.Protocol == models.ExposedPortProtocolTCP && route.HostPort > 0 {
-					needL4 = true
-					break
-				}
-			}
-			if needL4 {
-				break
-			}
-		}
-	}
+	desired, needL4 := s.buildClusterIngressIntents(placements, self)
 	if needL4 {
 		if err := s.EnsureLayer4Ready(ctx); err != nil {
 			return err
 		}
 	}
 
-	// Collect all admin operations into a slice and run them through a
-	// bounded worker pool. Each op is one Caddy admin HTTP call; with a
-	// 10K-route view the sequential version did 10K serial RTTs to Caddy
-	// admin per tick. The pool caps in-flight calls so we don't drown
-	// Caddy's admin server but lets us amortize HTTP overhead across N
-	// sockets in parallel.
-	tlsPeerPort := l4ListenPort(s.cfg.L4TLSListen)
-	var ops []func(context.Context) error
-	for _, p := range placements {
-		if p.SandboxID == "" || p.OwnerNodeID == self {
-			continue
-		}
-
-		ownerHost := dataPlaneHostForPlacement(p)
-		// In-flux: orphaned placement (dead owner) or owner data-plane host
-		// hasn't gossiped yet. Install an HTTP 503 route so clients get a
-		// clear Retry-After signal instead of the Caddy catch-all 404.
-		// Remove any live route that may still be installed from a prior
-		// healthy tick. The whole in-flux flow stays in one op so its
-		// internal ordering (delete-live-then-install-503) is preserved.
-		if p.OwnerNodeID == "" || ownerHost == "" {
-			ops = append(ops, func(ctx context.Context) error {
-				return s.applyInFluxRoute(ctx, p)
-			})
-			continue
-		}
-
-		// Healthy: install the live route(s) and drop any in-flux route
-		// left over from a previous orphan window. Independent ops; safe
-		// to run in parallel.
-		ops = append(ops, func(ctx context.Context) error {
-			return s.caddy.DeleteInFluxSandboxRoute(ctx, p.SandboxID)
-		})
-
-		if s.cfg.Domain != "" {
-			if tlsPeerPort <= 0 {
-				continue
-			}
-			sni := p.SandboxID + "." + s.cfg.Domain
-			ops = append(ops, func(ctx context.Context) error {
-				return s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID), sni, ownerHost, tlsPeerPort)
-			})
-		} else {
-			ops = append(ops, func(ctx context.Context) error {
-				return s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost)
-			})
-		}
-
-		for port, route := range cluster.ExposedPortRoutesForPlacement(p) {
-			protocol := route.Protocol
-			if protocol == "" {
-				protocol = models.ExposedPortProtocolHTTP
-			}
-			ops = append(ops, func(ctx context.Context) error {
-				return s.caddy.DeleteInFluxPortRoute(ctx, p.SandboxID, port)
-			})
-			switch protocol {
-			case models.ExposedPortProtocolHTTP:
-				if s.cfg.Domain != "" {
-					if tlsPeerPort <= 0 {
-						continue
-					}
-					sni := fmt.Sprintf("%s-%d.%s", p.SandboxID, port, s.cfg.Domain)
-					ops = append(ops, func(ctx context.Context) error {
-						return s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port), sni, ownerHost, tlsPeerPort)
-					})
-				} else {
-					ops = append(ops, func(ctx context.Context) error {
-						return s.caddy.UpsertPortRouteToPeer(ctx, p.SandboxID, port, ownerHost)
-					})
-				}
-			case models.ExposedPortProtocolTCP:
-				if route.HostPort <= 0 {
-					s.logger.Warn("cluster ingress: tcp exposure has no replicated host port; skipping",
-						"sandbox_id", p.SandboxID, "port", port, "owner", p.OwnerNodeID)
-					continue
-				}
-				ops = append(ops, func(ctx context.Context) error {
-					return s.caddy.UpsertTCPProxyRoute(ctx, p.SandboxID, port, route.HostPort, ownerHost, route.HostPort)
-				})
-			case models.ExposedPortProtocolTLS:
-				if s.cfg.Domain == "" || tlsPeerPort <= 0 {
-					continue
-				}
-				sni := fmt.Sprintf("%s-%d.%s", p.SandboxID, port, s.cfg.Domain)
-				ops = append(ops, func(ctx context.Context) error {
-					return s.caddy.UpsertSNIPassthroughRoute(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port), sni, ownerHost, tlsPeerPort)
-				})
-			}
-		}
-	}
-	if err := runIngressOps(ctx, ops, clusterIngressMaxConcurrentWrites); err != nil {
+	ops, commitDelta := s.planClusterIngressDelta(desired)
+	if err := runIngressOpsBatched(ctx, ops, clusterIngressMaxConcurrentWrites, clusterIngressBatchSize); err != nil {
 		firstErr = err
 	}
-	if err := s.gcClusterIngressRoutes(ctx); err != nil && firstErr == nil {
-		firstErr = err
+	if runFullGC {
+		if err := s.gcUnexpectedClusterIngressRoutes(ctx, desired); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr == nil {
+		commitDelta()
+	}
+	if firstErr == nil {
+		s.logger.Debug("cluster ingress reconcile applied",
+			"placement_shards", routeShardFilterLogValue(shardFilter),
+			"routes", len(desired),
+			"ops", len(ops),
+			"full_gc", runFullGC,
+		)
 	}
 	// Stash the hash only on full success — partial failures must retry next
 	// tick rather than wedging the idle-skip on a stale view.

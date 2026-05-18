@@ -387,6 +387,13 @@ type Client interface {
 	// to reconcile owner-aware public ingress routes.
 	Placements() []Placement
 
+	// PlacementsForShards returns only placements whose sandbox ID belongs to
+	// one of the requested placement shards. Ingress nodes use this instead of
+	// pulling the full global placement map; server nodes serve it from the
+	// FSM shard index and agent nodes delegate it to a server-role control
+	// plane peer. Empty Shards means "all placements."
+	PlacementsForShards(filter PlacementShardFilter) []Placement
+
 	// PlacementOf returns the full Placement record for sandboxID and true,
 	// or a zero Placement and false if no record exists. Operator/debug
 	// endpoints use this for convergence-status reads where the per-aspect

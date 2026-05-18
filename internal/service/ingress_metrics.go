@@ -20,6 +20,28 @@ import (
 // HTTP pipeline without overrunning it.
 const clusterIngressMaxConcurrentWrites = 8
 
+// clusterIngressBatchSize caps how many route mutations one reconcile pass
+// offers to the worker pool at once. Large failover or reshard events still
+// converge, but Caddy gets a bounded stream of batches instead of a single
+// unbounded wave of admin writes.
+const clusterIngressBatchSize = 256
+
+func runIngressOpsBatched(ctx context.Context, ops []func(context.Context) error, concurrency int, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = clusterIngressBatchSize
+	}
+	for start := 0; start < len(ops); start += batchSize {
+		end := start + batchSize
+		if end > len(ops) {
+			end = len(ops)
+		}
+		if err := runIngressOps(ctx, ops[start:end], concurrency); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // runIngressOps fans `ops` out across at most `concurrency` worker goroutines
 // and returns the first error any op produced. Cancellation is propagated
 // via ctx; remaining queued ops short-circuit once an error is recorded so
@@ -193,10 +215,11 @@ type ingressRouteCounts struct {
 }
 
 // hashPlacementView produces a stable digest of the placements relevant to
-// the cluster-ingress reconciler. Routes the reconciler would skip (no owner,
-// owner==self, no advertised data-plane host) are excluded so they don't
-// trigger spurious "view changed" reruns. Identical input → identical hash →
-// the reconciler skips Caddy admin calls entirely.
+// the cluster-ingress reconciler. Local-owner routes are excluded because the
+// local sandbox reconciler owns them; orphaned/unreachable-owner placements
+// stay in the hash because the cluster ingress reconciler installs in-flux
+// 503 routes for them. Identical input → identical hash → the reconciler
+// skips Caddy admin calls entirely.
 func hashPlacementView(self string, placements []cluster.Placement) (uint64, ingressRouteCounts, uint64) {
 	h := fnv.New64a()
 	var counts ingressRouteCounts
@@ -217,7 +240,7 @@ func hashPlacementView(self string, placements []cluster.Placement) (uint64, ing
 
 	for _, id := range ids {
 		p := idx[id]
-		if p.OwnerNodeID == "" || p.OwnerNodeID == self {
+		if p.OwnerNodeID == self {
 			continue
 		}
 		if p.Version > maxVersion {

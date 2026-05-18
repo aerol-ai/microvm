@@ -42,6 +42,24 @@ func (s *stubIngressCluster) Placements() []cluster.Placement {
 	return s.placements
 }
 
+func (s *stubIngressCluster) PlacementsForShards(filter cluster.PlacementShardFilter) []cluster.Placement {
+	filter = filter.Normalize()
+	if len(filter.Shards) == 0 {
+		return s.placements
+	}
+	want := make(map[int]struct{}, len(filter.Shards))
+	for _, shard := range filter.Shards {
+		want[shard] = struct{}{}
+	}
+	out := make([]cluster.Placement, 0, len(s.placements))
+	for _, p := range s.placements {
+		if _, ok := want[cluster.PlacementShardForSandbox(p.SandboxID, filter.ShardCount)]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func newGCCaddyFake() *gcCaddyFake {
 	return &gcCaddyFake{
 		httpRouteIDs:   map[string]struct{}{},

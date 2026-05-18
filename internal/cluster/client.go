@@ -790,12 +790,14 @@ func (c *Cluster) waitForLeader(ctx context.Context, max time.Duration) error {
 func (c *Cluster) Members() []Member { return c.gossip.members() }
 
 func (c *Cluster) Placements() []Placement {
-	snap := c.fsm.snapshot()
-	out := make([]Placement, 0, len(snap))
-	for _, p := range snap {
-		out = append(out, p)
+	return c.PlacementsForShards(PlacementShardFilter{})
+}
+
+func (c *Cluster) PlacementsForShards(filter PlacementShardFilter) []Placement {
+	if c.fsm == nil {
+		return nil
 	}
-	return out
+	return c.fsm.placementsForShards(filter)
 }
 
 // PlacementOf returns the FSM record for sandboxID. Goes through f.get so the

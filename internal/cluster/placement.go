@@ -246,6 +246,23 @@ func CanServeControlPlaneRole(role string) bool {
 	return false
 }
 
+// CanServeIngressRole reports whether a gossiped node role may host public
+// ingress routes. Empty is treated as ingress-capable for rolling upgrades
+// from builds that did not advertise role metadata.
+func CanServeIngressRole(role string) bool {
+	trimmed := strings.TrimSpace(role)
+	if trimmed == "" {
+		return true
+	}
+	for raw := range strings.SplitSeq(trimmed, ",") {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case config.NodeRoleIngress, config.NodeRoleMixed:
+			return true
+		}
+	}
+	return false
+}
+
 // SelectPlacement on Noop is in noop.go.
 
 // Sanity: the package-level SelectPlacement signature matches the Client interface.

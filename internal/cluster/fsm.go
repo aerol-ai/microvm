@@ -96,6 +96,12 @@ type placementFSM struct {
 	// placement write so the index can never lag the authoritative map; rebuilt
 	// from placements on Restore so older snapshots without an index still load.
 	nameIndex map[string]string
+	// shardIndex maps stable placement shard -> sandbox IDs in that shard.
+	// Ingress/control-plane reads use this to pull a bounded slice instead of
+	// scanning/copying the entire placement map for every shard-owned worker.
+	// The shard ID derives only from SandboxID, so ownership/spec/port changes
+	// update the placement row without touching this index.
+	shardIndex map[int]map[string]struct{}
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -116,6 +122,7 @@ func newPlacementFSM() *placementFSM {
 	return &placementFSM{
 		placements:   make(map[string]Placement),
 		nameIndex:    make(map[string]string),
+		shardIndex:   make(map[int]map[string]struct{}),
 		drainedNodes: make(map[string]bool),
 	}
 }
@@ -226,6 +233,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			ExpiresUnix: 0,
 		}
 		f.claimNameLocked(cmd.SandboxID, specName(spec))
+		f.claimShardLocked(cmd.SandboxID)
 		return nil
 	case opReserve:
 		// Reservations are the first-half of the two-step create: the router
@@ -259,6 +267,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// AND a different SandboxID is never reused for the same intent).
 			if now > existing.ExpiresUnix {
 				f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+				f.releaseShardLocked(cmd.SandboxID)
 			} else {
 				// Live reservation held by a different owner — conflict.
 				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
@@ -281,6 +290,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			ExpiresUnix:        cmd.ExpiresUnix,
 		}
 		f.claimNameLocked(cmd.SandboxID, specName(cmd.Spec))
+		f.claimShardLocked(cmd.SandboxID)
 		return nil
 	case opCancelReserve:
 		// Only cancel reservations — never delete a placed sandbox, even if a
@@ -293,11 +303,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return nil
 		}
 		f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+		f.releaseShardLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		return nil
 	case opDelete:
 		if existing, ok := f.placements[cmd.SandboxID]; ok {
 			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			f.releaseShardLocked(cmd.SandboxID)
 		}
 		delete(f.placements, cmd.SandboxID)
 		return nil
@@ -473,6 +485,37 @@ func (f *placementFSM) releaseNameLocked(sandboxID, name string) {
 	}
 }
 
+func (f *placementFSM) claimShardLocked(sandboxID string) {
+	if sandboxID == "" {
+		return
+	}
+	if f.shardIndex == nil {
+		f.shardIndex = make(map[int]map[string]struct{})
+	}
+	shard := PlacementShardForSandbox(sandboxID, DefaultPlacementShardCount)
+	ids := f.shardIndex[shard]
+	if ids == nil {
+		ids = make(map[string]struct{})
+		f.shardIndex[shard] = ids
+	}
+	ids[sandboxID] = struct{}{}
+}
+
+func (f *placementFSM) releaseShardLocked(sandboxID string) {
+	if sandboxID == "" || f.shardIndex == nil {
+		return
+	}
+	shard := PlacementShardForSandbox(sandboxID, DefaultPlacementShardCount)
+	ids := f.shardIndex[shard]
+	if ids == nil {
+		return
+	}
+	delete(ids, sandboxID)
+	if len(ids) == 0 {
+		delete(f.shardIndex, shard)
+	}
+}
+
 func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port int, route ExposedPortRoute) error {
 	if route.Protocol != models.ExposedPortProtocolTCP || route.HostPort <= 0 {
 		return nil
@@ -582,6 +625,48 @@ func (f *placementFSM) snapshot() map[string]Placement {
 	return out
 }
 
+func (f *placementFSM) placementsForShards(filter PlacementShardFilter) []Placement {
+	filter = filter.Normalize()
+	if filter.allShards() {
+		snap := f.snapshot()
+		out := make([]Placement, 0, len(snap))
+		for _, p := range snap {
+			out = append(out, p)
+		}
+		return out
+	}
+
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	// The in-memory shard index is built for the default shard space. If an
+	// operator ever asks for a different count, fall back to a scan rather
+	// than returning a subtly wrong slice.
+	if filter.ShardCount != DefaultPlacementShardCount {
+		want := make(map[int]struct{}, len(filter.Shards))
+		for _, shard := range filter.Shards {
+			want[shard] = struct{}{}
+		}
+		out := make([]Placement, 0)
+		for id, p := range f.placements {
+			if _, ok := want[PlacementShardForSandbox(id, filter.ShardCount)]; ok {
+				out = append(out, clonePlacement(p))
+			}
+		}
+		return out
+	}
+
+	out := make([]Placement, 0)
+	for _, shard := range filter.Shards {
+		for id := range f.shardIndex[shard] {
+			if p, ok := f.placements[id]; ok {
+				out = append(out, clonePlacement(p))
+			}
+		}
+	}
+	return out
+}
+
 // isNodeDrained reports whether nodeID has been marked drained via
 // opSetNodeDrainState. SelectPlacement reads this to filter the candidate set;
 // callers outside placement scoring can use it for observability (e.g. the
@@ -674,10 +759,12 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 	// (older snapshots predate it), and rebuilding keeps the FSM the single
 	// source of truth even after a cold restart.
 	f.nameIndex = make(map[string]string, len(payload.Placements))
+	f.shardIndex = make(map[int]map[string]struct{})
 	for id, p := range payload.Placements {
 		if name := specName(p.Spec); name != "" {
 			f.nameIndex[name] = id
 		}
+		f.claimShardLocked(id)
 	}
 	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the
 	// add path can write without a nil-map panic. Active drains carried in

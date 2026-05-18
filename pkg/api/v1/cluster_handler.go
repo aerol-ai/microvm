@@ -693,6 +693,24 @@ func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Requ
 	apihttp.WriteJSON(w, http.StatusOK, placements)
 }
 
+func (h *handlers) clusterInternalPlacementsQuery(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	var filter cluster.PlacementShardFilter
+	if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	placements := c.PlacementsForShards(filter)
+	for i := range placements {
+		placements[i].SealedSecrets = nil
+	}
+	apihttp.WriteJSON(w, http.StatusOK, placements)
+}
+
 func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
