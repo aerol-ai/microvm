@@ -197,6 +197,41 @@ func TestFSMPlacePromotesReservationInheritsSpec(t *testing.T) {
 	}
 }
 
+func TestFSMPlacePromotesReservationInheritsSecretRef(t *testing.T) {
+	fsm := newPlacementFSM()
+	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "demo-ref"}
+	applyOp(t, fsm, command{
+		Op: opReserve, SandboxID: "sb-ref", OwnerNodeID: "B",
+		Spec:          spec,
+		SecretRef:     "cluster-secret://sandbox/sb-ref/v1",
+		SecretVersion: 1,
+		SealedSecrets: []byte("must-not-enter-reservation"),
+		ExpiresUnix:   time.Now().Add(60 * time.Second).Unix(),
+	})
+	reserved, _ := fsm.get("sb-ref")
+	if reserved.SecretRef != "cluster-secret://sandbox/sb-ref/v1" || reserved.SecretVersion != 1 {
+		t.Fatalf("reservation secret handle = (%q,%d)", reserved.SecretRef, reserved.SecretVersion)
+	}
+	if len(reserved.SealedSecrets) != 0 {
+		t.Fatalf("reservation stored legacy sealed payload with ref: %q", string(reserved.SealedSecrets))
+	}
+
+	if got := applyOp(t, fsm, command{Op: opPlace, SandboxID: "sb-ref", OwnerNodeID: "B"}); got != nil {
+		t.Fatalf("opPlace promote = %v, want nil", got)
+	}
+
+	p, _ := fsm.get("sb-ref")
+	if p.IsReserved() {
+		t.Fatalf("State = %q, want placed after promote", p.State)
+	}
+	if p.SecretRef != "cluster-secret://sandbox/sb-ref/v1" || p.SecretVersion != 1 {
+		t.Fatalf("promoted secret handle = (%q,%d)", p.SecretRef, p.SecretVersion)
+	}
+	if len(p.SealedSecrets) != 0 {
+		t.Fatalf("promote stored legacy sealed payload with ref: %q", string(p.SealedSecrets))
+	}
+}
+
 // TestFSMCancelReserveRemovesReservedRow pins the rollback contract: opCancel
 // removes a Reserved row entirely, freeing both the slot and the name index
 // claim so a retry with the same Name can succeed.

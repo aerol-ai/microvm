@@ -126,13 +126,18 @@ Release gate:
 
 ## P1 - Reduce Secret Blast Radius
 
-Required changes:
+Implemented:
 
 - store only secret refs in placement;
 - decrypt only on owner or authorized recovery target;
 - per-sandbox or per-tenant envelope keys;
-- key rotation runbook and tests;
 - no worker-wide access to every user's sealed credential blob.
+
+Remaining release hardening:
+
+- external KMS provider wiring beyond the local provider;
+- key rotation runbook and provider-level rewrap tests;
+- secret-access audit events on every provider read.
 
 Release gate:
 

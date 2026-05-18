@@ -26,7 +26,7 @@ func (c *e2bForwardCluster) SelectPlacement(capacity.Request) (cluster.Placement
 	return c.target, nil
 }
 
-func (c *e2bForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, _ cluster.PlacementTarget, _ *models.CreateSandboxRequest, _ []byte, _ time.Duration) error {
+func (c *e2bForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, _ cluster.PlacementTarget, _ *models.CreateSandboxRequest, _ cluster.PlacementSecrets, _ time.Duration) error {
 	c.reservedID = sandboxID
 	return nil
 }

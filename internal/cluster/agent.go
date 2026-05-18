@@ -241,7 +241,7 @@ func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 	return resp.Target, nil
 }
 
-func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{
 		Op:                 opPlace,
 		SandboxID:          sandboxID,
@@ -249,12 +249,14 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		OwnerAPIURL:        a.apiURL,
 		OwnerDataPlaneHost: a.dataPlaneHost,
 		Spec:               spec,
-		SealedSecrets:      sealedSecrets,
+		SecretRef:          secrets.Ref,
+		SecretVersion:      secrets.Version,
+		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return a.applyCommand(ctx, cmd)
 }
 
-func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{
 		Op:                 opClaimOrphan,
 		SandboxID:          sandboxID,
@@ -262,16 +264,25 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 		OwnerAPIURL:        a.apiURL,
 		OwnerDataPlaneHost: a.dataPlaneHost,
 		Spec:               spec,
-		SealedSecrets:      sealedSecrets,
+		SecretRef:          secrets.Ref,
+		SecretVersion:      secrets.Version,
+		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return a.applyCommand(ctx, cmd)
 }
 
-func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
-	if spec == nil && sealedSecrets == nil {
+func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
-	return a.applyCommand(ctx, command{Op: opUpsertSpec, SandboxID: sandboxID, Spec: spec, SealedSecrets: sealedSecrets})
+	return a.applyCommand(ctx, command{
+		Op:            opUpsertSpec,
+		SandboxID:     sandboxID,
+		Spec:          spec,
+		SecretRef:     secrets.Ref,
+		SecretVersion: secrets.Version,
+		SealedSecrets: cloneBytes(secrets.LegacySealed),
+	})
 }
 
 func (a *Agent) SpecOf(sandboxID string) *models.CreateSandboxRequest {
@@ -286,7 +297,19 @@ func (a *Agent) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 	return cloneCreateSandboxRequest(lookup.Placement.Spec)
 }
 
-func (a *Agent) SealedSecretsOf(string) []byte { return nil }
+func (a *Agent) SecretsOf(sandboxID string) PlacementSecrets {
+	lookup, ok, err := a.lookupPlacement(context.Background(), sandboxID)
+	if err != nil {
+		a.logger.Warn("cluster agent: SecretsOf control-plane lookup failed", "sandbox_id", sandboxID, "err", err)
+		return PlacementSecrets{}
+	}
+	if !ok {
+		return PlacementSecrets{}
+	}
+	return secretsFromPlacement(lookup.Placement)
+}
+
+func (a *Agent) SealedSecretsOf(sandboxID string) []byte { return a.SecretsOf(sandboxID).LegacySealed }
 
 func (a *Agent) AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error {
 	if port <= 0 {
@@ -315,7 +338,7 @@ func (a *Agent) DeletePlacement(ctx context.Context, sandboxID string) error {
 	return a.applyCommand(ctx, command{Op: opDelete, SandboxID: sandboxID})
 }
 
-func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, sealedSecrets []byte, ttl time.Duration) error {
+func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
 	}
@@ -326,7 +349,9 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 		OwnerAPIURL:        target.APIURL,
 		OwnerDataPlaneHost: target.DataPlaneHost,
 		Spec:               redacted,
-		SealedSecrets:      sealedSecrets,
+		SecretRef:          secrets.Ref,
+		SecretVersion:      secrets.Version,
+		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	})
 }
@@ -377,7 +402,7 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 		}
 		switch {
 		case !ok:
-			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
+			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
 			for port, route := range st.ExposedPorts {
@@ -387,7 +412,7 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 			}
 		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned():
 			if existing.Placement.Spec == nil && st.Spec != nil {
-				if err := a.UpsertSpec(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
+				if err := a.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -397,7 +422,7 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 				}
 			}
 		case placementCanBeClaimedBy(existing.Placement, a.nodeID):
-			if err := a.ClaimOrphan(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil {
+			if err := a.ClaimOrphan(ctx, st.ID, st.Spec, st.Secrets); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}

@@ -1,19 +1,27 @@
 package service
 
 import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// clusterSealedSecrets is the cleartext schema of the encrypted blob the
-// cluster layer stores in Placement.SealedSecrets. It only carries the parts
-// of CreateSandboxRequest that are actually secret — registry password and
-// per-mount credential maps. Everything else (image, env, mount Source/Target,
-// etc.) rides on the redacted Spec, which the cluster replicates in plaintext.
+// clusterSealedSecrets is the cleartext schema stored behind a cluster secret
+// ref. It only carries the parts of CreateSandboxRequest that are actually
+// secret — registry password and per-mount credential maps. Everything else
+// (image, env, mount Source/Target, etc.) rides on the redacted Spec, which
+// the cluster replicates in plaintext.
 //
 // MountCreds is keyed by MountSpec.Target (the in-container mount path). Target
 // is required + unique per mount per service.createSandbox validation, so it
@@ -26,8 +34,12 @@ type clusterSealedSecrets struct {
 type clusterSealedSecretsEnvelope struct {
 	Version    int      `json:"version"`
 	Recipients []string `json:"recipients,omitempty"`
+	WrappedKey []byte   `json:"wrapped_key,omitempty"`
 	Payload    []byte   `json:"payload"`
 }
+
+const clusterSecretVersion = 1
+const clusterSecretEnvelopeVersion = 3
 
 // SealClusterSecrets extracts the secret-bearing portions of req, marshals
 // them as JSON, and encrypts the result with the service cipher. The output
@@ -68,20 +80,116 @@ func (s *Service) sealClusterSecrets(req models.CreateSandboxRequest, recipients
 	if bag.Registry == nil && len(bag.MountCreds) == 0 {
 		return nil, nil
 	}
+	if s.cipher == nil {
+		return nil, errors.New("cluster secrets cipher is not configured")
+	}
 	plain, err := json.Marshal(bag)
 	if err != nil {
 		return nil, fmt.Errorf("marshal cluster secrets: %w", err)
 	}
 	recipients = normalizeClusterSecretRecipients(recipients)
-	sealed, err := s.cipher.EncryptWithAAD(plain, clusterSecretAAD(recipients))
-	if err != nil {
-		return nil, fmt.Errorf("encrypt cluster secrets: %w", err)
+	return s.sealClusterSecretEnvelope(plain, recipients)
+}
+
+func (s *Service) sealClusterSecretEnvelope(plain []byte, recipients []string) ([]byte, error) {
+	dek := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		return nil, fmt.Errorf("generate cluster secret data key: %w", err)
 	}
-	envelope, err := json.Marshal(clusterSealedSecretsEnvelope{Version: 2, Recipients: recipients, Payload: sealed})
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return nil, fmt.Errorf("cluster secret data cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("cluster secret data gcm: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("cluster secret data nonce: %w", err)
+	}
+	payload := append(nonce, gcm.Seal(nil, nonce, plain, clusterSecretPayloadAAD(recipients))...)
+	wrappedKey, err := s.cipher.EncryptWithAAD(dek, clusterSecretKeyAAD(recipients))
+	if err != nil {
+		return nil, fmt.Errorf("wrap cluster secret data key: %w", err)
+	}
+	envelope, err := json.Marshal(clusterSealedSecretsEnvelope{
+		Version:    clusterSecretEnvelopeVersion,
+		Recipients: recipients,
+		WrappedKey: wrappedKey,
+		Payload:    payload,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal cluster secrets envelope: %w", err)
 	}
 	return envelope, nil
+}
+
+// PutClusterSecretsForRecipient stores the credential-bearing parts of req
+// behind a provider ref and returns the handle safe to replicate through Raft.
+// The local provider stores an encrypted recipient-bound envelope in SQLite;
+// external KMS/secret-store providers can replace this boundary without
+// changing cluster placement state.
+func (s *Service) PutClusterSecretsForRecipient(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipient string) (cluster.PlacementSecrets, error) {
+	sealed, err := s.SealClusterSecretsForRecipient(req, recipient)
+	if err != nil {
+		return cluster.PlacementSecrets{}, err
+	}
+	if len(sealed) == 0 {
+		return cluster.PlacementSecrets{}, nil
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return cluster.PlacementSecrets{}, errors.New("cluster secret sandbox id is required")
+	}
+	if s.store == nil {
+		return cluster.PlacementSecrets{}, errors.New("cluster secret store is not configured")
+	}
+	ref := clusterSecretRef(sandboxID, clusterSecretVersion)
+	if err := s.store.PutClusterSecret(ctx, store.ClusterSecretRecord{
+		Ref:           ref,
+		SandboxID:     sandboxID,
+		Version:       clusterSecretVersion,
+		Recipients:    normalizeClusterSecretRecipients([]string{recipient}),
+		SealedPayload: sealed,
+	}); err != nil {
+		return cluster.PlacementSecrets{}, err
+	}
+	return cluster.PlacementSecrets{Ref: ref, Version: clusterSecretVersion}, nil
+}
+
+// OpenClusterSecretsForNode resolves a replicated secret handle and merges the
+// decrypted credentials back into a redacted spec. LegacySealed is still
+// honored for placements written before the ref model.
+func (s *Service) OpenClusterSecretsForNode(ctx context.Context, redacted models.CreateSandboxRequest, secrets cluster.PlacementSecrets, nodeID string) (models.CreateSandboxRequest, error) {
+	if secrets.Ref != "" {
+		if s.store == nil {
+			return redacted, errors.New("cluster secret store is not configured")
+		}
+		rec, err := s.store.GetClusterSecret(ctx, secrets.Ref)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return redacted, fmt.Errorf("cluster secret ref %q not found", secrets.Ref)
+			}
+			return redacted, err
+		}
+		if secrets.Version != 0 && rec.Version != secrets.Version {
+			return redacted, fmt.Errorf("cluster secret ref %q version mismatch: placement=%d store=%d", secrets.Ref, secrets.Version, rec.Version)
+		}
+		return s.UnsealClusterSecretsForNode(redacted, rec.SealedPayload, nodeID)
+	}
+	return s.UnsealClusterSecretsForNode(redacted, secrets.LegacySealed, nodeID)
+}
+
+func (s *Service) OpenClusterSecrets(ctx context.Context, redacted models.CreateSandboxRequest, secrets cluster.PlacementSecrets) (models.CreateSandboxRequest, error) {
+	return s.OpenClusterSecretsForNode(ctx, redacted, secrets, "")
+}
+
+func (s *Service) DeleteClusterSecrets(ctx context.Context, sandboxID string) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.store.DeleteClusterSecretsForSandbox(ctx, sandboxID)
 }
 
 // RedactClusterSecrets returns a copy of req with credentials stripped — safe
@@ -193,16 +301,48 @@ func (s *Service) UnsealClusterSecretsForNode(redacted models.CreateSandboxReque
 
 func (s *Service) openClusterSecretPayload(sealed []byte, nodeID string) ([]byte, error) {
 	var envelope clusterSealedSecretsEnvelope
-	if err := json.Unmarshal(sealed, &envelope); err == nil && envelope.Version == 2 && len(envelope.Payload) > 0 {
+	if err := json.Unmarshal(sealed, &envelope); err == nil && len(envelope.Payload) > 0 {
 		recipients := normalizeClusterSecretRecipients(envelope.Recipients)
 		if !clusterSecretRecipientAllowed(recipients, nodeID) {
 			return nil, fmt.Errorf("recipient %q is not allowed to open this cluster secret", nodeID)
 		}
-		return s.cipher.DecryptWithAAD(envelope.Payload, clusterSecretAAD(recipients))
+		switch envelope.Version {
+		case clusterSecretEnvelopeVersion:
+			if len(envelope.WrappedKey) == 0 {
+				return nil, errors.New("cluster secret envelope missing wrapped data key")
+			}
+			dek, err := s.cipher.DecryptWithAAD(envelope.WrappedKey, clusterSecretKeyAAD(recipients))
+			if err != nil {
+				return nil, fmt.Errorf("unwrap cluster secret data key: %w", err)
+			}
+			return openClusterSecretEnvelopePayload(dek, envelope.Payload, recipients)
+		case 2:
+			return s.cipher.DecryptWithAAD(envelope.Payload, clusterSecretAAD(recipients))
+		}
 	}
 	// Legacy raw nonce||ciphertext blob. Kept for rolling upgrades and
 	// snapshots/raft logs written before v2 recipient envelopes existed.
 	return s.cipher.Decrypt(sealed)
+}
+
+func openClusterSecretEnvelopePayload(dek []byte, sealed []byte, recipients []string) ([]byte, error) {
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return nil, fmt.Errorf("cluster secret data cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("cluster secret data gcm: %w", err)
+	}
+	if len(sealed) < gcm.NonceSize() {
+		return nil, errors.New("cluster secret payload too short")
+	}
+	nonce, body := sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, body, clusterSecretPayloadAAD(recipients))
+	if err != nil {
+		return nil, fmt.Errorf("decrypt cluster secret payload: %w", err)
+	}
+	return plain, nil
 }
 
 func normalizeClusterSecretRecipients(in []string) []string {
@@ -238,4 +378,16 @@ func clusterSecretRecipientAllowed(recipients []string, nodeID string) bool {
 
 func clusterSecretAAD(recipients []string) []byte {
 	return []byte("aerolvm-cluster-secrets-v2\x00" + strings.Join(normalizeClusterSecretRecipients(recipients), "\x00"))
+}
+
+func clusterSecretKeyAAD(recipients []string) []byte {
+	return []byte("aerolvm-cluster-secrets-v3-key\x00" + strings.Join(normalizeClusterSecretRecipients(recipients), "\x00"))
+}
+
+func clusterSecretPayloadAAD(recipients []string) []byte {
+	return []byte("aerolvm-cluster-secrets-v3-payload\x00" + strings.Join(normalizeClusterSecretRecipients(recipients), "\x00"))
+}
+
+func clusterSecretRef(sandboxID string, version int) string {
+	return fmt.Sprintf("cluster-secret://sandbox/%s/v%d", strings.TrimSpace(sandboxID), version)
 }

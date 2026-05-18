@@ -356,10 +356,10 @@ func (c *Cluster) AttachInternalHandler(h http.Handler) {
 // follower. Passing spec=nil preserves a previously-recorded spec — see
 // fsm.go opPlace handling.
 //
-// spec MUST be redacted before being passed in; sealedSecrets is the opaque
-// encrypted bag the caller produces via service.SealClusterSecrets. Passing
-// sealedSecrets=nil preserves a previously-recorded bag.
-func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+// spec MUST be redacted before being passed in; secrets is the provider
+// handle the caller produces via service.PutClusterSecretsForRecipient.
+// Passing an empty handle preserves a previously-recorded handle.
+func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{
 		Op:                 opPlace,
 		SandboxID:          sandboxID,
@@ -367,7 +367,9 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		OwnerAPIURL:        c.apiURL,
 		OwnerDataPlaneHost: c.dataPlaneHost,
 		Spec:               spec,
-		SealedSecrets:      sealedSecrets,
+		SecretRef:          secrets.Ref,
+		SecretVersion:      secrets.Version,
+		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -377,7 +379,7 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 // previous-owner metadata). This is the false-positive recovery path for a
 // node that was marked dead by gossip but never actually lost its local
 // sandbox.
-func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	cmd := command{
 		Op:                 opClaimOrphan,
 		SandboxID:          sandboxID,
@@ -385,44 +387,59 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 		OwnerAPIURL:        c.apiURL,
 		OwnerDataPlaneHost: c.dataPlaneHost,
 		Spec:               spec,
-		SealedSecrets:      sealedSecrets,
+		SecretRef:          secrets.Ref,
+		SecretVersion:      secrets.Version,
+		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 	}
 	return c.applyCommand(ctx, cmd)
 }
 
 // UpsertSpec replicates a sandbox spec mutation (resize, lifecycle change)
-// without changing ownership. Idempotent; nil spec + nil sealedSecrets is a
+// without changing ownership. Idempotent; nil spec + empty secrets is a
 // no-op. Safe to call from any node — applyCommand forwards to the leader as
 // needed.
 //
-// spec MUST be redacted; sealedSecrets=nil preserves the previously
-// replicated bag (resize/lifecycle never change credentials).
-func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
-	if spec == nil && sealedSecrets == nil {
+// spec MUST be redacted; empty secrets preserves the previously replicated
+// handle (resize/lifecycle never change credentials).
+func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
-	cmd := command{Op: opUpsertSpec, SandboxID: sandboxID, Spec: spec, SealedSecrets: sealedSecrets}
+	cmd := command{
+		Op:            opUpsertSpec,
+		SandboxID:     sandboxID,
+		Spec:          spec,
+		SecretRef:     secrets.Ref,
+		SecretVersion: secrets.Version,
+		SealedSecrets: cloneBytes(secrets.LegacySealed),
+	}
 	return c.applyCommand(ctx, cmd)
 }
 
-// SealedSecretsOf returns a copy of the sealed credential bag paired with
-// SpecOf's spec. Returns nil when there's no placement, no sealed bag, or
-// the placement pre-dates secrets sealing. Caller-mutation is safe (the
-// returned slice is a fresh copy).
-func (c *Cluster) SealedSecretsOf(sandboxID string) []byte {
+// SecretsOf returns a copy of the provider handle paired with SpecOf's spec.
+func (c *Cluster) SecretsOf(sandboxID string) PlacementSecrets {
 	p, ok := c.fsm.get(sandboxID)
-	if !ok || len(p.SealedSecrets) == 0 {
+	if !ok {
+		return PlacementSecrets{}
+	}
+	return secretsFromPlacement(p)
+}
+
+// SealedSecretsOf returns a copy of the legacy sealed credential bag paired
+// with SpecOf's spec. Returns nil when there's no placement, no sealed bag, or
+// the placement uses the secret-reference model. Caller-mutation is safe.
+func (c *Cluster) SealedSecretsOf(sandboxID string) []byte {
+	secrets := c.SecretsOf(sandboxID)
+	if len(secrets.LegacySealed) == 0 {
 		return nil
 	}
-	out := make([]byte, len(p.SealedSecrets))
-	copy(out, p.SealedSecrets)
-	return out
+	return secrets.LegacySealed
 }
 
 // SpecOf returns a deep-copy of the replicated spec for sandboxID, or nil if
 // none is recorded. The returned spec is REDACTED — registry passwords and
-// mount credentials are stripped at write time. Use SealedSecretsOf to
-// retrieve the matching sealed bag and service.UnsealClusterSecrets to merge
+// mount credentials are stripped at write time. Use SecretsOf to retrieve the
+// matching secret ref and service.OpenClusterSecretsForNode to merge
 // credentials back in. Callers may safely mutate the returned struct (it
 // shares no memory with the FSM).
 func (c *Cluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
@@ -505,16 +522,16 @@ func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 // to cover the slowest expected image pull on the target.
 //
 // redacted MUST be stripped of plaintext credentials (call
-// service.RedactClusterSecrets); sealedSecrets is the encrypted bag from
-// service.SealClusterSecrets. Both ride the reservation so a successful
-// promote via opPlace can inherit them without re-shipping the payload —
-// see fsm.go opPlace preserve-on-nil rules.
+// service.RedactClusterSecrets); secrets is the secret provider handle. Both
+// ride the reservation so a successful promote via opPlace can inherit them
+// without re-shipping the payload — see fsm.go opPlace preserve-on-empty
+// rules.
 //
 // Returns ErrReservationConflict when the slot is already placed or held
 // by a different owner; ErrNameConflict when redacted.Name is held
 // cluster-wide. Either should map to 4xx at the API surface; transport
 // errors stay 5xx (caller may retry).
-func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, sealedSecrets []byte, ttl time.Duration) error {
+func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	if ttl <= 0 {
 		return fmt.Errorf("cluster: reservation ttl must be > 0")
 	}
@@ -525,7 +542,9 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		OwnerAPIURL:        target.APIURL,
 		OwnerDataPlaneHost: target.DataPlaneHost,
 		Spec:               redacted,
-		SealedSecrets:      sealedSecrets,
+		SecretRef:          secrets.Ref,
+		SecretVersion:      secrets.Version,
+		SealedSecrets:      cloneBytes(secrets.LegacySealed),
 		ExpiresUnix:        time.Now().Add(ttl).Unix(),
 	}
 	return c.applyCommand(ctx, cmd)
@@ -574,11 +593,11 @@ func (c *Cluster) IsNodeDrained(nodeID string) bool {
 // ownership (never overwrite an existing non-self owner):
 //
 //   - **No FSM placement.** Write opPlace claiming self as owner, with spec +
-//     sealed secrets so the new placement is born recoverable. This is the
+//     secret ref so the new placement is born recoverable. This is the
 //     normal case for sandboxes created before AssertOwnership last ran.
 //
 //   - **FSM owner == self.** No ownership change. Backfill missing Spec /
-//     SealedSecrets via opUpsertSpec (closes the pre-spec-replication gap)
+//     secret ref via opUpsertSpec (closes the pre-spec-replication gap)
 //     and replay ExposedPort intents via opAddExposedPort (no-ops when
 //     already recorded).
 //
@@ -620,9 +639,9 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 
 		switch {
 		case !ok:
-			// No placement exists — claim ownership. Pass spec + sealed
-			// secrets so the placement is born recoverable.
-			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
+			// No placement exists — claim ownership. Pass spec + secret handle
+			// so the placement is born recoverable.
+			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
 			// Replay port intents so the FSM matches local truth.
@@ -637,7 +656,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			// future failover-recreate has everything it needs (closes the
 			// pre-cluster-sandbox limitation), then replay port intents.
 			if existing.Spec == nil && st.Spec != nil {
-				if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
+				if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -648,7 +667,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 
 		case placementCanBeClaimedBy(existing, c.nodeID):
-			if err := c.ClaimOrphan(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil {
+			if err := c.ClaimOrphan(ctx, st.ID, st.Spec, st.Secrets); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}

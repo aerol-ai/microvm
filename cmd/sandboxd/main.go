@@ -302,33 +302,34 @@ func localSandboxStates(ctx context.Context, svc *service.Service, logger *slog.
 			continue
 		}
 		spec := specFromSandbox(svc, sb, logger)
-		// Seal credentials and redact the spec BEFORE handing it to the
-		// cluster — the cluster layer never sees plaintext registry passwords.
-		// On seal failure we still ship the placement (without secrets) so
-		// the cluster knows about the sandbox; the next failover-recreate
-		// will be unable to pull a private image, which the recreator logs
-		// loudly, but losing replication entirely would be worse.
-		var sealed []byte
+		// Store credentials behind a secret ref and redact the spec BEFORE
+		// handing it to the cluster — the cluster layer never sees plaintext
+		// registry passwords. On secret-store failure we still ship the
+		// placement (without secrets) so the cluster knows about the sandbox;
+		// the next failover-recreate will be unable to pull a private image,
+		// which the recreator logs loudly, but losing replication entirely
+		// would be worse.
+		var secrets cluster.PlacementSecrets
 		if spec != nil {
 			recipient := ""
 			if c := svc.Cluster(); c != nil {
 				recipient = c.SelfNodeID()
 			}
-			s, err := svc.SealClusterSecretsForRecipient(*spec, recipient)
+			s, err := svc.PutClusterSecretsForRecipient(ctx, sb.ID, *spec, recipient)
 			if err != nil {
-				logger.Warn("cluster: seal secrets at boot replay failed; placement will ship without sealed bag",
+				logger.Warn("cluster: store secret ref at boot replay failed; placement will ship without secret ref",
 					"sandbox_id", sb.ID, "err", err)
 			} else {
-				sealed = s
+				secrets = s
 				redacted := service.RedactClusterSecrets(*spec)
 				spec = &redacted
 			}
 		}
 		out = append(out, cluster.LocalSandboxState{
-			ID:            sb.ID,
-			Spec:          spec,
-			SealedSecrets: sealed,
-			ExposedPorts:  portsFromSandbox(sb),
+			ID:           sb.ID,
+			Spec:         spec,
+			Secrets:      secrets,
+			ExposedPorts: portsFromSandbox(sb),
 		})
 	}
 	return out, nil

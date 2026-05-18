@@ -249,10 +249,10 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // a previous recreate attempt may have created the container and then failed
 // while restoring Caddy/L4 ingress.
 //
-// sealedSecrets is the encrypted credential bag that the previous owner
-// stripped from spec before replicating it; we re-merge it here via
-// UnsealClusterSecrets so the recreated container can pull from the same
-// private registry / mount the same external storage. A decrypt failure is
+// secrets is the provider handle that can rehydrate the redacted spec; we
+// resolve and re-merge it here via OpenClusterSecretsForNode so the recreated
+// container can pull from the same private registry / mount the same external
+// storage. A decrypt failure is
 // fatal to this attempt but non-fatal globally — the watcher's retry loop
 // (now with reassign-after-K-failures) will eventually move the placement
 // to a node whose key matches.
@@ -267,7 +267,7 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // preserved here so a future opt-in failover flag can re-enable the watcher
 // without re-implementing recreate. Cluster-package tests still drive the
 // inner recreate paths through a mock recreator, not this implementation.
-func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]cluster.ExposedPortRoute) error {
+func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
 	}
@@ -275,7 +275,7 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 	if c := s.Cluster(); c != nil {
 		nodeID = c.SelfNodeID()
 	}
-	merged, err := s.UnsealClusterSecretsForNode(spec, sealedSecrets, nodeID)
+	merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
 	if err != nil {
 		return fmt.Errorf("recreate %s: %w", id, err)
 	}
@@ -843,6 +843,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", err)
 	}
 	if err := s.store.Delete(ctx, id); err != nil {
+		return err
+	}
+	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
 	}
 	if s.admitter != nil {

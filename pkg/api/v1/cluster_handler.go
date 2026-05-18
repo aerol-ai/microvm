@@ -195,15 +195,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
 		return
 	}
-	sealed, err := h.deps.Service.SealClusterSecretsForRecipient(req, target.NodeID)
-	if err != nil {
-		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: seal secrets: "+err.Error())
-		return
-	}
 	redacted := service.RedactClusterSecrets(req)
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	if err := c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, sealed, clusterReservationTTL); err != nil {
+	if err := c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, cluster.PlacementSecrets{}, clusterReservationTTL); err != nil {
 		// Name collision: deterministic 409 so clients can distinguish
 		// "pick a different name" from "cluster degraded, retry."
 		if errors.Is(err, cluster.ErrNameConflict) {
@@ -233,10 +228,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 //     reservation was written; run the existing single-commit flow
 //     (CreateSandbox → seal/redact → RecordPlacement).
 //   - reservationID != "": cross-node forward. The router already wrote the
-//     reservation with our redacted spec + sealed secrets. Use
-//     CreateSandboxWithID against the reserved ID, then RecordPlacement with
-//     nil spec/sealed — opPlace inherits them from the reservation and
-//     transitions State=Reserved → Placed atomically.
+//     reservation with our redacted spec. Use CreateSandboxWithID against the
+//     reserved ID, store a local secret ref, then RecordPlacement with the
+//     redacted spec + ref — opPlace transitions State=Reserved → Placed
+//     atomically while keeping secret material out of Raft.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
@@ -278,33 +273,27 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	defer cancel()
 
 	var promoteErr error
-	if reservationID != "" {
-		// Promote: opPlace inherits the redacted spec + sealed secrets from
-		// the reservation written by the router. Passing nil avoids re-
-		// shipping them on the wire and guarantees the FSM never sees a
-		// Placed row whose spec drifted from the reserved one.
-		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, nil, nil)
-	} else {
-		// Self-wins: no reservation existed. Replicate the original spec
-		// alongside the placement pointer so a future owner can recreate
-		// this sandbox if the current owner dies. The raft log must NOT
-		// carry plaintext credentials, so we seal + redact here.
-		sealed, sealErr := h.deps.Service.SealClusterSecretsForRecipient(req, c.SelfNodeID())
-		if sealErr != nil {
-			h.deps.Logger.Error("cluster: seal secrets failed; rolling back create",
-				"sandbox_id", resp.Sandbox.ID, "err", sealErr)
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
-				h.deps.Logger.Error("cluster: rollback destroy failed",
-					"sandbox_id", resp.Sandbox.ID, "err", rbErr)
-			}
-			rbCancel()
-			apihttp.WriteError(w, http.StatusInternalServerError, "cluster: seal secrets: "+sealErr.Error())
-			return
+	secrets, sealErr := h.deps.Service.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
+	if sealErr != nil {
+		h.deps.Logger.Error("cluster: store secret ref failed; rolling back create",
+			"sandbox_id", resp.Sandbox.ID, "err", sealErr)
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if rbErr := h.deps.Service.DestroySandbox(rbCtx, resp.Sandbox.ID); rbErr != nil {
+			h.deps.Logger.Error("cluster: rollback destroy failed",
+				"sandbox_id", resp.Sandbox.ID, "err", rbErr)
 		}
-		redacted := service.RedactClusterSecrets(req)
-		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, sealed)
+		if reservationID != "" {
+			if cErr := c.CancelReservation(rbCtx, reservationID); cErr != nil {
+				h.deps.Logger.Warn("cluster: cancel reservation after secret-ref failure",
+					"sandbox_id", reservationID, "err", cErr)
+			}
+		}
+		rbCancel()
+		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: store secret ref: "+sealErr.Error())
+		return
 	}
+	redacted := service.RedactClusterSecrets(req)
+	promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
 
 	if promoteErr != nil {
 		h.deps.Logger.Error("cluster: RecordPlacement failed; rolling back create",
@@ -560,9 +549,18 @@ func (h *handlers) writeClusterSandboxIndex(w http.ResponseWriter, r *http.Reque
 	}
 	resp := c.PlacementPage(req)
 	for i := range resp.Placements {
-		resp.Placements[i].SealedSecrets = nil
+		redactPlacementSecretFields(&resp.Placements[i])
 	}
 	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+func redactPlacementSecretFields(p *cluster.Placement) {
+	if p == nil {
+		return
+	}
+	p.SecretRef = ""
+	p.SecretVersion = 0
+	p.SealedSecrets = nil
 }
 
 // clusterDestroyWrap runs the local destroy then deletes the placement
@@ -680,7 +678,7 @@ func (h *handlers) clusterReclaimOrphanLocal(w http.ResponseWriter, r *http.Requ
 	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	if err := c.ClaimOrphan(commitCtx, id, nil, nil); err != nil {
+	if err := c.ClaimOrphan(commitCtx, id, nil, cluster.PlacementSecrets{}); err != nil {
 		if errors.Is(err, cluster.ErrNotLeader) {
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
 			return
@@ -820,7 +818,7 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 		}
 		if errors.Is(err, cluster.ErrOrphaned) {
 			if p, ok := c.PlacementOf(id); ok {
-				p.SealedSecrets = nil
+				redactPlacementSecretFields(&p)
 				apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Orphaned: true})
 				return
 			}
@@ -833,7 +831,7 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 		return
 	}
-	p.SealedSecrets = nil
+	redactPlacementSecretFields(&p)
 	apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
 }
 
@@ -852,7 +850,7 @@ func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
 		return
 	}
-	p.SealedSecrets = nil
+	redactPlacementSecretFields(&p)
 	owner, err := c.OwnerOf(id)
 	if err != nil {
 		if errors.Is(err, cluster.ErrOrphaned) {
@@ -873,7 +871,7 @@ func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Requ
 	}
 	placements := c.Placements()
 	for i := range placements {
-		placements[i].SealedSecrets = nil
+		redactPlacementSecretFields(&placements[i])
 	}
 	apihttp.WriteJSON(w, http.StatusOK, placements)
 }
@@ -891,7 +889,7 @@ func (h *handlers) clusterInternalPlacementsQuery(w http.ResponseWriter, r *http
 	}
 	placements := c.PlacementsForShards(filter)
 	for i := range placements {
-		placements[i].SealedSecrets = nil
+		redactPlacementSecretFields(&placements[i])
 	}
 	apihttp.WriteJSON(w, http.StatusOK, placements)
 }
@@ -909,7 +907,7 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	}
 	resp := c.PlacementPage(req)
 	for i := range resp.Placements {
-		resp.Placements[i].SealedSecrets = nil
+		redactPlacementSecretFields(&resp.Placements[i])
 	}
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
@@ -1069,11 +1067,9 @@ func (h *handlers) replicateSpecPatch(ctx context.Context, id string, patch func
 	patch(spec)
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	// Pass nil for sealedSecrets — resize / lifecycle never touch credentials,
-	// so preserving the existing sealed bag is correct (and required: re-sealing
-	// here would silently drop the bag because spec is already redacted, so
-	// SealClusterSecrets would return nil-nil and overwrite the original).
-	if err := c.UpsertSpec(commitCtx, id, spec, nil); err != nil {
+	// Pass an empty secret handle — resize / lifecycle never touch
+	// credentials, so preserving the existing ref is correct.
+	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil {
 		h.deps.Logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
 			"sandbox_id", id, "err", err)
 	}

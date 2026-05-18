@@ -41,7 +41,7 @@ type reserveCall struct {
 	sandboxID string
 	target    cluster.PlacementTarget
 	redacted  *models.CreateSandboxRequest
-	sealed    []byte
+	secrets   cluster.PlacementSecrets
 	ttl       time.Duration
 }
 
@@ -53,8 +53,8 @@ func (c *createForwardCluster) SelectPlacement(capacity.Request) (cluster.Placem
 	return c.target, nil
 }
 
-func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, sealed []byte, ttl time.Duration) error {
-	c.reserveCalls = append(c.reserveCalls, reserveCall{sandboxID, target, redacted, sealed, ttl})
+func (c *createForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string, target cluster.PlacementTarget, redacted *models.CreateSandboxRequest, secrets cluster.PlacementSecrets, ttl time.Duration) error {
+	c.reserveCalls = append(c.reserveCalls, reserveCall{sandboxID, target, redacted, secrets, ttl})
 	return c.reserveErr
 }
 
@@ -125,6 +125,45 @@ func TestClusterCreateWrapPinsForwardedCreateToSelectedTarget(t *testing.T) {
 	}
 	if len(fakeCluster.cancelCalls) != 0 {
 		t.Fatalf("CancelReservation called %d times on success; want 0", len(fakeCluster.cancelCalls))
+	}
+}
+
+func TestClusterCreateWrapDoesNotPutSecretPayloadInRouterReservation(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Deliberately no cipher/store on this router service: a cross-node
+	// router must be able to reserve and forward without sealing/storing
+	// another worker's secret material locally.
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("router", "http://router"),
+		target: cluster.PlacementTarget{NodeID: "worker-a", APIURL: "http://worker-a:21212", IsSelf: false},
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	body := `{"image":"private.example.com/app:latest","registry":{"server":"private.example.com","username":"u","password":"super-secret-password"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusAccepted)
+	}
+	if len(fakeCluster.reserveCalls) != 1 {
+		t.Fatalf("ReserveOnTarget calls = %d, want 1", len(fakeCluster.reserveCalls))
+	}
+	rc := fakeCluster.reserveCalls[0]
+	if rc.redacted == nil || rc.redacted.Registry == nil {
+		t.Fatalf("redacted spec missing registry metadata: %+v", rc.redacted)
+	}
+	if rc.redacted.Registry.Password != "" {
+		t.Fatalf("router reservation leaked registry password: %+v", rc.redacted.Registry)
+	}
+	if rc.redacted.Registry.Server != "private.example.com" || rc.redacted.Registry.Username != "u" {
+		t.Fatalf("router reservation lost non-secret registry fields: %+v", rc.redacted.Registry)
+	}
+	if rc.secrets.Ref != "" || rc.secrets.Version != 0 || len(rc.secrets.LegacySealed) != 0 {
+		t.Fatalf("router reservation carried secret handle/payload: %+v", rc.secrets)
 	}
 }
 
@@ -802,7 +841,7 @@ func (c *orphanOpsStubCluster) PlacementOf(string) (cluster.Placement, bool) {
 	return c.placement, c.hasPlace
 }
 
-func (c *orphanOpsStubCluster) ClaimOrphan(_ context.Context, sandboxID string, _ *models.CreateSandboxRequest, _ []byte) error {
+func (c *orphanOpsStubCluster) ClaimOrphan(_ context.Context, sandboxID string, _ *models.CreateSandboxRequest, _ cluster.PlacementSecrets) error {
 	c.claimCalls = append(c.claimCalls, sandboxID)
 	return c.claimErr
 }

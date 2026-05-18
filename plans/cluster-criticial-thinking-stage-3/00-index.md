@@ -36,8 +36,9 @@ The current design breaks down at larger targets because too many things are
 global and unbounded:
 
 - every cluster node starts Raft and can be added as a Raft non-voter;
-- every Raft participant stores the full placement map, full redacted create
-  specs, sealed secrets, exposed port maps, and drained-node state;
+- every server-role Raft participant stores the full placement map, full
+  redacted create specs, secret refs, exposed port maps, and drained-node
+  state;
 - placement scans all gossip members and all pending reservations per create;
 - cluster list fans out to every peer and returns every sandbox in one response;
 - ingress nodes scan and sort the entire placement map and then issue one Caddy

@@ -121,18 +121,46 @@ func (p Placement) IsOrphaned() bool {
 	return p.OwnerNodeID == "" || p.OwnerState == PlacementOwnerStateOrphaned
 }
 
+// PlacementSecrets is the recoverability handle paired with a redacted
+// placement spec. New writes populate Ref/Version only; the encrypted secret
+// payload lives behind the service secret provider rather than in Raft state.
+// LegacySealed is retained only so older snapshots/log entries that already
+// contain sealed bytes can still be opened during rolling upgrades.
+type PlacementSecrets struct {
+	Ref          string `json:"ref,omitempty"`
+	Version      int    `json:"version,omitempty"`
+	LegacySealed []byte `json:"legacy_sealed,omitempty"`
+}
+
+func (s PlacementSecrets) hasUpdate() bool {
+	return s.Ref != "" || s.Version != 0 || s.LegacySealed != nil
+}
+
+func secretsFromPlacement(p Placement) PlacementSecrets {
+	return PlacementSecrets{
+		Ref:          p.SecretRef,
+		Version:      p.SecretVersion,
+		LegacySealed: cloneBytes(p.SealedSecrets),
+	}
+}
+
+func cloneBytes(in []byte) []byte {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]byte(nil), in...)
+}
+
 // Placement is one row of the FSM's placement map. Spec is the replicated
 // sandbox creation request used by the new owner to re-materialize a sandbox
 // after its previous owner died (see owner_watcher.go). Spec is a pointer so
 // older snapshots written before spec replication still decode cleanly.
 //
-// SealedSecrets carries the encrypted credential bag (registry password,
-// per-mount credentials) that was stripped from Spec before replication.
-// The cluster never decrypts it — the service layer (which holds the
-// pkg/secrets cipher) re-merges credentials into Spec on recreate. The
-// payload is sealed by service.SealClusterSecrets / opened by
-// service.UnsealClusterSecrets; the schema is the latter's responsibility,
-// not the cluster's. Empty when the original create had no credentials.
+// SecretRef/SecretVersion identify the secret provider record that can
+// rehydrate the redacted Spec on the owner or an authorized recovery target.
+// SealedSecrets is a legacy fallback for snapshots/logs written before the
+// reference model; new placement writes must leave it empty so Raft never
+// fans out secret material to every participant.
 //
 // ExposedPortRoute is the replicated routing intent for one exposed sandbox
 // port. Protocol drives which Caddy surface is used. HostPort is populated for
@@ -159,6 +187,8 @@ type Placement struct {
 	CreatedUnix         int64                        `json:"created_unix"`
 	UpdatedUnix         int64                        `json:"updated_unix"`
 	Spec                *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef           string                       `json:"secret_ref,omitempty"`
+	SecretVersion       int                          `json:"secret_version,omitempty"`
 	SealedSecrets       []byte                       `json:"sealed_secrets,omitempty"`
 	ExposedPorts        map[int]string               `json:"exposed_ports,omitempty"`
 	ExposedPortRoutes   map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
@@ -198,16 +228,16 @@ type Member struct {
 // mutating call.
 //
 // Spec MUST be redacted (no plaintext registry password / mount credentials)
-// before being handed to AssertOwnership; SealedSecrets carries the encrypted
-// bag that the new owner re-merges on recreate. cmd/sandboxd takes care of
-// this via service.SealClusterSecrets + RedactClusterSecrets so the cluster
-// layer never sees plaintext. SealedSecrets may be empty when the sandbox
+// before being handed to AssertOwnership; Secrets carries the provider ref
+// that the new owner re-merges on recreate. cmd/sandboxd takes care of this
+// via service.PutClusterSecretsForRecipient + RedactClusterSecrets so the
+// cluster layer never sees plaintext. Secrets may be empty when the sandbox
 // has no secrets to ship.
 type LocalSandboxState struct {
-	ID            string
-	Spec          *models.CreateSandboxRequest
-	SealedSecrets []byte
-	ExposedPorts  map[int]ExposedPortRoute
+	ID           string
+	Spec         *models.CreateSandboxRequest
+	Secrets      PlacementSecrets
+	ExposedPorts map[int]ExposedPortRoute
 }
 
 // PlacementTarget is returned by SelectPlacement.
@@ -259,14 +289,13 @@ type Endpoint struct {
 // RecreateSandbox multiple times for the same id while a previous attempt is
 // still in flight or after an unexpected restart.
 //
-// sealedSecrets is the opaque encrypted bag that was stripped from the spec
-// before replication (see Placement.SealedSecrets). The implementation is
-// expected to decrypt and re-merge it back into spec before instantiating
-// the container — without this step, recreated sandboxes would lose access
-// to the user's private registry / mount credentials. May be empty when
-// the original create supplied no credentials.
+// secrets is the provider ref that can rehydrate the redacted spec. Legacy
+// sealed bytes may be present only for old placement rows. The implementation
+// is expected to resolve and re-merge it before instantiating the container —
+// without this step, recreated sandboxes would lose access to the user's
+// private registry / mount credentials.
 type SandboxRecreator interface {
-	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, sealedSecrets []byte, exposedPorts map[int]ExposedPortRoute) error
+	RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute) error
 }
 
 // Client is the surface the rest of the daemon (Service, API handlers)
@@ -300,41 +329,44 @@ type Client interface {
 	// the original CreateSandbox call).
 	//
 	// spec MUST be redacted (no plaintext credentials) before being passed in;
-	// sealedSecrets is the opaque encrypted credential bag produced by the
-	// service layer. Passing sealedSecrets=nil preserves any sealed bag
-	// previously replicated for this id (mirrors the spec-preservation rule —
-	// a boot-time replay that has the spec but not the secrets can't erase the
-	// secrets the original CreateSandbox stored).
-	RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error
+	// secrets is the provider handle produced by the service layer. Passing an
+	// empty handle preserves any previously replicated ref (mirrors the
+	// spec-preservation rule — a boot-time replay that has the spec but not
+	// the secrets can't erase the original create's recoverability handle).
+	RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error
 
 	// ClaimOrphan promotes an orphaned placement back to self. It succeeds
 	// only when the placement is currently orphaned and either has no recorded
 	// previous owner (legacy row) or was orphaned from this node. It preserves
 	// any replicated spec/secrets when the caller passes nil.
-	ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error
+	ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error
 
 	// UpsertSpec replaces the replicated spec for sandboxID without touching
 	// ownership. Mutating handlers (resize, lifecycle) call this after a
 	// successful local mutation so the FSM stays current — otherwise a
 	// failover-recreated sandbox would revert to its create-time shape.
 	//
-	// spec MUST be redacted. sealedSecrets=nil preserves the previously
-	// replicated bag — resize/lifecycle never touch credentials, so passing
-	// nil is the right choice for those callers; the "real" secrets are only
-	// re-shipped when the user re-runs create or rotates them explicitly.
-	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error
+	// spec MUST be redacted. An empty secrets handle preserves the previously
+	// replicated ref — resize/lifecycle never touch credentials, so passing an
+	// empty handle is the right choice for those callers; the "real" secrets
+	// are only re-shipped when the user re-runs create or rotates them
+	// explicitly.
+	UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error
 
 	// SpecOf returns the most-recently-replicated CreateSandboxRequest for
 	// sandboxID, or nil if no spec is recorded (pre-cluster sandbox, or no
 	// placement). The returned spec is REDACTED — no plaintext secrets. Use
-	// SealedSecretsOf to retrieve the matching sealed bag if you need to
+	// SecretsOf to retrieve the matching provider handle if you need to
 	// reconstruct the full spec for a recreate.
 	SpecOf(sandboxID string) *models.CreateSandboxRequest
 
-	// SealedSecretsOf returns the sealed credential bag that was paired with
-	// SpecOf's spec when the placement was last written. Empty when the
-	// sandbox was created without any private-registry / mount credentials,
-	// or when the placement pre-dates the secret-sealing work.
+	// SecretsOf returns the secret provider handle paired with SpecOf's spec.
+	// Empty when the sandbox was created without any private-registry / mount
+	// credentials, or when the placement predates secret replication.
+	SecretsOf(sandboxID string) PlacementSecrets
+
+	// SealedSecretsOf returns only the legacy sealed credential bag. New code
+	// should use SecretsOf; this method remains for older callsites/tests.
 	SealedSecretsOf(sandboxID string) []byte
 
 	// AddExposedPort records intent that sandboxID has port exposed. Raw TCP
@@ -354,13 +386,13 @@ type Client interface {
 
 	// ReserveOnTarget writes opReserve into the FSM holding capacity + name
 	// for target before the body is forwarded to it. The reservation carries
-	// the redacted spec + sealed secrets so the target's RecordPlacement
-	// promote step can run with nil Spec/SealedSecrets and inherit them
+	// the redacted spec + secret ref so the target's RecordPlacement promote
+	// step can run with nil Spec/empty Secrets and inherit them
 	// atomically. ttl bounds how long the reservation can hold capacity if
 	// the target never promotes (the leader's GC sweep cancels expired rows
 	// at ~5s tick cadence). Spec MUST already be redacted — the raft log
 	// must NOT carry plaintext credentials.
-	ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, sealedSecrets []byte, ttl time.Duration) error
+	ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error
 
 	// CancelReservation drops a pending reservation from the FSM. No-op on
 	// missing or already-promoted (Placed) rows, so router rollback / TTL GC

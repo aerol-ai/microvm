@@ -35,7 +35,7 @@ func TestClusterSingleNodeBootstrap(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.RecordPlacement(ctx, "sb-1", nil, nil); err != nil {
+	if err := c.RecordPlacement(ctx, "sb-1", nil, PlacementSecrets{}); err != nil {
 		t.Fatalf("RecordPlacement: %v", err)
 	}
 	owner, err := c.OwnerOf("sb-1")
@@ -82,7 +82,7 @@ func TestClusterTwoNodeReplication(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := leader.RecordPlacement(ctx, "sb-replicate", nil, nil); err != nil {
+	if err := leader.RecordPlacement(ctx, "sb-replicate", nil, PlacementSecrets{}); err != nil {
 		t.Fatalf("leader RecordPlacement: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestFollowerWriteForwardsToLeader(t *testing.T) {
 
 	// With the fix: forwarded to the leader and applied. Without the fix:
 	// returns ErrNotLeader from applyCommand on the follower.
-	if err := follower.RecordPlacement(ctx, "sb-forwarded", nil, nil); err != nil {
+	if err := follower.RecordPlacement(ctx, "sb-forwarded", nil, PlacementSecrets{}); err != nil {
 		t.Fatalf("follower RecordPlacement: %v", err)
 	}
 

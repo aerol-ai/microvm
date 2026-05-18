@@ -2,9 +2,12 @@ package service
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
+	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -118,7 +121,7 @@ func TestSealClusterSecretsRecipientBound(t *testing.T) {
 	s := &Service{cipher: newTestCipher(t)}
 	req := models.CreateSandboxRequest{
 		Image:    "private.example.com/app:latest",
-		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: "p"},
+		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: "super-secret-password"},
 	}
 	sealed, err := s.SealClusterSecretsForRecipient(req, "node-a")
 	if err != nil {
@@ -132,8 +135,67 @@ func TestSealClusterSecretsRecipientBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recipient failed to open sealed cluster secrets: %v", err)
 	}
-	if merged.Registry == nil || merged.Registry.Password != "p" {
+	if merged.Registry == nil || merged.Registry.Password != "super-secret-password" {
 		t.Fatalf("recipient merge lost registry password: %+v", merged.Registry)
+	}
+}
+
+func TestClusterSecretRefRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer st.Close()
+
+	s := &Service{cipher: newTestCipher(t), store: st}
+	req := models.CreateSandboxRequest{
+		Image:    "private.example.com/app:latest",
+		Registry: &models.RegistryAuth{Server: "private.example.com", Username: "u", Password: "super-secret-password"},
+		Mounts: []models.MountSpec{{
+			Type:        models.MountTypeS3,
+			Target:      "/data",
+			Source:      "bucket",
+			Credentials: map[string]string{"AWS_SECRET_ACCESS_KEY": "shh-secret-token"},
+		}},
+	}
+
+	handle, err := s.PutClusterSecretsForRecipient(ctx, "sb-secret-ref", req, "node-a")
+	if err != nil {
+		t.Fatalf("PutClusterSecretsForRecipient: %v", err)
+	}
+	if handle.Ref == "" || handle.Version != clusterSecretVersion || len(handle.LegacySealed) != 0 {
+		t.Fatalf("handle = %+v, want ref/version without legacy sealed payload", handle)
+	}
+
+	rec, err := st.GetClusterSecret(ctx, handle.Ref)
+	if err != nil {
+		t.Fatalf("GetClusterSecret: %v", err)
+	}
+	if bytes.Contains(rec.SealedPayload, []byte("super-secret-password")) || bytes.Contains(rec.SealedPayload, []byte("shh-secret-token")) {
+		t.Fatal("stored cluster secret payload leaks plaintext credentials")
+	}
+	var env clusterSealedSecretsEnvelope
+	if err := json.Unmarshal(rec.SealedPayload, &env); err != nil {
+		t.Fatalf("unmarshal stored envelope: %v", err)
+	}
+	if env.Version != clusterSecretEnvelopeVersion || len(env.WrappedKey) == 0 || len(env.Payload) == 0 {
+		t.Fatalf("envelope = %+v, want v3 with wrapped per-secret key and payload", env)
+	}
+
+	redacted := RedactClusterSecrets(req)
+	if _, err := s.OpenClusterSecretsForNode(ctx, redacted, handle, "node-b"); err == nil {
+		t.Fatal("wrong recipient opened cluster secret ref")
+	}
+	merged, err := s.OpenClusterSecretsForNode(ctx, redacted, handle, "node-a")
+	if err != nil {
+		t.Fatalf("OpenClusterSecretsForNode: %v", err)
+	}
+	if merged.Registry == nil || merged.Registry.Password != "super-secret-password" {
+		t.Fatalf("registry password not restored: %+v", merged.Registry)
+	}
+	if got := merged.Mounts[0].Credentials["AWS_SECRET_ACCESS_KEY"]; got != "shh-secret-token" {
+		t.Fatalf("mount credential = %q, want shh-secret-token", got)
 	}
 }
 

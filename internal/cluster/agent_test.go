@@ -40,7 +40,7 @@ func TestAgentDelegatesPlacementReadWriteToServerControlPlane(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := agent.RecordPlacement(ctx, "sb-agent-rpc", nil, nil); err != nil {
+	if err := agent.RecordPlacement(ctx, "sb-agent-rpc", nil, PlacementSecrets{}); err != nil {
 		t.Fatalf("agent RecordPlacement: %v", err)
 	}
 
@@ -92,6 +92,8 @@ func startAgentControlPlaneServer(t *testing.T, c *Cluster, ln net.Listener) *ht
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		p.SecretRef = ""
+		p.SecretVersion = 0
 		p.SealedSecrets = nil
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})

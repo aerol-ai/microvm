@@ -506,6 +506,61 @@ func TestFSMPreservesSealedSecrets(t *testing.T) {
 	}
 }
 
+func TestFSMStoresSecretRefWithoutReplicatedPayload(t *testing.T) {
+	fsm := newPlacementFSM()
+
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "nodeA", OwnerAPIURL: "http://a",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
+		SecretRef:     "cluster-secret://sandbox/sb1/v1",
+		SecretVersion: 1,
+		// If a buggy caller accidentally populates both shapes, the ref model
+		// must win so raft state does not fan out the encrypted payload.
+		SealedSecrets: []byte("must-not-enter-placement"),
+	})
+	if got := fsm.Apply(&raft.Log{Data: place}); got != nil {
+		t.Fatalf("opPlace: %v", got)
+	}
+	p, _ := fsm.get("sb1")
+	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+		t.Fatalf("secret handle = (%q,%d), want ref v1", p.SecretRef, p.SecretVersion)
+	}
+	if len(p.SealedSecrets) != 0 {
+		t.Fatalf("new ref placement stored legacy sealed payload: %q", string(p.SealedSecrets))
+	}
+
+	upsert, _ := encodeCommand(command{
+		Op: opUpsertSpec, SandboxID: "sb1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2, MemoryMB: 512},
+	})
+	if got := fsm.Apply(&raft.Log{Data: upsert}); got != nil {
+		t.Fatalf("opUpsertSpec: %v", got)
+	}
+	p, _ = fsm.get("sb1")
+	if p.SecretRef != "cluster-secret://sandbox/sb1/v1" || p.SecretVersion != 1 {
+		t.Fatalf("secret ref was not preserved through spec-only upsert: %+v", p)
+	}
+	if len(p.SealedSecrets) != 0 {
+		t.Fatalf("spec-only upsert introduced legacy sealed payload: %q", string(p.SealedSecrets))
+	}
+
+	rotated, _ := encodeCommand(command{
+		Op: opUpsertSpec, SandboxID: "sb1",
+		SecretRef:     "cluster-secret://sandbox/sb1/v2",
+		SecretVersion: 2,
+	})
+	if got := fsm.Apply(&raft.Log{Data: rotated}); got != nil {
+		t.Fatalf("opUpsertSpec ref-only: %v", got)
+	}
+	p, _ = fsm.get("sb1")
+	if p.SecretRef != "cluster-secret://sandbox/sb1/v2" || p.SecretVersion != 2 {
+		t.Fatalf("secret ref did not rotate: (%q,%d)", p.SecretRef, p.SecretVersion)
+	}
+	if len(p.SealedSecrets) != 0 {
+		t.Fatalf("ref rotation stored legacy sealed payload: %q", string(p.SealedSecrets))
+	}
+}
+
 func TestFSMReadSnapshotsAreDeepCopies(t *testing.T) {
 	fsm := newPlacementFSM()
 	place, _ := encodeCommand(command{

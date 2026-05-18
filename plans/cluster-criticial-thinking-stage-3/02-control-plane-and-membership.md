@@ -53,8 +53,8 @@ At 100,000 sandboxes this becomes expensive even if it still fits in memory:
 - every process GC sees a large object graph with maps, pointers, and slices.
 
 The current comment claiming roughly 150 bytes per row is no longer credible.
-A realistic placement row includes redacted spec, sealed secrets, tags, env,
-mount metadata, lifecycle, GPU config, and exposed routes.
+A realistic placement row includes redacted spec, secret refs, tags, env, mount
+metadata, lifecycle, GPU config, and exposed routes.
 
 **Required redesign:**
 
@@ -201,4 +201,3 @@ control-plane outage.
 - tune snapshot threshold by bytes and time, not only log count;
 - avoid storing large specs/secrets in the hot FSM;
 - use external KV compaction semantics or explicit sharding.
-

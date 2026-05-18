@@ -1227,6 +1227,42 @@ func (s sqlRowStub) Scan(dest ...any) error {
 	return nil
 }
 
+func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	rec := ClusterSecretRecord{
+		Ref:           "cluster-secret://sandbox/sb-store/v1",
+		SandboxID:     "sb-store",
+		Version:       1,
+		Recipients:    []string{"node-a"},
+		SealedPayload: []byte("opaque-ciphertext"),
+	}
+	if err := st.PutClusterSecret(ctx, rec); err != nil {
+		t.Fatalf("PutClusterSecret: %v", err)
+	}
+	got, err := st.GetClusterSecret(ctx, rec.Ref)
+	if err != nil {
+		t.Fatalf("GetClusterSecret: %v", err)
+	}
+	if got.Ref != rec.Ref || got.SandboxID != rec.SandboxID || got.Version != rec.Version {
+		t.Fatalf("record identity = %+v, want %+v", got, rec)
+	}
+	if len(got.Recipients) != 1 || got.Recipients[0] != "node-a" {
+		t.Fatalf("recipients = %+v, want node-a", got.Recipients)
+	}
+	if string(got.SealedPayload) != "opaque-ciphertext" {
+		t.Fatalf("sealed payload = %q", string(got.SealedPayload))
+	}
+
+	if err := st.DeleteClusterSecretsForSandbox(ctx, rec.SandboxID); err != nil {
+		t.Fatalf("DeleteClusterSecretsForSandbox: %v", err)
+	}
+	if _, err := st.GetClusterSecret(ctx, rec.Ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetClusterSecret after delete = %v, want ErrNotFound", err)
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "state.db")

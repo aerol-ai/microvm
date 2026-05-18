@@ -41,16 +41,17 @@ func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 	return PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}, nil
 }
 
-func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
-func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
-func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
+func (n *Noop) SecretsOf(sandboxID string) PlacementSecrets          { return PlacementSecrets{} }
 func (n *Noop) SealedSecretsOf(sandboxID string) []byte              { return nil }
 func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, route ExposedPortRoute) error {
 	return nil
@@ -58,7 +59,7 @@ func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, r
 func (n *Noop) RemoveExposedPort(ctx context.Context, sandboxID string, port int) error { return nil }
 func (n *Noop) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute                { return nil }
 func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error             { return nil }
-func (n *Noop) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, sealedSecrets []byte, ttl time.Duration) error {
+func (n *Noop) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	return nil
 }
 func (n *Noop) CancelReservation(ctx context.Context, sandboxID string) error { return nil }

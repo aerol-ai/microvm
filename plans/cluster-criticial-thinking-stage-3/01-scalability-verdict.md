@@ -49,7 +49,7 @@ row size ~150 bytes." That is not the current schema. `Placement` carries:
 - sandbox ID and owner fields;
 - placement version and timestamps;
 - a full redacted `CreateSandboxRequest`;
-- sealed secret blobs;
+- secret refs;
 - exposed port maps;
 - exposed route metadata;
 - reservation state and expiry.
@@ -158,4 +158,3 @@ not reclaim an existing orphaned placement, and `reconcileStaleOwnership`
 intentionally ignores `ErrOrphaned`.
 
 At large node counts, false-positive liveness events are not rare edge cases.
-

@@ -107,6 +107,21 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		// cluster_secrets is the local secret-reference backend used by
+		// cluster placement state. Placement rows store only ref/version; this
+		// table stores the opaque encrypted payload and recipient metadata.
+		// There is intentionally no FK to sandboxes: cluster reservations may
+		// be written before a local sandbox row exists, and cleanup is explicit
+		// by sandbox_id on rollback/destroy.
+		`CREATE TABLE IF NOT EXISTS cluster_secrets (
+			ref TEXT PRIMARY KEY,
+			sandbox_id TEXT NOT NULL,
+			version INTEGER NOT NULL,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			sealed_payload BLOB NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -178,6 +193,7 @@ func Open(path string) (*Store, error) {
 		// name-based lookup; everyone else benefits from collision-free
 		// names by default.
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`,
+		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
@@ -1738,6 +1754,99 @@ var ErrNotFound = errors.New("sandbox not found")
 var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
+
+// ClusterSecretRecord is an opaque cluster-secret payload addressed by ref.
+// The store never decrypts SealedPayload; service owns the envelope format.
+type ClusterSecretRecord struct {
+	Ref           string
+	SandboxID     string
+	Version       int
+	Recipients    []string
+	SealedPayload []byte
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) error {
+	rec.Ref = strings.TrimSpace(rec.Ref)
+	rec.SandboxID = strings.TrimSpace(rec.SandboxID)
+	if rec.Ref == "" {
+		return errors.New("cluster secret ref is required")
+	}
+	if rec.SandboxID == "" {
+		return errors.New("cluster secret sandbox_id is required")
+	}
+	if rec.Version <= 0 {
+		return errors.New("cluster secret version must be positive")
+	}
+	if len(rec.SealedPayload) == 0 {
+		return errors.New("cluster secret sealed payload is required")
+	}
+	recipientsJSON, err := json.Marshal(rec.Recipients)
+	if err != nil {
+		return fmt.Errorf("marshal cluster secret recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = now
+	}
+	if rec.UpdatedAt.IsZero() {
+		rec.UpdatedAt = now
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO cluster_secrets (
+			ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(ref) DO UPDATE SET
+			sandbox_id = excluded.sandbox_id,
+			version = excluded.version,
+			recipients_json = excluded.recipients_json,
+			sealed_payload = excluded.sealed_payload,
+			updated_at = excluded.updated_at
+	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("put cluster secret: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecretRecord, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return nil, ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
+		FROM cluster_secrets
+		WHERE ref = ?
+	`, ref)
+	var rec ClusterSecretRecord
+	var recipientsJSON string
+	if err := row.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get cluster secret: %w", err)
+	}
+	if recipientsJSON != "" {
+		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+			return nil, fmt.Errorf("unmarshal cluster secret recipients: %w", err)
+		}
+	}
+	rec.SealedPayload = nullableBlob(rec.SealedPayload)
+	return &rec, nil
+}
+
+func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
+		return fmt.Errorf("delete cluster secrets: %w", err)
+	}
+	return nil
+}
 
 // PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
 // to the store layer; encryption / decryption happens in the service layer.

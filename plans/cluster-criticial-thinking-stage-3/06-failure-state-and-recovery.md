@@ -79,31 +79,32 @@ If automatic recreate becomes product scope, it needs a separate design:
 - user-visible lifecycle state;
 - no silent recreation of interactive sessions.
 
-## P0. Secrets Are Replicated To Every Raft Participant
+## P0 Fixed. Secret Material Is No Longer Replicated Through Raft
 
 **Where:**
 
-- `internal/cluster/cluster.go` `Placement.SealedSecrets`
+- `internal/cluster/cluster.go` `Placement.SecretRef`,
+  `Placement.SecretVersion`, and legacy-only `Placement.SealedSecrets`;
+- `internal/cluster/fsm.go` `applyCommandSecretUpdate`;
 - `internal/service/cluster_secrets.go`
-- `internal/config/config.go` shared credential key requirement
+  `PutClusterSecretsForRecipient` / `OpenClusterSecretsForNode`;
+- `internal/store/store.go` `cluster_secrets`.
 
-The branch seals credentials, but the sealed blobs are still replicated to
-every Raft participant. Because every worker currently runs Raft, every worker
-stores every sandbox's sealed secrets. Since the service process on each node
-also has the shared credential encryption key, compromise of any node can
-become compromise of the cluster's replicated credentials.
+New placement writes store only a secret ref + version in Raft. The encrypted
+payload is stored behind the service secret-provider boundary, currently in
+the local `cluster_secrets` table, with a recipient-bound envelope and a
+per-secret data key wrapped by the service key. If a command accidentally
+contains both `SecretRef` and `SealedSecrets`, the FSM keeps the ref and drops
+the payload so Raft does not fan out secret material.
 
-At 3 nodes this may be acceptable for an operator-owned cluster. At 10,000
-nodes it is a major blast-radius problem.
+`Placement.SealedSecrets` remains as a rolling-upgrade fallback only: old
+snapshots/log entries can still be opened, but create/reserve/promote/assert
+paths no longer write it for new placements.
 
-**Required redesign:**
-
-- do not replicate secret material to all workers;
-- store secret refs in placement state;
-- fetch/decrypt secrets only on the owner or approved recovery target;
-- use KMS/envelope encryption with per-sandbox or per-tenant keys;
-- rotate keys without rewriting the entire placement map;
-- audit every secret access.
+The external KMS integration point is now the provider boundary, not placement
+state. A KMS-backed provider can replace the local table without rewriting the
+Raft map; key rotation can rewrap provider records while placement refs remain
+stable.
 
 ## P1. Reconcile And Lifecycle Are Full Local Scans
 

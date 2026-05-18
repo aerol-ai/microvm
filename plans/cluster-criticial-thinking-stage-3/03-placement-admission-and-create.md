@@ -104,9 +104,9 @@ and finally `RecordPlacement`.
 If the local create takes longer than the TTL:
 
 1. reservation GC cancels the row;
-2. the target later calls `RecordPlacement(resp.Sandbox.ID, nil, nil)`;
-3. `opPlace` can create a placed row without the original spec, sealed secrets,
-   or name;
+2. the target later calls `RecordPlacement` with no spec or secret handle;
+3. `opPlace` can create a placed row without the original spec, secret ref, or
+   name;
 4. cluster-wide name uniqueness can be lost;
 5. failover reconstruction data is gone.
 
@@ -241,4 +241,3 @@ should be simpler:
 ```text
 all creates reserve in the control plane before side effects
 ```
-

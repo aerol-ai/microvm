@@ -37,18 +37,19 @@ const (
 // command is the wire format for one raft log entry. Spec is non-nil for
 // opPlace (records the original creation request alongside the owner pointer)
 // and opUpsertSpec (records mutations like resize/lifecycle that must survive
-// failover). Spec MUST be redacted of plaintext credentials before encoding —
-// SealedSecrets carries the matching encrypted bag. Port/Protocol carry one
-// (port, protocol) tuple for opAddExposedPort and opRemoveExposedPort —
-// replicated as intent-only so the new owner picks a fresh host port from
-// its own pool.
+// failover). Spec MUST be redacted of plaintext credentials before encoding.
+// SecretRef/SecretVersion carry only the provider handle; SealedSecrets is a
+// legacy fallback for log entries written before secret refs existed.
+// Port/Protocol carry one (port, protocol) tuple for opAddExposedPort and
+// opRemoveExposedPort — replicated as intent-only so the new owner picks a
+// fresh host port from its own pool.
 //
-// SealedSecrets follows the same preserve-on-nil rule as Spec at the FSM
-// level: an opPlace or opUpsertSpec that omits SealedSecrets does NOT erase
-// a previously-replicated bag. That lets resize/lifecycle write-throughs
-// (which never touch credentials) leave the sealed payload alone, and lets
-// boot-time replays that have a spec but lost track of the sealed bytes
-// avoid clobbering the original.
+// Secrets follow the same preserve-on-empty rule as Spec at the FSM level: an
+// opPlace or opUpsertSpec that omits SecretRef/SecretVersion/SealedSecrets
+// does NOT erase a previously-replicated handle. That lets resize/lifecycle
+// write-throughs (which never touch credentials) leave the secret ref alone,
+// and lets boot-time replays that have the spec but not the secret provider
+// handle avoid clobbering the original.
 type command struct {
 	Op                 opCode                       `json:"op"`
 	SandboxID          string                       `json:"sandbox_id"`
@@ -56,6 +57,8 @@ type command struct {
 	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
 	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef          string                       `json:"secret_ref,omitempty"`
+	SecretVersion      int                          `json:"secret_version,omitempty"`
 	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
 	Port               int                          `json:"port,omitempty"`
 	Protocol           string                       `json:"protocol,omitempty"`
@@ -83,6 +86,28 @@ func decodeCommand(b []byte) (command, error) {
 		return command{}, err
 	}
 	return c, nil
+}
+
+func (c command) placementSecrets() PlacementSecrets {
+	return PlacementSecrets{
+		Ref:          c.SecretRef,
+		Version:      c.SecretVersion,
+		LegacySealed: c.SealedSecrets,
+	}
+}
+
+func (c command) hasSecretUpdate() bool {
+	return c.placementSecrets().hasUpdate()
+}
+
+func applyCommandSecretUpdate(existing Placement, exists bool, cmd command) PlacementSecrets {
+	if !cmd.hasSecretUpdate() && exists {
+		return secretsFromPlacement(existing)
+	}
+	if cmd.SecretRef != "" || cmd.SecretVersion != 0 {
+		return PlacementSecrets{Ref: cmd.SecretRef, Version: cmd.SecretVersion}
+	}
+	return PlacementSecrets{LegacySealed: cloneBytes(cmd.SealedSecrets)}
 }
 
 // placementFSM is the raft.FSM implementation. It holds the entire placement
@@ -225,11 +250,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// Idempotency: re-placing the same id with the same owner AND the same
 		// spec payload is a no-op when the existing row is already a placement.
 		// A reservation-state row with the same owner still needs the State
-		// transition + UpdatedUnix bump even when Spec/SealedSecrets are nil
+		// transition + UpdatedUnix bump even when Spec/Secrets are empty
 		// (the reservation already holds them) — so we fall through to the
 		// write path below in that case.
 		existing, exists := f.placements[cmd.SandboxID]
-		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && cmd.SealedSecrets == nil && !existing.IsReserved() {
+		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && !cmd.hasSecretUpdate() && !existing.IsReserved() {
 			return nil
 		}
 		if exists && existing.IsOrphaned() {
@@ -259,11 +284,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			spec = existing.Spec
 		}
 		// Same preservation rule as Spec: a partial replay must not erase the
-		// sealed credential bag the original create stored.
-		sealed := cmd.SealedSecrets
-		if sealed == nil && exists {
-			sealed = existing.SealedSecrets
-		}
+		// secret provider handle the original create stored.
+		secrets := applyCommandSecretUpdate(existing, exists, cmd)
 		var ports map[int]string
 		var portRoutes map[int]ExposedPortRoute
 		if exists {
@@ -297,7 +319,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			CreatedUnix:        created,
 			UpdatedUnix:        now,
 			Spec:               spec,
-			SealedSecrets:      sealed,
+			SecretRef:          secrets.Ref,
+			SecretVersion:      secrets.Version,
+			SealedSecrets:      secrets.LegacySealed,
 			ExposedPorts:       ports,
 			ExposedPortRoutes:  portRoutes,
 			// opPlace is the promotion path for reservations: writing the
@@ -316,10 +340,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	case opReserve:
 		// Reservations are the first-half of the two-step create: the router
 		// commits intent here, the chosen owner promotes via opPlace once the
-		// local create succeeds. The intent carries the redacted spec + sealed
-		// secrets so a TTL-expired-then-reclaimed reservation can be promoted
-		// by a future re-attempt without re-sealing, and so the FSM-side name
-		// uniqueness check has the Name to compare against.
+		// local create succeeds. The intent carries the redacted spec and,
+		// when the caller has a globally-resolvable provider, a secret ref so a
+		// TTL-expired-then-reclaimed reservation can be promoted by a future
+		// re-attempt without re-sealing. The FSM-side name uniqueness check
+		// uses the redacted spec's Name.
 		if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
 			return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
 		}
@@ -357,6 +382,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
 			return err
 		}
+		secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
 		p := Placement{
 			SandboxID:          cmd.SandboxID,
 			OwnerNodeID:        cmd.OwnerNodeID,
@@ -366,7 +392,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			CreatedUnix:        now,
 			UpdatedUnix:        now,
 			Spec:               cmd.Spec,
-			SealedSecrets:      cmd.SealedSecrets,
+			SecretRef:          secrets.Ref,
+			SecretVersion:      secrets.Version,
+			SealedSecrets:      secrets.LegacySealed,
 			State:              PlacementStateReserved,
 			ExpiresUnix:        cmd.ExpiresUnix,
 		}
@@ -508,8 +536,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			existing.Spec = cmd.Spec
 		}
-		if cmd.SealedSecrets != nil {
-			existing.SealedSecrets = cmd.SealedSecrets
+		if cmd.hasSecretUpdate() {
+			secrets := applyCommandSecretUpdate(existing, true, cmd)
+			existing.SecretRef = secrets.Ref
+			existing.SecretVersion = secrets.Version
+			existing.SealedSecrets = secrets.LegacySealed
 		}
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
@@ -530,7 +561,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// failed locally if the sandbox truly doesn't exist.
 			return nil
 		}
-		if cmd.Spec == nil && cmd.SealedSecrets == nil {
+		if cmd.Spec == nil && !cmd.hasSecretUpdate() {
 			return nil
 		}
 		if cmd.Spec != nil {
@@ -545,12 +576,15 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			existing.Spec = cmd.Spec
 		}
-		// Replace the sealed bag only when the caller supplied one. Resize /
-		// lifecycle write-throughs leave it nil, preserving the original
-		// secrets — the only call sites that ship a fresh bag are create
-		// (opPlace, not here) and an explicit credential rotation.
-		if cmd.SealedSecrets != nil {
-			existing.SealedSecrets = cmd.SealedSecrets
+		// Replace the provider handle only when the caller supplied one.
+		// Resize / lifecycle write-throughs leave it empty, preserving the
+		// original secrets — the only call sites that ship a fresh handle are
+		// create (opPlace, not here) and an explicit credential rotation.
+		if cmd.hasSecretUpdate() {
+			secrets := applyCommandSecretUpdate(existing, true, cmd)
+			existing.SecretRef = secrets.Ref
+			existing.SecretVersion = secrets.Version
+			existing.SealedSecrets = secrets.LegacySealed
 		}
 		wasReserved := existing.IsReserved()
 		if wasReserved {
@@ -1269,9 +1303,7 @@ func (s *fsmSnapshot) Release() {}
 
 func clonePlacement(p Placement) Placement {
 	p.Spec = cloneCreateSandboxRequest(p.Spec)
-	if len(p.SealedSecrets) > 0 {
-		p.SealedSecrets = append([]byte(nil), p.SealedSecrets...)
-	}
+	p.SealedSecrets = cloneBytes(p.SealedSecrets)
 	if len(p.ExposedPorts) > 0 {
 		ports := make(map[int]string, len(p.ExposedPorts))
 		for k, v := range p.ExposedPorts {

@@ -108,14 +108,9 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 		}
 		spec := *p.Spec
 		ports := exposedPortRoutesForPlacement(p)
-		// Pass the sealed credential bag through unchanged — only the service
-		// holds the cipher and is allowed to peek inside.
-		var sealed []byte
-		if len(p.SealedSecrets) > 0 {
-			sealed = make([]byte, len(p.SealedSecrets))
-			copy(sealed, p.SealedSecrets)
-		}
-		if err := r.RecreateSandbox(ctx, id, spec, sealed, ports); err != nil {
+		// Pass the secret provider handle through unchanged — only the service
+		// is allowed to resolve and merge credentials.
+		if err := r.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports); err != nil {
 			fails := c.recreateFailures.record(id)
 			c.logger.Warn("cluster: recreate owned sandbox failed",
 				"sandbox_id", id, "consecutive_failures", fails, "err", err)

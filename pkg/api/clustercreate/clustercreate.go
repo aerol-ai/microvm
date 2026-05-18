@@ -80,14 +80,9 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			return Decision{}, false
 		}
 	}
-	sealed, err := svc.SealClusterSecrets(req)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "cluster: seal secrets: "+err.Error())
-		return Decision{}, false
-	}
 	redacted := service.RedactClusterSecrets(req)
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, sealed, ReservationTTL)
+	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, cluster.PlacementSecrets{}, ReservationTTL)
 	cancel()
 	if err != nil {
 		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
@@ -161,15 +156,20 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	defer cancel()
 	var promoteErr error
 	if reservationID != "" && !opts.PromoteWithSpec {
-		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, nil, nil)
+		secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
+		if sealErr != nil {
+			rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+			return nil, sealErr
+		}
+		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, nil, secrets)
 	} else {
-		sealed, sealErr := svc.SealClusterSecrets(req)
+		secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
 		if sealErr != nil {
 			rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
 			return nil, sealErr
 		}
 		redacted := service.RedactClusterSecrets(req)
-		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, sealed)
+		promoteErr = c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets)
 	}
 	if promoteErr != nil {
 		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
