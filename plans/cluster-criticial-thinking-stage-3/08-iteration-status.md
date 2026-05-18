@@ -64,6 +64,19 @@ real production soak, not in the obvious unbounded hot paths.
   100k placement pagination/sharding, 100k placement plus pending-reservation
   create accounting, 100k raw-TCP host-port collision checks, 100k ingress
   delta churn, and failover/ingress storm behavior.
+- Dead-owner orphaning is now a single Raft command per dead owner in the
+  no-recreate policy path. The FSM maintains an active-owner index, records
+  explicit orphan metadata (`owner_state`, `orphaned_owner_node_id`,
+  `orphaned_unix`), cancels the dead owner's pending reservations, and exposes
+  a previous-owner-only `ClaimOrphan` path for false-positive recovery.
+- Operator orphan recovery now has API surface: inspect via
+  `/v1/cluster/placements/{id}`, reclaim a false-positive local orphan via
+  `POST /v1/cluster/orphans/{id}/reclaim-local`, and force-delete an orphaned
+  placement via `DELETE /v1/cluster/orphans/{id}`.
+- AssertOwnership on both server and worker-agent clients can reclaim only
+  orphaned placements that were orphaned from the same node. Active foreign
+  owners and other nodes' orphans remain non-claimable, preserving the stale
+  local-row safety property.
 
 ## Still Pending
 
@@ -71,6 +84,9 @@ real production soak, not in the obvious unbounded hot paths.
   integrations. The code now has recipient envelopes, pull dedupe, and clear
   local-only image failure semantics, but it does not ship a registry/cache
   service or a KMS plugin in-process.
+- Automatic sandbox recreate remains product-gated off. The code now supports
+  bounded orphan cleanup and previous-owner reclaim, but it still does not
+  promise HA recreation of running sandboxes after a real owner death.
 
 ## Verification
 

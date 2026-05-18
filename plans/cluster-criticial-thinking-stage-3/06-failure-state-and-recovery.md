@@ -1,75 +1,72 @@
 # 06 - Failure State And Recovery
 
-## P0. False Dead-Owner Orphaning Can Be Permanent
+## P0. False Dead-Owner Orphaning Can Be Permanent - Fixed
 
 **Where:**
 
-- `internal/cluster/dead_owner.go:18-25`
-- `internal/cluster/dead_owner.go:151-180`
-- `internal/service/service.go:198-239`
-- `internal/cluster/client.go:500-570`
+- `internal/cluster/cluster.go` defines explicit owner state and orphan
+  metadata on `Placement`.
+- `internal/cluster/fsm.go` implements `opOrphanOwner` and `opClaimOrphan`.
+- `internal/cluster/client.go` and `internal/cluster/agent.go` reclaim only
+  previous-owner or legacy orphans during `AssertOwnership`.
+- `pkg/api/v1/cluster_handler.go` exposes orphan inspect/reclaim/delete
+  operator paths.
 
 Automatic failover recreate is disabled. The leader orphans placements when a
 node is considered dead. If the liveness decision was a false positive, the
 original owner can still have the local sandbox running.
 
-The current branch does not have a clean automatic recovery path:
+This branch now has a bounded recovery path:
 
-- `OwnerOf` returns `ErrOrphaned`;
-- `reconcileStaleOwnership` ignores `ErrOrphaned` and leaves the local sandbox
-  alone;
-- `AssertOwnership` treats an existing placement with `OwnerNodeID == ""` as
-  "not self" and does not reclaim it;
-- clients see 410 even though the sandbox may still be running.
+- orphaned placements carry `owner_state=orphaned`,
+  `orphaned_owner_node_id`, and `orphaned_unix`;
+- `AssertOwnership` can reclaim only when the previous owner is this node (or
+  the row predates previous-owner metadata);
+- `POST /v1/cluster/orphans/{id}/reclaim-local` requires a local sandbox row
+  before claiming;
+- `DELETE /v1/cluster/orphans/{id}` force-deletes an orphaned placement record;
+- active foreign owners and other nodes' orphans are deliberately not
+  claimable.
 
-At 10,000 nodes, gossip false positives, partitions, pauses, and rolling
-network events are not theoretical.
+Clients still see 410 for unreclaimed orphans, which matches the current
+product policy that running sandboxes are not automatically highly available.
 
-**Required fix:**
+Remaining product decision:
 
-- represent owner liveness as durable lease state;
-- require a recoverable transition from orphaned to reclaimed when the original
-  owner proves it still has the sandbox;
-- add an operator API to claim/delete/recover orphan placements;
-- distinguish "owner dead and sandbox gone" from "owner unreachable" from
-  "control plane orphaned but local row exists."
+- whether to add opt-in recreate queues/backoff for sandboxes whose owner is
+  truly gone.
 
-## P0. Dead-Owner Handling Is One Raft Write Per Sandbox
+## P0. Dead-Owner Handling Is One Raft Write Per Sandbox - Fixed
 
 **Where:**
 
-- `internal/cluster/dead_owner.go:151-180`
+- `internal/cluster/dead_owner.go` sends one `opOrphanOwner` command in the
+  no-recreate policy path.
+- `internal/cluster/fsm.go` maintains `ownerIndex` and
+  `pendingReservationIDsByOwner`, so the command does not scan the full
+  placement map.
+- `internal/cluster/scale_gates_test.go` includes a 100k-placement batch
+  orphan gate.
 
-`evictDeadOwner` enumerates IDs owned by the dead node and applies one
-`opReassign` per sandbox. A node owning 100 sandboxes is fine. A node owning
-10,000 sandboxes or a rack event killing many nodes can generate a storm of
-Raft writes and ingress route updates.
+`evictDeadOwner` no longer emits one Raft apply per sandbox when recreate is
+disabled. It emits one batch orphan command by owner node ID, and the FSM:
 
-With recreate disabled, all those writes are just setting owner to empty.
-
-**Required redesign:**
-
-- add a batch orphan command by owner node ID;
-- or store node liveness separately and make `OwnerOf` interpret dead owners
-  without rewriting every placement immediately;
-- pace route changes;
-- expose orphan queue depth and age;
-- define rack/zone failure behavior.
+- orphans every active placement for that owner;
+- records the previous owner and orphan timestamp;
+- removes the owner from the active-owner index;
+- cancels that owner's pending reservations so failed creates do not hold
+  capacity/name slots until TTL.
 
 ## P0. Recreate Code Exists But Product Policy Disables It
 
-The PR replicates specs/secrets/ports as if failover recreation is central,
+The branch replicates specs/secrets/ports as if failover recreation is central,
 but `clusterRecreateOnFailoverEnabled` is false. The shipped product behavior
 is "owner death -> 410 Gone".
 
-That can be acceptable, but the architecture should then be simpler and more
-honest:
-
-- do not replicate large secret/spec payloads to every node for a disabled
-  feature;
-- document that running sandboxes do not recover;
-- provide operator cleanup and recreate APIs;
-- avoid implying that owner recovery has been solved.
+That behavior is now explicit in the orphan flow: running sandboxes do not
+recover automatically, but operators can inspect, reclaim a false-positive
+local orphan, or force-delete the orphaned placement. Automatic recreate still
+requires a separate product decision.
 
 If automatic recreate becomes product scope, it needs a separate design:
 
@@ -206,4 +203,3 @@ sandbox state is non-HA. The branch needs explicit answers for:
 
 Without this, operators cannot safely run the cluster as more than an
 experiment.
-

@@ -72,6 +72,10 @@ func TestEvictDeadOwnerOrphansAndRemoves(t *testing.T) {
 	if err != ErrOrphaned {
 		t.Fatalf("post-evict OwnerOf err = %v, want ErrOrphaned", err)
 	}
+	p, ok := c.PlacementOf("sb-orphan-me")
+	if !ok || !p.IsOrphaned() || p.OrphanedOwnerNodeID != "dead-node" || p.OrphanedUnix == 0 {
+		t.Fatalf("orphan metadata = %+v ok=%v, want previous owner dead-node", p, ok)
+	}
 }
 
 // TestReconcileDeadOwnersRespectsGrace asserts that a node within the grace

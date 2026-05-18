@@ -44,6 +44,9 @@ func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	return nil
 }
+func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+	return nil
+}
 func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	return nil
 }

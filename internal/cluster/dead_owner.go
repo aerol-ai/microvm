@@ -185,6 +185,21 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 // tick: a placement already orphaned stays orphaned, and RemoveServer is a
 // no-op once the dead node is gone.
 func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
+	if !clusterRecreateOnFailoverEnabled {
+		orphaned := len(c.fsm.idsOwnedBy(nodeID))
+		if err := c.orphanOwner(ctx, nodeID); err != nil {
+			c.logger.Warn("cluster: orphan dead-owner placements failed; will retry next tick",
+				"dead_node", nodeID, "err", err)
+			return
+		}
+		if orphaned > 0 {
+			c.logger.Warn("cluster: orphaned placements after owner death",
+				"dead_node", nodeID, "orphaned", orphaned)
+		}
+		c.removeDeadOwnerServer(nodeID)
+		return
+	}
+
 	ids := c.fsm.idsOwnedBy(nodeID)
 	var reassigned, orphaned int
 	for _, id := range ids {
@@ -221,6 +236,17 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		c.logger.Warn("cluster: handled placements after owner death",
 			"dead_node", nodeID, "reassigned", reassigned, "orphaned_no_spec", orphaned)
 	}
+	c.removeDeadOwnerServer(nodeID)
+}
+
+func (c *Cluster) orphanOwner(ctx context.Context, nodeID string) error {
+	if nodeID == "" {
+		return nil
+	}
+	return c.applyCommand(ctx, command{Op: opOrphanOwner, NodeID: nodeID})
+}
+
+func (c *Cluster) removeDeadOwnerServer(nodeID string) {
 	if _, ok := c.configuredServer(nodeID); ok {
 		f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, c.commitTimeout)
 		if err := f.Error(); err != nil {

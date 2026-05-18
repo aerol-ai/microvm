@@ -63,13 +63,17 @@ var ErrHostPortReserved = errors.New("cluster: tcp host port already reserved")
 var ErrNameConflict = errors.New("cluster: sandbox name already in use")
 
 // ErrOrphaned is returned by OwnerOf when a placement exists but its owner has
-// been auto-evicted and the dead-owner reconciler has cleared the pointer
-// without yet selecting a new owner. With auto-recreation enabled this is a
-// brief transient — the next reconcile tick reassigns the placement to a live
-// node and the new owner re-creates the sandbox from the replicated spec.
-// Callers should treat this as 410 Gone (the sandbox is currently unreachable
-// but the system is converging).
+// been auto-evicted and the dead-owner reconciler has cleared the pointer.
+// Under the current product policy this is a terminal manual-recovery state:
+// callers should surface 410 Gone. If auto-recreation is enabled later, the
+// owner watcher may converge it by reassigning the placement to a live node.
 var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned")
+
+// ErrOrphanClaimConflict is returned when a node tries to reclaim an orphaned
+// placement that was explicitly orphaned from a different previous owner.
+// This prevents a returning node from stealing another dead node's sandbox
+// just because it has a stale local row with the same ID.
+var ErrOrphanClaimConflict = errors.New("cluster: orphaned placement belongs to a different previous owner")
 
 // ErrCapacityExceeded is returned when an opReserve apply finds that the
 // chosen target no longer has headroom for the request once concurrent
@@ -103,6 +107,20 @@ const (
 // IsReserved reports whether p is a reservation awaiting promotion.
 func (p Placement) IsReserved() bool { return p.State == PlacementStateReserved }
 
+// PlacementOwnerState records the ownership lifecycle independently from the
+// reservation lifecycle. Empty means the placement has an active owner.
+type PlacementOwnerState string
+
+const (
+	PlacementOwnerStateActive   PlacementOwnerState = ""
+	PlacementOwnerStateOrphaned PlacementOwnerState = "orphaned"
+)
+
+// IsOrphaned reports whether the placement has no active owner.
+func (p Placement) IsOrphaned() bool {
+	return p.OwnerNodeID == "" || p.OwnerState == PlacementOwnerStateOrphaned
+}
+
 // Placement is one row of the FSM's placement map. Spec is the replicated
 // sandbox creation request used by the new owner to re-materialize a sandbox
 // after its previous owner died (see owner_watcher.go). Spec is a pointer so
@@ -130,17 +148,20 @@ type ExposedPortRoute struct {
 // ingress nodes can install owner-aware data-plane routes. Both fields are kept
 // so older snapshots still restore cleanly.
 type Placement struct {
-	SandboxID          string                       `json:"sandbox_id"`
-	OwnerNodeID        string                       `json:"owner_node_id"`
-	OwnerAPIURL        string                       `json:"owner_api_url"`
-	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
-	Version            uint64                       `json:"version"`
-	CreatedUnix        int64                        `json:"created_unix"`
-	UpdatedUnix        int64                        `json:"updated_unix"`
-	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
-	ExposedPorts       map[int]string               `json:"exposed_ports,omitempty"`
-	ExposedPortRoutes  map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	SandboxID           string                       `json:"sandbox_id"`
+	OwnerNodeID         string                       `json:"owner_node_id"`
+	OwnerAPIURL         string                       `json:"owner_api_url"`
+	OwnerDataPlaneHost  string                       `json:"owner_data_plane_host,omitempty"`
+	OwnerState          PlacementOwnerState          `json:"owner_state,omitempty"`
+	OrphanedOwnerNodeID string                       `json:"orphaned_owner_node_id,omitempty"`
+	OrphanedUnix        int64                        `json:"orphaned_unix,omitempty"`
+	Version             uint64                       `json:"version"`
+	CreatedUnix         int64                        `json:"created_unix"`
+	UpdatedUnix         int64                        `json:"updated_unix"`
+	Spec                *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SealedSecrets       []byte                       `json:"sealed_secrets,omitempty"`
+	ExposedPorts        map[int]string               `json:"exposed_ports,omitempty"`
+	ExposedPortRoutes   map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
 	// State is empty for materialized placements (the historical schema) and
 	// PlacementStateReserved for capacity-only intents that have not yet been
 	// promoted by a successful local create. Reservations are eligible for
@@ -285,6 +306,12 @@ type Client interface {
 	// a boot-time replay that has the spec but not the secrets can't erase the
 	// secrets the original CreateSandbox stored).
 	RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error
+
+	// ClaimOrphan promotes an orphaned placement back to self. It succeeds
+	// only when the placement is currently orphaned and either has no recorded
+	// previous owner (legacy row) or was orphaned from this node. It preserves
+	// any replicated spec/secrets when the caller passes nil.
+	ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error
 
 	// UpsertSpec replaces the replicated spec for sandboxID without touching
 	// ownership. Mutating handlers (resize, lifecycle) call this after a

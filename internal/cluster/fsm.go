@@ -24,12 +24,14 @@ const (
 	opPlace             opCode = 1
 	opDelete            opCode = 2
 	opReassign          opCode = 3
-	opUpsertSpec        opCode = 4 // overwrite Placement.Spec without touching ownership
-	opAddExposedPort    opCode = 5 // record one (port, protocol) intent
-	opRemoveExposedPort opCode = 6 // drop one port intent
-	opReserve           opCode = 7 // hold capacity + name for a chosen owner before docker
-	opCancelReserve     opCode = 8 // release a pending reservation (rollback or TTL GC)
-	opSetNodeDrainState opCode = 9 // operator-set "exclude from placement" mark for a node
+	opUpsertSpec        opCode = 4  // overwrite Placement.Spec without touching ownership
+	opAddExposedPort    opCode = 5  // record one (port, protocol) intent
+	opRemoveExposedPort opCode = 6  // drop one port intent
+	opReserve           opCode = 7  // hold capacity + name for a chosen owner before docker
+	opCancelReserve     opCode = 8  // release a pending reservation (rollback or TTL GC)
+	opSetNodeDrainState opCode = 9  // operator-set "exclude from placement" mark for a node
+	opOrphanOwner       opCode = 10 // atomically orphan all placements owned by a dead node
+	opClaimOrphan       opCode = 11 // reclaim an orphaned placement back to its previous owner
 )
 
 // command is the wire format for one raft log entry. Spec is non-nil for
@@ -109,14 +111,20 @@ type placementFSM struct {
 	// rejects collisions in O(1) under the FSM lock instead of scanning every
 	// placement at 100k-row scale.
 	hostPortIndex map[int]hostPortClaim
+	// ownerIndex maps active owner nodeID -> placed sandbox IDs. Dead-owner
+	// eviction reads this instead of scanning the full placement table. Pending
+	// reservations are tracked separately below because they are capacity
+	// holds, not materialized sandboxes.
+	ownerIndex map[string]map[string]struct{}
 	// pendingReservationClaims is the per-reservation ledger behind
 	// pendingReservationCapacity. SelectPlacement reads the aggregate instead
 	// of scanning every placement row on each create. Expiries are tracked in
 	// pendingReservationExpiries so stale reservations can be removed lazily in
 	// O(expired log reservations) without waiting for the leader GC sweep.
-	pendingReservationClaims   map[string]pendingReservationClaim
-	pendingReservationCapacity map[string]capacity.Request
-	pendingReservationExpiries pendingReservationExpiryHeap
+	pendingReservationClaims     map[string]pendingReservationClaim
+	pendingReservationCapacity   map[string]capacity.Request
+	pendingReservationIDsByOwner map[string]map[string]struct{}
+	pendingReservationExpiries   pendingReservationExpiryHeap
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -171,13 +179,15 @@ func (h *pendingReservationExpiryHeap) Pop() any {
 
 func newPlacementFSM() *placementFSM {
 	return &placementFSM{
-		placements:                 make(map[string]Placement),
-		nameIndex:                  make(map[string]string),
-		shardIndex:                 make(map[int]map[string]struct{}),
-		hostPortIndex:              make(map[int]hostPortClaim),
-		pendingReservationClaims:   make(map[string]pendingReservationClaim),
-		pendingReservationCapacity: make(map[string]capacity.Request),
-		drainedNodes:               make(map[string]bool),
+		placements:                   make(map[string]Placement),
+		nameIndex:                    make(map[string]string),
+		shardIndex:                   make(map[int]map[string]struct{}),
+		hostPortIndex:                make(map[int]hostPortClaim),
+		ownerIndex:                   make(map[string]map[string]struct{}),
+		pendingReservationClaims:     make(map[string]pendingReservationClaim),
+		pendingReservationCapacity:   make(map[string]capacity.Request),
+		pendingReservationIDsByOwner: make(map[string]map[string]struct{}),
+		drainedNodes:                 make(map[string]bool),
 	}
 }
 
@@ -221,6 +231,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		existing, exists := f.placements[cmd.SandboxID]
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && cmd.SealedSecrets == nil && !existing.IsReserved() {
 			return nil
+		}
+		if exists && existing.IsOrphaned() {
+			return fmt.Errorf("%w: %s is orphaned; use ClaimOrphan", ErrReservationConflict, cmd.SandboxID)
+		}
+		if exists && !existing.IsReserved() && existing.OwnerNodeID != "" && existing.OwnerNodeID != cmd.OwnerNodeID {
+			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
 		// Cluster-wide name uniqueness. Without this, two concurrent creates
 		// with the same Name landing on different owners would both succeed
@@ -266,8 +282,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// nameIndex entry pointing at this sandbox under its previous name.
 		if exists {
 			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			f.releaseOwnerLocked(cmd.SandboxID, existing)
 			if existing.IsReserved() {
 				f.releasePendingReservationLocked(cmd.SandboxID)
+				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
 		}
 		f.placements[cmd.SandboxID] = Placement{
@@ -291,6 +309,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.claimNameLocked(cmd.SandboxID, specName(spec))
 		f.claimShardLocked(cmd.SandboxID)
+		if p, ok := f.placements[cmd.SandboxID]; ok {
+			f.claimOwnerLocked(cmd.SandboxID, p)
+		}
 		return nil
 	case opReserve:
 		// Reservations are the first-half of the two-step create: the router
@@ -325,6 +346,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// AND a different SandboxID is never reused for the same intent).
 			if now > existing.ExpiresUnix {
 				f.releasePendingReservationLocked(cmd.SandboxID)
+				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 				f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
 				f.releaseShardLocked(cmd.SandboxID)
 			} else {
@@ -367,6 +389,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseShardLocked(cmd.SandboxID)
 		f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 		f.releasePendingReservationLocked(cmd.SandboxID)
+		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 		delete(f.placements, cmd.SandboxID)
 		return nil
 	case opDelete:
@@ -374,8 +397,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
 			f.releaseShardLocked(cmd.SandboxID)
 			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
+			f.releaseOwnerLocked(cmd.SandboxID, existing)
 			if existing.IsReserved() {
 				f.releasePendingReservationLocked(cmd.SandboxID)
+				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
 		}
 		delete(f.placements, cmd.SandboxID)
@@ -390,16 +415,112 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		wasReserved := existing.IsReserved()
 		if wasReserved {
 			f.releasePendingReservationLocked(cmd.SandboxID)
+			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 		}
+		f.releaseOwnerLocked(cmd.SandboxID, existing)
+		previousOwner := existing.OwnerNodeID
 		existing.OwnerNodeID = cmd.OwnerNodeID
 		existing.OwnerAPIURL = cmd.OwnerAPIURL
 		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
+		if cmd.OwnerNodeID == "" {
+			existing.OwnerState = PlacementOwnerStateOrphaned
+			if existing.OrphanedOwnerNodeID == "" {
+				existing.OrphanedOwnerNodeID = previousOwner
+			}
+			if existing.OrphanedUnix == 0 {
+				existing.OrphanedUnix = now
+			}
+		} else {
+			existing.OwnerState = PlacementOwnerStateActive
+			existing.OrphanedOwnerNodeID = ""
+			existing.OrphanedUnix = 0
+		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
 		f.placements[cmd.SandboxID] = existing
 		if wasReserved {
 			f.claimPendingReservationLocked(cmd.SandboxID, existing)
+		} else {
+			f.claimOwnerLocked(cmd.SandboxID, existing)
 		}
+		return nil
+	case opOrphanOwner:
+		if cmd.NodeID == "" {
+			return fmt.Errorf("placementFSM: opOrphanOwner requires node_id")
+		}
+		for _, id := range f.ownedPlacementIDsLocked(cmd.NodeID) {
+			existing, ok := f.placements[id]
+			if !ok || existing.IsReserved() || existing.OwnerNodeID != cmd.NodeID {
+				continue
+			}
+			f.releaseOwnerLocked(id, existing)
+			existing.OwnerNodeID = ""
+			existing.OwnerAPIURL = ""
+			existing.OwnerDataPlaneHost = ""
+			existing.OwnerState = PlacementOwnerStateOrphaned
+			existing.OrphanedOwnerNodeID = cmd.NodeID
+			existing.OrphanedUnix = now
+			existing.Version = f.version
+			existing.UpdatedUnix = now
+			f.placements[id] = existing
+		}
+		for _, id := range f.pendingReservationIDsLocked(cmd.NodeID) {
+			existing, ok := f.placements[id]
+			if !ok || !existing.IsReserved() || existing.OwnerNodeID != cmd.NodeID {
+				continue
+			}
+			f.releaseNameLocked(id, specName(existing.Spec))
+			f.releaseShardLocked(id)
+			f.releasePendingReservationLocked(id)
+			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
+			delete(f.placements, id)
+		}
+		return nil
+	case opClaimOrphan:
+		if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
+			return fmt.Errorf("placementFSM: opClaimOrphan requires sandbox_id and owner_node_id")
+		}
+		existing, exists := f.placements[cmd.SandboxID]
+		if !exists {
+			return ErrUnknownSandbox
+		}
+		if existing.IsReserved() {
+			return fmt.Errorf("%w: %s is a pending reservation", ErrReservationConflict, cmd.SandboxID)
+		}
+		if !existing.IsOrphaned() {
+			if existing.OwnerNodeID == cmd.OwnerNodeID {
+				return nil
+			}
+			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+		}
+		if existing.OrphanedOwnerNodeID != "" && existing.OrphanedOwnerNodeID != cmd.OwnerNodeID {
+			return fmt.Errorf("%w: %s orphaned from %s", ErrOrphanClaimConflict, cmd.SandboxID, existing.OrphanedOwnerNodeID)
+		}
+		if cmd.Spec != nil {
+			oldName := specName(existing.Spec)
+			newName := specName(cmd.Spec)
+			if newName != oldName {
+				if err := f.validateNameUniqueLocked(cmd.SandboxID, newName); err != nil {
+					return err
+				}
+				f.releaseNameLocked(cmd.SandboxID, oldName)
+				f.claimNameLocked(cmd.SandboxID, newName)
+			}
+			existing.Spec = cmd.Spec
+		}
+		if cmd.SealedSecrets != nil {
+			existing.SealedSecrets = cmd.SealedSecrets
+		}
+		existing.OwnerNodeID = cmd.OwnerNodeID
+		existing.OwnerAPIURL = cmd.OwnerAPIURL
+		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
+		existing.OwnerState = PlacementOwnerStateActive
+		existing.OrphanedOwnerNodeID = ""
+		existing.OrphanedUnix = 0
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		f.placements[cmd.SandboxID] = existing
+		f.claimOwnerLocked(cmd.SandboxID, existing)
 		return nil
 	case opUpsertSpec:
 		existing, exists := f.placements[cmd.SandboxID]
@@ -569,6 +690,51 @@ func (f *placementFSM) releaseNameLocked(sandboxID, name string) {
 	}
 }
 
+func (f *placementFSM) claimOwnerLocked(sandboxID string, p Placement) {
+	if sandboxID == "" || p.IsReserved() || p.IsOrphaned() || p.OwnerNodeID == "" {
+		return
+	}
+	if f.ownerIndex == nil {
+		f.ownerIndex = make(map[string]map[string]struct{})
+	}
+	ids := f.ownerIndex[p.OwnerNodeID]
+	if ids == nil {
+		ids = make(map[string]struct{})
+		f.ownerIndex[p.OwnerNodeID] = ids
+	}
+	ids[sandboxID] = struct{}{}
+}
+
+func (f *placementFSM) releaseOwnerLocked(sandboxID string, p Placement) {
+	if sandboxID == "" || p.OwnerNodeID == "" || f.ownerIndex == nil {
+		return
+	}
+	ids := f.ownerIndex[p.OwnerNodeID]
+	if ids == nil {
+		return
+	}
+	delete(ids, sandboxID)
+	if len(ids) == 0 {
+		delete(f.ownerIndex, p.OwnerNodeID)
+	}
+}
+
+func (f *placementFSM) ownedPlacementIDsLocked(nodeID string) []string {
+	if nodeID == "" {
+		return nil
+	}
+	ids := f.ownerIndex[nodeID]
+	if ids == nil {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (f *placementFSM) claimShardLocked(sandboxID string) {
 	if sandboxID == "" {
 		return
@@ -656,8 +822,14 @@ func (f *placementFSM) claimPendingReservationLocked(sandboxID string, p Placeme
 	if f.pendingReservationCapacity == nil {
 		f.pendingReservationCapacity = make(map[string]capacity.Request)
 	}
+	if f.pendingReservationIDsByOwner == nil {
+		f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
+	}
 	if old, ok := f.pendingReservationClaims[sandboxID]; ok {
 		f.subtractPendingCapacityLocked(old.OwnerNodeID, old.Request)
+		if old.OwnerNodeID != p.OwnerNodeID {
+			f.releasePendingReservationOwnerLocked(sandboxID, old.OwnerNodeID)
+		}
 	}
 	req := capacityRequestFromSpec(p.Spec)
 	claim := pendingReservationClaim{
@@ -667,6 +839,7 @@ func (f *placementFSM) claimPendingReservationLocked(sandboxID string, p Placeme
 	}
 	f.pendingReservationClaims[sandboxID] = claim
 	f.addPendingCapacityLocked(claim.OwnerNodeID, claim.Request)
+	f.claimPendingReservationOwnerLocked(sandboxID, claim.OwnerNodeID)
 	if claim.ExpiresUnix > 0 {
 		heap.Push(&f.pendingReservationExpiries, pendingReservationExpiry{SandboxID: sandboxID, ExpiresUnix: claim.ExpiresUnix})
 	}
@@ -682,6 +855,51 @@ func (f *placementFSM) releasePendingReservationLocked(sandboxID string) {
 	}
 	f.subtractPendingCapacityLocked(claim.OwnerNodeID, claim.Request)
 	delete(f.pendingReservationClaims, sandboxID)
+}
+
+func (f *placementFSM) claimPendingReservationOwnerLocked(sandboxID, owner string) {
+	if sandboxID == "" || owner == "" {
+		return
+	}
+	if f.pendingReservationIDsByOwner == nil {
+		f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
+	}
+	ids := f.pendingReservationIDsByOwner[owner]
+	if ids == nil {
+		ids = make(map[string]struct{})
+		f.pendingReservationIDsByOwner[owner] = ids
+	}
+	ids[sandboxID] = struct{}{}
+}
+
+func (f *placementFSM) releasePendingReservationOwnerLocked(sandboxID, owner string) {
+	if sandboxID == "" || owner == "" || f.pendingReservationIDsByOwner == nil {
+		return
+	}
+	ids := f.pendingReservationIDsByOwner[owner]
+	if ids == nil {
+		return
+	}
+	delete(ids, sandboxID)
+	if len(ids) == 0 {
+		delete(f.pendingReservationIDsByOwner, owner)
+	}
+}
+
+func (f *placementFSM) pendingReservationIDsLocked(owner string) []string {
+	if owner == "" || f.pendingReservationIDsByOwner == nil {
+		return nil
+	}
+	ids := f.pendingReservationIDsByOwner[owner]
+	if ids == nil {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (f *placementFSM) refreshPendingReservationExpiryLocked(sandboxID string, expiresUnix int64) {
@@ -774,13 +992,7 @@ func (f *placementFSM) sandboxIDByName(name string) (string, bool) {
 func (f *placementFSM) idsOwnedBy(nodeID string) []string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	var out []string
-	for id, p := range f.placements {
-		if p.OwnerNodeID == nodeID {
-			out = append(out, id)
-		}
-	}
-	return out
+	return f.ownedPlacementIDsLocked(nodeID)
 }
 
 // currentVersion returns the FSM's monotonic apply counter. The cluster
@@ -1007,8 +1219,10 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 	f.nameIndex = make(map[string]string, len(payload.Placements))
 	f.shardIndex = make(map[int]map[string]struct{})
 	f.hostPortIndex = make(map[int]hostPortClaim)
+	f.ownerIndex = make(map[string]map[string]struct{})
 	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
 	f.pendingReservationCapacity = make(map[string]capacity.Request)
+	f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
 	f.pendingReservationExpiries = nil
 	for id, p := range payload.Placements {
 		if name := specName(p.Spec); name != "" {
@@ -1020,6 +1234,8 @@ func (f *placementFSM) Restore(rc io.ReadCloser) error {
 		}
 		if p.IsReserved() {
 			f.claimPendingReservationLocked(id, p)
+		} else {
+			f.claimOwnerLocked(id, p)
 		}
 	}
 	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the

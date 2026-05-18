@@ -49,10 +49,10 @@ func TestFSMPlaceIdempotent(t *testing.T) {
 	}
 }
 
-func TestFSMReplaceOwner(t *testing.T) {
+func TestFSMReassignOwner(t *testing.T) {
 	fsm := newPlacementFSM()
 	c1, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", OwnerAPIURL: "http://a"})
-	c2, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b"})
+	c2, _ := encodeCommand(command{Op: opReassign, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b"})
 	fsm.Apply(&raft.Log{Data: c1})
 	createdFirst, _ := fsm.get("sb1")
 	time.Sleep(time.Second) // allow CreatedUnix preservation to be observable
@@ -63,6 +63,93 @@ func TestFSMReplaceOwner(t *testing.T) {
 	}
 	if got.CreatedUnix != createdFirst.CreatedUnix {
 		t.Fatalf("CreatedUnix should be preserved across reassign: was %d, now %d", createdFirst.CreatedUnix, got.CreatedUnix)
+	}
+}
+
+func TestFSMPlaceCannotOverwriteActiveOwner(t *testing.T) {
+	fsm := newPlacementFSM()
+	first, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A", OwnerAPIURL: "http://a"})
+	if got := fsm.Apply(&raft.Log{Data: first}); got != nil {
+		t.Fatalf("first place: %v", got)
+	}
+	overwrite, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "B", OwnerAPIURL: "http://b"})
+	got := fsm.Apply(&raft.Log{Data: overwrite})
+	err, _ := got.(error)
+	if err == nil || !errors.Is(err, ErrReservationConflict) {
+		t.Fatalf("overwrite = %v, want ErrReservationConflict", got)
+	}
+	p, _ := fsm.get("sb1")
+	if p.OwnerNodeID != "A" {
+		t.Fatalf("owner changed after rejected overwrite: %+v", p)
+	}
+}
+
+func TestFSMOrphanOwnerBatchesPlacedRowsAndCancelsReservations(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(idx uint64, cmd command) interface{} {
+		t.Helper()
+		payload, _ := encodeCommand(cmd)
+		return fsm.Apply(&raft.Log{Index: idx, Data: payload})
+	}
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb-dead-1", OwnerNodeID: "dead", OwnerAPIURL: "http://dead"}); got != nil {
+		t.Fatalf("place dead 1: %v", got)
+	}
+	if got := apply(2, command{Op: opPlace, SandboxID: "sb-live", OwnerNodeID: "live", OwnerAPIURL: "http://live"}); got != nil {
+		t.Fatalf("place live: %v", got)
+	}
+	if got := apply(3, command{Op: opReserve, SandboxID: "sb-dead-reserved", OwnerNodeID: "dead", Spec: &models.CreateSandboxRequest{Name: "held"}, ExpiresUnix: time.Now().Add(time.Hour).Unix()}); got != nil {
+		t.Fatalf("reserve dead: %v", got)
+	}
+
+	if got := apply(4, command{Op: opOrphanOwner, NodeID: "dead"}); got != nil {
+		t.Fatalf("opOrphanOwner: %v", got)
+	}
+	orphan, ok := fsm.get("sb-dead-1")
+	if !ok || !orphan.IsOrphaned() || orphan.OrphanedOwnerNodeID != "dead" || orphan.OrphanedUnix == 0 {
+		t.Fatalf("dead placement not orphaned with metadata: %+v ok=%v", orphan, ok)
+	}
+	if got := fsm.idsOwnedBy("dead"); len(got) != 0 {
+		t.Fatalf("dead owner index still has ids: %+v", got)
+	}
+	if _, ok := fsm.get("sb-dead-reserved"); ok {
+		t.Fatal("dead owner's pending reservation was not cancelled")
+	}
+	if got, ok := fsm.sandboxIDByName("held"); ok {
+		t.Fatalf("cancelled reservation still owns name as %q", got)
+	}
+	live, _ := fsm.get("sb-live")
+	if live.OwnerNodeID != "live" || live.IsOrphaned() {
+		t.Fatalf("live owner was disturbed: %+v", live)
+	}
+}
+
+func TestFSMClaimOrphanRequiresPreviousOwner(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(idx uint64, cmd command) interface{} {
+		t.Helper()
+		payload, _ := encodeCommand(cmd)
+		return fsm.Apply(&raft.Log{Index: idx, Data: payload})
+	}
+	if got := apply(1, command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "dead", Spec: &models.CreateSandboxRequest{Name: "original", Image: "alpine"}}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+	if got := apply(2, command{Op: opOrphanOwner, NodeID: "dead"}); got != nil {
+		t.Fatalf("orphan: %v", got)
+	}
+	got := apply(3, command{Op: opClaimOrphan, SandboxID: "sb1", OwnerNodeID: "other", OwnerAPIURL: "http://other"})
+	err, _ := got.(error)
+	if err == nil || !errors.Is(err, ErrOrphanClaimConflict) {
+		t.Fatalf("wrong-owner claim = %v, want ErrOrphanClaimConflict", got)
+	}
+	if got := apply(4, command{Op: opClaimOrphan, SandboxID: "sb1", OwnerNodeID: "dead", OwnerAPIURL: "http://dead-new", Spec: &models.CreateSandboxRequest{Name: "original", Image: "alpine:new"}}); got != nil {
+		t.Fatalf("previous-owner claim: %v", got)
+	}
+	p, _ := fsm.get("sb1")
+	if p.OwnerNodeID != "dead" || p.OwnerAPIURL != "http://dead-new" || p.IsOrphaned() || p.OrphanedOwnerNodeID != "" || p.OrphanedUnix != 0 {
+		t.Fatalf("claim did not restore active owner and clear orphan metadata: %+v", p)
+	}
+	if p.Spec == nil || p.Spec.Image != "alpine:new" {
+		t.Fatalf("claim did not update supplied spec: %+v", p.Spec)
 	}
 }
 
@@ -338,6 +425,9 @@ func TestFSMSnapshotRestoreRoundTrip(t *testing.T) {
 		if p.Spec == nil || p.Spec.Image != "img-"+id {
 			t.Errorf("spec lost in snapshot/restore for %s: got %+v", id, p.Spec)
 		}
+	}
+	if got := dst.idsOwnedBy("owner-a"); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("owner index was not rebuilt on restore: %+v", got)
 	}
 }
 

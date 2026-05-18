@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -636,6 +637,108 @@ func (h *handlers) clusterUncordonNode(w http.ResponseWriter, r *http.Request) {
 	h.setNodeDrainState(w, r, false)
 }
 
+// clusterReclaimOrphanLocal is the manual false-positive recovery endpoint:
+// it only claims an orphan when this node still has the sandbox in its local
+// store, and the FSM records this node as the previous orphaned owner (or the
+// row predates that metadata). Operators use this after confirming the node
+// was marked dead by mistake.
+func (h *handlers) clusterReclaimOrphanLocal(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	p, ok := c.PlacementOf(id)
+	if !ok {
+		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		return
+	}
+	if !p.IsOrphaned() {
+		apihttp.WriteError(w, http.StatusConflict, "placement is not orphaned")
+		return
+	}
+	if p.OrphanedOwnerNodeID != "" && p.OrphanedOwnerNodeID != c.SelfNodeID() {
+		apihttp.WriteError(w, http.StatusConflict, "orphaned placement belongs to previous owner "+p.OrphanedOwnerNodeID)
+		return
+	}
+	if _, err := h.deps.Service.GetSandbox(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			apihttp.WriteError(w, http.StatusConflict, "local sandbox row is missing; cannot reclaim locally")
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.ClaimOrphan(commitCtx, id, nil, nil); err != nil {
+		if errors.Is(err, cluster.ErrNotLeader) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+			return
+		}
+		if errors.Is(err, cluster.ErrUnknownSandbox) {
+			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+			return
+		}
+		if errors.Is(err, cluster.ErrOrphanClaimConflict) || errors.Is(err, cluster.ErrReservationConflict) {
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// clusterDeleteOrphan force-deletes only the FSM placement for an orphan. It
+// intentionally does not destroy any local sandbox because the owner is, by
+// definition, absent from the cluster routing view.
+func (h *handlers) clusterDeleteOrphan(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	p, ok := c.PlacementOf(id)
+	if !ok {
+		apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+		return
+	}
+	if !p.IsOrphaned() {
+		apihttp.WriteError(w, http.StatusConflict, "placement is not orphaned")
+		return
+	}
+	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.DeletePlacement(commitCtx, id); err != nil {
+		if errors.Is(err, cluster.ErrNotLeader) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+			return
+		}
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *handlers) setNodeDrainState(w http.ResponseWriter, r *http.Request, drained bool) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
@@ -860,6 +963,9 @@ type placementOwner struct {
 type placementResponse struct {
 	Owner                placementOwner                      `json:"owner"`
 	Orphaned             bool                                `json:"orphaned"`
+	OwnerState           cluster.PlacementOwnerState         `json:"owner_state,omitempty"`
+	OrphanedOwnerNodeID  string                              `json:"orphaned_owner_node_id,omitempty"`
+	OrphanedUnix         int64                               `json:"orphaned_unix,omitempty"`
 	ExposedPorts         map[string]cluster.ExposedPortRoute `json:"exposed_ports,omitempty"`
 	PlacementVersion     uint64                              `json:"placement_version"`
 	NodeInstalledVersion uint64                              `json:"node_installed_version"`
@@ -909,6 +1015,9 @@ func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 	// reading JSON via jq don't trip over numeric-key quirks in some clients.
 	if placement, ok := c.PlacementOf(id); ok {
 		resp.PlacementVersion = placement.Version
+		resp.OwnerState = placement.OwnerState
+		resp.OrphanedOwnerNodeID = placement.OrphanedOwnerNodeID
+		resp.OrphanedUnix = placement.OrphanedUnix
 		if len(placement.ExposedPortRoutes) > 0 {
 			resp.ExposedPorts = make(map[string]cluster.ExposedPortRoute, len(placement.ExposedPortRoutes))
 			for port, route := range placement.ExposedPortRoutes {

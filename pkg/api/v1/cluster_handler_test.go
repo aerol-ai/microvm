@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
+	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -541,9 +543,12 @@ func TestClusterPlacementReturnsOrphanedFlag(t *testing.T) {
 		Noop:     cluster.NewNoop("node-a", "http://node-a"),
 		ownerErr: cluster.ErrOrphaned,
 		placement: cluster.Placement{
-			SandboxID:   "sb-orphan",
-			OwnerNodeID: "",
-			Version:     7,
+			SandboxID:           "sb-orphan",
+			OwnerNodeID:         "",
+			OwnerState:          cluster.PlacementOwnerStateOrphaned,
+			OrphanedOwnerNodeID: "node-dead",
+			OrphanedUnix:        99,
+			Version:             7,
 		},
 		hasPlace: true,
 	}
@@ -565,6 +570,9 @@ func TestClusterPlacementReturnsOrphanedFlag(t *testing.T) {
 	owner, _ := got["owner"].(map[string]any)
 	if owner == nil || owner["node_id"] != "" || owner["is_self"] != false {
 		t.Fatalf("owner = %+v, want empty node_id for orphan", owner)
+	}
+	if got["owner_state"] != string(cluster.PlacementOwnerStateOrphaned) || got["orphaned_owner_node_id"] != "node-dead" {
+		t.Fatalf("orphan metadata = owner_state:%v orphaned_owner_node_id:%v", got["owner_state"], got["orphaned_owner_node_id"])
 	}
 }
 
@@ -777,6 +785,143 @@ func TestClusterDrainNodeRejectsEmptyID(t *testing.T) {
 	}
 	if len(stub.setCalls) != 0 {
 		t.Fatalf("setCalls = %+v, want zero — FSM must not see the empty drain", stub.setCalls)
+	}
+}
+
+type orphanOpsStubCluster struct {
+	*cluster.Noop
+	placement   cluster.Placement
+	hasPlace    bool
+	claimCalls  []string
+	claimErr    error
+	deleteCalls []string
+	deleteErr   error
+}
+
+func (c *orphanOpsStubCluster) PlacementOf(string) (cluster.Placement, bool) {
+	return c.placement, c.hasPlace
+}
+
+func (c *orphanOpsStubCluster) ClaimOrphan(_ context.Context, sandboxID string, _ *models.CreateSandboxRequest, _ []byte) error {
+	c.claimCalls = append(c.claimCalls, sandboxID)
+	return c.claimErr
+}
+
+func (c *orphanOpsStubCluster) DeletePlacement(_ context.Context, sandboxID string) error {
+	c.deleteCalls = append(c.deleteCalls, sandboxID)
+	return c.deleteErr
+}
+
+var _ cluster.Client = (*orphanOpsStubCluster)(nil)
+
+func newOrphanOpsService(t *testing.T, stub *orphanOpsStubCluster, seedLocal bool) (*handlers, func()) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if seedLocal {
+		now := time.Now().UTC()
+		if err := st.Create(context.Background(), &models.Sandbox{
+			ID:             "sb-orphan",
+			Image:          "alpine",
+			Status:         models.SandboxStatusStarted,
+			PublicURL:      "https://sb-orphan.example.com",
+			CPU:            1,
+			MemoryMB:       256,
+			DiskGB:         1,
+			OSUser:         "root",
+			ToolboxEnabled: true,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			LastActiveAt:   now,
+		}); err != nil {
+			t.Fatalf("store.Create: %v", err)
+		}
+	}
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(stub)
+	return &handlers{deps: Deps{Service: svc, Logger: logger}}, func() { _ = st.Close() }
+}
+
+func TestClusterReclaimOrphanLocalRequiresLocalRowAndPreviousOwner(t *testing.T) {
+	stub := &orphanOpsStubCluster{
+		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		placement: cluster.Placement{
+			SandboxID:           "sb-orphan",
+			OwnerState:          cluster.PlacementOwnerStateOrphaned,
+			OrphanedOwnerNodeID: "node-a",
+			OrphanedUnix:        123,
+		},
+		hasPlace: true,
+	}
+	h, cleanup := newOrphanOpsService(t, stub, true)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/orphans/sb-orphan/reclaim-local", nil)
+	req.SetPathValue("id", "sb-orphan")
+	rr := httptest.NewRecorder()
+	h.clusterReclaimOrphanLocal(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 body=%q", rr.Code, rr.Body.String())
+	}
+	if len(stub.claimCalls) != 1 || stub.claimCalls[0] != "sb-orphan" {
+		t.Fatalf("claimCalls = %+v, want [sb-orphan]", stub.claimCalls)
+	}
+}
+
+func TestClusterReclaimOrphanLocalRejectsOtherPreviousOwner(t *testing.T) {
+	stub := &orphanOpsStubCluster{
+		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		placement: cluster.Placement{
+			SandboxID:           "sb-orphan",
+			OwnerState:          cluster.PlacementOwnerStateOrphaned,
+			OrphanedOwnerNodeID: "node-b",
+			OrphanedUnix:        123,
+		},
+		hasPlace: true,
+	}
+	h, cleanup := newOrphanOpsService(t, stub, true)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/orphans/sb-orphan/reclaim-local", nil)
+	req.SetPathValue("id", "sb-orphan")
+	rr := httptest.NewRecorder()
+	h.clusterReclaimOrphanLocal(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 body=%q", rr.Code, rr.Body.String())
+	}
+	if len(stub.claimCalls) != 0 {
+		t.Fatalf("claimCalls = %+v, want none", stub.claimCalls)
+	}
+}
+
+func TestClusterDeleteOrphanDeletesOnlyOrphanPlacement(t *testing.T) {
+	stub := &orphanOpsStubCluster{
+		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		placement: cluster.Placement{
+			SandboxID:           "sb-orphan",
+			OwnerState:          cluster.PlacementOwnerStateOrphaned,
+			OrphanedOwnerNodeID: "node-b",
+		},
+		hasPlace: true,
+	}
+	h, cleanup := newOrphanOpsService(t, stub, false)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/cluster/orphans/sb-orphan", nil)
+	req.SetPathValue("id", "sb-orphan")
+	rr := httptest.NewRecorder()
+	h.clusterDeleteOrphan(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 body=%q", rr.Code, rr.Body.String())
+	}
+	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-orphan" {
+		t.Fatalf("deleteCalls = %+v, want [sb-orphan]", stub.deleteCalls)
 	}
 }
 

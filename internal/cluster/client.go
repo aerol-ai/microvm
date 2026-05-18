@@ -292,14 +292,14 @@ func (c *Cluster) currentRecreator() SandboxRecreator {
 
 // OwnerOf reads the placement map from the local FSM (no network round-trip).
 // Returns ErrUnknownSandbox if no row exists, or ErrOrphaned if the placement
-// exists but its owner field is empty (auto-orphaned after the owning node
-// died — see voter_autojoin / dead-owner reconciler).
+// exists but has no active owner (auto-orphaned after the owning node died —
+// see voter_autojoin / dead-owner reconciler).
 func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	p, ok := c.fsm.get(sandboxID)
 	if !ok {
 		return OwnerInfo{}, ErrUnknownSandbox
 	}
-	if p.OwnerNodeID == "" {
+	if p.IsOrphaned() {
 		return OwnerInfo{}, ErrOrphaned
 	}
 	apiURL := p.OwnerAPIURL
@@ -362,6 +362,24 @@ func (c *Cluster) AttachInternalHandler(h http.Handler) {
 func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	cmd := command{
 		Op:                 opPlace,
+		SandboxID:          sandboxID,
+		OwnerNodeID:        c.nodeID,
+		OwnerAPIURL:        c.apiURL,
+		OwnerDataPlaneHost: c.dataPlaneHost,
+		Spec:               spec,
+		SealedSecrets:      sealedSecrets,
+	}
+	return c.applyCommand(ctx, cmd)
+}
+
+// ClaimOrphan commits sandboxID -> self only if the existing placement is
+// currently orphaned and was orphaned from this node (or predates the
+// previous-owner metadata). This is the false-positive recovery path for a
+// node that was marked dead by gossip but never actually lost its local
+// sandbox.
+func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+	cmd := command{
+		Op:                 opClaimOrphan,
 		SandboxID:          sandboxID,
 		OwnerNodeID:        c.nodeID,
 		OwnerAPIURL:        c.apiURL,
@@ -564,27 +582,25 @@ func (c *Cluster) IsNodeDrained(nodeID string) bool {
 //     and replay ExposedPort intents via opAddExposedPort (no-ops when
 //     already recorded).
 //
-//   - **FSM owner != self.** **Do NOT reclaim.** This is the failover-recovery
-//     case: this node died, the dead-owner reconciler reassigned the sandbox
-//     to a new owner, the new owner already recreated it from the replicated
-//     spec, and now this node is back online with a stale local row. Calling
-//     RecordPlacement here would overwrite the new owner's ownership in the
-//     FSM, then the new owner's stale-ownership reconciler would destroy its
-//     freshly-recreated container — silently destroying user state.
-//     Instead: log loudly and leave the FSM alone. service.reconcileStaleOwnership
-//     handles destroying the local container + store row on the next reconcile
-//     pass (it runs at boot too, so cleanup is prompt).
+//   - **FSM orphaned from self.** Reclaim via opClaimOrphan, then replay the
+//     same spec/port backfill. This is the false-positive dead-owner recovery
+//     path: gossip/Raft marked us dead, but the local sandbox never left.
+//
+//   - **FSM owner != self, or orphaned from another owner.** **Do NOT reclaim.**
+//     This is the failover-recovery/stale-local-row case. Calling
+//     RecordPlacement here would overwrite another owner or steal a different
+//     dead node's orphan. Instead: log loudly and leave the FSM alone.
+//     service.reconcileStaleOwnership handles destroying stale local copies on
+//     its next pass when the placement has an active different owner.
 //
 // Edge cases:
 //   - Owner unknown to gossip yet (fresh boot, gossip not converged): we still
 //     defer. Treating "presumed alive" as the safe default keeps us from racing
 //     a peer whose announce just hasn't reached us. The next reconcile pass
 //     reclassifies.
-//   - Owner is dead in gossip: still defer. The dead-owner reconciler orphans
-//     stale placements after SB_DEAD_OWNER_GRACE; once orphaned, the placement
-//     either gets reassigned to us (we have it locally) via the watcher, or
-//     stays orphaned for some other live node to pick up. Either way, racing
-//     it from here would just create the same overwrite hazard.
+//   - Owner is dead in gossip: still defer until the leader has committed the
+//     orphan transition. Claiming before the FSM records which previous owner
+//     lost the row would recreate the overwrite hazard.
 func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState) error {
 	if len(local) == 0 {
 		return nil
@@ -616,7 +632,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				}
 			}
 
-		case existing.OwnerNodeID == c.nodeID:
+		case existing.OwnerNodeID == c.nodeID && !existing.IsOrphaned():
 			// We legitimately own it. Backfill any missing spec/secrets so
 			// future failover-recreate has everything it needs (closes the
 			// pre-cluster-sandbox limitation), then replay port intents.
@@ -631,21 +647,41 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				}
 			}
 
+		case placementCanBeClaimedBy(existing, c.nodeID):
+			if err := c.ClaimOrphan(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			for port, route := range st.ExposedPorts {
+				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+
 		default:
-			// existing.OwnerNodeID != self — we're the stale local copy from
-			// a failover-recreate that already ran on the new owner.
-			// MUST NOT call RecordPlacement here; see comment above.
-			// service.reconcileStaleOwnership destroys the local container
-			// and store row on its next pass (which runs at boot).
-			c.logger.Warn("cluster: local sandbox row is stale (FSM owner differs); leaving FSM alone, stale-ownership reconciler will clean up local state",
+			// existing.OwnerNodeID != self, or the row is orphaned from some
+			// other previous owner. MUST NOT call RecordPlacement here; see
+			// comment above.
+			c.logger.Warn("cluster: local sandbox row is stale or non-claimable; leaving FSM alone",
 				"sandbox_id", st.ID,
 				"fsm_owner", existing.OwnerNodeID,
+				"owner_state", existing.OwnerState,
+				"orphaned_owner", existing.OrphanedOwnerNodeID,
 				"self", c.nodeID,
 				"placement_version", existing.Version,
 			)
 		}
 	}
 	return firstErr
+}
+
+func placementCanBeClaimedBy(p Placement, nodeID string) bool {
+	if nodeID == "" || !p.IsOrphaned() {
+		return false
+	}
+	return p.OrphanedOwnerNodeID == "" || p.OrphanedOwnerNodeID == nodeID
 }
 
 // applyCommand encodes and submits a raft log entry. On a follower the

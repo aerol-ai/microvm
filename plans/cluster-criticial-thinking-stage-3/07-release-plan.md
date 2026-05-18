@@ -99,24 +99,30 @@ Release gate:
   request;
 - failed Caddy admin does not advance installed-version metrics.
 
-## P0 - Define Orphan And Recovery Semantics
+## P0 - Define Orphan And Recovery Semantics - Fixed For No-Recreate Policy
 
-Required changes:
+Implemented:
 
-- node lease model;
-- explicit owner states;
-- batch orphan/recover commands;
-- operator APIs for orphan inspect, reclaim, force-delete, and recreate;
+- explicit owner states and orphan metadata on placement records;
+- single-command batch orphan by owner node ID;
+- previous-owner-only orphan reclaim command;
+- operator APIs for orphan inspect, local reclaim, and force-delete;
 - false-positive dead-owner recovery path;
-- optional recreate policy with queues and backoff if product wants it.
+- 100k-placement scale gate for batch orphan behavior.
+
+Still product-gated:
+
+- optional recreate policy with queues and backoff if product wants automatic
+  HA recreation instead of the current 410 Gone policy.
 
 Release gate:
 
-- partition owner from servers, heal it, and verify documented behavior;
-- false-positive orphan can be recovered without DB surgery;
-- dead owner with 1,000 sandboxes does not generate unbounded Raft or Caddy
-  storms;
-- clients receive stable structured errors.
+- partition owner from servers, heal it, and verify previous-owner reclaim;
+- false-positive orphan can be recovered without DB surgery through
+  `/v1/cluster/orphans/{id}/reclaim-local`;
+- dead owner with 1,000 sandboxes emits one orphan command instead of one Raft
+  write per sandbox;
+- clients receive stable 410 for unreclaimed orphans.
 
 ## P1 - Reduce Secret Blast Radius
 
@@ -214,4 +220,3 @@ Target: 1,000+ workers and 100,000 total sandboxes.
 
 10,000 nodes should be treated as a separate architecture milestone, not a
 linear extension of this PR.
-

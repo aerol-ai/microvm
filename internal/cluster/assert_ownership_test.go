@@ -169,6 +169,103 @@ func TestAssertOwnershipDoesNotReclaimForeignOwnedPlacement(t *testing.T) {
 	}
 }
 
+func TestAssertOwnershipClaimsOwnOrphanedPlacement(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	place, _ := encodeCommand(command{
+		Op:          opPlace,
+		SandboxID:   "sb-orphaned-self",
+		OwnerNodeID: "leader",
+		OwnerAPIURL: "http://old-leader",
+		Spec:        &models.CreateSandboxRequest{Image: "alpine:old", CPU: 1},
+	})
+	if err := c.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
+		t.Fatalf("seed opPlace: %v", err)
+	}
+	orphan, _ := encodeCommand(command{Op: opOrphanOwner, NodeID: "leader"})
+	if err := c.raft.raft.Apply(orphan, 2*time.Second).Error(); err != nil {
+		t.Fatalf("seed opOrphanOwner: %v", err)
+	}
+	if _, err := c.OwnerOf("sb-orphaned-self"); err != ErrOrphaned {
+		t.Fatalf("seed OwnerOf err = %v, want ErrOrphaned", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	local := []LocalSandboxState{{
+		ID:           "sb-orphaned-self",
+		Spec:         &models.CreateSandboxRequest{Image: "alpine:new", CPU: 2, MemoryMB: 512},
+		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
+	}}
+	if err := c.AssertOwnership(ctx, local); err != nil {
+		t.Fatalf("AssertOwnership: %v", err)
+	}
+	got, ok := c.fsm.get("sb-orphaned-self")
+	if !ok {
+		t.Fatal("placement disappeared")
+	}
+	if got.OwnerNodeID != "leader" || got.IsOrphaned() || got.OrphanedOwnerNodeID != "" || got.OrphanedUnix != 0 {
+		t.Fatalf("orphan was not reclaimed by previous owner: %+v", got)
+	}
+	if got.Spec == nil || got.Spec.Image != "alpine:new" || got.Spec.CPU != 2 {
+		t.Fatalf("reclaimed placement did not backfill spec: %+v", got.Spec)
+	}
+	if got.ExposedPorts[8080] != "http" {
+		t.Fatalf("reclaimed placement did not replay port intent: %+v", got.ExposedPorts)
+	}
+}
+
+func TestAssertOwnershipDoesNotClaimOtherOwnerOrphan(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	place, _ := encodeCommand(command{
+		Op:          opPlace,
+		SandboxID:   "sb-other-orphan",
+		OwnerNodeID: "node-b",
+		OwnerAPIURL: "http://node-b",
+		Spec:        &models.CreateSandboxRequest{Image: "alpine:owner-b"},
+	})
+	if err := c.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
+		t.Fatalf("seed opPlace: %v", err)
+	}
+	orphan, _ := encodeCommand(command{Op: opOrphanOwner, NodeID: "node-b"})
+	if err := c.raft.raft.Apply(orphan, 2*time.Second).Error(); err != nil {
+		t.Fatalf("seed opOrphanOwner: %v", err)
+	}
+	before, _ := c.fsm.get("sb-other-orphan")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	local := []LocalSandboxState{{
+		ID:           "sb-other-orphan",
+		Spec:         &models.CreateSandboxRequest{Image: "alpine:leader-stale"},
+		ExposedPorts: map[int]ExposedPortRoute{9090: {Protocol: "http"}},
+	}}
+	if err := c.AssertOwnership(ctx, local); err != nil {
+		t.Fatalf("AssertOwnership: %v", err)
+	}
+	after, _ := c.fsm.get("sb-other-orphan")
+	if !after.IsOrphaned() || after.OrphanedOwnerNodeID != "node-b" {
+		t.Fatalf("other owner's orphan was claimed: %+v", after)
+	}
+	if after.Version != before.Version {
+		t.Fatalf("non-claimable orphan was mutated: version %d -> %d", before.Version, after.Version)
+	}
+	if _, exists := after.ExposedPorts[9090]; exists {
+		t.Fatalf("non-claimable orphan received local port intent: %+v", after.ExposedPorts)
+	}
+}
+
 // TestAssertOwnershipIsIdempotent guards the two-restart case: after the first
 // boot writes the backfill, a second boot with the same payload must produce
 // no churn — same ownership, same spec, same ports.

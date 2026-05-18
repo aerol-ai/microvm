@@ -129,3 +129,46 @@ func TestScaleGatePendingReservationIndexAt100KPlacements(t *testing.T) {
 		t.Fatalf("expired pending owner buckets=%d, want 0", got)
 	}
 }
+
+func TestScaleGateBatchOrphanOwnerAt100KPlacements(t *testing.T) {
+	requireScaleGates(t)
+	fsm := newPlacementFSM()
+	const n = 100_000
+	const owners = 10_000
+	for i := 0; i < n; i++ {
+		place, _ := encodeCommand(command{
+			Op:          opPlace,
+			SandboxID:   fmt.Sprintf("orphan-gate-%06d", i),
+			OwnerNodeID: fmt.Sprintf("node-%04d", i%owners),
+			Spec:        &models.CreateSandboxRequest{Image: "alpine"},
+		})
+		if got := fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: place}); got != nil {
+			t.Fatalf("place %d: %v", i, got)
+		}
+	}
+
+	dead := "node-0042"
+	if got := fsm.idsOwnedBy(dead); len(got) != n/owners {
+		t.Fatalf("pre-orphan idsOwnedBy(%s)=%d, want %d", dead, len(got), n/owners)
+	}
+	orphan, _ := encodeCommand(command{Op: opOrphanOwner, NodeID: dead})
+	if got := fsm.Apply(&raft.Log{Index: n + 1, Data: orphan}); got != nil {
+		t.Fatalf("opOrphanOwner at 100k: %v", got)
+	}
+	if got := fsm.idsOwnedBy(dead); len(got) != 0 {
+		t.Fatalf("post-orphan idsOwnedBy(%s)=%d, want 0", dead, len(got))
+	}
+	page := fsm.placementPage(PlacementPageRequest{Limit: 1000})
+	found := false
+	for _, p := range page.Placements {
+		if p.OrphanedOwnerNodeID == dead {
+			found = true
+			if !p.IsOrphaned() {
+				t.Fatalf("placement carries previous owner but is not orphaned: %+v", p)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("first placement page did not include any orphaned rows for %s; test seed may be invalid", dead)
+	}
+}

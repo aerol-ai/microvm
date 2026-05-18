@@ -254,6 +254,19 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 	return a.applyCommand(ctx, cmd)
 }
 
+func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
+	cmd := command{
+		Op:                 opClaimOrphan,
+		SandboxID:          sandboxID,
+		OwnerNodeID:        a.nodeID,
+		OwnerAPIURL:        a.apiURL,
+		OwnerDataPlaneHost: a.dataPlaneHost,
+		Spec:               spec,
+		SealedSecrets:      sealedSecrets,
+	}
+	return a.applyCommand(ctx, cmd)
+}
+
 func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, sealedSecrets []byte) error {
 	if spec == nil && sealedSecrets == nil {
 		return nil
@@ -372,7 +385,7 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 					firstErr = err
 				}
 			}
-		case existing.Placement.OwnerNodeID == a.nodeID:
+		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned():
 			if existing.Placement.Spec == nil && st.Spec != nil {
 				if err := a.UpsertSpec(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil && firstErr == nil {
 					firstErr = err
@@ -383,10 +396,24 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 					firstErr = err
 				}
 			}
+		case placementCanBeClaimedBy(existing.Placement, a.nodeID):
+			if err := a.ClaimOrphan(ctx, st.ID, st.Spec, st.SealedSecrets); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			for port, route := range st.ExposedPorts {
+				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 		default:
-			a.logger.Warn("cluster agent: local sandbox row is stale; placement belongs to another owner",
+			a.logger.Warn("cluster agent: local sandbox row is stale or non-claimable; leaving FSM alone",
 				"sandbox_id", st.ID,
 				"fsm_owner", existing.Placement.OwnerNodeID,
+				"owner_state", existing.Placement.OwnerState,
+				"orphaned_owner", existing.Placement.OrphanedOwnerNodeID,
 				"self", a.nodeID,
 				"placement_version", existing.Placement.Version,
 			)

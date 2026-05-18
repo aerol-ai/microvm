@@ -34,6 +34,9 @@ func TestNoopAlwaysSelf(t *testing.T) {
 	if err := n.RecordPlacement(context.Background(), "x", nil, nil); err != nil {
 		t.Fatalf("RecordPlacement: %v", err)
 	}
+	if err := n.ClaimOrphan(context.Background(), "x", nil, nil); err != nil {
+		t.Fatalf("ClaimOrphan: %v", err)
+	}
 	if err := n.UpsertSpec(context.Background(), "x", nil, nil); err != nil {
 		t.Fatalf("UpsertSpec: %v", err)
 	}
