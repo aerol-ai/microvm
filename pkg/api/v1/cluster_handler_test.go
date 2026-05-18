@@ -265,6 +265,93 @@ func TestClusterCreateWrapRejectsCreateForwardedToWrongNode(t *testing.T) {
 
 var _ cluster.Client = (*createForwardCluster)(nil)
 
+type membersStubCluster struct {
+	*cluster.Noop
+	members []cluster.Member
+}
+
+func (c *membersStubCluster) Members() []cluster.Member {
+	return c.members
+}
+
+var _ cluster.Client = (*membersStubCluster)(nil)
+
+func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	members := []cluster.Member{
+		{NodeID: "node-a", APIURL: "http://node-a:21212", Alive: true, Role: config.NodeRoleMixed},
+	}
+	for i := 0; i < clusterListMaxFanoutPeers+1; i++ {
+		members = append(members, cluster.Member{
+			NodeID: "worker-" + strconv.Itoa(i),
+			APIURL: "http://worker-" + strconv.Itoa(i) + ":21212",
+			Alive:  true,
+			Role:   config.NodeRoleWorker,
+		})
+	}
+	svc.AttachCluster(&membersStubCluster{
+		Noop:    cluster.NewNoop("node-a", "http://node-a:21212"),
+		members: members,
+	})
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil)
+	rr := httptest.NewRecorder()
+	h.clusterListWrap(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "/v1/cluster/sandbox-index") {
+		t.Fatalf("body = %q, want it to point callers at the paginated index", body)
+	}
+	if strings.Contains(body, `"placements"`) {
+		t.Fatalf("body = %q, must not return the sandbox-index response shape from /v1/sandboxes", body)
+	}
+}
+
+func TestClusterIngressRouteReturnsDeterministicShardOwner(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	members := []cluster.Member{
+		{NodeID: "worker-a", APIURL: "http://worker-a:21212", DataPlaneHost: "worker-a.internal", Alive: true, Role: config.NodeRoleWorker},
+		{NodeID: "ing-b", APIURL: "http://ing-b:21212", InternalURL: "https://ing-b.internal:21213", DataPlaneHost: "ing-b.internal", Alive: true, Role: config.NodeRoleIngress},
+		{NodeID: "ing-a", APIURL: "http://ing-a:21212", InternalURL: "https://ing-a.internal:21213", DataPlaneHost: "ing-a.internal", Alive: true, Role: config.NodeRoleIngress},
+		{NodeID: "ing-dead", APIURL: "http://ing-dead:21212", DataPlaneHost: "ing-dead.internal", Alive: false, Role: config.NodeRoleIngress},
+	}
+	svc.AttachCluster(&membersStubCluster{
+		Noop:    cluster.NewNoop("ing-a", "http://ing-a:21212"),
+		members: members,
+	})
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/cluster/ingress-route/sb-route", nil)
+	req.SetPathValue("id", "sb-route")
+	rr := httptest.NewRecorder()
+	h.clusterIngressRoute(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%q)", rr.Code, rr.Body.String())
+	}
+	var got cluster.IngressShardRoute
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v body=%q", err, rr.Body.String())
+	}
+	wantShard := cluster.PlacementShardForSandbox("sb-route", cluster.DefaultPlacementShardCount)
+	if got.SandboxID != "sb-route" || got.Shard != wantShard || got.ShardCount != cluster.DefaultPlacementShardCount {
+		t.Fatalf("route = %+v, want sandbox_id=sb-route shard=%d shard_count=%d", got, wantShard, cluster.DefaultPlacementShardCount)
+	}
+	wantOwner := []string{"ing-a", "ing-b"}[wantShard%2]
+	if len(got.Owners) != 1 || got.Owners[0].NodeID != wantOwner {
+		t.Fatalf("owners = %+v, want single owner %q", got.Owners, wantOwner)
+	}
+	if got.Owners[0].DataPlaneHost == "" || got.Owners[0].APIURL == "" || got.Owners[0].InternalURL == "" {
+		t.Fatalf("owner = %+v, want route targets populated for upstream routers", got.Owners[0])
+	}
+}
+
 // ownerOfStubCluster lets a test drive clusterForwardWrap's OwnerOf branch
 // without standing up a real raft FSM. The body returns whatever the test
 // configured.

@@ -35,6 +35,20 @@ type PlacementPageResponse struct {
 	NextPageToken string      `json:"next_page_token,omitempty"`
 }
 
+type IngressRouteOwner struct {
+	NodeID        string `json:"node_id"`
+	APIURL        string `json:"api_url,omitempty"`
+	InternalURL   string `json:"internal_url,omitempty"`
+	DataPlaneHost string `json:"data_plane_host,omitempty"`
+}
+
+type IngressShardRoute struct {
+	SandboxID  string              `json:"sandbox_id"`
+	Shard      int                 `json:"shard"`
+	ShardCount int                 `json:"shard_count"`
+	Owners     []IngressRouteOwner `json:"owners"`
+}
+
 func (r PlacementPageRequest) Normalize() PlacementPageRequest {
 	limit := r.Limit
 	if limit <= 0 {
@@ -88,4 +102,109 @@ func PlacementShardForSandbox(sandboxID string, count int) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(sandboxID))
 	return int(h.Sum32() % uint32(count))
+}
+
+// IngressShardFilterForNode returns the stable placement shard subset a single
+// ingress-capable node should reconcile. The nodeID is included even if gossip
+// has not reported the local member yet, which keeps a freshly booted ingress
+// process from temporarily reconciling the full placement table.
+func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFilter {
+	if nodeID == "" {
+		return PlacementShardFilter{}
+	}
+	ids := ingressShardNodeIDs(members)
+	found := false
+	for _, id := range ids {
+		if id == nodeID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		ids = append(ids, nodeID)
+		sort.Strings(ids)
+	}
+	selfIndex := -1
+	for i, id := range ids {
+		if id == nodeID {
+			selfIndex = i
+			break
+		}
+	}
+	if selfIndex < 0 || len(ids) == 0 {
+		return PlacementShardFilter{}
+	}
+
+	shards := make([]int, 0, DefaultPlacementShardCount/len(ids)+1)
+	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
+		if shard%len(ids) == selfIndex {
+			shards = append(shards, shard)
+		}
+	}
+	return PlacementShardFilter{
+		ShardCount: DefaultPlacementShardCount,
+		Shards:     shards,
+	}
+}
+
+// IngressRouteForSandbox returns the ingress owner set an upstream router
+// should target for sandboxID. Today the owner set has one member; the slice is
+// intentional so replicated shard owners can be added without changing the
+// response shape.
+func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRoute {
+	shardCount := DefaultPlacementShardCount
+	shard := PlacementShardForSandbox(sandboxID, shardCount)
+	owners := ingressRouteOwners(members)
+	route := IngressShardRoute{
+		SandboxID:  sandboxID,
+		Shard:      shard,
+		ShardCount: shardCount,
+		Owners:     []IngressRouteOwner{},
+	}
+	if len(owners) == 0 {
+		return route
+	}
+	route.Owners = append(route.Owners, owners[shard%len(owners)])
+	return route
+}
+
+func ingressShardNodeIDs(members []Member) []string {
+	seen := make(map[string]struct{}, len(members))
+	ids := make([]string, 0, len(members))
+	for _, m := range members {
+		if m.NodeID == "" || !m.Alive || !CanServeIngressRole(m.Role) {
+			continue
+		}
+		if _, ok := seen[m.NodeID]; ok {
+			continue
+		}
+		seen[m.NodeID] = struct{}{}
+		ids = append(ids, m.NodeID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func ingressRouteOwners(members []Member) []IngressRouteOwner {
+	seen := make(map[string]struct{}, len(members))
+	owners := make([]IngressRouteOwner, 0, len(members))
+	for _, m := range members {
+		if m.NodeID == "" || !m.Alive || !CanServeIngressRole(m.Role) {
+			continue
+		}
+		if _, ok := seen[m.NodeID]; ok {
+			continue
+		}
+		seen[m.NodeID] = struct{}{}
+		owners = append(owners, IngressRouteOwner{
+			NodeID:        m.NodeID,
+			APIURL:        m.APIURL,
+			InternalURL:   m.InternalURL,
+			DataPlaneHost: m.DataPlaneHost,
+		})
+	}
+	sort.Slice(owners, func(i, j int) bool {
+		return owners[i].NodeID < owners[j].NodeID
+	})
+	return owners
 }

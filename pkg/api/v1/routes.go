@@ -107,6 +107,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.Auth(http.HandlerFunc(h.clusterLeader)))
 	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", d.Auth(http.HandlerFunc(h.clusterPlacement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", d.Auth(http.HandlerFunc(h.clusterSandboxIndex)))
+	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", d.Auth(http.HandlerFunc(h.clusterIngressRoute)))
 	// Drain / uncordon are operator admission controls — they don't move
 	// existing work, they just stop SelectPlacement from sending new sandboxes
 	// to the node. PATCH-style verbs would also fit but POST keeps the surface

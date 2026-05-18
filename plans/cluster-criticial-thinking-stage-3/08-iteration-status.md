@@ -37,9 +37,14 @@ real production soak, not in the obvious unbounded hot paths.
 - Ingress route ownership is sharded across ingress-capable members. Reconcile
   builds desired route intents, applies only deltas, batches Caddy writes, and
   runs full Caddy snapshot GC as a sparse backstop rather than the normal path.
+- Upstream routers now have a deterministic shard lookup at
+  `/v1/cluster/ingress-route/{id}`. It returns the sandbox's stable shard and
+  the ingress owner node/targets, using the same shard assignment as the
+  reconciler instead of requiring every ingress node to hold every route.
 - Cluster-wide sandbox enumeration now has a paginated control-plane index at
-  `/v1/cluster/sandbox-index`; when legacy peer fanout would exceed the safe
-  cap, `/v1/sandboxes` falls back to the index instead of failing closed.
+  `/v1/cluster/sandbox-index`. Legacy `/v1/sandboxes` keeps its original
+  response contract and fails closed with a pointer to the paginated index when
+  peer fanout would exceed the safe cap.
 - Raw TCP exposure has an FSM host-port index, so cluster-wide host-port
   collision checks are O(1) at 100k placements instead of scanning the global
   placement map.

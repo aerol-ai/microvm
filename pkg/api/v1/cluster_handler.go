@@ -382,7 +382,7 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		peers = append(peers, m)
 	}
 	if len(peers) > clusterListMaxFanoutPeers {
-		h.writeClusterSandboxIndex(w, r)
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster list fanout exceeds safe peer cap; use /v1/cluster/sandbox-index for paginated global enumeration")
 		return
 	}
 
@@ -514,6 +514,29 @@ func parseRepeatedIntQuery(r *http.Request, key string) []int {
 
 func (h *handlers) clusterSandboxIndex(w http.ResponseWriter, r *http.Request) {
 	h.writeClusterSandboxIndex(w, r)
+}
+
+func (h *handlers) clusterIngressRoute(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	route := cluster.IngressRouteForSandbox(c.Members(), id)
+	if len(route.Owners) == 0 {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: no alive ingress route owners")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, route)
 }
 
 func (h *handlers) writeClusterSandboxIndex(w http.ResponseWriter, r *http.Request) {

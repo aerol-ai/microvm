@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,45 +36,7 @@ func clusterIngressShardFilter(c cluster.Client, self string) cluster.PlacementS
 	if c == nil || self == "" {
 		return cluster.PlacementShardFilter{}
 	}
-
-	members := c.Members()
-	ids := make([]string, 0, len(members)+1)
-	seen := make(map[string]struct{}, len(members)+1)
-	for _, m := range members {
-		if m.NodeID == "" || !m.Alive || !cluster.CanServeIngressRole(m.Role) {
-			continue
-		}
-		if _, ok := seen[m.NodeID]; ok {
-			continue
-		}
-		seen[m.NodeID] = struct{}{}
-		ids = append(ids, m.NodeID)
-	}
-	if _, ok := seen[self]; !ok {
-		ids = append(ids, self)
-	}
-	sort.Strings(ids)
-	selfIndex := -1
-	for i, id := range ids {
-		if id == self {
-			selfIndex = i
-			break
-		}
-	}
-	if selfIndex < 0 || len(ids) == 0 {
-		return cluster.PlacementShardFilter{}
-	}
-
-	shards := make([]int, 0, cluster.DefaultPlacementShardCount/len(ids)+1)
-	for shard := 0; shard < cluster.DefaultPlacementShardCount; shard++ {
-		if shard%len(ids) == selfIndex {
-			shards = append(shards, shard)
-		}
-	}
-	return cluster.PlacementShardFilter{
-		ShardCount: cluster.DefaultPlacementShardCount,
-		Shards:     shards,
-	}
+	return cluster.IngressShardFilterForNode(c.Members(), self)
 }
 
 func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, self string) (map[string]ingressRouteIntent, bool) {
