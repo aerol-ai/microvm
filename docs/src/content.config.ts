@@ -23,6 +23,7 @@ export enum NavigationCategory {
   ACCESS,
   SDKS,
   FEATURES,
+  OPERATIONS,
   USE_CASES,
 }
 
@@ -240,6 +241,20 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         href: '/sandbox-tags',
         label: 'Sandbox Tags',
         description: 'Filter list responses by tag with AND semantics for multi-tenant control planes.',
+      },
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Operations',
+    category: NavigationCategory.OPERATIONS,
+    homePageHref: '/',
+    entries: [
+      {
+        type: 'link',
+        href: '/dashboard',
+        label: 'Dashboard',
+        description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics — sign in with your PAT.',
       },
     ],
   },

@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex,nofollow" />
+<title>AerolVM — sandboxd dashboard</title>
+<style>
+:root {
+  --bg: #0c0e12;
+  --panel: #14171d;
+  --panel2: #1a1e26;
+  --border: #2a2f3a;
+  --text: #d7dbe2;
+  --muted: #8b95a7;
+  --accent: #7aa2ff;
+  --ok: #6cc46c;
+  --warn: #e9c46a;
+  --bad: #ef6e6e;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 13px; line-height: 1.4; }
+a { color: var(--accent); }
+button {
+  font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--border);
+  padding: 4px 10px; border-radius: 4px; cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.danger { color: #ffd2d2; border-color: #5a2a2a; }
+button.danger:hover { background: #2a1414; border-color: var(--bad); }
+input[type="password"], input[type="text"] {
+  font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--border);
+  padding: 6px 8px; border-radius: 4px; width: 100%;
+}
+header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--panel);
+  position: sticky; top: 0; z-index: 10;
+}
+header .brand { font-weight: 600; color: var(--text); }
+header .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+header .actions { display: flex; gap: 8px; align-items: center; }
+header .actions label { color: var(--muted); display: inline-flex; gap: 4px; align-items: center; }
+main { padding: 18px; max-width: 1280px; margin: 0 auto; display: grid; gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+.card h2 { margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+.card .body { padding: 12px 14px; overflow-x: auto; }
+.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 24px; }
+.kv { display: flex; flex-direction: column; gap: 2px; }
+.kv .k { color: var(--muted); font-size: 11px; }
+.kv .v { color: var(--text); font-size: 13px; word-break: break-all; }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+.pill.ok { color: var(--ok); border-color: #2c5a2c; background: #122312; }
+.pill.warn { color: var(--warn); border-color: #5a4a1c; background: #231e10; }
+.pill.bad { color: var(--bad); border-color: #5a2a2a; background: #221212; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; }
+tr:last-child td { border-bottom: none; }
+td.actions { display: flex; gap: 6px; }
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 18px; }
+.metric { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; }
+.metric .k { color: var(--muted); font-size: 11px; }
+.metric .v { color: var(--text); font-size: 14px; }
+.muted { color: var(--muted); }
+.error { color: var(--bad); }
+pre.raw { background: var(--panel2); padding: 10px 12px; border-radius: 4px; max-height: 320px; overflow: auto; font-size: 11px; color: var(--muted); }
+details > summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
+.pager { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+
+#login {
+  position: fixed; inset: 0; background: rgba(8, 9, 12, 0.96);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+}
+#login .box {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 24px; width: 360px; max-width: 92vw;
+}
+#login h1 { margin: 0 0 4px; font-size: 18px; }
+#login p { margin: 0 0 16px; color: var(--muted); }
+#login .actions { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; }
+#login .error { margin-top: 10px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div id="login" hidden>
+  <form class="box" id="login-form" autocomplete="off">
+    <h1>sandboxd</h1>
+    <p>Sign in with <code>SB_PAT_TOKEN</code> to view this node.</p>
+    <input type="password" id="pat-input" placeholder="Personal access token" autofocus />
+    <div class="actions">
+      <button type="submit">Sign in</button>
+    </div>
+    <div class="error" id="login-error" hidden></div>
+  </form>
+</div>
+
+<header hidden id="app-header">
+  <div class="brand">
+    AerolVM dashboard <small id="node-summary">loading…</small>
+  </div>
+  <div class="actions">
+    <label><input type="checkbox" id="autorefresh" checked /> auto-refresh</label>
+    <button id="refresh-btn" type="button">Refresh</button>
+    <button id="signout-btn" type="button">Sign out</button>
+  </div>
+</header>
+
+<main hidden id="app-main">
+  <section class="card" id="health-card">
+    <h2>Health</h2>
+    <div class="body"><div class="row" id="health-row"><span class="muted">loading…</span></div></div>
+  </section>
+
+  <section class="card" id="capacity-card">
+    <h2>Local capacity</h2>
+    <div class="body"><div class="row" id="capacity-row"><span class="muted">loading…</span></div></div>
+  </section>
+
+  <section class="card" id="cluster-card">
+    <h2>Cluster</h2>
+    <div class="body">
+      <div class="row" style="margin-bottom: 10px;">
+        <div class="kv"><span class="k">Leader</span><span class="v" id="cluster-leader">—</span></div>
+        <div class="kv"><span class="k">Members</span><span class="v" id="cluster-count">—</span></div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>node_id</th><th>role</th><th>alive</th><th>drained</th>
+            <th>api_url</th><th>capacity</th><th>actions</th>
+          </tr>
+        </thead>
+        <tbody id="members-tbody"><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" id="placements-card">
+    <h2>Placements</h2>
+    <div class="body">
+      <table>
+        <thead>
+          <tr>
+            <th>sandbox_id</th><th>owner_node_id</th><th>state</th><th>version</th>
+            <th>created</th><th>updated</th><th>actions</th>
+          </tr>
+        </thead>
+        <tbody id="placements-tbody"><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+      </table>
+      <div class="pager">
+        <button id="next-page-btn" type="button" disabled>Next page</button>
+        <button id="reset-page-btn" type="button">Reset</button>
+        <span class="muted" id="page-info"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="metrics-card">
+    <h2>Metrics (expvar)</h2>
+    <div class="body">
+      <div class="metrics-grid" id="metrics-grid"><span class="muted">loading…</span></div>
+      <details>
+        <summary>Show raw /debug/vars</summary>
+        <pre class="raw" id="metrics-raw">loading…</pre>
+      </details>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const PAT_KEY = "aerolvm.pat";
+const REFRESH_MS = 5000;
+
+const state = {
+  pat: sessionStorage.getItem(PAT_KEY) || "",
+  pageTokens: [""],
+  pageIndex: 0,
+  timer: null,
+};
+
+const el = (id) => document.getElementById(id);
+
+// ---------- auth ----------
+
+function showLogin(errorMsg) {
+  el("login").hidden = false;
+  el("app-header").hidden = true;
+  el("app-main").hidden = true;
+  if (errorMsg) {
+    el("login-error").hidden = false;
+    el("login-error").textContent = errorMsg;
+  } else {
+    el("login-error").hidden = true;
+  }
+  setTimeout(() => el("pat-input").focus(), 0);
+}
+
+function showApp() {
+  el("login").hidden = true;
+  el("app-header").hidden = false;
+  el("app-main").hidden = false;
+}
+
+el("login-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const v = el("pat-input").value.trim();
+  if (!v) { return; }
+  state.pat = v;
+  sessionStorage.setItem(PAT_KEY, v);
+  showApp();
+  refreshAll(true);
+});
+
+el("signout-btn").addEventListener("click", () => {
+  sessionStorage.removeItem(PAT_KEY);
+  state.pat = "";
+  el("pat-input").value = "";
+  stopTimer();
+  showLogin(null);
+});
+
+// ---------- fetch wrapper ----------
+
+async function api(path, opts) {
+  opts = opts || {};
+  const headers = Object.assign({}, opts.headers || {}, {
+    "Authorization": "Bearer " + state.pat,
+    "Accept": "application/json",
+  });
+  let res;
+  try {
+    res = await fetch(path, { method: opts.method || "GET", headers, body: opts.body });
+  } catch (err) {
+    throw new Error("network: " + (err && err.message ? err.message : err));
+  }
+  if (res.status === 401) {
+    sessionStorage.removeItem(PAT_KEY);
+    state.pat = "";
+    showLogin("Invalid or expired token. Sign in again.");
+    throw new Error("unauthorized");
+  }
+  return res;
+}
+
+async function apiJSON(path) {
+  const res = await api(path);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(res.status + " " + (text || res.statusText));
+  }
+  return res.json();
+}
+
+// ---------- formatters ----------
+
+function pill(status, kind) {
+  const cls = kind === "ok" ? "ok" : kind === "warn" ? "warn" : "bad";
+  return `<span class="pill ${cls}">${escapeHTML(status)}</span>`;
+}
+
+function escapeHTML(s) {
+  if (s === null || s === undefined) { return ""; }
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
+
+function fmtNum(n) {
+  if (n === undefined || n === null) { return "—"; }
+  return Number(n).toLocaleString();
+}
+
+function fmtFloat(n, digits) {
+  if (n === undefined || n === null) { return "—"; }
+  return Number(n).toFixed(digits == null ? 2 : digits);
+}
+
+function fmtPct(n) {
+  if (n === undefined || n === null) { return "—"; }
+  return (Number(n) * 100).toFixed(1) + "%";
+}
+
+function fmtUnix(u) {
+  if (!u) { return "—"; }
+  try { return new Date(Number(u) * 1000).toISOString().replace("T", " ").replace("Z", "Z"); }
+  catch (e) { return String(u); }
+}
+
+function fmtNanos(n) {
+  if (!n) { return "—"; }
+  const ms = Number(n) / 1e6;
+  if (ms >= 1000) { return (ms / 1000).toFixed(2) + " s"; }
+  if (ms >= 1) { return ms.toFixed(2) + " ms"; }
+  return (Number(n) / 1e3).toFixed(0) + " µs";
+}
+
+// ---------- panels ----------
+
+async function loadHealth() {
+  try {
+    const h = await apiJSON("/health");
+    const statusKind = h.status === "ok" ? "ok" : h.status === "degraded" ? "warn" : "bad";
+    const dockerKind = h.docker === "ok" ? "ok" : "bad";
+    const caddyKind = h.caddy === "ok" ? "ok" : "bad";
+    const sshKind = h.ssh_gateway === "ok" ? "ok" : h.ssh_gateway === "disabled" ? "warn" : "bad";
+    el("health-row").innerHTML = `
+      <div class="kv"><span class="k">overall</span><span class="v">${pill(h.status || "?", statusKind)}</span></div>
+      <div class="kv"><span class="k">docker</span><span class="v">${pill(h.docker || "?", dockerKind)}</span></div>
+      <div class="kv"><span class="k">caddy</span><span class="v">${pill(h.caddy || "?", caddyKind)}</span></div>
+      <div class="kv"><span class="k">ssh_gateway</span><span class="v">${pill(h.ssh_gateway || "?", sshKind)}</span></div>
+      <div class="kv"><span class="k">live sandboxes</span><span class="v">${fmtNum(h.sandboxes)}</span></div>
+      <div class="kv"><span class="k">version</span><span class="v">${escapeHTML(h.version || "—")}</span></div>
+    `;
+    el("node-summary").textContent = (h.version ? "v" + h.version + " · " : "") + (h.status || "?") + " · " + window.location.host;
+  } catch (err) {
+    el("health-row").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
+  }
+}
+
+async function loadCapacity() {
+  try {
+    const c = await apiJSON("/v1/capacity");
+    const admitKind = c.can_admit ? "ok" : "bad";
+    el("capacity-row").innerHTML = `
+      <div class="kv"><span class="k">can_admit</span><span class="v">${pill(c.can_admit ? "yes" : "no", admitKind)}</span></div>
+      <div class="kv"><span class="k">live sandboxes</span><span class="v">${fmtNum(c.sandboxes_active)}</span></div>
+      <div class="kv"><span class="k">cpu reserved</span><span class="v">${fmtFloat(c.reserved_cpu)} / ${fmtFloat(c.cpu_budget)} (${fmtPct(c.cpu_reservation_ratio)})</span></div>
+      <div class="kv"><span class="k">memory reserved</span><span class="v">${fmtNum(c.reserved_memory_mb)} / ${fmtNum(c.memory_budget_mb)} MB (${fmtPct(c.memory_reservation_ratio)})</span></div>
+      <div class="kv"><span class="k">disk reserved</span><span class="v">${fmtNum(c.reserved_disk_gb)} / ${fmtNum(c.disk_budget_gb)} GB${c.disk_reservation_ratio ? " (" + fmtPct(c.disk_reservation_ratio) + ")" : ""}</span></div>
+      <div class="kv"><span class="k">memory free</span><span class="v">${fmtNum(c.live_memory_free_mb)} MB</span></div>
+      <div class="kv"><span class="k">gpus</span><span class="v">${c.gpu_count ? fmtNum(c.reserved_gpus) + " / " + fmtNum(c.gpu_count) + " (" + escapeHTML(c.gpu_vendor || "?") + ")" : "—"}</span></div>
+      <div class="kv"><span class="k">runtimes</span><span class="v">${escapeHTML((c.supported_runtimes || []).join(", ") || "—")}</span></div>
+      ${c.reasons && c.reasons.length ? `<div class="kv" style="grid-column: 1 / -1;"><span class="k">reasons</span><span class="v error">${escapeHTML(c.reasons.join(" · "))}</span></div>` : ""}
+    `;
+  } catch (err) {
+    el("capacity-row").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
+  }
+}
+
+async function loadCluster() {
+  try {
+    const [leader, members] = await Promise.all([
+      apiJSON("/v1/cluster/leader"),
+      apiJSON("/v1/cluster/members"),
+    ]);
+    el("cluster-leader").textContent = leader.leader || "(single-node or no leader)";
+    const ms = members.members || [];
+    el("cluster-count").textContent = fmtNum(ms.length);
+    if (ms.length === 0) {
+      el("members-tbody").innerHTML = `<tr><td colspan="7" class="muted">no peers gossiped</td></tr>`;
+      return;
+    }
+    el("members-tbody").innerHTML = ms.map((m) => {
+      const aliveKind = m.alive ? "ok" : "bad";
+      const drainedKind = m.drained ? "warn" : "ok";
+      const cap = m.capacity || {};
+      const capSummary = (cap.host_cpu_cores != null)
+        ? `${fmtNum(cap.sandboxes_active || 0)} sb · cpu ${fmtPct(cap.cpu_reservation_ratio || 0)} · mem ${fmtPct(cap.memory_reservation_ratio || 0)}`
+        : "—";
+      const drainBtn = m.drained
+        ? `<button data-action="uncordon" data-id="${escapeHTML(m.node_id)}">Uncordon</button>`
+        : `<button class="danger" data-action="drain" data-id="${escapeHTML(m.node_id)}">Drain</button>`;
+      return `
+        <tr>
+          <td>${escapeHTML(m.node_id)}</td>
+          <td>${escapeHTML(m.role || "(mixed)")}</td>
+          <td>${pill(m.alive ? "alive" : "dead", aliveKind)}</td>
+          <td>${pill(m.drained ? "drained" : "active", drainedKind)}</td>
+          <td><span class="muted">${escapeHTML(m.api_url || "—")}</span></td>
+          <td><span class="muted">${capSummary}</span></td>
+          <td class="actions">${drainBtn}</td>
+        </tr>
+      `;
+    }).join("");
+  } catch (err) {
+    el("members-tbody").innerHTML = `<tr><td colspan="7" class="error">${escapeHTML(err.message)}</td></tr>`;
+  }
+}
+
+async function loadPlacements() {
+  try {
+    const token = state.pageTokens[state.pageIndex] || "";
+    const q = token ? "?limit=50&page_token=" + encodeURIComponent(token) : "?limit=50";
+    let p;
+    try {
+      p = await apiJSON("/v1/cluster/sandbox-index" + q);
+    } catch (err) {
+      if (String(err.message).startsWith("503")) {
+        el("placements-tbody").innerHTML = `<tr><td colspan="7" class="muted">cluster not enabled on this node</td></tr>`;
+        el("page-info").textContent = "";
+        el("next-page-btn").disabled = true;
+        return;
+      }
+      throw err;
+    }
+    const rows = p.placements || [];
+    if (rows.length === 0) {
+      el("placements-tbody").innerHTML = `<tr><td colspan="7" class="muted">no placements${token ? " on this page" : ""}</td></tr>`;
+    } else {
+      el("placements-tbody").innerHTML = rows.map((pl) => {
+        const orphaned = pl.owner_state === "orphaned";
+        const stateLabel = pl.state ? pl.state : (orphaned ? "orphaned" : "placed");
+        const stateKind = orphaned ? "bad" : (pl.state === "reserved" ? "warn" : "ok");
+        let actions = "";
+        if (orphaned) {
+          actions = `
+            <button data-action="reclaim" data-id="${escapeHTML(pl.sandbox_id)}">Reclaim local</button>
+            <button class="danger" data-action="delete-orphan" data-id="${escapeHTML(pl.sandbox_id)}">Force delete</button>
+          `;
+        }
+        return `
+          <tr>
+            <td>${escapeHTML(pl.sandbox_id)}</td>
+            <td>${escapeHTML(pl.owner_node_id || "—")}</td>
+            <td>${pill(stateLabel, stateKind)}</td>
+            <td>${fmtNum(pl.version)}</td>
+            <td><span class="muted">${fmtUnix(pl.created_unix)}</span></td>
+            <td><span class="muted">${fmtUnix(pl.updated_unix)}</span></td>
+            <td class="actions">${actions || '<span class="muted">—</span>'}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+    el("page-info").textContent = "page " + (state.pageIndex + 1);
+    el("next-page-btn").disabled = !p.next_page_token;
+    state.nextPageToken = p.next_page_token || "";
+  } catch (err) {
+    el("placements-tbody").innerHTML = `<tr><td colspan="7" class="error">${escapeHTML(err.message)}</td></tr>`;
+  }
+}
+
+// /debug/vars output is a JSON object. We surface a curated subset; the rest is in the raw collapsible.
+const METRIC_PICKS = [
+  ["aerolvm_raft_apply_total", "raft applies", fmtNum],
+  ["aerolvm_raft_apply_inflight", "raft apply inflight", fmtNum],
+  ["aerolvm_raft_apply_last_nanos", "raft apply last", fmtNanos],
+  ["aerolvm_raft_leader_forward_total", "leader forwards", fmtNum],
+  ["aerolvm_raft_snapshot_total", "raft snapshots", fmtNum],
+  ["aerolvm_raft_snapshot_last_nanos", "raft snapshot last", fmtNanos],
+  ["aerolvm_gossip_members_alive", "gossip alive", fmtNum],
+  ["aerolvm_gossip_members_total", "gossip total", fmtNum],
+  ["aerolvm_worker_leases_alive", "worker leases alive", fmtNum],
+  ["aerolvm_worker_leases_total", "worker leases total", fmtNum],
+  ["aerolvm_worker_lease_lost_total", "worker lease lost", fmtNum],
+  ["aerolvm_worker_lease_max_age_nanos", "worker lease max age", fmtNanos],
+  ["aerolvm_owner_forward_total", "owner forwards", fmtNum],
+  ["aerolvm_owner_forward_last_nanos", "owner forward last", fmtNanos],
+];
+
+async function loadMetrics() {
+  try {
+    const res = await api("/debug/vars");
+    if (!res.ok) { throw new Error(res.status + " " + res.statusText); }
+    const data = await res.json();
+    const grid = METRIC_PICKS.map(([key, label, fmt]) => {
+      if (!(key in data)) { return ""; }
+      return `<div class="metric"><span class="k">${escapeHTML(label)}</span><span class="v">${fmt(data[key])}</span></div>`;
+    }).filter(Boolean).join("");
+    el("metrics-grid").innerHTML = grid || `<span class="muted">no aerolvm_* metrics yet</span>`;
+    // Filter raw view to just aerolvm_* keys so the panel is operator-readable.
+    const filtered = {};
+    Object.keys(data).forEach((k) => { if (k.startsWith("aerolvm_")) { filtered[k] = data[k]; } });
+    el("metrics-raw").textContent = JSON.stringify(filtered, null, 2);
+  } catch (err) {
+    el("metrics-grid").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
+    el("metrics-raw").textContent = "";
+  }
+}
+
+// ---------- actions ----------
+
+async function postAction(method, path, label, id) {
+  if (!confirm(`${label} on ${id}?\n\nThis calls: ${method} ${path}`)) { return; }
+  try {
+    const res = await api(path, { method });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      alert(`${label} failed: ${res.status} ${res.statusText}\n${text}`);
+      return;
+    }
+    refreshAll(true);
+  } catch (err) {
+    alert(`${label} failed: ${err.message}`);
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  if (!(t instanceof Element) || !t.matches("button[data-action]")) { return; }
+  const id = t.getAttribute("data-id");
+  const action = t.getAttribute("data-action");
+  if (!id) { return; }
+  if (action === "drain") {
+    postAction("POST", `/v1/cluster/nodes/${encodeURIComponent(id)}/drain`, "Drain node", id);
+  } else if (action === "uncordon") {
+    postAction("POST", `/v1/cluster/nodes/${encodeURIComponent(id)}/uncordon`, "Uncordon node", id);
+  } else if (action === "reclaim") {
+    postAction("POST", `/v1/cluster/orphans/${encodeURIComponent(id)}/reclaim-local`, "Reclaim orphan locally", id);
+  } else if (action === "delete-orphan") {
+    postAction("DELETE", `/v1/cluster/orphans/${encodeURIComponent(id)}`, "Force-delete orphan placement", id);
+  }
+});
+
+el("next-page-btn").addEventListener("click", () => {
+  if (!state.nextPageToken) { return; }
+  state.pageTokens.push(state.nextPageToken);
+  state.pageIndex = state.pageTokens.length - 1;
+  loadPlacements();
+});
+
+el("reset-page-btn").addEventListener("click", () => {
+  state.pageTokens = [""];
+  state.pageIndex = 0;
+  loadPlacements();
+});
+
+el("refresh-btn").addEventListener("click", () => refreshAll(true));
+
+el("autorefresh").addEventListener("change", () => {
+  if (el("autorefresh").checked) { startTimer(); } else { stopTimer(); }
+});
+
+// ---------- loop ----------
+
+async function refreshAll(force) {
+  if (!state.pat) { return; }
+  if (!force && document.hidden) { return; }
+  await Promise.all([loadHealth(), loadCapacity(), loadCluster(), loadPlacements(), loadMetrics()]);
+}
+
+function startTimer() {
+  stopTimer();
+  state.timer = setInterval(() => refreshAll(false), REFRESH_MS);
+}
+
+function stopTimer() {
+  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+}
+
+// ---------- boot ----------
+
+if (state.pat) {
+  showApp();
+  refreshAll(true);
+  startTimer();
+} else {
+  showLogin(null);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.pat && el("autorefresh").checked) { refreshAll(true); }
+});
+</script>
+</body>
+</html>

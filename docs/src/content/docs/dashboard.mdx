@@ -1,0 +1,118 @@
+---
+title: Dashboard
+---
+
+sandboxd ships a built-in operator dashboard. It is a single page served
+directly by the daemon, requires only your `SB_PAT_TOKEN` to use, and gives
+you a live read of node health, cluster membership, placements, and the
+internal metrics counters the daemon already emits.
+
+There is nothing to install. If you have sandboxd running, you have the
+dashboard.
+
+## Opening the dashboard
+
+Point a browser at the same address your SDKs and CLI hit, with `/ui`
+appended:
+
+```
+http://<sandboxd-host>:<port>/ui
+```
+
+For a local install this is typically `http://localhost:8080/ui`.
+
+sandboxd also logs the URL on startup so you do not have to guess. Look
+for this line:
+
+```
+INFO starting sandboxd version=... addr=...
+INFO dashboard available url=http://0.0.0.0:8080/ui
+```
+
+The dashboard works on every node — server, worker, or ingress. Cluster
+status endpoints already forward to the right node internally, so opening
+the dashboard against any node gives you the cluster-wide view.
+
+## Signing in
+
+The page loads a short sign-in form. Paste the value of `SB_PAT_TOKEN`
+from the node you are connecting to and click **Sign in**.
+
+The token is held in `sessionStorage` for the duration of that browser
+tab. It is never written to `localStorage`, never sent to any origin
+other than sandboxd, and is cleared the moment you close the tab or
+click **Sign out** in the header.
+
+If your token is wrong the form rejects it with an inline error; no
+401 has any side effect.
+
+## What each panel shows
+
+Every panel reads from an existing v1 endpoint. The dashboard does not
+introduce any new business logic — it just renders what the API already
+exposes.
+
+| Panel | Endpoint | What it shows |
+|---|---|---|
+| **Health** | `GET /health` | Docker / Caddy / SSH gateway probes, overall status, sandboxd version, live sandbox count. |
+| **Local capacity** | `GET /v1/capacity` | CPU / memory / disk / GPU reservation ratios, post-overcommit budgets, whether the node currently admits new sandboxes, and any rejection reasons. |
+| **Cluster** | `GET /v1/cluster/leader` and `GET /v1/cluster/members` | Current Raft leader and every gossiped peer with its role, alive bit, drain state, and capacity summary. |
+| **Placements** | `GET /v1/cluster/sandbox-index` (paginated) | One row per cluster-replicated sandbox: ID, owning node, state (`placed` / `reserved` / `orphaned`), version, and timestamps. |
+| **Metrics (expvar)** | `GET /debug/vars` | Curated picks from the `aerolvm_*` counter set (Raft apply latency, owner forward count, worker lease health, etc.). A raw view is collapsed below the grid. |
+
+The whole page auto-refreshes every five seconds while the tab is
+visible. Refresh pauses automatically when the tab is hidden so it does
+not hit the API in the background. There is also a manual **Refresh**
+button and an **auto-refresh** toggle in the header.
+
+## Available actions
+
+The dashboard surfaces a small set of safe, idempotent operator actions.
+Every action is gated by a confirmation dialog and is a thin wrapper
+around an existing v1 endpoint.
+
+| Action | Where | Endpoint | What it does |
+|---|---|---|---|
+| **Drain** | Cluster panel, per-row | `POST /v1/cluster/nodes/{id}/drain` | Marks the node so future placement decisions exclude it. Idempotent. Existing sandboxes on the node keep running. |
+| **Uncordon** | Cluster panel, per-row when drained | `POST /v1/cluster/nodes/{id}/uncordon` | Clears the drain mark so the node becomes eligible for placement again. Idempotent. |
+| **Reclaim local** | Placements panel, on `orphaned` rows | `POST /v1/cluster/orphans/{id}/reclaim-local` | Recovery for a false-positive owner death: only succeeds when the local sandbox row is still present on this node and the placement was orphaned from this node. |
+| **Force delete** | Placements panel, on `orphaned` rows | `DELETE /v1/cluster/orphans/{id}` | Removes the FSM placement record for an orphan. Used when the previous owner is gone for good. Does not destroy any local sandbox — there is, by definition, no live owner to act on. |
+
+There are no create / destroy / resize buttons. Those mutations stay on
+the SDKs and CLI where they go through the same auth and idempotency
+guarantees as everything else.
+
+## Security model
+
+A short summary, because there are two related but distinct surfaces:
+
+- `GET /ui` is served unauthenticated. It returns static HTML and
+  JavaScript with no embedded credentials and no server data. The
+  sign-in form prompts for the PAT before any API call fires. This
+  matches how every standard login page works.
+- Every API call the page makes — `GET /health`, `GET /v1/...`,
+  `GET /debug/vars`, the action endpoints — sends the PAT as
+  `Authorization: Bearer <token>` and goes through the same
+  middleware as a curl or SDK call. Including `/debug/vars`: the
+  expvar counters carry operational shape (lease state, queue depths,
+  secret-decrypt failures) that should not be readable
+  unauthenticated, so the metrics handler is PAT-gated.
+- Tokens live in `sessionStorage` only. They are cleared on tab close
+  and on sign-out. They are never persisted to disk by the browser.
+
+If you want the dashboard reachable only on a trusted network, expose
+sandboxd on the listener you already use for the API. The dashboard
+inherits whatever network controls protect that listener — TLS,
+reverse-proxy auth, IP allowlists, all apply.
+
+## Multi-node and clustered setups
+
+You do not need to open one dashboard per node. The cluster panel and
+the placements panel both read from forwarding endpoints, so opening
+the dashboard against any reachable node gives you the cluster-wide
+view. The action buttons forward through the same path.
+
+The metrics panel is intentionally local to the node you opened the
+dashboard against — it reads the in-process expvar counters of *that*
+sandboxd process. To compare nodes side-by-side, open one tab per
+node.
