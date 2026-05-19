@@ -31,11 +31,49 @@ Cargo.lock
 Terraform/.terraform/
 .terraform/
 *.tfstate
+*.tfstate.*
 *.tfstate.backup
 crash.log
+crash.*.log
 override.tf
 override.tf.json
+*_override.tf
+*_override.tf.json
 terraform.tfstate
 terraform.tfstate.backup
 terraform.rc
 .terraformrc
+# Auto-loaded var files often hold secrets. terraform.tfvars is already
+# ignored above; this catches *.auto.tfvars / *.auto.tfvars.json too.
+*.auto.tfvars
+*.auto.tfvars.json
+.terraform.tfstate.lock.info
+# Note: do NOT add .terraform.lock.hcl here — it pins provider versions and
+# should be committed.
+
+# Ansible artifacts
+Ansible/.ansible/
+.ansible/
+*.retry
+# Vault password files — never commit these.
+.vault_pass
+.vault_pass.*
+vault-password*
+# Local-only inventory, vars, or config overrides (per-machine, never committed).
+Ansible/ansible.local.cfg
+Ansible/inventory/local.yml
+Ansible/group_vars/*.local.yml
+Ansible/host_vars/*.local.yml
+
+# Secrets / credentials that should never land in git
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+.env
+.env.*
+!.env.example
+.aws/
+credentials.json

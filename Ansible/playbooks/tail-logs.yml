@@ -1,0 +1,22 @@
+---
+# Pull the last N lines of journalctl for sandboxd from every node (or a subset).
+#
+#   ansible-playbook playbooks/tail-logs.yml
+#   ansible-playbook playbooks/tail-logs.yml -e lines=200 --limit aerolvm-srv1
+
+- name: Show recent sandboxd logs
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    lines: 50
+  tasks:
+    - name: journalctl -u sandboxd
+      ansible.builtin.command:
+        cmd: "journalctl -u {{ sandboxd_service_name }} -n {{ lines }} --no-pager"
+      register: logs
+      changed_when: false
+
+    - name: Print
+      ansible.builtin.debug:
+        msg: "{{ logs.stdout_lines }}"
