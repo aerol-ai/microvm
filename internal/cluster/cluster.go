@@ -205,6 +205,9 @@ type Placement struct {
 // Member is a snapshot of a peer's gossiped state.
 type Member struct {
 	NodeID        string `json:"node_id"`
+	// NodeName is the operator-friendly display label (SB_NODE_NAME). Empty
+	// for peers running pre-NodeName builds; dashboards fall back to NodeID.
+	NodeName      string `json:"node_name,omitempty"`
 	APIURL        string `json:"api_url"`
 	DataPlaneHost string `json:"data_plane_host,omitempty"`
 	RaftAddr      string `json:"raft_addr,omitempty"`

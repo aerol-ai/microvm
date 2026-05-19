@@ -1,0 +1,104 @@
+---
+# Roll a new sandboxd binary across the cluster.
+#
+# Usage:
+#   # Push a locally-built binary (the common case while developing):
+#   ansible-playbook playbooks/update-sandboxd.yml \
+#     -e sandboxd_local_binary=../bin/sandboxd
+#
+#   # Or fetch from a GitHub release URL on each node:
+#   ansible-playbook playbooks/update-sandboxd.yml \
+#     -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/sandboxd_linux_amd64
+#
+#   # Limit to a single host while testing:
+#   ansible-playbook playbooks/update-sandboxd.yml -e ... --limit aerolvm-srv1
+#
+# Safety:
+#   - serial: 1 → one node at a time. Critical for the Raft voters (server / mixed)
+#     since restarting more than (N-1)/2 simultaneously loses quorum.
+#   - Each node is verified healthy on :21212/healthz before moving to the next.
+#   - become: true → tasks that touch /usr/local/bin or systemd run as root via sudo.
+
+- name: Update sandboxd across the AerolVM cluster
+  hosts: all
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Validate that exactly one source was provided
+      delegate_to: localhost
+      become: false
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - (sandboxd_local_binary is defined) != (sandboxd_remote_url is defined)
+        fail_msg: >-
+          Set exactly one of -e sandboxd_local_binary=<path> or
+          -e sandboxd_remote_url=<url>.
+
+    - name: Confirm local binary exists
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: sandboxd_local_binary is defined
+      ansible.builtin.stat:
+        path: "{{ sandboxd_local_binary }}"
+      register: local_bin_stat
+      failed_when: not local_bin_stat.stat.exists
+
+  tasks:
+    - name: "[{{ inventory_hostname }}] Stage new binary at /tmp/sandboxd.new (local upload)"
+      when: sandboxd_local_binary is defined
+      ansible.builtin.copy:
+        src: "{{ sandboxd_local_binary }}"
+        dest: /tmp/sandboxd.new
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: "[{{ inventory_hostname }}] Stage new binary at /tmp/sandboxd.new (remote fetch)"
+      when: sandboxd_remote_url is defined
+      ansible.builtin.get_url:
+        url: "{{ sandboxd_remote_url }}"
+        dest: /tmp/sandboxd.new
+        mode: "0755"
+        owner: root
+        group: root
+        force: true
+
+    - name: "[{{ inventory_hostname }}] Atomic swap into {{ sandboxd_binary_path }}"
+      # Swap via `mv` so the in-flight process keeps its old inode running until
+      # systemctl restart picks up the new file.
+      ansible.builtin.command:
+        cmd: mv -f /tmp/sandboxd.new {{ sandboxd_binary_path }}
+      changed_when: true
+
+    - name: "[{{ inventory_hostname }}] Restart sandboxd"
+      ansible.builtin.systemd:
+        name: "{{ sandboxd_service_name }}"
+        state: restarted
+        daemon_reload: false
+
+    - name: "[{{ inventory_hostname }}] Wait for /healthz to come back"
+      ansible.builtin.uri:
+        url: "{{ sandboxd_health_url }}"
+        status_code: 200
+        return_content: false
+      register: health
+      until: health.status == 200
+      retries: "{{ sandboxd_health_wait_s }}"
+      delay: 1
+
+  post_tasks:
+    - name: "[{{ inventory_hostname }}] Report installed version"
+      ansible.builtin.command:
+        cmd: "{{ sandboxd_binary_path }} --version"
+      register: ver
+      changed_when: false
+      failed_when: false
+
+    - name: "[{{ inventory_hostname }}] sandboxd version"
+      ansible.builtin.debug:
+        msg: "{{ ver.stdout | default(ver.stderr) | default('(--version unsupported)') }}"

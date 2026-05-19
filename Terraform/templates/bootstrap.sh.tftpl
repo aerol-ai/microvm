@@ -61,6 +61,16 @@ INSTALL_ARGS+=(--idle-timeout-min '${idle_timeout_min}')
 
 sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 
+# Inject SB_NODE_NAME so the dashboard's CLUSTER table shows the Terraform
+# name (node1/srv1/wrk2/...) alongside the hostname-derived node_id. Restart
+# is best-effort — cluster-init/join below restart sandboxd anyway, but on
+# re-applies that skip those (already-joined) the explicit restart guarantees
+# the env reaches the running daemon.
+if [ -f /etc/sandboxd/sandboxd.env ] && ! grep -q '^SB_NODE_NAME=' /etc/sandboxd/sandboxd.env; then
+  echo "SB_NODE_NAME=${node_name}" | sudo tee -a /etc/sandboxd/sandboxd.env >/dev/null
+  sudo systemctl restart sandboxd || true
+fi
+
 %{ if is_seed ~}
 ###############################################################################
 # 2a. Seed: cluster-init.sh

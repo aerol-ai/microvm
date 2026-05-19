@@ -135,11 +135,12 @@ details > summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
       <table>
         <thead>
           <tr>
-            <th>node_id</th><th>role</th><th>alive</th><th>drained</th>
-            <th>api_url</th><th>capacity</th><th>actions</th>
+            <th>name</th><th>node_id</th><th>private_ip</th><th>role</th>
+            <th>alive</th><th>drained</th><th>api_url</th>
+            <th>capacity</th><th>actions</th>
           </tr>
         </thead>
-        <tbody id="members-tbody"><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+        <tbody id="members-tbody"><tr><td colspan="9" class="muted">loading…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -305,6 +306,16 @@ function fmtNanos(n) {
   return (Number(n) / 1e3).toFixed(0) + " µs";
 }
 
+// hostFromURL pulls the hostname (no port) out of a URL or host:port string.
+// Used to surface the private IP that the daemon advertises without making
+// operators eyeball the api_url column.
+function hostFromURL(s) {
+  if (!s) { return ""; }
+  try { return new URL(s).hostname; } catch (_) { /* not a full URL */ }
+  const i = s.lastIndexOf(":");
+  return i > 0 ? s.slice(0, i) : s;
+}
+
 // ---------- panels ----------
 
 async function loadHealth() {
@@ -332,13 +343,21 @@ async function loadCapacity() {
   try {
     const c = await apiJSON("/v1/capacity");
     const admitKind = c.can_admit ? "ok" : "bad";
+    const cpuFactor = c.cpu_overprovision_factor || 1;
+    const memFactor = c.memory_overprovision_factor || 1;
+    const cpuBreakdown = `${fmtNum(c.host_cpu_cores)} cores × ${fmtPct(c.cpu_reservation_ratio)}${cpuFactor > 1 ? " × " + fmtFloat(cpuFactor) + "× overcommit" : ""}`;
+    const memBreakdown = `${fmtNum(c.host_memory_total_mb)} MB × ${fmtPct(c.memory_reservation_ratio)}${memFactor > 1 ? " × " + fmtFloat(memFactor) + "× overcommit" : ""}`;
+    const diskBreakdown = c.host_disk_total_gb
+      ? `${fmtNum(c.host_disk_total_gb)} GB × ${fmtPct(c.disk_reservation_ratio || 0)}`
+      : "disk accounting disabled";
     el("capacity-row").innerHTML = `
       <div class="kv"><span class="k">can_admit</span><span class="v">${pill(c.can_admit ? "yes" : "no", admitKind)}</span></div>
       <div class="kv"><span class="k">live sandboxes</span><span class="v">${fmtNum(c.sandboxes_active)}</span></div>
-      <div class="kv"><span class="k">cpu reserved</span><span class="v">${fmtFloat(c.reserved_cpu)} / ${fmtFloat(c.cpu_budget)} (${fmtPct(c.cpu_reservation_ratio)})</span></div>
-      <div class="kv"><span class="k">memory reserved</span><span class="v">${fmtNum(c.reserved_memory_mb)} / ${fmtNum(c.memory_budget_mb)} MB (${fmtPct(c.memory_reservation_ratio)})</span></div>
-      <div class="kv"><span class="k">disk reserved</span><span class="v">${fmtNum(c.reserved_disk_gb)} / ${fmtNum(c.disk_budget_gb)} GB${c.disk_reservation_ratio ? " (" + fmtPct(c.disk_reservation_ratio) + ")" : ""}</span></div>
-      <div class="kv"><span class="k">memory free</span><span class="v">${fmtNum(c.live_memory_free_mb)} MB</span></div>
+      <div class="kv" style="grid-column: 1 / -1;"><span class="k">host hardware</span><span class="v">${fmtNum(c.host_cpu_cores)} cores · ${fmtNum(c.host_memory_total_mb)} MB ram${c.host_disk_total_gb ? " · " + fmtNum(c.host_disk_total_gb) + " GB disk" : ""}</span></div>
+      <div class="kv" style="grid-column: 1 / -1;"><span class="k">cpu reserved</span><span class="v">${fmtFloat(c.reserved_cpu)} / ${fmtFloat(c.cpu_budget)} budget <span class="muted">(${cpuBreakdown})</span></span></div>
+      <div class="kv" style="grid-column: 1 / -1;"><span class="k">memory reserved</span><span class="v">${fmtNum(c.reserved_memory_mb)} / ${fmtNum(c.memory_budget_mb)} MB budget <span class="muted">(${memBreakdown})</span></span></div>
+      <div class="kv" style="grid-column: 1 / -1;"><span class="k">disk reserved</span><span class="v">${fmtNum(c.reserved_disk_gb)} / ${fmtNum(c.disk_budget_gb)} GB budget <span class="muted">(${diskBreakdown})</span></span></div>
+      <div class="kv"><span class="k">memory free (live)</span><span class="v">${fmtNum(c.live_memory_free_mb)} MB${c.memory_floor_mb ? " <span class='muted'>(floor " + fmtNum(c.memory_floor_mb) + " MB)</span>" : ""}</span></div>
       <div class="kv"><span class="k">gpus</span><span class="v">${c.gpu_count ? fmtNum(c.reserved_gpus) + " / " + fmtNum(c.gpu_count) + " (" + escapeHTML(c.gpu_vendor || "?") + ")" : "—"}</span></div>
       <div class="kv"><span class="k">runtimes</span><span class="v">${escapeHTML((c.supported_runtimes || []).join(", ") || "—")}</span></div>
       ${c.reasons && c.reasons.length ? `<div class="kv" style="grid-column: 1 / -1;"><span class="k">reasons</span><span class="v error">${escapeHTML(c.reasons.join(" · "))}</span></div>` : ""}
@@ -358,22 +377,28 @@ async function loadCluster() {
     const ms = members.members || [];
     el("cluster-count").textContent = fmtNum(ms.length);
     if (ms.length === 0) {
-      el("members-tbody").innerHTML = `<tr><td colspan="7" class="muted">no peers gossiped</td></tr>`;
+      el("members-tbody").innerHTML = `<tr><td colspan="9" class="muted">no peers gossiped</td></tr>`;
       return;
     }
     el("members-tbody").innerHTML = ms.map((m) => {
       const aliveKind = m.alive ? "ok" : "bad";
       const drainedKind = m.drained ? "warn" : "ok";
       const cap = m.capacity || {};
+      const cpuUse = cap.cpu_budget > 0 ? (cap.reserved_cpu || 0) / cap.cpu_budget : 0;
+      const memUse = cap.memory_budget_mb > 0 ? (cap.reserved_memory_mb || 0) / cap.memory_budget_mb : 0;
       const capSummary = (cap.host_cpu_cores != null)
-        ? `${fmtNum(cap.sandboxes_active || 0)} sb · cpu ${fmtPct(cap.cpu_reservation_ratio || 0)} · mem ${fmtPct(cap.memory_reservation_ratio || 0)}`
+        ? `${fmtNum(cap.sandboxes_active || 0)} sb · cpu ${fmtFloat(cap.reserved_cpu || 0)}/${fmtFloat(cap.cpu_budget || 0)} (${fmtPct(cpuUse)}) · mem ${fmtNum(cap.reserved_memory_mb || 0)}/${fmtNum(cap.memory_budget_mb || 0)} MB (${fmtPct(memUse)})`
         : "—";
       const drainBtn = m.drained
         ? `<button data-action="uncordon" data-id="${escapeHTML(m.node_id)}">Uncordon</button>`
         : `<button class="danger" data-action="drain" data-id="${escapeHTML(m.node_id)}">Drain</button>`;
+      const name = m.node_name || m.node_id || "—";
+      const privateIP = hostFromURL(m.api_url) || hostFromURL(m.data_plane_host) || "—";
       return `
         <tr>
-          <td>${escapeHTML(m.node_id)}</td>
+          <td>${escapeHTML(name)}</td>
+          <td><span class="muted">${escapeHTML(m.node_id)}</span></td>
+          <td><span class="muted">${escapeHTML(privateIP)}</span></td>
           <td>${escapeHTML(m.role || "(mixed)")}</td>
           <td>${pill(m.alive ? "alive" : "dead", aliveKind)}</td>
           <td>${pill(m.drained ? "drained" : "active", drainedKind)}</td>
@@ -384,7 +409,7 @@ async function loadCluster() {
       `;
     }).join("");
   } catch (err) {
-    el("members-tbody").innerHTML = `<tr><td colspan="7" class="error">${escapeHTML(err.message)}</td></tr>`;
+    el("members-tbody").innerHTML = `<tr><td colspan="9" class="error">${escapeHTML(err.message)}</td></tr>`;
   }
 }
 

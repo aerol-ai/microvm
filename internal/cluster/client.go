@@ -225,6 +225,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 
 	gn, err := setupGossip(gossipSetupConfig{
 		NodeID:         nodeID,
+		NodeName:       cfg.NodeName,
 		BindAddr:       cfg.GossipBindAddr,
 		AdvertiseAddr:  cfg.GossipAdvertiseAddr,
 		APIURL:         cfg.SelfAPIAdvertiseURL,

@@ -1,0 +1,17 @@
+---
+# Smoke test: prove that the dynamic inventory + SSH keys + sudo all work
+# before you try anything destructive.
+#
+#   ansible-playbook playbooks/ping.yml
+#   ansible-playbook playbooks/ping.yml --limit aerolvm_role_server
+
+- name: Reachability check
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Ping
+      ansible.builtin.ping:
+
+    - name: Report node role + seed status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} role={{ node_role }} seed={{ is_seed }}"

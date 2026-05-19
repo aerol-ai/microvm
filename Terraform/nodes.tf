@@ -59,9 +59,10 @@ resource "aws_instance" "seed" {
 
   tags = merge(
     {
-      Name = "${var.cluster_name}-${local.seed_node.name}"
-      Role = local.seed_node.role
-      Seed = "true"
+      Name    = "${var.cluster_name}-${local.seed_node.name}"
+      Role    = local.seed_node.role
+      Seed    = "true"
+      Cluster = var.cluster_name
     },
     local.seed_node.tags,
   )
@@ -122,9 +123,10 @@ resource "aws_instance" "joiner" {
 
   tags = merge(
     {
-      Name = "${var.cluster_name}-${each.value.name}"
-      Role = each.value.role
-      Seed = "false"
+      Name    = "${var.cluster_name}-${each.value.name}"
+      Role    = each.value.role
+      Seed    = "false"
+      Cluster = var.cluster_name
     },
     each.value.tags,
   )
