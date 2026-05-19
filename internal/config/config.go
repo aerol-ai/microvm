@@ -218,8 +218,8 @@ type Config struct {
 	// NodeRoleMixed. Default NodeRoleMixed preserves pre-role behavior
 	// (every component runs on every node). SB_NODE_ROLE. Ignored when
 	// EnableCluster=false — single-node mode is implicitly "mixed".
-	NodeRole            string
-	NodeID              string
+	NodeRole string
+	NodeID   string
 	// NodeName is the operator-friendly label gossiped to peers and shown on
 	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
 	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
