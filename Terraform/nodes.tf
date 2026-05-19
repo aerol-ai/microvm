@@ -36,8 +36,10 @@ resource "aws_instance" "seed" {
     http_put_response_hop_limit = 2
   }
 
+  user_data_replace_on_change = true
+
   user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
-    node_name               = local.seed_node.name
+    node_name               = "${var.cluster_name}-${local.seed_node.name}"
     role                    = local.seed_node.role
     is_seed                 = true
     domain                  = var.domain_name
@@ -98,8 +100,10 @@ resource "aws_instance" "joiner" {
     http_put_response_hop_limit = 2
   }
 
+  user_data_replace_on_change = true
+
   user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
-    node_name               = each.value.name
+    node_name               = "${var.cluster_name}-${each.value.name}"
     role                    = each.value.role
     is_seed                 = false
     domain                  = var.domain_name
