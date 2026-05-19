@@ -220,6 +220,11 @@ type Config struct {
 	// EnableCluster=false — single-node mode is implicitly "mixed".
 	NodeRole            string
 	NodeID              string
+	// NodeName is the operator-friendly label gossiped to peers and shown on
+	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
+	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
+	// time so single-node and pre-existing deployments need no config change.
+	NodeName            string
 	RaftBindAddr        string
 	RaftAdvertiseAddr   string
 	RaftDataDir         string
@@ -416,6 +421,7 @@ func Load() (Config, error) {
 		EnableCluster:                 getEnvBool("SB_ENABLE_CLUSTER", false),
 		NodeRole:                      os.Getenv("SB_NODE_ROLE"),
 		NodeID:                        strings.TrimSpace(os.Getenv("SB_NODE_ID")),
+		NodeName:                      strings.TrimSpace(os.Getenv("SB_NODE_NAME")),
 		RaftBindAddr:                  getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
 		RaftAdvertiseAddr:             strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
 		RaftDataDir:                   strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
