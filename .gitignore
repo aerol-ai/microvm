@@ -9,7 +9,7 @@ dist-test/
 node_modules/
 sdk/typescript/node_modules
 docs/.astro/
-
+Terraform/terraform.tfvars
 # Python SDK artifacts
 sdk/python/__pycache__/
 sdk/python/.venv/
