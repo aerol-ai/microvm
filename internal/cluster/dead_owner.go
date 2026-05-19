@@ -320,6 +320,9 @@ func (c *Cluster) pickRecreationTarget(spec *models.CreateSandboxRequest) (nodeI
 	if spec == nil {
 		return "", "", ""
 	}
+	if spec.ImageDistributionMode == models.ImageDistributionLocalOnly {
+		return "", "", ""
+	}
 	req := capacityRequestFromSpec(spec)
 	target, err := c.SelectPlacement(req)
 	if err != nil {

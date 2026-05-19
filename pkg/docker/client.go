@@ -253,7 +253,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// error.
 	imageInspect, err := c.inspectImage(ctx, req.Image)
 	if err != nil {
-		if isLocalOnlyImageRef(req.Image) {
+		if IsLocalOnlyImageRef(req.Image) || req.ImageDistributionMode == models.ImageDistributionLocalOnly {
 			return nil, fmt.Errorf("image %q is local-only and is not present on this node; push/register it to a registry or pre-distribute it before failover recreate", req.Image)
 		}
 		if pullErr := c.pullImageDedup(ctx, req.Image, req.Registry); pullErr != nil {
@@ -694,7 +694,7 @@ func imagePullKey(imageRef string, auth *models.RegistryAuth) string {
 	return strings.TrimSpace(imageRef) + "\x00" + strings.TrimSpace(auth.Server) + "\x00" + strings.TrimSpace(auth.Username)
 }
 
-func isLocalOnlyImageRef(imageRef string) bool {
+func IsLocalOnlyImageRef(imageRef string) bool {
 	imageRef = strings.TrimSpace(imageRef)
 	return strings.HasPrefix(imageRef, BuiltImageNamespace+"/") || strings.HasPrefix(imageRef, "snapshots/")
 }

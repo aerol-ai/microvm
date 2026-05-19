@@ -70,6 +70,7 @@ type Service struct {
 	cipher   *secrets.Cipher
 	mounts   *mounts.Manager
 	admitter *capacity.Admitter
+	images   ImageDistributionProvider
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -121,6 +122,7 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		cipher:   cipher,
 		mounts:   mountManager,
 		admitter: admitter,
+		images:   newDefaultImageDistributionProvider(cfg.ImageDistributionAOCRHost),
 		// Default to Noop so callers don't have to nil-check the cluster
 		// reference. AttachCluster swaps in the real implementation when
 		// cluster mode is enabled at boot.
@@ -354,6 +356,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 
 	req = normalizeCreateRequest(req)
+	if err := s.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+		return nil, err
+	}
 	if req.Image == "" {
 		return nil, errors.New("image is required")
 	}
@@ -885,6 +890,9 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 	if strings.TrimSpace(snapshot.Image) == "" {
 		return nil, errors.New("snapshot image is required")
 	}
+	if err := s.normalizeSnapshotImageDistribution(ctx, snapshot, false); err != nil {
+		return nil, err
+	}
 
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
@@ -947,6 +955,9 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		ImageID:         imageID,
 		SourceSandboxID: sandboxID,
 		CreatedAt:       time.Now().UTC(),
+	}
+	if err := s.normalizeSnapshotImageDistribution(ctx, snapshot, true); err != nil {
+		return nil, false, err
 	}
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {

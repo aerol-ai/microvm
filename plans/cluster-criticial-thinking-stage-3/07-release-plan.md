@@ -159,6 +159,7 @@ The current unit tests are not enough. Add these integration tests:
 | E2B/Daytona through random LB | All calls route to owner or replay idempotently. |
 | Node false-positive death | Recover/reclaim path works. |
 | Registry/image pull storm | Pulls dedupe and queue; registry throttling does not wedge create. |
+| Local-only snapshot/image placement | Router never reserves or forwards a local-only image to a different node; missing local image fails before registry pull storm. |
 | Netstats at local max density | Poll duration stays below interval; no DB writer starvation. |
 
 ## P1 - Observability Required Before Scale
@@ -199,7 +200,9 @@ Before merging as anything beyond experimental, docs should state:
 - recommended maximum sandboxes per worker;
 - whether Daytona/E2B are cluster-supported;
 - whether SSH is owner-aware or owner-local;
-- whether snapshots/images are cluster-supported;
+- snapshot/image support mode: `external_registry` and `aocr` can run on any
+  worker that can pull them; `local_only` is pinned to the receiving worker and
+  has no cross-node failover promise;
 - raw TCP port-pool limits;
 - UDP unsupported;
 - failover means 410 by default, not running sandbox HA;

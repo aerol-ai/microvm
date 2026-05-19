@@ -39,7 +39,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	placementReq, err := h.clusterPlacementRequest(req)
+	placementReq, err := h.clusterPlacementRequest(r.Context(), req)
 	if err != nil {
 		switch {
 		case errors.Is(err, errVolumesUnsupported):
@@ -119,7 +119,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
 }
 
-func (h *handlers) clusterPlacementRequest(req createSandboxRequest) (models.CreateSandboxRequest, error) {
+func (h *handlers) clusterPlacementRequest(ctx context.Context, req createSandboxRequest) (models.CreateSandboxRequest, error) {
 	if req.NetworkAllowList != nil && strings.TrimSpace(*req.NetworkAllowList) != "" {
 		return models.CreateSandboxRequest{}, errors.New("networkAllowList is not supported by the Daytona facade")
 	}
@@ -129,7 +129,20 @@ func (h *handlers) clusterPlacementRequest(req createSandboxRequest) (models.Cre
 	if len(req.Volumes) > 0 {
 		return models.CreateSandboxRequest{}, errVolumesUnsupported
 	}
-	return models.CreateSandboxRequest{
+	image := "daytona-create"
+	var distribution models.ImageDistributionMetadata
+	if snapshotName := strings.TrimSpace(valueOrEmpty(req.Snapshot)); snapshotName != "" {
+		image = snapshotName
+		if h.deps.Service != nil {
+			if resolved, err := h.deps.Service.GetSnapshot(ctx, snapshotName); err == nil && resolved != nil {
+				if resolvedImage := strings.TrimSpace(resolved.Image); resolvedImage != "" {
+					image = resolvedImage
+				}
+				distribution = resolved.ImageDistribution()
+			}
+		}
+	}
+	out := models.CreateSandboxRequest{
 		Image:           "daytona-create",
 		CPU:             float64(int32Value(req.Cpu, 0)),
 		MemoryMB:        int(int32Value(req.Memory, 0)) * 1024,
@@ -137,7 +150,12 @@ func (h *handlers) clusterPlacementRequest(req createSandboxRequest) (models.Cre
 		Name:            trimmedString(req.Name),
 		Tags:            cloneStringMap(mapValue(req.Labels)),
 		NetworkBlockAll: boolValue(req.NetworkBlockAll),
-	}, nil
+	}
+	out.Image = image
+	if !distribution.IsZero() {
+		out.ApplyImageDistribution(distribution)
+	}
+	return out, nil
 }
 
 func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {

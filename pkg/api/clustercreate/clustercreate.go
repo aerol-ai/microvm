@@ -59,6 +59,18 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 
+	if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return Decision{}, false
+	}
+	if service.ImageRequiresLocalPlacement(req) {
+		if c.IsNodeDrained(c.SelfNodeID()) {
+			writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+			return Decision{}, false
+		}
+		return Decision{}, true
+	}
+
 	target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
 	if err != nil {
 		if errors.Is(err, cluster.ErrNoPlacementTarget) {
@@ -141,6 +153,9 @@ type CreateOptions struct {
 }
 
 func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slog.Logger, req models.CreateSandboxRequest, reservationID string, opts CreateOptions) (*models.CreateSandboxResponse, error) {
+	if err := svc.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+		return nil, err
+	}
 	c := svc.Cluster()
 	var (
 		resp *models.CreateSandboxResponse

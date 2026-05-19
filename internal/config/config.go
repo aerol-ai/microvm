@@ -347,6 +347,10 @@ type Config struct {
 	// transient hiccup doesn't have the janitor yanking an image a client
 	// is about to use.
 	ImageBuildGCTTL time.Duration
+	// ImageDistributionAOCRHost is the registry host treated as the optional
+	// managed AOCR image-distribution provider. Empty configs constructed in
+	// tests fall back to the product default in the service layer.
+	ImageDistributionAOCRHost string
 }
 
 func Load() (Config, error) {
@@ -437,6 +441,7 @@ func Load() (Config, error) {
 		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
 		ImageBuildGCInterval:          getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
 		ImageBuildGCTTL:               getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageDistributionAOCRHost:     strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
 	}
 
 	if cfg.PATToken == "" {

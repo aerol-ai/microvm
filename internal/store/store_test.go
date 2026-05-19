@@ -801,12 +801,17 @@ func TestStoreCases(t *testing.T) {
 			name: "snapshot_roundtrip_by_name",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
+				verifiedAt := time.Now().UTC().Round(0)
 				snapshot := &models.SandboxSnapshot{
-					Name:            "snapshots/demo:v1",
-					Image:           "snapshots/demo:v1",
-					ImageID:         "sha256:snap-1",
-					SourceSandboxID: "sb-source",
-					CreatedAt:       time.Now().UTC().Round(0),
+					Name:                  "snapshots/demo:v1",
+					Image:                 "registry.example.com/demo@sha256:abc",
+					ImageID:               "sha256:snap-1",
+					SourceSandboxID:       "sb-source",
+					CreatedAt:             time.Now().UTC().Round(0),
+					ImageDistributionMode: models.ImageDistributionExternalRegistry,
+					ImageDigest:           "sha256:abc",
+					ImageRegistryRef:      "registry.example.com/demo@sha256:abc",
+					ImageVerifiedAt:       &verifiedAt,
 				}
 				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)

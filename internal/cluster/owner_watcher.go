@@ -161,6 +161,9 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 	if spec == nil {
 		return PlacementTarget{}, false
 	}
+	if spec.ImageDistributionMode == models.ImageDistributionLocalOnly {
+		return PlacementTarget{}, false
+	}
 	excluded := make(map[string]struct{}, len(exclude))
 	for _, id := range exclude {
 		excluded[id] = struct{}{}

@@ -133,7 +133,11 @@ func Open(path string) (*Store, error) {
 			cpu REAL NOT NULL DEFAULT 0,
 			memory_mb INTEGER NOT NULL DEFAULT 0,
 			disk_gb INTEGER NOT NULL DEFAULT 0,
-			gpu REAL NOT NULL DEFAULT 0
+			gpu REAL NOT NULL DEFAULT 0,
+			image_distribution_mode TEXT NOT NULL DEFAULT '',
+			image_digest TEXT NOT NULL DEFAULT '',
+			image_registry_ref TEXT NOT NULL DEFAULT '',
+			image_verified_at DATETIME
 		);`,
 		// sandbox_compat_state holds opaque facade-private state that has
 		// no native meaning. One row per (sandbox, facade). state_json is
@@ -257,6 +261,10 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandbox_snapshots ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN disk_gb INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN gpu REAL NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_distribution_mode TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_digest TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_registry_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_verified_at DATETIME;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -1213,10 +1221,15 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 	if err != nil {
 		return err
 	}
+	var imageVerifiedAt any
+	if snapshot.ImageVerifiedAt != nil {
+		imageVerifiedAt = snapshot.ImageVerifiedAt.UTC()
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		strings.TrimSpace(snapshot.Name),
 		strings.TrimSpace(snapshot.Image),
@@ -1229,6 +1242,10 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 		snapshot.MemoryMB,
 		snapshot.DiskGB,
 		snapshot.GPU,
+		strings.TrimSpace(snapshot.ImageDistributionMode),
+		strings.TrimSpace(snapshot.ImageDigest),
+		strings.TrimSpace(snapshot.ImageRegistryRef),
+		imageVerifiedAt,
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -1242,7 +1259,8 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at
 		FROM sandbox_snapshots
 		WHERE name = ?
 	`, strings.TrimSpace(name))
@@ -1259,7 +1277,8 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at
 		FROM sandbox_snapshots
 		ORDER BY created_at DESC, name ASC
 	`)
@@ -1664,6 +1683,7 @@ func scanSnapshot(scanner interface {
 }) (*models.SandboxSnapshot, error) {
 	var snapshot models.SandboxSnapshot
 	var entrypointJSON string
+	var imageVerifiedAt sql.NullTime
 	err := scanner.Scan(
 		&snapshot.Name,
 		&snapshot.Image,
@@ -1676,9 +1696,17 @@ func scanSnapshot(scanner interface {
 		&snapshot.MemoryMB,
 		&snapshot.DiskGB,
 		&snapshot.GPU,
+		&snapshot.ImageDistributionMode,
+		&snapshot.ImageDigest,
+		&snapshot.ImageRegistryRef,
+		&imageVerifiedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if imageVerifiedAt.Valid {
+		verifiedAt := imageVerifiedAt.Time.UTC()
+		snapshot.ImageVerifiedAt = &verifiedAt
 	}
 	if entrypointJSON != "" && entrypointJSON != "[]" {
 		if err := json.Unmarshal([]byte(entrypointJSON), &snapshot.Entrypoint); err != nil {

@@ -53,9 +53,11 @@ real production soak, not in the obvious unbounded hot paths.
 - Raw TCP exposure has an FSM host-port index, so cluster-wide host-port
   collision checks are O(1) at 100k placements instead of scanning the global
   placement map.
-- Image pull storms are single-flighted per image/auth tuple, and local-only
-  built/snapshot image refs fail fast on a new owner when the image is missing
-  instead of stampeding a registry path that cannot contain them.
+- Image pull storms are single-flighted per image/auth tuple. Snapshot/create
+  specs now carry image-distribution metadata, and local-only built/snapshot
+  refs are pinned before placement/reservation and fail fast on a new owner
+  when the image is missing instead of stampeding a registry path that cannot
+  contain them.
 - Cluster placement now stores only secret refs and versions. The encrypted
   secret payload lives behind the service provider boundary in `cluster_secrets`
   with recipient-bound envelopes and per-secret data keys; legacy sealed blobs
@@ -86,11 +88,14 @@ real production soak, not in the obvious unbounded hot paths.
 
 ## Still Pending
 
-- External KMS provider wiring, provider-level key rewrap tests, secret-access
-  audit events, and image pre-distribution are still deployment-level
-  integrations. The code now has a secret-provider boundary, pull dedupe, and
-  clear local-only image failure semantics, but it does not ship a registry/cache
-  service or a KMS plugin in-process.
+- External KMS provider wiring, provider-level key rewrap tests, and
+  secret-access audit events are still deployment-level integrations.
+- Image distribution is intentionally a pluggable control-plane contract now:
+  snapshots and create specs carry `external_registry`, `aocr`, or `local_only`
+  metadata; AOCR is optional and recognized by registry host; local-only images
+  are pinned to the receiving worker before placement/reservation instead of
+  being forwarded to a node that cannot have the image. The daemon still does
+  not ship a bulky registry/cache service in-process.
 - Automatic sandbox recreate remains product-gated off. The code now supports
   bounded orphan cleanup and previous-owner reclaim, but it still does not
   promise HA recreation of running sandboxes after a real owner death.

@@ -168,6 +168,27 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	normalizedRaw, err := json.Marshal(req)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(normalizedRaw))
+	r.ContentLength = int64(len(normalizedRaw))
+
+	if service.ImageRequiresLocalPlacement(req) {
+		if c.IsNodeDrained(c.SelfNodeID()) {
+			apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+			return
+		}
+		h.createSandboxOnSelectedNode(w, r, req, "")
+		return
+	}
+
 	target, err := c.SelectPlacement(capacityRequestFromCreate(req))
 	if err != nil {
 		if errors.Is(err, cluster.ErrNoPlacementTarget) {
@@ -237,6 +258,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 //     redacted spec + ref — opPlace transitions State=Reserved → Placed
 //     atomically while keeping secret material out of Raft.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
+	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	c := h.deps.Service.Cluster()
 	if c == nil {
 		h.createSandbox(w, r)

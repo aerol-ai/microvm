@@ -248,6 +248,35 @@ func TestClusterCreateWrapReturns503WhenNoWorkerCanOwnSandbox(t *testing.T) {
 	}
 }
 
+func TestClusterCreateWrapKeepsLocalOnlyImagesOnReceivingNode(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("server-a", "http://server-a"),
+		target: cluster.PlacementTarget{NodeID: "worker-b", APIURL: "http://worker-b:21212", IsSelf: false},
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	body := `{"image":"e2b/sb-local:default","image_distribution_mode":"local_only"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	if fakeCluster.selectPlacementHit != 0 {
+		t.Fatalf("SelectPlacement calls = %d, want 0 for local-only image", fakeCluster.selectPlacementHit)
+	}
+	if len(fakeCluster.reserveCalls) != 0 {
+		t.Fatalf("ReserveOnTarget calls = %d, want 0 for local-only image", len(fakeCluster.reserveCalls))
+	}
+	if fakeCluster.forwardedPeer != "" {
+		t.Fatalf("ForwardHTTP fired with peer %q; local-only image must not be forwarded", fakeCluster.forwardedPeer)
+	}
+}
+
 // TestClusterCreateWrapForwardedRequiresCreateIDHeader pins the contract that
 // a forwarded create MUST carry X-Cluster-Create-ID. Without it, the receiving
 // target would mint its own ID and the reservation→placed promotion would
