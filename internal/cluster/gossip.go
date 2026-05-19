@@ -14,12 +14,17 @@ import (
 	"github.com/hashicorp/memberlist"
 )
 
-// nodeMeta is the per-node metadata broadcast through memberlist. It must stay
-// well under memberlist.Config.NodeMeta size limit (default 512 bytes); if
-// capacity.Snapshot grows past that, we'd need to switch to gossiped
-// user-events instead of node metadata.
+// nodeMeta is the per-node identity broadcast through memberlist. memberlist's
+// MetaMaxSize is a hardcoded 512-byte constant (not configurable on Config),
+// so this struct must stay small. Capacity used to live here but pushed the
+// encoded blob past 512 bytes, which triggered NodeMeta()'s fallback path and
+// stripped RaftAddr from peers' view — breaking voter auto-join entirely
+// (see voter_autojoin.go which gates on peerRaftAddr != ""). Capacity is now
+// surfaced per-node via /v1/capacity; peer Capacity in Member is left
+// zero-valued, and placement.go.nodeFits / headroomScore already handle the
+// unknown-capacity case (forward and let the remote admitter decide).
 type nodeMeta struct {
-	NodeID        string `json:"node_id"`
+	NodeID string `json:"node_id"`
 	// NodeName is the operator-friendly label (SB_NODE_NAME). Empty for
 	// peers running pre-NodeName builds; consumers fall back to NodeID for
 	// display.
@@ -36,8 +41,7 @@ type nodeMeta struct {
 	// uses this to decline to AddVoter a peer that announced itself as
 	// worker/ingress. Empty (older builds) is treated as "mixed" to preserve
 	// rolling-upgrade compatibility.
-	Role     string            `json:"role,omitempty"`
-	Capacity capacity.Snapshot `json:"capacity"`
+	Role string `json:"role,omitempty"`
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
@@ -71,20 +75,15 @@ func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, intern
 	return d
 }
 
-// refreshMeta rebuilds the encoded metadata blob from the current capacity
-// snapshot. memberlist's NodeMeta() must return a stable byte slice, so we
-// double-buffer.
+// refreshMeta rebuilds the encoded metadata blob. memberlist's NodeMeta()
+// must return a stable byte slice, so we double-buffer.
 func (d *gossipDelegate) refreshMeta() {
-	snap := capacity.Snapshot{}
-	if d.admitter != nil {
-		snap = d.admitter.Snapshot()
-	}
-	meta := nodeMeta{NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, Capacity: snap}
+	meta := nodeMeta{NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role}
 	enc, err := json.Marshal(meta)
 	if err != nil {
-		// JSON of a capacity.Snapshot can't fail; if it does, fall back to a
-		// minimal blob so peers still know we're here.
-		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, InternalURL: d.internalURL, Role: d.role})
+		// nodeMeta has only string fields; json.Marshal cannot fail. Keep the
+		// minimal fallback for paranoia so peers still see us if it ever does.
+		minimal, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost})
 		enc = minimal
 	}
 	d.mu.Lock()
@@ -281,14 +280,14 @@ func (d *indexedEventDelegate) NotifyUpdate(n *memberlist.Node) {
 }
 
 type gossipSetupConfig struct {
-	NodeID         string
-	BindAddr       string
-	AdvertiseAddr  string
-	APIURL         string
-	DataPlaneHost  string
-	RaftAddr       string
-	InternalURL    string
-	Role           string
+	NodeID        string
+	BindAddr      string
+	AdvertiseAddr string
+	APIURL        string
+	DataPlaneHost string
+	RaftAddr      string
+	InternalURL   string
+	Role          string
 	// NodeName is the operator-friendly display label (SB_NODE_NAME). Empty
 	// is acceptable; the delegate ships an empty value and dashboard
 	// consumers fall back to NodeID.
@@ -378,11 +377,12 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	return gn, nil
 }
 
-// runRefreshLoop periodically rebuilds the node-metadata blob and tells
-// memberlist to re-disseminate it. Without the UpdateNode call, peers would
-// see only the metadata observed at join time — power-of-two-choices
-// placement would then score against frozen capacity snapshots and slowly
-// pile load onto whichever nodes happened to look empty at gossip-join.
+// runRefreshLoop periodically rebuilds the cached member index from
+// memberlist's view so reads served from the index don't go stale. Node
+// metadata itself is now static (identity-only — see nodeMeta), so we no
+// longer call refreshMeta()+UpdateNode() here; the original purpose of that
+// pair was to disseminate live capacity, which is now fetched per-peer via
+// /v1/capacity instead.
 func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -391,14 +391,7 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			g.delegate.refreshMeta()
 			g.refreshMemberIndex()
-			// UpdateNode triggers memberlist's NodeMeta callback and queues
-			// the new blob for gossip dissemination. Bound the call so a
-			// stalled gossip layer doesn't block the refresh ticker.
-			if err := g.ml.UpdateNode(2 * time.Second); err != nil {
-				g.logger.Warn("cluster: memberlist UpdateNode failed", "err", err)
-			}
 		}
 	}
 }
@@ -453,7 +446,9 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.RaftAddr = meta.RaftAddr
 			m.InternalURL = meta.InternalURL
 			m.Role = meta.Role
-			m.Capacity = meta.Capacity
+			// m.Capacity stays zero — capacity no longer travels in nodeMeta
+			// (see the type comment). Callers needing peer capacity must hit
+			// the peer's /v1/capacity endpoint.
 		}
 	}
 	return m
@@ -466,7 +461,14 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 func (g *gossipNode) selfMember() Member {
 	g.delegate.mu.RLock()
 	meta := g.delegate.selfMeta
+	admitter := g.delegate.admitter
 	g.delegate.mu.RUnlock()
+	// Self can still report a live capacity snapshot — it's just no longer
+	// gossiped to peers. Pull straight from the local admitter.
+	var snap capacity.Snapshot
+	if admitter != nil {
+		snap = admitter.Snapshot()
+	}
 	return Member{
 		NodeID:        meta.NodeID,
 		NodeName:      meta.NodeName,
@@ -476,7 +478,7 @@ func (g *gossipNode) selfMember() Member {
 		InternalURL:   meta.InternalURL,
 		Role:          meta.Role,
 		Alive:         true,
-		Capacity:      meta.Capacity,
+		Capacity:      snap,
 	}
 }
 
