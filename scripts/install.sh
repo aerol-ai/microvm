@@ -21,6 +21,7 @@ RUNSC_PATH=""
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 LOCAL_MODE="false"
+NODE_NAME=""
 
 usage() {
 	cat <<'EOF'
@@ -73,6 +74,12 @@ Options:
                                Requires the amdgpu kernel module loaded on the
                                host (the GPU must already be recognized by the
                                OS — /dev/kfd must exist).
+  --node-name <name>           Human-readable identifier broadcast to the
+                               cluster (shown in the dashboard's CLUSTER
+                               table). Persisted as SB_NODE_NAME in
+                               sandboxd.env. Defaults to empty, in which
+                               case the dashboard falls back to the
+                               hostname-derived node_id.
   --local                      Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. Docker Desktop (macOS)
@@ -256,6 +263,10 @@ while [[ $# -gt 0 ]]; do
 		--local)
 			LOCAL_MODE="true"
 			shift
+			;;
+		--node-name)
+			NODE_NAME="$2"
+			shift 2
 			;;
 		--help)
 			usage
@@ -507,6 +518,7 @@ write_environment() {
 	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
+SB_NODE_NAME=$NODE_NAME
 SB_API_HOST=0.0.0.0
 SB_API_PORT=21212
 SB_DOMAIN=$DOMAIN
@@ -940,6 +952,7 @@ write_local_environment() {
 	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
+SB_NODE_NAME=$NODE_NAME
 SB_API_HOST=127.0.0.1
 SB_API_PORT=21212
 SB_PUBLIC_HOST=127.0.0.1
