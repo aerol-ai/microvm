@@ -7,17 +7,47 @@ service, tail logs across all nodes."
 ## Prereqs
 
 - Ansible ≥ 2.15 (`pipx install ansible-core` or `brew install ansible`)
-- Python 3 with `boto3` + `botocore` on the control machine (`pip install boto3 botocore`)
+- `boto3` + `botocore` reachable from **Ansible's Python** (see install note below)
 - AWS credentials in the default chain (env, profile, instance role) with
   `ec2:DescribeInstances` — that's all the inventory plugin needs
 - The same SSH private key Terraform installed on the nodes (default:
   `~/.ssh/id_rsa`; change in `ansible.cfg` if you use a different one)
 
-Install Ansible collections once:
+### One-time install
 
 ```bash
 cd Ansible
+
+# Install Ansible collections this repo depends on.
 ansible-galaxy collection install -r requirements.yml
+
+# Install boto3 / botocore for the dynamic EC2 inventory. The right command
+# depends on how Ansible itself was installed:
+#
+#   - pipx (recommended):    pipx inject ansible-core boto3 botocore
+#   - brew install ansible:  brew installs them as part of the formula — skip
+#   - system pip / venv:     pip install boto3 botocore  (into the SAME env
+#                            that owns the `ansible` binary)
+#
+# If you `pip install boto3` into your base/conda env while Ansible lives in
+# a pipx venv, Ansible won't see it and `ansible-inventory --graph` will fail
+# with "Failed to import the required Python library (botocore and boto3)".
+pipx inject ansible-core boto3 botocore
+
+# Load your SSH key into the agent (per session, no config edit needed).
+ssh-add ~/.ssh/your-aws-key.pem
+
+# Point at your cluster (defaults: cluster=aerolvm, region=us-east-1).
+export AEROLVM_CLUSTER=aerolvm
+export AEROLVM_REGION=us-east-1
+export AWS_PROFILE=default            # if you use named profiles
+```
+
+Smoke test:
+
+```bash
+ansible-inventory --graph        # should list your EC2 nodes grouped by tag
+ansible-playbook playbooks/ping.yml
 ```
 
 ## Inventory
@@ -58,15 +88,22 @@ ansible-playbook playbooks/update-sandboxd.yml --limit aerolvm_role_worker -e ..
 # Reachability check (run this first to verify SSH + sudo work):
 ansible-playbook playbooks/ping.yml
 
-# Push a locally-built sandboxd binary cluster-wide, one node at a time,
-# verifying /healthz between restarts:
+# Push the LATEST released sandboxd binary across the fleet (most common):
+ansible-playbook playbooks/update-sandboxd.yml \
+  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_amd64
+
+# arm64 / Graviton nodes:
+ansible-playbook playbooks/update-sandboxd.yml \
+  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_arm64
+
+# Pin to a specific release instead of "latest":
+ansible-playbook playbooks/update-sandboxd.yml \
+  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/sandboxd_linux_amd64
+
+# Push a locally-built binary (dev loop):
 make -C .. build-sandboxd
 ansible-playbook playbooks/update-sandboxd.yml \
   -e sandboxd_local_binary=../bin/sandboxd
-
-# Or pull a released binary from GitHub:
-ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/sandboxd_linux_amd64
 
 # Tail recent sandboxd logs from every node:
 ansible-playbook playbooks/tail-logs.yml -e lines=200
@@ -74,49 +111,44 @@ ansible-playbook playbooks/tail-logs.yml -e lines=200
 
 `update-sandboxd.yml` runs `serial: 1` — one host at a time, with
 `any_errors_fatal: true` — so a failed health check on node 1 stops the
-rollout before it touches the Raft quorum. Limit to a single test node first:
+rollout before it touches the Raft quorum. Limit to a single non-seed test
+node first (use a hostname from `ansible-inventory --graph`, e.g. one that
+shows up under `@aerolvm_false`):
 
 ```bash
 ansible-playbook playbooks/update-sandboxd.yml \
-  -e sandboxd_local_binary=../bin/sandboxd \
-  --limit aerolvm-srv1
+  -e sandboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/sandboxd_linux_amd64 \
+  --limit aerolvm-node3
 ```
 
-## Development practices
+Release asset names come from `.github/workflows/release.yml` and follow
+`sandboxd_<goos>_<goarch>` — `linux_amd64`, `linux_arm64`, `linux_armv7`,
+`linux_armv6`, `linux_386`, `freebsd_amd64`, `darwin_arm64`, etc.
 
-**Load your SSH key into the agent once per session** instead of editing
-`ansible.cfg` with your key path (the config is committed; your key path is
-per-machine and shouldn't be):
+## Per-machine config
 
-```bash
-ssh-add ~/.ssh/suman-saurabh-aws.pem
-# On macOS, persist across reboots via the Keychain:
-# ssh-add --apple-use-keychain ~/.ssh/suman-saurabh-aws.pem
-```
+`ansible.cfg` is committed — your SSH key path, AWS profile, region, and
+cluster name are per-machine and don't belong in it. Use:
 
-Once the agent has the key, `ssh`, `scp`, `git`, and `ansible-playbook` all
-pick it up automatically — no `--private-key` flag, no config edit.
-
-Anything else that varies between contributors' machines (AWS profile, region,
-cluster name) belongs in your shell env — never in a tracked file:
-
-```bash
-export AEROLVM_CLUSTER=aerolvm        # matches var.cluster_name in Terraform
-export AEROLVM_REGION=us-east-1
-export AWS_PROFILE=default            # if you use named profiles
-```
-
-If you really need a local config override, create
-`Ansible/ansible.local.cfg` (gitignored) and run with
-`ANSIBLE_CONFIG=$PWD/Ansible/ansible.local.cfg ansible-playbook ...`.
+- `ssh-add ~/.ssh/<your-key>.pem` for the key (persist on macOS with
+  `ssh-add --apple-use-keychain`). Once loaded, `ansible-playbook` picks it
+  up via the agent — no `--private-key` flag, no config edit.
+- `AEROLVM_CLUSTER`, `AEROLVM_REGION`, `AWS_PROFILE` env vars for cluster
+  selection (the dynamic inventory reads these directly).
+- `Ansible/ansible.local.cfg` (gitignored) + `ANSIBLE_CONFIG=$PWD/Ansible/ansible.local.cfg`
+  if you genuinely need to override `ansible.cfg` settings locally.
 
 ## Layout
 
 ```
 ansible.cfg            # forks, ssh args, default inventory + remote_user
 requirements.yml       # collections to install
-inventory/aws_ec2.yml  # dynamic inventory (EC2 → hosts/groups via tags)
-group_vars/all.yml     # binary path, service name, health URL defaults
+inventory/
+  aws_ec2.yml          # dynamic inventory (EC2 → hosts/groups via tags)
+  group_vars/all.yml   # binary path, service name, health URL defaults
+                       # (must live next to the inventory; Ansible auto-loads
+                       # group_vars only from inventory/ or playbooks/, not
+                       # from the repo root)
 playbooks/
   ping.yml             # connectivity smoke test
   update-sandboxd.yml  # rolling binary push + restart + healthcheck

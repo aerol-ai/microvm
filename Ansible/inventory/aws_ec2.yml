@@ -20,18 +20,18 @@ hostnames:
 
 compose:
   ansible_host: public_ip_address
-  node_name:    tags.Name
-  node_role:    tags.Role
-  is_seed:      tags.Seed == 'true'
+  node_name:    ec2_tags.Name
+  node_role:    ec2_tags.Role
+  is_seed:      ec2_tags.Seed == 'true'
 
 # Build groups from tags so playbooks can target subsets.
 #   - aerolvm_role_server / aerolvm_role_worker / aerolvm_role_ingress /
 #     aerolvm_role_mixed / aerolvm_role_worker_ingress / ...
 #   - aerolvm_seed (exactly one host) / aerolvm_joiner (everyone else)
 keyed_groups:
-  - key: tags.Role | regex_replace(',', '_')
+  - key: ec2_tags.Role | regex_replace(',', '_')
     prefix: aerolvm_role
     separator: _
-  - key: tags.Seed
+  - key: ec2_tags.Seed
     prefix: aerolvm
     separator: _

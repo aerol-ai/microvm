@@ -4,5 +4,5 @@
 sandboxd_binary_path:   /usr/local/bin/sandboxd
 sandboxd_service_name:  sandboxd
 sandboxd_env_file:      /etc/sandboxd/sandboxd.env
-sandboxd_health_url:    "http://127.0.0.1:21212/healthz"
+sandboxd_health_url:    "http://127.0.0.1:21212/health"
 sandboxd_health_wait_s: 30

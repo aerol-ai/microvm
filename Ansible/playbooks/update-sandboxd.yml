@@ -16,7 +16,7 @@
 # Safety:
 #   - serial: 1 → one node at a time. Critical for the Raft voters (server / mixed)
 #     since restarting more than (N-1)/2 simultaneously loses quorum.
-#   - Each node is verified healthy on :21212/healthz before moving to the next.
+#   - Each node is verified healthy on :21212/health before moving to the next.
 #   - become: true → tasks that touch /usr/local/bin or systemd run as root via sudo.
 
 - name: Update sandboxd across the AerolVM cluster
@@ -81,7 +81,7 @@
         state: restarted
         daemon_reload: false
 
-    - name: "[{{ inventory_hostname }}] Wait for /healthz to come back"
+    - name: "[{{ inventory_hostname }}] Wait for /health to come back"
       ansible.builtin.uri:
         url: "{{ sandboxd_health_url }}"
         status_code: 200
