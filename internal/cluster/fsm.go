@@ -1214,7 +1214,9 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 // Restore loads state from a previously written snapshot. Replaces in-memory
 // placements wholesale — raft only calls Restore on a cold start or follower
 // resync.
-func (f *placementFSM) Restore(rc io.ReadCloser) error {
+func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
+	start := time.Now()
+	defer func() { recordSnapshotRestore(time.Since(start), err) }()
 	defer rc.Close()
 	raw, err := io.ReadAll(rc)
 	if err != nil {
@@ -1290,8 +1292,13 @@ type fsmSnapshot struct {
 	drainedNodes map[string]bool
 }
 
-func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	enc := gob.NewEncoder(sink)
+func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
+	start := time.Now()
+	counting := &countingSnapshotSink{SnapshotSink: sink}
+	defer func() {
+		recordSnapshotPersist(time.Since(start), counting.bytes, len(s.placements), err)
+	}()
+	enc := gob.NewEncoder(counting)
 	if err := enc.Encode(fsmSnapshotPayload{Version: s.version, Placements: s.placements, DrainedNodes: s.drainedNodes}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
@@ -1300,6 +1307,17 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 }
 
 func (s *fsmSnapshot) Release() {}
+
+type countingSnapshotSink struct {
+	raft.SnapshotSink
+	bytes int64
+}
+
+func (s *countingSnapshotSink) Write(p []byte) (int, error) {
+	n, err := s.SnapshotSink.Write(p)
+	s.bytes += int64(n)
+	return n, err
+}
 
 func clonePlacement(p Placement) Placement {
 	p.Spec = cloneCreateSandboxRequest(p.Spec)

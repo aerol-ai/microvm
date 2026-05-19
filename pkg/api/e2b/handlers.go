@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	svcmetrics "github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -87,6 +88,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if replayed {
+				svcmetrics.RecordFacadeIdempotencyReplay(idempotencyScopeCreate)
 				writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, sandbox, storedMeta))
 				return
 			}
@@ -101,6 +103,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if replayed {
+			svcmetrics.RecordFacadeIdempotencyReplay(idempotencyScopeCreate)
 			writeJSON(w, http.StatusCreated, h.toSandboxResponse(r, sandbox, storedMeta))
 			return
 		}

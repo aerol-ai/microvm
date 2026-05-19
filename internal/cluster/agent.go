@@ -448,19 +448,7 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 }
 
 func (a *Agent) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("X-Cluster-Forwarded") == "1" {
-		http.Error(w, "cluster: forwarding loop detected", http.StatusMisdirectedRequest)
-		return
-	}
-	if a.mtlsProxies != nil && target.InternalURL != "" {
-		serveProxy(a.mtlsProxies, target.InternalURL, w, r)
-		return
-	}
-	if target.APIURL == "" {
-		http.Error(w, "cluster: peer API URL unknown", http.StatusServiceUnavailable)
-		return
-	}
-	serveProxy(a.publicProxies, target.APIURL, w, r)
+	forwardHTTPWithMetrics(a.mtlsProxies, a.publicProxies, target, w, r)
 }
 
 func (a *Agent) AttachInternalHandler(h http.Handler) {
@@ -482,6 +470,7 @@ func (a *Agent) Placements() []Placement {
 }
 
 func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
+	start := time.Now()
 	filter = filter.Normalize()
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
@@ -489,11 +478,15 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	if filter.allShards() {
 		if err := a.doControlPlaneJSON(ctx, http.MethodGet, PublicInternalPlacementsPath, PublicInternalPlacementsPath, nil, &out); err != nil {
 			a.logger.Warn("cluster agent: placements lookup failed; using cached placement view", "err", err)
-			return a.cachedPlacementsForShards(filter)
+			cached := a.cachedPlacementsForShards(filter)
+			recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
+			return cached
 		}
 	} else if err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalPlacementsQueryPath, PublicInternalPlacementsQueryPath, filter, &out); err != nil {
 		a.logger.Warn("cluster agent: shard placement lookup failed; using cached shard view", "err", err, "shards", len(filter.Shards))
-		return a.cachedPlacementsForShards(filter)
+		cached := a.cachedPlacementsForShards(filter)
+		recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
+		return cached
 	}
 	a.cacheMu.Lock()
 	if filter.allShards() {
@@ -503,8 +496,16 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 		a.shardCache = make(map[string][]Placement)
 	}
 	a.shardCache[placementShardFilterCacheKey(filter)] = clonePlacements(out)
+	shardEntries := len(a.shardCache)
 	a.cacheMu.Unlock()
+	recordPlacementCacheRefresh(time.Since(start), len(out), shardEntries, nil)
 	return out
+}
+
+func (a *Agent) shardCacheEntryCount() int {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	return len(a.shardCache)
 }
 
 func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {

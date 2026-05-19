@@ -3,8 +3,10 @@ package netstats
 import (
 	"context"
 	"errors"
+	"expvar"
 	"io/fs"
 	"log/slog"
+	"strconv"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -158,6 +160,40 @@ func TestPollerSkipsStoppedContainers(t *testing.T) {
 	if len(sink.batches) != 0 {
 		t.Fatalf("expected no samples for stopped container, got %#v", sink.batches)
 	}
+}
+
+func TestPollerPublishesScaleMetrics(t *testing.T) {
+	reader := NewReaderFS(fstest.MapFS{})
+	lookup := &fakeLookup{pids: map[string]int{"sb-stopped": 0}}
+	lister := &fakeLister{targets: []Target{{SandboxID: "sb-stopped", ContainerRef: "sb-stopped"}}}
+	sink := &fakeSink{}
+	p := NewPoller(slog.Default(), reader, lookup, lister, sink, time.Second)
+
+	beforePolls := pollTotal.Value()
+	beforeDropped := mapValue(pollDroppedTotal, "not_running")
+	p.tick(context.Background(), time.Unix(1000, 0))
+
+	if got := pollTotal.Value() - beforePolls; got != 1 {
+		t.Fatalf("poll total delta = %d, want 1", got)
+	}
+	if got := pollTargetsLast.Value(); got != 1 {
+		t.Fatalf("targets last = %d, want 1", got)
+	}
+	if got := pollSamplesLast.Value(); got != 0 {
+		t.Fatalf("samples last = %d, want 0", got)
+	}
+	if got := mapValue(pollDroppedTotal, "not_running") - beforeDropped; got != 1 {
+		t.Fatalf("dropped not_running delta = %d, want 1", got)
+	}
+}
+
+func mapValue(m interface{ Get(string) expvar.Var }, key string) int64 {
+	v := m.Get(key)
+	if v == nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(v.String(), 10, 64)
+	return n
 }
 
 func TestPollerGarbageCollectsBaselines(t *testing.T) {

@@ -149,6 +149,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 
 	if targetNodeID := strings.TrimSpace(r.Header.Get(clusterCreateTargetHeader)); targetNodeID != "" {
 		if targetNodeID != c.SelfNodeID() {
+			cluster.RecordOwnerForwardStale()
 			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return
 		}
@@ -202,6 +203,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		// Name collision: deterministic 409 so clients can distinguish
 		// "pick a different name" from "cluster degraded, retry."
 		if errors.Is(err, cluster.ErrNameConflict) {
+			service.RecordFacadeIdempotencyConflict("v1.create.name")
 			apihttp.WriteError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return
 		}
@@ -209,12 +211,14 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		// the same ID owned by someone else) — extremely unlikely with a
 		// freshly-minted ID, but surface it cleanly so the client retries.
 		if errors.Is(err, cluster.ErrReservationConflict) {
+			service.RecordFacadeIdempotencyConflict("v1.create.reservation")
 			apihttp.WriteError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return
 		}
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return
 	}
+	service.RecordCreateReservationState("reserve_remote")
 
 	r.Header.Set(clusterCreateTargetHeader, target.NodeID)
 	r.Header.Set(clusterCreateIDHeader, sandboxID)
@@ -244,8 +248,10 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		err  error
 	)
 	if reservationID != "" {
+		service.RecordCreateReservationState("promote_local")
 		resp, err = h.deps.Service.CreateSandboxWithID(r.Context(), req, reservationID)
 	} else {
+		service.RecordCreateReservationState("self_local")
 		resp, err = h.deps.Service.CreateSandbox(r.Context(), req)
 	}
 	if err != nil {

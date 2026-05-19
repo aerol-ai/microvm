@@ -91,6 +91,7 @@ type Snapshot struct {
 	ReservedCPU               float64  `json:"reserved_cpu"`
 	ReservedMemoryMB          int      `json:"reserved_memory_mb"`
 	ReservedDiskGB            int      `json:"reserved_disk_gb,omitempty"`
+	ReservedGPUs              int      `json:"reserved_gpus,omitempty"`
 	LiveMemoryFreeMB          int      `json:"live_memory_free_mb"`
 	SandboxesActive           int      `json:"sandboxes_active"`
 	CanAdmit                  bool     `json:"can_admit"`
@@ -353,6 +354,7 @@ func (a *Admitter) Snapshot() Snapshot {
 	totalCPU := a.totalCPU
 	totalMem := a.totalMemMB
 	totalDisk := a.totalDiskGB
+	totalGPUs := a.totalGPUs
 	a.mu.Unlock()
 
 	free := 0
@@ -369,6 +371,7 @@ func (a *Admitter) Snapshot() Snapshot {
 		ReservedCPU:               totalCPU,
 		ReservedMemoryMB:          totalMem,
 		ReservedDiskGB:            totalDisk,
+		ReservedGPUs:              totalGPUs,
 		LiveMemoryFreeMB:          free,
 		SandboxesActive:           count,
 		CPUReservationRatio:       a.limits.CPUReservationRatio,
@@ -389,6 +392,7 @@ func (a *Admitter) Snapshot() Snapshot {
 	// We don't use 0/0 because that bypasses every check and would always
 	// report CanAdmit=true even when the host is full.
 	snap.CanAdmit, snap.Reasons = a.dryRun(Request{CPU: 1, MemoryMB: 1})
+	recordHostPressure(snap)
 	return snap
 }
 

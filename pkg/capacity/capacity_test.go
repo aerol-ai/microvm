@@ -36,6 +36,32 @@ func TestAdmitUnderLimitsAccepts(t *testing.T) {
 	}
 }
 
+func TestSnapshotPublishesHostPressureMetrics(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096, DiskTotalGB: 100, GPUCount: 2}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		DiskReservationRatio:   1.0,
+	}, fakeProbe{free: 2048})
+	a.Reserve("sb-pressure", Request{CPU: 1.5, MemoryMB: 512, DiskGB: 10, GPUs: 1})
+
+	snap := a.Snapshot()
+	if snap.ReservedGPUs != 1 {
+		t.Fatalf("ReservedGPUs = %d, want 1", snap.ReservedGPUs)
+	}
+	if got := hostPressureSandboxes.Value(); got != 1 {
+		t.Fatalf("host pressure sandboxes = %d, want 1", got)
+	}
+	if got := hostPressureReservedCPU.Value(); got != 1500 {
+		t.Fatalf("reserved cpu millicores = %d, want 1500", got)
+	}
+	if got := hostPressureReservedMemory.Value(); got != 512 {
+		t.Fatalf("reserved memory = %d, want 512", got)
+	}
+	if got := hostPressureReservedGPUs.Value(); got != 1 {
+		t.Fatalf("reserved gpus = %d, want 1", got)
+	}
+}
+
 // TestAdmitNoCountCap exercises the design choice that admission is
 // pure-math — a host with very small per-sandbox requests should accept
 // arbitrarily many sandboxes as long as CPU/memory budgets allow.

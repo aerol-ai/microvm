@@ -112,7 +112,13 @@ func (p *Poller) run(ctx context.Context) {
 // tick is exposed (lowercase but visible to test files in-package) so tests
 // can drive a deterministic sample without standing up a real ticker.
 func (p *Poller) tick(ctx context.Context, now time.Time) {
+	start := time.Now()
 	targets := p.lister.NetstatsTargets(ctx)
+	dropped := make(map[string]int64)
+	sampleCount := 0
+	defer func() {
+		recordPoll(time.Since(start), len(targets), sampleCount, dropped)
+	}()
 	if len(targets) == 0 {
 		p.gcBaselines(targets)
 		return
@@ -121,6 +127,7 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 	samples := make([]Sample, 0, len(targets))
 	for _, t := range targets {
 		if t.SandboxID == "" {
+			dropped["missing_sandbox_id"]++
 			continue
 		}
 		// Per the SandboxLister contract, an empty ContainerRef means "not
@@ -131,16 +138,19 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		// for sandboxes stuck in not-yet-running states would accumulate.
 		if t.ContainerRef == "" {
 			p.dropBaseline(t.SandboxID)
+			dropped["empty_container_ref"]++
 			continue
 		}
 
 		pid, err := p.lookup.ContainerPID(ctx, t.ContainerRef)
 		if err != nil {
 			p.logger.Debug("netstats: pid lookup failed", "sandbox_id", t.SandboxID, "error", err)
+			dropped["pid_lookup_failed"]++
 			continue
 		}
 		if pid <= 0 {
 			p.dropBaseline(t.SandboxID)
+			dropped["not_running"]++
 			continue
 		}
 
@@ -148,9 +158,11 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		if err != nil {
 			if errors.Is(err, ErrNotRunning) {
 				p.dropBaseline(t.SandboxID)
+				dropped["not_running"]++
 				continue
 			}
 			p.logger.Debug("netstats: read failed", "sandbox_id", t.SandboxID, "pid", pid, "error", err)
+			dropped["read_failed"]++
 			continue
 		}
 
@@ -166,6 +178,7 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 	p.gcBaselines(targets)
 
 	if len(samples) > 0 {
+		sampleCount = len(samples)
 		p.sink.HandleSamples(ctx, samples)
 	}
 }

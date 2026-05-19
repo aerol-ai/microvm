@@ -346,7 +346,9 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 	return string(req.Vendor)
 }
 
-func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
+func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
+	done := beginSandboxCreateMetric()
+	defer func() { done(err) }()
 	if s.cfg.EnableCluster && !s.cfg.IsWorker() {
 		return nil, cluster.ErrNoPlacementTarget
 	}

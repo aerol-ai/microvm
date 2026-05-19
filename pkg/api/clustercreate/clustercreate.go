@@ -47,6 +47,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 
 	if targetNodeID := strings.TrimSpace(r.Header.Get(HeaderTarget)); targetNodeID != "" {
 		if targetNodeID != c.SelfNodeID() {
+			service.RecordFacadeIdempotencyConflict("cluster.create.forward")
 			writeError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return Decision{}, false
 		}
@@ -86,6 +87,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	cancel()
 	if err != nil {
 		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
+			service.RecordFacadeIdempotencyConflict("cluster.create.reservation")
 			handled, local := routeExistingPlacement(w, r, c, sandboxID, writeError)
 			if local {
 				return Decision{ReservationID: sandboxID}, true
@@ -95,16 +97,19 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			}
 		}
 		if errors.Is(err, cluster.ErrNameConflict) {
+			service.RecordFacadeIdempotencyConflict("cluster.create.name")
 			writeError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrReservationConflict) {
+			service.RecordFacadeIdempotencyConflict("cluster.create.reservation")
 			writeError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return Decision{}, false
 		}
 		writeError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return Decision{}, false
 	}
+	service.RecordCreateReservationState("reserve_remote")
 
 	r.Header.Set(HeaderTarget, target.NodeID)
 	r.Header.Set(HeaderID, sandboxID)
@@ -123,6 +128,7 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 		return false, true
 	}
 	if owner.APIURL == "" && owner.InternalURL == "" {
+		service.RecordRouteMiss()
 		writeError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 		return true, false
 	}
@@ -141,8 +147,10 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		err  error
 	)
 	if reservationID != "" {
+		service.RecordCreateReservationState("promote_local")
 		resp, err = svc.CreateSandboxWithID(ctx, req, reservationID)
 	} else {
+		service.RecordCreateReservationState("self_local")
 		resp, err = svc.CreateSandbox(ctx, req)
 	}
 	if err != nil {

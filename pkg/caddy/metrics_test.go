@@ -19,6 +19,7 @@ func TestInstrumentingTransportCountsCalls(t *testing.T) {
 
 	beforeCalls := caddyAdminCallsTotal.Value()
 	beforeErrors := caddyAdminErrorsTotal.Value()
+	beforeLatency := caddyAdminLatencyBuckets.Count()
 
 	transport := &instrumentingTransport{inner: http.DefaultTransport}
 	client := &http.Client{Transport: transport}
@@ -36,6 +37,9 @@ func TestInstrumentingTransportCountsCalls(t *testing.T) {
 	}
 	if caddyAdminLastNanos.Value() <= 0 {
 		t.Fatalf("last_nanos = %d, want > 0 after a successful call", caddyAdminLastNanos.Value())
+	}
+	if got := caddyAdminLatencyBuckets.Count() - beforeLatency; got != 1 {
+		t.Fatalf("latency bucket delta = %d, want 1", got)
 	}
 }
 

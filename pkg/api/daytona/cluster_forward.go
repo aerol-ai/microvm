@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
 
@@ -42,10 +43,12 @@ func (h *handlers) clusterForwardWrap(pathKey string, local http.Handler) http.H
 			return
 		}
 		if owner.APIURL == "" && owner.InternalURL == "" {
+			service.RecordRouteMiss()
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 			return
 		}
 		if r.Header.Get("X-Cluster-Forwarded") == "1" {
+			cluster.RecordOwnerForwardStale()
 			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarding loop detected")
 			return
 		}

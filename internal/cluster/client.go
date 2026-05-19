@@ -738,7 +738,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 // Caller is responsible for verifying we're the leader before this point —
 // raft itself returns ErrNotLeader if we lost leadership between the check
 // and the Apply call, which is mapped back to cluster.ErrNotLeader.
-func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
+func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) (err error) {
+	done := beginRaftApply()
+	defer func() { done(err) }()
 	timeout := c.commitTimeout
 	if dl, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(dl); remaining > 0 && remaining < timeout {
@@ -746,14 +748,17 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
 		}
 	}
 	f := c.raft.raft.Apply(payload, timeout)
-	if err := f.Error(); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
+	if applyErr := f.Error(); applyErr != nil {
+		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
+			err = ErrNotLeader
 			return ErrNotLeader
 		}
-		return fmt.Errorf("cluster: raft apply: %w", err)
+		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
+		return err
 	}
 	if appErr, ok := f.Response().(error); ok && appErr != nil {
-		return fmt.Errorf("cluster: fsm apply: %w", appErr)
+		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
+		return err
 	}
 	return nil
 }
@@ -799,7 +804,9 @@ func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) erro
 
 // doLeaderApply is the shared HTTP execution path used by both the mTLS
 // internal channel and the PAT-only public-API fallback in forwardApplyToLeader.
-func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoint string, payload []byte) error {
+func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoint string, payload []byte) (err error) {
+	done := beginLeaderForwardApply()
+	defer func() { done(err) }()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("cluster: build leader-forward request: %w", err)

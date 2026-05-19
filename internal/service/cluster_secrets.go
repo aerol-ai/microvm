@@ -161,7 +161,12 @@ func (s *Service) PutClusterSecretsForRecipient(ctx context.Context, sandboxID s
 // OpenClusterSecretsForNode resolves a replicated secret handle and merges the
 // decrypted credentials back into a redacted spec. LegacySealed is still
 // honored for placements written before the ref model.
-func (s *Service) OpenClusterSecretsForNode(ctx context.Context, redacted models.CreateSandboxRequest, secrets cluster.PlacementSecrets, nodeID string) (models.CreateSandboxRequest, error) {
+func (s *Service) OpenClusterSecretsForNode(ctx context.Context, redacted models.CreateSandboxRequest, secrets cluster.PlacementSecrets, nodeID string) (out models.CreateSandboxRequest, err error) {
+	if secrets.Ref == "" && len(secrets.LegacySealed) == 0 {
+		return redacted, nil
+	}
+	done := beginClusterSecretOpen()
+	defer func() { done(err) }()
 	if secrets.Ref != "" {
 		if s.store == nil {
 			return redacted, errors.New("cluster secret store is not configured")
@@ -174,6 +179,7 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, redacted models
 			return redacted, err
 		}
 		if secrets.Version != 0 && rec.Version != secrets.Version {
+			recordClusterSecretKeyMismatch()
 			return redacted, fmt.Errorf("cluster secret ref %q version mismatch: placement=%d store=%d", secrets.Ref, secrets.Version, rec.Version)
 		}
 		return s.UnsealClusterSecretsForNode(redacted, rec.SealedPayload, nodeID)

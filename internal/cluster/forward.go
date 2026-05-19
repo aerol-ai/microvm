@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -93,33 +94,45 @@ var defaultPublicTransport http.RoundTripper = &http.Transport{
 // surfaces such failures as 502 to the original caller, who can then retry
 // against a different peer.
 func (c *Cluster) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Request) {
+	forwardHTTPWithMetrics(c.mtlsProxies, c.publicProxies, target, w, r)
+}
+
+func forwardHTTPWithMetrics(mtlsProxies *proxyCache, publicProxies *proxyCache, target Endpoint, w http.ResponseWriter, r *http.Request) {
+	var err error
+	done := beginOwnerForward()
+	defer func() { done(err) }()
 	if r.Header.Get("X-Cluster-Forwarded") == "1" {
 		// Loop detection: someone forwarded to us, and we're about to forward
 		// onward. Return 421 so the original client retries with fresh
 		// placement info instead of bouncing forever.
+		err = errors.New("cluster: forwarding loop detected")
+		RecordOwnerForwardStale()
 		http.Error(w, "cluster: forwarding loop detected", http.StatusMisdirectedRequest)
 		return
 	}
-	if c.mtlsProxies != nil && target.InternalURL != "" {
-		serveProxy(c.mtlsProxies, target.InternalURL, w, r)
+	if mtlsProxies != nil && target.InternalURL != "" {
+		err = serveProxy(mtlsProxies, target.InternalURL, w, r)
 		return
 	}
 	if target.APIURL == "" {
+		err = errors.New("cluster: peer API URL unknown")
+		recordOwnerForwardTargetMiss("api_url_unknown")
 		http.Error(w, "cluster: peer API URL unknown", http.StatusServiceUnavailable)
 		return
 	}
-	serveProxy(c.publicProxies, target.APIURL, w, r)
+	err = serveProxy(publicProxies, target.APIURL, w, r)
 }
 
-func serveProxy(cache *proxyCache, baseURL string, w http.ResponseWriter, r *http.Request) {
+func serveProxy(cache *proxyCache, baseURL string, w http.ResponseWriter, r *http.Request) error {
 	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		http.Error(w, "cluster: peer URL must include scheme", http.StatusBadGateway)
-		return
+		return errors.New("cluster: peer URL must include scheme")
 	}
 	proxy, err := cache.get(baseURL)
 	if err != nil {
 		http.Error(w, "cluster: invalid peer URL: "+err.Error(), http.StatusBadGateway)
-		return
+		return err
 	}
 	proxy.ServeHTTP(w, r)
+	return nil
 }

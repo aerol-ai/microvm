@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -55,11 +56,24 @@ func TestSetIngressRouteLagZeroWhenFSMVersionUnknown(t *testing.T) {
 // canonical signal.
 func TestRecordRouteMissIncrements(t *testing.T) {
 	before := ingressRouteMissesTotal.Value()
+	beforeReason := ingressRouteMissesByReason.Get("owner_url_unknown")
+	var beforeReasonValue int64
+	if beforeReason != nil {
+		beforeReasonValue, _ = strconv.ParseInt(beforeReason.String(), 10, 64)
+	}
 	RecordRouteMiss()
 	RecordRouteMiss()
 	RecordRouteMiss()
 	if got := ingressRouteMissesTotal.Value() - before; got != 3 {
 		t.Fatalf("route miss delta = %d, want 3", got)
+	}
+	afterReason := ingressRouteMissesByReason.Get("owner_url_unknown")
+	if afterReason == nil {
+		t.Fatal("route miss reason counter missing")
+	}
+	afterReasonValue, _ := strconv.ParseInt(afterReason.String(), 10, 64)
+	if got := afterReasonValue - beforeReasonValue; got != 3 {
+		t.Fatalf("route miss reason delta = %d, want 3", got)
 	}
 }
 

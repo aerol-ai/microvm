@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -140,7 +141,28 @@ func TestHashPlacementViewCounts(t *testing.T) {
 	if counts.http != 2 || counts.tls != 1 || counts.tcp != 1 {
 		t.Fatalf("counts mismatch: http=%d tls=%d tcp=%d", counts.http, counts.tls, counts.tcp)
 	}
+	shard := cluster.PlacementShardForSandbox("sb", cluster.DefaultPlacementShardCount)
+	if got := counts.shards[shard]; got != 4 {
+		t.Fatalf("shard route count = %d, want 4", got)
+	}
 	if maxVersion != 1 {
 		t.Fatalf("maxVersion = %d, want 1", maxVersion)
+	}
+}
+
+func TestRecordIngressReconcilePublishesRevisionAndShardMetrics(t *testing.T) {
+	shard := cluster.PlacementShardForSandbox("sb-metrics", cluster.DefaultPlacementShardCount)
+	counts := ingressRouteCounts{http: 1, shards: map[int]int{shard: 1}}
+	recordIngressReconcile(reconcileApplied, time.Millisecond, counts, 55)
+	if got := ingressRouteAppliedRevision.Value(); got < 55 {
+		t.Fatalf("applied revision = %d, want at least 55", got)
+	}
+	if got := ingressRoutesByShard.Get(strconv.Itoa(shard)); got == nil || got.String() != "1" {
+		t.Fatalf("routes by shard = %v, want 1", got)
+	}
+
+	recordIngressReconcile(reconcileErrored, time.Millisecond, counts, 56)
+	if got := ingressRouteFailedRevision.Value(); got != 56 {
+		t.Fatalf("failed revision = %d, want 56", got)
 	}
 }

@@ -58,6 +58,7 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 // a peer is genuinely better.
 func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 	all := c.gossip.members()
+	rejects := make(map[string]int64)
 	// Subtract still-in-flight reservations (router wrote opReserve but the
 	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
 	// reflect them) from each peer's headroom. Without this, two creates that
@@ -74,20 +75,25 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 	candidates := make([]Member, 0, len(all))
 	for _, m := range all {
 		if !m.Alive {
+			rejects["dead"]++
 			continue
 		}
 		if !CanOwnSandboxRole(m.Role) {
+			rejects["role"]++
 			continue
 		}
 		// Only consider members that have advertised an APIURL — others may
 		// be partially-joined and forwarding to them would 502.
 		if m.APIURL == "" && m.NodeID != c.nodeID {
+			rejects["missing_api_url"]++
 			continue
 		}
 		if drained[m.NodeID] {
+			rejects["drained"]++
 			continue
 		}
 		if !nodeFits(m, req, pending[m.NodeID]) {
+			rejects["capacity"]++
 			continue
 		}
 		candidates = append(candidates, m)
@@ -95,6 +101,7 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
+		recordSchedulerDecision("no_target", 0, rejects)
 		return PlacementTarget{}, ErrNoPlacementTarget
 	}
 
@@ -106,8 +113,10 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 	}
 
 	if winner.NodeID == c.nodeID {
+		recordSchedulerDecision("self", len(candidates), rejects)
 		return self, nil
 	}
+	recordSchedulerDecision("remote", len(candidates), rejects)
 	return PlacementTarget{
 		NodeID:        winner.NodeID,
 		APIURL:        winner.APIURL,

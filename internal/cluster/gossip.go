@@ -122,18 +122,27 @@ type gossipNode struct {
 type gossipMemberIndex struct {
 	mu      sync.RWMutex
 	members map[string]Member
+	seen    map[string]int64
 }
 
 func newGossipMemberIndex() *gossipMemberIndex {
-	return &gossipMemberIndex{members: make(map[string]Member)}
+	return &gossipMemberIndex{members: make(map[string]Member), seen: make(map[string]int64)}
 }
 
 func (i *gossipMemberIndex) upsert(m Member) {
 	if i == nil || m.NodeID == "" {
 		return
 	}
+	now := time.Now().UnixNano()
 	i.mu.Lock()
+	if i.seen == nil {
+		i.seen = make(map[string]int64)
+	}
+	if m.Alive {
+		i.seen[m.NodeID] = now
+	}
 	i.members[m.NodeID] = m
+	i.recordMetricsLocked(now)
 	i.mu.Unlock()
 }
 
@@ -141,6 +150,7 @@ func (i *gossipMemberIndex) replace(members []Member) {
 	if i == nil {
 		return
 	}
+	now := time.Now().UnixNano()
 	next := make(map[string]Member, len(members))
 	for _, m := range members {
 		if m.NodeID == "" {
@@ -149,7 +159,22 @@ func (i *gossipMemberIndex) replace(members []Member) {
 		next[m.NodeID] = m
 	}
 	i.mu.Lock()
+	if i.seen == nil {
+		i.seen = make(map[string]int64)
+	}
+	for _, m := range next {
+		if m.Alive {
+			i.seen[m.NodeID] = now
+		}
+	}
+	for id := range i.seen {
+		if _, ok := next[id]; !ok {
+			delete(i.seen, id)
+		}
+	}
+	i.recordLeaseLossesLocked(next)
 	i.members = next
+	i.recordMetricsLocked(now)
 	i.mu.Unlock()
 }
 
@@ -164,6 +189,55 @@ func (i *gossipMemberIndex) snapshot() []Member {
 		out = append(out, m)
 	}
 	return out
+}
+
+func (i *gossipMemberIndex) recordLeaseLossesLocked(next map[string]Member) {
+	if i == nil {
+		return
+	}
+	for id, prev := range i.members {
+		if !prev.Alive || !CanOwnSandboxRole(prev.Role) {
+			continue
+		}
+		if curr, ok := next[id]; !ok || !curr.Alive {
+			workerLeaseLostTotal.Add(1)
+		}
+	}
+}
+
+func (i *gossipMemberIndex) recordMetricsLocked(now int64) {
+	if i == nil {
+		return
+	}
+	total := len(i.members)
+	alive := 0
+	workerTotal := 0
+	workerAlive := 0
+	var maxAge int64
+	for id, m := range i.members {
+		if m.Alive {
+			alive++
+		}
+		if !CanOwnSandboxRole(m.Role) {
+			continue
+		}
+		workerTotal++
+		if m.Alive {
+			workerAlive++
+		}
+		if seen := i.seen[id]; seen > 0 {
+			age := now - seen
+			if age > maxAge {
+				maxAge = age
+			}
+		}
+	}
+	gossipMembersTotal.Set(int64(total))
+	gossipMembersAlive.Set(int64(alive))
+	workerLeasesTotal.Set(int64(workerTotal))
+	workerLeasesAlive.Set(int64(workerAlive))
+	workerLeaseMaxAgeNanos.Set(maxAge)
+	workerLeaseRefreshNanos.Set(now)
 }
 
 type indexedEventDelegate struct {

@@ -306,6 +306,7 @@ func (c *Cluster) reconcileReservations(ctx context.Context) {
 				"sandbox_id", id, "owner", p.OwnerNodeID, "err", err)
 			continue
 		}
+		recordExpiredReservation()
 		c.logger.Info("cluster: cancelled expired reservation",
 			"sandbox_id", id, "owner", p.OwnerNodeID)
 	}

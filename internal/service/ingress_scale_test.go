@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,7 +68,7 @@ func TestHashPlacementViewAt10KIsStable(t *testing.T) {
 	if h1 != h2 {
 		t.Fatalf("hash changed across identical calls: %x vs %x", h1, h2)
 	}
-	if c1 != c2 {
+	if !reflect.DeepEqual(c1, c2) {
 		t.Fatalf("counts changed across identical calls: %+v vs %+v", c1, c2)
 	}
 	if v1 != v2 {

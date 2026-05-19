@@ -4,6 +4,8 @@ import (
 	"expvar"
 	"net/http"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 )
 
 // Caddy admin metrics. The hot path is the ingress reconciler at 10K-sandbox
@@ -19,10 +21,12 @@ var (
 	caddyAdminCallsTotal  = expvar.NewInt("aerolvm_caddy_admin_calls_total")
 	caddyAdminErrorsTotal = expvar.NewInt("aerolvm_caddy_admin_errors_total")
 	// caddyAdminLastNanos is the wall-clock duration of the most recent admin
-	// call. Gauge rather than histogram for the same reason ingress_metrics
-	// uses a gauge: no histogram dependency, percentiles via prom-exporter
-	// downstream if the operator wants them.
+	// call; the bucket map below carries the tail-latency signal.
 	caddyAdminLastNanos = expvar.NewInt("aerolvm_caddy_admin_last_nanos")
+	// caddyAdminLatencyBuckets is the scale gate histogram missing from the
+	// original PR. Last-call latency hides tail stalls; buckets let operators
+	// alert on Caddy admin p95/p99 while ingress churn is being reconciled.
+	caddyAdminLatencyBuckets = scaleobs.NewDurationBuckets("aerolvm_caddy_admin_latency_seconds_bucket")
 )
 
 // instrumentingTransport wraps an http.RoundTripper to record per-call
@@ -41,8 +45,10 @@ type instrumentingTransport struct {
 func (t *instrumentingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	resp, err := t.inner.RoundTrip(req)
+	elapsed := time.Since(start)
 	caddyAdminCallsTotal.Add(1)
-	caddyAdminLastNanos.Set(time.Since(start).Nanoseconds())
+	caddyAdminLastNanos.Set(elapsed.Nanoseconds())
+	caddyAdminLatencyBuckets.Observe(elapsed)
 	// Transport-level errors are connection failures (Caddy down, refused,
 	// timeout). HTTP 4xx/5xx returned from Caddy come back via resp.StatusCode
 	// and are NOT errors here — the caller decides whether they're errors

@@ -56,9 +56,15 @@ real production soak, not in the obvious unbounded hot paths.
 - Image pull storms are single-flighted per image/auth tuple, and local-only
   built/snapshot image refs fail fast on a new owner when the image is missing
   instead of stampeding a registry path that cannot contain them.
-- Cluster secret blobs now use a v2 recipient envelope: the recipient set is
-  authenticated as AES-GCM AAD, new create paths seal to the selected owner
-  node, and legacy raw blobs remain readable for rolling upgrades.
+- Cluster placement now stores only secret refs and versions. The encrypted
+  secret payload lives behind the service provider boundary in `cluster_secrets`
+  with recipient-bound envelopes and per-secret data keys; legacy sealed blobs
+  remain readable for rolling upgrades.
+- Scale observability now emits expvar metrics for Raft apply/snapshot
+  latency, worker lease/memberlist state, scheduler decisions, placement-cache
+  refreshes, create queue pressure, host pressure, ingress convergence,
+  Caddy admin latency histograms, owner-forward/stale-owner routing, facade
+  idempotency, netstats polling, and secret decrypt/key-mismatch failures.
 - Repeatable scale gates live behind `AEROLVM_SCALE_GATES=1` and can be run via
   `scripts/scale-gates.sh`; they cover 10k ingress-member shard assignment,
   100k placement pagination/sharding, 100k placement plus pending-reservation
@@ -80,9 +86,10 @@ real production soak, not in the obvious unbounded hot paths.
 
 ## Still Pending
 
-- External KMS rewrap and image pre-distribution are still deployment-level
-  integrations. The code now has recipient envelopes, pull dedupe, and clear
-  local-only image failure semantics, but it does not ship a registry/cache
+- External KMS provider wiring, provider-level key rewrap tests, secret-access
+  audit events, and image pre-distribution are still deployment-level
+  integrations. The code now has a secret-provider boundary, pull dedupe, and
+  clear local-only image failure semantics, but it does not ship a registry/cache
   service or a KMS plugin in-process.
 - Automatic sandbox recreate remains product-gated off. The code now supports
   bounded orphan cleanup and previous-owner reclaim, but it still does not

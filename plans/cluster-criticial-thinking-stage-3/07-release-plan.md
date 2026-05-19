@@ -163,22 +163,32 @@ The current unit tests are not enough. Add these integration tests:
 
 ## P1 - Observability Required Before Scale
 
-Add metrics for:
+Implemented in-process expvar metrics for the scale gates:
 
-- Raft write latency, queue depth, snapshot duration, snapshot size;
-- worker heartbeat age and lease state;
-- scheduler decision count by reason;
-- placement cache size and refresh latency;
-- create queue depth, age, admission rejects, and timeout causes;
-- reservation states and expired reservation count;
-- per-node local sandbox count and host pressure;
-- route desired/applied/failed revisions;
-- Caddy admin latency histogram, not just last nanos;
-- route count by protocol and shard;
-- owner-forward latency, stale-owner 421 count, route-miss count by reason;
-- facade idempotency replay/conflict counts;
-- netstats poll duration, targets, samples, dropped samples;
-- secret decrypt failures and key version mismatches.
+- Raft apply latency, in-flight apply queue depth, leader-forward latency,
+  snapshot duration, snapshot bytes, restore duration, and snapshot placement
+  count.
+- Worker lease/memberlist state: gossip members total/alive, worker-capable
+  leases total/alive, lost lease count, max lease age, and last refresh time.
+- Scheduler decisions by result and candidate rejection reason; placement cache
+  refresh latency/errors, cache size, and shard-cache entry count.
+- Create pressure: create queue depth, latency buckets, error causes,
+  admission rejects, timeout causes, reservation state transitions, and expired
+  reservation cancellations.
+- Per-node host pressure: local sandbox count, reserved CPU/memory/disk/GPU,
+  effective budgets, live free memory, can-admit gauge, and rejection reasons.
+- Ingress convergence: desired/applied/failed revisions, protocol route counts,
+  per-shard route counts, route lag, route misses by reason, Caddy operation
+  pending/in-flight gauges, batch counts, and batch size.
+- Caddy admin latency histogram in addition to call count, error count, and
+  last-call latency.
+- Owner forwarding: latency buckets, target-miss reasons, and stale-owner 421
+  count.
+- Facade idempotency: claim/acquire/replay/conflict/complete/delete counts.
+- Netstats: poll duration buckets, targets, samples, total samples, and dropped
+  samples by reason.
+- Secret access: decrypt latency/counts, decrypt failure reasons, recipient
+  denies, and key-version mismatches.
 
 ## P2 - Product Limits To Document Honestly
 

@@ -184,8 +184,21 @@ func TestClusterSecretRefRoundTrip(t *testing.T) {
 	}
 
 	redacted := RedactClusterSecrets(req)
+	beforeDenied := clusterSecretRecipientDenies.Value()
 	if _, err := s.OpenClusterSecretsForNode(ctx, redacted, handle, "node-b"); err == nil {
 		t.Fatal("wrong recipient opened cluster secret ref")
+	}
+	if got := clusterSecretRecipientDenies.Value() - beforeDenied; got != 1 {
+		t.Fatalf("recipient denied metric delta = %d, want 1", got)
+	}
+	mismatched := handle
+	mismatched.Version++
+	beforeMismatch := clusterSecretKeyMismatches.Value()
+	if _, err := s.OpenClusterSecretsForNode(ctx, redacted, mismatched, "node-a"); err == nil {
+		t.Fatal("version mismatch opened cluster secret ref")
+	}
+	if got := clusterSecretKeyMismatches.Value() - beforeMismatch; got != 1 {
+		t.Fatalf("key mismatch metric delta = %d, want 1", got)
 	}
 	merged, err := s.OpenClusterSecretsForNode(ctx, redacted, handle, "node-a")
 	if err != nil {

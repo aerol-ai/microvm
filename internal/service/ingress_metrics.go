@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -35,6 +36,7 @@ func runIngressOpsBatched(ctx context.Context, ops []func(context.Context) error
 		if end > len(ops) {
 			end = len(ops)
 		}
+		recordIngressCaddyBatch(end - start)
 		if err := runIngressOps(ctx, ops[start:end], concurrency); err != nil {
 			return err
 		}
@@ -54,7 +56,11 @@ func runIngressOps(ctx context.Context, ops []func(context.Context) error, concu
 		concurrency = 1
 	}
 
-	work := make(chan func(context.Context) error)
+	type ingressOp struct {
+		run   func(context.Context) error
+		start func()
+	}
+	work := make(chan ingressOp)
 	var (
 		mu       sync.Mutex
 		firstErr error
@@ -63,21 +69,24 @@ func runIngressOps(ctx context.Context, ops []func(context.Context) error, concu
 	worker := func() {
 		defer wg.Done()
 		for op := range work {
+			op.start()
 			// Bail out early if a previous op already errored — saves us
 			// from posting 9999 admin calls behind a connection failure.
 			mu.Lock()
 			haveErr := firstErr != nil
 			mu.Unlock()
 			if haveErr {
+				finishIngressCaddyOp()
 				continue
 			}
-			if err := op(ctx); err != nil {
+			if err := op.run(ctx); err != nil {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
 				}
 				mu.Unlock()
 			}
+			finishIngressCaddyOp()
 		}
 	}
 	if concurrency > len(ops) {
@@ -88,12 +97,14 @@ func runIngressOps(ctx context.Context, ops []func(context.Context) error, concu
 		go worker()
 	}
 	for _, op := range ops {
+		queued := queueIngressCaddyOp()
 		select {
 		case <-ctx.Done():
+			queued(false)
 			close(work)
 			wg.Wait()
 			return ctx.Err()
-		case work <- op:
+		case work <- ingressOp{run: op, start: func() { queued(true) }}:
 		}
 	}
 	close(work)
@@ -138,7 +149,13 @@ var (
 	// is lagging or a peer is misconfigured. Distinct from
 	// reconcile_errors_total: those count Caddy admin failures, not
 	// API-routing failures.
-	ingressRouteMissesTotal = expvar.NewInt("aerolvm_ingress_route_misses_total")
+	ingressRouteMissesTotal    = expvar.NewInt("aerolvm_ingress_route_misses_total")
+	ingressRouteMissesByReason = expvar.NewMap("aerolvm_ingress_route_misses_by_reason_total")
+)
+
+var (
+	ingressRouteShardKeysMu sync.Mutex
+	ingressRouteShardKeys   = make(map[string]struct{})
 )
 
 // RecordRouteMiss bumps the route-miss counter from the API layer. Exported so
@@ -146,8 +163,13 @@ var (
 // metric name owned by this package). Service has no logical role here — this
 // is a package-level counter the v1 wrap layer pokes when it observes the
 // no-usable-URL case.
-func RecordRouteMiss() {
+func RecordRouteMiss(reasons ...string) {
 	ingressRouteMissesTotal.Add(1)
+	reason := "owner_url_unknown"
+	if len(reasons) > 0 && reasons[0] != "" {
+		reason = reasons[0]
+	}
+	scaleobs.Add(ingressRouteMissesByReason, reason, 1)
 }
 
 // IngressInstalledVersion returns the highest placement.Version this node's
@@ -171,6 +193,7 @@ func IngressInstalledVersion() uint64 {
 // recordIngressReconcile) so callers that only have the FSM version can
 // still publish the lag without needing the reconciler's maxVersion.
 func SetIngressRouteLag(fsmVersion uint64) {
+	ingressRouteDesiredRevision.Set(int64(fsmVersion))
 	installed := ingressPlacementVersionMax.Value()
 	if fsmVersion == 0 || int64(fsmVersion) <= installed {
 		ingressRouteLagVersions.Set(0)
@@ -195,8 +218,19 @@ func recordIngressReconcile(outcome reconcileOutcome, elapsed time.Duration, cou
 	ingressRoutesTLS.Set(int64(counts.tls))
 	ingressRoutesTCP.Set(int64(counts.tcp))
 	ingressRoutesTotal.Set(int64(counts.http + counts.tls + counts.tcp))
+	recordIngressRoutesByShard(counts.shards)
 	if outcome != reconcileErrored && maxVersion > 0 && int64(maxVersion) > ingressPlacementVersionMax.Value() {
 		ingressPlacementVersionMax.Set(int64(maxVersion))
+	}
+	if maxVersion > 0 {
+		switch outcome {
+		case reconcileErrored:
+			ingressRouteFailedRevision.Set(int64(maxVersion))
+		default:
+			if int64(maxVersion) > ingressRouteAppliedRevision.Value() {
+				ingressRouteAppliedRevision.Set(int64(maxVersion))
+			}
+		}
 	}
 }
 
@@ -209,9 +243,40 @@ const (
 )
 
 type ingressRouteCounts struct {
-	http int
-	tls  int
-	tcp  int
+	http   int
+	tls    int
+	tcp    int
+	shards map[int]int
+}
+
+func (c *ingressRouteCounts) addShard(shard int) {
+	if c.shards == nil {
+		c.shards = make(map[int]int)
+	}
+	c.shards[shard]++
+}
+
+func recordIngressRoutesByShard(counts map[int]int) {
+	ingressRouteShardKeysMu.Lock()
+	defer ingressRouteShardKeysMu.Unlock()
+	next := make(map[string]struct{}, len(counts))
+	for shard, count := range counts {
+		key := strconv.Itoa(shard)
+		next[key] = struct{}{}
+		ingressRoutesByShard.Set(key, newExpvarInt(int64(count)))
+	}
+	for key := range ingressRouteShardKeys {
+		if _, ok := next[key]; !ok {
+			ingressRoutesByShard.Delete(key)
+		}
+	}
+	ingressRouteShardKeys = next
+}
+
+func newExpvarInt(value int64) *expvar.Int {
+	v := new(expvar.Int)
+	v.Set(value)
+	return v
 }
 
 // hashPlacementView produces a stable digest of the placements relevant to
@@ -243,6 +308,7 @@ func hashPlacementView(self string, placements []cluster.Placement) (uint64, ing
 		if p.OwnerNodeID == self {
 			continue
 		}
+		shard := cluster.PlacementShardForSandbox(id, cluster.DefaultPlacementShardCount)
 		if p.Version > maxVersion {
 			maxVersion = p.Version
 		}
@@ -279,12 +345,14 @@ func hashPlacementView(self string, placements []cluster.Placement) (uint64, ing
 			default:
 				counts.http++
 			}
+			counts.addShard(shard)
 		}
 		// The sandbox itself contributes one HTTP-or-TLS route depending on
 		// whether the deployment uses a domain. We count it generically here
 		// so the metric matches the work the reconciler actually does; the
 		// reconciler itself decides HTTP vs TLS at apply time.
 		counts.http++
+		counts.addShard(shard)
 	}
 
 	return h.Sum64(), counts, maxVersion
