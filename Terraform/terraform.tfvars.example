@@ -1,0 +1,61 @@
+###############################################################################
+# Copy to terraform.tfvars, fill in the four required values, then:
+#   terraform init && terraform apply
+###############################################################################
+
+# --- Required ---------------------------------------------------------------
+
+pat_token            = "REPLACE-with-shared-SB_PAT_TOKEN"
+cloudflare_api_token = "REPLACE-with-cloudflare-api-token"
+cloudflare_zone_id   = "REPLACE-with-zone-id-from-cloudflare-overview"
+domain_name          = "cluster.example.com"
+
+# --- AWS placement ----------------------------------------------------------
+
+aws_region  = "us-east-1"
+# aws_profile = "default"
+
+# --- SSH key ----------------------------------------------------------------
+# Either set ssh_key_name to an existing EC2 key pair, OR leave it empty and
+# point ssh_public_key_path at your local pub key (~/.ssh/id_rsa.pub default).
+# ssh_key_name        = "my-existing-keypair"
+# ssh_public_key_path = "~/.ssh/id_ed25519.pub"
+
+# --- Defaults applied when a node doesn't override ---------------------------
+
+default_instance_type     = "t3.medium"
+default_volume_size_gb    = 64
+default_volume_type       = "gp3"
+
+# --- Topology ----------------------------------------------------------------
+#
+# Roles: "server" | "worker" | "ingress" | "worker,ingress" |
+#        "server,worker" | "server,ingress" | "mixed"
+#
+# Exactly one node must have seed = true.
+
+# 3-node mixed (default in variables.tf):
+# nodes = {
+#   node1 = { role = "mixed", seed = true }
+#   node2 = { role = "mixed" }
+#   node3 = { role = "mixed" }
+# }
+
+# 7-node split (3 voters, 2 workers, 2 ingress):
+nodes = {
+  srv1 = { role = "server",  seed = true, instance_type = "t3.small" }
+  srv2 = { role = "server",                instance_type = "t3.small" }
+  srv3 = { role = "server",                instance_type = "t3.small" }
+
+  wrk1 = { role = "worker", instance_type = "t3.large",  volume_size_gb = 200 }
+  wrk2 = { role = "worker", instance_type = "t3.large",  volume_size_gb = 200 }
+
+  ing1 = { role = "ingress", instance_type = "t3.medium" }
+  ing2 = { role = "ingress", instance_type = "t3.medium" }
+}
+
+# Optional hardening: restrict admin access to your office IP.
+# admin_allowed_cidrs = ["203.0.113.42/32"]
+
+# Optional: orange-cloud the DNS records.
+# cloudflare_proxied = true

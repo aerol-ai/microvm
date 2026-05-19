@@ -1,0 +1,86 @@
+#!/bin/bash
+###############################################################################
+# AerolVM node bootstrap (rendered from Terraform).
+#
+# Variables expected:
+#   node_name, role, is_seed (bool), ingress_host,
+#   pat_token, bundle_bucket, aws_region, seed_private_ip,
+#   install_script_url, cluster_init_script_url, cluster_join_script_url,
+#   seed_wait_max_seconds, extra_user_data
+###############################################################################
+set -euxo pipefail
+exec > >(tee -a /var/log/aerolvm-bootstrap.log) 2>&1
+
+echo "[bootstrap] node=${node_name} role=${role} seed=${is_seed}"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y curl jq awscli openssl ca-certificates
+
+# Install single-node AerolVM. Same PAT token on every node.
+curl -fsSL '${install_script_url}' \
+  | sudo bash -s -- --pat-token '${pat_token}'
+
+%{ if is_seed ~}
+###############################################################################
+# Seed: generate gossip key, run cluster-init, publish artifacts to S3.
+###############################################################################
+GOSSIP_KEY="$(openssl rand -base64 32)"
+
+curl -fsSL '${cluster_init_script_url}' -o /tmp/cluster-init.sh
+chmod +x /tmp/cluster-init.sh
+sudo /tmp/cluster-init.sh \
+  --role '${role}' \
+  --ingress-advertise-host '${ingress_host}' \
+  --gossip-key "$GOSSIP_KEY"
+
+# Publish the gossip key + the generated TLS/credential bundle. Joiners poll
+# for these from S3 in the branch below.
+printf '%s' "$GOSSIP_KEY" > /tmp/gossip-key.txt
+aws --region '${aws_region}' s3 cp /tmp/gossip-key.txt \
+    "s3://${bundle_bucket}/gossip-key.txt" \
+    --sse AES256
+aws --region '${aws_region}' s3 cp /tmp/aerolvm-tls-bundle.tar.gz \
+    "s3://${bundle_bucket}/aerolvm-tls-bundle.tar.gz" \
+    --sse AES256
+
+echo "[bootstrap] seed published bundle to s3://${bundle_bucket}/"
+%{ else ~}
+###############################################################################
+# Joiner: wait for seed artifacts, then run cluster-join.
+###############################################################################
+deadline=$(( $(date +%s) + ${seed_wait_max_seconds} ))
+while :; do
+  if aws --region '${aws_region}' s3api head-object \
+       --bucket '${bundle_bucket}' --key 'gossip-key.txt' >/dev/null 2>&1 \
+     && aws --region '${aws_region}' s3api head-object \
+       --bucket '${bundle_bucket}' --key 'aerolvm-tls-bundle.tar.gz' >/dev/null 2>&1; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "[bootstrap] timed out waiting for seed artifacts" >&2
+    exit 1
+  fi
+  echo "[bootstrap] waiting for seed artifacts in s3://${bundle_bucket}/..."
+  sleep 10
+done
+
+aws --region '${aws_region}' s3 cp \
+    "s3://${bundle_bucket}/gossip-key.txt" /tmp/gossip-key.txt
+aws --region '${aws_region}' s3 cp \
+    "s3://${bundle_bucket}/aerolvm-tls-bundle.tar.gz" /tmp/aerolvm-tls-bundle.tar.gz
+GOSSIP_KEY="$(cat /tmp/gossip-key.txt)"
+
+curl -fsSL '${cluster_join_script_url}' -o /tmp/cluster-join.sh
+chmod +x /tmp/cluster-join.sh
+sudo /tmp/cluster-join.sh \
+  --role '${role}' \
+  --ingress-advertise-host '${ingress_host}' \
+  --gossip-key "$GOSSIP_KEY" \
+  --peers '${seed_private_ip}:7001' \
+  --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
+%{ endif ~}
+
+${extra_user_data}
+
+echo "[bootstrap] complete"

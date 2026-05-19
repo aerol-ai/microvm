@@ -26,3 +26,16 @@ sdk/rust/target/
 **/target/
 Cargo.lock
 .gstack/
+
+# Terraform artifacts
+Terraform/.terraform/
+.terraform/
+*.tfstate
+*.tfstate.backup
+crash.log
+override.tf
+override.tf.json
+terraform.tfstate
+terraform.tfstate.backup
+terraform.rc
+.terraformrc
