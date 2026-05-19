@@ -20,6 +20,11 @@
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 * { box-sizing: border-box; }
+/* The `hidden` HTML attribute is `display: none` via the UA stylesheet, but
+   `#login { display: flex }`, `header { display: flex }`, and `main { display: grid }`
+   below are author-specificity wins and would override it. Force `[hidden]`
+   to actually hide so the show/hide handlers work. */
+[hidden] { display: none !important; }
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 13px; line-height: 1.4; }
 a { color: var(--accent); }
 button {
