@@ -5,6 +5,7 @@ dist-test/
 *.db
 *.db-shm
 *.db-wal
+Terraform/.terraform.lock.hcl
 *.log
 node_modules/
 sdk/typescript/node_modules
