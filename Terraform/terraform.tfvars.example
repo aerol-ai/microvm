@@ -6,14 +6,18 @@
 # --- Required ---------------------------------------------------------------
 
 pat_token            = "REPLACE-with-shared-SB_PAT_TOKEN"
-cloudflare_api_token = "REPLACE-with-cloudflare-api-token"
+cloudflare_api_token = "REPLACE-with-cloudflare-api-token" # Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01.
 cloudflare_zone_id   = "REPLACE-with-zone-id-from-cloudflare-overview"
-domain_name          = "cluster.example.com"
+domain_name          = "cluster.example.com" # set empty to skip TLS and run in IP/path mode
 
 # --- AWS placement ----------------------------------------------------------
 
-aws_region  = "us-east-1"
-# aws_profile = "default"
+aws_region = "us-east-1"
+# aws_profile                  = "default"
+# aws_shared_credentials_files = ["~/.aws/credentials"]
+# availability_zone            = "us-east-1a"   # else: first AZ in region
+# vpc_cidr                     = "10.42.0.0/16"
+# subnet_cidr                  = "10.42.1.0/24"
 
 # --- SSH key ----------------------------------------------------------------
 # Either set ssh_key_name to an existing EC2 key pair, OR leave it empty and
@@ -26,36 +30,81 @@ aws_region  = "us-east-1"
 default_instance_type     = "t3.medium"
 default_volume_size_gb    = 64
 default_volume_type       = "gp3"
+# default_volume_iops       = 3000
+# default_volume_throughput = 125  # MiB/s, gp3 only
+
+# install.sh feature flags. Per-node overrides take precedence; these apply
+# to any node that doesn't set the field explicitly.
+# default_with_gvisor      = false   # adds --with-gvisor
+# default_with_nvidia_gpu  = false   # adds --with-nvidia-gpu (driver must be loaded)
+# default_with_amd_gpu     = false   # adds --with-amd-gpu (x86_64 only)
+# default_idle_timeout_min = 0       # sandbox auto-stop minutes; 0 disables
+
+# --- Cloudflare DNS behavior ------------------------------------------------
+
+# create_wildcard_record = true   # *.<domain_name> in addition to the apex
+# cloudflare_proxied     = false  # orange-cloud; set false for raw TCP ingress
+# cloudflare_record_ttl  = 1      # 1 = automatic (required when proxied)
 
 # --- Topology ----------------------------------------------------------------
 #
 # Roles: "server" | "worker" | "ingress" | "worker,ingress" |
 #        "server,worker" | "server,ingress" | "mixed"
 #
-# Exactly one node must have seed = true.
+# Validation (enforced at plan-time, mirrors cluster-init.sh / cluster-join.sh):
+#   - exactly one node has seed = true
+#   - the seed's role contains "server" or equals "mixed"
+#   - "mixed" cannot be combined with other tokens
 
-# 3-node mixed (default in variables.tf):
+# 3-node mixed (default in variables.tf — comment out the block below to use it):
 # nodes = {
 #   node1 = { role = "mixed", seed = true }
 #   node2 = { role = "mixed" }
 #   node3 = { role = "mixed" }
 # }
 
-# 7-node split (3 voters, 2 workers, 2 ingress):
+# 7-node split: 3 voters, 2 workers (one with an NVIDIA GPU), 2 ingress.
 nodes = {
-  srv1 = { role = "server",  seed = true, instance_type = "t3.small" }
-  srv2 = { role = "server",                instance_type = "t3.small" }
-  srv3 = { role = "server",                instance_type = "t3.small" }
+  srv1 = { role = "server", seed = true, instance_type = "t3.small" }
+  srv2 = { role = "server", instance_type = "t3.small" }
+  srv3 = { role = "server", instance_type = "t3.small" }
 
-  wrk1 = { role = "worker", instance_type = "t3.large",  volume_size_gb = 200 }
-  wrk2 = { role = "worker", instance_type = "t3.large",  volume_size_gb = 200 }
+  wrk1 = {
+    role             = "worker"
+    instance_type    = "t3.large"
+    volume_size_gb   = 200
+    idle_timeout_min = 30 # auto-stop idle sandboxes on this host after 30 min
+  }
+  wrk2 = {
+    role            = "worker"
+    instance_type   = "g5.xlarge" # NVIDIA A10G
+    volume_size_gb  = 500
+    with_nvidia_gpu = true # install nvidia-container-toolkit + configure docker
+    with_gvisor     = true # opt sandboxes into runsc isolation via runtime: "runsc"
+    tags            = { gpu = "nvidia-a10g" }
+  }
 
   ing1 = { role = "ingress", instance_type = "t3.medium" }
   ing2 = { role = "ingress", instance_type = "t3.medium" }
 }
 
-# Optional hardening: restrict admin access to your office IP.
+# --- Optional hardening / extras --------------------------------------------
+
+# Restrict admin access (SSH 22 and operator API 21212) to specific CIDRs.
 # admin_allowed_cidrs = ["203.0.113.42/32"]
 
-# Optional: orange-cloud the DNS records.
-# cloudflare_proxied = true
+# Override the public TCP ports opened on ingress-bearing nodes.
+# public_http_ports = [80, 443]
+
+# Skip force-destroying the bundle S3 bucket on tear-down (so you have to
+# empty it manually before `terraform destroy` succeeds).
+# bundle_bucket_force_destroy = false
+
+# How long joiners wait for the seed's S3 artifacts before failing cloud-init.
+# seed_wait_max_seconds = 1800
+
+# Extra tags applied to every AWS resource.
+# extra_tags = {
+#   Env   = "prod"
+#   Owner = "platform-team"
+# }

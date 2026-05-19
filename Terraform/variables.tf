@@ -168,16 +168,20 @@ variable "default_volume_throughput" {
 variable "nodes" {
   description = <<-EOT
     Map of node-name => node config. Each entry supports:
-      role          (string,  default "mixed")
-      seed          (bool,    default false; exactly one node must be true)
-      instance_type (string,  default var.default_instance_type)
-      volume_size_gb(number,  default var.default_volume_size_gb)
-      volume_type   (string,  default var.default_volume_type)
-      volume_iops   (number,  default var.default_volume_iops)
-      volume_throughput (number, default var.default_volume_throughput)
-      ami_id        (string,  default var.ami_id resolved to Ubuntu 22.04)
-      extra_user_data (string, default ""; appended to bootstrap.sh)
-      tags          (map(string), default {})
+      role             (string,  default "mixed")
+      seed             (bool,    default false; exactly one node must be true)
+      instance_type    (string,  default var.default_instance_type)
+      volume_size_gb   (number,  default var.default_volume_size_gb)
+      volume_type      (string,  default var.default_volume_type)
+      volume_iops      (number,  default var.default_volume_iops)
+      volume_throughput(number,  default var.default_volume_throughput)
+      ami_id           (string,  default var.ami_id resolved to Ubuntu 22.04)
+      with_gvisor      (bool,    default var.default_with_gvisor)
+      with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
+      with_amd_gpu     (bool,    default var.default_with_amd_gpu)
+      idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
+      extra_user_data  (string,  default ""; appended to bootstrap.sh)
+      tags             (map(string), default {})
   EOT
   type = map(object({
     role              = optional(string, "mixed")
@@ -188,6 +192,10 @@ variable "nodes" {
     volume_iops       = optional(number)
     volume_throughput = optional(number)
     ami_id            = optional(string)
+    with_gvisor       = optional(bool)
+    with_nvidia_gpu   = optional(bool)
+    with_amd_gpu      = optional(bool)
+    idle_timeout_min  = optional(number)
     extra_user_data   = optional(string, "")
     tags              = optional(map(string), {})
   }))
@@ -201,6 +209,72 @@ variable "nodes" {
     condition     = length([for k, v in var.nodes : k if try(v.seed, false)]) == 1
     error_message = "Exactly one node in var.nodes must have seed = true."
   }
+
+  # Mirror cluster-init.sh + cluster-join.sh validate_node_role(): every role
+  # token must be in {server, worker, ingress, mixed}, and "mixed" cannot be
+  # combined with other tokens. Catches typos at plan-time instead of at
+  # cloud-init time on the instance.
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes : alltrue([
+        for tok in split(",", replace(coalesce(v.role, "mixed"), " ", "")) :
+        contains(["server", "worker", "ingress", "mixed"], tok)
+      ])
+    ])
+    error_message = "Each node's role must be a comma-separated set of {server, worker, ingress, mixed}. Examples: \"mixed\", \"server\", \"worker,ingress\"."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      length(split(",", replace(coalesce(v.role, "mixed"), " ", ""))) == 1 ||
+      !contains(split(",", replace(coalesce(v.role, "mixed"), " ", "")), "mixed")
+    ])
+    error_message = "\"mixed\" is shorthand for server,worker,ingress and cannot be combined with other tokens."
+  }
+
+  # cluster-init.sh refuses to bootstrap a fresh cluster from a node whose role
+  # set lacks "server"/"mixed". Catching it here avoids a failed cloud-init.
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      !try(v.seed, false) ||
+      contains(
+        split(",", replace(coalesce(v.role, "mixed"), " ", "")),
+        "server",
+      ) ||
+      coalesce(v.role, "mixed") == "mixed"
+    ])
+    error_message = "The seed node's role must contain \"server\" or equal \"mixed\" (cluster-init.sh refuses to bootstrap from a pure worker/ingress node)."
+  }
+}
+
+###############################################################################
+# Install.sh feature defaults (per-node overrides live in var.nodes)
+###############################################################################
+
+variable "default_with_gvisor" {
+  description = "Install gVisor runsc and register it as an alternative OCI runtime. Per-node override via nodes[*].with_gvisor."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_nvidia_gpu" {
+  description = "Install nvidia-container-toolkit and configure Docker for NVIDIA GPUs. Host must already have NVIDIA drivers."
+  type        = bool
+  default     = false
+}
+
+variable "default_with_amd_gpu" {
+  description = "Install AMD ROCm so containers can access AMD GPUs via /dev/kfd and /dev/dri. x86_64 only."
+  type        = bool
+  default     = false
+}
+
+variable "default_idle_timeout_min" {
+  description = "Idle auto-stop timeout in minutes for sandboxes (install.sh --idle-timeout-min). 0 disables."
+  type        = number
+  default     = 0
 }
 
 ###############################################################################

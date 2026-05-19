@@ -69,32 +69,51 @@ nodes = {
 
 Per-node fields:
 
-| Field               | Default                        |
-|---------------------|--------------------------------|
-| `role`              | `"mixed"`                      |
-| `seed`              | `false`                        |
-| `instance_type`     | `var.default_instance_type`    |
-| `volume_size_gb`    | `var.default_volume_size_gb`   |
-| `volume_type`       | `var.default_volume_type`      |
-| `volume_iops`       | `var.default_volume_iops`      |
-| `volume_throughput` | `var.default_volume_throughput`|
-| `ami_id`            | latest Ubuntu 22.04 LTS amd64  |
-| `extra_user_data`   | `""` (appended to bootstrap)   |
-| `tags`              | `{}`                           |
+| Field               | Default                          | Notes                                            |
+|---------------------|----------------------------------|--------------------------------------------------|
+| `role`              | `"mixed"`                        | `server` / `worker` / `ingress` / `mixed` or csv |
+| `seed`              | `false`                          | exactly one node; role must contain `server`     |
+| `instance_type`     | `var.default_instance_type`      |                                                  |
+| `volume_size_gb`    | `var.default_volume_size_gb`     |                                                  |
+| `volume_type`       | `var.default_volume_type`        |                                                  |
+| `volume_iops`       | `var.default_volume_iops`        | gp3/io1/io2 only                                 |
+| `volume_throughput` | `var.default_volume_throughput`  | gp3 only                                         |
+| `ami_id`            | latest Ubuntu 22.04 LTS amd64    |                                                  |
+| `with_gvisor`       | `var.default_with_gvisor`        | adds `--with-gvisor` to install.sh               |
+| `with_nvidia_gpu`   | `var.default_with_nvidia_gpu`    | adds `--with-nvidia-gpu` (driver must be loaded) |
+| `with_amd_gpu`      | `var.default_with_amd_gpu`       | adds `--with-amd-gpu` (x86_64 only)              |
+| `idle_timeout_min`  | `var.default_idle_timeout_min`   | sandbox auto-stop minutes; 0 disables            |
+| `extra_user_data`   | `""`                             | shell, appended to bootstrap                     |
+| `tags`              | `{}`                             |                                                  |
+
+### Role rules (validated at plan time, mirrors `cluster-init.sh` / `cluster-join.sh`)
+
+- Each comma token must be in `{server, worker, ingress, mixed}`.
+- `mixed` (shorthand for `server,worker,ingress`) cannot be combined with other tokens.
+- The seed node's role must contain `server` or equal `mixed` — `cluster-init.sh` refuses to bootstrap from a pure `worker` / `ingress` / `worker,ingress` node.
 
 ## How bootstrap works
 
 Each instance's `user_data` (rendered from
-[`templates/bootstrap.sh.tftpl`](./templates/bootstrap.sh.tftpl)) runs the
-canonical install + cluster scripts from
-`github.com/aerol-ai/microvm/releases/latest/`, with one branch:
+[`templates/bootstrap.sh.tftpl`](./templates/bootstrap.sh.tftpl)) runs in three
+phases:
 
-- **Seed** generates a gossip key, runs `cluster-init.sh --role <its-role>
-  --ingress-advertise-host <domain_name>`, then uploads `gossip-key.txt` and
-  `aerolvm-tls-bundle.tar.gz` to the per-cluster S3 bucket.
-- **Every other node** polls the bucket (`seed_wait_max_seconds`, default
-  30 min), downloads both artifacts, then runs `cluster-join.sh --role
-  <its-role> --peers <seed-private-ip>:7001 --tls-bundle …`.
+1. **`install.sh`** with `--pat-token <shared> --domain <domain_name>
+   --dns-provider cloudflare --dns-api-token <cloudflare_api_token>` so the
+   per-node Caddy gets a real wildcard cert via Let's Encrypt DNS-01. Optional
+   `--with-gvisor` / `--with-nvidia-gpu` / `--with-amd-gpu` /
+   `--idle-timeout-min` are appended from per-node flags. If `domain_name` is
+   empty the DNS-01 args are dropped and install.sh falls back to IP/path mode
+   with no TLS.
+2. **Seed only — `cluster-init.sh`** with `--role <seed-role>
+   --ingress-advertise-host <domain_name> --gossip-key <generated>
+   --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz`. The seed then uploads
+   `gossip-key.txt` + `aerolvm-tls-bundle.tar.gz` to the per-cluster S3 bucket.
+3. **Every other node — `cluster-join.sh`** polls the S3 bucket
+   (`seed_wait_max_seconds`, default 30 min), downloads both artifacts, then
+   runs `cluster-join.sh --role <its-role> --ingress-advertise-host
+   <domain_name> --gossip-key <…> --peers <seed-private-ip>:7001 --tls-bundle
+   /tmp/aerolvm-tls-bundle.tar.gz`.
 
 The S3 bucket is private, SSE-encrypted, and `force_destroy = true` by
 default so `terraform destroy` doesn't fail on leftover objects. Flip

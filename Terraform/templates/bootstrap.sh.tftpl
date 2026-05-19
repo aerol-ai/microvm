@@ -3,10 +3,19 @@
 # AerolVM node bootstrap (rendered from Terraform).
 #
 # Variables expected:
-#   node_name, role, is_seed (bool), ingress_host,
-#   pat_token, bundle_bucket, aws_region, seed_private_ip,
+#   node_name, role, is_seed (bool),
+#   pat_token, domain, cloudflare_api_token,
+#   with_gvisor (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
+#   idle_timeout_min (number; 0 disables),
+#   bundle_bucket, aws_region, seed_private_ip,
 #   install_script_url, cluster_init_script_url, cluster_join_script_url,
 #   seed_wait_max_seconds, extra_user_data
+#
+# Order of operations matches the scripts' contracts:
+#   1. install.sh first  — sets up sandboxd + Caddy + (optionally) DNS-01 TLS.
+#                          Required by cluster-init/join (they check for
+#                          /etc/sandboxd/sandboxd.env and the systemd unit).
+#   2. cluster-init OR cluster-join — flips the daemon into cluster mode.
 ###############################################################################
 set -euxo pipefail
 exec > >(tee -a /var/log/aerolvm-bootstrap.log) 2>&1
@@ -17,13 +26,49 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y curl jq awscli openssl ca-certificates
 
-# Install single-node AerolVM. Same PAT token on every node.
-curl -fsSL '${install_script_url}' \
-  | sudo bash -s -- --pat-token '${pat_token}'
+###############################################################################
+# 1. install.sh
+#
+# Wildcard DNS-01 TLS requires --domain + --dns-provider cloudflare +
+# --dns-api-token. The Cloudflare token we already use for the cloudflare
+# provider (Zone:DNS:Edit on the zone) is the right scope. Without all three
+# install.sh runs in IP/path mode with no TLS, and the cluster's public URLs
+# fall back to http://<ip>/<id>/.
+###############################################################################
+curl -fsSL '${install_script_url}' -o /tmp/install.sh
+chmod +x /tmp/install.sh
+
+INSTALL_ARGS=(--pat-token '${pat_token}')
+if [ -n '${domain}' ]; then
+  INSTALL_ARGS+=(
+    --domain '${domain}'
+    --dns-provider cloudflare
+    --dns-api-token '${cloudflare_api_token}'
+  )
+fi
+%{ if with_gvisor ~}
+INSTALL_ARGS+=(--with-gvisor)
+%{ endif ~}
+%{ if with_nvidia_gpu ~}
+INSTALL_ARGS+=(--with-nvidia-gpu)
+%{ endif ~}
+%{ if with_amd_gpu ~}
+INSTALL_ARGS+=(--with-amd-gpu)
+%{ endif ~}
+%{ if idle_timeout_min > 0 ~}
+INSTALL_ARGS+=(--idle-timeout-min '${idle_timeout_min}')
+%{ endif ~}
+
+sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 
 %{ if is_seed ~}
 ###############################################################################
-# Seed: generate gossip key, run cluster-init, publish artifacts to S3.
+# 2a. Seed: cluster-init.sh
+#
+# --role must contain "server" or be "mixed" (cluster-init.sh validates).
+# --tls-bundle-out is pinned to /tmp so we can find it after sudo (the
+# script's default uses $PWD, which under cloud-init is unspecified).
+# --ingress-advertise-host is the public hostname SDK-returned URLs use.
 ###############################################################################
 GOSSIP_KEY="$(openssl rand -base64 32)"
 
@@ -31,11 +76,11 @@ curl -fsSL '${cluster_init_script_url}' -o /tmp/cluster-init.sh
 chmod +x /tmp/cluster-init.sh
 sudo /tmp/cluster-init.sh \
   --role '${role}' \
-  --ingress-advertise-host '${ingress_host}' \
-  --gossip-key "$GOSSIP_KEY"
+  --ingress-advertise-host '${domain}' \
+  --gossip-key "$GOSSIP_KEY" \
+  --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz
 
-# Publish the gossip key + the generated TLS/credential bundle. Joiners poll
-# for these from S3 in the branch below.
+# Publish artifacts joiners need. Bucket is private + SSE-encrypted.
 printf '%s' "$GOSSIP_KEY" > /tmp/gossip-key.txt
 aws --region '${aws_region}' s3 cp /tmp/gossip-key.txt \
     "s3://${bundle_bucket}/gossip-key.txt" \
@@ -47,7 +92,11 @@ aws --region '${aws_region}' s3 cp /tmp/aerolvm-tls-bundle.tar.gz \
 echo "[bootstrap] seed published bundle to s3://${bundle_bucket}/"
 %{ else ~}
 ###############################################################################
-# Joiner: wait for seed artifacts, then run cluster-join.
+# 2b. Joiner: cluster-join.sh
+#
+# Polls S3 for the seed's two artifacts (gossip key + TLS bundle), then runs
+# cluster-join.sh with --peers <seed-private-ip>:7001 (the seed's gossip
+# advertise address, derived by cluster-init from its primary IP).
 ###############################################################################
 deadline=$(( $(date +%s) + ${seed_wait_max_seconds} ))
 while :; do
@@ -75,7 +124,7 @@ curl -fsSL '${cluster_join_script_url}' -o /tmp/cluster-join.sh
 chmod +x /tmp/cluster-join.sh
 sudo /tmp/cluster-join.sh \
   --role '${role}' \
-  --ingress-advertise-host '${ingress_host}' \
+  --ingress-advertise-host '${domain}' \
   --gossip-key "$GOSSIP_KEY" \
   --peers '${seed_private_ip}:7001' \
   --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz

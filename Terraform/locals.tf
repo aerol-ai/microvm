@@ -13,8 +13,14 @@ locals {
       volume_iops       = coalesce(n.volume_iops, var.default_volume_iops)
       volume_throughput = coalesce(n.volume_throughput, var.default_volume_throughput)
       ami_id            = coalesce(n.ami_id, var.ami_id, data.aws_ami.ubuntu.id)
-      extra_user_data   = n.extra_user_data
-      tags              = n.tags
+      # bool defaults need explicit null handling — coalesce treats `false` as
+      # a real value, but optional() without a default returns null.
+      with_gvisor      = n.with_gvisor == null ? var.default_with_gvisor : n.with_gvisor
+      with_nvidia_gpu  = n.with_nvidia_gpu == null ? var.default_with_nvidia_gpu : n.with_nvidia_gpu
+      with_amd_gpu     = n.with_amd_gpu == null ? var.default_with_amd_gpu : n.with_amd_gpu
+      idle_timeout_min = n.idle_timeout_min == null ? var.default_idle_timeout_min : n.idle_timeout_min
+      extra_user_data  = n.extra_user_data
+      tags             = n.tags
     }
   }
 
