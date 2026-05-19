@@ -54,7 +54,22 @@ func (s *Service) DeleteSnapshotAlias(ctx context.Context, alias string) error {
 }
 
 func (s *Service) ClaimIdempotentRequest(ctx context.Context, scope, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.IdempotentRequestRecord, bool, error) {
-	return s.store.ClaimIdempotentRequest(ctx, scope, fingerprint, now, pendingTTL)
+	record, acquired, err := s.store.ClaimIdempotentRequest(ctx, scope, fingerprint, now, pendingTTL)
+	metricScope := idempotencyScope(scope)
+	if err == nil {
+		scaleKey := metricScope + "." + idempotencyState(record)
+		facadeIdempotencyClaims.Add(scaleKey, 1)
+		if acquired {
+			facadeIdempotencyAcquired.Add(metricScope, 1)
+		} else if record != nil && record.State == models.RequestStateReady {
+			// The facade increments replay once it has loaded and returned
+			// the target. A ready claim by itself may still expire or point at
+			// a deleted sandbox, so counting it here would over-report.
+		} else {
+			facadeIdempotencyConflicts.Add(metricScope, 1)
+		}
+	}
+	return record, acquired, err
 }
 
 func (s *Service) GetIdempotentRequest(ctx context.Context, scope, fingerprint string) (*models.IdempotentRequestRecord, error) {
@@ -62,9 +77,17 @@ func (s *Service) GetIdempotentRequest(ctx context.Context, scope, fingerprint s
 }
 
 func (s *Service) CompleteIdempotentRequest(ctx context.Context, scope, fingerprint, targetID string, now time.Time, replayTTL time.Duration) error {
-	return s.store.CompleteIdempotentRequest(ctx, scope, fingerprint, targetID, now, replayTTL)
+	err := s.store.CompleteIdempotentRequest(ctx, scope, fingerprint, targetID, now, replayTTL)
+	if err == nil {
+		facadeIdempotencyComplete.Add(idempotencyScope(scope), 1)
+	}
+	return err
 }
 
 func (s *Service) DeleteIdempotentRequest(ctx context.Context, scope, fingerprint string) error {
-	return s.store.DeleteIdempotentRequest(ctx, scope, fingerprint)
+	err := s.store.DeleteIdempotentRequest(ctx, scope, fingerprint)
+	if err == nil {
+		facadeIdempotencyDeletes.Add(idempotencyScope(scope), 1)
+	}
+	return err
 }

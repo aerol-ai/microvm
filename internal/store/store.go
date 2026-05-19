@@ -107,6 +107,21 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		// cluster_secrets is the local secret-reference backend used by
+		// cluster placement state. Placement rows store only ref/version; this
+		// table stores the opaque encrypted payload and recipient metadata.
+		// There is intentionally no FK to sandboxes: cluster reservations may
+		// be written before a local sandbox row exists, and cleanup is explicit
+		// by sandbox_id on rollback/destroy.
+		`CREATE TABLE IF NOT EXISTS cluster_secrets (
+			ref TEXT PRIMARY KEY,
+			sandbox_id TEXT NOT NULL,
+			version INTEGER NOT NULL,
+			recipients_json TEXT NOT NULL DEFAULT '[]',
+			sealed_payload BLOB NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
 			name TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
@@ -118,7 +133,11 @@ func Open(path string) (*Store, error) {
 			cpu REAL NOT NULL DEFAULT 0,
 			memory_mb INTEGER NOT NULL DEFAULT 0,
 			disk_gb INTEGER NOT NULL DEFAULT 0,
-			gpu REAL NOT NULL DEFAULT 0
+			gpu REAL NOT NULL DEFAULT 0,
+			image_distribution_mode TEXT NOT NULL DEFAULT '',
+			image_digest TEXT NOT NULL DEFAULT '',
+			image_registry_ref TEXT NOT NULL DEFAULT '',
+			image_verified_at DATETIME
 		);`,
 		// sandbox_compat_state holds opaque facade-private state that has
 		// no native meaning. One row per (sandbox, facade). state_json is
@@ -178,6 +197,7 @@ func Open(path string) (*Store, error) {
 		// name-based lookup; everyone else benefits from collision-free
 		// names by default.
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`,
+		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
@@ -197,6 +217,35 @@ func Open(path string) (*Store, error) {
 	// swallow so cold installs (where CREATE TABLE above already includes
 	// the column) and warm upgrades (where the column is new) both succeed.
 	migrations := []string{
+		`ALTER TABLE sandboxes ADD COLUMN toolbox_token TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN ssh_public_key TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN stop_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN stop_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN destroy_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
+		// Per-sandbox OCI runtime selector (runc / runsc). Pre-migration rows
+		// get '' and resolve to the host default at start time; new sandboxes
+		// always store the resolved value so the choice cannot drift across
+		// host restarts.
+		`ALTER TABLE sandboxes ADD COLUMN runtime TEXT NOT NULL DEFAULT '';`,
+		// GPU configuration as a JSON blob. Empty string means no GPU was
+		// requested. Stored as JSON to avoid schema churn as GPU options grow.
+		`ALTER TABLE sandboxes ADD COLUMN gpus_json TEXT NOT NULL DEFAULT '';`,
+		// AES-GCM-sealed RegistryAuth (server, username, password) from the
+		// create request. Empty blob means no credentials were supplied (public
+		// registry). Sealed bytes only; the encryption key never touches this
+		// table. Required for cluster failover to re-pull private images on a
+		// new owner — the runtime layer drops creds after the initial pull.
+		`ALTER TABLE sandboxes ADD COLUMN registry_auth_sealed BLOB NOT NULL DEFAULT X'';`,
+		// Protocol of an exposed port: "http" (Caddy HTTP reverse proxy,
+		// historical behavior), "tcp" (caddy-l4 listener at host_port), or
+		// "tls" (caddy-l4 SNI route on the shared TLS listener).
+		`ALTER TABLE exposed_ports ADD COLUMN protocol TEXT NOT NULL DEFAULT 'http';`,
+		// Parent-host TCP port reserved for protocol="tcp" exposures from the
+		// configured pool. Zero for http/tls. The partial unique index below
+		// rejects two reservations on the same host_port without preventing
+		// many rows at the default 0.
+		`ALTER TABLE exposed_ports ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in_limit INTEGER NOT NULL DEFAULT 0;`,
@@ -212,6 +261,10 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandbox_snapshots ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN disk_gb INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN gpu REAL NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_distribution_mode TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_digest TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_registry_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN image_verified_at DATETIME;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -294,8 +347,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
-			net_quota_exceeded, net_quota_exceeded_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -331,6 +385,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.NetworkBytesOutLimit,
 		boolToInt(sandbox.NetworkQuotaExceeded),
 		nullableTime(sandbox.NetworkQuotaExceededAt),
+		nullableBlob(sandbox.RegistryAuthSealed),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -339,6 +394,15 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		return fmt.Errorf("insert sandbox: %w", err)
 	}
 	return nil
+}
+
+// nullableBlob normalizes a nil byte slice to an empty one so SQLite stores
+// X” rather than NULL for the registry_auth_sealed column.
+func nullableBlob(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
 }
 
 func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
@@ -370,8 +434,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
-			net_quota_exceeded, net_quota_exceeded_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -400,7 +465,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			runtime = excluded.runtime,
 			gpus_json = excluded.gpus_json,
 			net_bytes_in_limit = excluded.net_bytes_in_limit,
-			net_bytes_out_limit = excluded.net_bytes_out_limit
+			net_bytes_out_limit = excluded.net_bytes_out_limit,
+			registry_auth_sealed = excluded.registry_auth_sealed
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -436,6 +502,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.NetworkBytesOutLimit,
 		boolToInt(sandbox.NetworkQuotaExceeded),
 		nullableTime(sandbox.NetworkQuotaExceededAt),
+		nullableBlob(sandbox.RegistryAuthSealed),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -454,7 +521,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
-			net_quota_exceeded, net_quota_exceeded_at
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -484,7 +552,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
-			net_quota_exceeded, net_quota_exceeded_at
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -1152,10 +1221,15 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 	if err != nil {
 		return err
 	}
+	var imageVerifiedAt any
+	if snapshot.ImageVerifiedAt != nil {
+		imageVerifiedAt = snapshot.ImageVerifiedAt.UTC()
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		strings.TrimSpace(snapshot.Name),
 		strings.TrimSpace(snapshot.Image),
@@ -1168,6 +1242,10 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 		snapshot.MemoryMB,
 		snapshot.DiskGB,
 		snapshot.GPU,
+		strings.TrimSpace(snapshot.ImageDistributionMode),
+		strings.TrimSpace(snapshot.ImageDigest),
+		strings.TrimSpace(snapshot.ImageRegistryRef),
+		imageVerifiedAt,
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -1181,7 +1259,8 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at
 		FROM sandbox_snapshots
 		WHERE name = ?
 	`, strings.TrimSpace(name))
@@ -1198,7 +1277,8 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
-			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at
 		FROM sandbox_snapshots
 		ORDER BY created_at DESC, name ASC
 	`)
@@ -1439,6 +1519,7 @@ func scanSandbox(scanner interface {
 	var stopIfIdleNs, destroyIfIdleNs, stopAtAgeNs, destroyAtAgeNs int64
 	var netQuotaExceeded int
 	var netQuotaExceededAt sql.NullTime
+	var registryAuthSealed []byte
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -1475,6 +1556,7 @@ func scanSandbox(scanner interface {
 		&sandbox.NetworkBytesOutLimit,
 		&netQuotaExceeded,
 		&netQuotaExceededAt,
+		&registryAuthSealed,
 	)
 	if err != nil {
 		return nil, err
@@ -1484,6 +1566,7 @@ func scanSandbox(scanner interface {
 		t := netQuotaExceededAt.Time.UTC()
 		sandbox.NetworkQuotaExceededAt = &t
 	}
+	sandbox.RegistryAuthSealed = nullableBlob(registryAuthSealed)
 
 	if envJSON != "" {
 		if err := json.Unmarshal([]byte(envJSON), &sandbox.Env); err != nil {
@@ -1600,6 +1683,7 @@ func scanSnapshot(scanner interface {
 }) (*models.SandboxSnapshot, error) {
 	var snapshot models.SandboxSnapshot
 	var entrypointJSON string
+	var imageVerifiedAt sql.NullTime
 	err := scanner.Scan(
 		&snapshot.Name,
 		&snapshot.Image,
@@ -1612,9 +1696,17 @@ func scanSnapshot(scanner interface {
 		&snapshot.MemoryMB,
 		&snapshot.DiskGB,
 		&snapshot.GPU,
+		&snapshot.ImageDistributionMode,
+		&snapshot.ImageDigest,
+		&snapshot.ImageRegistryRef,
+		&imageVerifiedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if imageVerifiedAt.Valid {
+		verifiedAt := imageVerifiedAt.Time.UTC()
+		snapshot.ImageVerifiedAt = &verifiedAt
 	}
 	if entrypointJSON != "" && entrypointJSON != "[]" {
 		if err := json.Unmarshal([]byte(entrypointJSON), &snapshot.Entrypoint); err != nil {
@@ -1690,6 +1782,99 @@ var ErrNotFound = errors.New("sandbox not found")
 var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
+
+// ClusterSecretRecord is an opaque cluster-secret payload addressed by ref.
+// The store never decrypts SealedPayload; service owns the envelope format.
+type ClusterSecretRecord struct {
+	Ref           string
+	SandboxID     string
+	Version       int
+	Recipients    []string
+	SealedPayload []byte
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) error {
+	rec.Ref = strings.TrimSpace(rec.Ref)
+	rec.SandboxID = strings.TrimSpace(rec.SandboxID)
+	if rec.Ref == "" {
+		return errors.New("cluster secret ref is required")
+	}
+	if rec.SandboxID == "" {
+		return errors.New("cluster secret sandbox_id is required")
+	}
+	if rec.Version <= 0 {
+		return errors.New("cluster secret version must be positive")
+	}
+	if len(rec.SealedPayload) == 0 {
+		return errors.New("cluster secret sealed payload is required")
+	}
+	recipientsJSON, err := json.Marshal(rec.Recipients)
+	if err != nil {
+		return fmt.Errorf("marshal cluster secret recipients: %w", err)
+	}
+	now := time.Now().UTC()
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = now
+	}
+	if rec.UpdatedAt.IsZero() {
+		rec.UpdatedAt = now
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO cluster_secrets (
+			ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(ref) DO UPDATE SET
+			sandbox_id = excluded.sandbox_id,
+			version = excluded.version,
+			recipients_json = excluded.recipients_json,
+			sealed_payload = excluded.sealed_payload,
+			updated_at = excluded.updated_at
+	`, rec.Ref, rec.SandboxID, rec.Version, string(recipientsJSON), rec.SealedPayload, rec.CreatedAt.UTC(), rec.UpdatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("put cluster secret: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetClusterSecret(ctx context.Context, ref string) (*ClusterSecretRecord, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return nil, ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT ref, sandbox_id, version, recipients_json, sealed_payload, created_at, updated_at
+		FROM cluster_secrets
+		WHERE ref = ?
+	`, ref)
+	var rec ClusterSecretRecord
+	var recipientsJSON string
+	if err := row.Scan(&rec.Ref, &rec.SandboxID, &rec.Version, &recipientsJSON, &rec.SealedPayload, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get cluster secret: %w", err)
+	}
+	if recipientsJSON != "" {
+		if err := json.Unmarshal([]byte(recipientsJSON), &rec.Recipients); err != nil {
+			return nil, fmt.Errorf("unmarshal cluster secret recipients: %w", err)
+		}
+	}
+	rec.SealedPayload = nullableBlob(rec.SealedPayload)
+	return &rec, nil
+}
+
+func (s *Store) DeleteClusterSecretsForSandbox(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_secrets WHERE sandbox_id = ?`, sandboxID); err != nil {
+		return fmt.Errorf("delete cluster secrets: %w", err)
+	}
+	return nil
+}
 
 // PutMounts stores an encrypted mount blob for a sandbox. The blob is opaque
 // to the store layer; encryption / decryption happens in the service layer.

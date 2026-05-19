@@ -3,6 +3,7 @@ package models
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -219,8 +220,62 @@ type UpdateLifecycleRequest struct {
 	Lifecycle
 }
 
+// DefaultCPU, DefaultMemoryMB, DefaultDiskGB are the values normalizeCreateRequest
+// substitutes when the caller leaves them at zero. Exported so any code path that
+// has to reason about an un-normalized CreateSandboxRequest (placement scoring on
+// the way IN, failover-recreate target selection on the way OUT) uses the same
+// numbers — drift here causes placement to score against ghost capacity that
+// doesn't match the eventual admission reservation.
+const (
+	DefaultCPU      float64 = 1
+	DefaultMemoryMB int     = 1024
+	DefaultDiskGB   int     = 10
+)
+
+const (
+	ImageDistributionExternalRegistry = "external_registry"
+	ImageDistributionAOCR             = "aocr"
+	ImageDistributionLocalOnly        = "local_only"
+)
+
+// ImageDistributionMetadata describes whether an image can be materialized on
+// an arbitrary worker. It is deliberately metadata only: registries, AOCR, and
+// cache services remain pluggable deployment choices outside the core daemon.
+type ImageDistributionMetadata struct {
+	Mode        string     `json:"mode,omitempty"`
+	Digest      string     `json:"digest,omitempty"`
+	RegistryRef string     `json:"registry_ref,omitempty"`
+	VerifiedAt  *time.Time `json:"verified_at,omitempty"`
+}
+
+func NormalizeImageDistributionMode(mode string) (string, error) {
+	switch normalized := strings.ToLower(strings.TrimSpace(mode)); normalized {
+	case "":
+		return "", nil
+	case ImageDistributionExternalRegistry, ImageDistributionAOCR, ImageDistributionLocalOnly:
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("invalid image distribution mode %q", mode)
+	}
+}
+
+func (m ImageDistributionMetadata) IsZero() bool {
+	return strings.TrimSpace(m.Mode) == "" &&
+		strings.TrimSpace(m.Digest) == "" &&
+		strings.TrimSpace(m.RegistryRef) == "" &&
+		m.VerifiedAt == nil
+}
+
 type CreateSandboxRequest struct {
 	Image string `json:"image"`
+	// ImageDistributionMode classifies whether Image can be pulled on any
+	// worker (external_registry/aocr) or is pinned to the local node
+	// (local_only). Empty is resolved by the service from snapshot metadata
+	// or by the default image distribution provider.
+	ImageDistributionMode string     `json:"image_distribution_mode,omitempty"`
+	ImageDigest           string     `json:"image_digest,omitempty"`
+	ImageRegistryRef      string     `json:"image_registry_ref,omitempty"`
+	ImageVerifiedAt       *time.Time `json:"image_verified_at,omitempty"`
 	// CPU is the number of CPU cores to allocate. Fractional values are
 	// supported (e.g. 0.5 = half a core, 1.5 = one and a half cores).
 	// Translates to Docker's CpuQuota at 100ms periods.
@@ -264,6 +319,25 @@ type CreateSandboxRequest struct {
 	// Crossing the limit installs an egress DROP rule via the same primitive
 	// NetworkBlockAll uses.
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
+}
+
+func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
+	return ImageDistributionMetadata{
+		Mode:        r.ImageDistributionMode,
+		Digest:      r.ImageDigest,
+		RegistryRef: r.ImageRegistryRef,
+		VerifiedAt:  r.ImageVerifiedAt,
+	}
+}
+
+func (r *CreateSandboxRequest) ApplyImageDistribution(meta ImageDistributionMetadata) {
+	if r == nil {
+		return
+	}
+	r.ImageDistributionMode = strings.TrimSpace(meta.Mode)
+	r.ImageDigest = strings.TrimSpace(meta.Digest)
+	r.ImageRegistryRef = strings.TrimSpace(meta.RegistryRef)
+	r.ImageVerifiedAt = meta.VerifiedAt
 }
 
 type ResizeSandboxRequest struct {
@@ -311,6 +385,12 @@ type Sandbox struct {
 	// GPUs is the GPU configuration this sandbox was created with. Nil means
 	// no GPU was requested.
 	GPUs *GPURequest `json:"gpus,omitempty"`
+	// RegistryAuthSealed is the AES-GCM-encrypted JSON of the original
+	// RegistryAuth supplied at create time, or nil/empty when the sandbox
+	// pulled from a public registry. Persisted so cluster failover can hand
+	// the credentials back to the new owner's docker pull. Never serialized
+	// over the API — it is internal store ↔ service plumbing.
+	RegistryAuthSealed []byte `json:"-"`
 	// NetworkBytesIn / NetworkBytesOut are cumulative byte counters
 	// maintained by the netstats poller. They survive container restarts —
 	// a new veth resets in-memory baseline math but the persisted total is
@@ -390,6 +470,14 @@ type SandboxSnapshot struct {
 	ImageID         string    `json:"image_id,omitempty"`
 	SourceSandboxID string    `json:"source_sandbox_id"`
 	CreatedAt       time.Time `json:"created_at"`
+	// Image distribution metadata is the snapshot-level placement contract.
+	// Local-only snapshots may be started only on the node whose Docker image
+	// store contains Image; external_registry/aocr snapshots may be placed on
+	// any worker that can pull RegistryRef/Image.
+	ImageDistributionMode string     `json:"image_distribution_mode,omitempty"`
+	ImageDigest           string     `json:"image_digest,omitempty"`
+	ImageRegistryRef      string     `json:"image_registry_ref,omitempty"`
+	ImageVerifiedAt       *time.Time `json:"image_verified_at,omitempty"`
 
 	// Entrypoint is the optional command override the caller wants the
 	// runtime to use when starting a sandbox from this snapshot.
@@ -405,6 +493,25 @@ type SandboxSnapshot struct {
 	MemoryMB int     `json:"memory_mb,omitempty"`
 	DiskGB   int     `json:"disk_gb,omitempty"`
 	GPU      float64 `json:"gpu,omitempty"`
+}
+
+func (s SandboxSnapshot) ImageDistribution() ImageDistributionMetadata {
+	return ImageDistributionMetadata{
+		Mode:        s.ImageDistributionMode,
+		Digest:      s.ImageDigest,
+		RegistryRef: s.ImageRegistryRef,
+		VerifiedAt:  s.ImageVerifiedAt,
+	}
+}
+
+func (s *SandboxSnapshot) ApplyImageDistribution(meta ImageDistributionMetadata) {
+	if s == nil {
+		return
+	}
+	s.ImageDistributionMode = strings.TrimSpace(meta.Mode)
+	s.ImageDigest = strings.TrimSpace(meta.Digest)
+	s.ImageRegistryRef = strings.TrimSpace(meta.RegistryRef)
+	s.ImageVerifiedAt = meta.VerifiedAt
 }
 
 // ExposePortRequest is the optional JSON body for POST /v1/sandboxes/{id}/ports/{port}.

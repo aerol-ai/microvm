@@ -807,6 +807,64 @@ class MicroVMClientTest {
         assertTrue(error.getMessage().contains("PAT token is required"));
     }
 
+    // Mirrors pkg/api/v1/list_filter_test.go: tag-filter list calls must
+    // emit every pair under the `tag.` prefix the server's parseTagFilter
+    // keys on. If this drifts (e.g. someone switches to `tags[user_id]`),
+    // the server silently returns the full list and breaks multi-tenant
+    // scoping.
+    @Test
+    void listWithTagsRendersTagDotPrefix() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenQuery = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            seenQuery.set(exchange.getRequestURI().getRawQuery());
+            writeJson(exchange, 200, List.of());
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Map<String, String> tags = new java.util.LinkedHashMap<>();
+            tags.put("user_id", "alice");
+            tags.put("project_id", "p1");
+            client.list(tags);
+            assertEquals("/v1/sandboxes", seenPath.get());
+            String q = seenQuery.get();
+            assertNotNull(q, "expected a query string");
+            assertTrue(q.contains("tag.user_id=alice"), "missing tag.user_id=alice: " + q);
+            assertTrue(q.contains("tag.project_id=p1"), "missing tag.project_id=p1: " + q);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // Backward-compat: list() and list(emptyMap) must produce the pre-filter
+    // URL byte-for-byte. A stray trailing "?" would break HTTP fixtures and
+    // request matchers in downstream code.
+    @Test
+    void listWithoutTagsOmitsQueryString() throws Exception {
+        AtomicReference<String> seenQuery = new AtomicReference<>();
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            seenQuery.set(exchange.getRequestURI().getRawQuery());
+            calls.incrementAndGet();
+            writeJson(exchange, 200, List.of());
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            client.list();
+            assertEquals(null, seenQuery.get());
+            client.list(java.util.Collections.emptyMap());
+            assertEquals(null, seenQuery.get());
+            client.list(null);
+            assertEquals(null, seenQuery.get());
+            assertEquals(3, calls.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
     private static MicroVMClient clientFor(HttpServer server) {
         return new MicroVMClient(
             new MicroVMConfig().setApiUrl(serverUrl(server)).setPatToken("pat-token"),

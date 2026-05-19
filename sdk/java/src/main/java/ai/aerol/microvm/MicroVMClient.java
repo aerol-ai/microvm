@@ -190,11 +190,47 @@ public class MicroVMClient {
     }
 
     public List<Sandbox> list() {
-        SandboxData[] response = doJson("GET", versioned("/sandboxes"), null, SandboxData[].class);
+        return list(Collections.emptyMap());
+    }
+
+    /**
+     * Lists sandboxes whose {@code tags} map contains every key/value pair in
+     * {@code tags} (AND semantics on the server). Wire format is
+     * {@code ?tag.<key>=<value>}; both key and value are URL-encoded. An empty
+     * or null map is equivalent to {@link #list()} — no query string is added,
+     * keeping fixtures and request matchers stable.
+     */
+    public List<Sandbox> list(java.util.Map<String, String> tags) {
+        String path = versioned("/sandboxes") + buildTagQuery(tags);
+        SandboxData[] response = doJson("GET", path, null, SandboxData[].class);
         if (response == null) {
             return Collections.emptyList();
         }
         return java.util.Arrays.stream(response).map(this::wrap).collect(Collectors.toList());
+    }
+
+    // Renders the tag filter as the server's ?tag.<key>=<value> wire format.
+    // The "tag." prefix is literal — parseTagFilter on the server checks the
+    // *decoded* query key — so only the user-supplied key and value get
+    // percent-encoded. Returns "" for null/empty so the URL stays
+    // byte-identical to the pre-filter call (no stray trailing "?").
+    private static String buildTagQuery(java.util.Map<String, String> tags) {
+        if (tags == null || tags.isEmpty()) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder("?");
+        boolean first = true;
+        for (java.util.Map.Entry<String, String> entry : tags.entrySet()) {
+            if (!first) {
+                out.append('&');
+            }
+            first = false;
+            out.append("tag.");
+            out.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8));
+            out.append('=');
+            out.append(URLEncoder.encode(entry.getValue(), StandardCharsets.UTF_8));
+        }
+        return out.toString();
     }
 
     public Sandbox get(String sandboxId) {

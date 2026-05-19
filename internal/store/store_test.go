@@ -801,12 +801,17 @@ func TestStoreCases(t *testing.T) {
 			name: "snapshot_roundtrip_by_name",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
+				verifiedAt := time.Now().UTC().Round(0)
 				snapshot := &models.SandboxSnapshot{
-					Name:            "snapshots/demo:v1",
-					Image:           "snapshots/demo:v1",
-					ImageID:         "sha256:snap-1",
-					SourceSandboxID: "sb-source",
-					CreatedAt:       time.Now().UTC().Round(0),
+					Name:                  "snapshots/demo:v1",
+					Image:                 "registry.example.com/demo@sha256:abc",
+					ImageID:               "sha256:snap-1",
+					SourceSandboxID:       "sb-source",
+					CreatedAt:             time.Now().UTC().Round(0),
+					ImageDistributionMode: models.ImageDistributionExternalRegistry,
+					ImageDigest:           "sha256:abc",
+					ImageRegistryRef:      "registry.example.com/demo@sha256:abc",
+					ImageVerifiedAt:       &verifiedAt,
 				}
 				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
@@ -1207,6 +1212,7 @@ func TestStoreHelperCases(t *testing.T) {
 			int64(0), int64(0), // net_bytes_in_limit, net_bytes_out_limit
 			0,              // net_quota_exceeded
 			sql.NullTime{}, // net_quota_exceeded_at
+			[]byte(nil),    // registry_auth_sealed
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {
@@ -1224,6 +1230,42 @@ func (s sqlRowStub) Scan(dest ...any) error {
 		reflect.ValueOf(dest[i]).Elem().Set(reflect.ValueOf(s.values[i]))
 	}
 	return nil
+}
+
+func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	rec := ClusterSecretRecord{
+		Ref:           "cluster-secret://sandbox/sb-store/v1",
+		SandboxID:     "sb-store",
+		Version:       1,
+		Recipients:    []string{"node-a"},
+		SealedPayload: []byte("opaque-ciphertext"),
+	}
+	if err := st.PutClusterSecret(ctx, rec); err != nil {
+		t.Fatalf("PutClusterSecret: %v", err)
+	}
+	got, err := st.GetClusterSecret(ctx, rec.Ref)
+	if err != nil {
+		t.Fatalf("GetClusterSecret: %v", err)
+	}
+	if got.Ref != rec.Ref || got.SandboxID != rec.SandboxID || got.Version != rec.Version {
+		t.Fatalf("record identity = %+v, want %+v", got, rec)
+	}
+	if len(got.Recipients) != 1 || got.Recipients[0] != "node-a" {
+		t.Fatalf("recipients = %+v, want node-a", got.Recipients)
+	}
+	if string(got.SealedPayload) != "opaque-ciphertext" {
+		t.Fatalf("sealed payload = %q", string(got.SealedPayload))
+	}
+
+	if err := st.DeleteClusterSecretsForSandbox(ctx, rec.SandboxID); err != nil {
+		t.Fatalf("DeleteClusterSecretsForSandbox: %v", err)
+	}
+	if _, err := st.GetClusterSecret(ctx, rec.Ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetClusterSecret after delete = %v, want ErrNotFound", err)
+	}
 }
 
 func newTestStore(t *testing.T) *Store {

@@ -778,5 +778,53 @@ class ClientTests(unittest.TestCase):
             client_module._load_websocket_module = original_loader
 
 
+class ListFilterTests(unittest.TestCase):
+    """Mirrors pkg/api/v1/list_filter_test.go: a tag-filter list call must
+    render every tag as `?tag.<k>=<v>` on the wire, since that is the prefix
+    the server's parseTagFilter inspects. A bare list() call must produce the
+    pre-filter URL byte-for-byte so existing callers and fixtures don't see a
+    stray trailing "?".
+    """
+
+    def _client_capturing(self):
+        captured = {"paths": []}
+
+        class CapturingClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                captured["paths"].append((method, path, payload))
+                return []
+
+        return CapturingClient(), captured
+
+    def test_list_with_tags_renders_tag_prefix(self):
+        client, captured = self._client_capturing()
+        client.list(tags={"user_id": "alice", "project_id": "p1"})
+        method, path, _ = captured["paths"][0]
+        self.assertEqual(method, "GET")
+        # Dict iteration is insertion-ordered on every supported Python; assert
+        # both pairs are present without depending on a stable join order.
+        self.assertTrue(path.startswith("/v1/sandboxes?"))
+        self.assertIn("tag.user_id=alice", path)
+        self.assertIn("tag.project_id=p1", path)
+
+    def test_list_with_tags_url_encodes_keys_and_values(self):
+        client, captured = self._client_capturing()
+        client.list(tags={"user/id": "alice bob", "needs=encode": "v&v"})
+        _, path, _ = captured["paths"][0]
+        self.assertIn("tag.user%2Fid=alice%20bob", path)
+        self.assertIn("tag.needs%3Dencode=v%26v", path)
+
+    def test_list_without_tags_omits_query_string(self):
+        client, captured = self._client_capturing()
+        client.list()
+        client.list(tags=None)
+        client.list(tags={})
+        for _, path, _ in captured["paths"]:
+            self.assertEqual(path, "/v1/sandboxes")
+
+
 if __name__ == "__main__":
     unittest.main()

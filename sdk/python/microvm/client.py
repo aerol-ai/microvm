@@ -461,8 +461,9 @@ class MicroVM:
         pushed: Optional[str] = str(pushed_value) if pushed_value else None
         return BuildImageResult(image=image_tag, pushed=pushed)
 
-    def list(self) -> List[Sandbox]:
-        sandboxes = self._do_json("GET", self._versioned("/sandboxes"), None)
+    def list(self, *, tags: Optional[Dict[str, str]] = None) -> List[Sandbox]:
+        path = self._versioned("/sandboxes") + _build_tag_query(tags)
+        sandboxes = self._do_json("GET", path, None)
         return [self._wrap_sandbox(item) for item in sandboxes]
 
     def get(self, sandbox_id: str) -> Sandbox:
@@ -775,6 +776,21 @@ def _first_of(mapping: Dict[str, Any], *keys: str) -> Any:
 
 def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
+
+
+def _build_tag_query(tags: Optional[Dict[str, str]]) -> str:
+    # Renders the tag filter as the server's `?tag.<key>=<value>` wire format.
+    # The `tag.` prefix is literal — the server's parseTagFilter inspects the
+    # decoded query key — so only the user-supplied key and value get
+    # percent-encoded. An empty or missing map returns "" so the request URL is
+    # byte-identical to the pre-filter call (no stray trailing "?").
+    if not tags:
+        return ""
+    parts = [
+        f"tag.{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(str(value), safe='')}"
+        for key, value in tags.items()
+    ]
+    return "?" + "&".join(parts)
 
 
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:

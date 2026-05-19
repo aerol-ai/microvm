@@ -19,6 +19,7 @@ import type {
   ExposeResult,
   HealthStatus,
   Lifecycle,
+  ListOptions,
   MountSpec,
   MountSpecRedacted,
   NetworkUsage,
@@ -304,8 +305,9 @@ export class APIClient {
     return { ...options, image: result.image };
   }
 
-  async list(): Promise<SandboxResource[]> {
-    const response = await this.doJSON<ApiSandbox[]>("GET", this.versioned("/sandboxes"));
+  async list(options?: ListOptions): Promise<SandboxResource[]> {
+    const path = this.versioned("/sandboxes") + buildTagQuery(options?.tags);
+    const response = await this.doJSON<ApiSandbox[]>("GET", path);
     return response.map((item) => this.wrap(item));
   }
 
@@ -951,6 +953,22 @@ function fromApiLifecycle(lifecycle?: ApiLifecycle): Lifecycle {
     result.destroyAtAge = lifecycle.destroy_at_age;
   }
   return result;
+}
+
+// buildTagQuery renders ListOptions.tags as the server's wire format. The
+// `tag.` prefix is literal — the server's parseTagFilter does a prefix check
+// on the *decoded* query key, so only the user-supplied key and value get
+// percent-encoded. An empty or absent map returns "" so the request URL is
+// byte-identical to the pre-filter call site (no trailing "?"), keeping
+// fixtures and middleware that match on path stable.
+function buildTagQuery(tags: Record<string, string> | undefined): string {
+  if (!tags) return "";
+  const entries = Object.entries(tags);
+  if (entries.length === 0) return "";
+  const parts = entries.map(
+    ([key, value]) => `tag.${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
+  );
+  return "?" + parts.join("&");
 }
 
 function cloneSandbox(sandbox: Sandbox): Sandbox {

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
-	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -256,10 +255,7 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	// to keep human-driven starts honest. Reserve is idempotent if the slot
 	// is already held (e.g. from API start that just upserted before us).
 	if s.admitter != nil {
-		s.admitter.Reserve(sandbox.ID, capacity.Request{
-			CPU:      sandbox.CPU,
-			MemoryMB: sandbox.MemoryMB,
-		})
+		s.admitter.Reserve(sandbox.ID, capacityRequestFromSandbox(sandbox))
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {

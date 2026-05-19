@@ -3,8 +3,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +17,81 @@ import (
 )
 
 const defaultToolboxPort = 2280
+
+// NodeRole values for SB_NODE_ROLE. The role partitions which components a
+// cluster-mode daemon runs (Raft voter promotion, sandbox worker work, public
+// ingress reconciler). Default is NodeRoleMixed — every node runs every
+// component, matching pre-role behavior bit-for-bit. The split exists so a
+// 200-worker cluster doesn't have 200 Raft voters and 200 nodes each holding
+// a 10K-route public ingress table; see plans/data-plane-load-balancer.md.
+//
+// SB_NODE_ROLE accepts either a single token or a comma-separated combination
+// of base roles, e.g. "worker,ingress" for a data-plane edge node or
+// "server,ingress" for a control + ingress node. NodeRoleMixed remains the
+// shorthand for "server,worker,ingress" and may not be combined with anything
+// else.
+const (
+	NodeRoleServer  = "server"
+	NodeRoleWorker  = "worker"
+	NodeRoleIngress = "ingress"
+	NodeRoleMixed   = "mixed"
+)
+
+func validNodeRoles() []string {
+	return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed}
+}
+
+// parseNodeRoles splits raw on commas, lowercases and trims each segment,
+// dedupes, and validates each token against the whitelist. It returns the
+// sorted, deduped role set; an empty raw returns an empty slice (caller
+// substitutes the default). The mixed token may not appear alongside any
+// other role: it already means all three and combining it is almost always a
+// misconfiguration, so we surface it at boot.
+func parseNodeRoles(raw string) ([]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	parts := strings.Split(trimmed, ",")
+	seen := make(map[string]bool, len(parts))
+	roles := make([]string, 0, len(parts))
+	for _, p := range parts {
+		tok := strings.ToLower(strings.TrimSpace(p))
+		if tok == "" {
+			return nil, fmt.Errorf("invalid SB_NODE_ROLE=%q: empty token (check for stray commas)", raw)
+		}
+		switch tok {
+		case NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed:
+		default:
+			return nil, fmt.Errorf("invalid SB_NODE_ROLE token %q in %q (allowed: %s)", tok, raw, strings.Join(validNodeRoles(), ", "))
+		}
+		if seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		roles = append(roles, tok)
+	}
+	if seen[NodeRoleMixed] && len(roles) > 1 {
+		return nil, fmt.Errorf("invalid SB_NODE_ROLE=%q: %q is shorthand for %q+%q+%q and may not be combined with other roles",
+			raw, NodeRoleMixed, NodeRoleServer, NodeRoleWorker, NodeRoleIngress)
+	}
+	sort.Strings(roles)
+	return roles, nil
+}
+
+// canonicalNodeRole renders a parsed role set back to its canonical wire
+// form. Single tokens stay as-is (so "worker" stays "worker"). Multi-role
+// sets become comma-separated and sorted ("ingress,worker"). The empty input
+// is the caller's signal to apply the NodeRoleMixed default.
+func canonicalNodeRole(roles []string) string {
+	if len(roles) == 0 {
+		return ""
+	}
+	if len(roles) == 1 {
+		return roles[0]
+	}
+	return strings.Join(roles, ",")
+}
 
 type Config struct {
 	PATToken            string
@@ -73,6 +152,24 @@ type Config struct {
 	MemoryOverProvisionFactor float64
 	HostCPUCoresOverride      int
 	HostMemoryMBOverride      int
+	// DiskReservationRatio gates total per-sandbox disk reservations against
+	// HostDiskGB. 0 disables disk admission entirely (legacy behaviour).
+	// HostDiskGB is operator-declared because robust auto-detection of the
+	// docker-data-root volume is filesystem-specific (overlay2, devicemapper,
+	// btrfs all report differently); we'd rather operators set the number
+	// they trust than guess wrong.
+	DiskReservationRatio float64
+	HostDiskGB           int
+	// HostGPUCount and HostGPUVendor describe the GPU inventory wired into
+	// Docker via nvidia-container-runtime / amdgpu / etc. Used by placement
+	// scheduling so a GPU sandbox is never forwarded to a GPU-less peer.
+	HostGPUCount  int
+	HostGPUVendor string
+	// HostSupportedRuntimes is a comma-separated SB_HOST_RUNTIMES list
+	// declaring which OCI runtimes this host has installed. Empty falls
+	// back to ["docker"] in capacity.New so existing single-runtime hosts
+	// don't need new env to keep accepting placements.
+	HostSupportedRuntimes []string
 
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
@@ -108,6 +205,105 @@ type Config struct {
 	// "127.0.0.1:8443" to match install.sh's relocated HTTPS listener.
 	L4TLSFallback string
 
+	// Cluster mode (Phase 1). When EnableCluster is false the daemon runs as
+	// a standalone single-node sandbox runner — byte-identical to the legacy
+	// behavior. When true, this node joins (or bootstraps) a Raft+gossip
+	// cluster that owns the placement map (sandbox_id -> owner node). Each
+	// sandbox is owned by exactly one node; the owner's local SQLite remains
+	// the source of truth for sandbox state. Hot-path traffic (toolbox,
+	// sessions, port forwards) is transparently reverse-proxied to the owner.
+	EnableCluster bool
+	// NodeRole partitions cluster-mode components across this daemon. Values
+	// are one of NodeRoleServer / NodeRoleWorker / NodeRoleIngress /
+	// NodeRoleMixed. Default NodeRoleMixed preserves pre-role behavior
+	// (every component runs on every node). SB_NODE_ROLE. Ignored when
+	// EnableCluster=false — single-node mode is implicitly "mixed".
+	NodeRole            string
+	NodeID              string
+	RaftBindAddr        string
+	RaftAdvertiseAddr   string
+	RaftDataDir         string
+	GossipBindAddr      string
+	GossipAdvertiseAddr string
+	BootstrapPeers      []string
+	ClusterBootstrap    bool
+	SelfAPIAdvertiseURL string
+	// DataPlaneAdvertiseHost is the host/IP other nodes use for sandbox
+	// public ingress (HTTP/SNI passthrough and raw TCP proxying) when this
+	// node owns a sandbox. It is intentionally separate from
+	// SelfAPIAdvertiseURL: many deployments put API traffic behind a shared
+	// load balancer or API-only DNS name that must not be used as the
+	// owner-data-plane target. SB_DATA_PLANE_ADVERTISE_HOST.
+	DataPlaneAdvertiseHost string
+	// IngressAdvertiseHost is the *public* host the SDK and end users hit for
+	// sandbox URLs in cluster mode. It is separate from PublicHost (which is
+	// the local node's bind-or-NAT address) and from DataPlaneAdvertiseHost
+	// (which is the peer-internal LAN address other nodes use). When set, the
+	// Caddy client uses it as the hostname in composed sandbox URLs; when
+	// empty, it falls back to PublicHost so single-node mode is unchanged.
+	//
+	// Operators point this at whatever the cluster's data-plane LB endpoint
+	// is — a wildcard DNS record fronting the ingress nodes, a cloud NLB, a
+	// MetalLB/BGP VIP, or DNS round-robin across ingress nodes. The build
+	// itself does not run any load balancer; that's a deployment decision.
+	// See plans/data-plane-load-balancer.md.
+	// SB_INGRESS_ADVERTISE_HOST.
+	IngressAdvertiseHost          string
+	ClusterRaftCommitTimeout      time.Duration
+	ClusterCapacityGossipInterval time.Duration
+	// ClusterMaxAutoVoters caps gossip-driven Raft voter promotion. Additional
+	// nodes are added as non-voters so they still receive the placement log
+	// without increasing quorum size. 0 means unlimited, preserving the old
+	// behavior for tests or intentionally small fully-voting clusters.
+	ClusterMaxAutoVoters int
+	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
+	// a node dead before orphaning its placements and removing it from the
+	// raft configuration. Long enough to absorb transient gossip flap
+	// (network blips, GC pauses) but short enough that operators don't have
+	// to wait minutes to recover.
+	ClusterDeadOwnerGrace time.Duration
+	// ClusterGossipSecretKey, when non-empty, enables AES gossip encryption +
+	// authentication. Accepts a base64-encoded 16/24/32-byte key (AES-128/192/256).
+	// Required in cluster mode (Load() refuses to start otherwise). The escape
+	// hatch is ClusterInsecureGossip below. SB_GOSSIP_SECRET_KEY.
+	ClusterGossipSecretKey string
+	// ClusterInsecureGossip explicitly opts out of the gossip-key requirement
+	// when SB_ENABLE_CLUSTER=true. Only safe on a fully isolated network where
+	// every peer that can reach gossip+raft ports is trusted. Default false —
+	// the daemon refuses to boot in cluster mode without a gossip key. Use only
+	// for ephemeral test setups. SB_CLUSTER_INSECURE_GOSSIP.
+	ClusterInsecureGossip bool
+	// ClusterInsecureCredentials opts out of the shared-credential-key
+	// requirement in cluster mode. Without a key shared across nodes, sealed
+	// registry passwords and per-mount credentials replicated via raft cannot
+	// be decrypted by a failover owner — recovered sandboxes lose access to
+	// private registries and credentialed mounts. Default false: the daemon
+	// refuses to boot in cluster mode unless either SB_CREDENTIAL_ENCRYPTION_KEY
+	// is set explicitly or a key file already exists at
+	// SB_CREDENTIAL_ENCRYPTION_KEY_PATH (the operator may have distributed it
+	// out of band). Set true only for ephemeral test setups that don't use
+	// sealed creds. SB_CLUSTER_INSECURE_CREDENTIALS.
+	ClusterInsecureCredentials bool
+
+	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
+	// any other future cluster-internal RPC) ride over a separate HTTPS listener
+	// that requires a client certificate signed by the cluster CA. Without TLS
+	// the same RPCs ride over the public API URL with only the shared PAT for
+	// auth — fine on a private overlay, but a client-cert pin is the right
+	// default for any internet-adjacent deployment.
+	//
+	// ClusterTLSDir holds ca.crt, ca.key (only on the bootstrap node and any
+	// joiner that received the bundle), node.crt, node.key. cluster-init.sh
+	// generates the CA and a node cert; cluster-join.sh signs a fresh node
+	// cert from the bundled CA. SB_CLUSTER_TLS_DIR.
+	ClusterTLSDir string
+	// ClusterInternalListenAddr is the bind address for the mTLS internal
+	// listener. SB_CLUSTER_INTERNAL_LISTEN. Default 0.0.0.0:7002.
+	ClusterInternalListenAddr string
+	// ClusterInternalAdvertiseURL is the URL peers dial for cluster-internal
+	// RPCs. Falls back to https://<derived-host>:<internal-port> when empty.
+	// Must be HTTPS — plaintext defeats the purpose. SB_CLUSTER_INTERNAL_ADVERTISE.
+	ClusterInternalAdvertiseURL string
 	// ImageBuildContextEnabled is the operator opt-in for the contextHashes
 	// upload path — image builds whose context includes caller-supplied
 	// local files (COPY/ADD). Off by default because the resolution path
@@ -151,6 +347,10 @@ type Config struct {
 	// transient hiccup doesn't have the janitor yanking an image a client
 	// is about to use.
 	ImageBuildGCTTL time.Duration
+	// ImageDistributionAOCRHost is the registry host treated as the optional
+	// managed AOCR image-distribution provider. Empty configs constructed in
+	// tests fall back to the product default in the service layer.
+	ImageDistributionAOCRHost string
 }
 
 func Load() (Config, error) {
@@ -202,17 +402,46 @@ func Load() (Config, error) {
 		MemoryOverProvisionFactor: getEnvFloat("SB_MEMORY_OVERPROVISION_FACTOR", 10.0),
 		HostCPUCoresOverride:      getEnvInt("SB_HOST_CPU_CORES", 0),
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
+		DiskReservationRatio:      getEnvFloat("SB_DISK_RESERVATION_RATIO", 0),
+		HostDiskGB:                getEnvInt("SB_HOST_DISK_GB", 0),
+		HostGPUCount:              getEnvInt("SB_HOST_GPU_COUNT", 0),
+		HostGPUVendor:             strings.ToLower(strings.TrimSpace(os.Getenv("SB_HOST_GPU_VENDOR"))),
+		HostSupportedRuntimes:     splitAndTrim(os.Getenv("SB_HOST_RUNTIMES"), ","),
 
 		L4PortRangeStart: getEnvInt("SB_L4_PORT_RANGE_START", 22000),
 		L4PortRangeEnd:   getEnvInt("SB_L4_PORT_RANGE_END", 23000),
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
 
-		ImageBuildContextEnabled: getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
-		ImageBuildTimeout:        getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
-		ImageBuildGCEnabled:      getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
-		ImageBuildGCInterval:     getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:          getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		EnableCluster:                 getEnvBool("SB_ENABLE_CLUSTER", false),
+		NodeRole:                      os.Getenv("SB_NODE_ROLE"),
+		NodeID:                        strings.TrimSpace(os.Getenv("SB_NODE_ID")),
+		RaftBindAddr:                  getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
+		RaftAdvertiseAddr:             strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
+		RaftDataDir:                   strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
+		GossipBindAddr:                getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
+		GossipAdvertiseAddr:           strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
+		BootstrapPeers:                splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
+		ClusterBootstrap:              getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
+		SelfAPIAdvertiseURL:           strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
+		DataPlaneAdvertiseHost:        normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
+		IngressAdvertiseHost:          normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
+		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
+		ClusterMaxAutoVoters:          getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
+		ClusterDeadOwnerGrace:         getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		ClusterGossipSecretKey:        strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
+		ClusterInsecureGossip:         getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
+		ClusterInsecureCredentials:    getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
+		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
+		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
+		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
+		ImageBuildContextEnabled:      getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:             getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:          getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:               getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageDistributionAOCRHost:     strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
 	}
 
 	if cfg.PATToken == "" {
@@ -257,7 +486,105 @@ func Load() (Config, error) {
 		return Config{}, errors.New("SB_L4_TLS_FALLBACK must be set when SB_L4_TLS_LISTEN is set (caddy-l4 needs a target for non-sandbox SNI)")
 	}
 
+	// NodeRole defaults to "mixed" and must be one of the known values when
+	// set. The role only changes daemon behavior in cluster mode; in
+	// single-node mode it stays at "mixed" implicitly (and an explicit
+	// non-default value would be a misconfiguration, not a silent override).
+	// Hybrid combinations like "worker,ingress" are allowed; parseNodeRoles
+	// validates each token and rejects illegal combos.
+	parsedRoles, err := parseNodeRoles(cfg.NodeRole)
+	if err != nil {
+		return Config{}, err
+	}
+	if len(parsedRoles) == 0 {
+		cfg.NodeRole = NodeRoleMixed
+	} else {
+		cfg.NodeRole = canonicalNodeRole(parsedRoles)
+	}
+	if cfg.NodeRole != NodeRoleMixed && !cfg.EnableCluster {
+		return Config{}, fmt.Errorf("SB_NODE_ROLE=%q requires SB_ENABLE_CLUSTER=true (single-node mode is implicitly %q)", cfg.NodeRole, NodeRoleMixed)
+	}
+
+	// Cluster-mode invariants. Single-node mode (EnableCluster=false) skips
+	// all of this — defaults are non-load-bearing in that case.
+	if cfg.EnableCluster {
+		if cfg.RaftDataDir == "" {
+			cfg.RaftDataDir = filepath.Join(filepath.Dir(cfg.DBPath), "raft")
+		}
+		if cfg.RaftAdvertiseAddr == "" {
+			cfg.RaftAdvertiseAddr = cfg.RaftBindAddr
+		}
+		if cfg.GossipAdvertiseAddr == "" {
+			cfg.GossipAdvertiseAddr = cfg.GossipBindAddr
+		}
+		if cfg.SelfAPIAdvertiseURL == "" {
+			host, _ := os.Hostname()
+			if host == "" {
+				host = "127.0.0.1"
+			}
+			cfg.SelfAPIAdvertiseURL = fmt.Sprintf("http://%s:%d", host, cfg.APIPort)
+		}
+		if cfg.DataPlaneAdvertiseHost == "" {
+			cfg.DataPlaneAdvertiseHost = normalizeAdvertiseHost(cfg.SelfAPIAdvertiseURL)
+		}
+		if cfg.DataPlaneAdvertiseHost == "" {
+			return Config{}, errors.New("SB_DATA_PLANE_ADVERTISE_HOST could not be derived; set it to the host/IP peers use for sandbox ingress")
+		}
+		if cfg.ClusterMaxAutoVoters < 0 {
+			return Config{}, errors.New("SB_CLUSTER_MAX_AUTO_VOTERS must be >= 0")
+		}
+		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
+			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
+		}
+		// Worker and ingress nodes never seed a fresh Raft cluster — only
+		// roles that include "server" (or the "mixed" shorthand) do. Catching
+		// this at boot avoids a confusing half-bootstrapped cluster where a
+		// non-voter tried to be the first voter. Hybrid combos like
+		// "server,worker" pass; "worker,ingress" is rejected here.
+		if cfg.ClusterBootstrap && !cfg.IsServer() {
+			return Config{}, fmt.Errorf("SB_CLUSTER_BOOTSTRAP=true is incompatible with SB_NODE_ROLE=%q (only roles containing %q, or the %q shorthand, may bootstrap a cluster)", cfg.NodeRole, NodeRoleServer, NodeRoleMixed)
+		}
+		// Gossip auth gates voter auto-promotion. Without it, any reachable peer
+		// can join the raft configuration. Refusing at boot is the safest default
+		// — operators who genuinely want plaintext gossip on a fully isolated
+		// network can set SB_CLUSTER_INSECURE_GOSSIP=true. The escape hatch is
+		// loud (separate variable, must be deliberate) rather than silently
+		// permissive.
+		if cfg.ClusterGossipSecretKey == "" && !cfg.ClusterInsecureGossip {
+			return Config{}, errors.New("SB_GOSSIP_SECRET_KEY is required when SB_ENABLE_CLUSTER=true (set SB_CLUSTER_INSECURE_GOSSIP=true to opt out — only safe on a fully isolated network)")
+		}
+		// Sealed registry passwords and per-mount credentials replicated via
+		// raft are decrypted with this key on the failover owner. If every
+		// node lazy-generates its own key (the default in single-node mode),
+		// recovered sandboxes silently lose access to private registries and
+		// credentialed mounts. Accept either an explicit env var or an
+		// already-distributed key file on disk; refuse boot otherwise unless
+		// the operator has acknowledged the trade-off via the insecure flag.
+		if cfg.CredentialEncryptionKey == "" && !cfg.ClusterInsecureCredentials {
+			if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
+				if os.IsNotExist(err) {
+					return Config{}, fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — sealed registry/mount creds will not survive failover without a shared key)", cfg.CredentialEncryptionKeyPath)
+				}
+				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+			}
+		}
+	}
+
 	return cfg, nil
+}
+
+func splitAndTrim(s, sep string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, sep)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (c Config) ListenAddr() string {
@@ -266,6 +593,67 @@ func (c Config) ListenAddr() string {
 
 func (c Config) DomainMode() bool {
 	return c.Domain != ""
+}
+
+// Roles returns the base-role set this daemon should run. NodeRoleMixed
+// expands to [server, worker, ingress]; hybrid comma-separated values
+// ("worker,ingress") are split into their constituent base roles. The empty
+// string maps to mixed for safety (callers that reach here via the validated
+// config never see an empty string, but consumers that build a Config{} by
+// hand in tests get the same default Load() applies). The returned slice is
+// sorted and deduped.
+func (c Config) Roles() []string {
+	raw := c.NodeRole
+	if strings.TrimSpace(raw) == "" {
+		raw = NodeRoleMixed
+	}
+	roles, err := parseNodeRoles(raw)
+	if err != nil || len(roles) == 0 {
+		// A Config that didn't go through Load() may carry an invalid string;
+		// fall back to "mixed" so the predicates degrade to pre-role behavior
+		// rather than silently turning every gate off.
+		return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress}
+	}
+	if len(roles) == 1 && roles[0] == NodeRoleMixed {
+		return []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress}
+	}
+	return roles
+}
+
+// hasRole reports whether the expanded role set contains target. Used by the
+// IsServer / IsWorker / IsIngress predicates so they share one parsing path
+// and treat "mixed", single roles, and hybrid combinations identically.
+func (c Config) hasRole(target string) bool {
+	return slices.Contains(c.Roles(), target)
+}
+
+// IsServer reports whether this daemon should run server-only responsibilities
+// (Raft voter promotion, FSM ownership). Mixed nodes and any hybrid that
+// includes "server" return true; pure worker, pure ingress, and the
+// worker+ingress combo return false.
+func (c Config) IsServer() bool { return c.hasRole(NodeRoleServer) }
+
+// IsWorker reports whether this daemon owns sandboxes locally (Docker,
+// lifecycle sweep, image GC, reservation replay). Pure ingress/server nodes
+// return false; mixed and any hybrid that includes "worker" return true.
+func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
+
+// IsIngress reports whether this daemon installs owner-aware Caddy routes for
+// remote sandboxes. Pure server/worker nodes return false; mixed and any
+// hybrid that includes "ingress" return true.
+func (c Config) IsIngress() bool { return c.hasRole(NodeRoleIngress) }
+
+// EffectivePublicHost returns the hostname or IP that should appear in
+// SDK-facing sandbox URLs. In cluster mode, operators set
+// SB_INGRESS_ADVERTISE_HOST to whatever fronts the ingress tier (cloud NLB,
+// MetalLB VIP, wildcard DNS, etc.); single-node mode and clusters that
+// haven't configured an ingress host fall back to PublicHost, matching the
+// pre-cluster behavior.
+func (c Config) EffectivePublicHost() string {
+	if c.IngressAdvertiseHost != "" {
+		return c.IngressAdvertiseHost
+	}
+	return c.PublicHost
 }
 
 func (c Config) IdleTimeout() time.Duration {
@@ -333,4 +721,25 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 
 func normalizeHost(value string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(value, "https://"), "http://"))
+}
+
+func normalizeAdvertiseHost(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if u, err := url.Parse(value); err == nil && u.Hostname() != "" {
+		return strings.Trim(u.Hostname(), "[]")
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	trimmed := strings.Trim(value, "[]")
+	if net.ParseIP(trimmed) != nil {
+		return trimmed
+	}
+	if i := strings.LastIndex(value, ":"); i > -1 && !strings.Contains(value[i+1:], "/") && strings.Count(value, ":") == 1 {
+		return strings.Trim(value[:i], "[]")
+	}
+	return trimmed
 }

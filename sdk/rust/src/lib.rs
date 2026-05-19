@@ -592,11 +592,22 @@ impl Client {
     }
 
     pub fn list(&self) -> Result<Vec<Sandbox>, Error> {
-        let raw = self.do_json::<(), Vec<SandboxData>>(
-            Method::GET,
-            &format!("{}/sandboxes", self.version_prefix()),
-            None,
-        )?;
+        self.list_with_tags(&std::collections::HashMap::new())
+    }
+
+    /// Lists sandboxes filtered by tag. Every key/value pair in `tags` must
+    /// be present on a sandbox's `tags` map for it to be returned (AND
+    /// semantics on the server). Wire format is `?tag.<key>=<value>`; both
+    /// key and value are percent-encoded. Passing an empty map is identical
+    /// to calling [`Client::list`].
+    pub fn list_with_tags(
+        &self,
+        tags: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<Sandbox>, Error> {
+        let mut path = format!("{}/sandboxes", self.version_prefix());
+        path.push_str(&build_tag_query(tags));
+        let raw =
+            self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
         Ok(raw
             .into_iter()
             .map(|item| Sandbox::new(self.clone(), item))
@@ -1355,6 +1366,32 @@ async fn run_session_attach(
 // caller sees the actual status + body the server returned (e.g.
 // "status=502, body=\"toolbox unavailable\"") instead of just
 // "Http error: 502 Bad Gateway".
+// Renders the tag filter as the server's `?tag.<key>=<value>` wire format.
+// The `tag.` prefix is literal — parseTagFilter on the server inspects the
+// decoded query key — so only the user-supplied key and value get
+// percent-encoded. An empty map returns "" so the URL is byte-identical to
+// the pre-filter call (no stray trailing "?"). Map iteration order is
+// unspecified; the server treats every `tag.*` pair as an AND clause so the
+// emitted order does not affect the response.
+fn build_tag_query(tags: &std::collections::HashMap<String, String>) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("?");
+    let mut first = true;
+    for (key, value) in tags {
+        if !first {
+            out.push('&');
+        }
+        first = false;
+        out.push_str("tag.");
+        out.push_str(&urlencoding::encode(key));
+        out.push('=');
+        out.push_str(&urlencoding::encode(value));
+    }
+    out
+}
+
 fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
     match err {
         WebSocketError::Http(response) => {
@@ -2542,6 +2579,77 @@ mod tests {
             serde_json::from_str::<Value>(&control_rx.recv().expect("signal should be captured"))
                 .expect("signal should parse"),
             serde_json::json!({ "type": "signal", "signal": "INT" })
+        );
+    }
+
+    // Mirrors pkg/api/v1/list_filter_test.go: list_with_tags must render every
+    // tag as `?tag.<k>=<v>`, which is the prefix the server's parseTagFilter
+    // keys on. The check is on the request line rather than parsed URL params
+    // because the test server captures the raw HTTP request.
+    #[test]
+    fn list_with_tags_renders_tag_prefix_on_wire() {
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("user_id".to_string(), "alice".to_string());
+        client
+            .list_with_tags(&tags)
+            .expect("list_with_tags should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("GET /v1/sandboxes?tag.user_id=alice HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+    }
+
+    // URL-encoding is delegated to urlencoding::encode in build_tag_query.
+    // This pins that both keys and values with reserved characters survive
+    // the round trip via the server's url.Values decode (which percent-
+    // decodes both sides before the `tag.` prefix check).
+    #[test]
+    fn list_with_tags_url_encodes_keys_and_values() {
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("user/id".to_string(), "alice bob".to_string());
+        client
+            .list_with_tags(&tags)
+            .expect("list_with_tags should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        // urlencoding crate encodes space as %20 (not '+'), slash as %2F.
+        assert!(
+            request.starts_with("GET /v1/sandboxes?tag.user%2Fid=alice%20bob HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+    }
+
+    // Backward-compat: list() and list_with_tags(&empty) must produce the
+    // pre-filter URL byte-for-byte — no stray trailing "?" — so fixtures and
+    // request matchers in downstream code keep working.
+    #[test]
+    fn list_without_tags_omits_query_string() {
+        let (url, request_rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client.list().expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("GET /v1/sandboxes HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+
+        let (url2, request_rx2) = spawn_json_server("[]".to_string());
+        let client2 = Client::new(Some(&url2), Some("pat-token")).expect("client should build");
+        client2
+            .list_with_tags(&std::collections::HashMap::new())
+            .expect("list_with_tags should succeed");
+        let request2 = request_rx2.recv().expect("request should be captured");
+        assert!(
+            request2.starts_with("GET /v1/sandboxes HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request2
         );
     }
 }

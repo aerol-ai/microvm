@@ -3,6 +3,7 @@ package capacity
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -32,6 +33,32 @@ func TestAdmitUnderLimitsAccepts(t *testing.T) {
 	snap := a.Snapshot()
 	if snap.SandboxesActive != 1 || snap.ReservedCPU != 1 || snap.ReservedMemoryMB != 1024 {
 		t.Fatalf("snapshot: %+v", snap)
+	}
+}
+
+func TestSnapshotPublishesHostPressureMetrics(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096, DiskTotalGB: 100, GPUCount: 2}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		DiskReservationRatio:   1.0,
+	}, fakeProbe{free: 2048})
+	a.Reserve("sb-pressure", Request{CPU: 1.5, MemoryMB: 512, DiskGB: 10, GPUs: 1})
+
+	snap := a.Snapshot()
+	if snap.ReservedGPUs != 1 {
+		t.Fatalf("ReservedGPUs = %d, want 1", snap.ReservedGPUs)
+	}
+	if got := hostPressureSandboxes.Value(); got != 1 {
+		t.Fatalf("host pressure sandboxes = %d, want 1", got)
+	}
+	if got := hostPressureReservedCPU.Value(); got != 1500 {
+		t.Fatalf("reserved cpu millicores = %d, want 1500", got)
+	}
+	if got := hostPressureReservedMemory.Value(); got != 512 {
+		t.Fatalf("reserved memory = %d, want 512", got)
+	}
+	if got := hostPressureReservedGPUs.Value(); got != 1 {
+		t.Fatalf("reserved gpus = %d, want 1", got)
 	}
 }
 
@@ -517,6 +544,177 @@ func TestReleaseIsolatedBetweenSandboxes(t *testing.T) {
 	mustAdmit(t, a, "d", Request{CPU: 1, MemoryMB: 1024})
 	if err := a.Admit("e", Request{CPU: 2, MemoryMB: 1024}); !errors.Is(err, ErrCapacityExceeded) {
 		t.Fatalf("expected CPU rejection, only 1 core free: %v", err)
+	}
+}
+
+// TestAdmitDiskReservationRatio mirrors the CPU/memory budget test: a host
+// with a 100 GB declared disk and 0.8 ratio rejects beyond 80 GB total
+// reservation. Without this, the placement scheduler can ship a sandbox to
+// a peer that physically can't hold its --storage-opt size.
+func TestAdmitDiskReservationRatio(t *testing.T) {
+	a := New(HostInfo{CPUCores: 16, MemoryTotalMB: 16384, DiskTotalGB: 100}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		DiskReservationRatio:   0.8,
+	}, nil)
+
+	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 100, DiskGB: 50})
+	mustAdmit(t, a, "b", Request{CPU: 1, MemoryMB: 100, DiskGB: 30})
+	if err := a.Admit("c", Request{CPU: 1, MemoryMB: 100, DiskGB: 1}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected disk rejection at 81 GB on 80 GB budget, got %v", err)
+	}
+	a.Release("a")
+	mustAdmit(t, a, "c", Request{CPU: 1, MemoryMB: 100, DiskGB: 50})
+}
+
+// TestAdmitDiskDisabledWhenRatioZero: matches the existing zero-ratio
+// contract for CPU/memory. With DiskReservationRatio=0 the admitter must
+// not reject even when DiskGB is huge — operators that don't opt in keep
+// today's "no disk admission" behavior.
+func TestAdmitDiskDisabledWhenRatioZero(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 8000, DiskTotalGB: 10}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		// DiskReservationRatio: 0
+	}, nil)
+	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, DiskGB: 1_000_000}); err != nil {
+		t.Fatalf("disk ratio=0 must bypass disk check, got %v", err)
+	}
+}
+
+// TestAdmitGPURejectsWhenHostHasNone exercises the contract that placement
+// scheduling depends on: a GPU sandbox forwarded to a GPU-less node will
+// 503, so the placement layer (and the local admitter as the source-of-
+// truth) must say no.
+func TestAdmitGPURejectsWhenHostHasNone(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 8000}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+	err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"})
+	if !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected GPU rejection on GPU-less host, got %v", err)
+	}
+}
+
+// TestAdmitGPUVendorMismatch: a host advertising AMD must reject a sandbox
+// asking for NVIDIA. Otherwise placement will land an NVIDIA sandbox on an
+// AMD node where docker --gpus would surface a confusing low-level error.
+func TestAdmitGPUVendorMismatch(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 8000, GPUCount: 4, GPUVendor: "amd"}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+	err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"})
+	if !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected GPU vendor mismatch rejection, got %v", err)
+	}
+	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "amd"}); err != nil {
+		t.Fatalf("matching vendor must admit, got %v", err)
+	}
+}
+
+// TestAdmitGPUExhaustsCount tracks reservations: on a 2-GPU host the third
+// 1-GPU sandbox must be rejected, then accepted once a slot is released.
+func TestAdmitGPUExhaustsCount(t *testing.T) {
+	a := New(HostInfo{CPUCores: 16, MemoryTotalMB: 16000, GPUCount: 2, GPUVendor: "nvidia"}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"})
+	mustAdmit(t, a, "b", Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"})
+	if err := a.Admit("c", Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"}); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected GPU exhaustion, got %v", err)
+	}
+	a.Release("a")
+	mustAdmit(t, a, "c", Request{CPU: 1, MemoryMB: 100, GPUs: 1, GPUVendor: "nvidia"})
+}
+
+// TestAdmitRuntimeUnsupported: a host that advertises only "docker" must
+// reject a request asking for "gvisor". Empty SupportedRuntimes (legacy
+// peer / pre-D snapshot) is a separate test because that is "any allowed."
+func TestAdmitRuntimeUnsupported(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 8000, SupportedRuntimes: []string{"docker"}}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+	err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"})
+	if !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected runtime rejection, got %v", err)
+	}
+	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, Runtime: "docker"}); err != nil {
+		t.Fatalf("supported runtime must admit, got %v", err)
+	}
+}
+
+// TestRuntimeUnsupportedSurfacesHostList: the rejection reason must echo the
+// declared SupportedRuntimes so an operator debugging "why was my gvisor
+// sandbox 503'd" can see "this host only has [docker]" in the response.
+func TestRuntimeUnsupportedSurfacesHostList(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 8000, SupportedRuntimes: []string{"docker"}}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+	err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, Runtime: "gvisor"})
+	if err == nil || !strings.Contains(err.Error(), `"gvisor"`) || !strings.Contains(err.Error(), "docker") {
+		t.Fatalf("rejection message must mention requested + supported runtimes, got %v", err)
+	}
+}
+
+// TestEmptySupportedRuntimesAllowsAny pins the rolling-upgrade contract: a
+// snapshot from a peer that pre-dates SupportedRuntimes must not have its
+// placements skipped. New(host) defaults the field to ["docker"], but Admit
+// itself uses runtimeSupported which returns true on empty for callers that
+// build an Admitter directly with an empty list — important for tests and
+// for runtime metadata wired in from raw gossip after JSON round-trip.
+func TestEmptySupportedRuntimesAllowsAny(t *testing.T) {
+	a := &Admitter{
+		host:         HostInfo{CPUCores: 8, MemoryTotalMB: 8000},
+		limits:       Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
+		reservations: map[string]Request{},
+	}
+	if err := a.Admit("a", Request{CPU: 1, MemoryMB: 100, Runtime: "anything"}); err != nil {
+		t.Fatalf("empty SupportedRuntimes must allow any runtime, got %v", err)
+	}
+}
+
+// TestNewDefaultsSupportedRuntimes verifies the docker default applied when
+// the operator doesn't set SB_HOST_RUNTIMES — without this default, the
+// first build that flips the gate would 503 every gvisor request even on
+// hosts that have always supported docker.
+func TestNewDefaultsSupportedRuntimes(t *testing.T) {
+	a := New(HostInfo{CPUCores: 1, MemoryTotalMB: 100}, Limits{}, nil)
+	snap := a.Snapshot()
+	if len(snap.SupportedRuntimes) != 1 || snap.SupportedRuntimes[0] != "docker" {
+		t.Fatalf("expected default [docker], got %v", snap.SupportedRuntimes)
+	}
+}
+
+// TestSnapshotReportsDiskGPURuntime: placement scoring on a peer reads these
+// fields off gossip, so they must round-trip through Snapshot accurately.
+func TestSnapshotReportsDiskGPURuntime(t *testing.T) {
+	a := New(HostInfo{
+		CPUCores: 8, MemoryTotalMB: 8000,
+		DiskTotalGB:       200,
+		GPUCount:          4,
+		GPUVendor:         "nvidia",
+		SupportedRuntimes: []string{"docker", "gvisor"},
+	}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		DiskReservationRatio:   0.5, // budget = 100 GB
+	}, nil)
+	mustAdmit(t, a, "a", Request{CPU: 1, MemoryMB: 100, DiskGB: 30, GPUs: 2, GPUVendor: "nvidia"})
+
+	snap := a.Snapshot()
+	if snap.HostDiskTotalGB != 200 || snap.DiskBudgetGB != 100 || snap.ReservedDiskGB != 30 {
+		t.Fatalf("disk fields wrong: %+v", snap)
+	}
+	if snap.GPUCount != 4 || snap.GPUVendor != "nvidia" {
+		t.Fatalf("gpu inventory wrong: %+v", snap)
+	}
+	if len(snap.SupportedRuntimes) != 2 {
+		t.Fatalf("runtimes wrong: %+v", snap.SupportedRuntimes)
 	}
 }
 

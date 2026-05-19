@@ -214,9 +214,10 @@ func (c *Client) BuildImageWithPush(ctx context.Context, dockerfile string, push
 	return BuildImageResult{Image: payload.Image, Pushed: payload.Pushed}, nil
 }
 
-func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
+func (c *Client) List(ctx context.Context, tags map[string]string) ([]*Sandbox, error) {
 	var response []models.Sandbox
-	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes", nil, &response); err != nil {
+	path := c.versionPrefix + "/sandboxes" + buildTagQuery(tags)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 		return nil, err
 	}
 	items := make([]*Sandbox, 0, len(response))
@@ -224,6 +225,22 @@ func (c *Client) List(ctx context.Context) ([]*Sandbox, error) {
 		items = append(items, c.wrap(item))
 	}
 	return items, nil
+}
+
+// buildTagQuery renders the tag filter as the server's `?tag.<key>=<value>`
+// wire format. The `tag.` prefix is literal — parseTagFilter on the server
+// inspects the *decoded* query key — so only the user-supplied key and value
+// get percent-encoded. An empty or nil map returns "" so the URL is identical
+// to the pre-filter call (no stray trailing "?").
+func buildTagQuery(tags map[string]string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	values := make(url.Values, len(tags))
+	for k, v := range tags {
+		values.Set("tag."+k, v)
+	}
+	return "?" + values.Encode()
 }
 
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {

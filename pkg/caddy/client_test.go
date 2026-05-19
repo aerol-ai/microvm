@@ -232,6 +232,22 @@ func TestRouteCases(t *testing.T) {
 			},
 		},
 		{
+			name: "upsert_sandbox_route_to_peer_uses_ip_mode_path",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, publicHost: "203.0.113.10", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertSandboxRouteToPeer(context.Background(), "abc", "10.0.0.9"); err != nil {
+					t.Fatalf("UpsertSandboxRouteToPeer() error = %v", err)
+				}
+				route, ok := fake.routes["sandbox-abc"]
+				if !ok {
+					t.Fatalf("route missing; routes=%+v", fake.routes)
+				}
+				assertRoutePathMatch(t, route, []string{"/abc", "/abc/*"})
+				assertRouteDial(t, route, "10.0.0.9:80")
+			},
+		},
+		{
 			name: "upsert_port_route_builds_host_match",
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
@@ -404,6 +420,23 @@ func TestL4Cases(t *testing.T) {
 			},
 		},
 		{
+			name: "upsert_tcp_proxy_route_targets_owner_host_port",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertTCPProxyRoute(context.Background(), "abc", 5432, 37412, "10.0.0.9", 37412); err != nil {
+					t.Fatalf("UpsertTCPProxyRoute() error = %v", err)
+				}
+				server, ok := fake.l4Servers["tcp-port-37412"]
+				if !ok {
+					t.Fatalf("tcp proxy server missing; servers=%+v", fake.l4Servers)
+				}
+				route := firstL4Route(t, server)
+				assertRouteField(t, route, "@id", "sandbox-abc-port-5432-tcp")
+				assertL4Dial(t, route, "10.0.0.9:37412")
+			},
+		},
+		{
 			name: "upsert_tls_sni_route_inserts_when_missing",
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
@@ -456,6 +489,25 @@ func TestL4Cases(t *testing.T) {
 				if _, ok := fake.routes["sandbox-abc-port-5432-tls"]; ok {
 					t.Fatalf("tls route should be removed")
 				}
+			},
+		},
+		{
+			name: "upsert_sni_passthrough_route_does_not_terminate_tls",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				fake.l4Servers[tlsMuxServerID] = map[string]any{"listen": []any{":443"}, "routes": []any{}}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertSNIPassthroughRoute(context.Background(), "sandbox-abc-ingress-sni", "abc.sandbox.example.com", "10.0.0.9", 443); err != nil {
+					t.Fatalf("UpsertSNIPassthroughRoute() error = %v", err)
+				}
+				route, ok := fake.routes["sandbox-abc-ingress-sni"]
+				if !ok {
+					t.Fatalf("passthrough route should be inserted; routes=%+v", fake.routes)
+				}
+				assertL4SNI(t, route, "abc.sandbox.example.com")
+				assertL4Dial(t, route, "10.0.0.9:443")
+				assertNoTLSTerminator(t, route)
 			},
 		},
 		{
@@ -639,6 +691,23 @@ func assertHasTLSTerminator(t *testing.T, route map[string]any) {
 		t.Fatalf("no tls handler in chain (TLS-SNI route must terminate, not passthrough): %#v", route)
 	}
 	t.Fatalf("no proxy handler after tls: %#v", route)
+}
+
+func assertNoTLSTerminator(t *testing.T, route map[string]any) {
+	t.Helper()
+	handles, ok := route["handle"].([]any)
+	if !ok || len(handles) == 0 {
+		t.Fatalf("missing handler chain: %#v", route)
+	}
+	for _, h := range handles {
+		hm, _ := h.(map[string]any)
+		if hm == nil {
+			continue
+		}
+		if handler, _ := hm["handler"].(string); handler == "tls" {
+			t.Fatalf("passthrough route must not terminate TLS: %#v", route)
+		}
+	}
 }
 
 func assertL4SNI(t *testing.T, route map[string]any, want string) {

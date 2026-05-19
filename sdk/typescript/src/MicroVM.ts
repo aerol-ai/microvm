@@ -10,6 +10,7 @@ import type {
   ExecStreamOptions,
   HealthStatus,
   Lifecycle,
+  ListOptions,
   MountSpecRedacted,
   RegisterSnapshotOptions,
   ResizeOptions,
@@ -67,8 +68,8 @@ export class MicroVM {
     return this.wrap(sandbox.toJSON());
   }
 
-  async list(): Promise<Sandbox[]> {
-    const sandboxes = await this.client.list();
+  async list(options?: ListOptions): Promise<Sandbox[]> {
+    const sandboxes = await this.client.list(options);
     return sandboxes.map((sandbox) => this.wrap(sandbox.toJSON()));
   }
 

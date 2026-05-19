@@ -37,6 +37,11 @@ type Limits struct {
 	// MemoryReservationRatio is the maximum fraction of host memory that may
 	// be reserved across all sandboxes. 0 = unlimited.
 	MemoryReservationRatio float64
+	// DiskReservationRatio is the maximum fraction of host disk that may be
+	// reserved across all sandboxes. Disk is sized in GB rather than MB
+	// because Docker's --storage-opt size is GB-granular and operators
+	// reason about disk in GB. 0 = unlimited.
+	DiskReservationRatio float64
 	// MemoryFloorRatio is the minimum live MemAvailable the host must retain
 	// after admitting the request, expressed as a fraction of total host
 	// memory (e.g. 0.05 = keep at least 5% of RAM free). Expressing this as a
@@ -59,25 +64,41 @@ type Limits struct {
 }
 
 // Request is the per-sandbox resource ask, in normalized units. CPU is
-// fractional cores (e.g. 0.5 = half a core); memory is whole MB.
+// fractional cores (e.g. 0.5 = half a core); memory is whole MB; disk is
+// whole GB. GPUs is the count requested (0 = no GPU); GPUVendor is the
+// required vendor when GPUs > 0 and is matched against HostInfo.GPUVendor
+// at admission/placement time. Runtime is the OCI runtime identifier
+// ("docker", "gvisor", ...) — empty means "any runtime the host supports."
 type Request struct {
-	CPU      float64
-	MemoryMB int
+	CPU       float64
+	MemoryMB  int
+	DiskGB    int
+	GPUs      int
+	GPUVendor string
+	Runtime   string
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
-// /capacity response.
+// /capacity response. It is also the payload that placement scoring reads
+// off gossip — every field that is needed to decide "can this peer host
+// this request?" must be present here, otherwise placement scores against
+// stale assumptions and the caller fans out to a node that can't actually
+// admit. See nodeMeta in internal/cluster/gossip.go for the size budget.
 type Snapshot struct {
 	HostCPUCores              int      `json:"host_cpu_cores"`
 	HostMemoryTotalMB         int      `json:"host_memory_total_mb"`
+	HostDiskTotalGB           int      `json:"host_disk_total_gb,omitempty"`
 	ReservedCPU               float64  `json:"reserved_cpu"`
 	ReservedMemoryMB          int      `json:"reserved_memory_mb"`
+	ReservedDiskGB            int      `json:"reserved_disk_gb,omitempty"`
+	ReservedGPUs              int      `json:"reserved_gpus,omitempty"`
 	LiveMemoryFreeMB          int      `json:"live_memory_free_mb"`
 	SandboxesActive           int      `json:"sandboxes_active"`
 	CanAdmit                  bool     `json:"can_admit"`
 	Reasons                   []string `json:"reasons,omitempty"`
 	CPUReservationRatio       float64  `json:"cpu_reservation_ratio"`
 	MemoryReservationRatio    float64  `json:"memory_reservation_ratio"`
+	DiskReservationRatio      float64  `json:"disk_reservation_ratio,omitempty"`
 	MemoryFloorRatio          float64  `json:"memory_floor_ratio"`
 	CPUOverProvisionFactor    float64  `json:"cpu_overprovision_factor"`
 	MemoryOverProvisionFactor float64  `json:"memory_overprovision_factor"`
@@ -88,6 +109,18 @@ type Snapshot struct {
 	// used by Admit, exposed so operators can see the effective ceiling.
 	CPUBudget      float64 `json:"cpu_budget"`
 	MemoryBudgetMB int     `json:"memory_budget_mb"`
+	DiskBudgetGB   int     `json:"disk_budget_gb,omitempty"`
+	// GPUCount and GPUVendor are static node attributes set by the operator
+	// (no auto-detection in Phase 1). Placement uses them to skip a peer
+	// that cannot satisfy a GPU sandbox at all — running the admitter
+	// remotely after a doomed forward would just 503.
+	GPUCount  int    `json:"gpu_count,omitempty"`
+	GPUVendor string `json:"gpu_vendor,omitempty"`
+	// SupportedRuntimes lists the OCI runtimes this host can run
+	// ("docker", "gvisor", ...). Used by placement to skip a peer that
+	// doesn't have, say, runsc installed. Empty = legacy node, treated as
+	// supporting any runtime so rolling upgrades don't strand pre-D peers.
+	SupportedRuntimes []string `json:"supported_runtimes,omitempty"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads
@@ -100,6 +133,20 @@ type MemProbe interface {
 type HostInfo struct {
 	CPUCores      int
 	MemoryTotalMB int
+	// DiskTotalGB is the disk budget the operator declares for sandbox
+	// storage (the volume backing Docker's data root). Auto-detection is
+	// out of scope for Phase 1 — operators set SB_HOST_DISK_GB. 0 means
+	// no disk accounting.
+	DiskTotalGB int
+	// GPUCount and GPUVendor describe the GPU inventory the operator has
+	// wired up to Docker. Operator-declared (SB_HOST_GPU_COUNT /
+	// SB_HOST_GPU_VENDOR); 0 means no GPUs available.
+	GPUCount  int
+	GPUVendor string
+	// SupportedRuntimes lists the OCI runtimes installed on this host.
+	// Empty defaults to []{"docker"} at Admitter construction so a node
+	// that doesn't set the field still admits the common case.
+	SupportedRuntimes []string
 }
 
 // Admitter is the thread-safe admission controller. Construct with New and
@@ -113,11 +160,21 @@ type Admitter struct {
 	reservations map[string]Request
 	totalCPU     float64
 	totalMemMB   int
+	totalDiskGB  int
+	totalGPUs    int
 }
 
 // New builds an admitter. host should reflect the machine's total capacity;
 // callers that don't care about per-host detection can use DetectHost.
 func New(host HostInfo, limits Limits, probe MemProbe) *Admitter {
+	// Default SupportedRuntimes to {"docker"} — every host that doesn't
+	// override is by definition a docker host (this binary requires it).
+	// Without this default, placement would treat unset SupportedRuntimes
+	// as "supports nothing" the moment a request specified Runtime, which
+	// is the opposite of the rolling-upgrade compatibility we want.
+	if len(host.SupportedRuntimes) == 0 {
+		host.SupportedRuntimes = []string{"docker"}
+	}
 	return &Admitter{
 		host:         host,
 		limits:       limits,
@@ -155,9 +212,13 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	prior, exists := a.reservations[sandboxID]
 	projectedCPU := a.totalCPU + req.CPU
 	projectedMem := a.totalMemMB + req.MemoryMB
+	projectedDisk := a.totalDiskGB + req.DiskGB
+	projectedGPUs := a.totalGPUs + req.GPUs
 	if exists {
 		projectedCPU -= prior.CPU
 		projectedMem -= prior.MemoryMB
+		projectedDisk -= prior.DiskGB
+		projectedGPUs -= prior.GPUs
 	}
 
 	var reasons []string
@@ -182,6 +243,44 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 		}
 	}
 
+	if a.limits.DiskReservationRatio > 0 && a.host.DiskTotalGB > 0 {
+		diskBudget := a.diskBudgetGB()
+		if projectedDisk > diskBudget {
+			reasons = append(reasons, fmt.Sprintf(
+				"disk reservation exceeded (%d+%d GB > %d GB budget)",
+				a.totalDiskGB, req.DiskGB, diskBudget,
+			))
+		}
+	}
+
+	// GPU and runtime are not "budgets" the operator scales — they are
+	// physical attributes of the host. We reject up front so a sandbox
+	// that asked for GPUs never even tries to start on a GPU-less node;
+	// silently letting docker fail later would leak partial state.
+	if req.GPUs > 0 {
+		if a.host.GPUCount <= 0 {
+			reasons = append(reasons, "host has no GPUs")
+		} else if projectedGPUs > a.host.GPUCount {
+			reasons = append(reasons, fmt.Sprintf(
+				"gpu reservation exceeded (%d+%d > %d available)",
+				a.totalGPUs, req.GPUs, a.host.GPUCount,
+			))
+		}
+		if req.GPUVendor != "" && a.host.GPUVendor != "" && req.GPUVendor != a.host.GPUVendor {
+			reasons = append(reasons, fmt.Sprintf(
+				"gpu vendor mismatch (requested %q, host has %q)",
+				req.GPUVendor, a.host.GPUVendor,
+			))
+		}
+	}
+
+	if req.Runtime != "" && !a.runtimeSupported(req.Runtime) {
+		reasons = append(reasons, fmt.Sprintf(
+			"runtime %q not supported on this host (have %v)",
+			req.Runtime, a.host.SupportedRuntimes,
+		))
+	}
+
 	if floor := a.memoryFloorMB(); floor > 0 && a.probe != nil {
 		free, err := a.probe.FreeMB()
 		// Probe failure is treated as "unknown, allow" — we'd rather admit
@@ -201,10 +300,14 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	if exists {
 		a.totalCPU -= prior.CPU
 		a.totalMemMB -= prior.MemoryMB
+		a.totalDiskGB -= prior.DiskGB
+		a.totalGPUs -= prior.GPUs
 	}
 	a.reservations[sandboxID] = req
 	a.totalCPU += req.CPU
 	a.totalMemMB += req.MemoryMB
+	a.totalDiskGB += req.DiskGB
+	a.totalGPUs += req.GPUs
 	return nil
 }
 
@@ -219,6 +322,8 @@ func (a *Admitter) Release(sandboxID string) {
 	delete(a.reservations, sandboxID)
 	a.totalCPU -= prior.CPU
 	a.totalMemMB -= prior.MemoryMB
+	a.totalDiskGB -= prior.DiskGB
+	a.totalGPUs -= prior.GPUs
 }
 
 // Reserve records a reservation without running admission checks. Use this on
@@ -230,10 +335,14 @@ func (a *Admitter) Reserve(sandboxID string, req Request) {
 	if prior, ok := a.reservations[sandboxID]; ok {
 		a.totalCPU -= prior.CPU
 		a.totalMemMB -= prior.MemoryMB
+		a.totalDiskGB -= prior.DiskGB
+		a.totalGPUs -= prior.GPUs
 	}
 	a.reservations[sandboxID] = req
 	a.totalCPU += req.CPU
 	a.totalMemMB += req.MemoryMB
+	a.totalDiskGB += req.DiskGB
+	a.totalGPUs += req.GPUs
 }
 
 // Snapshot returns a point-in-time view. Includes a CanAdmit answer for a
@@ -244,6 +353,8 @@ func (a *Admitter) Snapshot() Snapshot {
 	count := len(a.reservations)
 	totalCPU := a.totalCPU
 	totalMem := a.totalMemMB
+	totalDisk := a.totalDiskGB
+	totalGPUs := a.totalGPUs
 	a.mu.Unlock()
 
 	free := 0
@@ -256,23 +367,32 @@ func (a *Admitter) Snapshot() Snapshot {
 	snap := Snapshot{
 		HostCPUCores:              a.host.CPUCores,
 		HostMemoryTotalMB:         a.host.MemoryTotalMB,
+		HostDiskTotalGB:           a.host.DiskTotalGB,
 		ReservedCPU:               totalCPU,
 		ReservedMemoryMB:          totalMem,
+		ReservedDiskGB:            totalDisk,
+		ReservedGPUs:              totalGPUs,
 		LiveMemoryFreeMB:          free,
 		SandboxesActive:           count,
 		CPUReservationRatio:       a.limits.CPUReservationRatio,
 		MemoryReservationRatio:    a.limits.MemoryReservationRatio,
+		DiskReservationRatio:      a.limits.DiskReservationRatio,
 		MemoryFloorRatio:          a.limits.MemoryFloorRatio,
 		CPUOverProvisionFactor:    a.cpuOverProvisionFactor(),
 		MemoryOverProvisionFactor: a.memOverProvisionFactor(),
 		MemoryFloorMB:             a.memoryFloorMB(),
 		CPUBudget:                 a.cpuBudget(),
 		MemoryBudgetMB:            a.memBudgetMB(),
+		DiskBudgetGB:              a.diskBudgetGB(),
+		GPUCount:                  a.host.GPUCount,
+		GPUVendor:                 a.host.GPUVendor,
+		SupportedRuntimes:         a.host.SupportedRuntimes,
 	}
 	// Use the smallest meaningful request (1 CPU, 1 MB) as the probe ask.
 	// We don't use 0/0 because that bypasses every check and would always
 	// report CanAdmit=true even when the host is full.
 	snap.CanAdmit, snap.Reasons = a.dryRun(Request{CPU: 1, MemoryMB: 1})
+	recordHostPressure(snap)
 	return snap
 }
 
@@ -282,6 +402,8 @@ func (a *Admitter) dryRun(req Request) (bool, []string) {
 	a.mu.Lock()
 	totalCPU := a.totalCPU
 	totalMem := a.totalMemMB
+	totalDisk := a.totalDiskGB
+	totalGPUs := a.totalGPUs
 	a.mu.Unlock()
 
 	var reasons []string
@@ -296,6 +418,25 @@ func (a *Admitter) dryRun(req Request) (bool, []string) {
 		if totalMem+req.MemoryMB > memBudget {
 			reasons = append(reasons, fmt.Sprintf("memory reservation exceeded (%d MB/%d MB)", totalMem, memBudget))
 		}
+	}
+	if a.limits.DiskReservationRatio > 0 && a.host.DiskTotalGB > 0 {
+		diskBudget := a.diskBudgetGB()
+		if totalDisk+req.DiskGB > diskBudget {
+			reasons = append(reasons, fmt.Sprintf("disk reservation exceeded (%d GB/%d GB)", totalDisk, diskBudget))
+		}
+	}
+	if req.GPUs > 0 {
+		if a.host.GPUCount <= 0 {
+			reasons = append(reasons, "host has no GPUs")
+		} else if totalGPUs+req.GPUs > a.host.GPUCount {
+			reasons = append(reasons, fmt.Sprintf("gpu reservation exceeded (%d/%d)", totalGPUs, a.host.GPUCount))
+		}
+		if req.GPUVendor != "" && a.host.GPUVendor != "" && req.GPUVendor != a.host.GPUVendor {
+			reasons = append(reasons, fmt.Sprintf("gpu vendor mismatch (%q vs %q)", req.GPUVendor, a.host.GPUVendor))
+		}
+	}
+	if req.Runtime != "" && !a.runtimeSupported(req.Runtime) {
+		reasons = append(reasons, fmt.Sprintf("runtime %q unsupported", req.Runtime))
 	}
 	if floor := a.memoryFloorMB(); floor > 0 && a.probe != nil {
 		if free, err := a.probe.FreeMB(); err == nil && free-req.MemoryMB < floor {
@@ -345,4 +486,31 @@ func (a *Admitter) cpuBudget() float64 {
 
 func (a *Admitter) memBudgetMB() int {
 	return int(float64(a.host.MemoryTotalMB) * a.limits.MemoryReservationRatio * a.memOverProvisionFactor())
+}
+
+// diskBudgetGB is the post-ratio reservation ceiling for disk. Unlike
+// CPU/memory there is no overcommit factor — disk allocations are real
+// blocks Docker reserves via --storage-opt size; lying about headroom
+// just trades a clean 503 for a noisy ENOSPC mid-write.
+func (a *Admitter) diskBudgetGB() int {
+	if a.limits.DiskReservationRatio <= 0 || a.host.DiskTotalGB <= 0 {
+		return 0
+	}
+	return int(float64(a.host.DiskTotalGB) * a.limits.DiskReservationRatio)
+}
+
+// runtimeSupported reports whether the host advertises support for the named
+// runtime. Empty SupportedRuntimes (legacy snapshot from a peer that pre-dates
+// the field) is treated as "supports anything" so rolling upgrades don't
+// strand pre-D peers from receiving placements.
+func (a *Admitter) runtimeSupported(runtime string) bool {
+	if len(a.host.SupportedRuntimes) == 0 {
+		return true
+	}
+	for _, r := range a.host.SupportedRuntimes {
+		if r == runtime {
+			return true
+		}
+	}
+	return false
 }

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -58,6 +59,13 @@ type Client struct {
 	networkRules       *netrules.Manager
 	waitTimeout        time.Duration
 	toolboxWaitTimeout time.Duration
+	pullMu             sync.Mutex
+	pulls              map[string]*imagePull
+}
+
+type imagePull struct {
+	done chan struct{}
+	err  error
 }
 
 func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Client, error) {
@@ -92,6 +100,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		networkRules:       rules,
 		waitTimeout:        cfg.DockerRuntimeWaitTimeout,
 		toolboxWaitTimeout: cfg.ToolboxWaitTimeout,
+		pulls:              make(map[string]*imagePull),
 	}, nil
 }
 
@@ -244,7 +253,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// error.
 	imageInspect, err := c.inspectImage(ctx, req.Image)
 	if err != nil {
-		if pullErr := c.pullImage(ctx, req.Image, req.Registry); pullErr != nil {
+		if IsLocalOnlyImageRef(req.Image) || req.ImageDistributionMode == models.ImageDistributionLocalOnly {
+			return nil, fmt.Errorf("image %q is local-only and is not present on this node; push/register it to a registry or pre-distribute it before failover recreate", req.Image)
+		}
+		if pullErr := c.pullImageDedup(ctx, req.Image, req.Registry); pullErr != nil {
 			return nil, pullErr
 		}
 		imageInspect, err = c.inspectImage(ctx, req.Image)
@@ -648,6 +660,43 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 			return fmt.Errorf("pull image %s: %s", imageRef, msg.Error)
 		}
 	}
+}
+
+func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+	key := imagePullKey(imageRef, auth)
+	c.pullMu.Lock()
+	if inFlight := c.pulls[key]; inFlight != nil {
+		c.pullMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-inFlight.done:
+			return inFlight.err
+		}
+	}
+	inFlight := &imagePull{done: make(chan struct{})}
+	c.pulls[key] = inFlight
+	c.pullMu.Unlock()
+
+	inFlight.err = c.pullImage(ctx, imageRef, auth)
+
+	c.pullMu.Lock()
+	delete(c.pulls, key)
+	c.pullMu.Unlock()
+	close(inFlight.done)
+	return inFlight.err
+}
+
+func imagePullKey(imageRef string, auth *models.RegistryAuth) string {
+	if auth == nil {
+		return strings.TrimSpace(imageRef)
+	}
+	return strings.TrimSpace(imageRef) + "\x00" + strings.TrimSpace(auth.Server) + "\x00" + strings.TrimSpace(auth.Username)
+}
+
+func IsLocalOnlyImageRef(imageRef string) bool {
+	imageRef = strings.TrimSpace(imageRef)
+	return strings.HasPrefix(imageRef, BuiltImageNamespace+"/") || strings.HasPrefix(imageRef, "snapshots/")
 }
 
 func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*SandboxRuntime, error) {

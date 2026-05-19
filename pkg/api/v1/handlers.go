@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -45,13 +47,39 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes, err := h.deps.Service.ListSandboxes(r.Context())
+	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), parseTagFilter(r))
 	if err != nil {
 		h.deps.Logger.Warn("list sandboxes failed", "error", err)
 		apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, sandboxes)
+}
+
+// parseTagFilter pulls every query parameter of the form `tag.<key>=<value>`
+// into a flat map. Multiple tag.* params AND together at the service layer.
+// Anything else in the query string is ignored. This is the read-path twin of
+// CreateSandboxRequest.Tags — an external control plane stamps tags at create
+// time and uses the same keys here to scope its list calls. See
+// plans/multi-tenancy-via-control-plane.md.
+func parseTagFilter(r *http.Request) map[string]string {
+	const prefix = "tag."
+	q := r.URL.Query()
+	var filter map[string]string
+	for key, values := range q {
+		if !strings.HasPrefix(key, prefix) || len(values) == 0 {
+			continue
+		}
+		name := key[len(prefix):]
+		if name == "" {
+			continue
+		}
+		if filter == nil {
+			filter = make(map[string]string, 2)
+		}
+		filter[name] = values[0]
+	}
+	return filter
 }
 
 func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
@@ -95,25 +123,29 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusCreated, response)
 }
 
-func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
-	if err := h.deps.Service.DestroySandbox(r.Context(), r.PathValue("id")); err != nil {
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 	var req models.ResizeSandboxRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	sandbox, err := h.deps.Service.ResizeSandbox(r.Context(), r.PathValue("id"), req)
+	id := r.PathValue("id")
+	sandbox, err := h.deps.Service.ResizeSandbox(r.Context(), id, req)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	h.replicateSpecPatch(r.Context(), id, func(s *models.CreateSandboxRequest) {
+		if req.CPU > 0 {
+			s.CPU = req.CPU
+		}
+		if req.MemoryMB > 0 {
+			s.MemoryMB = req.MemoryMB
+		}
+		if req.DiskGB > 0 {
+			s.DiskGB = req.DiskGB
+		}
+	})
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 
@@ -123,11 +155,16 @@ func (h *handlers) updateLifecycle(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	sandbox, err := h.deps.Service.UpdateLifecycle(r.Context(), r.PathValue("id"), req.Lifecycle)
+	id := r.PathValue("id")
+	sandbox, err := h.deps.Service.UpdateLifecycle(r.Context(), id, req.Lifecycle)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	lc := req.Lifecycle
+	h.replicateSpecPatch(r.Context(), id, func(s *models.CreateSandboxRequest) {
+		s.Lifecycle = &lc
+	})
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 
@@ -149,11 +186,20 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	resp, err := h.deps.Service.ExposePort(r.Context(), r.PathValue("id"), port, req.Protocol)
+	id := r.PathValue("id")
+	resp, err := h.deps.Service.ExposePort(r.Context(), id, port, req.Protocol)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// Replicate the canonical protocol the service settled on (not the raw
+	// request value) so a future failover-recreate uses the same protocol the
+	// user is seeing.
+	h.replicateAddExposedPort(r.Context(), id, port, cluster.ExposedPortRoute{
+		Protocol:  resp.Protocol,
+		HostPort:  resp.HostPort,
+		PublicURL: resp.PublicURL,
+	})
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
@@ -163,10 +209,12 @@ func (h *handlers) unexposePort(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid port")
 		return
 	}
-	if err := h.deps.Service.UnexposePort(r.Context(), r.PathValue("id"), port); err != nil {
+	id := r.PathValue("id")
+	if err := h.deps.Service.UnexposePort(r.Context(), id, port); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	h.replicateRemoveExposedPort(r.Context(), id, port)
 	w.WriteHeader(http.StatusNoContent)
 }
 

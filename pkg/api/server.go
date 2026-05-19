@@ -78,6 +78,10 @@ func (s *Server) routes() {
 		Builder: s.builder,
 		Build:   apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
 	})
+
+	// Operator dashboard + expvar. /ui is unauth (static HTML; PAT prompted
+	// in-page), /debug/vars is PAT-gated. See pkg/api/dashboard.go.
+	s.registerDashboard()
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

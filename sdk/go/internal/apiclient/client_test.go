@@ -353,3 +353,60 @@ func TestRegisterSnapshotClientValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestListRendersTagFilterAsTagDotPrefix mirrors
+// pkg/api/v1/list_filter_test.go: every supplied tag must reach the wire
+// under the `tag.` prefix, which is what the server's parseTagFilter keys
+// on. If this drifts (e.g. someone switches to `tags[user_id]`), the server
+// silently returns the full list and breaks multi-tenant scoping.
+func TestListRendersTagFilterAsTagDotPrefix(t *testing.T) {
+	ctx := context.Background()
+	var seen *http.Request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Clone(r.Context())
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	if _, err := client.List(ctx, map[string]string{"user_id": "alice", "project_id": "p1"}); err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if seen == nil {
+		t.Fatalf("server received no request")
+	}
+	if seen.URL.Path != "/v1/sandboxes" {
+		t.Fatalf("path = %q, want /v1/sandboxes", seen.URL.Path)
+	}
+	q := seen.URL.Query()
+	if got := q.Get("tag.user_id"); got != "alice" {
+		t.Fatalf("tag.user_id = %q, want alice", got)
+	}
+	if got := q.Get("tag.project_id"); got != "p1" {
+		t.Fatalf("tag.project_id = %q, want p1", got)
+	}
+}
+
+// TestListWithoutTagsOmitsQueryString pins the byte-identical-to-pre-filter
+// guarantee: a bare List call must not introduce a stray "?". Without this,
+// HTTP fixtures and request matchers in downstream code break the moment the
+// SDK gains a filter arg.
+func TestListWithoutTagsOmitsQueryString(t *testing.T) {
+	ctx := context.Background()
+	var seenURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenURL = r.URL.String()
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	for _, tags := range []map[string]string{nil, {}} {
+		if _, err := client.List(ctx, tags); err != nil {
+			t.Fatalf("List(%v) error = %v", tags, err)
+		}
+		if seenURL != "/v1/sandboxes" {
+			t.Fatalf("URL = %q, want /v1/sandboxes (tags=%v)", seenURL, tags)
+		}
+	}
+}

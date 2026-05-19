@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,6 +35,11 @@ func TestLoadCases(t *testing.T) {
 			"SB_LOG_LEVEL",
 			"SB_SHUTDOWN_TIMEOUT",
 			"SB_HTTP_CLIENT_TIMEOUT",
+			"SB_CLUSTER_MAX_AUTO_VOTERS",
+			"SB_DATA_PLANE_ADVERTISE_HOST",
+			"SB_NODE_ROLE",
+			"SB_ENABLE_CLUSTER",
+			"SB_CLUSTER_BOOTSTRAP",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -80,6 +86,15 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.Runtime != "docker" {
 					t.Fatalf("expected default Runtime=docker, got %q", cfg.Runtime)
+				}
+				if cfg.ClusterMaxAutoVoters != 5 {
+					t.Fatalf("expected default ClusterMaxAutoVoters=5, got %d", cfg.ClusterMaxAutoVoters)
+				}
+				if cfg.NodeRole != NodeRoleMixed {
+					t.Fatalf("expected default NodeRole=%q, got %q", NodeRoleMixed, cfg.NodeRole)
+				}
+				if !cfg.IsServer() || !cfg.IsWorker() || !cfg.IsIngress() {
+					t.Fatalf("expected mixed default to return true for all role predicates: %+v", cfg)
 				}
 			},
 		},
@@ -154,6 +169,7 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_AUTO_RECONCILE", "false")
 				t.Setenv("SB_ENABLE_CADDY", "false")
 				t.Setenv("SB_ENABLE_NETWORK_RULES", "false")
+				t.Setenv("SB_CLUSTER_MAX_AUTO_VOTERS", "3")
 				t.Setenv("SB_LOG_LEVEL", "DEBUG")
 				t.Setenv("SB_SHUTDOWN_TIMEOUT", "25s")
 				t.Setenv("SB_HTTP_CLIENT_TIMEOUT", "12s")
@@ -172,6 +188,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.AutoReconcile || cfg.EnableCaddy || cfg.EnableNetworkRules {
 					t.Fatalf("expected disabled bool overrides: %+v", cfg)
+				}
+				if cfg.ClusterMaxAutoVoters != 3 {
+					t.Fatalf("expected ClusterMaxAutoVoters=3, got %d", cfg.ClusterMaxAutoVoters)
 				}
 				if cfg.LogLevel != "debug" || cfg.ShutdownTimeout != 25*time.Second || cfg.HTTPClientTimeout != 12*time.Second {
 					t.Fatalf("unexpected log/duration overrides: %+v", cfg)
@@ -208,6 +227,396 @@ func TestLoadCases(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, tc.run)
 	}
+}
+
+func TestClusterCredentialKeyValidation(t *testing.T) {
+	// The cluster-mode credential-key check is the safety net for the silent
+	// per-node lazy-key divergence that breaks failover for sealed registry
+	// and mount creds. Cover the four matrix corners.
+	setClusterDefaults := func(t *testing.T, keyPath string) {
+		t.Helper()
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "true")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") // 32-byte base64
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", keyPath)
+		// Clear vars the test toggles per-case so previous cases don't leak.
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "")
+		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "")
+		t.Setenv("SB_API_ADVERTISE_URL", "")
+		t.Setenv("SB_DATA_PLANE_ADVERTISE_HOST", "")
+	}
+
+	t.Run("refuses_when_no_env_and_no_file", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CREDENTIAL_ENCRYPTION_KEY") {
+			t.Fatalf("expected SB_CREDENTIAL_ENCRYPTION_KEY error, got %v", err)
+		}
+	})
+
+	t.Run("accepts_when_env_set", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("accepts_when_key_file_present", func(t *testing.T) {
+		dir := t.TempDir()
+		keyPath := filepath.Join(dir, "cred.key")
+		if err := os.WriteFile(keyPath, []byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="), 0o600); err != nil {
+			t.Fatalf("seed key file: %v", err)
+		}
+		setClusterDefaults(t, keyPath)
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("accepts_when_opt_out_set", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+
+	t.Run("derives_data_plane_host_from_api_advertise_url", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_API_ADVERTISE_URL", "http://10.0.0.5:21212")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.DataPlaneAdvertiseHost != "10.0.0.5" {
+			t.Fatalf("DataPlaneAdvertiseHost = %q", cfg.DataPlaneAdvertiseHost)
+		}
+	})
+
+	t.Run("accepts_explicit_data_plane_host", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_API_ADVERTISE_URL", "http://shared-api.internal:21212")
+		t.Setenv("SB_DATA_PLANE_ADVERTISE_HOST", "10.0.0.7")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.DataPlaneAdvertiseHost != "10.0.0.7" {
+			t.Fatalf("DataPlaneAdvertiseHost = %q", cfg.DataPlaneAdvertiseHost)
+		}
+	})
+}
+
+func TestNodeRoleCases(t *testing.T) {
+	// Helper: a known-good cluster-mode env so role-specific cases don't
+	// trip the credential/gossip/peer invariants. Each subtest tweaks only
+	// what it's testing.
+	setClusterDefaults := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "true")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		t.Setenv("SB_GOSSIP_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_API_ADVERTISE_URL", "http://10.0.0.5:21212")
+		t.Setenv("SB_NODE_ROLE", "")
+	}
+
+	t.Run("default_is_mixed_in_single_node_mode", func(t *testing.T) {
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "")
+		t.Setenv("SB_NODE_ROLE", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != NodeRoleMixed {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, NodeRoleMixed)
+		}
+	})
+
+	t.Run("accepts_each_known_role", func(t *testing.T) {
+		for _, role := range []string{NodeRoleServer, NodeRoleWorker, NodeRoleIngress, NodeRoleMixed} {
+			t.Run(role, func(t *testing.T) {
+				setClusterDefaults(t)
+				t.Setenv("SB_NODE_ROLE", role)
+				// Worker/ingress can't bootstrap; flip to a peer join for those.
+				if role == NodeRoleWorker || role == NodeRoleIngress {
+					t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+					t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+				}
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("role=%q Load() error = %v", role, err)
+				}
+				if cfg.NodeRole != role {
+					t.Fatalf("role=%q parsed as %q", role, cfg.NodeRole)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects_unknown_role", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "controller")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_NODE_ROLE") {
+			t.Fatalf("expected SB_NODE_ROLE error, got %v", err)
+		}
+	})
+
+	t.Run("lowercases_input", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "Worker")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != NodeRoleWorker {
+			t.Fatalf("expected lowercase normalization, got %q", cfg.NodeRole)
+		}
+	})
+
+	t.Run("non_default_role_requires_cluster_mode", func(t *testing.T) {
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "")
+		t.Setenv("SB_NODE_ROLE", "worker")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_ENABLE_CLUSTER") {
+			t.Fatalf("expected SB_ENABLE_CLUSTER requirement error, got %v", err)
+		}
+	})
+
+	t.Run("worker_cannot_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_BOOTSTRAP") {
+			t.Fatalf("expected bootstrap-incompatible error, got %v", err)
+		}
+	})
+
+	t.Run("ingress_cannot_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_BOOTSTRAP") {
+			t.Fatalf("expected bootstrap-incompatible error, got %v", err)
+		}
+	})
+
+	t.Run("ingress_advertise_host_default_falls_back_to_public_host", func(t *testing.T) {
+		c := Config{PublicHost: "203.0.113.10"}
+		if got := c.EffectivePublicHost(); got != "203.0.113.10" {
+			t.Fatalf("EffectivePublicHost fallback = %q, want PublicHost", got)
+		}
+	})
+
+	t.Run("ingress_advertise_host_overrides_public_host", func(t *testing.T) {
+		c := Config{PublicHost: "10.0.0.5", IngressAdvertiseHost: "ingress.example.com"}
+		if got := c.EffectivePublicHost(); got != "ingress.example.com" {
+			t.Fatalf("EffectivePublicHost override = %q, want ingress.example.com", got)
+		}
+	})
+
+	t.Run("ingress_advertise_host_is_normalized_from_env", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_INGRESS_ADVERTISE_HOST", "https://ingress.example.com:443")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.IngressAdvertiseHost != "ingress.example.com" {
+			t.Fatalf("IngressAdvertiseHost = %q, want host-only normalization", cfg.IngressAdvertiseHost)
+		}
+	})
+
+	t.Run("helpers_match_role", func(t *testing.T) {
+		cases := []struct {
+			role                            string
+			wantServer, wantWorker, wantIng bool
+		}{
+			// Legacy single-role truth table — bit-for-bit unchanged.
+			{NodeRoleMixed, true, true, true},
+			{NodeRoleServer, true, false, false},
+			{NodeRoleWorker, false, true, false},
+			{NodeRoleIngress, false, false, true},
+			// Hybrid combinations — caller may have already canonicalised via
+			// Load() or may be constructing the Config{} by hand in tests.
+			// Both forms must work, so include unsorted inputs too.
+			{"worker,ingress", false, true, true},
+			{"ingress,worker", false, true, true},
+			{"server,worker", true, true, false},
+			{"server,ingress", true, false, true},
+			{"server,worker,ingress", true, true, true},
+			// An empty NodeRole on a hand-built Config{} should degrade to
+			// mixed (every gate on) rather than silently turning all the
+			// startup work off.
+			{"", true, true, true},
+		}
+		for _, tc := range cases {
+			c := Config{NodeRole: tc.role}
+			if c.IsServer() != tc.wantServer || c.IsWorker() != tc.wantWorker || c.IsIngress() != tc.wantIng {
+				t.Fatalf("role=%q: IsServer=%v IsWorker=%v IsIngress=%v (want %v %v %v)",
+					tc.role, c.IsServer(), c.IsWorker(), c.IsIngress(),
+					tc.wantServer, tc.wantWorker, tc.wantIng)
+			}
+		}
+	})
+
+	t.Run("accepts_hybrid_worker_ingress", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		// Canonical form is sorted, so "worker,ingress" becomes "ingress,worker".
+		if cfg.NodeRole != "ingress,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,worker")
+		}
+		if cfg.IsServer() || !cfg.IsWorker() || !cfg.IsIngress() {
+			t.Fatalf("IsServer=%v IsWorker=%v IsIngress=%v (want false/true/true)",
+				cfg.IsServer(), cfg.IsWorker(), cfg.IsIngress())
+		}
+	})
+
+	t.Run("accepts_hybrid_server_worker", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "server,worker")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "server,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "server,worker")
+		}
+		if !cfg.IsServer() || !cfg.IsWorker() || cfg.IsIngress() {
+			t.Fatalf("IsServer=%v IsWorker=%v IsIngress=%v (want true/true/false)",
+				cfg.IsServer(), cfg.IsWorker(), cfg.IsIngress())
+		}
+	})
+
+	t.Run("accepts_hybrid_server_ingress", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "server,ingress")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "ingress,server" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,server")
+		}
+		if !cfg.IsServer() || cfg.IsWorker() || !cfg.IsIngress() {
+			t.Fatalf("IsServer=%v IsWorker=%v IsIngress=%v (want true/false/true)",
+				cfg.IsServer(), cfg.IsWorker(), cfg.IsIngress())
+		}
+	})
+
+	t.Run("hybrid_dedupes_and_normalises_case", func(t *testing.T) {
+		setClusterDefaults(t)
+		// Mixed case + duplicate + extra whitespace: all should collapse to
+		// the canonical sorted form.
+		t.Setenv("SB_NODE_ROLE", "Worker,WORKER,ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "ingress,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,worker")
+		}
+	})
+
+	t.Run("hybrid_trims_whitespace", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "  worker , ingress  ")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "false")
+		t.Setenv("SB_BOOTSTRAP_PEERS", "10.0.0.1:7000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.NodeRole != "ingress,worker" {
+			t.Fatalf("NodeRole = %q, want %q", cfg.NodeRole, "ingress,worker")
+		}
+	})
+
+	t.Run("rejects_mixed_combined_with_other", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "mixed,worker")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), NodeRoleMixed) {
+			t.Fatalf("expected error mentioning %q, got %v", NodeRoleMixed, err)
+		}
+	})
+
+	t.Run("rejects_hybrid_with_unknown_token", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,controller")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "controller") {
+			t.Fatalf("expected error naming bad token %q, got %v", "controller", err)
+		}
+	})
+
+	t.Run("rejects_empty_token", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,,ingress")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "empty token") {
+			t.Fatalf("expected empty-token error, got %v", err)
+		}
+	})
+
+	t.Run("hybrid_without_server_cannot_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "worker,ingress")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_CLUSTER_BOOTSTRAP") {
+			t.Fatalf("expected bootstrap-incompatible error, got %v", err)
+		}
+	})
+
+	t.Run("hybrid_with_server_can_bootstrap", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_NODE_ROLE", "server,worker")
+		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.ClusterBootstrap {
+			t.Fatalf("expected ClusterBootstrap=true")
+		}
+	})
+
+	t.Run("hybrid_requires_cluster_mode", func(t *testing.T) {
+		t.Setenv("SB_PAT_TOKEN", "token")
+		t.Setenv("SB_ENABLE_CLUSTER", "")
+		t.Setenv("SB_NODE_ROLE", "worker,ingress")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "SB_ENABLE_CLUSTER") {
+			t.Fatalf("expected SB_ENABLE_CLUSTER requirement error, got %v", err)
+		}
+	})
 }
 
 func TestConfigMethodCases(t *testing.T) {

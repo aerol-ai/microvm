@@ -29,9 +29,19 @@ function normalizePath(value: string): string {
   return normalized === '' ? '/' : normalized
 }
 
+function groupHomePageLink(entry: NavigationGroup): NavigationLink[] {
+  if (!entry.homePageHref || !entry.label) {
+    return []
+  }
+
+  return [{ type: 'link', href: entry.homePageHref, label: entry.label }]
+}
+
 function flattenEntries(entries: NavigationEntry[]): NavigationLink[] {
   return entries.flatMap(entry =>
-    entry.type === 'link' ? [entry] : flattenEntries(entry.entries || [])
+    entry.type === 'link'
+      ? [entry]
+      : [...groupHomePageLink(entry), ...flattenEntries(entry.entries || [])]
   )
 }
 

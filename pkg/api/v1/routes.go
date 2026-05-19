@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
@@ -61,27 +62,70 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Auth(http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.buildImage)))
 
-	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
+	// POST /sandboxes is special: placement happens in the wrapper before any
+	// local handler runs. The wrapper falls through to createSandbox when this
+	// node is the chosen owner.
+	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.clusterCreateWrap)))
+	// GET /sandboxes is cluster-wide: clusterListWrap fans out to peers and
+	// merges with the local list so the "any node accepts any request"
+	// invariant covers list, not just per-sandbox routes. Single-node and
+	// already-forwarded requests fall through to listSandboxes unchanged.
+	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.clusterListWrap)))
 
-	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.createSandbox)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Auth(http.HandlerFunc(h.listSandboxes)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", d.Auth(http.HandlerFunc(h.getSandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/start", d.Auth(http.HandlerFunc(h.startSandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/stop", d.Auth(http.HandlerFunc(h.stopSandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Auth(http.HandlerFunc(h.createSnapshot)))
-	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Auth(http.HandlerFunc(h.destroySandbox)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Auth(http.HandlerFunc(h.resizeSandbox)))
-	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Auth(http.HandlerFunc(h.updateLifecycle)))
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(http.HandlerFunc(h.exposePort)))
-	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(http.HandlerFunc(h.unexposePort)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(http.HandlerFunc(h.listMounts)))
-	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(http.HandlerFunc(h.getNetworkUsage)))
-	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(http.HandlerFunc(h.updateNetworkLimits)))
+	// Per-sandbox routes are wrapped with clusterForwardWrap so that requests
+	// addressing a sandbox owned by another node are transparently forwarded
+	// to that node. In single-node mode (Noop cluster) the wrapper is a
+	// pass-through.
+	wrap := h.clusterForwardWrap
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", d.Auth(wrap(http.HandlerFunc(h.getSandbox))))
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/start", d.Auth(wrap(http.HandlerFunc(h.startSandbox))))
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/stop", d.Auth(wrap(http.HandlerFunc(h.stopSandbox))))
+	// DELETE goes through clusterForwardWrap (forward to owner if not us)
+	// then through clusterDestroyWrap (local destroy + DeletePlacement).
+	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Auth(wrap(http.HandlerFunc(h.clusterDestroyWrap))))
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Auth(wrap(http.HandlerFunc(h.resizeSandbox))))
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Auth(wrap(http.HandlerFunc(h.createSnapshot))))
+	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Auth(wrap(http.HandlerFunc(h.updateLifecycle))))
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(wrap(http.HandlerFunc(h.exposePort))))
+	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(wrap(http.HandlerFunc(h.unexposePort))))
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
+	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
+	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
-	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.Auth(http.HandlerFunc(h.sessionsProxy)))
-	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions/{path...}", d.Auth(http.HandlerFunc(h.sessionsProxy)))
-	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox", d.Auth(http.HandlerFunc(h.toolboxProxy)))
-	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox/{path...}", d.Auth(http.HandlerFunc(h.toolboxProxy)))
+	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.Auth(wrap(http.HandlerFunc(h.sessionsProxy))))
+	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions/{path...}", d.Auth(wrap(http.HandlerFunc(h.sessionsProxy))))
+	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox", d.Auth(wrap(http.HandlerFunc(h.toolboxProxy))))
+	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox/{path...}", d.Auth(wrap(http.HandlerFunc(h.toolboxProxy))))
+
+	// Cluster observability (Phase 1). Read-only; safe to expose alongside
+	// the v1 surface without violating the v1 freeze (these are net-new
+	// paths, not changes to existing wire format).
+	mux.Handle("GET "+PathPrefix+"/cluster/members", d.Auth(http.HandlerFunc(h.clusterMembers)))
+	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.Auth(http.HandlerFunc(h.clusterLeader)))
+	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", d.Auth(http.HandlerFunc(h.clusterPlacement)))
+	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", d.Auth(http.HandlerFunc(h.clusterSandboxIndex)))
+	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", d.Auth(http.HandlerFunc(h.clusterIngressRoute)))
+	// Drain / uncordon are operator admission controls — they don't move
+	// existing work, they just stop SelectPlacement from sending new sandboxes
+	// to the node. PATCH-style verbs would also fit but POST keeps the surface
+	// consistent with /admin/reconcile (also a leader-side write side effect).
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", d.Auth(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", d.Auth(http.HandlerFunc(h.clusterUncordonNode)))
+	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", d.Auth(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", d.Auth(http.HandlerFunc(h.clusterDeleteOrphan)))
+	// Internal endpoint: receives leader-forwarded raft commands from peer
+	// nodes that aren't the current leader. Auth-gated by the same PAT as
+	// every other route — see clusterInternalApply for the leadership-shift
+	// retry contract.
+	mux.Handle("POST "+cluster.PublicInternalApplyPath, d.Auth(http.HandlerFunc(h.clusterInternalApply)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", d.Auth(http.HandlerFunc(h.clusterInternalPlacementByName)))
+	mux.Handle("GET "+cluster.PublicInternalPlacementsPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacements)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsQueryPath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsQuery)))
+	mux.Handle("POST "+cluster.PublicInternalPlacementsPagePath, d.Auth(http.HandlerFunc(h.clusterInternalPlacementsPage)))
+	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
 }

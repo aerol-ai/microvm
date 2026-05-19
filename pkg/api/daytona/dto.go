@@ -41,15 +41,15 @@ type createSandboxSnapshotRequest struct {
 // POST /daytona/snapshots. Either ImageName (pre-built image reference) or
 // BuildInfo (Dockerfile + optional context hashes) must be present.
 type createSnapshotRequest struct {
-	Name       string             `json:"name"`
-	ImageName  *string            `json:"imageName,omitempty"`
-	Entrypoint []string           `json:"entrypoint,omitempty"`
-	CPU        *float32           `json:"cpu,omitempty"`
-	GPU        *float32           `json:"gpu,omitempty"`
-	Memory     *float32           `json:"memory,omitempty"`
-	Disk       *float32           `json:"disk,omitempty"`
-	BuildInfo  *buildInfoRequest  `json:"buildInfo,omitempty"`
-	RegionID   *string            `json:"regionId,omitempty"`
+	Name       string            `json:"name"`
+	ImageName  *string           `json:"imageName,omitempty"`
+	Entrypoint []string          `json:"entrypoint,omitempty"`
+	CPU        *float32          `json:"cpu,omitempty"`
+	GPU        *float32          `json:"gpu,omitempty"`
+	Memory     *float32          `json:"memory,omitempty"`
+	Disk       *float32          `json:"disk,omitempty"`
+	BuildInfo  *buildInfoRequest `json:"buildInfo,omitempty"`
+	RegionID   *string           `json:"regionId,omitempty"`
 }
 
 type snapshotResponse struct {

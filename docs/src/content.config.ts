@@ -23,6 +23,7 @@ export enum NavigationCategory {
   ACCESS,
   SDKS,
   FEATURES,
+  OPERATIONS,
   USE_CASES,
 }
 
@@ -41,21 +42,53 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
-        href: '/getting-started',
-        label: 'Server Setup',
-        description: 'Install and configure AerolVM on a Linux host.',
+        href: '/comparison',
+        label: 'AerolVM vs Daytona vs e2b',
+        description: 'How AerolVM compares to e2b and Daytona, and why we built it.',
       },
+      {
+        type: 'group',
+        label: 'Server Setup',
+        homePageHref: '/getting-started',
+        entries: [
+          {
+            type: 'link',
+            href: '/getting-started/local-setup',
+            label: 'Local Setup',
+            description: 'Run AerolVM directly on your Mac or Linux machine for local development.',
+          },
+          {
+            type: 'link',
+            href: '/getting-started/single-node-setup',
+            label: 'Single-Node Setup',
+            description: 'Install AerolVM on one Linux host with domain, TLS, SSH, and optional GPU support.',
+          },
+          {
+            type: 'link',
+            href: '/cluster-setup',
+            label: 'Cluster Setup',
+            description: 'Bootstrap a multi-node AerolVM cluster with raft-coordinated placement.',
+          },
+          {
+            type: 'link',
+            href: '/cluster-ingress',
+            label: 'Cluster Ingress',
+            description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
+          },
+          {
+            type: 'link',
+            href: '/cluster-setup-step-by-step',
+            label: 'Cluster Setup Step by Step',
+            description: 'Guided checklist for bootstrapping a 3-node or custom AerolVM cluster.',
+          },
+        ],
+      },
+      
       {
         type: 'link',
         href: '/sdk-setup',
         label: 'SDK Setup',
         description: 'Connect an SDK to your AerolVM server.',
-      },
-      {
-        type: 'link',
-        href: '/comparison',
-        label: 'AerolVM vs Daytona vs e2b',
-        description: 'How AerolVM compares to e2b and Daytona, and why we built it.',
       },
     ],
   },
@@ -100,6 +133,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         href: '/reconcile',
         label: 'Reconcile',
         description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
+      },
+      {
+        type: 'link',
+        href: '/durability',
+        label: 'Durability & Failover',
+        description: 'What survives host crashes and cluster-mode owner failover, and how to make workspace state durable.',
       },
     ],
   },
@@ -196,6 +235,26 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         href: '/port-allowlist',
         label: 'Port Allowlist',
         description: 'Require explicit exposure before public traffic reaches a sandbox port.',
+      },
+      {
+        type: 'link',
+        href: '/sandbox-tags',
+        label: 'Sandbox Tags',
+        description: 'Filter list responses by tag with AND semantics for multi-tenant control planes.',
+      },
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Operations',
+    category: NavigationCategory.OPERATIONS,
+    homePageHref: '/',
+    entries: [
+      {
+        type: 'link',
+        href: '/dashboard',
+        label: 'Dashboard',
+        description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics — sign in with your PAT.',
       },
     ],
   },

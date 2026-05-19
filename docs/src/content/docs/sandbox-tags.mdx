@@ -1,0 +1,117 @@
+---
+title: Filter Sandboxes by Tag
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Every sandbox carries an optional `tags` map - a free-form `string → string` bag stamped at create time by the control plane that owns the deployment. Tags travel with the sandbox on every read, and `list` can be scoped to a subset of tags with `AND` semantics. This is the recommended way to slice a shared AerolVM deployment into per-tenant, per-environment, or per-owner views from an external control plane.
+
+Tags are stored on the sandbox record. They are not unique, not validated beyond key length, and do not affect scheduling, billing, or networking.
+
+## List sandboxes filtered by tag
+
+Every tag passed to the list call must match for a sandbox to be returned. An empty or omitted tag map returns every sandbox visible to the PAT - byte-identical to the unfiltered call.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandboxes = await client.list({
+      tags: { tenant: 'acme', environment: 'staging' },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandboxes = client.list(tags={
+        'tenant': 'acme',
+        'environment': 'staging',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandboxes, err := client.List(ctx, microvm.WithTags(map[string]string{
+        "tenant":      "acme",
+        "environment": "staging",
+    }))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mut tags = std::collections::HashMap::new();
+    tags.insert("tenant".into(), "acme".into());
+    tags.insert("environment".into(), "staging".into());
+
+    let sandboxes = client.list_with_tags(&tags)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    java.util.Map<String, String> tags = new java.util.HashMap<>();
+    tags.put("tenant", "acme");
+    tags.put("environment", "staging");
+
+    java.util.List<Sandbox> sandboxes = client.list(tags);
+    ```
+  </TabItem>
+</Tabs>
+
+## Read tags off a sandbox
+
+Tags are returned on every sandbox payload from `create`, `get`, and `list`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    for (const sandbox of sandboxes) {
+      console.log(sandbox.id, sandbox.tags?.tenant)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    for sandbox in sandboxes:
+        print(sandbox['id'], sandbox.get('tags', {}).get('tenant'))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    for _, sandbox := range sandboxes {
+        fmt.Println(sandbox.ID, sandbox.Tags["tenant"])
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    for sandbox in &sandboxes {
+        let tenant = sandbox.data.tags
+            .as_ref()
+            .and_then(|t| t.get("tenant"));
+        println!("{:?} {:?}", sandbox.data.id, tenant);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    for (Sandbox sandbox : sandboxes) {
+        System.out.println(sandbox.id + " " + sandbox.tags.get("tenant"));
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Wire format
+
+The SDKs encode the filter as repeated query parameters of the form `?tag.<key>=<value>`. Keys and values are URL-encoded, so dots, slashes, and spaces are safe. The server reads every `tag.*` parameter, drops any with empty keys, and ANDs the rest together at the storage layer. Parameters that do not start with `tag.` are ignored, so the format is forward-compatible with future list-filter options.
+
+A request like `client.list({ tags: { tenant: 'acme', environment: 'staging' } })` produces:
+
+```
+GET /v1/sandboxes?tag.tenant=acme&tag.environment=staging
+```
+
+## Common patterns
+
+- **Multi-tenant control plane.** Stamp a `tenant` tag at create time; every list call from a tenant scope passes `{ tenant: '<id>' }`. The PAT continues to gate the underlying deployment; the tag scopes the view inside it.
+- **Environment slicing.** Combine `environment: 'staging' | 'production'` with a `service` tag to fetch the subset of sandboxes a deploy pipeline owns.
+- **Per-user scratch sandboxes.** Tag with `owner: '<email>'` to drive a "my sandboxes" view in an internal dashboard without a separate ownership column.
