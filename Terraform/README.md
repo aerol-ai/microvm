@@ -19,7 +19,9 @@ Spawns a complete AerolVM cluster on EC2 in one `terraform apply`:
 - Terraform ≥ 1.5
 - AWS credentials (env, profile, or instance role) with EC2 / VPC / IAM / S3
   rights in `aws_region`
-- A Cloudflare API token with `Zone:DNS:Edit` on `cloudflare_zone_id`
+- A Cloudflare API token with `Zone:DNS:Edit` on the target zone (add
+  `Zone:Read` if you want to skip `cloudflare_zone_id` and let Terraform
+  resolve it from `domain_name`)
 - An SSH public key (the default reads `~/.ssh/id_rsa.pub`; pass
   `ssh_key_name` to reuse an existing EC2 keypair instead)
 - A shared `SB_PAT_TOKEN` value — the same string is installed on every node
@@ -121,9 +123,15 @@ default so `terraform destroy` doesn't fail on leftover objects. Flip
 
 ## Cloudflare DNS
 
-The variable named "Cloudflare region key" in your zone overview is the
-**zone ID** — paste it into `cloudflare_zone_id`. For each ingress-bearing
-node, two records are created:
+`cloudflare_zone_id` is optional. If you leave it empty, Terraform strips the
+first label off `domain_name` (so `cluster.example.com` → `example.com`) and
+looks the zone up via the Cloudflare API — that requires `Zone:Read` on the
+token. Set it explicitly if you'd rather skip the lookup or if the apex is a
+multi-label TLD like `co.uk` (the strip-one-label heuristic doesn't handle
+those). The value to paste is the "Cloudflare region key" shown on the zone
+overview page.
+
+For each ingress-bearing node, two records are created:
 
 - `<domain_name>` → public IP (one record per ingress node, DNS RR)
 - `*.<domain_name>` → same set (skip with `create_wildcard_record = false`)

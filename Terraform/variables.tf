@@ -288,8 +288,9 @@ variable "cloudflare_api_token" {
 }
 
 variable "cloudflare_zone_id" {
-  description = "Cloudflare zone ID for the apex domain (the 'region key' shown on the zone overview page)."
+  description = "Cloudflare zone ID for the apex domain (the 'region key' shown on the zone overview page). Leave empty to auto-resolve from domain_name (requires Zone:Read on the API token)."
   type        = string
+  default     = ""
 }
 
 variable "domain_name" {

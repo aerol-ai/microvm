@@ -6,9 +6,14 @@
 # --- Required ---------------------------------------------------------------
 
 pat_token            = "REPLACE-with-shared-SB_PAT_TOKEN"
-cloudflare_api_token = "REPLACE-with-cloudflare-api-token" # Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01.
-cloudflare_zone_id   = "REPLACE-with-zone-id-from-cloudflare-overview"
-domain_name          = "cluster.example.com" # set empty to skip TLS and run in IP/path mode
+cloudflare_api_token = "REPLACE-with-cloudflare-api-token" # Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01. Add Zone:Read if you want auto-zone-lookup below.
+domain_name          = "cluster.example.com"               # set empty to skip TLS and run in IP/path mode
+
+# cloudflare_zone_id is optional. Leave it unset to auto-resolve the zone from
+# domain_name by stripping the first label ("cluster.example.com" -> "example.com").
+# Requires Zone:Read on the API token. Set explicitly to avoid the lookup or for
+# multi-label TLDs (co.uk, com.au, ...).
+# cloudflare_zone_id = "REPLACE-with-zone-id-from-cloudflare-overview"
 
 # --- AWS placement ----------------------------------------------------------
 
