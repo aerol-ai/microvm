@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -622,6 +623,142 @@ func (c *Cluster) SetNodeDrainState(ctx context.Context, nodeID string, drained 
 	}
 	cmd := command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained}
 	return c.applyCommand(ctx, cmd)
+}
+
+// RemoveMember explicitly retires nodeID from the raft configuration. It is an
+// operator lifecycle command, not gossip failure detection: the caller should
+// drain the node first, then stop/terminate it, then remove it from raft.
+//
+// Before RemoveServer, we persist a drain mark and orphan any placements owned
+// by the retiring node so surviving nodes stop routing new work there and
+// clients get a clear 410 for lost sandboxes under the current non-HA policy.
+func (c *Cluster) RemoveMember(ctx context.Context, nodeID string, force bool) error {
+	if nodeID == "" {
+		return fmt.Errorf("cluster: RemoveMember requires non-empty nodeID")
+	}
+	if c.raft == nil || c.raft.raft == nil {
+		return ErrUnknownMember
+	}
+	if c.raft.raft.State() != raft.Leader {
+		return c.forwardRemoveMemberToLeader(ctx, nodeID, force)
+	}
+	return c.removeMemberLocal(ctx, nodeID, force)
+}
+
+func (c *Cluster) removeMemberLocal(ctx context.Context, nodeID string, force bool) error {
+	srv, ok := c.configuredServer(nodeID)
+	if !ok {
+		return ErrUnknownMember
+	}
+	if srv.Suffrage == raft.Voter {
+		voters, ok := c.currentVoterCount()
+		if !ok {
+			return fmt.Errorf("cluster: read raft configuration")
+		}
+		if voters <= 1 {
+			return ErrLastVoter
+		}
+	}
+	if !force && c.memberAlive(nodeID) {
+		return ErrMemberStillAlive
+	}
+	if err := c.SetNodeDrainState(ctx, nodeID, true); err != nil {
+		return err
+	}
+	if err := c.orphanOwner(ctx, nodeID); err != nil {
+		return err
+	}
+	timeout := c.commitTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	f := c.raft.raft.RemoveServer(raft.ServerID(nodeID), 0, timeout)
+	if err := f.Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
+			return ErrNotLeader
+		}
+		return fmt.Errorf("cluster: remove raft member: %w", err)
+	}
+	c.deadOwners.clear(nodeID)
+	c.logger.Info("cluster: removed raft member", "node_id", nodeID, "force", force)
+	return nil
+}
+
+func (c *Cluster) memberAlive(nodeID string) bool {
+	if c.gossip == nil {
+		return false
+	}
+	for _, m := range c.gossip.members() {
+		if m.NodeID == nodeID {
+			return m.Alive
+		}
+	}
+	return false
+}
+
+func (c *Cluster) forwardRemoveMemberToLeader(ctx context.Context, nodeID string, force bool) error {
+	leader := c.Leader()
+	if leader == "" {
+		return ErrNotLeader
+	}
+	path := "/v1/cluster/members/" + url.PathEscape(nodeID)
+	if force {
+		path += "?force=true"
+	}
+	if c.internalClient != nil && c.gossip != nil {
+		if peerInternal := c.gossip.peerInternalURL(leader); peerInternal != "" {
+			return c.doLeaderLifecycle(ctx, c.internalClient, strings.TrimRight(peerInternal, "/")+path, http.MethodDelete, nil)
+		}
+	}
+	leaderURL := c.LeaderAPIURL()
+	if leaderURL == "" {
+		return ErrNotLeader
+	}
+	return c.doLeaderLifecycle(ctx, c.httpClient, strings.TrimRight(leaderURL, "/")+path, http.MethodDelete, nil)
+}
+
+func (c *Cluster) doLeaderLifecycle(ctx context.Context, client *http.Client, endpoint, method string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("cluster: build lifecycle request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.patToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("cluster: lifecycle request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	message := strings.TrimSpace(string(msg))
+	switch resp.StatusCode {
+	case http.StatusServiceUnavailable:
+		if strings.Contains(message, ErrNotLeader.Error()) || strings.Contains(message, "not leader") {
+			return ErrNotLeader
+		}
+	case http.StatusNotFound:
+		if strings.Contains(message, ErrUnknownMember.Error()) {
+			return ErrUnknownMember
+		}
+	case http.StatusConflict:
+		if strings.Contains(message, ErrMemberStillAlive.Error()) {
+			return ErrMemberStillAlive
+		}
+		if strings.Contains(message, ErrLastVoter.Error()) {
+			return ErrLastVoter
+		}
+	}
+	return fmt.Errorf("cluster: lifecycle request: status %d: %s", resp.StatusCode, message)
 }
 
 // IsNodeDrained reports the FSM's view of nodeID's drain state. Read from the

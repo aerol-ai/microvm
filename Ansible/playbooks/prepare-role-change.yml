@@ -1,0 +1,62 @@
+---
+# Drain a node before a Terraform role change or instance replacement.
+#
+# Usage:
+#   ansible-playbook playbooks/prepare-role-change.yml --limit aerolvm-worker-17
+#
+# The playbook marks the node drained in the cluster FSM and waits until the
+# node owns zero placements. If long-lived sandboxes remain, it fails before
+# Terraform can recreate the instance and lose those workloads.
+
+- name: Prepare sandboxd nodes for role change
+  hosts: all
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+
+  tasks:
+    - name: Deploy sandboxd node lifecycle helper
+      ansible.builtin.copy:
+        src: "../../scripts/sandboxd-node-lifecycle.sh"
+        dest: "{{ sandboxd_lifecycle_script_path }}"
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Check sandboxd base env file
+      ansible.builtin.stat:
+        path: "{{ sandboxd_env_file }}"
+      register: sandboxd_base_env
+
+    - name: Refuse when sandboxd base env file is missing
+      ansible.builtin.assert:
+        that:
+          - sandboxd_base_env.stat.exists
+        fail_msg: "{{ sandboxd_env_file }} is missing; run install.sh/bootstrap first."
+
+    - name: Check sandboxd cluster env file
+      ansible.builtin.stat:
+        path: "{{ sandboxd_cluster_env_file }}"
+      register: sandboxd_cluster_env
+
+    - name: Refuse when sandboxd cluster env file is missing
+      ansible.builtin.assert:
+        that:
+          - sandboxd_cluster_env.stat.exists
+        fail_msg: "{{ sandboxd_cluster_env_file }} is missing; this playbook is only for cluster nodes."
+
+    - name: Drain node and wait for owned placements to leave
+      ansible.builtin.command:
+        cmd: >-
+          {{ sandboxd_lifecycle_script_path }}
+          pre-role-change
+          --env-file {{ sandboxd_env_file }}
+          --env-file {{ sandboxd_cluster_env_file }}
+          --timeout {{ sandboxd_role_change_drain_timeout_s }}
+      register: drain_result
+      changed_when: "'drained node' in drain_result.stdout"
+
+    - name: Report drain result
+      ansible.builtin.debug:
+        msg: "{{ drain_result.stdout_lines }}"

@@ -109,6 +109,19 @@ var ErrNoPlacementTarget = errors.New("cluster: no worker placement target avail
 // malformed request.
 var ErrInvalidTopology = errors.New("cluster: invalid topology")
 
+// ErrUnknownMember is returned when an operator asks to remove a node that is
+// not present in the current raft configuration.
+var ErrUnknownMember = errors.New("cluster: unknown raft member")
+
+// ErrMemberStillAlive protects operators from accidentally removing a live
+// control-plane node. Stop the node first, or pass force through the public
+// lifecycle API when intentionally retiring a live member.
+var ErrMemberStillAlive = errors.New("cluster: raft member is still alive")
+
+// ErrLastVoter prevents an explicit removal from deleting the last voting raft
+// server and leaving the cluster with no quorum path.
+var ErrLastVoter = errors.New("cluster: cannot remove last raft voter")
+
 const (
 	// CreateBackpressureRetryAfterSeconds is the public Retry-After hint for
 	// queue/concurrency backpressure. Keep it short: these rejects are caused by
@@ -455,6 +468,12 @@ type Client interface {
 	// going away — the operator's intent must outlast the process they're
 	// about to stop.
 	SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error
+
+	// RemoveMember explicitly removes nodeID from the raft configuration after
+	// marking it drained and orphaning any placements it owned. Unknown raft
+	// members return ErrUnknownMember. Live members require force=true so an
+	// operator cannot accidentally cut out a healthy server by typo.
+	RemoveMember(ctx context.Context, nodeID string, force bool) error
 
 	// IsNodeDrained reports whether nodeID is currently marked drained.
 	// Reads the local FSM (no network hop). Used by observability endpoints

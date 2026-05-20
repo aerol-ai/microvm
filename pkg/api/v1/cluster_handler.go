@@ -647,6 +647,49 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": view})
 }
 
+// clusterRemoveMember explicitly removes a node from the raft configuration.
+// It is the operator path for decommissioned control-plane members; worker
+// role changes should use /cluster/nodes/{id}/drain before the infrastructure
+// replacement, not this endpoint.
+func (h *handlers) clusterRemoveMember(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "node id required")
+		return
+	}
+	force := parseBoolQuery(r, "force")
+	commitCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := c.RemoveMember(commitCtx, id, force); err != nil {
+		switch {
+		case errors.Is(err, cluster.ErrNotLeader):
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+		case errors.Is(err, cluster.ErrUnknownMember):
+			apihttp.WriteError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, cluster.ErrMemberStillAlive), errors.Is(err, cluster.ErrLastVoter):
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
+		default:
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func parseBoolQuery(r *http.Request, key string) bool {
+	raw := strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key)))
+	return raw == "1" || raw == "true" || raw == "yes"
+}
+
 // clusterLeader returns the current Raft leader's node ID.
 func (h *handlers) clusterLeader(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()

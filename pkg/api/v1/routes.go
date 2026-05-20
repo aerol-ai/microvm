@@ -104,6 +104,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// the v1 surface without violating the v1 freeze (these are net-new
 	// paths, not changes to existing wire format).
 	mux.Handle("GET "+PathPrefix+"/cluster/members", d.Auth(http.HandlerFunc(h.clusterMembers)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", d.Auth(http.HandlerFunc(h.clusterRemoveMember)))
 	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.Auth(http.HandlerFunc(h.clusterLeader)))
 	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", d.Auth(http.HandlerFunc(h.clusterPlacement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", d.Auth(http.HandlerFunc(h.clusterSandboxIndex)))

@@ -84,10 +84,23 @@ Total time: 5–10 minutes per node.
 
 | Concern | Mitigation |
 |---|---|
-| Workloads on a worker node are lost when it's recreated | Drain sandboxes before the apply (manual today; there's no `aerolvm drain` yet). For production, schedule role changes in maintenance windows. |
+| Workloads on a worker node are lost when it's recreated | Run `ansible-playbook Ansible/playbooks/prepare-role-change.yml --limit <node>` before the Terraform apply. It marks the node drained and waits until the cluster placement index shows zero owned placements. |
 | Brief capacity dip while the new instance comes up | Use `create_before_destroy = true` in the lifecycle block, especially for ingress nodes. New node + DNS record exist before old one disappears → zero public-traffic downtime. |
-| Losing a Raft voter momentarily | The cluster tolerates `(N-1)/2` voter losses. Change one server-role node at a time and you stay in quorum. With three voters, you can recreate one with no impact. |
+| Losing a Raft voter momentarily | The cluster tolerates `(N-1)/2` voter losses. Change one server-role node at a time and you stay in quorum. After terminating a stale server-role node, call `DELETE /v1/cluster/members/<node-id>` from a survivor to remove it from raft explicitly. |
 | "But 5–10 minutes is slow for me!" | If role changes are frequent enough that this hurts, the right fix is the long-term option below, not a faster patch. Role changes in real deployments are rare. |
+
+Pre-drain command:
+
+```bash
+cd Ansible
+ansible-playbook playbooks/prepare-role-change.yml --limit <inventory-host>
+```
+
+The playbook deploys `sandboxd-node-lifecycle.sh`, calls the node-local API to
+drain its own `SB_NODE_ID`, and waits up to
+`sandboxd_role_change_drain_timeout_s` seconds. A timeout is a hard stop: the
+Terraform apply should wait or the operator should intentionally destroy the
+remaining sandboxes first.
 
 ## What Ansible *does* own
 
@@ -97,6 +110,7 @@ still owns everything that isn't declared state:
 | Operation | Tool |
 |---|---|
 | Add / remove / resize / change role | Terraform |
+| Pre-drain before role change | Ansible (`playbooks/prepare-role-change.yml`) |
 | Push a new `sandboxd` binary | Ansible (`playbooks/update-sandboxd.yml`) |
 | Restart services, rotate PATs, tail logs | Ansible |
 | Run one-off shell commands across many nodes | Ansible |

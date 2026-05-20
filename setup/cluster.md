@@ -1032,18 +1032,39 @@ it is added as a non-voter.
 
 ### Removing a node
 
-Stop the daemon on the node. After `SB_DEAD_OWNER_GRACE` (default 30s) the
-leader's dead-owner reconciler orphans every placement that node owned
-(`OwnerNodeID = ""` in the FSM — subsequent API calls for those sandboxes
-return `410 Gone`) and `RemoveServer`s the node from the raft configuration.
-Any sandboxes that were on it are gone for good under the current non-HA
-policy; clients should create fresh sandboxes.
+For worker or ingress-only nodes, drain admission first, wait until the node
+owns no placements, then replace or terminate the instance:
 
-There is no public API endpoint for explicit raft membership removal yet —
-`DELETE /v1/cluster/members/<node-id>` is **not implemented** in this release.
-Treat permanent node removal as an operator action and validate against the
-current raft membership before the node's data directory is reused or
-discarded.
+```bash
+export SB_PAT_TOKEN=<redacted>
+curl -fsS -X POST -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  http://<any-node>:21212/v1/cluster/nodes/<node-id>/drain
+curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  'http://<any-node>:21212/v1/cluster/sandbox-index?limit=5000'
+```
+
+The packaged helper does the same check and fails if long-lived placements are
+still present:
+
+```bash
+sudo /usr/local/sbin/sandboxd-node-lifecycle.sh pre-role-change <node-id>
+```
+
+For server-role raft members, stop the daemon or terminate the instance, then
+remove the stale raft member explicitly from any surviving node:
+
+```bash
+curl -fsS -X DELETE -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  http://<any-survivor>:21212/v1/cluster/members/<node-id>
+```
+
+`DELETE /v1/cluster/members/<node-id>` persists a drain mark, orphans any
+placements owned by that node (`OwnerNodeID = ""`; subsequent API calls return
+`410 Gone` under the current non-HA policy), and calls raft `RemoveServer`.
+It refuses to remove a member that is still gossiped alive unless
+`?force=true` is supplied, and it refuses to remove the last raft voter.
+Any sandboxes that were on the removed node are gone for good under the current
+non-HA policy; clients should create fresh sandboxes.
 
 ### Rolling restart
 

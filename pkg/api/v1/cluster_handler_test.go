@@ -765,6 +765,8 @@ type drainStubCluster struct {
 	*cluster.Noop
 	setCalls    []drainSetCall
 	setErr      error
+	removeCalls []removeMemberCall
+	removeErr   error
 	drainedView map[string]bool
 }
 
@@ -773,9 +775,19 @@ type drainSetCall struct {
 	drained bool
 }
 
+type removeMemberCall struct {
+	nodeID string
+	force  bool
+}
+
 func (c *drainStubCluster) SetNodeDrainState(_ context.Context, nodeID string, drained bool) error {
 	c.setCalls = append(c.setCalls, drainSetCall{nodeID, drained})
 	return c.setErr
+}
+
+func (c *drainStubCluster) RemoveMember(_ context.Context, nodeID string, force bool) error {
+	c.removeCalls = append(c.removeCalls, removeMemberCall{nodeID: nodeID, force: force})
+	return c.removeErr
 }
 
 func (c *drainStubCluster) IsNodeDrained(nodeID string) bool {
@@ -879,6 +891,51 @@ func TestClusterDrainNodeRejectsEmptyID(t *testing.T) {
 	}
 	if len(stub.setCalls) != 0 {
 		t.Fatalf("setCalls = %+v, want zero — FSM must not see the empty drain", stub.setCalls)
+	}
+}
+
+func TestClusterRemoveMemberReturns204AndCallsRemove(t *testing.T) {
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	h := drainTestHandler(t, stub)
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/cluster/members/node-b?force=true", nil)
+	req.SetPathValue("id", "node-b")
+	rr := httptest.NewRecorder()
+	h.clusterRemoveMember(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d (body=%q)", rr.Code, http.StatusNoContent, rr.Body.String())
+	}
+	if len(stub.removeCalls) != 1 || stub.removeCalls[0].nodeID != "node-b" || !stub.removeCalls[0].force {
+		t.Fatalf("removeCalls = %+v, want one forced node-b removal", stub.removeCalls)
+	}
+}
+
+func TestClusterRemoveMemberMapsLifecycleErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "not leader", err: cluster.ErrNotLeader, want: http.StatusServiceUnavailable},
+		{name: "unknown", err: cluster.ErrUnknownMember, want: http.StatusNotFound},
+		{name: "alive", err: cluster.ErrMemberStillAlive, want: http.StatusConflict},
+		{name: "last voter", err: cluster.ErrLastVoter, want: http.StatusConflict},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a"), removeErr: tc.err}
+			h := drainTestHandler(t, stub)
+
+			req := httptest.NewRequest(http.MethodDelete, "/v1/cluster/members/node-b", nil)
+			req.SetPathValue("id", "node-b")
+			rr := httptest.NewRecorder()
+			h.clusterRemoveMember(rr, req)
+
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d (body=%q)", rr.Code, tc.want, rr.Body.String())
+			}
+		})
 	}
 }
 

@@ -55,6 +55,7 @@
         - { src: "../../scripts/sandboxd-backup.sh", dest: "sandboxd-backup.sh" }
         - { src: "../../scripts/sandboxd-restore.sh", dest: "sandboxd-restore.sh" }
         - { src: "../../scripts/raft-lost-quorum-recover.sh", dest: "raft-lost-quorum-recover.sh" }
+        - { src: "../../scripts/sandboxd-node-lifecycle.sh", dest: "sandboxd-node-lifecycle.sh" }
 
     - name: Create Grafana dashboard artifact directory
       ansible.builtin.file:

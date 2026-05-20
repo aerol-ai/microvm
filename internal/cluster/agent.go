@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -378,6 +379,17 @@ func (a *Agent) SetNodeDrainState(ctx context.Context, nodeID string, drained bo
 	return a.applyCommand(ctx, command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained})
 }
 
+func (a *Agent) RemoveMember(ctx context.Context, nodeID string, force bool) error {
+	if nodeID == "" {
+		return fmt.Errorf("cluster: RemoveMember requires non-empty nodeID")
+	}
+	path := "/v1/cluster/members/" + url.PathEscape(nodeID)
+	if force {
+		path += "?force=true"
+	}
+	return a.doControlPlaneBytes(ctx, http.MethodDelete, path, path, nil, nil)
+}
+
 func (a *Agent) IsNodeDrained(nodeID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlaneRequestTimeout)
 	defer cancel()
@@ -713,7 +725,7 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrCreateBackpressure.Error()) {
 			return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
 		}
-		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNotLeader.Error()) {
+		if resp.StatusCode == http.StatusServiceUnavailable && (strings.Contains(message, ErrNotLeader.Error()) || strings.Contains(message, "not leader")) {
 			return ErrNotLeader
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrCapacityExceeded.Error()) {
@@ -721,6 +733,15 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNoPlacementTarget.Error()) {
 			return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
+		}
+		if resp.StatusCode == http.StatusNotFound && strings.Contains(message, ErrUnknownMember.Error()) {
+			return ErrUnknownMember
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
+			return ErrMemberStillAlive
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrLastVoter.Error()) {
+			return ErrLastVoter
 		}
 		return statusError{status: resp.StatusCode, message: message}
 	}

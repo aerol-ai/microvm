@@ -8,6 +8,7 @@ sandboxd_cluster_env_file: /etc/sandboxd/cluster.env
 sandboxd_health_url:    "http://127.0.0.1:21212/health"
 sandboxd_health_wait_s: 30
 sandboxd_ops_script_dir: /usr/local/sbin
+sandboxd_lifecycle_script_path: /usr/local/sbin/sandboxd-node-lifecycle.sh
 sandboxd_grafana_dashboard_dir: /etc/sandboxd/grafana
 sandboxd_prometheus_rules_dir: /etc/sandboxd/prometheus
 sandboxd_alertmanager_config_dir: /etc/sandboxd/alertmanager
@@ -28,3 +29,6 @@ sandboxd_backup_output_dir: /var/backups/sandboxd
 sandboxd_backup_cron_minute: "17"
 sandboxd_backup_cron_hour: "2"
 sandboxd_backup_retention_days: 7
+
+# Node lifecycle defaults used by playbooks/prepare-role-change.yml.
+sandboxd_role_change_drain_timeout_s: 3600
