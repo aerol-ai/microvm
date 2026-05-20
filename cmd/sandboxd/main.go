@@ -12,6 +12,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -37,6 +38,26 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	otelShutdown, err := observability.StartOTELMetrics(ctx, logger, observability.OTELMetricsConfig{
+		Enabled:     cfg.OTELMetricsEnabled,
+		Endpoint:    cfg.OTELMetricsEndpoint,
+		Interval:    cfg.OTELMetricsInterval,
+		ServiceName: cfg.OTELServiceName,
+		NodeID:      cfg.NodeID,
+		NodeRole:    cfg.NodeRole,
+	})
+	if err != nil {
+		logger.Warn("failed to start otel metrics exporter", "error", err)
+	} else if otelShutdown != nil {
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := otelShutdown(shutdownCtx); err != nil {
+				logger.Warn("otel metrics shutdown failed", "error", err)
+			}
+		}()
+	}
 
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {

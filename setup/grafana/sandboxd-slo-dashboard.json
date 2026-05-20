@@ -1,0 +1,145 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        { "expr": "sum(aerolvm_create_queue_depth)", "legendFormat": "queued creates", "refId": "A" }
+      ],
+      "title": "Create Queue Depth",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_create_requests_total[5m]))", "legendFormat": "creates/s", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_create_errors_total[5m]))", "legendFormat": "errors/s", "refId": "B" }
+      ],
+      "title": "Create Throughput And Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(aerolvm_host_pressure_reserved_cpu_millicores) / clamp_min(sum(aerolvm_host_pressure_cpu_budget_millicores), 1)", "legendFormat": "cpu", "refId": "A" },
+        { "expr": "sum(aerolvm_host_pressure_reserved_memory_mb) / clamp_min(sum(aerolvm_host_pressure_memory_budget_mb), 1)", "legendFormat": "memory", "refId": "B" },
+        { "expr": "sum(aerolvm_host_pressure_reserved_disk_gb) / clamp_min(sum(aerolvm_host_pressure_disk_budget_gb), 1)", "legendFormat": "disk", "refId": "C" }
+      ],
+      "title": "Worker Pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "max(aerolvm_worker_lease_max_age_nanos) / 1e9", "legendFormat": "max lease age", "refId": "A" }
+      ],
+      "title": "Worker Lease Age",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "max(aerolvm_ingress_route_desired_revision - aerolvm_ingress_route_applied_revision)", "legendFormat": "route lag", "refId": "A" },
+        { "expr": "sum(aerolvm_ingress_caddy_ops_pending)", "legendFormat": "caddy pending", "refId": "B" },
+        { "expr": "sum(aerolvm_ingress_caddy_ops_inflight)", "legendFormat": "caddy inflight", "refId": "C" }
+      ],
+      "title": "Ingress Route Lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_raft_apply_errors_total[5m])) by (key)", "legendFormat": "{{key}}", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_raft_snapshot_errors_total[5m])) by (key)", "legendFormat": "snapshot {{key}}", "refId": "B" }
+      ],
+      "title": "Raft Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "id": 7,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(aerolvm_image_pull_inflight)", "legendFormat": "inflight", "refId": "A" },
+        { "expr": "sum(aerolvm_image_pull_queued)", "legendFormat": "queued", "refId": "B" },
+        { "expr": "sum(rate(aerolvm_image_pull_errors_total[5m])) by (key)", "legendFormat": "errors {{key}}", "refId": "C" },
+        { "expr": "sum(rate(aerolvm_image_pull_backoff_rejects_total[5m]))", "legendFormat": "backoff rejects/s", "refId": "D" }
+      ],
+      "title": "Image Pull Storms",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 14 },
+      "id": 8,
+      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(aerolvm_ingress_routes_by_shard) by (key)", "legendFormat": "shard {{key}}", "refId": "A" }
+      ],
+      "title": "Shard Health",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 14 },
+      "id": 9,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_caddy_admin_errors_total[5m])) by (key)", "legendFormat": "{{key}}", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_owner_forward_errors_total[5m])) by (key)", "legendFormat": "forward {{key}}", "refId": "B" }
+      ],
+      "title": "Data Plane Errors",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["sandboxd", "aerolvm", "slo"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "sandboxd SLOs",
+  "uid": "sandboxd-slos",
+  "version": 1,
+  "weekStart": ""
+}

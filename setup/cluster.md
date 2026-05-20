@@ -1105,6 +1105,11 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered nodes auto-promoted as raft voters. Default `5`; additional nodes become non-voters. Set `0` for unlimited. |
 | `SB_DEAD_OWNER_GRACE` | no | Wait before reassigning a dead node's placements. Default `30s`. |
+| `SB_OTEL_METRICS_ENDPOINT` | no | OTLP/HTTP metrics endpoint, for example `http://otel-collector:4318/v1/metrics`. Setting it enables OTEL metrics. |
+| `SB_OTEL_METRICS_ENABLED` | no | Enables OTEL metrics without an explicit endpoint; the OTEL exporter env defaults apply. |
+| `SB_OTEL_METRICS_INTERVAL` | no | OTEL export interval. Default `30s`. |
+| `SB_IMAGE_PULL_MAX_CONCURRENT` | no | Per-worker cap on concurrent Docker image pulls. Default `4`; set `0` to disable the cap. |
+| `SB_IMAGE_PULL_FAILURE_BACKOFF` | no | Per-image/auth retry suppression after a failed pull. Default `30s`; set `0s` to disable. |
 
 The daemon **refuses to boot** in cluster mode if either gossip or
 credential keys are missing (and the matching `INSECURE_*` flag isn't set).
@@ -1151,6 +1156,21 @@ For a full cluster recovery from total destruction, you also need the
 cluster TLS bundle (CA + CA key) and the gossip key. Store these in your
 secrets manager.
 
+The repo includes a backup helper that packages the local SQLite DB, Raft
+state, and `/etc/sandboxd` config tree into one restricted archive:
+
+```bash
+sudo scripts/sandboxd-backup.sh --output /secure/backups/sandboxd-$(hostname)-$(date +%F).tar.gz
+```
+
+To restore onto a stopped replacement node:
+
+```bash
+sudo systemctl stop sandboxd
+sudo scripts/sandboxd-restore.sh --input /secure/backups/sandboxd-node-a-2026-05-20.tar.gz --target-root / --force
+sudo systemctl start sandboxd
+```
+
 ---
 
 ## Lost-quorum recovery
@@ -1180,17 +1200,19 @@ If the lost voters are gone for good (disk loss, hardware destroyed):
 
 1. Stop `sandboxd` on every survivor.
 2. On the node with the highest raft `LastIndex` (check `journalctl`),
-   create `/var/lib/sandboxd/raft/peers.json`:
+   create `/var/lib/sandboxd/raft/peers.json` directly or with the helper:
 
-   ```json
-   [
-     { "id": "this-node-id", "address": "10.0.0.5:7000", "non_voter": false, "suffrage": "Voter" }
-   ]
+   ```bash
+   sudo scripts/raft-lost-quorum-recover.sh \
+     --raft-dir /var/lib/sandboxd/raft \
+     --node-id this-node-id \
+     --raft-address 10.0.0.5:7000
    ```
 
-3. Start `sandboxd` on that node only. It detects `peers.json` and rewrites
-   the raft configuration to itself — bootstraps a fresh single-node cluster
-   from its existing log.
+3. Start `sandboxd` on that node only. It detects `peers.json`, runs
+   HashiCorp Raft's recovery path, rewrites the raft configuration to the
+   supplied peers, and renames the file to `peers.json.applied.<unix>` after
+   success.
 4. Once it elects itself leader, re-add the other survivors:
 
    ```bash
@@ -1235,7 +1257,21 @@ curl -H "Authorization: Bearer $SB_PAT_TOKEN" http://<node>:8080/v1/metrics
 Scrape servers, workers, and ingress nodes separately. The endpoint exports
 only `aerolvm_*` metrics and includes the operational signals needed for the
 large-cluster SLOs: Raft apply/snapshot health, route lag, create queue depth,
-worker lease freshness, host pressure, and Caddy/admin errors.
+worker lease freshness, host pressure, image-pull pressure, and Caddy/admin
+errors.
+
+For OTEL, set:
+
+```bash
+SB_OTEL_METRICS_ENDPOINT=http://otel-collector:4318/v1/metrics
+SB_OTEL_METRICS_INTERVAL=30s
+OTEL_SERVICE_NAME=sandboxd
+```
+
+The OTEL bridge exports the same `aerolvm_*` expvars under
+`aerolvm.expvar.int64` and `aerolvm.expvar.float64`, with the original expvar
+name in the `metric` attribute. A starter Grafana dashboard is available at
+`setup/grafana/sandboxd-slo-dashboard.json`.
 
 ---
 

@@ -135,6 +135,13 @@ type Config struct {
 	ReconcileInterval           time.Duration
 	NetstatsPollInterval        time.Duration
 	UploadMaxBytes              int64
+	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
+	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
+	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
+	OTELMetricsEnabled  bool
+	OTELMetricsEndpoint string
+	OTELMetricsInterval time.Duration
+	OTELServiceName     string
 
 	// Admission control. Admission is purely resource-math: CPU/memory
 	// reservation ratios plus a live memory floor. There is no fixed sandbox
@@ -364,6 +371,15 @@ type Config struct {
 	// managed AOCR image-distribution provider. Empty configs constructed in
 	// tests fall back to the product default in the service layer.
 	ImageDistributionAOCRHost string
+	// ImagePullMaxConcurrent caps simultaneous Docker /images/create streams
+	// per worker. Pulls for the same image/auth key are still deduplicated; this
+	// cap protects the daemon and registry when many different cold images are
+	// requested at once. 0 disables the cap.
+	ImagePullMaxConcurrent int
+	// ImagePullFailureBackoff suppresses immediate retries for the same
+	// image/auth key after Docker or the registry returns an error. This keeps a
+	// bad tag or rate-limit response from turning into a per-create retry storm.
+	ImagePullFailureBackoff time.Duration
 }
 
 func Load() (Config, error) {
@@ -407,6 +423,10 @@ func Load() (Config, error) {
 		ReconcileInterval:           getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:        getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:              int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		OTELMetricsEnabled:          getEnvBool("SB_OTEL_METRICS_ENABLED", false),
+		OTELMetricsEndpoint:         firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
+		OTELMetricsInterval:         getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		OTELServiceName:             getEnv("OTEL_SERVICE_NAME", "sandboxd"),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
@@ -457,6 +477,11 @@ func Load() (Config, error) {
 		ImageBuildGCInterval:             getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
 		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
 		ImageDistributionAOCRHost:        strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
+		ImagePullMaxConcurrent:           getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
+		ImagePullFailureBackoff:          getEnvDuration("SB_IMAGE_PULL_FAILURE_BACKOFF", 30*time.Second),
+	}
+	if cfg.OTELMetricsEndpoint != "" {
+		cfg.OTELMetricsEnabled = true
 	}
 
 	if cfg.PATToken == "" {
@@ -465,6 +490,15 @@ func Load() (Config, error) {
 
 	if cfg.DBPath == "" {
 		return Config{}, errors.New("SB_DB_PATH is required")
+	}
+	if cfg.OTELMetricsEnabled && cfg.OTELMetricsInterval <= 0 {
+		return Config{}, errors.New("SB_OTEL_METRICS_INTERVAL must be > 0 when OTEL metrics are enabled")
+	}
+	if cfg.ImagePullMaxConcurrent < 0 {
+		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
+	}
+	if cfg.ImagePullFailureBackoff < 0 {
+		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
 	}
 
 	if cfg.ToolboxMountPath == "" || !strings.HasPrefix(cfg.ToolboxMountPath, "/") {
@@ -603,6 +637,15 @@ func splitAndTrim(s, sep string) []string {
 		}
 	}
 	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (c Config) ListenAddr() string {

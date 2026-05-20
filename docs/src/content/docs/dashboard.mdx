@@ -134,6 +134,29 @@ scrape_configs:
 ```
 
 Useful first alerts are `aerolvm_raft_apply_errors_total`,
-`aerolvm_ingress_route_lag_versions`, `aerolvm_create_queue_depth`,
-`aerolvm_worker_lease_max_age_nanos`, and the `aerolvm_host_pressure_*`
-gauges.
+`aerolvm_ingress_route_desired_revision - aerolvm_ingress_route_applied_revision`,
+`aerolvm_create_queue_depth`, `aerolvm_worker_lease_max_age_nanos`,
+`aerolvm_image_pull_backoff_rejects_total`, and the
+`aerolvm_host_pressure_*` gauges.
+
+## Prometheus, OTEL, and Grafana
+
+Prometheus is pull-based through `GET /v1/metrics`. Native OTEL metrics
+are push-based over OTLP/HTTP and are enabled by either setting
+`SB_OTEL_METRICS_ENABLED=true` or by setting an OTLP endpoint:
+
+```bash
+SB_OTEL_METRICS_ENDPOINT=http://otel-collector:4318/v1/metrics
+SB_OTEL_METRICS_INTERVAL=30s
+OTEL_SERVICE_NAME=sandboxd
+```
+
+The OTEL bridge exports the same `aerolvm_*` expvars as observations under
+`aerolvm.expvar.int64` and `aerolvm.expvar.float64`; the original expvar
+name is attached as the `metric` attribute, with expvar map keys attached
+as `key`, `key2`, and so on.
+
+A starter Grafana dashboard is checked in at
+`setup/grafana/sandboxd-slo-dashboard.json`. It covers create queue depth,
+worker pressure, route lag, shard health, Raft errors, data-plane errors,
+and image-pull storm signals.

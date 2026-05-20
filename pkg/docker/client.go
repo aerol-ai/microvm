@@ -61,11 +61,20 @@ type Client struct {
 	toolboxWaitTimeout time.Duration
 	pullMu             sync.Mutex
 	pulls              map[string]*imagePull
+	pullSlots          chan struct{}
+	pullBackoff        time.Duration
+	pullFailures       map[string]imagePullFailure
 }
 
 type imagePull struct {
 	done chan struct{}
 	err  error
+}
+
+type imagePullFailure struct {
+	err       error
+	retryAt   time.Time
+	createdAt time.Time
 }
 
 func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Client, error) {
@@ -84,6 +93,10 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		},
 	}
 
+	var pullSlots chan struct{}
+	if cfg.ImagePullMaxConcurrent > 0 {
+		pullSlots = make(chan struct{}, cfg.ImagePullMaxConcurrent)
+	}
 	return &Client{
 		logger:             logger,
 		socketPath:         socketPath,
@@ -101,6 +114,9 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		waitTimeout:        cfg.DockerRuntimeWaitTimeout,
 		toolboxWaitTimeout: cfg.ToolboxWaitTimeout,
 		pulls:              make(map[string]*imagePull),
+		pullSlots:          pullSlots,
+		pullBackoff:        cfg.ImagePullFailureBackoff,
+		pullFailures:       make(map[string]imagePullFailure),
 	}, nil
 }
 
@@ -663,28 +679,118 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 }
 
 func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+	finishMetric := beginImagePullMetric()
+	var resultErr error
+	defer func() { finishMetric(resultErr) }()
+
 	key := imagePullKey(imageRef, auth)
 	c.pullMu.Lock()
 	if inFlight := c.pulls[key]; inFlight != nil {
+		recordImagePullDedupWaiter()
 		c.pullMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			resultErr = ctx.Err()
+			return resultErr
 		case <-inFlight.done:
-			return inFlight.err
+			resultErr = inFlight.err
+			return resultErr
 		}
+	}
+	if failure, blocked := c.pullBackoffFailureLocked(key, time.Now()); blocked {
+		recordImagePullBackoffReject()
+		c.pullMu.Unlock()
+		resultErr = fmt.Errorf("pull image %s suppressed by failure backoff until %s: %w", imageRef, failure.retryAt.Format(time.RFC3339), failure.err)
+		return resultErr
 	}
 	inFlight := &imagePull{done: make(chan struct{})}
 	c.pulls[key] = inFlight
 	c.pullMu.Unlock()
 
-	inFlight.err = c.pullImage(ctx, imageRef, auth)
+	slotAcquired, err := c.acquirePullSlot(ctx)
+	if err != nil {
+		inFlight.err = err
+	} else {
+		inFlight.err = c.pullImage(ctx, imageRef, auth)
+		if slotAcquired {
+			c.releasePullSlot()
+		}
+	}
 
 	c.pullMu.Lock()
 	delete(c.pulls, key)
+	c.recordPullFailureLocked(key, inFlight.err)
 	c.pullMu.Unlock()
 	close(inFlight.done)
-	return inFlight.err
+	resultErr = inFlight.err
+	return resultErr
+}
+
+func (c *Client) pullBackoffFailureLocked(key string, now time.Time) (imagePullFailure, bool) {
+	if c.pullBackoff <= 0 || c.pullFailures == nil {
+		return imagePullFailure{}, false
+	}
+	failure, ok := c.pullFailures[key]
+	if !ok {
+		return imagePullFailure{}, false
+	}
+	if now.Before(failure.retryAt) {
+		return failure, true
+	}
+	delete(c.pullFailures, key)
+	return imagePullFailure{}, false
+}
+
+func (c *Client) recordPullFailureLocked(key string, err error) {
+	if c.pullFailures == nil {
+		c.pullFailures = make(map[string]imagePullFailure)
+	}
+	if err == nil || c.pullBackoff <= 0 {
+		delete(c.pullFailures, key)
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		delete(c.pullFailures, key)
+		return
+	}
+	now := time.Now()
+	c.pullFailures[key] = imagePullFailure{
+		err:       err,
+		createdAt: now,
+		retryAt:   now.Add(c.pullBackoff),
+	}
+}
+
+func (c *Client) acquirePullSlot(ctx context.Context) (bool, error) {
+	if c.pullSlots == nil {
+		return false, nil
+	}
+	select {
+	case c.pullSlots <- struct{}{}:
+		imagePullInflight.Add(1)
+		return true, nil
+	default:
+	}
+	imagePullQueued.Add(1)
+	defer imagePullQueued.Add(-1)
+	select {
+	case c.pullSlots <- struct{}{}:
+		imagePullInflight.Add(1)
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+func (c *Client) releasePullSlot() {
+	if c.pullSlots == nil {
+		return
+	}
+	select {
+	case <-c.pullSlots:
+		imagePullInflight.Add(-1)
+	default:
+	}
 }
 
 func imagePullKey(imageRef string, auth *models.RegistryAuth) string {

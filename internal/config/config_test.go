@@ -35,8 +35,16 @@ func TestLoadCases(t *testing.T) {
 			"SB_LOG_LEVEL",
 			"SB_SHUTDOWN_TIMEOUT",
 			"SB_HTTP_CLIENT_TIMEOUT",
+			"SB_OTEL_METRICS_ENABLED",
+			"SB_OTEL_METRICS_ENDPOINT",
+			"SB_OTEL_METRICS_INTERVAL",
+			"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+			"OTEL_EXPORTER_OTLP_ENDPOINT",
+			"OTEL_SERVICE_NAME",
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
 			"SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER",
+			"SB_IMAGE_PULL_MAX_CONCURRENT",
+			"SB_IMAGE_PULL_FAILURE_BACKOFF",
 			"SB_DATA_PLANE_ADVERTISE_HOST",
 			"SB_NODE_ROLE",
 			"SB_ENABLE_CLUSTER",
@@ -93,6 +101,12 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.ClusterCreateMaxPendingPerWorker != 32 {
 					t.Fatalf("expected default ClusterCreateMaxPendingPerWorker=32, got %d", cfg.ClusterCreateMaxPendingPerWorker)
+				}
+				if cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "" || cfg.OTELMetricsInterval != 30*time.Second || cfg.OTELServiceName != "sandboxd" {
+					t.Fatalf("unexpected otel defaults: %+v", cfg)
+				}
+				if cfg.ImagePullMaxConcurrent != 4 || cfg.ImagePullFailureBackoff != 30*time.Second {
+					t.Fatalf("unexpected image pull defaults: %+v", cfg)
 				}
 				if cfg.NodeRole != NodeRoleMixed {
 					t.Fatalf("expected default NodeRole=%q, got %q", NodeRoleMixed, cfg.NodeRole)
@@ -177,6 +191,11 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_LOG_LEVEL", "DEBUG")
 				t.Setenv("SB_SHUTDOWN_TIMEOUT", "25s")
 				t.Setenv("SB_HTTP_CLIENT_TIMEOUT", "12s")
+				t.Setenv("SB_OTEL_METRICS_ENDPOINT", "http://otel.example.test:4318/v1/metrics")
+				t.Setenv("SB_OTEL_METRICS_INTERVAL", "45s")
+				t.Setenv("OTEL_SERVICE_NAME", "sandboxd-prod")
+				t.Setenv("SB_IMAGE_PULL_MAX_CONCURRENT", "8")
+				t.Setenv("SB_IMAGE_PULL_FAILURE_BACKOFF", "2m")
 				cfg, err := Load()
 				if err != nil {
 					t.Fatalf("Load() error = %v", err)
@@ -198,6 +217,12 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.LogLevel != "debug" || cfg.ShutdownTimeout != 25*time.Second || cfg.HTTPClientTimeout != 12*time.Second {
 					t.Fatalf("unexpected log/duration overrides: %+v", cfg)
+				}
+				if !cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "http://otel.example.test:4318/v1/metrics" || cfg.OTELMetricsInterval != 45*time.Second || cfg.OTELServiceName != "sandboxd-prod" {
+					t.Fatalf("unexpected otel overrides: %+v", cfg)
+				}
+				if cfg.ImagePullMaxConcurrent != 8 || cfg.ImagePullFailureBackoff != 2*time.Minute {
+					t.Fatalf("unexpected image pull overrides: %+v", cfg)
 				}
 			},
 		},
