@@ -1280,6 +1280,13 @@ errors, image-pull storms, and secret decrypt failures. An Alertmanager
 route/receiver example is available at
 `setup/alertmanager/sandboxd-alertmanager-example.yml`.
 
+Full incident runbooks are available under `setup/runbooks/`:
+
+- `backup-restore.md`
+- `lost-quorum-recovery.md`
+- `image-pull-storm.md`
+- `slo-breach.md`
+
 ---
 
 ## Troubleshooting

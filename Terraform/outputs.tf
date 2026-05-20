@@ -64,3 +64,8 @@ output "alertmanager_example_file" {
   description = "Repo-local Alertmanager example route/receiver config."
   value       = "setup/alertmanager/sandboxd-alertmanager-example.yml"
 }
+
+output "operational_runbooks_dir" {
+  description = "Repo-local operator runbooks for restore, lost quorum, image-pull storms, and SLO breaches."
+  value       = "setup/runbooks"
+}

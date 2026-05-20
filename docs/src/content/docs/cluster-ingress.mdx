@@ -85,7 +85,7 @@ AerolVM does not build, run, or manage any of the three. The ingress nodes thems
 
 | Cluster size | Suggested layout |
 |---|---|
-| <= 10 nodes | `mixed` or a small split. Hybrid roles are allowed here for constrained deployments. |
+| &lt;= 10 nodes | `mixed` or a small split. Hybrid roles are allowed here for constrained deployments. |
 | 11+ nodes | Mandatory split: 3 or 5 `server` + N `worker` + 2+ dedicated `ingress`. Mixed and hybrid roles are rejected for placement/create. |
 | 1000-worker target | 3 or 5 `server`, 1000 `worker`, and a separately scaled `ingress` tier behind your LB. |
 

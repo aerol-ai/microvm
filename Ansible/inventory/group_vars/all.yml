@@ -11,6 +11,7 @@ sandboxd_ops_script_dir: /usr/local/sbin
 sandboxd_grafana_dashboard_dir: /etc/sandboxd/grafana
 sandboxd_prometheus_rules_dir: /etc/sandboxd/prometheus
 sandboxd_alertmanager_config_dir: /etc/sandboxd/alertmanager
+sandboxd_runbook_dir: /etc/sandboxd/runbooks
 
 # Observability / pull-storm controls managed by playbooks/configure-ops.yml.
 sandboxd_otel_metrics_enabled: false

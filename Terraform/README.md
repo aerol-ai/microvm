@@ -146,6 +146,7 @@ The repo-local observability artifacts to import are:
 - Grafana dashboard: `../setup/grafana/sandboxd-slo-dashboard.json`
 - Prometheus alerts: `../setup/prometheus/sandboxd-alerts.yml`
 - Alertmanager example: `../setup/alertmanager/sandboxd-alertmanager-example.yml`
+- Operational runbooks: `../setup/runbooks/`
 
 ## Cloudflare DNS
 

@@ -11,7 +11,7 @@ groups:
         annotations:
           summary: "sandboxd Raft apply errors are occurring"
           description: "Raft apply errors have been non-zero for 5 minutes. Writes may be failing or retrying."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#verifying-cluster-health"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdRaftApplyStuck
         expr: sum(aerolvm_raft_apply_inflight) > 0
@@ -22,7 +22,7 @@ groups:
         annotations:
           summary: "sandboxd Raft apply appears stuck"
           description: "At least one Raft apply has remained in-flight for more than 2 minutes."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#verifying-cluster-health"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdRaftSnapshotErrors
         expr: sum(rate(aerolvm_raft_snapshot_errors_total[10m])) > 0
@@ -33,7 +33,7 @@ groups:
         annotations:
           summary: "sandboxd Raft snapshot errors are occurring"
           description: "Snapshot persistence has reported errors. Follower recovery and restart time may degrade."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#backups-in-cluster-mode"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/backup-restore.md"
 
       - alert: SandboxdWorkerLeaseStale
         expr: max(aerolvm_worker_lease_max_age_nanos) / 1e9 > 30
@@ -44,7 +44,7 @@ groups:
         annotations:
           summary: "sandboxd worker capacity leases are stale"
           description: "The freshest scheduler-visible worker capacity lease is older than 30 seconds. Placement may reject or misroute creates."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#verifying-cluster-health"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdWorkerLeaseLoss
         expr: sum(rate(aerolvm_worker_lease_lost_total[5m])) > 0
@@ -55,7 +55,7 @@ groups:
         annotations:
           summary: "sandboxd worker capacity leases are being lost"
           description: "Workers are dropping out of the scheduler's fresh-capacity set."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
   - name: sandboxd.create-and-capacity
     interval: 30s
@@ -69,7 +69,7 @@ groups:
         annotations:
           summary: "sandboxd create queue backlog is high"
           description: "Create queue depth has been above 100 for 5 minutes. Clients may see 429/503 Retry-After responses."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdCreateErrors
         expr: sum(rate(aerolvm_create_errors_total[5m])) > 0.1
@@ -80,7 +80,7 @@ groups:
         annotations:
           summary: "sandboxd create errors are elevated"
           description: "Sandbox create errors are above 0.1/s for 10 minutes."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdNoAdmitWorkers
         expr: sum(aerolvm_host_pressure_can_admit) == 0
@@ -91,7 +91,7 @@ groups:
         annotations:
           summary: "no sandboxd worker can admit new sandboxes"
           description: "All scraped workers report can_admit=0. New sandbox creates will fail until capacity recovers."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#verifying-cluster-health"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdHighCPUReservation
         expr: sum(aerolvm_host_pressure_reserved_cpu_millicores) / clamp_min(sum(aerolvm_host_pressure_cpu_budget_millicores), 1) > 0.9
@@ -102,7 +102,7 @@ groups:
         annotations:
           summary: "sandboxd CPU reservation pressure is high"
           description: "Cluster-wide reserved CPU is above 90% of the configured admission budget."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdHighMemoryReservation
         expr: sum(aerolvm_host_pressure_reserved_memory_mb) / clamp_min(sum(aerolvm_host_pressure_memory_budget_mb), 1) > 0.9
@@ -113,7 +113,7 @@ groups:
         annotations:
           summary: "sandboxd memory reservation pressure is high"
           description: "Cluster-wide reserved memory is above 90% of the configured admission budget."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdHighDiskReservation
         expr: sum(aerolvm_host_pressure_disk_budget_gb) > 0 and sum(aerolvm_host_pressure_reserved_disk_gb) / clamp_min(sum(aerolvm_host_pressure_disk_budget_gb), 1) > 0.9
@@ -124,7 +124,7 @@ groups:
         annotations:
           summary: "sandboxd disk reservation pressure is high"
           description: "Cluster-wide reserved disk is above 90% of the configured admission budget."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
   - name: sandboxd.ingress-and-data-plane
     interval: 30s
@@ -138,7 +138,7 @@ groups:
         annotations:
           summary: "sandboxd ingress route lag is high"
           description: "Ingress route reconciliation is more than 100 placement revisions behind."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdIngressRouteReconcileErrors
         expr: sum(rate(aerolvm_ingress_reconcile_errors_total[5m])) > 0
@@ -149,7 +149,7 @@ groups:
         annotations:
           summary: "sandboxd ingress reconcile errors are occurring"
           description: "The ingress reconciler is failing to converge routes."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdCaddyAdminErrors
         expr: sum(rate(aerolvm_caddy_admin_errors_total[5m])) > 0
@@ -160,7 +160,7 @@ groups:
         annotations:
           summary: "sandboxd Caddy admin errors are occurring"
           description: "Caddy admin calls are failing. Public route convergence may be delayed."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdIngressRouteMisses
         expr: sum(rate(aerolvm_ingress_route_misses_total[5m])) > 0
@@ -171,7 +171,7 @@ groups:
         annotations:
           summary: "sandboxd owner route misses are occurring"
           description: "Requests are reaching nodes that cannot resolve a usable owner URL. Check gossip convergence and advertise URLs."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
       - alert: SandboxdOwnerForwardErrors
         expr: sum(rate(aerolvm_owner_forward_errors_total[5m])) > 0
@@ -182,7 +182,7 @@ groups:
         annotations:
           summary: "sandboxd owner-forward errors are occurring"
           description: "Cross-node owner API forwards are failing."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
   - name: sandboxd.image-pulls-and-secrets
     interval: 30s
@@ -196,7 +196,7 @@ groups:
         annotations:
           summary: "sandboxd image pulls are queued"
           description: "Image pulls have been waiting behind the per-worker concurrency cap for 10 minutes."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/image-pull-storm.md"
 
       - alert: SandboxdImagePullBackoffRejects
         expr: sum(rate(aerolvm_image_pull_backoff_rejects_total[5m])) > 0
@@ -207,7 +207,7 @@ groups:
         annotations:
           summary: "sandboxd image pulls are suppressed by failure backoff"
           description: "Repeated pulls for failing image/auth keys are being rejected by backoff. Check tags, registry auth, and registry rate limits."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/image-pull-storm.md"
 
       - alert: SandboxdImagePullErrors
         expr: sum(rate(aerolvm_image_pull_errors_total[5m])) > 0.05
@@ -218,7 +218,7 @@ groups:
         annotations:
           summary: "sandboxd image pull errors are elevated"
           description: "Image pull errors are above 0.05/s for 10 minutes."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/image-pull-storm.md"
 
       - alert: SandboxdSecretDecryptErrors
         expr: sum(rate(aerolvm_secret_decrypt_errors_total[5m])) > 0
@@ -229,4 +229,4 @@ groups:
         annotations:
           summary: "sandboxd secret decrypt errors are occurring"
           description: "Cluster recovery secret decrypts are failing. Verify credential encryption keys are identical on every node."
-          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/cluster.md#troubleshooting"
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"

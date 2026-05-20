@@ -167,3 +167,7 @@ at `setup/alertmanager/sandboxd-alertmanager-example.yml`. The alert file
 covers Raft apply/snapshot health, stale worker leases, create queue backlog,
 worker pressure, ingress route lag, Caddy/admin errors, owner-forward errors,
 image-pull storms, and secret decrypt failures.
+
+Incident runbooks are checked in under `setup/runbooks/` for backup/restore,
+lost-quorum recovery, image-pull storms, and general SLO breaches. The
+Prometheus alerts link directly to these runbooks.

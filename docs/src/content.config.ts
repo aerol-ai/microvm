@@ -256,6 +256,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'Dashboard',
         description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics — sign in with your PAT.',
       },
+      {
+        type: 'link',
+        href: '/operational-runbooks',
+        label: 'Operational Runbooks',
+        description: 'Incident procedures for restore, lost quorum, image-pull storms, and SLO breaches.',
+      },
     ],
   },
 ]

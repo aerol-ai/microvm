@@ -104,6 +104,28 @@
         owner: root
         group: root
 
+    - name: Create runbook artifact directory
+      ansible.builtin.file:
+        path: "{{ sandboxd_runbook_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Deploy sandboxd operational runbooks
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ sandboxd_runbook_dir }}/{{ item | basename }}"
+        mode: "0644"
+        owner: root
+        group: root
+      loop:
+        - "../../setup/runbooks/README.md"
+        - "../../setup/runbooks/backup-restore.md"
+        - "../../setup/runbooks/lost-quorum-recovery.md"
+        - "../../setup/runbooks/image-pull-storm.md"
+        - "../../setup/runbooks/slo-breach.md"
+
     - name: Write sandboxd operational env vars
       ansible.builtin.lineinfile:
         path: "{{ sandboxd_ops_env_file }}"

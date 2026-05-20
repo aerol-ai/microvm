@@ -109,7 +109,7 @@ ansible-playbook playbooks/update-sandboxd.yml \
 ansible-playbook playbooks/tail-logs.yml -e lines=200
 
 # Configure OTEL/image-pull hardening and deploy backup/recovery,
-# Grafana, Prometheus, and Alertmanager artifacts:
+# Grafana, Prometheus, Alertmanager, and runbook artifacts:
 ansible-playbook playbooks/configure-ops.yml \
   -e sandboxd_otel_metrics_endpoint=http://otel-collector:4318/v1/metrics \
   -e sandboxd_backup_enabled=true
@@ -158,7 +158,7 @@ inventory/
 playbooks/
   ping.yml             # connectivity smoke test
   update-sandboxd.yml  # rolling binary push + restart + healthcheck
-  configure-ops.yml    # OTEL env, image-pull knobs, ops alert/dashboard files
+  configure-ops.yml    # OTEL env, image-pull knobs, ops alert/dashboard/runbook files
   tail-logs.yml        # journalctl across the fleet
 ```
 
@@ -172,6 +172,7 @@ playbooks/
 | Change OTEL/image-pull env on running nodes     | Ansible     |
 | Deploy backup/recovery helpers or backup cron   | Ansible     |
 | Deploy Grafana/Prometheus/Alertmanager artifacts | Ansible     |
+| Deploy operational runbooks                     | Ansible     |
 | Restart a service, rotate a PAT, tail logs      | Ansible     |
 | Run one-off shell commands across many nodes    | Ansible     |
 
