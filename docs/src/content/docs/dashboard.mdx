@@ -60,6 +60,7 @@ exposes.
 | **Cluster** | `GET /v1/cluster/leader` and `GET /v1/cluster/members` | Current Raft leader, aggregate cluster CPU / memory / disk / GPU availability from fresh worker capacity heartbeats, and every peer with its role, alive bit, drain state, and capacity freshness. |
 | **Placements** | `GET /v1/cluster/sandbox-index` (paginated) | One row per cluster-replicated sandbox: ID, owning node, state (`placed` / `reserved` / `orphaned`), version, and timestamps. |
 | **Metrics (expvar)** | `GET /debug/vars` | Curated picks from the `aerolvm_*` counter set (Raft apply latency, owner forward count, worker lease health, etc.). A raw view is collapsed below the grid. |
+| **Metrics (Prometheus)** | `GET /v1/metrics` | Prometheus text-format export of the same `aerolvm_*` counters and gauges for scrapers and alerting. |
 
 The whole page auto-refreshes every five seconds while the tab is
 visible. Refresh pauses automatically when the tab is hidden so it does
@@ -92,7 +93,7 @@ A short summary, because there are two related but distinct surfaces:
   sign-in form prompts for the PAT before any API call fires. This
   matches how every standard login page works.
 - Every API call the page makes — `GET /health`, `GET /v1/...`,
-  `GET /debug/vars`, the action endpoints — sends the PAT as
+  `GET /debug/vars`, `GET /v1/metrics`, the action endpoints — sends the PAT as
   `Authorization: Bearer <token>` and goes through the same
   middleware as a curl or SDK call. Including `/debug/vars`: the
   expvar counters carry operational shape (lease state, queue depths,
@@ -117,3 +118,22 @@ The metrics panel is intentionally local to the node you opened the
 dashboard against — it reads the in-process expvar counters of *that*
 sandboxd process. To compare nodes side-by-side, open one tab per
 node.
+
+Prometheus scraping is local in the same way. Scrape every server, worker,
+and ingress node independently:
+
+```yaml
+scrape_configs:
+  - job_name: sandboxd
+    metrics_path: /v1/metrics
+    bearer_token: "<SB_PAT_TOKEN>"
+    static_configs:
+      - targets:
+          - server-1.example.com:8080
+          - worker-1.example.com:8080
+```
+
+Useful first alerts are `aerolvm_raft_apply_errors_total`,
+`aerolvm_ingress_route_lag_versions`, `aerolvm_create_queue_depth`,
+`aerolvm_worker_lease_max_age_nanos`, and the `aerolvm_host_pressure_*`
+gauges.

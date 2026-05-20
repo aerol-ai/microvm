@@ -1226,6 +1226,17 @@ A healthy cluster reports:
 Set up monitoring on `GET /v1/cluster/leader` returning empty for more than
 30 seconds — that's the earliest signal of a brewing quorum problem.
 
+For metric scraping, use the PAT-gated Prometheus endpoint on every node:
+
+```bash
+curl -H "Authorization: Bearer $SB_PAT_TOKEN" http://<node>:8080/v1/metrics
+```
+
+Scrape servers, workers, and ingress nodes separately. The endpoint exports
+only `aerolvm_*` metrics and includes the operational signals needed for the
+large-cluster SLOs: Raft apply/snapshot health, route lag, create queue depth,
+worker lease freshness, host pressure, and Caddy/admin errors.
+
 ---
 
 ## Troubleshooting

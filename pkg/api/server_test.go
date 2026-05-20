@@ -2,12 +2,15 @@ package api
 
 import (
 	"encoding/json"
+	"expvar"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 )
@@ -116,6 +119,8 @@ func TestRequireAuthCases(t *testing.T) {
 //     correct bearer token. The stdlib expvar handler always publishes
 //     "cmdline" and "memstats" so the JSON shape is stable even with a
 //     nil service.
+//  3. GET /v1/metrics is PAT-gated and renders aerolvm_* expvars in
+//     Prometheus text format for production scrapers.
 func TestDashboardEndpoints(t *testing.T) {
 	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, config.Config{}, "pat-token")
 
@@ -161,6 +166,46 @@ func TestDashboardEndpoints(t *testing.T) {
 		// cmdline to prove we got the real handler and not an empty body.
 		if _, ok := parsed["cmdline"]; !ok {
 			t.Fatalf("expvar body missing standard \"cmdline\" key; got keys: %v", keysOf(parsed))
+		}
+	})
+
+	t.Run("prometheus_metrics_requires_auth", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/v1/metrics", nil)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", response.Code)
+		}
+	})
+
+	t.Run("prometheus_metrics_returns_aerolvm_expvars_with_pat", func(t *testing.T) {
+		scalarName := fmt.Sprintf("aerolvm_api_prometheus_test_scalar_%d", time.Now().UnixNano())
+		expvar.NewInt(scalarName).Set(42)
+		mapName := fmt.Sprintf("aerolvm_api_prometheus_test_map_%d", time.Now().UnixNano())
+		mapped := expvar.NewMap(mapName)
+		mapped.Add("route lag", 7)
+
+		request := httptest.NewRequest(http.MethodGet, "/v1/metrics", nil)
+		request.Header.Set("Authorization", "Bearer pat-token")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", response.Code)
+		}
+		ct := response.Header().Get("Content-Type")
+		if !strings.HasPrefix(ct, "text/plain") {
+			t.Fatalf("Content-Type = %q, want text/plain prefix", ct)
+		}
+		body := response.Body.String()
+		if !strings.Contains(body, "# TYPE "+scalarName+" gauge\n"+scalarName+" 42\n") {
+			t.Fatalf("body missing scalar metric %q:\n%s", scalarName, body)
+		}
+		wantMapLine := mapName + "{key=\"route lag\"} 7\n"
+		if !strings.Contains(body, wantMapLine) {
+			t.Fatalf("body missing map metric line %q:\n%s", wantMapLine, body)
+		}
+		if strings.Contains(body, "cmdline") || strings.Contains(body, "memstats") {
+			t.Fatalf("prometheus endpoint should only expose aerolvm_* expvars; body contains stdlib vars:\n%s", body)
 		}
 	})
 }
