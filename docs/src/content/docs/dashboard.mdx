@@ -31,7 +31,8 @@ INFO dashboard available url=http://0.0.0.0:8080/ui
 
 The dashboard works on every node — server, worker, or ingress. Cluster
 status endpoints already forward to the right node internally, so opening
-the dashboard against any node gives you the cluster-wide view.
+the dashboard against any node gives you the cluster-wide view instead of
+only the node your DNS record happened to pick.
 
 ## Signing in
 
@@ -55,8 +56,8 @@ exposes.
 | Panel | Endpoint | What it shows |
 |---|---|---|
 | **Health** | `GET /health` | Docker / Caddy / SSH gateway probes, overall status, sandboxd version, live sandbox count. |
-| **Local capacity** | `GET /v1/capacity` | CPU / memory / disk / GPU reservation ratios, post-overcommit budgets, whether the node currently admits new sandboxes, and any rejection reasons. |
-| **Cluster** | `GET /v1/cluster/leader` and `GET /v1/cluster/members` | Current Raft leader and every gossiped peer with its role, alive bit, drain state, and capacity summary. |
+| **Local capacity** | `GET /v1/capacity` | CPU / memory / disk / GPU reservation ratios, available capacity, post-overcommit budgets, whether the node currently admits new sandboxes, and any rejection reasons. |
+| **Cluster** | `GET /v1/cluster/leader` and `GET /v1/cluster/members` | Current Raft leader, aggregate cluster CPU / memory / disk / GPU availability from fresh worker capacity heartbeats, and every peer with its role, alive bit, drain state, and capacity freshness. |
 | **Placements** | `GET /v1/cluster/sandbox-index` (paginated) | One row per cluster-replicated sandbox: ID, owning node, state (`placed` / `reserved` / `orphaned`), version, and timestamps. |
 | **Metrics (expvar)** | `GET /debug/vars` | Curated picks from the `aerolvm_*` counter set (Raft apply latency, owner forward count, worker lease health, etc.). A raw view is collapsed below the grid. |
 

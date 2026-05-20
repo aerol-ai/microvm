@@ -83,6 +83,11 @@ type Cluster struct {
 	// opReserve rows. Followers run no loop because every CancelReservation
 	// has to land via raft anyway. See dead_owner.go for the loop body.
 	reservationGCStop context.CancelFunc
+	// capacityLeases holds authenticated worker capacity heartbeats used by
+	// SelectPlacement. Gossip carries identity only; placement requires a
+	// fresh lease before a worker can receive new sandboxes.
+	capacityLeases    *capacityLeaseCache
+	capacityLeaseStop context.CancelFunc
 
 	// recreator is the service-layer hook the owner watcher uses to bring up
 	// a sandbox the FSM says we own but the local store doesn't have. Set via
@@ -246,6 +251,8 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		return nil, fmt.Errorf("cluster.New: gossip: %w", err)
 	}
 	c.gossip = gn
+	c.capacityLeases = newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
+	c.startCapacityLeaseLoop(cfg.ClusterCapacityGossipInterval)
 
 	// Slow reconcile loop: catches the "joined too fast" race where the
 	// memberlist event fires before the joiner's nodeMeta has propagated. The
@@ -849,8 +856,22 @@ func (c *Cluster) waitForLeader(ctx context.Context, max time.Duration) error {
 	}
 }
 
-// Members returns gossip-known members (self included).
-func (c *Cluster) Members() []Member { return c.gossip.members() }
+// Members returns gossip-known members (self included), enriched with fresh
+// capacity heartbeats where available.
+func (c *Cluster) Members() []Member {
+	if c.gossip == nil {
+		return nil
+	}
+	return c.membersWithCapacity()
+}
+
+func (c *Cluster) membersWithCapacity() []Member {
+	members := c.gossip.members()
+	if c.capacityLeases == nil {
+		return members
+	}
+	return c.capacityLeases.apply(members, time.Now())
+}
 
 func (c *Cluster) Placements() []Placement {
 	return c.PlacementsForShards(PlacementShardFilter{})
@@ -941,6 +962,9 @@ func (c *Cluster) Close() error {
 	}
 	if c.reservationGCStop != nil {
 		c.reservationGCStop()
+	}
+	if c.capacityLeaseStop != nil {
+		c.capacityLeaseStop()
 	}
 	if c.ownerWatcherStop != nil {
 		c.ownerWatcherStop()

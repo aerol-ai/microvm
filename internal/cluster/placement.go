@@ -57,7 +57,7 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 // "place locally" is the existing single-node behavior; we only forward when
 // a peer is genuinely better.
 func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
-	all := c.gossip.members()
+	all := c.membersWithCapacity()
 	rejects := make(map[string]int64)
 	if err := LargeClusterTopologyError(all); err != nil {
 		rejects["topology"] = 1
@@ -91,6 +91,10 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		// be partially-joined and forwarding to them would 502.
 		if m.APIURL == "" && m.NodeID != c.nodeID {
 			rejects["missing_api_url"]++
+			continue
+		}
+		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			rejects["capacity_heartbeat"]++
 			continue
 		}
 		if drained[m.NodeID] {
@@ -132,17 +136,17 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 }
 
 // nodeFits returns true if the member could plausibly accept req based on its
-// gossiped capacity snapshot. We use the budget numbers (post-overcommit)
+// latest capacity heartbeat. We use the budget numbers (post-overcommit)
 // because that's what the remote admitter will check. extraReserved is the sum
-// of in-flight reservations the cluster has against this node but the gossip
-// ledger doesn't yet reflect (zero value when none).
+// of in-flight reservations the cluster has against this node but the
+// heartbeat doesn't yet reflect (zero value when none).
 func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bool {
 	cap := m.Capacity
-	// If the snapshot is zero-valued (no advertisement yet), treat as
-	// unknown-but-allowed: better to forward and let the remote admitter
-	// reject than to skip a viable peer.
-	if cap.HostCPUCores == 0 && cap.HostMemoryTotalMB == 0 {
-		return true
+	if m.CapacityStale || !hasCapacitySnapshot(cap) {
+		return false
+	}
+	if !cap.CanAdmit && len(cap.Reasons) > 0 {
+		return false
 	}
 	if cap.CPUBudget > 0 && cap.ReservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
 		return false

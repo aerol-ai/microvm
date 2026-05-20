@@ -58,8 +58,9 @@ type DrainStateResponse struct {
 
 // Agent is the worker/ingress-side cluster client. It deliberately does not
 // start Raft, does not create a placement FSM, and never joins the raft
-// configuration as a non-voter. It only gossips local capacity/addresses and
-// delegates every authoritative placement read/write to server-role nodes.
+// configuration as a non-voter. It gossips identity/addresses, serves local
+// capacity heartbeats, and delegates every authoritative placement read/write
+// to server-role nodes.
 type Agent struct {
 	cfg           config.Config
 	logger        *slog.Logger
@@ -465,6 +466,14 @@ func (a *Agent) AttachInternalHandler(h http.Handler) {
 func (a *Agent) Members() []Member {
 	if a.gossip == nil {
 		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var resp struct {
+		Members []Member `json:"members"`
+	}
+	if err := a.doControlPlaneJSON(ctx, http.MethodGet, "/v1/cluster/members", "/v1/cluster/members", nil, &resp); err == nil && resp.Members != nil {
+		return resp.Members
 	}
 	return a.gossip.members()
 }

@@ -184,7 +184,8 @@ If you ever need to re-expose a port manually (for example, the original `Expose
 
 Cluster traffic uses two transports:
 
-- **Gossip** (`SB_GOSSIP_BIND_ADDR`, default `:7001`) - SWIM membership and capacity dissemination.
+- **Gossip** (`SB_GOSSIP_BIND_ADDR`, default `:7001`) - SWIM membership and role/identity metadata.
+- **Capacity heartbeats** (`GET /v1/capacity`) - authenticated worker capacity snapshots used by server-role schedulers.
 - **Raft** (`SB_RAFT_BIND_ADDR`, default `:7000`) - placement-map consensus.
 
 When a node successfully joins gossip, it is added to the Raft configuration as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached, then as a non-voter. **Anyone who can reach these ports can still join the cluster and influence placement replication.** Run them on a private network the operator controls (VPC peering, WireGuard mesh, dedicated cluster subnet); never expose them to the public internet.

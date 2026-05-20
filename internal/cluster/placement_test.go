@@ -32,13 +32,29 @@ func TestNodeFitsRespectsBudget(t *testing.T) {
 	}
 }
 
-// TestNodeFitsUnknownCapacity asserts that a peer with no advertised capacity
-// snapshot is treated as candidate (better to forward and be rejected by the
-// remote admitter than to skip a viable node).
-func TestNodeFitsUnknownCapacity(t *testing.T) {
+// TestNodeFitsRejectsUnknownCapacity asserts that a peer with no capacity
+// heartbeat is not a candidate. Forwarding unknown-capacity creates causes
+// avoidable remote 503s and retry storms.
+func TestNodeFitsRejectsUnknownCapacity(t *testing.T) {
 	unknown := Member{NodeID: "u", APIURL: "http://u", Alive: true}
-	if !nodeFits(unknown, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{}) {
-		t.Fatal("unknown-capacity node should be treated as candidate")
+	if nodeFits(unknown, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{}) {
+		t.Fatal("unknown-capacity node should not be treated as candidate")
+	}
+}
+
+func TestNodeFitsRejectsStaleCapacityHeartbeat(t *testing.T) {
+	stale := Member{
+		NodeID:        "stale",
+		APIURL:        "http://stale",
+		Alive:         true,
+		CapacityStale: true,
+		Capacity: capacity.Snapshot{
+			HostCPUCores: 8, HostMemoryTotalMB: 8000,
+			CPUBudget: 8, MemoryBudgetMB: 8000,
+		},
+	}
+	if nodeFits(stale, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{}) {
+		t.Fatal("stale-capacity node should not be treated as candidate")
 	}
 }
 
@@ -163,9 +179,9 @@ func TestNodeFitsRejectsUnsupportedRuntime(t *testing.T) {
 }
 
 // TestNodeFitsLegacyEmptyRuntimesAllowsAny: a peer that pre-dates the
-// SupportedRuntimes field (empty list, but non-zero CPU/memory so the
-// "unknown capacity" early-return doesn't fire) must remain a candidate
-// for any runtime — otherwise a rolling upgrade would freeze placements.
+// SupportedRuntimes field (empty list, but with a fresh non-zero capacity
+// heartbeat) must remain a candidate for any runtime — otherwise a rolling
+// upgrade would freeze placements.
 func TestNodeFitsLegacyEmptyRuntimesAllowsAny(t *testing.T) {
 	legacy := Member{NodeID: "l", APIURL: "http://l", Alive: true, Capacity: capacity.Snapshot{
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,
@@ -231,8 +247,9 @@ func TestCapacityRequestFromSpecGPUCountDefaults(t *testing.T) {
 	}
 }
 
-// TestHeadroomScoreSymmetricNeutral verifies the unknown-capacity path
-// returns a neutral 0.5 score so it ties with peers that haven't reported.
+// TestHeadroomScoreSymmetricNeutral verifies the scoring helper's defensive
+// unknown-capacity path returns a neutral 0.5. SelectPlacement filters unknown
+// capacity before scoring; this keeps direct helper use deterministic.
 func TestHeadroomScoreSymmetricNeutral(t *testing.T) {
 	unknown := Member{}
 	score := headroomScore(unknown, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{})

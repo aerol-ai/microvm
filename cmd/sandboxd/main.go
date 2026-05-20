@@ -90,7 +90,9 @@ func main() {
 	if cfg.HostMemoryMBOverride > 0 {
 		host.MemoryTotalMB = cfg.HostMemoryMBOverride
 	}
-	host.DiskTotalGB = cfg.HostDiskGB
+	if cfg.HostDiskGB > 0 {
+		host.DiskTotalGB = cfg.HostDiskGB
+	}
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = cfg.HostSupportedRuntimes
@@ -106,6 +108,7 @@ func main() {
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
 		"host_disk_gb", host.DiskTotalGB,
+		"host_disk_free_gb", host.DiskFreeGB,
 		"host_gpu_count", host.GPUCount,
 		"host_gpu_vendor", host.GPUVendor,
 		"host_supported_runtimes", host.SupportedRuntimes,

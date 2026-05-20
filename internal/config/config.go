@@ -155,11 +155,10 @@ type Config struct {
 	HostCPUCoresOverride      int
 	HostMemoryMBOverride      int
 	// DiskReservationRatio gates total per-sandbox disk reservations against
-	// HostDiskGB. 0 disables disk admission entirely (legacy behaviour).
-	// HostDiskGB is operator-declared because robust auto-detection of the
-	// docker-data-root volume is filesystem-specific (overlay2, devicemapper,
-	// btrfs all report differently); we'd rather operators set the number
-	// they trust than guess wrong.
+	// HostDiskGB, or the auto-detected host disk size when HostDiskGB is not
+	// set. 0 disables disk admission while still reporting disk observability.
+	// HostDiskGB remains the operator override for a stricter Docker-volume
+	// budget when the host filesystem is larger than the sandbox pool.
 	DiskReservationRatio float64
 	HostDiskGB           int
 	// HostGPUCount and HostGPUVendor describe the GPU inventory wired into

@@ -691,7 +691,8 @@ func TestNewDefaultsSupportedRuntimes(t *testing.T) {
 }
 
 // TestSnapshotReportsDiskGPURuntime: placement scoring on a peer reads these
-// fields off gossip, so they must round-trip through Snapshot accurately.
+// fields off capacity heartbeats, so they must round-trip through Snapshot
+// accurately.
 func TestSnapshotReportsDiskGPURuntime(t *testing.T) {
 	a := New(HostInfo{
 		CPUCores: 8, MemoryTotalMB: 8000,
@@ -709,6 +710,12 @@ func TestSnapshotReportsDiskGPURuntime(t *testing.T) {
 	snap := a.Snapshot()
 	if snap.HostDiskTotalGB != 200 || snap.DiskBudgetGB != 100 || snap.ReservedDiskGB != 30 {
 		t.Fatalf("disk fields wrong: %+v", snap)
+	}
+	if snap.AvailableDiskGB != 70 {
+		t.Fatalf("AvailableDiskGB = %d, want 70", snap.AvailableDiskGB)
+	}
+	if snap.AvailableCPU != 7 || snap.AvailableMemoryMB != 7900 || snap.AvailableGPUs != 2 {
+		t.Fatalf("available fields wrong: %+v", snap)
 	}
 	if snap.GPUCount != 4 || snap.GPUVendor != "nvidia" {
 		t.Fatalf("gpu inventory wrong: %+v", snap)

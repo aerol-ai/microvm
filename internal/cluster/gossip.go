@@ -19,10 +19,9 @@ import (
 // so this struct must stay small. Capacity used to live here but pushed the
 // encoded blob past 512 bytes, which triggered NodeMeta()'s fallback path and
 // stripped RaftAddr from peers' view — breaking voter auto-join entirely
-// (see voter_autojoin.go which gates on peerRaftAddr != ""). Capacity is now
-// surfaced per-node via /v1/capacity; peer Capacity in Member is left
-// zero-valued, and placement.go.nodeFits / headroomScore already handle the
-// unknown-capacity case (forward and let the remote admitter decide).
+// (see voter_autojoin.go which gates on peerRaftAddr != ""). Capacity now
+// travels as authenticated /v1/capacity heartbeats into capacityLeaseCache;
+// placement rejects worker candidates without a fresh heartbeat.
 type nodeMeta struct {
 	NodeID string `json:"node_id"`
 	// NodeName is the operator-friendly label (SB_NODE_NAME). Empty for
@@ -45,7 +44,7 @@ type nodeMeta struct {
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
-// node's metadata (which includes the capacity snapshot) and accept others'.
+// node's identity metadata and accept others'.
 type gossipDelegate struct {
 	mu            sync.RWMutex
 	selfMeta      nodeMeta
@@ -396,7 +395,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 // metadata itself is now static (identity-only — see nodeMeta), so we no
 // longer call refreshMeta()+UpdateNode() here; the original purpose of that
 // pair was to disseminate live capacity, which is now fetched per-peer via
-// /v1/capacity instead.
+// authenticated /v1/capacity heartbeats instead.
 func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -460,9 +459,9 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.RaftAddr = meta.RaftAddr
 			m.InternalURL = meta.InternalURL
 			m.Role = meta.Role
-			// m.Capacity stays zero — capacity no longer travels in nodeMeta
-			// (see the type comment). Callers needing peer capacity must hit
-			// the peer's /v1/capacity endpoint.
+			// m.Capacity stays zero here — capacity no longer travels in
+			// nodeMeta (see the type comment). Cluster.Members and
+			// SelectPlacement overlay fresh capacity leases later.
 		}
 	}
 	return m

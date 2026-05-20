@@ -2,14 +2,18 @@
 //
 // Architecture (Phase 1):
 //
-//   - Membership and capacity dissemination: SWIM gossip via hashicorp/memberlist.
-//     Every node periodically advertises a capacity.Snapshot in its memberlist
-//     metadata; placement decisions read these advertised snapshots.
+//   - Membership: SWIM gossip via hashicorp/memberlist. Gossip carries
+//     identity and role metadata only so memberlist's 512-byte NodeMeta limit
+//     cannot strip Raft addresses.
+//
+//   - Capacity heartbeats: server-role nodes fetch authenticated
+//     capacity.Snapshot payloads from worker-capable peers and require a fresh
+//     heartbeat before placement can target that worker.
 //
 //   - Placement map: server-role nodes run a small Raft FSM (hashicorp/raft)
 //     holding sandbox_id -> owner_node_id plus replicated recovery metadata.
 //     Mutations happen on the leader; server reads are local from the FSM.
-//     Worker/ingress-only nodes run Agent instead: they gossip capacity and
+//     Worker/ingress-only nodes run Agent instead: they gossip identity and
 //     receive owner API forwards, but all placement reads/writes go to the
 //     server quorum over authenticated RPC. They do not store the FSM and do
 //     not join Raft as non-voters.
@@ -227,6 +231,11 @@ type Member struct {
 	Role     string            `json:"role,omitempty"`
 	Alive    bool              `json:"alive"`
 	Capacity capacity.Snapshot `json:"capacity"`
+	// CapacityUpdatedUnix is when this node's last capacity heartbeat was
+	// observed by the scheduler. CapacityStale means the last heartbeat is
+	// missing or too old for placement admission.
+	CapacityUpdatedUnix int64 `json:"capacity_updated_unix,omitempty"`
+	CapacityStale       bool  `json:"capacity_stale,omitempty"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.
