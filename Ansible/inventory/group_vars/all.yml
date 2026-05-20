@@ -9,6 +9,8 @@ sandboxd_health_url:    "http://127.0.0.1:21212/health"
 sandboxd_health_wait_s: 30
 sandboxd_ops_script_dir: /usr/local/sbin
 sandboxd_grafana_dashboard_dir: /etc/sandboxd/grafana
+sandboxd_prometheus_rules_dir: /etc/sandboxd/prometheus
+sandboxd_alertmanager_config_dir: /etc/sandboxd/alertmanager
 
 # Observability / pull-storm controls managed by playbooks/configure-ops.yml.
 sandboxd_otel_metrics_enabled: false

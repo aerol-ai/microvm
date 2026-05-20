@@ -160,3 +160,10 @@ A starter Grafana dashboard is checked in at
 `setup/grafana/sandboxd-slo-dashboard.json`. It covers create queue depth,
 worker pressure, route lag, shard health, Raft errors, data-plane errors,
 and image-pull storm signals.
+
+Prometheus alert rules are checked in at
+`setup/prometheus/sandboxd-alerts.yml`, with an Alertmanager routing example
+at `setup/alertmanager/sandboxd-alertmanager-example.yml`. The alert file
+covers Raft apply/snapshot health, stale worker leases, create queue backlog,
+worker pressure, ingress route lag, Caddy/admin errors, owner-forward errors,
+image-pull storms, and secret decrypt failures.

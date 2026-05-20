@@ -1273,6 +1273,13 @@ The OTEL bridge exports the same `aerolvm_*` expvars under
 name in the `metric` attribute. A starter Grafana dashboard is available at
 `setup/grafana/sandboxd-slo-dashboard.json`.
 
+Prometheus alert rules are available at `setup/prometheus/sandboxd-alerts.yml`.
+They cover Raft apply/snapshot health, worker lease freshness, create backlog,
+capacity pressure, ingress route lag, Caddy/admin failures, owner-forward
+errors, image-pull storms, and secret decrypt failures. An Alertmanager
+route/receiver example is available at
+`setup/alertmanager/sandboxd-alertmanager-example.yml`.
+
 ---
 
 ## Troubleshooting

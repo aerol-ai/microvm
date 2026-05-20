@@ -72,6 +72,38 @@
         owner: root
         group: root
 
+    - name: Create Prometheus alert rule artifact directory
+      ansible.builtin.file:
+        path: "{{ sandboxd_prometheus_rules_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Deploy Prometheus alert rules
+      ansible.builtin.copy:
+        src: "../../setup/prometheus/sandboxd-alerts.yml"
+        dest: "{{ sandboxd_prometheus_rules_dir }}/sandboxd-alerts.yml"
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Create Alertmanager example artifact directory
+      ansible.builtin.file:
+        path: "{{ sandboxd_alertmanager_config_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Deploy Alertmanager example config
+      ansible.builtin.copy:
+        src: "../../setup/alertmanager/sandboxd-alertmanager-example.yml"
+        dest: "{{ sandboxd_alertmanager_config_dir }}/sandboxd-alertmanager-example.yml"
+        mode: "0644"
+        owner: root
+        group: root
+
     - name: Write sandboxd operational env vars
       ansible.builtin.lineinfile:
         path: "{{ sandboxd_ops_env_file }}"

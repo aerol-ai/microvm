@@ -54,3 +54,13 @@ output "grafana_dashboard_file" {
   description = "Repo-local dashboard JSON to import into Grafana."
   value       = "setup/grafana/sandboxd-slo-dashboard.json"
 }
+
+output "prometheus_alert_rules_file" {
+  description = "Repo-local Prometheus alert rule file for sandboxd SLOs."
+  value       = "setup/prometheus/sandboxd-alerts.yml"
+}
+
+output "alertmanager_example_file" {
+  description = "Repo-local Alertmanager example route/receiver config."
+  value       = "setup/alertmanager/sandboxd-alertmanager-example.yml"
+}

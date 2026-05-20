@@ -141,8 +141,11 @@ image_pull_max_concurrent  = 4
 image_pull_failure_backoff = "30s"
 ```
 
-The Grafana dashboard JSON to import is
-`../setup/grafana/sandboxd-slo-dashboard.json`.
+The repo-local observability artifacts to import are:
+
+- Grafana dashboard: `../setup/grafana/sandboxd-slo-dashboard.json`
+- Prometheus alerts: `../setup/prometheus/sandboxd-alerts.yml`
+- Alertmanager example: `../setup/alertmanager/sandboxd-alertmanager-example.yml`
 
 ## Cloudflare DNS
 
