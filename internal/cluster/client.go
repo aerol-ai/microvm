@@ -133,7 +133,10 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		return nil, errors.New("cluster.New: SelfAPIAdvertiseURL required in cluster mode")
 	}
 
-	fsm := newPlacementFSM()
+	fsm, err := newPlacementFSMWithFileRecovery(cfg.RaftDataDir)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.New: recovery store: %w", err)
+	}
 
 	// Load cluster TLS material first — both raft transport and the internal
 	// HTTPS listener need it. Empty SB_CLUSTER_TLS_DIR keeps the legacy

@@ -171,11 +171,14 @@ type placementFSM struct {
 	mu sync.RWMutex
 	// placements is the hot row map. Values deliberately keep Placement.Spec,
 	// SecretRef, SecretVersion, and SealedSecrets empty; those larger recovery
-	// fields live in recovery and are attached only for point lookups, snapshots,
-	// and failover/recreate flows.
+	// fields live behind Placement.RecoveryRef and are attached only for point
+	// lookups and failover/recreate flows.
 	placements map[string]Placement
-	recovery   map[string]placementRecovery
-	version    uint64
+	// recovery is a legacy/in-memory fallback for tests and old snapshots that
+	// contained inline recovery payloads. New snapshots do not persist it.
+	recovery      map[string]placementRecovery
+	recoveryStore placementRecoveryStore
+	version       uint64
 	// nameIndex maps sandbox Name → SandboxID for cluster-wide name uniqueness.
 	// Empty names are NOT indexed (anonymous sandboxes don't conflict, matching
 	// the local SQLite partial unique index that allows many empty names but
@@ -275,9 +278,14 @@ func (h *pendingReservationExpiryHeap) Pop() any {
 }
 
 func newPlacementFSM() *placementFSM {
+	return newPlacementFSMWithRecoveryStore(newPlacementRecoveryMemoryStore())
+}
+
+func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFSM {
 	return &placementFSM{
 		placements:                   make(map[string]Placement),
 		recovery:                     make(map[string]placementRecovery),
+		recoveryStore:                store,
 		nameIndex:                    make(map[string]string),
 		shardIndex:                   make(map[int]map[string]struct{}),
 		placementIDs:                 newPlacementIDIndex(),
@@ -349,7 +357,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// Done before any state mutation so a conflict leaves the FSM
 		// untouched and the leader's apply path returns the sentinel for the
 		// API handler to roll back the local create.
-		if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
+		name := specName(cmd.Spec)
+		if cmd.Spec == nil && exists {
+			name = placementName(existing)
+		}
+		if err := f.validateNameUniqueLocked(cmd.SandboxID, name); err != nil {
 			return err
 		}
 		created := now
@@ -382,7 +394,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// otherwise a re-place with a renamed spec would leave a phantom
 		// nameIndex entry pointing at this sandbox under its previous name.
 		if exists {
-			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseOwnerLocked(cmd.SandboxID, existing)
 			if existing.IsReserved() {
 				f.releasePendingReservationLocked(cmd.SandboxID)
@@ -397,6 +409,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			Version:            f.version,
 			CreatedUnix:        created,
 			UpdatedUnix:        now,
+			Name:               name,
 			Spec:               spec,
 			SecretRef:          secrets.Ref,
 			SecretVersion:      secrets.Version,
@@ -410,8 +423,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			State:       PlacementStatePlaced,
 			ExpiresUnix: 0,
 		}
-		f.storePlacementLocked(cmd.SandboxID, p)
-		f.claimNameLocked(cmd.SandboxID, specName(spec))
+		if err := f.storePlacementLocked(cmd.SandboxID, p); err != nil {
+			return err
+		}
+		f.claimNameLocked(cmd.SandboxID, name)
 		f.claimShardLocked(cmd.SandboxID)
 		f.claimOwnerLocked(cmd.SandboxID, p)
 		return nil
@@ -450,17 +465,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if !exists || !existing.IsReserved() {
 			return nil
 		}
-		f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 		f.releaseShardLocked(cmd.SandboxID)
 		f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 		f.releasePendingReservationLocked(cmd.SandboxID)
 		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
-		delete(f.recovery, cmd.SandboxID)
 		return nil
 	case opDelete:
 		if existing, ok := f.fullPlacementLocked(cmd.SandboxID); ok {
-			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
 			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
 			f.releaseOwnerLocked(cmd.SandboxID, existing)
@@ -469,8 +484,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
 		}
+		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
-		delete(f.recovery, cmd.SandboxID)
 		return nil
 	case opReassign:
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
@@ -504,7 +519,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
-		f.storePlacementLocked(cmd.SandboxID, existing)
+		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+			return err
+		}
 		if wasReserved {
 			f.claimPendingReservationLocked(cmd.SandboxID, existing)
 		} else {
@@ -529,19 +546,21 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			existing.OrphanedUnix = now
 			existing.Version = f.version
 			existing.UpdatedUnix = now
-			f.storePlacementLocked(id, existing)
+			if err := f.storePlacementLocked(id, existing); err != nil {
+				return err
+			}
 		}
 		for _, id := range f.pendingReservationIDsLocked(cmd.NodeID) {
 			existing, ok := f.fullPlacementLocked(id)
 			if !ok || !existing.IsReserved() || existing.OwnerNodeID != cmd.NodeID {
 				continue
 			}
-			f.releaseNameLocked(id, specName(existing.Spec))
+			f.releaseNameLocked(id, placementName(existing))
 			f.releaseShardLocked(id)
 			f.releasePendingReservationLocked(id)
 			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
+			f.deletePlacementRecoveryLocked(id)
 			delete(f.placements, id)
-			delete(f.recovery, id)
 		}
 		return nil
 	case opClaimOrphan:
@@ -565,7 +584,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return fmt.Errorf("%w: %s orphaned from %s", ErrOrphanClaimConflict, cmd.SandboxID, existing.OrphanedOwnerNodeID)
 		}
 		if cmd.Spec != nil {
-			oldName := specName(existing.Spec)
+			oldName := placementName(existing)
 			newName := specName(cmd.Spec)
 			if newName != oldName {
 				if err := f.validateNameUniqueLocked(cmd.SandboxID, newName); err != nil {
@@ -574,6 +593,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.releaseNameLocked(cmd.SandboxID, oldName)
 				f.claimNameLocked(cmd.SandboxID, newName)
 			}
+			existing.Name = newName
 			existing.Spec = cmd.Spec
 		}
 		if cmd.hasSecretUpdate() {
@@ -590,7 +610,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		existing.OrphanedUnix = 0
 		existing.Version = f.version
 		existing.UpdatedUnix = now
-		f.storePlacementLocked(cmd.SandboxID, existing)
+		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+			return err
+		}
 		f.claimOwnerLocked(cmd.SandboxID, existing)
 		return nil
 	case opUpsertSpec:
@@ -605,7 +627,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return nil
 		}
 		if cmd.Spec != nil {
-			oldName := specName(existing.Spec)
+			oldName := placementName(existing)
 			newName := specName(cmd.Spec)
 			if newName != oldName {
 				if err := f.validateNameUniqueLocked(cmd.SandboxID, newName); err != nil {
@@ -614,6 +636,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.releaseNameLocked(cmd.SandboxID, oldName)
 				f.claimNameLocked(cmd.SandboxID, newName)
 			}
+			existing.Name = newName
 			existing.Spec = cmd.Spec
 		}
 		// Replace the provider handle only when the caller supplied one.
@@ -632,7 +655,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
-		f.storePlacementLocked(cmd.SandboxID, existing)
+		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+			return err
+		}
 		if wasReserved {
 			f.claimPendingReservationLocked(cmd.SandboxID, existing)
 		}
@@ -670,7 +695,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.claimHostPortLocked(cmd.SandboxID, cmd.Port, route)
 		existing.Version = f.version
 		existing.UpdatedUnix = now
-		f.storePlacementLocked(cmd.SandboxID, existing)
+		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+			return err
+		}
 		return nil
 	case opRemoveExposedPort:
 		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
@@ -691,7 +718,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		existing.Version = f.version
 		existing.UpdatedUnix = now
-		f.storePlacementLocked(cmd.SandboxID, existing)
+		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+			return err
+		}
 		return nil
 	case opSetNodeDrainState:
 		// Drain marks live in the FSM so an operator-issued drain persists past
@@ -724,6 +753,13 @@ func specName(spec *models.CreateSandboxRequest) string {
 		return ""
 	}
 	return strings.TrimSpace(spec.Name)
+}
+
+func placementName(p Placement) string {
+	if name := strings.TrimSpace(p.Name); name != "" {
+		return name
+	}
+	return specName(p.Spec)
 }
 
 func (f *placementFSM) validateReservationBatchLocked(reservations []reservationCommand, now int64) error {
@@ -779,7 +815,9 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
 			existing.UpdatedUnix = now
-			f.storePlacementLocked(cmd.SandboxID, existing)
+			if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+				return err
+			}
 			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 			return nil
 		}
@@ -787,7 +825,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		if now > existing.ExpiresUnix {
 			f.releasePendingReservationLocked(cmd.SandboxID)
 			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
-			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
 		} else {
 			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
@@ -805,6 +843,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		Version:            f.version,
 		CreatedUnix:        now,
 		UpdatedUnix:        now,
+		Name:               specName(cmd.Spec),
 		Spec:               cmd.Spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
@@ -812,8 +851,10 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		State:              PlacementStateReserved,
 		ExpiresUnix:        cmd.ExpiresUnix,
 	}
-	f.storePlacementLocked(cmd.SandboxID, p)
-	f.claimNameLocked(cmd.SandboxID, specName(cmd.Spec))
+	if err := f.storePlacementLocked(cmd.SandboxID, p); err != nil {
+		return err
+	}
+	f.claimNameLocked(cmd.SandboxID, placementName(p))
 	f.claimShardLocked(cmd.SandboxID)
 	f.claimPendingReservationLocked(cmd.SandboxID, p)
 	return nil
@@ -823,6 +864,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 // name. Empty name is always allowed (anonymous sandboxes don't conflict);
 // matches the local SQLite partial-unique-index behavior.
 func (f *placementFSM) validateNameUniqueLocked(sandboxID, name string) error {
+	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil
 	}
@@ -835,6 +877,7 @@ func (f *placementFSM) validateNameUniqueLocked(sandboxID, name string) error {
 // claimNameLocked records sandboxID as the owner of name. Empty name is a
 // no-op — anonymous sandboxes don't enter the index.
 func (f *placementFSM) claimNameLocked(sandboxID, name string) {
+	name = strings.TrimSpace(name)
 	if name == "" {
 		return
 	}
@@ -849,6 +892,7 @@ func (f *placementFSM) claimNameLocked(sandboxID, name string) {
 // order: if the rename's claim already wrote the new owner, a stale release
 // for the old name could otherwise unmap the new placement.
 func (f *placementFSM) releaseNameLocked(sandboxID, name string) {
+	name = strings.TrimSpace(name)
 	if name == "" {
 		return
 	}
@@ -1179,6 +1223,16 @@ func (f *placementFSM) fullPlacementLocked(id string) (Placement, bool) {
 	if !ok {
 		return Placement{}, false
 	}
+	if p.RecoveryRef != "" && f.recoveryStore != nil {
+		rec, ok, err := f.recoveryStore.Get(p.RecoveryRef)
+		if err == nil && ok {
+			p.Spec = rec.Spec
+			p.SecretRef = rec.SecretRef
+			p.SecretVersion = rec.SecretVersion
+			p.SealedSecrets = rec.SealedSecrets
+			return p, true
+		}
+	}
 	if rec, ok := f.recovery[id]; ok {
 		p.Spec = rec.Spec
 		p.SecretRef = rec.SecretRef
@@ -1188,17 +1242,34 @@ func (f *placementFSM) fullPlacementLocked(id string) (Placement, bool) {
 	return p, true
 }
 
-func (f *placementFSM) storePlacementLocked(id string, p Placement) {
+func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 	hot, rec := splitPlacement(p)
-	f.placements[id] = hot
 	if rec.empty() {
+		if hot.RecoveryRef == "" {
+			delete(f.recovery, id)
+		}
+		f.placements[id] = hot
+		return nil
+	}
+	if f.recoveryStore != nil {
+		ref, err := f.recoveryStore.Put(id, rec)
+		if err != nil {
+			return err
+		}
+		hot.RecoveryRef = ref
 		delete(f.recovery, id)
-		return
+	} else {
+		if f.recovery == nil {
+			f.recovery = make(map[string]placementRecovery)
+		}
+		f.recovery[id] = clonePlacementRecovery(rec)
 	}
-	if f.recovery == nil {
-		f.recovery = make(map[string]placementRecovery)
-	}
-	f.recovery[id] = rec
+	f.placements[id] = hot
+	return nil
+}
+
+func (f *placementFSM) deletePlacementRecoveryLocked(id string) {
+	delete(f.recovery, id)
 }
 
 func splitPlacement(p Placement) (Placement, placementRecovery) {
@@ -1207,6 +1278,9 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 		SecretRef:     p.SecretRef,
 		SecretVersion: p.SecretVersion,
 		SealedSecrets: p.SealedSecrets,
+	}
+	if p.Name == "" {
+		p.Name = specName(p.Spec)
 	}
 	p.Spec = nil
 	p.SecretRef = ""
@@ -1490,11 +1564,12 @@ func (f *placementFSM) drainedNodesSnapshot() map[string]bool {
 }
 
 // fsmSnapshotPayload is the on-disk envelope for an FSM snapshot. Rows is the
-// compact current format: hot placement fields plus optional recovery payload
-// without duplicating the sandbox ID in separate maps. Placements/Recovery are
-// retained for older envelope snapshots, and Restore also accepts the original
-// bare map[string]Placement format. DrainedNodes is optional; older snapshots
-// decode it as nil and the FSM treats that as "no drains."
+// compact current format: hot placement fields plus a small RecoveryRef. The
+// bulky recovery spec/secret payload lives in the local recovery store, not in
+// snapshot bytes. Placements/Recovery are retained for older envelope snapshots,
+// and Restore also accepts the original bare map[string]Placement format.
+// DrainedNodes is optional; older snapshots decode it as nil and the FSM treats
+// that as "no drains."
 type fsmSnapshotPayload struct {
 	Version      uint64
 	Rows         []placementSnapshotRow
@@ -1505,7 +1580,9 @@ type fsmSnapshotPayload struct {
 
 type placementSnapshotRow struct {
 	Placement Placement
-	Recovery  placementRecovery
+	// Recovery is retained only so Restore can read snapshots produced by the
+	// previous hot/cold FSM format. New snapshots leave it empty.
+	Recovery placementRecovery
 }
 
 // Snapshot returns a raft.FSMSnapshot capturing current placement state.
@@ -1514,12 +1591,8 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	defer f.mu.RUnlock()
 	version := f.version
 	rows := make([]placementSnapshotRow, 0, len(f.placements))
-	for id, p := range f.placements {
-		row := placementSnapshotRow{Placement: cloneHotPlacement(p)}
-		if rec, ok := f.recovery[id]; ok && !rec.empty() {
-			row.Recovery = clonePlacementRecovery(rec)
-		}
-		rows = append(rows, row)
+	for _, p := range f.placements {
+		rows = append(rows, placementSnapshotRow{Placement: cloneHotPlacement(p)})
 	}
 	drained := make(map[string]bool, len(f.drainedNodes))
 	for k, v := range f.drainedNodes {
@@ -1594,35 +1667,38 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	for id, p := range payload.Placements {
-		hot, legacyRec := splitPlacement(p)
+		full := p
+		if full.SandboxID == "" {
+			full.SandboxID = id
+		}
+		_, legacyRec := splitPlacement(p)
 		rec := legacyRec
 		if payload.Recovery != nil {
 			if payloadRec, ok := payload.Recovery[id]; ok {
 				rec = payloadRec
 			}
 		}
-		f.placements[id] = cloneHotPlacement(hot)
-		if !rec.empty() {
-			f.recovery[id] = clonePlacementRecovery(rec)
-		}
-		full := hot
 		if !rec.empty() {
 			full.Spec = rec.Spec
 			full.SecretRef = rec.SecretRef
 			full.SecretVersion = rec.SecretVersion
 			full.SealedSecrets = rec.SealedSecrets
 		}
-		if name := specName(full.Spec); name != "" {
+		if err := f.storePlacementLocked(id, full); err != nil {
+			return err
+		}
+		indexed, _ := f.fullPlacementLocked(id)
+		if name := placementName(indexed); name != "" {
 			f.nameIndex[name] = id
 		}
 		f.claimShardLocked(id)
-		for port, route := range exposedPortRoutesForPlacement(full) {
+		for port, route := range exposedPortRoutesForPlacement(indexed) {
 			f.claimHostPortLocked(id, port, route)
 		}
-		if full.IsReserved() {
-			f.claimPendingReservationLocked(id, full)
+		if indexed.IsReserved() {
+			f.claimPendingReservationLocked(id, indexed)
 		} else {
-			f.claimOwnerLocked(id, full)
+			f.claimOwnerLocked(id, indexed)
 		}
 	}
 	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the

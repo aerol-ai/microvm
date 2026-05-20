@@ -356,7 +356,7 @@ func TestFSMSnapshotRoundTripPreservesReservedState(t *testing.T) {
 		t.Fatalf("persist: %v", err)
 	}
 
-	dst := newPlacementFSM()
+	dst := newPlacementFSMWithRecoveryStore(src.recoveryStore)
 	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}

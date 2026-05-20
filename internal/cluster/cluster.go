@@ -200,22 +200,29 @@ type ExposedPortRoute struct {
 // ingress nodes can install owner-aware data-plane routes. Both fields are kept
 // so older snapshots still restore cleanly.
 type Placement struct {
-	SandboxID           string                       `json:"sandbox_id"`
-	OwnerNodeID         string                       `json:"owner_node_id"`
-	OwnerAPIURL         string                       `json:"owner_api_url"`
-	OwnerDataPlaneHost  string                       `json:"owner_data_plane_host,omitempty"`
-	OwnerState          PlacementOwnerState          `json:"owner_state,omitempty"`
-	OrphanedOwnerNodeID string                       `json:"orphaned_owner_node_id,omitempty"`
-	OrphanedUnix        int64                        `json:"orphaned_unix,omitempty"`
-	Version             uint64                       `json:"version"`
-	CreatedUnix         int64                        `json:"created_unix"`
-	UpdatedUnix         int64                        `json:"updated_unix"`
-	Spec                *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef           string                       `json:"secret_ref,omitempty"`
-	SecretVersion       int                          `json:"secret_version,omitempty"`
-	SealedSecrets       []byte                       `json:"sealed_secrets,omitempty"`
-	ExposedPorts        map[int]string               `json:"exposed_ports,omitempty"`
-	ExposedPortRoutes   map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	SandboxID           string              `json:"sandbox_id"`
+	OwnerNodeID         string              `json:"owner_node_id"`
+	OwnerAPIURL         string              `json:"owner_api_url"`
+	OwnerDataPlaneHost  string              `json:"owner_data_plane_host,omitempty"`
+	OwnerState          PlacementOwnerState `json:"owner_state,omitempty"`
+	OrphanedOwnerNodeID string              `json:"orphaned_owner_node_id,omitempty"`
+	OrphanedUnix        int64               `json:"orphaned_unix,omitempty"`
+	Version             uint64              `json:"version"`
+	CreatedUnix         int64               `json:"created_unix"`
+	UpdatedUnix         int64               `json:"updated_unix"`
+	// Name is the small, hot copy of Spec.Name used to rebuild the cluster-wide
+	// uniqueness index without loading the larger recovery spec payload.
+	Name string `json:"name,omitempty"`
+	// RecoveryRef points at the out-of-snapshot recovery payload for this row.
+	// Spec/secret fields are hydrated from that store only for point lookups and
+	// recreate flows.
+	RecoveryRef       string                       `json:"-"`
+	Spec              *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef         string                       `json:"secret_ref,omitempty"`
+	SecretVersion     int                          `json:"secret_version,omitempty"`
+	SealedSecrets     []byte                       `json:"sealed_secrets,omitempty"`
+	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
+	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
 	// State is empty for materialized placements (the historical schema) and
 	// PlacementStateReserved for capacity-only intents that have not yet been
 	// promoted by a successful local create. Reservations are eligible for

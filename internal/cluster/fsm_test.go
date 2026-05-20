@@ -453,7 +453,7 @@ func TestFSMSnapshotRestoreRoundTrip(t *testing.T) {
 		t.Fatal("sink should not have been cancelled on success")
 	}
 
-	dst := newPlacementFSM()
+	dst := newPlacementFSMWithRecoveryStore(src.recoveryStore)
 	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -472,6 +472,37 @@ func TestFSMSnapshotRestoreRoundTrip(t *testing.T) {
 	}
 	if got := dst.idsOwnedBy("owner-a"); len(got) != 1 || got[0] != "a" {
 		t.Fatalf("owner index was not rebuilt on restore: %+v", got)
+	}
+}
+
+func TestFSMSnapshotOmitsRecoveryPayload(t *testing.T) {
+	fsm := newPlacementFSM()
+	payload, _ := encodeCommand(command{
+		Op:            opPlace,
+		SandboxID:     "sb-secret",
+		OwnerNodeID:   "node-a",
+		Spec:          &models.CreateSandboxRequest{Image: "unique-image-only-in-recovery"},
+		SealedSecrets: []byte("unique-sealed-secret-only-in-recovery"),
+	})
+	if got := fsm.Apply(&raft.Log{Data: payload}); got != nil {
+		t.Fatalf("place: %v", got)
+	}
+	snap, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	raw := sink.Buffer.Bytes()
+	for _, forbidden := range [][]byte{
+		[]byte("unique-image-only-in-recovery"),
+		[]byte("unique-sealed-secret-only-in-recovery"),
+	} {
+		if bytes.Contains(raw, forbidden) {
+			t.Fatalf("snapshot persisted recovery payload %q", forbidden)
+		}
 	}
 }
 
@@ -755,7 +786,7 @@ func TestFSMRestoreRebuildsNameIndex(t *testing.T) {
 	if err := snap.Persist(sink); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
-	dst := newPlacementFSM()
+	dst := newPlacementFSMWithRecoveryStore(src.recoveryStore)
 	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -882,7 +913,7 @@ func TestFSMSnapshotPreservesVersion(t *testing.T) {
 		t.Fatalf("persist: %v", err)
 	}
 
-	dst := newPlacementFSM()
+	dst := newPlacementFSMWithRecoveryStore(src.recoveryStore)
 	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -963,7 +994,7 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 		t.Fatalf("persist: %v", err)
 	}
 
-	dst := newPlacementFSM()
+	dst := newPlacementFSMWithRecoveryStore(src.recoveryStore)
 	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -972,7 +1003,7 @@ func TestFSMSnapshotIsolatedFromLaterApplies(t *testing.T) {
 		t.Fatal("sb1 missing after restore")
 	}
 	if got.Spec == nil || got.Spec.Image != "alpine:before" {
-		t.Fatalf("snapshot leaked post-snapshot Spec mutation: image=%q", got.Spec.Image)
+		t.Fatalf("snapshot leaked post-snapshot Spec mutation: spec=%+v", got.Spec)
 	}
 	if got.Spec.Env["K"] != "before" {
 		t.Fatalf("snapshot leaked post-snapshot Env mutation: K=%q", got.Spec.Env["K"])
