@@ -45,6 +45,22 @@ default_volume_type       = "gp3"
 # default_with_amd_gpu     = false   # adds --with-amd-gpu (x86_64 only)
 # default_idle_timeout_min = 0       # sandbox auto-stop minutes; 0 disables
 
+# --- Observability / operational hardening ----------------------------------
+
+# Prometheus scrapes every node at /v1/metrics with the shared PAT. Terraform
+# outputs private-IP scrape targets after apply.
+#
+# Native OTEL metrics export is optional. Setting otel_metrics_endpoint enables
+# SB_OTEL_METRICS_ENABLED and writes SB_OTEL_METRICS_ENDPOINT into cluster.env.
+# otel_metrics_endpoint = "http://otel-collector.internal:4318/v1/metrics"
+# otel_metrics_interval = "30s"
+# otel_service_name     = "sandboxd"
+
+# Docker image-pull storm controls. These are written into cluster.env on every
+# node; defaults match sandboxd's runtime defaults.
+# image_pull_max_concurrent  = 4
+# image_pull_failure_backoff = "30s"
+
 # --- Cloudflare DNS behavior ------------------------------------------------
 
 # create_wildcard_record = true   # *.<domain_name> in addition to the apex

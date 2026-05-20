@@ -107,6 +107,11 @@ ansible-playbook playbooks/update-sandboxd.yml \
 
 # Tail recent sandboxd logs from every node:
 ansible-playbook playbooks/tail-logs.yml -e lines=200
+
+# Configure OTEL/image-pull hardening and deploy backup/recovery helpers:
+ansible-playbook playbooks/configure-ops.yml \
+  -e sandboxd_otel_metrics_endpoint=http://otel-collector:4318/v1/metrics \
+  -e sandboxd_backup_enabled=true
 ```
 
 `update-sandboxd.yml` runs `serial: 1` — one host at a time, with
@@ -152,6 +157,7 @@ inventory/
 playbooks/
   ping.yml             # connectivity smoke test
   update-sandboxd.yml  # rolling binary push + restart + healthcheck
+  configure-ops.yml    # OTEL env, image-pull knobs, backup/recovery helpers
   tail-logs.yml        # journalctl across the fleet
 ```
 
@@ -162,6 +168,8 @@ playbooks/
 | Add / remove / resize nodes                     | Terraform   |
 | Change SG rules, DNS, AMI                       | Terraform   |
 | Push a new `sandboxd` binary                    | Ansible     |
+| Change OTEL/image-pull env on running nodes     | Ansible     |
+| Deploy backup/recovery helpers or backup cron   | Ansible     |
 | Restart a service, rotate a PAT, tail logs      | Ansible     |
 | Run one-off shell commands across many nodes    | Ansible     |
 

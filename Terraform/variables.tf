@@ -278,6 +278,61 @@ variable "default_idle_timeout_min" {
 }
 
 ###############################################################################
+# Observability and operational hardening
+###############################################################################
+
+variable "otel_metrics_enabled" {
+  description = "Enable sandboxd's native OTLP/HTTP metrics exporter. Automatically true when otel_metrics_endpoint is non-empty."
+  type        = bool
+  default     = false
+}
+
+variable "otel_metrics_endpoint" {
+  description = "OTLP/HTTP metrics endpoint written as SB_OTEL_METRICS_ENDPOINT, for example http://otel-collector:4318/v1/metrics. Empty disables endpoint-specific config."
+  type        = string
+  default     = ""
+}
+
+variable "otel_metrics_interval" {
+  description = "sandboxd OTEL metrics export interval written as SB_OTEL_METRICS_INTERVAL."
+  type        = string
+  default     = "30s"
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.otel_metrics_interval))
+    error_message = "otel_metrics_interval must be a Go duration such as 30s, 1m, or 500ms."
+  }
+}
+
+variable "otel_service_name" {
+  description = "OTEL_SERVICE_NAME written into sandboxd env."
+  type        = string
+  default     = "sandboxd"
+}
+
+variable "image_pull_max_concurrent" {
+  description = "Per-worker cap on concurrent Docker image pulls. 0 disables the cap."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.image_pull_max_concurrent >= 0
+    error_message = "image_pull_max_concurrent must be >= 0."
+  }
+}
+
+variable "image_pull_failure_backoff" {
+  description = "Per-image/auth retry suppression after a failed pull, written as SB_IMAGE_PULL_FAILURE_BACKOFF. Use 0s to disable."
+  type        = string
+  default     = "30s"
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.image_pull_failure_backoff))
+    error_message = "image_pull_failure_backoff must be a Go duration such as 30s, 1m, or 0s."
+  }
+}
+
+###############################################################################
 # Cloudflare DNS
 ###############################################################################
 

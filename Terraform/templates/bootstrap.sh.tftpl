@@ -130,6 +130,26 @@ sudo /tmp/cluster-join.sh \
   --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 %{ endif ~}
 
+###############################################################################
+# 3. Operational hardening env
+#
+# cluster-init/join writes /etc/sandboxd/cluster.env and the systemd drop-in
+# already includes it. Append the observability and image-pull storm controls
+# Terraform owns, then restart so the just-bootstrapped daemon picks them up.
+###############################################################################
+cat > /tmp/aerolvm-ops.env <<'EOF'
+
+# Managed by Terraform bootstrap: observability and operational hardening.
+SB_OTEL_METRICS_ENABLED=${otel_metrics_enabled}
+SB_OTEL_METRICS_ENDPOINT=${otel_metrics_endpoint}
+SB_OTEL_METRICS_INTERVAL=${otel_metrics_interval}
+OTEL_SERVICE_NAME=${otel_service_name}
+SB_IMAGE_PULL_MAX_CONCURRENT=${image_pull_max_concurrent}
+SB_IMAGE_PULL_FAILURE_BACKOFF=${image_pull_failure_backoff}
+EOF
+sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
+sudo systemctl restart sandboxd
+
 ${extra_user_data}
 
 echo "[bootstrap] complete"

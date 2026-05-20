@@ -36,7 +36,9 @@ terraform apply
 ```
 
 Outputs include every node's public IP, the seed's SSH command, and the
-verify-cluster `curl`. Watch one node's bootstrap with:
+verify-cluster `curl`. They also include Prometheus scrape targets for
+`/v1/metrics` on every node's private API address. Watch one node's bootstrap
+with:
 
 ```bash
 ssh ubuntu@<public-ip> sudo tail -f /var/log/aerolvm-bootstrap.log
@@ -116,10 +118,31 @@ phases:
    runs `cluster-join.sh --role <its-role> --ingress-advertise-host
    <domain_name> --gossip-key <…> --peers <seed-private-ip>:7001 --tls-bundle
    /tmp/aerolvm-tls-bundle.tar.gz`.
+4. **Operational env** is appended to `/etc/sandboxd/cluster.env` on every
+   node: OTEL metrics settings and image-pull storm controls. The bootstrap
+   then restarts sandboxd once so those env vars are active immediately.
 
 The S3 bucket is private, SSE-encrypted, and `force_destroy = true` by
 default so `terraform destroy` doesn't fail on leftover objects. Flip
 `bundle_bucket_force_destroy = false` if you want belt-and-braces.
+
+## Observability and pull-storm controls
+
+Prometheus scraping is always available at `GET /v1/metrics` on each node's
+API port. The `prometheus_scrape_targets` output returns private-IP targets
+for a Prometheus running inside the VPC:
+
+```hcl
+otel_metrics_endpoint = "http://otel-collector.internal:4318/v1/metrics"
+otel_metrics_interval = "30s"
+otel_service_name     = "sandboxd"
+
+image_pull_max_concurrent  = 4
+image_pull_failure_backoff = "30s"
+```
+
+The Grafana dashboard JSON to import is
+`../setup/grafana/sandboxd-slo-dashboard.json`.
 
 ## Cloudflare DNS
 
