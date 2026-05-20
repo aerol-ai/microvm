@@ -284,7 +284,7 @@ func (c *Cluster) startReservationGCLoop() {
 
 // reconcileReservations cancels any reservation whose expiry has passed.
 // Cancel is best-effort + idempotent: a reservation that was promoted to
-// Placed between snapshot and Apply is left alone (opCancelReserve is a no-op
+// Placed between enumeration and Apply is left alone (opCancelReserve is a no-op
 // on placed rows), and a reservation already cancelled by the router's
 // rollback path is also a no-op. So a partial sweep on leader-flap re-runs
 // safely on the next tick.
@@ -293,14 +293,8 @@ func (c *Cluster) reconcileReservations(ctx context.Context) {
 		return
 	}
 	now := time.Now().Unix()
-	snapshot := c.fsm.snapshot()
-	for id, p := range snapshot {
-		if p.State != PlacementStateReserved {
-			continue
-		}
-		if p.ExpiresUnix == 0 || now <= p.ExpiresUnix {
-			continue
-		}
+	for _, id := range c.fsm.expiredReservationIDs(now) {
+		p, _ := c.fsm.get(id)
 		if err := c.CancelReservation(ctx, id); err != nil {
 			c.logger.Warn("cluster: cancel expired reservation failed; will retry next tick",
 				"sandbox_id", id, "owner", p.OwnerNodeID, "err", err)

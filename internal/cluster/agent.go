@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -83,6 +84,10 @@ type Agent struct {
 	cacheMu        sync.RWMutex
 	placementCache []Placement
 	shardCache     map[string][]Placement
+	// placementVersion tracks the highest placement version observed via
+	// shard/page/point reads. It keeps PlacementVersion() off the full-map
+	// endpoint on worker/ingress-only agents.
+	placementVersion atomic.Uint64
 }
 
 func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Agent, error) {
@@ -511,6 +516,7 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	a.shardCache[placementShardFilterCacheKey(filter)] = clonePlacements(out)
 	shardEntries := len(a.shardCache)
 	a.cacheMu.Unlock()
+	a.observePlacementVersions(out)
 	recordPlacementCacheRefresh(time.Since(start), len(out), shardEntries, nil)
 	return out
 }
@@ -530,6 +536,7 @@ func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 		a.logger.Warn("cluster agent: placement page lookup failed", "err", err, "limit", req.Limit, "page_token", req.PageToken)
 		return PlacementPageResponse{}
 	}
+	a.observePlacementVersions(out.Placements)
 	return out
 }
 
@@ -538,17 +545,12 @@ func (a *Agent) PlacementOf(sandboxID string) (Placement, bool) {
 	if err != nil || !ok {
 		return Placement{}, false
 	}
+	a.observePlacementVersion(lookup.Placement.Version)
 	return lookup.Placement, true
 }
 
 func (a *Agent) PlacementVersion() uint64 {
-	var max uint64
-	for _, p := range a.Placements() {
-		if p.Version > max {
-			max = p.Version
-		}
-	}
-	return max
+	return a.placementVersion.Load()
 }
 
 func (a *Agent) SubscribePlacement(context.Context) <-chan struct{} { return nil }
@@ -589,7 +591,33 @@ func (a *Agent) lookupPlacement(ctx context.Context, sandboxID string) (Placemen
 		}
 		return PlacementLookupResponse{}, false, err
 	}
+	a.observePlacementVersion(lookup.Placement.Version)
 	return lookup, true, nil
+}
+
+func (a *Agent) observePlacementVersions(placements []Placement) {
+	var max uint64
+	for _, p := range placements {
+		if p.Version > max {
+			max = p.Version
+		}
+	}
+	a.observePlacementVersion(max)
+}
+
+func (a *Agent) observePlacementVersion(version uint64) {
+	if version == 0 {
+		return
+	}
+	for {
+		cur := a.placementVersion.Load()
+		if version <= cur {
+			return
+		}
+		if a.placementVersion.CompareAndSwap(cur, version) {
+			return
+		}
+	}
 }
 
 func (a *Agent) applyCommand(ctx context.Context, cmd command) error {

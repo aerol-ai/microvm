@@ -61,6 +61,22 @@ func TestAgentDelegatesPlacementReadWriteToServerControlPlane(t *testing.T) {
 	}
 }
 
+func TestAgentPlacementVersionUsesObservedReads(t *testing.T) {
+	agent := &Agent{}
+	agent.observePlacementVersions([]Placement{{SandboxID: "a", Version: 3}, {SandboxID: "b", Version: 2}})
+	if got := agent.PlacementVersion(); got != 3 {
+		t.Fatalf("PlacementVersion after shard read = %d, want 3", got)
+	}
+	agent.observePlacementVersion(1)
+	if got := agent.PlacementVersion(); got != 3 {
+		t.Fatalf("PlacementVersion regressed to %d, want 3", got)
+	}
+	agent.observePlacementVersion(5)
+	if got := agent.PlacementVersion(); got != 5 {
+		t.Fatalf("PlacementVersion after point read = %d, want 5", got)
+	}
+}
+
 func startAgentControlPlaneServer(t *testing.T, c *Cluster, ln net.Listener) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()

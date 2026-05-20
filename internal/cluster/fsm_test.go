@@ -215,6 +215,50 @@ func TestFSMUpsertSpec(t *testing.T) {
 	}
 }
 
+func TestFSMHotPlacementReadsOmitRecoveryPayload(t *testing.T) {
+	fsm := newPlacementFSM()
+	place, _ := encodeCommand(command{
+		Op:            opPlace,
+		SandboxID:     "sb-hot",
+		OwnerNodeID:   "node-a",
+		OwnerAPIURL:   "http://node-a",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine", Name: "demo", Env: map[string]string{"K": "V"}},
+		SecretRef:     "cluster-secret://sandbox/sb-hot/v1",
+		SecretVersion: 1,
+	})
+	if got := fsm.Apply(&raft.Log{Index: 1, Data: place}); got != nil {
+		t.Fatalf("opPlace: %v", got)
+	}
+	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb-hot", Port: 8080, Protocol: "http"})
+	if got := fsm.Apply(&raft.Log{Index: 2, Data: add}); got != nil {
+		t.Fatalf("opAddExposedPort: %v", got)
+	}
+
+	full, ok := fsm.get("sb-hot")
+	if !ok || full.Spec == nil || full.Spec.Image != "alpine" || full.SecretRef == "" {
+		t.Fatalf("point lookup lost recovery payload: %+v ok=%v", full, ok)
+	}
+
+	shardRows := fsm.placementsForShards(PlacementShardFilter{})
+	if len(shardRows) != 1 {
+		t.Fatalf("placementsForShards len=%d, want 1", len(shardRows))
+	}
+	if shardRows[0].Spec != nil || shardRows[0].SecretRef != "" || shardRows[0].SecretVersion != 0 || len(shardRows[0].SealedSecrets) != 0 {
+		t.Fatalf("hot shard read included recovery payload: %+v", shardRows[0])
+	}
+	if shardRows[0].ExposedPorts[8080] != "http" {
+		t.Fatalf("hot shard read lost route fields: %+v", shardRows[0].ExposedPorts)
+	}
+
+	page := fsm.placementPage(PlacementPageRequest{Limit: 10})
+	if len(page.Placements) != 1 {
+		t.Fatalf("placementPage len=%d, want 1", len(page.Placements))
+	}
+	if page.Placements[0].Spec != nil || page.Placements[0].SecretRef != "" {
+		t.Fatalf("hot page read included recovery payload: %+v", page.Placements[0])
+	}
+}
+
 func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
 	fsm := newPlacementFSM()
 	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",

@@ -460,21 +460,23 @@ type Client interface {
 	// Members returns a snapshot of all known cluster members.
 	Members() []Member
 
-	// Placements returns the local FSM's placement snapshot. Used by each node
-	// to reconcile owner-aware public ingress routes.
+	// Placements returns the local FSM's hot placement snapshot. Recovery
+	// payloads (Spec/secrets) are omitted; use PlacementOf/SpecOf for point
+	// lookups that need them.
 	Placements() []Placement
 
 	// PlacementsForShards returns only placements whose sandbox ID belongs to
 	// one of the requested placement shards. Ingress nodes use this instead of
 	// pulling the full global placement map; server nodes serve it from the
 	// FSM shard index and agent nodes delegate it to a server-role control
-	// plane peer. Empty Shards means "all placements."
+	// plane peer. Empty Shards means "all placements." Returned rows are hot
+	// rows without Spec/secrets.
 	PlacementsForShards(filter PlacementShardFilter) []Placement
 
 	// PlacementPage returns a bounded global placement-index page sorted by
 	// sandbox ID. It is the scalable read path for operators/control planes
-	// that need to enumerate 100k sandboxes without asking every worker for
-	// its local DB.
+	// that need to enumerate large clusters without asking every worker for
+	// its local DB. Returned rows are hot rows without Spec/secrets.
 	PlacementPage(req PlacementPageRequest) PlacementPageResponse
 
 	// PlacementOf returns the full Placement record for sandboxID and true,

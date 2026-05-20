@@ -379,6 +379,31 @@ func TestFSMPendingReservationsByNodeSumsAndExcludesExpired(t *testing.T) {
 	}
 }
 
+func TestFSMExpiredReservationIDsSurviveCapacityPrune(t *testing.T) {
+	fsm := newPlacementFSM()
+	now := time.Now()
+	applyOp(t, fsm, command{
+		Op:          opReserve,
+		SandboxID:   "sb-expired",
+		OwnerNodeID: "B",
+		Spec:        &models.CreateSandboxRequest{CPU: 2},
+		ExpiresUnix: now.Add(-time.Second).Unix(),
+	})
+
+	if got := fsm.pendingReservationsByNode(now.Unix()); len(got) != 0 {
+		t.Fatalf("expired reservation counted as pending capacity: %+v", got)
+	}
+	ids := fsm.expiredReservationIDs(now.Unix())
+	if len(ids) != 1 || ids[0] != "sb-expired" {
+		t.Fatalf("expiredReservationIDs = %+v, want [sb-expired]", ids)
+	}
+
+	applyOp(t, fsm, command{Op: opCancelReserve, SandboxID: "sb-expired"})
+	if ids := fsm.expiredReservationIDs(now.Unix()); len(ids) != 0 {
+		t.Fatalf("expired reservation remained after cancel: %+v", ids)
+	}
+}
+
 func TestFSMPendingReservationIndexReleasesOnStateTransitions(t *testing.T) {
 	fsm := newPlacementFSM()
 	expiry := time.Now().Add(60 * time.Second).Unix()

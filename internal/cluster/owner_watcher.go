@@ -94,11 +94,8 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 	if r == nil {
 		return
 	}
-	placements := c.fsm.snapshot()
+	placements := c.fsm.fullPlacementsForOwner(c.nodeID)
 	for id, p := range placements {
-		if p.OwnerNodeID != c.nodeID {
-			continue
-		}
 		if p.Spec == nil {
 			// Pre-cluster sandbox or never-replicated spec. Without a spec we
 			// can't reconstruct the container; leave it unhandled. The
