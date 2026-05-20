@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,6 +77,8 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
 				w.Header().Set("Retry-After", "300")
+			} else {
+				w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 			}
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return Decision{}, false
@@ -83,10 +86,6 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return Decision{}, false
 	}
-	if target.IsSelf {
-		return Decision{}, true
-	}
-
 	sandboxID := strings.TrimSpace(opts.PreferredSandboxID)
 	if sandboxID == "" {
 		var err error
@@ -121,13 +120,26 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return Decision{}, false
 		}
+		if errors.Is(err, cluster.ErrCreateBackpressure) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
+			writeError(w, http.StatusTooManyRequests, err.Error())
+			return Decision{}, false
+		}
+		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return Decision{}, false
+		}
 		writeError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return Decision{}, false
 	}
-	service.RecordCreateReservationState("reserve_remote")
-
 	r.Header.Set(HeaderTarget, target.NodeID)
 	r.Header.Set(HeaderID, sandboxID)
+	if target.IsSelf {
+		service.RecordCreateReservationState("reserve_local")
+		return Decision{ReservationID: sandboxID}, true
+	}
+	service.RecordCreateReservationState("reserve_remote")
 	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 	return Decision{}, false
 }

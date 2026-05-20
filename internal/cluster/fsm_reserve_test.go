@@ -162,6 +162,52 @@ func TestFSMReserveRejectsNameCollision(t *testing.T) {
 	}
 }
 
+func TestFSMReserveBatchWritesReservationsAtomically(t *testing.T) {
+	fsm := newPlacementFSM()
+	expiry := time.Now().Add(60 * time.Second).Unix()
+	got := applyOp(t, fsm, command{
+		Op: opReserveBatch,
+		Reservations: []reservationCommand{
+			{SandboxID: "sb-batch-1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{Name: "batch-a", CPU: 1}, ExpiresUnix: expiry},
+			{SandboxID: "sb-batch-2", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{Name: "batch-b", CPU: 2}, ExpiresUnix: expiry},
+		},
+	})
+	if got != nil {
+		t.Fatalf("opReserveBatch returned %v, want nil", got)
+	}
+	if p, ok := fsm.get("sb-batch-1"); !ok || !p.IsReserved() || p.OwnerNodeID != "worker-a" {
+		t.Fatalf("sb-batch-1 = %+v ok=%v, want reserved on worker-a", p, ok)
+	}
+	if p, ok := fsm.get("sb-batch-2"); !ok || !p.IsReserved() || p.OwnerNodeID != "worker-a" {
+		t.Fatalf("sb-batch-2 = %+v ok=%v, want reserved on worker-a", p, ok)
+	}
+	if got := fsm.pendingReservationsByNode(time.Now().Unix())["worker-a"].CPU; got != 3 {
+		t.Fatalf("pending CPU after batch = %v, want 3", got)
+	}
+}
+
+func TestFSMReserveBatchRejectsDuplicateNameWithoutPartialWrite(t *testing.T) {
+	fsm := newPlacementFSM()
+	expiry := time.Now().Add(60 * time.Second).Unix()
+	got := applyOp(t, fsm, command{
+		Op: opReserveBatch,
+		Reservations: []reservationCommand{
+			{SandboxID: "sb-batch-1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{Name: "same"}, ExpiresUnix: expiry},
+			{SandboxID: "sb-batch-2", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{Name: "same"}, ExpiresUnix: expiry},
+		},
+	})
+	err, ok := got.(error)
+	if !ok || !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("opReserveBatch duplicate name = %v, want ErrNameConflict", got)
+	}
+	if _, ok := fsm.get("sb-batch-1"); ok {
+		t.Fatal("first batch row was written despite duplicate-name rejection")
+	}
+	if _, ok := fsm.get("sb-batch-2"); ok {
+		t.Fatal("second batch row was written despite duplicate-name rejection")
+	}
+}
+
 // TestFSMPlacePromotesReservationInheritsSpec pins the central invariant of
 // the reservation→placed transition: opPlace with nil Spec/SealedSecrets must
 // (a) clear State and ExpiresUnix and (b) preserve the Spec + SealedSecrets

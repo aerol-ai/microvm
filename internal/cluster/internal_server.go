@@ -67,6 +67,16 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 				http.Error(w, applyErr.Error(), http.StatusServiceUnavailable)
 				return
 			}
+			if errors.Is(applyErr, ErrCreateBackpressure) {
+				w.Header().Set("Retry-After", fmt.Sprint(CreateBackpressureRetryAfterSeconds))
+				http.Error(w, applyErr.Error(), http.StatusTooManyRequests)
+				return
+			}
+			if errors.Is(applyErr, ErrCapacityExceeded) || errors.Is(applyErr, ErrNoPlacementTarget) {
+				w.Header().Set("Retry-After", fmt.Sprint(CapacityRetryAfterSeconds))
+				http.Error(w, applyErr.Error(), http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, applyErr.Error(), http.StatusInternalServerError)
 			return
 		}

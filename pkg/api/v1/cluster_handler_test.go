@@ -223,6 +223,32 @@ func TestClusterCreateWrapReturns409OnReservationNameConflict(t *testing.T) {
 	}
 }
 
+func TestClusterCreateWrapReturns429OnCreateBackpressure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:       cluster.NewNoop("node-a", "http://node-a"),
+		target:     cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
+		reserveErr: cluster.ErrCreateBackpressure,
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine"}`))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusTooManyRequests)
+	}
+	if got := rr.Header().Get("Retry-After"); got != strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds) {
+		t.Fatalf("Retry-After = %q, want %d", got, cluster.CreateBackpressureRetryAfterSeconds)
+	}
+	if fakeCluster.forwardedPeer != "" {
+		t.Fatalf("ForwardHTTP fired; must not forward on create backpressure")
+	}
+}
+
 func TestClusterCreateWrapReturns503WhenNoWorkerCanOwnSandbox(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)

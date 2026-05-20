@@ -47,7 +47,7 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	// clients (and load balancers) back off instead of treating it as a
 	// permanent 4xx. The error string already carries human-readable
 	// reasons from the admitter.
-	if errors.Is(err, capacity.ErrCapacityExceeded) {
+	if errors.Is(err, capacity.ErrCapacityExceeded) || errors.Is(err, cluster.ErrCapacityExceeded) {
 		logger.Info("capacity rejected", "error", err)
 		w.Header().Set("Retry-After", "30")
 		msg := err.Error()
@@ -55,6 +55,11 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 			msg = msg[:200]
 		}
 		WriteError(w, http.StatusServiceUnavailable, msg)
+		return
+	}
+	if errors.Is(err, cluster.ErrCreateBackpressure) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
 	if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {

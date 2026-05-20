@@ -701,14 +701,24 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(string(msg), ErrNotLeader.Error()) {
-			return ErrNotLeader
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			message := strings.TrimSpace(string(msg))
+			if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrCreateBackpressure.Error()) {
+				return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
+			}
+			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNotLeader.Error()) {
+				return ErrNotLeader
+			}
+			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrCapacityExceeded.Error()) {
+				return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
+			}
+			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNoPlacementTarget.Error()) {
+				return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
+			}
+			return statusError{status: resp.StatusCode, message: message}
 		}
-		return statusError{status: resp.StatusCode, message: strings.TrimSpace(string(msg))}
-	}
 	if out == nil {
 		io.Copy(io.Discard, resp.Body)
 		return nil

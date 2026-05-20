@@ -67,7 +67,7 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, "Snapshot name already in use")
 		return
 	}
-	if errors.Is(err, capacity.ErrCapacityExceeded) {
+	if errors.Is(err, capacity.ErrCapacityExceeded) || errors.Is(err, cluster.ErrCapacityExceeded) {
 		if logger != nil {
 			logger.Info("capacity rejected", "error", err)
 		}
@@ -77,6 +77,11 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 			message = message[:200]
 		}
 		WriteError(w, http.StatusServiceUnavailable, message)
+		return
+	}
+	if errors.Is(err, cluster.ErrCreateBackpressure) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
 	if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {

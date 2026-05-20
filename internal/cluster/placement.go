@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"strings"
 	"time"
@@ -229,6 +230,66 @@ func pickTwo(c []Member) (Member, Member) {
 }
 
 func sameNode(a, b Member) bool { return a.NodeID == b.NodeID }
+
+func (c *Cluster) admitReservationCommand(cmd command) error {
+	reservations := reservationCommands(cmd)
+	if len(reservations) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	pending := c.fsm.pendingReservationsByNode(now)
+	pendingCounts := make(map[string]int, len(reservations))
+	for _, r := range reservations {
+		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
+			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
+		}
+	}
+	return admitReservationCommands(c.membersWithCapacity(), pending, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
+}
+
+func admitReservationCommands(members []Member, pending map[string]capacity.Request, pendingCounts map[string]int, maxPendingPerWorker int, reservations []reservationCommand) error {
+	byID := make(map[string]Member, len(members))
+	for _, m := range members {
+		if m.NodeID != "" {
+			byID[m.NodeID] = m
+		}
+	}
+	batchPending := make(map[string]capacity.Request)
+	batchCounts := make(map[string]int)
+	for _, r := range reservations {
+		if r.SandboxID == "" || r.OwnerNodeID == "" {
+			return fmt.Errorf("%w: reservation missing sandbox_id or owner_node_id", ErrReservationConflict)
+		}
+		m, ok := byID[r.OwnerNodeID]
+		if !ok || !m.Alive || !CanOwnSandboxRole(m.Role) {
+			return fmt.Errorf("%w: worker %s is not an alive placement target", ErrNoPlacementTarget, r.OwnerNodeID)
+		}
+		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			return fmt.Errorf("%w: worker %s has no fresh capacity heartbeat", ErrNoPlacementTarget, r.OwnerNodeID)
+		}
+		if maxPendingPerWorker > 0 && pendingCounts[r.OwnerNodeID]+batchCounts[r.OwnerNodeID] >= maxPendingPerWorker {
+			return fmt.Errorf("%w: worker %s has %d pending creates (cap %d)",
+				ErrCreateBackpressure, r.OwnerNodeID, pendingCounts[r.OwnerNodeID]+batchCounts[r.OwnerNodeID], maxPendingPerWorker)
+		}
+		req := capacityRequestFromSpec(r.Spec)
+		extra := pending[r.OwnerNodeID]
+		batchExtra := batchPending[r.OwnerNodeID]
+		extra.CPU += batchExtra.CPU
+		extra.MemoryMB += batchExtra.MemoryMB
+		extra.DiskGB += batchExtra.DiskGB
+		extra.GPUs += batchExtra.GPUs
+		if !nodeFits(m, req, extra) {
+			return fmt.Errorf("%w: worker %s cannot fit sandbox %s", ErrCapacityExceeded, r.OwnerNodeID, r.SandboxID)
+		}
+		batchExtra.CPU += req.CPU
+		batchExtra.MemoryMB += req.MemoryMB
+		batchExtra.DiskGB += req.DiskGB
+		batchExtra.GPUs += req.GPUs
+		batchPending[r.OwnerNodeID] = batchExtra
+		batchCounts[r.OwnerNodeID]++
+	}
+	return nil
+}
 
 // CanOwnSandboxRole reports whether a gossiped node role may own sandboxes.
 // Empty is treated as worker-capable for rolling upgrades from builds that

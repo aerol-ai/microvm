@@ -86,6 +86,12 @@ var ErrOrphanClaimConflict = errors.New("cluster: orphaned placement belongs to 
 // will see the new reservation and pick a different node.
 var ErrCapacityExceeded = errors.New("cluster: target capacity exceeded after pending reservations")
 
+// ErrCreateBackpressure is returned when the leader-side create queue for a
+// worker is full. This is intentionally distinct from ErrCapacityExceeded:
+// capacity means "pick another worker or wait for resources"; backpressure means
+// "too many creates are already in-flight to this worker, retry shortly."
+var ErrCreateBackpressure = errors.New("cluster: create backpressure")
+
 // ErrReservationConflict is returned when opReserve tries to reserve a
 // sandbox ID that already has a non-expired placement (placed or actively
 // reserved by a different owner). Indicates either a router racing a
@@ -102,6 +108,14 @@ var ErrNoPlacementTarget = errors.New("cluster: no worker placement target avail
 // retry after the operator fixes membership instead of treating it as a
 // malformed request.
 var ErrInvalidTopology = errors.New("cluster: invalid topology")
+
+const (
+	// CreateBackpressureRetryAfterSeconds is the public Retry-After hint for
+	// queue/concurrency backpressure. Keep it short: these rejects are caused by
+	// transient in-flight create fan-in, not by a long operator action.
+	CreateBackpressureRetryAfterSeconds = 5
+	CapacityRetryAfterSeconds           = 30
+)
 
 // PlacementState distinguishes a reservation (capacity held, no docker yet)
 // from a placement (sandbox materialized). Empty defaults to Placed so
@@ -269,6 +283,17 @@ type PlacementTarget struct {
 	// preference to APIURL so the hop rides the cert-pinned channel.
 	InternalURL string
 	IsSelf      bool
+}
+
+// PlacementReservation is one item in a leader-side batch reservation request.
+// Redacted MUST have plaintext credentials stripped before the caller passes it
+// in; Secrets carries only a provider handle or legacy sealed bytes.
+type PlacementReservation struct {
+	SandboxID string
+	Target    PlacementTarget
+	Redacted  *models.CreateSandboxRequest
+	Secrets   PlacementSecrets
+	TTL       time.Duration
 }
 
 // OwnerInfo is returned by OwnerOf.

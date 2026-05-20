@@ -88,6 +88,12 @@ type Cluster struct {
 	// fresh lease before a worker can receive new sandboxes.
 	capacityLeases    *capacityLeaseCache
 	capacityLeaseStop context.CancelFunc
+	// reservationAdmissionMu serializes leader-side reservation admission.
+	// Capacity leases are outside the Raft FSM, so the leader must check
+	// target capacity + per-worker pending caps under one queue before
+	// appending opReserve/opReserveBatch. Otherwise two routers can both
+	// validate against the same pending snapshot and overfill a worker.
+	reservationAdmissionMu sync.Mutex
 
 	// recreator is the service-layer hook the owner watcher uses to bring up
 	// a sandbox the FSM says we own but the local store doesn't have. Set via
@@ -558,6 +564,36 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 	return c.applyCommand(ctx, cmd)
 }
 
+// ReserveBatchOnTargets commits multiple reservation intents in one Raft entry.
+// It is intended for create-burst frontends that have already selected targets
+// and want the leader to admit the whole chunk against the same capacity view.
+// The public one-create API still uses ReserveOnTarget, but scale harnesses and
+// bulk create callers use this to avoid one Raft log entry per sandbox.
+func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []PlacementReservation) error {
+	if len(reservations) == 0 {
+		return nil
+	}
+	cmd := command{Op: opReserveBatch, Reservations: make([]reservationCommand, 0, len(reservations))}
+	now := time.Now()
+	for _, r := range reservations {
+		if r.TTL <= 0 {
+			return fmt.Errorf("cluster: reservation ttl must be > 0")
+		}
+		cmd.Reservations = append(cmd.Reservations, reservationCommand{
+			SandboxID:          r.SandboxID,
+			OwnerNodeID:        r.Target.NodeID,
+			OwnerAPIURL:        r.Target.APIURL,
+			OwnerDataPlaneHost: r.Target.DataPlaneHost,
+			Spec:               r.Redacted,
+			SecretRef:          r.Secrets.Ref,
+			SecretVersion:      r.Secrets.Version,
+			SealedSecrets:      cloneBytes(r.Secrets.LegacySealed),
+			ExpiresUnix:        now.Add(r.TTL).Unix(),
+		})
+	}
+	return c.applyCommand(ctx, cmd)
+}
+
 // CancelReservation deletes a pending reservation for sandboxID. Safe to
 // call at any rollback point: opCancelReserve only fires when the row is
 // State == Reserved, so a stale cancel after a successful promote is a
@@ -723,6 +759,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
 	if c.raft.raft.State() == raft.Leader {
+		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
+			return c.applyReservationEncodedLocal(ctx, payload, cmd)
+		}
 		return c.applyEncodedLocal(ctx, payload)
 	}
 	return c.forwardApplyToLeader(ctx, payload)
@@ -733,11 +772,27 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 // and applies it locally. Returns ErrNotLeader if leadership has changed
 // since the forwarder picked us — the caller is expected to retry.
 func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
-	if _, err := decodeCommand(payload); err != nil {
+	cmd, err := decodeCommand(payload)
+	if err != nil {
 		return fmt.Errorf("cluster: decode forwarded command: %w", err)
 	}
 	if c.raft.raft.State() != raft.Leader {
 		return ErrNotLeader
+	}
+	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
+		return c.applyReservationEncodedLocal(ctx, payload, cmd)
+	}
+	return c.applyEncodedLocal(ctx, payload)
+}
+
+func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {
+	c.reservationAdmissionMu.Lock()
+	defer c.reservationAdmissionMu.Unlock()
+	if c.raft.raft.State() != raft.Leader {
+		return ErrNotLeader
+	}
+	if err := c.admitReservationCommand(cmd); err != nil {
+		return err
 	}
 	return c.applyEncodedLocal(ctx, payload)
 }
@@ -832,10 +887,23 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	message := strings.TrimSpace(string(body))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
+	}
 	if resp.StatusCode == http.StatusServiceUnavailable {
+		if strings.Contains(message, ErrCapacityExceeded.Error()) {
+			return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
+		}
+		if strings.Contains(message, ErrNoPlacementTarget.Error()) {
+			return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
+		}
+		if strings.Contains(message, ErrCreateBackpressure.Error()) {
+			return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
+		}
 		return ErrNotLeader
 	}
-	return fmt.Errorf("cluster: leader-forward apply: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	return fmt.Errorf("cluster: leader-forward apply: status %d: %s", resp.StatusCode, message)
 }
 
 // waitForLeader blocks until raft reports a leader or the deadline passes.

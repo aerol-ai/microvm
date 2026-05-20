@@ -33,6 +33,7 @@ const (
 	opSetNodeDrainState opCode = 9  // operator-set "exclude from placement" mark for a node
 	opOrphanOwner       opCode = 10 // atomically orphan all placements owned by a dead node
 	opClaimOrphan       opCode = 11 // reclaim an orphaned placement back to its previous owner
+	opReserveBatch      opCode = 12 // hold capacity + names for a create burst in one raft entry
 )
 
 // command is the wire format for one raft log entry. Spec is non-nil for
@@ -75,6 +76,22 @@ type command struct {
 	// from SelectPlacement, false = uncordon). All other ops leave them zero.
 	NodeID  string `json:"node_id,omitempty"`
 	Drained bool   `json:"drained,omitempty"`
+
+	// Reservations is populated by opReserveBatch. The single opReserve fields
+	// above are retained for wire compatibility and the normal one-create path.
+	Reservations []reservationCommand `json:"reservations,omitempty"`
+}
+
+type reservationCommand struct {
+	SandboxID          string                       `json:"sandbox_id"`
+	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
+	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
+	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
+	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef          string                       `json:"secret_ref,omitempty"`
+	SecretVersion      int                          `json:"secret_version,omitempty"`
+	SealedSecrets      []byte                       `json:"sealed_secrets,omitempty"`
+	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
 }
 
 func encodeCommand(c command) ([]byte, error) {
@@ -95,6 +112,42 @@ func (c command) placementSecrets() PlacementSecrets {
 		Version:      c.SecretVersion,
 		LegacySealed: c.SealedSecrets,
 	}
+}
+
+func reservationFromCommand(c command) reservationCommand {
+	return reservationCommand{
+		SandboxID:          c.SandboxID,
+		OwnerNodeID:        c.OwnerNodeID,
+		OwnerAPIURL:        c.OwnerAPIURL,
+		OwnerDataPlaneHost: c.OwnerDataPlaneHost,
+		Spec:               c.Spec,
+		SecretRef:          c.SecretRef,
+		SecretVersion:      c.SecretVersion,
+		SealedSecrets:      cloneBytes(c.SealedSecrets),
+		ExpiresUnix:        c.ExpiresUnix,
+	}
+}
+
+func commandFromReservation(r reservationCommand) command {
+	return command{
+		Op:                 opReserve,
+		SandboxID:          r.SandboxID,
+		OwnerNodeID:        r.OwnerNodeID,
+		OwnerAPIURL:        r.OwnerAPIURL,
+		OwnerDataPlaneHost: r.OwnerDataPlaneHost,
+		Spec:               r.Spec,
+		SecretRef:          r.SecretRef,
+		SecretVersion:      r.SecretVersion,
+		SealedSecrets:      cloneBytes(r.SealedSecrets),
+		ExpiresUnix:        r.ExpiresUnix,
+	}
+}
+
+func reservationCommands(c command) []reservationCommand {
+	if c.Op == opReserveBatch {
+		return c.Reservations
+	}
+	return []reservationCommand{reservationFromCommand(c)}
 }
 
 func (c command) hasSecretUpdate() bool {
@@ -370,63 +423,22 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// TTL-expired-then-reclaimed reservation can be promoted by a future
 		// re-attempt without re-sealing. The FSM-side name uniqueness check
 		// uses the redacted spec's Name.
-		if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
-			return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
-		}
-		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
-		if exists {
-			// Reject when the slot is already materialized — a router racing
-			// a completed sandbox should back off and let the caller see 409.
-			if !existing.IsReserved() {
-				return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
-			}
-			// Re-reserve from the same owner before expiry is an idempotent
-			// retry — refresh the TTL and treat it as a no-op otherwise.
-			if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
-				existing.ExpiresUnix = cmd.ExpiresUnix
-				existing.Version = f.version
-				existing.UpdatedUnix = now
-				f.storePlacementLocked(cmd.SandboxID, existing)
-				f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
-				return nil
-			}
-			// Expired reservations are eligible for overwrite by a fresh
-			// reservation (the GC sweep racing the new opReserve is harmless
-			// because the GC's opCancelReserve only fires for State==Reserved
-			// AND a different SandboxID is never reused for the same intent).
-			if now > existing.ExpiresUnix {
-				f.releasePendingReservationLocked(cmd.SandboxID)
-				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
-				f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
-				f.releaseShardLocked(cmd.SandboxID)
-			} else {
-				// Live reservation held by a different owner — conflict.
-				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
-			}
-		}
-		if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
+		if err := f.reservePlacementLocked(cmd, now); err != nil {
 			return err
 		}
-		secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
-		p := Placement{
-			SandboxID:          cmd.SandboxID,
-			OwnerNodeID:        cmd.OwnerNodeID,
-			OwnerAPIURL:        cmd.OwnerAPIURL,
-			OwnerDataPlaneHost: cmd.OwnerDataPlaneHost,
-			Version:            f.version,
-			CreatedUnix:        now,
-			UpdatedUnix:        now,
-			Spec:               cmd.Spec,
-			SecretRef:          secrets.Ref,
-			SecretVersion:      secrets.Version,
-			SealedSecrets:      secrets.LegacySealed,
-			State:              PlacementStateReserved,
-			ExpiresUnix:        cmd.ExpiresUnix,
+		return nil
+	case opReserveBatch:
+		if len(cmd.Reservations) == 0 {
+			return fmt.Errorf("placementFSM: opReserveBatch requires at least one reservation")
 		}
-		f.storePlacementLocked(cmd.SandboxID, p)
-		f.claimNameLocked(cmd.SandboxID, specName(cmd.Spec))
-		f.claimShardLocked(cmd.SandboxID)
-		f.claimPendingReservationLocked(cmd.SandboxID, p)
+		if err := f.validateReservationBatchLocked(cmd.Reservations, now); err != nil {
+			return err
+		}
+		for _, r := range cmd.Reservations {
+			if err := f.reservePlacementLocked(commandFromReservation(r), now); err != nil {
+				return err
+			}
+		}
 		return nil
 	case opCancelReserve:
 		// Only cancel reservations — never delete a placed sandbox, even if a
@@ -714,6 +726,99 @@ func specName(spec *models.CreateSandboxRequest) string {
 	return strings.TrimSpace(spec.Name)
 }
 
+func (f *placementFSM) validateReservationBatchLocked(reservations []reservationCommand, now int64) error {
+	seenIDs := make(map[string]struct{}, len(reservations))
+	seenNames := make(map[string]string, len(reservations))
+	for _, r := range reservations {
+		if r.SandboxID == "" || r.OwnerNodeID == "" {
+			return fmt.Errorf("placementFSM: opReserveBatch requires sandbox_id and owner_node_id")
+		}
+		if _, dup := seenIDs[r.SandboxID]; dup {
+			return fmt.Errorf("%w: duplicate reservation for %s in batch", ErrReservationConflict, r.SandboxID)
+		}
+		seenIDs[r.SandboxID] = struct{}{}
+
+		if existing, exists := f.fullPlacementLocked(r.SandboxID); exists {
+			if !existing.IsReserved() {
+				return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
+			}
+			if existing.OwnerNodeID != r.OwnerNodeID && now <= existing.ExpiresUnix {
+				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
+			}
+		}
+
+		name := specName(r.Spec)
+		if name == "" {
+			continue
+		}
+		if prior, ok := seenNames[name]; ok && prior != r.SandboxID {
+			return fmt.Errorf("%w: %q appears more than once in reservation batch", ErrNameConflict, name)
+		}
+		seenNames[name] = r.SandboxID
+		if err := f.validateNameUniqueLocked(r.SandboxID, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+	if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
+		return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
+	}
+	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+	if exists {
+		// Reject when the slot is already materialized — a router racing a
+		// completed sandbox should back off and let the caller see 409.
+		if !existing.IsReserved() {
+			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+		}
+		// Re-reserve from the same owner before expiry is an idempotent retry —
+		// refresh the TTL and treat it as a no-op otherwise.
+		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
+			existing.ExpiresUnix = cmd.ExpiresUnix
+			existing.Version = f.version
+			existing.UpdatedUnix = now
+			f.storePlacementLocked(cmd.SandboxID, existing)
+			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
+			return nil
+		}
+		// Expired reservations are eligible for overwrite by a fresh reservation.
+		if now > existing.ExpiresUnix {
+			f.releasePendingReservationLocked(cmd.SandboxID)
+			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+			f.releaseNameLocked(cmd.SandboxID, specName(existing.Spec))
+			f.releaseShardLocked(cmd.SandboxID)
+		} else {
+			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+		}
+	}
+	if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
+		return err
+	}
+	secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
+	p := Placement{
+		SandboxID:          cmd.SandboxID,
+		OwnerNodeID:        cmd.OwnerNodeID,
+		OwnerAPIURL:        cmd.OwnerAPIURL,
+		OwnerDataPlaneHost: cmd.OwnerDataPlaneHost,
+		Version:            f.version,
+		CreatedUnix:        now,
+		UpdatedUnix:        now,
+		Spec:               cmd.Spec,
+		SecretRef:          secrets.Ref,
+		SecretVersion:      secrets.Version,
+		SealedSecrets:      secrets.LegacySealed,
+		State:              PlacementStateReserved,
+		ExpiresUnix:        cmd.ExpiresUnix,
+	}
+	f.storePlacementLocked(cmd.SandboxID, p)
+	f.claimNameLocked(cmd.SandboxID, specName(cmd.Spec))
+	f.claimShardLocked(cmd.SandboxID)
+	f.claimPendingReservationLocked(cmd.SandboxID, p)
+	return nil
+}
+
 // validateNameUniqueLocked checks that no other placement currently claims
 // name. Empty name is always allowed (anonymous sandboxes don't conflict);
 // matches the local SQLite partial-unique-index behavior.
@@ -979,6 +1084,33 @@ func (f *placementFSM) pendingReservationIDsLocked(owner string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (f *placementFSM) livePendingReservationCount(owner string, now int64) int {
+	if owner == "" {
+		return 0
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pendingReservationIDsByOwner == nil {
+		return 0
+	}
+	f.pruneExpiredPendingReservationsLocked(now)
+	ids := f.pendingReservationIDsByOwner[owner]
+	if len(ids) == 0 {
+		return 0
+	}
+	count := 0
+	for id := range ids {
+		claim, ok := f.pendingReservationClaims[id]
+		if !ok {
+			continue
+		}
+		if claim.ExpiresUnix <= 0 || now <= claim.ExpiresUnix {
+			count++
+		}
+	}
+	return count
 }
 
 func (f *placementFSM) refreshPendingReservationExpiryLocked(sandboxID string, expiresUnix int64) {

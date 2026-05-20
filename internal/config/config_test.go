@@ -36,6 +36,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_SHUTDOWN_TIMEOUT",
 			"SB_HTTP_CLIENT_TIMEOUT",
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
+			"SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER",
 			"SB_DATA_PLANE_ADVERTISE_HOST",
 			"SB_NODE_ROLE",
 			"SB_ENABLE_CLUSTER",
@@ -89,6 +90,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.ClusterMaxAutoVoters != 5 {
 					t.Fatalf("expected default ClusterMaxAutoVoters=5, got %d", cfg.ClusterMaxAutoVoters)
+				}
+				if cfg.ClusterCreateMaxPendingPerWorker != 32 {
+					t.Fatalf("expected default ClusterCreateMaxPendingPerWorker=32, got %d", cfg.ClusterCreateMaxPendingPerWorker)
 				}
 				if cfg.NodeRole != NodeRoleMixed {
 					t.Fatalf("expected default NodeRole=%q, got %q", NodeRoleMixed, cfg.NodeRole)

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -255,5 +256,45 @@ func TestHeadroomScoreSymmetricNeutral(t *testing.T) {
 	score := headroomScore(unknown, capacity.Request{CPU: 1, MemoryMB: 1024}, capacity.Request{})
 	if math.Abs(score-0.5) > 1e-9 {
 		t.Fatalf("expected neutral 0.5 score for unknown capacity, got %v", score)
+	}
+}
+
+func TestAdmitReservationCommandsRejectsMissingCapacityHeartbeat(t *testing.T) {
+	err := admitReservationCommands([]Member{
+		{NodeID: "worker-a", APIURL: "http://worker-a", Alive: true, Role: "worker"},
+	}, nil, nil, 32, []reservationCommand{
+		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
+	})
+	if !errors.Is(err, ErrNoPlacementTarget) {
+		t.Fatalf("admitReservationCommands error = %v, want ErrNoPlacementTarget", err)
+	}
+}
+
+func TestAdmitReservationCommandsAppliesPerWorkerBackpressure(t *testing.T) {
+	err := admitReservationCommands([]Member{
+		{NodeID: "worker-a", APIURL: "http://worker-a", Alive: true, Role: "worker", Capacity: capacity.Snapshot{
+			HostCPUCores: 16, HostMemoryTotalMB: 32000,
+			CPUBudget: 16, MemoryBudgetMB: 32000,
+		}},
+	}, nil, map[string]int{"worker-a": 2}, 2, []reservationCommand{
+		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
+	})
+	if !errors.Is(err, ErrCreateBackpressure) {
+		t.Fatalf("admitReservationCommands error = %v, want ErrCreateBackpressure", err)
+	}
+}
+
+func TestAdmitReservationCommandsAccountsForBatchCapacity(t *testing.T) {
+	err := admitReservationCommands([]Member{
+		{NodeID: "worker-a", APIURL: "http://worker-a", Alive: true, Role: "worker", Capacity: capacity.Snapshot{
+			HostCPUCores: 4, HostMemoryTotalMB: 4096,
+			CPUBudget: 2, MemoryBudgetMB: 4096,
+		}},
+	}, nil, nil, 32, []reservationCommand{
+		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
+		{SandboxID: "sb2", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1.5, MemoryMB: 128}},
+	})
+	if !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("admitReservationCommands error = %v, want ErrCapacityExceeded", err)
 	}
 }

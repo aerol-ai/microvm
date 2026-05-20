@@ -194,6 +194,8 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
 				w.Header().Set("Retry-After", "300")
+			} else {
+				w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 			}
 			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
 			return
@@ -201,20 +203,9 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return
 	}
-	if target.IsSelf {
-		// Self wins: no reservation needed. There's no network hop where
-		// intermediate state could be lost, so the existing single-commit
-		// flow (CreateSandbox → RecordPlacement) stays correct and avoids
-		// an extra raft round-trip on the local-create critical path.
-		h.createSandboxOnSelectedNode(w, r, req, "")
-		return
-	}
-
-	// Cross-node create: write the reservation BEFORE forwarding so the
-	// cluster has intent the instant Node A loses ownership of the request.
-	// This fixes B2 (intent-before-side-effect) and prevents the multi-node
-	// admission race where two routers both pass T's local admitter before
-	// either's placement is replicated.
+	// Cluster create: write the reservation BEFORE any Docker side effect.
+	// Remote targets need intent before forwarding; self targets need the
+	// same leader-side capacity/backpressure accounting at large scale.
 	sandboxID, err := service.GenerateSandboxID()
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
@@ -239,11 +230,25 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 			apihttp.WriteError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return
 		}
+		if errors.Is(err, cluster.ErrCreateBackpressure) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
+		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return
 	}
+	if target.IsSelf {
+		service.RecordCreateReservationState("reserve_local")
+		h.createSandboxOnSelectedNode(w, r, req, sandboxID)
+		return
+	}
 	service.RecordCreateReservationState("reserve_remote")
-
 	r.Header.Set(clusterCreateTargetHeader, target.NodeID)
 	r.Header.Set(clusterCreateIDHeader, sandboxID)
 	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
@@ -252,14 +257,14 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 // createSandboxOnSelectedNode performs the local side effect once placement has
 // already selected this node. Two entry points:
 //
-//   - reservationID == "": self won SelectPlacement on this node. No
-//     reservation was written; run the existing single-commit flow
-//     (CreateSandbox → seal/redact → RecordPlacement).
-//   - reservationID != "": cross-node forward. The router already wrote the
-//     reservation with our redacted spec. Use CreateSandboxWithID against the
-//     reserved ID, store a local secret ref, then RecordPlacement with the
-//     redacted spec + ref — opPlace transitions State=Reserved → Placed
-//     atomically while keeping secret material out of Raft.
+//   - reservationID == "": local-only image path. No cluster reservation was
+//     written because the image cannot be moved to another worker.
+//   - reservationID != "": normal cluster create. The router already wrote
+//     the reservation with our redacted spec, even when this node is the
+//     selected worker. Use CreateSandboxWithID against the reserved ID, store
+//     a local secret ref, then RecordPlacement with the redacted spec + ref —
+//     opPlace transitions State=Reserved → Placed atomically while keeping
+//     secret material out of Raft.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
 	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
@@ -820,6 +825,16 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 	if err := c.ApplyEncoded(r.Context(), body); err != nil {
 		if errors.Is(err, cluster.ErrNotLeader) {
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+			return
+		}
+		if errors.Is(err, cluster.ErrCreateBackpressure) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
+		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())

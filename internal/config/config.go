@@ -262,6 +262,13 @@ type Config struct {
 	// without increasing quorum size. 0 means unlimited, preserving the old
 	// behavior for tests or intentionally small fully-voting clusters.
 	ClusterMaxAutoVoters int
+	// ClusterCreateMaxPendingPerWorker caps reservation-stage creates per
+	// worker. This is a leader-side queue guard: when a burst tries to send
+	// more than this many not-yet-promoted creates to one worker, the leader
+	// rejects with Retry-After instead of letting that worker absorb an
+	// unbounded image-pull/docker-create storm. 0 disables the cap.
+	// SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER.
+	ClusterCreateMaxPendingPerWorker int
 	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
 	// a node dead before orphaning its placements and removing it from the
 	// raft configuration. Long enough to absorb transient gossip flap
@@ -419,36 +426,37 @@ func Load() (Config, error) {
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
 
-		EnableCluster:                 getEnvBool("SB_ENABLE_CLUSTER", false),
-		NodeRole:                      os.Getenv("SB_NODE_ROLE"),
-		NodeID:                        strings.TrimSpace(os.Getenv("SB_NODE_ID")),
-		NodeName:                      strings.TrimSpace(os.Getenv("SB_NODE_NAME")),
-		RaftBindAddr:                  getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
-		RaftAdvertiseAddr:             strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
-		RaftDataDir:                   strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
-		GossipBindAddr:                getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
-		GossipAdvertiseAddr:           strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
-		BootstrapPeers:                splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
-		ClusterBootstrap:              getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
-		SelfAPIAdvertiseURL:           strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
-		DataPlaneAdvertiseHost:        normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
-		IngressAdvertiseHost:          normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
-		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
-		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
-		ClusterMaxAutoVoters:          getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
-		ClusterDeadOwnerGrace:         getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
-		ClusterGossipSecretKey:        strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
-		ClusterInsecureGossip:         getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
-		ClusterInsecureCredentials:    getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
-		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
-		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
-		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
-		ImageBuildContextEnabled:      getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
-		ImageBuildTimeout:             getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
-		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
-		ImageBuildGCInterval:          getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:               getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
-		ImageDistributionAOCRHost:     strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
+		EnableCluster:                    getEnvBool("SB_ENABLE_CLUSTER", false),
+		NodeRole:                         os.Getenv("SB_NODE_ROLE"),
+		NodeID:                           strings.TrimSpace(os.Getenv("SB_NODE_ID")),
+		NodeName:                         strings.TrimSpace(os.Getenv("SB_NODE_NAME")),
+		RaftBindAddr:                     getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
+		RaftAdvertiseAddr:                strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
+		RaftDataDir:                      strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
+		GossipBindAddr:                   getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
+		GossipAdvertiseAddr:              strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
+		BootstrapPeers:                   splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
+		ClusterBootstrap:                 getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
+		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
+		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
+		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
+		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
+		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
+		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
+		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
+		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
+		ClusterInsecureCredentials:       getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
+		ClusterTLSDir:                    strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
+		ClusterInternalListenAddr:        getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
+		ClusterInternalAdvertiseURL:      strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
+		ImageBuildContextEnabled:         getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:                getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:              getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:             getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageDistributionAOCRHost:        strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
 	}
 
 	if cfg.PATToken == "" {
@@ -539,6 +547,9 @@ func Load() (Config, error) {
 		}
 		if cfg.ClusterMaxAutoVoters < 0 {
 			return Config{}, errors.New("SB_CLUSTER_MAX_AUTO_VOTERS must be >= 0")
+		}
+		if cfg.ClusterCreateMaxPendingPerWorker < 0 {
+			return Config{}, errors.New("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER must be >= 0")
 		}
 		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
 			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
