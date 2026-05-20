@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -45,6 +46,43 @@ func TestGossipMemberIndexStoresDecodedMemberMetadata(t *testing.T) {
 	// remote admitter decide." Asserting it here pins that contract.
 	if m.Capacity.CPUBudget != 0 || m.Capacity.MemoryBudgetMB != 0 {
 		t.Fatalf("decoded capacity = %+v, want zero (capacity is no longer gossiped)", m.Capacity)
+	}
+}
+
+func TestNodeMetaFallbackPreservesRaftJoinFields(t *testing.T) {
+	d := newGossipDelegate(
+		"ip-10-42-1-76",
+		strings.Repeat("aerolvm-node2-", 50),
+		"http://10.42.1.76:21212",
+		"10.42.1.76",
+		"10.42.1.76:7000",
+		"https://10.42.1.76:7002",
+		config.NodeRoleMixed,
+		nil,
+	)
+	if len(d.encoded) <= memberlist.MetaMaxSize {
+		t.Fatalf("test setup encoded meta len=%d, want > %d", len(d.encoded), memberlist.MetaMaxSize)
+	}
+
+	encoded := d.NodeMeta(memberlist.MetaMaxSize)
+	if len(encoded) > memberlist.MetaMaxSize {
+		t.Fatalf("NodeMeta len=%d, want <= %d", len(encoded), memberlist.MetaMaxSize)
+	}
+	var meta nodeMeta
+	if err := json.Unmarshal(encoded, &meta); err != nil {
+		t.Fatalf("fallback NodeMeta is not valid JSON: %v; %q", err, string(encoded))
+	}
+	if meta.NodeID != "ip-10-42-1-76" {
+		t.Fatalf("fallback NodeID=%q, want ip-10-42-1-76", meta.NodeID)
+	}
+	if meta.RaftAddr != "10.42.1.76:7000" {
+		t.Fatalf("fallback RaftAddr=%q, want 10.42.1.76:7000", meta.RaftAddr)
+	}
+	if meta.Role != config.NodeRoleMixed {
+		t.Fatalf("fallback Role=%q, want %s", meta.Role, config.NodeRoleMixed)
+	}
+	if meta.APIURL != "http://10.42.1.76:21212" {
+		t.Fatalf("fallback APIURL=%q, want http://10.42.1.76:21212", meta.APIURL)
 	}
 }
 

@@ -95,14 +95,28 @@ func (d *gossipDelegate) refreshMeta() {
 func (d *gossipDelegate) NodeMeta(limit int) []byte {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	if limit <= 0 {
+		return nil
+	}
 	if len(d.encoded) > limit {
-		// Truncated metadata is worse than minimal metadata (peers can't
-		// decode partial JSON). Fall back to ID+URL only.
-		fallback, _ := json.Marshal(nodeMeta{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost})
-		if len(fallback) > limit {
-			return fallback[:limit]
+		// Truncated metadata is worse than minimal metadata because peers
+		// cannot decode partial JSON. Drop display/convenience fields first,
+		// but preserve raft join identity as long as it fits.
+		fallbacks := []nodeMeta{
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role},
+			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role},
+			{NodeID: d.nodeID, RaftAddr: d.raftAddr, Role: d.role},
+			{NodeID: d.nodeID, RaftAddr: d.raftAddr},
+			{NodeID: d.nodeID},
 		}
-		return fallback
+		for _, meta := range fallbacks {
+			fallback, _ := json.Marshal(meta)
+			if len(fallback) <= limit {
+				return fallback
+			}
+		}
+		return []byte("{}")
 	}
 	return d.encoded
 }
