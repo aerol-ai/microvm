@@ -961,6 +961,64 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+type clusterRecoveryBlobStore interface {
+	StoreRecoveryBlob(context.Context, cluster.RecoveryBlob) error
+	RecoveryBlob(context.Context, string) (cluster.RecoveryBlob, bool, error)
+}
+
+func (h *handlers) clusterInternalRecoveryPut(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.PathValue("ref"))
+	if ref == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref required")
+		return
+	}
+	c, ok := h.deps.Service.Cluster().(clusterRecoveryBlobStore)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: recovery store unavailable on this node")
+		return
+	}
+	var blob cluster.RecoveryBlob
+	if err := json.NewDecoder(r.Body).Decode(&blob); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if blob.Ref == "" {
+		blob.Ref = ref
+	}
+	if blob.Ref != ref {
+		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref mismatch")
+		return
+	}
+	if err := c.StoreRecoveryBlob(r.Context(), blob); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) clusterInternalRecoveryGet(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.PathValue("ref"))
+	if ref == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref required")
+		return
+	}
+	c, ok := h.deps.Service.Cluster().(clusterRecoveryBlobStore)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: recovery store unavailable on this node")
+		return
+	}
+	blob, found, err := c.RecoveryBlob(r.Context(), ref)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		apihttp.WriteError(w, http.StatusNotFound, "recovery blob not found")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, blob)
+}
+
 func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {

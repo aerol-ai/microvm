@@ -178,6 +178,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		tls:           clusterTLS,
 		publicProxies: newProxyCache(defaultPublicTransport),
 	}
+	fsm.recoveryResolver = c.fetchRecoveryBlob
 
 	// Build the cluster-internal HTTPS client + listener when TLS is loaded.
 	// Both ride on the same CA + node keypair as raft, so a peer's cert can
@@ -757,12 +758,16 @@ func placementCanBeClaimedBy(p Placement, nodeID string) bool {
 // DeletePlacement) safe to call from any node — without it, every owner-side
 // caller would have to know whether it's the leader and forward by hand.
 func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
-	payload, err := encodeCommand(cmd)
+	raftCmd, err := c.externalizeCommandRecovery(ctx, cmd)
+	if err != nil {
+		return fmt.Errorf("cluster: externalize recovery: %w", err)
+	}
+	payload, err := encodeCommand(raftCmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
 	if c.raft.raft.State() == raft.Leader {
-		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
+		if raftCmd.Op == opReserve || raftCmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
 		}
 		return c.applyEncodedLocal(ctx, payload)
@@ -782,10 +787,21 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if c.raft.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
-	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
-		return c.applyReservationEncodedLocal(ctx, payload, cmd)
+	if err := c.fsm.hydrateCommandRecovery(&cmd); err != nil {
+		return err
 	}
-	return c.applyEncodedLocal(ctx, payload)
+	raftCmd, err := c.externalizeCommandRecovery(ctx, cmd)
+	if err != nil {
+		return fmt.Errorf("cluster: externalize recovery: %w", err)
+	}
+	raftPayload, err := encodeCommand(raftCmd)
+	if err != nil {
+		return fmt.Errorf("cluster: encode command: %w", err)
+	}
+	if raftCmd.Op == opReserve || raftCmd.Op == opReserveBatch {
+		return c.applyReservationEncodedLocal(ctx, raftPayload, cmd)
+	}
+	return c.applyEncodedLocal(ctx, raftPayload)
 }
 
 func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {

@@ -30,6 +30,7 @@ const (
 	PublicInternalPlacementsPath        = "/v1/cluster/internal/placements"
 	PublicInternalPlacementsQueryPath   = "/v1/cluster/internal/placements/query"
 	PublicInternalPlacementsPagePath    = "/v1/cluster/internal/placements/page"
+	PublicInternalRecoveryPath          = "/v1/cluster/internal/recovery/"
 	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
 	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
 	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
@@ -621,7 +622,11 @@ func (a *Agent) observePlacementVersion(version uint64) {
 }
 
 func (a *Agent) applyCommand(ctx context.Context, cmd command) error {
-	payload, err := encodeCommand(cmd)
+	raftCmd, err := a.externalizeCommandRecovery(ctx, cmd)
+	if err != nil {
+		return fmt.Errorf("cluster agent: externalize recovery: %w", err)
+	}
+	payload, err := encodeCommand(raftCmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
@@ -701,24 +706,24 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 	if err != nil {
 		return err
 	}
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			message := strings.TrimSpace(string(msg))
-			if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrCreateBackpressure.Error()) {
-				return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
-			}
-			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNotLeader.Error()) {
-				return ErrNotLeader
-			}
-			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrCapacityExceeded.Error()) {
-				return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
-			}
-			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNoPlacementTarget.Error()) {
-				return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
-			}
-			return statusError{status: resp.StatusCode, message: message}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		message := strings.TrimSpace(string(msg))
+		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrCreateBackpressure.Error()) {
+			return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
 		}
+		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNotLeader.Error()) {
+			return ErrNotLeader
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrCapacityExceeded.Error()) {
+			return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNoPlacementTarget.Error()) {
+			return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
+		}
+		return statusError{status: resp.StatusCode, message: message}
+	}
 	if out == nil {
 		io.Copy(io.Discard, resp.Body)
 		return nil

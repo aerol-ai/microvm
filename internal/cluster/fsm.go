@@ -3,6 +3,7 @@ package cluster
 import (
 	"bytes"
 	"container/heap"
+	"context"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
@@ -36,12 +37,11 @@ const (
 	opReserveBatch      opCode = 12 // hold capacity + names for a create burst in one raft entry
 )
 
-// command is the wire format for one raft log entry. Spec is non-nil for
-// opPlace (records the original creation request alongside the owner pointer)
-// and opUpsertSpec (records mutations like resize/lifecycle that must survive
-// failover). Spec MUST be redacted of plaintext credentials before encoding.
-// SecretRef/SecretVersion carry only the provider handle; SealedSecrets is a
-// legacy fallback for log entries written before secret refs existed.
+// command is the wire format for one raft log entry. New writers externalize
+// recovery payloads before encoding, so raft carries Name + RecoveryRef instead
+// of full Spec/secret bytes. Spec/SecretRef/SealedSecrets remain in the struct
+// for legacy log entries and direct FSM tests; any Spec MUST be redacted of
+// plaintext credentials before encoding.
 // Port/Protocol carry one (port, protocol) tuple for opAddExposedPort and
 // opRemoveExposedPort — replicated as intent-only so the new owner picks a
 // fresh host port from its own pool.
@@ -58,6 +58,8 @@ type command struct {
 	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
 	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
 	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
+	Name               string                       `json:"name,omitempty"`
+	RecoveryRef        string                       `json:"recovery_ref,omitempty"`
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
@@ -87,6 +89,8 @@ type reservationCommand struct {
 	OwnerNodeID        string                       `json:"owner_node_id,omitempty"`
 	OwnerAPIURL        string                       `json:"owner_api_url,omitempty"`
 	OwnerDataPlaneHost string                       `json:"owner_data_plane_host,omitempty"`
+	Name               string                       `json:"name,omitempty"`
+	RecoveryRef        string                       `json:"recovery_ref,omitempty"`
 	Spec               *models.CreateSandboxRequest `json:"spec,omitempty"`
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
@@ -120,6 +124,8 @@ func reservationFromCommand(c command) reservationCommand {
 		OwnerNodeID:        c.OwnerNodeID,
 		OwnerAPIURL:        c.OwnerAPIURL,
 		OwnerDataPlaneHost: c.OwnerDataPlaneHost,
+		Name:               c.Name,
+		RecoveryRef:        c.RecoveryRef,
 		Spec:               c.Spec,
 		SecretRef:          c.SecretRef,
 		SecretVersion:      c.SecretVersion,
@@ -135,6 +141,8 @@ func commandFromReservation(r reservationCommand) command {
 		OwnerNodeID:        r.OwnerNodeID,
 		OwnerAPIURL:        r.OwnerAPIURL,
 		OwnerDataPlaneHost: r.OwnerDataPlaneHost,
+		Name:               r.Name,
+		RecoveryRef:        r.RecoveryRef,
 		Spec:               r.Spec,
 		SecretRef:          r.SecretRef,
 		SecretVersion:      r.SecretVersion,
@@ -178,7 +186,11 @@ type placementFSM struct {
 	// contained inline recovery payloads. New snapshots do not persist it.
 	recovery      map[string]placementRecovery
 	recoveryStore placementRecoveryStore
-	version       uint64
+	// recoveryResolver fetches missing content-addressed recovery blobs from
+	// peer servers during log replay or point lookup. It is optional so unit
+	// tests and single-process FSM use can stay local-only.
+	recoveryResolver func(context.Context, string) (RecoveryBlob, bool, error)
+	version          uint64
 	// nameIndex maps sandbox Name → SandboxID for cluster-wide name uniqueness.
 	// Empty names are NOT indexed (anonymous sandboxes don't conflict, matching
 	// the local SQLite partial unique index that allows many empty names but
@@ -319,6 +331,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	if err != nil {
 		return fmt.Errorf("placementFSM: decode: %w", err)
 	}
+	if err := f.hydrateCommandRecovery(&cmd); err != nil {
+		return err
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -357,7 +372,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// Done before any state mutation so a conflict leaves the FSM
 		// untouched and the leader's apply path returns the sentinel for the
 		// API handler to roll back the local create.
-		name := specName(cmd.Spec)
+		name := commandName(cmd)
 		if cmd.Spec == nil && exists {
 			name = placementName(existing)
 		}
@@ -755,6 +770,20 @@ func specName(spec *models.CreateSandboxRequest) string {
 	return strings.TrimSpace(spec.Name)
 }
 
+func commandName(cmd command) string {
+	if name := strings.TrimSpace(cmd.Name); name != "" {
+		return name
+	}
+	return specName(cmd.Spec)
+}
+
+func reservationName(r reservationCommand) string {
+	if name := strings.TrimSpace(r.Name); name != "" {
+		return name
+	}
+	return specName(r.Spec)
+}
+
 func placementName(p Placement) string {
 	if name := strings.TrimSpace(p.Name); name != "" {
 		return name
@@ -783,7 +812,7 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 			}
 		}
 
-		name := specName(r.Spec)
+		name := reservationName(r)
 		if name == "" {
 			continue
 		}
@@ -831,7 +860,8 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
 	}
-	if err := f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec)); err != nil {
+	name := commandName(cmd)
+	if err := f.validateNameUniqueLocked(cmd.SandboxID, name); err != nil {
 		return err
 	}
 	secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
@@ -843,7 +873,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		Version:            f.version,
 		CreatedUnix:        now,
 		UpdatedUnix:        now,
-		Name:               specName(cmd.Spec),
+		Name:               name,
 		Spec:               cmd.Spec,
 		SecretRef:          secrets.Ref,
 		SecretVersion:      secrets.Version,
@@ -854,7 +884,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 	if err := f.storePlacementLocked(cmd.SandboxID, p); err != nil {
 		return err
 	}
-	f.claimNameLocked(cmd.SandboxID, placementName(p))
+	f.claimNameLocked(cmd.SandboxID, name)
 	f.claimShardLocked(cmd.SandboxID)
 	f.claimPendingReservationLocked(cmd.SandboxID, p)
 	return nil
@@ -1223,23 +1253,93 @@ func (f *placementFSM) fullPlacementLocked(id string) (Placement, bool) {
 	if !ok {
 		return Placement{}, false
 	}
-	if p.RecoveryRef != "" && f.recoveryStore != nil {
-		rec, ok, err := f.recoveryStore.Get(p.RecoveryRef)
-		if err == nil && ok {
-			p.Spec = rec.Spec
-			p.SecretRef = rec.SecretRef
-			p.SecretVersion = rec.SecretVersion
-			p.SealedSecrets = rec.SealedSecrets
-			return p, true
+	if p.RecoveryRef != "" {
+		if rec, ok, err := f.resolveRecoveryRef(p.RecoveryRef); err == nil && ok {
+			return attachPlacementRecovery(p, rec), true
 		}
 	}
 	if rec, ok := f.recovery[id]; ok {
-		p.Spec = rec.Spec
-		p.SecretRef = rec.SecretRef
-		p.SecretVersion = rec.SecretVersion
-		p.SealedSecrets = rec.SealedSecrets
+		p = attachPlacementRecovery(p, rec)
 	}
 	return p, true
+}
+
+func attachPlacementRecovery(p Placement, rec placementRecovery) Placement {
+	p.Spec = rec.Spec
+	p.SecretRef = rec.SecretRef
+	p.SecretVersion = rec.SecretVersion
+	p.SealedSecrets = rec.SealedSecrets
+	return p
+}
+
+func (f *placementFSM) hydrateCommandRecovery(cmd *command) error {
+	if err := f.hydrateCommandRecoveryFields(cmd.SandboxID, cmd.RecoveryRef, &cmd.Spec, &cmd.SecretRef, &cmd.SecretVersion, &cmd.SealedSecrets); err != nil {
+		return err
+	}
+	for i := range cmd.Reservations {
+		r := &cmd.Reservations[i]
+		if err := f.hydrateCommandRecoveryFields(r.SandboxID, r.RecoveryRef, &r.Spec, &r.SecretRef, &r.SecretVersion, &r.SealedSecrets); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *placementFSM) hydrateCommandRecoveryFields(sandboxID, ref string, spec **models.CreateSandboxRequest, secretRef *string, secretVersion *int, sealed *[]byte) error {
+	if ref == "" {
+		return nil
+	}
+	rec, ok, err := f.resolveRecoveryRef(ref)
+	if err != nil {
+		return fmt.Errorf("placementFSM: load recovery %s for %s: %w", ref, sandboxID, err)
+	}
+	if !ok {
+		return fmt.Errorf("placementFSM: missing recovery blob %s for %s", ref, sandboxID)
+	}
+	*spec = rec.Spec
+	*secretRef = rec.SecretRef
+	*secretVersion = rec.SecretVersion
+	*sealed = rec.SealedSecrets
+	return nil
+}
+
+func (f *placementFSM) resolveRecoveryRef(ref string) (placementRecovery, bool, error) {
+	if f.recoveryStore != nil {
+		rec, ok, err := f.recoveryStore.Get(ref)
+		if err != nil {
+			return placementRecovery{}, false, err
+		}
+		if ok {
+			return rec, true, nil
+		}
+	}
+	if f.recoveryResolver == nil {
+		return placementRecovery{}, false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
+	defer cancel()
+	blob, ok, err := f.recoveryResolver(ctx, ref)
+	if err != nil || !ok {
+		return placementRecovery{}, ok, err
+	}
+	if err := f.storeRecoveryBlob(blob); err != nil {
+		return placementRecovery{}, false, err
+	}
+	return blob.recovery(), true, nil
+}
+
+func (f *placementFSM) storeRecoveryBlob(blob RecoveryBlob) error {
+	if f.recoveryStore == nil {
+		return nil
+	}
+	ref, err := f.recoveryStore.Put(blob.SandboxID, blob.recovery())
+	if err != nil {
+		return err
+	}
+	if ref != blob.Ref {
+		return fmt.Errorf("placement recovery blob ref mismatch: got %s want %s", ref, blob.Ref)
+	}
+	return nil
 }
 
 func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
@@ -1591,14 +1691,18 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	defer f.mu.RUnlock()
 	version := f.version
 	rows := make([]placementSnapshotRow, 0, len(f.placements))
+	recoveryRefs := make([]string, 0, len(f.placements))
 	for _, p := range f.placements {
 		rows = append(rows, placementSnapshotRow{Placement: cloneHotPlacement(p)})
+		if p.RecoveryRef != "" {
+			recoveryRefs = append(recoveryRefs, p.RecoveryRef)
+		}
 	}
 	drained := make(map[string]bool, len(f.drainedNodes))
 	for k, v := range f.drainedNodes {
 		drained[k] = v
 	}
-	return &fsmSnapshot{version: version, rows: rows, drainedNodes: drained}, nil
+	return &fsmSnapshot{version: version, rows: rows, drainedNodes: drained, recoveryStore: f.recoveryStore, recoveryRefs: recoveryRefs}, nil
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -1714,9 +1818,11 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 }
 
 type fsmSnapshot struct {
-	version      uint64
-	rows         []placementSnapshotRow
-	drainedNodes map[string]bool
+	version       uint64
+	rows          []placementSnapshotRow
+	drainedNodes  map[string]bool
+	recoveryStore placementRecoveryStore
+	recoveryRefs  []string
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
@@ -1730,7 +1836,13 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
 	}
-	return sink.Close()
+	if err := sink.Close(); err != nil {
+		return err
+	}
+	if s.recoveryStore != nil {
+		_ = s.recoveryStore.RetainSnapshotRefs(s.recoveryRefs)
+	}
+	return nil
 }
 
 func (s *fsmSnapshot) Release() {}
