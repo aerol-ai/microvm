@@ -93,6 +93,12 @@ var ErrReservationConflict = errors.New("cluster: sandbox already placed or rese
 // ingress node must not silently fall back to local Docker ownership.
 var ErrNoPlacementTarget = errors.New("cluster: no worker placement target available")
 
+// ErrInvalidTopology is returned when the live cluster shape violates a
+// production topology invariant. API layers translate this to 503 so clients
+// retry after the operator fixes membership instead of treating it as a
+// malformed request.
+var ErrInvalidTopology = errors.New("cluster: invalid topology")
+
 // PlacementState distinguishes a reservation (capacity held, no docker yet)
 // from a placement (sandbox materialized). Empty defaults to Placed so
 // pre-reservation snapshots restore correctly: every old row is a real

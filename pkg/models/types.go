@@ -574,12 +574,14 @@ func ValidExposedPortProtocol(value string) (string, error) {
 }
 
 type HealthStatus struct {
-	Status     string `json:"status"`
-	Sandboxes  int    `json:"sandboxes"`
-	Docker     string `json:"docker"`
-	Caddy      string `json:"caddy"`
-	SSHGateway string `json:"ssh_gateway"`
-	Version    string `json:"version"`
+	Status          string `json:"status"`
+	Sandboxes       int    `json:"sandboxes"`
+	Docker          string `json:"docker"`
+	Caddy           string `json:"caddy"`
+	SSHGateway      string `json:"ssh_gateway"`
+	ClusterTopology string `json:"cluster_topology,omitempty"`
+	ClusterNodes    int    `json:"cluster_nodes,omitempty"`
+	Version         string `json:"version"`
 }
 
 type ExecRequest struct {

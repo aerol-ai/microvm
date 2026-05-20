@@ -148,6 +148,21 @@ func (s *Service) Cluster() cluster.Client {
 	return s.cluster
 }
 
+// ClusterTopologyError returns a production-topology violation for the current
+// live member set. It is intentionally a runtime check so rolling membership,
+// old nodes that still gossip empty roles, and explicit hybrid roles are all
+// evaluated from the same source of truth the scheduler uses.
+func (s *Service) ClusterTopologyError() error {
+	if !s.cfg.EnableCluster {
+		return nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	return cluster.LargeClusterTopologyError(c.Members())
+}
+
 // EnsureClusterReady blocks until the cluster has elected a leader, mirroring
 // the EnsureLayer4Ready single-flight latch shape. Single-node mode latches
 // immediately. The API wrapper calls this before any RecordPlacement so a
@@ -351,6 +366,9 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	done := beginSandboxCreateMetric()
 	defer func() { done(err) }()
+	if err := s.ClusterTopologyError(); err != nil {
+		return nil, err
+	}
 	if s.cfg.EnableCluster && !s.cfg.IsWorker() {
 		return nil, cluster.ErrNoPlacementTarget
 	}
@@ -1577,13 +1595,29 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		status = "degraded"
 	}
 
+	clusterTopology := ""
+	clusterNodes := 0
+	if s.cfg.EnableCluster {
+		clusterTopology = "ok"
+		if c := s.Cluster(); c != nil {
+			members := c.Members()
+			clusterNodes = cluster.LiveMemberCount(members)
+			if err := cluster.LargeClusterTopologyError(members); err != nil {
+				clusterTopology = err.Error()
+				status = "degraded"
+			}
+		}
+	}
+
 	return models.HealthStatus{
-		Status:     status,
-		Sandboxes:  live,
-		Docker:     dockerStatus,
-		Caddy:      caddyStatus,
-		SSHGateway: sshStatus,
-		Version:    version.Version,
+		Status:          status,
+		Sandboxes:       live,
+		Docker:          dockerStatus,
+		Caddy:           caddyStatus,
+		SSHGateway:      sshStatus,
+		ClusterTopology: clusterTopology,
+		ClusterNodes:    clusterNodes,
+		Version:         version.Version,
 	}, nil
 }
 

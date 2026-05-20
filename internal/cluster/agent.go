@@ -231,6 +231,9 @@ func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, ErrNoPlacementTarget
 		}
+		if err := invalidTopologyFromMessage(resp.Error); err != nil {
+			return PlacementTarget{}, err
+		}
 		return PlacementTarget{}, errors.New(resp.Error)
 	}
 	if resp.Target.NodeID == a.nodeID {

@@ -91,12 +91,15 @@ Options:
                                 comma-separated combination of server / worker
                                 / ingress (e.g. "server,worker") for hybrid
                                 nodes. Default mixed (every component on every
-                                node — fine for small clusters; split at 10+
-                                nodes). "mixed" cannot be combined with other
-                                tokens. The bootstrap node's role set must
-                                contain "server" (or be "mixed"); pure worker
-                                / ingress / worker,ingress refuse to bootstrap
-                                a fresh cluster.
+                                node — fine through 10 live nodes only).
+                                Clusters above 10 live nodes must use
+                                dedicated server, worker, and ingress roles;
+                                mixed and hybrid-role members block placement.
+                                "mixed" cannot be combined with other tokens.
+                                The bootstrap node's role set must contain
+                                "server" (or be "mixed"); pure worker /
+                                ingress / worker,ingress refuse to bootstrap a
+                                fresh cluster.
   --ingress-advertise-host <h>  SB_INGRESS_ADVERTISE_HOST — the public host
                                 in SDK-returned sandbox URLs. Defaults to
                                 empty (URLs use SB_PUBLIC_HOST or

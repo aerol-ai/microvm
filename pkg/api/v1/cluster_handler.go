@@ -191,7 +191,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 
 	target, err := c.SelectPlacement(capacityRequestFromCreate(req))
 	if err != nil {
-		if errors.Is(err, cluster.ErrNoPlacementTarget) {
+		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
+			if errors.Is(err, cluster.ErrInvalidTopology) {
+				w.Header().Set("Retry-After", "300")
+			}
 			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}

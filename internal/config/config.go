@@ -29,7 +29,9 @@ const defaultToolboxPort = 2280
 // of base roles, e.g. "worker,ingress" for a data-plane edge node or
 // "server,ingress" for a control + ingress node. NodeRoleMixed remains the
 // shorthand for "server,worker,ingress" and may not be combined with anything
-// else.
+// else. Runtime topology validation keeps mixed and hybrid-role nodes as a
+// small-cluster convenience only; clusters above 10 live nodes must use
+// dedicated server, worker, and ingress roles.
 const (
 	NodeRoleServer  = "server"
 	NodeRoleWorker  = "worker"

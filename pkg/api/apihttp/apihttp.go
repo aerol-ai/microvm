@@ -30,10 +30,10 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 }
 
 // WriteStoreAwareError maps the small set of well-known service-layer error
-// kinds to HTTP responses. The mapping (404 for missing sandboxes, 503 +
-// Retry-After for capacity, 400 for everything else) is a contract clients
-// depend on regardless of API version, so it lives here in the shared helper
-// package.
+// kinds to HTTP responses. The mapping (404 for missing sandboxes, 503 for
+// capacity/topology admission failures, 400 for everything else) is a contract
+// clients depend on regardless of API version, so it lives here in the shared
+// helper package.
 func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		WriteError(w, http.StatusNotFound, "sandbox not found")
@@ -57,7 +57,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, msg)
 		return
 	}
-	if errors.Is(err, cluster.ErrNoPlacementTarget) {
+	if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
+		if errors.Is(err, cluster.ErrInvalidTopology) {
+			w.Header().Set("Retry-After", "300")
+		}
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}

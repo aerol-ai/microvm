@@ -3,7 +3,9 @@ title: Cluster Ingress
 description: Split an AerolVM cluster into server / worker / ingress roles and front it with a single advertised load-balancer endpoint.
 ---
 
-In single-node and small-cluster deployments, every AerolVM node does three jobs at once: it votes in Raft (the control plane), it runs sandbox containers (the worker), and it accepts public traffic and routes it to the correct sandbox owner (the ingress). That topology is fine through about ten nodes. Beyond it, every additional node adds a Raft voter and another copy of the cluster-wide route table - the same fan-out problem Kubernetes solves by separating control-plane masters from worker nodes and ingress controllers.
+In single-node and small-cluster deployments, every AerolVM node does three jobs at once: it votes in Raft (the control plane), it runs sandbox containers (the worker), and it accepts public traffic and routes it to the correct sandbox owner (the ingress). That topology is fine through ten live nodes. Beyond it, every additional mixed node adds a Raft voter and another copy of the cluster-wide route table - the same fan-out problem Kubernetes solves by separating control-plane masters from worker nodes and ingress controllers.
+
+AerolVM now enforces that split at runtime. When a cluster has more than 10 live nodes, placement and local creates fail with `503` if any live member is `mixed` or a comma-separated hybrid role, or if the live membership is missing one of the dedicated `server`, `worker`, or `ingress` tiers.
 
 `SB_NODE_ROLE` is the switch that splits those three jobs across different nodes. The cluster-init and cluster-join scripts accept `--role` so operators can opt into the split when they need it, without changing anything for clusters that don't.
 
@@ -16,11 +18,11 @@ In single-node and small-cluster deployments, every AerolVM node does three jobs
 | `ingress` | no (non-voter only) | no | yes |
 | `mixed` (default) | yes | yes | yes |
 
-`mixed` is the default and preserves every existing deployment's behaviour bit-for-bit. The split only kicks in when an operator passes `--role` (or sets `SB_NODE_ROLE` in the env file).
+`mixed` is the default and preserves existing single-node and small-cluster behaviour. It is not a production topology for clusters above 10 live nodes.
 
 ## Hybrid roles
 
-`SB_NODE_ROLE` also accepts a **comma-separated combination** of `server`, `worker`, and `ingress` for nodes that should run more than one job - but not all three. This is the middle ground between a single-purpose node and a full `mixed` node.
+`SB_NODE_ROLE` also accepts a **comma-separated combination** of `server`, `worker`, and `ingress` for small clusters that should run more than one job - but not all three. This is the middle ground between a single-purpose node and a full `mixed` node while the cluster has 10 or fewer live nodes.
 
 | Hybrid value | Voter? | Runs sandboxes? | Holds route table? | Use case |
 |---|---|---|---|---|
@@ -35,6 +37,7 @@ Notes:
 - Token order does not matter and the value is normalised: `SB_NODE_ROLE=ingress,worker` and `SB_NODE_ROLE=worker,ingress` both parse to the same canonical form.
 - `mixed` may not be combined with other tokens. `SB_NODE_ROLE=mixed,worker` is rejected at boot - `mixed` is already the all-three shorthand and combining it is almost always a misconfiguration.
 - A hybrid value that does **not** include `server` (e.g. `worker,ingress`) cannot bootstrap a fresh cluster - same rule as the single `worker` / `ingress` roles. Pick a node with `server` (or `mixed`) for `cluster-init.sh`.
+- Any hybrid value is a small-cluster convenience only. Above 10 live nodes, the scheduler rejects mixed and hybrid-role members so production clusters stay on dedicated server, worker, and ingress tiers.
 
 A small production cluster looks like this:
 
@@ -82,10 +85,9 @@ AerolVM does not build, run, or manage any of the three. The ingress nodes thems
 
 | Cluster size | Suggested layout |
 |---|---|
-| ≤ 5 nodes | All `mixed`. No reason to split. |
-| 5–20 nodes | 3 `server` + the rest `worker` + 2 `ingress`. Workers stop weighing on Raft quorum. |
-| 20+ nodes | 3 or 5 `server` + N `worker` + 3 `ingress` (scaled to expected bandwidth). |
-| 5–20 nodes, hardware-constrained | 3 `server` + the rest `worker,ingress`. Each data-plane node both owns sandboxes and serves public ingress, so you don't need a separate ingress tier. |
+| <= 10 nodes | `mixed` or a small split. Hybrid roles are allowed here for constrained deployments. |
+| 11+ nodes | Mandatory split: 3 or 5 `server` + N `worker` + 2+ dedicated `ingress`. Mixed and hybrid roles are rejected for placement/create. |
+| 1000-worker target | 3 or 5 `server`, 1000 `worker`, and a separately scaled `ingress` tier behind your LB. |
 
 The voter-cap setting (`SB_CLUSTER_MAX_AUTO_VOTERS`, default 5) is still in effect, but the role split is the real control: any node whose role-set lacks `server` (single `worker`, single `ingress`, or any hybrid like `worker,ingress`) never becomes a Raft voter regardless of the cap.
 
@@ -124,7 +126,7 @@ sudo ./cluster-join.sh \
 
 Point your wildcard DNS (`*.sandbox.example.com`) at the ingress nodes (or at the LB in front of them) and `ingress.sandbox.example.com` at the same target. The SDK will return sandbox URLs that resolve there; the ingress nodes' caddy-l4 will SNI-route each request to the worker that owns the sandbox.
 
-### Hybrid bootstrap example
+### Hybrid bootstrap example (10 nodes or fewer)
 
 Three-server + five `worker,ingress` edge nodes (no separate ingress tier):
 
@@ -151,7 +153,7 @@ sudo ./cluster-join.sh \
     --peers '<seed-ip>:7001'
 ```
 
-The LB / DNS in front of `ingress.sandbox.example.com` should target every edge node - they all hold the public route table and can answer for any sandbox in the cluster.
+The LB / DNS in front of `ingress.sandbox.example.com` should target every edge node - they all hold the public route table and can answer for any sandbox in the cluster. Do not use this shape once the cluster grows beyond 10 live nodes; at that point, move to dedicated `worker` and `ingress` tiers first.
 
 ## What lives where after the split
 

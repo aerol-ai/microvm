@@ -79,7 +79,10 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, message)
 		return
 	}
-	if errors.Is(err, cluster.ErrNoPlacementTarget) {
+	if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
+		if errors.Is(err, cluster.ErrInvalidTopology) {
+			w.Header().Set("Retry-After", "300")
+		}
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}

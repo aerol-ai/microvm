@@ -73,7 +73,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 
 	target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
 	if err != nil {
-		if errors.Is(err, cluster.ErrNoPlacementTarget) {
+		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
+			if errors.Is(err, cluster.ErrInvalidTopology) {
+				w.Header().Set("Retry-After", "300")
+			}
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return Decision{}, false
 		}

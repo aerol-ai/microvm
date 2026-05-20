@@ -40,3 +40,41 @@ func TestCreateSandboxRejectsPureServerClusterNode(t *testing.T) {
 		t.Fatalf("CreateSandbox error = %v, want ErrNoPlacementTarget", err)
 	}
 }
+
+func TestCreateSandboxRejectsInvalidLargeClusterTopology(t *testing.T) {
+	svc := New(
+		config.Config{EnableCluster: true, NodeRole: config.NodeRoleWorker},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil, nil, nil, nil, nil, nil, nil,
+	)
+	svc.AttachCluster(&topologyCluster{
+		Noop: cluster.NewNoop("node-01", "http://node-01"),
+		members: []cluster.Member{
+			{NodeID: "server-1", Role: config.NodeRoleServer, Alive: true},
+			{NodeID: "server-2", Role: config.NodeRoleServer, Alive: true},
+			{NodeID: "server-3", Role: config.NodeRoleServer, Alive: true},
+			{NodeID: "worker-1", Role: config.NodeRoleWorker, Alive: true},
+			{NodeID: "worker-2", Role: config.NodeRoleWorker, Alive: true},
+			{NodeID: "worker-3", Role: config.NodeRoleWorker, Alive: true},
+			{NodeID: "worker-4", Role: config.NodeRoleWorker, Alive: true},
+			{NodeID: "worker-5", Role: config.NodeRoleWorker, Alive: true},
+			{NodeID: "worker-6", Role: config.NodeRoleWorker, Alive: true},
+			{NodeID: "ingress-1", Role: config.NodeRoleIngress, Alive: true},
+			{NodeID: "edge-1", Role: "worker,ingress", Alive: true},
+		},
+	})
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{Image: "alpine"})
+	if !errors.Is(err, cluster.ErrInvalidTopology) {
+		t.Fatalf("CreateSandbox error = %v, want ErrInvalidTopology", err)
+	}
+}
+
+type topologyCluster struct {
+	*cluster.Noop
+	members []cluster.Member
+}
+
+func (c *topologyCluster) Members() []cluster.Member {
+	return c.members
+}

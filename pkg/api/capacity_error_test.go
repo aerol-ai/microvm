@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
@@ -31,5 +32,23 @@ func TestWriteStoreAwareErrorMapsCapacityTo503(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "cpu reservation exceeded") {
 		t.Fatalf("body should include reasons, got %q", rec.Body.String())
+	}
+}
+
+func TestWriteStoreAwareErrorMapsInvalidTopologyTo503(t *testing.T) {
+	server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	rec := httptest.NewRecorder()
+
+	err := fmt.Errorf("%w: clusters with more than 10 live nodes cannot include mixed-role nodes", cluster.ErrInvalidTopology)
+	server.writeStoreAwareError(rec, err)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "300" {
+		t.Fatalf("Retry-After = %q, want 300", got)
+	}
+	if !strings.Contains(rec.Body.String(), cluster.ErrInvalidTopology.Error()) {
+		t.Fatalf("body should include topology error, got %q", rec.Body.String())
 	}
 }

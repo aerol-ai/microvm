@@ -59,6 +59,11 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 	all := c.gossip.members()
 	rejects := make(map[string]int64)
+	if err := LargeClusterTopologyError(all); err != nil {
+		rejects["topology"] = 1
+		recordSchedulerDecision("invalid_topology", 0, rejects)
+		return PlacementTarget{}, err
+	}
 	// Subtract still-in-flight reservations (router wrote opReserve but the
 	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
 	// reflect them) from each peer's headroom. Without this, two creates that
