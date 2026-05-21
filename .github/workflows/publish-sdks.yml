@@ -142,6 +142,54 @@ jobs:
             exit 1
           fi
 
+      - name: Verify npm token can publish requested package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          publish_user="$(npm whoami)"
+          package_name="$(node -p "require('./package.json').name")"
+
+          if [[ "$package_name" != @*/* ]]; then
+            exit 0
+          fi
+
+          scope="${package_name#@}"
+          scope="${scope%%/*}"
+
+          if [[ "$publish_user" == "$scope" ]]; then
+            exit 0
+          fi
+
+          org_membership_json="$(npm org ls "$scope" "$publish_user" --json 2>/dev/null || true)"
+          publish_role="$(node -e "const raw = process.argv[1]; if (!raw) process.exit(0); const data = JSON.parse(raw); const entries = Object.entries(data); if (entries.length !== 1) process.exit(0); process.stdout.write(String(entries[0][1] ?? ''));" "$org_membership_json")"
+
+          if [[ -z "$publish_role" ]]; then
+            echo "::error::NPM_TOKEN authenticates as $publish_user, but that account cannot publish the scoped package $package_name. Use an npm token from the $scope scope owner or an npm org member with developer, admin, or owner access."
+            exit 1
+          fi
+
+          case "$publish_role" in
+            developer|admin|owner) ;;
+            *)
+              echo "::error::NPM_TOKEN authenticates as $publish_user, but its npm org role in $scope is '$publish_role'. Publishing $package_name requires developer, admin, or owner access."
+              exit 1
+              ;;
+          esac
+
+      - name: Check whether package version is already published
+        id: npm_publish_state
+        run: |
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+
+          if npm view "${package_name}@${package_version}" version --json >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::TypeScript SDK version $package_version is already present on npm; skipping deploy on this rerun."
+            exit 0
+          fi
+
+          echo "already_published=false" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies
         run: npm ci
 
@@ -155,6 +203,7 @@ jobs:
         run: npm pack --dry-run
 
       - name: Publish package
+        if: steps.npm_publish_state.outputs.already_published != 'true'
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
