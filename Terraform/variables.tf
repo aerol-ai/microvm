@@ -428,6 +428,12 @@ variable "bundle_bucket_force_destroy" {
   default     = true
 }
 
+variable "caddy_certs_bucket_force_destroy" {
+  description = "Whether `terraform destroy` may delete the managed Caddy cert S3 bucket even if it still has object versions."
+  type        = bool
+  default     = false
+}
+
 variable "seed_wait_max_seconds" {
   description = "How long a joiner will poll S3 for the seed's gossip key + TLS bundle before giving up."
   type        = number

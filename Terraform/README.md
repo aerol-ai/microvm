@@ -126,6 +126,13 @@ The S3 bucket is private, SSE-encrypted, and `force_destroy = true` by
 default so `terraform destroy` doesn't fail on leftover objects. Flip
 `bundle_bucket_force_destroy = false` if you want belt-and-braces.
 
+If you enable managed shared cert storage (`caddy_shared_cert_storage = {
+enabled = true }` with the default `mode = "managed"`), Terraform creates a
+second versioned S3 bucket for Caddy certs. That bucket stays conservative by
+default: `caddy_certs_bucket_force_destroy = false`. Set it to `true` before
+`terraform destroy` if you want Terraform to purge stored cert object versions
+and remove the bucket automatically.
+
 ## Observability and pull-storm controls
 
 Prometheus scraping is always available at `GET /v1/metrics` on each node's
@@ -191,4 +198,6 @@ terraform destroy
 ```
 
 This deletes the VPC, instances, security group, IAM profiles, S3 bundle
-bucket (force-destroyed), and the Cloudflare records.
+bucket (force-destroyed), and the Cloudflare records. If managed shared cert
+storage is enabled, the cert bucket is only auto-deleted when
+`caddy_certs_bucket_force_destroy = true`; otherwise empty it manually first.

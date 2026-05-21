@@ -125,15 +125,16 @@ resource "aws_iam_instance_profile" "joiner" {
 # keys via var.caddy_shared_cert_storage and we skip the IAM attachment.
 #
 # Versioning is ON so an accidental delete of a renewed cert is recoverable.
-# force_destroy is OFF — `terraform destroy` should not silently wipe long-
-# lived TLS material the way the one-shot bundle bucket can be.
+# force_destroy defaults OFF — `terraform destroy` should not silently wipe
+# long-lived TLS material the way the one-shot bundle bucket can be unless the
+# operator explicitly opts in for full teardown.
 ###############################################################################
 
 resource "aws_s3_bucket" "caddy_certs" {
   count = local.caddy_storage_s3_managed ? 1 : 0
 
   bucket        = local.caddy_certs_bucket_name
-  force_destroy = false
+  force_destroy = var.caddy_certs_bucket_force_destroy
 }
 
 resource "aws_s3_bucket_public_access_block" "caddy_certs" {
