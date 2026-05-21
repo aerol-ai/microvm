@@ -14,6 +14,11 @@ const DefaultPlacementShardCount = 16384
 const (
 	DefaultPlacementPageLimit = 1000
 	MaxPlacementPageLimit     = 5000
+	// MaxReplicatedIngressRouteNodes is the largest ingress tier where every
+	// ingress-capable node keeps the full public route table. Ordinary DNS
+	// round-robin / TCP load balancers can only work if any advertised ingress
+	// node can answer for any sandbox.
+	MaxReplicatedIngressRouteNodes = 10
 )
 
 // PlacementShardFilter asks the control plane for only a subset of placement
@@ -104,10 +109,11 @@ func PlacementShardForSandbox(sandboxID string, count int) int {
 	return int(h.Sum32() % uint32(count))
 }
 
-// IngressShardFilterForNode returns the stable placement shard subset a single
-// ingress-capable node should reconcile. The nodeID is included even if gossip
-// has not reported the local member yet, which keeps a freshly booted ingress
-// process from temporarily reconciling the full placement table.
+// IngressShardFilterForNode returns the placement shard subset a single
+// ingress-capable node should reconcile. Small ingress tiers replicate the full
+// public route table to each ingress node so ordinary DNS round-robin / TCP
+// load balancers work for every sandbox. Very large ingress tiers shard the
+// table and require a shard-aware upstream router.
 func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFilter {
 	if nodeID == "" {
 		return PlacementShardFilter{}
@@ -134,6 +140,9 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 	if selfIndex < 0 || len(ids) == 0 {
 		return PlacementShardFilter{}
 	}
+	if len(ids) <= MaxReplicatedIngressRouteNodes {
+		return PlacementShardFilter{}
+	}
 
 	shards := make([]int, 0, DefaultPlacementShardCount/len(ids)+1)
 	for shard := 0; shard < DefaultPlacementShardCount; shard++ {
@@ -148,9 +157,8 @@ func IngressShardFilterForNode(members []Member, nodeID string) PlacementShardFi
 }
 
 // IngressRouteForSandbox returns the ingress owner set an upstream router
-// should target for sandboxID. Today the owner set has one member; the slice is
-// intentional so replicated shard owners can be added without changing the
-// response shape.
+// should target for sandboxID. Small ingress tiers all own every sandbox route;
+// very large ingress tiers return the stable shard owner.
 func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRoute {
 	shardCount := DefaultPlacementShardCount
 	shard := PlacementShardForSandbox(sandboxID, shardCount)
@@ -162,6 +170,10 @@ func IngressRouteForSandbox(members []Member, sandboxID string) IngressShardRout
 		Owners:     []IngressRouteOwner{},
 	}
 	if len(owners) == 0 {
+		return route
+	}
+	if len(owners) <= MaxReplicatedIngressRouteNodes {
+		route.Owners = owners
 		return route
 	}
 	route.Owners = append(route.Owners, owners[shard%len(owners)])
