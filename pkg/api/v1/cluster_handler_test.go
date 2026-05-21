@@ -408,7 +408,7 @@ func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *te
 	}
 }
 
-func TestClusterIngressRouteReturnsDeterministicShardOwner(t *testing.T) {
+func TestClusterIngressRouteReturnsReplicatedOwnersForSmallIngressTier(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	members := []cluster.Member{
@@ -439,9 +439,8 @@ func TestClusterIngressRouteReturnsDeterministicShardOwner(t *testing.T) {
 	if got.SandboxID != "sb-route" || got.Shard != wantShard || got.ShardCount != cluster.DefaultPlacementShardCount {
 		t.Fatalf("route = %+v, want sandbox_id=sb-route shard=%d shard_count=%d", got, wantShard, cluster.DefaultPlacementShardCount)
 	}
-	wantOwner := []string{"ing-a", "ing-b"}[wantShard%2]
-	if len(got.Owners) != 1 || got.Owners[0].NodeID != wantOwner {
-		t.Fatalf("owners = %+v, want single owner %q", got.Owners, wantOwner)
+	if len(got.Owners) != 2 || got.Owners[0].NodeID != "ing-a" || got.Owners[1].NodeID != "ing-b" {
+		t.Fatalf("owners = %+v, want replicated owners ing-a and ing-b", got.Owners)
 	}
 	if got.Owners[0].DataPlaneHost == "" || got.Owners[0].APIURL == "" || got.Owners[0].InternalURL == "" {
 		t.Fatalf("owner = %+v, want route targets populated for upstream routers", got.Owners[0])
