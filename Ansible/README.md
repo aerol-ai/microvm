@@ -107,6 +107,17 @@ ansible-playbook playbooks/update-sandboxd.yml \
 
 # Tail recent sandboxd logs from every node:
 ansible-playbook playbooks/tail-logs.yml -e lines=200
+
+# Drain a node and wait until it owns zero placements before a Terraform
+# role change or instance replacement:
+ansible-playbook playbooks/prepare-role-change.yml --limit aerolvm-worker-17
+
+# Configure OTEL/image-pull hardening and deploy backup/recovery,
+# node lifecycle, Grafana, Prometheus, Alertmanager, and runbook artifacts:
+ansible-playbook playbooks/configure-ops.yml \
+  -e sandboxd_otel_metrics_endpoint=http://otel-collector:4318/v1/metrics \
+  -e sandboxd_otel_traces_endpoint=http://otel-collector:4318/v1/traces \
+  -e sandboxd_backup_enabled=true
 ```
 
 `update-sandboxd.yml` runs `serial: 1` — one host at a time, with
@@ -152,6 +163,8 @@ inventory/
 playbooks/
   ping.yml             # connectivity smoke test
   update-sandboxd.yml  # rolling binary push + restart + healthcheck
+  prepare-role-change.yml # drain + wait-empty guard before Terraform role changes
+  configure-ops.yml    # OTEL env, image-pull knobs, ops alert/dashboard/runbook files
   tail-logs.yml        # journalctl across the fleet
 ```
 
@@ -161,7 +174,12 @@ playbooks/
 |-------------------------------------------------|-------------|
 | Add / remove / resize nodes                     | Terraform   |
 | Change SG rules, DNS, AMI                       | Terraform   |
+| Drain a node before Terraform role changes      | Ansible     |
 | Push a new `sandboxd` binary                    | Ansible     |
+| Change OTEL/image-pull env on running nodes     | Ansible     |
+| Deploy backup/recovery helpers or backup cron   | Ansible     |
+| Deploy Grafana/Prometheus/Alertmanager artifacts | Ansible     |
+| Deploy operational runbooks                     | Ansible     |
 | Restart a service, rotate a PAT, tail logs      | Ansible     |
 | Run one-off shell commands across many nodes    | Ansible     |
 

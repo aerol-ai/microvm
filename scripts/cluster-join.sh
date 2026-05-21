@@ -91,7 +91,11 @@ Optional:
                                 "worker,ingress" for a data-plane edge node
                                 that owns sandboxes AND fans out public
                                 ingress without joining the raft quorum).
-                                Default mixed. A role set without "server" /
+                                Default mixed, for clusters through 10 live
+                                nodes only. Clusters above 10 live nodes must
+                                use dedicated server, worker, and ingress
+                                roles; mixed and hybrid-role members block
+                                placement. A role set without "server" /
                                 "mixed" never becomes a raft voter even after
                                 gossip join. "mixed" cannot be combined with
                                 other tokens.

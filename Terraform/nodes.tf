@@ -39,24 +39,33 @@ resource "aws_instance" "seed" {
   user_data_replace_on_change = true
 
   user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
-    node_name               = "${var.cluster_name}-${local.seed_node.name}"
-    role                    = local.seed_node.role
-    is_seed                 = true
-    domain                  = var.domain_name
-    pat_token               = var.pat_token
-    cloudflare_api_token    = var.cloudflare_api_token
-    with_gvisor             = local.seed_node.with_gvisor
-    with_nvidia_gpu         = local.seed_node.with_nvidia_gpu
-    with_amd_gpu            = local.seed_node.with_amd_gpu
-    idle_timeout_min        = local.seed_node.idle_timeout_min
-    bundle_bucket           = aws_s3_bucket.bundle.bucket
-    aws_region              = var.aws_region
-    seed_private_ip         = ""
-    install_script_url      = var.install_script_url
-    cluster_init_script_url = var.cluster_init_script_url
-    cluster_join_script_url = var.cluster_join_script_url
-    seed_wait_max_seconds   = var.seed_wait_max_seconds
-    extra_user_data         = local.seed_node.extra_user_data
+    node_name                  = "${var.cluster_name}-${local.seed_node.name}"
+    role                       = local.seed_node.role
+    is_seed                    = true
+    domain                     = var.domain_name
+    pat_token                  = var.pat_token
+    cloudflare_api_token       = var.cloudflare_api_token
+    with_gvisor                = local.seed_node.with_gvisor
+    with_nvidia_gpu            = local.seed_node.with_nvidia_gpu
+    with_amd_gpu               = local.seed_node.with_amd_gpu
+    idle_timeout_min           = local.seed_node.idle_timeout_min
+    bundle_bucket              = aws_s3_bucket.bundle.bucket
+    aws_region                 = var.aws_region
+    seed_private_ip            = ""
+    install_script_url         = var.install_script_url
+    cluster_init_script_url    = var.cluster_init_script_url
+    cluster_join_script_url    = var.cluster_join_script_url
+    seed_wait_max_seconds      = var.seed_wait_max_seconds
+    otel_metrics_enabled       = var.otel_metrics_enabled || var.otel_metrics_endpoint != ""
+    otel_metrics_endpoint      = var.otel_metrics_endpoint
+    otel_metrics_interval      = var.otel_metrics_interval
+    otel_traces_enabled        = var.otel_traces_enabled || var.otel_traces_endpoint != ""
+    otel_traces_endpoint       = var.otel_traces_endpoint
+    otel_traces_sample_ratio   = var.otel_traces_sample_ratio
+    otel_service_name          = var.otel_service_name
+    image_pull_max_concurrent  = var.image_pull_max_concurrent
+    image_pull_failure_backoff = var.image_pull_failure_backoff
+    extra_user_data            = local.seed_node.extra_user_data
   })
 
   tags = merge(
@@ -103,24 +112,33 @@ resource "aws_instance" "joiner" {
   user_data_replace_on_change = true
 
   user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
-    node_name               = "${var.cluster_name}-${each.value.name}"
-    role                    = each.value.role
-    is_seed                 = false
-    domain                  = var.domain_name
-    pat_token               = var.pat_token
-    cloudflare_api_token    = var.cloudflare_api_token
-    with_gvisor             = each.value.with_gvisor
-    with_nvidia_gpu         = each.value.with_nvidia_gpu
-    with_amd_gpu            = each.value.with_amd_gpu
-    idle_timeout_min        = each.value.idle_timeout_min
-    bundle_bucket           = aws_s3_bucket.bundle.bucket
-    aws_region              = var.aws_region
-    seed_private_ip         = aws_instance.seed.private_ip
-    install_script_url      = var.install_script_url
-    cluster_init_script_url = var.cluster_init_script_url
-    cluster_join_script_url = var.cluster_join_script_url
-    seed_wait_max_seconds   = var.seed_wait_max_seconds
-    extra_user_data         = each.value.extra_user_data
+    node_name                  = "${var.cluster_name}-${each.value.name}"
+    role                       = each.value.role
+    is_seed                    = false
+    domain                     = var.domain_name
+    pat_token                  = var.pat_token
+    cloudflare_api_token       = var.cloudflare_api_token
+    with_gvisor                = each.value.with_gvisor
+    with_nvidia_gpu            = each.value.with_nvidia_gpu
+    with_amd_gpu               = each.value.with_amd_gpu
+    idle_timeout_min           = each.value.idle_timeout_min
+    bundle_bucket              = aws_s3_bucket.bundle.bucket
+    aws_region                 = var.aws_region
+    seed_private_ip            = aws_instance.seed.private_ip
+    install_script_url         = var.install_script_url
+    cluster_init_script_url    = var.cluster_init_script_url
+    cluster_join_script_url    = var.cluster_join_script_url
+    seed_wait_max_seconds      = var.seed_wait_max_seconds
+    otel_metrics_enabled       = var.otel_metrics_enabled || var.otel_metrics_endpoint != ""
+    otel_metrics_endpoint      = var.otel_metrics_endpoint
+    otel_metrics_interval      = var.otel_metrics_interval
+    otel_traces_enabled        = var.otel_traces_enabled || var.otel_traces_endpoint != ""
+    otel_traces_endpoint       = var.otel_traces_endpoint
+    otel_traces_sample_ratio   = var.otel_traces_sample_ratio
+    otel_service_name          = var.otel_service_name
+    image_pull_max_concurrent  = var.image_pull_max_concurrent
+    image_pull_failure_backoff = var.image_pull_failure_backoff
+    extra_user_data            = each.value.extra_user_data
   })
 
   depends_on = [aws_instance.seed]

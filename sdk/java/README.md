@@ -38,6 +38,7 @@ import ai.aerol.microvm.MicroVMClient;
 import ai.aerol.microvm.MicroVMConfig;
 import ai.aerol.microvm.Sandbox;
 import ai.aerol.microvm.model.CreateOptions;
+import ai.aerol.microvm.model.Failover;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 
@@ -53,6 +54,7 @@ Sandbox sandbox = client.create(
         .setLifecycle(new Lifecycle()
             .setStopIfIdleFor(3_600_000_000_000L)
             .setDestroyAtAge(86_400_000_000_000L))
+        .setFailover(new Failover().setPolicy("recreate"))
         .setMounts(java.util.List.of(
             new MountSpec()
                 .setType("s3")

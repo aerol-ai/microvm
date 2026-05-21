@@ -142,23 +142,24 @@ gossip on surviving nodes marks B "suspect" then "dead"
         │
         ▼
 leader runs the dead-owner reconciler:
-  - for each placement owned by B: set owner = "" (orphan)
+  - for each default placement owned by B: set owner = "" (orphan)
+  - for each placement with failover.policy="recreate": reassign to a live worker
   - RemoveServer B from the raft configuration
         │
         ▼
-subsequent API calls for any of B's sandboxes return 410 Gone
+default sandboxes return 410 Gone; opted-in sandboxes are recreated
         │
         ▼
 clients (or operators) issue a fresh create — placement picks
 a new owner from the live, healthy nodes
 ```
 
-**Sandboxes do not auto-recreate.** Spec, sealed credentials, and exposed-port
-metadata replicated via raft are *retained in the FSM* (and a future opt-in
-lifecycle policy may rematerialize them), but the current product policy is
-"a killed sandbox stays gone." The reassign + recreate code paths exist in
-`internal/cluster/{dead_owner,owner_watcher}.go` and `service.RecreateSandbox`
-but are gated off behind `clusterRecreateOnFailoverEnabled = false`.
+**Sandbox auto-recreate is opt-in.** Spec, sealed credentials, and exposed-port
+metadata replicated via raft are retained in the FSM for every sandbox, but
+the default product policy is "a killed sandbox stays gone." A create request
+with `failover.policy="recreate"` tells the dead-owner reconciler to reassign
+that placement to a live worker and let the owner watcher call
+`service.RecreateSandbox`.
 
 ### 4. A node joins for the first time
 
@@ -187,14 +188,16 @@ sandboxes and can accept new placements based on its capacity
 
 ## Failover semantics
 
-**The product policy is non-HA sandboxes.** When an owner node dies, every
-sandbox on it is gone. The cluster keeps running; the sandboxes do not.
+**The default product policy is non-HA sandboxes.** When an owner node dies,
+default sandboxes on it are gone. Sandboxes created with
+`failover.policy="recreate"` are best-effort recreated on another worker from
+their replicated spec. The cluster keeps running either way.
 
 | State | Survives node failure | Why |
 |---|---|---|
-| Sandbox spec, sealed creds, port intents | **Retained in the FSM, not auto-recreated** | Replicated by raft so a future opt-in failover policy could rematerialize the sandbox. The current default does not. |
+| Sandbox spec, sealed creds, port intents | **Retained in the FSM** | Replicated by raft for orphan inspection, manual recovery, and opt-in failover recreation. |
 | Sandbox runtime (container, filesystem, sessions, host ports, SSH) | **No** | Lives only on the dead host. There is no automatic replacement. |
-| Sandbox URL (`<id>.<domain>`) | **No** | The ID is gone from the live cluster — API returns 410 Gone. Clients should create a fresh sandbox and get a fresh ID. |
+| Sandbox URL (`<id>.<domain>`) | Default: **No**. Opt-in recreate: **Best effort** | Default placement is orphaned and API returns 410 Gone. Opted-in sandboxes keep the ID while ingress repoints to the new owner. |
 | Sessions / recordings on disk | **No (without external storage)** | Live in the dead host's `/var/lib/`. Use external mounts if you need to retrieve them later. |
 | Cluster control plane (raft, placement of *other* sandboxes) | **Yes** | Quorum stays available as long as you keep `(N-1)/2` voters alive. Other sandboxes on healthy nodes continue to run. |
 | New placements after the failure | **Yes** | Capacity from the dead node leaves the gossip pool; new creates pick from the remaining healthy candidates. |
@@ -210,10 +213,9 @@ inside one sandbox:
 3. Do not assume the sandbox URL, container ID, or host ports persist across
    the owner's death.
 
-The reassign + recreate code paths exist behind a gate
-(`clusterRecreateOnFailoverEnabled` in `internal/cluster/dead_owner.go`). They
-are preserved for a future opt-in lifecycle policy and are not active in this
-release.
+If a workload can tolerate writable-layer loss but should keep its sandbox ID,
+create it with `failover.policy="recreate"`. Local-only images are rejected
+for this policy because another worker cannot pull them.
 
 See [Durability and Failover](https://docs.aerol.ai/durability) for the
 production runbook.
@@ -985,13 +987,11 @@ on each node's `/debug/vars` are the operator signals.
 
 #### Preferred host-port replay during failover-recreate
 
-When a placement re-lands on a new owner via the failover-recreate path (gated
-off by default — sandboxes are not HA under current product policy), the FSM
-carries the original TCP `host_port` so the new owner can re-bind it and
-preserve the public endpoint. If that host port is already reserved on the
-new owner (taken by an unrelated TCP exposure, or in use locally), the
-replay **parks** the exposure rather than silently allocating a different
-host port:
+When a placement re-lands on a new owner via the opt-in failover-recreate path,
+the FSM carries the original TCP `host_port` so the new owner can re-bind it
+and preserve the public endpoint. If that host port is already reserved on the
+new owner (taken by an unrelated TCP exposure, or in use locally), the replay
+**parks** the exposure rather than silently allocating a different host port:
 
 - The FSM record (with the original `host_port`) stays intact.
 - The local re-bind fails with `ErrPreferredHostPortUnavailable`; the
@@ -1032,18 +1032,39 @@ it is added as a non-voter.
 
 ### Removing a node
 
-Stop the daemon on the node. After `SB_DEAD_OWNER_GRACE` (default 30s) the
-leader's dead-owner reconciler orphans every placement that node owned
-(`OwnerNodeID = ""` in the FSM — subsequent API calls for those sandboxes
-return `410 Gone`) and `RemoveServer`s the node from the raft configuration.
-Any sandboxes that were on it are gone for good under the current non-HA
-policy; clients should create fresh sandboxes.
+For worker or ingress-only nodes, drain admission first, wait until the node
+owns no placements, then replace or terminate the instance:
 
-There is no public API endpoint for explicit raft membership removal yet —
-`DELETE /v1/cluster/members/<node-id>` is **not implemented** in this release.
-Treat permanent node removal as an operator action and validate against the
-current raft membership before the node's data directory is reused or
-discarded.
+```bash
+export SB_PAT_TOKEN=<redacted>
+curl -fsS -X POST -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  http://<any-node>:21212/v1/cluster/nodes/<node-id>/drain
+curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  'http://<any-node>:21212/v1/cluster/sandbox-index?limit=5000'
+```
+
+The packaged helper does the same check and fails if long-lived placements are
+still present:
+
+```bash
+sudo /usr/local/sbin/sandboxd-node-lifecycle.sh pre-role-change <node-id>
+```
+
+For server-role raft members, stop the daemon or terminate the instance, then
+remove the stale raft member explicitly from any surviving node:
+
+```bash
+curl -fsS -X DELETE -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  http://<any-survivor>:21212/v1/cluster/members/<node-id>
+```
+
+`DELETE /v1/cluster/members/<node-id>` persists a drain mark, orphans any
+placements owned by that node (`OwnerNodeID = ""`; subsequent API calls return
+`410 Gone` under the current non-HA policy), and calls raft `RemoveServer`.
+It refuses to remove a member that is still gossiped alive unless
+`?force=true` is supplied, and it refuses to remove the last raft voter.
+Any sandboxes that were on the removed node are gone for good under the current
+non-HA policy; clients should create fresh sandboxes.
 
 ### Rolling restart
 
@@ -1105,6 +1126,14 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered nodes auto-promoted as raft voters. Default `5`; additional nodes become non-voters. Set `0` for unlimited. |
 | `SB_DEAD_OWNER_GRACE` | no | Wait before reassigning a dead node's placements. Default `30s`. |
+| `SB_OTEL_METRICS_ENDPOINT` | no | OTLP/HTTP metrics endpoint, for example `http://otel-collector:4318/v1/metrics`. Setting it enables OTEL metrics. |
+| `SB_OTEL_METRICS_ENABLED` | no | Enables OTEL metrics without an explicit endpoint; the OTEL exporter env defaults apply. |
+| `SB_OTEL_METRICS_INTERVAL` | no | OTEL export interval. Default `30s`. |
+| `SB_OTEL_TRACES_ENDPOINT` | no | OTLP/HTTP traces endpoint, for example `http://otel-collector:4318/v1/traces`. Setting it enables OTEL traces. |
+| `SB_OTEL_TRACES_ENABLED` | no | Enables OTEL traces without an explicit endpoint; the OTEL exporter env defaults apply. |
+| `SB_OTEL_TRACES_SAMPLE_RATIO` | no | Parent-based trace sample ratio. Default `0.05`; use `1` for all root traces or `0` to disable local root sampling. |
+| `SB_IMAGE_PULL_MAX_CONCURRENT` | no | Per-worker cap on concurrent Docker image pulls. Default `4`; set `0` to disable the cap. |
+| `SB_IMAGE_PULL_FAILURE_BACKOFF` | no | Per-image/auth retry suppression after a failed pull. Default `30s`; set `0s` to disable. |
 
 The daemon **refuses to boot** in cluster mode if either gossip or
 credential keys are missing (and the matching `INSECURE_*` flag isn't set).
@@ -1151,6 +1180,21 @@ For a full cluster recovery from total destruction, you also need the
 cluster TLS bundle (CA + CA key) and the gossip key. Store these in your
 secrets manager.
 
+The repo includes a backup helper that packages the local SQLite DB, Raft
+state, and `/etc/sandboxd` config tree into one restricted archive:
+
+```bash
+sudo scripts/sandboxd-backup.sh --output /secure/backups/sandboxd-$(hostname)-$(date +%F).tar.gz
+```
+
+To restore onto a stopped replacement node:
+
+```bash
+sudo systemctl stop sandboxd
+sudo scripts/sandboxd-restore.sh --input /secure/backups/sandboxd-node-a-2026-05-20.tar.gz --target-root / --force
+sudo systemctl start sandboxd
+```
+
 ---
 
 ## Lost-quorum recovery
@@ -1180,17 +1224,19 @@ If the lost voters are gone for good (disk loss, hardware destroyed):
 
 1. Stop `sandboxd` on every survivor.
 2. On the node with the highest raft `LastIndex` (check `journalctl`),
-   create `/var/lib/sandboxd/raft/peers.json`:
+   create `/var/lib/sandboxd/raft/peers.json` directly or with the helper:
 
-   ```json
-   [
-     { "id": "this-node-id", "address": "10.0.0.5:7000", "non_voter": false, "suffrage": "Voter" }
-   ]
+   ```bash
+   sudo scripts/raft-lost-quorum-recover.sh \
+     --raft-dir /var/lib/sandboxd/raft \
+     --node-id this-node-id \
+     --raft-address 10.0.0.5:7000
    ```
 
-3. Start `sandboxd` on that node only. It detects `peers.json` and rewrites
-   the raft configuration to itself — bootstraps a fresh single-node cluster
-   from its existing log.
+3. Start `sandboxd` on that node only. It detects `peers.json`, runs
+   HashiCorp Raft's recovery path, rewrites the raft configuration to the
+   supplied peers, and renames the file to `peers.json.applied.<unix>` after
+   success.
 4. Once it elects itself leader, re-add the other survivors:
 
    ```bash
@@ -1225,6 +1271,50 @@ A healthy cluster reports:
 
 Set up monitoring on `GET /v1/cluster/leader` returning empty for more than
 30 seconds — that's the earliest signal of a brewing quorum problem.
+
+For metric scraping, use the PAT-gated Prometheus endpoint on every node:
+
+```bash
+curl -H "Authorization: Bearer $SB_PAT_TOKEN" http://<node>:8080/v1/metrics
+```
+
+Scrape servers, workers, and ingress nodes separately. The endpoint exports
+only `aerolvm_*` metrics and includes the operational signals needed for the
+large-cluster SLOs: Raft apply/snapshot health, route lag, create queue depth,
+worker lease freshness, host pressure, image-pull pressure, and Caddy/admin
+errors.
+
+For OTEL, set:
+
+```bash
+SB_OTEL_METRICS_ENDPOINT=http://otel-collector:4318/v1/metrics
+SB_OTEL_METRICS_INTERVAL=30s
+SB_OTEL_TRACES_ENDPOINT=http://otel-collector:4318/v1/traces
+SB_OTEL_TRACES_SAMPLE_RATIO=0.05
+OTEL_SERVICE_NAME=sandboxd
+```
+
+The OTEL bridge exports the same `aerolvm_*` expvars under
+`aerolvm.expvar.int64` and `aerolvm.expvar.float64`, with the original expvar
+name in the `metric` attribute. The trace exporter emits server spans for API
+requests, preserves incoming W3C trace context, and attaches the matched
+`http.route`, response status, node ID, node role, service name, and version.
+A starter Grafana dashboard is available at
+`setup/grafana/sandboxd-slo-dashboard.json`.
+
+Prometheus alert rules are available at `setup/prometheus/sandboxd-alerts.yml`.
+They cover Raft apply/snapshot health, worker lease freshness, create backlog,
+capacity pressure, ingress route lag, Caddy/admin failures, owner-forward
+errors, image-pull storms, and secret decrypt failures. An Alertmanager
+route/receiver example is available at
+`setup/alertmanager/sandboxd-alertmanager-example.yml`.
+
+Full incident runbooks are available under `setup/runbooks/`:
+
+- `backup-restore.md`
+- `lost-quorum-recovery.md`
+- `image-pull-storm.md`
+- `slo-breach.md`
 
 ---
 

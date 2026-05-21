@@ -25,8 +25,10 @@ import (
 // if reached, so a future refactor that starts calling them in reconcile fails
 // the test instead of silently passing.
 type fakeReconcileRuntime struct {
-	managed         map[string]*models.SandboxRuntimeState
-	removeImageHits atomic.Int32
+	managed               map[string]*models.SandboxRuntimeState
+	removeImageHits       atomic.Int32
+	networkBlockAllCalls  []string
+	allowPushAllowedPorts bool
 }
 
 func (f *fakeReconcileRuntime) ListManaged(_ context.Context) (map[string]*models.SandboxRuntimeState, error) {
@@ -67,12 +69,16 @@ func (f *fakeReconcileRuntime) Ping(context.Context) error {
 	panic("unexpected Ping on reconcile destroyed path")
 }
 func (f *fakeReconcileRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
-	panic("unexpected PushAllowedPorts on reconcile destroyed path")
+	if !f.allowPushAllowedPorts {
+		panic("unexpected PushAllowedPorts on reconcile destroyed path")
+	}
+	return nil
 }
 func (f *fakeReconcileRuntime) ClearNetworkRules(string) error {
 	return nil
 }
-func (f *fakeReconcileRuntime) ApplyNetworkBlockAll(string) error {
+func (f *fakeReconcileRuntime) ApplyNetworkBlockAll(containerIP string) error {
+	f.networkBlockAllCalls = append(f.networkBlockAllCalls, containerIP)
 	return nil
 }
 func (f *fakeReconcileRuntime) ApplyNetworkBlockIngress(string) error {
@@ -83,6 +89,87 @@ func (f *fakeReconcileRuntime) ClearNetworkBlockIngress(string) error {
 }
 func (f *fakeReconcileRuntime) ClearNetworkBlockEgress(string) error {
 	return nil
+}
+
+func TestReconcileReappliesNetworkBlockAllWithCurrentContainerIP(t *testing.T) {
+	ctx := context.Background()
+
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
+		RootDir:     filepath.Join(t.TempDir(), "mounts"),
+		CredDir:     filepath.Join(t.TempDir(), "cred"),
+		WaitTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("mounts.New: %v", err)
+	}
+	t.Cleanup(mgr.Close)
+
+	caddyClient := caddy.New(config.Config{
+		EnableCaddy:       false,
+		HTTPClientTimeout: time.Second,
+	})
+	rt := &fakeReconcileRuntime{
+		allowPushAllowedPorts: true,
+		managed: map[string]*models.SandboxRuntimeState{
+			"sb-blocked": {
+				SandboxID:   "sb-blocked",
+				ContainerID: "ctr-current",
+				ContainerIP: "10.0.0.42",
+				Status:      models.SandboxStatusStarted,
+			},
+		},
+	}
+	svc := &Service{
+		cfg:    config.Config{},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:  st,
+		docker: rt,
+		caddy:  caddyClient,
+		mounts: mgr,
+	}
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:              "sb-blocked",
+		Image:           "ubuntu:22.04",
+		Status:          models.SandboxStatusStarted,
+		ContainerID:     "ctr-stale",
+		ContainerIP:     "10.0.0.7",
+		CPU:             1,
+		MemoryMB:        512,
+		Runtime:         models.RuntimeDocker,
+		NetworkBlockAll: true,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		LastActiveAt:    now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got, want := rt.networkBlockAllCalls, []string{"10.0.0.42"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("ApplyNetworkBlockAll calls = %v, want %v", got, want)
+	}
+	refreshed, err := st.Get(ctx, "sb-blocked")
+	if err != nil {
+		t.Fatalf("Get refreshed sandbox: %v", err)
+	}
+	if refreshed.ContainerID != "ctr-current" || refreshed.ContainerIP != "10.0.0.42" {
+		t.Fatalf("reconcile did not persist current runtime identity: id=%q ip=%q", refreshed.ContainerID, refreshed.ContainerIP)
+	}
+	if !refreshed.NetworkBlockAll {
+		t.Fatal("NetworkBlockAll flag was lost during reconcile")
+	}
 }
 
 // TestReconcileDestroyedRowFreesHostPort is the regression test required by

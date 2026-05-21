@@ -111,6 +111,13 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 		}
 	}
 
+	if err := maybeRecoverRaftClusterFromPeersFile(cfg, rcfg, fsm, logStore, stableStore, snaps, transport, logger); err != nil {
+		_ = transport.Close()
+		_ = logStore.Close()
+		_ = stableStore.Close()
+		return nil, err
+	}
+
 	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, transport)
 	if err != nil {
 		_ = transport.Close()

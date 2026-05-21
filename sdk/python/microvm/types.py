@@ -78,6 +78,15 @@ class Lifecycle(TypedDict, total=False):
 UpdateLifecycleOptions = Lifecycle
 
 
+FailoverPolicy = Literal["none", "recreate"]
+
+
+class Failover(TypedDict, total=False):
+    # "none" (default) returns 410 Gone after owner-node death. "recreate"
+    # opts into best-effort cluster recreation from the replicated create spec.
+    policy: FailoverPolicy
+
+
 GPUVendor = Literal["nvidia", "amd", "apple"]
 
 
@@ -122,6 +131,7 @@ class CreateOptions(TypedDict, total=False):
     containerCommand: List[str]
     mounts: List[MountSpec]
     lifecycle: Lifecycle
+    failover: Failover
     # Container runtime to use for this sandbox. Omit to inherit the host
     # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
     # when running untrusted workloads. "kata" is reserved and rejected by the
@@ -281,6 +291,7 @@ class SandboxData(TypedDict, total=False):
     lastError: str
     containerCommand: List[str]
     lifecycle: Lifecycle
+    failover: Failover
     # Container runtime this sandbox is running under. Empty string indicates
     # a pre-migration row that resolves to the host default at start time.
     runtime: Literal["", "docker", "gvisor", "kata"]

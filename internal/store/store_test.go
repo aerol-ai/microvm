@@ -1079,6 +1079,24 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "failover_policy_persists_through_create_and_get",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-failover")
+				sandbox.Failover = &models.Failover{Policy: models.FailoverPolicyRecreate}
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Failover == nil || got.Failover.Policy != models.FailoverPolicyRecreate {
+					t.Fatalf("Failover roundtrip mismatch: got %+v", got.Failover)
+				}
+			},
+		},
+		{
 			name: "update_lifecycle_replaces_fields",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
@@ -1206,6 +1224,7 @@ func TestStoreHelperCases(t *testing.T) {
 			"{}",                        // tags_json
 			now, now, now,               // created_at, updated_at, last_active_at
 			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
+			"",                 // failover_policy
 			"",                 // runtime
 			"",                 // gpus_json
 			int64(0), int64(0), // net_bytes_in, net_bytes_out

@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -29,6 +31,7 @@ const (
 	PublicInternalPlacementsPath        = "/v1/cluster/internal/placements"
 	PublicInternalPlacementsQueryPath   = "/v1/cluster/internal/placements/query"
 	PublicInternalPlacementsPagePath    = "/v1/cluster/internal/placements/page"
+	PublicInternalRecoveryPath          = "/v1/cluster/internal/recovery/"
 	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
 	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
 	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
@@ -58,8 +61,9 @@ type DrainStateResponse struct {
 
 // Agent is the worker/ingress-side cluster client. It deliberately does not
 // start Raft, does not create a placement FSM, and never joins the raft
-// configuration as a non-voter. It only gossips local capacity/addresses and
-// delegates every authoritative placement read/write to server-role nodes.
+// configuration as a non-voter. It gossips identity/addresses, serves local
+// capacity heartbeats, and delegates every authoritative placement read/write
+// to server-role nodes.
 type Agent struct {
 	cfg           config.Config
 	logger        *slog.Logger
@@ -82,6 +86,10 @@ type Agent struct {
 	cacheMu        sync.RWMutex
 	placementCache []Placement
 	shardCache     map[string][]Placement
+	// placementVersion tracks the highest placement version observed via
+	// shard/page/point reads. It keeps PlacementVersion() off the full-map
+	// endpoint on worker/ingress-only agents.
+	placementVersion atomic.Uint64
 }
 
 func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Agent, error) {
@@ -231,6 +239,9 @@ func (a *Agent) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, ErrNoPlacementTarget
 		}
+		if err := invalidTopologyFromMessage(resp.Error); err != nil {
+			return PlacementTarget{}, err
+		}
 		return PlacementTarget{}, errors.New(resp.Error)
 	}
 	if resp.Target.NodeID == a.nodeID {
@@ -368,6 +379,17 @@ func (a *Agent) SetNodeDrainState(ctx context.Context, nodeID string, drained bo
 	return a.applyCommand(ctx, command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained})
 }
 
+func (a *Agent) RemoveMember(ctx context.Context, nodeID string, force bool) error {
+	if nodeID == "" {
+		return fmt.Errorf("cluster: RemoveMember requires non-empty nodeID")
+	}
+	path := "/v1/cluster/members/" + url.PathEscape(nodeID)
+	if force {
+		path += "?force=true"
+	}
+	return a.doControlPlaneBytes(ctx, http.MethodDelete, path, path, nil, nil)
+}
+
 func (a *Agent) IsNodeDrained(nodeID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlaneRequestTimeout)
 	defer cancel()
@@ -463,6 +485,14 @@ func (a *Agent) Members() []Member {
 	if a.gossip == nil {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var resp struct {
+		Members []Member `json:"members"`
+	}
+	if err := a.doControlPlaneJSON(ctx, http.MethodGet, "/v1/cluster/members", "/v1/cluster/members", nil, &resp); err == nil && resp.Members != nil {
+		return resp.Members
+	}
 	return a.gossip.members()
 }
 
@@ -499,6 +529,7 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	a.shardCache[placementShardFilterCacheKey(filter)] = clonePlacements(out)
 	shardEntries := len(a.shardCache)
 	a.cacheMu.Unlock()
+	a.observePlacementVersions(out)
 	recordPlacementCacheRefresh(time.Since(start), len(out), shardEntries, nil)
 	return out
 }
@@ -518,6 +549,7 @@ func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 		a.logger.Warn("cluster agent: placement page lookup failed", "err", err, "limit", req.Limit, "page_token", req.PageToken)
 		return PlacementPageResponse{}
 	}
+	a.observePlacementVersions(out.Placements)
 	return out
 }
 
@@ -526,17 +558,12 @@ func (a *Agent) PlacementOf(sandboxID string) (Placement, bool) {
 	if err != nil || !ok {
 		return Placement{}, false
 	}
+	a.observePlacementVersion(lookup.Placement.Version)
 	return lookup.Placement, true
 }
 
 func (a *Agent) PlacementVersion() uint64 {
-	var max uint64
-	for _, p := range a.Placements() {
-		if p.Version > max {
-			max = p.Version
-		}
-	}
-	return max
+	return a.placementVersion.Load()
 }
 
 func (a *Agent) SubscribePlacement(context.Context) <-chan struct{} { return nil }
@@ -577,11 +604,41 @@ func (a *Agent) lookupPlacement(ctx context.Context, sandboxID string) (Placemen
 		}
 		return PlacementLookupResponse{}, false, err
 	}
+	a.observePlacementVersion(lookup.Placement.Version)
 	return lookup, true, nil
 }
 
+func (a *Agent) observePlacementVersions(placements []Placement) {
+	var max uint64
+	for _, p := range placements {
+		if p.Version > max {
+			max = p.Version
+		}
+	}
+	a.observePlacementVersion(max)
+}
+
+func (a *Agent) observePlacementVersion(version uint64) {
+	if version == 0 {
+		return
+	}
+	for {
+		cur := a.placementVersion.Load()
+		if version <= cur {
+			return
+		}
+		if a.placementVersion.CompareAndSwap(cur, version) {
+			return
+		}
+	}
+}
+
 func (a *Agent) applyCommand(ctx context.Context, cmd command) error {
-	payload, err := encodeCommand(cmd)
+	raftCmd, err := a.externalizeCommandRecovery(ctx, cmd)
+	if err != nil {
+		return fmt.Errorf("cluster agent: externalize recovery: %w", err)
+	}
+	payload, err := encodeCommand(raftCmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
@@ -664,10 +721,29 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(string(msg), ErrNotLeader.Error()) {
+		message := strings.TrimSpace(string(msg))
+		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrCreateBackpressure.Error()) {
+			return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable && (strings.Contains(message, ErrNotLeader.Error()) || strings.Contains(message, "not leader")) {
 			return ErrNotLeader
 		}
-		return statusError{status: resp.StatusCode, message: strings.TrimSpace(string(msg))}
+		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrCapacityExceeded.Error()) {
+			return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNoPlacementTarget.Error()) {
+			return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
+		}
+		if resp.StatusCode == http.StatusNotFound && strings.Contains(message, ErrUnknownMember.Error()) {
+			return ErrUnknownMember
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
+			return ErrMemberStillAlive
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrLastVoter.Error()) {
+			return ErrLastVoter
+		}
+		return statusError{status: resp.StatusCode, message: message}
 	}
 	if out == nil {
 		io.Copy(io.Discard, resp.Body)

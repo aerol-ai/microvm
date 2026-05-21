@@ -5,6 +5,7 @@ import "github.com/aerol-ai/microvm/pkg/models"
 type CreateSandboxOptions = models.CreateSandboxRequest
 type ResizeSandboxOptions = models.ResizeSandboxRequest
 type Lifecycle = models.Lifecycle
+type Failover = models.Failover
 type UpdateLifecycleOptions = models.UpdateLifecycleRequest
 type ExecRequest = models.ExecRequest
 type ExecResult = models.ExecResult
@@ -18,6 +19,11 @@ type SandboxSnapshot = models.SandboxSnapshot
 
 // ExposeProtocol selects the wire surface an exposure publishes through.
 type ExposeProtocol string
+
+const (
+	FailoverPolicyNone     = models.FailoverPolicyNone
+	FailoverPolicyRecreate = models.FailoverPolicyRecreate
+)
 
 const (
 	// ExposeProtocolHTTP is the default — Caddy HTTP reverse proxy at

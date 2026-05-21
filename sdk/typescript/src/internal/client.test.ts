@@ -34,6 +34,7 @@ test("internal client create maps request and response", async () => {
           stop_if_idle_for: 3_600_000_000_000,
           destroy_at_age: 86_400_000_000_000,
         },
+        failover: { policy: "recreate" },
       }));
     },
   });
@@ -46,6 +47,7 @@ test("internal client create maps request and response", async () => {
       stopIfIdleFor: 3_600_000_000_000,
       destroyAtAge: 86_400_000_000_000,
     },
+    failover: { policy: "recreate" },
   });
   assert.equal(sandbox.id, "sb-create");
   assert.ok(seenRequest);
@@ -58,11 +60,13 @@ test("internal client create maps request and response", async () => {
       stop_if_idle_for: 3_600_000_000_000,
       destroy_at_age: 86_400_000_000_000,
     },
+    failover: { policy: "recreate" },
   });
   assert.deepEqual(sandbox.lifecycle, {
     stopIfIdleFor: 3_600_000_000_000,
     destroyAtAge: 86_400_000_000_000,
   });
+  assert.deepEqual(sandbox.failover, { policy: "recreate" });
 });
 
 test("internal client createSnapshot maps request and response", async () => {

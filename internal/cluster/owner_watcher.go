@@ -27,25 +27,11 @@ const maxRecreateFailuresBeforeReassign = 5
 // startOwnerWatcher spawns the per-node loop that bridges FSM placements into
 // the service layer. It runs on every node (not just the leader): each node
 // is responsible for materializing the sandboxes it owns. The loop is a no-op
-// until AttachRecreator wires in the service hook.
-//
-// Gated by clusterRecreateOnFailoverEnabled (see dead_owner.go). When the gate
-// is off (current product policy), the loop is never started so a placement
-// owned by self is never materialized into a container after failover —
-// dead_owner.evictDeadOwner orphans placements instead of reassigning them, so
-// no FSM row should ever name self as the owner without a matching local
-// sandbox under the current policy. The tracker and loop body remain intact so
-// the existing tests can drive recreateOwnedSandboxes directly, and so a
-// future opt-in flip of the gate re-enables failover without re-implementing
-// it.
+// until AttachRecreator wires in the service hook. Only placements whose spec
+// opts into failover.policy=recreate are materialized; all others remain
+// ordinary non-HA sandboxes and are orphaned when their owner dies.
 func (c *Cluster) startOwnerWatcher() {
 	c.recreateFailures = &recreateFailureTracker{counts: make(map[string]int)}
-	if !clusterRecreateOnFailoverEnabled {
-		// Product policy: sandboxes are not highly available. Do not start
-		// the recreate loop. Keep the tracker non-nil so callers (and tests
-		// that hit recreateOwnedSandboxes directly) don't deref nil.
-		return
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ownerWatcherStop = cancel
 	go func() {
@@ -94,9 +80,9 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 	if r == nil {
 		return
 	}
-	placements := c.fsm.snapshot()
+	placements := c.fsm.fullPlacementsForOwner(c.nodeID)
 	for id, p := range placements {
-		if p.OwnerNodeID != c.nodeID {
+		if !placementWantsFailoverRecreate(p) {
 			continue
 		}
 		if p.Spec == nil {
@@ -130,6 +116,9 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 // recoverable placement). The failure counter resets on a successful
 // reassign so the new owner gets a fresh window.
 func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Placement) {
+	if !placementWantsFailoverRecreate(p) {
+		return
+	}
 	target, ok := c.selectRecreationTargetExcluding(p.Spec, c.nodeID)
 	if !ok {
 		c.logger.Warn("cluster: no alternate node available for stuck placement; will keep retrying locally",

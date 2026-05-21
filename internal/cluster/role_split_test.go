@@ -79,8 +79,8 @@ func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []strin
 
 // TestRoleSplitWorkerDoesNotJoinRaft is the headline gate: a worker must not
 // start raft at all and therefore must not appear in the raft configuration as
-// either voter or non-voter. It still joins gossip so servers can see capacity
-// and route ownership to it.
+// either voter or non-voter. It still joins gossip so servers can discover it
+// and fetch authenticated capacity heartbeats from it.
 func TestRoleSplitWorkerDoesNotJoinRaft(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft/memberlist sockets")

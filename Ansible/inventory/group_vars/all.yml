@@ -4,5 +4,34 @@
 sandboxd_binary_path:   /usr/local/bin/sandboxd
 sandboxd_service_name:  sandboxd
 sandboxd_env_file:      /etc/sandboxd/sandboxd.env
+sandboxd_cluster_env_file: /etc/sandboxd/cluster.env
 sandboxd_health_url:    "http://127.0.0.1:21212/health"
 sandboxd_health_wait_s: 30
+sandboxd_ops_script_dir: /usr/local/sbin
+sandboxd_lifecycle_script_path: /usr/local/sbin/sandboxd-node-lifecycle.sh
+sandboxd_grafana_dashboard_dir: /etc/sandboxd/grafana
+sandboxd_prometheus_rules_dir: /etc/sandboxd/prometheus
+sandboxd_alertmanager_config_dir: /etc/sandboxd/alertmanager
+sandboxd_runbook_dir: /etc/sandboxd/runbooks
+
+# Observability / pull-storm controls managed by playbooks/configure-ops.yml.
+sandboxd_otel_metrics_enabled: false
+sandboxd_otel_metrics_endpoint: ""
+sandboxd_otel_metrics_interval: "30s"
+sandboxd_otel_traces_enabled: false
+sandboxd_otel_traces_endpoint: ""
+sandboxd_otel_traces_sample_ratio: 0.05
+sandboxd_otel_service_name: "sandboxd"
+sandboxd_image_pull_max_concurrent: 4
+sandboxd_image_pull_failure_backoff: "30s"
+sandboxd_restart_after_ops_config: true
+
+# Optional local backup schedule managed by playbooks/configure-ops.yml.
+sandboxd_backup_enabled: false
+sandboxd_backup_output_dir: /var/backups/sandboxd
+sandboxd_backup_cron_minute: "17"
+sandboxd_backup_cron_hour: "2"
+sandboxd_backup_retention_days: 7
+
+# Node lifecycle defaults used by playbooks/prepare-role-change.yml.
+sandboxd_role_change_drain_timeout_s: 3600

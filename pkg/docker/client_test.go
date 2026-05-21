@@ -1,6 +1,15 @@
 package docker
 
-import "testing"
+import (
+	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 func TestSandboxIDFromContainerNameCases(t *testing.T) {
 	tests := []struct {
@@ -57,5 +66,80 @@ func TestSplitSnapshotImageRefCases(t *testing.T) {
 				t.Fatalf("splitSnapshotImageRef(%q) = (%q, %q), want (%q, %q)", tc.input, repo, tag, tc.wantRepo, tc.wantTag)
 			}
 		})
+	}
+}
+
+func TestPullImageDedupSharesInflightPull(t *testing.T) {
+	var calls atomic.Int64
+	release := make(chan struct{})
+	client := &Client{
+		logger: slog.Default(),
+		streamClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			<-release
+			return pullResponse(`{"status":"done"}`), nil
+		})},
+		pulls:        make(map[string]*imagePull),
+		pullFailures: make(map[string]imagePullFailure),
+		pullBackoff:  time.Minute,
+	}
+
+	errs := make(chan error, 2)
+	go func() { errs <- client.pullImageDedup(context.Background(), "busybox:latest", nil) }()
+	for deadline := time.Now().Add(time.Second); calls.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	go func() { errs <- client.pullImageDedup(context.Background(), "busybox:latest", nil) }()
+
+	time.Sleep(25 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("pull calls while first in-flight = %d, want 1", got)
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("pullImageDedup error = %v", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("pull calls after waiters completed = %d, want 1", got)
+	}
+}
+
+func TestPullImageDedupBacksOffAfterFailure(t *testing.T) {
+	var calls atomic.Int64
+	client := &Client{
+		logger: slog.Default(),
+		streamClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return pullResponse(`{"error":"too many requests"}`), nil
+		})},
+		pulls:        make(map[string]*imagePull),
+		pullFailures: make(map[string]imagePullFailure),
+		pullBackoff:  time.Minute,
+	}
+
+	if err := client.pullImageDedup(context.Background(), "registry.example/app:bad", nil); err == nil {
+		t.Fatalf("first pull expected error")
+	}
+	if err := client.pullImageDedup(context.Background(), "registry.example/app:bad", nil); err == nil || !strings.Contains(err.Error(), "backoff") {
+		t.Fatalf("second pull expected backoff error, got %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("pull calls = %d, want 1 while backoff is active", got)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func pullResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
 	}
 }

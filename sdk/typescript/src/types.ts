@@ -86,6 +86,16 @@ export interface Lifecycle {
 
 export type UpdateLifecycleOptions = Lifecycle;
 
+export type FailoverPolicy = "none" | "recreate";
+
+export interface Failover {
+  /**
+   * "none" (default) returns 410 Gone after owner-node death. "recreate"
+   * opts into best-effort cluster recreation from the replicated create spec.
+   */
+  policy: FailoverPolicy;
+}
+
 export type GPUVendor = "nvidia" | "amd" | "apple";
 
 export interface GPUOptions {
@@ -152,6 +162,7 @@ export interface CreateOptions {
   containerCommand?: string[];
   mounts?: MountSpec[];
   lifecycle?: Lifecycle;
+  failover?: Failover;
   /**
    * Container runtime to use for this sandbox. Omit to inherit the host
    * default (`SB_CONTAINER_RUNTIME`). Use `"gvisor"` for runsc-backed
@@ -285,6 +296,7 @@ export interface Sandbox {
   lastError?: string;
   containerCommand?: string[];
   lifecycle: Lifecycle;
+  failover?: Failover;
   /**
    * Container runtime this sandbox is running under. Empty string indicates
    * a pre-migration row that resolves to the host default at start time.

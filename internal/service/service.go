@@ -148,6 +148,21 @@ func (s *Service) Cluster() cluster.Client {
 	return s.cluster
 }
 
+// ClusterTopologyError returns a production-topology violation for the current
+// live member set. It is intentionally a runtime check so rolling membership,
+// old nodes that still gossip empty roles, and explicit hybrid roles are all
+// evaluated from the same source of truth the scheduler uses.
+func (s *Service) ClusterTopologyError() error {
+	if !s.cfg.EnableCluster {
+		return nil
+	}
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	return cluster.LargeClusterTopologyError(c.Members())
+}
+
 // EnsureClusterReady blocks until the cluster has elected a leader, mirroring
 // the EnsureLayer4Ready single-flight latch shape. Single-node mode latches
 // immediately. The API wrapper calls this before any RecordPlacement so a
@@ -263,12 +278,8 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // the owner watcher keeps retrying and can eventually reassign the placement.
 // ExposePort is idempotent, so a partial replay is safe to resume.
 //
-// Currently unreachable in production: cluster.startOwnerWatcher is gated off
-// by cluster.clusterRecreateOnFailoverEnabled (product policy: sandboxes are
-// not highly available; a dead owner's placements are orphaned). The method is
-// preserved here so a future opt-in failover flag can re-enable the watcher
-// without re-implementing recreate. Cluster-package tests still drive the
-// inner recreate paths through a mock recreator, not this implementation.
+// Only placements whose create spec opted into failover.policy=recreate reach
+// this path; default sandboxes remain non-HA and are orphaned on owner death.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
@@ -351,12 +362,18 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	done := beginSandboxCreateMetric()
 	defer func() { done(err) }()
+	if err := s.ClusterTopologyError(); err != nil {
+		return nil, err
+	}
 	if s.cfg.EnableCluster && !s.cfg.IsWorker() {
 		return nil, cluster.ErrNoPlacementTarget
 	}
 
 	req = normalizeCreateRequest(req)
 	if err := s.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+		return nil, err
+	}
+	if err := NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
 	if req.Image == "" {
@@ -511,6 +528,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		LastActiveAt:         now,
 		ContainerCommand:     req.ContainerCommand,
 		Lifecycle:            lifecycle,
+		Failover:             req.Failover,
 		Runtime:              chosenRuntime,
 		GPUs:                 req.GPUs,
 		RegistryAuthSealed:   sealedRegistry,
@@ -1067,6 +1085,22 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err
 	}
+	// Mirror the resize into the FSM-replicated spec so a future failover
+	// recreate uses the post-resize footprint, not the create-time one. Lives
+	// in the service layer so v1, Daytona, and E2B all inherit the write-
+	// through; previously this was duplicated in the v1 handler and silently
+	// missing from the facades.
+	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
+		if req.CPU > 0 {
+			spec.CPU = req.CPU
+		}
+		if req.MemoryMB > 0 {
+			spec.MemoryMB = req.MemoryMB
+		}
+		if req.DiskGB > 0 {
+			spec.DiskGB = req.DiskGB
+		}
+	})
 	return s.store.Get(ctx, id)
 }
 
@@ -1081,6 +1115,10 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
 	}
+	lc := l
+	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
+		spec.Lifecycle = &lc
+	})
 	return s.store.Get(ctx, id)
 }
 
@@ -1577,13 +1615,29 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		status = "degraded"
 	}
 
+	clusterTopology := ""
+	clusterNodes := 0
+	if s.cfg.EnableCluster {
+		clusterTopology = "ok"
+		if c := s.Cluster(); c != nil {
+			members := c.Members()
+			clusterNodes = cluster.LiveMemberCount(members)
+			if err := cluster.LargeClusterTopologyError(members); err != nil {
+				clusterTopology = err.Error()
+				status = "degraded"
+			}
+		}
+	}
+
 	return models.HealthStatus{
-		Status:     status,
-		Sandboxes:  live,
-		Docker:     dockerStatus,
-		Caddy:      caddyStatus,
-		SSHGateway: sshStatus,
-		Version:    version.Version,
+		Status:          status,
+		Sandboxes:       live,
+		Docker:          dockerStatus,
+		Caddy:           caddyStatus,
+		SSHGateway:      sshStatus,
+		ClusterTopology: clusterTopology,
+		ClusterNodes:    clusterNodes,
+		Version:         version.Version,
 	}, nil
 }
 
@@ -2383,6 +2437,25 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 		req.Env = map[string]string{}
 	}
 	return req
+}
+
+func NormalizeCreateFailover(req *models.CreateSandboxRequest) error {
+	if req == nil || req.Failover == nil {
+		return nil
+	}
+	policy, err := models.NormalizeFailoverPolicy(req.Failover.Policy)
+	if err != nil {
+		return fmt.Errorf("invalid failover: %w", err)
+	}
+	if policy == models.FailoverPolicyNone {
+		req.Failover = nil
+		return nil
+	}
+	if policy == models.FailoverPolicyRecreate && ImageRequiresLocalPlacement(*req) {
+		return errors.New("failover.policy=recreate requires a portable image; local-only images cannot be recreated on another node")
+	}
+	req.Failover = &models.Failover{Policy: policy}
+	return nil
 }
 
 func sandboxContainerRef(sandbox *models.Sandbox) string {

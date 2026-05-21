@@ -35,6 +35,7 @@ class RecordingMicroVM(MicroVM):
                 "updated_at": "2026-05-07T10:00:00Z",
                 "last_active_at": "2026-05-07T10:00:00Z",
                 "lifecycle": payload.get("lifecycle", {}),
+                "failover": payload.get("failover"),
             }
         if method == "PUT" and path == "/v1/sandboxes/sb-1/lifecycle":
             return {
@@ -348,6 +349,7 @@ class ClientTests(unittest.TestCase):
                     "stopIfIdleFor": 3_600_000_000_000,
                     "destroyAtAge": 86_400_000_000_000,
                 },
+                "failover": {"policy": "recreate"},
             }
         )
 
@@ -376,6 +378,7 @@ class ClientTests(unittest.TestCase):
                         "stop_if_idle_for": 3_600_000_000_000,
                         "destroy_at_age": 86_400_000_000_000,
                     },
+                    "failover": {"policy": "recreate"},
                 },
             ),
         )
@@ -391,6 +394,7 @@ class ClientTests(unittest.TestCase):
                 "destroyAtAge": 86_400_000_000_000,
             },
         )
+        self.assertEqual(sandbox.failover, {"policy": "recreate"})
 
     def test_update_lifecycle_maps_request_and_updates_sandbox_state(self):
         client = RecordingMicroVM()

@@ -44,3 +44,28 @@ output "verify_cluster_command" {
   description = "Run this from any node (after bootstrap) to confirm membership."
   value       = "curl -s -H 'Authorization: Bearer <PAT>' http://127.0.0.1:21212/v1/cluster/members | jq ."
 }
+
+output "prometheus_scrape_targets" {
+  description = "Private-IP sandboxd API targets for Prometheus scraping with metrics_path=/v1/metrics and bearer_token=<PAT>."
+  value       = [for n, inst in local.all_instances : "${inst.private_ip}:21212"]
+}
+
+output "grafana_dashboard_file" {
+  description = "Repo-local dashboard JSON to import into Grafana."
+  value       = "setup/grafana/sandboxd-slo-dashboard.json"
+}
+
+output "prometheus_alert_rules_file" {
+  description = "Repo-local Prometheus alert rule file for sandboxd SLOs."
+  value       = "setup/prometheus/sandboxd-alerts.yml"
+}
+
+output "alertmanager_example_file" {
+  description = "Repo-local Alertmanager example route/receiver config."
+  value       = "setup/alertmanager/sandboxd-alertmanager-example.yml"
+}
+
+output "operational_runbooks_dir" {
+  description = "Repo-local operator runbooks for restore, lost quorum, image-pull storms, and SLO breaches."
+  value       = "setup/runbooks"
+}

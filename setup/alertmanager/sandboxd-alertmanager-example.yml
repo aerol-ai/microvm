@@ -1,0 +1,33 @@
+route:
+  receiver: sandboxd-platform
+  group_by:
+    - alertname
+    - cluster
+    - component
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity="critical"
+      receiver: sandboxd-platform-critical
+      repeat_interval: 30m
+
+receivers:
+  - name: sandboxd-platform
+    webhook_configs:
+      - url: http://alert-webhook.example.internal/sandboxd
+        send_resolved: true
+
+  - name: sandboxd-platform-critical
+    webhook_configs:
+      - url: http://alert-webhook.example.internal/sandboxd-critical
+        send_resolved: true
+
+inhibit_rules:
+  - source_matchers:
+      - alertname="SandboxdWorkerLeaseStale"
+    target_matchers:
+      - alertname="SandboxdCreateQueueBacklog"
+    equal:
+      - cluster

@@ -1,0 +1,194 @@
+---
+# Configure sandboxd operational hardening across the fleet.
+#
+# Usage:
+#   ansible-playbook playbooks/configure-ops.yml \
+#     -e sandboxd_otel_metrics_endpoint=http://otel-collector:4318/v1/metrics \
+#     -e sandboxd_otel_traces_endpoint=http://otel-collector:4318/v1/traces \
+#     -e sandboxd_backup_enabled=true
+
+- name: Configure sandboxd observability and operations
+  hosts: all
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+
+  vars:
+    sandboxd_ops_env:
+      SB_OTEL_METRICS_ENABLED: "{{ ((sandboxd_otel_metrics_enabled | bool) or (sandboxd_otel_metrics_endpoint | length > 0)) | string | lower }}"
+      SB_OTEL_METRICS_ENDPOINT: "{{ sandboxd_otel_metrics_endpoint }}"
+      SB_OTEL_METRICS_INTERVAL: "{{ sandboxd_otel_metrics_interval }}"
+      SB_OTEL_TRACES_ENABLED: "{{ ((sandboxd_otel_traces_enabled | bool) or (sandboxd_otel_traces_endpoint | length > 0)) | string | lower }}"
+      SB_OTEL_TRACES_ENDPOINT: "{{ sandboxd_otel_traces_endpoint }}"
+      SB_OTEL_TRACES_SAMPLE_RATIO: "{{ sandboxd_otel_traces_sample_ratio }}"
+      OTEL_SERVICE_NAME: "{{ sandboxd_otel_service_name }}"
+      SB_IMAGE_PULL_MAX_CONCURRENT: "{{ sandboxd_image_pull_max_concurrent }}"
+      SB_IMAGE_PULL_FAILURE_BACKOFF: "{{ sandboxd_image_pull_failure_backoff }}"
+
+  pre_tasks:
+    - name: Check base sandboxd env file
+      ansible.builtin.stat:
+        path: "{{ sandboxd_env_file }}"
+      register: sandboxd_base_env
+
+    - name: Refuse when base sandboxd env file is missing
+      ansible.builtin.assert:
+        that:
+          - sandboxd_base_env.stat.exists
+        fail_msg: "{{ sandboxd_env_file }} is missing; run install.sh/bootstrap first."
+
+    - name: Check cluster env file
+      ansible.builtin.stat:
+        path: "{{ sandboxd_cluster_env_file }}"
+      register: sandboxd_cluster_env
+
+    - name: Pick env file to manage
+      ansible.builtin.set_fact:
+        sandboxd_ops_env_file: "{{ sandboxd_cluster_env_file if sandboxd_cluster_env.stat.exists else sandboxd_env_file }}"
+
+  tasks:
+    - name: Deploy sandboxd backup/recovery helpers
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ sandboxd_ops_script_dir }}/{{ item.dest }}"
+        mode: "0755"
+        owner: root
+        group: root
+      loop:
+        - { src: "../../scripts/sandboxd-backup.sh", dest: "sandboxd-backup.sh" }
+        - { src: "../../scripts/sandboxd-restore.sh", dest: "sandboxd-restore.sh" }
+        - { src: "../../scripts/raft-lost-quorum-recover.sh", dest: "raft-lost-quorum-recover.sh" }
+        - { src: "../../scripts/sandboxd-node-lifecycle.sh", dest: "sandboxd-node-lifecycle.sh" }
+
+    - name: Create Grafana dashboard artifact directory
+      ansible.builtin.file:
+        path: "{{ sandboxd_grafana_dashboard_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Deploy Grafana SLO dashboard JSON
+      ansible.builtin.copy:
+        src: "../../setup/grafana/sandboxd-slo-dashboard.json"
+        dest: "{{ sandboxd_grafana_dashboard_dir }}/sandboxd-slo-dashboard.json"
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Create Prometheus alert rule artifact directory
+      ansible.builtin.file:
+        path: "{{ sandboxd_prometheus_rules_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Deploy Prometheus alert rules
+      ansible.builtin.copy:
+        src: "../../setup/prometheus/sandboxd-alerts.yml"
+        dest: "{{ sandboxd_prometheus_rules_dir }}/sandboxd-alerts.yml"
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Create Alertmanager example artifact directory
+      ansible.builtin.file:
+        path: "{{ sandboxd_alertmanager_config_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Deploy Alertmanager example config
+      ansible.builtin.copy:
+        src: "../../setup/alertmanager/sandboxd-alertmanager-example.yml"
+        dest: "{{ sandboxd_alertmanager_config_dir }}/sandboxd-alertmanager-example.yml"
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Create runbook artifact directory
+      ansible.builtin.file:
+        path: "{{ sandboxd_runbook_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Deploy sandboxd operational runbooks
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ sandboxd_runbook_dir }}/{{ item | basename }}"
+        mode: "0644"
+        owner: root
+        group: root
+      loop:
+        - "../../setup/runbooks/README.md"
+        - "../../setup/runbooks/backup-restore.md"
+        - "../../setup/runbooks/lost-quorum-recovery.md"
+        - "../../setup/runbooks/image-pull-storm.md"
+        - "../../setup/runbooks/slo-breach.md"
+
+    - name: Write sandboxd operational env vars
+      ansible.builtin.lineinfile:
+        path: "{{ sandboxd_ops_env_file }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: false
+        mode: "0600"
+        owner: root
+        group: root
+      loop: "{{ sandboxd_ops_env | dict2items }}"
+      notify: Apply sandboxd ops config
+
+    - name: Create backup output directory
+      when: sandboxd_backup_enabled | bool
+      ansible.builtin.file:
+        path: "{{ sandboxd_backup_output_dir }}"
+        state: directory
+        mode: "0700"
+        owner: root
+        group: root
+
+    - name: Configure local sandboxd backup cron
+      when: sandboxd_backup_enabled | bool
+      ansible.builtin.cron:
+        name: sandboxd local backup
+        minute: "{{ sandboxd_backup_cron_minute }}"
+        hour: "{{ sandboxd_backup_cron_hour }}"
+        user: root
+        job: >-
+          {{ sandboxd_ops_script_dir }}/sandboxd-backup.sh
+          --output {{ sandboxd_backup_output_dir }}/sandboxd-$(hostname)-$(date +\%F-\%H\%M\%S).tar.gz
+          && find {{ sandboxd_backup_output_dir }} -type f -name 'sandboxd-*.tar.gz'
+          -mtime +{{ sandboxd_backup_retention_days }} -delete
+
+    - name: Remove local sandboxd backup cron
+      when: not (sandboxd_backup_enabled | bool)
+      ansible.builtin.cron:
+        name: sandboxd local backup
+        user: root
+        state: absent
+
+  handlers:
+    - name: Restart sandboxd
+      listen: Apply sandboxd ops config
+      when: sandboxd_restart_after_ops_config | bool
+      ansible.builtin.systemd:
+        name: "{{ sandboxd_service_name }}"
+        state: restarted
+        daemon_reload: false
+
+    - name: Wait for sandboxd health
+      listen: Apply sandboxd ops config
+      when: sandboxd_restart_after_ops_config | bool
+      ansible.builtin.uri:
+        url: "{{ sandboxd_health_url }}"
+        status_code: 200
+        return_content: false
+      register: health
+      until: health.status == 200
+      retries: "{{ sandboxd_health_wait_s }}"
+      delay: 1

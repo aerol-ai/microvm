@@ -79,6 +79,7 @@ func Open(path string) (*Store, error) {
 			destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0,
 			stop_at_age_ns INTEGER NOT NULL DEFAULT 0,
 			destroy_at_age_ns INTEGER NOT NULL DEFAULT 0,
+			failover_policy TEXT NOT NULL DEFAULT '',
 			runtime TEXT NOT NULL DEFAULT '',
 			gpus_json TEXT NOT NULL DEFAULT '',
 			net_bytes_in INTEGER NOT NULL DEFAULT 0,
@@ -223,6 +224,9 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN destroy_if_idle_for_ns INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN stop_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN destroy_at_age_ns INTEGER NOT NULL DEFAULT 0;`,
+		// Per-sandbox owner-death policy. Empty/none means orphan on owner
+		// death; "recreate" opts into best-effort cluster recreation.
+		`ALTER TABLE sandboxes ADD COLUMN failover_policy TEXT NOT NULL DEFAULT '';`,
 		// Per-sandbox OCI runtime selector (runc / runsc). Pre-migration rows
 		// get '' and resolve to the host default at start time; new sandboxes
 		// always store the resolved value so the choice cannot drift across
@@ -345,11 +349,12 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			failover_policy,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -377,6 +382,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyIfIdleFor),
 		int64(sandbox.Lifecycle.StopAtAge),
 		int64(sandbox.Lifecycle.DestroyAtAge),
+		sandboxFailoverPolicy(sandbox),
 		sandbox.Runtime,
 		gpusJSON,
 		sandbox.NetworkBytesIn,
@@ -403,6 +409,17 @@ func nullableBlob(b []byte) []byte {
 		return []byte{}
 	}
 	return b
+}
+
+func sandboxFailoverPolicy(sandbox *models.Sandbox) string {
+	if sandbox == nil || sandbox.Failover == nil {
+		return ""
+	}
+	policy, err := models.NormalizeFailoverPolicy(sandbox.Failover.Policy)
+	if err != nil || policy == models.FailoverPolicyNone {
+		return ""
+	}
+	return policy
 }
 
 func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
@@ -432,11 +449,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			failover_policy,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -462,6 +480,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			destroy_if_idle_for_ns = excluded.destroy_if_idle_for_ns,
 			stop_at_age_ns = excluded.stop_at_age_ns,
 			destroy_at_age_ns = excluded.destroy_at_age_ns,
+			failover_policy = excluded.failover_policy,
 			runtime = excluded.runtime,
 			gpus_json = excluded.gpus_json,
 			net_bytes_in_limit = excluded.net_bytes_in_limit,
@@ -494,6 +513,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		int64(sandbox.Lifecycle.DestroyIfIdleFor),
 		int64(sandbox.Lifecycle.StopAtAge),
 		int64(sandbox.Lifecycle.DestroyAtAge),
+		sandboxFailoverPolicy(sandbox),
 		sandbox.Runtime,
 		gpusJSON,
 		sandbox.NetworkBytesIn,
@@ -519,6 +539,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			failover_policy,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
@@ -550,6 +571,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			failover_policy,
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
@@ -1516,6 +1538,7 @@ func scanSandbox(scanner interface {
 	var commandJSON string
 	var tagsJSON string
 	var gpusJSON string
+	var failoverPolicy string
 	var stopIfIdleNs, destroyIfIdleNs, stopAtAgeNs, destroyAtAgeNs int64
 	var netQuotaExceeded int
 	var netQuotaExceededAt sql.NullTime
@@ -1548,6 +1571,7 @@ func scanSandbox(scanner interface {
 		&destroyIfIdleNs,
 		&stopAtAgeNs,
 		&destroyAtAgeNs,
+		&failoverPolicy,
 		&sandbox.Runtime,
 		&gpusJSON,
 		&sandbox.NetworkBytesIn,
@@ -1598,6 +1622,9 @@ func scanSandbox(scanner interface {
 		DestroyIfIdleFor: time.Duration(destroyIfIdleNs),
 		StopAtAge:        time.Duration(stopAtAgeNs),
 		DestroyAtAge:     time.Duration(destroyAtAgeNs),
+	}
+	if policy, err := models.NormalizeFailoverPolicy(failoverPolicy); err == nil && policy == models.FailoverPolicyRecreate {
+		sandbox.Failover = &models.Failover{Policy: policy}
 	}
 
 	return &sandbox, nil

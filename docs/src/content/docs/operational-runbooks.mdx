@@ -1,0 +1,39 @@
+---
+title: Operational Runbooks
+---
+
+sandboxd ships checked-in production runbooks under `setup/runbooks/`. They are
+the procedures used by the Prometheus alert rules and by the deployment
+artifacts installed through Ansible.
+
+## Runbooks
+
+| Runbook | Incident |
+|---|---|
+| `setup/runbooks/backup-restore.md` | Restore a node, prove backup usability, or recover local state. |
+| `setup/runbooks/lost-quorum-recovery.md` | Recover when too many Raft voters are gone and no leader can be elected. |
+| `setup/runbooks/image-pull-storm.md` | Respond to queued, failing, rate-limited, or backoff-suppressed image pulls. |
+| `setup/runbooks/slo-breach.md` | First-response procedure for Raft, scheduler, create, ingress, data-plane, image, and secret SLO alerts. |
+
+## Deployment
+
+Runbooks are deployed by:
+
+```bash
+ansible-playbook Ansible/playbooks/configure-ops.yml
+```
+
+The playbook copies them to `/etc/sandboxd/runbooks` by default, alongside the
+Grafana dashboard, Prometheus alert rules, and Alertmanager example.
+
+## Drill Expectation
+
+Each runbook includes a drill checklist. Run these drills in staging monthly:
+
+- backup restore
+- lost-quorum tabletop
+- image-pull storm
+- SLO breach response
+
+The goal is to prove the commands, access, metrics, and escalation path before
+an outage.

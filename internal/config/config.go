@@ -29,7 +29,9 @@ const defaultToolboxPort = 2280
 // of base roles, e.g. "worker,ingress" for a data-plane edge node or
 // "server,ingress" for a control + ingress node. NodeRoleMixed remains the
 // shorthand for "server,worker,ingress" and may not be combined with anything
-// else.
+// else. Runtime topology validation keeps mixed and hybrid-role nodes as a
+// small-cluster convenience only; clusters above 10 live nodes must use
+// dedicated server, worker, and ingress roles.
 const (
 	NodeRoleServer  = "server"
 	NodeRoleWorker  = "worker"
@@ -133,6 +135,19 @@ type Config struct {
 	ReconcileInterval           time.Duration
 	NetstatsPollInterval        time.Duration
 	UploadMaxBytes              int64
+	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
+	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
+	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
+	OTELMetricsEnabled  bool
+	OTELMetricsEndpoint string
+	OTELMetricsInterval time.Duration
+	// OTELTracesEnabled starts a native OTLP/HTTP trace exporter for API
+	// request spans. It is also enabled automatically when
+	// SB_OTEL_TRACES_ENDPOINT is set.
+	OTELTracesEnabled     bool
+	OTELTracesEndpoint    string
+	OTELTracesSampleRatio float64
+	OTELServiceName       string
 
 	// Admission control. Admission is purely resource-math: CPU/memory
 	// reservation ratios plus a live memory floor. There is no fixed sandbox
@@ -153,11 +168,10 @@ type Config struct {
 	HostCPUCoresOverride      int
 	HostMemoryMBOverride      int
 	// DiskReservationRatio gates total per-sandbox disk reservations against
-	// HostDiskGB. 0 disables disk admission entirely (legacy behaviour).
-	// HostDiskGB is operator-declared because robust auto-detection of the
-	// docker-data-root volume is filesystem-specific (overlay2, devicemapper,
-	// btrfs all report differently); we'd rather operators set the number
-	// they trust than guess wrong.
+	// HostDiskGB, or the auto-detected host disk size when HostDiskGB is not
+	// set. 0 disables disk admission while still reporting disk observability.
+	// HostDiskGB remains the operator override for a stricter Docker-volume
+	// budget when the host filesystem is larger than the sandbox pool.
 	DiskReservationRatio float64
 	HostDiskGB           int
 	// HostGPUCount and HostGPUVendor describe the GPU inventory wired into
@@ -261,6 +275,13 @@ type Config struct {
 	// without increasing quorum size. 0 means unlimited, preserving the old
 	// behavior for tests or intentionally small fully-voting clusters.
 	ClusterMaxAutoVoters int
+	// ClusterCreateMaxPendingPerWorker caps reservation-stage creates per
+	// worker. This is a leader-side queue guard: when a burst tries to send
+	// more than this many not-yet-promoted creates to one worker, the leader
+	// rejects with Retry-After instead of letting that worker absorb an
+	// unbounded image-pull/docker-create storm. 0 disables the cap.
+	// SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER.
+	ClusterCreateMaxPendingPerWorker int
 	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
 	// a node dead before orphaning its placements and removing it from the
 	// raft configuration. Long enough to absorb transient gossip flap
@@ -356,6 +377,15 @@ type Config struct {
 	// managed AOCR image-distribution provider. Empty configs constructed in
 	// tests fall back to the product default in the service layer.
 	ImageDistributionAOCRHost string
+	// ImagePullMaxConcurrent caps simultaneous Docker /images/create streams
+	// per worker. Pulls for the same image/auth key are still deduplicated; this
+	// cap protects the daemon and registry when many different cold images are
+	// requested at once. 0 disables the cap.
+	ImagePullMaxConcurrent int
+	// ImagePullFailureBackoff suppresses immediate retries for the same
+	// image/auth key after Docker or the registry returns an error. This keeps a
+	// bad tag or rate-limit response from turning into a per-create retry storm.
+	ImagePullFailureBackoff time.Duration
 }
 
 func Load() (Config, error) {
@@ -399,6 +429,13 @@ func Load() (Config, error) {
 		ReconcileInterval:           getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:        getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:              int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		OTELMetricsEnabled:          getEnvBool("SB_OTEL_METRICS_ENABLED", false),
+		OTELMetricsEndpoint:         firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
+		OTELMetricsInterval:         getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		OTELTracesEnabled:           getEnvBool("SB_OTEL_TRACES_ENABLED", false),
+		OTELTracesEndpoint:          firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+		OTELTracesSampleRatio:       getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
+		OTELServiceName:             getEnv("OTEL_SERVICE_NAME", "sandboxd"),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
@@ -418,36 +455,45 @@ func Load() (Config, error) {
 		L4TLSListen:      strings.TrimSpace(os.Getenv("SB_L4_TLS_LISTEN")),
 		L4TLSFallback:    getEnv("SB_L4_TLS_FALLBACK", "127.0.0.1:8443"),
 
-		EnableCluster:                 getEnvBool("SB_ENABLE_CLUSTER", false),
-		NodeRole:                      os.Getenv("SB_NODE_ROLE"),
-		NodeID:                        strings.TrimSpace(os.Getenv("SB_NODE_ID")),
-		NodeName:                      strings.TrimSpace(os.Getenv("SB_NODE_NAME")),
-		RaftBindAddr:                  getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
-		RaftAdvertiseAddr:             strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
-		RaftDataDir:                   strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
-		GossipBindAddr:                getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
-		GossipAdvertiseAddr:           strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
-		BootstrapPeers:                splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
-		ClusterBootstrap:              getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
-		SelfAPIAdvertiseURL:           strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
-		DataPlaneAdvertiseHost:        normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
-		IngressAdvertiseHost:          normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
-		ClusterRaftCommitTimeout:      getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
-		ClusterCapacityGossipInterval: getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
-		ClusterMaxAutoVoters:          getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
-		ClusterDeadOwnerGrace:         getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
-		ClusterGossipSecretKey:        strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
-		ClusterInsecureGossip:         getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
-		ClusterInsecureCredentials:    getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
-		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
-		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
-		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
-		ImageBuildContextEnabled:      getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
-		ImageBuildTimeout:             getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
-		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
-		ImageBuildGCInterval:          getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:               getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
-		ImageDistributionAOCRHost:     strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
+		EnableCluster:                    getEnvBool("SB_ENABLE_CLUSTER", false),
+		NodeRole:                         os.Getenv("SB_NODE_ROLE"),
+		NodeID:                           strings.TrimSpace(os.Getenv("SB_NODE_ID")),
+		NodeName:                         strings.TrimSpace(os.Getenv("SB_NODE_NAME")),
+		RaftBindAddr:                     getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
+		RaftAdvertiseAddr:                strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
+		RaftDataDir:                      strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
+		GossipBindAddr:                   getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
+		GossipAdvertiseAddr:              strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
+		BootstrapPeers:                   splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
+		ClusterBootstrap:                 getEnvBool("SB_CLUSTER_BOOTSTRAP", false),
+		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
+		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
+		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
+		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
+		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
+		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
+		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
+		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
+		ClusterInsecureCredentials:       getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
+		ClusterTLSDir:                    strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
+		ClusterInternalListenAddr:        getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
+		ClusterInternalAdvertiseURL:      strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
+		ImageBuildContextEnabled:         getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
+		ImageBuildTimeout:                getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
+		ImageBuildGCEnabled:              getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
+		ImageBuildGCInterval:             getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
+		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageDistributionAOCRHost:        strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
+		ImagePullMaxConcurrent:           getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
+		ImagePullFailureBackoff:          getEnvDuration("SB_IMAGE_PULL_FAILURE_BACKOFF", 30*time.Second),
+	}
+	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
+		cfg.OTELMetricsEnabled = true
+	}
+	if cfg.OTELTracesEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
+		cfg.OTELTracesEnabled = true
 	}
 
 	if cfg.PATToken == "" {
@@ -456,6 +502,18 @@ func Load() (Config, error) {
 
 	if cfg.DBPath == "" {
 		return Config{}, errors.New("SB_DB_PATH is required")
+	}
+	if cfg.OTELMetricsEnabled && cfg.OTELMetricsInterval <= 0 {
+		return Config{}, errors.New("SB_OTEL_METRICS_INTERVAL must be > 0 when OTEL metrics are enabled")
+	}
+	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
+		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
+	}
+	if cfg.ImagePullMaxConcurrent < 0 {
+		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
+	}
+	if cfg.ImagePullFailureBackoff < 0 {
+		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
 	}
 
 	if cfg.ToolboxMountPath == "" || !strings.HasPrefix(cfg.ToolboxMountPath, "/") {
@@ -539,6 +597,9 @@ func Load() (Config, error) {
 		if cfg.ClusterMaxAutoVoters < 0 {
 			return Config{}, errors.New("SB_CLUSTER_MAX_AUTO_VOTERS must be >= 0")
 		}
+		if cfg.ClusterCreateMaxPendingPerWorker < 0 {
+			return Config{}, errors.New("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER must be >= 0")
+		}
 		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
 			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
 		}
@@ -591,6 +652,15 @@ func splitAndTrim(s, sep string) []string {
 		}
 	}
 	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (c Config) ListenAddr() string {

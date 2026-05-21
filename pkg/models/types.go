@@ -238,6 +238,47 @@ const (
 	ImageDistributionLocalOnly        = "local_only"
 )
 
+const (
+	FailoverPolicyNone     = "none"
+	FailoverPolicyRecreate = "recreate"
+)
+
+// Failover controls what the cluster should do if the sandbox's owner node is
+// declared dead. Empty or omitted means "none": orphan the placement and return
+// 410 Gone. "recreate" opts the sandbox into best-effort recreation from its
+// replicated create spec on another worker.
+type Failover struct {
+	Policy string `json:"policy,omitempty"`
+}
+
+func NormalizeFailoverPolicy(policy string) (string, error) {
+	switch normalized := strings.ToLower(strings.TrimSpace(policy)); normalized {
+	case "", FailoverPolicyNone:
+		return FailoverPolicyNone, nil
+	case FailoverPolicyRecreate:
+		return FailoverPolicyRecreate, nil
+	default:
+		return "", fmt.Errorf("invalid failover policy %q", policy)
+	}
+}
+
+func (f Failover) NormalizedPolicy() string {
+	policy, err := NormalizeFailoverPolicy(f.Policy)
+	if err != nil {
+		return ""
+	}
+	return policy
+}
+
+func (f Failover) ShouldRecreate() bool {
+	return f.NormalizedPolicy() == FailoverPolicyRecreate
+}
+
+func (f Failover) Validate() error {
+	_, err := NormalizeFailoverPolicy(f.Policy)
+	return err
+}
+
 // ImageDistributionMetadata describes whether an image can be materialized on
 // an arbitrary worker. It is deliberately metadata only: registries, AOCR, and
 // cache services remain pluggable deployment choices outside the core daemon.
@@ -289,6 +330,7 @@ type CreateSandboxRequest struct {
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Mounts           []MountSpec       `json:"mounts,omitempty"`
 	Lifecycle        *Lifecycle        `json:"lifecycle,omitempty"`
+	Failover         *Failover         `json:"failover,omitempty"`
 	// Name is an optional human-readable identifier. When set, it must be
 	// unique across all sandboxes — the store enforces this with a partial
 	// unique index. Empty means no name; the sandbox can only be referenced
@@ -340,6 +382,10 @@ func (r *CreateSandboxRequest) ApplyImageDistribution(meta ImageDistributionMeta
 	r.ImageVerifiedAt = meta.VerifiedAt
 }
 
+func (r CreateSandboxRequest) ShouldRecreateOnFailover() bool {
+	return r.Failover != nil && r.Failover.ShouldRecreate()
+}
+
 type ResizeSandboxRequest struct {
 	CPU      float64 `json:"cpu"`
 	MemoryMB int     `json:"memory_mb"`
@@ -369,6 +415,7 @@ type Sandbox struct {
 	LastError        string            `json:"last_error,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Lifecycle        Lifecycle         `json:"lifecycle"`
+	Failover         *Failover         `json:"failover,omitempty"`
 	// Name is the optional unique identifier set at create time. Empty when
 	// the sandbox was created without one (the common path on /v1 today).
 	Name string `json:"name,omitempty"`
@@ -574,12 +621,14 @@ func ValidExposedPortProtocol(value string) (string, error) {
 }
 
 type HealthStatus struct {
-	Status     string `json:"status"`
-	Sandboxes  int    `json:"sandboxes"`
-	Docker     string `json:"docker"`
-	Caddy      string `json:"caddy"`
-	SSHGateway string `json:"ssh_gateway"`
-	Version    string `json:"version"`
+	Status          string `json:"status"`
+	Sandboxes       int    `json:"sandboxes"`
+	Docker          string `json:"docker"`
+	Caddy           string `json:"caddy"`
+	SSHGateway      string `json:"ssh_gateway"`
+	ClusterTopology string `json:"cluster_topology,omitempty"`
+	ClusterNodes    int    `json:"cluster_nodes,omitempty"`
+	Version         string `json:"version"`
 }
 
 type ExecRequest struct {

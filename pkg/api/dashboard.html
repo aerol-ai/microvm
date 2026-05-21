@@ -132,6 +132,9 @@ details > summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
         <div class="kv"><span class="k">Leader</span><span class="v" id="cluster-leader">—</span></div>
         <div class="kv"><span class="k">Members</span><span class="v" id="cluster-count">—</span></div>
       </div>
+      <div class="row" id="cluster-capacity-row" style="margin-bottom: 10px;">
+        <span class="muted">loading…</span>
+      </div>
       <table>
         <thead>
           <tr>
@@ -292,6 +295,11 @@ function fmtPct(n) {
   return (Number(n) * 100).toFixed(1) + "%";
 }
 
+function fmtCapacityPct(used, total) {
+  if (!total || total <= 0) { return "—"; }
+  return ((Number(used || 0) / Number(total)) * 100).toFixed(1) + "%";
+}
+
 function fmtUnix(u) {
   if (!u) { return "—"; }
   try { return new Date(Number(u) * 1000).toISOString().replace("T", " ").replace("Z", "Z"); }
@@ -314,6 +322,42 @@ function hostFromURL(s) {
   try { return new URL(s).hostname; } catch (_) { /* not a full URL */ }
   const i = s.lastIndexOf(":");
   return i > 0 ? s.slice(0, i) : s;
+}
+
+function aggregateCapacity(members) {
+  const agg = {
+    nodes: 0, stale: 0, sandboxes: 0,
+    hostCPU: 0, cpuBudget: 0, reservedCPU: 0, availableCPU: 0,
+    hostMem: 0, memBudget: 0, reservedMem: 0, availableMem: 0,
+    hostDisk: 0, diskFree: 0, diskBudget: 0, reservedDisk: 0, availableDisk: 0,
+    gpuCount: 0, reservedGPUs: 0, availableGPUs: 0,
+  };
+  (members || []).forEach((m) => {
+    const c = m.capacity || {};
+    if (!m.alive || !(c.host_cpu_cores > 0 || c.host_memory_total_mb > 0)) {
+      return;
+    }
+    agg.nodes += 1;
+    if (m.capacity_stale) { agg.stale += 1; }
+    agg.sandboxes += Number(c.sandboxes_active || 0);
+    agg.hostCPU += Number(c.host_cpu_cores || 0);
+    agg.cpuBudget += Number(c.cpu_budget || 0);
+    agg.reservedCPU += Number(c.reserved_cpu || 0);
+    agg.availableCPU += Number(c.available_cpu != null ? c.available_cpu : Math.max((c.cpu_budget || 0) - (c.reserved_cpu || 0), 0));
+    agg.hostMem += Number(c.host_memory_total_mb || 0);
+    agg.memBudget += Number(c.memory_budget_mb || 0);
+    agg.reservedMem += Number(c.reserved_memory_mb || 0);
+    agg.availableMem += Number(c.available_memory_mb != null ? c.available_memory_mb : Math.max((c.memory_budget_mb || 0) - (c.reserved_memory_mb || 0), 0));
+    agg.hostDisk += Number(c.host_disk_total_gb || 0);
+    agg.diskFree += Number(c.host_disk_free_gb || 0);
+    agg.diskBudget += Number(c.disk_budget_gb || 0);
+    agg.reservedDisk += Number(c.reserved_disk_gb || 0);
+    agg.availableDisk += Number(c.available_disk_gb != null ? c.available_disk_gb : Math.max((c.disk_budget_gb || 0) - (c.reserved_disk_gb || 0), 0));
+    agg.gpuCount += Number(c.gpu_count || 0);
+    agg.reservedGPUs += Number(c.reserved_gpus || 0);
+    agg.availableGPUs += Number(c.available_gpus != null ? c.available_gpus : Math.max((c.gpu_count || 0) - (c.reserved_gpus || 0), 0));
+  });
+  return agg;
 }
 
 // ---------- panels ----------
@@ -348,15 +392,15 @@ async function loadCapacity() {
     const cpuBreakdown = `${fmtNum(c.host_cpu_cores)} cores × ${fmtPct(c.cpu_reservation_ratio)}${cpuFactor > 1 ? " × " + fmtFloat(cpuFactor) + "× overcommit" : ""}`;
     const memBreakdown = `${fmtNum(c.host_memory_total_mb)} MB × ${fmtPct(c.memory_reservation_ratio)}${memFactor > 1 ? " × " + fmtFloat(memFactor) + "× overcommit" : ""}`;
     const diskBreakdown = c.host_disk_total_gb
-      ? `${fmtNum(c.host_disk_total_gb)} GB × ${fmtPct(c.disk_reservation_ratio || 0)}`
+      ? `${fmtNum(c.host_disk_total_gb)} GB total${c.host_disk_free_gb ? " · " + fmtNum(c.host_disk_free_gb) + " GB free" : ""} × ${fmtPct(c.disk_reservation_ratio || 0)}`
       : "disk accounting disabled";
     el("capacity-row").innerHTML = `
       <div class="kv"><span class="k">can_admit</span><span class="v">${pill(c.can_admit ? "yes" : "no", admitKind)}</span></div>
       <div class="kv"><span class="k">live sandboxes</span><span class="v">${fmtNum(c.sandboxes_active)}</span></div>
       <div class="kv" style="grid-column: 1 / -1;"><span class="k">host hardware</span><span class="v">${fmtNum(c.host_cpu_cores)} cores · ${fmtNum(c.host_memory_total_mb)} MB ram${c.host_disk_total_gb ? " · " + fmtNum(c.host_disk_total_gb) + " GB disk" : ""}</span></div>
-      <div class="kv" style="grid-column: 1 / -1;"><span class="k">cpu reserved</span><span class="v">${fmtFloat(c.reserved_cpu)} / ${fmtFloat(c.cpu_budget)} budget <span class="muted">(${cpuBreakdown})</span></span></div>
-      <div class="kv" style="grid-column: 1 / -1;"><span class="k">memory reserved</span><span class="v">${fmtNum(c.reserved_memory_mb)} / ${fmtNum(c.memory_budget_mb)} MB budget <span class="muted">(${memBreakdown})</span></span></div>
-      <div class="kv" style="grid-column: 1 / -1;"><span class="k">disk reserved</span><span class="v">${fmtNum(c.reserved_disk_gb)} / ${fmtNum(c.disk_budget_gb)} GB budget <span class="muted">(${diskBreakdown})</span></span></div>
+      <div class="kv" style="grid-column: 1 / -1;"><span class="k">cpu reserved / available</span><span class="v">${fmtFloat(c.reserved_cpu)} / ${fmtFloat(c.available_cpu)} available / ${fmtFloat(c.cpu_budget)} budget <span class="muted">(${cpuBreakdown})</span></span></div>
+      <div class="kv" style="grid-column: 1 / -1;"><span class="k">memory reserved / available</span><span class="v">${fmtNum(c.reserved_memory_mb)} / ${fmtNum(c.available_memory_mb)} MB available / ${fmtNum(c.memory_budget_mb)} MB budget <span class="muted">(${memBreakdown})</span></span></div>
+      <div class="kv" style="grid-column: 1 / -1;"><span class="k">disk reserved / available</span><span class="v">${fmtNum(c.reserved_disk_gb)} / ${fmtNum(c.available_disk_gb)} GB available / ${fmtNum(c.disk_budget_gb)} GB budget <span class="muted">(${diskBreakdown})</span></span></div>
       <div class="kv"><span class="k">memory free (live)</span><span class="v">${fmtNum(c.live_memory_free_mb)} MB${c.memory_floor_mb ? " <span class='muted'>(floor " + fmtNum(c.memory_floor_mb) + " MB)</span>" : ""}</span></div>
       <div class="kv"><span class="k">gpus</span><span class="v">${c.gpu_count ? fmtNum(c.reserved_gpus) + " / " + fmtNum(c.gpu_count) + " (" + escapeHTML(c.gpu_vendor || "?") + ")" : "—"}</span></div>
       <div class="kv"><span class="k">runtimes</span><span class="v">${escapeHTML((c.supported_runtimes || []).join(", ") || "—")}</span></div>
@@ -376,6 +420,19 @@ async function loadCluster() {
     el("cluster-leader").textContent = leader.leader || "(single-node or no leader)";
     const ms = members.members || [];
     el("cluster-count").textContent = fmtNum(ms.length);
+    const agg = aggregateCapacity(ms);
+    if (agg.nodes === 0) {
+      el("cluster-capacity-row").innerHTML = `<span class="muted">no capacity heartbeats yet</span>`;
+    } else {
+      el("cluster-capacity-row").innerHTML = `
+        <div class="kv"><span class="k">capacity heartbeats</span><span class="v">${fmtNum(agg.nodes)} nodes${agg.stale ? " · " + fmtNum(agg.stale) + " stale" : ""}</span></div>
+        <div class="kv"><span class="k">sandboxes</span><span class="v">${fmtNum(agg.sandboxes)}</span></div>
+        <div class="kv"><span class="k">cpu available</span><span class="v">${fmtFloat(agg.availableCPU)} / ${fmtFloat(agg.cpuBudget)} cores <span class="muted">(${fmtCapacityPct(agg.reservedCPU, agg.cpuBudget)} used)</span></span></div>
+        <div class="kv"><span class="k">memory available</span><span class="v">${fmtNum(agg.availableMem)} / ${fmtNum(agg.memBudget)} MB <span class="muted">(${fmtCapacityPct(agg.reservedMem, agg.memBudget)} used)</span></span></div>
+        <div class="kv"><span class="k">disk available</span><span class="v">${fmtNum(agg.availableDisk)} / ${fmtNum(agg.diskBudget)} GB budget <span class="muted">${agg.hostDisk ? "· " + fmtNum(agg.diskFree) + " / " + fmtNum(agg.hostDisk) + " GB host free" : ""}</span></span></div>
+        <div class="kv"><span class="k">gpu available</span><span class="v">${agg.gpuCount ? fmtNum(agg.availableGPUs) + " / " + fmtNum(agg.gpuCount) : "—"}</span></div>
+      `;
+    }
     if (ms.length === 0) {
       el("members-tbody").innerHTML = `<tr><td colspan="9" class="muted">no peers gossiped</td></tr>`;
       return;
@@ -386,9 +443,10 @@ async function loadCluster() {
       const cap = m.capacity || {};
       const cpuUse = cap.cpu_budget > 0 ? (cap.reserved_cpu || 0) / cap.cpu_budget : 0;
       const memUse = cap.memory_budget_mb > 0 ? (cap.reserved_memory_mb || 0) / cap.memory_budget_mb : 0;
-      const capSummary = (cap.host_cpu_cores != null)
-        ? `${fmtNum(cap.sandboxes_active || 0)} sb · cpu ${fmtFloat(cap.reserved_cpu || 0)}/${fmtFloat(cap.cpu_budget || 0)} (${fmtPct(cpuUse)}) · mem ${fmtNum(cap.reserved_memory_mb || 0)}/${fmtNum(cap.memory_budget_mb || 0)} MB (${fmtPct(memUse)})`
-        : "—";
+      const diskUse = cap.disk_budget_gb > 0 ? (cap.reserved_disk_gb || 0) / cap.disk_budget_gb : 0;
+      const capSummary = (cap.host_cpu_cores > 0 || cap.host_memory_total_mb > 0)
+        ? `${m.capacity_stale ? "STALE · " : ""}${fmtNum(cap.sandboxes_active || 0)} sb · cpu ${fmtFloat(cap.available_cpu || 0)} free/${fmtFloat(cap.cpu_budget || 0)} (${fmtPct(cpuUse)} used) · mem ${fmtNum(cap.available_memory_mb || 0)} MB free/${fmtNum(cap.memory_budget_mb || 0)} (${fmtPct(memUse)} used) · disk ${fmtNum(cap.available_disk_gb || 0)} GB free/${fmtNum(cap.disk_budget_gb || 0)} (${fmtPct(diskUse)} used)${cap.gpu_count ? " · gpu " + fmtNum(cap.available_gpus || 0) + "/" + fmtNum(cap.gpu_count) : ""}`
+        : (m.capacity_stale ? "STALE / missing heartbeat" : "—");
       const drainBtn = m.drained
         ? `<button data-action="uncordon" data-id="${escapeHTML(m.node_id)}">Uncordon</button>`
         : `<button class="danger" data-action="drain" data-id="${escapeHTML(m.node_id)}">Drain</button>`;
@@ -409,6 +467,7 @@ async function loadCluster() {
       `;
     }).join("");
   } catch (err) {
+    el("cluster-capacity-row").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
     el("members-tbody").innerHTML = `<tr><td colspan="9" class="error">${escapeHTML(err.message)}</td></tr>`;
   }
 }

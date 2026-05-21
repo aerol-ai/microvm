@@ -33,6 +33,7 @@ import ai.aerol.microvm.model.ExecExitInfo;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
+import ai.aerol.microvm.model.Failover;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 import ai.aerol.microvm.model.MountSpecRedacted;
@@ -259,7 +260,8 @@ class MicroVMClientTest {
                 "lifecycle", mapOf(
                     "stop_if_idle_for", 3_600_000_000_000L,
                     "destroy_at_age", 86_400_000_000_000L
-                )
+                ),
+                "failover", mapOf("policy", "recreate")
             ));
         });
 
@@ -279,6 +281,7 @@ class MicroVMClientTest {
                     .setLifecycle(new Lifecycle()
                         .setStopIfIdleFor(3_600_000_000_000L)
                         .setDestroyAtAge(86_400_000_000_000L))
+                    .setFailover(new Failover().setPolicy("recreate"))
             );
 
             assertEquals("sb-create", sandbox.id);
@@ -287,6 +290,8 @@ class MicroVMClientTest {
             assertEquals(2048, sandbox.memoryMb);
             assertEquals(3_600_000_000_000L, sandbox.lifecycle.stopIfIdleFor);
             assertEquals(86_400_000_000_000L, sandbox.lifecycle.destroyAtAge);
+            assertNotNull(sandbox.failover);
+            assertEquals("recreate", sandbox.failover.policy);
 
             Map<String, Object> payload = requestBody.get();
             assertEquals("ubuntu:22.04", payload.get("image"));
@@ -295,6 +300,8 @@ class MicroVMClientTest {
             Map<String, Object> lifecycle = castMap(payload.get("lifecycle"));
             assertEquals(3_600_000_000_000L, ((Number) lifecycle.get("stop_if_idle_for")).longValue());
             assertEquals(86_400_000_000_000L, ((Number) lifecycle.get("destroy_at_age")).longValue());
+            Map<String, Object> failover = castMap(payload.get("failover"));
+            assertEquals("recreate", failover.get("policy"));
         } finally {
             server.stop(0);
         }

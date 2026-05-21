@@ -32,6 +32,7 @@ sandbox = client.create(
 			"stopIfIdleFor": 3_600_000_000_000,
 			"destroyAtAge": 86_400_000_000_000,
 		},
+		"failover": {"policy": "recreate"},
 		"mounts": [
 			{
 				"type": "s3",

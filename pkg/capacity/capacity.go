@@ -20,8 +20,10 @@ package capacity
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
+	"syscall"
 )
 
 // ErrCapacityExceeded is returned by Admit when the host cannot accept a new
@@ -79,19 +81,23 @@ type Request struct {
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
-// /capacity response. It is also the payload that placement scoring reads
-// off gossip — every field that is needed to decide "can this peer host
-// this request?" must be present here, otherwise placement scores against
-// stale assumptions and the caller fans out to a node that can't actually
-// admit. See nodeMeta in internal/cluster/gossip.go for the size budget.
+// /capacity response. It is also the payload in cluster capacity heartbeats:
+// every field needed to decide "can this peer host this request?" must be
+// present here, otherwise placement scores against stale assumptions and the
+// caller fans out to a node that can't actually admit.
 type Snapshot struct {
 	HostCPUCores              int      `json:"host_cpu_cores"`
 	HostMemoryTotalMB         int      `json:"host_memory_total_mb"`
 	HostDiskTotalGB           int      `json:"host_disk_total_gb,omitempty"`
+	HostDiskFreeGB            int      `json:"host_disk_free_gb,omitempty"`
 	ReservedCPU               float64  `json:"reserved_cpu"`
 	ReservedMemoryMB          int      `json:"reserved_memory_mb"`
 	ReservedDiskGB            int      `json:"reserved_disk_gb,omitempty"`
 	ReservedGPUs              int      `json:"reserved_gpus,omitempty"`
+	AvailableCPU              float64  `json:"available_cpu"`
+	AvailableMemoryMB         int      `json:"available_memory_mb"`
+	AvailableDiskGB           int      `json:"available_disk_gb,omitempty"`
+	AvailableGPUs             int      `json:"available_gpus,omitempty"`
 	LiveMemoryFreeMB          int      `json:"live_memory_free_mb"`
 	SandboxesActive           int      `json:"sandboxes_active"`
 	CanAdmit                  bool     `json:"can_admit"`
@@ -133,11 +139,14 @@ type MemProbe interface {
 type HostInfo struct {
 	CPUCores      int
 	MemoryTotalMB int
-	// DiskTotalGB is the disk budget the operator declares for sandbox
-	// storage (the volume backing Docker's data root). Auto-detection is
-	// out of scope for Phase 1 — operators set SB_HOST_DISK_GB. 0 means
-	// no disk accounting.
+	// DiskTotalGB is the disk budget for sandbox storage. It is auto-detected
+	// from the host filesystem by default and can be overridden by
+	// SB_HOST_DISK_GB when the sandbox pool is smaller than the filesystem.
 	DiskTotalGB int
+	// DiskFreeGB is the currently available space on the detected sandbox
+	// storage filesystem. It is an observability signal; reservation
+	// admission uses DiskTotalGB × DiskReservationRatio.
+	DiskFreeGB int
 	// GPUCount and GPUVendor describe the GPU inventory the operator has
 	// wired up to Docker. Operator-declared (SB_HOST_GPU_COUNT /
 	// SB_HOST_GPU_VENDOR); 0 means no GPUs available.
@@ -190,10 +199,13 @@ func DetectHost() (HostInfo, error) {
 	if err != nil {
 		return HostInfo{}, fmt.Errorf("read host memory: %w", err)
 	}
+	diskTotal, diskFree, diskErr := detectDiskGB(defaultDiskPath())
 	return HostInfo{
 		CPUCores:      runtime.NumCPU(),
 		MemoryTotalMB: mem,
-	}, nil
+		DiskTotalGB:   diskTotal,
+		DiskFreeGB:    diskFree,
+	}, diskErr
 }
 
 // Admit decides whether a new sandbox with the given resource request can be
@@ -363,15 +375,24 @@ func (a *Admitter) Snapshot() Snapshot {
 			free = v
 		}
 	}
+	diskFree := a.host.DiskFreeGB
+	if _, v, err := detectDiskGB(defaultDiskPath()); err == nil {
+		diskFree = v
+	}
 
 	snap := Snapshot{
 		HostCPUCores:              a.host.CPUCores,
 		HostMemoryTotalMB:         a.host.MemoryTotalMB,
 		HostDiskTotalGB:           a.host.DiskTotalGB,
+		HostDiskFreeGB:            diskFree,
 		ReservedCPU:               totalCPU,
 		ReservedMemoryMB:          totalMem,
 		ReservedDiskGB:            totalDisk,
 		ReservedGPUs:              totalGPUs,
+		AvailableCPU:              maxFloat(a.cpuBudget()-totalCPU, 0),
+		AvailableMemoryMB:         maxInt(a.memBudgetMB()-totalMem, 0),
+		AvailableDiskGB:           maxInt(a.diskBudgetGB()-totalDisk, 0),
+		AvailableGPUs:             maxInt(a.host.GPUCount-totalGPUs, 0),
 		LiveMemoryFreeMB:          free,
 		SandboxesActive:           count,
 		CPUReservationRatio:       a.limits.CPUReservationRatio,
@@ -513,4 +534,51 @@ func (a *Admitter) runtimeSupported(runtime string) bool {
 		}
 	}
 	return false
+}
+
+func defaultDiskPath() string {
+	if _, err := os.Stat("/var/lib/docker"); err == nil {
+		return "/var/lib/docker"
+	}
+	return "/"
+}
+
+func detectDiskGB(path string) (int, int, error) {
+	if path == "" {
+		path = "/"
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, 0, fmt.Errorf("read host disk: %w", err)
+	}
+	blockSize := uint64(st.Bsize)
+	total := bytesToGB(uint64(st.Blocks) * blockSize)
+	free := bytesToGB(uint64(st.Bavail) * blockSize)
+	return total, free, nil
+}
+
+func bytesToGB(bytes uint64) int {
+	if bytes == 0 {
+		return 0
+	}
+	const gib = uint64(1024 * 1024 * 1024)
+	gb := bytes / gib
+	if gb == 0 {
+		return 1
+	}
+	return int(gb)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }

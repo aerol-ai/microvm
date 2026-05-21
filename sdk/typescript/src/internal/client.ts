@@ -17,6 +17,7 @@ import type {
   ExposePortOptions,
   ExposeProtocol,
   ExposeResult,
+  Failover,
   HealthStatus,
   Lifecycle,
   ListOptions,
@@ -90,6 +91,10 @@ interface ApiLifecycle {
   destroy_at_age?: number;
 }
 
+interface ApiFailover {
+  policy?: string;
+}
+
 interface ApiSandbox {
   id: string;
   image: string;
@@ -112,6 +117,7 @@ interface ApiSandbox {
   last_error?: string;
   container_command?: string[];
   lifecycle?: ApiLifecycle;
+  failover?: ApiFailover;
   runtime?: string;
 }
 
@@ -575,6 +581,7 @@ export class SandboxResource implements Sandbox {
   declare lastError?: string;
   declare containerCommand?: string[];
   declare lifecycle: Lifecycle;
+  declare failover?: Failover;
   declare runtime: Sandbox["runtime"];
 
   protected readonly client: APIClient;
@@ -714,6 +721,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     container_command: options.containerCommand,
     mounts: options.mounts?.map(toApiMountSpec),
     lifecycle: options.lifecycle ? toApiLifecycle(options.lifecycle) : undefined,
+    failover: options.failover ? toApiFailover(options.failover) : undefined,
     runtime: options.runtime,
   };
 }
@@ -772,6 +780,12 @@ function toApiLifecycle(lifecycle: Lifecycle): ApiLifecycle {
   };
 }
 
+function toApiFailover(failover: Failover): ApiFailover {
+  return {
+    policy: failover.policy,
+  };
+}
+
 function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
   return {
     id: sandbox.id,
@@ -795,6 +809,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     lastError: sandbox.last_error,
     containerCommand: sandbox.container_command,
     lifecycle: fromApiLifecycle(sandbox.lifecycle),
+    failover: fromApiFailover(sandbox.failover),
     runtime: normalizeRuntime(sandbox.runtime),
   };
 }
@@ -955,6 +970,14 @@ function fromApiLifecycle(lifecycle?: ApiLifecycle): Lifecycle {
   return result;
 }
 
+function fromApiFailover(failover?: ApiFailover): Failover | undefined {
+  const policy = failover?.policy;
+  if (policy !== "recreate" && policy !== "none") {
+    return undefined;
+  }
+  return { policy };
+}
+
 // buildTagQuery renders ListOptions.tags as the server's wire format. The
 // `tag.` prefix is literal — the server's parseTagFilter does a prefix check
 // on the *decoded* query key, so only the user-supplied key and value get
@@ -978,6 +1001,7 @@ function cloneSandbox(sandbox: Sandbox): Sandbox {
     exposedPorts: sandbox.exposedPorts?.map((port) => ({ ...port })),
     containerCommand: sandbox.containerCommand ? [...sandbox.containerCommand] : undefined,
     lifecycle: { ...sandbox.lifecycle },
+    failover: sandbox.failover ? { ...sandbox.failover } : undefined,
   };
 }
 

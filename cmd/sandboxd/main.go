@@ -12,6 +12,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -37,6 +38,46 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	otelTracesShutdown, err := observability.StartOTELTraces(ctx, logger, observability.OTELTracesConfig{
+		Enabled:     cfg.OTELTracesEnabled,
+		Endpoint:    cfg.OTELTracesEndpoint,
+		SampleRatio: cfg.OTELTracesSampleRatio,
+		ServiceName: cfg.OTELServiceName,
+		NodeID:      cfg.NodeID,
+		NodeRole:    cfg.NodeRole,
+	})
+	if err != nil {
+		logger.Warn("failed to start otel trace exporter", "error", err)
+	} else if otelTracesShutdown != nil {
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := otelTracesShutdown(shutdownCtx); err != nil {
+				logger.Warn("otel trace shutdown failed", "error", err)
+			}
+		}()
+	}
+
+	otelShutdown, err := observability.StartOTELMetrics(ctx, logger, observability.OTELMetricsConfig{
+		Enabled:     cfg.OTELMetricsEnabled,
+		Endpoint:    cfg.OTELMetricsEndpoint,
+		Interval:    cfg.OTELMetricsInterval,
+		ServiceName: cfg.OTELServiceName,
+		NodeID:      cfg.NodeID,
+		NodeRole:    cfg.NodeRole,
+	})
+	if err != nil {
+		logger.Warn("failed to start otel metrics exporter", "error", err)
+	} else if otelShutdown != nil {
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := otelShutdown(shutdownCtx); err != nil {
+				logger.Warn("otel metrics shutdown failed", "error", err)
+			}
+		}()
+	}
 
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {
@@ -84,13 +125,18 @@ func main() {
 			"error", err,
 		)
 	}
+	// Keep the detected disk total separate from the admission budget so we
+	// can log it for observability without changing placement behavior on
+	// deployments that never configured SB_HOST_DISK_GB. Disk admission stays
+	// opt-in: DiskTotalGB only carries the operator's declared budget.
+	detectedDiskTotalGB := host.DiskTotalGB
 	if cfg.HostCPUCoresOverride > 0 {
 		host.CPUCores = cfg.HostCPUCoresOverride
 	}
 	if cfg.HostMemoryMBOverride > 0 {
 		host.MemoryTotalMB = cfg.HostMemoryMBOverride
 	}
-	host.DiskTotalGB = cfg.HostDiskGB
+	host.DiskTotalGB = max(cfg.HostDiskGB, 0)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = cfg.HostSupportedRuntimes
@@ -106,6 +152,8 @@ func main() {
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
 		"host_disk_gb", host.DiskTotalGB,
+		"host_disk_detected_gb", detectedDiskTotalGB,
+		"host_disk_free_gb", host.DiskFreeGB,
 		"host_gpu_count", host.GPUCount,
 		"host_gpu_vendor", host.GPUVendor,
 		"host_supported_runtimes", host.SupportedRuntimes,
@@ -354,6 +402,7 @@ func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logg
 		ContainerCommand: sb.ContainerCommand,
 		Runtime:          sb.Runtime,
 		GPUs:             sb.GPUs,
+		Failover:         sb.Failover,
 	}
 	// Lifecycle on Sandbox is value-typed; spec wants a pointer so the JSON
 	// "omitempty" stays meaningful for fresh creates that didn't pass one.

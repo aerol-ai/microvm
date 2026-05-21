@@ -172,6 +172,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := service.NormalizeCreateFailover(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	normalizedRaw, err := json.Marshal(req)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
@@ -191,27 +195,21 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 
 	target, err := c.SelectPlacement(capacityRequestFromCreate(req))
 	if err != nil {
-		if errors.Is(err, cluster.ErrNoPlacementTarget) {
+		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
+			if errors.Is(err, cluster.ErrInvalidTopology) {
+				w.Header().Set("Retry-After", "300")
+			} else {
+				w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+			}
 			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		apihttp.WriteError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return
 	}
-	if target.IsSelf {
-		// Self wins: no reservation needed. There's no network hop where
-		// intermediate state could be lost, so the existing single-commit
-		// flow (CreateSandbox → RecordPlacement) stays correct and avoids
-		// an extra raft round-trip on the local-create critical path.
-		h.createSandboxOnSelectedNode(w, r, req, "")
-		return
-	}
-
-	// Cross-node create: write the reservation BEFORE forwarding so the
-	// cluster has intent the instant Node A loses ownership of the request.
-	// This fixes B2 (intent-before-side-effect) and prevents the multi-node
-	// admission race where two routers both pass T's local admitter before
-	// either's placement is replicated.
+	// Cluster create: write the reservation BEFORE any Docker side effect.
+	// Remote targets need intent before forwarding; self targets need the
+	// same leader-side capacity/backpressure accounting at large scale.
 	sandboxID, err := service.GenerateSandboxID()
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
@@ -236,11 +234,25 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 			apihttp.WriteError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return
 		}
+		if errors.Is(err, cluster.ErrCreateBackpressure) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
+		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return
 	}
+	if target.IsSelf {
+		service.RecordCreateReservationState("reserve_local")
+		h.createSandboxOnSelectedNode(w, r, req, sandboxID)
+		return
+	}
 	service.RecordCreateReservationState("reserve_remote")
-
 	r.Header.Set(clusterCreateTargetHeader, target.NodeID)
 	r.Header.Set(clusterCreateIDHeader, sandboxID)
 	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
@@ -249,16 +261,20 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 // createSandboxOnSelectedNode performs the local side effect once placement has
 // already selected this node. Two entry points:
 //
-//   - reservationID == "": self won SelectPlacement on this node. No
-//     reservation was written; run the existing single-commit flow
-//     (CreateSandbox → seal/redact → RecordPlacement).
-//   - reservationID != "": cross-node forward. The router already wrote the
-//     reservation with our redacted spec. Use CreateSandboxWithID against the
-//     reserved ID, store a local secret ref, then RecordPlacement with the
-//     redacted spec + ref — opPlace transitions State=Reserved → Placed
-//     atomically while keeping secret material out of Raft.
+//   - reservationID == "": local-only image path. No cluster reservation was
+//     written because the image cannot be moved to another worker.
+//   - reservationID != "": normal cluster create. The router already wrote
+//     the reservation with our redacted spec, even when this node is the
+//     selected worker. Use CreateSandboxWithID against the reserved ID, store
+//     a local secret ref, then RecordPlacement with the redacted spec + ref —
+//     opPlace transitions State=Reserved → Placed atomically while keeping
+//     secret material out of Raft.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
 	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := service.NormalizeCreateFailover(&req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -639,6 +655,49 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": view})
 }
 
+// clusterRemoveMember explicitly removes a node from the raft configuration.
+// It is the operator path for decommissioned control-plane members; worker
+// role changes should use /cluster/nodes/{id}/drain before the infrastructure
+// replacement, not this endpoint.
+func (h *handlers) clusterRemoveMember(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "node id required")
+		return
+	}
+	force := parseBoolQuery(r, "force")
+	commitCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := c.RemoveMember(commitCtx, id, force); err != nil {
+		switch {
+		case errors.Is(err, cluster.ErrNotLeader):
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+		case errors.Is(err, cluster.ErrUnknownMember):
+			apihttp.WriteError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, cluster.ErrMemberStillAlive), errors.Is(err, cluster.ErrLastVoter):
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
+		default:
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func parseBoolQuery(r *http.Request, key string) bool {
+	raw := strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key)))
+	return raw == "1" || raw == "true" || raw == "yes"
+}
+
 // clusterLeader returns the current Raft leader's node ID.
 func (h *handlers) clusterLeader(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
@@ -819,6 +878,16 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
 			return
 		}
+		if errors.Is(err, cluster.ErrCreateBackpressure) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
+		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -943,6 +1012,64 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+type clusterRecoveryBlobStore interface {
+	StoreRecoveryBlob(context.Context, cluster.RecoveryBlob) error
+	RecoveryBlob(context.Context, string) (cluster.RecoveryBlob, bool, error)
+}
+
+func (h *handlers) clusterInternalRecoveryPut(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.PathValue("ref"))
+	if ref == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref required")
+		return
+	}
+	c, ok := h.deps.Service.Cluster().(clusterRecoveryBlobStore)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: recovery store unavailable on this node")
+		return
+	}
+	var blob cluster.RecoveryBlob
+	if err := json.NewDecoder(r.Body).Decode(&blob); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if blob.Ref == "" {
+		blob.Ref = ref
+	}
+	if blob.Ref != ref {
+		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref mismatch")
+		return
+	}
+	if err := c.StoreRecoveryBlob(r.Context(), blob); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) clusterInternalRecoveryGet(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.PathValue("ref"))
+	if ref == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "recovery ref required")
+		return
+	}
+	c, ok := h.deps.Service.Cluster().(clusterRecoveryBlobStore)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: recovery store unavailable on this node")
+		return
+	}
+	blob, found, err := c.RecoveryBlob(r.Context(), ref)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		apihttp.WriteError(w, http.StatusNotFound, "recovery blob not found")
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, blob)
+}
+
 func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
@@ -1065,45 +1192,6 @@ func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 		resp.NodeInstalledVersion >= resp.PlacementVersion
 
 	apihttp.WriteJSON(w, http.StatusOK, resp)
-}
-
-// replicateSpecPatch is the write-through used by mutating handlers (resize,
-// lifecycle) to keep the FSM-replicated spec in sync with the local sandbox.
-// It reads the current spec from the cluster, applies patch, and writes back
-// via UpsertSpec. No-op when:
-//   - cluster is nil (single-node mode handled by Noop returning nil from SpecOf)
-//   - no spec is recorded yet (pre-cluster sandbox; recreate is impossible
-//     until a future write-through bumps the spec — known limitation)
-//
-// Failures are logged at warn rather than failing the response: the local
-// mutation already succeeded and was confirmed to the user. A stale FSM spec
-// only matters if this owner dies before the next successful write-through;
-// the next mutating call (or an explicit reconcile) will refresh it.
-//
-// Race: two concurrent mutations for the same sandbox can clobber each other
-// in the FSM, but the local sandbox is already authoritative — the worst case
-// is a stale spec on a node that hasn't died yet, which the next mutation
-// fixes. Same-sandbox mutations are rare and serialize at the docker layer
-// anyway.
-func (h *handlers) replicateSpecPatch(ctx context.Context, id string, patch func(*models.CreateSandboxRequest)) {
-	c := h.deps.Service.Cluster()
-	if c == nil {
-		return
-	}
-	spec := c.SpecOf(id)
-	if spec == nil {
-		// Pre-cluster sandbox or never-recorded spec; nothing to patch.
-		return
-	}
-	patch(spec)
-	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	// Pass an empty secret handle — resize / lifecycle never touch
-	// credentials, so preserving the existing ref is correct.
-	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil {
-		h.deps.Logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
-			"sandbox_id", id, "err", err)
-	}
 }
 
 // replicateAddExposedPort write-throughs an expose-port intent to the FSM. The

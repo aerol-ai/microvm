@@ -16,6 +16,8 @@ export type {
   ExposePortOptions,
   ExposeProtocol,
   ExposeResult,
+  Failover,
+  FailoverPolicy,
   HealthStatus,
   Lifecycle,
   MountSpec,

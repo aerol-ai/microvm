@@ -2,14 +2,18 @@
 //
 // Architecture (Phase 1):
 //
-//   - Membership and capacity dissemination: SWIM gossip via hashicorp/memberlist.
-//     Every node periodically advertises a capacity.Snapshot in its memberlist
-//     metadata; placement decisions read these advertised snapshots.
+//   - Membership: SWIM gossip via hashicorp/memberlist. Gossip carries
+//     identity and role metadata only so memberlist's 512-byte NodeMeta limit
+//     cannot strip Raft addresses.
+//
+//   - Capacity heartbeats: server-role nodes fetch authenticated
+//     capacity.Snapshot payloads from worker-capable peers and require a fresh
+//     heartbeat before placement can target that worker.
 //
 //   - Placement map: server-role nodes run a small Raft FSM (hashicorp/raft)
 //     holding sandbox_id -> owner_node_id plus replicated recovery metadata.
 //     Mutations happen on the leader; server reads are local from the FSM.
-//     Worker/ingress-only nodes run Agent instead: they gossip capacity and
+//     Worker/ingress-only nodes run Agent instead: they gossip identity and
 //     receive owner API forwards, but all placement reads/writes go to the
 //     server quorum over authenticated RPC. They do not store the FSM and do
 //     not join Raft as non-voters.
@@ -64,9 +68,9 @@ var ErrNameConflict = errors.New("cluster: sandbox name already in use")
 
 // ErrOrphaned is returned by OwnerOf when a placement exists but its owner has
 // been auto-evicted and the dead-owner reconciler has cleared the pointer.
-// Under the current product policy this is a terminal manual-recovery state:
-// callers should surface 410 Gone. If auto-recreation is enabled later, the
-// owner watcher may converge it by reassigning the placement to a live node.
+// This is the terminal state for default non-HA sandboxes; callers should
+// surface 410 Gone. Sandboxes that opted into failover.policy=recreate are
+// reassigned before the remaining dead-owner placements are orphaned.
 var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned")
 
 // ErrOrphanClaimConflict is returned when a node tries to reclaim an orphaned
@@ -82,6 +86,12 @@ var ErrOrphanClaimConflict = errors.New("cluster: orphaned placement belongs to 
 // will see the new reservation and pick a different node.
 var ErrCapacityExceeded = errors.New("cluster: target capacity exceeded after pending reservations")
 
+// ErrCreateBackpressure is returned when the leader-side create queue for a
+// worker is full. This is intentionally distinct from ErrCapacityExceeded:
+// capacity means "pick another worker or wait for resources"; backpressure means
+// "too many creates are already in-flight to this worker, retry shortly."
+var ErrCreateBackpressure = errors.New("cluster: create backpressure")
+
 // ErrReservationConflict is returned when opReserve tries to reserve a
 // sandbox ID that already has a non-expired placement (placed or actively
 // reserved by a different owner). Indicates either a router racing a
@@ -92,6 +102,38 @@ var ErrReservationConflict = errors.New("cluster: sandbox already placed or rese
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
 var ErrNoPlacementTarget = errors.New("cluster: no worker placement target available")
+
+// ErrInvalidTopology is returned when the live cluster shape violates a
+// production topology invariant. API layers translate this to 503 so clients
+// retry after the operator fixes membership instead of treating it as a
+// malformed request.
+var ErrInvalidTopology = errors.New("cluster: invalid topology")
+
+// ErrUnknownMember is returned when an operator asks to remove a node that is
+// not present in the current raft configuration.
+var ErrUnknownMember = errors.New("cluster: unknown raft member")
+
+// ErrMemberStillAlive protects operators from accidentally removing a live
+// control-plane node. Stop the node first, or pass force through the public
+// lifecycle API when intentionally retiring a live member.
+var ErrMemberStillAlive = errors.New("cluster: raft member is still alive")
+
+// ErrLastVoter prevents an explicit removal from deleting the last voting raft
+// server and leaving the cluster with no quorum path.
+var ErrLastVoter = errors.New("cluster: cannot remove last raft voter")
+
+const (
+	// CreateBackpressureRetryAfterSeconds is the public Retry-After hint for
+	// queue/concurrency backpressure. Keep it short: these rejects are caused by
+	// transient in-flight create fan-in, not by a long operator action.
+	CreateBackpressureRetryAfterSeconds = 5
+	CapacityRetryAfterSeconds           = 30
+	// InvalidTopologyRetryAfterSeconds is the hint for ErrInvalidTopology
+	// rejects, which only clear when an operator reshapes the cluster
+	// (promoting servers or adding workers). A long back-off keeps clients
+	// from busy-retrying while the human change is in flight.
+	InvalidTopologyRetryAfterSeconds = 300
+)
 
 // PlacementState distinguishes a reservation (capacity held, no docker yet)
 // from a placement (sandbox materialized). Empty defaults to Placed so
@@ -176,22 +218,29 @@ type ExposedPortRoute struct {
 // ingress nodes can install owner-aware data-plane routes. Both fields are kept
 // so older snapshots still restore cleanly.
 type Placement struct {
-	SandboxID           string                       `json:"sandbox_id"`
-	OwnerNodeID         string                       `json:"owner_node_id"`
-	OwnerAPIURL         string                       `json:"owner_api_url"`
-	OwnerDataPlaneHost  string                       `json:"owner_data_plane_host,omitempty"`
-	OwnerState          PlacementOwnerState          `json:"owner_state,omitempty"`
-	OrphanedOwnerNodeID string                       `json:"orphaned_owner_node_id,omitempty"`
-	OrphanedUnix        int64                        `json:"orphaned_unix,omitempty"`
-	Version             uint64                       `json:"version"`
-	CreatedUnix         int64                        `json:"created_unix"`
-	UpdatedUnix         int64                        `json:"updated_unix"`
-	Spec                *models.CreateSandboxRequest `json:"spec,omitempty"`
-	SecretRef           string                       `json:"secret_ref,omitempty"`
-	SecretVersion       int                          `json:"secret_version,omitempty"`
-	SealedSecrets       []byte                       `json:"sealed_secrets,omitempty"`
-	ExposedPorts        map[int]string               `json:"exposed_ports,omitempty"`
-	ExposedPortRoutes   map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	SandboxID           string              `json:"sandbox_id"`
+	OwnerNodeID         string              `json:"owner_node_id"`
+	OwnerAPIURL         string              `json:"owner_api_url"`
+	OwnerDataPlaneHost  string              `json:"owner_data_plane_host,omitempty"`
+	OwnerState          PlacementOwnerState `json:"owner_state,omitempty"`
+	OrphanedOwnerNodeID string              `json:"orphaned_owner_node_id,omitempty"`
+	OrphanedUnix        int64               `json:"orphaned_unix,omitempty"`
+	Version             uint64              `json:"version"`
+	CreatedUnix         int64               `json:"created_unix"`
+	UpdatedUnix         int64               `json:"updated_unix"`
+	// Name is the small, hot copy of Spec.Name used to rebuild the cluster-wide
+	// uniqueness index without loading the larger recovery spec payload.
+	Name string `json:"name,omitempty"`
+	// RecoveryRef points at the out-of-snapshot recovery payload for this row.
+	// Spec/secret fields are hydrated from that store only for point lookups and
+	// recreate flows.
+	RecoveryRef       string                       `json:"-"`
+	Spec              *models.CreateSandboxRequest `json:"spec,omitempty"`
+	SecretRef         string                       `json:"secret_ref,omitempty"`
+	SecretVersion     int                          `json:"secret_version,omitempty"`
+	SealedSecrets     []byte                       `json:"sealed_secrets,omitempty"`
+	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
+	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
 	// State is empty for materialized placements (the historical schema) and
 	// PlacementStateReserved for capacity-only intents that have not yet been
 	// promoted by a successful local create. Reservations are eligible for
@@ -221,6 +270,11 @@ type Member struct {
 	Role     string            `json:"role,omitempty"`
 	Alive    bool              `json:"alive"`
 	Capacity capacity.Snapshot `json:"capacity"`
+	// CapacityUpdatedUnix is when this node's last capacity heartbeat was
+	// observed by the scheduler. CapacityStale means the last heartbeat is
+	// missing or too old for placement admission.
+	CapacityUpdatedUnix int64 `json:"capacity_updated_unix,omitempty"`
+	CapacityStale       bool  `json:"capacity_stale,omitempty"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.
@@ -254,6 +308,17 @@ type PlacementTarget struct {
 	// preference to APIURL so the hop rides the cert-pinned channel.
 	InternalURL string
 	IsSelf      bool
+}
+
+// PlacementReservation is one item in a leader-side batch reservation request.
+// Redacted MUST have plaintext credentials stripped before the caller passes it
+// in; Secrets carries only a provider handle or legacy sealed bytes.
+type PlacementReservation struct {
+	SandboxID string
+	Target    PlacementTarget
+	Redacted  *models.CreateSandboxRequest
+	Secrets   PlacementSecrets
+	TTL       time.Duration
 }
 
 // OwnerInfo is returned by OwnerOf.
@@ -409,6 +474,12 @@ type Client interface {
 	// about to stop.
 	SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error
 
+	// RemoveMember explicitly removes nodeID from the raft configuration after
+	// marking it drained and orphaning any placements it owned. Unknown raft
+	// members return ErrUnknownMember. Live members require force=true so an
+	// operator cannot accidentally cut out a healthy server by typo.
+	RemoveMember(ctx context.Context, nodeID string, force bool) error
+
 	// IsNodeDrained reports whether nodeID is currently marked drained.
 	// Reads the local FSM (no network hop). Used by observability endpoints
 	// — placement scoring uses an internal accessor that takes one lock for
@@ -445,21 +516,23 @@ type Client interface {
 	// Members returns a snapshot of all known cluster members.
 	Members() []Member
 
-	// Placements returns the local FSM's placement snapshot. Used by each node
-	// to reconcile owner-aware public ingress routes.
+	// Placements returns the local FSM's hot placement snapshot. Recovery
+	// payloads (Spec/secrets) are omitted; use PlacementOf/SpecOf for point
+	// lookups that need them.
 	Placements() []Placement
 
 	// PlacementsForShards returns only placements whose sandbox ID belongs to
 	// one of the requested placement shards. Ingress nodes use this instead of
 	// pulling the full global placement map; server nodes serve it from the
 	// FSM shard index and agent nodes delegate it to a server-role control
-	// plane peer. Empty Shards means "all placements."
+	// plane peer. Empty Shards means "all placements." Returned rows are hot
+	// rows without Spec/secrets.
 	PlacementsForShards(filter PlacementShardFilter) []Placement
 
 	// PlacementPage returns a bounded global placement-index page sorted by
 	// sandbox ID. It is the scalable read path for operators/control planes
-	// that need to enumerate 100k sandboxes without asking every worker for
-	// its local DB.
+	// that need to enumerate large clusters without asking every worker for
+	// its local DB. Returned rows are hot rows without Spec/secrets.
 	PlacementPage(req PlacementPageRequest) PlacementPageResponse
 
 	// PlacementOf returns the full Placement record for sandboxID and true,

@@ -12,7 +12,7 @@ Single-node installs ([Server Setup](/getting-started)) handle every workload th
 - Per-node failure isolation - the loss of one node only affects the sandboxes it owned, and survivors keep serving traffic.
 - Geographic distribution across multiple data centers behind one logical API.
 
-Cluster mode adds two new pieces on top of the single-node binaries: a Raft quorum (placement decisions) and a SWIM gossip ring (membership + capacity). See [Durability and Failover](/durability) for what survives node loss.
+Cluster mode adds three pieces on top of the single-node binaries: a Raft quorum (placement decisions), a SWIM gossip ring (membership), and authenticated worker capacity heartbeats used by the scheduler. See [Durability and Failover](/durability) for what survives node loss.
 
 ## Prerequisites
 
@@ -88,10 +88,10 @@ Both require the same `Authorization: Bearer $SB_PAT_TOKEN` header as the rest o
 
 When a create lands on a node (call it `A`):
 
-1. `A` runs placement scoring against the gossiped capacity snapshot, biased
-   by any pending reservations it knows about, and picks a target `T`. If
-   `A == T`, `A` runs the create locally and commits a placement to the raft
-   log on success.
+1. `A` runs placement scoring against fresh worker capacity heartbeats,
+   biased by any pending reservations it knows about, and picks a target `T`.
+   If `A == T`, `A` runs the create locally and commits a placement to the
+   raft log on success.
 2. If `T` is a different node, `A` mints a sandbox ID, seals + redacts the
    request secrets, and writes a **reservation** for `T` to the raft log
    *before* forwarding. The reservation holds the requested capacity and the

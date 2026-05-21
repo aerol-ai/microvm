@@ -128,7 +128,7 @@ pub struct GPUOptions {
     pub device_ids: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CreateOptions {
     pub image: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,13 +146,19 @@ pub struct CreateOptions {
     /// Cap on bytes the sandbox may receive before its ingress is dropped via
     /// per-IP iptables rule. `0` (or omit) means unlimited. Limits can be
     /// raised or lifted at runtime via [`Client::set_network_limits`].
-    #[serde(rename = "network_bytes_in_limit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "network_bytes_in_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub network_bytes_in_limit: Option<i64>,
     /// Cap on bytes the sandbox may send before its egress is dropped. `0`
     /// (or omit) means unlimited. The block reuses the same iptables row as
     /// `network_block_all`; clearing the quota does not lift an operator-set
     /// blanket egress block.
-    #[serde(rename = "network_bytes_out_limit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "network_bytes_out_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub network_bytes_out_limit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<RegistryAuth>,
@@ -162,6 +168,11 @@ pub struct CreateOptions {
     pub mounts: Option<Vec<MountSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<Lifecycle>,
+    /// Owner-node death policy. Omit for non-HA sandboxes; set
+    /// `Failover { policy: "recreate".into() }` to opt into best-effort
+    /// cluster recreation from the replicated create spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover: Option<Failover>,
     /// Container runtime for this sandbox. Omit to inherit the host default
     /// (SB_CONTAINER_RUNTIME). Use `"gvisor"` for runsc-backed isolation when
     /// running untrusted workloads. `"kata"` is reserved and rejected by the
@@ -176,17 +187,35 @@ pub struct CreateOptions {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lifecycle {
-    #[serde(rename = "stop_if_idle_for", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(
+        rename = "stop_if_idle_for",
+        default,
+        skip_serializing_if = "is_zero_u64"
+    )]
     pub stop_if_idle_for: u64,
-    #[serde(rename = "destroy_if_idle_for", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(
+        rename = "destroy_if_idle_for",
+        default,
+        skip_serializing_if = "is_zero_u64"
+    )]
     pub destroy_if_idle_for: u64,
     #[serde(rename = "stop_at_age", default, skip_serializing_if = "is_zero_u64")]
     pub stop_at_age: u64,
-    #[serde(rename = "destroy_at_age", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(
+        rename = "destroy_at_age",
+        default,
+        skip_serializing_if = "is_zero_u64"
+    )]
     pub destroy_at_age: u64,
 }
 
 pub type UpdateLifecycleOptions = Lifecycle;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct Failover {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub policy: String,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ResizeOptions {
@@ -323,6 +352,10 @@ pub struct Sandbox {
     pub container_command: Option<Vec<String>>,
     #[serde(default)]
     pub lifecycle: Lifecycle,
+    /// Owner-node death policy this sandbox was created with. `None` means
+    /// the default non-HA behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover: Option<Failover>,
     /// Container runtime this sandbox is running under. Empty string indicates
     /// a pre-migration row that resolves to the host default at start time.
     #[serde(default)]
@@ -487,7 +520,11 @@ pub struct NetworkUsage {
     /// Absent (`None`) until the netstats poller has produced at least one
     /// sample. `default` lets us deserialize a server response that omits the
     /// field entirely (pre-first-tick) rather than failing.
-    #[serde(rename = "last_sampled_at", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "last_sampled_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_sampled_at: Option<String>,
 }
 
@@ -496,8 +533,14 @@ pub struct NetworkUsage {
 /// `Some(0)` means unlimited.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SetNetworkLimitsOptions {
-    #[serde(rename = "network_bytes_in_limit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "network_bytes_in_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub network_bytes_in_limit: Option<i64>,
-    #[serde(rename = "network_bytes_out_limit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "network_bytes_out_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub network_bytes_out_limit: Option<i64>,
 }

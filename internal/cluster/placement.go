@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"strings"
 	"time"
@@ -57,8 +58,13 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 // "place locally" is the existing single-node behavior; we only forward when
 // a peer is genuinely better.
 func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
-	all := c.gossip.members()
+	all := c.membersWithCapacity()
 	rejects := make(map[string]int64)
+	if err := LargeClusterTopologyError(all); err != nil {
+		rejects["topology"] = 1
+		recordSchedulerDecision("invalid_topology", 0, rejects)
+		return PlacementTarget{}, err
+	}
 	// Subtract still-in-flight reservations (router wrote opReserve but the
 	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
 	// reflect them) from each peer's headroom. Without this, two creates that
@@ -86,6 +92,10 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 		// be partially-joined and forwarding to them would 502.
 		if m.APIURL == "" && m.NodeID != c.nodeID {
 			rejects["missing_api_url"]++
+			continue
+		}
+		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			rejects["capacity_heartbeat"]++
 			continue
 		}
 		if drained[m.NodeID] {
@@ -127,17 +137,17 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 }
 
 // nodeFits returns true if the member could plausibly accept req based on its
-// gossiped capacity snapshot. We use the budget numbers (post-overcommit)
+// latest capacity heartbeat. We use the budget numbers (post-overcommit)
 // because that's what the remote admitter will check. extraReserved is the sum
-// of in-flight reservations the cluster has against this node but the gossip
-// ledger doesn't yet reflect (zero value when none).
+// of in-flight reservations the cluster has against this node but the
+// heartbeat doesn't yet reflect (zero value when none).
 func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bool {
 	cap := m.Capacity
-	// If the snapshot is zero-valued (no advertisement yet), treat as
-	// unknown-but-allowed: better to forward and let the remote admitter
-	// reject than to skip a viable peer.
-	if cap.HostCPUCores == 0 && cap.HostMemoryTotalMB == 0 {
-		return true
+	if m.CapacityStale || !hasCapacitySnapshot(cap) {
+		return false
+	}
+	if !cap.CanAdmit && len(cap.Reasons) > 0 {
+		return false
 	}
 	if cap.CPUBudget > 0 && cap.ReservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
 		return false
@@ -220,6 +230,66 @@ func pickTwo(c []Member) (Member, Member) {
 }
 
 func sameNode(a, b Member) bool { return a.NodeID == b.NodeID }
+
+func (c *Cluster) admitReservationCommand(cmd command) error {
+	reservations := reservationCommands(cmd)
+	if len(reservations) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	pending := c.fsm.pendingReservationsByNode(now)
+	pendingCounts := make(map[string]int, len(reservations))
+	for _, r := range reservations {
+		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
+			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
+		}
+	}
+	return admitReservationCommands(c.membersWithCapacity(), pending, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
+}
+
+func admitReservationCommands(members []Member, pending map[string]capacity.Request, pendingCounts map[string]int, maxPendingPerWorker int, reservations []reservationCommand) error {
+	byID := make(map[string]Member, len(members))
+	for _, m := range members {
+		if m.NodeID != "" {
+			byID[m.NodeID] = m
+		}
+	}
+	batchPending := make(map[string]capacity.Request)
+	batchCounts := make(map[string]int)
+	for _, r := range reservations {
+		if r.SandboxID == "" || r.OwnerNodeID == "" {
+			return fmt.Errorf("%w: reservation missing sandbox_id or owner_node_id", ErrReservationConflict)
+		}
+		m, ok := byID[r.OwnerNodeID]
+		if !ok || !m.Alive || !CanOwnSandboxRole(m.Role) {
+			return fmt.Errorf("%w: worker %s is not an alive placement target", ErrNoPlacementTarget, r.OwnerNodeID)
+		}
+		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			return fmt.Errorf("%w: worker %s has no fresh capacity heartbeat", ErrNoPlacementTarget, r.OwnerNodeID)
+		}
+		if maxPendingPerWorker > 0 && pendingCounts[r.OwnerNodeID]+batchCounts[r.OwnerNodeID] >= maxPendingPerWorker {
+			return fmt.Errorf("%w: worker %s has %d pending creates (cap %d)",
+				ErrCreateBackpressure, r.OwnerNodeID, pendingCounts[r.OwnerNodeID]+batchCounts[r.OwnerNodeID], maxPendingPerWorker)
+		}
+		req := capacityRequestFromSpec(r.Spec)
+		extra := pending[r.OwnerNodeID]
+		batchExtra := batchPending[r.OwnerNodeID]
+		extra.CPU += batchExtra.CPU
+		extra.MemoryMB += batchExtra.MemoryMB
+		extra.DiskGB += batchExtra.DiskGB
+		extra.GPUs += batchExtra.GPUs
+		if !nodeFits(m, req, extra) {
+			return fmt.Errorf("%w: worker %s cannot fit sandbox %s", ErrCapacityExceeded, r.OwnerNodeID, r.SandboxID)
+		}
+		batchExtra.CPU += req.CPU
+		batchExtra.MemoryMB += req.MemoryMB
+		batchExtra.DiskGB += req.DiskGB
+		batchExtra.GPUs += req.GPUs
+		batchPending[r.OwnerNodeID] = batchExtra
+		batchCounts[r.OwnerNodeID]++
+	}
+	return nil
+}
 
 // CanOwnSandboxRole reports whether a gossiped node role may own sandboxes.
 // Empty is treated as worker-capable for rolling upgrades from builds that
