@@ -79,6 +79,12 @@ func StartOTELMetrics(ctx context.Context, logger *slog.Logger, cfg OTELMetricsC
 		return nil, err
 	}
 	if _, err := meter.RegisterCallback(func(ctx context.Context, observer otelmetric.Observer) error {
+		// Bail out without surfacing the cancellation as a callback error:
+		// the OTEL SDK logs non-nil callback returns on every cycle, which
+		// turns routine periodic-reader timeouts into log noise.
+		if err := ctx.Err(); err != nil {
+			return nil
+		}
 		for _, sample := range CollectAerolVMExpvars() {
 			attrs := expvarAttributes(sample)
 			if sample.Int64 != nil {
@@ -88,7 +94,7 @@ func StartOTELMetrics(ctx context.Context, logger *slog.Logger, cfg OTELMetricsC
 				observer.ObserveFloat64(floatGauge, *sample.Float, otelmetric.WithAttributes(attrs...))
 			}
 		}
-		return ctx.Err()
+		return nil
 	}, intGauge, floatGauge); err != nil {
 		_ = provider.Shutdown(ctx)
 		return nil, err

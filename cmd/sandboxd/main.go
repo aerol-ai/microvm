@@ -125,15 +125,18 @@ func main() {
 			"error", err,
 		)
 	}
+	// Keep the detected disk total separate from the admission budget so we
+	// can log it for observability without changing placement behavior on
+	// deployments that never configured SB_HOST_DISK_GB. Disk admission stays
+	// opt-in: DiskTotalGB only carries the operator's declared budget.
+	detectedDiskTotalGB := host.DiskTotalGB
 	if cfg.HostCPUCoresOverride > 0 {
 		host.CPUCores = cfg.HostCPUCoresOverride
 	}
 	if cfg.HostMemoryMBOverride > 0 {
 		host.MemoryTotalMB = cfg.HostMemoryMBOverride
 	}
-	if cfg.HostDiskGB > 0 {
-		host.DiskTotalGB = cfg.HostDiskGB
-	}
+	host.DiskTotalGB = max(cfg.HostDiskGB, 0)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = cfg.HostSupportedRuntimes
@@ -149,6 +152,7 @@ func main() {
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
 		"host_disk_gb", host.DiskTotalGB,
+		"host_disk_detected_gb", detectedDiskTotalGB,
 		"host_disk_free_gb", host.DiskFreeGB,
 		"host_gpu_count", host.GPUCount,
 		"host_gpu_vendor", host.GPUVendor,

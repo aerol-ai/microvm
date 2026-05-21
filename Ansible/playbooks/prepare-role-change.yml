@@ -16,6 +16,21 @@
   gather_facts: false
 
   tasks:
+    - name: Refuse to run without an explicit --limit (or confirm_drain_all=true)
+      # `hosts: all` is intentional so an operator can target any single node
+      # with --limit, but forgetting --limit would serially drain every host
+      # in the inventory. Require either --limit, or an opt-in override for
+      # the rare case where draining the whole inventory is the actual goal.
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - (ansible_limit is defined and ansible_limit | length > 0)
+            or (confirm_drain_all | default(false) | bool)
+        fail_msg: >-
+          Refusing to run without --limit. Pass --limit <host> to drain a
+          single node, or -e confirm_drain_all=true to drain every host in
+          the inventory on purpose.
+
     - name: Deploy sandboxd node lifecycle helper
       ansible.builtin.copy:
         src: "../../scripts/sandboxd-node-lifecycle.sh"

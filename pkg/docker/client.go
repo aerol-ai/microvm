@@ -759,6 +759,32 @@ func (c *Client) recordPullFailureLocked(key string, err error) {
 		createdAt: now,
 		retryAt:   now.Add(c.pullBackoff),
 	}
+	// Opportunistically prune entries whose backoff window has already
+	// elapsed: they would normally be deleted lazily on the next pull of the
+	// same key, but a unique image/auth combination that fails once and is
+	// never retried would otherwise sit in the map forever. We bound the
+	// per-call work so the lock stays cheap even with a large map.
+	pruneExpiredPullFailuresLocked(c.pullFailures, now, pullFailureMaxPrunePerCall)
+}
+
+// pullFailureMaxPrunePerCall caps how many expired entries a single
+// recordPullFailureLocked call evicts. The bound keeps the critical section
+// short under pull-storm conditions; subsequent calls keep draining the map.
+const pullFailureMaxPrunePerCall = 32
+
+func pruneExpiredPullFailuresLocked(failures map[string]imagePullFailure, now time.Time, budget int) {
+	if budget <= 0 || len(failures) == 0 {
+		return
+	}
+	for key, failure := range failures {
+		if budget == 0 {
+			return
+		}
+		if !now.Before(failure.retryAt) {
+			delete(failures, key)
+			budget--
+		}
+	}
 }
 
 func (c *Client) acquirePullSlot(ctx context.Context) (bool, error) {

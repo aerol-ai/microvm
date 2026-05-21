@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -49,7 +50,7 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	// reasons from the admitter.
 	if errors.Is(err, capacity.ErrCapacityExceeded) || errors.Is(err, cluster.ErrCapacityExceeded) {
 		logger.Info("capacity rejected", "error", err)
-		w.Header().Set("Retry-After", "30")
+		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 		msg := err.Error()
 		if len(msg) > 200 {
 			msg = msg[:200]
@@ -58,13 +59,13 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		return
 	}
 	if errors.Is(err, cluster.ErrCreateBackpressure) {
-		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
 		WriteError(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
 	if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 		if errors.Is(err, cluster.ErrInvalidTopology) {
-			w.Header().Set("Retry-After", "300")
+			w.Header().Set("Retry-After", strconv.Itoa(cluster.InvalidTopologyRetryAfterSeconds))
 		}
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return

@@ -128,6 +128,11 @@ const (
 	// transient in-flight create fan-in, not by a long operator action.
 	CreateBackpressureRetryAfterSeconds = 5
 	CapacityRetryAfterSeconds           = 30
+	// InvalidTopologyRetryAfterSeconds is the hint for ErrInvalidTopology
+	// rejects, which only clear when an operator reshapes the cluster
+	// (promoting servers or adding workers). A long back-off keeps clients
+	// from busy-retrying while the human change is in flight.
+	InvalidTopologyRetryAfterSeconds = 300
 )
 
 // PlacementState distinguishes a reservation (capacity held, no docker yet)

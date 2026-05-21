@@ -116,7 +116,15 @@ func isFinite(v float64) bool {
 }
 
 func prometheusMetricType(name string) string {
-	if strings.HasSuffix(name, "_total") {
+	// Histogram families publish three monotonically non-decreasing series
+	// (_bucket, _count, _sum) alongside their _total counters. Prometheus
+	// tooling (rate(), histogram_quantile()) requires all of them to be
+	// declared as counters; tagging them as gauges silently breaks queries.
+	switch {
+	case strings.HasSuffix(name, "_total"),
+		strings.HasSuffix(name, "_bucket"),
+		strings.HasSuffix(name, "_count"),
+		strings.HasSuffix(name, "_sum"):
 		return "counter"
 	}
 	return "gauge"
