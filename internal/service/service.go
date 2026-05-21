@@ -1085,6 +1085,22 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err
 	}
+	// Mirror the resize into the FSM-replicated spec so a future failover
+	// recreate uses the post-resize footprint, not the create-time one. Lives
+	// in the service layer so v1, Daytona, and E2B all inherit the write-
+	// through; previously this was duplicated in the v1 handler and silently
+	// missing from the facades.
+	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
+		if req.CPU > 0 {
+			spec.CPU = req.CPU
+		}
+		if req.MemoryMB > 0 {
+			spec.MemoryMB = req.MemoryMB
+		}
+		if req.DiskGB > 0 {
+			spec.DiskGB = req.DiskGB
+		}
+	})
 	return s.store.Get(ctx, id)
 }
 
@@ -1099,6 +1115,10 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
 	}
+	lc := l
+	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
+		spec.Lifecycle = &lc
+	})
 	return s.store.Get(ctx, id)
 }
 

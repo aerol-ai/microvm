@@ -135,17 +135,8 @@ func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	h.replicateSpecPatch(r.Context(), id, func(s *models.CreateSandboxRequest) {
-		if req.CPU > 0 {
-			s.CPU = req.CPU
-		}
-		if req.MemoryMB > 0 {
-			s.MemoryMB = req.MemoryMB
-		}
-		if req.DiskGB > 0 {
-			s.DiskGB = req.DiskGB
-		}
-	})
+	// FSM spec write-through now lives in Service.ResizeSandbox so Daytona and
+	// E2B inherit the same contract.
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 
@@ -161,10 +152,7 @@ func (h *handlers) updateLifecycle(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	lc := req.Lifecycle
-	h.replicateSpecPatch(r.Context(), id, func(s *models.CreateSandboxRequest) {
-		s.Lifecycle = &lc
-	})
+	// FSM spec write-through now lives in Service.UpdateLifecycle.
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 

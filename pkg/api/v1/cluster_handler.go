@@ -1194,45 +1194,6 @@ func (h *handlers) clusterPlacement(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
-// replicateSpecPatch is the write-through used by mutating handlers (resize,
-// lifecycle) to keep the FSM-replicated spec in sync with the local sandbox.
-// It reads the current spec from the cluster, applies patch, and writes back
-// via UpsertSpec. No-op when:
-//   - cluster is nil (single-node mode handled by Noop returning nil from SpecOf)
-//   - no spec is recorded yet (pre-cluster sandbox; recreate is impossible
-//     until a future write-through bumps the spec — known limitation)
-//
-// Failures are logged at warn rather than failing the response: the local
-// mutation already succeeded and was confirmed to the user. A stale FSM spec
-// only matters if this owner dies before the next successful write-through;
-// the next mutating call (or an explicit reconcile) will refresh it.
-//
-// Race: two concurrent mutations for the same sandbox can clobber each other
-// in the FSM, but the local sandbox is already authoritative — the worst case
-// is a stale spec on a node that hasn't died yet, which the next mutation
-// fixes. Same-sandbox mutations are rare and serialize at the docker layer
-// anyway.
-func (h *handlers) replicateSpecPatch(ctx context.Context, id string, patch func(*models.CreateSandboxRequest)) {
-	c := h.deps.Service.Cluster()
-	if c == nil {
-		return
-	}
-	spec := c.SpecOf(id)
-	if spec == nil {
-		// Pre-cluster sandbox or never-recorded spec; nothing to patch.
-		return
-	}
-	patch(spec)
-	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	// Pass an empty secret handle — resize / lifecycle never touch
-	// credentials, so preserving the existing ref is correct.
-	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil {
-		h.deps.Logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
-			"sandbox_id", id, "err", err)
-	}
-}
-
 // replicateAddExposedPort write-throughs an expose-port intent to the FSM. The
 // failure profile is identical to replicateSpecPatch: log warn, don't fail the
 // response. The local store already has the exposure recorded; a stale FSM

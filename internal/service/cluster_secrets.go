@@ -11,11 +11,42 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// replicateSpecPatch keeps the FSM-replicated spec in sync after a local
+// mutation (resize, lifecycle update). It is a best-effort write-through that
+// mirrors the v1 wrapper of the same name: on failure it warns and returns
+// without surfacing the error to the caller, because the local sandbox is
+// already authoritative and the next mutation will refresh the FSM.
+//
+// No-op when the cluster doesn't carry a spec for this sandbox yet
+// (pre-cluster sandbox; Noop client in single-node mode also returns nil).
+// Same-sandbox concurrent mutations can clobber each other in the FSM, but
+// the worst case is a stale spec on a node that hasn't died — the next
+// mutating call fixes it. Single-sandbox mutations serialize at the docker
+// layer anyway.
+func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(*models.CreateSandboxRequest)) {
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	spec := c.SpecOf(id)
+	if spec == nil {
+		return
+	}
+	patch(spec)
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil && s.logger != nil {
+		s.logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
+			"sandbox_id", id, "err", err)
+	}
+}
 
 // clusterSealedSecrets is the cleartext schema stored behind a cluster secret
 // ref. It only carries the parts of CreateSandboxRequest that are actually
