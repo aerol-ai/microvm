@@ -25,6 +25,7 @@ public class CreateOptions {
     public List<String> containerCommand;
     public List<MountSpec> mounts;
     public Lifecycle lifecycle;
+    public Failover failover;
     public String runtime;
     /** Attach GPU resources to the sandbox. Null means no GPU (CPU-only). */
     public GpuOptions gpus;
@@ -91,6 +92,11 @@ public class CreateOptions {
 
     public CreateOptions setLifecycle(Lifecycle lifecycle) {
         this.lifecycle = lifecycle;
+        return this;
+    }
+
+    public CreateOptions setFailover(Failover failover) {
+        this.failover = failover;
         return this;
     }
 

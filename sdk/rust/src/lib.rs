@@ -27,10 +27,10 @@ use types::ExposePortResponseWire;
 pub use types::{
     BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions,
     CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, ExposeProtocol,
-    ExposeResult, ExposedPort, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted, MountType,
-    NetworkUsage, RegisterSnapshotOptions, RegistryAuth, ResizeOptions, Sandbox as SandboxData,
-    SandboxSnapshot, Session, SessionList, SessionStatus, SetNetworkLimitsOptions,
-    UpdateLifecycleOptions,
+    ExposeResult, ExposedPort, Failover, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted,
+    MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth, ResizeOptions,
+    Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus,
+    SetNetworkLimitsOptions, UpdateLifecycleOptions,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -606,8 +606,7 @@ impl Client {
     ) -> Result<Vec<Sandbox>, Error> {
         let mut path = format!("{}/sandboxes", self.version_prefix());
         path.push_str(&build_tag_query(tags));
-        let raw =
-            self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
+        let raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
         Ok(raw
             .into_iter()
             .map(|item| Sandbox::new(self.clone(), item))
@@ -654,7 +653,10 @@ impl Client {
         )
     }
 
-    pub fn register_snapshot(&self, opts: RegisterSnapshotOptions) -> Result<SandboxSnapshot, Error> {
+    pub fn register_snapshot(
+        &self,
+        opts: RegisterSnapshotOptions,
+    ) -> Result<SandboxSnapshot, Error> {
         #[derive(Serialize)]
         struct RegisterSnapshotRequest<'a> {
             name: &'a str,
@@ -1650,6 +1652,7 @@ mod tests {
             container_command: None,
             mounts: None,
             lifecycle: None,
+            failover: None,
             runtime: None,
             gpus: None,
         }
@@ -1943,7 +1946,8 @@ mod tests {
             "lifecycle": {
                 "stop_if_idle_for": 3600000000000u64,
                 "destroy_at_age": 86400000000000u64
-            }
+            },
+            "failover": { "policy": "recreate" }
         })
         .to_string();
         let (url, request_rx) = spawn_json_server(body);
@@ -1955,6 +1959,9 @@ mod tests {
                     stop_if_idle_for: 3600000000000,
                     destroy_at_age: 86400000000000,
                     ..Default::default()
+                }),
+                failover: Some(Failover {
+                    policy: "recreate".to_string(),
                 }),
                 ..minimal_create_options()
             })
@@ -1969,7 +1976,8 @@ mod tests {
                 "lifecycle": {
                     "stop_if_idle_for": 3600000000000u64,
                     "destroy_at_age": 86400000000000u64
-                }
+                },
+                "failover": { "policy": "recreate" }
             })
         );
         assert_eq!(
@@ -1980,6 +1988,12 @@ mod tests {
                 stop_at_age: 0,
                 destroy_at_age: 86400000000000,
             }
+        );
+        assert_eq!(
+            sandbox.data.failover,
+            Some(Failover {
+                policy: "recreate".to_string()
+            })
         );
     }
 
@@ -2152,7 +2166,11 @@ mod tests {
                 "built",
                 &Image::base("debian:bookworm-slim").run_command("apt-get update"),
                 RegisterSnapshotOptions {
-                    entrypoint: vec!["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+                    entrypoint: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "echo hi".to_string(),
+                    ],
                     ..Default::default()
                 },
             )
@@ -2199,11 +2217,9 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("missing image/dockerfile should fail");
-        assert!(
-            missing_payload
-                .to_string()
-                .contains("image or dockerfile_content is required")
-        );
+        assert!(missing_payload
+            .to_string()
+            .contains("image or dockerfile_content is required"));
 
         let both_set = client
             .register_snapshot(RegisterSnapshotOptions {

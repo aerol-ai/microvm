@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -114,31 +115,29 @@ func TestReconcileDeadOwnersRespectsGrace(t *testing.T) {
 	}
 }
 
-// TestEvictDeadOwnerReassignsWhenSpecExists drives the spec-replication
-// codepath: a placement carrying a Spec gets reassigned to a live node (the
-// only candidate is self/leader) instead of being marked orphan. This is the
-// behaviour change behind auto-recreation — the owner watcher on the new
+// TestEvictDeadOwnerReassignsWhenSpecOptsIn drives the opt-in
+// failover-recreate path: a placement carrying a portable Spec with
+// failover.policy=recreate gets reassigned to a live node (the only candidate
+// is self/leader) instead of being marked orphan. The owner watcher on the new
 // owner picks up from there.
-//
-// Skipped under the current product policy (clusterRecreateOnFailoverEnabled
-// is false): evictDeadOwner always orphans, regardless of spec. The test is
-// kept so the reassign path is still validated whenever the gate flips back
-// on.
-func TestEvictDeadOwnerReassignsWhenSpecExists(t *testing.T) {
-	if !clusterRecreateOnFailoverEnabled {
-		t.Skip("failover recreate is gated off; flip clusterRecreateOnFailoverEnabled to exercise")
-	}
+func TestEvictDeadOwnerReassignsWhenSpecOptsIn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft socket")
 	}
 	c, cleanup := newTestCluster(t, "leader", true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
 
 	// Placement with a non-nil spec belongs to a phantom dead node.
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-reassign", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256},
+		Spec: &models.CreateSandboxRequest{
+			Image:    "alpine",
+			CPU:      0.5,
+			MemoryMB: 256,
+			Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+		},
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
@@ -158,6 +157,32 @@ func TestEvictDeadOwnerReassignsWhenSpecExists(t *testing.T) {
 	}
 }
 
+func TestEvictDeadOwnerOrphansSpecWithoutFailoverOptIn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-no-ha", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256},
+	}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.evictDeadOwner(ctx, "dead-node")
+
+	if _, err := c.OwnerOf("sb-no-ha"); err != ErrOrphaned {
+		t.Fatalf("post-evict OwnerOf err = %v, want ErrOrphaned", err)
+	}
+}
+
 // newTestClusterWithCfg is newTestCluster but with a hook to mutate the
 // generated config before it's handed to New. Used by tests that need to
 // shorten time-based knobs.
@@ -168,4 +193,22 @@ func newTestClusterWithCfg(t *testing.T, nodeID string, bootstrap bool, gossipPe
 		mutate(&c.cfg)
 	}
 	return c, cleanup
+}
+
+func seedSelfFailoverCapacity(c *Cluster) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.set(c.nodeID, capacity.Snapshot{
+		HostCPUCores:      16,
+		HostMemoryTotalMB: 65536,
+		HostDiskTotalGB:   1024,
+		CPUBudget:         16,
+		MemoryBudgetMB:    65536,
+		DiskBudgetGB:      1024,
+		AvailableCPU:      16,
+		AvailableMemoryMB: 65536,
+		AvailableDiskGB:   1024,
+		CanAdmit:          true,
+	}, time.Now())
 }

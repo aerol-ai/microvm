@@ -77,11 +77,12 @@ func TestOwnerWatcherRecreatesOwnedSandbox(t *testing.T) {
 	c, cleanup := newTestCluster(t, "leader", true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
 
 	rec := newRecordingRecreator()
 	c.AttachRecreator(rec)
 
-	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512}
+	spec := failoverRecreateSpec()
 	cmd := command{Op: opPlace, SandboxID: "sb-failover", OwnerNodeID: "leader", Spec: spec}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
@@ -95,6 +96,30 @@ func TestOwnerWatcherRecreatesOwnedSandbox(t *testing.T) {
 	}
 	if got.spec.Image != "alpine" || got.spec.CPU != 1 || got.spec.MemoryMB != 512 {
 		t.Fatalf("recreator received wrong spec: %+v", got)
+	}
+}
+
+func TestOwnerWatcherSkipsSandboxWithoutFailoverOptIn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	rec := newRecordingRecreator()
+	c.AttachRecreator(rec)
+
+	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512}
+	cmd := command{Op: opPlace, SandboxID: "sb-no-ha", OwnerNodeID: "leader", Spec: spec}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+
+	c.recreateOwnedSandboxes(context.Background())
+	if _, ok := rec.get("sb-no-ha"); ok {
+		t.Fatal("recreator was invoked for a sandbox without failover opt-in")
 	}
 }
 
@@ -113,7 +138,7 @@ func TestOwnerWatcherReplaysExposedPorts(t *testing.T) {
 	rec := newRecordingRecreator()
 	c.AttachRecreator(rec)
 
-	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512}
+	spec := failoverRecreateSpec()
 	place := command{Op: opPlace, SandboxID: "sb-with-ports", OwnerNodeID: "leader", Spec: spec}
 	payload, _ := encodeCommand(place)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
@@ -148,30 +173,29 @@ func TestOwnerWatcherReplaysExposedPorts(t *testing.T) {
 }
 
 // TestEvictThenWatcherEndToEnd is the end-to-end pipeline: a placement on a
-// dead node carries a spec; eviction reassigns it to the live leader; the
-// next watcher tick recreates it via the mock recreator. This is the
+// dead node carries an opt-in spec; eviction reassigns it to the live leader;
+// the next watcher tick recreates it via the mock recreator. This is the
 // failover-recreation scenario expressed against a single-node test cluster
 // (the leader picks itself as the recreation target via SelectPlacement's
 // fallback-to-self).
-//
-// Skipped under the current product policy (clusterRecreateOnFailoverEnabled
-// is false): evictDeadOwner orphans the placement, so the watcher never sees
-// it as owned-by-self. Kept for the future opt-in flip.
 func TestEvictThenWatcherEndToEnd(t *testing.T) {
-	if !clusterRecreateOnFailoverEnabled {
-		t.Skip("failover recreate is gated off; flip clusterRecreateOnFailoverEnabled to exercise")
-	}
 	if testing.Short() {
 		t.Skip("integration test: requires real raft socket")
 	}
 	c, cleanup := newTestCluster(t, "leader", true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
 
 	rec := newRecordingRecreator()
 	c.AttachRecreator(rec)
 
-	spec := &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256}
+	spec := &models.CreateSandboxRequest{
+		Image:    "alpine",
+		CPU:      0.5,
+		MemoryMB: 256,
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-e2e", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
 		Spec: spec,
@@ -197,5 +221,14 @@ func TestEvictThenWatcherEndToEnd(t *testing.T) {
 	}
 	if got.spec.Image != "alpine" {
 		t.Fatalf("recreator received wrong spec: %+v", got)
+	}
+}
+
+func failoverRecreateSpec() *models.CreateSandboxRequest {
+	return &models.CreateSandboxRequest{
+		Image:    "alpine",
+		CPU:      1,
+		MemoryMB: 512,
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
 	}
 }

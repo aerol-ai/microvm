@@ -25,6 +25,7 @@ from .types import (
     ExecStreamOptions,
     ExposeProtocol,
     ExposeResult,
+    Failover,
     HealthStatus,
     Lifecycle,
     MountSpec,
@@ -795,6 +796,7 @@ def _build_tag_query(tags: Optional[Dict[str, str]]) -> str:
 
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
     lifecycle = _first_of(options, "lifecycle")
+    failover = _first_of(options, "failover")
     return _compact(
         {
             "image": _first_of(options, "image"),
@@ -810,6 +812,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "container_command": _first_of(options, "containerCommand", "container_command"),
             "mounts": [_to_api_mount_spec(item) for item in (_first_of(options, "mounts") or [])],
             "lifecycle": _to_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else None,
+            "failover": _to_api_failover(failover) if isinstance(failover, dict) else None,
         }
     )
 
@@ -889,6 +892,10 @@ def _to_api_lifecycle(lifecycle: Lifecycle) -> Dict[str, Any]:
             "destroy_at_age": _first_of(lifecycle, "destroyAtAge", "destroy_at_age"),
         }
     )
+
+
+def _to_api_failover(failover: Failover) -> Dict[str, Any]:
+    return _compact({"policy": _first_of(failover, "policy")})
 
 
 def _from_api_exec_result(result: Dict[str, Any]) -> ExecResult:
@@ -1043,6 +1050,7 @@ def _from_api_session(session: Dict[str, Any]) -> Session:
 def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     exposed_ports = _first_of(sandbox, "exposed_ports", "exposedPorts") or []
     lifecycle = _first_of(sandbox, "lifecycle")
+    failover = _first_of(sandbox, "failover")
     result: SandboxData = {
         "id": str(_first_of(sandbox, "id") or ""),
         "image": str(_first_of(sandbox, "image") or ""),
@@ -1060,6 +1068,10 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
         "lastActiveAt": str(_first_of(sandbox, "last_active_at", "lastActiveAt") or ""),
         "lifecycle": _from_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else {},
     }
+    if isinstance(failover, dict):
+        mapped_failover = _from_api_failover(failover)
+        if mapped_failover:
+            result["failover"] = mapped_failover
 
     container_id = _first_of(sandbox, "container_id", "containerID")
     if container_id not in (None, ""):
@@ -1105,6 +1117,13 @@ def _from_api_lifecycle(lifecycle: Dict[str, Any]) -> Lifecycle:
         result["destroyAtAge"] = int(destroy_at_age)
 
     return result
+
+
+def _from_api_failover(failover: Dict[str, Any]) -> Failover:
+    policy = _first_of(failover, "policy")
+    if policy not in ("none", "recreate"):
+        return {}
+    return {"policy": policy}
 
 
 def _from_api_health_status(status: Dict[str, Any]) -> HealthStatus:

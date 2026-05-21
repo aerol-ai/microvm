@@ -142,23 +142,24 @@ gossip on surviving nodes marks B "suspect" then "dead"
         │
         ▼
 leader runs the dead-owner reconciler:
-  - for each placement owned by B: set owner = "" (orphan)
+  - for each default placement owned by B: set owner = "" (orphan)
+  - for each placement with failover.policy="recreate": reassign to a live worker
   - RemoveServer B from the raft configuration
         │
         ▼
-subsequent API calls for any of B's sandboxes return 410 Gone
+default sandboxes return 410 Gone; opted-in sandboxes are recreated
         │
         ▼
 clients (or operators) issue a fresh create — placement picks
 a new owner from the live, healthy nodes
 ```
 
-**Sandboxes do not auto-recreate.** Spec, sealed credentials, and exposed-port
-metadata replicated via raft are *retained in the FSM* (and a future opt-in
-lifecycle policy may rematerialize them), but the current product policy is
-"a killed sandbox stays gone." The reassign + recreate code paths exist in
-`internal/cluster/{dead_owner,owner_watcher}.go` and `service.RecreateSandbox`
-but are gated off behind `clusterRecreateOnFailoverEnabled = false`.
+**Sandbox auto-recreate is opt-in.** Spec, sealed credentials, and exposed-port
+metadata replicated via raft are retained in the FSM for every sandbox, but
+the default product policy is "a killed sandbox stays gone." A create request
+with `failover.policy="recreate"` tells the dead-owner reconciler to reassign
+that placement to a live worker and let the owner watcher call
+`service.RecreateSandbox`.
 
 ### 4. A node joins for the first time
 
@@ -187,14 +188,16 @@ sandboxes and can accept new placements based on its capacity
 
 ## Failover semantics
 
-**The product policy is non-HA sandboxes.** When an owner node dies, every
-sandbox on it is gone. The cluster keeps running; the sandboxes do not.
+**The default product policy is non-HA sandboxes.** When an owner node dies,
+default sandboxes on it are gone. Sandboxes created with
+`failover.policy="recreate"` are best-effort recreated on another worker from
+their replicated spec. The cluster keeps running either way.
 
 | State | Survives node failure | Why |
 |---|---|---|
-| Sandbox spec, sealed creds, port intents | **Retained in the FSM, not auto-recreated** | Replicated by raft so a future opt-in failover policy could rematerialize the sandbox. The current default does not. |
+| Sandbox spec, sealed creds, port intents | **Retained in the FSM** | Replicated by raft for orphan inspection, manual recovery, and opt-in failover recreation. |
 | Sandbox runtime (container, filesystem, sessions, host ports, SSH) | **No** | Lives only on the dead host. There is no automatic replacement. |
-| Sandbox URL (`<id>.<domain>`) | **No** | The ID is gone from the live cluster — API returns 410 Gone. Clients should create a fresh sandbox and get a fresh ID. |
+| Sandbox URL (`<id>.<domain>`) | Default: **No**. Opt-in recreate: **Best effort** | Default placement is orphaned and API returns 410 Gone. Opted-in sandboxes keep the ID while ingress repoints to the new owner. |
 | Sessions / recordings on disk | **No (without external storage)** | Live in the dead host's `/var/lib/`. Use external mounts if you need to retrieve them later. |
 | Cluster control plane (raft, placement of *other* sandboxes) | **Yes** | Quorum stays available as long as you keep `(N-1)/2` voters alive. Other sandboxes on healthy nodes continue to run. |
 | New placements after the failure | **Yes** | Capacity from the dead node leaves the gossip pool; new creates pick from the remaining healthy candidates. |
@@ -210,10 +213,9 @@ inside one sandbox:
 3. Do not assume the sandbox URL, container ID, or host ports persist across
    the owner's death.
 
-The reassign + recreate code paths exist behind a gate
-(`clusterRecreateOnFailoverEnabled` in `internal/cluster/dead_owner.go`). They
-are preserved for a future opt-in lifecycle policy and are not active in this
-release.
+If a workload can tolerate writable-layer loss but should keep its sandbox ID,
+create it with `failover.policy="recreate"`. Local-only images are rejected
+for this policy because another worker cannot pull them.
 
 See [Durability and Failover](https://docs.aerol.ai/durability) for the
 production runbook.
@@ -985,13 +987,11 @@ on each node's `/debug/vars` are the operator signals.
 
 #### Preferred host-port replay during failover-recreate
 
-When a placement re-lands on a new owner via the failover-recreate path (gated
-off by default — sandboxes are not HA under current product policy), the FSM
-carries the original TCP `host_port` so the new owner can re-bind it and
-preserve the public endpoint. If that host port is already reserved on the
-new owner (taken by an unrelated TCP exposure, or in use locally), the
-replay **parks** the exposure rather than silently allocating a different
-host port:
+When a placement re-lands on a new owner via the opt-in failover-recreate path,
+the FSM carries the original TCP `host_port` so the new owner can re-bind it
+and preserve the public endpoint. If that host port is already reserved on the
+new owner (taken by an unrelated TCP exposure, or in use locally), the replay
+**parks** the exposure rather than silently allocating a different host port:
 
 - The FSM record (with the original `host_port`) stays intact.
 - The local re-bind fails with `ErrPreferredHostPortUnavailable`; the

@@ -78,6 +78,29 @@ func TestRegisterSnapshotClassifiesImageDistribution(t *testing.T) {
 	}
 }
 
+func TestNormalizeCreateFailover(t *testing.T) {
+	req := models.CreateSandboxRequest{
+		Image:                 "ubuntu:22.04",
+		ImageDistributionMode: models.ImageDistributionExternalRegistry,
+		Failover:              &models.Failover{Policy: "ReCreate"},
+	}
+	if err := NormalizeCreateFailover(&req); err != nil {
+		t.Fatalf("NormalizeCreateFailover() error = %v", err)
+	}
+	if req.Failover == nil || req.Failover.Policy != models.FailoverPolicyRecreate {
+		t.Fatalf("normalized failover = %+v, want recreate", req.Failover)
+	}
+
+	req = models.CreateSandboxRequest{
+		Image:                 docker.BuiltImageNamespace + "/abc123:latest",
+		ImageDistributionMode: models.ImageDistributionLocalOnly,
+		Failover:              &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+	if err := NormalizeCreateFailover(&req); err == nil {
+		t.Fatal("expected local-only failover recreate to be rejected")
+	}
+}
+
 func TestCreateSnapshotWithOwnershipMarksLocalOnly(t *testing.T) {
 	ctx := context.Background()
 	st := openImageDistributionStore(t)

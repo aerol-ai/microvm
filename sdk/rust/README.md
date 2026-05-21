@@ -11,7 +11,7 @@ cargo add aerolvm-sdk
 ## Usage
 
 ```rust
-use aerolvm_sdk::{Client, CreateOptions, Lifecycle};
+use aerolvm_sdk::{Client, CreateOptions, Failover, Lifecycle};
 
 let client = Client::new(Some("http://127.0.0.1:21212"), Some("your-pat-token"))?;
 let health = client.health()?;
@@ -33,6 +33,7 @@ let sandbox = client.create(CreateOptions {
 		destroy_at_age: 86_400_000_000_000,
 		..Default::default()
 	}),
+	failover: Some(Failover { policy: "recreate".to_string() }),
 	runtime: None,
 	gpus: None,
 })?;
@@ -71,6 +72,7 @@ let sandbox = client.create(CreateOptions {
 	container_command: None,
 	mounts: None,
 	lifecycle: None,
+	failover: None,
 	runtime: None,
 	gpus: None,
 })?;

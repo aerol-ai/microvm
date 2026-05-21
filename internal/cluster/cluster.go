@@ -68,9 +68,9 @@ var ErrNameConflict = errors.New("cluster: sandbox name already in use")
 
 // ErrOrphaned is returned by OwnerOf when a placement exists but its owner has
 // been auto-evicted and the dead-owner reconciler has cleared the pointer.
-// Under the current product policy this is a terminal manual-recovery state:
-// callers should surface 410 Gone. If auto-recreation is enabled later, the
-// owner watcher may converge it by reassigning the placement to a live node.
+// This is the terminal state for default non-HA sandboxes; callers should
+// surface 410 Gone. Sandboxes that opted into failover.policy=recreate are
+// reassigned before the remaining dead-owner placements are orphaned.
 var ErrOrphaned = errors.New("cluster: sandbox owner is dead, placement orphaned")
 
 // ErrOrphanClaimConflict is returned when a node tries to reclaim an orphaned

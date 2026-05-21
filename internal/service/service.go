@@ -278,12 +278,8 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // the owner watcher keeps retrying and can eventually reassign the placement.
 // ExposePort is idempotent, so a partial replay is safe to resume.
 //
-// Currently unreachable in production: cluster.startOwnerWatcher is gated off
-// by cluster.clusterRecreateOnFailoverEnabled (product policy: sandboxes are
-// not highly available; a dead owner's placements are orphaned). The method is
-// preserved here so a future opt-in failover flag can re-enable the watcher
-// without re-implementing recreate. Cluster-package tests still drive the
-// inner recreate paths through a mock recreator, not this implementation.
+// Only placements whose create spec opted into failover.policy=recreate reach
+// this path; default sandboxes remain non-HA and are orphaned on owner death.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
@@ -375,6 +371,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	req = normalizeCreateRequest(req)
 	if err := s.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+		return nil, err
+	}
+	if err := NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
 	if req.Image == "" {
@@ -529,6 +528,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		LastActiveAt:         now,
 		ContainerCommand:     req.ContainerCommand,
 		Lifecycle:            lifecycle,
+		Failover:             req.Failover,
 		Runtime:              chosenRuntime,
 		GPUs:                 req.GPUs,
 		RegistryAuthSealed:   sealedRegistry,
@@ -2417,6 +2417,25 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 		req.Env = map[string]string{}
 	}
 	return req
+}
+
+func NormalizeCreateFailover(req *models.CreateSandboxRequest) error {
+	if req == nil || req.Failover == nil {
+		return nil
+	}
+	policy, err := models.NormalizeFailoverPolicy(req.Failover.Policy)
+	if err != nil {
+		return fmt.Errorf("invalid failover: %w", err)
+	}
+	if policy == models.FailoverPolicyNone {
+		req.Failover = nil
+		return nil
+	}
+	if policy == models.FailoverPolicyRecreate && ImageRequiresLocalPlacement(*req) {
+		return errors.New("failover.policy=recreate requires a portable image; local-only images cannot be recreated on another node")
+	}
+	req.Failover = &models.Failover{Policy: policy}
+	return nil
 }
 
 func sandboxContainerRef(sandbox *models.Sandbox) string {

@@ -5,6 +5,8 @@ from .types import (
     BuildImageResult,
     ExposeProtocol,
     ExposeResult,
+    Failover,
+    FailoverPolicy,
     SandboxSnapshot,
 )
 
@@ -15,5 +17,7 @@ __all__ = [
     "MicroVM",
     "ExposeProtocol",
     "ExposeResult",
+    "Failover",
+    "FailoverPolicy",
     "SandboxSnapshot",
 ]

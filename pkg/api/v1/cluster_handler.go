@@ -172,6 +172,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := service.NormalizeCreateFailover(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	normalizedRaw, err := json.Marshal(req)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
@@ -267,6 +271,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 //     secret material out of Raft.
 func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Request, req models.CreateSandboxRequest, reservationID string) {
 	if err := h.deps.Service.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := service.NormalizeCreateFailover(&req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}

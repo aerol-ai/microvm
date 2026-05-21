@@ -630,6 +630,7 @@ public class MicroVMClient {
         copy.containerCommand = source.containerCommand;
         copy.mounts = source.mounts;
         copy.lifecycle = source.lifecycle;
+        copy.failover = source.failover;
         copy.runtime = source.runtime;
         copy.gpus = source.gpus;
         return copy;

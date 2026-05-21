@@ -171,12 +171,12 @@ The placement FSM is replicated to every node so any node can answer "where does
 
 ## Failure semantics
 
-- **Worker dies:** the sandboxes it owned are orphaned after `SB_DEAD_OWNER_GRACE`. Clients see `410 Gone` and must call `Create` again on the surviving fleet. See [Durability and Failover](/durability) for the full story.
+- **Worker dies:** default sandboxes are orphaned after `SB_DEAD_OWNER_GRACE`; clients see `410 Gone` and must call `Create` again. Sandboxes created with `failover.policy="recreate"` are reassigned to a surviving worker and recreated from the replicated spec. See [Durability and Failover](/durability) for the full story.
 - **Ingress node dies:** the LB in front of the ingress tier sheds it. Public URLs continue through the surviving ingress nodes. No effect on Raft quorum.
 - **Server node dies:** as long as a majority of `server` nodes remain, the cluster continues writing to the FSM. Below quorum, writes pause until a majority returns.
 
 ## Limitations
 
-- Cluster mode does not yet auto-recreate sandboxes after worker death (see [Durability and Failover](/durability)). The placement spec, sealed credentials, and exposed-port intents are replicated through Raft so a future opt-in failover policy can recover specific sandboxes, but the auto-recreate code path is gated off today.
+- Sandbox HA is opt-in per sandbox (see [Durability and Failover](/durability)). The placement spec, sealed credentials, and exposed-port intents are replicated through Raft; only sandboxes created with `failover.policy="recreate"` are auto-recreated after worker death.
 - Route convergence is currently driven by a 5-second poll, not a watch. In steady state this is well within the 2-second p95 target stated in the release plan; immediately after a placement change, expect up to one tick of `503 placement in flux` before ingress reconciles.
 - UDP is not supported. caddy-l4 can carry TCP and TLS/SNI; UDP exposure needs a separate design.

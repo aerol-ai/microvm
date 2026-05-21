@@ -2,7 +2,9 @@ use aerolvm_sdk::{Client, CreateOptions};
 use std::env;
 
 fn main() {
-    let api_url = env::args().nth(1).unwrap_or_else(|| "http://127.0.0.1:21212".to_owned());
+    let api_url = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "http://127.0.0.1:21212".to_owned());
     let pat_token = env::args().nth(2).expect("PAT token is required");
     let image = env::args().nth(3).expect("Image is required");
 
@@ -25,6 +27,7 @@ fn main() {
             container_command: None,
             mounts: None,
             lifecycle: None,
+            failover: None,
             runtime: None,
             gpus: None,
         })

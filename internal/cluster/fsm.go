@@ -1932,6 +1932,10 @@ func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSa
 		lifecycle := *in.Lifecycle
 		out.Lifecycle = &lifecycle
 	}
+	if in.Failover != nil {
+		failover := *in.Failover
+		out.Failover = &failover
+	}
 	if in.GPUs != nil {
 		gpus := *in.GPUs
 		if len(in.GPUs.DeviceIDs) > 0 {

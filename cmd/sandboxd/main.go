@@ -378,6 +378,7 @@ func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logg
 		ContainerCommand: sb.ContainerCommand,
 		Runtime:          sb.Runtime,
 		GPUs:             sb.GPUs,
+		Failover:         sb.Failover,
 	}
 	// Lifecycle on Sandbox is value-typed; spec wants a pointer so the JSON
 	// "omitempty" stays meaningful for fresh creates that didn't pass one.

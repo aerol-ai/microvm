@@ -238,6 +238,10 @@ func RedactClusterSecrets(req models.CreateSandboxRequest) models.CreateSandboxR
 		}
 		out.Env = env
 	}
+	if out.Failover != nil {
+		failover := *out.Failover
+		out.Failover = &failover
+	}
 	return out
 }
 

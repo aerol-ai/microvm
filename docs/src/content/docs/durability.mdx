@@ -4,7 +4,7 @@ title: Durability and Failover
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A sandbox's container is ephemeral. Files written into the container's writable layer (`/tmp`, the working directory, anywhere not on a mount) live only as long as the container itself. If the container is destroyed - by an explicit `Destroy`, by a host crash, or by the loss of the owner node in cluster mode - that data is gone, **and the sandbox itself is gone too**: the current release does not auto-recreate a sandbox after the owner dies.
+A sandbox's container is ephemeral. Files written into the container's writable layer (`/tmp`, the working directory, anywhere not on a mount) live only as long as the container itself. If the container is destroyed - by an explicit `Destroy`, by a host crash, or by the loss of the owner node in cluster mode - that data is gone. By default the sandbox placement is gone too: the API returns `410 Gone`. Sandboxes that opt into `failover.policy = "recreate"` are best-effort recreated on another worker from their replicated create spec.
 
 This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle. Add cluster mode and *the sandbox* is also treated as cattle - a fresh `Create` is the way to recover.
 
@@ -14,13 +14,13 @@ This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder 
 |---|---|---|---|
 | Container writable layer | Lost | Lost | Lost |
 | Mounted volumes (S3, NFS, SSHFS, rclone) | Survive (external) | Survive (external) | Survive (external) - a *new* sandbox can re-mount them |
-| Sandbox ID | Reused on next `Create` | Preserved if record persisted | **Lost** - API returns `410 Gone`; create a new sandbox |
-| Environment variables, image, resource limits | N/A | Restored on `Start` | Lost (spec is replicated in the FSM but not rematerialized) |
-| Idle lifecycle policy | N/A | Restored on `Start` | Lost |
-| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Lost - the new sandbox declares its own |
-| Caddy routes | Removed | Restored on `Start` | Lost - ingress routes are torn down when the placement orphans |
-| Host port number | N/A | Same host, same port | Lost |
-| Public URL | Removed | Restored on `Start` | Lost - a new sandbox gets a new URL |
+| Sandbox ID | Reused on next `Create` | Preserved if record persisted | Default: lost (`410 Gone`). With `failover.policy="recreate"`: preserved if recreation succeeds |
+| Environment variables, image, resource limits | N/A | Restored on `Start` | Default: lost. With recreate: restored from replicated spec |
+| Idle lifecycle policy | N/A | Restored on `Start` | Default: lost. With recreate: restored |
+| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Default: lost. With recreate: replayed when possible |
+| Caddy routes | Removed | Restored on `Start` | Default: lost. With recreate: rebuilt by the new owner and ingress reconciler |
+| Host port number | N/A | Same host, same port | Default: lost. With recreate: preferred raw TCP host ports are replayed when available |
+| Public URL | Removed | Restored on `Start` | Default: lost. With recreate: stable ingress host remains, owner route changes underneath |
 
 ## Make workspace state durable
 
@@ -129,15 +129,62 @@ Anything written under `/workspace` outlives the container. Anything written els
 
 ## Cluster-mode owner death
 
-When `SB_ENABLE_CLUSTER=true` and a sandbox's owner node dies, the current product policy is:
+When `SB_ENABLE_CLUSTER=true` and a sandbox's owner node dies, the default policy is:
 
 1. After `SB_DEAD_OWNER_GRACE` (default 30s) the cluster leader **orphans** every placement that the dead node owned (`OwnerNodeID = ""` in the replicated FSM) and removes the node from the raft configuration.
 2. Any further API call for one of those sandboxes returns `410 Gone`.
-3. The sandbox is not auto-recreated on a different node. Clients should issue a fresh `Create` to land a new sandbox on the surviving fleet.
+3. Clients should issue a fresh `Create` to land a new sandbox on the surviving fleet.
 
-The cluster *does* still replicate each sandbox's create spec (image, env, resource limits, mounts, lifecycle), the sealed registry/mount credential bag, and every exposed-port route intent into the raft log. That replication is preserved deliberately so a future opt-in lifecycle policy can recover specific sandboxes; the auto-recreate code path is present in the codebase but gated off (`clusterRecreateOnFailoverEnabled` in `internal/cluster/dead_owner.go`).
+For workloads that can tolerate losing writable-layer state but need the same sandbox ID and route intents, opt in at create time:
 
-For now: design your application around the assumption that a sandbox is a session, not a service. Put durable state on a mount, and recreate the sandbox on top of that mount when the old one goes away.
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      failover: { policy: 'recreate' },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'failover': {'policy': 'recreate'},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Failover: &sdktypes.Failover{Policy: sdktypes.FailoverPolicyRecreate},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        failover: Some(aerolvm_sdk::Failover { policy: "recreate".to_string() }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setFailover(new Failover().setPolicy("recreate"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+The cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle, failover policy), the sealed registry/mount credential bag, and every exposed-port route intent. When an opted-in owner dies, the leader reassigns that placement to a live worker that satisfies the spec; the new worker recreates the sandbox with the original ID and replays exposed ports.
+
+`failover.policy="recreate"` is rejected for local-only images because no other worker can pull them. Writable-layer state is still lost, so put durable state on a mount.
 
 If you ever need to re-expose a port manually (for example, the original `ExposePort` call landed during a network partition and was dropped), the API is idempotent:
 
@@ -204,7 +251,7 @@ When `SB_GOSSIP_SECRET_KEY` is unset, the daemon logs a warning at boot. Raft it
 
 ## Limitations
 
-- **Sandboxes are not highly available.** Owner-node death orphans the placement; clients see `410 Gone` and must create a fresh sandbox. Spec, sealed creds, and port intents are still replicated through raft for a future opt-in failover policy, but no auto-recreate runs in this release.
+- **Sandbox HA is opt-in.** Owner-node death orphans default placements; clients see `410 Gone` and must create a fresh sandbox. Only sandboxes created with `failover.policy="recreate"` are reassigned and recreated.
 - **Ingress has a convergence window.** Public HTTP/TLS URLs and raw TCP host ports for *live* sandboxes are replicated through the cluster route map, but non-owner ingress routes refresh periodically. Immediately after a new `ExposePort` call, a backend can briefly return 404/502 until it has reconciled.
 - **Writable-layer state is not replicated.** Treat anything outside a mount as cache. If you need it after a crash, write it to a mount.
 - **Single-node deployments inherit the same model.** A host crash loses the writable layer just as owner death does. Mount external storage for anything that must survive.
