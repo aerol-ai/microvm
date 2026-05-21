@@ -32,6 +32,8 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
 
 > **`--domain` requires `--dns-provider`.** The installer hard-fails otherwise. Caddy issues exactly two certificates — `<domain>` and `*.<domain>` — once at startup via DNS-01, then renews them on a schedule. Use `--local` for the only no-DNS path (binds to `127.0.0.1`, no TLS).
 
+> **Running 10+ ingress nodes?** Opt into S3-backed shared Caddy cert storage so one node issues the wildcard and the rest read it from S3 — see [`setup/multi-node-cert-sharing.md`](./setup/multi-node-cert-sharing.md). Off by default.
+
 If you omit `--pat-token`, the installer generates a token and prints it once at the end.
 
 ## What AerolVM Does

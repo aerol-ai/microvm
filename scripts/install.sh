@@ -23,6 +23,20 @@ WITH_AMD_GPU="false"
 LOCAL_MODE="false"
 NODE_NAME=""
 
+# Shared Caddy cert storage (S3). All default empty / off; the feature is
+# off unless --caddy-storage-s3 is passed. When enabled, every node points
+# at the same S3 bucket so exactly one node holds the ACME lock and the
+# rest read the cert from S3 — sidesteps Let's Encrypt rate limits at 10+
+# ingress nodes. See setup/multi-node-cert-sharing.md.
+CADDY_STORAGE_S3="false"
+CADDY_STORAGE_S3_BUCKET=""
+CADDY_STORAGE_S3_REGION=""
+CADDY_STORAGE_S3_ENDPOINT=""
+CADDY_STORAGE_S3_PREFIX="caddy"
+CADDY_STORAGE_S3_ACCESS_KEY=""
+CADDY_STORAGE_S3_SECRET_KEY=""
+CADDY_STORAGE_S3_ENCRYPTION_KEY=""
+
 usage() {
 	cat <<'EOF'
 Usage: install.sh [options]
@@ -80,6 +94,43 @@ Options:
                                sandboxd.env. Defaults to empty, in which
                                case the dashboard falls back to the
                                hostname-derived node_id.
+  --caddy-storage-s3           Enable S3-backed shared Caddy cert storage.
+                               One node issues + renews the wildcard cert
+                               via DNS-01; every node reads it from S3.
+                               Requires --domain and --dns-provider.
+                               Off by default; each node issues its own
+                               cert when off (fine up to a handful of
+                               ingress nodes, brittle at 10+ because of
+                               Let's Encrypt rate limits).
+  --caddy-storage-s3-bucket <name>
+                               S3 bucket holding the encrypted cert
+                               objects. Required when --caddy-storage-s3
+                               is set.
+  --caddy-storage-s3-region <region>
+                               AWS region of the bucket (or the region
+                               header for non-AWS endpoints). Required
+                               when --caddy-storage-s3 is set.
+  --caddy-storage-s3-endpoint <url>
+                               Optional S3-compatible endpoint URL for
+                               Cloudflare R2, MinIO, etc. Empty selects
+                               the default AWS S3 endpoint for the region.
+  --caddy-storage-s3-prefix <path>
+                               Key prefix inside the bucket. Default
+                               "caddy". All nodes must agree.
+  --caddy-storage-s3-access-key <key>
+                               Static access key. Optional — empty falls
+                               back to the AWS default credential chain
+                               (env vars, EC2 instance role, IRSA).
+  --caddy-storage-s3-secret-key <secret>
+                               Static secret key. Pair with access key.
+  --caddy-storage-s3-encryption-key <b64>
+                               Base64-encoded 32-byte key used to encrypt
+                               cert + private key bytes before upload.
+                               Generate once with
+                               'openssl rand -base64 32' and use the
+                               SAME value on every node. Required when
+                               --caddy-storage-s3 is set; losing it
+                               renders stored certs unrecoverable.
   --local                      Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. Docker Desktop (macOS)
@@ -268,6 +319,38 @@ while [[ $# -gt 0 ]]; do
 			NODE_NAME="$2"
 			shift 2
 			;;
+		--caddy-storage-s3)
+			CADDY_STORAGE_S3="true"
+			shift
+			;;
+		--caddy-storage-s3-bucket)
+			CADDY_STORAGE_S3_BUCKET="$2"
+			shift 2
+			;;
+		--caddy-storage-s3-region)
+			CADDY_STORAGE_S3_REGION="$2"
+			shift 2
+			;;
+		--caddy-storage-s3-endpoint)
+			CADDY_STORAGE_S3_ENDPOINT="$2"
+			shift 2
+			;;
+		--caddy-storage-s3-prefix)
+			CADDY_STORAGE_S3_PREFIX="$2"
+			shift 2
+			;;
+		--caddy-storage-s3-access-key)
+			CADDY_STORAGE_S3_ACCESS_KEY="$2"
+			shift 2
+			;;
+		--caddy-storage-s3-secret-key)
+			CADDY_STORAGE_S3_SECRET_KEY="$2"
+			shift 2
+			;;
+		--caddy-storage-s3-encryption-key)
+			CADDY_STORAGE_S3_ENCRYPTION_KEY="$2"
+			shift 2
+			;;
 		--help)
 			usage
 			exit 0
@@ -335,6 +418,36 @@ if [[ -n "$DNS_PROVIDER" ]]; then
 	L4_TLS_LISTEN_DEFAULT=":443"
 else
 	L4_TLS_LISTEN_DEFAULT=""
+fi
+
+# Shared cert storage validation. The feature only makes sense alongside
+# DNS-01 wildcard issuance — sharing has no benefit in IP/local mode (no
+# TLS) and HTTP-01 isn't supported here anyway. Missing required values
+# should fail at install time with a paste-able remediation, never at
+# first cert-renewal hours/days later.
+if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+	if [[ -z "$DOMAIN" || -z "$DNS_PROVIDER" ]]; then
+		echo "--caddy-storage-s3 requires --domain and --dns-provider (DNS-01 wildcard TLS)." >&2
+		echo "Shared cert storage only matters when there is a wildcard cert to share." >&2
+		exit 1
+	fi
+	missing=()
+	[[ -z "$CADDY_STORAGE_S3_BUCKET" ]] && missing+=("--caddy-storage-s3-bucket")
+	[[ -z "$CADDY_STORAGE_S3_REGION" ]] && missing+=("--caddy-storage-s3-region")
+	[[ -z "$CADDY_STORAGE_S3_ENCRYPTION_KEY" ]] && missing+=("--caddy-storage-s3-encryption-key")
+	if [[ ${#missing[@]} -gt 0 ]]; then
+		echo "--caddy-storage-s3 requires: ${missing[*]}" >&2
+		echo "" >&2
+		echo "Generate the encryption key ONCE for the whole cluster and reuse it on every node:" >&2
+		echo "  openssl rand -base64 32" >&2
+		echo "Losing the key means stored certs cannot be decrypted — keep it in a secrets manager." >&2
+		exit 1
+	fi
+	if [[ -n "$CADDY_STORAGE_S3_ACCESS_KEY" && -z "$CADDY_STORAGE_S3_SECRET_KEY" ]] \
+	   || [[ -z "$CADDY_STORAGE_S3_ACCESS_KEY" && -n "$CADDY_STORAGE_S3_SECRET_KEY" ]]; then
+		echo "--caddy-storage-s3-access-key and --caddy-storage-s3-secret-key must be set together (or both omitted to use the default credential chain)." >&2
+		exit 1
+	fi
 fi
 
 if [[ "$BUILD_FROM_SOURCE" == "auto" ]]; then
@@ -437,6 +550,13 @@ install_custom_caddy() {
 	if [[ -n "$provider" ]]; then
 		download_url="${download_url}&p=github.com/caddy-dns/${provider}"
 	fi
+	# Shared cert storage adds the certmagic-s3 plugin so multiple ingress
+	# nodes can pool ACME issuance via a single S3 object set. The plugin
+	# handles distributed locking via S3 conditional writes — no
+	# orchestration code lives in install.sh.
+	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+		download_url="${download_url}&p=github.com/ss098/certmagic-s3"
+	fi
 
 	local tmp_binary
 	tmp_binary="$(mktemp)"
@@ -470,6 +590,10 @@ install_custom_caddy() {
 	if [[ -n "$provider" ]]; then
 		required_modules+=("dns.providers.${provider}")
 	fi
+	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+		# The ss098 module registers under caddy.storage.s3.
+		required_modules+=("caddy.storage.s3")
+	fi
 	local module
 	local present
 	present="$("$tmp_binary" list-modules 2>/dev/null || true)"
@@ -477,7 +601,7 @@ install_custom_caddy() {
 		if ! grep -q "^${module}\$" <<<"$present"; then
 			echo "Downloaded Caddy does not include required module: ${module}" >&2
 			echo "Modules present (filtered):" >&2
-			grep -E "^(layer4|dns\.providers)" <<<"$present" >&2 || true
+			grep -E "^(layer4|dns\.providers|caddy\.storage)" <<<"$present" >&2 || true
 			rm -f "$tmp_binary"
 			exit 1
 		fi
@@ -586,13 +710,36 @@ EOF
 	#     first L4 expose call.
 	#   - DNS-01 means we don't need :443 free for ACME (validation goes
 	#     through DNS), so handing :443 to caddy-l4 is safe.
+	#
+	# Shared cert storage: when --caddy-storage-s3 is set, we inject a
+	# `storage s3` directive so every node points at the same bucket.
+	# certmagic-s3 holds a distributed lock during ACME, so exactly one
+	# node issues / renews the wildcard while the others read from S3.
+	# Optional lines (host, access_id/secret_key) are emitted only when
+	# the operator supplied a value — empty strings would otherwise
+	# override the AWS default credential chain / endpoint.
+	local storage_block=""
+	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+		storage_block=$'\n\tstorage s3 {'
+		if [[ -n "$CADDY_STORAGE_S3_ENDPOINT" ]]; then
+			storage_block+=$'\n\t\thost {env.SB_CADDY_S3_ENDPOINT}'
+		fi
+		storage_block+=$'\n\t\tbucket {env.SB_CADDY_S3_BUCKET}'
+		storage_block+=$'\n\t\tprefix {env.SB_CADDY_S3_PREFIX}'
+		if [[ -n "$CADDY_STORAGE_S3_ACCESS_KEY" ]]; then
+			storage_block+=$'\n\t\taccess_id {env.SB_CADDY_S3_ACCESS_KEY}'
+			storage_block+=$'\n\t\tsecret_key {env.SB_CADDY_S3_SECRET_KEY}'
+		fi
+		storage_block+=$'\n\t\tencryption_key {env.SB_CADDY_S3_ENCRYPTION_KEY}'
+		storage_block+=$'\n\t}'
+	fi
 	cat > /etc/caddy/Caddyfile <<EOF
 {
 	admin localhost:2019
 	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
 	# only receive traffic forwarded from caddy-l4's SNI fallback route.
 	# Disable Caddy's auto-managed :80 -> :443 redirect since :443 isn't ours.
-	auto_https disable_redirects
+	auto_https disable_redirects${storage_block}
 }
 
 https://$DOMAIN:8443 {
@@ -620,24 +767,49 @@ EOF
 }
 
 write_caddy_env() {
-	if [[ -z "$DNS_PROVIDER" ]]; then
+	if [[ -z "$DNS_PROVIDER" && "$CADDY_STORAGE_S3" != "true" ]]; then
 		return
 	fi
 	# The stock Caddy debian unit from Cloudsmith does NOT load
 	# /etc/default/caddy as an EnvironmentFile, so writing it alone is not
 	# enough. write_caddy_systemd_dropin() installs a drop-in that wires it
 	# in. 0600 root:root is fine — Caddy receives the value via process env.
-	cat > /etc/default/caddy <<EOF
-# Managed by AerolVM install.sh.
-# Read by Caddy via {env.SB_DNS_API_TOKEN} substitution in /etc/caddy/Caddyfile.
-SB_DNS_API_TOKEN=$DNS_API_TOKEN
-EOF
+	{
+		echo "# Managed by AerolVM install.sh."
+		echo "# Read by Caddy via {env.NAME} substitution in /etc/caddy/Caddyfile."
+		if [[ -n "$DNS_PROVIDER" ]]; then
+			echo "SB_DNS_API_TOKEN=$DNS_API_TOKEN"
+		fi
+		if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+			# certmagic-s3 reads these via the {env.NAME} substitutions
+			# emitted by write_caddyfile. Encryption key MUST match every
+			# other node — losing it means the bucket's cert objects are
+			# unreadable. See setup/multi-node-cert-sharing.md.
+			echo "SB_CADDY_S3_BUCKET=$CADDY_STORAGE_S3_BUCKET"
+			echo "SB_CADDY_S3_REGION=$CADDY_STORAGE_S3_REGION"
+			echo "SB_CADDY_S3_ENDPOINT=$CADDY_STORAGE_S3_ENDPOINT"
+			echo "SB_CADDY_S3_PREFIX=$CADDY_STORAGE_S3_PREFIX"
+			# AWS_REGION lets the SDK inside certmagic-s3 pick the right
+			# endpoint when SB_CADDY_S3_ENDPOINT is empty.
+			echo "AWS_REGION=$CADDY_STORAGE_S3_REGION"
+			if [[ -n "$CADDY_STORAGE_S3_ACCESS_KEY" ]]; then
+				echo "SB_CADDY_S3_ACCESS_KEY=$CADDY_STORAGE_S3_ACCESS_KEY"
+				echo "SB_CADDY_S3_SECRET_KEY=$CADDY_STORAGE_S3_SECRET_KEY"
+				# Also expose under the canonical AWS SDK names so the
+				# default credential chain inside certmagic-s3 picks them
+				# up even when the Caddyfile lines are omitted.
+				echo "AWS_ACCESS_KEY_ID=$CADDY_STORAGE_S3_ACCESS_KEY"
+				echo "AWS_SECRET_ACCESS_KEY=$CADDY_STORAGE_S3_SECRET_KEY"
+			fi
+			echo "SB_CADDY_S3_ENCRYPTION_KEY=$CADDY_STORAGE_S3_ENCRYPTION_KEY"
+		fi
+	} > /etc/default/caddy
 	chmod 0600 /etc/default/caddy
 	chown root:root /etc/default/caddy
 }
 
 write_caddy_systemd_dropin() {
-	if [[ -z "$DNS_PROVIDER" ]]; then
+	if [[ -z "$DNS_PROVIDER" && "$CADDY_STORAGE_S3" != "true" ]]; then
 		return
 	fi
 	mkdir -p /etc/systemd/system/caddy.service.d

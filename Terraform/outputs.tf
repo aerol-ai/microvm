@@ -35,6 +35,17 @@ output "bundle_bucket" {
   value       = aws_s3_bucket.bundle.bucket
 }
 
+output "caddy_certs_bucket" {
+  description = "Shared Caddy cert storage bucket name. Empty when shared storage is disabled. In BYO mode this echoes the operator-supplied bucket."
+  value       = local.caddy_storage_s3.enabled ? local.caddy_storage_s3.bucket : ""
+}
+
+output "caddy_certs_encryption_key" {
+  description = "Encryption key used by certmagic-s3 to protect cert bytes at rest in S3. SAVE THIS — losing it means the bucket's stored certs become unreadable. Re-export with `terraform output -raw caddy_certs_encryption_key`."
+  value       = local.caddy_storage_s3.encryption_key
+  sensitive   = true
+}
+
 output "ssh_command_seed" {
   description = "Convenience SSH command to the seed (uses default Ubuntu user)."
   value       = "ssh ubuntu@${aws_instance.seed.public_ip}"
