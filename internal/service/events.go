@@ -211,6 +211,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}
+	s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "docker-destroy-event")
 	s.maybeRemoveImage(ctx, sandbox.Image)
 
 	s.logger.Info("audit sandbox destroyed via docker event",

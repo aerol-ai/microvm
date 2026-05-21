@@ -881,6 +881,33 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	return nil
 }
 
+func (s *Service) deleteSelfOwnedClusterPlacement(ctx context.Context, id, reason string) {
+	if !s.cfg.EnableCluster || id == "" {
+		return
+	}
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	owner, err := c.OwnerOf(id)
+	if err != nil {
+		if !errors.Is(err, cluster.ErrUnknownSandbox) && !errors.Is(err, cluster.ErrOrphaned) {
+			s.logger.Warn("cluster placement ownership check before delete failed",
+				"sandbox_id", id, "reason", reason, "error", err)
+		}
+		return
+	}
+	if !owner.IsSelf {
+		return
+	}
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.DeletePlacement(commitCtx, id); err != nil {
+		s.logger.Warn("cluster placement delete after local destroy failed",
+			"sandbox_id", id, "reason", reason, "error", err)
+	}
+}
+
 // CreateSnapshot commits the sandbox container into a reusable local image.
 // Idempotency is by snapshot name: repeated requests for the same sandbox +
 // name return the stored snapshot metadata, while a different sandbox trying
@@ -1702,6 +1729,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	for _, sandbox := range known {
 		knownIDs[sandbox.ID] = struct{}{}
 	}
+	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
 		state, ok := managed[sandbox.ID]
@@ -1737,6 +1765,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
+			s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "reconcile-destroyed")
 			s.maybeRemoveImage(ctx, sandbox.Image)
 			s.logger.Info("audit reconcile destroyed",
 				"sandbox_id", sandbox.ID,
@@ -1862,6 +1891,32 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	return nil
 }
 
+func (s *Service) reconcileMissingSelfOwnedPlacements(ctx context.Context, knownIDs map[string]struct{}) {
+	if !s.cfg.EnableCluster {
+		return
+	}
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	self := c.SelfNodeID()
+	if self == "" {
+		return
+	}
+	for _, p := range c.Placements() {
+		if p.SandboxID == "" || p.OwnerNodeID != self || p.IsReserved() || p.IsOrphaned() {
+			continue
+		}
+		if _, ok := knownIDs[p.SandboxID]; ok {
+			continue
+		}
+		if spec := c.SpecOf(p.SandboxID); spec != nil && spec.ShouldRecreateOnFailover() {
+			continue
+		}
+		s.deleteSelfOwnedClusterPlacement(ctx, p.SandboxID, "missing-local-row")
+	}
+}
+
 // StartLifecycleSweep launches the per-sandbox lifecycle ticker. Every minute
 // it evaluates each sandbox's Lifecycle timers (StopIfIdleFor / DestroyIfIdleFor
 // / StopAtAge / DestroyAtAge) plus the legacy global SB_IDLE_TIMEOUT_MIN
@@ -1900,6 +1955,7 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
+				s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "lifecycle-auto-destroy")
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
 			}
 		case lifecycleStop:

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
@@ -373,6 +374,136 @@ func seedSandbox(t *testing.T, st *store.Store, id string, status models.Sandbox
 		t.Fatalf("seed sandbox %s: %v", id, err)
 	}
 	return sb
+}
+
+type lifecyclePlacementCluster struct {
+	*cluster.Noop
+	owner       cluster.OwnerInfo
+	ownerErr    error
+	deleteCalls []string
+	deleteErr   error
+	placements  []cluster.Placement
+	specs       map[string]*models.CreateSandboxRequest
+}
+
+func newLifecyclePlacementCluster(self bool) *lifecyclePlacementCluster {
+	return &lifecyclePlacementCluster{
+		Noop:  cluster.NewNoop("node-self", "http://self"),
+		owner: cluster.OwnerInfo{NodeID: "node-self", APIURL: "http://self", IsSelf: self},
+	}
+}
+
+func (c *lifecyclePlacementCluster) OwnerOf(string) (cluster.OwnerInfo, error) {
+	if c.ownerErr != nil {
+		return cluster.OwnerInfo{}, c.ownerErr
+	}
+	return c.owner, nil
+}
+
+func (c *lifecyclePlacementCluster) DeletePlacement(_ context.Context, sandboxID string) error {
+	c.deleteCalls = append(c.deleteCalls, sandboxID)
+	return c.deleteErr
+}
+
+func (c *lifecyclePlacementCluster) Placements() []cluster.Placement {
+	out := make([]cluster.Placement, len(c.placements))
+	copy(out, c.placements)
+	return out
+}
+
+func (c *lifecyclePlacementCluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
+	return c.specs[sandboxID]
+}
+
+func TestLifecycleAutoDestroyDeletesSelfOwnedPlacement(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	fc := newLifecyclePlacementCluster(true)
+	svc.AttachCluster(fc)
+
+	sb := seedSandbox(t, st, "sb-lifecycle-cluster-delete", models.SandboxStatusStarted, 1, 1024)
+	sb.Lifecycle = models.Lifecycle{DestroyIfIdleFor: time.Minute}
+	sb.LastActiveAt = time.Now().UTC().Add(-2 * time.Minute)
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("upsert lifecycle: %v", err)
+	}
+
+	svc.runLifecycleSweep(ctx)
+
+	if len(fc.deleteCalls) != 1 || fc.deleteCalls[0] != sb.ID {
+		t.Fatalf("DeletePlacement calls = %v, want [%s]", fc.deleteCalls, sb.ID)
+	}
+	if _, err := st.Get(ctx, sb.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sandbox row after lifecycle destroy error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLifecycleAutoDestroyDoesNotDeleteForeignPlacement(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	fc := newLifecyclePlacementCluster(false)
+	svc.AttachCluster(fc)
+
+	sb := seedSandbox(t, st, "sb-lifecycle-foreign", models.SandboxStatusStarted, 1, 1024)
+	sb.Lifecycle = models.Lifecycle{DestroyIfIdleFor: time.Minute}
+	sb.LastActiveAt = time.Now().UTC().Add(-2 * time.Minute)
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("upsert lifecycle: %v", err)
+	}
+
+	svc.runLifecycleSweep(ctx)
+
+	if len(fc.deleteCalls) != 0 {
+		t.Fatalf("DeletePlacement calls = %v, want none", fc.deleteCalls)
+	}
+}
+
+func TestReconcileDeletesSelfOwnedPlacementMissingLocalRow(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	fc := newLifecyclePlacementCluster(true)
+	fc.placements = []cluster.Placement{{
+		SandboxID:   "sb-stale-placement",
+		OwnerNodeID: "node-self",
+	}}
+	svc.AttachCluster(fc)
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(fc.deleteCalls) != 1 || fc.deleteCalls[0] != "sb-stale-placement" {
+		t.Fatalf("DeletePlacement calls = %v, want [sb-stale-placement]", fc.deleteCalls)
+	}
+}
+
+func TestReconcileKeepsMissingFailoverRecreatePlacement(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	fc := newLifecyclePlacementCluster(true)
+	fc.placements = []cluster.Placement{{
+		SandboxID:   "sb-recreate-placement",
+		OwnerNodeID: "node-self",
+	}}
+	fc.specs = map[string]*models.CreateSandboxRequest{
+		"sb-recreate-placement": {
+			Image:    "ubuntu:22.04",
+			Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+		},
+	}
+	svc.AttachCluster(fc)
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(fc.deleteCalls) != 0 {
+		t.Fatalf("DeletePlacement calls = %v, want none", fc.deleteCalls)
+	}
 }
 
 // TestStopSandboxAPIReleasesAdmitter pairs with TestDieEventReleasesAdmitter

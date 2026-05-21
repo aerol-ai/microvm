@@ -7,26 +7,35 @@
 <title>AerolVM — sandboxd dashboard</title>
 <style>
 :root {
-  --bg: #0c0e12;
+  --bg: #0b0d11;
   --panel: #14171d;
   --panel2: #1a1e26;
+  --panel3: #20242e;
   --border: #2a2f3a;
-  --text: #d7dbe2;
+  --border-soft: #232732;
+  --text: #e4e7ee;
   --muted: #8b95a7;
+  --muted2: #6a7385;
   --accent: #7aa2ff;
   --ok: #6cc46c;
   --warn: #e9c46a;
   --bad: #ef6e6e;
+  --bar-bg: #1f2330;
+  --bar-fill: #4a78d4;
+  --bar-warn: #c69830;
+  --bar-bad: #b9434a;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 * { box-sizing: border-box; }
 /* The `hidden` HTML attribute is `display: none` via the UA stylesheet, but
-   `#login { display: flex }`, `header { display: flex }`, and `main { display: grid }`
-   below are author-specificity wins and would override it. Force `[hidden]`
-   to actually hide so the show/hide handlers work. */
+   author-specificity wins below would override it. Force `[hidden]` so the
+   show/hide handlers work. */
 [hidden] { display: none !important; }
-html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 13px; line-height: 1.4; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 13px; line-height: 1.45; }
+code, .mono { font-family: var(--mono); }
 a { color: var(--accent); }
+
 button {
   font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--border);
   padding: 4px 10px; border-radius: 4px; cursor: pointer;
@@ -35,45 +44,94 @@ button:hover { border-color: var(--accent); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.danger { color: #ffd2d2; border-color: #5a2a2a; }
 button.danger:hover { background: #2a1414; border-color: var(--bad); }
+button.ghost { background: transparent; }
+
 input[type="password"], input[type="text"] {
   font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--border);
   padding: 6px 8px; border-radius: 4px; width: 100%;
 }
+
 header {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--panel);
+  padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
   position: sticky; top: 0; z-index: 10;
 }
-header .brand { font-weight: 600; color: var(--text); }
-header .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+header .brand { font-weight: 600; font-size: 14px; display: flex; align-items: baseline; gap: 10px; }
+header .brand .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted2); }
+header .brand .dot.ok { background: var(--ok); }
+header .brand .dot.warn { background: var(--warn); }
+header .brand .dot.bad { background: var(--bad); }
+header .brand small { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; }
 header .actions { display: flex; gap: 8px; align-items: center; }
-header .actions label { color: var(--muted); display: inline-flex; gap: 4px; align-items: center; }
-main { padding: 18px; max-width: 1280px; margin: 0 auto; display: grid; gap: 16px; }
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
-.card h2 { margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
-.card .body { padding: 12px 14px; overflow-x: auto; }
-.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 24px; }
-.kv { display: flex; flex-direction: column; gap: 2px; }
-.kv .k { color: var(--muted); font-size: 11px; }
-.kv .v { color: var(--text); font-size: 13px; word-break: break-all; }
-.pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+header .actions label { color: var(--muted); display: inline-flex; gap: 4px; align-items: center; font-size: 12px; }
+
+main { padding: 20px 24px 32px; max-width: 1320px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+
+/* KPI tiles — at-a-glance cluster signal */
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.kpi {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;
+}
+.kpi .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.kpi .v { font-size: 22px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.kpi .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+.kpi .sub .warn { color: var(--warn); }
+.kpi .sub .bad { color: var(--bad); }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.card > h2 {
+  margin: 0; padding: 11px 16px; border-bottom: 1px solid var(--border-soft);
+  font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.7px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.card > h2 .meta { color: var(--muted2); font-weight: 400; text-transform: none; letter-spacing: 0; font-family: var(--mono); font-size: 11px; }
+.card > .body { padding: 12px 16px; overflow-x: auto; }
+.card.flat > .body { padding: 10px 16px; }
+
+/* Health: one row, pills only */
+.health-row { display: flex; flex-wrap: wrap; gap: 18px 22px; align-items: center; }
+.health-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.health-item .k { color: var(--muted); }
+
+.pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); font-family: var(--mono); }
 .pill.ok { color: var(--ok); border-color: #2c5a2c; background: #122312; }
 .pill.warn { color: var(--warn); border-color: #5a4a1c; background: #231e10; }
 .pill.bad { color: var(--bad); border-color: #5a2a2a; background: #221212; }
+.pill.muted { color: var(--muted); }
+
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
-th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
-th { color: var(--muted); font-weight: 500; }
+th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
 tr:last-child td { border-bottom: none; }
-td.actions { display: flex; gap: 6px; }
-.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 18px; }
-.metric { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; }
+tbody tr:hover { background: rgba(255,255,255,0.015); }
+td.actions { white-space: nowrap; }
+td.actions button { margin-right: 4px; }
+td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
+td.id { font-family: var(--mono); font-size: 11px; color: var(--text); }
+td.id .sub { color: var(--muted2); font-size: 10px; display: block; margin-top: 1px; }
+
+/* Inline usage bars */
+.usage { min-width: 120px; }
+.usage .label { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; font-family: var(--mono); color: var(--text); margin-bottom: 3px; }
+.usage .label .pct { color: var(--muted); font-variant-numeric: tabular-nums; }
+.usage .bar { height: 4px; border-radius: 2px; background: var(--bar-bg); overflow: hidden; }
+.usage .bar > div { height: 100%; background: var(--bar-fill); transition: width 0.2s ease; }
+.usage .bar.warn > div { background: var(--bar-warn); }
+.usage .bar.bad > div { background: var(--bar-bad); }
+
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 18px; }
+.metric { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
 .metric .k { color: var(--muted); font-size: 11px; }
-.metric .v { color: var(--text); font-size: 14px; }
+.metric .v { color: var(--text); font-size: 14px; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
 .muted { color: var(--muted); }
 .error { color: var(--bad); }
+.empty { color: var(--muted); padding: 6px 2px; font-style: italic; }
 pre.raw { background: var(--panel2); padding: 10px 12px; border-radius: 4px; max-height: 320px; overflow: auto; font-size: 11px; color: var(--muted); }
-details > summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
-.pager { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+details > summary { cursor: pointer; color: var(--muted); padding: 6px 0; font-size: 12px; }
+details[open] > summary { margin-bottom: 6px; }
+.pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
 
 #login {
   position: fixed; inset: 0; background: rgba(8, 9, 12, 0.96);
@@ -105,60 +163,77 @@ details > summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
 
 <header hidden id="app-header">
   <div class="brand">
-    AerolVM dashboard <small id="node-summary">loading…</small>
+    <span class="dot" id="status-dot"></span>
+    AerolVM <small id="node-summary">loading…</small>
   </div>
   <div class="actions">
     <label><input type="checkbox" id="autorefresh" checked /> auto-refresh</label>
     <button id="refresh-btn" type="button">Refresh</button>
-    <button id="signout-btn" type="button">Sign out</button>
+    <button id="signout-btn" type="button" class="ghost">Sign out</button>
   </div>
 </header>
 
 <main hidden id="app-main">
-  <section class="card" id="health-card">
-    <h2>Health</h2>
-    <div class="body"><div class="row" id="health-row"><span class="muted">loading…</span></div></div>
+
+  <!-- Cluster overview: at-a-glance KPI tiles. Single source of truth for
+       cluster totals; per-node breakdown lives in the Nodes table below. -->
+  <section class="kpi-grid" id="kpi-grid">
+    <div class="kpi"><span class="k">Nodes</span><span class="v" id="kpi-nodes">—</span><span class="sub" id="kpi-nodes-sub">&nbsp;</span></div>
+    <div class="kpi"><span class="k">Sandboxes</span><span class="v" id="kpi-sandboxes">—</span><span class="sub" id="kpi-sandboxes-sub">&nbsp;</span></div>
+    <div class="kpi"><span class="k">CPU</span><span class="v" id="kpi-cpu">—</span><span class="sub" id="kpi-cpu-sub">&nbsp;</span></div>
+    <div class="kpi"><span class="k">Memory</span><span class="v" id="kpi-mem">—</span><span class="sub" id="kpi-mem-sub">&nbsp;</span></div>
+    <div class="kpi"><span class="k">Disk</span><span class="v" id="kpi-disk">—</span><span class="sub" id="kpi-disk-sub">&nbsp;</span></div>
   </section>
 
-  <section class="card" id="capacity-card">
-    <h2>Local capacity</h2>
-    <div class="body"><div class="row" id="capacity-row"><span class="muted">loading…</span></div></div>
+  <!-- Health: compact strip. Per-service pills only — no key/value sprawl. -->
+  <section class="card flat" id="health-card">
+    <h2>Health <span class="meta" id="health-meta"></span></h2>
+    <div class="body"><div class="health-row" id="health-row"><span class="muted">loading…</span></div></div>
   </section>
 
+  <!-- Nodes: every per-node datum lives here. CPU/Mem/Disk shown as inline
+       usage bars (concrete numbers in the tooltip-style label) so the table
+       reads at a glance instead of as a wall of comma-separated numbers. -->
   <section class="card" id="cluster-card">
-    <h2>Cluster</h2>
+    <h2>Nodes <span class="meta" id="cluster-meta"></span></h2>
     <div class="body">
-      <div class="row" style="margin-bottom: 10px;">
-        <div class="kv"><span class="k">Leader</span><span class="v" id="cluster-leader">—</span></div>
-        <div class="kv"><span class="k">Members</span><span class="v" id="cluster-count">—</span></div>
-      </div>
-      <div class="row" id="cluster-capacity-row" style="margin-bottom: 10px;">
-        <span class="muted">loading…</span>
-      </div>
       <table>
         <thead>
           <tr>
-            <th>name</th><th>node_id</th><th>private_ip</th><th>role</th>
-            <th>alive</th><th>drained</th><th>api_url</th>
-            <th>capacity</th><th>actions</th>
+            <th>Node</th>
+            <th>Status</th>
+            <th>Role</th>
+            <th class="num">Sandboxes</th>
+            <th>CPU</th>
+            <th>Memory</th>
+            <th>Disk</th>
+            <th>GPU</th>
+            <th></th>
           </tr>
         </thead>
-        <tbody id="members-tbody"><tr><td colspan="9" class="muted">loading…</td></tr></tbody>
+        <tbody id="members-tbody"><tr><td colspan="9" class="empty">loading…</td></tr></tbody>
       </table>
     </div>
   </section>
 
+  <!-- Placements: cluster-wide sandbox list with per-row Stop/Delete. The
+       cluster forwarder routes those calls to the owning node. -->
   <section class="card" id="placements-card">
-    <h2>Placements</h2>
+    <h2>Placements <span class="meta" id="placements-meta"></span></h2>
     <div class="body">
       <table>
         <thead>
           <tr>
-            <th>sandbox_id</th><th>owner_node_id</th><th>state</th><th>version</th>
-            <th>created</th><th>updated</th><th>actions</th>
+            <th>Sandbox</th>
+            <th>Owner</th>
+            <th>State</th>
+            <th class="num">Version</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th></th>
           </tr>
         </thead>
-        <tbody id="placements-tbody"><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+        <tbody id="placements-tbody"><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
       </table>
       <div class="pager">
         <button id="next-page-btn" type="button" disabled>Next page</button>
@@ -269,7 +344,7 @@ async function apiJSON(path) {
 // ---------- formatters ----------
 
 function pill(status, kind) {
-  const cls = kind === "ok" ? "ok" : kind === "warn" ? "warn" : "bad";
+  const cls = kind === "ok" ? "ok" : kind === "warn" ? "warn" : kind === "muted" ? "muted" : "bad";
   return `<span class="pill ${cls}">${escapeHTML(status)}</span>`;
 }
 
@@ -295,15 +370,19 @@ function fmtPct(n) {
   return (Number(n) * 100).toFixed(1) + "%";
 }
 
-function fmtCapacityPct(used, total) {
-  if (!total || total <= 0) { return "—"; }
-  return ((Number(used || 0) / Number(total)) * 100).toFixed(1) + "%";
-}
-
 function fmtUnix(u) {
   if (!u) { return "—"; }
   try { return new Date(Number(u) * 1000).toISOString().replace("T", " ").replace("Z", "Z"); }
   catch (e) { return String(u); }
+}
+
+function fmtAge(u) {
+  if (!u) { return "—"; }
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - Number(u)));
+  if (secs < 60) { return secs + "s"; }
+  if (secs < 3600) { return Math.floor(secs / 60) + "m"; }
+  if (secs < 86400) { return Math.floor(secs / 3600) + "h"; }
+  return Math.floor(secs / 86400) + "d";
 }
 
 function fmtNanos(n) {
@@ -314,9 +393,12 @@ function fmtNanos(n) {
   return (Number(n) / 1e3).toFixed(0) + " µs";
 }
 
+function fmtGB(mb) {
+  if (mb === undefined || mb === null) { return "—"; }
+  return (Number(mb) / 1024).toFixed(1) + " GB";
+}
+
 // hostFromURL pulls the hostname (no port) out of a URL or host:port string.
-// Used to surface the private IP that the daemon advertises without making
-// operators eyeball the api_url column.
 function hostFromURL(s) {
   if (!s) { return ""; }
   try { return new URL(s).hostname; } catch (_) { /* not a full URL */ }
@@ -324,35 +406,53 @@ function hostFromURL(s) {
   return i > 0 ? s.slice(0, i) : s;
 }
 
+// usageBar renders an inline progress bar with a label like "12.0 / 32 cores"
+// and a percentage. Color flips warn at ≥75%, bad at ≥90%.
+function usageBar(label, used, total, unit) {
+  const pct = total > 0 ? Math.min(1, Number(used || 0) / Number(total)) : 0;
+  const pctStr = total > 0 ? (pct * 100).toFixed(0) + "%" : "—";
+  const cls = pct >= 0.9 ? "bad" : pct >= 0.75 ? "warn" : "";
+  const display = total > 0
+    ? `${escapeHTML(label)} ${unit ? `<span class="muted">${escapeHTML(unit)}</span>` : ""}`
+    : `<span class="muted">—</span>`;
+  return `
+    <div class="usage">
+      <div class="label"><span>${display}</span><span class="pct">${pctStr}</span></div>
+      <div class="bar ${cls}"><div style="width: ${(pct * 100).toFixed(1)}%"></div></div>
+    </div>
+  `;
+}
+
 function aggregateCapacity(members) {
   const agg = {
-    nodes: 0, stale: 0, sandboxes: 0,
-    hostCPU: 0, cpuBudget: 0, reservedCPU: 0, availableCPU: 0,
-    hostMem: 0, memBudget: 0, reservedMem: 0, availableMem: 0,
-    hostDisk: 0, diskFree: 0, diskBudget: 0, reservedDisk: 0, availableDisk: 0,
+    nodes: 0, alive: 0, drained: 0, stale: 0, sandboxes: 0,
+    cpuBudget: 0, reservedCPU: 0, availableCPU: 0,
+    memBudget: 0, reservedMem: 0, availableMem: 0,
+    diskBudget: 0, reservedDisk: 0, availableDisk: 0,
+    hostDisk: 0, hostDiskFree: 0,
     gpuCount: 0, reservedGPUs: 0, availableGPUs: 0,
   };
   (members || []).forEach((m) => {
+    agg.nodes += 1;
+    if (m.alive) { agg.alive += 1; }
+    if (m.drained) { agg.drained += 1; }
     const c = m.capacity || {};
     if (!m.alive || !(c.host_cpu_cores > 0 || c.host_memory_total_mb > 0)) {
       return;
     }
-    agg.nodes += 1;
     if (m.capacity_stale) { agg.stale += 1; }
     agg.sandboxes += Number(c.sandboxes_active || 0);
-    agg.hostCPU += Number(c.host_cpu_cores || 0);
     agg.cpuBudget += Number(c.cpu_budget || 0);
     agg.reservedCPU += Number(c.reserved_cpu || 0);
     agg.availableCPU += Number(c.available_cpu != null ? c.available_cpu : Math.max((c.cpu_budget || 0) - (c.reserved_cpu || 0), 0));
-    agg.hostMem += Number(c.host_memory_total_mb || 0);
     agg.memBudget += Number(c.memory_budget_mb || 0);
     agg.reservedMem += Number(c.reserved_memory_mb || 0);
     agg.availableMem += Number(c.available_memory_mb != null ? c.available_memory_mb : Math.max((c.memory_budget_mb || 0) - (c.reserved_memory_mb || 0), 0));
-    agg.hostDisk += Number(c.host_disk_total_gb || 0);
-    agg.diskFree += Number(c.host_disk_free_gb || 0);
     agg.diskBudget += Number(c.disk_budget_gb || 0);
     agg.reservedDisk += Number(c.reserved_disk_gb || 0);
     agg.availableDisk += Number(c.available_disk_gb != null ? c.available_disk_gb : Math.max((c.disk_budget_gb || 0) - (c.reserved_disk_gb || 0), 0));
+    agg.hostDisk += Number(c.host_disk_total_gb || 0);
+    agg.hostDiskFree += Number(c.host_disk_free_gb || 0);
     agg.gpuCount += Number(c.gpu_count || 0);
     agg.reservedGPUs += Number(c.reserved_gpus || 0);
     agg.availableGPUs += Number(c.available_gpus != null ? c.available_gpus : Math.max((c.gpu_count || 0) - (c.reserved_gpus || 0), 0));
@@ -370,45 +470,76 @@ async function loadHealth() {
     const caddyKind = h.caddy === "ok" ? "ok" : "bad";
     const sshKind = h.ssh_gateway === "ok" ? "ok" : h.ssh_gateway === "disabled" ? "warn" : "bad";
     el("health-row").innerHTML = `
-      <div class="kv"><span class="k">overall</span><span class="v">${pill(h.status || "?", statusKind)}</span></div>
-      <div class="kv"><span class="k">docker</span><span class="v">${pill(h.docker || "?", dockerKind)}</span></div>
-      <div class="kv"><span class="k">caddy</span><span class="v">${pill(h.caddy || "?", caddyKind)}</span></div>
-      <div class="kv"><span class="k">ssh_gateway</span><span class="v">${pill(h.ssh_gateway || "?", sshKind)}</span></div>
-      <div class="kv"><span class="k">live sandboxes</span><span class="v">${fmtNum(h.sandboxes)}</span></div>
-      <div class="kv"><span class="k">version</span><span class="v">${escapeHTML(h.version || "—")}</span></div>
+      <div class="health-item"><span class="k">overall</span>${pill(h.status || "?", statusKind)}</div>
+      <div class="health-item"><span class="k">docker</span>${pill(h.docker || "?", dockerKind)}</div>
+      <div class="health-item"><span class="k">caddy</span>${pill(h.caddy || "?", caddyKind)}</div>
+      <div class="health-item"><span class="k">ssh</span>${pill(h.ssh_gateway || "?", sshKind)}</div>
+      <div class="health-item"><span class="k">live sandboxes</span><span class="mono">${fmtNum(h.sandboxes)}</span></div>
     `;
+    el("health-meta").textContent = h.version ? "v" + h.version : "";
     el("node-summary").textContent = (h.version ? "v" + h.version + " · " : "") + (h.status || "?") + " · " + window.location.host;
+    const dot = el("status-dot");
+    dot.classList.remove("ok", "warn", "bad");
+    dot.classList.add(statusKind);
   } catch (err) {
     el("health-row").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
+    el("status-dot").className = "dot bad";
   }
 }
 
-async function loadCapacity() {
-  try {
-    const c = await apiJSON("/v1/capacity");
-    const admitKind = c.can_admit ? "ok" : "bad";
-    const cpuFactor = c.cpu_overprovision_factor || 1;
-    const memFactor = c.memory_overprovision_factor || 1;
-    const cpuBreakdown = `${fmtNum(c.host_cpu_cores)} cores × ${fmtPct(c.cpu_reservation_ratio)}${cpuFactor > 1 ? " × " + fmtFloat(cpuFactor) + "× overcommit" : ""}`;
-    const memBreakdown = `${fmtNum(c.host_memory_total_mb)} MB × ${fmtPct(c.memory_reservation_ratio)}${memFactor > 1 ? " × " + fmtFloat(memFactor) + "× overcommit" : ""}`;
-    const diskBreakdown = c.host_disk_total_gb
-      ? `${fmtNum(c.host_disk_total_gb)} GB total${c.host_disk_free_gb ? " · " + fmtNum(c.host_disk_free_gb) + " GB free" : ""} × ${fmtPct(c.disk_reservation_ratio || 0)}`
-      : "disk accounting disabled";
-    el("capacity-row").innerHTML = `
-      <div class="kv"><span class="k">can_admit</span><span class="v">${pill(c.can_admit ? "yes" : "no", admitKind)}</span></div>
-      <div class="kv"><span class="k">live sandboxes</span><span class="v">${fmtNum(c.sandboxes_active)}</span></div>
-      <div class="kv" style="grid-column: 1 / -1;"><span class="k">host hardware</span><span class="v">${fmtNum(c.host_cpu_cores)} cores · ${fmtNum(c.host_memory_total_mb)} MB ram${c.host_disk_total_gb ? " · " + fmtNum(c.host_disk_total_gb) + " GB disk" : ""}</span></div>
-      <div class="kv" style="grid-column: 1 / -1;"><span class="k">cpu reserved / available</span><span class="v">${fmtFloat(c.reserved_cpu)} / ${fmtFloat(c.available_cpu)} available / ${fmtFloat(c.cpu_budget)} budget <span class="muted">(${cpuBreakdown})</span></span></div>
-      <div class="kv" style="grid-column: 1 / -1;"><span class="k">memory reserved / available</span><span class="v">${fmtNum(c.reserved_memory_mb)} / ${fmtNum(c.available_memory_mb)} MB available / ${fmtNum(c.memory_budget_mb)} MB budget <span class="muted">(${memBreakdown})</span></span></div>
-      <div class="kv" style="grid-column: 1 / -1;"><span class="k">disk reserved / available</span><span class="v">${fmtNum(c.reserved_disk_gb)} / ${fmtNum(c.available_disk_gb)} GB available / ${fmtNum(c.disk_budget_gb)} GB budget <span class="muted">(${diskBreakdown})</span></span></div>
-      <div class="kv"><span class="k">memory free (live)</span><span class="v">${fmtNum(c.live_memory_free_mb)} MB${c.memory_floor_mb ? " <span class='muted'>(floor " + fmtNum(c.memory_floor_mb) + " MB)</span>" : ""}</span></div>
-      <div class="kv"><span class="k">gpus</span><span class="v">${c.gpu_count ? fmtNum(c.reserved_gpus) + " / " + fmtNum(c.gpu_count) + " (" + escapeHTML(c.gpu_vendor || "?") + ")" : "—"}</span></div>
-      <div class="kv"><span class="k">runtimes</span><span class="v">${escapeHTML((c.supported_runtimes || []).join(", ") || "—")}</span></div>
-      ${c.reasons && c.reasons.length ? `<div class="kv" style="grid-column: 1 / -1;"><span class="k">reasons</span><span class="v error">${escapeHTML(c.reasons.join(" · "))}</span></div>` : ""}
-    `;
-  } catch (err) {
-    el("capacity-row").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
+function renderKPIs(leader, members) {
+  const ms = members || [];
+  const agg = aggregateCapacity(ms);
+
+  el("kpi-nodes").textContent = ms.length === 0 ? "—" : `${agg.alive} / ${ms.length}`;
+  const nodeSubBits = [];
+  if (ms.length > 0) { nodeSubBits.push(ms.length === 1 ? "single node" : "alive / total"); }
+  if (agg.drained) { nodeSubBits.push(`<span class="warn">${agg.drained} drained</span>`); }
+  if (agg.stale) { nodeSubBits.push(`<span class="warn">${agg.stale} stale</span>`); }
+  el("kpi-nodes-sub").innerHTML = nodeSubBits.join(" · ") || "&nbsp;";
+
+  el("kpi-sandboxes").textContent = fmtNum(agg.sandboxes);
+  el("kpi-sandboxes-sub").innerHTML = agg.nodes > 0 ? `across ${agg.nodes} reporting` : "&nbsp;";
+
+  if (agg.cpuBudget > 0) {
+    const cpuPct = agg.reservedCPU / agg.cpuBudget;
+    el("kpi-cpu").textContent = (cpuPct * 100).toFixed(1) + "%";
+    el("kpi-cpu-sub").innerHTML = `${fmtFloat(agg.availableCPU)} / ${fmtFloat(agg.cpuBudget)} cores free`;
+  } else {
+    el("kpi-cpu").textContent = "—";
+    el("kpi-cpu-sub").innerHTML = "&nbsp;";
   }
+
+  if (agg.memBudget > 0) {
+    const memPct = agg.reservedMem / agg.memBudget;
+    el("kpi-mem").textContent = (memPct * 100).toFixed(1) + "%";
+    el("kpi-mem-sub").innerHTML = `${fmtGB(agg.availableMem)} / ${fmtGB(agg.memBudget)} free`;
+  } else {
+    el("kpi-mem").textContent = "—";
+    el("kpi-mem-sub").innerHTML = "&nbsp;";
+  }
+
+  // Disk: prefer the operator-set budget; fall back to raw host disk so the
+  // tile isn't empty on nodes that have disk accounting disabled (disk_budget_gb=0).
+  if (agg.diskBudget > 0) {
+    const diskPct = agg.reservedDisk / agg.diskBudget;
+    el("kpi-disk").textContent = (diskPct * 100).toFixed(1) + "%";
+    el("kpi-disk-sub").innerHTML = `${fmtNum(agg.availableDisk)} / ${fmtNum(agg.diskBudget)} GB free`;
+  } else if (agg.hostDisk > 0) {
+    const usedHost = Math.max(agg.hostDisk - agg.hostDiskFree, 0);
+    const diskPct = usedHost / agg.hostDisk;
+    el("kpi-disk").textContent = (diskPct * 100).toFixed(1) + "%";
+    el("kpi-disk-sub").innerHTML = `${fmtNum(agg.hostDiskFree)} / ${fmtNum(agg.hostDisk)} GB host free <span class="muted">(budget off)</span>`;
+  } else {
+    el("kpi-disk").textContent = "—";
+    el("kpi-disk-sub").innerHTML = "&nbsp;";
+  }
+
+  // Leader + member count surface in the Nodes card subhead.
+  const leaderName = (leader && leader.leader) ? leader.leader : "(single-node / no leader)";
+  el("cluster-meta").textContent = ms.length === 0
+    ? "leader: " + leaderName
+    : `leader: ${leaderName} · ${ms.length} member${ms.length === 1 ? "" : "s"}`;
 }
 
 async function loadCluster() {
@@ -417,57 +548,76 @@ async function loadCluster() {
       apiJSON("/v1/cluster/leader"),
       apiJSON("/v1/cluster/members"),
     ]);
-    el("cluster-leader").textContent = leader.leader || "(single-node or no leader)";
     const ms = members.members || [];
-    el("cluster-count").textContent = fmtNum(ms.length);
-    const agg = aggregateCapacity(ms);
-    if (agg.nodes === 0) {
-      el("cluster-capacity-row").innerHTML = `<span class="muted">no capacity heartbeats yet</span>`;
-    } else {
-      el("cluster-capacity-row").innerHTML = `
-        <div class="kv"><span class="k">capacity heartbeats</span><span class="v">${fmtNum(agg.nodes)} nodes${agg.stale ? " · " + fmtNum(agg.stale) + " stale" : ""}</span></div>
-        <div class="kv"><span class="k">sandboxes</span><span class="v">${fmtNum(agg.sandboxes)}</span></div>
-        <div class="kv"><span class="k">cpu available</span><span class="v">${fmtFloat(agg.availableCPU)} / ${fmtFloat(agg.cpuBudget)} cores <span class="muted">(${fmtCapacityPct(agg.reservedCPU, agg.cpuBudget)} used)</span></span></div>
-        <div class="kv"><span class="k">memory available</span><span class="v">${fmtNum(agg.availableMem)} / ${fmtNum(agg.memBudget)} MB <span class="muted">(${fmtCapacityPct(agg.reservedMem, agg.memBudget)} used)</span></span></div>
-        <div class="kv"><span class="k">disk available</span><span class="v">${fmtNum(agg.availableDisk)} / ${fmtNum(agg.diskBudget)} GB budget <span class="muted">${agg.hostDisk ? "· " + fmtNum(agg.diskFree) + " / " + fmtNum(agg.hostDisk) + " GB host free" : ""}</span></span></div>
-        <div class="kv"><span class="k">gpu available</span><span class="v">${agg.gpuCount ? fmtNum(agg.availableGPUs) + " / " + fmtNum(agg.gpuCount) : "—"}</span></div>
-      `;
-    }
+    renderKPIs(leader, ms);
+
     if (ms.length === 0) {
-      el("members-tbody").innerHTML = `<tr><td colspan="9" class="muted">no peers gossiped</td></tr>`;
+      el("members-tbody").innerHTML = `<tr><td colspan="9" class="empty">no peers gossiped</td></tr>`;
       return;
     }
     el("members-tbody").innerHTML = ms.map((m) => {
-      const aliveKind = m.alive ? "ok" : "bad";
-      const drainedKind = m.drained ? "warn" : "ok";
       const cap = m.capacity || {};
-      const cpuUse = cap.cpu_budget > 0 ? (cap.reserved_cpu || 0) / cap.cpu_budget : 0;
-      const memUse = cap.memory_budget_mb > 0 ? (cap.reserved_memory_mb || 0) / cap.memory_budget_mb : 0;
-      const diskUse = cap.disk_budget_gb > 0 ? (cap.reserved_disk_gb || 0) / cap.disk_budget_gb : 0;
-      const capSummary = (cap.host_cpu_cores > 0 || cap.host_memory_total_mb > 0)
-        ? `${m.capacity_stale ? "STALE · " : ""}${fmtNum(cap.sandboxes_active || 0)} sb · cpu ${fmtFloat(cap.available_cpu || 0)} free/${fmtFloat(cap.cpu_budget || 0)} (${fmtPct(cpuUse)} used) · mem ${fmtNum(cap.available_memory_mb || 0)} MB free/${fmtNum(cap.memory_budget_mb || 0)} (${fmtPct(memUse)} used) · disk ${fmtNum(cap.available_disk_gb || 0)} GB free/${fmtNum(cap.disk_budget_gb || 0)} (${fmtPct(diskUse)} used)${cap.gpu_count ? " · gpu " + fmtNum(cap.available_gpus || 0) + "/" + fmtNum(cap.gpu_count) : ""}`
-        : (m.capacity_stale ? "STALE / missing heartbeat" : "—");
+      const name = m.node_name || m.node_id || "—";
+      const privateIP = hostFromURL(m.api_url) || hostFromURL(m.data_plane_host) || "—";
+      const apiURLAttr = m.api_url ? ` title="${escapeHTML(m.api_url)}"` : "";
+
+      let statusHTML;
+      if (!m.alive) {
+        statusHTML = pill("dead", "bad");
+      } else if (m.drained) {
+        statusHTML = pill("drained", "warn");
+      } else if (m.capacity_stale) {
+        statusHTML = pill("stale", "warn");
+      } else {
+        statusHTML = pill("active", "ok");
+      }
+
+      const hasCap = cap.host_cpu_cores > 0 || cap.host_memory_total_mb > 0;
+      const cpuCell = hasCap
+        ? usageBar(`${fmtFloat(cap.available_cpu || 0)} / ${fmtFloat(cap.cpu_budget || 0)}`, cap.reserved_cpu, cap.cpu_budget, "cores")
+        : `<span class="muted">—</span>`;
+      const memCell = hasCap
+        ? usageBar(`${fmtGB(cap.available_memory_mb || 0)} / ${fmtGB(cap.memory_budget_mb || 0)}`, cap.reserved_memory_mb, cap.memory_budget_mb, "")
+        : `<span class="muted">—</span>`;
+      // Disk: budget bar if disk accounting is on; otherwise fall back to raw
+      // host disk free/total so the column isn't blank on nodes with
+      // disk_budget_gb=0 (the previous "Local capacity" card had this fallback).
+      let diskCell;
+      if (cap.disk_budget_gb > 0) {
+        diskCell = usageBar(`${fmtNum(cap.available_disk_gb || 0)} / ${fmtNum(cap.disk_budget_gb || 0)}`, cap.reserved_disk_gb, cap.disk_budget_gb, "GB");
+      } else if (cap.host_disk_total_gb > 0) {
+        const usedHost = Math.max((cap.host_disk_total_gb || 0) - (cap.host_disk_free_gb || 0), 0);
+        diskCell = usageBar(`${fmtNum(cap.host_disk_free_gb || 0)} / ${fmtNum(cap.host_disk_total_gb)}`, usedHost, cap.host_disk_total_gb, "GB host");
+      } else {
+        diskCell = `<span class="muted">—</span>`;
+      }
+      const gpuCell = cap.gpu_count
+        ? `<span class="mono">${fmtNum(cap.available_gpus || 0)} / ${fmtNum(cap.gpu_count)}</span>`
+        : `<span class="muted">—</span>`;
+
       const drainBtn = m.drained
         ? `<button data-action="uncordon" data-id="${escapeHTML(m.node_id)}">Uncordon</button>`
         : `<button class="danger" data-action="drain" data-id="${escapeHTML(m.node_id)}">Drain</button>`;
-      const name = m.node_name || m.node_id || "—";
-      const privateIP = hostFromURL(m.api_url) || hostFromURL(m.data_plane_host) || "—";
+
       return `
         <tr>
-          <td>${escapeHTML(name)}</td>
-          <td><span class="muted">${escapeHTML(m.node_id)}</span></td>
-          <td><span class="muted">${escapeHTML(privateIP)}</span></td>
-          <td>${escapeHTML(m.role || "(mixed)")}</td>
-          <td>${pill(m.alive ? "alive" : "dead", aliveKind)}</td>
-          <td>${pill(m.drained ? "drained" : "active", drainedKind)}</td>
-          <td><span class="muted">${escapeHTML(m.api_url || "—")}</span></td>
-          <td><span class="muted">${capSummary}</span></td>
+          <td class="id"${apiURLAttr}>
+            ${escapeHTML(name)}
+            <span class="sub">${escapeHTML(privateIP)} · ${escapeHTML(m.node_id || "")}</span>
+          </td>
+          <td>${statusHTML}</td>
+          <td><span class="muted">${escapeHTML(m.role || "(mixed)")}</span></td>
+          <td class="num">${fmtNum(cap.sandboxes_active || 0)}</td>
+          <td>${cpuCell}</td>
+          <td>${memCell}</td>
+          <td>${diskCell}</td>
+          <td>${gpuCell}</td>
           <td class="actions">${drainBtn}</td>
         </tr>
       `;
     }).join("");
   } catch (err) {
-    el("cluster-capacity-row").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
+    el("cluster-meta").textContent = "";
     el("members-tbody").innerHTML = `<tr><td colspan="9" class="error">${escapeHTML(err.message)}</td></tr>`;
   }
 }
@@ -481,7 +631,8 @@ async function loadPlacements() {
       p = await apiJSON("/v1/cluster/sandbox-index" + q);
     } catch (err) {
       if (String(err.message).startsWith("503")) {
-        el("placements-tbody").innerHTML = `<tr><td colspan="7" class="muted">cluster not enabled on this node</td></tr>`;
+        el("placements-tbody").innerHTML = `<tr><td colspan="7" class="empty">cluster not enabled on this node</td></tr>`;
+        el("placements-meta").textContent = "";
         el("page-info").textContent = "";
         el("next-page-btn").disabled = true;
         return;
@@ -489,8 +640,12 @@ async function loadPlacements() {
       throw err;
     }
     const rows = p.placements || [];
+    el("placements-meta").textContent = rows.length === 0
+      ? (token ? "page empty" : "none placed")
+      : `${rows.length} on this page`;
+
     if (rows.length === 0) {
-      el("placements-tbody").innerHTML = `<tr><td colspan="7" class="muted">no placements${token ? " on this page" : ""}</td></tr>`;
+      el("placements-tbody").innerHTML = `<tr><td colspan="7" class="empty">no placements${token ? " on this page" : ""}</td></tr>`;
     } else {
       el("placements-tbody").innerHTML = rows.map((pl) => {
         const orphaned = pl.owner_state === "orphaned";
@@ -502,15 +657,20 @@ async function loadPlacements() {
             <button data-action="reclaim" data-id="${escapeHTML(pl.sandbox_id)}">Reclaim local</button>
             <button class="danger" data-action="delete-orphan" data-id="${escapeHTML(pl.sandbox_id)}">Force delete</button>
           `;
+        } else {
+          actions = `
+            <button data-action="stop-sandbox" data-id="${escapeHTML(pl.sandbox_id)}">Stop</button>
+            <button class="danger" data-action="delete-sandbox" data-id="${escapeHTML(pl.sandbox_id)}">Delete</button>
+          `;
         }
         return `
           <tr>
-            <td>${escapeHTML(pl.sandbox_id)}</td>
-            <td>${escapeHTML(pl.owner_node_id || "—")}</td>
+            <td class="id">${escapeHTML(pl.sandbox_id)}</td>
+            <td><span class="mono muted">${escapeHTML(pl.owner_node_id || "—")}</span></td>
             <td>${pill(stateLabel, stateKind)}</td>
-            <td>${fmtNum(pl.version)}</td>
-            <td><span class="muted">${fmtUnix(pl.created_unix)}</span></td>
-            <td><span class="muted">${fmtUnix(pl.updated_unix)}</span></td>
+            <td class="num">${fmtNum(pl.version)}</td>
+            <td class="num" title="${escapeHTML(fmtUnix(pl.created_unix))}"><span class="muted">${fmtAge(pl.created_unix)}</span></td>
+            <td class="num" title="${escapeHTML(fmtUnix(pl.updated_unix))}"><span class="muted">${fmtAge(pl.updated_unix)}</span></td>
             <td class="actions">${actions || '<span class="muted">—</span>'}</td>
           </tr>
         `;
@@ -593,6 +753,10 @@ document.addEventListener("click", (e) => {
     postAction("POST", `/v1/cluster/orphans/${encodeURIComponent(id)}/reclaim-local`, "Reclaim orphan locally", id);
   } else if (action === "delete-orphan") {
     postAction("DELETE", `/v1/cluster/orphans/${encodeURIComponent(id)}`, "Force-delete orphan placement", id);
+  } else if (action === "stop-sandbox") {
+    postAction("POST", `/v1/sandboxes/${encodeURIComponent(id)}/stop`, "Stop sandbox", id);
+  } else if (action === "delete-sandbox") {
+    postAction("DELETE", `/v1/sandboxes/${encodeURIComponent(id)}`, "Delete sandbox", id);
   }
 });
 
@@ -620,7 +784,7 @@ el("autorefresh").addEventListener("change", () => {
 async function refreshAll(force) {
   if (!state.pat) { return; }
   if (!force && document.hidden) { return; }
-  await Promise.all([loadHealth(), loadCapacity(), loadCluster(), loadPlacements(), loadMetrics()]);
+  await Promise.all([loadHealth(), loadCluster(), loadPlacements(), loadMetrics()]);
 }
 
 function startTimer() {
