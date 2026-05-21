@@ -135,6 +135,8 @@ for a Prometheus running inside the VPC:
 ```hcl
 otel_metrics_endpoint = "http://otel-collector.internal:4318/v1/metrics"
 otel_metrics_interval = "30s"
+otel_traces_endpoint = "http://otel-collector.internal:4318/v1/traces"
+otel_traces_sample_ratio = 0.05
 otel_service_name     = "sandboxd"
 
 image_pull_max_concurrent  = 4

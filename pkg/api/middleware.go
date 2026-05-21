@@ -11,6 +11,11 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // extractBearerToken returns the caller's bearer token from either:
@@ -64,17 +69,45 @@ func (s *Server) requireE2BAuth(next http.Handler) http.Handler {
 func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := otel.Tracer("github.com/aerol-ai/microvm/pkg/api").Start(ctx, r.Method+" "+r.URL.Path,
+			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+			oteltrace.WithAttributes(
+				attribute.String("http.request.method", r.Method),
+				attribute.String("url.path", r.URL.Path),
+				attribute.String("network.protocol.name", r.Proto),
+			),
+		)
+		defer span.End()
+		r = r.WithContext(ctx)
 		// Wrap the writer so we can record the status code and whether the
 		// connection was hijacked (i.e. WebSocket upgrade succeeded). The
 		// wrapper proxies http.Hijacker / http.Flusher so the toolbox proxy
 		// can still upgrade through this middleware.
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
+		duration := time.Since(start)
+		status := rec.statusCode()
+		if r.Pattern != "" {
+			route := strings.TrimPrefix(r.Pattern, r.Method+" ")
+			span.SetName(r.Method + " " + route)
+			span.SetAttributes(attribute.String("http.route", route))
+		}
+		span.SetAttributes(
+			attribute.Int("http.response.status_code", status),
+			attribute.Int64("http.server.duration_ms", duration.Milliseconds()),
+		)
+		if rec.hijacked {
+			span.SetAttributes(attribute.Bool("aerolvm.http.hijacked", true))
+		}
+		if status >= http.StatusInternalServerError {
+			span.SetStatus(codes.Error, http.StatusText(status))
+		}
 		fields := []any{
 			"method", r.Method,
 			"path", r.URL.Path,
-			"duration", time.Since(start),
-			"status", rec.statusCode(),
+			"duration", duration,
+			"status", status,
 		}
 		if rec.hijacked {
 			fields = append(fields, "hijacked", true)

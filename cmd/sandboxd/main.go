@@ -39,6 +39,26 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	otelTracesShutdown, err := observability.StartOTELTraces(ctx, logger, observability.OTELTracesConfig{
+		Enabled:     cfg.OTELTracesEnabled,
+		Endpoint:    cfg.OTELTracesEndpoint,
+		SampleRatio: cfg.OTELTracesSampleRatio,
+		ServiceName: cfg.OTELServiceName,
+		NodeID:      cfg.NodeID,
+		NodeRole:    cfg.NodeRole,
+	})
+	if err != nil {
+		logger.Warn("failed to start otel trace exporter", "error", err)
+	} else if otelTracesShutdown != nil {
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := otelTracesShutdown(shutdownCtx); err != nil {
+				logger.Warn("otel trace shutdown failed", "error", err)
+			}
+		}()
+	}
+
 	otelShutdown, err := observability.StartOTELMetrics(ctx, logger, observability.OTELMetricsConfig{
 		Enabled:     cfg.OTELMetricsEnabled,
 		Endpoint:    cfg.OTELMetricsEndpoint,

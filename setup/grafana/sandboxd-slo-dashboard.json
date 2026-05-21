@@ -125,6 +125,91 @@
       ],
       "title": "Data Plane Errors",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_create_latency_seconds_bucket[5m])) by (key)", "legendFormat": "{{key}}", "refId": "A" }
+      ],
+      "title": "Create Latency Buckets",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_create_admission_rejects_total[5m])) by (key)", "legendFormat": "admission {{key}}", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_scheduler_decisions_total[5m])) by (key)", "legendFormat": "decision {{key}}", "refId": "B" },
+        { "expr": "sum(rate(aerolvm_scheduler_candidate_rejects_total[5m])) by (key)", "legendFormat": "candidate reject {{key}}", "refId": "C" }
+      ],
+      "title": "Admission And Scheduler Decisions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 28 },
+      "id": 12,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(aerolvm_worker_leases_alive)", "legendFormat": "fresh worker leases", "refId": "A" },
+        { "expr": "sum(aerolvm_worker_leases_total)", "legendFormat": "known worker leases", "refId": "B" },
+        { "expr": "sum(aerolvm_gossip_members_alive)", "legendFormat": "alive gossip members", "refId": "C" },
+        { "expr": "sum(aerolvm_gossip_members_total)", "legendFormat": "known gossip members", "refId": "D" }
+      ],
+      "title": "Worker Lease Coverage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 28 },
+      "id": 13,
+      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(aerolvm_raft_apply_inflight)", "legendFormat": "apply inflight", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_raft_apply_latency_seconds_bucket[5m])) by (key)", "legendFormat": "apply latency {{key}}", "refId": "B" },
+        { "expr": "max(aerolvm_raft_snapshot_last_bytes)", "legendFormat": "snapshot bytes", "refId": "C" },
+        { "expr": "max(aerolvm_raft_snapshot_placements_last)", "legendFormat": "snapshot placements", "refId": "D" }
+      ],
+      "title": "Raft Apply And Snapshot Cost",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 35 },
+      "id": 14,
+      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_ingress_reconcile_errors_total[5m]))", "legendFormat": "reconcile errors/s", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_ingress_route_misses_total[5m]))", "legendFormat": "route misses/s", "refId": "B" },
+        { "expr": "sum(rate(aerolvm_caddy_admin_latency_seconds_bucket[5m])) by (key)", "legendFormat": "caddy latency {{key}}", "refId": "C" }
+      ],
+      "title": "Ingress Reconcile And Caddy Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 35 },
+      "id": 15,
+      "options": { "legend": { "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_secret_decrypt_errors_total[5m])) by (key)", "legendFormat": "decrypt error {{key}}", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_secret_key_version_mismatches_total[5m]))", "legendFormat": "key version mismatch/s", "refId": "B" },
+        { "expr": "sum(rate(aerolvm_secret_recipient_denied_total[5m]))", "legendFormat": "recipient denied/s", "refId": "C" },
+        { "expr": "sum(rate(aerolvm_secret_decrypt_latency_seconds_bucket[5m])) by (key)", "legendFormat": "decrypt latency {{key}}", "refId": "D" }
+      ],
+      "title": "Secret Recovery Health",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

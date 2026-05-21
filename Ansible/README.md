@@ -116,6 +116,7 @@ ansible-playbook playbooks/prepare-role-change.yml --limit aerolvm-worker-17
 # node lifecycle, Grafana, Prometheus, Alertmanager, and runbook artifacts:
 ansible-playbook playbooks/configure-ops.yml \
   -e sandboxd_otel_metrics_endpoint=http://otel-collector:4318/v1/metrics \
+  -e sandboxd_otel_traces_endpoint=http://otel-collector:4318/v1/traces \
   -e sandboxd_backup_enabled=true
 ```
 

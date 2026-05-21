@@ -38,7 +38,11 @@ func TestLoadCases(t *testing.T) {
 			"SB_OTEL_METRICS_ENABLED",
 			"SB_OTEL_METRICS_ENDPOINT",
 			"SB_OTEL_METRICS_INTERVAL",
+			"SB_OTEL_TRACES_ENABLED",
+			"SB_OTEL_TRACES_ENDPOINT",
+			"SB_OTEL_TRACES_SAMPLE_RATIO",
 			"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+			"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
 			"OTEL_EXPORTER_OTLP_ENDPOINT",
 			"OTEL_SERVICE_NAME",
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
@@ -102,7 +106,7 @@ func TestLoadCases(t *testing.T) {
 				if cfg.ClusterCreateMaxPendingPerWorker != 32 {
 					t.Fatalf("expected default ClusterCreateMaxPendingPerWorker=32, got %d", cfg.ClusterCreateMaxPendingPerWorker)
 				}
-				if cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "" || cfg.OTELMetricsInterval != 30*time.Second || cfg.OTELServiceName != "sandboxd" {
+				if cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "" || cfg.OTELMetricsInterval != 30*time.Second || cfg.OTELTracesEnabled || cfg.OTELTracesEndpoint != "" || cfg.OTELTracesSampleRatio != 0.05 || cfg.OTELServiceName != "sandboxd" {
 					t.Fatalf("unexpected otel defaults: %+v", cfg)
 				}
 				if cfg.ImagePullMaxConcurrent != 4 || cfg.ImagePullFailureBackoff != 30*time.Second {
@@ -193,6 +197,8 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_HTTP_CLIENT_TIMEOUT", "12s")
 				t.Setenv("SB_OTEL_METRICS_ENDPOINT", "http://otel.example.test:4318/v1/metrics")
 				t.Setenv("SB_OTEL_METRICS_INTERVAL", "45s")
+				t.Setenv("SB_OTEL_TRACES_ENDPOINT", "http://otel.example.test:4318/v1/traces")
+				t.Setenv("SB_OTEL_TRACES_SAMPLE_RATIO", "0.25")
 				t.Setenv("OTEL_SERVICE_NAME", "sandboxd-prod")
 				t.Setenv("SB_IMAGE_PULL_MAX_CONCURRENT", "8")
 				t.Setenv("SB_IMAGE_PULL_FAILURE_BACKOFF", "2m")
@@ -218,11 +224,26 @@ func TestLoadCases(t *testing.T) {
 				if cfg.LogLevel != "debug" || cfg.ShutdownTimeout != 25*time.Second || cfg.HTTPClientTimeout != 12*time.Second {
 					t.Fatalf("unexpected log/duration overrides: %+v", cfg)
 				}
-				if !cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "http://otel.example.test:4318/v1/metrics" || cfg.OTELMetricsInterval != 45*time.Second || cfg.OTELServiceName != "sandboxd-prod" {
+				if !cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "http://otel.example.test:4318/v1/metrics" || cfg.OTELMetricsInterval != 45*time.Second || !cfg.OTELTracesEnabled || cfg.OTELTracesEndpoint != "http://otel.example.test:4318/v1/traces" || cfg.OTELTracesSampleRatio != 0.25 || cfg.OTELServiceName != "sandboxd-prod" {
 					t.Fatalf("unexpected otel overrides: %+v", cfg)
 				}
 				if cfg.ImagePullMaxConcurrent != 8 || cfg.ImagePullFailureBackoff != 2*time.Minute {
 					t.Fatalf("unexpected image pull overrides: %+v", cfg)
+				}
+			},
+		},
+		{
+			name: "generic_otel_endpoint_enables_exporters_without_endpoint_override",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example.test:4318")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if !cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "" || !cfg.OTELTracesEnabled || cfg.OTELTracesEndpoint != "" {
+					t.Fatalf("unexpected generic otel config: %+v", cfg)
 				}
 			},
 		},
@@ -248,6 +269,19 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.ShutdownTimeout != 10*time.Second {
 					t.Fatalf("expected invalid duration fallback, got %s", cfg.ShutdownTimeout)
+				}
+			},
+		},
+		{
+			name: "rejects_invalid_otel_trace_sample_ratio",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_OTEL_TRACES_ENABLED", "true")
+				t.Setenv("SB_OTEL_TRACES_SAMPLE_RATIO", "1.25")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_OTEL_TRACES_SAMPLE_RATIO") {
+					t.Fatalf("expected trace sample ratio error, got %v", err)
 				}
 			},
 		},

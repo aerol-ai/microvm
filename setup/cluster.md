@@ -1129,6 +1129,9 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_OTEL_METRICS_ENDPOINT` | no | OTLP/HTTP metrics endpoint, for example `http://otel-collector:4318/v1/metrics`. Setting it enables OTEL metrics. |
 | `SB_OTEL_METRICS_ENABLED` | no | Enables OTEL metrics without an explicit endpoint; the OTEL exporter env defaults apply. |
 | `SB_OTEL_METRICS_INTERVAL` | no | OTEL export interval. Default `30s`. |
+| `SB_OTEL_TRACES_ENDPOINT` | no | OTLP/HTTP traces endpoint, for example `http://otel-collector:4318/v1/traces`. Setting it enables OTEL traces. |
+| `SB_OTEL_TRACES_ENABLED` | no | Enables OTEL traces without an explicit endpoint; the OTEL exporter env defaults apply. |
+| `SB_OTEL_TRACES_SAMPLE_RATIO` | no | Parent-based trace sample ratio. Default `0.05`; use `1` for all root traces or `0` to disable local root sampling. |
 | `SB_IMAGE_PULL_MAX_CONCURRENT` | no | Per-worker cap on concurrent Docker image pulls. Default `4`; set `0` to disable the cap. |
 | `SB_IMAGE_PULL_FAILURE_BACKOFF` | no | Per-image/auth retry suppression after a failed pull. Default `30s`; set `0s` to disable. |
 
@@ -1286,12 +1289,17 @@ For OTEL, set:
 ```bash
 SB_OTEL_METRICS_ENDPOINT=http://otel-collector:4318/v1/metrics
 SB_OTEL_METRICS_INTERVAL=30s
+SB_OTEL_TRACES_ENDPOINT=http://otel-collector:4318/v1/traces
+SB_OTEL_TRACES_SAMPLE_RATIO=0.05
 OTEL_SERVICE_NAME=sandboxd
 ```
 
 The OTEL bridge exports the same `aerolvm_*` expvars under
 `aerolvm.expvar.int64` and `aerolvm.expvar.float64`, with the original expvar
-name in the `metric` attribute. A starter Grafana dashboard is available at
+name in the `metric` attribute. The trace exporter emits server spans for API
+requests, preserves incoming W3C trace context, and attaches the matched
+`http.route`, response status, node ID, node role, service name, and version.
+A starter Grafana dashboard is available at
 `setup/grafana/sandboxd-slo-dashboard.json`.
 
 Prometheus alert rules are available at `setup/prometheus/sandboxd-alerts.yml`.

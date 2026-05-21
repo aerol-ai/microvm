@@ -143,6 +143,9 @@ cat > /tmp/aerolvm-ops.env <<'EOF'
 SB_OTEL_METRICS_ENABLED=${otel_metrics_enabled}
 SB_OTEL_METRICS_ENDPOINT=${otel_metrics_endpoint}
 SB_OTEL_METRICS_INTERVAL=${otel_metrics_interval}
+SB_OTEL_TRACES_ENABLED=${otel_traces_enabled}
+SB_OTEL_TRACES_ENDPOINT=${otel_traces_endpoint}
+SB_OTEL_TRACES_SAMPLE_RATIO=${otel_traces_sample_ratio}
 OTEL_SERVICE_NAME=${otel_service_name}
 SB_IMAGE_PULL_MAX_CONCURRENT=${image_pull_max_concurrent}
 SB_IMAGE_PULL_FAILURE_BACKOFF=${image_pull_failure_backoff}

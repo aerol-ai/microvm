@@ -59,6 +59,9 @@ resource "aws_instance" "seed" {
     otel_metrics_enabled       = var.otel_metrics_enabled || var.otel_metrics_endpoint != ""
     otel_metrics_endpoint      = var.otel_metrics_endpoint
     otel_metrics_interval      = var.otel_metrics_interval
+    otel_traces_enabled        = var.otel_traces_enabled || var.otel_traces_endpoint != ""
+    otel_traces_endpoint       = var.otel_traces_endpoint
+    otel_traces_sample_ratio   = var.otel_traces_sample_ratio
     otel_service_name          = var.otel_service_name
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff
@@ -129,6 +132,9 @@ resource "aws_instance" "joiner" {
     otel_metrics_enabled       = var.otel_metrics_enabled || var.otel_metrics_endpoint != ""
     otel_metrics_endpoint      = var.otel_metrics_endpoint
     otel_metrics_interval      = var.otel_metrics_interval
+    otel_traces_enabled        = var.otel_traces_enabled || var.otel_traces_endpoint != ""
+    otel_traces_endpoint       = var.otel_traces_endpoint
+    otel_traces_sample_ratio   = var.otel_traces_sample_ratio
     otel_service_name          = var.otel_service_name
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff

@@ -141,7 +141,13 @@ type Config struct {
 	OTELMetricsEnabled  bool
 	OTELMetricsEndpoint string
 	OTELMetricsInterval time.Duration
-	OTELServiceName     string
+	// OTELTracesEnabled starts a native OTLP/HTTP trace exporter for API
+	// request spans. It is also enabled automatically when
+	// SB_OTEL_TRACES_ENDPOINT is set.
+	OTELTracesEnabled     bool
+	OTELTracesEndpoint    string
+	OTELTracesSampleRatio float64
+	OTELServiceName       string
 
 	// Admission control. Admission is purely resource-math: CPU/memory
 	// reservation ratios plus a live memory floor. There is no fixed sandbox
@@ -424,8 +430,11 @@ func Load() (Config, error) {
 		NetstatsPollInterval:        getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:              int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
 		OTELMetricsEnabled:          getEnvBool("SB_OTEL_METRICS_ENABLED", false),
-		OTELMetricsEndpoint:         firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
+		OTELMetricsEndpoint:         firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
 		OTELMetricsInterval:         getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		OTELTracesEnabled:           getEnvBool("SB_OTEL_TRACES_ENABLED", false),
+		OTELTracesEndpoint:          firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+		OTELTracesSampleRatio:       getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
 		OTELServiceName:             getEnv("OTEL_SERVICE_NAME", "sandboxd"),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
@@ -480,8 +489,11 @@ func Load() (Config, error) {
 		ImagePullMaxConcurrent:           getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
 		ImagePullFailureBackoff:          getEnvDuration("SB_IMAGE_PULL_FAILURE_BACKOFF", 30*time.Second),
 	}
-	if cfg.OTELMetricsEndpoint != "" {
+	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
+	}
+	if cfg.OTELTracesEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
+		cfg.OTELTracesEnabled = true
 	}
 
 	if cfg.PATToken == "" {
@@ -493,6 +505,9 @@ func Load() (Config, error) {
 	}
 	if cfg.OTELMetricsEnabled && cfg.OTELMetricsInterval <= 0 {
 		return Config{}, errors.New("SB_OTEL_METRICS_INTERVAL must be > 0 when OTEL metrics are enabled")
+	}
+	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
+		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")

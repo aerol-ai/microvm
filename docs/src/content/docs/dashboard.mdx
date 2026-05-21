@@ -141,13 +141,15 @@ Useful first alerts are `aerolvm_raft_apply_errors_total`,
 
 ## Prometheus, OTEL, and Grafana
 
-Prometheus is pull-based through `GET /v1/metrics`. Native OTEL metrics
-are push-based over OTLP/HTTP and are enabled by either setting
-`SB_OTEL_METRICS_ENABLED=true` or by setting an OTLP endpoint:
+Prometheus is pull-based through `GET /v1/metrics`. Native OTEL metrics and
+traces are push-based over OTLP/HTTP and are enabled by either setting
+`SB_OTEL_*_ENABLED=true` or by setting the matching OTLP endpoint:
 
 ```bash
 SB_OTEL_METRICS_ENDPOINT=http://otel-collector:4318/v1/metrics
 SB_OTEL_METRICS_INTERVAL=30s
+SB_OTEL_TRACES_ENDPOINT=http://otel-collector:4318/v1/traces
+SB_OTEL_TRACES_SAMPLE_RATIO=0.05
 OTEL_SERVICE_NAME=sandboxd
 ```
 
@@ -156,10 +158,17 @@ The OTEL bridge exports the same `aerolvm_*` expvars as observations under
 name is attached as the `metric` attribute, with expvar map keys attached
 as `key`, `key2`, and so on.
 
+The trace exporter emits server spans for API requests, extracts incoming
+W3C trace context, and tags spans with `http.route`, status code, node ID,
+node role, service name, and daemon version. The default local root sampling
+ratio is `0.05` so large clusters can send traces without turning every burst
+into telemetry load.
+
 A starter Grafana dashboard is checked in at
 `setup/grafana/sandboxd-slo-dashboard.json`. It covers create queue depth,
-worker pressure, route lag, shard health, Raft errors, data-plane errors,
-and image-pull storm signals.
+create latency buckets, worker pressure, worker lease coverage, route lag,
+shard health, Raft errors and snapshot size, data-plane errors, secret
+decrypt health, and image-pull storm signals.
 
 Prometheus alert rules are checked in at
 `setup/prometheus/sandboxd-alerts.yml`, with an Alertmanager routing example

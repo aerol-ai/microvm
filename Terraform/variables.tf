@@ -304,6 +304,29 @@ variable "otel_metrics_interval" {
   }
 }
 
+variable "otel_traces_enabled" {
+  description = "Enable sandboxd's native OTLP/HTTP trace exporter. Automatically true when otel_traces_endpoint is non-empty."
+  type        = bool
+  default     = false
+}
+
+variable "otel_traces_endpoint" {
+  description = "OTLP/HTTP traces endpoint written as SB_OTEL_TRACES_ENDPOINT, for example http://otel-collector:4318/v1/traces. Empty disables endpoint-specific config."
+  type        = string
+  default     = ""
+}
+
+variable "otel_traces_sample_ratio" {
+  description = "Parent-based trace sample ratio written as SB_OTEL_TRACES_SAMPLE_RATIO. 0 disables local sampling; 1 samples every root trace."
+  type        = number
+  default     = 0.05
+
+  validation {
+    condition     = var.otel_traces_sample_ratio >= 0 && var.otel_traces_sample_ratio <= 1
+    error_message = "otel_traces_sample_ratio must be between 0 and 1."
+  }
+}
+
 variable "otel_service_name" {
   description = "OTEL_SERVICE_NAME written into sandboxd env."
   type        = string
