@@ -1042,7 +1042,32 @@ func (c *Client) removeContainer(ctx context.Context, containerRef string, force
 	if force {
 		query.Set("force", "1")
 	}
-	return c.doJSON(ctx, http.MethodDelete, "/containers/"+url.PathEscape(containerRef), query, nil, nil, nil)
+	err := c.doJSON(ctx, http.MethodDelete, "/containers/"+url.PathEscape(containerRef), query, nil, nil, nil)
+	if err == nil {
+		return nil
+	}
+	// 404 = already gone. The post-condition we want ("container no longer
+	// exists") is already satisfied, so swallow it. Without this, a retry of
+	// a destroy that partially succeeded — or a destroy that races a
+	// `docker rm` / `--rm`-on-exit / lifecycle auto-destroy on the same
+	// container — propagates an error up through Service.DestroySandbox,
+	// which then skips the post-destroy cleanup the caller relies on (e.g.
+	// runLifecycleSweep's else-branch DeletePlacement). The result is a
+	// stranded FSM placement pointing at a node with no container.
+	// 409 is intentionally NOT benign: with force=true Docker won't return
+	// 409 for "container in use", so a 409 here means a real constraint
+	// the caller needs to see.
+	if isContainerRemoveBenignError(err.Error()) {
+		return nil
+	}
+	return err
+}
+
+// isContainerRemoveBenignError matches the substring doRequest emits for HTTP
+// 404 from the Docker daemon when deleting a container. The post-condition of
+// removeContainer is "container is gone"; 404 means it already is.
+func isContainerRemoveBenignError(message string) bool {
+	return strings.Contains(message, "status 404")
 }
 
 // RemoveImage deletes an image from the local Docker daemon by reference
