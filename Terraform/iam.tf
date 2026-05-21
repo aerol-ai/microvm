@@ -177,10 +177,15 @@ locals {
     : (var.caddy_shared_cert_storage.bucket != "" ? "arn:aws:s3:::${var.caddy_shared_cert_storage.bucket}" : "")
   )
 
+  # Don't reference local.caddy_certs_bucket_arn here — it depends on the
+  # managed bucket's arn, which is unknown until apply on the first run and
+  # makes `count` on the data source/policies below unplannable. The arn is
+  # non-empty exactly when (managed mode) OR (byo mode with bucket set), so
+  # check the inputs directly — both are known at plan time.
   caddy_certs_attach_iam = (
     var.caddy_shared_cert_storage.enabled
     && var.caddy_shared_cert_storage.access_key == ""
-    && local.caddy_certs_bucket_arn != ""
+    && (local.caddy_storage_s3_managed || var.caddy_shared_cert_storage.bucket != "")
   )
 }
 
