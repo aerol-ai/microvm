@@ -460,6 +460,15 @@ if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
 		echo "--caddy-storage-s3-access-key and --caddy-storage-s3-secret-key must be set together (or both omitted to use the default credential chain)." >&2
 		exit 1
 	fi
+	# Default the S3 endpoint to the AWS regional host when none was passed.
+	# The ss098/certmagic-s3 module wraps minio-go, which has no built-in AWS
+	# default — an empty host fails immediately with "Endpoint: does not
+	# follow ip address or domain name standards". The regional form works
+	# for every region (us-east-1 included) and gives correct SigV4 region
+	# inference inside minio-go.
+	if [[ -z "$CADDY_STORAGE_S3_ENDPOINT" ]]; then
+		CADDY_STORAGE_S3_ENDPOINT="s3.${CADDY_STORAGE_S3_REGION}.amazonaws.com"
+	fi
 fi
 
 if [[ "$BUILD_FROM_SOURCE" == "auto" ]]; then
@@ -741,9 +750,10 @@ EOF
 	local storage_block=""
 	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
 		storage_block=$'\n\tstorage s3 {'
-		if [[ -n "$CADDY_STORAGE_S3_ENDPOINT" ]]; then
-			storage_block+=$'\n\t\thost {env.SB_CADDY_S3_ENDPOINT}'
-		fi
+		# host is always emitted: certmagic-s3 / minio-go reject an empty
+		# endpoint. CADDY_STORAGE_S3_ENDPOINT was defaulted upstream to
+		# s3.<region>.amazonaws.com when the operator didn't pass one.
+		storage_block+=$'\n\t\thost {env.SB_CADDY_S3_ENDPOINT}'
 		storage_block+=$'\n\t\tbucket {env.SB_CADDY_S3_BUCKET}'
 		storage_block+=$'\n\t\tprefix {env.SB_CADDY_S3_PREFIX}'
 		if [[ -n "$CADDY_STORAGE_S3_ACCESS_KEY" ]]; then
@@ -815,8 +825,9 @@ write_caddy_env() {
 			echo "SB_CADDY_S3_REGION=$CADDY_STORAGE_S3_REGION"
 			echo "SB_CADDY_S3_ENDPOINT=$CADDY_STORAGE_S3_ENDPOINT"
 			echo "SB_CADDY_S3_PREFIX=$CADDY_STORAGE_S3_PREFIX"
-			# AWS_REGION lets the SDK inside certmagic-s3 pick the right
-			# endpoint when SB_CADDY_S3_ENDPOINT is empty.
+			# AWS_REGION lets minio-go (inside certmagic-s3) sign SigV4
+			# with the correct region. The endpoint host alone isn't
+			# enough — minio-go infers signing region from this env var.
 			echo "AWS_REGION=$CADDY_STORAGE_S3_REGION"
 			if [[ -n "$CADDY_STORAGE_S3_ACCESS_KEY" ]]; then
 				echo "SB_CADDY_S3_ACCESS_KEY=$CADDY_STORAGE_S3_ACCESS_KEY"
