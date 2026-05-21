@@ -16,7 +16,7 @@ Any change to:
 - `Service.allocateHostPort` allocator loop (`internal/service/`)
 - `Service.EnsureLayer4` / `Service.EnsureLayer4Ready` (`internal/service/service.go`)
 - The `l4Ready` `atomic.Bool` latch or the `l4Mu` mutex
-- `allocatorRandomAttempts` constant (`internal/service/service.go:37`)
+- `allocatorRandomAttempts` constant (`internal/service/service.go`)
 - `pkg/caddy/client.go` L4 route installation
 
 ## What you MUST do

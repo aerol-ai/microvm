@@ -21,9 +21,10 @@ Read [`pr-review.md`](./pr-review.md) before opening any PR that touches the ser
 
 ### API & server changes
 
-Before touching `internal/service`, `internal/store`, `pkg/caddy`, `pkg/api`, or
-the SDKs, read [`pr-review.md`](./pr-review.md). Non-negotiables (silence in the
-PR description is **not** acceptable on these axes):
+Before touching `internal/service`, `internal/store`, `internal/cluster`,
+`pkg/caddy`, `pkg/api`, or the SDKs, read [`pr-review.md`](./pr-review.md).
+Non-negotiables (silence in the PR description is **not** acceptable on
+these axes):
 
 1. **Idempotency.** Every sandbox API must be safe under retry + concurrent
    duplicate calls. `expose_port` returns the existing URL; never walks the
@@ -42,6 +43,15 @@ PR description is **not** acceptable on these axes):
    `EnsureLayer4`, `EnsureLayer4Ready`, or the `l4Ready` latch needs a
    regression test (see `store_test.go` / `layer4_bootstrap_test.go`) AND a PR
    call-out.
+6. **Cluster mode is fragile.** `internal/cluster/` runs Raft (FSM placement
+   state), SWIM gossip (membership + capacity heartbeats), and cross-node
+   forwarding. Any change to the FSM, placement selection, recovery
+   replication, owner watcher, or capacity-lease/heartbeat path needs a
+   regression test next to the file it changes (cluster_test.go, fsm_*_test.go,
+   placement_test.go, etc.) AND a PR call-out describing the cluster-correctness
+   impact (split brain risk, replay safety, leader-change behavior, single-node
+   regression). Cluster-mode code must remain a no-op when `cfg.EnableCluster`
+   is false — `Noop` exists for that.
 
 ## Repository map
 
@@ -51,12 +61,23 @@ cmd/
                  caddy → service → api server).
   toolboxd/      In-container agent (file/exec/sessions proxy target).
 internal/
+  cluster/       Cluster mode (Phase 1): SWIM gossip + Raft FSM placement +
+                 owner-sharded execution. cluster.go is the package overview.
+                 fsm.go owns the placement state machine; placement.go does
+                 power-of-two-choices selection; recovery_replication.go and
+                 recovery_store.go handle failover replicas; forward.go is
+                 the cross-node HTTP reverse proxy. High-risk area — touching
+                 anything in here needs the same care as the TCP pool.
   config/        Env-driven config loader.
+  observability/ OTEL traces + expvar metrics exporter for sandboxd.
   runtime/       Runtime.Runtime interface (Docker today, gVisor/Kata later).
+  scaleobs/      Scale-out observability metrics (admission / placement).
   service/       Business logic. Version-agnostic. Owns Service struct,
-                 CreateSandbox path, lifecycle, snapshots, l4 latch, mounts.
-                 Daytona/E2B helpers live here as named files (daytona.go,
-                 e2b.go), NOT version-aware branching.
+                 CreateSandbox / CreateSandboxWithID / RecreateSandbox entry
+                 points, lifecycle, snapshots, l4 latch, mounts, cluster
+                 secrets, image distribution. Daytona/E2B helpers live here
+                 as named files (daytona.go, e2b.go), NOT version-aware
+                 branching.
   store/         SQLite store. Single-writer (MaxOpenConns=1, WAL).
                  store.go has all schema + CRUD; store_test.go is the
                  regression-test target for host-port pool changes.
@@ -97,6 +118,18 @@ plans/
 .github/
   pull_request_template.md   Auto-fills PR descriptions; sections are required.
   workflows/                 test.yml (path-filtered), release.yml, publish-sdks.yml.
+Ansible/         Cluster deployment + role-change playbooks (sandboxd install,
+                 inventory, drain/remove-member, recovery runbooks).
+Terraform/       AWS provisioning for AerolVM clusters (network, nodes, IAM,
+                 DNS via Cloudflare, S3 backend for state).
+agentic_docs/    Reference docs for AI agents working in this repo
+                 (E2B SDK method map, request flow, idempotency timeline).
+packaging/       Systemd unit + Caddyfile template for sandboxd deployment.
+scripts/         Operational scripts (install/uninstall, cluster init/join,
+                 backup/restore, lost-quorum recovery, node-lifecycle, load).
+setup/           Operator-facing setup assets (Prometheus alerts, Alertmanager
+                 config, Grafana dashboards, deployment topology docs,
+                 runbooks).
 pr-review.md     The canonical PR review rules. Read before reviewing.
 .claude/skills/  Project-local Claude Code skills — invocable via /<name>.
                  See "Project skills" below.
@@ -152,11 +185,17 @@ For changes that don't match a skill, the file-level "where to look" map is:
 | Task | Start here |
 |---|---|
 | Add server business logic | `internal/service/service.go` (or new file in same package) |
+| Cluster placement / Raft FSM / gossip / failover | `internal/cluster/` — see `cluster.go` for the package overview, `fsm.go` + `placement.go` for owner assignment, `recovery_*.go` for failover replicas |
+| OTEL traces / expvar metrics exporter | `internal/observability/` |
 | Caddy route / TLS / L4 wiring | `pkg/caddy/client.go` |
 | Capacity / admission rules | `pkg/capacity/` |
 | Docker events / image GC | `pkg/docker/events.go`, `pkg/docker/image_gc_test.go` |
 | SSH gateway behavior | `pkg/sshgateway/gateway.go` |
 | In-sandbox toolbox agent | `cmd/toolboxd/` |
+| Cluster ops playbooks / inventory | `Ansible/playbooks/`, `Ansible/inventory/` |
+| Cluster infra (AWS) | `Terraform/` |
+| Operator alerts / dashboards / runbooks | `setup/prometheus/`, `setup/alertmanager/`, `setup/grafana/`, `setup/runbooks/` |
+| Operational scripts (backup, restore, cluster lifecycle) | `scripts/` |
 
 ## Conventions
 
