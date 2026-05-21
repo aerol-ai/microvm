@@ -8,6 +8,7 @@
 pat_token            = "REPLACE-with-shared-SB_PAT_TOKEN"
 cloudflare_api_token = "REPLACE-with-cloudflare-api-token" # Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01. Add Zone:Read if you want auto-zone-lookup below.
 domain_name          = "cluster.example.com"               # set empty to skip TLS and run in IP/path mode
+acme_email           = "ops@example.com"                   # Let's Encrypt contact email (expiry/revocation notices). Strongly recommended in domain mode; empty creates an anonymous ACME account with no notifications.
 
 # cloudflare_zone_id is optional. Leave it unset to auto-resolve the zone from
 # domain_name by stripping the first label ("cluster.example.com" -> "example.com").

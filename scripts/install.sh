@@ -15,6 +15,7 @@ CHECKSUMS_URL=""
 IDLE_TIMEOUT_MIN="0"
 DNS_PROVIDER=""
 DNS_API_TOKEN=""
+ACME_EMAIL=""
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
 WITH_GVISOR="false"
 RUNSC_PATH=""
@@ -63,6 +64,13 @@ Options:
   --dns-api-token <token>      API token for the configured DNS provider.
                                For cloudflare: a scoped API token with
                                Zone:Read + DNS:Edit on the target zone.
+  --acme-email <email>         Contact email registered with Let's Encrypt.
+                               Lets ACME send cert-expiry and revocation
+                               notices, and surfaces this account in any
+                               future rate-limit/abuse triage. Optional but
+                               strongly recommended in domain mode; without
+                               it Caddy creates an anonymous account and
+                               you get no warnings before things break.
   --with-gvisor                Install gVisor's runsc and register it as an
                                alternative OCI runtime in
                                /etc/docker/daemon.json so sandboxes can opt
@@ -293,6 +301,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--dns-api-token)
 			DNS_API_TOKEN="$2"
+			shift 2
+			;;
+		--acme-email)
+			ACME_EMAIL="$2"
 			shift 2
 			;;
 		--with-gvisor)
@@ -718,6 +730,14 @@ EOF
 	# Optional lines (host, access_id/secret_key) are emitted only when
 	# the operator supplied a value — empty strings would otherwise
 	# override the AWS default credential chain / endpoint.
+	# ACME account email lives in the global block. Without it Caddy creates
+	# an anonymous LE account and operators get no advance notice of
+	# expiring / revoked / rate-limited certs. Empty string omits the line
+	# entirely (preserves prior behavior for installs that don't pass one).
+	local email_line=""
+	if [[ -n "$ACME_EMAIL" ]]; then
+		email_line=$'\n\temail '"$ACME_EMAIL"
+	fi
 	local storage_block=""
 	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
 		storage_block=$'\n\tstorage s3 {'
@@ -735,7 +755,7 @@ EOF
 	fi
 	cat > /etc/caddy/Caddyfile <<EOF
 {
-	admin localhost:2019
+	admin localhost:2019${email_line}
 	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
 	# only receive traffic forwarded from caddy-l4's SNI fallback route.
 	# Disable Caddy's auto-managed :80 -> :443 redirect since :443 isn't ours.

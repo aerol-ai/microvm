@@ -45,6 +45,7 @@ resource "aws_instance" "seed" {
     domain                     = var.domain_name
     pat_token                  = var.pat_token
     cloudflare_api_token       = var.cloudflare_api_token
+    acme_email                 = var.acme_email
     with_gvisor                = local.seed_node.with_gvisor
     with_nvidia_gpu            = local.seed_node.with_nvidia_gpu
     with_amd_gpu               = local.seed_node.with_amd_gpu
@@ -127,6 +128,7 @@ resource "aws_instance" "joiner" {
     domain                     = var.domain_name
     pat_token                  = var.pat_token
     cloudflare_api_token       = var.cloudflare_api_token
+    acme_email                 = var.acme_email
     with_gvisor                = each.value.with_gvisor
     with_nvidia_gpu            = each.value.with_nvidia_gpu
     with_amd_gpu               = each.value.with_amd_gpu
