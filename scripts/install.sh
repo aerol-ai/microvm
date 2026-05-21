@@ -749,6 +749,12 @@ EOF
 		if [[ -n "$CADDY_STORAGE_S3_ACCESS_KEY" ]]; then
 			storage_block+=$'\n\t\taccess_id {env.SB_CADDY_S3_ACCESS_KEY}'
 			storage_block+=$'\n\t\tsecret_key {env.SB_CADDY_S3_SECRET_KEY}'
+		else
+			# No static creds → fall back to the AWS default credential
+			# chain (EC2 instance role, IRSA, env vars, ~/.aws/credentials).
+			# Without this line certmagic-s3 refuses to start with
+			# "access_id is empty and use_iam_provider is false".
+			storage_block+=$'\n\t\tuse_iam_provider true'
 		fi
 		storage_block+=$'\n\t\tencryption_key {env.SB_CADDY_S3_ENCRYPTION_KEY}'
 		storage_block+=$'\n\t}'
