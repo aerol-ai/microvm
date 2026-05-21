@@ -119,25 +119,37 @@ the rule isn't firing. Common causes:
   scale; not worth the complexity until you're at >1000 concurrent
   blocked sandboxes.
 
+## Reconcile and reboot recovery
+
+`networkBlockAll` is stored on the sandbox row and reconciled from Docker's
+current runtime view. On every boot reconcile and periodic reconcile pass,
+`sandboxd`:
+
+1. Lists the managed containers Docker currently has.
+2. Refreshes each sandbox row with the container's current ID and IP.
+3. Re-applies `BlockAllEgress(<current container IP>)` for every running
+   sandbox with `networkBlockAll=true`.
+
+This means host reboot, Docker chain rebuild, `iptables` flush, or a missed
+create/start rule install is healed by the next reconcile pass. The reapply is
+idempotent: the netrules manager checks for an existing `DOCKER-USER` rule
+before inserting, so running reconcile repeatedly does not create duplicate
+rules.
+
+You can force the same repair immediately:
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer $SB_PAT_TOKEN" \
+  http://127.0.0.1:21212/v1/admin/reconcile
+```
+
 ## Cleanup
 
-`ClearBlockAllEgress` is called in two places:
-
-1. `Destroy` (always) - removes the DROP rule when the sandbox is
-   destroyed.
-2. Reconcile (boot) - currently no-op for blocked containers (we don't
-   re-apply rules during reconcile because Docker's IPs may have
-   changed; the rule survives reboots only if iptables is persisted by
-   the host).
-
-⚠️ **iptables rules do not survive a host reboot by default**. If
-`networkBlockAll` is critical for security on your host, install
-`iptables-persistent` (Debian/Ubuntu) and persist after each
-sandbox change, OR run a periodic re-apply in `sandboxd`. The current
-implementation does the former - when the host reboots, the rules are
-gone until a new sandbox is created or destroyed.
-
-This is a real gap for production hardening; track in TODO.
+`ClearBlockAllEgress` is called when the sandbox is destroyed or when the
+runtime reports a stop/die/destroy event for that container IP. The stop path
+clears the per-IP rule because Docker may later assign that IP to an unrelated
+container. A later `Start` or reconcile pass re-applies the rule if the sandbox
+is still configured with `networkBlockAll=true`.
 
 ## File map
 
@@ -145,4 +157,5 @@ This is a real gap for production hardening; track in TODO.
 | --- | --- |
 | `pkg/docker/netrules/manager.go` | `Manager`, `BlockAllEgress`, `ClearBlockAllEgress` |
 | `pkg/docker/client.go` | calls `BlockAllEgress` after container start when `req.NetworkBlockAll` is set |
+| `internal/service/service.go` | re-applies `networkBlockAll` during start and reconcile using Docker's current container IP |
 | `internal/config/config.go` | `EnableNetworkRules` (env: `SB_ENABLE_NETWORK_RULES`, default `true`) |
