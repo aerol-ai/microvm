@@ -60,4 +60,51 @@ locals {
     substr(lower(replace(var.cluster_name, "/[^a-z0-9-]/", "-")), 0, 40),
     random_id.bundle_suffix.hex,
   )
+
+  # Caddy shared cert storage — resolved config that bootstrap.sh.tftpl
+  # consumes regardless of mode. In managed mode, fields point at TF-created
+  # resources; in byo mode, fields come straight from the user's tfvars. The
+  # template never needs to branch on mode this way.
+  caddy_storage_s3_enabled = var.caddy_shared_cert_storage.enabled
+  caddy_storage_s3_managed = (
+    var.caddy_shared_cert_storage.enabled
+    && var.caddy_shared_cert_storage.mode == "managed"
+  )
+  caddy_certs_bucket_name = format(
+    "%s-caddy-certs-%s",
+    substr(lower(replace(var.cluster_name, "/[^a-z0-9-]/", "-")), 0, 40),
+    random_id.bundle_suffix.hex,
+  )
+  caddy_storage_s3 = {
+    enabled  = var.caddy_shared_cert_storage.enabled
+    bucket   = local.caddy_storage_s3_managed ? local.caddy_certs_bucket_name : var.caddy_shared_cert_storage.bucket
+    region   = local.caddy_storage_s3_managed ? var.aws_region : var.caddy_shared_cert_storage.region
+    endpoint = var.caddy_shared_cert_storage.endpoint
+    prefix   = var.caddy_shared_cert_storage.prefix
+    # In managed mode the EC2 instance role grants the bucket, so we leave
+    # static creds empty (the AWS SDK default chain picks up the role).
+    # BYO mode passes whatever the operator supplied.
+    access_key = local.caddy_storage_s3_managed ? "" : var.caddy_shared_cert_storage.access_key
+    secret_key = local.caddy_storage_s3_managed ? "" : var.caddy_shared_cert_storage.secret_key
+    encryption_key = (
+      local.caddy_storage_s3_managed
+      ? (length(random_id.caddy_storage_s3_encryption_key) > 0 ? random_id.caddy_storage_s3_encryption_key[0].b64_std : "")
+      : var.caddy_shared_cert_storage.encryption_key
+    )
+  }
+}
+
+# certmagic-s3 encrypts cert+private-key bytes with this 32-byte key before
+# uploading. Every node MUST present the same value or readers can't decrypt
+# what the issuing node wrote. Managed mode auto-generates and threads it via
+# user_data; BYO mode uses var.caddy_shared_cert_storage.encryption_key
+# directly (and this resource is suppressed).
+#
+# random_id with byte_length = 32 gives us a true 32-byte secret; b64_std
+# emits the same base64 format an operator would produce by hand with
+# `openssl rand -base64 32`.
+resource "random_id" "caddy_storage_s3_encryption_key" {
+  count = local.caddy_storage_s3_managed && var.caddy_shared_cert_storage.encryption_key == "" ? 1 : 0
+
+  byte_length = 32
 }

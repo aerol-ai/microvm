@@ -66,6 +66,15 @@ resource "aws_instance" "seed" {
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff
     extra_user_data            = local.seed_node.extra_user_data
+    # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
+    caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
+    caddy_storage_s3_bucket         = local.caddy_storage_s3.bucket
+    caddy_storage_s3_region         = local.caddy_storage_s3.region
+    caddy_storage_s3_endpoint       = local.caddy_storage_s3.endpoint
+    caddy_storage_s3_prefix         = local.caddy_storage_s3.prefix
+    caddy_storage_s3_access_key     = local.caddy_storage_s3.access_key
+    caddy_storage_s3_secret_key     = local.caddy_storage_s3.secret_key
+    caddy_storage_s3_encryption_key = local.caddy_storage_s3.encryption_key
   })
 
   tags = merge(
@@ -139,6 +148,15 @@ resource "aws_instance" "joiner" {
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff
     extra_user_data            = each.value.extra_user_data
+    # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
+    caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
+    caddy_storage_s3_bucket         = local.caddy_storage_s3.bucket
+    caddy_storage_s3_region         = local.caddy_storage_s3.region
+    caddy_storage_s3_endpoint       = local.caddy_storage_s3.endpoint
+    caddy_storage_s3_prefix         = local.caddy_storage_s3.prefix
+    caddy_storage_s3_access_key     = local.caddy_storage_s3.access_key
+    caddy_storage_s3_secret_key     = local.caddy_storage_s3.secret_key
+    caddy_storage_s3_encryption_key = local.caddy_storage_s3.encryption_key
   })
 
   depends_on = [aws_instance.seed]

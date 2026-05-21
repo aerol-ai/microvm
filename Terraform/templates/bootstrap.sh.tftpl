@@ -58,6 +58,29 @@ INSTALL_ARGS+=(--with-amd-gpu)
 %{ if idle_timeout_min > 0 ~}
 INSTALL_ARGS+=(--idle-timeout-min '${idle_timeout_min}')
 %{ endif ~}
+%{ if caddy_storage_s3_enabled ~}
+# Shared S3-backed Caddy cert storage. Every node points at the same
+# bucket; certmagic-s3 holds a distributed lock during ACME so only the
+# leader issues / renews. encryption_key must match across every node
+# or readers can't decrypt what the leader wrote. See
+# setup/multi-node-cert-sharing.md for the operator-level explanation.
+INSTALL_ARGS+=(
+  --caddy-storage-s3
+  --caddy-storage-s3-bucket '${caddy_storage_s3_bucket}'
+  --caddy-storage-s3-region '${caddy_storage_s3_region}'
+  --caddy-storage-s3-prefix '${caddy_storage_s3_prefix}'
+  --caddy-storage-s3-encryption-key '${caddy_storage_s3_encryption_key}'
+)
+%{ if caddy_storage_s3_endpoint != "" ~}
+INSTALL_ARGS+=(--caddy-storage-s3-endpoint '${caddy_storage_s3_endpoint}')
+%{ endif ~}
+%{ if caddy_storage_s3_access_key != "" ~}
+INSTALL_ARGS+=(
+  --caddy-storage-s3-access-key '${caddy_storage_s3_access_key}'
+  --caddy-storage-s3-secret-key '${caddy_storage_s3_secret_key}'
+)
+%{ endif ~}
+%{ endif ~}
 
 sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 

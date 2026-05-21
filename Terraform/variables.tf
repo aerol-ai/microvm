@@ -427,3 +427,57 @@ variable "seed_wait_max_seconds" {
   type        = number
   default     = 1800
 }
+
+variable "caddy_shared_cert_storage" {
+  description = <<-EOT
+    Shared S3-backed Caddy cert storage. Lets every ingress node read the
+    wildcard cert issued by one node, sidestepping Let's Encrypt rate
+    limits when the cluster has 10+ ingress-bearing nodes. Disabled by
+    default; each node issues its own cert when off (the existing
+    behaviour, fine up to a handful of nodes).
+
+    mode = "managed": Terraform creates a dedicated S3 bucket + IAM
+                      grants, and generates the encryption_key
+                      automatically (stored in TF state).
+    mode = "byo":     Operator supplies bucket / region / encryption_key
+                      (and optional creds for non-EC2-instance-role auth).
+                      Useful when the bucket already exists, lives in
+                      another account, or is Cloudflare R2 / MinIO.
+
+    encryption_key must be a base64-encoded 32-byte secret and identical
+    on every node. Losing it makes existing stored certs unreadable.
+    See setup/multi-node-cert-sharing.md.
+  EOT
+  type = object({
+    enabled        = bool
+    mode           = optional(string, "managed")
+    bucket         = optional(string, "")
+    region         = optional(string, "")
+    endpoint       = optional(string, "")
+    prefix         = optional(string, "caddy")
+    access_key     = optional(string, "")
+    secret_key     = optional(string, "")
+    encryption_key = optional(string, "")
+  })
+  default = {
+    enabled = false
+  }
+
+  validation {
+    condition     = !var.caddy_shared_cert_storage.enabled || contains(["managed", "byo"], var.caddy_shared_cert_storage.mode)
+    error_message = "caddy_shared_cert_storage.mode must be either \"managed\" or \"byo\"."
+  }
+
+  validation {
+    condition = (
+      !var.caddy_shared_cert_storage.enabled
+      || var.caddy_shared_cert_storage.mode != "byo"
+      || (
+        var.caddy_shared_cert_storage.bucket != ""
+        && var.caddy_shared_cert_storage.region != ""
+        && var.caddy_shared_cert_storage.encryption_key != ""
+      )
+    )
+    error_message = "When caddy_shared_cert_storage.mode = \"byo\", bucket, region, and encryption_key are all required."
+  }
+}

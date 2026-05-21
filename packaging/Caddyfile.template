@@ -6,6 +6,13 @@
 # domain ceiling. HTTP-01 on-demand was removed because the per-subdomain ask
 # endpoint allowed arbitrary subdomain probes to burn the issuance quota.
 #
+# Optional shared cert storage (opt-in, see setup/multi-node-cert-sharing.md):
+# when scripts/install.sh is invoked with --caddy-storage-s3, an additional
+# `storage s3 { ... }` directive is injected into the global block below.
+# certmagic-s3 then holds a distributed lock during ACME, so exactly one node
+# issues / renews the wildcard while the rest read it from S3 — the path that
+# matters once a cluster has 10+ ingress nodes racing for the same wildcard.
+#
 # Substitution placeholders below:
 #   {{ROOT_SITE_ADDRESS}}     — the apex domain ($DOMAIN)
 #   {{WILDCARD_SITE_ADDRESS}} — *.$DOMAIN

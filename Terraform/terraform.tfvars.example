@@ -126,6 +126,28 @@ nodes = {
 # How long joiners wait for the seed's S3 artifacts before failing cloud-init.
 # seed_wait_max_seconds = 1800
 
+# Shared Caddy cert storage. Off by default — each node issues its own
+# wildcard cert via DNS-01, which works at low ingress counts. Flip on
+# when running 10+ ingress nodes so a single node holds the ACME lock
+# and the rest read the cert from S3. See setup/multi-node-cert-sharing.md.
+#
+# Managed mode — Terraform owns the bucket + IAM + encryption key:
+# caddy_shared_cert_storage = {
+#   enabled = true
+# }
+#
+# BYO mode — point at an existing S3-compatible bucket (R2, MinIO, ...):
+# caddy_shared_cert_storage = {
+#   enabled        = true
+#   mode           = "byo"
+#   bucket         = "my-caddy-certs"
+#   region         = "auto"                                                    # "auto" for R2
+#   endpoint       = "https://<accountid>.r2.cloudflarestorage.com"
+#   access_key     = "REPLACE-with-r2-or-minio-key"
+#   secret_key     = "REPLACE-with-r2-or-minio-secret"
+#   encryption_key = "REPLACE-with-output-of-openssl-rand-base64-32"
+# }
+
 # Extra tags applied to every AWS resource.
 # extra_tags = {
 #   Env   = "prod"
