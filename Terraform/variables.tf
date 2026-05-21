@@ -376,6 +376,12 @@ variable "domain_name" {
   type        = string
 }
 
+variable "acme_email" {
+  description = "Contact email registered with Let's Encrypt. Receives cert-expiry warnings and is the identity LE uses for rate-limit triage. Strongly recommended in domain mode; empty creates an anonymous ACME account with no notifications."
+  type        = string
+  default     = ""
+}
+
 variable "create_wildcard_record" {
   description = "Whether to create a wildcard *.<domain_name> A record alongside the apex."
   type        = bool
