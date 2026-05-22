@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -426,5 +427,47 @@ func TestAgentPlacementCollectionsUseControlPlaneAndFallbackCache(t *testing.T) 
 	pages := capture.pageRequestsSnapshot()
 	if len(pages) != 1 || pages[0].Limit != DefaultPlacementPageLimit {
 		t.Fatalf("page requests = %+v, want normalized default limit", pages)
+	}
+}
+
+func TestAgentMiscWrappers(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Cluster-Forwarded") != "1" {
+			t.Fatalf("forwarded request missing loop-detection header")
+		}
+		_, _ = w.Write([]byte("forwarded"))
+	}))
+	defer target.Close()
+
+	agent := &Agent{
+		publicProxies:  newProxyCache(defaultPublicTransport),
+		internalServer: &internalServer{},
+		placementCache: []Placement{{SandboxID: "sb-cache"}},
+		shardCache: map[string][]Placement{
+			placementShardFilterCacheKey(PlacementShardFilter{}): {{SandboxID: "sb-cache"}},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-cache", nil)
+	rr := httptest.NewRecorder()
+	agent.ForwardHTTP(Endpoint{APIURL: target.URL}, rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "forwarded" {
+		t.Fatalf("ForwardHTTP() = (%d, %q), want (200, forwarded)", rr.Code, rr.Body.String())
+	}
+
+	agent.AttachInternalHandler(http.NotFoundHandler())
+	if agent.internalServer.extra.Load() == nil {
+		t.Fatal("AttachInternalHandler() did not install the extra handler")
+	}
+	if got := agent.SubscribePlacement(context.Background()); got != nil {
+		t.Fatalf("SubscribePlacement() = %v, want nil", got)
+	}
+	cached := agent.cachedPlacements()
+	if len(cached) != 1 || cached[0].SandboxID != "sb-cache" {
+		t.Fatalf("cachedPlacements() = %+v, want cached placement copy", cached)
+	}
+	cached[0].SandboxID = "mutated"
+	if agent.placementCache[0].SandboxID != "sb-cache" {
+		t.Fatalf("cachedPlacements() did not deep-clone: %+v", agent.placementCache)
 	}
 }
