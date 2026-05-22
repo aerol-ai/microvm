@@ -206,6 +206,21 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleExec(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/process/code-run":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaCodeRun(w, r)
+		case strings.HasPrefix(r.URL.Path, "/process/interpreter/"):
+			// codeInterpreter.runCode() is Daytona's stateful Jupyter-kernel API.
+			// We don't host a kernel in the default toolbox image; without an
+			// explicit 501 here a WS upgrade GET would 404 with the default
+			// branch's "not found" body, which the SDK can't disambiguate from
+			// other "thing missing" failures. Hand back a clear 501.
+			if !s.requireAuth(w, r) {
+				return
+			}
+			writeError(w, http.StatusNotImplemented, "codeInterpreter is not implemented; use process.codeRun or process.executeCommand instead")
 		case strings.HasPrefix(r.URL.Path, "/process/session"):
 			if !s.requireAuth(w, r) {
 				return

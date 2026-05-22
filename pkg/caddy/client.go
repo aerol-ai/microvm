@@ -467,6 +467,8 @@ func inFluxPortRouteID(id string, port int) string {
 }
 
 // IDs exposed for the zombie GC to add to its keep-set.
+func SandboxRouteID(id string) string              { return sandboxRouteID(id) }
+func PortRouteID(id string, port int) string       { return portRouteID(id, port) }
 func InFluxSandboxRouteID(id string) string        { return inFluxSandboxRouteID(id) }
 func InFluxPortRouteID(id string, port int) string { return inFluxPortRouteID(id, port) }
 
