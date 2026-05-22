@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
+	"github.com/gorilla/websocket"
 )
 
 func newDaytonaTestServer(t *testing.T) *server {
 	t.Helper()
-	mgr, err := sessions.New(slog.New(slog.NewTextHandler(io.Discard, nil)), sessions.Config{
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr, err := sessions.New(logger, sessions.Config{
 		SandboxID:    "sb-test",
 		RecordingDir: filepath.Join(t.TempDir(), "recordings"),
 		BufferBytes:  1 << 14,
@@ -26,7 +28,7 @@ func newDaytonaTestServer(t *testing.T) *server {
 		t.Fatalf("sessions.New: %v", err)
 	}
 	t.Cleanup(mgr.Close)
-	return &server{sessions: mgr, daytona: newDaytonaCompat()}
+	return &server{sessions: mgr, daytona: newDaytonaCompat(), logger: logger}
 }
 
 func TestHandleDaytonaProcessRouteSessionLifecycle(t *testing.T) {
@@ -225,4 +227,151 @@ func waitForCommandStdoutContains(t *testing.T, srv *server, sessionID, commandI
 		time.Sleep(20 * time.Millisecond)
 	}
 	return false
+}
+
+// TestHandleDaytonaSessionCommandLogsFollowStreamsWebSocket pins the
+// /process/session/{sid}/command/{cid}/logs?follow=true contract: the
+// handler must accept a WebSocket upgrade and emit stdout/stderr chunks
+// framed with the Daytona-SDK demux markers (0x01x3 / 0x02x3). Without
+// this path, @daytona/sdk's getSessionCommandLogs(..., onStdout, onStderr)
+// receives HTTP 200 and aborts with `Unexpected server response: 200`.
+func TestHandleDaytonaSessionCommandLogsFollowStreamsWebSocket(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !srv.handleDaytonaProcessRoute(w, r) {
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(httpSrv.Close)
+
+	createReq, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/process/session",
+		bytes.NewBufferString(`{"sessionId":"follow-session"}`))
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_ = createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create status = %d", createResp.StatusCode)
+	}
+
+	// Long-running async command: print, sleep, print. With async=true the
+	// exec endpoint returns immediately, so the WebSocket subscriber joins
+	// while output is still being produced.
+	execBody := `{"command":"printf first ; sleep 0.2 ; printf second","runAsync":true}`
+	execResp, err := http.Post(httpSrv.URL+"/process/session/follow-session/exec",
+		"application/json", bytes.NewBufferString(execBody))
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	defer execResp.Body.Close()
+	if execResp.StatusCode != http.StatusOK {
+		t.Fatalf("exec status = %d", execResp.StatusCode)
+	}
+	var execPayload daytonaSessionExecuteResponse
+	if err := json.NewDecoder(execResp.Body).Decode(&execPayload); err != nil {
+		t.Fatalf("decode exec: %v", err)
+	}
+	if execPayload.CmdID == "" {
+		t.Fatal("expected cmdId")
+	}
+
+	wsURL := strings.Replace(httpSrv.URL, "http://", "ws://", 1) +
+		"/process/session/follow-session/command/" + execPayload.CmdID + "/logs?follow=true"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("WS dial: %v (resp status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var collected []byte
+	for {
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			// EOF when the runner closes the subscriber channel after the
+			// command finishes — expected.
+			break
+		}
+		if msgType != websocket.BinaryMessage {
+			t.Fatalf("frame type = %d, want binary", msgType)
+		}
+		collected = append(collected, payload...)
+		if bytes.Contains(collected, []byte("first")) && bytes.Contains(collected, []byte("second")) {
+			break
+		}
+	}
+
+	// Every byte we received should be inside a stdout-prefixed region —
+	// the SDK's stdDemuxStream slices on these markers to assign streams.
+	if !bytes.HasPrefix(collected, daytonaStdoutPrefix) {
+		t.Fatalf("first bytes = % x, want stdout marker prefix", collected[:min(len(collected), 6)])
+	}
+	// Strip the marker(s) and compare payload bytes. There may be a
+	// single replay frame or multiple live frames concatenated; either
+	// way the marker bytes themselves are not part of the user payload.
+	payload := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
+	payload = bytes.ReplaceAll(payload, daytonaStderrPrefix, nil)
+	if !bytes.Contains(payload, []byte("first")) || !bytes.Contains(payload, []byte("second")) {
+		t.Fatalf("payload after demux = %q, want both 'first' and 'second'", payload)
+	}
+}
+
+// TestHandleDaytonaSessionCommandLogsFollowReplaysFinishedCommand covers
+// the cold-cache case: by the time the subscriber connects, the command
+// has already finished. The handler must still replay the buffered
+// stdout/stderr from a single frame and then close cleanly.
+func TestHandleDaytonaSessionCommandLogsFollowReplaysFinishedCommand(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !srv.handleDaytonaProcessRoute(w, r) {
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(httpSrv.Close)
+
+	createResp, err := http.Post(httpSrv.URL+"/process/session", "application/json",
+		bytes.NewBufferString(`{"sessionId":"replay-session"}`))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_ = createResp.Body.Close()
+
+	// Synchronous exec — by the time we get the response, the command has
+	// finished and stream.finish() has already been called.
+	execResp, err := http.Post(httpSrv.URL+"/process/session/replay-session/exec",
+		"application/json", bytes.NewBufferString(`{"command":"printf replay-payload"}`))
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	defer execResp.Body.Close()
+	var execPayload daytonaSessionExecuteResponse
+	if err := json.NewDecoder(execResp.Body).Decode(&execPayload); err != nil {
+		t.Fatalf("decode exec: %v", err)
+	}
+
+	wsURL := strings.Replace(httpSrv.URL, "http://", "ws://", 1) +
+		"/process/session/replay-session/command/" + execPayload.CmdID + "/logs?follow=true"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("WS dial: %v", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var collected []byte
+	for {
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		collected = append(collected, payload...)
+	}
+	payload := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
+	payload = bytes.ReplaceAll(payload, daytonaStderrPrefix, nil)
+	if !bytes.Contains(payload, []byte("replay-payload")) {
+		t.Fatalf("replay payload = %q, want to contain 'replay-payload'", payload)
+	}
 }
