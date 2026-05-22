@@ -3,6 +3,9 @@
 
 sandboxd_binary_path:   /usr/local/bin/sandboxd
 sandboxd_service_name:  sandboxd
+# Toolboxd is the in-container agent; it's bind-mounted into every sandbox
+# from this host path (see pkg/docker/client.go and packaging/.env.template).
+toolboxd_binary_path:   /usr/local/bin/toolboxd
 sandboxd_env_file:      /etc/sandboxd/sandboxd.env
 sandboxd_cluster_env_file: /etc/sandboxd/cluster.env
 sandboxd_health_url:    "http://127.0.0.1:21212/health"

@@ -1,0 +1,127 @@
+---
+# Roll a new toolboxd binary across the cluster.
+#
+# Toolboxd is the in-container agent. Sandboxd bind-mounts it read-only into
+# every new sandbox at container-create time (pkg/docker/client.go:318), so:
+#   - There is no systemd service to restart on the host.
+#   - The host's /health endpoint reflects sandboxd, not toolboxd, so we
+#     can't verify the new binary works without creating a sandbox.
+#   - Existing sandboxes keep running the OLD toolboxd loaded into RAM at
+#     their create time. They MUST be recreated to pick up the new binary.
+#
+# Usage:
+#   # Push a locally-built binary (the common case while developing):
+#   ansible-playbook playbooks/update-toolboxd.yml \
+#     -e toolboxd_local_binary=../bin/toolboxd
+#
+#   # Or fetch from a GitHub release URL on each node:
+#   ansible-playbook playbooks/update-toolboxd.yml \
+#     -e toolboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/toolboxd_linux_amd64
+#
+#   # Limit to a single host while testing:
+#   ansible-playbook playbooks/update-toolboxd.yml -e ... --limit aerolvm-srv1
+#
+# Safety:
+#   - serial: 1 → one node at a time. Not strictly required (no host process
+#     restart), but matches update-sandboxd.yml so concurrent sandbox creates
+#     never race the file-swap.
+#   - The atomic mv guarantees a sandbox starting during the rollout sees
+#     either the old or the new inode, never a half-written file.
+#   - become: true → /usr/local/bin writes require root.
+
+- name: Update toolboxd across the AerolVM cluster
+  hosts: all
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Validate that exactly one source was provided
+      delegate_to: localhost
+      become: false
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - (toolboxd_local_binary is defined) != (toolboxd_remote_url is defined)
+        fail_msg: >-
+          Set exactly one of -e toolboxd_local_binary=<path> or
+          -e toolboxd_remote_url=<url>.
+
+    # Ansible doesn't run tasks in the directory you invoked ansible-playbook
+    # from — it switches into its own temp dir, so a user-supplied relative
+    # path like `../bin/toolboxd` would silently miss. Anchor relative paths
+    # to playbook_dir so the same -e value works regardless of CWD. The
+    # passed path is assumed to be relative to the Ansible/ directory (one
+    # level above playbooks/), matching how operators run this from there.
+    - name: Resolve toolboxd_local_binary to an absolute path
+      when: toolboxd_local_binary is defined
+      delegate_to: localhost
+      become: false
+      run_once: true
+      ansible.builtin.set_fact:
+        toolboxd_local_binary_abs: >-
+          {{ toolboxd_local_binary if toolboxd_local_binary.startswith('/')
+             else (playbook_dir + '/../' + toolboxd_local_binary) }}
+
+    - name: Confirm local binary exists
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: toolboxd_local_binary is defined
+      ansible.builtin.stat:
+        path: "{{ toolboxd_local_binary_abs }}"
+      register: local_bin_stat
+      failed_when: not local_bin_stat.stat.exists
+
+  tasks:
+    - name: "[{{ inventory_hostname }}] Stage new binary at /tmp/toolboxd.new (local upload)"
+      when: toolboxd_local_binary is defined
+      ansible.builtin.copy:
+        src: "{{ toolboxd_local_binary_abs }}"
+        dest: /tmp/toolboxd.new
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: "[{{ inventory_hostname }}] Stage new binary at /tmp/toolboxd.new (remote fetch)"
+      when: toolboxd_remote_url is defined
+      ansible.builtin.get_url:
+        url: "{{ toolboxd_remote_url }}"
+        dest: /tmp/toolboxd.new
+        mode: "0755"
+        owner: root
+        group: root
+        force: true
+
+    - name: "[{{ inventory_hostname }}] Atomic swap into {{ toolboxd_binary_path }}"
+      # mv is atomic within a filesystem. A sandbox bind-mount captured before
+      # the swap keeps its old inode; one captured after sees the new file.
+      ansible.builtin.command:
+        cmd: mv -f /tmp/toolboxd.new {{ toolboxd_binary_path }}
+      changed_when: true
+
+  post_tasks:
+    - name: "[{{ inventory_hostname }}] Report installed toolboxd version"
+      # Wrap in `timeout 5s`: toolboxd builds older than the --version flag
+      # (added 2026-05-23) interpret any argv as a user entrypoint and then
+      # block on ListenAndServe, hanging the playbook. The timeout bounds
+      # that worst case — newer binaries return in milliseconds.
+      ansible.builtin.command:
+        cmd: timeout 5s {{ toolboxd_binary_path }} --version
+      register: ver
+      changed_when: false
+      failed_when: false
+
+    - name: "[{{ inventory_hostname }}] toolboxd version"
+      ansible.builtin.debug:
+        msg: "{{ ver.stdout | default(ver.stderr) | default('(--version unsupported)') }}"
+
+    - name: "[{{ inventory_hostname }}] Reminder"
+      run_once: true
+      delegate_to: localhost
+      become: false
+      ansible.builtin.debug:
+        msg: >-
+          toolboxd binary replaced on host(s). EXISTING sandboxes still run the
+          old in-RAM binary — destroy and recreate them to pick up the new code.

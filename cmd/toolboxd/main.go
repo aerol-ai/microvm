@@ -62,6 +62,21 @@ func (s *server) portAllowed(port int) bool {
 }
 
 func main() {
+	// --version / -v must be handled before any server setup so deploy
+	// tooling (Ansible's update-toolboxd.yml) can probe an installed binary
+	// without accidentally launching it as a daemon. Note: when toolboxd
+	// runs inside a sandbox container, os.Args[1:] is the user's entry-point
+	// command — there's no ambiguity here because a user command starting
+	// with "--version" isn't a sensible sandbox entrypoint, and treating it
+	// as a flag means we exit before binding the listener.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version", "-v", "version":
+			fmt.Println(version.Version)
+			return
+		}
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
 
 	srv := &server{

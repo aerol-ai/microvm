@@ -30,6 +30,20 @@ func TestIsMixedArchitectureRole(t *testing.T) {
 	}
 }
 
+func TestLiveMemberCountSkipsDeadAndBlankNodes(t *testing.T) {
+	members := []Member{
+		{NodeID: "node-1", Alive: true},
+		{NodeID: "node-2", Alive: false},
+		{NodeID: "", Alive: true},
+		{NodeID: "   ", Alive: true},
+		{NodeID: "node-3", Alive: true},
+	}
+
+	if got := LiveMemberCount(members); got != 2 {
+		t.Fatalf("LiveMemberCount() = %d, want 2", got)
+	}
+}
+
 func TestLargeClusterTopologyAllowsSmallMixedCluster(t *testing.T) {
 	members := makeTopologyMembers(
 		config.NodeRoleMixed,

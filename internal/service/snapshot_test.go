@@ -202,3 +202,80 @@ func TestDeleteSnapshotRemovesImageAndStoreEntry(t *testing.T) {
 		t.Fatalf("expected ErrNotFound after delete, got %v", err)
 	}
 }
+
+func TestGetSnapshotFindsByImageID(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	snapshot := &models.SandboxSnapshot{
+		Name:            "demo-snapshot-by-id",
+		Image:           "snapshots/demo:by-id",
+		ImageID:         "sha256:demo-by-id",
+		SourceSandboxID: "sb-source",
+		CreatedAt:       time.Now().UTC().Round(0),
+	}
+	if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+		t.Fatalf("CreateSnapshot() error = %v", err)
+	}
+
+	svc := &Service{store: st, docker: &fakeSnapshotRuntime{}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	got, err := svc.GetSnapshot(ctx, snapshot.ImageID)
+	if err != nil {
+		t.Fatalf("GetSnapshot() by image id error = %v", err)
+	}
+	if got.Name != snapshot.Name {
+		t.Fatalf("GetSnapshot() name = %q, want %q", got.Name, snapshot.Name)
+	}
+	if got.ImageID != snapshot.ImageID {
+		t.Fatalf("GetSnapshot() image id = %q, want %q", got.ImageID, snapshot.ImageID)
+	}
+}
+
+func TestListSnapshotsReturnsNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	older := &models.SandboxSnapshot{
+		Name:            "demo-snapshot-older",
+		Image:           "snapshots/demo:older",
+		ImageID:         "sha256:older",
+		SourceSandboxID: "sb-source",
+		CreatedAt:       time.Now().UTC().Add(-time.Minute).Round(0),
+	}
+	newer := &models.SandboxSnapshot{
+		Name:            "demo-snapshot-newer",
+		Image:           "snapshots/demo:newer",
+		ImageID:         "sha256:newer",
+		SourceSandboxID: "sb-source",
+		CreatedAt:       time.Now().UTC().Round(0),
+	}
+	for _, snapshot := range []*models.SandboxSnapshot{older, newer} {
+		if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+			t.Fatalf("CreateSnapshot(%q) error = %v", snapshot.Name, err)
+		}
+	}
+
+	svc := &Service{store: st, docker: &fakeSnapshotRuntime{}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	items, err := svc.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots() error = %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(ListSnapshots()) = %d, want 2", len(items))
+	}
+	if items[0].Name != newer.Name || items[1].Name != older.Name {
+		t.Fatalf("ListSnapshots() order = [%s %s], want [%s %s]", items[0].Name, items[1].Name, newer.Name, older.Name)
+	}
+}
