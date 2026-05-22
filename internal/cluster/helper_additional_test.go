@@ -151,6 +151,25 @@ func TestAgentMembersFallsBackToGossipOnControlPlaneError(t *testing.T) {
 	}
 }
 
+func TestAgentMembersFallsBackToGossipWhenControlPlanePayloadHasNoMembers(t *testing.T) {
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/cluster/members" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+	}),
+		Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker},
+		Member{NodeID: "worker-2", Alive: true, Role: config.NodeRoleWorker},
+	)
+
+	got := agent.Members()
+	if ids := memberIDs(got); len(ids) != 3 || ids[0] != "server-1" || ids[1] != "worker-2" || ids[2] != "worker-self" {
+		t.Fatalf("Members() fallback ids = %v, want [server-1 worker-2 worker-self]", ids)
+	}
+}
+
 func TestAgentLeaderReadsControlPlane(t *testing.T) {
 	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != PublicInternalClusterLeaderPath {
@@ -163,6 +182,16 @@ func TestAgentLeaderReadsControlPlane(t *testing.T) {
 
 	if got := agent.Leader(); got != "server-1" {
 		t.Fatalf("Leader() = %q, want server-1", got)
+	}
+}
+
+func TestAgentLeaderReturnsEmptyOnControlPlaneError(t *testing.T) {
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+
+	if got := agent.Leader(); got != "" {
+		t.Fatalf("Leader() = %q, want empty string on control-plane error", got)
 	}
 }
 
