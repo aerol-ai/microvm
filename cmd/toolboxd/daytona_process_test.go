@@ -165,6 +165,57 @@ func TestHandleDaytonaSessionCommandInputDeliversStdin(t *testing.T) {
 	}
 }
 
+// TestHandleDaytonaSessionCommandInputAutoTerminates pins the auto-newline
+// accommodation: bash's `read` blocks until EOL, and the Daytona SDK's
+// sendSessionCommandInput helper ships examples that omit the trailing \n.
+// The server appends one when missing so the "send a line of input" intent
+// works without forcing callers to know the bash detail.
+func TestHandleDaytonaSessionCommandInputAutoTerminates(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/process/session",
+		bytes.NewBufferString(`{"sessionId":"auto-newline-session"}`))
+	createRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(createRec, createReq) {
+		t.Fatal("expected create route to be handled")
+	}
+
+	execBody := `{"command":"read name && printf 'Hello, %s' \"$name\"","runAsync":true}`
+	execReq := httptest.NewRequest(http.MethodPost, "/process/session/auto-newline-session/exec",
+		bytes.NewBufferString(execBody))
+	execRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(execRec, execReq) {
+		t.Fatal("expected exec route to be handled")
+	}
+	var execResp daytonaSessionExecuteResponse
+	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("decode exec response: %v", err)
+	}
+
+	if !waitForActiveCommand(t, srv, "auto-newline-session", execResp.CmdID, 2*time.Second) {
+		t.Fatal("command never reached the active state")
+	}
+
+	// Send the input without a trailing newline, matching what the
+	// Daytona SDK does for `sendSessionCommandInput(sid, cid, 'Alice')`.
+	inputReq := httptest.NewRequest(http.MethodPost,
+		"/process/session/auto-newline-session/command/"+execResp.CmdID+"/input",
+		bytes.NewBufferString(`{"data":"Alice"}`))
+	inputRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(inputRec, inputReq) {
+		t.Fatal("expected input route to be handled")
+	}
+	if inputRec.Code != http.StatusOK {
+		t.Fatalf("input status = %d body=%s", inputRec.Code, inputRec.Body.String())
+	}
+
+	// The command should still complete, proving that the server
+	// supplied the missing newline for `read`.
+	if !waitForCommandStdoutContains(t, srv, "auto-newline-session", execResp.CmdID, "Hello, Alice", 3*time.Second) {
+		t.Fatal("command never received the input (no auto-newline?)")
+	}
+}
+
 func TestHandleDaytonaSessionCommandInputRejectsInactive(t *testing.T) {
 	srv := newDaytonaTestServer(t)
 
