@@ -137,7 +137,14 @@ func newToolboxProxyTestEnv(t *testing.T) *toolboxProxyTestEnv {
 		_, _, _ = conn.ReadMessage()
 	}
 	mux.HandleFunc("/process/interpreter/execute", wsHandler)
-	mux.HandleFunc("/process/session/", wsHandler)
+	mux.HandleFunc("/process/session", echoOK)
+	mux.HandleFunc("/process/session/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			wsHandler(w, r)
+			return
+		}
+		echoOK(w, r)
+	})
 
 	toolboxServer := httptest.NewServer(mux)
 	wsClose = toolboxServer.Close
@@ -419,6 +426,10 @@ func TestToolboxProxyForwardedRoutes(t *testing.T) {
 		// pty (bare path covers list + create)
 		{"createPty", "pty", http.MethodPost, "/process/pty", "/process/pty"},
 		{"listPty", "pty", http.MethodGet, "/process/pty", "/process/pty"},
+		// exec-command session lifecycle + stdin
+		{"createSession", "exec-command", http.MethodPost, "/process/session", "/process/session"},
+		{"sessionExec", "exec-command", http.MethodPost, "/process/session/s1/exec", "/process/session/s1/exec"},
+		{"sessionInput", "exec-command", http.MethodPost, "/process/session/s1/command/c1/input", "/process/session/s1/command/c1/input"},
 	}
 
 	env := newToolboxProxyTestEnv(t)

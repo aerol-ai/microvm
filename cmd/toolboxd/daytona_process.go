@@ -417,8 +417,16 @@ func (s *server) handleDaytonaSessionCommandRoute(w http.ResponseWriter, r *http
 // session reads stdin one byte at a time when stdin is a pipe (a documented
 // bash behavior for non-interactive scripts), so a `read` builtin inside the
 // running command picks up the input directly — no shared-buffer races with
-// the wrapper's end marker. Data is written verbatim; callers that need a
-// trailing newline must include it.
+// the wrapper's end marker.
+//
+// We append a trailing newline if the payload doesn't already end in one
+// (\n or \r). Daytona's own SDK helper `sendSessionCommandInput(sid, cid,
+// 'Alice')` ships line-oriented examples that omit the terminator, and
+// bash's `read` builtin blocks forever without it, so verbatim forwarding
+// silently hangs interactive commands. Auto-terminating preserves the
+// obvious semantics ("send a line of input"), matches what the Daytona
+// platform appears to do, and still lets explicit-newline callers send
+// multi-line input by including their own \n bytes.
 func (s *server) handleDaytonaSessionCommandInput(w http.ResponseWriter, r *http.Request, sessionID, commandID string) {
 	sess, state, ok := s.lookupDaytonaSession(sessionID)
 	if !ok {
@@ -438,7 +446,11 @@ func (s *server) handleDaytonaSessionCommandInput(w http.ResponseWriter, r *http
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if _, err := sess.Write([]byte(req.Data)); err != nil {
+	data := req.Data
+	if !strings.HasSuffix(data, "\n") && !strings.HasSuffix(data, "\r") {
+		data += "\n"
+	}
+	if _, err := sess.Write([]byte(data)); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
