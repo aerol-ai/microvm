@@ -18,6 +18,7 @@ document it, enforce it.
 | Add or remove ingress capacity, DNS | Terraform |
 | Security group / VPC / IAM changes | Terraform |
 | Push a new `sandboxd` binary | Ansible (`Ansible/playbooks/update-sandboxd.yml`) |
+| Push a new `toolboxd` binary | Ansible (see [`toolboxd-updates.md`](./toolboxd-updates.md)) |
 | Restart services, rotate PATs | Ansible |
 | Tail logs across nodes | Ansible (`Ansible/playbooks/tail-logs.yml`) |
 | Run one-off shell commands | Ansible |
@@ -34,6 +35,10 @@ dynamic inventory asks AWS).
   consistently. Why role lives in Terraform only, the `user_data_replace_on_change`
   setting that makes it work, and why there is no `change-role.yml`
   playbook.
+- [**toolboxd-updates.md**](./toolboxd-updates.md) — Rolling a new
+  `toolboxd` binary across the fleet. Local-build vs release-asset paths,
+  the atomic file swap, and why existing sandboxes have to be recreated to
+  pick up the new code.
 
 (More guidelines land here as drift-prone operations show up. The pattern is
 always the same: identify the field, pick the writer, document the rule.)
