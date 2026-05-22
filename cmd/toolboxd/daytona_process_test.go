@@ -229,6 +229,101 @@ func waitForCommandStdoutContains(t *testing.T, srv *server, sessionID, commandI
 	return false
 }
 
+// TestLongestEndMarkerPrefixSuffix pins the rolling-match behavior that
+// decides how many trailing bytes the streaming runner must withhold
+// from /logs?follow=true subscribers. Getting this wrong stalls
+// interactive commands (short output, blocked on stdin) because the
+// fixed hold-back kept everything inside the buffer.
+func TestLongestEndMarkerPrefixSuffix(t *testing.T) {
+	pattern := "__SB_DAYTONA_END_abcd__:"
+	tests := []struct {
+		name     string
+		captured string
+		want     int
+	}{
+		{"no overlap — flush all", "Enter your name: \n", 0},
+		{"trailing newline — flush all", "Hello, Alice\n", 0},
+		{"buffer ends with marker prefix", "some output __SB_", 5},
+		{"buffer ends with longer prefix", "x__SB_DAYTONA", 12},
+		{"trailing single underscore — partial start", "blah_", 1},
+		{"empty buffer", "", 0},
+		{"buffer shorter than any prefix", "ab", 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := longestEndMarkerPrefixSuffix(tc.captured, pattern)
+			if got != tc.want {
+				t.Fatalf("longestEndMarkerPrefixSuffix(%q, ...) = %d, want %d",
+					tc.captured, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleDaytonaSessionCommandLogsFollowStreamsShortOutput pins the
+// regression case behind the hold-back fix: a command that prints a
+// short prompt and then blocks on stdin must still surface that prompt
+// over the WebSocket promptly, well before the command itself finishes.
+func TestHandleDaytonaSessionCommandLogsFollowStreamsShortOutput(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !srv.handleDaytonaProcessRoute(w, r) {
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(httpSrv.Close)
+
+	createResp, err := http.Post(httpSrv.URL+"/process/session", "application/json",
+		bytes.NewBufferString(`{"sessionId":"short-output-session"}`))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_ = createResp.Body.Close()
+
+	// printf then read — read blocks forever (no input sent), so the
+	// command never reaches its end marker. The prompt MUST still
+	// appear on the WS before we time out the test.
+	execBody := `{"command":"printf 'Enter your name: ' ; read name","runAsync":true}`
+	execResp, err := http.Post(httpSrv.URL+"/process/session/short-output-session/exec",
+		"application/json", bytes.NewBufferString(execBody))
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	defer execResp.Body.Close()
+	var execPayload daytonaSessionExecuteResponse
+	if err := json.NewDecoder(execResp.Body).Decode(&execPayload); err != nil {
+		t.Fatalf("decode exec: %v", err)
+	}
+
+	wsURL := strings.Replace(httpSrv.URL, "http://", "ws://", 1) +
+		"/process/session/short-output-session/command/" + execPayload.CmdID + "/logs?follow=true"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("WS dial: %v", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var collected []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		collected = append(collected, payload...)
+		demuxed := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
+		demuxed = bytes.ReplaceAll(demuxed, daytonaStderrPrefix, nil)
+		if bytes.Contains(demuxed, []byte("Enter your name:")) {
+			return
+		}
+	}
+	demuxed := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
+	demuxed = bytes.ReplaceAll(demuxed, daytonaStderrPrefix, nil)
+	t.Fatalf("never saw the prompt on the WS within 2s; got %q", demuxed)
+}
+
 // TestHandleDaytonaSessionCommandLogsFollowStreamsWebSocket pins the
 // /process/session/{sid}/command/{cid}/logs?follow=true contract: the
 // handler must accept a WebSocket upgrade and emit stdout/stderr chunks

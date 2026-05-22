@@ -760,11 +760,13 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 				Stdout:   stringOrNil(stdoutText),
 			}, nil
 		}
-		// No end marker yet: broadcast everything except a trailing
-		// window that could still resolve into the marker. Holding back
-		// len(pattern)-1 bytes is the minimum safe — a full marker is
-		// only possible once we have len(pattern) bytes of buffer.
-		hold := len(pattern) - 1
+		// No end marker yet. Only hold back the trailing window that is
+		// actually a partial prefix of the end marker — anything else
+		// can be broadcast immediately. A naive `hold := len(pattern)-1`
+		// would stall short outputs ("Enter name: \n" = 18 bytes,
+		// pattern = ~34 bytes) until enough later text accumulates,
+		// which never happens for interactive commands blocked on stdin.
+		hold := longestEndMarkerPrefixSuffix(captured, pattern)
 		if safeLen := len(captured) - hold; safeLen > stdoutBroadcasted {
 			command.stream.broadcast(sessions.StreamStdout, []byte(captured[stdoutBroadcasted:safeLen]))
 			stdoutBroadcasted = safeLen
@@ -803,6 +805,24 @@ func newDaytonaCommandID() (string, error) {
 
 func shellSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+// longestEndMarkerPrefixSuffix returns the length of the longest trailing
+// substring of `captured` that is also a prefix of `pattern`. Used by the
+// streaming runner to decide how many bytes at the end of the stdout
+// buffer MUST stay un-broadcast in case they turn out to be the start of
+// the end marker. Any shorter suffix is safe to flush immediately, which
+// is what makes short interactive output (e.g. "Enter name: \n") visible
+// to /logs?follow=true subscribers without waiting for the command to
+// finish.
+func longestEndMarkerPrefixSuffix(captured, pattern string) int {
+	maxLen := min(len(pattern)-1, len(captured))
+	for k := maxLen; k > 0; k-- {
+		if strings.HasPrefix(pattern, captured[len(captured)-k:]) {
+			return k
+		}
+	}
+	return 0
 }
 
 func int32Ptr(value int32) *int32 {
