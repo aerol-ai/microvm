@@ -60,6 +60,56 @@ func TestPlacementRecoveryMemoryStoreDeleteRemovesBlob(t *testing.T) {
 	}
 }
 
+func TestPlacementRecoveryFileStorePutAndGetRecordRoundTrip(t *testing.T) {
+	store, err := newPlacementRecoveryFileStore(filepath.Join(t.TempDir(), "recovery"))
+	if err != nil {
+		t.Fatalf("newPlacementRecoveryFileStore() error = %v", err)
+	}
+
+	ref, err := store.Put("sb-roundtrip", placementRecovery{
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:3.20"},
+		SecretRef:     "cluster-secret:demo",
+		SecretVersion: 7,
+		SealedSecrets: []byte("sealed"),
+	})
+	if err != nil {
+		t.Fatalf("Put() error = %v", err)
+	}
+	if !strings.HasPrefix(ref, placementRecoveryRefPrefix) {
+		t.Fatalf("Put() ref = %q, want %q prefix", ref, placementRecoveryRefPrefix)
+	}
+
+	record, ok, err := store.GetRecord(ref)
+	if err != nil || !ok {
+		t.Fatalf("GetRecord() = ok:%v err:%v, want ok:true err:nil", ok, err)
+	}
+	if record.SandboxID != "sb-roundtrip" {
+		t.Fatalf("GetRecord() sandbox id = %q, want sb-roundtrip", record.SandboxID)
+	}
+	if record.Recovery.Spec == nil || record.Recovery.Spec.Image != "alpine:3.20" {
+		t.Fatalf("GetRecord() spec = %+v, want alpine spec", record.Recovery.Spec)
+	}
+	if record.Recovery.SecretRef != "cluster-secret:demo" || record.Recovery.SecretVersion != 7 {
+		t.Fatalf("GetRecord() secrets = %+v, want ref/version preserved", record.Recovery)
+	}
+	if string(record.Recovery.SealedSecrets) != "sealed" {
+		t.Fatalf("GetRecord() sealed secrets = %q, want sealed", string(record.Recovery.SealedSecrets))
+	}
+
+	record.Recovery.Spec.Image = "mutated"
+	record.Recovery.SealedSecrets[0] = 'X'
+	again, ok, err := store.GetRecord(ref)
+	if err != nil || !ok {
+		t.Fatalf("GetRecord() second read = ok:%v err:%v, want ok:true err:nil", ok, err)
+	}
+	if again.Recovery.Spec == nil || again.Recovery.Spec.Image != "alpine:3.20" {
+		t.Fatalf("GetRecord() second read spec = %+v, want original alpine spec", again.Recovery.Spec)
+	}
+	if string(again.Recovery.SealedSecrets) != "sealed" {
+		t.Fatalf("GetRecord() second read sealed secrets = %q, want sealed", string(again.Recovery.SealedSecrets))
+	}
+}
+
 func TestPlacementRecoveryFileStoreGetRecordRejectsCorruptBlob(t *testing.T) {
 	store, err := newPlacementRecoveryFileStore(filepath.Join(t.TempDir(), "recovery"))
 	if err != nil {
@@ -132,5 +182,45 @@ func TestPlacementRecoveryFileStoreRetainSnapshotRefsRejectsCorruptManifest(t *t
 	err = store.RetainSnapshotRefs([]string{placementRecoveryRefPrefix + strings.Repeat("0", 64)})
 	if err == nil || !strings.Contains(err.Error(), "decode gc manifest") {
 		t.Fatalf("RetainSnapshotRefs() error = %v, want decode gc manifest", err)
+	}
+}
+
+func TestPlacementRecoveryFileStoreRetainSnapshotRefsKeepsLastThreeWindows(t *testing.T) {
+	store, err := newPlacementRecoveryFileStore(filepath.Join(t.TempDir(), "recovery"))
+	if err != nil {
+		t.Fatalf("newPlacementRecoveryFileStore() error = %v", err)
+	}
+
+	refs := make([]string, 0, 4)
+	for i := 0; i < 4; i++ {
+		ref, err := store.Put("sb-window-"+string(rune('a'+i)), placementRecovery{Spec: &models.CreateSandboxRequest{Image: "image:" + string(rune('a'+i))}})
+		if err != nil {
+			t.Fatalf("Put(%d) error = %v", i, err)
+		}
+		refs = append(refs, ref)
+		if err := store.RetainSnapshotRefs([]string{ref}); err != nil {
+			t.Fatalf("RetainSnapshotRefs(%q) error = %v", ref, err)
+		}
+	}
+
+	manifest, err := store.readGCManifest()
+	if err != nil {
+		t.Fatalf("readGCManifest() error = %v", err)
+	}
+	if len(manifest.Snapshots) != placementRecoverySnapshotRefSets {
+		t.Fatalf("len(manifest.Snapshots) = %d, want %d", len(manifest.Snapshots), placementRecoverySnapshotRefSets)
+	}
+	for i, want := range refs[1:] {
+		if got := manifest.Snapshots[i].Refs; len(got) != 1 || got[0] != want {
+			t.Fatalf("manifest window %d refs = %v, want [%s]", i, got, want)
+		}
+	}
+	if _, ok, err := store.GetRecord(refs[0]); err != nil || ok {
+		t.Fatalf("GetRecord(oldest) = ok:%v err:%v, want ok:false err:nil", ok, err)
+	}
+	for _, ref := range refs[1:] {
+		if _, ok, err := store.GetRecord(ref); err != nil || !ok {
+			t.Fatalf("GetRecord(%q) = ok:%v err:%v, want ok:true err:nil", ref, ok, err)
+		}
 	}
 }
