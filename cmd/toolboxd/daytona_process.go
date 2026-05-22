@@ -14,7 +14,23 @@ import (
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/gorilla/websocket"
 )
+
+// Daytona SDK ≥0.175 streams session command logs over WebSocket on
+// /process/session/{sid}/command/{cid}/logs?follow=true. Frames are binary;
+// the client (stdDemuxStream in @daytona/sdk's utils/Stream.js) demultiplexes
+// stdout and stderr by these three-byte markers preceding each chunk.
+var (
+	daytonaStdoutPrefix = []byte{0x01, 0x01, 0x01}
+	daytonaStderrPrefix = []byte{0x02, 0x02, 0x02}
+)
+
+var daytonaLogsUpgrader = websocket.Upgrader{
+	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize:  64 * 1024,
+	WriteBufferSize: 64 * 1024,
+}
 
 type daytonaCompat struct {
 	mu       sync.Mutex
@@ -38,6 +54,118 @@ type daytonaCommandState struct {
 	exitCode  *int32
 	running   bool
 	createdAt time.Time
+
+	// stream is pointer-indirect on purpose: the outer struct is copied
+	// for snapshot reads (commandsSnapshot, command()), so embedding a
+	// mutex directly would trip `go vet` copylocks. All copies share the
+	// same live stream, which is exactly what subscribers need.
+	stream *daytonaCommandStream
+}
+
+// daytonaCommandStream owns the live streaming state for /logs?follow=true
+// subscribers: a replay buffer of bytes already broadcast, the list of
+// active subscriber channels, and a once-closed `finished` channel. mu
+// covers all three fields.
+type daytonaCommandStream struct {
+	mu       sync.Mutex
+	stdout   []byte
+	stderr   []byte
+	subs     []chan []byte
+	finished chan struct{}
+}
+
+func newDaytonaCommandStream() *daytonaCommandStream {
+	return &daytonaCommandStream{finished: make(chan struct{})}
+}
+
+// broadcast appends a chunk to the streaming buffer and pushes a framed copy
+// to every active subscriber. Sends are non-blocking — a slow subscriber
+// drops the frame rather than stalling the command runner.
+func (c *daytonaCommandStream) broadcast(stream sessions.Stream, chunk []byte) {
+	if c == nil || len(chunk) == 0 {
+		return
+	}
+	prefix := daytonaStdoutPrefix
+	if stream == sessions.StreamStderr {
+		prefix = daytonaStderrPrefix
+	}
+	frame := make([]byte, 0, len(prefix)+len(chunk))
+	frame = append(frame, prefix...)
+	frame = append(frame, chunk...)
+
+	c.mu.Lock()
+	if stream == sessions.StreamStderr {
+		c.stderr = append(c.stderr, chunk...)
+	} else {
+		c.stdout = append(c.stdout, chunk...)
+	}
+	subs := make([]chan []byte, len(c.subs))
+	copy(subs, c.subs)
+	c.mu.Unlock()
+
+	for _, sub := range subs {
+		select {
+		case sub <- frame:
+		default:
+		}
+	}
+}
+
+// finish signals all subscribers the command has ended and clears the
+// subscriber list. Safe to call multiple times — finished is closed at
+// most once.
+func (c *daytonaCommandStream) finish() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	select {
+	case <-c.finished:
+		c.mu.Unlock()
+		return
+	default:
+		close(c.finished)
+	}
+	subs := c.subs
+	c.subs = nil
+	c.mu.Unlock()
+	for _, sub := range subs {
+		close(sub)
+	}
+}
+
+// subscribe registers a new live subscriber. Returns the framed replay of
+// bytes already broadcast (so the subscriber doesn't miss earlier output)
+// and a channel for future frames. If the command has already finished the
+// returned channel is closed. Registration is atomic with the replay
+// snapshot: no broadcast can slip in between the two without showing up
+// either in the replay or on the channel.
+func (c *daytonaCommandStream) subscribe() (initial []byte, ch <-chan []byte, finished bool) {
+	if c == nil {
+		closed := make(chan []byte)
+		close(closed)
+		return nil, closed, true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.stdout) > 0 {
+		initial = append(initial, daytonaStdoutPrefix...)
+		initial = append(initial, c.stdout...)
+	}
+	if len(c.stderr) > 0 {
+		initial = append(initial, daytonaStderrPrefix...)
+		initial = append(initial, c.stderr...)
+	}
+	select {
+	case <-c.finished:
+		closed := make(chan []byte)
+		close(closed)
+		return initial, closed, true
+	default:
+	}
+	sub := make(chan []byte, 256)
+	c.subs = append(c.subs, sub)
+	return initial, sub, false
 }
 
 type daytonaCreateSessionRequest struct {
@@ -166,6 +294,17 @@ func (s *daytonaSessionState) command(commandID string) (*daytonaCommandState, b
 	copy := *command
 	s.mu.RUnlock()
 	return &copy, true
+}
+
+// commandPtr returns the live pointer (NOT a copy) so the streaming
+// /logs?follow=true handler can register subscribers on the shared state.
+// Callers must restrict themselves to the dedicated streamMu-protected
+// surface (broadcast / finishStream / subscribeStream).
+func (s *daytonaSessionState) commandPtr(commandID string) (*daytonaCommandState, bool) {
+	s.mu.RLock()
+	command, ok := s.commands[commandID]
+	s.mu.RUnlock()
+	return command, ok
 }
 
 func (s *daytonaSessionState) commandsSnapshot() []daytonaCommandState {
@@ -395,6 +534,7 @@ func (s *server) handleDaytonaSessionExec(w http.ResponseWriter, r *http.Request
 		command:   commandText,
 		createdAt: time.Now().UTC(),
 		running:   true,
+		stream:    newDaytonaCommandStream(),
 	}
 	state.addCommand(command)
 	async := (req.RunAsync != nil && *req.RunAsync) || (req.Async != nil && *req.Async)
@@ -431,12 +571,72 @@ func (s *server) handleDaytonaSessionCommandLogs(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
+	if strings.EqualFold(r.URL.Query().Get("follow"), "true") {
+		cmd, ok := state.commandPtr(commandID)
+		if !ok {
+			writeError(w, http.StatusNotFound, "command not found")
+			return
+		}
+		s.streamDaytonaSessionCommandLogs(w, r, cmd)
+		return
+	}
 	command, ok := state.command(commandID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "command not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, daytonaSessionLogsResponse{Output: command.output, Stderr: command.stderr, Stdout: command.stdout})
+}
+
+// streamDaytonaSessionCommandLogs upgrades the request to a WebSocket and
+// streams stdout/stderr to the client until the command ends. Frame format
+// is the Daytona convention: each binary message begins with a 3-byte
+// marker (0x01x3 = stdout, 0x02x3 = stderr) followed by the chunk bytes.
+// On subscribe we first send the replay of bytes already broadcast, then
+// stream new frames. Closing the channel (when the runner finishes) ends
+// the loop and the WebSocket is closed.
+func (s *server) streamDaytonaSessionCommandLogs(w http.ResponseWriter, r *http.Request, cmd *daytonaCommandState) {
+	conn, err := daytonaLogsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		// Upgrader has already written an HTTP error response on failure.
+		s.logger.Warn("daytona session logs upgrade failed", "error", err)
+		return
+	}
+	defer conn.Close()
+
+	initial, ch, _ := cmd.stream.subscribe()
+	if len(initial) > 0 {
+		if err := conn.WriteMessage(websocket.BinaryMessage, initial); err != nil {
+			return
+		}
+	}
+
+	// Detect client disconnects so we don't block forever waiting on a
+	// command that may run indefinitely. Reads here drain any frames the
+	// client sends (none, per protocol) but unblock when the peer closes.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case frame, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+				return
+			}
+		case <-done:
+			return
+		}
+	}
 }
 
 func (s *server) lookupDaytonaSession(sessionID string) (*sessions.Session, *daytonaSessionState, bool) {
@@ -467,9 +667,14 @@ func buildDaytonaSessionResponse(sessionID string, state *daytonaSessionState) d
 func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytonaSessionState, command *daytonaCommandState) (*daytonaSessionExecuteResponse, error) {
 	state.execMu.Lock()
 	defer state.execMu.Unlock()
+	// finishStream always fires once the runner exits so any live
+	// /logs?follow=true subscribers see EOF promptly, regardless of which
+	// branch below returns (write error, end-marker, or session close).
+	defer command.stream.finish()
 
 	startMarker := "__SB_DAYTONA_START_" + command.id + "__"
 	endMarker := "__SB_DAYTONA_END_" + command.id + "__"
+	pattern := endMarker + ":"
 	frames, cancel := sess.Subscribe()
 	defer cancel()
 	state.setActive(command.id)
@@ -490,11 +695,16 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	var stdout strings.Builder
 	var stderr strings.Builder
 	started := false
+	// stdoutBroadcasted tracks how many bytes of the post-start stdout
+	// buffer have already been pushed to live subscribers, so each new
+	// frame broadcasts only the genuinely new prefix-safe slice.
+	stdoutBroadcasted := 0
 	for frame := range frames {
 		chunk := string(frame.Data)
 		if frame.Stream == sessions.StreamStderr {
 			if started {
 				stderr.WriteString(chunk)
+				command.stream.broadcast(sessions.StreamStderr, []byte(chunk))
 			}
 			continue
 		}
@@ -516,34 +726,49 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 			captured = strings.TrimPrefix(captured, "\n")
 			stdout.Reset()
 			stdout.WriteString(captured)
+			stdoutBroadcasted = 0
 		}
 
 		captured = stdout.String()
-		pattern := endMarker + ":"
-		index := strings.Index(captured, pattern)
-		if index < 0 {
-			continue
+		if index := strings.Index(captured, pattern); index >= 0 {
+			// End marker located: flush any unbroadcast pre-end bytes
+			// once, then finalize. stdoutBroadcasted is bumped to index
+			// so any later iteration is a no-op (e.g. when we continue
+			// below waiting for the exit-code newline).
+			if index > stdoutBroadcasted {
+				command.stream.broadcast(sessions.StreamStdout, []byte(captured[stdoutBroadcasted:index]))
+				stdoutBroadcasted = index
+			}
+			rest := captured[index+len(pattern):]
+			lineEnd := strings.IndexByte(rest, '\n')
+			if lineEnd < 0 {
+				continue
+			}
+			exitCode, err := strconv.Atoi(strings.TrimSpace(rest[:lineEnd]))
+			if err != nil {
+				exitCode = 1
+			}
+			stdoutText := captured[:index]
+			stderrText := stderr.String()
+			state.finishCommand(command.id, stdoutText, stderrText, int32(exitCode))
+			output := stdoutText + stderrText
+			return &daytonaSessionExecuteResponse{
+				CmdID:    command.id,
+				ExitCode: int32Ptr(int32(exitCode)),
+				Output:   stringOrNil(output),
+				Stderr:   stringOrNil(stderrText),
+				Stdout:   stringOrNil(stdoutText),
+			}, nil
 		}
-		rest := captured[index+len(pattern):]
-		lineEnd := strings.IndexByte(rest, '\n')
-		if lineEnd < 0 {
-			continue
+		// No end marker yet: broadcast everything except a trailing
+		// window that could still resolve into the marker. Holding back
+		// len(pattern)-1 bytes is the minimum safe — a full marker is
+		// only possible once we have len(pattern) bytes of buffer.
+		hold := len(pattern) - 1
+		if safeLen := len(captured) - hold; safeLen > stdoutBroadcasted {
+			command.stream.broadcast(sessions.StreamStdout, []byte(captured[stdoutBroadcasted:safeLen]))
+			stdoutBroadcasted = safeLen
 		}
-		exitCode, err := strconv.Atoi(strings.TrimSpace(rest[:lineEnd]))
-		if err != nil {
-			exitCode = 1
-		}
-		stdoutText := captured[:index]
-		stderrText := stderr.String()
-		state.finishCommand(command.id, stdoutText, stderrText, int32(exitCode))
-		output := stdoutText + stderrText
-		return &daytonaSessionExecuteResponse{
-			CmdID:    command.id,
-			ExitCode: int32Ptr(int32(exitCode)),
-			Output:   stringOrNil(output),
-			Stderr:   stringOrNil(stderrText),
-			Stdout:   stringOrNil(stdoutText),
-		}, nil
 	}
 
 	stdoutText := stdout.String()
@@ -551,6 +776,11 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	exitCode, _ := sess.ExitInfo()
 	if exitCode < 0 {
 		exitCode = 1
+	}
+	// Session ended without the end marker — there is no partial marker
+	// to worry about. Flush whatever tail wasn't broadcast yet.
+	if started && len(stdoutText) > stdoutBroadcasted {
+		command.stream.broadcast(sessions.StreamStdout, []byte(stdoutText[stdoutBroadcasted:]))
 	}
 	state.finishCommand(command.id, stdoutText, stderrText, int32(exitCode))
 	output := stdoutText + stderrText
