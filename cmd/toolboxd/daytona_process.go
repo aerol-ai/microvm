@@ -76,6 +76,10 @@ type daytonaSessionLogsResponse struct {
 	Stdout string `json:"stdout"`
 }
 
+type daytonaSessionInputRequest struct {
+	Data string `json:"data"`
+}
+
 func newDaytonaCompat() *daytonaCompat {
 	return &daytonaCompat{sessions: map[string]*daytonaSessionState{}}
 }
@@ -259,10 +263,47 @@ func (s *server) handleDaytonaSessionCommandRoute(w http.ResponseWriter, r *http
 		}
 		s.handleDaytonaSessionCommandLogs(w, r, sessionID, commandID)
 	case "input":
-		writeError(w, http.StatusNotImplemented, "interactive command input is not implemented")
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		s.handleDaytonaSessionCommandInput(w, r, sessionID, commandID)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+// handleDaytonaSessionCommandInput forwards bytes from a Daytona-style
+// {"data": "..."} payload to the session's stdin. The shell that backs the
+// session reads stdin one byte at a time when stdin is a pipe (a documented
+// bash behavior for non-interactive scripts), so a `read` builtin inside the
+// running command picks up the input directly — no shared-buffer races with
+// the wrapper's end marker. Data is written verbatim; callers that need a
+// trailing newline must include it.
+func (s *server) handleDaytonaSessionCommandInput(w http.ResponseWriter, r *http.Request, sessionID, commandID string) {
+	sess, state, ok := s.lookupDaytonaSession(sessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if _, ok := state.command(commandID); !ok {
+		writeError(w, http.StatusNotFound, "command not found")
+		return
+	}
+	if !state.acceptsInput(commandID) {
+		writeError(w, http.StatusConflict, "command is not currently accepting input")
+		return
+	}
+	var req daytonaSessionInputRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if _, err := sess.Write([]byte(req.Data)); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *server) handleDaytonaSessionCreate(w http.ResponseWriter, r *http.Request) {
@@ -433,7 +474,14 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	defer cancel()
 	state.setActive(command.id)
 
-	payload := "printf '%s\\n' " + shellSingleQuote(startMarker) + "\n" + command.command + "\n__sb_daytona_status=$?\nprintf '%s:%s\\n' " + shellSingleQuote(endMarker) + " \"$__sb_daytona_status\"\n"
+	// Wrap the user command in a `{ ... }` brace group joined by semicolons so
+	// the wrapper is a single compound statement. Bash buffers its stdin and
+	// parses the entire compound before executing — without the group, a
+	// `read` inside the user command would consume the wrapper's own follow-up
+	// lines (status capture, end marker) from bash's parse buffer instead of
+	// waiting for input. The trailing newline before `}` lets the user's last
+	// command terminate normally.
+	payload := "printf '%s\\n' " + shellSingleQuote(startMarker) + "; { " + command.command + "\n}; __sb_daytona_status=$?; printf '%s:%s\\n' " + shellSingleQuote(endMarker) + " \"$__sb_daytona_status\"\n"
 	if _, err := sess.Write([]byte(payload)); err != nil {
 		state.finishCommand(command.id, "", err.Error(), 1)
 		return nil, err

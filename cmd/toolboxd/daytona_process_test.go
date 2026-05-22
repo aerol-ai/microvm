@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 )
@@ -107,4 +109,120 @@ func TestHandleDaytonaProcessRouteSessionLifecycle(t *testing.T) {
 	if deleteRec.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d", deleteRec.Code)
 	}
+}
+
+func TestHandleDaytonaSessionCommandInputDeliversStdin(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/process/session",
+		bytes.NewBufferString(`{"sessionId":"input-session"}`))
+	createRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(createRec, createReq) {
+		t.Fatal("expected create route to be handled")
+	}
+
+	// Run an async interactive command that blocks on `read` until we send input.
+	execBody := `{"command":"read name && printf 'Hello, %s' \"$name\"","runAsync":true}`
+	execReq := httptest.NewRequest(http.MethodPost, "/process/session/input-session/exec",
+		bytes.NewBufferString(execBody))
+	execRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(execRec, execReq) {
+		t.Fatal("expected exec route to be handled")
+	}
+	if execRec.Code != http.StatusOK {
+		t.Fatalf("async exec status = %d body=%s", execRec.Code, execRec.Body.String())
+	}
+	var execResp daytonaSessionExecuteResponse
+	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("decode exec response: %v", err)
+	}
+	if execResp.CmdID == "" {
+		t.Fatal("expected cmdId in async exec response")
+	}
+
+	// Wait for the goroutine to mark the command active before sending input.
+	if !waitForActiveCommand(t, srv, "input-session", execResp.CmdID, 2*time.Second) {
+		t.Fatal("command never reached the active state")
+	}
+
+	inputReq := httptest.NewRequest(http.MethodPost,
+		"/process/session/input-session/command/"+execResp.CmdID+"/input",
+		bytes.NewBufferString(`{"data":"Alice\n"}`))
+	inputRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(inputRec, inputReq) {
+		t.Fatal("expected input route to be handled")
+	}
+	if inputRec.Code != http.StatusOK {
+		t.Fatalf("input status = %d body=%s", inputRec.Code, inputRec.Body.String())
+	}
+
+	// Once the command receives the line, the wrapper script prints the end
+	// marker and finishCommand records stdout. Poll until that happens.
+	if !waitForCommandStdoutContains(t, srv, "input-session", execResp.CmdID, "Hello, Alice", 3*time.Second) {
+		t.Fatal("never saw expected stdout from interactive command")
+	}
+}
+
+func TestHandleDaytonaSessionCommandInputRejectsInactive(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/process/session",
+		bytes.NewBufferString(`{"sessionId":"input-session-2"}`))
+	createRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(createRec, createReq) {
+		t.Fatal("expected create route to be handled")
+	}
+
+	// Sync exec — the command is finished before the response returns.
+	execReq := httptest.NewRequest(http.MethodPost, "/process/session/input-session-2/exec",
+		bytes.NewBufferString(`{"command":"printf done"}`))
+	execRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(execRec, execReq) {
+		t.Fatal("expected exec route to be handled")
+	}
+	if execRec.Code != http.StatusOK {
+		t.Fatalf("sync exec status = %d", execRec.Code)
+	}
+	var execResp daytonaSessionExecuteResponse
+	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("decode exec response: %v", err)
+	}
+
+	inputReq := httptest.NewRequest(http.MethodPost,
+		"/process/session/input-session-2/command/"+execResp.CmdID+"/input",
+		bytes.NewBufferString(`{"data":"hi\n"}`))
+	inputRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(inputRec, inputReq) {
+		t.Fatal("expected input route to be handled")
+	}
+	if inputRec.Code != http.StatusConflict {
+		t.Fatalf("input status = %d, want %d, body=%s",
+			inputRec.Code, http.StatusConflict, inputRec.Body.String())
+	}
+}
+
+func waitForActiveCommand(t *testing.T, srv *server, sessionID, commandID string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, state, ok := srv.lookupDaytonaSession(sessionID); ok && state.acceptsInput(commandID) {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+func waitForCommandStdoutContains(t *testing.T, srv *server, sessionID, commandID, want string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, state, ok := srv.lookupDaytonaSession(sessionID); ok {
+			if cmd, found := state.command(commandID); found && strings.Contains(cmd.stdout, want) {
+				return true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
 }
