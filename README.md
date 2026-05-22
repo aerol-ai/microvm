@@ -1,7 +1,7 @@
 # AerolVM
 
 [![Tests](https://github.com/aerol-ai/microvm/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aerol-ai/microvm/actions/workflows/test.yml)
-[![Release](https://github.com/aerol-ai/microvm/actions/workflows/release.yml/badge.svg)](https://github.com/aerol-ai/microvm/actions/workflows/release.yml)
+[![Release](https://github.com/aerol-ai/microvm/actions/workflows/release.yml/badge.svg?event=release)](https://github.com/aerol-ai/microvm/actions/workflows/release.yml)
 [![Publish SDKs](https://github.com/aerol-ai/microvm/actions/workflows/publish-sdks.yml/badge.svg)](https://github.com/aerol-ai/microvm/actions/workflows/publish-sdks.yml)
 
 AerolVM is a self-hosted platform for creating isolated Docker-backed sandboxes on a single Linux host. This repository contains the server, installer, SDKs, and documentation you use to provision a host, create containers, expose preview URLs, and manage sandboxes over an API.
