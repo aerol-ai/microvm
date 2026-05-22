@@ -88,6 +88,38 @@ func TestAgentSpecOfUsesControlPlaneAndReturnsDeepCopy(t *testing.T) {
 	}
 }
 
+func TestAgentSpecOfReturnsNilOnControlPlaneError(t *testing.T) {
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+
+	if got := agent.SpecOf("sb-agent-error"); got != nil {
+		t.Fatalf("SpecOf() = %+v, want nil on control-plane error", got)
+	}
+}
+
+func TestAgentSpecOfReturnsNilWhenPlacementHasNoSpec(t *testing.T) {
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != PublicInternalPlacementPath+"sb-agent-no-spec" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+			SandboxID: "sb-agent-no-spec",
+			Placement: Placement{SandboxID: "sb-agent-no-spec", Version: 9},
+			Owner:     OwnerInfo{NodeID: "worker-self", IsSelf: true},
+		})
+	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+
+	if got := agent.SpecOf("sb-agent-no-spec"); got != nil {
+		t.Fatalf("SpecOf() = %+v, want nil when placement spec is absent", got)
+	}
+	if gotVersion := agent.PlacementVersion(); gotVersion != 9 {
+		t.Fatalf("PlacementVersion() = %d, want 9 after nil-spec lookup", gotVersion)
+	}
+}
+
 func TestAgentMembersUsesControlPlaneResponse(t *testing.T) {
 	controlPlaneMembers := []Member{{NodeID: "server-control", Alive: true, Role: config.NodeRoleServer}}
 	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
