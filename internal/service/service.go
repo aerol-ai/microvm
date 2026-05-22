@@ -2407,7 +2407,7 @@ func (s *Service) applyInFluxRoute(ctx context.Context, p cluster.Placement) err
 			continue
 		}
 		if s.cfg.Domain == "" {
-			if err := s.caddy.DeletePortRoute(ctx, p.SandboxID, port); err != nil && firstErr == nil {
+			if err := s.caddy.DeleteRouteByID(ctx, caddy.PortRouteID(p.SandboxID, port)); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		} else {

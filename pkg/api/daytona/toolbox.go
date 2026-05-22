@@ -69,7 +69,10 @@ func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 		h.proxyToolbox(w, r, sandboxID, "/"+path)
 	case strings.HasPrefix(path, "process/interpreter/"):
 		// /process/interpreter/execute is a WebSocket stream; the context
-		// endpoints are plain HTTP. ReverseProxy handles both.
+		// endpoints are plain HTTP. ReverseProxy handles both. The shipped
+		// toolboxd returns 501 from this prefix (see daytona_code_run.go);
+		// custom toolbox builds can implement a Jupyter kernel and have
+		// requests reach them transparently.
 		h.proxyToolbox(w, r, sandboxID, "/"+path)
 	case path == "process/pty" || strings.HasPrefix(path, "process/pty/"):
 		// /process/pty (bare) covers list/create; /process/pty/{id}/connect
