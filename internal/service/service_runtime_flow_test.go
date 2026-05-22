@@ -348,6 +348,64 @@ func TestServiceLifecycleStopStartDestroyAndHealth(t *testing.T) {
 	}
 }
 
+func TestStartSandboxReleasesAdmissionWhenMountLoadFails(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+
+	sealCipher := newTestCipher(t)
+	svc.cipher = sealCipher
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:           "sb-start-mount-error",
+		Image:        "alpine:3.20",
+		Status:       models.SandboxStatusStopped,
+		ContainerID:  "ctr-start-mount-error",
+		ContainerIP:  "10.0.0.20",
+		Runtime:      models.RuntimeDocker,
+		CPU:          2,
+		MemoryMB:     1024,
+		DiskGB:       10,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	sealed, err := svc.sealMounts([]models.MountSpec{{
+		Type:        models.MountTypeS3,
+		Target:      "/data",
+		Source:      "bucket",
+		Credentials: map[string]string{"access_key": "key", "secret_key": "secret"},
+	}})
+	if err != nil {
+		t.Fatalf("sealMounts() error = %v", err)
+	}
+	if err := st.PutMounts(ctx, "sb-start-mount-error", sealed); err != nil {
+		t.Fatalf("PutMounts() error = %v", err)
+	}
+	// Swap to a different key so loadMounts fails before docker.Start runs.
+	svc.cipher = newTestCipher(t)
+
+	_, err = svc.StartSandbox(ctx, "sb-start-mount-error")
+	if err == nil || !strings.Contains(err.Error(), "decrypt mounts") {
+		t.Fatalf("StartSandbox() error = %v, want mount decrypt failure", err)
+	}
+	if len(rt.startRefs) != 0 {
+		t.Fatalf("runtime Start refs = %v, want none when mount load fails first", rt.startRefs)
+	}
+	if cap := svc.Capacity(); cap.SandboxesActive != 0 || cap.ReservedCPU != 0 || cap.ReservedMemoryMB != 0 {
+		t.Fatalf("capacity snapshot after failed start = %+v, want released admission", cap)
+	}
+	got, err := st.Get(ctx, "sb-start-mount-error")
+	if err != nil {
+		t.Fatalf("store.Get() error = %v", err)
+	}
+	if got.Status != models.SandboxStatusStopped {
+		t.Fatalf("sandbox status = %q, want stopped after failed start", got.Status)
+	}
+}
+
 func TestToolboxTargetRequiresContainerIP(t *testing.T) {
 	ctx := context.Background()
 	rt := &recordingRuntime{}

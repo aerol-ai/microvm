@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
+	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -110,6 +112,78 @@ func TestRecreateSandboxReplaysPortsForExistingSandbox(t *testing.T) {
 	exposure := findExposure(got, 3000)
 	if exposure == nil || exposure.Protocol != models.ExposedPortProtocolHTTP {
 		t.Fatalf("expected replayed http exposure, got %+v", exposure)
+	}
+}
+
+func TestRecreateSandboxRejectsMissingImageSpec(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+
+	err := svc.RecreateSandbox(ctx, "sb-recreate-missing-image", models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "image is required") {
+		t.Fatalf("RecreateSandbox() error = %v, want missing image", err)
+	}
+	if rt.createCalls != 0 {
+		t.Fatalf("runtime Create calls = %d, want 0", rt.createCalls)
+	}
+	if _, err := st.Get(ctx, "sb-recreate-missing-image"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("sandbox row after rejected recreate = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecreateSandboxFailsWhenClusterSecretRefMissing(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+
+	err := svc.RecreateSandbox(ctx, "sb-recreate-missing-secret", models.CreateSandboxRequest{Image: "alpine:3.20"}, cluster.PlacementSecrets{
+		Ref:     "cluster-secret:missing",
+		Version: 1,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("RecreateSandbox() error = %v, want missing secret ref", err)
+	}
+	if rt.createCalls != 0 {
+		t.Fatalf("runtime Create calls = %d, want 0", rt.createCalls)
+	}
+	if _, err := st.Get(ctx, "sb-recreate-missing-secret"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("sandbox row after secret-open failure = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecreateSandboxKeepsCreatedSandboxWhenReplayFails(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	svc.cfg.EnableCluster = true
+	svc.cfg.NodeRole = config.NodeRoleWorker
+	svc.cfg.L4PortRangeStart = 30500
+	svc.cfg.L4PortRangeEnd = 30510
+	reserver := &hostPortReserveCluster{
+		Noop:     cluster.NewNoop("self", "http://self"),
+		reserved: map[int]bool{30505: true},
+	}
+	svc.AttachCluster(reserver)
+
+	err := svc.RecreateSandbox(ctx, "sb-recreate-replay-failure", models.CreateSandboxRequest{Image: "alpine:3.20"}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
+		5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 30505},
+	})
+	if err == nil || !errors.Is(err, ErrPreferredHostPortUnavailable) {
+		t.Fatalf("RecreateSandbox() error = %v, want ErrPreferredHostPortUnavailable", err)
+	}
+	if rt.createCalls != 1 {
+		t.Fatalf("runtime Create calls = %d, want 1", rt.createCalls)
+	}
+	got, err := st.Get(ctx, "sb-recreate-replay-failure")
+	if err != nil {
+		t.Fatalf("store.Get() error = %v", err)
+	}
+	if got.Status != models.SandboxStatusStarted {
+		t.Fatalf("sandbox status = %q, want started", got.Status)
+	}
+	if exposure := findExposure(got, 5432); exposure != nil {
+		t.Fatalf("failing replay unexpectedly persisted exposure: %+v", exposure)
 	}
 }
 
