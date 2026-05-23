@@ -136,27 +136,30 @@ in `systemctl show sandboxd` or process listings.
 ## Ansible setup
 
 If you provision with Ansible instead of (or alongside) Terraform, set
-the same values in `Ansible/inventory/group_vars/all.yml` (or any more
-specific group/host vars file) and run `configure-ops.yml`.
+the same values in `Ansible/inventory/group_vars/all/local.yml` (gitignored
+per-operator overrides, auto-loaded after the committed `defaults.yml`)
+and run `configure-ops.yml`.
+
+Inline-value mode (single operator / laptop):
 
 ```yaml
-# Mirror
-sandboxd_mirror_host:        "mirror.aocr.example.com"
-sandboxd_upstream_wrap_key_src: "/path/on/control/node/upstream_wrap_key"
+# inventory/group_vars/all/local.yml — gitignored
+sandboxd_mirror_host:                    "mirror.aocr.example.com"
+sandboxd_upstream_wrap_key_value:        "<base64 wrap key>"
 
-# + Auto-import
-sandboxd_auto_import_enabled:          true
-sandboxd_auto_import_hooks_url:        "https://aocr.example.com"
-sandboxd_auto_import_cluster_id:       "prod-aerolvm-us-east-1"
-sandboxd_auto_import_cluster_pat_src:  "/path/on/control/node/cluster_pat"
+sandboxd_auto_import_enabled:            true
+sandboxd_auto_import_hooks_url:          "https://aocr.example.com"
+sandboxd_auto_import_cluster_id:         "prod-aerolvm-us-east-1"
+sandboxd_auto_import_cluster_pat_value:  "<internal API token>"
 # sandboxd_auto_import_retention_suffix: "--idle-90d"   # default
 ```
 
-`*_src` paths point at files on the Ansible **control node**. The
-playbook copies them to `/etc/sandboxd/secrets/upstream-wrap.key` and
-`/etc/sandboxd/secrets/cluster-pat` on each managed host with `mode 0600`.
-Leave a `*_src` empty to skip that copy (use this if your fleet renders
-the file via Vault or another mechanism).
+Control-node file mode (fleet / Vault-rendered) — swap `_value` for `_src`
+and point at a file path on the Ansible control node. The playbook writes
+the bytes to `/etc/sandboxd/secrets/upstream-wrap.key` and
+`/etc/sandboxd/secrets/cluster-pat` on each managed host at `mode 0600`
+either way. See [`Ansible/README.md` § Step 2](../../Ansible/README.md#step-2--choose-how-to-hand-the-secrets-to-the-play)
+for the full file-layout pattern and both modes.
 
 Then:
 
@@ -168,7 +171,7 @@ Sandboxd restarts on each host as the env file changes (controlled by
 `sandboxd_restart_after_ops_config`).
 
 The full list of `sandboxd_mirror_*` / `sandboxd_auto_import_*` defaults
-lives in [`Ansible/inventory/group_vars/all.yml`](../../Ansible/inventory/group_vars/all.yml).
+lives in [`Ansible/inventory/group_vars/all/defaults.yml`](../../Ansible/inventory/group_vars/all/defaults.yml).
 
 ---
 

@@ -28,11 +28,11 @@
       SB_MIRROR_HOST: "{{ sandboxd_mirror_host }}"
       SB_MIRROR_PUSH_HOST: "{{ sandboxd_mirror_push_host }}"
       SB_MIRROR_UPSTREAMS: "{{ sandboxd_mirror_upstreams }}"
-      SB_UPSTREAM_WRAP_KEY_PATH: "{{ sandboxd_upstream_wrap_key_path if (sandboxd_upstream_wrap_key_src | length > 0) else '' }}"
+      SB_UPSTREAM_WRAP_KEY_PATH: "{{ sandboxd_upstream_wrap_key_path if ((sandboxd_upstream_wrap_key_src | length > 0) or (sandboxd_upstream_wrap_key_value | length > 0)) else '' }}"
       SB_AUTO_IMPORT_ENABLED: "{{ sandboxd_auto_import_enabled | bool | string | lower }}"
       SB_AUTO_IMPORT_HOOKS_URL: "{{ sandboxd_auto_import_hooks_url }}"
       SB_AUTO_IMPORT_CLUSTER_ID: "{{ sandboxd_auto_import_cluster_id }}"
-      SB_AUTO_IMPORT_CLUSTER_PAT_PATH: "{{ sandboxd_auto_import_cluster_pat_path if (sandboxd_auto_import_cluster_pat_src | length > 0) else '' }}"
+      SB_AUTO_IMPORT_CLUSTER_PAT_PATH: "{{ sandboxd_auto_import_cluster_pat_path if ((sandboxd_auto_import_cluster_pat_src | length > 0) or (sandboxd_auto_import_cluster_pat_value | length > 0)) else '' }}"
       SB_AUTO_IMPORT_RETENTION_SUFFIX: "{{ sandboxd_auto_import_retention_suffix }}"
       SB_AUTO_IMPORT_REQUEST_TIMEOUT: "{{ sandboxd_auto_import_request_timeout }}"
       SB_AUTO_IMPORT_RECONCILE_INTERVAL: "{{ sandboxd_auto_import_reconcile_interval }}"
@@ -144,7 +144,11 @@
         - "../../setup/runbooks/slo-breach.md"
 
     - name: Ensure sandboxd secrets directory exists
-      when: (sandboxd_upstream_wrap_key_src | length > 0) or (sandboxd_auto_import_cluster_pat_src | length > 0)
+      when: >-
+        (sandboxd_upstream_wrap_key_src | length > 0)
+        or (sandboxd_upstream_wrap_key_value | length > 0)
+        or (sandboxd_auto_import_cluster_pat_src | length > 0)
+        or (sandboxd_auto_import_cluster_pat_value | length > 0)
       ansible.builtin.file:
         path: "{{ sandboxd_secrets_dir }}"
         state: directory
@@ -152,8 +156,25 @@
         owner: root
         group: root
 
-    - name: Install upstream wrap key (Phase 4 F17)
-      when: sandboxd_upstream_wrap_key_src | length > 0
+    # Upstream wrap key (Phase 4 F17). Two modes:
+    #   * inline value  -> sandboxd_upstream_wrap_key_value (single-operator / laptop)
+    #   * control-node file -> sandboxd_upstream_wrap_key_src (fleet / Vault rendering)
+    # If both are set, the inline value wins (it runs first).
+    - name: Install upstream wrap key (from inline value)
+      when: sandboxd_upstream_wrap_key_value | length > 0
+      ansible.builtin.copy:
+        content: "{{ sandboxd_upstream_wrap_key_value }}\n"
+        dest: "{{ sandboxd_upstream_wrap_key_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      no_log: true
+      notify: Apply sandboxd ops config
+
+    - name: Install upstream wrap key (from control-node file)
+      when:
+        - sandboxd_upstream_wrap_key_src | length > 0
+        - (sandboxd_upstream_wrap_key_value | length) == 0
       ansible.builtin.copy:
         src: "{{ sandboxd_upstream_wrap_key_src }}"
         dest: "{{ sandboxd_upstream_wrap_key_path }}"
@@ -162,8 +183,22 @@
         group: root
       notify: Apply sandboxd ops config
 
-    - name: Install cluster PAT for auto-import (Phase 4 F21)
-      when: sandboxd_auto_import_cluster_pat_src | length > 0
+    # Cluster PAT for auto-import (Phase 4 F21). Same two-mode pattern.
+    - name: Install cluster PAT for auto-import (from inline value)
+      when: sandboxd_auto_import_cluster_pat_value | length > 0
+      ansible.builtin.copy:
+        content: "{{ sandboxd_auto_import_cluster_pat_value }}\n"
+        dest: "{{ sandboxd_auto_import_cluster_pat_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      no_log: true
+      notify: Apply sandboxd ops config
+
+    - name: Install cluster PAT for auto-import (from control-node file)
+      when:
+        - sandboxd_auto_import_cluster_pat_src | length > 0
+        - (sandboxd_auto_import_cluster_pat_value | length) == 0
       ansible.builtin.copy:
         src: "{{ sandboxd_auto_import_cluster_pat_src }}"
         dest: "{{ sandboxd_auto_import_cluster_pat_path }}"
