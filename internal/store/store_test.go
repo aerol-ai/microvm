@@ -812,6 +812,10 @@ func TestStoreCases(t *testing.T) {
 					ImageDigest:           "sha256:abc",
 					ImageRegistryRef:      "registry.example.com/demo@sha256:abc",
 					ImageVerifiedAt:       &verifiedAt,
+					// Mirror what CreateSnapshot writes when push_state is
+					// unset: schema default is 'active', so a read-back will
+					// have it filled in even though the input did not.
+					PushState: models.SnapshotPushStateActive,
 				}
 				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
@@ -879,6 +883,7 @@ func TestStoreCases(t *testing.T) {
 					ImageID:         "sha256:alpha",
 					SourceSandboxID: "sb-alpha",
 					CreatedAt:       time.Now().UTC().Add(-time.Hour).Round(0),
+					PushState:       models.SnapshotPushStateActive,
 				}
 				newer := &models.SandboxSnapshot{
 					Name:            "beta",
@@ -886,6 +891,7 @@ func TestStoreCases(t *testing.T) {
 					ImageID:         "sha256:beta",
 					SourceSandboxID: "sb-beta",
 					CreatedAt:       time.Now().UTC().Round(0),
+					PushState:       models.SnapshotPushStateActive,
 				}
 				if err := st.CreateSnapshot(ctx, older); err != nil {
 					t.Fatalf("CreateSnapshot(older) error = %v", err)

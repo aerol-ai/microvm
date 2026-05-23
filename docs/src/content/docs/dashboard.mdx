@@ -29,7 +29,7 @@ INFO starting sandboxd version=... addr=...
 INFO dashboard available url=http://0.0.0.0:8080/ui
 ```
 
-The dashboard works on every node — server, worker, or ingress. Cluster
+The dashboard works on every node - server, worker, or ingress. Cluster
 status endpoints already forward to the right node internally, so opening
 the dashboard against any node gives you the cluster-wide view instead of
 only the node your DNS record happened to pick.
@@ -50,7 +50,7 @@ If your token is wrong the form rejects it with an inline error; no
 ## What each panel shows
 
 Every panel reads from an existing v1 endpoint. The dashboard does not
-introduce any new business logic — it just renders what the API already
+introduce any new business logic - it just renders what the API already
 exposes.
 
 | Panel | Endpoint | What it shows |
@@ -78,7 +78,7 @@ around an existing v1 endpoint.
 | **Drain** | Cluster panel, per-row | `POST /v1/cluster/nodes/{id}/drain` | Marks the node so future placement decisions exclude it. Idempotent. Existing sandboxes on the node keep running. |
 | **Uncordon** | Cluster panel, per-row when drained | `POST /v1/cluster/nodes/{id}/uncordon` | Clears the drain mark so the node becomes eligible for placement again. Idempotent. |
 | **Reclaim local** | Placements panel, on `orphaned` rows | `POST /v1/cluster/orphans/{id}/reclaim-local` | Recovery for a false-positive owner death: only succeeds when the local sandbox row is still present on this node and the placement was orphaned from this node. |
-| **Force delete** | Placements panel, on `orphaned` rows | `DELETE /v1/cluster/orphans/{id}` | Removes the FSM placement record for an orphan. Used when the previous owner is gone for good. Does not destroy any local sandbox — there is, by definition, no live owner to act on. |
+| **Force delete** | Placements panel, on `orphaned` rows | `DELETE /v1/cluster/orphans/{id}` | Removes the FSM placement record for an orphan. Used when the previous owner is gone for good. Does not destroy any local sandbox - there is, by definition, no live owner to act on. |
 
 There are no create / destroy / resize buttons. Those mutations stay on
 the SDKs and CLI where they go through the same auth and idempotency
@@ -92,8 +92,8 @@ A short summary, because there are two related but distinct surfaces:
   JavaScript with no embedded credentials and no server data. The
   sign-in form prompts for the PAT before any API call fires. This
   matches how every standard login page works.
-- Every API call the page makes — `GET /health`, `GET /v1/...`,
-  `GET /debug/vars`, `GET /v1/metrics`, the action endpoints — sends the PAT as
+- Every API call the page makes - `GET /health`, `GET /v1/...`,
+  `GET /debug/vars`, `GET /v1/metrics`, the action endpoints - sends the PAT as
   `Authorization: Bearer <token>` and goes through the same
   middleware as a curl or SDK call. Including `/debug/vars`: the
   expvar counters carry operational shape (lease state, queue depths,
@@ -104,7 +104,7 @@ A short summary, because there are two related but distinct surfaces:
 
 If you want the dashboard reachable only on a trusted network, expose
 sandboxd on the listener you already use for the API. The dashboard
-inherits whatever network controls protect that listener — TLS,
+inherits whatever network controls protect that listener - TLS,
 reverse-proxy auth, IP allowlists, all apply.
 
 ## Multi-node and clustered setups
@@ -115,7 +115,7 @@ the dashboard against any reachable node gives you the cluster-wide
 view. The action buttons forward through the same path.
 
 The metrics panel is intentionally local to the node you opened the
-dashboard against — it reads the in-process expvar counters of *that*
+dashboard against - it reads the in-process expvar counters of *that*
 sandboxd process. To compare nodes side-by-side, open one tab per
 node.
 

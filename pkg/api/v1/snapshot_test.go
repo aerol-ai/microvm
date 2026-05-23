@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -98,6 +99,72 @@ func TestRegisterSnapshotFromImage(t *testing.T) {
 	if len(env.builder.builds) != 0 {
 		t.Errorf("image path must not invoke builder, got %d builds", len(env.builder.builds))
 	}
+	// External registry refs need no AOCR push — the response must surface
+	// push_state="active" immediately so a polling client doesn't wait.
+	if resp.PushState != models.SnapshotPushStateActive {
+		t.Errorf("resp.PushState = %q, want %q (external image needs no push)",
+			resp.PushState, models.SnapshotPushStateActive)
+	}
+}
+
+// TestRegisterSnapshotWithPusherMarksPending exercises the wiring that flips
+// new rows to push_state="pending" when the pusher is attached. Reading the
+// row back from the store (rather than relying on the response body) keeps
+// this test isolated from the goroutine the service kicks after CreateSnapshot
+// — we just want to prove the persisted state is what the reconciler will
+// pick up on its next tick.
+func TestRegisterSnapshotWithPusherMarksPending(t *testing.T) {
+	env := newSnapshotV1TestEnv(t, nil, BuildConfig{})
+
+	patPath := filepath.Join(t.TempDir(), "pat")
+	if err := writeTestFile(patPath, "token"); err != nil {
+		t.Fatalf("write pat: %v", err)
+	}
+	pusher, err := service.NewSnapshotPusher(service.SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-v1",
+		PATPath:   patPath,
+	}, &v1NoopPushDocker{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewSnapshotPusher: %v", err)
+	}
+	reconciler := service.NewSnapshotPushReconciler(pusher, env.store, slog.New(slog.NewTextHandler(io.Discard, nil)), 1)
+	env.svc.AttachSnapshotPusher(pusher, reconciler)
+
+	body := `{"name":"locally-built","dockerfile_content":"FROM debian:bookworm-slim\nRUN true"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/snapshots", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d; body=%s", rr.Code, rr.Body.String())
+	}
+
+	stored, err := env.svc.GetSnapshot(context.Background(), "locally-built")
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	// Built dockerfile snapshots land as local_only and therefore need a push;
+	// the row must be queued (pending) so the reconciler picks it up.
+	if stored.ImageDistributionMode != models.ImageDistributionLocalOnly {
+		t.Fatalf("ImageDistributionMode = %q, want %q", stored.ImageDistributionMode, models.ImageDistributionLocalOnly)
+	}
+	if stored.PushState != models.SnapshotPushStatePending {
+		t.Fatalf("PushState = %q, want %q", stored.PushState, models.SnapshotPushStatePending)
+	}
+}
+
+// v1NoopPushDocker is a stand-in for the snapshot pusher's docker dep that
+// never gets invoked in this test (we assert on the queued state, not on
+// the reconciler outcome). Declaring it here keeps the test self-contained.
+type v1NoopPushDocker struct{}
+
+func (v1NoopPushDocker) PushImage(_ context.Context, req docker.PushImageRequest) (string, error) {
+	return req.DestRef, nil
+}
+
+func writeTestFile(path, contents string) error {
+	return os.WriteFile(path, []byte(contents), 0o600)
 }
 
 // TestRegisterSnapshotFromDockerfile covers the multi-line dockerfile path:

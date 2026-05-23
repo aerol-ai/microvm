@@ -130,12 +130,12 @@ func NewAutoImporter(cfg AutoImportConfig) (*AutoImporter, error) {
 // 400 `invalid_request` — there is a regression test on both sides that
 // pins these names.
 type importBody struct {
-	UpstreamHost     string `json:"upstream_host"`
-	UpstreamRepo     string `json:"upstream_repo"`
-	UpstreamTag      string `json:"upstream_tag,omitempty"`
-	UpstreamDigest   string `json:"upstream_digest"`
-	ClusterID        string `json:"cluster_id"`
-	TargetTagSuffix  string `json:"target_tag_suffix,omitempty"`
+	UpstreamHost    string `json:"upstream_host"`
+	UpstreamRepo    string `json:"upstream_repo"`
+	UpstreamTag     string `json:"upstream_tag,omitempty"`
+	UpstreamDigest  string `json:"upstream_digest"`
+	ClusterID       string `json:"cluster_id"`
+	TargetTagSuffix string `json:"target_tag_suffix,omitempty"`
 }
 
 // importResponse is the success shape. status is one of "imported" /

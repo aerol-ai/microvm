@@ -247,6 +247,11 @@ type PushImageRequest struct {
 	DestRef   string
 	Auth      models.RegistryAuth
 	OnLog     func(line string)
+	// OnDigest is invoked once with the manifest digest the registry
+	// returned for the pushed tag (e.g. "sha256:abc..."), if the daemon
+	// surfaced one in the push stream's `aux` payload. Optional —
+	// callers that don't care about the digest can leave it nil.
+	OnDigest func(digest string)
 }
 
 // PushImage tags SourceTag as DestRef and pushes the result to the
@@ -318,7 +323,7 @@ func (c *Client) PushImage(ctx context.Context, req PushImageRequest) (string, e
 		return "", fmt.Errorf("docker API POST /images/%s/push failed with status %d: %s",
 			repo, response.StatusCode, strings.TrimSpace(string(data)))
 	}
-	if err := decodePushStream(response.Body, req.OnLog); err != nil {
+	if err := decodePushStream(response.Body, req.OnLog, req.OnDigest); err != nil {
 		return "", err
 	}
 	return repo + ":" + tag, nil
@@ -352,7 +357,7 @@ func (c *Client) tagImage(ctx context.Context, sourceRef, repo, tag string) erro
 	return nil
 }
 
-func decodePushStream(body io.Reader, onLog func(line string)) error {
+func decodePushStream(body io.Reader, onLog func(line string), onDigest func(digest string)) error {
 	decoder := json.NewDecoder(body)
 	for {
 		var msg struct {
@@ -361,6 +366,12 @@ func decodePushStream(body io.Reader, onLog func(line string)) error {
 			ErrorDetail struct {
 				Message string `json:"message"`
 			} `json:"errorDetail"`
+			// Aux carries the manifest digest the registry assigned to the
+			// pushed tag. Docker emits this exactly once near the end of a
+			// successful push; absent on failure paths.
+			Aux *struct {
+				Digest string `json:"Digest"`
+			} `json:"aux"`
 		}
 		if err := decoder.Decode(&msg); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -376,6 +387,9 @@ func decodePushStream(body io.Reader, onLog func(line string)) error {
 		}
 		if onLog != nil && msg.Status != "" {
 			onLog(msg.Status)
+		}
+		if onDigest != nil && msg.Aux != nil && strings.TrimSpace(msg.Aux.Digest) != "" {
+			onDigest(strings.TrimSpace(msg.Aux.Digest))
 		}
 	}
 }

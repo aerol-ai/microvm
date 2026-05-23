@@ -71,6 +71,14 @@ type Service struct {
 	mounts   *mounts.Manager
 	admitter *capacity.Admitter
 	images   ImageDistributionProvider
+	// snapshotPusher + snapshotPushReconciler are non-nil only when
+	// cfg.SnapshotPushEnabled is true. The snapshot-create path checks
+	// snapshotPusher for nil to decide whether to mark a new row as
+	// "pending" vs straight-to-"active", and kicks the reconciler once
+	// (best-effort, in a goroutine) so callers don't always wait for the
+	// next reconciler tick.
+	snapshotPusher         *SnapshotPusher
+	snapshotPushReconciler *SnapshotPushReconciler
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -139,6 +147,25 @@ func (s *Service) AttachCluster(c cluster.Client) {
 	s.clusterMu.Lock()
 	defer s.clusterMu.Unlock()
 	s.cluster = c
+}
+
+// AttachSnapshotPusher wires in the optional AOCR snapshot-push pipeline.
+// Both arguments must be non-nil to activate the feature; passing nil
+// leaves the service in the legacy local-only snapshot mode. Called once
+// from main() after cfg.SnapshotPushEnabled validation.
+func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *SnapshotPushReconciler) {
+	if pusher == nil || reconciler == nil {
+		return
+	}
+	s.snapshotPusher = pusher
+	s.snapshotPushReconciler = reconciler
+}
+
+// SnapshotPushReconciler exposes the reconciler so main.go can drive it
+// from a ticker. Returns nil when snapshot push is disabled — the ticker
+// wrapper should no-op cleanly in that case.
+func (s *Service) SnapshotPushReconciler() *SnapshotPushReconciler {
+	return s.snapshotPushReconciler
 }
 
 // Cluster returns the attached cluster.Client. Always non-nil.
@@ -957,9 +984,11 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		snapshot.CreatedAt = time.Now().UTC()
 	}
 	snapshot.Name = name
+	snapshot.PushState = s.initialSnapshotPushState(snapshot)
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		return nil, err
 	}
+	s.kickSnapshotPushReconciler(snapshot)
 	return snapshot, nil
 }
 
@@ -1004,6 +1033,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	if err := s.normalizeSnapshotImageDistribution(ctx, snapshot, true); err != nil {
 		return nil, false, err
 	}
+	snapshot.PushState = s.initialSnapshotPushState(snapshot)
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
 			existing, getErr := s.store.GetSnapshot(ctx, name)
@@ -1013,7 +1043,46 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		}
 		return nil, false, err
 	}
+	s.kickSnapshotPushReconciler(snapshot)
 	return snapshot, true, nil
+}
+
+// initialSnapshotPushState picks the push_state value to write for a
+// newly-created snapshot row. When the feature is off (or the image is
+// already remote), the value is "active" — identical to pre-feature
+// behavior. When the feature is on and the image is local_only, the
+// row starts as "pending" so the reconciler picks it up.
+func (s *Service) initialSnapshotPushState(snapshot *models.SandboxSnapshot) string {
+	if s.snapshotPusher == nil {
+		return models.SnapshotPushStateActive
+	}
+	if !SnapshotNeedsPush(snapshot) {
+		return models.SnapshotPushStateActive
+	}
+	return models.SnapshotPushStatePending
+}
+
+// kickSnapshotPushReconciler runs the reconciler once in a background
+// goroutine after a snapshot was just inserted in 'pending' state. This
+// is purely a latency optimization — without it, the caller would have
+// to wait up to SnapshotPushReconcileInterval before the push begins.
+// The reconciler is safe to invoke concurrently; the 'pushing' state
+// guards against double-claim.
+func (s *Service) kickSnapshotPushReconciler(snapshot *models.SandboxSnapshot) {
+	if s.snapshotPushReconciler == nil || snapshot == nil {
+		return
+	}
+	if snapshot.PushState != models.SnapshotPushStatePending {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+		if _, err := s.snapshotPushReconciler.RunOnce(ctx); err != nil && s.logger != nil {
+			s.logger.Warn("snapshot push: post-create reconciler tick failed",
+				"snapshot", snapshot.Name, "error", err)
+		}
+	}()
 }
 
 func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.SandboxSnapshot, error) {

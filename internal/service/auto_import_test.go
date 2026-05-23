@@ -31,10 +31,10 @@ func TestAutoImportConfig_ValidateDisabledAlwaysOK(t *testing.T) {
 
 func TestAutoImportConfig_ValidateRequiresFields(t *testing.T) {
 	cases := map[string]AutoImportConfig{
-		"no host":   {Enabled: true, ClusterID: "x", ClusterPAT: "y"},
-		"no id":     {Enabled: true, HooksBaseURL: "https://x", ClusterPAT: "y"},
-		"no pat":    {Enabled: true, HooksBaseURL: "https://x", ClusterID: "y"},
-		"bad suffix":{Enabled: true, HooksBaseURL: "https://x", ClusterID: "y", ClusterPAT: "z", RetentionSuffix: "idle-90d"},
+		"no host":    {Enabled: true, ClusterID: "x", ClusterPAT: "y"},
+		"no id":      {Enabled: true, HooksBaseURL: "https://x", ClusterPAT: "y"},
+		"no pat":     {Enabled: true, HooksBaseURL: "https://x", ClusterID: "y"},
+		"bad suffix": {Enabled: true, HooksBaseURL: "https://x", ClusterID: "y", ClusterPAT: "z", RetentionSuffix: "idle-90d"},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {

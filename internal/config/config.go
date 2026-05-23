@@ -456,6 +456,28 @@ type Config struct {
 	// unreadable, the mirror falls back to anonymous pulls — fine for
 	// public images, but private images will 401. SB_UPSTREAM_WRAP_KEY_PATH.
 	UpstreamWrapKeyPath string
+
+	// SnapshotPushEnabled gates the optional background push of sandbox
+	// snapshots to the AOCR registry. When false (the default), snapshots
+	// stay local-only — identical to pre-feature behavior. When true,
+	// snapshots whose distribution mode is `local_only` (sandbox commits
+	// and aerolvm-build/* tags) are pushed in the background to
+	// `<MirrorPushHost|ImageDistributionAOCRHost>/cluster/<ClusterID>/snapshots/<name>`,
+	// reusing the cluster PAT as the registry password. Requires
+	// AutoImportClusterID and AutoImportClusterPATPath to be set —
+	// validated at startup. SB_SNAPSHOT_PUSH_ENABLED.
+	SnapshotPushEnabled bool
+	// SnapshotPushReconcileInterval is the tick period for the background
+	// retry of failed snapshot pushes. Default 5m — shorter wastes credit
+	// when a registry is flapping; longer leaves new snapshots stuck in
+	// `pending` for longer than necessary on cold paths.
+	// SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL.
+	SnapshotPushReconcileInterval time.Duration
+	// SnapshotPushMaxInFlight bounds per-tick fan-out so a burst of newly
+	// created snapshots cannot saturate the local Docker daemon or the
+	// AOCR registry. Default 2 — pushes are I/O-heavy per snapshot.
+	// SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT.
+	SnapshotPushMaxInFlight int
 }
 
 // MirrorUpstreamMapping is a single host=shortname pair parsed from
@@ -579,6 +601,9 @@ func Load() (Config, error) {
 		MirrorPushHost:                   strings.TrimSpace(os.Getenv("SB_MIRROR_PUSH_HOST")),
 		MirrorUpstreams:                  parseMirrorUpstreams(getEnv("SB_MIRROR_UPSTREAMS", "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s")),
 		UpstreamWrapKeyPath:              strings.TrimSpace(os.Getenv("SB_UPSTREAM_WRAP_KEY_PATH")),
+		SnapshotPushEnabled:              getEnvBool("SB_SNAPSHOT_PUSH_ENABLED", false),
+		SnapshotPushReconcileInterval:    getEnvDuration("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL", 5*time.Minute),
+		SnapshotPushMaxInFlight:          getEnvInt("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT", 2),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -621,6 +646,27 @@ func Load() (Config, error) {
 		}
 		if cfg.AutoImportRetentionSuffix != "" && !strings.HasPrefix(cfg.AutoImportRetentionSuffix, "--") {
 			return Config{}, fmt.Errorf("SB_AUTO_IMPORT_RETENTION_SUFFIX must start with `--`, got %q", cfg.AutoImportRetentionSuffix)
+		}
+	}
+
+	if cfg.SnapshotPushEnabled {
+		// Reuse the auto-import cluster identity + PAT. This is deliberate:
+		// the AOCR registry endpoint accepts the same bearer the hooks API
+		// does, so operators don't manage two credentials for the same
+		// cluster. Push host falls back to ImageDistributionAOCRHost when
+		// MirrorPushHost is unset — both have non-empty defaults so the
+		// destination is always resolvable.
+		if cfg.AutoImportClusterID == "" {
+			return Config{}, errors.New("SB_AUTO_IMPORT_CLUSTER_ID is required when SB_SNAPSHOT_PUSH_ENABLED=true")
+		}
+		if cfg.AutoImportClusterPATPath == "" {
+			return Config{}, errors.New("SB_AUTO_IMPORT_CLUSTER_PAT_PATH is required when SB_SNAPSHOT_PUSH_ENABLED=true")
+		}
+		if cfg.SnapshotPushReconcileInterval <= 0 {
+			return Config{}, errors.New("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL must be > 0 when snapshot push is enabled")
+		}
+		if cfg.SnapshotPushMaxInFlight <= 0 {
+			return Config{}, errors.New("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT must be > 0 when snapshot push is enabled")
 		}
 	}
 

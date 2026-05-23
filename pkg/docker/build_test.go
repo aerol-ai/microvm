@@ -178,11 +178,25 @@ func TestDecodePushStreamForwardsStatuses(t *testing.T) {
 			`{"status":"v1: digest: sha256:abc size: 123"}` + "\n",
 	)
 	var lines []string
-	if err := decodePushStream(body, func(line string) { lines = append(lines, line) }); err != nil {
+	if err := decodePushStream(body, func(line string) { lines = append(lines, line) }, nil); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(lines) != 2 {
 		t.Fatalf("statuses = %v", lines)
+	}
+}
+
+func TestDecodePushStreamCapturesAuxDigest(t *testing.T) {
+	body := strings.NewReader(
+		`{"status":"Pushing"}` + "\n" +
+			`{"progressDetail":{},"aux":{"Tag":"latest","Digest":"sha256:abc123","Size":42}}` + "\n",
+	)
+	var digest string
+	if err := decodePushStream(body, nil, func(d string) { digest = d }); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if digest != "sha256:abc123" {
+		t.Fatalf("digest = %q, want sha256:abc123", digest)
 	}
 }
 
@@ -191,7 +205,7 @@ func TestDecodePushStreamPromotesError(t *testing.T) {
 		`{"status":"Pushing"}` + "\n" +
 			`{"errorDetail":{"message":"unauthorized: authentication required"}}` + "\n",
 	)
-	err := decodePushStream(body, nil)
+	err := decodePushStream(body, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "unauthorized") {
 		t.Fatalf("expected push error, got %v", err)
 	}

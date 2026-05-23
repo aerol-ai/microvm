@@ -138,6 +138,81 @@ func TestCreateSnapshotWithOwnershipMarksLocalOnly(t *testing.T) {
 	}
 }
 
+func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
+	// When a peer node took a snapshot and pushed it under the
+	// cluster's deterministic AOCR namespace, this node may receive a
+	// create request naming a snapshot it has never seen locally.
+	// Rather than wire snapshot rows through the FSM, the normalizer
+	// rewrites the image to the canonical AOCR ref so the docker pull
+	// acts as the existence check.
+	ctx := context.Background()
+	st := openImageDistributionStore(t)
+	defer st.Close()
+
+	patPath := writePATFile(t, "token")
+	pusher, err := NewSnapshotPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-7",
+		PATPath:   patPath,
+	}, &fakeSnapshotPushDocker{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewSnapshotPusher: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		image     string
+		pusher    *SnapshotPusher
+		wantImage string
+		wantMode  string
+	}{
+		{
+			name:      "bare name with pusher rewrites to AOCR ref",
+			image:     "my-snap",
+			pusher:    pusher,
+			wantImage: "aocr.test/cluster/cluster-7/snapshots/my-snap:latest",
+			wantMode:  models.ImageDistributionAOCR,
+		},
+		{
+			name:      "bare name without pusher is left to classifier",
+			image:     "my-snap",
+			pusher:    nil,
+			wantImage: "my-snap",
+			wantMode:  models.ImageDistributionExternalRegistry,
+		},
+		{
+			name:      "registry ref is left alone",
+			image:     "ghcr.io/org/img:latest",
+			pusher:    pusher,
+			wantImage: "ghcr.io/org/img:latest",
+			wantMode:  models.ImageDistributionExternalRegistry,
+		},
+		{
+			name:      "local-only build tag is left alone",
+			image:     docker.BuiltImageNamespace + "/abc123:latest",
+			pusher:    pusher,
+			wantImage: docker.BuiltImageNamespace + "/abc123:latest",
+			wantMode:  models.ImageDistributionLocalOnly,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &Service{store: st, snapshotPusher: tc.pusher}
+			req := models.CreateSandboxRequest{Image: tc.image}
+			if err := svc.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+				t.Fatalf("NormalizeCreateImageDistribution: %v", err)
+			}
+			if req.Image != tc.wantImage {
+				t.Fatalf("Image = %q, want %q", req.Image, tc.wantImage)
+			}
+			if req.ImageDistributionMode != tc.wantMode {
+				t.Fatalf("ImageDistributionMode = %q, want %q", req.ImageDistributionMode, tc.wantMode)
+			}
+		})
+	}
+}
+
 func openImageDistributionStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
