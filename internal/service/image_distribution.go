@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -62,12 +64,34 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 	req.Image = strings.TrimSpace(req.Image)
 
 	if s != nil && s.store != nil && req.Image != "" {
-		if snapshot, err := s.store.GetSnapshot(ctx, req.Image); err == nil && snapshot != nil {
+		snapshot, err := s.store.GetSnapshot(ctx, req.Image)
+		switch {
+		case err == nil && snapshot != nil:
 			if image := strings.TrimSpace(snapshot.Image); image != "" {
 				req.Image = image
 			}
 			if req.ImageDistribution().IsZero() {
 				req.ApplyImageDistribution(snapshot.ImageDistribution())
+			}
+		case errors.Is(err, store.ErrNotFound) && s.snapshotPusher != nil:
+			// Cross-node snapshot lookup: a peer node took the snapshot,
+			// pushed it under the deterministic AOCR namespace, but the
+			// local store has never seen the row (we don't replicate
+			// snapshot rows through the FSM). Construct the canonical
+			// AOCR ref and let the docker pull act as the existence
+			// check. Only applies to bare identifiers — anything that
+			// looks like a registry ref or a local-only build tag goes
+			// through the normal classifier below.
+			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) {
+				if dest := s.snapshotPusher.DestRefFor(req.Image); dest != "" {
+					req.Image = dest
+					if req.ImageDistribution().IsZero() {
+						req.ApplyImageDistribution(models.ImageDistributionMetadata{
+							Mode:        models.ImageDistributionAOCR,
+							RegistryRef: dest,
+						})
+					}
+				}
 			}
 		}
 	}

@@ -71,6 +71,12 @@ type SnapshotPushDocker interface {
 // will see when they decide where to start a sandbox from this snapshot.
 type SnapshotPushResult struct {
 	RegistryRef string
+	// Digest is the manifest digest (`sha256:...`) the registry assigned
+	// to the pushed tag, as reported by Docker's push stream `aux`
+	// payload. Empty when the daemon did not surface one — older daemons
+	// or registries that don't return a manifest digest will leave this
+	// blank and the reconciler stores "" rather than fabricating a value.
+	Digest string
 }
 
 // SnapshotPusher pushes a locally-committed snapshot image to AOCR. It
@@ -137,6 +143,7 @@ func (p *SnapshotPusher) PushOnce(ctx context.Context, snapshot *models.SandboxS
 
 	dest := snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name)
 
+	var digest string
 	pushed, err := p.docker.PushImage(ctx, docker.PushImageRequest{
 		SourceTag: source,
 		DestRef:   dest,
@@ -150,6 +157,9 @@ func (p *SnapshotPusher) PushOnce(ctx context.Context, snapshot *models.SandboxS
 				p.logger.Debug("snapshot push", "snapshot", name, "dest", dest, "line", line)
 			}
 		},
+		OnDigest: func(d string) {
+			digest = d
+		},
 	})
 	if err != nil {
 		return SnapshotPushResult{}, fmt.Errorf("snapshot push %s -> %s: %w", source, dest, err)
@@ -160,7 +170,24 @@ func (p *SnapshotPusher) PushOnce(ctx context.Context, snapshot *models.SandboxS
 		// snapshot row still gets a usable ref.
 		pushed = dest
 	}
-	return SnapshotPushResult{RegistryRef: pushed}, nil
+	return SnapshotPushResult{RegistryRef: pushed, Digest: digest}, nil
+}
+
+// DestRefFor returns the AOCR destination ref this pusher would write
+// for the given snapshot name. Used by callers that need the canonical
+// ref without actually pushing — e.g. cross-node snapshot lookup, where
+// a peer node took the snapshot and we want to pull from AOCR without
+// asking the FSM whether the snapshot exists. Returns "" when the
+// pusher is nil so callers can no-op cleanly when push is disabled.
+func (p *SnapshotPusher) DestRefFor(snapshotName string) string {
+	if p == nil {
+		return ""
+	}
+	name := strings.TrimSpace(snapshotName)
+	if name == "" {
+		return ""
+	}
+	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name)
 }
 
 // snapshotAOCRRef is the AOCR destination convention for cluster-local

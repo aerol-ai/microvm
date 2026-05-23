@@ -15,7 +15,51 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// TestDaytonaSnapshotStateMapping pins the Daytona-facing state translation
+// for every push-lifecycle value the snapshot row can hold. The SDK's poll
+// loop exits only on "active" or "error" — getting any of these wrong
+// either hangs the client or fails it early, so we lock in the table.
+func TestDaytonaSnapshotStateMapping(t *testing.T) {
+	cases := []struct {
+		name        string
+		pushState   string
+		pushError   string
+		wantState   string
+		wantReason  string
+		reasonNil   bool
+	}{
+		{"empty (legacy row) is active", "", "", "active", "", true},
+		{"active", models.SnapshotPushStateActive, "", "active", "", true},
+		{"pending → pulling_image", models.SnapshotPushStatePending, "", "pulling_image", "", true},
+		{"pushing → pulling_image", models.SnapshotPushStatePushing, "", "pulling_image", "", true},
+		{"error surfaces push error", models.SnapshotPushStateError, "registry 500", "error", "registry 500", false},
+		{"error without message gets fallback reason", models.SnapshotPushStateError, "", "error", "snapshot push failed", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := &models.SandboxSnapshot{PushState: tc.pushState, PushError: tc.pushError}
+			state, reason := daytonaSnapshotState(snap)
+			if state != tc.wantState {
+				t.Fatalf("state = %q, want %q", state, tc.wantState)
+			}
+			if tc.reasonNil {
+				if reason != nil {
+					t.Fatalf("reason = %q, want nil", *reason)
+				}
+				return
+			}
+			if reason == nil {
+				t.Fatalf("reason = nil, want %q", tc.wantReason)
+			}
+			if *reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", *reason, tc.wantReason)
+			}
+		})
+	}
+}
 
 // snapshotCreateTestEnv bundles the moving parts a snapshot-create test
 // needs. Tests that only drive HTTP use .handler; tests that want to call

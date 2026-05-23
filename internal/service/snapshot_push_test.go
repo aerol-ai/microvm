@@ -23,6 +23,7 @@ type fakeSnapshotPushDocker struct {
 	mu     sync.Mutex
 	calls  []docker.PushImageRequest
 	result string
+	digest string
 	err    error
 }
 
@@ -32,6 +33,9 @@ func (f *fakeSnapshotPushDocker) PushImage(_ context.Context, req docker.PushIma
 	f.calls = append(f.calls, req)
 	if f.err != nil {
 		return "", f.err
+	}
+	if f.digest != "" && req.OnDigest != nil {
+		req.OnDigest(f.digest)
 	}
 	if f.result != "" {
 		return f.result, nil
@@ -101,6 +105,22 @@ func TestSnapshotPusher_HappyPath(t *testing.T) {
 	}
 	if call.Auth.Server != "aocr.test" {
 		t.Fatalf("Auth.Server = %q", call.Auth.Server)
+	}
+}
+
+func TestSnapshotPusher_CapturesDigestFromAux(t *testing.T) {
+	patPath := writePATFile(t, "token")
+	fake := &fakeSnapshotPushDocker{digest: "sha256:deadbeef"}
+	pusher := newTestPusher(t, patPath, fake)
+
+	result, err := pusher.PushOnce(context.Background(), &models.SandboxSnapshot{
+		Name: "snap", Image: "aerolvm-build/x:latest",
+	})
+	if err != nil {
+		t.Fatalf("PushOnce: %v", err)
+	}
+	if result.Digest != "sha256:deadbeef" {
+		t.Fatalf("Digest = %q, want sha256:deadbeef", result.Digest)
 	}
 }
 

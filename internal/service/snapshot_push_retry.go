@@ -172,11 +172,11 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, snapshot *models.S
 
 	// Success — flip the distribution metadata first (so a crash between
 	// the two updates leaves the row still reachable by `aocr` mode), then
-	// clear the push state. Digest is empty for now — the Docker push API
-	// does not surface RepoDigests without an extra Inspect call; the
-	// ImageVerifiedAt timestamp written below is enough to prove the push
-	// completed for downstream consumers.
-	if err := r.store.UpdateSnapshotImageDistribution(ctx, name, models.ImageDistributionAOCR, result.RegistryRef, ""); err != nil {
+	// clear the push state. Digest comes from the push stream's `aux`
+	// payload; older daemons may leave it empty, in which case we store ""
+	// rather than fabricating a value (downstream consumers treat absent
+	// digest as "ref is the source of truth").
+	if err := r.store.UpdateSnapshotImageDistribution(ctx, name, models.ImageDistributionAOCR, result.RegistryRef, result.Digest); err != nil {
 		// Mark error so we re-attempt next tick rather than silently leaving
 		// the row in 'pushing' forever.
 		if setErr := r.store.SetSnapshotPushState(ctx, name, models.SnapshotPushStateError, err.Error()); setErr != nil {
