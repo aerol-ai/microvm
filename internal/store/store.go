@@ -139,7 +139,9 @@ func Open(path string) (*Store, error) {
 			image_distribution_mode TEXT NOT NULL DEFAULT '',
 			image_digest TEXT NOT NULL DEFAULT '',
 			image_registry_ref TEXT NOT NULL DEFAULT '',
-			image_verified_at DATETIME
+			image_verified_at DATETIME,
+			push_state TEXT NOT NULL DEFAULT 'active',
+			push_error TEXT NOT NULL DEFAULT ''
 		);`,
 		// sandbox_compat_state holds opaque facade-private state that has
 		// no native meaning. One row per (sandbox, facade). state_json is
@@ -270,6 +272,13 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandbox_snapshots ADD COLUMN image_digest TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN image_registry_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN image_verified_at DATETIME;`,
+		// Background-push lifecycle for the SB_SNAPSHOT_PUSH_ENABLED feature.
+		// Default 'active' so warm-upgrade rows (created before this feature
+		// existed) are treated as terminal — the reconciler ignores them.
+		// New rows that need push start at 'pending' and transition through
+		// 'pushing' to 'active' or 'error'.
+		`ALTER TABLE sandbox_snapshots ADD COLUMN push_state TEXT NOT NULL DEFAULT 'active';`,
+		`ALTER TABLE sandbox_snapshots ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
 		// auto_import_pending is set when the post-pull AOCR auto-import
 		// (F21) failed and a background reconciler should retry. It is
 		// local-node bookkeeping only — never replicated, never user-visible.
@@ -1316,11 +1325,16 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 	if snapshot.ImageVerifiedAt != nil {
 		imageVerifiedAt = snapshot.ImageVerifiedAt.UTC()
 	}
+	pushState := strings.TrimSpace(snapshot.PushState)
+	if pushState == "" {
+		pushState = models.SnapshotPushStateActive
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
-			image_distribution_mode, image_digest, image_registry_ref, image_verified_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		strings.TrimSpace(snapshot.Name),
 		strings.TrimSpace(snapshot.Image),
@@ -1337,6 +1351,8 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 		strings.TrimSpace(snapshot.ImageDigest),
 		strings.TrimSpace(snapshot.ImageRegistryRef),
 		imageVerifiedAt,
+		pushState,
+		strings.TrimSpace(snapshot.PushError),
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -1351,7 +1367,8 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 	row := s.db.QueryRowContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
-			image_distribution_mode, image_digest, image_registry_ref, image_verified_at
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error
 		FROM sandbox_snapshots
 		WHERE name = ?
 	`, strings.TrimSpace(name))
@@ -1369,7 +1386,8 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, e
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
-			image_distribution_mode, image_digest, image_registry_ref, image_verified_at
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error
 		FROM sandbox_snapshots
 		ORDER BY created_at DESC, name ASC
 	`)
@@ -1396,6 +1414,89 @@ func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_snapshots WHERE name = ?`, strings.TrimSpace(name))
 	if err != nil {
 		return fmt.Errorf("delete snapshot: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListSnapshotsPendingPush returns snapshots the reconciler should retry —
+// 'pending' is the brand-new state set by the snapshot-create path, 'error'
+// is what a failed previous attempt left behind. 'pushing' is intentionally
+// excluded so a row currently being processed by another reconciler tick
+// (or a still-running goroutine kicked off by snapshot-create) is not
+// re-claimed before its terminal state lands.
+func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.SandboxSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error
+		FROM sandbox_snapshots
+		WHERE push_state IN ('pending', 'error')
+		ORDER BY created_at ASC, name ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots pending push: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.SandboxSnapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot: %w", err)
+		}
+		items = append(items, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshots: %w", err)
+	}
+	return items, nil
+}
+
+// SetSnapshotPushState is a narrow single-column update used by the push
+// reconciler. errMsg is overwritten unconditionally (including to empty
+// on success transitions) so callers don't have to remember to clear it.
+func (s *Store) SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandbox_snapshots
+		SET push_state = ?, push_error = ?
+		WHERE name = ?
+	`, strings.TrimSpace(state), errMsg, strings.TrimSpace(name))
+	if err != nil {
+		return fmt.Errorf("set snapshot push state: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateSnapshotImageDistribution flips the distribution metadata on a
+// snapshot row after a successful AOCR push — local_only → aocr. Called
+// from the reconciler success path together with SetSnapshotPushState.
+// VerifiedAt records when the push completed; cluster placement on other
+// nodes uses this together with the new mode to decide the snapshot is
+// fan-outable.
+func (s *Store) UpdateSnapshotImageDistribution(ctx context.Context, name, mode, registryRef, digest string) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandbox_snapshots
+		SET image_distribution_mode = ?, image_registry_ref = ?, image_digest = ?, image_verified_at = ?
+		WHERE name = ?
+	`,
+		strings.TrimSpace(mode),
+		strings.TrimSpace(registryRef),
+		strings.TrimSpace(digest),
+		now,
+		strings.TrimSpace(name),
+	)
+	if err != nil {
+		return fmt.Errorf("update snapshot image distribution: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -1799,6 +1900,8 @@ func scanSnapshot(scanner interface {
 		&snapshot.ImageDigest,
 		&snapshot.ImageRegistryRef,
 		&imageVerifiedAt,
+		&snapshot.PushState,
+		&snapshot.PushError,
 	)
 	if err != nil {
 		return nil, err

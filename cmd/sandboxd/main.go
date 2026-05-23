@@ -280,6 +280,7 @@ func main() {
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
+		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
 		if cfg.AutoImportEnabled {
 			// Wire the post-pull trigger: when the docker client finishes a
 			// successful pull that BOTH used the mirror AND carried private
@@ -559,6 +560,72 @@ func startAutoImportReconciler(ctx context.Context, logger *slog.Logger, cfg con
 					continue
 				}
 				logger.Info("auto-import reconcile sweep",
+					"scanned", stats.Scanned,
+					"succeeded", stats.Succeeded,
+					"failed", stats.Failed,
+					"skipped", stats.Skipped,
+				)
+			}
+		}
+	}()
+}
+
+// startSnapshotPushReconciler builds the optional AOCR snapshot pusher +
+// reconciler and starts a ticker goroutine if the feature is enabled. When
+// disabled (or when the pusher fails to build) we log and return without
+// scheduling anything — the snapshot path runs unchanged.
+//
+// Push host falls back to ImageDistributionAOCRHost when MirrorPushHost is
+// unset; both have non-empty defaults so the destination is always
+// resolvable. Auth reuses the auto-import cluster PAT path (re-read on
+// every push so rotation works without a restart).
+func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service, dockerClient *docker.Client) {
+	if !cfg.SnapshotPushEnabled {
+		return
+	}
+	host := strings.TrimSpace(cfg.MirrorPushHost)
+	if host == "" {
+		host = strings.TrimSpace(cfg.ImageDistributionAOCRHost)
+	}
+	pusher, err := service.NewSnapshotPusher(service.SnapshotPushConfig{
+		Enabled:   true,
+		Host:      host,
+		ClusterID: cfg.AutoImportClusterID,
+		PATPath:   cfg.AutoImportClusterPATPath,
+	}, dockerClient, logger)
+	if err != nil {
+		logger.Warn("snapshot push: pusher build failed; feature stays off",
+			"error", err)
+		return
+	}
+	r := service.NewSnapshotPushReconciler(pusher, db, logger, cfg.SnapshotPushMaxInFlight)
+	if r == nil {
+		return
+	}
+	svc.AttachSnapshotPusher(pusher, r)
+	logger.Info("snapshot push reconciler started",
+		"host", host,
+		"cluster_id", cfg.AutoImportClusterID,
+		"interval", cfg.SnapshotPushReconcileInterval,
+		"max_in_flight", cfg.SnapshotPushMaxInFlight,
+	)
+	go func() {
+		t := time.NewTicker(cfg.SnapshotPushReconcileInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				stats, err := r.RunOnce(ctx)
+				if err != nil {
+					logger.Warn("snapshot push reconcile sweep failed", "error", err)
+					continue
+				}
+				if stats.Scanned == 0 {
+					continue
+				}
+				logger.Info("snapshot push reconcile sweep",
 					"scanned", stats.Scanned,
 					"succeeded", stats.Succeeded,
 					"failed", stats.Failed,

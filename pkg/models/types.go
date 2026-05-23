@@ -247,6 +247,22 @@ const (
 	ImageDistributionAOCRImported = "aocr_imported"
 )
 
+// SnapshotPushState tracks the lifecycle of the optional background push of a
+// local snapshot to the AOCR registry. The two terminal states a polling SDK
+// cares about are "active" (snapshot is ready everywhere it can be) and
+// "error" (push failed; the snapshot is still usable on the originating node
+// and the reconciler will retry). "pending" / "pushing" are transient.
+//
+// When SB_SNAPSHOT_PUSH_ENABLED is false, or when the snapshot's image already
+// lives in a remote registry, new rows are written with state "active"
+// directly — making the response shape identical to today's behavior.
+const (
+	SnapshotPushStateActive  = "active"
+	SnapshotPushStatePending = "pending"
+	SnapshotPushStatePushing = "pushing"
+	SnapshotPushStateError   = "error"
+)
+
 const (
 	FailoverPolicyNone     = "none"
 	FailoverPolicyRecreate = "recreate"
@@ -557,6 +573,17 @@ type SandboxSnapshot struct {
 	MemoryMB int     `json:"memory_mb,omitempty"`
 	DiskGB   int     `json:"disk_gb,omitempty"`
 	GPU      float64 `json:"gpu,omitempty"`
+
+	// PushState reflects the AOCR-push lifecycle for this snapshot. See the
+	// SnapshotPushState* constants above. When push is disabled (or the image
+	// already lives in a remote registry) this is "active" from the moment
+	// the row is inserted, matching pre-feature behavior. Otherwise it
+	// transitions pending → pushing → active|error, and the cluster placement
+	// path treats the snapshot as locally-pinned until it hits "active".
+	PushState string `json:"push_state,omitempty"`
+	// PushError is populated only when PushState is "error" — the last error
+	// the reconciler saw, surfaced to the Daytona facade's errorReason field.
+	PushError string `json:"push_error,omitempty"`
 }
 
 func (s SandboxSnapshot) ImageDistribution() ImageDistributionMetadata {

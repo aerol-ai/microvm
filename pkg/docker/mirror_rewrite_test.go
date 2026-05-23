@@ -19,8 +19,8 @@ func defaultMirrorCfg() MirrorConfig {
 
 func TestRewriteImageRefForMirror_DisabledConfig(t *testing.T) {
 	for name, cfg := range map[string]MirrorConfig{
-		"zero":       {},
-		"no-host":    {Upstreams: []MirrorUpstream{{Host: "ghcr.io", Shortname: "ghcr"}}},
+		"zero":         {},
+		"no-host":      {Upstreams: []MirrorUpstream{{Host: "ghcr.io", Shortname: "ghcr"}}},
 		"no-upstreams": {Host: "mirror.aocr.aerol.ai"},
 	} {
 		t.Run(name, func(t *testing.T) {

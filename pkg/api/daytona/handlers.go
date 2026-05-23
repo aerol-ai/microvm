@@ -913,25 +913,52 @@ func (h *handlers) toSnapshotResponse(r *http.Request, snapshot *models.SandboxS
 		memGB = float32(snapshot.MemoryMB) / 1024
 	}
 
+	state, errorReason := daytonaSnapshotState(snapshot)
+
 	return snapshotResponse{
 		ID:             id,
 		OrganizationID: nonEmptyStringPtr(&organizationID),
 		General:        false,
 		Name:           snapshot.Name,
 		ImageName:      imageName,
-		State:          "active",
+		State:          state,
 		Size:           nil,
 		Entrypoint:     entrypoint,
 		CPU:            float32(snapshot.CPU),
 		GPU:            float32(snapshot.GPU),
 		Mem:            memGB,
 		Disk:           float32(snapshot.DiskGB),
-		ErrorReason:    nil,
+		ErrorReason:    errorReason,
 		CreatedAt:      createdAt,
 		UpdatedAt:      createdAt,
 		LastUsedAt:     nil,
 		Ref:            cloneStringPtr(imageName),
 		RegionIDs:      regionIDs,
+	}
+}
+
+// daytonaSnapshotState maps the internal snapshot push lifecycle to
+// Daytona's published snapshot states. The Daytona SDK polls until state
+// reaches "active" or "error" — `pulling_image` keeps it in the polling
+// loop without surfacing a transient error to the caller.
+//
+// Pre-feature snapshot rows that exist on warm-upgrade disks have an empty
+// PushState; the store migration defaults them to "active", so the empty
+// case here only fires for rows constructed in-memory without going
+// through the store (e.g. some test setups). Treating empty as "active"
+// keeps the response identical to today's behavior.
+func daytonaSnapshotState(snapshot *models.SandboxSnapshot) (string, *string) {
+	switch snapshot.PushState {
+	case models.SnapshotPushStatePending, models.SnapshotPushStatePushing:
+		return "pulling_image", nil
+	case models.SnapshotPushStateError:
+		reason := strings.TrimSpace(snapshot.PushError)
+		if reason == "" {
+			reason = "snapshot push failed"
+		}
+		return "error", &reason
+	default:
+		return "active", nil
 	}
 }
 
