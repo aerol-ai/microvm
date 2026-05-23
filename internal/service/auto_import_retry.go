@@ -281,7 +281,7 @@ func autoImportRequestFromSpec(spec *models.CreateSandboxRequest) (AutoImportReq
 // is optional — the digest is what makes the import authoritative.
 //
 // This deliberately does NOT understand AOCR mirror-prefix rewriting
-// (`mirror.aocr.aerol.ai/_/ghcr/...`): the AutoImport path runs against
+// (`mirror.aocr.aerol.ai/aocr/ghcr/...`): the AutoImport path runs against
 // the *original* upstream ref, not the mirror-rewritten one. The mirror
 // rewrite is a pull-time concern only.
 func parseUpstreamFromRegistryRef(registryRef, image string) (host, repo, tag string) {

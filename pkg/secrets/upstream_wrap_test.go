@@ -15,7 +15,7 @@ func sampleCreds() UpstreamCredentials {
 		UpstreamHost: "ghcr.io",
 		Username:     "octocat",
 		Password:     "ghp_xxxxxxxxxxxx",
-		Scope:        "repository:_/ghcr/aerol-ai/sandbox:pull",
+		Scope:        "repository:aocr/ghcr/aerol-ai/sandbox:pull",
 	}
 }
 

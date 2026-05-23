@@ -26,6 +26,43 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y curl jq awscli openssl ca-certificates
 
+%{ if aocr_enabled && aocr_mirror_host != "" ~}
+###############################################################################
+# 0. Docker Hub mirror (AOCR) — day-0 daemon.json
+#
+# Sandboxd's client-side rewriter handles ghcr.io / gcr.io / quay.io /
+# registry.k8s.io by URL substitution, but Docker Hub is special: dockerd
+# *only* honours a mirror for Hub via /etc/docker/daemon.json
+# `registry-mirrors`. Without this block, `docker pull alpine` bypasses
+# the AOCR mirror entirely (same name "library/alpine" exists upstream).
+#
+# Written before install.sh so dockerd starts with the setting on its
+# very first boot — no restart-races, no containers to evict.
+# `live-restore: true` is set proactively so future daemon restarts
+# (cert rotation, package upgrades) don't kill running sandboxes.
+#
+# jq-merges into any pre-existing daemon.json (e.g. baked into a custom
+# AMI) instead of clobbering it.
+###############################################################################
+install -d -m 0755 /etc/docker
+if [ -s /etc/docker/daemon.json ]; then
+  jq --arg mirror "https://${aocr_mirror_host}" \
+     '. + {"registry-mirrors": [$mirror], "live-restore": true}' \
+     /etc/docker/daemon.json > /etc/docker/daemon.json.new
+else
+  jq -n --arg mirror "https://${aocr_mirror_host}" \
+     '{"registry-mirrors": [$mirror], "live-restore": true}' \
+     > /etc/docker/daemon.json.new
+fi
+mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+chmod 0644 /etc/docker/daemon.json
+# Restart only if dockerd is already running (custom AMI); otherwise
+# install.sh will start it and pick the config up on its first boot.
+if systemctl is-active --quiet docker; then
+  systemctl restart docker
+fi
+%{ endif ~}
+
 ###############################################################################
 # 1. install.sh
 #
