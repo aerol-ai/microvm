@@ -76,6 +76,20 @@ resource "aws_instance" "seed" {
     caddy_storage_s3_access_key     = local.caddy_storage_s3.access_key
     caddy_storage_s3_secret_key     = local.caddy_storage_s3.secret_key
     caddy_storage_s3_encryption_key = local.caddy_storage_s3.encryption_key
+    # AOCR mirror + auto-import (Phase 4 F17-F21) — see local.aocr.
+    aocr_enabled             = local.aocr.enabled
+    aocr_mirror_host         = local.aocr.mirror_host
+    aocr_mirror_push_host    = local.aocr.mirror_push_host
+    aocr_mirror_upstreams    = local.aocr.mirror_upstreams
+    aocr_upstream_wrap_key   = local.aocr.upstream_wrap_key
+    aocr_auto_import_enabled = local.aocr.auto_import_enabled
+    aocr_hooks_url           = local.aocr.hooks_url
+    aocr_cluster_id          = local.aocr.cluster_id
+    aocr_cluster_pat         = local.aocr.cluster_pat
+    aocr_retention_suffix    = local.aocr.retention_suffix
+    aocr_request_timeout     = local.aocr.request_timeout
+    aocr_reconcile_interval  = local.aocr.reconcile_interval
+    aocr_max_in_flight       = local.aocr.max_in_flight
   })
 
   tags = merge(
@@ -159,6 +173,20 @@ resource "aws_instance" "joiner" {
     caddy_storage_s3_access_key     = local.caddy_storage_s3.access_key
     caddy_storage_s3_secret_key     = local.caddy_storage_s3.secret_key
     caddy_storage_s3_encryption_key = local.caddy_storage_s3.encryption_key
+    # AOCR mirror + auto-import (Phase 4 F17-F21) — see local.aocr.
+    aocr_enabled             = local.aocr.enabled
+    aocr_mirror_host         = local.aocr.mirror_host
+    aocr_mirror_push_host    = local.aocr.mirror_push_host
+    aocr_mirror_upstreams    = local.aocr.mirror_upstreams
+    aocr_upstream_wrap_key   = local.aocr.upstream_wrap_key
+    aocr_auto_import_enabled = local.aocr.auto_import_enabled
+    aocr_hooks_url           = local.aocr.hooks_url
+    aocr_cluster_id          = local.aocr.cluster_id
+    aocr_cluster_pat         = local.aocr.cluster_pat
+    aocr_retention_suffix    = local.aocr.retention_suffix
+    aocr_request_timeout     = local.aocr.request_timeout
+    aocr_reconcile_interval  = local.aocr.reconcile_interval
+    aocr_max_in_flight       = local.aocr.max_in_flight
   })
 
   depends_on = [aws_instance.seed]

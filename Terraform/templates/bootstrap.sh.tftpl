@@ -179,6 +179,60 @@ OTEL_SERVICE_NAME=${otel_service_name}
 SB_IMAGE_PULL_MAX_CONCURRENT=${image_pull_max_concurrent}
 SB_IMAGE_PULL_FAILURE_BACKOFF=${image_pull_failure_backoff}
 EOF
+
+%{ if aocr_enabled ~}
+###############################################################################
+# 3b. AOCR (Phase 4 F17-F21) — authenticated mirror + auto-import.
+#
+# Wrap key and cluster PAT are file-sourced so they never appear in
+# `systemctl show sandboxd` env dumps or process listings. Install both at
+# 0600 under /etc/sandboxd/secrets/ (matches the paths the sandboxd
+# config defaults expect and that the Ansible configure-ops playbook uses).
+###############################################################################
+sudo install -d -m 0700 -o root -g root /etc/sandboxd/secrets
+
+%{ if aocr_upstream_wrap_key != "" ~}
+# Base64 AES-GCM wrap key. Must match an entry in AOCR's
+# UPSTREAM_AUTH_WRAP_KEYS env var or wrapping will silently fail and
+# private upstream pulls will 401.
+umask 077
+cat > /etc/sandboxd/secrets/upstream-wrap.key <<'EOF'
+${aocr_upstream_wrap_key}
+EOF
+sudo chown root:root /etc/sandboxd/secrets/upstream-wrap.key
+sudo chmod 0600 /etc/sandboxd/secrets/upstream-wrap.key
+%{ endif ~}
+
+%{ if aocr_cluster_pat != "" ~}
+# Cluster PAT used as Bearer token on POST /v1/internal/imports. Sandboxd
+# reads it via SB_AUTO_IMPORT_CLUSTER_PAT_PATH at request time; never put it
+# in an env var (it would land in logs and `ps`/`systemctl show` output).
+umask 077
+cat > /etc/sandboxd/secrets/cluster-pat <<'EOF'
+${aocr_cluster_pat}
+EOF
+sudo chown root:root /etc/sandboxd/secrets/cluster-pat
+sudo chmod 0600 /etc/sandboxd/secrets/cluster-pat
+%{ endif ~}
+
+cat >> /tmp/aerolvm-ops.env <<'EOF'
+
+# Managed by Terraform bootstrap: AOCR mirror + auto-import (Phase 4).
+SB_MIRROR_HOST=${aocr_mirror_host}
+SB_MIRROR_PUSH_HOST=${aocr_mirror_push_host}
+SB_MIRROR_UPSTREAMS=${aocr_mirror_upstreams}
+SB_UPSTREAM_WRAP_KEY_PATH=%{ if aocr_upstream_wrap_key != "" ~}/etc/sandboxd/secrets/upstream-wrap.key%{ endif ~}
+SB_AUTO_IMPORT_ENABLED=${aocr_auto_import_enabled}
+SB_AUTO_IMPORT_HOOKS_URL=${aocr_hooks_url}
+SB_AUTO_IMPORT_CLUSTER_ID=${aocr_cluster_id}
+SB_AUTO_IMPORT_CLUSTER_PAT_PATH=%{ if aocr_cluster_pat != "" ~}/etc/sandboxd/secrets/cluster-pat%{ endif ~}
+SB_AUTO_IMPORT_RETENTION_SUFFIX=${aocr_retention_suffix}
+SB_AUTO_IMPORT_REQUEST_TIMEOUT=${aocr_request_timeout}
+SB_AUTO_IMPORT_RECONCILE_INTERVAL=${aocr_reconcile_interval}
+SB_AUTO_IMPORT_MAX_IN_FLIGHT=${aocr_max_in_flight}
+EOF
+%{ endif ~}
+
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
 sudo systemctl restart sandboxd
 

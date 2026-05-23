@@ -158,3 +158,36 @@ nodes = {
 #   Env   = "prod"
 #   Owner = "platform-team"
 # }
+
+# --- AOCR (authenticated mirror + auto-import) ------------------------------
+#
+# Day-0 wiring against an already-deployed AOCR (Phase 4 F17-F21). Off by
+# default; flip enabled = true to template SB_MIRROR_* / SB_AUTO_IMPORT_*
+# into cluster.env and install wrap-key + cluster-PAT secrets under
+# /etc/sandboxd/secrets/ on every node. See sandbox-library/AUTHENTICATED_MIRROR.md.
+#
+# Mirror-only mode (cache + credential wrapping, no Raft-coordinated
+# imports). Pulls flowing through SB_MIRROR_HOST get private upstream
+# credentials wrapped with upstream_wrap_key before they leave the node.
+# aocr = {
+#   enabled            = true
+#   mirror_host        = "mirror.aocr.aerol.ai"
+#   mirror_push_host   = "aocr.aerol.ai"
+#   upstream_wrap_key  = "REPLACE-with-base64-32-byte-key-from-aocr-secrets/upstream_wrap_key"
+# }
+#
+# Mirror + auto-import (full F21). hooks_url / cluster_id / cluster_pat are
+# required when auto_import_enabled = true (plan-time validation matches
+# sandboxd's startup guard). cluster_pat must equal the AOCR side's
+# INTERNAL_API_TOKEN (file aocr/secrets/internal_api_token).
+# aocr = {
+#   enabled             = true
+#   mirror_host         = "mirror.aocr.aerol.ai"
+#   mirror_push_host    = "aocr.aerol.ai"
+#   upstream_wrap_key   = "REPLACE-with-base64-32-byte-key"
+#   auto_import_enabled = true
+#   hooks_url           = "https://aocr.aerol.ai"
+#   cluster_id          = "prod-aerolvm-us-east-1"
+#   cluster_pat         = "REPLACE-with-internal-api-token"
+#   retention_suffix    = "--idle-90d"
+# }
