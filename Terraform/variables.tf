@@ -493,3 +493,122 @@ variable "caddy_shared_cert_storage" {
     error_message = "When caddy_shared_cert_storage.mode = \"byo\", bucket, region, and encryption_key are all required."
   }
 }
+
+###############################################################################
+# AOCR (Aerol OCI Registry) — Authenticated mirror + auto-import (Phase 4 F17-F21)
+#
+# Day-0 wiring against an already-deployed AOCR. When enabled = false (the
+# default), nothing AOCR-related is templated and the bootstrap is identical
+# to the pre-Phase-4 path. See sandbox-library/AUTHENTICATED_MIRROR.md for
+# the full operator reference.
+#
+# upstream_wrap_key and cluster_pat are real secrets and end up both in
+# Terraform state and in the EC2 instance user_data — same handling as
+# pat_token and cloudflare_api_token. Marking the whole object sensitive
+# keeps them out of plan/apply output.
+###############################################################################
+
+variable "aocr" {
+  description = <<-EOT
+    Connect this cluster to an already-deployed AOCR.
+
+    enabled              Master switch. When false, no AOCR env or secret
+                         files are templated.
+    mirror_host          Mirror vhost for cached pulls (e.g.
+                         "mirror.aocr.aerol.ai"). Empty disables rewrite
+                         even when enabled = true (auto-import can still
+                         run on its own).
+    mirror_push_host     Push vhost for the same AOCR cluster (e.g.
+                         "aocr.aerol.ai"). Refs already pointing here are
+                         left alone so they are not double-rewritten.
+    mirror_upstreams     Comma-separated host=short map of upstreams the
+                         mirror handles. Default covers ghcr/gcr/quay/k8s.
+    upstream_wrap_key    Base64-encoded 32-byte AES-GCM key. Must equal
+                         the active key in AOCR's UPSTREAM_AUTH_WRAP_KEYS
+                         (use the value from secrets/upstream_wrap_key
+                         emitted by the AOCR Ansible playbook). Empty
+                         disables credential wrapping; private pulls 401.
+    auto_import_enabled  Turn on post-pull auto-import (F21). When true,
+                         hooks_url + cluster_id + cluster_pat are required
+                         (plan-time validation mirrors sandboxd's startup
+                         guard).
+    hooks_url            AOCR hooks service root, no trailing slash, e.g.
+                         "https://aocr.aerol.ai".
+    cluster_id           This cluster's ID on the AOCR side.
+    cluster_pat          Bearer token AOCR validates against its
+                         INTERNAL_API_TOKEN. Same value as
+                         aocr_internal_api_token on the AOCR side
+                         (secrets/internal_api_token).
+    retention_suffix     Tag suffix imported tags get in the cluster
+                         namespace (e.g. "--idle-90d"); drives reaper
+                         eviction window.
+    request_timeout      Per-call timeout for the ImportAPI POST.
+    reconcile_interval   Ticker period for the local auto_import_pending
+                         reconciler.
+    max_in_flight        Fan-out cap for one reconciler sweep.
+  EOT
+  type = object({
+    enabled             = bool
+    mirror_host         = optional(string, "")
+    mirror_push_host    = optional(string, "")
+    mirror_upstreams    = optional(string, "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s")
+    upstream_wrap_key   = optional(string, "")
+    auto_import_enabled = optional(bool, false)
+    hooks_url           = optional(string, "")
+    cluster_id          = optional(string, "")
+    cluster_pat         = optional(string, "")
+    retention_suffix    = optional(string, "--idle-90d")
+    request_timeout     = optional(string, "15s")
+    reconcile_interval  = optional(string, "5m")
+    max_in_flight       = optional(number, 4)
+  })
+  sensitive = true
+  default = {
+    enabled = false
+  }
+
+  validation {
+    condition = (
+      !var.aocr.enabled
+      || !var.aocr.auto_import_enabled
+      || (
+        var.aocr.hooks_url != ""
+        && var.aocr.cluster_id != ""
+        && var.aocr.cluster_pat != ""
+      )
+    )
+    error_message = "When aocr.auto_import_enabled = true, aocr.hooks_url, aocr.cluster_id, and aocr.cluster_pat are all required."
+  }
+
+  validation {
+    condition = (
+      !var.aocr.enabled
+      || var.aocr.cluster_id == ""
+      || can(regex("^[A-Za-z0-9_-]{1,64}$", var.aocr.cluster_id))
+    )
+    error_message = "aocr.cluster_id must match ^[A-Za-z0-9_-]{1,64}$ (matches AOCR ImportAPI validation)."
+  }
+
+  validation {
+    condition = (
+      var.aocr.retention_suffix == ""
+      || can(regex("^--[a-z0-9]+(-[a-z0-9]+)*$", var.aocr.retention_suffix))
+    )
+    error_message = "aocr.retention_suffix must start with '--' followed by lowercase alphanumerics, e.g. '--idle-90d'."
+  }
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.aocr.request_timeout))
+    error_message = "aocr.request_timeout must be a Go duration such as 15s or 1m."
+  }
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.aocr.reconcile_interval))
+    error_message = "aocr.reconcile_interval must be a Go duration such as 5m or 30s."
+  }
+
+  validation {
+    condition     = var.aocr.max_in_flight >= 1
+    error_message = "aocr.max_in_flight must be >= 1."
+  }
+}

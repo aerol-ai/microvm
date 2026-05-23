@@ -23,6 +23,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // managedLabelKey is the Docker label every sandbox container we create
@@ -64,6 +65,13 @@ type Client struct {
 	pullSlots          chan struct{}
 	pullBackoff        time.Duration
 	pullFailures       map[string]imagePullFailure
+	// Mirror configuration: zero value disables rewriting and the pull
+	// path behaves exactly as it did before AOCR mirror support landed.
+	// Set via ConfigureMirror after construction; main() is responsible
+	// for loading the key ring once and handing it in.
+	mirrorCfg    MirrorConfig
+	wrapKeyRing  *secrets.UpstreamWrapKeyRing
+	pullObserver PullObserver
 }
 
 type imagePull struct {
@@ -118,6 +126,58 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		pullBackoff:        cfg.ImagePullFailureBackoff,
 		pullFailures:       make(map[string]imagePullFailure),
 	}, nil
+}
+
+// ConfigureMirror installs the AOCR mirror policy onto an existing Client.
+// Both arguments are optional: a zero MirrorConfig disables rewriting, and
+// a nil key ring disables identity-token wrapping (the pull falls back to
+// raw username/password in X-Registry-Auth). main() is expected to load the
+// wrap key ring exactly once at startup and hand it in here.
+func (c *Client) ConfigureMirror(cfg MirrorConfig, ring *secrets.UpstreamWrapKeyRing) {
+	c.mirrorCfg = cfg
+	c.wrapKeyRing = ring
+}
+
+// PullObserver is invoked exactly once per successful pull that BOTH went
+// through a mirror rewrite AND used non-anonymous upstream credentials —
+// the precondition for the F21 auto-import flow. The sandboxID is whatever
+// the caller stashed on the context with WithSandboxID; empty IDs skip the
+// observer call (no row to flag).
+//
+// Errors inside the observer are the caller's problem: pullImage does not
+// surface them, so the observer must not panic and should handle its own
+// retry/logging. The observer runs synchronously on the pull goroutine; keep
+// it fast.
+type PullObserver func(ctx context.Context, sandboxID string)
+
+// SetPullObserver installs a single observer. Calling again replaces the
+// previous one. Pass nil to disable. main() is expected to set this once at
+// startup to wire the post-pull AutoImportPending flag.
+func (c *Client) SetPullObserver(obs PullObserver) {
+	c.pullObserver = obs
+}
+
+// sandboxIDCtxKey is the unexported type used to stash the sandbox ID on the
+// pull context so pullImage can pass it to the PullObserver without us
+// having to grow signatures across the (already wide) pull stack.
+type sandboxIDCtxKey struct{}
+
+// WithSandboxID returns a context derived from parent that carries the
+// sandbox identifier the pull is being executed on behalf of. Used by the
+// Create path so the PullObserver fired after a successful private mirror
+// pull can flag the correct row. Empty IDs are ignored.
+func WithSandboxID(parent context.Context, sandboxID string) context.Context {
+	if strings.TrimSpace(sandboxID) == "" {
+		return parent
+	}
+	return context.WithValue(parent, sandboxIDCtxKey{}, sandboxID)
+}
+
+// sandboxIDFromContext is the readback half of WithSandboxID. Returns "" if
+// no ID was stashed — callers must treat empty as "no observer call".
+func sandboxIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(sandboxIDCtxKey{}).(string)
+	return v
 }
 
 // ClearNetworkRules releases any per-IP network rules previously attached to a
@@ -272,7 +332,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if IsLocalOnlyImageRef(req.Image) || req.ImageDistributionMode == models.ImageDistributionLocalOnly {
 			return nil, fmt.Errorf("image %q is local-only and is not present on this node; push/register it to a registry or pre-distribute it before failover recreate", req.Image)
 		}
-		if pullErr := c.pullImageDedup(ctx, req.Image, req.Registry); pullErr != nil {
+		// Stash the sandbox ID on the pull context so the PullObserver can
+		// route the post-pull AutoImportPending flag to the right row when
+		// the pull qualifies (mirror rewrite + private creds).
+		pullCtx := WithSandboxID(ctx, sandboxID)
+		if pullErr := c.pullImageDedup(pullCtx, req.Image, req.Registry); pullErr != nil {
 			return nil, pullErr
 		}
 		imageInspect, err = c.inspectImage(ctx, req.Image)
@@ -617,20 +681,52 @@ func (c *Client) ensureToolboxBinary() error {
 }
 
 func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+	// Apply mirror rewrite first so the auth payload we build below can be
+	// keyed off the *upstream* host (the AOCR auth service wants the
+	// upstream's username/password wrapped inside an identity token, not the
+	// mirror vhost as the serveraddress).
+	rewrite := RewriteImageRefForMirror(imageRef, c.mirrorCfg)
+	pullRef := rewrite.RewrittenRef
+
 	headers := map[string]string{}
 	if auth != nil && auth.Username != "" {
-		encoded, err := json.Marshal(map[string]string{
+		authPayload := map[string]string{
 			"username":      auth.Username,
 			"password":      auth.Password,
 			"serveraddress": auth.Server,
-		})
+		}
+		// When the ref was rewritten and we have a wrap key ring, hand
+		// the upstream credentials to AOCR as a wrapped identity token.
+		// Docker's auth handling treats `identitytoken` as authoritative
+		// and ignores username/password when it's present, which is what
+		// we want — the mirror sees only the opaque blob.
+		if rewrite.Rewritten && c.wrapKeyRing != nil {
+			creds := secrets.UpstreamCredentials{
+				UpstreamHost: rewrite.UpstreamHost,
+				Username:     auth.Username,
+				Password:     auth.Password,
+				Scope:        "repository:" + rewrite.UpstreamRepo + ":pull",
+			}
+			token, err := secrets.WrapUpstreamCreds(c.wrapKeyRing, creds)
+			if err != nil {
+				return fmt.Errorf("wrap upstream credentials: %w", err)
+			}
+			// Identity token is authoritative: blank username/password so
+			// the mirror never sees the upstream PAT in cleartext, even
+			// in error paths.
+			authPayload = map[string]string{
+				"identitytoken": token,
+				"serveraddress": c.mirrorCfg.Host,
+			}
+		}
+		encoded, err := json.Marshal(authPayload)
 		if err != nil {
 			return fmt.Errorf("marshal registry auth: %w", err)
 		}
 		headers["X-Registry-Auth"] = base64.StdEncoding.EncodeToString(encoded)
 	}
 
-	query := queryValues(map[string]string{"fromImage": imageRef})
+	query := queryValues(map[string]string{"fromImage": pullRef})
 	target := "http://docker/images/create?" + query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
 	if err != nil {
@@ -665,6 +761,7 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 		}
 		if err := decoder.Decode(&msg); err != nil {
 			if errors.Is(err, io.EOF) {
+				c.firePullObserver(ctx, rewrite, auth)
 				return nil
 			}
 			return fmt.Errorf("decode pull stream: %w", err)
@@ -676,6 +773,24 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 			return fmt.Errorf("pull image %s: %s", imageRef, msg.Error)
 		}
 	}
+}
+
+// firePullObserver invokes the registered observer iff the pull was a
+// private-image pull that went through the mirror — the F21 precondition.
+// Anonymous pulls (no auth), pass-through pulls (no rewrite), missing sandbox
+// ID, and an unset observer all short-circuit cheaply.
+func (c *Client) firePullObserver(ctx context.Context, rewrite MirrorRewrite, auth *models.RegistryAuth) {
+	if c.pullObserver == nil || !rewrite.Rewritten {
+		return
+	}
+	if auth == nil || strings.TrimSpace(auth.Username) == "" {
+		return
+	}
+	sandboxID := sandboxIDFromContext(ctx)
+	if sandboxID == "" {
+		return
+	}
+	c.pullObserver(ctx, sandboxID)
 }
 
 func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {

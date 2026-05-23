@@ -92,6 +92,27 @@ locals {
       : var.caddy_shared_cert_storage.encryption_key
     )
   }
+
+  # AOCR (Phase 4 F17-F21) — resolved view for bootstrap.sh.tftpl. Same
+  # pattern as caddy_storage_s3: when enabled is false, every field
+  # collapses to its empty/default value so the template can splat the
+  # whole shape unconditionally and the `if aocr_enabled` block stays
+  # the only branch the renderer evaluates.
+  aocr = {
+    enabled             = var.aocr.enabled
+    mirror_host         = var.aocr.enabled ? var.aocr.mirror_host : ""
+    mirror_push_host    = var.aocr.enabled ? var.aocr.mirror_push_host : ""
+    mirror_upstreams    = var.aocr.enabled ? var.aocr.mirror_upstreams : ""
+    upstream_wrap_key   = var.aocr.enabled ? var.aocr.upstream_wrap_key : ""
+    auto_import_enabled = var.aocr.enabled && var.aocr.auto_import_enabled
+    hooks_url           = var.aocr.enabled ? var.aocr.hooks_url : ""
+    cluster_id          = var.aocr.enabled ? var.aocr.cluster_id : ""
+    cluster_pat         = var.aocr.enabled ? var.aocr.cluster_pat : ""
+    retention_suffix    = var.aocr.enabled ? var.aocr.retention_suffix : "--idle-90d"
+    request_timeout     = var.aocr.enabled ? var.aocr.request_timeout : "15s"
+    reconcile_interval  = var.aocr.enabled ? var.aocr.reconcile_interval : "5m"
+    max_in_flight       = var.aocr.enabled ? var.aocr.max_in_flight : 4
+  }
 }
 
 # certmagic-s3 encrypts cert+private-key bytes with this 32-byte key before

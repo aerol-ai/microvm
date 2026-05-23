@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -97,6 +98,7 @@ func main() {
 		logger.Error("failed to create docker client", "error", err)
 		os.Exit(1)
 	}
+	configureMirror(logger, cfg, dockerClient)
 
 	caddyClient := caddy.New(cfg)
 
@@ -277,6 +279,26 @@ func main() {
 		svc.StartLifecycleSweep(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
+		startAutoImportReconciler(ctx, logger, cfg, db, svc)
+		if cfg.AutoImportEnabled {
+			// Wire the post-pull trigger: when the docker client finishes a
+			// successful pull that BOTH used the mirror AND carried private
+			// creds, the observer flips the sandbox row's auto_import_pending
+			// flag. The reconciler then picks it up on its next sweep, calls
+			// AOCR ImportAPI, and clears the flag on success. Worker-only:
+			// non-worker nodes never pull sandbox images.
+			dockerClient.SetPullObserver(func(obsCtx context.Context, sandboxID string) {
+				// Use a fresh short-deadline context: the pull's ctx may be
+				// cancelled before this fires (Docker ack races container
+				// start), and a SQLite UPDATE is local and quick.
+				flagCtx, flagCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer flagCancel()
+				if err := db.SetAutoImportPending(flagCtx, sandboxID, true); err != nil {
+					logger.Warn("auto-import: flag pending failed; reconciler will not retry",
+						"sandbox_id", sandboxID, "error", err)
+				}
+			})
+		}
 	}
 
 	if cfg.EnableSSHGateway && cfg.IsWorker() {
@@ -421,6 +443,167 @@ func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logg
 		spec.Registry = auth
 	}
 	return spec
+}
+
+// configureMirror loads the upstream wrap-key ring (if a path is set) and
+// hands a built MirrorConfig to the docker client. Disabled-by-default:
+// MirrorHost empty or upstream list empty means rewriting stays off and the
+// docker client pulls from upstream registries directly.
+//
+// Wrap-key absence is a soft failure: we log a clear warning and configure
+// the mirror without a ring. Public images still mirror cleanly (anonymous
+// auth); private images will 401 against the mirror until the operator
+// installs the key. This keeps the node bootable on a misconfigured wrap
+// path rather than gating all pulls behind one secret.
+func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
+	if strings.TrimSpace(cfg.MirrorHost) == "" || len(cfg.MirrorUpstreams) == 0 {
+		return
+	}
+	upstreams := make([]docker.MirrorUpstream, 0, len(cfg.MirrorUpstreams))
+	for _, m := range cfg.MirrorUpstreams {
+		upstreams = append(upstreams, docker.MirrorUpstream{Host: m.Host, Shortname: m.Shortname})
+	}
+	mcfg := docker.MirrorConfig{
+		Host:      cfg.MirrorHost,
+		PushHost:  cfg.MirrorPushHost,
+		Upstreams: upstreams,
+	}
+
+	var ring *secrets.UpstreamWrapKeyRing
+	if cfg.UpstreamWrapKeyPath != "" {
+		r, err := secrets.LoadUpstreamWrapKeyRing(cfg.UpstreamWrapKeyPath)
+		if err != nil {
+			logger.Warn("mirror: upstream wrap key unavailable; private images via the mirror will 401 until the key is installed",
+				"path", cfg.UpstreamWrapKeyPath, "error", err)
+		} else {
+			ring = r
+		}
+	} else {
+		logger.Info("mirror: no upstream wrap key path configured; private-image pulls via the mirror are not supported on this node",
+			"hint", "set SB_UPSTREAM_WRAP_KEY_PATH to enable wrapped-credential auth")
+	}
+
+	c.ConfigureMirror(mcfg, ring)
+	logger.Info("mirror configured",
+		"host", mcfg.Host,
+		"push_host", mcfg.PushHost,
+		"upstreams", len(mcfg.Upstreams),
+		"wrap_key_loaded", ring != nil,
+	)
+}
+
+// startAutoImportReconciler builds the F21 auto-import importer + reconciler
+// and starts a ticker goroutine if the feature is enabled. When disabled (or
+// when the importer fails to build) we log and return without scheduling
+// anything — the rest of the daemon runs unchanged. The reconciler depends on
+// the cluster client for replicated CreateSandboxRequest lookup; in
+// standalone mode the noop cluster returns nil for every spec and the
+// reconciler's `retryOne` will clear the flag with reason `no spec`. That's
+// the right behavior: without a replicated spec there's no recreate path that
+// could benefit from the import anyway.
+func startAutoImportReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service) {
+	if !cfg.AutoImportEnabled {
+		return
+	}
+	pat, err := os.ReadFile(cfg.AutoImportClusterPATPath)
+	if err != nil {
+		logger.Warn("auto-import: PAT file unreadable; feature stays off until next restart",
+			"path", cfg.AutoImportClusterPATPath, "error", err)
+		return
+	}
+	importer, err := service.NewAutoImporter(service.AutoImportConfig{
+		Enabled:         true,
+		HooksBaseURL:    cfg.AutoImportHooksBaseURL,
+		ClusterID:       cfg.AutoImportClusterID,
+		ClusterPAT:      string(bytesTrimSpace(pat)),
+		RetentionSuffix: cfg.AutoImportRetentionSuffix,
+		RequestTimeout:  cfg.AutoImportRequestTimeout,
+	})
+	if err != nil {
+		logger.Warn("auto-import: importer build failed; feature stays off",
+			"error", err)
+		return
+	}
+	resolver := autoImportSpecResolver{svc: svc}
+	r := service.NewAutoImportReconciler(importer, db, resolver, logger, cfg.AutoImportMaxInFlight)
+	if r == nil {
+		// Should not happen when importer is non-nil, but defensive: don't
+		// start a goroutine that has nothing to do.
+		return
+	}
+	// Wire the spec write-back so successful imports flip the replicated
+	// CreateSandboxRequest to ImageDistributionAOCRImported and point
+	// ImageRegistryRef at the new cluster-side ref. Subsequent failovers
+	// then pull through the cluster PAT, fully decoupled from the original
+	// upstream credential.
+	r.SetSpecMutator(svc)
+	logger.Info("auto-import reconciler started",
+		"hooks_url", importer.Endpoint(),
+		"interval", cfg.AutoImportReconcileInterval,
+		"max_in_flight", cfg.AutoImportMaxInFlight,
+	)
+	go func() {
+		t := time.NewTicker(cfg.AutoImportReconcileInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				stats, err := r.RunOnce(ctx)
+				if err != nil {
+					logger.Warn("auto-import reconcile sweep failed", "error", err)
+					continue
+				}
+				if stats.Scanned == 0 {
+					continue
+				}
+				logger.Info("auto-import reconcile sweep",
+					"scanned", stats.Scanned,
+					"succeeded", stats.Succeeded,
+					"failed", stats.Failed,
+					"skipped", stats.Skipped,
+				)
+			}
+		}
+	}()
+}
+
+// autoImportSpecResolver adapts the service+cluster surface to the
+// AutoImportSpecResolver interface. The replicated CreateSandboxRequest lives
+// in the cluster FSM (via cluster.SpecOf); we go through svc.Cluster() so the
+// adapter works under both Noop (standalone) and Cluster/Agent modes.
+type autoImportSpecResolver struct {
+	svc *service.Service
+}
+
+func (r autoImportSpecResolver) GetSandboxSpec(sandboxID string) (*models.CreateSandboxRequest, bool) {
+	c := r.svc.Cluster()
+	if c == nil {
+		return nil, false
+	}
+	spec := c.SpecOf(sandboxID)
+	if spec == nil {
+		return nil, false
+	}
+	return spec, true
+}
+
+// bytesTrimSpace is a tiny helper so we don't pull `strings` for one call —
+// PAT files commonly include a trailing newline.
+func bytesTrimSpace(b []byte) []byte {
+	start, end := 0, len(b)
+	for start < end && isSpace(b[start]) {
+		start++
+	}
+	for end > start && isSpace(b[end-1]) {
+		end--
+	}
+	return b[start:end]
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 // portsFromSandbox extracts the routing intents the sandbox currently has

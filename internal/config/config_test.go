@@ -823,3 +823,36 @@ func TestDurationAndNormalizeCases(t *testing.T) {
 		t.Run(tc.name, tc.run)
 	}
 }
+
+func TestParseMirrorUpstreams(t *testing.T) {
+	cases := []struct {
+		name, raw string
+		want      []MirrorUpstreamMapping
+	}{
+		{"empty input returns empty slice", "", []MirrorUpstreamMapping{}},
+		{"single pair", "ghcr.io=ghcr", []MirrorUpstreamMapping{{"ghcr.io", "ghcr"}}},
+		{
+			"default day-1 four upstreams",
+			"ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s",
+			[]MirrorUpstreamMapping{
+				{"ghcr.io", "ghcr"}, {"gcr.io", "gcr"}, {"quay.io", "quay"}, {"registry.k8s.io", "k8s"},
+			},
+		},
+		{"whitespace tolerated", "  ghcr.io = ghcr , gcr.io = gcr  ", []MirrorUpstreamMapping{{"ghcr.io", "ghcr"}, {"gcr.io", "gcr"}}},
+		{"malformed entries skipped silently", "ghcr.io=ghcr,bogus,quay.io=quay,=,no_value=,=no_host", []MirrorUpstreamMapping{{"ghcr.io", "ghcr"}, {"quay.io", "quay"}}},
+		{"only commas and spaces returns empty", " , , , ", []MirrorUpstreamMapping{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := parseMirrorUpstreams(c.raw)
+			if len(got) != len(c.want) {
+				t.Fatalf("len = %d, want %d (%+v)", len(got), len(c.want), got)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("entry %d = %+v, want %+v", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}

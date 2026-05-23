@@ -236,6 +236,15 @@ const (
 	ImageDistributionExternalRegistry = "external_registry"
 	ImageDistributionAOCR             = "aocr"
 	ImageDistributionLocalOnly        = "local_only"
+	// ImageDistributionAOCRImported is the post-auto-import distribution mode:
+	// the bytes have been re-mounted under the cluster's own AOCR namespace
+	// (`cluster/<id>/_imported/...`) and subsequent pulls use the cluster PAT,
+	// not the user's upstream credentials. The user-visible Image field is
+	// preserved; only the RegistryRef and mode flip. See F21 of the
+	// cluster-mirror-and-snapshot-distribution plan for the full rationale —
+	// the short version is that this is what makes `failover.policy: recreate`
+	// survive upstream credential rotation.
+	ImageDistributionAOCRImported = "aocr_imported"
 )
 
 const (
@@ -293,7 +302,7 @@ func NormalizeImageDistributionMode(mode string) (string, error) {
 	switch normalized := strings.ToLower(strings.TrimSpace(mode)); normalized {
 	case "":
 		return "", nil
-	case ImageDistributionExternalRegistry, ImageDistributionAOCR, ImageDistributionLocalOnly:
+	case ImageDistributionExternalRegistry, ImageDistributionAOCR, ImageDistributionAOCRImported, ImageDistributionLocalOnly:
 		return normalized, nil
 	default:
 		return "", fmt.Errorf("invalid image distribution mode %q", mode)
@@ -455,6 +464,14 @@ type Sandbox struct {
 	// NetworkQuotaExceededAt is the wall-clock time the limit was first
 	// observed crossed. Nil while under quota.
 	NetworkQuotaExceededAt *time.Time `json:"network_quota_exceeded_at,omitempty"`
+	// AutoImportPending is set by the post-pull auto-import path when the
+	// AOCR ImportAPI call failed. A background reconciler walks rows with
+	// this flag and re-tries the import; once the import succeeds the flag
+	// is cleared and the create spec's ImageDistributionMode flips to
+	// `aocr_imported`. The flag is local-node bookkeeping — it is not
+	// replicated via Raft, since each owner gets one opportunistic shot
+	// at the import per pull.
+	AutoImportPending bool `json:"-"`
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.

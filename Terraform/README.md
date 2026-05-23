@@ -191,6 +191,163 @@ proxies HTTP(S); leave it `false` for raw TCP ingress.
 | `templates/bootstrap.sh.tftpl` | Single user_data template (seed/joiner) |
 | `terraform.tfvars.example`  | Drop-in starter config                    |
 
+## Connect this cluster to AOCR (mirror + auto-import)
+
+If you operate an [AOCR](https://github.com/aerolai/aocr) deployment alongside
+this cluster, you can route every public-registry pull through AOCR's
+authenticated mirror — and optionally auto-import each first pull into a
+cluster-owned namespace so future failovers are decoupled from the original
+upstream credential. The Terraform variable `aocr` (defined in
+`variables.tf`) is already plumbed through `locals.tf` → `nodes.tf` → the
+node user_data template. Enabling it requires zero code edits — only values.
+
+For the threat model and per-node env-var contract, read
+[`../AUTHENTICATED_MIRROR.md`](../AUTHENTICATED_MIRROR.md). For AOCR-side
+architecture, read
+[`aocr.sh/MIRROR.md`](https://github.com/aerolai/aocr/blob/main/MIRROR.md).
+For the full end-to-end deploy + stitch story, read
+[`aocr.sh/aocr_aerol_stitch.md`](https://github.com/aerolai/aocr/blob/main/aocr_aerol_stitch.md).
+
+### Step 1 — Pull 4 values from your AOCR side
+
+The AOCR Ansible playbook auto-generates every secret on first deploy. After
+you've run it once, the values you need are sitting in `aocr.sh/secrets/`
+and `aocr.sh/ansible/inventory/group_vars/all/vars.yml`:
+
+```bash
+cd /path/to/aocr.sh
+
+# 1. Mirror host — derived from your aocr_global_domain
+#    Default is "mirror." + aocr_global_domain (e.g. mirror.aocr.aerol.ai).
+grep aocr_global_domain ansible/inventory/group_vars/all/vars.yml
+
+# 2. Upstream wrap key (base64, 32 bytes) — required for private upstream pulls
+cat secrets/upstream_wrap_key
+
+# 3. Internal API token (64-char bearer) — only needed if auto_import_enabled=true
+cat secrets/internal_api_token
+
+# 4. Hooks URL — the AOCR root, no trailing slash (e.g. https://aocr.aerol.ai)
+```
+
+> **Where does the value actually live?** Each AOCR secret is *either* a
+> generated file under `aocr.sh/secrets/` (default on first deploy) *or* an
+> inline override in `aocr.sh/ansible/inventory/group_vars/all/secrets.yml`
+> (the deploy playbook skips file generation when the override is set). If
+> `cat secrets/upstream_wrap_key` errors with "No such file or directory",
+> grep `secrets.yml` for the matching `aocr_*` key instead:
+>
+> ```bash
+> cd /path/to/aocr.sh
+> # Falls back from inline override → generated file
+> aocr_secret() {
+>   local s="ansible/inventory/group_vars/all/secrets.yml" v
+>   v=$(awk -F'"' -v k="^$1:" '$0 ~ k {print $2; exit}' "$s" 2>/dev/null)
+>   if [ -n "$v" ]; then echo "$v"; else cat "secrets/$2"; fi
+> }
+> aocr_secret aocr_auth_upstream_wrap_key upstream_wrap_key
+> aocr_secret aocr_internal_api_token     internal_api_token
+> ```
+>
+> See `aocr.sh/aocr_aerol_stitch.md` § *Resolving AOCR secret values* for
+> the full table.
+
+You also pick a **cluster ID** yourself — any string matching
+`^[A-Za-z0-9_-]{1,64}$`, e.g. `prod-aerolvm-us-east-1`. AOCR has no
+pre-registered list of clusters; this is a label you choose so AOCR can
+group your imported tags under `cluster/<your-id>/_imported/...`. Pick once
+per cluster and never change it (changing it later orphans previously
+imported tags under the old namespace).
+
+### Step 2 — Add the `aocr` block to `terraform.tfvars`
+
+```hcl
+aocr = {
+  enabled             = true
+  mirror_host         = "mirror.aocr.aerol.ai"
+  upstream_wrap_key   = "<paste contents of aocr.sh/secrets/upstream_wrap_key>"
+
+  # Auto-import (F21) — drop these four if you only want the cached mirror.
+  auto_import_enabled = true
+  hooks_url           = "https://aocr.aerol.ai"
+  cluster_id          = "prod-aerolvm-us-east-1"   # pick once, never change
+  cluster_pat         = "<paste contents of aocr.sh/secrets/internal_api_token>"
+  # retention_suffix  = "--idle-90d"   # default; cluster-imported tags live 90 days idle
+}
+```
+
+The whole variable is `sensitive = true`, so `terraform plan/apply` won't
+print the wrap key or PAT.
+
+### Step 3 — Apply
+
+```bash
+terraform plan       # expect existing nodes to recycle; user_data changed
+terraform apply
+```
+
+`nodes.tf` sets `user_data_replace_on_change = true`, so existing EC2
+instances **are replaced** when this block changes. New nodes come up with:
+
+1. `/etc/sandboxd/secrets/upstream-wrap.key` written at `0600`.
+2. `/etc/sandboxd/secrets/cluster-pat` written at `0600` (when auto-import on).
+3. `SB_MIRROR_*` and `SB_AUTO_IMPORT_*` appended to `/etc/sandboxd/cluster.env`.
+4. `systemctl restart sandboxd`.
+
+The cluster PAT is **file-sourced** — never an env var, never visible in
+`systemctl show sandboxd` or process listings.
+
+### Step 4 — Verify
+
+SSH into any node:
+
+```bash
+sudo grep -E '^SB_(MIRROR|AUTO_IMPORT)_' /etc/sandboxd/cluster.env
+sudo ls -l /etc/sandboxd/secrets/        # both files 0600 root:root
+systemctl is-active sandboxd
+```
+
+Then trigger a private pull (via any sandbox) and check AOCR:
+
+```bash
+# Mirror cache populated?
+curl -sf -H "Authorization: Bearer $(cat aocr.sh/secrets/auth_pat_token)" \
+  "https://aocr.aerol.ai/v1/images?limit=20" | jq -r '.images[].repository' | sort -u
+
+# Auto-import landed under your cluster namespace?
+curl -sf -H "Authorization: Bearer $(cat aocr.sh/secrets/auth_pat_token)" \
+  "https://aocr.aerol.ai/v1/images?limit=200" | jq -r '.images[].repository' \
+  | grep "cluster/prod-aerolvm-us-east-1/_imported/"
+```
+
+### What each `aocr.*` field means
+
+| Field | Purpose | Where the value comes from |
+|---|---|---|
+| `enabled` | Master switch. When false, nothing else templates. | You |
+| `mirror_host` | Vhost sandboxd rewrites `ghcr.io` / `gcr.io` / `quay.io` / `registry.k8s.io` pulls onto. Docker Hub is intentionally not rewritten. | AOCR side — derived from `aocr_global_domain` |
+| `upstream_wrap_key` | Base64 32-byte AES-GCM key. Sandboxd wraps per-pull upstream creds with this; only AOCR's mirror can unwrap. Without it, private upstream pulls 401 at the mirror. | AOCR side — `secrets/upstream_wrap_key` (auto-generated on first AOCR deploy) |
+| `mirror_push_host` | Optional. Push vhost (e.g. `aocr.aerol.ai`) so already-pushed refs aren't double-rewritten. Leave empty unless you also push from sandboxes. | AOCR side |
+| `mirror_upstreams` | Default `ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s`. Override only if your AOCR exposes different upstream shortnames. | AOCR operator |
+| `auto_import_enabled` | Master switch for F21. When true, every successful private pull triggers a re-mount under `cluster/<id>/_imported/...`. | You |
+| `hooks_url` | AOCR hooks service root, e.g. `https://aocr.aerol.ai`. Sandboxd appends `/v1/internal/imports`. | AOCR side — same as `aocr_global_domain` |
+| `cluster_id` | **A label you choose**, not internal AOCR config. AOCR validates only the format (`^[A-Za-z0-9_-]{1,64}$`) and uses it as a namespace prefix for imported tags. Pick a meaningful per-cluster name like `prod-us-east-1`, `staging`, `dev-suman`. | You |
+| `cluster_pat` | Bearer token sandboxd presents on `POST /v1/internal/imports`. Despite the name, this is AOCR's `internal_api_token`, not the UUID-keyed cluster PAT used by `auth/src/clusterPat.ts` (different concept; see `aocr_aerol_stitch.md`). | AOCR side — `secrets/internal_api_token` |
+| `retention_suffix` | Suffix appended to imported tags. Drives the reaper's idle-eviction window (see [`aocr.sh/RETENTION.md`](https://github.com/aerolai/aocr/blob/main/RETENTION.md)). | Operator policy |
+
+Everything else (`request_timeout`, `reconcile_interval`, `max_in_flight`)
+has a sensible default — only tune if recovery storms or remote latency
+warrant it. The full default set lives in `variables.tf`.
+
+### TL;DR
+
+1. AOCR was deployed once; its secrets sit in `aocr.sh/secrets/`.
+2. Add the `aocr = { … }` block to `terraform.tfvars` with values copied
+   from those files plus a `cluster_id` you pick.
+3. `terraform apply` — nodes recycle, secrets land at `/etc/sandboxd/secrets/`,
+   sandboxd restarts wired to the mirror.
+4. Verify with `grep` / `ls` on a node and `curl /v1/images` on AOCR.
+
 ## Tear-down
 
 ```bash

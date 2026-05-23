@@ -88,6 +88,7 @@ func Open(path string) (*Store, error) {
 			net_bytes_out_limit INTEGER NOT NULL DEFAULT 0,
 			net_quota_exceeded INTEGER NOT NULL DEFAULT 0,
 			net_quota_exceeded_at DATETIME,
+			auto_import_pending INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			last_active_at DATETIME NOT NULL
@@ -269,6 +270,12 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandbox_snapshots ADD COLUMN image_digest TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN image_registry_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN image_verified_at DATETIME;`,
+		// auto_import_pending is set when the post-pull AOCR auto-import
+		// (F21) failed and a background reconciler should retry. It is
+		// local-node bookkeeping only — never replicated, never user-visible.
+		// The partial index below makes the reconciler scan cheap even when
+		// the steady-state count of pending rows is zero.
+		`ALTER TABLE sandboxes ADD COLUMN auto_import_pending INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -284,6 +291,14 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_exposed_ports_host_port ON exposed_ports(host_port) WHERE host_port > 0;`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create exposed_ports host_port index: %w", err)
+	}
+
+	// Partial index keeps the auto-import reconciler scan O(pending), not
+	// O(sandboxes). Steady-state count is zero so the index footprint is
+	// negligible; spikes happen when AOCR is briefly unreachable.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_auto_import_pending ON sandboxes(id) WHERE auto_import_pending = 1;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes auto_import_pending index: %w", err)
 	}
 
 	// SQLite materialized the DB file (and the WAL/SHM sidecars on the
@@ -353,8 +368,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
-			registry_auth_sealed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			registry_auth_sealed,
+			auto_import_pending
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -392,6 +408,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.NetworkQuotaExceeded),
 		nullableTime(sandbox.NetworkQuotaExceededAt),
 		nullableBlob(sandbox.RegistryAuthSealed),
+		boolToInt(sandbox.AutoImportPending),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -453,8 +470,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
-			registry_auth_sealed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			registry_auth_sealed,
+			auto_import_pending
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -485,7 +503,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			gpus_json = excluded.gpus_json,
 			net_bytes_in_limit = excluded.net_bytes_in_limit,
 			net_bytes_out_limit = excluded.net_bytes_out_limit,
-			registry_auth_sealed = excluded.registry_auth_sealed
+			registry_auth_sealed = excluded.registry_auth_sealed,
+			auto_import_pending = excluded.auto_import_pending
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -523,6 +542,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.NetworkQuotaExceeded),
 		nullableTime(sandbox.NetworkQuotaExceededAt),
 		nullableBlob(sandbox.RegistryAuthSealed),
+		boolToInt(sandbox.AutoImportPending),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -543,7 +563,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
-			registry_auth_sealed
+			registry_auth_sealed,
+			auto_import_pending
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -575,7 +596,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			runtime, gpus_json,
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
-			registry_auth_sealed
+			registry_auth_sealed,
+			auto_import_pending
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -821,6 +843,53 @@ func (s *Store) ClearNetworkQuotaExceeded(ctx context.Context, id string) error 
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetAutoImportPending toggles the AOCR auto-import retry flag. The post-pull
+// auto-import path sets it to true on failure; the reconciler clears it after
+// a successful import. The reconciler must call this rather than Upsert to
+// avoid racing the runtime-state machine on the rest of the sandbox row.
+func (s *Store) SetAutoImportPending(ctx context.Context, id string, pending bool) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET auto_import_pending = ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, boolToInt(pending), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set auto_import_pending: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListAutoImportPendingIDs returns the IDs of sandboxes whose post-pull
+// auto-import has not yet succeeded. Returns IDs only (not full Sandbox
+// rows) so the reconciler can fetch+retry one at a time and skip rows that
+// have meanwhile been deleted without holding a large in-memory snapshot.
+// Hits the partial index on (auto_import_pending = 1).
+func (s *Store) ListAutoImportPendingIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM sandboxes
+		WHERE auto_import_pending = 1
+		ORDER BY updated_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list auto_import_pending sandboxes: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan auto_import_pending id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (s *Store) Delete(ctx context.Context, id string) error {
@@ -1543,6 +1612,7 @@ func scanSandbox(scanner interface {
 	var netQuotaExceeded int
 	var netQuotaExceededAt sql.NullTime
 	var registryAuthSealed []byte
+	var autoImportPending int
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -1581,6 +1651,7 @@ func scanSandbox(scanner interface {
 		&netQuotaExceeded,
 		&netQuotaExceededAt,
 		&registryAuthSealed,
+		&autoImportPending,
 	)
 	if err != nil {
 		return nil, err
@@ -1591,6 +1662,7 @@ func scanSandbox(scanner interface {
 		sandbox.NetworkQuotaExceededAt = &t
 	}
 	sandbox.RegistryAuthSealed = nullableBlob(registryAuthSealed)
+	sandbox.AutoImportPending = autoImportPending == 1
 
 	if envJSON != "" {
 		if err := json.Unmarshal([]byte(envJSON), &sandbox.Env); err != nil {
