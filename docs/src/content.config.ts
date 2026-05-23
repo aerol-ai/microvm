@@ -124,6 +124,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/snapshots',
+        label: 'Snapshots',
+        description: 'Capture a running sandbox or register an image as a named, reusable template.',
+      },
+      {
+        type: 'link',
         href: '/preview',
         label: 'Preview',
         description: 'Expose container ports publicly over HTTPS through Caddy routes.',
@@ -254,7 +260,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         type: 'link',
         href: '/dashboard',
         label: 'Dashboard',
-        description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics — sign in with your PAT.',
+        description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics - sign in with your PAT.',
       },
       {
         type: 'link',
