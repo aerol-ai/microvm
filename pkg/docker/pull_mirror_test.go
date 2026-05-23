@@ -17,35 +17,54 @@ import (
 )
 
 // captureClient builds a Client that records the X-Registry-Auth header and
-// the fromImage query value of the last /images/create call.
+// the fromImage query value of the last /images/create call, plus the path
+// and query of any follow-up /tag call (the mirror-alias retag).
 type captureClient struct {
-	client      *Client
-	calls       atomic.Int64
-	lastFrom    atomic.Value // string
-	lastAuthB64 atomic.Value // string
+	client       *Client
+	calls        atomic.Int64
+	lastFrom     atomic.Value // string
+	lastAuthB64  atomic.Value // string
+	lastTagPath  atomic.Value // string
+	lastTagQuery atomic.Value // string
 }
 
 func newCaptureClient(cfg MirrorConfig, ring *secrets.UpstreamWrapKeyRing) *captureClient {
 	cap := &captureClient{}
 	cap.lastFrom.Store("")
 	cap.lastAuthB64.Store("")
-	cap.client = &Client{
-		logger: slog.Default(),
-		streamClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			cap.calls.Add(1)
-			q, _ := url.ParseQuery(r.URL.RawQuery)
-			cap.lastFrom.Store(q.Get("fromImage"))
-			cap.lastAuthB64.Store(r.Header.Get("X-Registry-Auth"))
+	cap.lastTagPath.Store("")
+	cap.lastTagQuery.Store("")
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/tag") {
+			cap.lastTagPath.Store(r.URL.Path)
+			cap.lastTagQuery.Store(r.URL.RawQuery)
 			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"status":"done"}`)),
+				StatusCode: http.StatusCreated,
+				Body:       io.NopCloser(strings.NewReader("")),
 				Header:     make(http.Header),
 			}, nil
-		})},
+		}
+		cap.calls.Add(1)
+		q, _ := url.ParseQuery(r.URL.RawQuery)
+		cap.lastFrom.Store(q.Get("fromImage"))
+		cap.lastAuthB64.Store(r.Header.Get("X-Registry-Auth"))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"status":"done"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	cap.client = &Client{
+		logger:       slog.Default(),
+		streamClient: &http.Client{Transport: transport},
+		httpClient:   &http.Client{Transport: transport},
 	}
 	cap.client.ConfigureMirror(cfg, ring)
 	return cap
 }
+
+func (c *captureClient) tagPath() string  { return c.lastTagPath.Load().(string) }
+func (c *captureClient) tagQuery() string { return c.lastTagQuery.Load().(string) }
 
 func (c *captureClient) from() string { return c.lastFrom.Load().(string) }
 func (c *captureClient) auth() map[string]string {
@@ -161,6 +180,85 @@ func TestPullImage_DockerHub_PassesThrough_EvenWithMirror(t *testing.T) {
 	}
 	if a["username"] != "u" {
 		t.Fatalf("raw username dropped on passthrough: %+v", a)
+	}
+}
+
+// Docker stores pulled images keyed by `fromImage`, so a mirror-rewritten
+// pull lands ONLY under the rewritten ref. CreateSandbox then inspects /
+// runs by the user's original ref and 404s. aliasMirrorPull adds the
+// original ref as a tag on the same image ID after a successful pull so
+// the rest of the pipeline keeps working unchanged.
+func TestPullImage_MirrorEnabled_AddsAliasTagForOriginalRef(t *testing.T) {
+	ring := secrets.ParseUpstreamWrapKeyRing(b64DockerTest(key32DockerTest(0xb0)))
+	cap := newCaptureClient(defaultMirrorCfg(), ring)
+	if err := cap.client.pullImage(context.Background(), "ghcr.io/aerol-ai/sandbox:v1", nil); err != nil {
+		t.Fatalf("pullImage: %v", err)
+	}
+	// URL parsing normalizes the percent-escaped slashes back to "/" by the
+	// time the round-tripper sees the request, so assert on the substring
+	// (the source ref) rather than the exact pre-escape encoding.
+	if got := cap.tagPath(); !strings.Contains(got, "mirror.aocr.aerol.ai") ||
+		!strings.HasSuffix(got, "sandbox:v1/tag") {
+		t.Fatalf("tag path: got %q want it to target the rewritten ref", got)
+	}
+	q, err := url.ParseQuery(cap.tagQuery())
+	if err != nil {
+		t.Fatalf("parse tag query: %v", err)
+	}
+	if got := q.Get("repo"); got != "ghcr.io/aerol-ai/sandbox" {
+		t.Fatalf("tag repo: got %q want ghcr.io/aerol-ai/sandbox", got)
+	}
+	if got := q.Get("tag"); got != "v1" {
+		t.Fatalf("tag tag: got %q want v1", got)
+	}
+}
+
+func TestPullImage_MirrorEnabled_UntaggedRef_AliasesAsLatest(t *testing.T) {
+	cap := newCaptureClient(defaultMirrorCfg(), nil)
+	if err := cap.client.pullImage(context.Background(), "ghcr.io/aerol-ai/sandbox", nil); err != nil {
+		t.Fatalf("pullImage: %v", err)
+	}
+	q, _ := url.ParseQuery(cap.tagQuery())
+	if got := q.Get("repo"); got != "ghcr.io/aerol-ai/sandbox" {
+		t.Fatalf("tag repo: got %q", got)
+	}
+	if got := q.Get("tag"); got != "latest" {
+		t.Fatalf("tag defaults to latest, got %q", got)
+	}
+}
+
+func TestPullImage_MirrorEnabled_DigestPull_SkipsAlias(t *testing.T) {
+	// Digest refs are content-addressable: inspect by `repo@sha256:...`
+	// resolves to the same image ID regardless of which name we pulled
+	// under. No alias needed; we must not POST /tag with a malformed
+	// (digest-as-tag) request.
+	cap := newCaptureClient(defaultMirrorCfg(), nil)
+	digestRef := "ghcr.io/aerol-ai/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	if err := cap.client.pullImage(context.Background(), digestRef, nil); err != nil {
+		t.Fatalf("pullImage: %v", err)
+	}
+	if got := cap.tagPath(); got != "" {
+		t.Fatalf("digest pull should skip retag, got tag path %q", got)
+	}
+}
+
+func TestPullImage_NoMirrorConfig_SkipsAlias(t *testing.T) {
+	cap := newCaptureClient(MirrorConfig{}, nil)
+	if err := cap.client.pullImage(context.Background(), "ghcr.io/aerol-ai/sandbox:v1", nil); err != nil {
+		t.Fatalf("pullImage: %v", err)
+	}
+	if got := cap.tagPath(); got != "" {
+		t.Fatalf("passthrough pull should skip retag, got tag path %q", got)
+	}
+}
+
+func TestPullImage_DockerHub_PassesThrough_SkipsAlias(t *testing.T) {
+	cap := newCaptureClient(defaultMirrorCfg(), nil)
+	if err := cap.client.pullImage(context.Background(), "redis:7.2", nil); err != nil {
+		t.Fatalf("pullImage: %v", err)
+	}
+	if got := cap.tagPath(); got != "" {
+		t.Fatalf("docker.io pull should skip retag (no rewrite), got tag path %q", got)
 	}
 }
 

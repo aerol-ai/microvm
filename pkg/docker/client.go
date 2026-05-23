@@ -761,6 +761,9 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 		}
 		if err := decoder.Decode(&msg); err != nil {
 			if errors.Is(err, io.EOF) {
+				if err := c.aliasMirrorPull(ctx, rewrite); err != nil {
+					return err
+				}
 				c.firePullObserver(ctx, rewrite, auth)
 				return nil
 			}
@@ -773,6 +776,35 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 			return fmt.Errorf("pull image %s: %s", imageRef, msg.Error)
 		}
 	}
+}
+
+// aliasMirrorPull tags a successfully-pulled mirror image under its
+// user-visible original ref. Docker stores pulled images keyed by the
+// `fromImage` name, so a pull of `mirror.aocr.aerol.ai/aocr/ghcr/foo:v1`
+// lands ONLY under that name — subsequent inspect/Create calls keyed off
+// the original `ghcr.io/foo:v1` 404. We add the alias here so the rest
+// of the pull path (Create's `imageInspect(req.Image)` and `Image:
+// req.Image` in the container spec) keeps working unchanged.
+//
+// Pre-conditions for tagging:
+//   - The rewrite actually fired (Rewritten=true). Passthrough pulls
+//     (Docker Hub, unknown host, mirror disabled) already land under
+//     the original ref — no alias needed.
+//   - The original ref is tag-based, not digest-based. Digest pulls
+//     are content-addressable and inspect resolves them via image ID
+//     regardless of which name they were pulled under.
+func (c *Client) aliasMirrorPull(ctx context.Context, rewrite MirrorRewrite) error {
+	if !rewrite.Rewritten {
+		return nil
+	}
+	if strings.Contains(rewrite.OriginalRef, "@") {
+		return nil
+	}
+	repo, tag := splitDestRef(rewrite.OriginalRef)
+	if repo == "" {
+		return nil
+	}
+	return c.tagImage(ctx, rewrite.RewrittenRef, repo, tag)
 }
 
 // firePullObserver invokes the registered observer iff the pull was a
