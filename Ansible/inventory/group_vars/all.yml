@@ -38,3 +38,35 @@ sandboxd_backup_retention_days: 7
 
 # Node lifecycle defaults used by playbooks/prepare-role-change.yml.
 sandboxd_role_change_drain_timeout_s: 3600
+
+# --- Phase 4: Authenticated Mirror + Auto-Import (SB_MIRROR_*, SB_AUTO_IMPORT_*)
+# See sandbox-library/AUTHENTICATED_MIRROR.md for the full operator reference.
+# Defaults below leave the feature disabled (empty SB_MIRROR_HOST). Set
+# sandboxd_mirror_host on a host/group to opt in; the playbook then templates
+# wrap-key and cluster-PAT files into /etc/sandboxd/secrets/ from the control
+# node and wires the matching SB_* env vars into the sandboxd env file.
+
+sandboxd_secrets_dir: /etc/sandboxd/secrets
+sandboxd_upstream_wrap_key_path: "{{ sandboxd_secrets_dir }}/upstream-wrap.key"
+sandboxd_auto_import_cluster_pat_path: "{{ sandboxd_secrets_dir }}/cluster-pat"
+
+# Source files on the Ansible control node. Empty values skip the copy (use
+# this if your fleet renders these files via another mechanism, e.g. Vault).
+sandboxd_upstream_wrap_key_src: ""
+sandboxd_auto_import_cluster_pat_src: ""
+
+# Mirror rewrite (empty SB_MIRROR_HOST disables all of this).
+sandboxd_mirror_host: ""
+sandboxd_mirror_push_host: ""
+sandboxd_mirror_upstreams: "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
+
+# Auto-import (F21). Master switch + the three required pieces. Validation
+# at sandboxd startup will refuse to boot if SB_AUTO_IMPORT_ENABLED=true is
+# set without HOOKS_URL, CLUSTER_ID, and CLUSTER_PAT_PATH all present.
+sandboxd_auto_import_enabled: false
+sandboxd_auto_import_hooks_url: ""
+sandboxd_auto_import_cluster_id: ""
+sandboxd_auto_import_retention_suffix: "--idle-90d"
+sandboxd_auto_import_request_timeout: "15s"
+sandboxd_auto_import_reconcile_interval: "5m"
+sandboxd_auto_import_max_in_flight: 4

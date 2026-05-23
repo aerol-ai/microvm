@@ -25,6 +25,18 @@
       OTEL_SERVICE_NAME: "{{ sandboxd_otel_service_name }}"
       SB_IMAGE_PULL_MAX_CONCURRENT: "{{ sandboxd_image_pull_max_concurrent }}"
       SB_IMAGE_PULL_FAILURE_BACKOFF: "{{ sandboxd_image_pull_failure_backoff }}"
+      SB_MIRROR_HOST: "{{ sandboxd_mirror_host }}"
+      SB_MIRROR_PUSH_HOST: "{{ sandboxd_mirror_push_host }}"
+      SB_MIRROR_UPSTREAMS: "{{ sandboxd_mirror_upstreams }}"
+      SB_UPSTREAM_WRAP_KEY_PATH: "{{ sandboxd_upstream_wrap_key_path if (sandboxd_upstream_wrap_key_src | length > 0) else '' }}"
+      SB_AUTO_IMPORT_ENABLED: "{{ sandboxd_auto_import_enabled | bool | string | lower }}"
+      SB_AUTO_IMPORT_HOOKS_URL: "{{ sandboxd_auto_import_hooks_url }}"
+      SB_AUTO_IMPORT_CLUSTER_ID: "{{ sandboxd_auto_import_cluster_id }}"
+      SB_AUTO_IMPORT_CLUSTER_PAT_PATH: "{{ sandboxd_auto_import_cluster_pat_path if (sandboxd_auto_import_cluster_pat_src | length > 0) else '' }}"
+      SB_AUTO_IMPORT_RETENTION_SUFFIX: "{{ sandboxd_auto_import_retention_suffix }}"
+      SB_AUTO_IMPORT_REQUEST_TIMEOUT: "{{ sandboxd_auto_import_request_timeout }}"
+      SB_AUTO_IMPORT_RECONCILE_INTERVAL: "{{ sandboxd_auto_import_reconcile_interval }}"
+      SB_AUTO_IMPORT_MAX_IN_FLIGHT: "{{ sandboxd_auto_import_max_in_flight }}"
 
   pre_tasks:
     - name: Check base sandboxd env file
@@ -130,6 +142,35 @@
         - "../../setup/runbooks/lost-quorum-recovery.md"
         - "../../setup/runbooks/image-pull-storm.md"
         - "../../setup/runbooks/slo-breach.md"
+
+    - name: Ensure sandboxd secrets directory exists
+      when: (sandboxd_upstream_wrap_key_src | length > 0) or (sandboxd_auto_import_cluster_pat_src | length > 0)
+      ansible.builtin.file:
+        path: "{{ sandboxd_secrets_dir }}"
+        state: directory
+        mode: "0700"
+        owner: root
+        group: root
+
+    - name: Install upstream wrap key (Phase 4 F17)
+      when: sandboxd_upstream_wrap_key_src | length > 0
+      ansible.builtin.copy:
+        src: "{{ sandboxd_upstream_wrap_key_src }}"
+        dest: "{{ sandboxd_upstream_wrap_key_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      notify: Apply sandboxd ops config
+
+    - name: Install cluster PAT for auto-import (Phase 4 F21)
+      when: sandboxd_auto_import_cluster_pat_src | length > 0
+      ansible.builtin.copy:
+        src: "{{ sandboxd_auto_import_cluster_pat_src }}"
+        dest: "{{ sandboxd_auto_import_cluster_pat_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      notify: Apply sandboxd ops config
 
     - name: Write sandboxd operational env vars
       ansible.builtin.lineinfile:
