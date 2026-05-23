@@ -166,7 +166,23 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	// Drop the Caddy routes while the container is down so requests hit the
 	// fallback "sandbox not found" handler instead of a 502 from a stale
 	// upstream IP. StartSandbox re-upserts every route on the way back up.
+	//
+	// Wake-arming exception (D5): for an HTTP port on a wake-armed stop
+	// we must KEEP a route alive — but in the wake-aware shape, not the
+	// direct one — so the next HTTP request lands on the ingress proxy
+	// and resurrects the sandbox instead of 404'ing. Install-then-delete
+	// ordering avoids a window with no matching route.
 	for _, port := range sandbox.ExposedPorts {
+		isHTTP := port.Protocol == "" || port.Protocol == models.ExposedPortProtocolHTTP
+		if arm && isHTTP {
+			if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port.Port); err != nil {
+				s.logger.Warn("install wake HTTP route on stop failed", "sandbox_id", id, "port", port.Port, "error", err)
+			}
+			if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
+				s.logger.Warn("delete direct HTTP route on wake-arming stop failed", "sandbox_id", id, "port", port.Port, "error", err)
+			}
+			continue
+		}
 		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
 			s.logger.Warn("caddy port route cleanup on stop failed", "sandbox_id", id, "port", port.Port, "protocol", port.Protocol, "error", err)
 		}

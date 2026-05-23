@@ -54,6 +54,8 @@ func TestLoadCases(t *testing.T) {
 			"SB_ENABLE_CLUSTER",
 			"SB_CLUSTER_BOOTSTRAP",
 			"SB_ENABLE_SERVERLESS",
+			"SB_INTERNAL_INGRESS_ADDR",
+			"SB_HTTP_WAKE_MAX_BUFFER",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -124,6 +126,12 @@ func TestLoadCases(t *testing.T) {
 				if cfg.EnableServerless {
 					t.Fatalf("expected EnableServerless to default to false, got true")
 				}
+				if cfg.InternalIngressAddr != "127.0.0.1:21213" {
+					t.Fatalf("expected default InternalIngressAddr=127.0.0.1:21213, got %q", cfg.InternalIngressAddr)
+				}
+				if cfg.HTTPWakeMaxBuffer != 8*1024*1024 {
+					t.Fatalf("expected default HTTPWakeMaxBuffer=8MiB, got %d", cfg.HTTPWakeMaxBuffer)
+				}
 			},
 		},
 		{
@@ -138,6 +146,39 @@ func TestLoadCases(t *testing.T) {
 				}
 				if !cfg.EnableServerless {
 					t.Fatalf("expected EnableServerless=true, got false")
+				}
+			},
+		},
+		{
+			name: "serverless_ingress_overrides",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:33333")
+				t.Setenv("SB_HTTP_WAKE_MAX_BUFFER", "16777216")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.InternalIngressAddr != "127.0.0.1:33333" {
+					t.Fatalf("expected InternalIngressAddr override, got %q", cfg.InternalIngressAddr)
+				}
+				if cfg.HTTPWakeMaxBuffer != 16*1024*1024 {
+					t.Fatalf("expected HTTPWakeMaxBuffer override, got %d", cfg.HTTPWakeMaxBuffer)
+				}
+			},
+		},
+		{
+			name: "serverless_rejects_zero_buffer",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_HTTP_WAKE_MAX_BUFFER", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_HTTP_WAKE_MAX_BUFFER") {
+					t.Fatalf("expected SB_HTTP_WAKE_MAX_BUFFER error, got %v", err)
 				}
 			},
 		},

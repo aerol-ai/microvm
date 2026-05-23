@@ -129,6 +129,14 @@ type Config struct {
 	// true on a per-host basis to opt that host into wake-aware control-plane
 	// proxying. Acts as a rollout gate, not a per-sandbox toggle.
 	EnableServerless bool
+	// InternalIngressAddr is the loopback-only listen address for the
+	// wake-aware HTTP ingress proxy. Caddy dials this address from
+	// wake-aware HTTP port routes; it must NOT be exposed publicly.
+	InternalIngressAddr string
+	// HTTPWakeMaxBuffer caps the request body buffered while a cold-start
+	// wake is in progress. Requests with bodies larger than this are
+	// rejected with 413 — see plan D2.
+	HTTPWakeMaxBuffer int64
 	SSHListenAddr               string
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
@@ -525,6 +533,8 @@ func Load() (Config, error) {
 		EnableEventMonitor:          getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:            getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:            getEnvBool("SB_ENABLE_SERVERLESS", false),
+		InternalIngressAddr:         getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
+		HTTPWakeMaxBuffer:           int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
 		SSHListenAddr:               getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:              getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:     strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
@@ -798,6 +808,15 @@ func Load() (Config, error) {
 				}
 				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
 			}
+		}
+	}
+
+	if cfg.EnableServerless {
+		if strings.TrimSpace(cfg.InternalIngressAddr) == "" {
+			return Config{}, errors.New("SB_INTERNAL_INGRESS_ADDR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxBuffer <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER must be > 0 when SB_ENABLE_SERVERLESS=true")
 		}
 	}
 

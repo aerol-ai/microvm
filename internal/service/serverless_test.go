@@ -2,14 +2,22 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -589,3 +597,271 @@ func TestWakeFailureWindowSlides(t *testing.T) {
 		t.Fatalf("breaker tripped on second failure outside the window")
 	}
 }
+
+// routeFake is a tiny Caddy admin fake that records PATCH (upsert) and
+// DELETE (remove) calls per route @id so installHTTPPortRoute /
+// removeHTTPPortRoute can be observed without a real Caddy.
+type routeFake struct {
+	mu      sync.Mutex
+	routes  map[string]map[string]any // routeID -> body
+	deletes map[string]int            // routeID -> delete count
+}
+
+func newRouteFake() *routeFake {
+	return &routeFake{
+		routes:  map[string]map[string]any{},
+		deletes: map[string]int{},
+	}
+}
+
+func (f *routeFake) handler(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/id/"):
+			id := strings.TrimPrefix(r.URL.Path, "/id/")
+			body, _ := io.ReadAll(r.Body)
+			var parsed map[string]any
+			_ = json.Unmarshal(body, &parsed)
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			// Treat PATCH-on-missing as 404 so the upsertRoute fallback
+			// runs through PUT — but our minimal fake answers PUT too.
+			if _, ok := f.routes[id]; !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			f.routes[id] = parsed
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/config/apps/http/servers/"):
+			body, _ := io.ReadAll(r.Body)
+			var parsed map[string]any
+			_ = json.Unmarshal(body, &parsed)
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if id, _ := parsed["@id"].(string); id != "" {
+				f.routes[id] = parsed
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/id/"):
+			id := strings.TrimPrefix(r.URL.Path, "/id/")
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.deletes[id]++
+			if _, ok := f.routes[id]; !ok {
+				// caddy.Client treats 404 as success.
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			delete(f.routes, id)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+}
+
+func (f *routeFake) routeIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := make([]string, 0, len(f.routes))
+	for id := range f.routes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func newRouteTestService(t *testing.T, fake *routeFake, enableServerless bool) *Service {
+	t.Helper()
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	client := caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	return &Service{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy:  client,
+		cfg: config.Config{
+			EnableServerless:    enableServerless,
+			InternalIngressAddr: "127.0.0.1:21213",
+			Domain:              "sandbox.example.com",
+			EnableCaddy:         true,
+		},
+	}
+}
+
+func TestInstallHTTPPortRouteServerlessInstallsWakeAndClearsDirect(t *testing.T) {
+	fake := newRouteFake()
+	svc := newRouteTestService(t, fake, true)
+	sb := &models.Sandbox{
+		ID:          "abc",
+		ContainerIP: "10.0.0.10",
+		Lifecycle:   models.Lifecycle{Serverless: true},
+	}
+	if err := svc.installHTTPPortRoute(context.Background(), sb, 3000); err != nil {
+		t.Fatalf("installHTTPPortRoute: %v", err)
+	}
+	ids := fake.routeIDs()
+	want := []string{"sandbox-abc-port-3000-wake"}
+	if !equalSorted(ids, want) {
+		t.Fatalf("route ids = %v, want %v", ids, want)
+	}
+	// Direct delete was attempted (idempotent, 404 absorbed).
+	if fake.deletes["sandbox-abc-port-3000"] == 0 {
+		t.Fatalf("direct route delete should have been attempted; deletes=%+v", fake.deletes)
+	}
+}
+
+func TestInstallHTTPPortRouteNonServerlessInstallsDirectAndClearsWake(t *testing.T) {
+	fake := newRouteFake()
+	svc := newRouteTestService(t, fake, true)
+	sb := &models.Sandbox{
+		ID:          "abc",
+		ContainerIP: "10.0.0.10",
+		Lifecycle:   models.Lifecycle{Serverless: false},
+	}
+	if err := svc.installHTTPPortRoute(context.Background(), sb, 3000); err != nil {
+		t.Fatalf("installHTTPPortRoute: %v", err)
+	}
+	ids := fake.routeIDs()
+	want := []string{"sandbox-abc-port-3000"}
+	if !equalSorted(ids, want) {
+		t.Fatalf("route ids = %v, want %v", ids, want)
+	}
+	if fake.deletes["sandbox-abc-port-3000-wake"] == 0 {
+		t.Fatalf("wake route delete should have been attempted; deletes=%+v", fake.deletes)
+	}
+}
+
+func TestInstallHTTPPortRouteGateOffIgnoresServerlessFlag(t *testing.T) {
+	fake := newRouteFake()
+	svc := newRouteTestService(t, fake, false) // gate off
+	sb := &models.Sandbox{
+		ID:          "abc",
+		ContainerIP: "10.0.0.10",
+		Lifecycle:   models.Lifecycle{Serverless: true}, // SDK pre-set the flag
+	}
+	if err := svc.installHTTPPortRoute(context.Background(), sb, 3000); err != nil {
+		t.Fatalf("installHTTPPortRoute: %v", err)
+	}
+	ids := fake.routeIDs()
+	want := []string{"sandbox-abc-port-3000"}
+	if !equalSorted(ids, want) {
+		t.Fatalf("route ids = %v, want %v (gate off must keep legacy direct routes regardless of flag)", ids, want)
+	}
+}
+
+// TestStopSandboxInternalWakeArmedKeepsWakeRouteLive: stopping a
+// serverless sandbox with wake_armed must KEEP a route alive for any
+// HTTP exposure — in the wake-aware shape so the ingress proxy can
+// resurrect on next request. The direct shape (if any) gets removed.
+func TestStopSandboxInternalWakeArmedKeepsWakeRouteLive(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	// Seed the direct route as if the sandbox had been running.
+	fake.routes["sandbox-sb-stop-arm-port-3000"] = map[string]any{"@id": "sandbox-sb-stop-arm-port-3000"}
+
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	sb := seedServerlessSandbox(t, st, "sb-stop-arm", true)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+
+	if _, err := svc.stopSandboxInternal(ctx, sb.ID, stopModeLifecycle); err != nil {
+		t.Fatalf("stopSandboxInternal: %v", err)
+	}
+
+	ids := fake.routeIDs()
+	want := []string{"sandbox-sb-stop-arm-port-3000-wake"}
+	if !equalSorted(ids, want) {
+		t.Fatalf("after stop+arm, routes = %v, want %v", ids, want)
+	}
+}
+
+// TestGCZombieKeepsWakeRouteForServerlessSandbox: the keep-set must
+// include the wake @id for any HTTP exposure on a serverless sandbox so
+// the reconcile GC does not delete it between sweeps.
+func TestGCZombieKeepsWakeRouteForServerlessSandbox(t *testing.T) {
+	fake := newGCCaddyFake()
+	fake.httpRouteIDs["sandbox-sl"] = struct{}{}
+	fake.httpRouteIDs["sandbox-sl-port-3000-wake"] = struct{}{}
+	// Also seed a wake route for a non-serverless sandbox — it must
+	// be GC'd because the keep-set excludes wake @ids for those.
+	fake.httpRouteIDs["sandbox-plain-port-3000-wake"] = struct{}{}
+	fake.httpRouteIDs["sandbox-plain"] = struct{}{}
+	fake.httpRouteIDs["sandbox-plain-port-3000"] = struct{}{}
+
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+
+	svc := &Service{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy: caddy.New(config.Config{
+			CaddyAdminURL:     server.URL,
+			CaddyServerID:     "srv0",
+			EnableCaddy:       true,
+			HTTPClientTimeout: 2 * time.Second,
+		}),
+		cfg: config.Config{EnableServerless: true},
+	}
+
+	serverless := &models.Sandbox{
+		ID:        "sl",
+		Status:    models.SandboxStatusStopped,
+		Lifecycle: models.Lifecycle{Serverless: true},
+		WakeArmed: true,
+		ExposedPorts: []models.ExposedPort{{
+			SandboxID: "sl", Port: 3000, Protocol: models.ExposedPortProtocolHTTP, CreatedAt: time.Now().UTC(),
+		}},
+	}
+	plain := &models.Sandbox{
+		ID:     "plain",
+		Status: models.SandboxStatusStarted,
+		ExposedPorts: []models.ExposedPort{{
+			SandboxID: "plain", Port: 3000, Protocol: models.ExposedPortProtocolHTTP, CreatedAt: time.Now().UTC(),
+		}},
+	}
+	svc.gcZombieCaddyEntries(context.Background(), []*models.Sandbox{serverless, plain})
+
+	wantKept := []string{"sandbox-plain", "sandbox-plain-port-3000", "sandbox-sl", "sandbox-sl-port-3000-wake"}
+	if got := fake.keys(fake.httpRouteIDs); !equalSorted(got, wantKept) {
+		t.Fatalf("after gc: got %v, want %v", got, wantKept)
+	}
+}
+
+func TestRemoveHTTPPortRouteDeletesBothShapes(t *testing.T) {
+	fake := newRouteFake()
+	// Seed both shapes so removeHTTPPortRoute has work to do.
+	fake.routes["sandbox-abc-port-3000"] = map[string]any{"@id": "sandbox-abc-port-3000"}
+	fake.routes["sandbox-abc-port-3000-wake"] = map[string]any{"@id": "sandbox-abc-port-3000-wake"}
+	svc := newRouteTestService(t, fake, true)
+	if err := svc.removeHTTPPortRoute(context.Background(), "abc", 3000); err != nil {
+		t.Fatalf("removeHTTPPortRoute: %v", err)
+	}
+	if len(fake.routeIDs()) != 0 {
+		t.Fatalf("expected all routes deleted; got %v", fake.routeIDs())
+	}
+}
+

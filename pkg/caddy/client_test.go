@@ -264,6 +264,79 @@ func TestRouteCases(t *testing.T) {
 				assertRouteDial(t, route, "10.0.0.2:3000")
 			},
 		},
+		{
+			name: "upsert_wake_http_port_route_dials_ingress_and_rewrites",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertWakeHTTPPortRoute(context.Background(), "abc", "127.0.0.1:21213", 3000); err != nil {
+					t.Fatalf("UpsertWakeHTTPPortRoute() error = %v", err)
+				}
+				route, ok := fake.routes["sandbox-abc-port-3000-wake"]
+				if !ok {
+					t.Fatalf("wake route missing; routes=%+v", fake.routes)
+				}
+				assertRouteField(t, route, "@id", "sandbox-abc-port-3000-wake")
+				assertRouteHostMatch(t, route, "abc-3000.sandbox.example.com")
+				// handle[0] = rewrite to /__ingress/http/abc/3000{path}
+				// handle[1] = reverse_proxy to the ingress addr
+				handles, ok := route["handle"].([]any)
+				if !ok || len(handles) != 2 {
+					t.Fatalf("wake route should have two handlers, got: %#v", route["handle"])
+				}
+				rewrite, _ := handles[0].(map[string]any)
+				if rewrite["handler"] != "rewrite" {
+					t.Fatalf("first handler should be rewrite, got %v", rewrite["handler"])
+				}
+				if uri, _ := rewrite["uri"].(string); uri != "/__ingress/http/abc/3000{http.request.uri.path}" {
+					t.Fatalf("unexpected rewrite uri: %q", uri)
+				}
+				rp, _ := handles[1].(map[string]any)
+				if rp["handler"] != "reverse_proxy" {
+					t.Fatalf("second handler should be reverse_proxy, got %v", rp["handler"])
+				}
+				upstreams, _ := rp["upstreams"].([]any)
+				if len(upstreams) == 0 {
+					t.Fatalf("missing upstreams: %#v", rp)
+				}
+				upstream, _ := upstreams[0].(map[string]any)
+				if dial, _ := upstream["dial"].(string); dial != "127.0.0.1:21213" {
+					t.Fatalf("expected dial=127.0.0.1:21213, got %q", dial)
+				}
+			},
+		},
+		{
+			name: "delete_wake_http_port_route_removes_route",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertWakeHTTPPortRoute(context.Background(), "abc", "127.0.0.1:21213", 3000); err != nil {
+					t.Fatalf("UpsertWakeHTTPPortRoute() error = %v", err)
+				}
+				if err := client.DeleteWakeHTTPPortRoute(context.Background(), "abc", 3000); err != nil {
+					t.Fatalf("DeleteWakeHTTPPortRoute() error = %v", err)
+				}
+				if _, ok := fake.routes["sandbox-abc-port-3000-wake"]; ok {
+					t.Fatalf("wake route should be deleted; routes=%+v", fake.routes)
+				}
+			},
+		},
+		{
+			name: "wake_http_port_route_skipped_when_path_mode",
+			run: func(t *testing.T) {
+				// Path mode (no domain configured) doesn't install per-port
+				// HTTP routes — wake-aware variant must follow the same rule
+				// to avoid leaking an unmatched dial entry.
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertWakeHTTPPortRoute(context.Background(), "abc", "127.0.0.1:21213", 3000); err != nil {
+					t.Fatalf("UpsertWakeHTTPPortRoute() error = %v", err)
+				}
+				if _, ok := fake.routes["sandbox-abc-port-3000-wake"]; ok {
+					t.Fatalf("wake route should not exist in path mode; routes=%+v", fake.routes)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {

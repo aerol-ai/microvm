@@ -254,6 +254,48 @@ func (c *Client) DeletePortRoute(ctx context.Context, id string, port int) error
 	return c.deleteRoute(ctx, portRouteID(id, port))
 }
 
+// UpsertWakeHTTPPortRoute installs a wake-aware per-port HTTP route that
+// dials the loopback ingress proxy at ingressAddr instead of the container.
+// The route's @id is namespaced with a "-wake" suffix so reconcile can
+// distinguish it from the legacy direct route — both must never exist at
+// the same time for the same sandbox+port (see D5 in the plan).
+//
+// The route rewrites the URI to /__ingress/http/{id}/{port}{path} before
+// proxying so the ingress handler can parse the target sandbox+port out of
+// the path without relying on host-header inspection.
+func (c *Client) UpsertWakeHTTPPortRoute(ctx context.Context, id, ingressAddr string, port int) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	routeID := wakePortRouteID(id, port)
+	route := map[string]any{
+		"@id":   routeID,
+		"match": []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}},
+		"handle": []map[string]any{
+			{
+				"handler": "rewrite",
+				"uri":     fmt.Sprintf("/__ingress/http/%s/%d{http.request.uri.path}", id, port),
+			},
+			{
+				"handler": "reverse_proxy",
+				"upstreams": []map[string]string{{
+					"dial": ingressAddr,
+				}},
+			},
+		},
+		"terminal": true,
+	}
+	return c.upsertRoute(ctx, routeID, route)
+}
+
+// DeleteWakeHTTPPortRoute removes the wake-aware route. 404 is a no-op.
+func (c *Client) DeleteWakeHTTPPortRoute(ctx context.Context, id string, port int) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	return c.deleteRoute(ctx, wakePortRouteID(id, port))
+}
+
 // UpsertInFluxSandboxRoute installs an HTTP route for the sandbox's public
 // hostname/path that responds with 503 Service Unavailable + Retry-After: 2.
 // Used by the cluster-ingress reconciler when a placement is orphaned or
@@ -466,11 +508,16 @@ func inFluxPortRouteID(id string, port int) string {
 	return fmt.Sprintf("sandbox-%s-port-%d-in-flux", id, port)
 }
 
+func wakePortRouteID(id string, port int) string {
+	return fmt.Sprintf("sandbox-%s-port-%d-wake", id, port)
+}
+
 // IDs exposed for the zombie GC to add to its keep-set.
 func SandboxRouteID(id string) string              { return sandboxRouteID(id) }
 func PortRouteID(id string, port int) string       { return portRouteID(id, port) }
 func InFluxSandboxRouteID(id string) string        { return inFluxSandboxRouteID(id) }
 func InFluxPortRouteID(id string, port int) string { return inFluxPortRouteID(id, port) }
+func WakePortRouteID(id string, port int) string   { return wakePortRouteID(id, port) }
 
 // Layer4 admin API conventions.
 //
