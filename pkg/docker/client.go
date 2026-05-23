@@ -23,6 +23,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // managedLabelKey is the Docker label every sandbox container we create
@@ -64,6 +65,12 @@ type Client struct {
 	pullSlots          chan struct{}
 	pullBackoff        time.Duration
 	pullFailures       map[string]imagePullFailure
+	// Mirror configuration: zero value disables rewriting and the pull
+	// path behaves exactly as it did before AOCR mirror support landed.
+	// Set via ConfigureMirror after construction; main() is responsible
+	// for loading the key ring once and handing it in.
+	mirrorCfg     MirrorConfig
+	wrapKeyRing   *secrets.UpstreamWrapKeyRing
 }
 
 type imagePull struct {
@@ -118,6 +125,16 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		pullBackoff:        cfg.ImagePullFailureBackoff,
 		pullFailures:       make(map[string]imagePullFailure),
 	}, nil
+}
+
+// ConfigureMirror installs the AOCR mirror policy onto an existing Client.
+// Both arguments are optional: a zero MirrorConfig disables rewriting, and
+// a nil key ring disables identity-token wrapping (the pull falls back to
+// raw username/password in X-Registry-Auth). main() is expected to load the
+// wrap key ring exactly once at startup and hand it in here.
+func (c *Client) ConfigureMirror(cfg MirrorConfig, ring *secrets.UpstreamWrapKeyRing) {
+	c.mirrorCfg = cfg
+	c.wrapKeyRing = ring
 }
 
 // ClearNetworkRules releases any per-IP network rules previously attached to a
@@ -617,20 +634,52 @@ func (c *Client) ensureToolboxBinary() error {
 }
 
 func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+	// Apply mirror rewrite first so the auth payload we build below can be
+	// keyed off the *upstream* host (the AOCR auth service wants the
+	// upstream's username/password wrapped inside an identity token, not the
+	// mirror vhost as the serveraddress).
+	rewrite := RewriteImageRefForMirror(imageRef, c.mirrorCfg)
+	pullRef := rewrite.RewrittenRef
+
 	headers := map[string]string{}
 	if auth != nil && auth.Username != "" {
-		encoded, err := json.Marshal(map[string]string{
+		authPayload := map[string]string{
 			"username":      auth.Username,
 			"password":      auth.Password,
 			"serveraddress": auth.Server,
-		})
+		}
+		// When the ref was rewritten and we have a wrap key ring, hand
+		// the upstream credentials to AOCR as a wrapped identity token.
+		// Docker's auth handling treats `identitytoken` as authoritative
+		// and ignores username/password when it's present, which is what
+		// we want — the mirror sees only the opaque blob.
+		if rewrite.Rewritten && c.wrapKeyRing != nil {
+			creds := secrets.UpstreamCredentials{
+				UpstreamHost: rewrite.UpstreamHost,
+				Username:     auth.Username,
+				Password:     auth.Password,
+				Scope:        "repository:" + rewrite.UpstreamRepo + ":pull",
+			}
+			token, err := secrets.WrapUpstreamCreds(c.wrapKeyRing, creds)
+			if err != nil {
+				return fmt.Errorf("wrap upstream credentials: %w", err)
+			}
+			// Identity token is authoritative: blank username/password so
+			// the mirror never sees the upstream PAT in cleartext, even
+			// in error paths.
+			authPayload = map[string]string{
+				"identitytoken": token,
+				"serveraddress": c.mirrorCfg.Host,
+			}
+		}
+		encoded, err := json.Marshal(authPayload)
 		if err != nil {
 			return fmt.Errorf("marshal registry auth: %w", err)
 		}
 		headers["X-Registry-Auth"] = base64.StdEncoding.EncodeToString(encoded)
 	}
 
-	query := queryValues(map[string]string{"fromImage": imageRef})
+	query := queryValues(map[string]string{"fromImage": pullRef})
 	target := "http://docker/images/create?" + query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
 	if err != nil {
