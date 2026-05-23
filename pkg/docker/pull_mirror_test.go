@@ -164,6 +164,81 @@ func TestPullImage_DockerHub_PassesThrough_EvenWithMirror(t *testing.T) {
 	}
 }
 
+// observerFires tests the PullObserver firing predicate. Hand-rolled against
+// the actual pullImage path (no daemon, just our roundtrip stub) so the
+// truth table is observable: only (mirror-rewrite AND non-anonymous auth AND
+// sandbox ID on ctx AND observer set) fires the callback.
+func TestPullObserver_FirePredicate(t *testing.T) {
+	ring := secrets.ParseUpstreamWrapKeyRing(b64DockerTest(key32DockerTest(0x42)))
+	cases := []struct {
+		name      string
+		image     string
+		auth      *models.RegistryAuth
+		ctxSbxID  string
+		setObs    bool
+		wantFires bool
+	}{
+		{"private mirror pull + sandbox id fires once", "ghcr.io/aerol-ai/sandbox:v1", &models.RegistryAuth{Username: "u", Password: "p", Server: "ghcr.io"}, "sb-1", true, true},
+		{"anonymous mirror pull does not fire", "ghcr.io/aerol-ai/sandbox:v1", nil, "sb-1", true, false},
+		{"empty username treated as anonymous", "ghcr.io/aerol-ai/sandbox:v1", &models.RegistryAuth{Username: "", Password: ""}, "sb-1", true, false},
+		{"docker.io passthrough does not fire", "redis:7", &models.RegistryAuth{Username: "u", Password: "p", Server: "https://index.docker.io/v1/"}, "sb-1", true, false},
+		{"missing sandbox id does not fire", "ghcr.io/aerol-ai/sandbox:v1", &models.RegistryAuth{Username: "u", Password: "p", Server: "ghcr.io"}, "", true, false},
+		{"no observer installed is a no-op", "ghcr.io/aerol-ai/sandbox:v1", &models.RegistryAuth{Username: "u", Password: "p", Server: "ghcr.io"}, "sb-1", false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cap := newCaptureClient(defaultMirrorCfg(), ring)
+			var fired atomic.Int64
+			var gotID atomic.Value
+			gotID.Store("")
+			if c.setObs {
+				cap.client.SetPullObserver(func(_ context.Context, id string) {
+					fired.Add(1)
+					gotID.Store(id)
+				})
+			}
+			ctx := context.Background()
+			if c.ctxSbxID != "" {
+				ctx = WithSandboxID(ctx, c.ctxSbxID)
+			}
+			if err := cap.client.pullImage(ctx, c.image, c.auth); err != nil {
+				t.Fatalf("pullImage: %v", err)
+			}
+			got := fired.Load()
+			if c.wantFires {
+				if got != 1 {
+					t.Fatalf("observer fired %d times, want 1", got)
+				}
+				if id := gotID.Load().(string); id != c.ctxSbxID {
+					t.Fatalf("observer got sandbox id %q, want %q", id, c.ctxSbxID)
+				}
+			} else if got != 0 {
+				t.Fatalf("observer fired %d times, want 0", got)
+			}
+		})
+	}
+}
+
+// TestWithSandboxID_RoundTripAndEmptyHandling asserts the ctx helper drops
+// empty IDs (a guardrail so a missing sandboxID doesn't accidentally overwrite
+// a real one set further up the stack).
+func TestWithSandboxID_RoundTripAndEmptyHandling(t *testing.T) {
+	base := context.Background()
+	if got := sandboxIDFromContext(base); got != "" {
+		t.Fatalf("empty base ctx returned %q, want empty", got)
+	}
+	ctx := WithSandboxID(base, "sb-42")
+	if got := sandboxIDFromContext(ctx); got != "sb-42" {
+		t.Fatalf("round-trip returned %q, want sb-42", got)
+	}
+	// Whitespace-only IDs are treated as empty so they don't shadow the
+	// parent's real value.
+	ctx2 := WithSandboxID(ctx, "   ")
+	if got := sandboxIDFromContext(ctx2); got != "sb-42" {
+		t.Fatalf("whitespace ID shadowed parent: got %q", got)
+	}
+}
+
 // Local helpers (duplicated rather than imported across packages — these
 // mirror the secrets/test helpers so we don't widen the secrets package's
 // export surface just for tests).

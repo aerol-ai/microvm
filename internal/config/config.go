@@ -430,6 +430,41 @@ type Config struct {
 	// AOCR or the local Docker socket. Default 4.
 	// SB_AUTO_IMPORT_MAX_IN_FLIGHT.
 	AutoImportMaxInFlight int
+
+	// MirrorHost is the AOCR pull-through mirror vhost
+	// (e.g. `mirror.aocr.aerol.ai`). When non-empty AND at least one
+	// upstream is configured, the docker client rewrites matching image
+	// refs through this host before pulling. Empty disables rewriting and
+	// pulls hit the upstream registry directly — the safety hatch for
+	// nodes not running with AOCR mirror enabled. SB_MIRROR_HOST.
+	MirrorHost string
+	// MirrorPushHost is the AOCR push vhost (e.g. `aocr.aerol.ai`). Used
+	// only for idempotency: a ref that already points at the push vhost
+	// (e.g. a cluster snapshot or a previously-imported image) is not
+	// re-rewritten. Optional. SB_MIRROR_PUSH_HOST.
+	MirrorPushHost string
+	// MirrorUpstreams is the comma-separated host=shortname mapping
+	// (`ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s`). Docker
+	// Hub is intentionally absent — it's mirrored via the Docker daemon's
+	// `registry-mirrors` daemon.json setting, not client-side rewriting.
+	// SB_MIRROR_UPSTREAMS.
+	MirrorUpstreams []MirrorUpstreamMapping
+	// UpstreamWrapKeyPath is the file path to the per-cluster AES-GCM wrap
+	// key used to seal docker `RegistryAuth` payloads before they reach
+	// the mirror, so the mirror vhost never sees raw upstream PATs.
+	// File-sourced (not env) with required mode 0400. When empty or
+	// unreadable, the mirror falls back to anonymous pulls — fine for
+	// public images, but private images will 401. SB_UPSTREAM_WRAP_KEY_PATH.
+	UpstreamWrapKeyPath string
+}
+
+// MirrorUpstreamMapping is a single host=shortname pair parsed from
+// SB_MIRROR_UPSTREAMS. Kept here (not in pkg/docker) so the config layer
+// has no dependency on the docker package — main.go translates to
+// docker.MirrorUpstream at wiring time.
+type MirrorUpstreamMapping struct {
+	Host      string
+	Shortname string
 }
 
 func Load() (Config, error) {
@@ -540,6 +575,10 @@ func Load() (Config, error) {
 		AutoImportRequestTimeout:         getEnvDuration("SB_AUTO_IMPORT_REQUEST_TIMEOUT", 15*time.Second),
 		AutoImportReconcileInterval:      getEnvDuration("SB_AUTO_IMPORT_RECONCILE_INTERVAL", 5*time.Minute),
 		AutoImportMaxInFlight:            getEnvInt("SB_AUTO_IMPORT_MAX_IN_FLIGHT", 4),
+		MirrorHost:                       strings.TrimSpace(os.Getenv("SB_MIRROR_HOST")),
+		MirrorPushHost:                   strings.TrimSpace(os.Getenv("SB_MIRROR_PUSH_HOST")),
+		MirrorUpstreams:                  parseMirrorUpstreams(getEnv("SB_MIRROR_UPSTREAMS", "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s")),
+		UpstreamWrapKeyPath:              strings.TrimSpace(os.Getenv("SB_UPSTREAM_WRAP_KEY_PATH")),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -866,6 +905,30 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 
 func normalizeHost(value string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(value, "https://"), "http://"))
+}
+
+// parseMirrorUpstreams parses the comma-separated host=shortname list for
+// SB_MIRROR_UPSTREAMS. Tolerates surrounding whitespace and skips malformed
+// entries silently — a typo in one entry shouldn't prevent the others from
+// taking effect, and `MirrorConfig.Enabled()` already requires at least one
+// valid entry. Empty input returns an empty (non-nil) slice so callers can
+// range over it unconditionally.
+func parseMirrorUpstreams(raw string) []MirrorUpstreamMapping {
+	out := []MirrorUpstreamMapping{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		host, short, ok := strings.Cut(part, "=")
+		host = strings.TrimSpace(host)
+		short = strings.TrimSpace(short)
+		if !ok || host == "" || short == "" {
+			continue
+		}
+		out = append(out, MirrorUpstreamMapping{Host: host, Shortname: short})
+	}
+	return out
 }
 
 func normalizeAdvertiseHost(value string) string {

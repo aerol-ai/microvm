@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -97,6 +98,7 @@ func main() {
 		logger.Error("failed to create docker client", "error", err)
 		os.Exit(1)
 	}
+	configureMirror(logger, cfg, dockerClient)
 
 	caddyClient := caddy.New(cfg)
 
@@ -278,6 +280,25 @@ func main() {
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
+		if cfg.AutoImportEnabled {
+			// Wire the post-pull trigger: when the docker client finishes a
+			// successful pull that BOTH used the mirror AND carried private
+			// creds, the observer flips the sandbox row's auto_import_pending
+			// flag. The reconciler then picks it up on its next sweep, calls
+			// AOCR ImportAPI, and clears the flag on success. Worker-only:
+			// non-worker nodes never pull sandbox images.
+			dockerClient.SetPullObserver(func(obsCtx context.Context, sandboxID string) {
+				// Use a fresh short-deadline context: the pull's ctx may be
+				// cancelled before this fires (Docker ack races container
+				// start), and a SQLite UPDATE is local and quick.
+				flagCtx, flagCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer flagCancel()
+				if err := db.SetAutoImportPending(flagCtx, sandboxID, true); err != nil {
+					logger.Warn("auto-import: flag pending failed; reconciler will not retry",
+						"sandbox_id", sandboxID, "error", err)
+				}
+			})
+		}
 	}
 
 	if cfg.EnableSSHGateway && cfg.IsWorker() {
@@ -422,6 +443,53 @@ func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logg
 		spec.Registry = auth
 	}
 	return spec
+}
+
+// configureMirror loads the upstream wrap-key ring (if a path is set) and
+// hands a built MirrorConfig to the docker client. Disabled-by-default:
+// MirrorHost empty or upstream list empty means rewriting stays off and the
+// docker client pulls from upstream registries directly.
+//
+// Wrap-key absence is a soft failure: we log a clear warning and configure
+// the mirror without a ring. Public images still mirror cleanly (anonymous
+// auth); private images will 401 against the mirror until the operator
+// installs the key. This keeps the node bootable on a misconfigured wrap
+// path rather than gating all pulls behind one secret.
+func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
+	if strings.TrimSpace(cfg.MirrorHost) == "" || len(cfg.MirrorUpstreams) == 0 {
+		return
+	}
+	upstreams := make([]docker.MirrorUpstream, 0, len(cfg.MirrorUpstreams))
+	for _, m := range cfg.MirrorUpstreams {
+		upstreams = append(upstreams, docker.MirrorUpstream{Host: m.Host, Shortname: m.Shortname})
+	}
+	mcfg := docker.MirrorConfig{
+		Host:      cfg.MirrorHost,
+		PushHost:  cfg.MirrorPushHost,
+		Upstreams: upstreams,
+	}
+
+	var ring *secrets.UpstreamWrapKeyRing
+	if cfg.UpstreamWrapKeyPath != "" {
+		r, err := secrets.LoadUpstreamWrapKeyRing(cfg.UpstreamWrapKeyPath)
+		if err != nil {
+			logger.Warn("mirror: upstream wrap key unavailable; private images via the mirror will 401 until the key is installed",
+				"path", cfg.UpstreamWrapKeyPath, "error", err)
+		} else {
+			ring = r
+		}
+	} else {
+		logger.Info("mirror: no upstream wrap key path configured; private-image pulls via the mirror are not supported on this node",
+			"hint", "set SB_UPSTREAM_WRAP_KEY_PATH to enable wrapped-credential auth")
+	}
+
+	c.ConfigureMirror(mcfg, ring)
+	logger.Info("mirror configured",
+		"host", mcfg.Host,
+		"push_host", mcfg.PushHost,
+		"upstreams", len(mcfg.Upstreams),
+		"wrap_key_loaded", ring != nil,
+	)
 }
 
 // startAutoImportReconciler builds the F21 auto-import importer + reconciler
