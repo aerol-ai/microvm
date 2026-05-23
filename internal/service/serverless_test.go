@@ -949,9 +949,9 @@ func TestStopSandboxInternalD5CaddyBeforeStore(t *testing.T) {
 	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
 
 	var (
-		wakeRouteSeen           bool
-		armedWhenWakeUpserted   bool
-		captureWakeUpsertMu     sync.Mutex
+		wakeRouteSeen         bool
+		armedWhenWakeUpserted bool
+		captureWakeUpsertMu   sync.Mutex
 	)
 	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// PUT (path: /config/apps/http/servers/...) or PATCH (/id/<id>)
@@ -1064,6 +1064,88 @@ func TestStopSandboxInternalD5WakeRouteFailureDegradesToNonArm(t *testing.T) {
 	}
 	if final.WakeArmed {
 		t.Fatalf("wake_armed = true after all wake-route upserts failed; should have degraded to non-arm")
+	}
+}
+
+// TestStopEventPreservesWakeRouteForArmingStop is the P0 regression:
+// after stopSandboxInternal installs the wake route and calls docker.Stop,
+// the resulting die event must NOT delete the wake route. Pre-fix,
+// markSandboxStopped's per-port deleteExposedPortRoute loop nuked the
+// wake-aware shape too, so a stopped serverless sandbox lost its only
+// ingress and the next inbound HTTP request would 404 through Caddy.
+//
+// The test simulates the post-stopSandboxInternal state (sandbox row at
+// Stopped with WakeArmed=true, wake route installed in Caddy, expectation
+// recorded as stopModeLifecycle) and fires the die event. The wake route
+// must survive and wake_armed must remain true.
+func TestStopEventPreservesWakeRouteForArmingStop(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	// Post-stopSandboxInternal Caddy state: wake route installed, direct
+	// route already removed.
+	fake.routes["sandbox-sb-evt-arm-port-3000-wake"] = map[string]any{"@id": "sandbox-sb-evt-arm-port-3000-wake"}
+
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	// Seed at status=Stopped with WakeArmed=true to mirror the row state
+	// stopSandboxInternal would have left behind by the time the die event
+	// arrives. ContainerIP empty so the netrules branch is a no-op.
+	sb := seedServerlessSandbox(t, st, "sb-evt-arm", true)
+	sb.Status = models.SandboxStatusStopped
+	sb.WakeArmed = true
+	sb.ContainerIP = ""
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("upsert seed: %v", err)
+	}
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+	// stopSandboxInternal recorded a lifecycle expectation before
+	// docker.Stop — replicate that so the event classifier returns
+	// stopModeLifecycle and shouldArmWake stays true.
+	svc.recordExpectedStop(sb.ID, stopModeLifecycle)
+
+	if err := svc.handleDockerEvent(ctx, docker.DockerEvent{
+		SandboxID: sb.ID,
+		Action:    "die",
+		ExitCode:  0,
+		Time:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("handleDockerEvent die: %v", err)
+	}
+
+	// The wake route must still be present after the die event.
+	ids := fake.routeIDs()
+	want := []string{"sandbox-sb-evt-arm-port-3000-wake"}
+	if !equalSorted(ids, want) {
+		t.Fatalf("after die event, routes = %v, want %v (P0: stop event wiped the wake route)", ids, want)
+	}
+
+	// And wake_armed must remain true so EnsureSandboxAwakeForHTTP
+	// will actually resurrect on the next request.
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("get after die: %v", err)
+	}
+	if !got.WakeArmed {
+		t.Fatalf("wake_armed = false after die event on serverless lifecycle stop; want true")
 	}
 }
 

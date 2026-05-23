@@ -3,8 +3,10 @@ package ingressproxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/store"
 )
 
 type fakeResolver struct {
@@ -24,6 +27,12 @@ type fakeResolver struct {
 	lastPrt   int
 	touchCnt  atomic.Int32
 	touchedID atomic.Value // string
+	// started flips IsSandboxStarted's return. Default false keeps
+	// the body-buffering branch live for tests that exercise it
+	// (oversize cap, replay, upgrade-skip); warm-bypass tests flip
+	// it to true to assert buffering is skipped.
+	started    bool
+	startedErr error
 }
 
 func (f *fakeResolver) WakeAwarePortTarget(_ context.Context, id string, port int) (service.PortEndpoint, error) {
@@ -42,9 +51,17 @@ func (f *fakeResolver) TouchSandbox(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeResolver) IsSandboxStarted(_ context.Context, _ string) (bool, error) {
+	return f.started, f.startedErr
+}
+
 func newHandler(resolver PortResolver, max int64) http.Handler {
 	mux := http.NewServeMux()
-	RegisterRoutes(mux, Deps{Resolver: resolver, MaxBufferBytes: max})
+	RegisterRoutes(mux, Deps{
+		Resolver:       resolver,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBufferBytes: max,
+	})
 	return mux
 }
 
@@ -126,6 +143,8 @@ func TestHTTPWakeRejectsOversizedBody(t *testing.T) {
 	}))
 	defer upstream.Close()
 
+	// Sandbox cold (started=false default) so the buffering branch
+	// engages — that's the path the 413 cap belongs to.
 	h := newHandler(&fakeResolver{target: upstream.URL}, 8)
 	req := httptest.NewRequest(http.MethodPost,
 		"/__ingress/http/abc/3000/api",
@@ -306,6 +325,99 @@ func TestHTTPWakeUpgradeBodyNotBuffered(t *testing.T) {
 	}
 	if !strings.EqualFold(gotConnection, "Upgrade") {
 		t.Fatalf("upstream Connection = %q, want Upgrade", gotConnection)
+	}
+}
+
+// TestHTTPWakeWarmRequestBypassesBodyBuffer: P1 — when the sandbox is
+// already running, the buffering branch must be skipped so a normal
+// upload doesn't get capped at MaxBufferBytes. We set MaxBufferBytes=8
+// (anything stopped would 413) and send a 1 KiB POST. With warm-bypass
+// engaged the body streams straight through to the upstream and the
+// request returns 200.
+func TestHTTPWakeWarmRequestBypassesBodyBuffer(t *testing.T) {
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = b
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	resolver := &fakeResolver{target: upstream.URL, started: true}
+	h := newHandler(resolver, 8) // 8 byte cap → would 413 a cold request
+
+	payload := strings.Repeat("x", 1024)
+	req := httptest.NewRequest(http.MethodPost,
+		"/__ingress/http/sb-warm/3000/upload",
+		strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (warm bypass should skip buffer cap); body=%q", rec.Code, rec.Body.String())
+	}
+	if string(gotBody) != payload {
+		t.Fatalf("upstream body mismatch len got=%d want=%d", len(gotBody), len(payload))
+	}
+}
+
+// TestHTTPWakeWarmRequestSurfaces404OnMissingSandbox: the warm-bypass
+// preflight check runs first, so a missing sandbox must short-circuit
+// to 404 before the buffer / wake-target paths are reached.
+func TestHTTPWakeWarmRequestSurfaces404OnMissingSandbox(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatalf("upstream should not be reached when sandbox is missing")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	resolver := &fakeResolver{target: upstream.URL, startedErr: store.ErrNotFound}
+	h := newHandler(resolver, 1024)
+
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/sb-missing/3000/api", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+// TestHTTPWakeColdStartTimeoutReturns503: P1 — a wake that fails with
+// a generic error (e.g. context.DeadlineExceeded from wakeStartTimeout,
+// or any unclassified Docker start error) must surface as 503 +
+// Retry-After:2, not 400. Pre-fix the handler delegated to
+// WriteStoreAwareError whose fallback is 400 Bad Request, so
+// load-balancers and clients saw a 4xx for a transient cold-start
+// failure and would not retry.
+func TestHTTPWakeColdStartTimeoutReturns503(t *testing.T) {
+	resolver := &fakeResolver{err: context.DeadlineExceeded}
+	h := newHandler(resolver, 1024)
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/sb-slow/3000/api", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+}
+
+// TestHTTPWakeUnknownStartErrorReturns503: same shape as the timeout
+// case but with an arbitrary error (think Docker daemon transient).
+// Anything not on the recognized-sentinel list must be 503 so clients
+// retry instead of treating the failure as permanent.
+func TestHTTPWakeUnknownStartErrorReturns503(t *testing.T) {
+	resolver := &fakeResolver{err: errors.New("docker daemon: connection refused")}
+	h := newHandler(resolver, 1024)
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/sb-err/3000/api", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
 	}
 }
 

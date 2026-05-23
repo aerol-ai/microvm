@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -12,9 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
 // httpWake serves /__ingress/http/{id}/{port}[/{path...}]. The flow:
@@ -46,11 +49,27 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 	// Buffer the request body before initiating wake — we can't replay
 	// a client stream after the cold-start delay. Upgrades have no body
 	// in the HTTP sense, so skip buffering for them.
+	//
+	// Warm-bypass: when the sandbox is already running, WakeAwarePortTarget
+	// returns instantly with no cold-start window, so buffering serves no
+	// purpose — it would just enforce MaxBufferBytes against normal
+	// uploads (turning a 100 MiB POST into a 413) and waste memory on
+	// every request. We pay one extra store.Get to decide, which is
+	// cheaper than the buffer + allocation. If IsSandboxStarted returns
+	// ErrNotFound we surface 404 immediately; other errors fall through
+	// to the buffer-and-wake path (the wake helper will surface them
+	// with the right status if they recur).
 	isUpgrade := strings.EqualFold(r.Header.Get("Connection"), "upgrade") ||
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") ||
 		r.Header.Get("Upgrade") != ""
 
-	if !isUpgrade && r.Body != nil && r.ContentLength != 0 {
+	started, startedErr := h.deps.Resolver.IsSandboxStarted(r.Context(), id)
+	if errors.Is(startedErr, store.ErrNotFound) {
+		apihttp.WriteError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+
+	if !started && !isUpgrade && r.Body != nil && r.ContentLength != 0 {
 		buf, err := bufferBody(r.Body, h.deps.MaxBufferBytes)
 		if err != nil {
 			if errors.Is(err, errBodyTooLarge) {
@@ -71,26 +90,7 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 
 	endpoint, err := h.deps.Resolver.WakeAwarePortTarget(r.Context(), id, port)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			apihttp.WriteError(w, http.StatusNotFound, "sandbox not found")
-			return
-		}
-		// Wake-timeout (context deadline) surfaces as a generic error
-		// from StartSandbox — translate to 503+Retry-After:2 per D6
-		// so clients retry quickly while the cold start finishes.
-		if errors.Is(err, service.ErrWakeCircuitOpen) {
-			w.Header().Set("Retry-After", "60")
-			apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		if errors.Is(err, service.ErrSandboxManuallyStopped) {
-			apihttp.WriteError(w, http.StatusConflict, err.Error())
-			return
-		}
-		// Timeouts / capacity / other transient failures: tell the
-		// client to retry shortly.
-		w.Header().Set("Retry-After", "2")
-		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		writeWakeError(h.deps.Logger, w, id, port, err)
 		return
 	}
 
@@ -138,6 +138,43 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// writeWakeError maps a wake failure to the HTTP response the docs
+// promise (serverless.mdx). Any error that does not match a known
+// sentinel — cold-start timeout (context.DeadlineExceeded from
+// wakeStartTimeout), Docker start failures, capacity rejections that
+// slip past the cluster check — is a transient failure of the cold
+// start, so the fallback is 503 + Retry-After:2 rather than the
+// generic 400 WriteStoreAwareError defaults to. A 4xx here would
+// confuse clients and load balancers into treating the failure as
+// permanent and never retrying.
+//
+// Order matters: WriteStoreAwareError is the canonical mapper for
+// capacity errors (it sets the cluster-aware Retry-After). We delegate
+// to it for the recognized error families and only fall through to
+// the 503 default for "unknown wake failure".
+func writeWakeError(logger *slog.Logger, w http.ResponseWriter, id string, port int, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		apihttp.WriteError(w, http.StatusNotFound, "sandbox not found")
+	case errors.Is(err, service.ErrSandboxManuallyStopped):
+		apihttp.WriteError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, service.ErrWakeCircuitOpen):
+		w.Header().Set("Retry-After", "60")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.Is(err, capacity.ErrCapacityExceeded), errors.Is(err, cluster.ErrCapacityExceeded),
+		errors.Is(err, cluster.ErrCreateBackpressure), errors.Is(err, cluster.ErrNoPlacementTarget),
+		errors.Is(err, cluster.ErrInvalidTopology):
+		apihttp.WriteStoreAwareError(logger, w, err)
+	default:
+		// Unknown wake failure: cold-start timeout, Docker start error,
+		// or anything else surfaced by StartSandbox. All are transient
+		// from the client's perspective — retry shortly.
+		logger.Warn("wake failed", "sandbox_id", id, "port", port, "error", err)
+		w.Header().Set("Retry-After", "2")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox wake failed")
+	}
 }
 
 // activityTicker re-touches the sandbox every activityTickInterval for

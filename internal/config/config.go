@@ -114,12 +114,12 @@ type Config struct {
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
-	Runtime                     string
-	AutoReconcile               bool
-	EnableCaddy                 bool
-	EnableNetworkRules          bool
-	EnableEventMonitor          bool
-	EnableSSHGateway            bool
+	Runtime            string
+	AutoReconcile      bool
+	EnableCaddy        bool
+	EnableNetworkRules bool
+	EnableEventMonitor bool
+	EnableSSHGateway   bool
 	// EnableServerless gates HTTP-wake behavior for sandboxes created with
 	// Lifecycle.Serverless=true. When false (default), the serverless flag
 	// is accepted at the API surface (so SDK callers can pre-set it without
@@ -136,7 +136,7 @@ type Config struct {
 	// HTTPWakeMaxBuffer caps the request body buffered while a cold-start
 	// wake is in progress. Requests with bodies larger than this are
 	// rejected with 413 — see plan D2.
-	HTTPWakeMaxBuffer int64
+	HTTPWakeMaxBuffer           int64
 	SSHListenAddr               string
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string

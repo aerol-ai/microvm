@@ -51,7 +51,7 @@ const (
 // corresponding event, if it ever arrives late, then gets treated as
 // involuntary, which is the safe default.
 type expectedStopRecord struct {
-	mode      stopMode
+	mode       stopMode
 	recordedAt time.Time
 }
 
@@ -156,46 +156,12 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	// Drop the Caddy routes while the container is down so requests hit the
 	// fallback "sandbox not found" handler instead of a 502 from a stale
 	// upstream IP. StartSandbox re-upserts every route on the way back up.
-	//
-	// Wake-arming exception (D5): for an HTTP port on a wake-armed stop
-	// we must KEEP a route alive — but in the wake-aware shape, not the
-	// direct one — so the next HTTP request lands on the ingress proxy
-	// and resurrects the sandbox instead of 404'ing. Install-then-delete
-	// ordering avoids a window with no matching route. We also track
-	// whether any wake route installed successfully: if every HTTP
-	// upsert fails, fall back to a non-arm stop rather than claim a
-	// wake state we can't serve.
-	var (
-		wakeRouteAttempted bool
-		wakeRouteInstalled bool
-	)
-	for _, port := range sandbox.ExposedPorts {
-		isHTTP := port.Protocol == "" || port.Protocol == models.ExposedPortProtocolHTTP
-		if arm && isHTTP {
-			wakeRouteAttempted = true
-			if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port.Port); err != nil {
-				s.logger.Warn("install wake HTTP route on stop failed", "sandbox_id", id, "port", port.Port, "error", err)
-			} else {
-				wakeRouteInstalled = true
-			}
-			if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
-				s.logger.Warn("delete direct HTTP route on wake-arming stop failed", "sandbox_id", id, "port", port.Port, "error", err)
-			}
-			continue
-		}
-		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
-			s.logger.Warn("caddy port route cleanup on stop failed", "sandbox_id", id, "port", port.Port, "protocol", port.Protocol, "error", err)
-		}
-	}
+	// tearDownPortRoutesForStop applies the D5 wake-arming exception (keep
+	// the wake-aware shape live for HTTP ports on an arming stop) and
+	// returns the demoted arm value if every wake route upsert failed.
+	arm = s.tearDownPortRoutesForStop(ctx, sandbox, arm)
 	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 		s.logger.Warn("caddy route cleanup on stop failed", "sandbox_id", id, "error", err)
-	}
-
-	// D5 fallback: if we tried to install a wake route for at least
-	// one HTTP port and every attempt failed, we cannot honor wake.
-	// Degrade to a non-arm stop so wake_armed and route state agree.
-	if arm && wakeRouteAttempted && !wakeRouteInstalled {
-		arm = false
 	}
 
 	// D5 ordering: flip wake_armed AFTER caddy work so we never end
@@ -214,6 +180,54 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 		return nil, err
 	}
 	return sandbox, nil
+}
+
+// tearDownPortRoutesForStop drops the Caddy port routes for a stopping
+// sandbox. For HTTP ports on a wake-arming stop the direct route is
+// REPLACED with the wake-aware shape (install-then-delete ordering, so
+// no window without a matching route) so the next inbound request
+// resurrects the sandbox through the ingress proxy. All other ports
+// (HTTP without arm, TCP, TLS-SNI) are deleted outright.
+//
+// Returns the final arm value. The input is preserved unless arm=true
+// was passed, at least one HTTP wake-route install was attempted, and
+// every attempt failed — in which case arm is demoted to false so
+// wake_armed and route state never disagree (D5 fallback).
+//
+// Shared between the API-driven stop path (stopSandboxInternal) and
+// the Docker-event stop path (events.markSandboxStopped) so the wake
+// route just installed by the former cannot be silently wiped by the
+// latter when the die event arrives.
+func (s *Service) tearDownPortRoutesForStop(ctx context.Context, sandbox *models.Sandbox, arm bool) bool {
+	var (
+		wakeRouteAttempted bool
+		wakeRouteInstalled bool
+	)
+	for _, port := range sandbox.ExposedPorts {
+		isHTTP := port.Protocol == "" || port.Protocol == models.ExposedPortProtocolHTTP
+		if arm && isHTTP {
+			wakeRouteAttempted = true
+			if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port.Port); err != nil {
+				s.logger.Warn("install wake HTTP route on stop failed",
+					"sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+			} else {
+				wakeRouteInstalled = true
+			}
+			if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
+				s.logger.Warn("delete direct HTTP route on wake-arming stop failed",
+					"sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+			}
+			continue
+		}
+		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
+			s.logger.Warn("caddy port route cleanup on stop failed",
+				"sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
+		}
+	}
+	if arm && wakeRouteAttempted && !wakeRouteInstalled {
+		return false
+	}
+	return arm
 }
 
 // shouldArmWake centralizes the wake-arming decision so the runtime stop

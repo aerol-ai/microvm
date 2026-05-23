@@ -1790,6 +1790,20 @@ func (s *Service) TouchSandbox(ctx context.Context, id string) error {
 	return s.store.Touch(ctx, id, time.Now().UTC())
 }
 
+// IsSandboxStarted is the preflight check the wake-aware ingress proxy
+// uses to skip request-body buffering for warm sandboxes. It returns
+// (true, nil) only when the sandbox row exists and its status is
+// Started; any other status (Stopped, Destroyed, in-flight create)
+// returns (false, nil). store.ErrNotFound is returned unwrapped so the
+// proxy can map it to 404 without a second store hit.
+func (s *Service) IsSandboxStarted(ctx context.Context, id string) (bool, error) {
+	sb, err := s.store.Get(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	return sb.Status == models.SandboxStatusStarted, nil
+}
+
 func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	sandboxes, err := s.store.List(ctx)
 	if err != nil {

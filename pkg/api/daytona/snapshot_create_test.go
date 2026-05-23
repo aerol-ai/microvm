@@ -24,12 +24,12 @@ import (
 // either hangs the client or fails it early, so we lock in the table.
 func TestDaytonaSnapshotStateMapping(t *testing.T) {
 	cases := []struct {
-		name        string
-		pushState   string
-		pushError   string
-		wantState   string
-		wantReason  string
-		reasonNil   bool
+		name       string
+		pushState  string
+		pushError  string
+		wantState  string
+		wantReason string
+		reasonNil  bool
 	}{
 		{"empty (legacy row) is active", "", "", "active", "", true},
 		{"active", models.SnapshotPushStateActive, "", "active", "", true},

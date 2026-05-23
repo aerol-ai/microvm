@@ -31,9 +31,19 @@ const PathPrefix = "/__ingress/http"
 // not stop a sandbox that is currently serving a long-lived request
 // (WebSocket, SSE, long-poll). The handler calls it at request start
 // AND on a 30s ticker for as long as the upstream proxy is running.
+//
+// IsSandboxStarted is the fast preflight check used to bypass request-body
+// buffering for warm sandboxes. Buffering exists so the body survives the
+// cold-start wait (and to enforce MaxBufferBytes against unbounded uploads
+// during wake), but it has no purpose when the upstream is already running
+// — paying that cost on every warm request would cap normal POST uploads
+// at MaxBufferBytes and add avoidable memory pressure under load.
+// Returns store.ErrNotFound when no sandbox row matches id so the handler
+// can surface 404 without a second store hit.
 type PortResolver interface {
 	WakeAwarePortTarget(ctx context.Context, id string, port int) (service.PortEndpoint, error)
 	TouchSandbox(ctx context.Context, id string) error
+	IsSandboxStarted(ctx context.Context, id string) (bool, error)
 }
 
 // activityTickInterval is how often a long-lived in-flight request

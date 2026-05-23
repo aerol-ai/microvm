@@ -126,11 +126,42 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 // is treated as involuntary. A serverless sandbox stopped via lifecycle
 // or involuntarily arms wake_armed so the next inbound HTTP request can
 // transparently resurrect it.
+//
+// Ordering matters: route work runs BEFORE the row Upsert so the wake_armed
+// bit we persist reflects whether a wake route was actually installed. The
+// API stop path (stopSandboxInternal) already installed the wake route
+// before docker.Stop fired; tearDownPortRoutesForStop is the shared helper
+// that preserves it here (D5 install-then-delete) instead of wiping it.
+// Inverting these would re-introduce the bug where the API stop installs a
+// wake route and the subsequent die event silently deletes it.
 func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent) error {
 	previousIP := sandbox.ContainerIP
 
 	mode := s.classifyDockerStopEvent(sandbox.ID, event)
 	arm := s.shouldArmWake(sandbox, mode)
+
+	// Release the admitter slot — a stopped container holds no host CPU/RAM
+	// and the reservation would otherwise block new admissions until the
+	// sandbox is destroyed. handleStartEvent re-Reserves on the way back up
+	// (out-of-band `docker start`), and the API StartSandbox path calls
+	// Admit. Idempotent if a concurrent Stop API call also released.
+	if s.admitter != nil {
+		s.admitter.Release(sandbox.ID)
+	}
+
+	// Tear down routes and per-IP netrules best-effort. Caddy upsert/delete
+	// helpers and netrules.ClearBlockAllEgress are all idempotent. The
+	// helper applies the D5 wake-arming exception for HTTP ports and
+	// demotes arm to false if every wake-route install attempt failed.
+	arm = s.tearDownPortRoutesForStop(ctx, sandbox, arm)
+	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
+	}
+	if previousIP != "" {
+		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
+			s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+		}
+	}
 
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
@@ -143,31 +174,6 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
-	}
-
-	// Release the admitter slot — a stopped container holds no host CPU/RAM
-	// and the reservation would otherwise block new admissions until the
-	// sandbox is destroyed. handleStartEvent re-Reserves on the way back up
-	// (out-of-band `docker start`), and the API StartSandbox path calls
-	// Admit. Idempotent if a concurrent Stop API call also released.
-	if s.admitter != nil {
-		s.admitter.Release(sandbox.ID)
-	}
-
-	// Tear down routes and per-IP netrules best-effort. Caddy upsert/delete
-	// helpers and netrules.ClearBlockAllEgress are all idempotent.
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
-		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
-	}
-	for _, port := range sandbox.ExposedPorts {
-		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
-			s.logger.Warn("delete port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
-		}
-	}
-	if previousIP != "" {
-		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
-			s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
-		}
 	}
 
 	s.logger.Info("audit sandbox stopped via docker event",
