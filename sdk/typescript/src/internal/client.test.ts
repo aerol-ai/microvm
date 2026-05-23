@@ -228,6 +228,40 @@ test("internal client updateLifecycle sends flat request body", async () => {
   });
 });
 
+test("internal client create round-trips serverless lifecycle flag", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-serverless", {
+        lifecycle: {
+          stop_if_idle_for: 300_000_000_000,
+          serverless: true,
+        },
+      }));
+    },
+  });
+
+  const sandbox = await client.create({
+    image: "ubuntu:22.04",
+    lifecycle: {
+      stopIfIdleFor: 300_000_000_000,
+      serverless: true,
+    },
+  });
+
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as { lifecycle?: Record<string, unknown> };
+  assert.deepEqual(body.lifecycle, {
+    stop_if_idle_for: 300_000_000_000,
+    serverless: true,
+  });
+  assert.equal(sandbox.lifecycle.serverless, true);
+  assert.equal(sandbox.lifecycle.stopIfIdleFor, 300_000_000_000);
+});
+
 test("internal client uploadFile sends multipart form", async () => {
   let request: Request | undefined;
   const client = new APIClient({

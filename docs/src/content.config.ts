@@ -118,6 +118,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/serverless',
+        label: 'Serverless',
+        description: 'Auto-stop sandboxes on idle and wake them on the next inbound HTTP request.',
+      },
+      {
+        type: 'link',
         href: '/external-storage',
         label: 'Volumes',
         description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',

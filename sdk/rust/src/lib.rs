@@ -1987,6 +1987,7 @@ mod tests {
                 destroy_if_idle_for: 0,
                 stop_at_age: 0,
                 destroy_at_age: 86400000000000,
+                serverless: false,
             }
         );
         assert_eq!(
@@ -2055,8 +2056,61 @@ mod tests {
                 destroy_if_idle_for: 0,
                 stop_at_age: 0,
                 destroy_at_age: 172800000000000,
+                serverless: false,
             }
         );
+    }
+
+    #[test]
+    fn create_round_trips_serverless_lifecycle_flag() {
+        let body = serde_json::json!({
+            "id": "sb-serverless",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-serverless.example.com",
+            "cpu": 1,
+            "memory_mb": 1024,
+            "disk_gb": 10,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "exposed_ports": [],
+            "created_at": "2026-05-24T10:00:00Z",
+            "updated_at": "2026-05-24T10:00:00Z",
+            "last_active_at": "2026-05-24T10:00:00Z",
+            "lifecycle": {
+                "stop_if_idle_for": 300000000000u64,
+                "serverless": true
+            }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .create(CreateOptions {
+                lifecycle: Some(Lifecycle {
+                    stop_if_idle_for: 300000000000,
+                    serverless: true,
+                    ..Default::default()
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let wire = request_json_body(&request);
+
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "image": "ubuntu:22.04",
+                "lifecycle": {
+                    "stop_if_idle_for": 300000000000u64,
+                    "serverless": true
+                }
+            })
+        );
+        assert!(sandbox.data.lifecycle.serverless);
     }
 
     #[test]

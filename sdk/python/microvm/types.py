@@ -73,6 +73,11 @@ class Lifecycle(TypedDict, total=False):
     destroyIfIdleFor: int
     stopAtAge: int
     destroyAtAge: int
+    # serverless=True opts the sandbox into HTTP wake-on-request:
+    # auto-stop when idle, resume on the next inbound HTTP request.
+    # stopIfIdleFor must also be set explicitly — the server rejects
+    # serverless=True without an idle window.
+    serverless: bool
 
 
 UpdateLifecycleOptions = Lifecycle

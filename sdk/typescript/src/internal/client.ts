@@ -89,6 +89,7 @@ interface ApiLifecycle {
   destroy_if_idle_for?: number;
   stop_at_age?: number;
   destroy_at_age?: number;
+  serverless?: boolean;
 }
 
 interface ApiFailover {
@@ -777,6 +778,7 @@ function toApiLifecycle(lifecycle: Lifecycle): ApiLifecycle {
     destroy_if_idle_for: lifecycle.destroyIfIdleFor,
     stop_at_age: lifecycle.stopAtAge,
     destroy_at_age: lifecycle.destroyAtAge,
+    serverless: lifecycle.serverless,
   };
 }
 
@@ -966,6 +968,9 @@ function fromApiLifecycle(lifecycle?: ApiLifecycle): Lifecycle {
   }
   if (lifecycle?.destroy_at_age !== undefined) {
     result.destroyAtAge = lifecycle.destroy_at_age;
+  }
+  if (lifecycle?.serverless) {
+    result.serverless = true;
   }
   return result;
 }

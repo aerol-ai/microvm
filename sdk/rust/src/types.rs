@@ -207,6 +207,16 @@ pub struct Lifecycle {
         skip_serializing_if = "is_zero_u64"
     )]
     pub destroy_at_age: u64,
+    /// Opts the sandbox into HTTP wake-on-request: auto-stop when idle,
+    /// resume on the next inbound HTTP request. Requires `stop_if_idle_for`
+    /// to be set; the server rejects `serverless = true` without an idle
+    /// window.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub serverless: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 pub type UpdateLifecycleOptions = Lifecycle;

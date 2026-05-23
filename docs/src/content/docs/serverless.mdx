@@ -1,0 +1,149 @@
+---
+title: Serverless Sandboxes
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A serverless sandbox auto-stops when it goes idle and is transparently restarted on the next inbound HTTP request to one of its exposed ports. Long-lived sandboxes that only serve occasional traffic — preview deployments, per-user code environments, model endpoints — stop consuming CPU and memory between requests without losing their disk state or public URL.
+
+## What it does
+
+Set `serverless: true` on the sandbox's lifecycle alongside `stopIfIdleFor`. When the idle timer fires, the sandbox stops, but its HTTP routes stay alive and `wake_armed` is set in the store. The next request through its public URL drives a cold start, the request is replayed against the started container, and the response is streamed back.
+
+| Aspect | Behavior |
+|---|---|
+| Idle trigger | `stopIfIdleFor` (required) — sandboxes stopped by lifecycle / age / involuntary exit re-arm for wake. |
+| Manual stop | Calling stop explicitly clears `wake_armed`. The sandbox stays down until you start it again. |
+| Cold-start latency | Hundreds of milliseconds to a few seconds, dominated by container start. |
+| Cold-start timeout | 15s. After that, the ingress handler returns `503 Retry-After: 2`. |
+| Request body cap | 8 MiB. Larger requests during cold start are rejected with `413`. |
+| Protocols woken | HTTP exposures only. TCP and TLS-SNI exposures stay always-on; they do not idle the sandbox. |
+
+The sandbox keeps its ID, public URL, environment, mounts, and disk across stop / wake cycles. Memory and in-process state do not survive — a serverless sandbox is more like a fast scale-to-zero container than a snapshot resume.
+
+## Enable per-sandbox
+
+`stopIfIdleFor` is required when `serverless: true`. The server rejects the request otherwise.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ghcr.io/me/my-http-app:latest',
+      lifecycle: {
+        stopIfIdleFor: 5 * 60 * 1_000_000_000, // 5 minutes
+        serverless: true,
+      },
+    })
+    await sandbox.exposePort(8080)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ghcr.io/me/my-http-app:latest',
+        'lifecycle': {
+            'stopIfIdleFor': 5 * 60 * 1_000_000_000,
+            'serverless': True,
+        },
+    })
+    sandbox.expose_port(8080)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ghcr.io/me/my-http-app:latest",
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: 5 * time.Minute,
+            Serverless:    true,
+        },
+    })
+    if err != nil {
+        return err
+    }
+    _, err = sandbox.ExposePort(ctx, 8080)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ghcr.io/me/my-http-app:latest".to_string(),
+        lifecycle: Some(Lifecycle {
+            stop_if_idle_for: 300_000_000_000,
+            serverless: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    sandbox.expose_port(8080)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ghcr.io/me/my-http-app:latest")
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(300_000_000_000L)
+                .setServerless(Boolean.TRUE))
+    );
+    sandbox.exposePort(8080);
+    ```
+  </TabItem>
+</Tabs>
+
+## Update an existing sandbox
+
+The lifecycle update endpoint accepts the same field. Toggle `serverless` on or off on a running sandbox; the new policy takes effect at the next idle-window evaluation.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.updateLifecycle({
+      stopIfIdleFor: 5 * 60 * 1_000_000_000,
+      serverless: true,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.update_lifecycle({
+        'stopIfIdleFor': 5 * 60 * 1_000_000_000,
+        'serverless': True,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UpdateLifecycle(ctx, sdktypes.Lifecycle{
+        StopIfIdleFor: 5 * time.Minute,
+        Serverless:    true,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.update_lifecycle(&sandbox.data.id, Lifecycle {
+        stop_if_idle_for: 300_000_000_000,
+        serverless: true,
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.updateLifecycle(sandbox.id, new Lifecycle()
+        .setStopIfIdleFor(300_000_000_000L)
+        .setServerless(Boolean.TRUE));
+    ```
+  </TabItem>
+</Tabs>
+
+## Manual stop blocks wake
+
+Stopping the sandbox through the API is treated as an operator decision — `wake_armed` is cleared and HTTP requests will get a 410-style response from Caddy until the sandbox is explicitly started again. Only lifecycle-driven stops (idle timer, age, involuntary container exit) re-arm wake-on-HTTP. Use this to take a serverless sandbox out of rotation without destroying it.
+
+## Operator gate
+
+Serverless is gated by `SB_ENABLE_SERVERLESS` (default `false`). Sandbox-level `serverless: true` is ignored until the operator turns the gate on. The cold-start ingress runs on `SB_INTERNAL_INGRESS_ADDR` (loopback-only, default `127.0.0.1:21213`) and buffers request bodies up to `SB_HTTP_WAKE_MAX_BUFFER` (default 8 MiB).
