@@ -1232,6 +1232,7 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // net_quota_exceeded
 			sql.NullTime{}, // net_quota_exceeded_at
 			[]byte(nil),    // registry_auth_sealed
+			0,              // auto_import_pending
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {
