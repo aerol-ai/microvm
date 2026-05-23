@@ -129,8 +129,12 @@ func TestRegisterSnapshotWithPusherMarksPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSnapshotPusher: %v", err)
 	}
-	reconciler := service.NewSnapshotPushReconciler(pusher, env.store, slog.New(slog.NewTextHandler(io.Discard, nil)), 1)
-	env.svc.AttachSnapshotPusher(pusher, reconciler)
+	// Attach only the pusher, not the reconciler. The test asserts on the
+	// initial persisted state (local_only + pending). Attaching a reconciler
+	// would cause kickSnapshotPushReconciler to fire a goroutine that races
+	// with GetSnapshot below — the noop docker returns immediately and the
+	// reconciler would flip ImageDistributionMode to "aocr" before we read.
+	env.svc.AttachSnapshotPusher(pusher, nil)
 
 	body := `{"name":"locally-built","dockerfile_content":"FROM debian:bookworm-slim\nRUN true"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/snapshots", strings.NewReader(body))
@@ -144,8 +148,9 @@ func TestRegisterSnapshotWithPusherMarksPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
-	// Built dockerfile snapshots land as local_only and therefore need a push;
-	// the row must be queued (pending) so the reconciler picks it up.
+	// Built dockerfile snapshots start as local_only with push_state=pending
+	// so the reconciler picks them up. We check the persisted row (not the
+	// response body) to prove the store has the correct initial state.
 	if stored.ImageDistributionMode != models.ImageDistributionLocalOnly {
 		t.Fatalf("ImageDistributionMode = %q, want %q", stored.ImageDistributionMode, models.ImageDistributionLocalOnly)
 	}

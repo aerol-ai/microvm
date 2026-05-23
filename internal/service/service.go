@@ -150,11 +150,13 @@ func (s *Service) AttachCluster(c cluster.Client) {
 }
 
 // AttachSnapshotPusher wires in the optional AOCR snapshot-push pipeline.
-// Both arguments must be non-nil to activate the feature; passing nil
-// leaves the service in the legacy local-only snapshot mode. Called once
-// from main() after cfg.SnapshotPushEnabled validation.
+// pusher must be non-nil to activate the feature; a nil pusher is a no-op
+// and leaves the service in legacy local-only snapshot mode. reconciler may
+// be nil — when nil, kick-after-create is disabled (useful in tests that
+// assert on the initial persisted state before any reconcile runs). Called
+// once from main() after cfg.SnapshotPushEnabled validation.
 func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *SnapshotPushReconciler) {
-	if pusher == nil || reconciler == nil {
+	if pusher == nil {
 		return
 	}
 	s.snapshotPusher = pusher
