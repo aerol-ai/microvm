@@ -277,6 +277,7 @@ func main() {
 		svc.StartLifecycleSweep(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
+		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 	}
 
 	if cfg.EnableSSHGateway && cfg.IsWorker() {
@@ -421,6 +422,114 @@ func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logg
 		spec.Registry = auth
 	}
 	return spec
+}
+
+// startAutoImportReconciler builds the F21 auto-import importer + reconciler
+// and starts a ticker goroutine if the feature is enabled. When disabled (or
+// when the importer fails to build) we log and return without scheduling
+// anything — the rest of the daemon runs unchanged. The reconciler depends on
+// the cluster client for replicated CreateSandboxRequest lookup; in
+// standalone mode the noop cluster returns nil for every spec and the
+// reconciler's `retryOne` will clear the flag with reason `no spec`. That's
+// the right behavior: without a replicated spec there's no recreate path that
+// could benefit from the import anyway.
+func startAutoImportReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service) {
+	if !cfg.AutoImportEnabled {
+		return
+	}
+	pat, err := os.ReadFile(cfg.AutoImportClusterPATPath)
+	if err != nil {
+		logger.Warn("auto-import: PAT file unreadable; feature stays off until next restart",
+			"path", cfg.AutoImportClusterPATPath, "error", err)
+		return
+	}
+	importer, err := service.NewAutoImporter(service.AutoImportConfig{
+		Enabled:         true,
+		HooksBaseURL:    cfg.AutoImportHooksBaseURL,
+		ClusterID:       cfg.AutoImportClusterID,
+		ClusterPAT:      string(bytesTrimSpace(pat)),
+		RetentionSuffix: cfg.AutoImportRetentionSuffix,
+		RequestTimeout:  cfg.AutoImportRequestTimeout,
+	})
+	if err != nil {
+		logger.Warn("auto-import: importer build failed; feature stays off",
+			"error", err)
+		return
+	}
+	resolver := autoImportSpecResolver{svc: svc}
+	r := service.NewAutoImportReconciler(importer, db, resolver, logger, cfg.AutoImportMaxInFlight)
+	if r == nil {
+		// Should not happen when importer is non-nil, but defensive: don't
+		// start a goroutine that has nothing to do.
+		return
+	}
+	logger.Info("auto-import reconciler started",
+		"hooks_url", importer.Endpoint(),
+		"interval", cfg.AutoImportReconcileInterval,
+		"max_in_flight", cfg.AutoImportMaxInFlight,
+	)
+	go func() {
+		t := time.NewTicker(cfg.AutoImportReconcileInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				stats, err := r.RunOnce(ctx)
+				if err != nil {
+					logger.Warn("auto-import reconcile sweep failed", "error", err)
+					continue
+				}
+				if stats.Scanned == 0 {
+					continue
+				}
+				logger.Info("auto-import reconcile sweep",
+					"scanned", stats.Scanned,
+					"succeeded", stats.Succeeded,
+					"failed", stats.Failed,
+					"skipped", stats.Skipped,
+				)
+			}
+		}
+	}()
+}
+
+// autoImportSpecResolver adapts the service+cluster surface to the
+// AutoImportSpecResolver interface. The replicated CreateSandboxRequest lives
+// in the cluster FSM (via cluster.SpecOf); we go through svc.Cluster() so the
+// adapter works under both Noop (standalone) and Cluster/Agent modes.
+type autoImportSpecResolver struct {
+	svc *service.Service
+}
+
+func (r autoImportSpecResolver) GetSandboxSpec(sandboxID string) (*models.CreateSandboxRequest, bool) {
+	c := r.svc.Cluster()
+	if c == nil {
+		return nil, false
+	}
+	spec := c.SpecOf(sandboxID)
+	if spec == nil {
+		return nil, false
+	}
+	return spec, true
+}
+
+// bytesTrimSpace is a tiny helper so we don't pull `strings` for one call —
+// PAT files commonly include a trailing newline.
+func bytesTrimSpace(b []byte) []byte {
+	start, end := 0, len(b)
+	for start < end && isSpace(b[start]) {
+		start++
+	}
+	for end > start && isSpace(b[end-1]) {
+		end--
+	}
+	return b[start:end]
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 // portsFromSandbox extracts the routing intents the sandbox currently has

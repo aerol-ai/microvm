@@ -386,6 +386,50 @@ type Config struct {
 	// image/auth key after Docker or the registry returns an error. This keeps a
 	// bad tag or rate-limit response from turning into a per-create retry storm.
 	ImagePullFailureBackoff time.Duration
+
+	// AutoImportEnabled gates the F21 post-pull auto-import path: after a
+	// successful pull of a private upstream image, sandboxd asks AOCR to
+	// re-mount the bytes under `cluster/<id>/_imported/...` so future
+	// recreates on other nodes pull with the cluster PAT and survive an
+	// upstream credential rotation. Off by default; flipping it on requires
+	// AutoImportHooksBaseURL, AutoImportClusterID, and a non-empty PAT file.
+	// SB_AUTO_IMPORT_ENABLED.
+	AutoImportEnabled bool
+	// AutoImportHooksBaseURL is the AOCR hooks service root (no trailing
+	// slash). The importer appends `/v1/internal/imports`.
+	// SB_AUTO_IMPORT_HOOKS_URL.
+	AutoImportHooksBaseURL string
+	// AutoImportClusterID identifies this sandboxd cluster to AOCR. Goes
+	// into the import request body and constrains the cluster PAT's scope
+	// on the AOCR side. SB_AUTO_IMPORT_CLUSTER_ID.
+	AutoImportClusterID string
+	// AutoImportClusterPATPath is the file path to the bearer token
+	// presented to the AOCR ImportAPI. File-sourced (not env) so the secret
+	// is rotatable without restarting and never appears in process listings.
+	// SB_AUTO_IMPORT_CLUSTER_PAT_PATH.
+	AutoImportClusterPATPath string
+	// AutoImportRetentionSuffix is appended to the imported tag in the
+	// cluster namespace (e.g. `--idle-90d`). Must begin with `--` to match
+	// AOCR's retention parser; empty falls back to the server-side default.
+	// SB_AUTO_IMPORT_RETENTION_SUFFIX.
+	AutoImportRetentionSuffix string
+	// AutoImportRequestTimeout caps a single ImportAPI call. The mount-from-
+	// repo flow is normally sub-second; the timeout guards against an
+	// upstream that hangs on layer enumeration.
+	// SB_AUTO_IMPORT_REQUEST_TIMEOUT.
+	AutoImportRequestTimeout time.Duration
+	// AutoImportReconcileInterval is the period between retry sweeps for
+	// rows the post-pull path left flagged `auto_import_pending`. Too short
+	// and a flapping AOCR causes a fan-out storm; too long and a transient
+	// outage leaves the failover path on the F17 wrap-creds fallback for
+	// longer than necessary. Default 5m.
+	// SB_AUTO_IMPORT_RECONCILE_INTERVAL.
+	AutoImportReconcileInterval time.Duration
+	// AutoImportMaxInFlight bounds per-tick fan-out so a recovery storm
+	// (everything pending at once after a long outage) cannot saturate
+	// AOCR or the local Docker socket. Default 4.
+	// SB_AUTO_IMPORT_MAX_IN_FLIGHT.
+	AutoImportMaxInFlight int
 }
 
 func Load() (Config, error) {
@@ -488,6 +532,14 @@ func Load() (Config, error) {
 		ImageDistributionAOCRHost:        strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
 		ImagePullMaxConcurrent:           getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
 		ImagePullFailureBackoff:          getEnvDuration("SB_IMAGE_PULL_FAILURE_BACKOFF", 30*time.Second),
+		AutoImportEnabled:                getEnvBool("SB_AUTO_IMPORT_ENABLED", false),
+		AutoImportHooksBaseURL:           strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_HOOKS_URL")),
+		AutoImportClusterID:              strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_CLUSTER_ID")),
+		AutoImportClusterPATPath:         strings.TrimSpace(os.Getenv("SB_AUTO_IMPORT_CLUSTER_PAT_PATH")),
+		AutoImportRetentionSuffix:        strings.TrimSpace(getEnv("SB_AUTO_IMPORT_RETENTION_SUFFIX", "--idle-90d")),
+		AutoImportRequestTimeout:         getEnvDuration("SB_AUTO_IMPORT_REQUEST_TIMEOUT", 15*time.Second),
+		AutoImportReconcileInterval:      getEnvDuration("SB_AUTO_IMPORT_RECONCILE_INTERVAL", 5*time.Minute),
+		AutoImportMaxInFlight:            getEnvInt("SB_AUTO_IMPORT_MAX_IN_FLIGHT", 4),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -514,6 +566,23 @@ func Load() (Config, error) {
 	}
 	if cfg.ImagePullFailureBackoff < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
+	}
+	if cfg.AutoImportEnabled {
+		if cfg.AutoImportHooksBaseURL == "" {
+			return Config{}, errors.New("SB_AUTO_IMPORT_HOOKS_URL is required when SB_AUTO_IMPORT_ENABLED=true")
+		}
+		if cfg.AutoImportClusterID == "" {
+			return Config{}, errors.New("SB_AUTO_IMPORT_CLUSTER_ID is required when SB_AUTO_IMPORT_ENABLED=true")
+		}
+		if cfg.AutoImportClusterPATPath == "" {
+			return Config{}, errors.New("SB_AUTO_IMPORT_CLUSTER_PAT_PATH is required when SB_AUTO_IMPORT_ENABLED=true")
+		}
+		if cfg.AutoImportReconcileInterval <= 0 {
+			return Config{}, errors.New("SB_AUTO_IMPORT_RECONCILE_INTERVAL must be > 0 when auto-import is enabled")
+		}
+		if cfg.AutoImportRetentionSuffix != "" && !strings.HasPrefix(cfg.AutoImportRetentionSuffix, "--") {
+			return Config{}, fmt.Errorf("SB_AUTO_IMPORT_RETENTION_SUFFIX must start with `--`, got %q", cfg.AutoImportRetentionSuffix)
+		}
 	}
 
 	if cfg.ToolboxMountPath == "" || !strings.HasPrefix(cfg.ToolboxMountPath, "/") {
