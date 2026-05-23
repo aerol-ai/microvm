@@ -120,6 +120,15 @@ type Config struct {
 	EnableNetworkRules          bool
 	EnableEventMonitor          bool
 	EnableSSHGateway            bool
+	// EnableServerless gates HTTP-wake behavior for sandboxes created with
+	// Lifecycle.Serverless=true. When false (default), the serverless flag
+	// is accepted at the API surface (so SDK callers can pre-set it without
+	// 4xx churn) but the runtime never arms wake on stop and the
+	// control-plane proxies never call EnsureSandboxAwakeForHTTP — i.e. the
+	// sandbox behaves exactly as it did before the feature existed. Flip to
+	// true on a per-host basis to opt that host into wake-aware control-plane
+	// proxying. Acts as a rollout gate, not a per-sandbox toggle.
+	EnableServerless bool
 	SSHListenAddr               string
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
@@ -515,6 +524,7 @@ func Load() (Config, error) {
 		EnableNetworkRules:          getEnvBool("SB_ENABLE_NETWORK_RULES", true),
 		EnableEventMonitor:          getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:            getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
+		EnableServerless:            getEnvBool("SB_ENABLE_SERVERLESS", false),
 		SSHListenAddr:               getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:              getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:     strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),

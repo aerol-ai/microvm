@@ -113,11 +113,16 @@ lifecycle: { serverless: true }
 
 `serverless: true` implies:
 
-- `stop_if_idle_for` defaults to 5 minutes if the user did not set one,
 - wake-on-HTTP is enabled for all HTTP exposed ports on the sandbox,
 - toolbox/session/runtime control-plane HTTP paths also auto-wake.
 
-Users who want a different idle window still set `stop_if_idle_for` themselves.
+`stop_if_idle_for` is **required** when `serverless: true` and create/update
+rejects the request with a validation error if it is missing or zero. We do
+not pick a default idle window for the user — the right value is workload
+specific (a webhook receiver and a per-tenant API have very different idle
+profiles) and a silent default would invite surprises. Users who want
+serverless behavior must say how long is "idle."
+
 We do not ship a separate `wakeOnHttp` flag, a `wake_armed` flag, or any
 wake-timeout knob in the SDK. The internals exist; the API does not expose
 them.
@@ -408,8 +413,9 @@ Removed from the earlier draft: `SB_HTTP_WAKE_TIMEOUT` is hardcoded to 15s
 - add `serverless` column to `sandboxes`
 - add `wake_armed` column to `sandboxes` (internal, not surfaced)
 - thread both fields through create, upsert, get, list, and `UpdateLifecycle`
-- in `CreateSandbox` / `UpdateLifecycle`: if `Serverless=true` and the user
-  did not set `stop_if_idle_for`, default it to 5 minutes
+- in `CreateSandbox` / `UpdateLifecycle`: reject the request with a
+  validation error (`models.ErrInvalid` or equivalent) when `Serverless=true`
+  and `stop_if_idle_for` is unset or zero. No silent default.
 - keep zero/default behavior identical for old rows (Serverless=false,
   wake_armed=false)
 
@@ -638,7 +644,8 @@ Why this matters:
   project rule
 - document:
   - what `serverless: true` does (auto-stop + wake on HTTP)
-  - the default 5-minute idle window and how to override
+  - that `stop_if_idle_for` is required alongside `serverless: true` and
+    must be chosen explicitly (no implicit default)
   - cold-start latency expectations (~hundreds of ms to seconds)
   - the 8 MiB body cap during cold start (D2)
   - that TCP/TLS exposures stay always-on in phase 1
@@ -653,7 +660,8 @@ Why this matters:
 - `internal/store/store_test.go`
   - migration compatibility for `serverless` and `wake_armed` columns
   - full replace semantics for `UpdateLifecycle`
-  - default `stop_if_idle_for` applied when `Serverless=true` and idle is unset
+  - create/update rejects `Serverless=true` without an explicit
+    `stop_if_idle_for`
 - `internal/service/lifecycle_test.go`
   - lifecycle sleep on a serverless sandbox arms `wake_armed`
   - manual stop never arms it (even on serverless sandboxes)
@@ -705,8 +713,9 @@ Why this matters:
 
 ### End-to-end manual run
 
-1. Create sandbox with `serverless: true` (no explicit idle timeout —
-   verify it defaults to 5 minutes).
+1. Create sandbox with `serverless: true` and no `stop_if_idle_for` —
+   verify the request is rejected with a validation error. Then retry with
+   `serverless: true, stop_if_idle_for: 5m`.
 2. Start an HTTP app and `exposePort(3000)`.
 3. Hit the public URL successfully.
 4. Wait for lifecycle auto-stop.

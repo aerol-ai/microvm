@@ -358,7 +358,7 @@ func (h *handlers) runToolboxCommand(ctx context.Context, sandboxID string, req 
 // negotiates Upgrade: websocket handshakes — unlike forwardToolbox, which
 // reads the body fully through httpClient.Do and breaks WS streams.
 func (h *handlers) proxyToolbox(w http.ResponseWriter, r *http.Request, sandboxID, path string) {
-	endpoint, err := h.deps.Service.ToolboxTarget(r.Context(), sandboxID)
+	endpoint, err := h.deps.Service.WakeAwareToolboxTarget(r.Context(), sandboxID)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -439,7 +439,7 @@ func (h *handlers) sendToolboxRequest(ctx context.Context, sandboxID, method, pa
 }
 
 func (h *handlers) newToolboxRequest(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Request, error) {
-	endpoint, err := h.deps.Service.ToolboxTarget(ctx, sandboxID)
+	endpoint, err := h.deps.Service.WakeAwareToolboxTarget(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}

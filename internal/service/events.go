@@ -117,11 +117,24 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 // the capacity reservation is legitimately held. Routes are torn down and
 // per-IP netrules cleared so a stopped sandbox doesn't leave dangling Caddy
 // upstreams pointing at an IP Docker may reassign on the next start.
+//
+// Wake-arming (D5 in plans/serverless-sandbox-http-wake.md): the event is
+// classified into one of the three stop modes by consulting the
+// expected-stop bookkeeping populated by stopSandboxInternal. Manual /
+// lifecycle stops carry their recorded mode (StopSandbox / lifecycle
+// sweep registered the expectation before docker.Stop); anything else
+// is treated as involuntary. A serverless sandbox stopped via lifecycle
+// or involuntarily arms wake_armed so the next inbound HTTP request can
+// transparently resurrect it.
 func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent) error {
 	previousIP := sandbox.ContainerIP
 
+	mode := s.classifyDockerStopEvent(sandbox.ID, event)
+	arm := s.shouldArmWake(sandbox, mode)
+
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
+	sandbox.WakeArmed = arm
 	if event.Action == "oom" {
 		sandbox.LastError = "container killed by OOM"
 	} else if event.Action == "die" && event.ExitCode != 0 {
@@ -162,6 +175,8 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		"action", event.Action,
 		"exit_code", event.ExitCode,
 		"status", string(sandbox.Status),
+		"stop_mode", mode.String(),
+		"wake_armed", arm,
 	)
 	return nil
 }
@@ -244,6 +259,11 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
+	// A successful start (whether driven by the API, a wake, or
+	// out-of-band `docker start`) means the sandbox is live again, so
+	// drop wake_armed. The next stop is the one that decides whether
+	// to re-arm.
+	sandbox.WakeArmed = false
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return fmt.Errorf("update sandbox runtime: %w", err)
 	}

@@ -105,6 +105,28 @@ type Service struct {
 	clusterMu    sync.Mutex
 	clusterReady atomic.Bool
 
+	// expectedStops tracks sandboxes whose stop was issued by sandboxd
+	// itself (manual API call or lifecycle sweep). The Docker /events
+	// stream surfaces every "die"/"stop" the same way regardless of who
+	// asked for it, so without this side-channel the event handler cannot
+	// tell whether a stop was the operator's intent (no wake) or an
+	// involuntary exit (arm wake on serverless sandboxes). Entries are
+	// consumed by markSandboxStopped; whatever is left at sweep time is
+	// implicitly involuntary (timeout cleanup runs from a janitor).
+	expectedStopsMu sync.Mutex
+	expectedStops   map[string]expectedStopRecord
+
+	// wakeFlights holds the per-sandbox single-flight + circuit-breaker
+	// state used by EnsureSandboxAwakeForHTTP. Same pattern as l4Ready,
+	// but per-sandbox: a wave of HTTP requests targeting a sleeping
+	// sandbox must collapse to one StartSandbox call, and a cold-start
+	// that keeps failing (admission rejected, image fetch fails) must
+	// not retry on every request indefinitely. Entries are created
+	// lazily on first wake; they live for the daemon lifetime to keep
+	// the breaker state stable across the 60s windows the policy uses.
+	wakeFlightsMu sync.Mutex
+	wakeFlights   map[string]*wakeFlight
+
 	// ingressLastHash is the hash of the placement view that the last
 	// successful cluster-ingress reconcile installed. The reconciler hashes
 	// the next view and skips work when unchanged — this is the cheap idle
@@ -840,43 +862,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	return refreshed, nil
 }
 
+// StopSandbox is the operator-initiated stop (API surface, manual). It is a
+// thin wrapper over stopSandboxInternal that pins the stop mode to manual:
+// wake_armed is always cleared, so a serverless sandbox stopped via this
+// path stays down until the operator explicitly starts it again.
+// See serverless.go for the full wake-arming policy.
 func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	sandbox, err := s.store.Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.docker.Stop(ctx, sandboxContainerRef(sandbox)); err != nil {
-		return nil, err
-	}
-	// Release the admitter slot now that the container is no longer running.
-	// A stopped sandbox holds no CPU/RAM on the host; keeping the reservation
-	// would let the host budget run out even though nothing is consuming it,
-	// and admins routinely use Stop+Start to free capacity for new work.
-	// StartSandbox re-Admits on the way back up. Release is idempotent so a
-	// concurrent die event running the same path is safe.
-	if s.admitter != nil {
-		s.admitter.Release(id)
-	}
-	if err := s.mounts.UnmountAll(id); err != nil {
-		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
-	}
-	// Drop the Caddy routes while the container is down so requests hit the
-	// fallback "sandbox not found" handler instead of a 502 from a stale
-	// upstream IP. StartSandbox re-upserts every route on the way back up.
-	for _, port := range sandbox.ExposedPorts {
-		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
-			s.logger.Warn("caddy port route cleanup on stop failed", "sandbox_id", id, "port", port.Port, "protocol", port.Protocol, "error", err)
-		}
-	}
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
-		s.logger.Warn("caddy route cleanup on stop failed", "sandbox_id", id, "error", err)
-	}
-	sandbox.Status = models.SandboxStatusStopped
-	sandbox.UpdatedAt = time.Now().UTC()
-	if err := s.store.Upsert(ctx, sandbox); err != nil {
-		return nil, err
-	}
-	return sandbox, nil
+	return s.stopSandboxInternal(ctx, id, stopModeManual)
 }
 
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
@@ -1664,6 +1656,25 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	}, nil
 }
 
+// WakeAwareToolboxTarget is the entry point every control-plane HTTP
+// proxy (v1 toolbox/sessions, daytona toolbox, e2b runtime) calls in
+// place of ToolboxTarget. It funnels every request through the wake
+// helper so a stopped serverless sandbox with wake_armed=true is
+// resurrected before the proxy attempts to dial the toolbox.
+//
+// Behavior is exactly ToolboxTarget for: running sandboxes, stopped
+// non-serverless sandboxes, and any case where cfg.EnableServerless
+// is off (rollout-gate contract). The two new sentinels
+// (ErrSandboxManuallyStopped, ErrWakeCircuitOpen) are surfaced
+// upstream so apihttp can map them to 409 and 503+Retry-After:60
+// respectively.
+func (s *Service) WakeAwareToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint, error) {
+	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, id); err != nil {
+		return ToolboxEndpoint{}, err
+	}
+	return s.ToolboxTarget(ctx, id)
+}
+
 func (s *Service) TouchSandbox(ctx context.Context, id string) error {
 	return s.store.Touch(ctx, id, time.Now().UTC())
 }
@@ -2028,10 +2039,14 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
 			}
 		case lifecycleStop:
-			if _, err := s.StopSandbox(ctx, sandbox.ID); err != nil {
+			// Lifecycle stop: pass mode=stopModeLifecycle so serverless
+			// sandboxes arm wake (the next inbound HTTP request will
+			// resurrect the sandbox transparently).
+			if _, err := s.stopSandboxInternal(ctx, sandbox.ID, stopModeLifecycle); err != nil {
 				s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
-				s.logger.Info("audit lifecycle auto-stop", "sandbox_id", sandbox.ID)
+				s.logger.Info("audit lifecycle auto-stop",
+					formatStopAuditFields(sandbox.ID, stopModeLifecycle, s.shouldArmWake(sandbox, stopModeLifecycle))...)
 			}
 		}
 	}

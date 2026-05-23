@@ -41,7 +41,7 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	endpoint, err := h.deps.Service.ToolboxTarget(r.Context(), sandboxID)
+	endpoint, err := h.deps.Service.WakeAwareToolboxTarget(r.Context(), sandboxID)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return

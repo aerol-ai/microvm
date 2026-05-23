@@ -28,6 +28,14 @@ import (
 type fakeCapacityRuntime struct {
 	managed map[string]*models.SandboxRuntimeState
 	inspect map[string]*models.SandboxRuntimeState
+	// startResult / startErr let wake/serverless tests drive what Start
+	// returns. Defaults preserve the prior nil-return behavior for the
+	// capacity tests that never exercise the StartSandbox path.
+	startResult *models.SandboxRuntimeState
+	startErr    error
+	// startCount counts Start invocations so wake-helper tests can
+	// assert single-flight collapsing.
+	startCount int
 }
 
 func (f *fakeCapacityRuntime) ListManaged(_ context.Context) (map[string]*models.SandboxRuntimeState, error) {
@@ -52,6 +60,13 @@ func (f *fakeCapacityRuntime) CreateSnapshot(context.Context, string, string) (s
 	return "", nil
 }
 func (f *fakeCapacityRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
+	f.startCount++
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
+	if f.startResult != nil {
+		return f.startResult, nil
+	}
 	return nil, nil
 }
 func (f *fakeCapacityRuntime) Stop(context.Context, string) error             { return nil }

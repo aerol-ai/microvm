@@ -53,6 +53,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_NODE_ROLE",
 			"SB_ENABLE_CLUSTER",
 			"SB_CLUSTER_BOOTSTRAP",
+			"SB_ENABLE_SERVERLESS",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -117,6 +118,26 @@ func TestLoadCases(t *testing.T) {
 				}
 				if !cfg.IsServer() || !cfg.IsWorker() || !cfg.IsIngress() {
 					t.Fatalf("expected mixed default to return true for all role predicates: %+v", cfg)
+				}
+				// SB_ENABLE_SERVERLESS defaults off so the wake path
+				// stays opt-in until the operator flips it on.
+				if cfg.EnableServerless {
+					t.Fatalf("expected EnableServerless to default to false, got true")
+				}
+			},
+		},
+		{
+			name: "enable_serverless_override",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if !cfg.EnableServerless {
+					t.Fatalf("expected EnableServerless=true, got false")
 				}
 			},
 		},
