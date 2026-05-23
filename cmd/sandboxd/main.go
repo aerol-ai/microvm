@@ -531,6 +531,12 @@ func startAutoImportReconciler(ctx context.Context, logger *slog.Logger, cfg con
 		// start a goroutine that has nothing to do.
 		return
 	}
+	// Wire the spec write-back so successful imports flip the replicated
+	// CreateSandboxRequest to ImageDistributionAOCRImported and point
+	// ImageRegistryRef at the new cluster-side ref. Subsequent failovers
+	// then pull through the cluster PAT, fully decoupled from the original
+	// upstream credential.
+	r.SetSpecMutator(svc)
 	logger.Info("auto-import reconciler started",
 		"hooks_url", importer.Endpoint(),
 		"interval", cfg.AutoImportReconcileInterval,

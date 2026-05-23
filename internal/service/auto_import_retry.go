@@ -34,6 +34,25 @@ type AutoImportSpecResolver interface {
 	GetSandboxSpec(sandboxID string) (*models.CreateSandboxRequest, bool)
 }
 
+// AutoImportSpecMutator is the optional write-back hook. After a successful
+// import, the reconciler calls MarkImported so the replicated spec carries
+// the new cluster registry ref and `aocr_imported` distribution mode. Future
+// failovers then pull from the cluster namespace with the cluster PAT, fully
+// decoupled from the original upstream credential.
+//
+// Implementations must be safe to call on a non-leader node: the leader-
+// forwarding lives below this surface (cluster.UpsertSpec proposes through
+// the Raft FSM regardless of caller node). Errors are absorbed inside the
+// implementation — the reconciler always treats import success as a clean
+// retryOutcome even if the mutator can't reach the leader, because the
+// imported bytes are already in AOCR.
+//
+// A nil mutator disables write-through cleanly; the reconciler logs the new
+// ref and moves on. This is the standalone-mode default.
+type AutoImportSpecMutator interface {
+	MarkImported(ctx context.Context, sandboxID string, registryRef string)
+}
+
 // AutoImportReconciler walks the rows the post-pull path flagged
 // `auto_import_pending = true` and re-tries them. One ticker per node;
 // fan-out inside a single tick is capped to keep a recovery storm from
@@ -45,11 +64,23 @@ type AutoImportSpecResolver interface {
 // the operator trigger an immediate retry from a debug endpoint if
 // they want.
 type AutoImportReconciler struct {
-	importer   *AutoImporter
-	store      AutoImportPendingStore
-	specs      AutoImportSpecResolver
-	logger     *slog.Logger
+	importer    *AutoImporter
+	store       AutoImportPendingStore
+	specs       AutoImportSpecResolver
+	mutator     AutoImportSpecMutator
+	logger      *slog.Logger
 	maxInFlight int
+}
+
+// SetSpecMutator installs the optional write-back hook. Calling again
+// replaces the previous one; pass nil to disable. Separated from the
+// constructor so existing call sites (and tests) keep working unchanged —
+// the mutator is a strict upgrade, not a required dependency.
+func (r *AutoImportReconciler) SetSpecMutator(m AutoImportSpecMutator) {
+	if r == nil {
+		return
+	}
+	r.mutator = m
 }
 
 // NewAutoImportReconciler builds the reconciler. Returns nil if the
@@ -191,17 +222,18 @@ func (r *AutoImportReconciler) retryOne(ctx context.Context, sandboxID string) r
 		return retryFailed
 	}
 
-	// Import succeeded — clear the flag. The spec's RegistryRef rewrite
-	// is intentionally NOT done here: it requires a Raft write and the
-	// reconciler runs on every node, including non-leader nodes. The
-	// service layer (callsite of the reconciler) is responsible for
-	// proposing the spec mutation through the cluster.Client path. For
-	// now we just clear the local flag and log the new ref so an operator
-	// can observe progress.
+	// Import succeeded — clear the flag, then (best-effort) propose the
+	// spec mutation through the cluster. The spec write-through goes via
+	// the leader regardless of which node we're on; failures are absorbed
+	// by the mutator since the bytes are already in AOCR and future
+	// pulls of the original ref still resolve cleanly through the mirror.
 	if err := r.store.SetAutoImportPending(ctx, sandboxID, false); err != nil {
 		r.logger.Warn("auto-import retry: succeeded but flag clear failed",
 			"sandbox_id", sandboxID, "ref", result.RegistryRef, "error", err)
 		return retryFailed
+	}
+	if r.mutator != nil {
+		r.mutator.MarkImported(ctx, sandboxID, result.RegistryRef)
 	}
 	r.logger.Info("auto-import retry: succeeded",
 		"sandbox_id", sandboxID, "registry_ref", result.RegistryRef,
