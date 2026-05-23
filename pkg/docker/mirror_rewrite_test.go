@@ -50,7 +50,7 @@ func TestRewriteImageRefForMirror_GHCRWithTag(t *testing.T) {
 	if !r.Rewritten {
 		t.Fatalf("expected rewrite, got %+v", r)
 	}
-	if r.RewrittenRef != "mirror.aocr.aerol.ai/_/ghcr/aerol-ai/sandbox:v1.2.3" {
+	if r.RewrittenRef != "mirror.aocr.aerol.ai/aocr/ghcr/aerol-ai/sandbox:v1.2.3" {
 		t.Fatalf("unexpected rewritten ref: %s", r.RewrittenRef)
 	}
 	if r.OriginalRef != "ghcr.io/aerol-ai/sandbox:v1.2.3" {
@@ -59,7 +59,7 @@ func TestRewriteImageRefForMirror_GHCRWithTag(t *testing.T) {
 	if r.UpstreamHost != "ghcr.io" {
 		t.Fatalf("UpstreamHost: %s", r.UpstreamHost)
 	}
-	if r.UpstreamRepo != "_/ghcr/aerol-ai/sandbox" {
+	if r.UpstreamRepo != "aocr/ghcr/aerol-ai/sandbox" {
 		t.Fatalf("UpstreamRepo: %s", r.UpstreamRepo)
 	}
 	if r.UpstreamTag != "v1.2.3" {
@@ -73,7 +73,7 @@ func TestRewriteImageRefForMirror_DigestRef(t *testing.T) {
 	if !r.Rewritten {
 		t.Fatalf("expected rewrite, got %+v", r)
 	}
-	want := "mirror.aocr.aerol.ai/_/gcr/distroless/base@" + digest
+	want := "mirror.aocr.aerol.ai/aocr/gcr/distroless/base@" + digest
 	if r.RewrittenRef != want {
 		t.Fatalf("rewritten ref: got %s want %s", r.RewrittenRef, want)
 	}
@@ -87,7 +87,7 @@ func TestRewriteImageRefForMirror_NoTag(t *testing.T) {
 	if !r.Rewritten {
 		t.Fatalf("expected rewrite, got %+v", r)
 	}
-	if r.RewrittenRef != "mirror.aocr.aerol.ai/_/quay/prometheus/node-exporter" {
+	if r.RewrittenRef != "mirror.aocr.aerol.ai/aocr/quay/prometheus/node-exporter" {
 		t.Fatalf("rewritten ref: %s", r.RewrittenRef)
 	}
 	if r.UpstreamTag != "" {
@@ -102,10 +102,10 @@ func TestRewriteImageRefForMirror_K8sSingleSegment(t *testing.T) {
 	if !r.Rewritten {
 		t.Fatalf("expected rewrite, got %+v", r)
 	}
-	if r.RewrittenRef != "mirror.aocr.aerol.ai/_/k8s/pause:3.9" {
+	if r.RewrittenRef != "mirror.aocr.aerol.ai/aocr/k8s/pause:3.9" {
 		t.Fatalf("rewritten ref: %s", r.RewrittenRef)
 	}
-	if r.UpstreamRepo != "_/k8s/pause" {
+	if r.UpstreamRepo != "aocr/k8s/pause" {
 		t.Fatalf("UpstreamRepo: %s", r.UpstreamRepo)
 	}
 }
@@ -146,7 +146,7 @@ func TestRewriteImageRefForMirror_UnknownHostPassesThrough(t *testing.T) {
 
 func TestRewriteImageRefForMirror_IdempotentOnAlreadyRewritten(t *testing.T) {
 	cfg := defaultMirrorCfg()
-	ref := "mirror.aocr.aerol.ai/_/ghcr/aerol-ai/sandbox:v1"
+	ref := "mirror.aocr.aerol.ai/aocr/ghcr/aerol-ai/sandbox:v1"
 	r := RewriteImageRefForMirror(ref, cfg)
 	if r.Rewritten {
 		t.Fatalf("already-rewritten ref must pass through, got %+v", r)
@@ -172,7 +172,7 @@ func TestRewriteImageRefForMirror_HostCaseInsensitive(t *testing.T) {
 		t.Fatalf("uppercase host should still match, got %+v", r)
 	}
 	// Host gets lowercased but repo + tag are preserved verbatim.
-	if r.RewrittenRef != "mirror.aocr.aerol.ai/_/ghcr/Aerol-AI/Sandbox:V1" {
+	if r.RewrittenRef != "mirror.aocr.aerol.ai/aocr/ghcr/Aerol-AI/Sandbox:V1" {
 		t.Fatalf("rewritten ref: %s", r.RewrittenRef)
 	}
 }

@@ -53,7 +53,7 @@ to function — everything else is additive.
 |------------------------------|--------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `SB_MIRROR_HOST`             | *(empty — disables rewrite)*                                       | Mirror vhost for cached pulls, e.g. `mirror.aocr.aerol.ai`. When empty, all upstream refs are passed through unchanged.                               |
 | `SB_MIRROR_PUSH_HOST`        | *(empty)*                                                          | Push vhost for the same AOCR cluster (e.g. `aocr.aerol.ai`). Refs already pointing here are left alone so they are not double-rewritten.              |
-| `SB_MIRROR_UPSTREAMS`        | `ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s`         | Comma-separated `host=shortname` map controlling which upstreams get rewritten and the short name used in the rewritten ref (`mirror/_/<short>/...`). |
+| `SB_MIRROR_UPSTREAMS`        | `ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s`         | Comma-separated `host=shortname` map controlling which upstreams get rewritten and the short name used in the rewritten ref (`<mirrorHost>/aocr/<short>/...`). |
 | `SB_UPSTREAM_WRAP_KEY_PATH`  | *(empty — soft-fail to raw creds)*                                 | Path to the base64-encoded 32-byte upstream wrap key. When unset, pulls are still rewritten but creds go to the mirror unwrapped (public images only). |
 
 `SB_UPSTREAM_WRAP_KEY_PATH` is intentionally **soft-fail**: a missing key

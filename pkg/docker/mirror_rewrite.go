@@ -9,10 +9,17 @@ import (
 //
 // Example: `{Host: "ghcr.io", Shortname: "ghcr"}` causes
 // `ghcr.io/aerol-ai/sandbox:v1` to be rewritten to
-// `mirror.aocr.aerol.ai/_/ghcr/aerol-ai/sandbox:v1`. The `_/` prefix is the
-// Distribution-v2 reserved-namespace convention; AOCR's auth route helper
-// (`auth/src/upstreamAuth/route.ts`) strips `_/<short>/` back off when
-// routing scope strings to the upstream probe.
+// `mirror.aocr.aerol.ai/aocr/ghcr/aerol-ai/sandbox:v1`. The `aocr/` prefix
+// is a reserved namespace owned by the AOCR mirror; AOCR's auth route
+// helper (`auth/src/upstreamAuth/route.ts`) strips `aocr/<short>/` back off
+// when routing scope strings to the upstream probe.
+//
+// Why `aocr` and not `_`: Docker's reference grammar
+// (distribution/reference) requires each path component to match
+// `[a-z0-9]+([._-][a-z0-9]+)*`. The bare `_` segment that early drafts of
+// the mirror used is NOT a valid component, and Docker daemon rejects refs
+// like `mirror.aocr.aerol.ai/_/ghcr/...` with "invalid reference format"
+// before they ever leave the client.
 //
 // Docker Hub is intentionally absent from this list: it's handled by the
 // Docker daemon's `registry-mirrors` daemon.json setting (which only
@@ -61,7 +68,7 @@ type MirrorRewrite struct {
 	// upstream. They are populated only when Rewritten=true.
 	UpstreamHost string
 	// UpstreamRepo is the *mirror-side* repo path, e.g.
-	// `_/ghcr/aerol-ai/sandbox` — this matches the Distribution scope
+	// `aocr/ghcr/aerol-ai/sandbox` — this matches the Distribution scope
 	// string AOCR's `route.ts` parses. For Docker Hub passthrough or
 	// non-rewritten refs this is empty.
 	UpstreamRepo string
@@ -77,7 +84,7 @@ type MirrorRewrite struct {
 //  2. Refs that already point at the mirror or push vhost are passed
 //     through (idempotency — re-running a rewrite is a no-op).
 //  3. Refs whose host matches a configured `MirrorUpstream.Host` are
-//     rewritten to `<mirrorHost>/_/<short>/<repo>:<tag>`.
+//     rewritten to `<mirrorHost>/aocr/<short>/<repo>:<tag>`.
 //  4. Docker Hub refs (host=docker.io, or no host prefix at all) pass
 //     through — the Docker daemon handles them via `registry-mirrors`.
 //  5. Refs with an unknown host pass through, so private registries the
@@ -126,7 +133,7 @@ func RewriteImageRefForMirror(ref string, cfg MirrorConfig) MirrorRewrite {
 		return pass
 	}
 
-	mirrorRepo := "_/" + short + "/" + repoOnly
+	mirrorRepo := "aocr/" + short + "/" + repoOnly
 	rewrittenRef := mirrorHost + "/" + mirrorRepo
 	if tag != "" {
 		rewrittenRef += ":" + tag

@@ -17,7 +17,7 @@ import (
 // match `auth/src/upstreamAuth/wrap.ts` exactly or the round-trip breaks.
 //
 // `Scope` pins the wrap to a specific Distribution token-server scope
-// string (e.g. `repository:_/ghcr/org/repo:pull`). AOCR cross-checks the
+// string (e.g. `repository:aocr/ghcr/org/repo:pull`). AOCR cross-checks the
 // scope inside the blob against the scope on the `/v2/token` request, so
 // a leaked blob cannot be reused for a different repo.
 type UpstreamCredentials struct {

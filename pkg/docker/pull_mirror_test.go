@@ -89,7 +89,7 @@ func TestPullImage_MirrorEnabled_RewritesURL(t *testing.T) {
 	if err := cap.client.pullImage(context.Background(), "ghcr.io/aerol-ai/sandbox:v1", auth); err != nil {
 		t.Fatalf("pullImage: %v", err)
 	}
-	if want := "mirror.aocr.aerol.ai/_/ghcr/aerol-ai/sandbox:v1"; cap.from() != want {
+	if want := "mirror.aocr.aerol.ai/aocr/ghcr/aerol-ai/sandbox:v1"; cap.from() != want {
 		t.Fatalf("fromImage: got %q want %q", cap.from(), want)
 	}
 	a := cap.auth()
@@ -115,7 +115,7 @@ func TestPullImage_MirrorEnabled_NoWrapKeyRing_FallsBackToRawAuth(t *testing.T) 
 	if err := cap.client.pullImage(context.Background(), "ghcr.io/aerol-ai/sandbox:v1", auth); err != nil {
 		t.Fatalf("pullImage: %v", err)
 	}
-	if cap.from() != "mirror.aocr.aerol.ai/_/ghcr/aerol-ai/sandbox:v1" {
+	if cap.from() != "mirror.aocr.aerol.ai/aocr/ghcr/aerol-ai/sandbox:v1" {
 		t.Fatalf("fromImage: %q", cap.from())
 	}
 	a := cap.auth()
@@ -135,7 +135,7 @@ func TestPullImage_MirrorEnabled_NoAuth_NoIdentityToken(t *testing.T) {
 	if err := cap.client.pullImage(context.Background(), "ghcr.io/aerol-ai/sandbox:v1", nil); err != nil {
 		t.Fatalf("pullImage: %v", err)
 	}
-	if cap.from() != "mirror.aocr.aerol.ai/_/ghcr/aerol-ai/sandbox:v1" {
+	if cap.from() != "mirror.aocr.aerol.ai/aocr/ghcr/aerol-ai/sandbox:v1" {
 		t.Fatalf("fromImage: %q", cap.from())
 	}
 	if cap.lastAuthB64.Load().(string) != "" {
