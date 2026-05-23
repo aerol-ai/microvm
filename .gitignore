@@ -65,6 +65,8 @@ Ansible/ansible.local.cfg
 Ansible/inventory/local.yml
 Ansible/group_vars/*.local.yml
 Ansible/host_vars/*.local.yml
+Ansible/inventory/group_vars/local.yml
+Ansible/inventory/group_vars/all/local.yml
 
 # Secrets / credentials that should never land in git
 *.pem

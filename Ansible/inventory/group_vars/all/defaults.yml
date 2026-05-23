@@ -1,0 +1,92 @@
+# Defaults shared by every playbook. File name matters: Ansible loads every
+# *.yml in group_vars/all/ alphabetically and later files win, so this file
+# must sort BEFORE local.yml. Keep it named defaults.yml (don't rename to
+# main.yml / vars.yml / etc. — those would sort AFTER local.yml and silently
+# clobber the overrides).
+#
+# Override per-operator in this directory's local.yml (gitignored).
+# Override per-invocation with `-e key=value`.
+#
+# This file holds ONLY mandatory plumbing + safe defaults that ship the
+# feature OFF. To opt into a feature (mirror, auto-import, OTEL, backup,
+# etc.), copy the relevant block into local.yml and set the values there.
+# Do not enable optional features here — they would apply to every operator
+# who checks out this repo.
+
+# --- Core paths and service identity ----------------------------------------
+sandboxd_binary_path:   /usr/local/bin/sandboxd
+sandboxd_service_name:  sandboxd
+# Toolboxd is the in-container agent; it's bind-mounted into every sandbox
+# from this host path (see pkg/docker/client.go and packaging/.env.template).
+toolboxd_binary_path:   /usr/local/bin/toolboxd
+sandboxd_env_file:      /etc/sandboxd/sandboxd.env
+sandboxd_cluster_env_file: /etc/sandboxd/cluster.env
+sandboxd_health_url:    "http://127.0.0.1:21212/health"
+sandboxd_health_wait_s: 30
+sandboxd_ops_script_dir: /usr/local/sbin
+sandboxd_lifecycle_script_path: /usr/local/sbin/sandboxd-node-lifecycle.sh
+sandboxd_grafana_dashboard_dir: /etc/sandboxd/grafana
+sandboxd_prometheus_rules_dir: /etc/sandboxd/prometheus
+sandboxd_alertmanager_config_dir: /etc/sandboxd/alertmanager
+sandboxd_runbook_dir: /etc/sandboxd/runbooks
+sandboxd_restart_after_ops_config: true
+
+# --- Observability / pull-storm controls -----------------------------------
+# OFF by default. To enable, set the matching keys in local.yml.
+sandboxd_otel_metrics_enabled: false
+sandboxd_otel_metrics_endpoint: ""
+sandboxd_otel_metrics_interval: "30s"
+sandboxd_otel_traces_enabled: false
+sandboxd_otel_traces_endpoint: ""
+sandboxd_otel_traces_sample_ratio: 0.05
+sandboxd_otel_service_name: "sandboxd"
+sandboxd_image_pull_max_concurrent: 4
+sandboxd_image_pull_failure_backoff: "30s"
+
+# --- Local backup schedule -------------------------------------------------
+# OFF by default. To enable, set sandboxd_backup_enabled: true in local.yml.
+sandboxd_backup_enabled: false
+sandboxd_backup_output_dir: /var/backups/sandboxd
+sandboxd_backup_cron_minute: "17"
+sandboxd_backup_cron_hour: "2"
+sandboxd_backup_retention_days: 7
+
+# --- Node lifecycle defaults (playbooks/prepare-role-change.yml) -----------
+sandboxd_role_change_drain_timeout_s: 3600
+
+# --- Phase 4: Authenticated Mirror + Auto-Import ---------------------------
+# OFF by default (empty SB_MIRROR_HOST disables the whole feature).
+# To opt in, set the relevant keys in local.yml. Full operator reference:
+# sandbox-library/AUTHENTICATED_MIRROR.md.
+#
+# These three are internal plumbing — the playbook templates them into
+# SB_*_PATH env vars on each managed host. Do not override.
+sandboxd_secrets_dir: /etc/sandboxd/secrets
+sandboxd_upstream_wrap_key_path:       "{{ sandboxd_secrets_dir }}/upstream-wrap.key"
+sandboxd_auto_import_cluster_pat_path: "{{ sandboxd_secrets_dir }}/cluster-pat"
+
+# Secret delivery — pick ONE per secret, in local.yml:
+#   sandboxd_upstream_wrap_key_value: "<base64 wrap key>"        # inline (laptop)
+#   sandboxd_upstream_wrap_key_src:   "/path/on/control/node"    # file (Vault/SOPS)
+#   sandboxd_auto_import_cluster_pat_value: "<token>"
+#   sandboxd_auto_import_cluster_pat_src:   "/path/on/control/node"
+# If both _value and _src are set, _value wins. Both empty = feature off.
+sandboxd_upstream_wrap_key_value: ""
+sandboxd_upstream_wrap_key_src: ""
+sandboxd_auto_import_cluster_pat_value: ""
+sandboxd_auto_import_cluster_pat_src: ""
+
+# Mirror rewrite — set sandboxd_mirror_host in local.yml to opt in.
+sandboxd_mirror_host: ""
+sandboxd_mirror_push_host: ""
+sandboxd_mirror_upstreams: "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
+
+# Auto-import — sandboxd refuses to boot with enabled=true unless
+# hooks_url, cluster_id, and a cluster-pat (value or src) are all set.
+sandboxd_auto_import_enabled: false
+sandboxd_auto_import_hooks_url: ""
+sandboxd_auto_import_cluster_id: ""
+sandboxd_auto_import_retention_suffix: "--idle-7d"
+sandboxd_auto_import_request_timeout: "15s"
+sandboxd_auto_import_reconcile_interval: "5m"
+sandboxd_auto_import_max_in_flight: 4
