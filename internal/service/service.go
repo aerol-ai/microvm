@@ -331,6 +331,12 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // this path; default sandboxes remain non-HA and are orphaned on owner death.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		// D1 reconstruction: on owner change, a Serverless && stopped row
+		// without wake_armed is the new owner's first chance to install
+		// wake routes and arm the bit. Done before port replay so the
+		// wake-aware route shape is in place when replayClusterExposedPorts
+		// touches HTTP exposures.
+		s.ReconstructWakeArmedIfNeeded(ctx, existing)
 		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
 	}
 	nodeID := ""
@@ -1979,6 +1985,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			case models.SandboxStatusStopped:
 				s.admitter.Release(sandbox.ID)
 			}
+		}
+		// D1 reconstruction: a serverless sandbox observed as stopped
+		// without wake_armed set is the cross-owner / post-restart case
+		// the plan calls out. Reinstall the wake route(s) and flip the
+		// bit so the next HTTP request can resurrect it. No-op for
+		// non-serverless rows and for sandboxes already armed.
+		if state.Status == models.SandboxStatusStopped {
+			s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
 		}
 		if state.Status == models.SandboxStatusStarted {
 			// Heal the per-IP egress DROP rule for sandboxes opted into

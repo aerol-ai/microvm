@@ -2,6 +2,7 @@ package ingressproxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -106,19 +108,51 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 		upstreamPath = "/" + rest
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.URL.Path = upstreamPath
-		req.URL.RawPath = ""
-		req.Host = target.Host
-	}
-	// FlushInterval=-1 disables buffering so streaming responses (SSE,
-	// chunked, long-poll) reach the client as the sandbox emits them.
-	proxy.FlushInterval = -1
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-		apihttp.WriteError(w, http.StatusBadGateway, "sandbox unavailable")
+	// Activity at request start: bump last_active_at so the lifecycle
+	// idle sweep does not stop a sandbox currently serving traffic.
+	// Then a 30s ticker keeps it alive for the duration of any
+	// long-lived connection (WebSocket, SSE, long-poll). Errors are
+	// swallowed — failing to touch should never break the request.
+	_ = h.deps.Resolver.TouchSandbox(r.Context(), id)
+	tickerCtx, cancelTicker := context.WithCancel(r.Context())
+	defer cancelTicker()
+	go h.activityTicker(tickerCtx, id)
+
+	// Use Rewrite (not the deprecated Director) so the request is built
+	// once with the correct upstream URL. SetXForwarded propagates the
+	// caller IP for visibility in upstream logs.
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.URL.Path = upstreamPath
+			pr.Out.URL.RawPath = ""
+			pr.Out.Host = target.Host
+			pr.SetXForwarded()
+		},
+		// FlushInterval=-1 disables buffering so streaming responses
+		// (SSE, chunked, long-poll) reach the client as the sandbox
+		// emits them.
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			apihttp.WriteError(w, http.StatusBadGateway, "sandbox unavailable")
+		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// activityTicker re-touches the sandbox every activityTickInterval for
+// as long as ctx is live. The first touch already fired in httpWake;
+// this only handles long-lived streams where a single request can
+// outlive a normal idle threshold.
+func (h *handlers) activityTicker(ctx context.Context, id string) {
+	t := time.NewTicker(activityTickInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = h.deps.Resolver.TouchSandbox(ctx, id)
+		}
+	}
 }

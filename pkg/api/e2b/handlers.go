@@ -614,11 +614,34 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	}
 
+	// Serverless opt-in (plans/serverless-sandbox-http-wake.md): callers
+	// flip the AerolVM-native serverless mode via metadata. When set,
+	// the lifecycle is rewritten so that `timeout` becomes the idle
+	// window (StopIfIdleFor) instead of a wall-clock age limit — that
+	// is the only lifecycle shape the wake helper accepts as a valid
+	// serverless config. autoResume / autoPause are left untouched.
+	serverless := serverlessFromMetadata(metadata)
+	lifecycle := lifecyclePtr(timeoutSeconds, onTimeout)
+	if serverless {
+		lifecycle.Serverless = true
+		// The native store rejects Serverless=true without
+		// StopIfIdleFor — move whatever duration the timeout
+		// translation produced into that field so the request
+		// passes validation.
+		if lifecycle.StopAtAge > 0 {
+			lifecycle.StopIfIdleFor = lifecycle.StopAtAge
+			lifecycle.StopAtAge = 0
+		} else if lifecycle.DestroyAtAge > 0 {
+			lifecycle.StopIfIdleFor = lifecycle.DestroyAtAge
+			lifecycle.DestroyAtAge = 0
+		}
+	}
+
 	serviceReq := models.CreateSandboxRequest{
 		Image:           resolvedImage,
 		Env:             envVars,
 		NetworkBlockAll: networkBlockAll,
-		Lifecycle:       lifecyclePtr(timeoutSeconds, onTimeout),
+		Lifecycle:       lifecycle,
 		// E2B's metadata is the same shape as Daytona's labels — write it
 		// into the native tags column so it round-trips through any API
 		// surface, not just /e2b.

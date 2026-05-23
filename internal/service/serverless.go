@@ -109,11 +109,18 @@ func (s *Service) consumeExpectedStop(id string) stopMode {
 //     mode. The rollout gate must produce identical behavior to the
 //     pre-feature codebase.
 //
-// Ordering (D5): we set wake_armed in the store BEFORE removing the
-// Caddy route in the wake-arming case, so a request that lands between
-// docker.Stop and DeleteSandboxRoute hits the wake-aware proxy with
-// wake_armed=true already visible. For non-wake stops the legacy
-// caddy-first ordering is preserved.
+// Ordering (D5): for wake-arming stops we install the wake-aware
+// Caddy route BEFORE flipping wake_armed in the store. The inverse
+// order would leave a window where the sandbox is recorded as
+// sleeping but the wake route does not exist, so a request landing
+// in that window would 502 through Caddy. Install-then-delete on the
+// route pair (wake upserted before direct deleted) also avoids any
+// window with zero matching routes for the host.
+//
+// If wake-route install fails for every HTTP port, we treat the stop
+// as a non-arming stop (clear wake_armed) so we never claim a wake
+// state we can't honor. Reconcile will reinstall later from
+// Serverless && status=stopped (D1 reconstruction).
 //
 // recordExpectedStop must be called before docker.Stop so the events
 // handler does not race the stop and classify it as involuntary.
@@ -146,23 +153,6 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
 	}
 
-	if arm {
-		// Wake-arming order: store first, then caddy. A request landing
-		// between docker.Stop and DeleteSandboxRoute now sees
-		// wake_armed=true and is funneled through the wake helper
-		// rather than 502'ing against a dead upstream IP.
-		if err := s.store.SetWakeArmed(ctx, id, true); err != nil && !errors.Is(err, store.ErrNotFound) {
-			s.logger.Warn("arm wake on stop failed", "sandbox_id", id, "error", err)
-		}
-	} else {
-		// Non-wake stops should clear any stale arming (a previous
-		// lifecycle stop may have armed and the operator is now
-		// manually stopping; we must honor the operator's intent).
-		if err := s.store.SetWakeArmed(ctx, id, false); err != nil && !errors.Is(err, store.ErrNotFound) {
-			s.logger.Warn("clear wake on stop failed", "sandbox_id", id, "error", err)
-		}
-	}
-
 	// Drop the Caddy routes while the container is down so requests hit the
 	// fallback "sandbox not found" handler instead of a 502 from a stale
 	// upstream IP. StartSandbox re-upserts every route on the way back up.
@@ -171,12 +161,22 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	// we must KEEP a route alive — but in the wake-aware shape, not the
 	// direct one — so the next HTTP request lands on the ingress proxy
 	// and resurrects the sandbox instead of 404'ing. Install-then-delete
-	// ordering avoids a window with no matching route.
+	// ordering avoids a window with no matching route. We also track
+	// whether any wake route installed successfully: if every HTTP
+	// upsert fails, fall back to a non-arm stop rather than claim a
+	// wake state we can't serve.
+	var (
+		wakeRouteAttempted bool
+		wakeRouteInstalled bool
+	)
 	for _, port := range sandbox.ExposedPorts {
 		isHTTP := port.Protocol == "" || port.Protocol == models.ExposedPortProtocolHTTP
 		if arm && isHTTP {
+			wakeRouteAttempted = true
 			if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port.Port); err != nil {
 				s.logger.Warn("install wake HTTP route on stop failed", "sandbox_id", id, "port", port.Port, "error", err)
+			} else {
+				wakeRouteInstalled = true
 			}
 			if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
 				s.logger.Warn("delete direct HTTP route on wake-arming stop failed", "sandbox_id", id, "port", port.Port, "error", err)
@@ -191,8 +191,24 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 		s.logger.Warn("caddy route cleanup on stop failed", "sandbox_id", id, "error", err)
 	}
 
+	// D5 fallback: if we tried to install a wake route for at least
+	// one HTTP port and every attempt failed, we cannot honor wake.
+	// Degrade to a non-arm stop so wake_armed and route state agree.
+	if arm && wakeRouteAttempted && !wakeRouteInstalled {
+		arm = false
+	}
+
+	// D5 ordering: flip wake_armed AFTER caddy work so we never end
+	// up with wake_armed=true while no wake route exists. For the
+	// non-arm path we still clear any stale arming (operator may be
+	// manually stopping a previously-armed sandbox).
+	armedValue := arm
+	if err := s.store.SetWakeArmed(ctx, id, armedValue); err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logger.Warn("update wake_armed on stop failed", "sandbox_id", id, "armed", armedValue, "error", err)
+	}
+
 	sandbox.Status = models.SandboxStatusStopped
-	sandbox.WakeArmed = arm
+	sandbox.WakeArmed = armedValue
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err
@@ -216,6 +232,83 @@ func (s *Service) shouldArmWake(sandbox *models.Sandbox, mode stopMode) bool {
 		return false
 	}
 	return true
+}
+
+// ReconstructWakeArmedIfNeeded is the D1 reconstruction rule from
+// plans/serverless-sandbox-http-wake.md. A serverless sandbox can land
+// in `stopped + wake_armed=false` on a node that does not own the
+// arming history — typically after a cluster owner change (the old
+// owner's SQLite wake_armed bit doesn't migrate) or after a daemon
+// restart that lost the in-memory expected-stop bookkeeping and saw a
+// crash event arrive before the row got an armed value. In both cases
+// the conservative default is the same as the involuntary-stop policy:
+// arm wake so the next HTTP request resurrects the sandbox, instead of
+// leaving a stopped serverless sandbox permanently dark until an
+// operator notices.
+//
+// Reconstruction is a no-op unless ALL of:
+//   - cfg.EnableServerless is on
+//   - sandbox is Lifecycle.Serverless
+//   - sandbox is in Stopped status
+//   - sandbox.WakeArmed is currently false
+//   - the sandbox has at least one HTTP exposed port (the only ingress
+//     surface the wake plan covers in phase 1)
+//
+// Caddy-first per D5: install wake routes for every HTTP exposure
+// before flipping the store bit. If every wake route install fails we
+// leave wake_armed=false to keep route state and the bit in sync —
+// the next reconcile pass will retry.
+func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *models.Sandbox) {
+	if sandbox == nil {
+		return
+	}
+	if !s.cfg.EnableServerless {
+		return
+	}
+	if !sandbox.Lifecycle.Serverless {
+		return
+	}
+	if sandbox.Status != models.SandboxStatusStopped {
+		return
+	}
+	if sandbox.WakeArmed {
+		return
+	}
+
+	var (
+		httpPortsSeen      int
+		wakeRouteInstalled bool
+	)
+	for _, port := range sandbox.ExposedPorts {
+		isHTTP := port.Protocol == "" || port.Protocol == models.ExposedPortProtocolHTTP
+		if !isHTTP {
+			continue
+		}
+		httpPortsSeen++
+		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port.Port); err != nil {
+			s.logger.Warn("reconstruct wake HTTP route failed",
+				"sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+			continue
+		}
+		wakeRouteInstalled = true
+	}
+	if httpPortsSeen == 0 {
+		return
+	}
+	if !wakeRouteInstalled {
+		return
+	}
+
+	if err := s.store.SetWakeArmed(ctx, sandbox.ID, true); err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logger.Warn("reconstruct wake_armed store update failed",
+			"sandbox_id", sandbox.ID, "error", err)
+		return
+	}
+	sandbox.WakeArmed = true
+	s.logger.Info("audit wake_armed reconstructed",
+		"sandbox_id", sandbox.ID,
+		"reason", "serverless-stopped-without-armed-bit",
+	)
 }
 
 // classifyDockerStopEvent maps a Docker die/stop/oom event to the stop

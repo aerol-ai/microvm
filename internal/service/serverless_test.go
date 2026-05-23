@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -598,6 +599,74 @@ func TestWakeFailureWindowSlides(t *testing.T) {
 	}
 }
 
+// TestWakeCircuitOpenWindowIs60s pins the D3 contract: when the
+// breaker trips, the open window is exactly wakeCircuitOpenFor (60s
+// per the plan). Locks the duration so we notice if someone changes
+// the constant without updating the public Retry-After surface.
+func TestWakeCircuitOpenWindowIs60s(t *testing.T) {
+	if wakeCircuitOpenFor != 60*time.Second {
+		t.Fatalf("wakeCircuitOpenFor = %v, want 60s (D3 contract)", wakeCircuitOpenFor)
+	}
+	w := &wakeFlight{}
+	start := time.Now()
+	for i := 0; i < wakeFailureThreshold; i++ {
+		w.recordFailure(start.Add(time.Duration(i) * time.Second))
+	}
+	if w.openUntil.IsZero() {
+		t.Fatalf("breaker did not trip after %d failures", wakeFailureThreshold)
+	}
+	// openUntil is set on the final failure (start + (N-1)s), so the
+	// expected close time is start + (N-1)s + wakeCircuitOpenFor.
+	wantClose := start.Add(time.Duration(wakeFailureThreshold-1)*time.Second + wakeCircuitOpenFor)
+	if !w.openUntil.Equal(wantClose) {
+		t.Fatalf("openUntil = %v, want %v (delta %v)", w.openUntil, wantClose, w.openUntil.Sub(wantClose))
+	}
+}
+
+// TestWakeCircuitTripsOnCapacityErrors: the plan's D3 wording is
+// "5 consecutive capacity failures open the circuit." Verify the
+// breaker counts capacity.ErrCapacityExceeded the same as any other
+// start error — it is the most operationally important failure mode
+// to circuit-break against (a host out of CPU/RAM should not be
+// hammered by every wake request).
+func TestWakeCircuitTripsOnCapacityErrors(t *testing.T) {
+	ctx := context.Background()
+	runtime := &fakeCapacityRuntime{
+		startErr: capacity.ErrCapacityExceeded,
+	}
+	svc, st := newServerlessHarness(t, runtime)
+	seedSleepingSandbox(t, st, "sb-cap-trip")
+
+	for i := 0; i < wakeFailureThreshold; i++ {
+		_, err := svc.EnsureSandboxAwakeForHTTP(ctx, "sb-cap-trip")
+		if err == nil {
+			t.Fatalf("attempt %d: want capacity error, got nil", i)
+		}
+		// Re-arm so the next attempt is a real wake (StartSandbox sets
+		// status=error on failure).
+		sb, getErr := st.Get(ctx, "sb-cap-trip")
+		if getErr != nil {
+			t.Fatalf("get after attempt %d: %v", i, getErr)
+		}
+		sb.Status = models.SandboxStatusStopped
+		sb.WakeArmed = true
+		if err := st.Upsert(ctx, sb); err != nil {
+			t.Fatalf("re-arm: %v", err)
+		}
+	}
+
+	// Sixth call must be rejected by the breaker without another
+	// Start invocation (this is the whole point of the breaker
+	// versus retrying every request).
+	_, err := svc.EnsureSandboxAwakeForHTTP(ctx, "sb-cap-trip")
+	if !errors.Is(err, ErrWakeCircuitOpen) {
+		t.Fatalf("post-trip err = %v, want ErrWakeCircuitOpen", err)
+	}
+	if runtime.startCount != wakeFailureThreshold {
+		t.Fatalf("Start called %d times during open circuit; want exactly %d", runtime.startCount, wakeFailureThreshold)
+	}
+}
+
 // routeFake is a tiny Caddy admin fake that records PATCH (upsert) and
 // DELETE (remove) calls per route @id so installHTTPPortRoute /
 // removeHTTPPortRoute can be observed without a real Caddy.
@@ -865,3 +934,415 @@ func TestRemoveHTTPPortRouteDeletesBothShapes(t *testing.T) {
 	}
 }
 
+// TestStopSandboxInternalD5CaddyBeforeStore proves the D5 invariant:
+// the Caddy wake-route upsert happens BEFORE wake_armed is flipped
+// in the store. The inverse order would leave a window where the
+// sandbox is recorded as sleeping with no matching wake route, so
+// requests landing in that window would 502 through Caddy. We
+// observe the order by reading the store inside the fake Caddy
+// admin handler at the moment the wake route is upserted.
+func TestStopSandboxInternalD5CaddyBeforeStore(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	fake.routes["sandbox-sb-d5-port-3000"] = map[string]any{"@id": "sandbox-sb-d5-port-3000"}
+
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+
+	var (
+		wakeRouteSeen           bool
+		armedWhenWakeUpserted   bool
+		captureWakeUpsertMu     sync.Mutex
+	)
+	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// PUT (path: /config/apps/http/servers/...) or PATCH (/id/<id>)
+		// is how upsertRoute installs a route. Snapshot the store the
+		// moment we see the wake-route id come through.
+		if isWakeUpsert(r, "sandbox-sb-d5-port-3000-wake") {
+			captureWakeUpsertMu.Lock()
+			if !wakeRouteSeen {
+				wakeRouteSeen = true
+				if sb, err := st.Get(ctx, "sb-d5"); err == nil {
+					armedWhenWakeUpserted = sb.WakeArmed
+				}
+			}
+			captureWakeUpsertMu.Unlock()
+		}
+		fake.handler(t).ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(wrappedHandler)
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	sb := seedServerlessSandbox(t, st, "sb-d5", true)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+
+	if _, err := svc.stopSandboxInternal(ctx, sb.ID, stopModeLifecycle); err != nil {
+		t.Fatalf("stopSandboxInternal: %v", err)
+	}
+
+	if !wakeRouteSeen {
+		t.Fatalf("wake route was never upserted — test setup broken")
+	}
+	if armedWhenWakeUpserted {
+		t.Fatalf("D5 violation: wake_armed was already true when wake route was being upserted; store flipped before caddy")
+	}
+	// And after the stop completes, wake_armed must be true (the
+	// caddy-first ordering still results in the same final state).
+	final, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("get after stop: %v", err)
+	}
+	if !final.WakeArmed {
+		t.Fatalf("after stop, wake_armed = false; expected true on lifecycle stop of serverless sandbox")
+	}
+}
+
+// TestStopSandboxInternalD5WakeRouteFailureDegradesToNonArm proves
+// the D5 fallback: if every wake-route upsert fails, we degrade to
+// a non-arm stop so wake_armed and route state never disagree.
+func TestStopSandboxInternalD5WakeRouteFailureDegradesToNonArm(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	fake.routes["sandbox-sb-d5fail-port-3000"] = map[string]any{"@id": "sandbox-sb-d5fail-port-3000"}
+
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+
+	// Reject every wake-route upsert with 500 so the install loop
+	// exhausts all attempts without success.
+	failHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isWakeUpsert(r, "sandbox-sb-d5fail-port-3000-wake") {
+			http.Error(w, "caddy admin down", http.StatusInternalServerError)
+			return
+		}
+		fake.handler(t).ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(failHandler)
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	sb := seedServerlessSandbox(t, st, "sb-d5fail", true)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+
+	if _, err := svc.stopSandboxInternal(ctx, sb.ID, stopModeLifecycle); err != nil {
+		t.Fatalf("stopSandboxInternal: %v", err)
+	}
+	final, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("get after stop: %v", err)
+	}
+	if final.WakeArmed {
+		t.Fatalf("wake_armed = true after all wake-route upserts failed; should have degraded to non-arm")
+	}
+}
+
+// isWakeUpsert reports whether r is a PATCH or PUT request that is
+// installing the route identified by wakeID. PATCH addresses by
+// /id/<id>; PUT carries the body with `"@id": <id>`.
+func isWakeUpsert(r *http.Request, wakeID string) bool {
+	if r.Method == http.MethodPatch {
+		return strings.HasSuffix(r.URL.Path, "/id/"+wakeID)
+	}
+	if r.Method == http.MethodPut {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return false
+		}
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
+		var parsed map[string]any
+		if json.Unmarshal(body, &parsed) != nil {
+			return false
+		}
+		id, _ := parsed["@id"].(string)
+		return id == wakeID
+	}
+	return false
+}
+
+// TestReconstructWakeArmedAfterOwnerChange proves D1: a Serverless
+// sandbox that landed on a new owner in `stopped + wake_armed=false`
+// (typical after cluster failover, where the previous owner's local
+// wake_armed bit doesn't migrate) gets its wake route reinstalled and
+// the bit flipped on the next reconcile pass.
+func TestReconstructWakeArmedAfterOwnerChange(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	sb := seedServerlessSandbox(t, st, "sb-d1", true)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+	// Simulate the post-failover shape: stopped row, wake_armed=false,
+	// HTTP exposure carried over from the spec.
+	sb.Status = models.SandboxStatusStopped
+	sb.WakeArmed = false
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("seed stopped: %v", err)
+	}
+	reloaded, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	svc.ReconstructWakeArmedIfNeeded(ctx, reloaded)
+
+	if !reloaded.WakeArmed {
+		t.Fatalf("in-memory sandbox WakeArmed = false; want true after reconstruction")
+	}
+	final, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get after reconstruct: %v", err)
+	}
+	if !final.WakeArmed {
+		t.Fatalf("store wake_armed = false after reconstruction; want true")
+	}
+	ids := fake.routeIDs()
+	want := []string{"sandbox-sb-d1-port-3000-wake"}
+	if !equalSorted(ids, want) {
+		t.Fatalf("wake route not installed; routes = %v, want %v", ids, want)
+	}
+}
+
+// TestReconstructWakeArmedIsNoOpForNonServerless proves the helper is
+// inert for sandboxes that did not opt into serverless: we must never
+// flip wake_armed for a plain stopped sandbox.
+func TestReconstructWakeArmedIsNoOpForNonServerless(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	sb := seedServerlessSandbox(t, st, "sb-plain", false)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+	sb.Status = models.SandboxStatusStopped
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("seed stopped: %v", err)
+	}
+	reloaded, _ := st.Get(ctx, sb.ID)
+
+	svc.ReconstructWakeArmedIfNeeded(ctx, reloaded)
+
+	final, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.WakeArmed {
+		t.Fatalf("non-serverless sandbox wake_armed = true after reconstruction; should remain false")
+	}
+	if len(fake.routeIDs()) != 0 {
+		t.Fatalf("no wake routes should be installed for non-serverless; got %v", fake.routeIDs())
+	}
+}
+
+// TestReconstructWakeArmedIsNoOpWhenAlreadyArmed proves the helper
+// does not re-install routes (or touch the store) for sandboxes that
+// already have wake_armed=true — covers the steady-state reconcile
+// pass where most stopped serverless sandboxes were already armed by
+// the lifecycle sweep.
+func TestReconstructWakeArmedIsNoOpWhenAlreadyArmed(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	sb := seedServerlessSandbox(t, st, "sb-armed", true)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+	sb.Status = models.SandboxStatusStopped
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("seed stopped: %v", err)
+	}
+	if err := st.SetWakeArmed(ctx, sb.ID, true); err != nil {
+		t.Fatalf("pre-arm: %v", err)
+	}
+	reloaded, _ := st.Get(ctx, sb.ID)
+
+	svc.ReconstructWakeArmedIfNeeded(ctx, reloaded)
+
+	if len(fake.routeIDs()) != 0 {
+		t.Fatalf("already-armed sandbox should not trigger a wake route install; got %v", fake.routeIDs())
+	}
+}
+
+// TestReconstructWakeArmedGateOffIsNoOp proves the rollout gate is
+// respected: even a serverless sandbox in stopped state must not have
+// wake_armed reconstructed when SB_ENABLE_SERVERLESS is off.
+func TestReconstructWakeArmedGateOffIsNoOp(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+	svc.cfg.EnableServerless = false // explicit gate off
+
+	sb := seedServerlessSandbox(t, st, "sb-gateoff", true)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+	sb.Status = models.SandboxStatusStopped
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("seed stopped: %v", err)
+	}
+	reloaded, _ := st.Get(ctx, sb.ID)
+
+	svc.ReconstructWakeArmedIfNeeded(ctx, reloaded)
+
+	final, _ := st.Get(ctx, sb.ID)
+	if final.WakeArmed {
+		t.Fatalf("gate-off must not reconstruct wake_armed")
+	}
+	if len(fake.routeIDs()) != 0 {
+		t.Fatalf("gate-off must not install wake routes; got %v", fake.routeIDs())
+	}
+}
+
+// TestReconstructWakeArmedSkipsWhenAllInstallsFail proves that if
+// every wake-route install fails, we leave wake_armed=false rather
+// than claim a wake state we can't serve. Matches the D5 fallback
+// inside stopSandboxInternal.
+func TestReconstructWakeArmedSkipsWhenAllInstallsFail(t *testing.T) {
+	ctx := context.Background()
+	fake := newRouteFake()
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+
+	failHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isWakeUpsert(r, "sandbox-sb-d1fail-port-3000-wake") {
+			http.Error(w, "caddy admin down", http.StatusInternalServerError)
+			return
+		}
+		fake.handler(t).ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(failHandler)
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		EnableCaddy:       true,
+		HTTPClientTimeout: 2 * time.Second,
+	})
+	svc.cfg.InternalIngressAddr = "127.0.0.1:21213"
+	svc.cfg.Domain = "sandbox.example.com"
+	svc.cfg.EnableCaddy = true
+
+	sb := seedServerlessSandbox(t, st, "sb-d1fail", true)
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: sb.ID,
+		Port:      3000,
+		Protocol:  models.ExposedPortProtocolHTTP,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed port: %v", err)
+	}
+	sb.Status = models.SandboxStatusStopped
+	if err := st.Upsert(ctx, sb); err != nil {
+		t.Fatalf("seed stopped: %v", err)
+	}
+	reloaded, _ := st.Get(ctx, sb.ID)
+
+	svc.ReconstructWakeArmedIfNeeded(ctx, reloaded)
+
+	final, _ := st.Get(ctx, sb.ID)
+	if final.WakeArmed {
+		t.Fatalf("wake_armed flipped despite all wake-route upserts failing; expected non-arm fallback")
+	}
+}

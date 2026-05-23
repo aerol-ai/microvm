@@ -12,6 +12,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
 )
@@ -25,9 +26,23 @@ const PathPrefix = "/__ingress/http"
 // PortResolver is the narrow slice of *service.Service the ingress
 // handler needs. Kept as an interface so the package is testable
 // without standing up a real Service + Docker + store stack.
+//
+// TouchSandbox bumps last_active_at so the lifecycle idle sweep does
+// not stop a sandbox that is currently serving a long-lived request
+// (WebSocket, SSE, long-poll). The handler calls it at request start
+// AND on a 30s ticker for as long as the upstream proxy is running.
 type PortResolver interface {
 	WakeAwarePortTarget(ctx context.Context, id string, port int) (service.PortEndpoint, error)
+	TouchSandbox(ctx context.Context, id string) error
 }
+
+// activityTickInterval is how often a long-lived in-flight request
+// re-touches the sandbox during proxy.ServeHTTP. 30s is comfortably
+// shorter than any realistic StopIfIdleFor (the field is documented
+// as minutes) so a stream that emits no traffic for several minutes
+// still keeps its sandbox marked active. Var (not const) so tests can
+// shrink it to run in <1s.
+var activityTickInterval = 30 * time.Second
 
 // Deps wires the ingress proxy to the rest of the daemon. Resolver
 // is required; MaxBufferBytes caps how much request body is buffered
