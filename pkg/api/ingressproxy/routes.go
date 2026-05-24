@@ -72,18 +72,30 @@ var defaultUpstreamReadyTimeout = 30 * time.Second
 // is required; MaxBufferBytes caps how much request body is buffered
 // while a cold-start wake is in flight; UpstreamReadyTimeout bounds
 // the post-wake TCP-readiness probe (zero → defaultUpstreamReadyTimeout).
+//
+// MaxPendingPerSandbox / MaxPendingGlobal / MaxBufferBytesGlobal cap
+// how many cold-start requests can simultaneously hold the wake window
+// and how much memory their buffered bodies may pin. Zero on any of
+// them disables that specific cap (intended for tests; production
+// wiring in cmd/sandboxd/main.go always sets all three).
 type Deps struct {
 	Resolver             PortResolver
 	Logger               *slog.Logger
 	MaxBufferBytes       int64
 	UpstreamReadyTimeout time.Duration
+	MaxPendingPerSandbox int
+	MaxPendingGlobal     int
+	MaxBufferBytesGlobal int64
 }
 
 // RegisterRoutes mounts the ingress proxy routes onto mux. The mux is
 // expected to be served on a loopback-only listener (see pkg/api/server
 // wiring in cmd/sandboxd/main.go).
 func RegisterRoutes(mux *http.ServeMux, d Deps) {
-	h := &handlers{deps: d}
+	h := &handlers{
+		deps:  d,
+		state: newProxyState(d.MaxPendingPerSandbox, d.MaxPendingGlobal, d.MaxBufferBytesGlobal),
+	}
 	// {path...} captures everything after /__ingress/http/{id}/{port}/.
 	// We register the prefix shape twice so that requests landing at
 	// /__ingress/http/{id}/{port} (no trailing path) still match.
@@ -92,5 +104,6 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 }
 
 type handlers struct {
-	deps Deps
+	deps  Deps
+	state *proxyState
 }

@@ -355,6 +355,9 @@ func main() {
 			Logger:               logger,
 			MaxBufferBytes:       cfg.HTTPWakeMaxBuffer,
 			UpstreamReadyTimeout: cfg.HTTPWakeUpstreamReadyTimeout,
+			MaxPendingPerSandbox: cfg.HTTPWakeMaxPendingPerSandbox,
+			MaxPendingGlobal:     cfg.HTTPWakeMaxPendingGlobal,
+			MaxBufferBytesGlobal: cfg.HTTPWakeMaxBufferBytesGlobal,
 		})
 		ingressServer = &http.Server{
 			Addr:              cfg.InternalIngressAddr,

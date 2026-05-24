@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -156,21 +156,30 @@ func (s *Service) WakeAwareL4PortTarget(ctx context.Context, id string, port int
 	return net.JoinHostPort(sandbox.ContainerIP, strconv.Itoa(port)), nil
 }
 
-// dialL4Upstream connects to addr with retry on ECONNREFUSED. This is
-// the L4 counterpart to the HTTP ingress upstream-readiness probe: the
-// wake helper returns as soon as Docker reports the container running,
-// but the user's TCP process (SOCKS5 server, database, etc.) typically
-// needs another second or two to bind its listening port. A single
-// dial fails immediately on the kernel RST and the caller's connection
-// closes. We retry only on the "not bound yet" signal — any other
-// error (network unreachable, context cancel, DNS) returns
-// immediately. Overridable in tests.
+// dialL4Upstream connects to addr with retry on any transient dial
+// error. This is the L4 counterpart to the HTTP ingress upstream
+// readiness probe: the wake helper returns as soon as Docker reports
+// the container running, but the user's TCP process (SOCKS5 server,
+// database, etc.) typically needs another second or two to bind its
+// listening port. A single dial fails immediately on the kernel RST
+// and the caller's connection closes.
+//
+// Retries on any error except caller cancellation / deadline. Docker
+// bridge networks during container start can briefly emit
+// EHOSTUNREACH, ENETUNREACH, or ECONNRESET in addition to the usual
+// ECONNREFUSED — narrowing the retry to only ECONNREFUSED would
+// surface those races to the client. Initial backoff carries 0-50ms
+// jitter so a convoy of waiters released by one wake doesn't all
+// dial in lockstep. Overridable in tests.
 var dialL4Upstream = func(ctx context.Context, addr string, budget time.Duration) (net.Conn, error) {
 	deadline := time.Now().Add(budget)
 	dialCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	delay := l4WakeUpstreamReadyBackoffStart
+	// Jitter the initial delay so 10k waiters released by a wake do
+	// not all dial at exactly t+100ms. math/rand global is
+	// concurrent-safe since Go 1.20.
+	delay := l4WakeUpstreamReadyBackoffStart + time.Duration(rand.Int63n(int64(50*time.Millisecond)))
 	var lastErr error
 	for {
 		if err := dialCtx.Err(); err != nil {
@@ -184,12 +193,13 @@ var dialL4Upstream = func(ctx context.Context, addr string, budget time.Duration
 		if err == nil {
 			return conn, nil
 		}
-		lastErr = err
-		// Retry only on connection refused — the kernel's "port not
-		// bound yet" signal. Anything else is a real failure.
-		if !errors.Is(err, syscall.ECONNREFUSED) {
+		// Caller cancellation / deadline are terminal — don't keep
+		// dialling against a dead caller. Everything else is treated
+		// as the "container is up but service not bound yet" signal.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
+		lastErr = err
 		select {
 		case <-dialCtx.Done():
 			return nil, lastErr

@@ -162,6 +162,22 @@ type Config struct {
 	// bind its TCP port after wake. Defaults to 30s; raise for workloads
 	// with slow startups (JVM, large Python imports).
 	HTTPWakeUpstreamReadyTimeout time.Duration
+	// HTTPWakeMaxPendingPerSandbox caps cold-start HTTP requests
+	// simultaneously holding the wake + readiness window for ONE
+	// sandbox. Counterpart of L4WakeMaxPendingPerSandbox. Excess is
+	// rejected with 503 + Retry-After. Required > 0 when serverless
+	// is on.
+	HTTPWakeMaxPendingPerSandbox int
+	// HTTPWakeMaxPendingGlobal caps cold-start HTTP requests
+	// simultaneously holding the wake + readiness window across ALL
+	// sandboxes on this node. Counterpart of L4WakeMaxPendingGlobal.
+	HTTPWakeMaxPendingGlobal int
+	// HTTPWakeMaxBufferBytesGlobal caps total bytes buffered across all
+	// in-flight cold-start requests at any moment. Prevents a flood of
+	// near-MaxBuffer cold POSTs from exhausting node memory (10k × 8 MiB
+	// = 80 GB worst case without this). Required > 0 when serverless
+	// is on.
+	HTTPWakeMaxBufferBytesGlobal int64
 	SSHListenAddr                string
 	SSHHostKeyPath               string
 	CredentialEncryptionKey      string
@@ -567,6 +583,9 @@ func Load() (Config, error) {
 		L4WakeMaxActiveGlobal:        getEnvInt("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", 65536),
 		HTTPWakeMaxBuffer:            int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
 		HTTPWakeUpstreamReadyTimeout: getEnvDuration("SB_HTTP_WAKE_UPSTREAM_READY_TIMEOUT", 30*time.Second),
+		HTTPWakeMaxPendingPerSandbox: getEnvInt("SB_HTTP_WAKE_MAX_PENDING_PER_SANDBOX", 256),
+		HTTPWakeMaxPendingGlobal:     getEnvInt("SB_HTTP_WAKE_MAX_PENDING_GLOBAL", 4096),
+		HTTPWakeMaxBufferBytesGlobal: int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL", 1024*1024*1024)),
 		SSHListenAddr:                getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:               getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:      strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
@@ -873,6 +892,15 @@ func Load() (Config, error) {
 		}
 		if cfg.HTTPWakeMaxBuffer <= 0 {
 			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxPendingPerSandbox <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_PENDING_PER_SANDBOX must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxPendingGlobal <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_PENDING_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxBufferBytesGlobal <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
 		}
 	}
 
