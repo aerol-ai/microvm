@@ -221,6 +221,37 @@ func (l Lifecycle) Validate() error {
 	return nil
 }
 
+// ValidateWithBypassFloor runs Validate then additionally enforces the
+// activity-floor constraint that HTTP-wake direct-route bypass imposes
+// on serverless sandboxes: the netstats poller is the per-sandbox
+// activity signal in the bypass shape, and the idle sweep needs at
+// least one full netstats tick + one reconcile pass to observe "no
+// traffic" without false-stopping a busy sandbox. The floor is
+// 2 × pollInterval + reconcileInterval; sub-floor StopIfIdleFor values
+// would let the sweep fire between netstats ticks and stop a sandbox
+// that was actively serving the whole time.
+//
+// Callers in the wake-aware (non-bypass) shape must use Validate()
+// directly — the floor does not apply when every request still bumps
+// LastActiveAt through sandboxd's ingress proxy. See
+// plans/warm-direct-route-bypass.md D4.
+func (l Lifecycle) ValidateWithBypassFloor(pollInterval, reconcileInterval time.Duration) error {
+	if err := l.Validate(); err != nil {
+		return err
+	}
+	if !l.Serverless || l.StopIfIdleFor == 0 {
+		return nil
+	}
+	floor := 2*pollInterval + reconcileInterval
+	if l.StopIfIdleFor < floor {
+		return fmt.Errorf(
+			"stop_if_idle_for (%s) is below the %s floor required by SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED=true (2 × netstats poll interval + reconcile interval); raise stop_if_idle_for or disable the bypass",
+			l.StopIfIdleFor, floor,
+		)
+	}
+	return nil
+}
+
 // IsZero reports whether all four timers are disabled. Useful for skipping
 // Lifecycle inspection in the sweep when there's nothing to evaluate.
 func (l Lifecycle) IsZero() bool {

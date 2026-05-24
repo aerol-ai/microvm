@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 )
@@ -219,6 +220,44 @@ func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, po
 		"terminal": true,
 	}
 
+	return c.upsertRoute(ctx, routeID, route)
+}
+
+// UpsertPortRouteWithRetry is UpsertPortRoute plus a
+// load_balancing.try_duration / try_interval window. Used by the
+// HTTP-wake direct-bypass path (plans/warm-direct-route-bypass.md C5):
+// when a warm sandbox container dies, the docker `die` event takes
+// ~10ms to propagate before the route flips back to wake-aware.
+// During that window Caddy may already be holding the direct route
+// pointing at a now-dead IP. The retry window absorbs the gap by
+// retrying the dial for tryDuration before failing — outside the
+// window, Caddy returns 502 just like any direct-route service.
+//
+// tryDuration must be > 0; tryDuration <= 0 means "behave like the
+// no-retry UpsertPortRoute" and the caller should use that method
+// instead. UpsertPortRoute is kept byte-for-byte identical so the
+// non-serverless surface does not inherit retry semantics it never
+// asked for.
+func (c *Client) UpsertPortRouteWithRetry(ctx context.Context, id, containerIP string, port int, tryDuration time.Duration) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	routeID := portRouteID(id, port)
+	route := map[string]any{
+		"@id":   routeID,
+		"match": []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}},
+		"handle": []map[string]any{{
+			"handler": "reverse_proxy",
+			"upstreams": []map[string]string{{
+				"dial": fmt.Sprintf("%s:%d", containerIP, port),
+			}},
+			"load_balancing": map[string]any{
+				"try_duration": tryDuration.String(),
+				"try_interval": "100ms",
+			},
+		}},
+		"terminal": true,
+	}
 	return c.upsertRoute(ctx, routeID, route)
 }
 

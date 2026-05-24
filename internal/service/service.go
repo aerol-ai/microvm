@@ -90,7 +90,16 @@ type Service struct {
 	l4WakeMu   sync.Mutex
 	l4WakeTCP  net.Listener
 	l4WakeTLS  map[string]net.Listener
-	l4LimitMu  sync.Mutex
+	// pendingTLSClose holds the in-flight delayed-close timers for TLS
+	// wake sockets keyed by (id, port). D2 of warm-direct-route-bypass:
+	// on warm→cold (Started → wake-shape PATCH), the listener stays alive
+	// for cfg.TLSWakeListenerCloseDelay so a TLS handshake started against
+	// the wake-aware route can complete before the socket goes away.
+	// ensureTLSWakeListener cancels any pending timer on its key so a
+	// rapid cold→warm→cold flip doesn't tear down a socket that the new
+	// wake route depends on.
+	pendingTLSClose map[string]*time.Timer
+	l4LimitMu       sync.Mutex
 	// pending counts L4 connections waiting for wake/target resolution.
 	// active counts connections already admitted to proxy bytes. Keeping both
 	// lets cold-start bursts shed excess work without blocking unrelated warm
@@ -111,6 +120,23 @@ type Service struct {
 	netstatsReady    atomic.Bool
 	netstatsPoller   *netstats.Poller
 	netstatsLastTick atomic.Int64 // unix nanos; last successful tick for /usage staleness reporting
+
+	// netstatsActivity is the per-sandbox "last non-zero BytesIn delta"
+	// timestamp (unix nanos), populated by the netstats poller sink.
+	// The idle sweep uses it as the activity floor under
+	// HTTPWakeDirectBypassEnabled so warm traffic that never reaches
+	// sandboxd (Caddy → container direct) still keeps the sweep from
+	// stopping a busy sandbox. RWMutex because the sweep reads more
+	// often than the poller writes (default 60s vs 10s). See
+	// plans/warm-direct-route-bypass.md C2.
+	netstatsActivityMu sync.RWMutex
+	netstatsActivity   map[string]int64
+
+	// Poll-failure detection is derived from netstatsLastTick
+	// staleness in netstatsPollIsStale; the poller does not expose an
+	// error-reporting path to the sink, and absence-of-a-recent-tick
+	// is the operationally meaningful signal (whether the cause was
+	// docker-stats hiccup, namespace teardown, or anything else).
 
 	// cluster is the cluster.Client used by the API layer for owner lookup
 	// and cross-node forwarding. Defaults to a Noop in single-node mode so
@@ -186,6 +212,19 @@ type Service struct {
 	touchCoalescer     *touchCoalescer
 	touchCoalescerOnce sync.Once
 
+	// caddyCoalescer batches Caddy admin writes for the same (id, port)
+	// so a rapid wake→stop→wake sequence collapses to one admin call.
+	// installHTTPPortRoute routes through Flush so callers still observe
+	// synchronous errors, while concurrent callers for the same key
+	// coalesce into a single admin write per drain. The periodic Run
+	// goroutine (started from cmd/sandboxd/main.go) drains any
+	// fire-and-forget Enqueues left over after the daemon idles. Same
+	// lazy-init pattern as touchCoalescer so &Service{...} literals in
+	// tests still work — see plans/warm-direct-route-bypass.md D6/D12.
+	caddyCoalescer        *caddyCoalescer
+	caddyCoalescerOnce    sync.Once
+	caddyCoalescerStarted atomic.Bool
+
 	// ingressLastHash is the hash of the placement view that the last
 	// successful cluster-ingress reconcile installed. The reconciler hashes
 	// the next view and skips work when unchanged — this is the cheap idle
@@ -218,6 +257,7 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		cluster: cluster.NewNoop("standalone", ""),
 	}
 	s.ensureTouchCoalescer()
+	s.ensureCaddyCoalescer()
 	return s
 }
 
@@ -232,6 +272,42 @@ func (s *Service) ensureTouchCoalescer() {
 			return s.store.Touch(ctx, id, at)
 		})
 	})
+}
+
+// ensureCaddyCoalescer lazily constructs the per-(id,port) Caddy write
+// batcher. Same rationale as ensureTouchCoalescer: &Service{...} test
+// literals skip New(), so installHTTPPortRoute initializes on demand.
+// Tick falls back to the 250ms default when cfg.CaddyCoalesceInterval
+// is zero — that covers test harnesses that don't populate cfg.
+func (s *Service) ensureCaddyCoalescer() {
+	s.caddyCoalescerOnce.Do(func() {
+		s.caddyCoalescer = newCaddyCoalescer(s.logger, s.cfg.CaddyCoalesceInterval)
+	})
+}
+
+// StartCaddyCoalescer starts the periodic-drain goroutine. Called once
+// from cmd/sandboxd/main.go after svc.New on worker nodes. Flush-only
+// callers (installHTTPPortRoute today) don't strictly need this — Flush
+// drives its own drain — but the ticker is the safety net for any
+// future Enqueue (fire-and-forget) callsites and for ops that get
+// stranded when a Flush caller's ctx cancels mid-drain.
+func (s *Service) StartCaddyCoalescer(ctx context.Context) {
+	s.ensureCaddyCoalescer()
+	if !s.caddyCoalescerStarted.CompareAndSwap(false, true) {
+		return
+	}
+	go s.caddyCoalescer.Run(ctx)
+}
+
+// StopCaddyCoalescer drains any pending op and exits the Run goroutine.
+// No-op when StartCaddyCoalescer was never called — caddyCoalescer.Stop
+// blocks on c.done which is only closed by Run, so calling it without
+// a prior Start would hang shutdown.
+func (s *Service) StopCaddyCoalescer() {
+	if !s.caddyCoalescerStarted.CompareAndSwap(true, false) {
+		return
+	}
+	s.caddyCoalescer.Stop()
 }
 
 // AttachCluster swaps in a cluster.Client. Called from cmd/sandboxd/main after
@@ -982,6 +1058,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	}
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
+	s.forgetNetstatsActivity(id)
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
 	}
@@ -1755,44 +1832,126 @@ func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sa
 }
 
 // installHTTPPortRoute writes the HTTP port route in the shape that
-// matches the sandbox's current serverless mode, and removes the other
-// shape afterwards. Install-then-delete ordering means there is never
-// a window where neither shape exists, so a request landing mid-flip
-// always hits one valid route.
+// matches the sandbox's current serverless mode AND current status,
+// then removes any other shape. Install-then-delete ordering means
+// there is never a window where neither shape exists, so a request
+// landing mid-flip always hits one valid route.
+//
+// Shape selection is delegated to chooseRouteShape so reconcile,
+// lifecycle, and event paths share one source of truth — see
+// plans/warm-direct-route-bypass.md D7/D8.
+//
+// Routed through caddyCoalescer.Flush so concurrent callers targeting
+// the same (id, port) collapse into one admin write. Flush preserves
+// the synchronous error contract callers (ExposePort, reconcile, the
+// rollback path) depend on; an op superseded by a later Enqueue/Flush
+// for the same key returns nil to the prior waiter, which is correct
+// because the newer intent represents the same converged state the
+// caller wanted. See plans/warm-direct-route-bypass.md D6/D12.
 func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
-	if s.serverlessWakeEnabled(sandbox) {
+	s.ensureCaddyCoalescer()
+	// Snapshot the sandbox row by value so a concurrent mutation
+	// (Status flip, ContainerIP rebind) between Flush enqueue and the
+	// drain's invocation of `do` cannot change the intent the caller
+	// asked for. The closure must operate on a stable view.
+	snapshot := *sandbox
+	return s.caddyCoalescer.Flush(ctx, sandbox.ID, port, func() error {
+		return s.applyHTTPPortRoute(ctx, &snapshot, port)
+	})
+}
+
+// applyHTTPPortRoute performs the actual Caddy admin writes for one
+// (sandbox, port) install intent. Extracted from installHTTPPortRoute
+// so the coalescer's drain can invoke it with a stable sandbox
+// snapshot. Not called directly outside the coalescer path.
+func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
+	case RouteShapeDirect:
+		// Non-serverless callers (and serverless-bypass-off callers)
+		// fall through to UpsertPortRoute byte-for-byte, so the
+		// non-serverless JSON regression test stays valid. Only the
+		// warm-bypass path adopts the retry window.
+		if s.serverlessWakeEnabled(sandbox) && s.cfg.HTTPWakeDirectBypassEnabled {
+			if err := s.caddy.UpsertPortRouteWithRetry(ctx, sandbox.ID, sandbox.ContainerIP, port, s.cfg.HTTPWakeDirectRouteRetryDuration); err != nil {
+				return err
+			}
+		} else {
+			if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
+				return err
+			}
+		}
+		// Best-effort: any leftover wake route from a prior
+		// Stopped+armed state (or a flag flip back to bypass-on) must
+		// go so Caddy doesn't keep two routes matching the same host.
+		// DeleteWakeHTTPPortRoute treats 404 as success.
+		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
+		return nil
+	case RouteShapeWake:
 		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port); err != nil {
 			return err
 		}
-		// Best-effort: any leftover direct route from a pre-serverless
-		// state must go so Caddy doesn't keep two routes matching the
-		// same host. DeletePortRoute treats 404 as success.
 		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
 		return nil
+	case RouteShapeNone:
+		// Destroyed sandboxes or stopped-unarmed serverless sandboxes
+		// publish neither route. Idempotent deletes; either or both
+		// may already be absent.
+		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
+		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
+		return nil
 	}
-	if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
-		return err
-	}
-	_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
 	return nil
 }
 
+// installTCPPortRoute publishes the correct L4-TCP server config for
+// the (sandbox, port, hostPort) tuple based on chooseRouteShape. Today
+// (bypass off) every serverless sandbox still gets the wake-aware
+// shape — chooseRouteShape short-circuits to Wake when
+// L4WakeDirectBypassEnabled=false, preserving pre-Phase-2 behavior.
+// With the flag on, warm serverless TCP exposures publish a direct
+// upstream and stopped-unarmed sandboxes drop the L4 server entirely.
 func (s *Service) installTCPPortRoute(ctx context.Context, sandbox *models.Sandbox, port, hostPort int) error {
 	if err := s.EnsureLayer4Ready(ctx); err != nil {
 		return err
 	}
-	if s.serverlessWakeEnabled(sandbox) {
+	switch s.chooseRouteShape(sandbox, RouteKindL4) {
+	case RouteShapeDirect:
+		return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
+	case RouteShapeWake:
 		return s.caddy.UpsertWakeTCPRoute(ctx, sandbox.ID, port, hostPort, s.cfg.InternalL4WakeAddr)
+	case RouteShapeNone:
+		return s.caddy.DeleteTCPRoute(ctx, hostPort)
 	}
-	return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
+	return nil
 }
 
+// installTLSPortRoute publishes the correct TLS-SNI route for the
+// (sandbox, port) tuple based on chooseRouteShape. The Unix-socket
+// lifecycle is intertwined with the route shape:
+//
+//   - Direct shape: PATCH first, then schedule a delayed close on the
+//     wake listener (D2 — a TLS handshake started against the prior
+//     wake route may still be in flight when PATCH lands; closing the
+//     socket immediately drops that handshake).
+//   - Wake shape: create the socket first so the upstream is reachable
+//     the instant Caddy PATCHes the route to point at it; roll back the
+//     socket on PATCH failure to avoid leaking a listener with no live
+//     route.
+//   - None: delete the route then close the socket; both are
+//     idempotent.
 func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
 	if err := s.EnsureLayer4Ready(ctx); err != nil {
 		return err
 	}
 	sniHost := s.caddy.SNIHost(sandbox.ID, port)
-	if s.serverlessWakeEnabled(sandbox) {
+	switch s.chooseRouteShape(sandbox, RouteKindL4) {
+	case RouteShapeDirect:
+		if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {
+			return err
+		}
+		s.scheduleTLSWakeListenerClose(sandbox.ID, port, s.cfg.TLSWakeListenerCloseDelay)
+		return nil
+	case RouteShapeWake:
 		socketPath, err := s.ensureTLSWakeListener(sandbox.ID, port)
 		if err != nil {
 			return err
@@ -1802,11 +1961,13 @@ func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandb
 			return err
 		}
 		return nil
+	case RouteShapeNone:
+		if err := s.caddy.DeleteTLSSNIRoute(ctx, sandbox.ID, port); err != nil {
+			return err
+		}
+		s.closeTLSWakeListener(sandbox.ID, port)
+		return nil
 	}
-	if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {
-		return err
-	}
-	s.closeTLSWakeListener(sandbox.ID, port)
 	return nil
 }
 
@@ -2383,8 +2544,21 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 
 	now := time.Now().UTC()
 	globalIdle := s.cfg.IdleTimeout()
+	// netstatsFallback is checked once per sweep, not per sandbox —
+	// the fallback applies to the entire tick (D3). If the most recent
+	// successful poll is older than 2 × poll interval, the docker
+	// stats subsystem is probably degraded for every sandbox on this
+	// node; trusting an absent floor as "idle" would cascade into
+	// stopping every warm sandbox. The next successful poll re-arms
+	// the netstats signal automatically.
+	netstatsFallback := s.netstatsPollIsStale(now)
+	if netstatsFallback {
+		s.logger.Warn("idle sweep using LastActiveAt fallback",
+			"reason", "netstats_poll_failed", "netstats_fallback", true)
+	}
 	for _, sandbox := range sandboxes {
-		switch lifecycleActionFor(sandbox, now, globalIdle) {
+		floor := s.activityFloorFor(sandbox, netstatsFallback)
+		switch lifecycleActionForWithFloor(sandbox, now, globalIdle, floor) {
 		case lifecycleDestroy:
 			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
@@ -2414,6 +2588,98 @@ const (
 	lifecycleDestroy
 )
 
+// activityFloorFor computes the timestamp the lifecycle sweep should
+// treat as the sandbox's most recent activity. Default is
+// sandbox.LastActiveAt; when any warm-direct bypass is enabled (HTTP or
+// L4) and the netstats poller has a recorded non-zero BytesIn delta
+// more recent than LastActiveAt, the netstats timestamp wins so warm
+// traffic that bypasses sandboxd does not get false-idle-stopped.
+// Netstats observes container interface bytes regardless of protocol,
+// so one floor covers HTTP + L4 with a single mechanism — the OR over
+// both flags is what makes Phase 2 (L4 bypass) safe to enable without
+// also flipping HTTP. When the most recent netstats poll failed
+// (netstatsFallback=true), we fall back to LastActiveAt alone for this
+// tick to avoid stopping busy sandboxes on a docker-stats outage (D3).
+func (s *Service) activityFloorFor(sandbox *models.Sandbox, netstatsFallback bool) time.Time {
+	if sandbox == nil {
+		return time.Time{}
+	}
+	floor := sandbox.LastActiveAt
+	if !s.anyBypassEnabled() || netstatsFallback {
+		return floor
+	}
+	if observed := s.netstatsRecentBytesInAt(sandbox.ID); !observed.IsZero() && observed.After(floor) {
+		return observed
+	}
+	return floor
+}
+
+// netstatsPollIsStale reports whether the most recent successful
+// netstats poll is older than 2 × NetstatsPollInterval — the D3
+// signal that the docker stats subsystem is degraded and the sweep
+// must fall back to LastActiveAt rather than treat an absent floor
+// as "idle." Returns false when the bypass is off (the floor is not
+// used either way) or when the poller has never recorded a tick (the
+// daemon may have just booted; treating that as stale would prematurely
+// false-stop warm sandboxes during the first sweep after a restart —
+// the start path itself updates LastActiveAt, so falling back is the
+// correct conservative answer).
+func (s *Service) netstatsPollIsStale(now time.Time) bool {
+	if !s.anyBypassEnabled() {
+		return false
+	}
+	if s.cfg.NetstatsPollInterval <= 0 {
+		return true
+	}
+	last := s.netstatsLastTick.Load()
+	if last == 0 {
+		return true
+	}
+	return now.Sub(time.Unix(0, last)) > 2*s.cfg.NetstatsPollInterval
+}
+
+// netstatsRecentBytesInAt returns the unix-nano timestamp of the most
+// recent non-zero BytesIn sample observed for the sandbox, or the
+// zero time if no observation has been recorded yet. Cheap read-lock
+// lookup populated by the netstats poller sink.
+func (s *Service) netstatsRecentBytesInAt(id string) time.Time {
+	s.netstatsActivityMu.RLock()
+	ts, ok := s.netstatsActivity[id]
+	s.netstatsActivityMu.RUnlock()
+	if !ok || ts == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ts).UTC()
+}
+
+// recordNetstatsActivity is called by the netstats sink for every
+// non-zero BytesIn sample. SampledAt comes from the docker stats
+// reader so timestamps are consistent with the rest of the
+// observability surface.
+func (s *Service) recordNetstatsActivity(id string, sampledAt time.Time) {
+	if id == "" || sampledAt.IsZero() {
+		return
+	}
+	s.netstatsActivityMu.Lock()
+	if s.netstatsActivity == nil {
+		s.netstatsActivity = make(map[string]int64)
+	}
+	s.netstatsActivity[id] = sampledAt.UnixNano()
+	s.netstatsActivityMu.Unlock()
+}
+
+// forgetNetstatsActivity drops a sandbox's recorded activity floor.
+// Called when a sandbox is destroyed so the map does not leak entries
+// for ids the rest of the daemon has forgotten.
+func (s *Service) forgetNetstatsActivity(id string) {
+	if id == "" {
+		return
+	}
+	s.netstatsActivityMu.Lock()
+	delete(s.netstatsActivity, id)
+	s.netstatsActivityMu.Unlock()
+}
+
 // lifecycleActionFor decides what the sweep should do for one sandbox given
 // the current time and the operator's global idle fallback. Pure function:
 // no DB, no Docker, easy to exhaustively test.
@@ -2429,10 +2695,24 @@ const (
 //     stop. Backwards-compat with the pre-Lifecycle behavior.
 //  5. Otherwise → none.
 func lifecycleActionFor(sb *models.Sandbox, now time.Time, globalIdle time.Duration) lifecycleAction {
+	return lifecycleActionForWithFloor(sb, now, globalIdle, time.Time{})
+}
+
+// lifecycleActionForWithFloor is lifecycleActionFor with an explicit
+// activity-floor timestamp injected by the sweep (e.g. the netstats
+// poller's most recent BytesIn observation under bypass-on). When
+// activityFloor is later than sb.LastActiveAt, idle is measured from
+// activityFloor; otherwise the function behaves identically to
+// lifecycleActionFor. Pure: callers compute the floor.
+func lifecycleActionForWithFloor(sb *models.Sandbox, now time.Time, globalIdle time.Duration, activityFloor time.Time) lifecycleAction {
 	if sb == nil || sb.Status == models.SandboxStatusDestroyed {
 		return lifecycleNone
 	}
-	idle := now.Sub(sb.LastActiveAt)
+	floor := sb.LastActiveAt
+	if !activityFloor.IsZero() && activityFloor.After(floor) {
+		floor = activityFloor
+	}
+	idle := now.Sub(floor)
 	age := now.Sub(sb.CreatedAt)
 
 	l := sb.Lifecycle

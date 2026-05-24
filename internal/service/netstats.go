@@ -219,6 +219,14 @@ func (k netstatsServiceSink) HandleSamples(ctx context.Context, samples []netsta
 		return
 	}
 	for _, sample := range samples {
+		// Activity floor for the idle sweep under bypass-on: record
+		// the SampledAt of any non-zero BytesIn observation. We do this
+		// BEFORE the BytesOut-only skip below because warm HTTP traffic
+		// is exactly a "BytesIn>0 only" signal; without this record the
+		// sweep cannot tell a chatty warm sandbox apart from an idle one.
+		if sample.BytesIn > 0 {
+			k.svc.recordNetstatsActivity(sample.SandboxID, sample.SampledAt)
+		}
 		if sample.BytesIn == 0 && sample.BytesOut == 0 {
 			continue
 		}
