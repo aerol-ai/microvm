@@ -112,7 +112,10 @@ func newCapacityHarness(t *testing.T, managed, inspect map[string]*models.Sandbo
 	)
 
 	svc := &Service{
-		cfg:    config.Config{},
+		// ImageBuildGCEnabled toggles whether destroy paths enqueue the
+		// pending_image_gc row at all. These lifecycle tests exercise the
+		// schedule -> janitor handoff, so the flag has to be on.
+		cfg:    config.Config{ImageBuildGCEnabled: true},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:  st,
 		docker: &fakeCapacityRuntime{managed: managed, inspect: inspect},
@@ -835,7 +838,7 @@ func TestImageGCSkippedWhenAnotherSandboxReferences(t *testing.T) {
 	if imageRemoved != 0 {
 		t.Fatalf("image GC ran while sibling still references image: hits=%d", imageRemoved)
 	}
-	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
 	if err != nil {
 		t.Fatalf("ListPendingImageGCDue: %v", err)
 	}
@@ -882,7 +885,7 @@ func TestImageGCRunsWhenLastReferenceDestroyed(t *testing.T) {
 	if imageRemoved != 1 {
 		t.Fatalf("expected janitor to remove image exactly once, got %d", imageRemoved)
 	}
-	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
 	if err != nil {
 		t.Fatalf("ListPendingImageGCDue: %v", err)
 	}

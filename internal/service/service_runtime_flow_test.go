@@ -347,11 +347,11 @@ func TestServiceLifecycleStopStartDestroyAndHealth(t *testing.T) {
 	if len(rt.removeImages) != 0 {
 		t.Fatalf("RemoveImage must NOT run inline on destroy, got %v", rt.removeImages)
 	}
-	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
 	if err != nil {
 		t.Fatalf("ListPendingImageGCDue: %v", err)
 	}
-	if len(due) != 1 || due[0] != resp.Image {
+	if len(due) != 1 || due[0].Image != resp.Image {
 		t.Fatalf("pending_image_gc = %v, want [%s]", due, resp.Image)
 	}
 	if _, err := st.Get(ctx, resp.ID); !errors.Is(err, storepkg.ErrNotFound) {
@@ -875,6 +875,9 @@ func newServiceRuntimeHarness(t *testing.T, rt *recordingRuntime) (*Service, *st
 			ToolboxPort:       4321,
 			EnableCaddy:       false,
 			HTTPClientTimeout: time.Second,
+			// Required for the destroy-side assertion that DestroySandbox
+			// enqueues a pending_image_gc row.
+			ImageBuildGCEnabled: true,
 		},
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    st,

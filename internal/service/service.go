@@ -3111,6 +3111,15 @@ func (s *Service) StartPendingImageGC(ctx context.Context) {
 	}()
 }
 
+// pendingImageGCSweepLimit caps how many ledger rows one sweep
+// processes. Each row is a serial Docker RemoveImage round-trip, so an
+// unbounded backlog (operator re-enables GC after a long pause, or
+// thousands of destroyed sandboxes share a few base images) would
+// otherwise stall the daemon for minutes. The cap turns that into
+// "drain over a few ticks" instead. Oldest-first ordering from the
+// store keeps the long-overdue rows at the front of the queue.
+const pendingImageGCSweepLimit = 256
+
 // runPendingImageGC is one pass of the pending-image janitor. Reads
 // ledger rows older than ImageBuildGCTTL, re-checks HasActiveImageRef
 // (in case a new sandbox grabbed the image after scheduling), and
@@ -3119,19 +3128,27 @@ func (s *Service) StartPendingImageGC(ctx context.Context) {
 // "referenced now" outcome) deletes the row so we don't keep
 // re-attempting. Failures are logged, never returned — the janitor
 // must not block on a bad row.
+//
+// Refresh-race guard: each row's scheduled_at is captured at list time
+// and re-verified before RemoveImage; the post-remove cleanup uses a
+// conditional delete on (image, scheduled_at). If a destroy path
+// re-upserted the row between list and remove, the row stays and the
+// remove is skipped this tick — otherwise the freshly-extended TTL
+// would be silently overridden.
 func (s *Service) runPendingImageGC(ctx context.Context) {
 	cutoff := time.Now().UTC().Add(-s.cfg.ImageBuildGCTTL)
-	images, err := s.store.ListPendingImageGCDue(ctx, cutoff)
+	entries, err := s.store.ListPendingImageGCDue(ctx, cutoff, pendingImageGCSweepLimit)
 	if err != nil {
 		s.logger.Warn("pending image gc list failed", "error", err)
 		return
 	}
-	for _, image := range images {
+	for _, entry := range entries {
+		image := entry.Image
 		if s.imageGCWhitelisted(image) {
 			// Operator whitelisted this image after the row landed.
 			// Drop it so the ledger doesn't carry it forever; the
 			// destroy path's short-circuit keeps new rows out.
-			if err := s.store.DeletePendingImageGC(ctx, image); err != nil {
+			if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, image, entry.ScheduledAt); err != nil {
 				s.logger.Warn("pending image gc whitelist row clear failed", "image", image, "error", err)
 			}
 			continue
@@ -3158,7 +3175,14 @@ func (s *Service) runPendingImageGC(ctx context.Context) {
 			s.logger.Warn("pending image gc remove failed", "image", image, "error", err)
 			continue
 		}
-		if err := s.store.DeletePendingImageGC(ctx, image); err != nil {
+		// Conditional delete: if a destroy refreshed the row between
+		// the list and now, leave the fresh row in place — the next
+		// tick will pick it up after the new TTL elapses. The image
+		// was already removed from Docker in that case, which is
+		// acceptable: it gets re-pulled on the next create. The thing
+		// we MUST avoid is silently throwing away the row that would
+		// have extended the TTL.
+		if _, err := s.store.DeletePendingImageGCIfScheduledAt(ctx, image, entry.ScheduledAt); err != nil {
 			s.logger.Warn("pending image gc row delete failed", "image", image, "error", err)
 			continue
 		}
@@ -3505,6 +3529,16 @@ func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
 	if image == "" {
 		return
 	}
+	// Mirror the janitor's kill switch: when ImageBuildGCEnabled is
+	// false no sweep will ever drain the ledger, so writing here would
+	// just grow pending_image_gc forever for an operator who has opted
+	// out of image GC entirely. The trade-off is symmetric with the
+	// disabled janitor: images of destroyed sandboxes are left on the
+	// daemon (which is the explicit "don't reclaim" choice), and they
+	// stay reachable for warm re-creates instead of getting yanked.
+	if !s.cfg.ImageBuildGCEnabled {
+		return
+	}
 	// Short-circuit on whitelist so the ledger doesn't accumulate rows
 	// the janitor would only ever skip. Cheap O(N) scan over a small,
 	// operator-curated list — much smaller than the per-tick scan cost.
@@ -3521,12 +3555,18 @@ func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
 // imageGCWhitelisted reports whether image is protected from both
 // janitors by cfg.ImageGCWhitelist. Three match shapes:
 //   - exact ref equality (entry == image)
-//   - repo equality, tag/digest agnostic (entry has no ':' / '@', and image
+//   - repo equality, tag/digest agnostic (entry has no tag/digest, and image
 //     starts with entry followed by ':' or '@')
 //   - registry/org prefix when entry ends in '/'
 //
 // Anchored boundaries on every shape so a "ubuntu" entry can't accidentally
 // shield "ubuntu-base" — the operator gets exactly what they typed.
+//
+// The tag/digest detection inspects the segment AFTER the last '/' rather
+// than the whole entry: Docker accepts ports in registry hosts
+// ("localhost:5000/team/app"), so a literal ':' before the last '/' is
+// part of the host, not a tag separator. Without this, every entry for a
+// non-standard-port registry would silently degrade to exact-ref only.
 func (s *Service) imageGCWhitelisted(image string) bool {
 	if image == "" || len(s.cfg.ImageGCWhitelist) == 0 {
 		return false
@@ -3544,7 +3584,11 @@ func (s *Service) imageGCWhitelisted(image string) bool {
 			}
 			continue
 		}
-		if !strings.ContainsAny(entry, ":@") {
+		// Look for tag/digest separators only in the last path segment —
+		// ':' inside a registry host (e.g. "localhost:5000/...") must
+		// not be treated as a tag boundary.
+		lastSeg := entry[strings.LastIndex(entry, "/")+1:]
+		if !strings.ContainsAny(lastSeg, ":@") {
 			if strings.HasPrefix(image, entry+":") || strings.HasPrefix(image, entry+"@") {
 				return true
 			}

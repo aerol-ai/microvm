@@ -55,11 +55,16 @@ func seedPending(t *testing.T, st *store.Store, image string, at time.Time) {
 func listPending(t *testing.T, st *store.Store) []string {
 	t.Helper()
 	// Large cutoff so the call returns every row regardless of timestamp.
-	got, err := st.ListPendingImageGCDue(context.Background(), time.Now().UTC().Add(100*365*24*time.Hour))
+	// Limit 0 == unbounded, which is what we want for assertions.
+	entries, err := st.ListPendingImageGCDue(context.Background(), time.Now().UTC().Add(100*365*24*time.Hour), 0)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
-	return got
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.Image
+	}
+	return out
 }
 
 func TestPendingImageGCRemovesDueUnreferenced(t *testing.T) {
@@ -269,6 +274,119 @@ func TestPendingImageGCDropsWhitelistedRow(t *testing.T) {
 	}
 	if pending := listPending(t, st); len(pending) != 0 {
 		t.Fatalf("expected ledger to drop whitelisted row, got %v", pending)
+	}
+}
+
+// Refresh-race guard: if a destroy path upserts pending_image_gc with a
+// fresh timestamp between the janitor's list and its post-remove delete,
+// the new (refreshed) row must NOT be silently overwritten. Otherwise a
+// busy churn pattern would race the janitor and lose the extended TTL
+// the destroy path was supposed to buy.
+func TestPendingImageGCPreservesRefreshedRow(t *testing.T) {
+	svc, st, removed, _ := newPendingImageGCHarness(t, time.Hour)
+	image := "alpine:latest"
+	// Row is initially due (scheduled 2h ago, TTL 1h).
+	oldAt := time.Now().UTC().Add(-2 * time.Hour)
+	seedPending(t, st, image, oldAt)
+	// Simulate the destroy of another sandbox sharing this image
+	// landing in the gap between list and remove. We do it before
+	// runPendingImageGC since the harness is single-threaded; the
+	// janitor must then observe the refreshed timestamp and skip the
+	// conditional delete (because it lists from the original cutoff).
+	//
+	// Trick: bump TTL so the original cutoff still sees `oldAt` as
+	// due, then refresh to a timestamp that's inside the original
+	// cutoff window — i.e. newer than oldAt but older than now-TTL.
+	// Easier: list with the original cutoff (the janitor does), but
+	// physically refresh the row to "now" before the conditional
+	// delete fires.
+	refreshAt := time.Now().UTC()
+	if err := st.SchedulePendingImageGC(context.Background(), image, refreshAt); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	svc.runPendingImageGC(context.Background())
+
+	// Image is no longer due (refreshAt > now-TTL), so the janitor
+	// never reaches RemoveImage. List returns empty for the original
+	// cutoff, sweep is a no-op.
+	if len(*removed) != 0 {
+		t.Fatalf("refreshed row must not trigger RemoveImage, got %+v", *removed)
+	}
+	pending := listPending(t, st)
+	if len(pending) != 1 || pending[0] != image {
+		t.Fatalf("refreshed row must survive the sweep, got %v", pending)
+	}
+}
+
+// Counterpart to the refresh-race test: simulate the harder timing where
+// the row IS visible at list-time but a destroy refreshes between list
+// and delete. We exercise the conditional delete by directly invoking
+// it with a stale timestamp; the row must remain.
+func TestPendingImageGCConditionalDeleteSkipsRefreshed(t *testing.T) {
+	_, st, _, _ := newPendingImageGCHarness(t, time.Hour)
+	image := "alpine:latest"
+	seenAt := time.Now().UTC().Add(-2 * time.Hour)
+	seedPending(t, st, image, seenAt)
+
+	// Destroy of a sibling sandbox refreshed the row after the sweep
+	// listed it but before the conditional delete fired.
+	refreshAt := time.Now().UTC()
+	if err := st.SchedulePendingImageGC(context.Background(), image, refreshAt); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	ok, err := st.DeletePendingImageGCIfScheduledAt(context.Background(), image, seenAt)
+	if err != nil {
+		t.Fatalf("conditional delete: %v", err)
+	}
+	if ok {
+		t.Fatalf("stale conditional delete must not remove the refreshed row")
+	}
+	if pending := listPending(t, st); len(pending) != 1 || pending[0] != image {
+		t.Fatalf("refreshed row must survive, got %v", pending)
+	}
+}
+
+// Kill-switch contract: when image GC is disabled, destroy paths must
+// NOT keep writing ledger rows that nobody will ever drain. Otherwise
+// pending_image_gc grows unbounded over the operator's "no GC" choice.
+func TestSchedulePendingImageGCSkippedWhenDisabled(t *testing.T) {
+	svc, st, _, _ := newPendingImageGCHarness(t, time.Hour)
+	svc.cfg.ImageBuildGCEnabled = false
+
+	svc.schedulePendingImageGC(context.Background(), "alpine:latest")
+
+	if pending := listPending(t, st); len(pending) != 0 {
+		t.Fatalf("disabled GC must not enqueue ledger rows, got %v", pending)
+	}
+}
+
+// Whitelist matcher must treat ':' inside a registry host as part of
+// the host (port), not as a tag boundary — otherwise every entry that
+// names a non-standard-port registry silently degrades to exact-ref
+// only, which is almost never what the operator typed.
+func TestImageGCWhitelistHandlesRegistryPort(t *testing.T) {
+	svc := &Service{cfg: config.Config{ImageGCWhitelist: []string{
+		"localhost:5000/team/app", // repo on a non-standard-port registry
+		"registry.local:5000/",    // prefix on a non-standard-port registry
+	}}}
+	cases := []struct {
+		image string
+		want  bool
+	}{
+		{"localhost:5000/team/app:v1", true},              // repo + tag
+		{"localhost:5000/team/app@sha256:deadbeef", true}, // repo + digest
+		{"localhost:5000/team/app", true},                 // exact ref
+		{"localhost:5000/team/app-extra:v1", false},       // boundary not crossed
+		{"localhost:5000/other/app:v1", false},            // different repo
+		{"registry.local:5000/anyorg/svc:v1", true},       // prefix match
+		{"registry.local:6000/anyorg/svc:v1", false},      // wrong port
+	}
+	for _, tc := range cases {
+		if got := svc.imageGCWhitelisted(tc.image); got != tc.want {
+			t.Errorf("imageGCWhitelisted(%q) = %v, want %v", tc.image, got, tc.want)
+		}
 	}
 }
 

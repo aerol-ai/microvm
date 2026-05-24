@@ -127,7 +127,9 @@ func TestReconcileReappliesNetworkBlockAllWithCurrentContainerIP(t *testing.T) {
 		},
 	}
 	svc := &Service{
-		cfg:    config.Config{},
+		// schedulePendingImageGC checks ImageBuildGCEnabled — leave it on
+		// so the destroy branches produce the expected ledger rows.
+		cfg:    config.Config{ImageBuildGCEnabled: true},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:  st,
 		docker: rt,
@@ -218,7 +220,9 @@ func TestReconcileDestroyedRowFreesHostPort(t *testing.T) {
 	rt := &fakeReconcileRuntime{managed: map[string]*models.SandboxRuntimeState{}}
 
 	svc := &Service{
-		cfg:      config.Config{},
+		// Reconcile's destroyed-branch goes through schedulePendingImageGC,
+		// which checks ImageBuildGCEnabled before writing the ledger row.
+		cfg:      config.Config{ImageBuildGCEnabled: true},
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    st,
 		docker:   rt,
@@ -311,11 +315,11 @@ func TestReconcileDestroyedRowFreesHostPort(t *testing.T) {
 	if got := rt.removeImageHits.Load(); got != 0 {
 		t.Fatalf("RemoveImage must NOT be called inline, hits = %d", got)
 	}
-	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
 	if err != nil {
 		t.Fatalf("ListPendingImageGCDue: %v", err)
 	}
-	if len(due) != 1 || due[0] != image {
+	if len(due) != 1 || due[0].Image != image {
 		t.Fatalf("expected pending_image_gc to contain %q, got %v", image, due)
 	}
 }
@@ -359,7 +363,9 @@ func TestDestroyEventFreesHostPort(t *testing.T) {
 	rt := &fakeReconcileRuntime{managed: map[string]*models.SandboxRuntimeState{}}
 
 	svc := &Service{
-		cfg:      config.Config{},
+		// Reconcile's destroyed-branch goes through schedulePendingImageGC,
+		// which checks ImageBuildGCEnabled before writing the ledger row.
+		cfg:      config.Config{ImageBuildGCEnabled: true},
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    st,
 		docker:   rt,
@@ -445,11 +451,11 @@ func TestDestroyEventFreesHostPort(t *testing.T) {
 	if got := rt.removeImageHits.Load(); got != 0 {
 		t.Fatalf("RemoveImage must NOT be called inline, hits = %d", got)
 	}
-	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
 	if err != nil {
 		t.Fatalf("ListPendingImageGCDue: %v", err)
 	}
-	if len(due) != 1 || due[0] != image {
+	if len(due) != 1 || due[0].Image != image {
 		t.Fatalf("expected pending_image_gc to contain %q, got %v", image, due)
 	}
 }
@@ -481,7 +487,9 @@ func TestDieEventDoesNotDeleteRow(t *testing.T) {
 
 	rt := &fakeReconcileRuntime{managed: map[string]*models.SandboxRuntimeState{}}
 	svc := &Service{
-		cfg:    config.Config{},
+		// schedulePendingImageGC checks ImageBuildGCEnabled — leave it on
+		// so the destroy branches produce the expected ledger rows.
+		cfg:    config.Config{ImageBuildGCEnabled: true},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:  st,
 		docker: rt,
