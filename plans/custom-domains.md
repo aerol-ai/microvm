@@ -119,12 +119,18 @@ hostname (a hostname maps to exactly one sandbox at a time).
 CREATE TABLE sandbox_custom_domains (
     hostname    TEXT PRIMARY KEY,                  -- lowercased, no trailing dot
     sandbox_id  TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending_dns',
+    last_error  TEXT,
     created_at  DATETIME NOT NULL,
+    updated_at  DATETIME NOT NULL,
     FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_sandbox_custom_domains_sandbox_id
     ON sandbox_custom_domains(sandbox_id);
 ```
+
+The `status` column is the per-domain state machine surfaced through the API
+(OV4A) — see §2.
 
 The PK on `hostname` is the global uniqueness enforcement — the same
 pattern the L4 host-port partial unique index uses for collision-safe
@@ -153,20 +159,65 @@ sibling `attachCustomDomainsBulk` does one query and groups by
 
 ```go
 // pkg/models/types.go
+
+// CustomDomainStatus is the per-domain lifecycle state surfaced through
+// API + SDK (OV4A). Drives UX: clients render "DNS not pointed yet" vs
+// "issuing cert" vs "ready" without polling Caddy.
+type CustomDomainStatus string
+
+const (
+    CustomDomainPendingDNS CustomDomainStatus = "pending_dns" // row exists, no cert seen
+    CustomDomainIssuing    CustomDomainStatus = "issuing"     // ACME flow started (first ask hit)
+    CustomDomainReady      CustomDomainStatus = "ready"       // cert in storage
+    CustomDomainFailed     CustomDomainStatus = "failed"      // ACME gave up; LastError set
+)
+
+type CustomDomain struct {
+    Hostname  string             `json:"hostname"`
+    Status    CustomDomainStatus `json:"status"`
+    LastError string             `json:"last_error,omitempty"`
+    CreatedAt time.Time          `json:"created_at"`
+    UpdatedAt time.Time          `json:"updated_at"`
+}
+
 type CreateSandboxRequest struct {
     // ... existing fields
-    CustomDomains []string `json:"custom_domains,omitempty"`
+    CustomDomains []string `json:"custom_domains,omitempty"` // bare hostnames on create
 }
 
 type Sandbox struct {
     // ... existing fields
-    CustomDomains []string `json:"custom_domains,omitempty"`
+    CustomDomains []CustomDomain `json:"custom_domains,omitempty"` // full status on read
 }
 
 type AddCustomDomainRequest struct {
     Hostname string `json:"hostname"`
 }
 ```
+
+State machine (driven by service layer, not by the SDK caller):
+
+```
+            AddCustomDomain
+                  │
+                  ▼
+            pending_dns ──── ask hit ────▶ issuing
+                  │                           │
+                  │                           │ cert in storage
+                  ▼                           ▼
+              (delete)                      ready
+                                              │
+                                              │ cert renew fails
+                                              ▼
+                                            failed ──── ask hit ────▶ issuing
+```
+
+The `pending_dns → issuing` transition happens inside `TLSAsk` (§5) the
+first time Caddy asks about the hostname. `issuing → ready` happens when
+the next `ask` hit confirms the cert exists in storage (cheap stat via
+certmagic). `* → failed` is observability-only for v1: we surface a Caddy
+ACME failure log line as `last_error`; no automatic retry beyond Caddy's
+own backoff.
 
 Validation in `pkg/models` (called from both the v1 handler and
 `Service.CreateSandbox`):
@@ -238,6 +289,16 @@ In domain-mode today the HTTPS site reuses the wildcard cert manager. For
 custom hostnames we add an on-demand TLS policy that calls back into
 sandboxd to check whether the hostname is allowed.
 
+**Shared cert storage is already wired (A4-doc).** When deployed via
+`scripts/install.sh --caddy-storage-s3`, `packaging/Caddyfile.template`
+injects a `storage s3 { ... }` directive that points Caddy at S3 via the
+certmagic-s3 plugin. The plugin handles distributed locking so two nodes
+issuing the same custom hostname simultaneously coordinate through S3
+rather than racing Let's Encrypt twice. The new on-demand policy below
+inherits that storage automatically — no new code, just a docs cross-link
+to `setup/multi-node-cert-sharing.md`. The doc must be updated to mention
+that custom-hostname certs now share the same S3 bucket as the wildcard.
+
 Caddy's on-demand config (added to the existing `apps/tls/automation`
 section in `pkg/caddy/client.go`'s install-time config push):
 
@@ -271,45 +332,82 @@ everything else. Hosts unknown to sandboxd are rejected by `ask`,
 which means Caddy never attempts ACME for them — that is the abuse
 defense.
 
-The `ask` endpoint (loopback-only, never exposed publicly):
+The `ask` endpoint lives as a sibling file in the wake-proxy package
+(A5A — `pkg/api/ingressproxy/tls_ask.go`), not in a new `internal/ingress/`
+package. It registers on the existing `InternalIngressAddr` listener
+(loopback-only, bound in `cmd/sandboxd/main.go:397`):
 
 ```go
-// internal/ingress/tls_ask.go (new file)
+// pkg/api/ingressproxy/tls_ask.go (new file, sibling of routes.go)
+//
 // GET /internal/tls-ask?domain=<host>
 //
 // 200 → Caddy may issue a cert for this host.
 // 4xx → Caddy refuses to attempt issuance.
 //
-// Hot path. Single PK lookup; no logs on the success path.
-func (h *Handler) TLSAsk(w http.ResponseWriter, r *http.Request) {
-    host := r.URL.Query().Get("domain")
+// Hot path. Cluster-wide hostname lookup hits the local Raft FSM (A2A);
+// no SQLite touch. Negative results are LRU-cached for 60s (C1A) so an
+// SNI flood from a scanner can't burn CPU.
+func (h *TLSAskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    host := strings.ToLower(strings.TrimSuffix(r.URL.Query().Get("domain"), "."))
     if host == "" {
         http.Error(w, "missing domain", http.StatusBadRequest)
         return
     }
-    host = strings.ToLower(strings.TrimSuffix(host, "."))
-    // Allow our own wildcard children (defense in depth — wildcard policy
-    // should match first, but if Caddy ever falls through, we still say yes).
-    if strings.HasSuffix(host, "."+h.cfg.Domain) || host == h.cfg.Domain {
+    // Defense in depth — wildcard policy should match first.
+    if host == h.cfg.Domain || strings.HasSuffix(host, "."+h.cfg.Domain) {
         w.WriteHeader(http.StatusOK)
         return
     }
-    if _, err := h.store.ResolveCustomDomain(r.Context(), host); err != nil {
-        if errors.Is(err, models.ErrNotFound) {
-            http.Error(w, "unknown host", http.StatusForbidden)
-            return
-        }
-        http.Error(w, "lookup failed", http.StatusInternalServerError)
+    if h.negCache.has(host) {
+        http.Error(w, "unknown host", http.StatusForbidden)
         return
     }
+    sandboxID, ok := h.fsm.ResolveCustomDomain(host) // local Raft FSM lookup
+    if !ok {
+        h.negCache.add(host) // 60s TTL, cap 10k entries
+        http.Error(w, "unknown host", http.StatusForbidden)
+        return
+    }
+    h.acmeBudget.RecordAttempt(sandboxID) // see §5b
+    h.status.MarkIssuing(host)            // pending_dns → issuing
     w.WriteHeader(http.StatusOK)
 }
 ```
 
-Listen address: `internal/config.Config.InternalIngressAddr` (already
-loopback-only — same address the wake proxy binds to). Add an
-`/internal/tls-ask` route on that listener; **must not** be on the public
-API listener.
+The handler reads from the cluster FSM (`internal/cluster/fsm.go`'s
+hostname → sandbox map — see §10), not from the local SQLite store. In
+single-node mode the in-process FSM still serves the same lookup
+(`cluster.Noop` exposes a degenerate hostname map backed by the store).
+Negative cache entries are evicted whenever `AddCustomDomain` succeeds for
+that hostname (so a legitimate add doesn't have to wait 60s).
+
+### 5b. ACME budget (OV5A)
+
+Let's Encrypt enforces a per-account `new-orders` limit (currently 300 /
+3hr). A misconfigured user with 100 custom domains can blow that for the
+whole cluster. v1 ships a daemon-wide token bucket:
+
+```go
+// internal/service/acme_budget.go
+//
+// One bucket per Caddy ACME account. Refills at the LE published rate.
+// On every TLSAsk that would trigger issuance (status != ready), Reserve
+// returns false if we're at >=80% of the burst capacity, and ask returns
+// 429 to Caddy. 80% leaves headroom for the cert renewals already in
+// flight.
+type ACMEBudget struct { ... }
+
+func (b *ACMEBudget) Reserve(sandboxID string) (ok bool)
+```
+
+The 80% threshold is configurable via `SB_ACME_DAEMON_BUDGET_FRACTION`
+(default `0.8`). Budget exhaustion is logged with `sandbox_id` so the
+operator can see which tenant burned the quota. Cluster-mode: each node
+maintains its own bucket; we deliberately do **not** synchronise via
+Raft (one bucket per ingress node is fine — LE limits are per-account,
+not per-IP, and serial issuance across nodes is rare given the s3
+distributed lock).
 
 ### 6. HTTP-01 challenge path
 
@@ -393,40 +491,108 @@ plan it also:
    DB set (e.g. caddy was wiped, or a node took over and didn't have
    the matcher).
 
+**Fan-out ceiling (P1A).** Reconcile walks all sandboxes; each
+custom-domain matcher write is O(1) in Caddy. At 10k sandboxes × 25
+custom domains the bounded matcher-string size is ~25k hostnames
+per cluster, well under Caddy's host-matcher scaling. We do not
+paginate reconcile in v1; if cluster size ever crosses 50k sandboxes
+we revisit. (Documented assumption, not a code gate.)
+
 ### 9. Cluster mode
 
-`internal/cluster/` carries no per-sandbox routing state — that lives
-in the owner's local store. Custom domains follow the same shape:
+Custom-domain routing piggybacks on the **delta-driven ingress
+convergence** mechanism in `internal/service/ingress_delta.go` (A1A) —
+the same path that already keeps non-owner ingress nodes in sync for
+per-port routes. We do **not** make direct `UpsertSandboxRouteToPeer`
+calls from `AddCustomDomain`.
 
-- **DB rows live on the owner.** `sandbox_custom_domains` is part of
-  the owner's SQLite. Failover replication (`recovery_replication.go`)
-  must include the new table — every place we currently replicate
-  `exposed_ports` for a sandbox, we replicate `sandbox_custom_domains`
-  alongside it.
-- **Ingress nodes need the matcher.** Today the ingress path for a non-
-  owned sandbox is `UpsertSandboxRouteToPeer` (`client.go:175`). That
-  function must learn the custom hostnames too. The owner pushes them
-  via the existing route-publish gossip path; ingress nodes apply.
-- **`ask` endpoint is per-node.** Each node's `ResolveCustomDomain` only
-  knows about sandboxes whose state it has — i.e. the owner and any
-  ingress node that has been told about the route. For v1 we accept
-  that the first request after a custom domain is added might hit a
-  cold ingress node that returns 403 to Caddy on the `ask`. The owner
-  push to ingress nodes happens on the same code path as the existing
-  per-port route push, so the window is small. If this is unacceptable
-  we add a cluster-wide hostname → sandbox lookup that any node can
-  serve (e.g. via the placement FSM); call this an open question for
-  the eng review.
+Flow:
+
+1. **Owner applies the change locally.** `AddCustomDomain` validates,
+   inserts the SQLite row, and submits an `ApplyAddCustomDomain` Raft
+   command (§10). The command writes the hostname → sandbox mapping into
+   the FSM and bumps the sandbox's `ingress_version`.
+2. **Ingress delta loop notices.** `ingress_delta.go` watches the FSM
+   for `ingress_version` changes on sandboxes whose routes this node
+   serves. On bump it computes the delta between
+   `cluster.SandboxRouteSpec.CustomHostnames` (now the union from the
+   FSM) and Caddy's currently-installed matcher set, and PATCHes
+   `UpsertSandboxRouteToPeer` once with the full set.
+3. **`cluster.ForwardHTTP` is unchanged.** Cross-node HTTP forwarding
+   keys off `sandbox_id`, not hostname; once Caddy on the ingress node
+   matches the custom hostname, the existing reverse-proxy path
+   transparently reaches the owner.
+4. **Failover.** `recovery_replication.go` already replicates
+   per-sandbox state to the failover replicas. Extend the replicated
+   blob with `custom_domains: []{hostname, status, last_error}` so the
+   new owner has the SQLite rows on takeover. The FSM hostname map is
+   already replicated by Raft itself.
 
 PR call-outs required (`CLAUDE.md` cluster hard-rule):
 
-- Replication tests: a custom domain set on the owner before failover
-  appears on the new owner.
-- Single-node regression: `EnableCluster=false` still works (the
-  `cluster.Noop` already returns nil; we just need to not call
-  cluster-specific paths in single-node).
-- Replay safety: re-applying an `AddCustomDomain` event after recovery
-  is a no-op (the `INSERT OR IGNORE` semantics already give us this).
+- **Replication test**: sandbox with two custom domains, kill the
+  owner, assert new owner answers `TLSAsk` for both hostnames and
+  Caddy still serves them.
+- **FSM replay test**: re-applying `ApplyAddCustomDomain` after Raft
+  snapshot restore is a no-op (idempotent on hostname PK in the map).
+- **Single-node regression**: `EnableCluster=false` uses a degenerate
+  `Noop` FSM that resolves hostnames from the local store; no Raft
+  commands submitted; same `TLSAsk` and route-install code paths.
+- **Cluster ingress on a non-owner node**: SNI for the custom hostname
+  arrives at node Z which is not the owner; FSM lookup resolves it;
+  Caddy matches the route; `cluster.ForwardHTTP` reaches the owner.
+
+### 10. FSM hostname uniqueness (A2A + OV7A)
+
+`internal/cluster/fsm.go` gains a hostname → sandbox map and two new
+Raft commands:
+
+```go
+// internal/cluster/fsm.go
+type FSMState struct {
+    // ... existing
+    CustomDomains map[string]string // hostname → sandboxID (lowercase)
+}
+
+type ApplyAddCustomDomain struct {
+    Hostname  string
+    SandboxID string
+    NodeID    string // owner node, for audit
+}
+
+type ApplyRemoveCustomDomain struct {
+    Hostname  string
+    SandboxID string // must match; cross-sandbox removal rejected
+}
+```
+
+`ApplyAddCustomDomain` is the **uniqueness gate**. On replay:
+
+- If `CustomDomains[hostname]` is unset → insert, bump
+  `sandboxes[id].IngressVersion`, return ok.
+- If it points to the same `SandboxID` → no-op (replay-safe), return ok.
+- Otherwise → return `models.ErrConflict`. The owner's `AddCustomDomain`
+  reverses the SQLite insert and returns 409 to the caller. This is the
+  cluster-wide collision-safe allocation guarantee — the same shape as
+  the `host_port` partial-unique-index pattern (`store.go:312`) but at
+  the Raft layer because SQLite-PK uniqueness is per-node.
+
+**Lifecycle tied to placement (OV7A).** Hostname entries are owned by
+the sandbox placement, not by the SQLite row. Wherever a placement is
+removed from the FSM (sandbox destroy, owner-drained-and-not-recovered,
+cluster shrink), the same Raft command path releases every hostname in
+`CustomDomains` whose `sandboxID` matches. There is no
+"orphan hostname" path — if the placement is gone the hostname is gone
+in the same Raft log entry. The matching `ApplyRemoveSandbox` (or
+whichever existing command tears placement down) is extended with the
+hostname-release sweep.
+
+Snapshot/restore: the hostname map serializes alongside the rest of
+`FSMState`. No new snapshot path; piggybacks on the existing one.
+
+`cluster.Noop` (single-node) implements the same interface against a
+local store-backed map; in single-node mode SQLite PK uniqueness is the
+backing guarantee. The single-node path is the regression test target.
 
 ---
 
@@ -444,13 +610,21 @@ PR call-outs required (`CLAUDE.md` cluster hard-rule):
 | `internal/service/custom_domains.go` *(new)* | `AddCustomDomain`, `RemoveCustomDomain`, `reinstallCustomDomainRoutes`. |
 | `internal/service/service.go` | `CreateSandbox` consumes `req.CustomDomains` after route install. `StartSandbox`/`RecreateSandbox` pass custom hostnames into `UpsertSandboxRoute`. |
 | `internal/service/reconcile.go` (or service.go if not yet split) | Apply custom hostnames in the re-install pass; zombie matcher GC. |
-| `internal/ingress/tls_ask.go` *(new)* | The `ask` handler. Bound to `InternalIngressAddr`. |
-| `cmd/sandboxd/main.go` | Wire the new internal route on the existing internal listener. |
-| `pkg/caddy/client.go` | `UpsertSandboxRoute` and `UpsertSandboxRouteToPeer` take `customHostnames []string`. Install-time config push adds the on-demand TLS policy. |
+| `pkg/api/ingressproxy/tls_ask.go` *(new)* | The `ask` handler + LRU negative cache. Sibling of `routes.go` on the existing `InternalIngressAddr` listener (A5A). |
+| `pkg/api/ingressproxy/routes.go` | Register `/internal/tls-ask` on the ingress mux. |
+| `pkg/caddy/client.go` | `UpsertSandboxRoute` and `UpsertSandboxRouteToPeer` take `customHostnames []string`. Install-time config push adds the on-demand TLS policy (after the wildcard policy). |
 | `pkg/caddy/client_test.go` | New: matcher PATCH includes custom hostnames; on-demand policy is present after install push; rate-limit shape matches. |
-| `internal/cluster/recovery_replication.go` | Replicate the new table. |
-| `internal/cluster/*_test.go` | Failover regression: custom domains survive owner change. |
-| `internal/config/config.go` | Read `SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX` (default 25), `SB_TLS_ON_DEMAND_BURST` (default 5), `SB_TLS_ON_DEMAND_INTERVAL` (default `1m`). |
+| `internal/cluster/fsm.go` | Hostname → sandbox map; `ApplyAddCustomDomain` / `ApplyRemoveCustomDomain` Raft commands; hostname-release sweep in placement-teardown command (OV7A). |
+| `internal/cluster/fsm_test.go` | Conflict, replay safety, placement-teardown release, snapshot/restore. |
+| `internal/cluster/noop.go` | Degenerate hostname-map shim backed by the local store (single-node mode). |
+| `internal/cluster/recovery_replication.go` | Replicate the new table alongside `exposed_ports`. |
+| `internal/service/ingress_delta.go` | Extend the spec carried per sandbox to include `CustomHostnames`; bump `ingress_version` on add/remove. |
+| `internal/service/ingress_delta_test.go` | Delta-driven matcher propagation to ingress nodes. |
+| `internal/service/acme_budget.go` *(new)* | Daemon-wide ACME token bucket (OV5A). 80%-of-LE-account-limit gate. |
+| `internal/observability/metrics.go` | `acme_lock_held_seconds` gauge, `acme_lock_acquire_duration_seconds` histogram, `ask_requests_total{result}` counter (F3/F4). |
+| `setup/prometheus/alerts/sandboxd.yml` | Alert on `acme_lock_held_seconds > 300`; alert on `rate(ask_requests_total[2m]) == 0 while up == 1`. |
+| `setup/multi-node-cert-sharing.md` | Cross-link from §5: explicitly mention custom-hostname certs ride the same S3 bucket as the wildcard (A4-doc). |
+| `internal/config/config.go` | `SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX` (default 25), `SB_TLS_ON_DEMAND_BURST` (default 5), `SB_TLS_ON_DEMAND_INTERVAL` (default `1m`), `SB_ENABLE_CUSTOM_DOMAINS` (gate, default false), `SB_ACME_DAEMON_BUDGET_FRACTION` (default 0.8). |
 | `sdk/typescript/src/Sandbox.ts` and the other 4 SDKs | `sandbox.customDomains` add/remove/list, `customDomains: string[]` on the create request. Use `/add-sdk-method` to keep lockstep. |
 | `docs/src/content/docs/custom-domains.mdx` *(new)* | Hard rule: 5-language tabs, no curl. Includes DNS setup steps (CNAME to ingress host) and the `ask` flow at a high level. |
 | `docs/src/content.config.ts` | Register the new page in the sidebar. |
@@ -461,31 +635,147 @@ PR call-outs required (`CLAUDE.md` cluster hard-rule):
 
 Required (per `CLAUDE.md` hard rules and `pr-review.md`):
 
-- `internal/store/store_test.go`
-  - `AddCustomDomain` returns ErrConflict on PK collision.
-  - `RemoveCustomDomain` is no-op + ErrNotFound on mismatched sandbox.
-  - `ResolveCustomDomain` returns ErrNotFound for unknown hosts (no panic).
+**Store** — `internal/store/store_test.go`
+  - `AddCustomDomain` returns `ErrConflict` on hostname PK collision
+    across sandboxes.
+  - `AddCustomDomain` is idempotent for same `(sandbox, hostname)`.
+  - `RemoveCustomDomain` returns `ErrNotFound` on mismatched sandbox.
+  - `ResolveCustomDomain` returns `ErrNotFound` for unknown hosts.
   - Cascade: deleting the sandbox row removes its custom domains.
-- `pkg/caddy/client_test.go`
+  - `attachCustomDomainsBulk` correctly groups by `sandbox_id` across
+    a mixed-result query.
+  - Status transitions: `MarkIssuing`, `MarkReady`, `MarkFailed` are
+    idempotent and update `updated_at`.
+
+**Models / validation** — `pkg/models/types_test.go`
+  - Case-folding (`API.ACME.COM` → `api.acme.com`).
+  - Trailing dot stripped.
+  - Base-domain rejection (`<id>.$DOMAIN`, `$DOMAIN` itself).
+  - IP literal rejection (v4 + v6).
+  - `localhost`, `*.local` rejected.
+  - Boundary: 63-char label accepted, 64-char rejected; 253-char total
+    accepted, 254 rejected.
+  - Per-request cap (5 on create) → validation error.
+
+**Caddy** — `pkg/caddy/client_test.go`
   - `UpsertSandboxRoute` writes `host: [...]` with the union of base
     name and custom hostnames; passing the same set twice is byte-
     identical (idempotent PATCH).
+  - `UpsertSandboxRouteToPeer` (cluster ingress path) includes the
+    custom-hostname set in its matcher.
   - Install config push contains exactly one on-demand policy with
-    `ask` pointing at the loopback address.
-- `internal/service/custom_domains_test.go`
-  - Add → Caddy failure → store row deleted.
-  - Remove → Caddy success → store row deleted.
-  - Add over the per-sandbox cap → 4xx with stable error.
-- `internal/ingress/tls_ask_test.go`
-  - Known host → 200, unknown → 403, malformed → 400, base-domain child
-    → 200.
-- `internal/cluster/recovery_replication_test.go`
-  - Sandbox has 2 custom domains, owner dies, new owner answers
-    `ask` for both.
-- `layer4_bootstrap_test.go` — unchanged, but cross-link: custom
-  domains must not interact with the L4 latch (TCP/TLS exposures
-  are explicitly rejected when custom_domains is set; the test
-  asserts the error path).
+    `ask` URL pointing at `InternalIngressAddr/internal/tls-ask`,
+    `rate_limit.interval=1m`, `rate_limit.burst=5`.
+
+**Service** — `internal/service/custom_domains_test.go`
+  - Add → store insert OK → Caddy PATCH fails → store row rolled back.
+  - Remove → Caddy PATCH OK → store delete; reconcile recovers if step 2
+    fails.
+  - Add over per-sandbox cap → stable error with cap name.
+  - **IRON RULE regression**: `protocol="tcp"` exposure + `custom_domains`
+    → rejected with explicit error (not silently accepted, not panic).
+  - **IRON RULE regression**: `protocol="tls"` exposure + `custom_domains`
+    → same.
+  - IP-mode deployment (`SB_DOMAIN=""`) + `custom_domains` →
+    412 Precondition Failed.
+  - `EnableCustomDomains=false` + `custom_domains` → 412.
+
+**ask handler** — `pkg/api/ingressproxy/tls_ask_test.go`
+  - Known host → 200; unknown → 403; malformed (empty / IP) → 400;
+    base-domain child → 200.
+  - Negative cache: 1000 successive lookups for an unknown host hit FSM
+    once, return 403 from cache subsequently; entries expire after 60s.
+  - `AddCustomDomain` evicts the host from negative cache (verified by
+    immediate ask returning 200 without 60s wait).
+  - ACME budget exhaustion → 429 with `Retry-After` header.
+
+**FSM** — `internal/cluster/fsm_test.go`
+  - `ApplyAddCustomDomain` rejects cross-sandbox hostname conflict.
+  - `ApplyAddCustomDomain` is replay-safe for same `(host, sandbox)`.
+  - Removing a sandbox releases all its hostnames in the same Raft
+    command.
+  - Snapshot + restore round-trips the hostname map intact.
+
+**Cluster ingress** — `internal/service/ingress_delta_test.go`
+  - Adding a custom domain bumps `ingress_version`; ingress nodes
+    pick up the new matcher within one delta cycle.
+  - SNI request for a custom hostname arrives at a non-owner node →
+    matched by Caddy → forwarded via `cluster.ForwardHTTP` to owner.
+
+**Failover** — `internal/cluster/recovery_replication_test.go`
+  - Sandbox has 2 custom domains; owner dies; new owner answers
+    `TLSAsk` 200 for both; Caddy still serves them via shared S3 cert
+    storage (no re-issuance triggered).
+
+**API contract** — `pkg/api/v1/handlers_test.go`
+  - `GET /v1/sandboxes/{id}` includes `custom_domains` with per-domain
+    `status` field.
+  - `POST /v1/sandboxes/{id}/custom-domains` idempotent for same host.
+  - `DELETE` returns 404 for unknown host, 204 for known.
+
+**E2E ACME** (T1A) — `internal/service/custom_domains_e2e_test.go`
+  - Stand up Pebble (LE staging stand-in) + localstack S3 + sandboxd.
+  - Add a custom domain with `/etc/hosts` override pointing at ingress.
+  - Hit `https://<host>/` → first request triggers issuance via Pebble,
+    second request serves cached cert from S3.
+  - Kill ingress node, bring up a second one against the same S3 — cert
+    reused, no second Pebble issuance.
+
+**Layer4 cross-link** — `layer4_bootstrap_test.go` unchanged; the
+IRON RULE regression above is the assertion that custom domains do not
+interact with the L4 latch.
+
+---
+
+## 11. Workload assumptions (OV1A)
+
+Designing for these workloads — scope decisions become wrong if reality
+drifts far from them:
+
+- **Long-lived sandboxes with stable hostnames.** Median sandbox lifetime
+  measured in days, custom hostname attached at create time and rarely
+  changed. We are **not** optimising for the "thousands of ephemeral
+  one-off hostnames per hour" case — that would warrant a different
+  cert-cache strategy (and is what TODO `Custom domains — cert blob GC
+  after removal` is for at scale, see `TODOS.md`).
+- **Bounded fan-out per sandbox.** Per-sandbox cap of 25 is intentional;
+  it lets us keep the host matcher as a single in-place PATCH and avoid
+  paginating reconcile.
+- **Operator-controlled DNS.** Users own the DNS record they point at the
+  cluster. We do not validate DNS pre-issuance; the `ask` endpoint is
+  the only gate. Misconfigured users get a 502 until they fix DNS, not
+  a silent failure.
+- **Multi-tenant cluster.** A misbehaving tenant burning ACME budget
+  must not starve other tenants. This is the OV5A motivation.
+- **Read-heavy `ask` path.** Caddy can hammer `ask` during SNI bursts
+  (scanners, mistuned clients). We size the negative cache for that.
+
+If any of these stop holding (e.g. we want hostname-per-port, or we
+expect 100k churning hostnames/day), revisit before extending v1.
+
+## 12. Observability
+
+Two failure modes from the eng review require monitoring before ship,
+not just tests:
+
+- **F3 — S3 lock held by a dead node during ACME.** certmagic-s3 takes
+  a distributed lock on the cert key for the duration of the ACME flow.
+  If a node dies mid-issuance the lock falls off via TTL; in pathological
+  cases (network partition that masks the death) it can stick.
+  Instrument: `acme_lock_acquire_duration_seconds` histogram +
+  `acme_lock_held_seconds` per-active-lock gauge in `expvar`;
+  Prometheus alert at >5m held.
+- **F4 — `ask` loopback listener crashes mid-process.** If
+  `ingressproxy.Server` exits but the rest of sandboxd keeps running,
+  every new HTTPS connection will fail TLS until the next restart and
+  Caddy's on-demand cache is cold. Instrument: `ask_requests_total{result}`
+  counter + a Prometheus alert on the absence of any successful `ask`
+  for >2m while the process is up.
+
+Implementation lives next to existing metrics in
+`internal/observability/`. Prometheus rules go in
+`setup/prometheus/alerts/` alongside existing alerts. Both metrics + rules
+ship in the v1 PR — not a follow-up.
 
 ---
 
@@ -515,27 +805,20 @@ The gate is a rollout switch, not a per-sandbox toggle — matches the
    Cloud DNS providers that don't support `ALIAS` (e.g. Route53 for
    non-AWS targets, raw bind) will be limited to subdomains. Document
    clearly; consider supporting per-domain DNS-01 in v2 to sidestep.
-2. **Cold ingress node returning 403 on `ask`.** Stated above. The
-   cleanest fix is a cluster-wide lookup via the placement FSM, but it
-   adds Raft load. Eng review should decide: accept the small window,
-   or add the FSM lookup.
-3. **ACME rate limits.** Let's Encrypt has per-domain and per-account
-   limits. A misconfigured user could ask for 100 custom domains and
-   burn issuance budget. Per-sandbox cap + on-demand `rate_limit` give
-   us two layers; consider also a daemon-wide budget counter for v2.
-4. **Cert revocation on remove.** When a user removes a custom domain
+2. **Cert revocation on remove.** When a user removes a custom domain
    we delete the matcher; Caddy keeps the cert in storage until expiry.
-   That's fine for correctness (the host no longer routes) but bloats
-   `data_dir`. A background sweep that prunes cached certs for unknown
-   hosts is a follow-up.
-5. **Cluster-wide hostname uniqueness.** The store PK is per-owner. If
-   sandbox A on node N1 and sandbox B on node N2 both claim
-   `api.acme.com`, both inserts succeed locally. Today no global lock
-   exists. Either route this through Raft (placement FSM gains a
-   hostname→sandbox map) or accept that the second one to hit ingress
-   wins. Open question.
-6. **Wildcard custom domain via DNS-01.** Out of scope; flagged for
+   Correctness intact, bloat only. Background sweep deferred to a
+   follow-up — see `TODOS.md`.
+3. **Wildcard custom domain via DNS-01.** Out of scope; flagged for
    the v2 plan.
+
+**Closed during eng review** (decisions captured in GSTACK REVIEW REPORT below):
+
+- Cluster-wide hostname uniqueness → resolved via FSM (A2A, §10).
+- Cold ingress node returning 403 on `ask` → collapsed into FSM
+  lookup (A3A).
+- ACME budget burn by a misconfigured tenant → promoted to v1 scope
+  via daemon-wide token bucket (OV5A, §5b).
 
 ---
 
