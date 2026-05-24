@@ -337,6 +337,59 @@ func TestRouteCases(t *testing.T) {
 				}
 			},
 		},
+		{
+			// UpsertPortRouteWithRetry must preserve the byte-for-byte
+			// shape of UpsertPortRoute and only add the load_balancing
+			// block. The shape is consumed by the bypass-on path which
+			// flips between this method and UpsertPortRoute on every
+			// warm/cold transition — divergent fields would leak across
+			// shapes via Caddy's PATCH overlay.
+			name: "upsert_port_route_with_retry_adds_load_balancing",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertPortRouteWithRetry(context.Background(), "abc", "10.0.0.2", 3000, 2*time.Second); err != nil {
+					t.Fatalf("UpsertPortRouteWithRetry() error = %v", err)
+				}
+				route, ok := fake.routes["sandbox-abc-port-3000"]
+				if !ok {
+					t.Fatalf("port route missing; routes=%+v", fake.routes)
+				}
+				assertRouteField(t, route, "@id", "sandbox-abc-port-3000")
+				assertRouteHostMatch(t, route, "abc-3000.sandbox.example.com")
+				assertRouteDial(t, route, "10.0.0.2:3000")
+
+				handle := route["handle"].([]any)[0].(map[string]any)
+				lb, ok := handle["load_balancing"].(map[string]any)
+				if !ok {
+					t.Fatalf("load_balancing missing in handle: %+v", handle)
+				}
+				if got := lb["try_duration"]; got != "2s" {
+					t.Fatalf("try_duration = %v, want %q", got, "2s")
+				}
+				if got := lb["try_interval"]; got != "100ms" {
+					t.Fatalf("try_interval = %v, want %q", got, "100ms")
+				}
+			},
+		},
+		{
+			// UpsertPortRoute MUST NOT acquire load_balancing implicitly
+			// — that would change the non-serverless surface's retry
+			// behavior, which the plan explicitly scopes out.
+			name: "upsert_port_route_has_no_load_balancing",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertPortRoute(context.Background(), "abc", "10.0.0.2", 3000); err != nil {
+					t.Fatalf("UpsertPortRoute() error = %v", err)
+				}
+				route := fake.routes["sandbox-abc-port-3000"]
+				handle := route["handle"].([]any)[0].(map[string]any)
+				if _, present := handle["load_balancing"]; present {
+					t.Fatalf("non-retry UpsertPortRoute leaked load_balancing block: %+v", handle)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {

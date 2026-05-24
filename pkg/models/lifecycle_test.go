@@ -120,3 +120,75 @@ func TestLifecycleIsZero(t *testing.T) {
 		t.Fatal("Lifecycle with Serverless=true should not be IsZero()")
 	}
 }
+
+func TestLifecycleValidateWithBypassFloor(t *testing.T) {
+	poll := 15 * time.Second
+	reconcile := 30 * time.Second
+	floor := 2*poll + reconcile // 60s
+
+	cases := []struct {
+		name      string
+		lifecycle Lifecycle
+		wantErr   string // substring; empty means must succeed
+	}{
+		{
+			// Non-serverless lifecycles bypass the floor entirely — they
+			// still bump LastActiveAt through sandboxd, so the netstats
+			// dependency does not apply.
+			name:      "non_serverless_below_floor_passes",
+			lifecycle: Lifecycle{StopIfIdleFor: time.Second},
+		},
+		{
+			// Validate already requires Serverless lifecycles to set
+			// StopIfIdleFor; we surface that upstream error rather than
+			// silently passing the floor check.
+			name:      "serverless_no_idle_timer_fails_validate",
+			lifecycle: Lifecycle{Serverless: true},
+			wantErr:   "stop_if_idle_for",
+		},
+		{
+			name:      "serverless_above_floor_passes",
+			lifecycle: Lifecycle{Serverless: true, StopIfIdleFor: floor + time.Second},
+		},
+		{
+			name:      "serverless_at_floor_passes",
+			lifecycle: Lifecycle{Serverless: true, StopIfIdleFor: floor},
+		},
+		{
+			name:      "serverless_one_ns_below_floor_fails",
+			lifecycle: Lifecycle{Serverless: true, StopIfIdleFor: floor - time.Nanosecond},
+			wantErr:   "below the 1m0s floor",
+		},
+		{
+			name:      "serverless_well_below_floor_fails",
+			lifecycle: Lifecycle{Serverless: true, StopIfIdleFor: 5 * time.Second},
+			wantErr:   "stop_if_idle_for",
+		},
+		{
+			// Validate failure (negative timer) is surfaced ahead of the
+			// floor check, so the user sees the more fundamental error
+			// first.
+			name:      "validate_failure_takes_precedence",
+			lifecycle: Lifecycle{Serverless: true, StopIfIdleFor: -time.Second},
+			wantErr:   "non-negative",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.lifecycle.ValidateWithBypassFloor(poll, reconcile)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("want error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
