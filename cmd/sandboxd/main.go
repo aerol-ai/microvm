@@ -404,8 +404,15 @@ func main() {
 		// call surface still works because the handler is mounted, and
 		// an operator-driven reconcile can re-install the policy later.
 		if cfg.EnableCustomDomains {
+			// Cluster-aware resolver: try the in-process FSM hostname index
+			// first (PK lookup, no I/O) and fall back to the SQLite store on
+			// miss. Under Noop the cluster lookup always returns ("", false)
+			// so single-node mode keeps the existing PK-lookup behavior.
+			// Under Cluster/Agent a hit short-circuits the disk read and
+			// keeps the on-demand TLS ask path fully in-memory across the
+			// cluster.
 			askHandler := ingressproxy.NewTLSAskHandler(ingressproxy.TLSAskDeps{
-				Resolver:    db,
+				Resolver:    clusterAwareDomainResolver{cluster: svc.Cluster(), store: db},
 				BaseDomain:  cfg.Domain,
 				NegCacheTTL: 60 * time.Second,
 				NegCacheCap: 10000,
@@ -707,6 +714,32 @@ func (r autoImportSpecResolver) GetSandboxSpec(sandboxID string) (*models.Create
 		return nil, false
 	}
 	return spec, true
+}
+
+// clusterAwareDomainResolver answers TLS-ask lookups from the cluster FSM
+// first and falls back to the local store on miss. The cluster path is an
+// in-memory map lookup (placementFSM.customHostnameIndex) so the hot path
+// for an SNI flood does not hit SQLite once the FSM is populated. The
+// store fallback covers two cases: (a) Noop / single-node mode where the
+// cluster always reports miss, and (b) the brief window after a leader
+// change before the local FSM has caught up on a fresh peer.
+//
+// We return store.ErrNotFound on miss so the handler's existing branching
+// (negative-cache + 403) treats both backends identically. A nil cluster
+// can't happen in practice (svc.Cluster() always returns at least Noop),
+// but we null-check defensively rather than panic from the ask path.
+type clusterAwareDomainResolver struct {
+	cluster cluster.Client
+	store   *store.Store
+}
+
+func (r clusterAwareDomainResolver) ResolveCustomDomain(ctx context.Context, hostname string) (string, error) {
+	if r.cluster != nil {
+		if id, ok := r.cluster.ResolveCustomDomain(hostname); ok {
+			return id, nil
+		}
+	}
+	return r.store.ResolveCustomDomain(ctx, hostname)
 }
 
 // bytesTrimSpace is a tiny helper so we don't pull `strings` for one call —
