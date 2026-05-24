@@ -226,7 +226,6 @@ func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
 	)
 
 	s.l4LimitMu.Lock()
-	defer s.l4LimitMu.Unlock()
 	if s.l4ActiveBySandbox == nil {
 		s.l4ActiveBySandbox = make(map[string]int)
 	}
@@ -234,6 +233,7 @@ func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
 		s.l4ActivityGenerations = make(map[string]uint64)
 	}
 	if s.l4ActiveBySandbox[id] >= perSandboxMax || s.l4ActiveGlobal >= globalMax {
+		s.l4LimitMu.Unlock()
 		return nil, false
 	}
 	if s.l4ActiveBySandbox[id] == 0 {
@@ -244,6 +244,7 @@ func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
 	}
 	s.l4ActiveBySandbox[id]++
 	s.l4ActiveGlobal++
+	s.l4LimitMu.Unlock()
 	if startTicker {
 		go s.touchDuringL4Activity(id, generation)
 	}

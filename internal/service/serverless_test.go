@@ -679,6 +679,79 @@ func TestL4WakeProxyWakesTCPExposure(t *testing.T) {
 	}
 }
 
+func TestL4WakePendingLimitRejectsOverflow(t *testing.T) {
+	svc := &Service{cfg: config.Config{
+		L4WakeMaxPendingPerSandbox: 1,
+		L4WakeMaxPendingGlobal:     2,
+	}}
+
+	release, ok := svc.tryAcquireL4Pending("sb-a")
+	if !ok {
+		t.Fatal("first pending acquire rejected")
+	}
+	if _, ok := svc.tryAcquireL4Pending("sb-a"); ok {
+		t.Fatal("second same-sandbox pending acquire accepted; want rejected")
+	}
+	release()
+	if release, ok := svc.tryAcquireL4Pending("sb-a"); !ok {
+		t.Fatal("pending acquire after release rejected")
+	} else {
+		release()
+	}
+
+	releaseA, ok := svc.tryAcquireL4Pending("sb-a")
+	if !ok {
+		t.Fatal("pending acquire for sb-a rejected")
+	}
+	defer releaseA()
+	releaseB, ok := svc.tryAcquireL4Pending("sb-b")
+	if !ok {
+		t.Fatal("pending acquire for sb-b rejected")
+	}
+	defer releaseB()
+	if _, ok := svc.tryAcquireL4Pending("sb-c"); ok {
+		t.Fatal("global pending overflow accepted; want rejected")
+	}
+}
+
+func TestL4WakeActiveLimitRejectsOverflow(t *testing.T) {
+	svc := &Service{
+		cfg: config.Config{
+			L4WakeMaxActivePerSandbox: 1,
+			L4WakeMaxActiveGlobal:     2,
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	release, ok := svc.tryAcquireL4Active("sb-a")
+	if !ok {
+		t.Fatal("first active acquire rejected")
+	}
+	if _, ok := svc.tryAcquireL4Active("sb-a"); ok {
+		t.Fatal("second same-sandbox active acquire accepted; want rejected")
+	}
+	release()
+	if release, ok := svc.tryAcquireL4Active("sb-a"); !ok {
+		t.Fatal("active acquire after release rejected")
+	} else {
+		release()
+	}
+
+	releaseA, ok := svc.tryAcquireL4Active("sb-a")
+	if !ok {
+		t.Fatal("active acquire for sb-a rejected")
+	}
+	defer releaseA()
+	releaseB, ok := svc.tryAcquireL4Active("sb-b")
+	if !ok {
+		t.Fatal("active acquire for sb-b rejected")
+	}
+	defer releaseB()
+	if _, ok := svc.tryAcquireL4Active("sb-c"); ok {
+		t.Fatal("global active overflow accepted; want rejected")
+	}
+}
+
 // TestWakeFailureWindowSlides: failures more than wakeFailureWindow
 // apart must NOT accumulate — otherwise an hour of one-off blips
 // would trip the breaker even though the sandbox is healthy. This is

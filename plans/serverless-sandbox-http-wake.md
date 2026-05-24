@@ -847,6 +847,11 @@ extends the same `wake_armed` state machine to the layer4 surfaces:
 - started serverless sandboxes also use the wake-aware route shape. This keeps
   activity accounting on the sandboxd side and avoids route rewrites at idle
   time for the 100K-sandbox fleet case.
+- sandboxd sheds L4 bursts before they all wait on wake: pending wake
+  connections are capped per sandbox and per node, then active proxied L4
+  connections are also capped per sandbox and per node. One activity ticker per
+  active sandbox refreshes `last_active_at`; the existing touch coalescer still
+  collapses store writes to one per debounce window.
 - non-serverless sandboxes keep direct Caddy routes.
 
 This adds one shared TCP listener per node and one Unix listener per serverless
