@@ -9,6 +9,8 @@ export type {
   BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
+  CustomDomain,
+  CustomDomainStatus,
   ExecRequest,
   ExecResult,
   ExecExitInfo,

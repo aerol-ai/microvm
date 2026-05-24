@@ -26,6 +26,13 @@ When **not** to pick this:
 This feature does NOT change SDK behaviour, sandbox URL shape, or the wire
 protocol. End users see no difference.
 
+> **Required for custom domains in multi-node clusters.** The per-hostname
+> ACME flow described in [Custom Domains](../docs/src/content/docs/custom-domains.mdx)
+> issues one cert per user-supplied hostname. Without shared S3 storage,
+> each ingress node would race to issue the same cert and burn through
+> Let's Encrypt's `new-orders` per-account budget. Enable this before
+> turning on `SB_ENABLE_CUSTOM_DOMAINS` on any cluster larger than one node.
+
 ---
 
 ## How it works

@@ -371,6 +371,34 @@ func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 	return s.client.inner.UnexposePort(ctx, s.ID, port)
 }
 
+// AddCustomDomain attaches a public hostname (e.g. "api.acme.com") to this
+// sandbox. The server lowercases / trims and validates the hostname; the
+// returned slice is the full per-hostname row list, so callers can read the
+// canonical form and initial status without a follow-up GET.
+//
+// 412 Precondition Failed surfaces when the deployment is in IP mode or the
+// custom-domain feature is disabled. 409 Conflict surfaces when the hostname
+// is already attached to a different sandbox, or when the sandbox has any
+// tcp/tls-protocol exposed port (the IRON RULE: SNI cannot route per host on
+// a shared L4 listener).
+func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string) ([]sdktypes.CustomDomain, error) {
+	return s.client.inner.AddCustomDomain(ctx, s.ID, hostname)
+}
+
+// RemoveCustomDomain detaches a hostname previously attached via
+// AddCustomDomain or CreateSandboxOptions.CustomDomains. Case-insensitive;
+// the server normalizes before comparing.
+func (s *Sandbox) RemoveCustomDomain(ctx context.Context, hostname string) error {
+	return s.client.inner.RemoveCustomDomain(ctx, s.ID, hostname)
+}
+
+// ListCustomDomains returns the per-hostname rows currently attached to the
+// sandbox. Use this to poll Status (pending_dns → issuing → ready/failed)
+// after AddCustomDomain.
+func (s *Sandbox) ListCustomDomains(ctx context.Context) ([]sdktypes.CustomDomain, error) {
+	return s.client.inner.ListCustomDomains(ctx, s.ID)
+}
+
 func (s *Sandbox) CreateSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {
 	return s.client.CreateSnapshot(ctx, s.ID, name)
 }

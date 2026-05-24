@@ -831,6 +831,199 @@ test("internal client create with bare image string skips build call", async () 
   assert.ok(seenURLs[0].endsWith("/v1/sandboxes"));
 });
 
+test("internal client addCustomDomain POSTs hostname and parses list", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(
+        {
+          custom_domains: [
+            {
+              hostname: "api.acme.com",
+              status: "pending_dns",
+              created_at: "2026-05-24T10:00:00Z",
+              updated_at: "2026-05-24T10:00:00Z",
+            },
+          ],
+        },
+        201,
+      );
+    },
+  });
+
+  const domains = await client.addCustomDomain("sb-cd", "api.acme.com");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "POST");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-cd/custom-domains"));
+  assert.deepEqual(await seenRequest.json(), { hostname: "api.acme.com" });
+  assert.equal(domains.length, 1);
+  assert.equal(domains[0].hostname, "api.acme.com");
+  assert.equal(domains[0].status, "pending_dns");
+  assert.equal(domains[0].lastError, undefined);
+});
+
+test("internal client addCustomDomain preserves hostname case sent by caller", async () => {
+  let sentBody: { hostname?: string } | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      sentBody = (await req.json()) as { hostname?: string };
+      return jsonResponse({ custom_domains: [] }, 201);
+    },
+  });
+
+  await client.addCustomDomain("sb-cd", "API.Acme.COM");
+  assert.equal(sentBody?.hostname, "API.Acme.COM");
+});
+
+test("internal client listCustomDomains GETs and maps response", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        custom_domains: [
+          {
+            hostname: "a.example.com",
+            status: "ready",
+            created_at: "2026-05-24T10:00:00Z",
+            updated_at: "2026-05-24T10:05:00Z",
+          },
+          {
+            hostname: "b.example.com",
+            status: "failed",
+            last_error: "dns lookup failed",
+            created_at: "2026-05-24T10:01:00Z",
+            updated_at: "2026-05-24T10:06:00Z",
+          },
+        ],
+      });
+    },
+  });
+
+  const domains = await client.listCustomDomains("sb-cd");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-cd/custom-domains"));
+  assert.equal(domains.length, 2);
+  assert.equal(domains[0].status, "ready");
+  assert.equal(domains[1].status, "failed");
+  assert.equal(domains[1].lastError, "dns lookup failed");
+});
+
+test("internal client removeCustomDomain DELETEs encoded hostname and resolves void", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return new Response(null, { status: 204 });
+    },
+  });
+
+  const result = await client.removeCustomDomain("sb-cd", "weird host.example.com");
+  assert.equal(result, undefined);
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "DELETE");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-cd/custom-domains/weird%20host.example.com"));
+});
+
+test("internal client addCustomDomain throws with server status on conflict", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ error: "hostname already bound to another sandbox" }, 409),
+  });
+
+  await assert.rejects(
+    () => client.addCustomDomain("sb-cd", "api.acme.com"),
+    /hostname already bound/,
+  );
+});
+
+test("internal client addCustomDomain surfaces 412 precondition errors", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ error: "custom domains require SB_PUBLIC_DOMAIN" }, 412),
+  });
+
+  await assert.rejects(
+    () => client.addCustomDomain("sb-cd", "api.acme.com"),
+    /SB_PUBLIC_DOMAIN/,
+  );
+});
+
+test("sandbox resource customDomains accessor delegates to client", async () => {
+  const calls: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (req.url.endsWith("/v1/sandboxes/sb-cd")) {
+        return jsonResponse(apiSandbox("sb-cd"));
+      }
+      if (req.method === "POST" && req.url.endsWith("/custom-domains")) {
+        calls.push("add");
+        return jsonResponse(
+          {
+            custom_domains: [
+              {
+                hostname: "staging.acme.com",
+                status: "pending_dns",
+                created_at: "2026-05-24T10:00:00Z",
+                updated_at: "2026-05-24T10:00:00Z",
+              },
+            ],
+          },
+          201,
+        );
+      }
+      if (req.method === "GET" && req.url.endsWith("/custom-domains")) {
+        calls.push("list");
+        return jsonResponse({ custom_domains: [] });
+      }
+      if (req.method === "DELETE" && req.url.includes("/custom-domains/")) {
+        calls.push("remove");
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected ${req.method} ${req.url}`);
+    },
+  });
+
+  const sandbox = await client.get("sb-cd");
+  const added = await sandbox.customDomains.add("staging.acme.com");
+  assert.equal(added[0].hostname, "staging.acme.com");
+  await sandbox.customDomains.list();
+  await sandbox.customDomains.remove("staging.acme.com");
+  assert.deepEqual(calls, ["add", "list", "remove"]);
+});
+
+test("internal client create forwards customDomains as snake_case", async () => {
+  let body: { custom_domains?: unknown } | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      body = (await req.json()) as { custom_domains?: unknown };
+      return jsonResponse(apiSandbox("sb-cd-create"));
+    },
+  });
+
+  await client.create({ image: "ubuntu:22.04", customDomains: ["api.acme.com", "www.acme.com"] });
+  assert.deepEqual(body?.custom_domains, ["api.acme.com", "www.acme.com"]);
+});
+
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,

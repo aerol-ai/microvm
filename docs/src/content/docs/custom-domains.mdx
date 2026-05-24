@@ -1,0 +1,196 @@
+---
+title: Custom Domains
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Attach an arbitrary public hostname (`api.acme.com`, `acme.com`) to a sandbox so traffic to that host reaches the sandbox's root service over HTTPS. Certificates are issued automatically per hostname via ACME HTTP-01 — the wildcard cert that covers `*.<SB_DOMAIN>` is **not** reused.
+
+## Prerequisites
+
+1. **Domain mode is required.** The server must be started with `SB_DOMAIN` set. In IP / path-mode deployments the API returns `412 Precondition Failed`.
+2. **DNS must already point at the cluster's ingress host.** Create a `CNAME` (or `ALIAS` / `ANAME` for apex) from the custom hostname to the same target your sandbox URLs resolve to. AerolVM does not host DNS; if the record is missing when the first HTTPS request arrives, ACME issuance will fail and the domain stays in `issuing` until DNS is fixed.
+3. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope — they reject with `400 Bad Request` if a custom domain is configured.
+
+## Attach at create time
+
+Pass `customDomains` on the create call. Up to 5 hostnames per request; the server validates each one and rejects the entire create with `400` if any is malformed or already taken.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sb = await microvm.sandboxes.create({
+      image: "node:20",
+      customDomains: ["api.acme.com", "acme.com"],
+    });
+    for (const d of sb.customDomains ?? []) {
+      console.log(d.hostname, d.status); // "api.acme.com" "pending_dns"
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sb = microvm.create(CreateOptions(
+        image="node:20",
+        customDomains=["api.acme.com", "acme.com"],
+    ))
+    for d in sb.get("customDomains", []):
+        print(d["hostname"], d["status"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sb, err := client.CreateSandbox(ctx, &microvm.CreateOptions{
+        Image:         "node:20",
+        CustomDomains: []string{"api.acme.com", "acme.com"},
+    })
+    if err != nil { log.Fatal(err) }
+    for _, d := range sb.CustomDomains {
+        fmt.Println(d.Hostname, d.Status)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sb = client.create_sandbox(CreateOptions {
+        image: Some("node:20".into()),
+        custom_domains: Some(vec!["api.acme.com".into(), "acme.com".into()]),
+        ..Default::default()
+    })?;
+    for d in sb.custom_domains.unwrap_or_default() {
+        println!("{} {:?}", d.hostname, d.status);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sb = client.create(new CreateOptions()
+        .setImage("node:20")
+        .setCustomDomains(List.of("api.acme.com", "acme.com")));
+    for (CustomDomain d : sb.customDomains) {
+        System.out.println(d.hostname + " " + d.status);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Attach to a running sandbox
+
+The add call returns the post-attach list with the new row's `status` so callers don't need a follow-up `list`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const domains = await sandbox.customDomains.add("staging.acme.com");
+    console.log(domains.map(d => d.hostname));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    domains = sandbox.add_custom_domain("staging.acme.com")
+    print([d["hostname"] for d in domains])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    domains, err := sandbox.AddCustomDomain(ctx, "staging.acme.com")
+    if err != nil { log.Fatal(err) }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let domains = sandbox.add_custom_domain("staging.acme.com")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    List<CustomDomain> domains = sandbox.addCustomDomain("staging.acme.com");
+    ```
+  </TabItem>
+</Tabs>
+
+## Detach
+
+Detach removes the Caddy route and deletes the row. The issued certificate stays in Caddy's storage and ages out on renewal. Returns `404` if the hostname is not attached to this sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.customDomains.remove("acme.com");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.remove_custom_domain("acme.com")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.RemoveCustomDomain(ctx, "acme.com")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.remove_custom_domain("acme.com")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.removeCustomDomain("acme.com");
+    ```
+  </TabItem>
+</Tabs>
+
+## List
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const domains = await sandbox.customDomains.list();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    domains = sandbox.list_custom_domains()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    domains, err := sandbox.ListCustomDomains(ctx)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let domains = sandbox.list_custom_domains()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    List<CustomDomain> domains = sandbox.listCustomDomains();
+    ```
+  </TabItem>
+</Tabs>
+
+## Status lifecycle
+
+Each attached hostname carries a `status` that reflects where Caddy is in the per-host ACME flow. Poll `list` (or re-read the sandbox) to observe transitions — there is no push notification.
+
+| Status | Meaning |
+|---|---|
+| `pending_dns` | Row exists, no TLS handshake seen for this host yet. Either DNS isn't pointed yet, or no client has connected. |
+| `issuing` | Caddy has started the ACME flow (first HTTPS hit arrived). HTTP-01 challenge in progress. |
+| `ready` | Certificate is in Caddy storage and serving traffic. |
+| `failed` | ACME gave up. `lastError` carries the reason — usually DNS still wrong, or LE rate-limited. Detach + reattach after fixing DNS to retry. |
+
+## Errors
+
+| Status | When |
+|---|---|
+| `400 Bad Request` | Hostname is malformed, includes a port, or matches a TCP/TLS-only sandbox port. |
+| `409 Conflict` | The hostname is already attached to a different sandbox. Hostnames are globally unique across the cluster. |
+| `412 Precondition Failed` | The server runs in IP mode (`SB_DOMAIN` unset). Custom domains require domain mode. |
+| `429 Too Many Requests` | The daemon-wide ACME issuance budget is exhausted (LE `new-orders` per-account limit nearing 80% of 300/3h). Honour `Retry-After` and try again. |
+
+## Cluster mode
+
+In multi-node clusters the hostname-to-sandbox mapping is replicated through Raft, so any ingress node accepts traffic for a custom domain regardless of which node owns the sandbox. Non-owner ingress nodes pass TLS through to the owner over SNI. The shared `certmagic-s3` cert store means only one node performs the ACME flow per hostname — see [multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md) for the storage / lock layout.

@@ -865,5 +865,163 @@ class ListFilterTests(unittest.TestCase):
             self.assertEqual(path, "/v1/sandboxes")
 
 
+class CustomDomainsTests(unittest.TestCase):
+    """Mirrors the wire shape of the custom-domains endpoints
+    (POST/GET/DELETE /v1/sandboxes/{id}/custom-domains[...]).
+    """
+
+    def _client(self, *, post_status=201, post_body=None, get_body=None, delete_status=204):
+        captured = {"calls": []}
+
+        class FakeMicroVM(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                captured["calls"].append((method, path, payload))
+                if method == "POST" and path.endswith("/custom-domains"):
+                    if post_status >= 400:
+                        raise client_module.MicroVMHTTPError(post_status, "boom")
+                    return post_body or {"custom_domains": []}
+                if method == "GET" and path.endswith("/custom-domains"):
+                    return get_body or {"custom_domains": []}
+                if method == "DELETE" and "/custom-domains/" in path:
+                    if delete_status >= 400:
+                        raise client_module.MicroVMHTTPError(delete_status, "boom")
+                    return {}
+                raise AssertionError(f"unexpected call: {method} {path}")
+
+        return FakeMicroVM(), captured
+
+    def test_add_custom_domain_returns_list_and_sends_body(self):
+        client, captured = self._client(
+            post_body={
+                "custom_domains": [
+                    {
+                        "hostname": "api.acme.com",
+                        "status": "pending_dns",
+                        "created_at": "2026-05-25T10:00:00Z",
+                        "updated_at": "2026-05-25T10:00:00Z",
+                    }
+                ]
+            },
+        )
+
+        domains = client.add_custom_domain("sb-1", "api.acme.com")
+
+        self.assertEqual(
+            captured["calls"][0],
+            ("POST", "/v1/sandboxes/sb-1/custom-domains", {"hostname": "api.acme.com"}),
+        )
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0]["hostname"], "api.acme.com")
+        self.assertEqual(domains[0]["status"], "pending_dns")
+        self.assertEqual(domains[0]["createdAt"], "2026-05-25T10:00:00Z")
+        self.assertNotIn("lastError", domains[0])
+
+    def test_add_custom_domain_preserves_hostname_case(self):
+        # Case is forwarded as-passed; the server normalizes. The SDK must not
+        # lowercase locally or the wire payload diverges from caller intent.
+        client, captured = self._client(post_body={"custom_domains": []})
+        client.add_custom_domain("sb-1", "API.AcMe.COM")
+        self.assertEqual(captured["calls"][0][2], {"hostname": "API.AcMe.COM"})
+
+    def test_list_custom_domains_maps_response_shape(self):
+        client, captured = self._client(
+            get_body={
+                "custom_domains": [
+                    {
+                        "hostname": "a.acme.com",
+                        "status": "ready",
+                        "created_at": "2026-05-24T10:00:00Z",
+                        "updated_at": "2026-05-25T10:00:00Z",
+                    },
+                    {
+                        "hostname": "b.acme.com",
+                        "status": "failed",
+                        "last_error": "challenge timeout",
+                        "created_at": "2026-05-24T10:00:00Z",
+                        "updated_at": "2026-05-25T10:01:00Z",
+                    },
+                ]
+            },
+        )
+
+        domains = client.list_custom_domains("sb-1")
+
+        self.assertEqual(captured["calls"][0], ("GET", "/v1/sandboxes/sb-1/custom-domains", None))
+        self.assertEqual(len(domains), 2)
+        self.assertEqual(domains[0]["status"], "ready")
+        self.assertNotIn("lastError", domains[0])
+        self.assertEqual(domains[1]["status"], "failed")
+        self.assertEqual(domains[1]["lastError"], "challenge timeout")
+
+    def test_remove_custom_domain_returns_none_and_url_encodes_host(self):
+        client, captured = self._client()
+        # Hostname with characters that require percent-encoding to round-trip.
+        result = client.remove_custom_domain("sb-1", "weird host/.example.com")
+        self.assertIsNone(result)
+        method, path, payload = captured["calls"][0]
+        self.assertEqual(method, "DELETE")
+        self.assertEqual(payload, None)
+        self.assertEqual(
+            path,
+            "/v1/sandboxes/sb-1/custom-domains/weird%20host%2F.example.com",
+        )
+
+    def test_add_custom_domain_propagates_409_protocol_conflict(self):
+        client, _ = self._client(post_status=409)
+        with self.assertRaises(client_module.MicroVMHTTPError) as ctx:
+            client.add_custom_domain("sb-1", "api.acme.com")
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_add_custom_domain_propagates_412_not_supported(self):
+        client, _ = self._client(post_status=412)
+        with self.assertRaises(client_module.MicroVMHTTPError) as ctx:
+            client.add_custom_domain("sb-1", "api.acme.com")
+        self.assertEqual(ctx.exception.status_code, 412)
+
+    def test_sandbox_methods_delegate_to_client(self):
+        client, captured = self._client(
+            post_body={
+                "custom_domains": [
+                    {
+                        "hostname": "api.acme.com",
+                        "status": "pending_dns",
+                        "created_at": "2026-05-25T10:00:00Z",
+                        "updated_at": "2026-05-25T10:00:00Z",
+                    }
+                ]
+            },
+        )
+        # Construct a Sandbox without a create roundtrip.
+        sandbox = client_module.Sandbox(client, {"id": "sb-1"})
+
+        sandbox.add_custom_domain("api.acme.com")
+        sandbox.list_custom_domains()
+        sandbox.remove_custom_domain("api.acme.com")
+
+        self.assertEqual(
+            [(m, p) for (m, p, _) in captured["calls"]],
+            [
+                ("POST", "/v1/sandboxes/sb-1/custom-domains"),
+                ("GET", "/v1/sandboxes/sb-1/custom-domains"),
+                ("DELETE", "/v1/sandboxes/sb-1/custom-domains/api.acme.com"),
+            ],
+        )
+
+    def test_create_forwards_custom_domains_list(self):
+        client = RecordingMicroVM()
+        client.create(
+            {
+                "image": "ubuntu:22.04",
+                "customDomains": ["api.acme.com", "edge.acme.com"],
+            }
+        )
+        method, path, payload = client.calls[0]
+        self.assertEqual((method, path), ("POST", "/v1/sandboxes"))
+        self.assertEqual(payload["custom_domains"], ["api.acme.com", "edge.acme.com"])
+
+
 if __name__ == "__main__":
     unittest.main()

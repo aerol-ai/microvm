@@ -186,6 +186,13 @@ export interface CreateOptions {
    * Not compatible with runtime="gvisor".
    */
   gpus?: GPUOptions;
+  /**
+   * Custom hostnames to bind to this sandbox at create-time. Each entry is
+   * lowercased server-side and progresses through the standard custom-domain
+   * lifecycle (pending_dns → issuing → ready). Equivalent to calling
+   * `sandbox.customDomains.add(host)` for each entry after create.
+   */
+  customDomains?: string[];
 }
 
 export interface ResizeOptions {
@@ -240,6 +247,23 @@ export interface ExposedPort {
   port: number;
   publicURL: string;
   createdAt: string;
+}
+
+/**
+ * Lifecycle states for a per-sandbox custom hostname.
+ *  - "pending_dns": hostname registered; awaiting DNS to point at the daemon.
+ *  - "issuing":     DNS resolves; Caddy is acquiring an ACME certificate.
+ *  - "ready":       certificate issued; traffic served end-to-end on the host.
+ *  - "failed":      ACME or DNS validation failed; see `lastError`.
+ */
+export type CustomDomainStatus = "pending_dns" | "issuing" | "ready" | "failed";
+
+export interface CustomDomain {
+  hostname: string;
+  status: CustomDomainStatus;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /**

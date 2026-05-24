@@ -30,6 +30,7 @@ fn main() {
             failover: None,
             runtime: None,
             gpus: None,
+            custom_domains: None,
         })
         .expect("sandbox creation failed");
 

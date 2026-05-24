@@ -71,6 +71,22 @@ const (
 type NetworkUsage = models.NetworkUsage
 type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
 
+// CustomDomain is the per-hostname row attached to a sandbox. Status moves
+// pending_dns → issuing → ready (or failed), driven server-side by Caddy's
+// on-demand TLS asks; clients read but never write Status.
+type CustomDomain = models.CustomDomain
+
+// CustomDomainStatus enumerates the lifecycle states surfaced on
+// CustomDomain.Status.
+type CustomDomainStatus = models.CustomDomainStatus
+
+const (
+	CustomDomainPendingDNS = models.CustomDomainPendingDNS
+	CustomDomainIssuing    = models.CustomDomainIssuing
+	CustomDomainReady      = models.CustomDomainReady
+	CustomDomainFailed     = models.CustomDomainFailed
+)
+
 // BuildImagePushOptions describes the per-request push directive for
 // Client.BuildImageWithOptions. Credentials are forwarded to the daemon
 // as a one-shot X-Registry-Auth header on the push call and are never

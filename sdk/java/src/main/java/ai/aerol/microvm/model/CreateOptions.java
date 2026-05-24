@@ -29,6 +29,15 @@ public class CreateOptions {
     public String runtime;
     /** Attach GPU resources to the sandbox. Null means no GPU (CPU-only). */
     public GpuOptions gpus;
+    /**
+     * Operator-supplied hostnames to attach to the sandbox's HTTP entrypoint
+     * at creation time. Each entry travels through the same lifecycle as
+     * {@link ai.aerol.microvm.MicroVMClient#addCustomDomain(String, String)}
+     * (pending_dns → issuing → ready). The server lowercases each entry on
+     * write.
+     */
+    @JsonProperty("custom_domains")
+    public List<String> customDomains;
 
     public CreateOptions setImage(String image) {
         this.image = image;
@@ -107,6 +116,11 @@ public class CreateOptions {
 
     public CreateOptions setGpus(GpuOptions gpus) {
         this.gpus = gpus;
+        return this;
+    }
+
+    public CreateOptions setCustomDomains(List<String> customDomains) {
+        this.customDomains = customDomains;
         return this;
     }
 }
