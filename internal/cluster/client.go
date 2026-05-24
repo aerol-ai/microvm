@@ -771,8 +771,8 @@ func (c *Cluster) IsNodeDrained(nodeID string) bool {
 }
 
 // AssertOwnership reconciles local sandbox state against the cluster FSM at
-// boot. Used at boot. Idempotent. Best-effort: errors are logged but do not
-// abort boot — the next reconcile loop will retry.
+// boot. Used at boot. Idempotent. Best-effort callers should log errors and
+// retry later.
 //
 // Three-way decision per local row, with the FSM as the source of truth for
 // ownership (never overwrite an existing non-self owner):
@@ -810,10 +810,12 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 		return nil
 	}
 	// Wait briefly for a leader to exist so we can apply. If no leader emerges
-	// (e.g. fresh non-bootstrap node still joining), defer to reconcile.
+	// (e.g. fresh non-bootstrap node still joining), report the failure so the
+	// caller can retry instead of permanently leaving local rows out of the
+	// placement index.
 	if err := c.waitForLeader(ctx, 10*time.Second); err != nil {
 		c.logger.Warn("cluster: AssertOwnership skipped, no leader yet", "err", err)
-		return nil
+		return err
 	}
 	var firstErr error
 	for _, st := range local {
@@ -830,6 +832,16 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				firstErr = err
 			}
 			// Replay port intents so the FSM matches local truth.
+			for port, route := range st.ExposedPorts {
+				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+
+		case existing.OwnerNodeID == c.nodeID && !existing.IsOrphaned() && existing.IsReserved():
+			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
+				firstErr = err
+			}
 			for port, route := range st.ExposedPorts {
 				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
 					firstErr = err

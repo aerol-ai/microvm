@@ -95,6 +95,56 @@ func TestAssertOwnershipBackfillsMissingSpec(t *testing.T) {
 	}
 }
 
+func TestAssertOwnershipPromotesSelfReservation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	cmd := command{
+		Op:          opReserve,
+		SandboxID:   "sb-reserved-local",
+		OwnerNodeID: "leader",
+		Spec:        &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
+		ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+	}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("seed opReserve: %v", err)
+	}
+	before, ok := c.fsm.get("sb-reserved-local")
+	if !ok || !before.IsReserved() {
+		t.Fatalf("seed placement = %+v, want reserved", before)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	local := []LocalSandboxState{{
+		ID:           "sb-reserved-local",
+		Spec:         &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
+		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
+	}}
+	if err := c.AssertOwnership(ctx, local); err != nil {
+		t.Fatalf("AssertOwnership: %v", err)
+	}
+
+	after, ok := c.fsm.get("sb-reserved-local")
+	if !ok {
+		t.Fatal("placement disappeared")
+	}
+	if after.IsReserved() {
+		t.Fatalf("reservation was not promoted: %+v", after)
+	}
+	if after.ExpiresUnix != 0 {
+		t.Fatalf("promoted placement kept reservation expiry: %+v", after)
+	}
+	if after.ExposedPorts[8080] != "http" {
+		t.Fatalf("port intent not replayed on promote: %+v", after.ExposedPorts)
+	}
+}
+
 // TestAssertOwnershipDoesNotReclaimForeignOwnedPlacement is the
 // failover-recovery regression. Scenario:
 //
