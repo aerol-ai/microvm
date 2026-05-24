@@ -290,6 +290,16 @@ func main() {
 		}
 	}
 
+	// Start the Caddy admin write coalescer on worker nodes so
+	// installHTTPPortRoute's Flush path has the periodic-drain safety
+	// net for any stranded ops (Flush callers whose ctx cancelled
+	// before drain finished). Worker-only: non-worker nodes don't
+	// install per-sandbox Caddy routes. See
+	// plans/warm-direct-route-bypass.md D6/D12.
+	if cfg.IsWorker() {
+		svc.StartCaddyCoalescer(ctx)
+	}
+
 	// AutoReconcile / lifecycle sweep / event monitor / built-image GC are all
 	// worker-side concerns — they reach into Docker, sandbox rows, and
 	// per-container caddy routes. Pure server/ingress nodes have neither
@@ -416,6 +426,10 @@ func main() {
 			logger.Warn("ingress proxy graceful shutdown failed", "error", err)
 		}
 	}
+	// Drain any pending Caddy admin writes before the process exits so
+	// the last batch of route changes is not silently dropped. No-op on
+	// nodes that never started the coalescer.
+	svc.StopCaddyCoalescer()
 }
 
 func replayClusterOwnership(ctx context.Context, svc *service.Service, logger *slog.Logger) bool {

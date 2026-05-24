@@ -203,6 +203,31 @@ type Config struct {
 	// Default 250ms; lower bound is the per-write latency budget the
 	// node can tolerate before reconcile starts looking stale.
 	CaddyCoalesceInterval time.Duration
+	// L4WakeDirectBypassEnabled is the Phase 2 sibling of
+	// HTTPWakeDirectBypassEnabled — same shape decision applied to
+	// TCP and TLS exposures. False (default) keeps today's behavior
+	// where every warm L4 byte is proxied through sandboxd's
+	// proxyL4WakeConn path; true flips warm sandboxes to a direct
+	// Caddy → container route and lets sandboxd's L4 active-connection
+	// accounting become a cold-path-only counter. Gated separately
+	// from the HTTP flag so each protocol can be canaried independently
+	// (per plan §Phase 2: TCP/TLS may ship only after HTTP has been
+	// default-on for two cycles). When either flag is enabled, the
+	// idle sweep's netstats activity floor and stale-poll fallback
+	// (D3/D4) become active — netstats observes container interface
+	// bytes regardless of protocol so the floor covers both layers
+	// with one mechanism. See plans/warm-direct-route-bypass.md
+	// §Phase 2.
+	L4WakeDirectBypassEnabled bool
+	// TLSWakeListenerCloseDelay is the grace window between PATCHing a
+	// TLS-SNI route from wake-aware to direct and closing the per-
+	// exposure Unix socket. D2 of the bypass plan: a TLS handshake that
+	// started against the wake-aware route may still be in flight when
+	// PATCH lands; closing the socket immediately drops that handshake
+	// mid-stream. 5s is enough for any reasonable handshake to complete
+	// while keeping the socket short-lived enough that a flap doesn't
+	// stack up listener FDs. Only consulted when L4WakeDirectBypassEnabled.
+	TLSWakeListenerCloseDelay time.Duration
 	// WakeStartConcurrency caps concurrent StartSandbox invocations
 	// initiated by the wake path across the whole node. Inside the global
 	// HTTP+L4 pending caps, up to (HTTPWakeMaxPendingGlobal +
@@ -628,6 +653,8 @@ func Load() (Config, error) {
 		HTTPWakeDirectBypassEnabled:      getEnvBool("SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED", false),
 		HTTPWakeDirectRouteRetryDuration: getEnvDuration("SB_HTTP_WAKE_DIRECT_ROUTE_RETRY_DURATION", 2*time.Second),
 		CaddyCoalesceInterval:            getEnvDuration("SB_CADDY_COALESCE_INTERVAL", 250*time.Millisecond),
+		L4WakeDirectBypassEnabled:        getEnvBool("SB_L4_WAKE_DIRECT_BYPASS_ENABLED", false),
+		TLSWakeListenerCloseDelay:        getEnvDuration("SB_TLS_WAKE_LISTENER_CLOSE_DELAY", 5*time.Second),
 		SSHListenAddr:                    getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:                   getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:          strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),

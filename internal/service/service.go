@@ -90,7 +90,16 @@ type Service struct {
 	l4WakeMu   sync.Mutex
 	l4WakeTCP  net.Listener
 	l4WakeTLS  map[string]net.Listener
-	l4LimitMu  sync.Mutex
+	// pendingTLSClose holds the in-flight delayed-close timers for TLS
+	// wake sockets keyed by (id, port). D2 of warm-direct-route-bypass:
+	// on warm→cold (Started → wake-shape PATCH), the listener stays alive
+	// for cfg.TLSWakeListenerCloseDelay so a TLS handshake started against
+	// the wake-aware route can complete before the socket goes away.
+	// ensureTLSWakeListener cancels any pending timer on its key so a
+	// rapid cold→warm→cold flip doesn't tear down a socket that the new
+	// wake route depends on.
+	pendingTLSClose map[string]*time.Timer
+	l4LimitMu       sync.Mutex
 	// pending counts L4 connections waiting for wake/target resolution.
 	// active counts connections already admitted to proxy bytes. Keeping both
 	// lets cold-start bursts shed excess work without blocking unrelated warm
@@ -203,6 +212,19 @@ type Service struct {
 	touchCoalescer     *touchCoalescer
 	touchCoalescerOnce sync.Once
 
+	// caddyCoalescer batches Caddy admin writes for the same (id, port)
+	// so a rapid wake→stop→wake sequence collapses to one admin call.
+	// installHTTPPortRoute routes through Flush so callers still observe
+	// synchronous errors, while concurrent callers for the same key
+	// coalesce into a single admin write per drain. The periodic Run
+	// goroutine (started from cmd/sandboxd/main.go) drains any
+	// fire-and-forget Enqueues left over after the daemon idles. Same
+	// lazy-init pattern as touchCoalescer so &Service{...} literals in
+	// tests still work — see plans/warm-direct-route-bypass.md D6/D12.
+	caddyCoalescer        *caddyCoalescer
+	caddyCoalescerOnce    sync.Once
+	caddyCoalescerStarted atomic.Bool
+
 	// ingressLastHash is the hash of the placement view that the last
 	// successful cluster-ingress reconcile installed. The reconciler hashes
 	// the next view and skips work when unchanged — this is the cheap idle
@@ -235,6 +257,7 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		cluster: cluster.NewNoop("standalone", ""),
 	}
 	s.ensureTouchCoalescer()
+	s.ensureCaddyCoalescer()
 	return s
 }
 
@@ -249,6 +272,42 @@ func (s *Service) ensureTouchCoalescer() {
 			return s.store.Touch(ctx, id, at)
 		})
 	})
+}
+
+// ensureCaddyCoalescer lazily constructs the per-(id,port) Caddy write
+// batcher. Same rationale as ensureTouchCoalescer: &Service{...} test
+// literals skip New(), so installHTTPPortRoute initializes on demand.
+// Tick falls back to the 250ms default when cfg.CaddyCoalesceInterval
+// is zero — that covers test harnesses that don't populate cfg.
+func (s *Service) ensureCaddyCoalescer() {
+	s.caddyCoalescerOnce.Do(func() {
+		s.caddyCoalescer = newCaddyCoalescer(s.logger, s.cfg.CaddyCoalesceInterval)
+	})
+}
+
+// StartCaddyCoalescer starts the periodic-drain goroutine. Called once
+// from cmd/sandboxd/main.go after svc.New on worker nodes. Flush-only
+// callers (installHTTPPortRoute today) don't strictly need this — Flush
+// drives its own drain — but the ticker is the safety net for any
+// future Enqueue (fire-and-forget) callsites and for ops that get
+// stranded when a Flush caller's ctx cancels mid-drain.
+func (s *Service) StartCaddyCoalescer(ctx context.Context) {
+	s.ensureCaddyCoalescer()
+	if !s.caddyCoalescerStarted.CompareAndSwap(false, true) {
+		return
+	}
+	go s.caddyCoalescer.Run(ctx)
+}
+
+// StopCaddyCoalescer drains any pending op and exits the Run goroutine.
+// No-op when StartCaddyCoalescer was never called — caddyCoalescer.Stop
+// blocks on c.done which is only closed by Run, so calling it without
+// a prior Start would hang shutdown.
+func (s *Service) StopCaddyCoalescer() {
+	if !s.caddyCoalescerStarted.CompareAndSwap(true, false) {
+		return
+	}
+	s.caddyCoalescer.Stop()
 }
 
 // AttachCluster swaps in a cluster.Client. Called from cmd/sandboxd/main after
@@ -1781,8 +1840,32 @@ func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sa
 // Shape selection is delegated to chooseRouteShape so reconcile,
 // lifecycle, and event paths share one source of truth — see
 // plans/warm-direct-route-bypass.md D7/D8.
+//
+// Routed through caddyCoalescer.Flush so concurrent callers targeting
+// the same (id, port) collapse into one admin write. Flush preserves
+// the synchronous error contract callers (ExposePort, reconcile, the
+// rollback path) depend on; an op superseded by a later Enqueue/Flush
+// for the same key returns nil to the prior waiter, which is correct
+// because the newer intent represents the same converged state the
+// caller wanted. See plans/warm-direct-route-bypass.md D6/D12.
 func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
-	switch s.chooseRouteShape(sandbox) {
+	s.ensureCaddyCoalescer()
+	// Snapshot the sandbox row by value so a concurrent mutation
+	// (Status flip, ContainerIP rebind) between Flush enqueue and the
+	// drain's invocation of `do` cannot change the intent the caller
+	// asked for. The closure must operate on a stable view.
+	snapshot := *sandbox
+	return s.caddyCoalescer.Flush(ctx, sandbox.ID, port, func() error {
+		return s.applyHTTPPortRoute(ctx, &snapshot, port)
+	})
+}
+
+// applyHTTPPortRoute performs the actual Caddy admin writes for one
+// (sandbox, port) install intent. Extracted from installHTTPPortRoute
+// so the coalescer's drain can invoke it with a stable sandbox
+// snapshot. Not called directly outside the coalescer path.
+func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
 	case RouteShapeDirect:
 		// Non-serverless callers (and serverless-bypass-off callers)
 		// fall through to UpsertPortRoute byte-for-byte, so the
@@ -1820,22 +1903,55 @@ func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sand
 	return nil
 }
 
+// installTCPPortRoute publishes the correct L4-TCP server config for
+// the (sandbox, port, hostPort) tuple based on chooseRouteShape. Today
+// (bypass off) every serverless sandbox still gets the wake-aware
+// shape — chooseRouteShape short-circuits to Wake when
+// L4WakeDirectBypassEnabled=false, preserving pre-Phase-2 behavior.
+// With the flag on, warm serverless TCP exposures publish a direct
+// upstream and stopped-unarmed sandboxes drop the L4 server entirely.
 func (s *Service) installTCPPortRoute(ctx context.Context, sandbox *models.Sandbox, port, hostPort int) error {
 	if err := s.EnsureLayer4Ready(ctx); err != nil {
 		return err
 	}
-	if s.serverlessWakeEnabled(sandbox) {
+	switch s.chooseRouteShape(sandbox, RouteKindL4) {
+	case RouteShapeDirect:
+		return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
+	case RouteShapeWake:
 		return s.caddy.UpsertWakeTCPRoute(ctx, sandbox.ID, port, hostPort, s.cfg.InternalL4WakeAddr)
+	case RouteShapeNone:
+		return s.caddy.DeleteTCPRoute(ctx, hostPort)
 	}
-	return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
+	return nil
 }
 
+// installTLSPortRoute publishes the correct TLS-SNI route for the
+// (sandbox, port) tuple based on chooseRouteShape. The Unix-socket
+// lifecycle is intertwined with the route shape:
+//
+//   - Direct shape: PATCH first, then schedule a delayed close on the
+//     wake listener (D2 — a TLS handshake started against the prior
+//     wake route may still be in flight when PATCH lands; closing the
+//     socket immediately drops that handshake).
+//   - Wake shape: create the socket first so the upstream is reachable
+//     the instant Caddy PATCHes the route to point at it; roll back the
+//     socket on PATCH failure to avoid leaking a listener with no live
+//     route.
+//   - None: delete the route then close the socket; both are
+//     idempotent.
 func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
 	if err := s.EnsureLayer4Ready(ctx); err != nil {
 		return err
 	}
 	sniHost := s.caddy.SNIHost(sandbox.ID, port)
-	if s.serverlessWakeEnabled(sandbox) {
+	switch s.chooseRouteShape(sandbox, RouteKindL4) {
+	case RouteShapeDirect:
+		if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {
+			return err
+		}
+		s.scheduleTLSWakeListenerClose(sandbox.ID, port, s.cfg.TLSWakeListenerCloseDelay)
+		return nil
+	case RouteShapeWake:
 		socketPath, err := s.ensureTLSWakeListener(sandbox.ID, port)
 		if err != nil {
 			return err
@@ -1845,11 +1961,13 @@ func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandb
 			return err
 		}
 		return nil
+	case RouteShapeNone:
+		if err := s.caddy.DeleteTLSSNIRoute(ctx, sandbox.ID, port); err != nil {
+			return err
+		}
+		s.closeTLSWakeListener(sandbox.ID, port)
+		return nil
 	}
-	if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {
-		return err
-	}
-	s.closeTLSWakeListener(sandbox.ID, port)
 	return nil
 }
 
@@ -2472,19 +2590,22 @@ const (
 
 // activityFloorFor computes the timestamp the lifecycle sweep should
 // treat as the sandbox's most recent activity. Default is
-// sandbox.LastActiveAt; when HTTPWakeDirectBypassEnabled and the
-// netstats poller has a recorded non-zero BytesIn delta more recent
-// than LastActiveAt, the netstats timestamp wins so warm traffic that
-// bypasses sandboxd does not get false-idle-stopped. When the most
-// recent netstats poll failed (netstatsFallback=true), we fall back
-// to LastActiveAt alone for this tick to avoid stopping busy sandboxes
-// on a docker-stats outage (D3).
+// sandbox.LastActiveAt; when any warm-direct bypass is enabled (HTTP or
+// L4) and the netstats poller has a recorded non-zero BytesIn delta
+// more recent than LastActiveAt, the netstats timestamp wins so warm
+// traffic that bypasses sandboxd does not get false-idle-stopped.
+// Netstats observes container interface bytes regardless of protocol,
+// so one floor covers HTTP + L4 with a single mechanism — the OR over
+// both flags is what makes Phase 2 (L4 bypass) safe to enable without
+// also flipping HTTP. When the most recent netstats poll failed
+// (netstatsFallback=true), we fall back to LastActiveAt alone for this
+// tick to avoid stopping busy sandboxes on a docker-stats outage (D3).
 func (s *Service) activityFloorFor(sandbox *models.Sandbox, netstatsFallback bool) time.Time {
 	if sandbox == nil {
 		return time.Time{}
 	}
 	floor := sandbox.LastActiveAt
-	if !s.cfg.HTTPWakeDirectBypassEnabled || netstatsFallback {
+	if !s.anyBypassEnabled() || netstatsFallback {
 		return floor
 	}
 	if observed := s.netstatsRecentBytesInAt(sandbox.ID); !observed.IsZero() && observed.After(floor) {
@@ -2504,7 +2625,7 @@ func (s *Service) activityFloorFor(sandbox *models.Sandbox, netstatsFallback boo
 // the start path itself updates LastActiveAt, so falling back is the
 // correct conservative answer).
 func (s *Service) netstatsPollIsStale(now time.Time) bool {
-	if !s.cfg.HTTPWakeDirectBypassEnabled {
+	if !s.anyBypassEnabled() {
 		return false
 	}
 	if s.cfg.NetstatsPollInterval <= 0 {

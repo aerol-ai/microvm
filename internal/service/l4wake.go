@@ -406,6 +406,13 @@ func (s *Service) ensureTLSWakeListener(id string, port int) (string, error) {
 
 	s.l4WakeMu.Lock()
 	defer s.l4WakeMu.Unlock()
+	// A cold→warm→cold flip within the D2 grace window must not leave a
+	// timer pending against this key: when it fires it would close the
+	// listener the new wake route now depends on.
+	if t, ok := s.pendingTLSClose[key]; ok {
+		t.Stop()
+		delete(s.pendingTLSClose, key)
+	}
 	if s.l4WakeTLS == nil {
 		s.l4WakeTLS = make(map[string]net.Listener)
 	}
@@ -448,12 +455,61 @@ func (s *Service) closeTLSWakeListener(id string, port int) {
 	path := s.tlsWakeSocketPath(id, port)
 
 	s.l4WakeMu.Lock()
+	if t, ok := s.pendingTLSClose[key]; ok {
+		t.Stop()
+		delete(s.pendingTLSClose, key)
+	}
 	if ln, ok := s.l4WakeTLS[key]; ok {
 		_ = ln.Close()
 		delete(s.l4WakeTLS, key)
 	}
 	s.l4WakeMu.Unlock()
 	_ = os.Remove(path)
+}
+
+// scheduleTLSWakeListenerClose defers a closeTLSWakeListener call by
+// delay so a TLS handshake started against the wake-aware route (which
+// terminates on the per-exposure Unix socket) can complete before the
+// listener goes away. D2 of warm-direct-route-bypass: PATCHing the
+// route from wake-aware to direct flips Caddy's view immediately, but
+// any handshake mid-stream when PATCH lands is still talking to the
+// socket — closing it synchronously drops that connection mid-TLS.
+//
+// If delay is non-positive (or the bypass flag is off, leaving the
+// helper to act like closeTLSWakeListener), the close runs inline so
+// tests can poke the lifecycle without sleeping. Any pending timer for
+// the same key is replaced — the most recent direct transition is the
+// one whose grace window applies.
+func (s *Service) scheduleTLSWakeListenerClose(id string, port int, delay time.Duration) {
+	if delay <= 0 {
+		s.closeTLSWakeListener(id, port)
+		return
+	}
+	key := tlsWakeKey(id, port)
+	s.l4WakeMu.Lock()
+	defer s.l4WakeMu.Unlock()
+	if s.pendingTLSClose == nil {
+		s.pendingTLSClose = make(map[string]*time.Timer)
+	}
+	if t, ok := s.pendingTLSClose[key]; ok {
+		t.Stop()
+	}
+	s.pendingTLSClose[key] = time.AfterFunc(delay, func() {
+		// Re-check inside the mutex that this timer is still the
+		// authoritative one for the key. A cold→warm→cold sequence may
+		// have replaced it; in that case the newer schedule (or
+		// ensureTLSWakeListener's cancellation) already owns the
+		// lifecycle decision and we must not double-close.
+		s.l4WakeMu.Lock()
+		current, ok := s.pendingTLSClose[key]
+		if !ok || current == nil {
+			s.l4WakeMu.Unlock()
+			return
+		}
+		delete(s.pendingTLSClose, key)
+		s.l4WakeMu.Unlock()
+		s.closeTLSWakeListener(id, port)
+	})
 }
 
 func (s *Service) closeAllTLSWakeListeners() {
