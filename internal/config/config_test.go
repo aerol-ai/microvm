@@ -231,6 +231,53 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			// The wake ingress proxies carry no auth and trust that Caddy
+			// on localhost is their only client. Overriding the listen
+			// address to a routable interface would silently publish an
+			// unauthenticated endpoint that can wake any sandbox by ID;
+			// boot must refuse rather than start in that state.
+			name: "serverless_rejects_non_loopback_ingress_addr",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "0.0.0.0:21213")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_INTERNAL_INGRESS_ADDR") {
+					t.Fatalf("expected SB_INTERNAL_INGRESS_ADDR loopback error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "serverless_rejects_non_loopback_l4_wake_addr",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "192.168.1.10:21214")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_INTERNAL_L4_WAKE_ADDR") {
+					t.Fatalf("expected SB_INTERNAL_L4_WAKE_ADDR loopback error, got %v", err)
+				}
+			},
+		},
+		{
+			// "localhost" and ::1 are both legitimate loopback bindings;
+			// the validator must accept them so operators aren't forced
+			// into a specific spelling.
+			name: "serverless_accepts_localhost_and_ipv6_loopback",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "localhost:21213")
+				t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "[::1]:21214")
+				if _, err := Load(); err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+			},
+		},
+		{
 			name: "accepts_gvisor_runtime",
 			run: func(t *testing.T) {
 				clearEnv(t)

@@ -110,13 +110,13 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 
 	// Activity at request start: bump last_active_at so the lifecycle
 	// idle sweep does not stop a sandbox currently serving traffic.
-	// Then a 30s ticker keeps it alive for the duration of any
-	// long-lived connection (WebSocket, SSE, long-poll). Errors are
-	// swallowed — failing to touch should never break the request.
+	// For long-lived connections (WebSocket, SSE, long-poll) we keep
+	// touching every activityTickInterval. Short requests that finish
+	// before the first interval pay only a timer-heap entry — no
+	// goroutine is spawned. Errors are swallowed; failing to touch
+	// should never break the request.
 	_ = h.deps.Resolver.TouchSandbox(r.Context(), id)
-	tickerCtx, cancelTicker := context.WithCancel(r.Context())
-	defer cancelTicker()
-	go h.activityTicker(tickerCtx, id)
+	h.scheduleActivityTouch(r.Context(), id)
 
 	// Use Rewrite (not the deprecated Director) so the request is built
 	// once with the correct upstream URL. SetXForwarded propagates the
@@ -177,19 +177,28 @@ func writeWakeError(logger *slog.Logger, w http.ResponseWriter, id string, port 
 	}
 }
 
-// activityTicker re-touches the sandbox every activityTickInterval for
-// as long as ctx is live. The first touch already fired in httpWake;
-// this only handles long-lived streams where a single request can
-// outlive a normal idle threshold.
-func (h *handlers) activityTicker(ctx context.Context, id string) {
-	t := time.NewTicker(activityTickInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+// scheduleActivityTouch arms a self-rearming timer that re-touches the
+// sandbox every activityTickInterval while ctx is alive. The first
+// touch already fired in httpWake; this only handles long-lived streams
+// where a single request can outlive a normal idle threshold.
+//
+// Using time.AfterFunc instead of a long-lived goroutine + ticker means
+// sub-interval requests (the common case) cost only a single timer-heap
+// entry. AfterFunc runs each callback in a fresh, short-lived goroutine
+// so idle requests carry no goroutine at all. ctx cancellation is
+// observed at the next tick — one stray AfterFunc invocation may run
+// after the request completes, but it short-circuits on ctx.Err().
+func (h *handlers) scheduleActivityTouch(ctx context.Context, id string) {
+	var fire func()
+	fire = func() {
+		if ctx.Err() != nil {
 			return
-		case <-t.C:
-			_ = h.deps.Resolver.TouchSandbox(ctx, id)
 		}
+		_ = h.deps.Resolver.TouchSandbox(ctx, id)
+		if ctx.Err() != nil {
+			return
+		}
+		time.AfterFunc(activityTickInterval, fire)
 	}
+	time.AfterFunc(activityTickInterval, fire)
 }

@@ -841,8 +841,14 @@ func Load() (Config, error) {
 		if strings.TrimSpace(cfg.InternalIngressAddr) == "" {
 			return Config{}, errors.New("SB_INTERNAL_INGRESS_ADDR must be set when SB_ENABLE_SERVERLESS=true")
 		}
+		if err := requireLoopbackAddr("SB_INTERNAL_INGRESS_ADDR", cfg.InternalIngressAddr); err != nil {
+			return Config{}, err
+		}
 		if strings.TrimSpace(cfg.InternalL4WakeAddr) == "" {
 			return Config{}, errors.New("SB_INTERNAL_L4_WAKE_ADDR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if err := requireLoopbackAddr("SB_INTERNAL_L4_WAKE_ADDR", cfg.InternalL4WakeAddr); err != nil {
+			return Config{}, err
 		}
 		if strings.TrimSpace(cfg.InternalL4WakeDir) == "" {
 			return Config{}, errors.New("SB_INTERNAL_L4_WAKE_DIR must be set when SB_ENABLE_SERVERLESS=true")
@@ -1048,6 +1054,38 @@ func parseMirrorUpstreams(raw string) []MirrorUpstreamMapping {
 		out = append(out, MirrorUpstreamMapping{Host: host, Shortname: short})
 	}
 	return out
+}
+
+// requireLoopbackAddr rejects internal listen addrs that are not bound to a
+// loopback interface. The wake-aware HTTP/L4 ingress proxies carry no auth —
+// they trust that Caddy is the only client and assume reachability is limited
+// to localhost. An operator who overrides SB_INTERNAL_INGRESS_ADDR /
+// SB_INTERNAL_L4_WAKE_ADDR to 0.0.0.0 (or any routable interface) would
+// silently publish an unauthenticated endpoint that can wake any sandbox by
+// ID. Default values are loopback; this check enforces the field doc.
+//
+// Accepts: "localhost", any IPv4 127.0.0.0/8 address, "::1". Empty host
+// (":21213" form) is treated as wildcard and rejected — be explicit.
+func requireLoopbackAddr(envKey, value string) error {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("%s=%q must be host:port: %w", envKey, value, err)
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return fmt.Errorf("%s=%q must bind to a loopback interface (got wildcard); use 127.0.0.1 or localhost", envKey, value)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("%s=%q host %q must be a loopback IP or \"localhost\"", envKey, value, host)
+	}
+	if !ip.IsLoopback() {
+		return fmt.Errorf("%s=%q must bind to a loopback interface (got %s); the wake ingress carries no auth", envKey, value, ip)
+	}
+	return nil
 }
 
 func normalizeAdvertiseHost(value string) string {

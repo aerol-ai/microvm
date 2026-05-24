@@ -283,6 +283,36 @@ func TestConsumeExpectedStopAgeOutTreatsAsInvoluntary(t *testing.T) {
 	}
 }
 
+// TestRecordExpectedStopSweepsStaleEntries: an entry whose matching
+// Docker event never arrived (events stream drop, daemon restart,
+// sandbox deleted mid-stop) must be reaped opportunistically so the
+// map can't grow unbounded. The next stop on any other sandbox triggers
+// the sweep.
+func TestRecordExpectedStopSweepsStaleEntries(t *testing.T) {
+	svc := &Service{
+		cfg:           config.Config{EnableServerless: true},
+		expectedStops: make(map[string]expectedStopRecord),
+	}
+	svc.expectedStops["leaked"] = expectedStopRecord{
+		mode:       stopModeLifecycle,
+		recordedAt: time.Now().Add(-expectedStopMaxAge - time.Second),
+	}
+	svc.expectedStops["fresh"] = expectedStopRecord{
+		mode:       stopModeLifecycle,
+		recordedAt: time.Now(),
+	}
+	svc.recordExpectedStop("new", stopModeManual)
+	if _, ok := svc.expectedStops["leaked"]; ok {
+		t.Fatalf("stale entry still present after sweep")
+	}
+	if _, ok := svc.expectedStops["fresh"]; !ok {
+		t.Fatalf("fresh entry was incorrectly reaped")
+	}
+	if _, ok := svc.expectedStops["new"]; !ok {
+		t.Fatalf("new entry was not recorded")
+	}
+}
+
 // seedSleepingSandbox seeds a stopped + wake_armed=true serverless
 // sandbox — the state the wake helper expects to wake. Centralizes
 // the field set so every wake test starts from the same baseline.

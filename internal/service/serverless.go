@@ -44,12 +44,13 @@ const (
 )
 
 // expectedStopRecord is the value stored in Service.expectedStops. It pairs
-// the mode with the time we recorded the expectation so a janitor can
-// reap entries that never produce a Docker event (Docker daemon went away
-// mid-stop, network blip on the events stream, etc.). At sweep time any
-// entry older than expectedStopMaxAge is silently dropped — the
-// corresponding event, if it ever arrives late, then gets treated as
-// involuntary, which is the safe default.
+// the mode with the time we recorded the expectation so stale entries that
+// never produce a Docker event (Docker daemon went away mid-stop, network
+// blip on the events stream, sandbox deleted before the event was
+// delivered) can be reaped opportunistically by recordExpectedStop. Any
+// entry older than expectedStopMaxAge at consume time is treated as
+// involuntary, which is the safe default — a late-arriving event for a
+// reaped entry then re-arms wake under the involuntary policy.
 type expectedStopRecord struct {
 	mode       stopMode
 	recordedAt time.Time
@@ -66,13 +67,26 @@ const expectedStopMaxAge = 5 * time.Minute
 // by consumeExpectedStop in the events handler. Safe to call concurrently
 // — entries with the same id silently overwrite, which is the right
 // behavior for retries that issue a fresh stop.
+//
+// Opportunistic GC: this is the only write path that grows the map, so
+// every call also sweeps entries older than expectedStopMaxAge. The map
+// would otherwise leak on every stop whose Docker event never arrives
+// (events stream drop, daemon restart, sandbox deleted mid-stop). The
+// lock is already held; the scan cost is bounded by the number of
+// concurrently in-flight stops, which is small in practice.
 func (s *Service) recordExpectedStop(id string, mode stopMode) {
 	s.expectedStopsMu.Lock()
 	defer s.expectedStopsMu.Unlock()
 	if s.expectedStops == nil {
 		s.expectedStops = make(map[string]expectedStopRecord)
 	}
-	s.expectedStops[id] = expectedStopRecord{mode: mode, recordedAt: time.Now()}
+	now := time.Now()
+	for staleID, rec := range s.expectedStops {
+		if now.Sub(rec.recordedAt) > expectedStopMaxAge {
+			delete(s.expectedStops, staleID)
+		}
+	}
+	s.expectedStops[id] = expectedStopRecord{mode: mode, recordedAt: now}
 }
 
 // consumeExpectedStop returns the mode recorded by recordExpectedStop and
