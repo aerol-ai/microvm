@@ -6,12 +6,26 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
 )
+
+// ACMEBudgetReserver is the daemon-wide brake on new ACME orders. A nil
+// implementation is fine: the handler treats nil as "no brake" so the
+// hot path stays one-branch when the feature is off. The handler calls
+// Reserve only when the ask would actually allow issuance — base-domain
+// fast-fail and negative-cache hits don't consume budget.
+//
+// Returns (true, 0) to permit, (false, retryAfter) to refuse. The
+// retryAfter is surfaced as the HTTP Retry-After header on the 429
+// response so Caddy backs off coherently with the budget window.
+type ACMEBudgetReserver interface {
+	Reserve(sandboxID, hostname string) (bool, time.Duration)
+}
 
 // TLSAskPath is Caddy's on-demand TLS `ask` callback path. Caddy passes the
 // requested hostname as the `domain` query parameter and decides whether to
@@ -43,6 +57,22 @@ type TLSAskDeps struct {
 	NegCacheTTL time.Duration
 	NegCacheCap int
 	Logger      *slog.Logger
+	// Budget is the daemon-wide ACME issuance brake (OV5A). Nil disables
+	// the brake — single-node deployments and tests that don't care
+	// about LE rate limits pass nil and Reserve is skipped entirely.
+	Budget ACMEBudgetReserver
+	// Tracker observes the issuance lifecycle for the
+	// aerolvm_acme_lock_held_seconds gauge. Nil disables tracking. Wired
+	// to the package-global tracker in production via the helpers in
+	// metrics.go; tests can substitute a stub.
+	Tracker IssuanceObserver
+}
+
+// IssuanceObserver lets the handler signal the issuance lifecycle
+// without depending on the concrete tracker — kept minimal so tests can
+// stub it without dragging in expvar state.
+type IssuanceObserver interface {
+	Started(hostname string)
 }
 
 // TLSAskHandler answers Caddy's on-demand TLS `ask` callback for custom
@@ -80,6 +110,7 @@ func (h *TLSAskHandler) EvictNegativeCache(host string) {
 func (h *TLSAskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := normalizeAskHost(r.URL.Query().Get("domain"))
 	if host == "" {
+		RecordAskResult(AskResultBadRequest)
 		http.Error(w, "missing domain", http.StatusBadRequest)
 		return
 	}
@@ -91,18 +122,41 @@ func (h *TLSAskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.deps.BaseDomain != "" {
 		base := strings.ToLower(h.deps.BaseDomain)
 		if host == base || strings.HasSuffix(host, "."+base) {
+			RecordAskResult(AskResultBaseDomain)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}
 
 	if h.negCache != nil && h.negCache.has(host) {
+		RecordAskResult(AskResultUnknown)
 		http.Error(w, "unknown host", http.StatusForbidden)
 		return
 	}
 
-	_, err := h.deps.Resolver.ResolveCustomDomain(r.Context(), host)
+	sandboxID, err := h.deps.Resolver.ResolveCustomDomain(r.Context(), host)
 	if err == nil {
+		// Daemon-wide ACME budget brake (OV5A). Reserve only after the
+		// hostname is known to be ours so unknown-host floods can't
+		// drain the bucket. A nil budget allows unconditionally.
+		if h.deps.Budget != nil {
+			if ok, retry := h.deps.Budget.Reserve(sandboxID, host); !ok {
+				RecordAskResult(AskResultThrottled)
+				if retry > 0 {
+					// Retry-After in seconds, RFC 7231 §7.1.3. Round
+					// up so a sub-second retry doesn't become "0"
+					// (which Caddy reads as "no backoff").
+					secs := max(int((retry+time.Second-1)/time.Second), 1)
+					w.Header().Set("Retry-After", strconv.Itoa(secs))
+				}
+				http.Error(w, "acme budget exhausted", http.StatusTooManyRequests)
+				return
+			}
+		}
+		if h.deps.Tracker != nil {
+			h.deps.Tracker.Started(host)
+		}
+		RecordAskResult(AskResultOK)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -110,6 +164,7 @@ func (h *TLSAskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.negCache != nil {
 			h.negCache.add(host)
 		}
+		RecordAskResult(AskResultUnknown)
 		http.Error(w, "unknown host", http.StatusForbidden)
 		return
 	}
@@ -119,6 +174,7 @@ func (h *TLSAskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Do NOT add to the negative cache: this is a transient backend
 	// failure, not a "host doesn't exist" signal.
 	h.deps.Logger.WarnContext(r.Context(), "tls-ask resolve failed", "host", host, "err", err)
+	RecordAskResult(AskResultResolveError)
 	http.Error(w, "resolve failed", http.StatusInternalServerError)
 }
 

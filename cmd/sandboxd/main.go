@@ -411,12 +411,27 @@ func main() {
 			// Under Cluster/Agent a hit short-circuits the disk read and
 			// keeps the on-demand TLS ask path fully in-memory across the
 			// cluster.
+			// Daemon-wide ACME budget (OV5A): a per-node sliding window
+			// over Let's Encrypt's per-account new-orders limit (300 / 3h
+			// by default). One misconfigured tenant adding 100 custom
+			// domains can drain the LE window for the whole cluster, so
+			// every TLSAsk that would trigger a new issuance passes
+			// through Reserve; a nil budget is allowed but disables the
+			// brake — we wire one whenever custom domains are on.
+			acmeBudget := service.NewACMEBudget(service.ACMEBudgetConfig{
+				Capacity: cfg.ACMEDaemonBudgetCapacity,
+				Window:   cfg.ACMEDaemonBudgetWindow,
+				Fraction: cfg.ACMEDaemonBudgetFraction,
+				Logger:   logger,
+			})
 			askHandler := ingressproxy.NewTLSAskHandler(ingressproxy.TLSAskDeps{
 				Resolver:    clusterAwareDomainResolver{cluster: svc.Cluster(), store: db},
 				BaseDomain:  cfg.Domain,
 				NegCacheTTL: 60 * time.Second,
 				NegCacheCap: 10000,
 				Logger:      logger,
+				Budget:      acmeBudget,
+				Tracker:     ingressproxy.DefaultIssuanceTracker(),
 			})
 			ingressproxy.RegisterTLSAsk(ingressMux, askHandler)
 			svc.AttachCustomDomainCacheEvicter(askHandler)
