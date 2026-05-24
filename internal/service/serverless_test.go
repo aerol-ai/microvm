@@ -1484,12 +1484,16 @@ func TestReconstructWakeArmedIsNoOpForNonServerless(t *testing.T) {
 	}
 }
 
-// TestReconstructWakeArmedIsNoOpWhenAlreadyArmed proves the helper
-// does not re-install routes (or touch the store) for sandboxes that
-// already have wake_armed=true — covers the steady-state reconcile
-// pass where most stopped serverless sandboxes were already armed by
-// the lifecycle sweep.
-func TestReconstructWakeArmedIsNoOpWhenAlreadyArmed(t *testing.T) {
+// TestReconstructWakeArmedReinstallsRoutesWhenAlreadyArmed proves the
+// helper re-upserts wake routes even when wake_armed=true is already set.
+// Caddy's admin-API routes do not survive a Caddy restart, so the daemon
+// must treat wake_armed=true as a goal state to reassert against Caddy
+// on every reconcile pass — without this, a Caddy restart between
+// auto-stop and the next wake request would leave the wildcard 404
+// fallback serving requests forever even though the DB looks correct.
+// The store, however, must not be touched (the bit is already true and
+// pointless writes churn the row on every reconcile tick).
+func TestReconstructWakeArmedReinstallsRoutesWhenAlreadyArmed(t *testing.T) {
 	ctx := context.Background()
 	fake := newRouteFake()
 	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
@@ -1526,8 +1530,17 @@ func TestReconstructWakeArmedIsNoOpWhenAlreadyArmed(t *testing.T) {
 
 	svc.ReconstructWakeArmedIfNeeded(ctx, reloaded)
 
-	if len(fake.routeIDs()) != 0 {
-		t.Fatalf("already-armed sandbox should not trigger a wake route install; got %v", fake.routeIDs())
+	ids := fake.routeIDs()
+	want := []string{"sandbox-sb-armed-port-3000-wake"}
+	if !equalSorted(ids, want) {
+		t.Fatalf("already-armed sandbox should still re-install wake route to self-heal Caddy; routes = %v, want %v", ids, want)
+	}
+	final, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !final.WakeArmed {
+		t.Fatalf("wake_armed must remain true after reassert pass")
 	}
 }
 
