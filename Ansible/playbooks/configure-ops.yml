@@ -25,6 +25,17 @@
       OTEL_SERVICE_NAME: "{{ sandboxd_otel_service_name }}"
       SB_IMAGE_PULL_MAX_CONCURRENT: "{{ sandboxd_image_pull_max_concurrent }}"
       SB_IMAGE_PULL_FAILURE_BACKOFF: "{{ sandboxd_image_pull_failure_backoff }}"
+      # Matches the SB_IMAGE_GC_WHITELIST line Terraform's bootstrap writes
+      # (Terraform/templates/bootstrap.sh.tftpl). Bootstrap only fires at
+      # node provisioning, so without this entry a tfvars change never
+      # reaches a running fleet — the playbook keeps the two in sync.
+      SB_IMAGE_GC_WHITELIST: "{{ sandboxd_image_gc_whitelist }}"
+      # Image GC master switch and cadence — same Terraform-vs-day-2 gap
+      # as the whitelist above. Bool is lowercased so it matches the
+      # "true"/"false" SB_IMAGE_BUILD_GC_ENABLED string config.go expects.
+      SB_IMAGE_BUILD_GC_ENABLED: "{{ sandboxd_image_build_gc_enabled | bool | string | lower }}"
+      SB_IMAGE_BUILD_GC_INTERVAL: "{{ sandboxd_image_build_gc_interval }}"
+      SB_IMAGE_BUILD_GC_TTL: "{{ sandboxd_image_build_gc_ttl }}"
       SB_MIRROR_HOST: "{{ sandboxd_mirror_host }}"
       SB_MIRROR_PUSH_HOST: "{{ sandboxd_mirror_push_host }}"
       SB_MIRROR_UPSTREAMS: "{{ sandboxd_mirror_upstreams }}"

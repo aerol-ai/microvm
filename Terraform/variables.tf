@@ -369,6 +369,34 @@ variable "image_gc_whitelist" {
   default     = []
 }
 
+variable "image_build_gc_enabled" {
+  description = "Master switch for BOTH image janitors (built-image sweep + pending-image sweep). Written as SB_IMAGE_BUILD_GC_ENABLED. true (default) matches the sandboxd default; flip to false to disable both sweeps without unsetting the interval/TTL knobs."
+  type        = bool
+  default     = true
+}
+
+variable "image_build_gc_interval" {
+  description = "How often each image janitor ticker fires, written as SB_IMAGE_BUILD_GC_INTERVAL. Go duration."
+  type        = string
+  default     = "10m"
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.image_build_gc_interval))
+    error_message = "image_build_gc_interval must be a Go duration such as 30s, 10m, or 1h."
+  }
+}
+
+variable "image_build_gc_ttl" {
+  description = "Minimum age before an image becomes eligible for GC removal (both built images and pending-destroy images). Written as SB_IMAGE_BUILD_GC_TTL. Go duration. Default 24h trades disk for warm-start latency: shorter values reclaim disk faster but re-pull on destroy/recreate cycles inside the window."
+  type        = string
+  default     = "24h"
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.image_build_gc_ttl))
+    error_message = "image_build_gc_ttl must be a Go duration such as 1h, 24h, or 7d expressed as 168h."
+  }
+}
+
 ###############################################################################
 # Cloudflare DNS
 ###############################################################################

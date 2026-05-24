@@ -76,6 +76,14 @@ default_volume_type       = "gp3"
 #   "ghcr.io/myorg/",    # everything from this org
 # ]
 
+# Image GC janitors — master switch and cadence. Both knobs apply to BOTH
+# sweeps (built images + pending-destroy images). Defaults match sandboxd:
+# enabled, fire every 10m, 24h minimum age. Shorten the TTL when disk
+# pressure outweighs the cost of re-pulling on destroy/recreate cycles.
+# image_build_gc_enabled  = true
+# image_build_gc_interval = "10m"
+# image_build_gc_ttl      = "24h"
+
 # --- Cloudflare DNS behavior ------------------------------------------------
 
 # create_wildcard_record = true   # *.<domain_name> in addition to the apex

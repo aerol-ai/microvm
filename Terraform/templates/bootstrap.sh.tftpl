@@ -216,6 +216,9 @@ OTEL_SERVICE_NAME=${otel_service_name}
 SB_IMAGE_PULL_MAX_CONCURRENT=${image_pull_max_concurrent}
 SB_IMAGE_PULL_FAILURE_BACKOFF=${image_pull_failure_backoff}
 SB_IMAGE_GC_WHITELIST=${image_gc_whitelist}
+SB_IMAGE_BUILD_GC_ENABLED=${image_build_gc_enabled}
+SB_IMAGE_BUILD_GC_INTERVAL=${image_build_gc_interval}
+SB_IMAGE_BUILD_GC_TTL=${image_build_gc_ttl}
 EOF
 
 %{ if aocr_enabled ~}

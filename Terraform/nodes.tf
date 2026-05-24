@@ -67,6 +67,9 @@ resource "aws_instance" "seed" {
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff
     image_gc_whitelist         = join(",", var.image_gc_whitelist)
+    image_build_gc_enabled     = var.image_build_gc_enabled
+    image_build_gc_interval    = var.image_build_gc_interval
+    image_build_gc_ttl         = var.image_build_gc_ttl
     extra_user_data            = local.seed_node.extra_user_data
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
@@ -165,6 +168,9 @@ resource "aws_instance" "joiner" {
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff
     image_gc_whitelist         = join(",", var.image_gc_whitelist)
+    image_build_gc_enabled     = var.image_build_gc_enabled
+    image_build_gc_interval    = var.image_build_gc_interval
+    image_build_gc_ttl         = var.image_build_gc_ttl
     extra_user_data            = each.value.extra_user_data
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled

@@ -42,6 +42,18 @@ sandboxd_otel_traces_sample_ratio: 0.05
 sandboxd_otel_service_name: "sandboxd"
 sandboxd_image_pull_max_concurrent: 4
 sandboxd_image_pull_failure_backoff: "30s"
+# Image GC whitelist. Comma-joined list passed to SB_IMAGE_GC_WHITELIST.
+# Entries can be exact image refs ("nginx:1.27"), repos ("nginx",
+# "myorg/web"), or registry-org prefixes ending in "/" ("ghcr.io/myorg/").
+# Empty string (default) = no whitelist; the janitor's normal scope applies.
+sandboxd_image_gc_whitelist: ""
+# Image GC janitor cadence. Mirrors sandboxd's defaults. Both knobs apply
+# to BOTH sweeps (built-image + pending-destroy). Shorten the TTL when
+# disk pressure outweighs the cost of re-pulling on destroy/recreate
+# cycles inside the window.
+sandboxd_image_build_gc_enabled: true
+sandboxd_image_build_gc_interval: "10m"
+sandboxd_image_build_gc_ttl: "24h"
 
 # --- Local backup schedule -------------------------------------------------
 # OFF by default. To enable, set sandboxd_backup_enabled: true in local.yml.
