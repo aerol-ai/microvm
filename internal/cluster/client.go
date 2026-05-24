@@ -527,6 +527,46 @@ func (c *Cluster) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute {
 	return exposedPortRoutesForPlacement(p)
 }
 
+// AddCustomDomain replicates a sandbox→hostname binding through raft so every
+// node can answer the TLS-ask probe and install the matching Caddy matcher.
+// hostname is canonicalized (trim + lower) here so callers don't have to
+// remember to do it themselves — the local SQLite layer already trims.
+// Idempotent for the same (sandbox, hostname) pair; returns
+// ErrCustomHostnameConflict when the hostname is held by a different sandbox.
+func (c *Cluster) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if sandboxID == "" || hostname == "" {
+		return nil
+	}
+	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	return c.applyCommand(ctx, cmd)
+}
+
+// RemoveCustomDomain releases the binding. Idempotent — a stale call after a
+// successful DeletePlacement is a no-op.
+func (c *Cluster) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if sandboxID == "" || hostname == "" {
+		return nil
+	}
+	cmd := command{Op: opRemoveCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	return c.applyCommand(ctx, cmd)
+}
+
+// CustomDomainsOf returns a sorted copy of the hostnames bound to sandboxID,
+// or nil when none. Used by the ingress reconciler so a peer-owned sandbox
+// still gets its TLS matchers installed in the local Caddy.
+func (c *Cluster) CustomDomainsOf(sandboxID string) []string {
+	return c.fsm.customHostnamesForSandbox(sandboxID)
+}
+
+// ResolveCustomDomain answers the TLS-ask probe from the local FSM index in
+// O(1). Returns sandboxID, true when the hostname is bound somewhere in the
+// cluster; false otherwise. hostname is canonicalized inside the FSM.
+func (c *Cluster) ResolveCustomDomain(hostname string) (string, bool) {
+	return c.fsm.sandboxIDByCustomHostname(hostname)
+}
+
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	cmd := command{Op: opDelete, SandboxID: sandboxID}
