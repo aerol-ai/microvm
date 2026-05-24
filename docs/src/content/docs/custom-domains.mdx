@@ -10,7 +10,14 @@ Attach an arbitrary public hostname (`api.acme.com`, `acme.com`) to a sandbox so
 
 1. **Domain mode is required.** The server must be started with `SB_DOMAIN` set. In IP / path-mode deployments the API returns `412 Precondition Failed`.
 2. **DNS must already point at the cluster's ingress host.** Create a `CNAME` (or `ALIAS` / `ANAME` for apex) from the custom hostname to the same target your sandbox URLs resolve to. AerolVM does not host DNS; if the record is missing when the first HTTPS request arrives, ACME issuance will fail and the domain stays in `issuing` until DNS is fixed.
-3. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope — they reject with `400 Bad Request` if a custom domain is configured.
+3. **Port 80 must be reachable from Let's Encrypt.** Issuance uses HTTP-01, so LE's validation servers need to reach `http://<host>/.well-known/acme-challenge/...` on the ingress. If a firewall blocks inbound `:80`, the status sticks at `issuing` and eventually flips to `failed`.
+4. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope — they reject with `400 Bad Request` if a custom domain is configured.
+
+### Cloudflare: turn the proxy off
+
+If your DNS lives in Cloudflare, set the record to **DNS-only (gray cloud)**, not Proxied (orange cloud). With the proxy on, Cloudflare terminates TLS with its own certificate and the cluster never sees the SNI — Caddy's `ask` handler is never invoked, ACME never runs, and the domain stays `pending_dns` forever. The same applies to any CDN or reverse proxy that intercepts TLS in front of the ingress.
+
+DNS-01 issuance (which works behind a proxy) is tracked for v2 in `plans/custom-domains-dns01.md`.
 
 ## Attach at create time
 
