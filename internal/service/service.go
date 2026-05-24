@@ -112,6 +112,23 @@ type Service struct {
 	netstatsPoller   *netstats.Poller
 	netstatsLastTick atomic.Int64 // unix nanos; last successful tick for /usage staleness reporting
 
+	// netstatsActivity is the per-sandbox "last non-zero BytesIn delta"
+	// timestamp (unix nanos), populated by the netstats poller sink.
+	// The idle sweep uses it as the activity floor under
+	// HTTPWakeDirectBypassEnabled so warm traffic that never reaches
+	// sandboxd (Caddy → container direct) still keeps the sweep from
+	// stopping a busy sandbox. RWMutex because the sweep reads more
+	// often than the poller writes (default 60s vs 10s). See
+	// plans/warm-direct-route-bypass.md C2.
+	netstatsActivityMu sync.RWMutex
+	netstatsActivity   map[string]int64
+
+	// Poll-failure detection is derived from netstatsLastTick
+	// staleness in netstatsPollIsStale; the poller does not expose an
+	// error-reporting path to the sink, and absence-of-a-recent-tick
+	// is the operationally meaningful signal (whether the cause was
+	// docker-stats hiccup, namespace teardown, or anything else).
+
 	// cluster is the cluster.Client used by the API layer for owner lookup
 	// and cross-node forwarding. Defaults to a Noop in single-node mode so
 	// callsites (and the API wrapper) can stay unconditional.
@@ -982,6 +999,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	}
 	s.forgetWakeFlight(id)
 	s.invalidateWarm(id)
+	s.forgetNetstatsActivity(id)
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
 	}
@@ -1755,25 +1773,50 @@ func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sa
 }
 
 // installHTTPPortRoute writes the HTTP port route in the shape that
-// matches the sandbox's current serverless mode, and removes the other
-// shape afterwards. Install-then-delete ordering means there is never
-// a window where neither shape exists, so a request landing mid-flip
-// always hits one valid route.
+// matches the sandbox's current serverless mode AND current status,
+// then removes any other shape. Install-then-delete ordering means
+// there is never a window where neither shape exists, so a request
+// landing mid-flip always hits one valid route.
+//
+// Shape selection is delegated to chooseRouteShape so reconcile,
+// lifecycle, and event paths share one source of truth — see
+// plans/warm-direct-route-bypass.md D7/D8.
 func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
-	if s.serverlessWakeEnabled(sandbox) {
+	switch s.chooseRouteShape(sandbox) {
+	case RouteShapeDirect:
+		// Non-serverless callers (and serverless-bypass-off callers)
+		// fall through to UpsertPortRoute byte-for-byte, so the
+		// non-serverless JSON regression test stays valid. Only the
+		// warm-bypass path adopts the retry window.
+		if s.serverlessWakeEnabled(sandbox) && s.cfg.HTTPWakeDirectBypassEnabled {
+			if err := s.caddy.UpsertPortRouteWithRetry(ctx, sandbox.ID, sandbox.ContainerIP, port, s.cfg.HTTPWakeDirectRouteRetryDuration); err != nil {
+				return err
+			}
+		} else {
+			if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
+				return err
+			}
+		}
+		// Best-effort: any leftover wake route from a prior
+		// Stopped+armed state (or a flag flip back to bypass-on) must
+		// go so Caddy doesn't keep two routes matching the same host.
+		// DeleteWakeHTTPPortRoute treats 404 as success.
+		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
+		return nil
+	case RouteShapeWake:
 		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port); err != nil {
 			return err
 		}
-		// Best-effort: any leftover direct route from a pre-serverless
-		// state must go so Caddy doesn't keep two routes matching the
-		// same host. DeletePortRoute treats 404 as success.
 		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
 		return nil
+	case RouteShapeNone:
+		// Destroyed sandboxes or stopped-unarmed serverless sandboxes
+		// publish neither route. Idempotent deletes; either or both
+		// may already be absent.
+		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
+		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
+		return nil
 	}
-	if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
-		return err
-	}
-	_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
 	return nil
 }
 
@@ -2383,8 +2426,21 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 
 	now := time.Now().UTC()
 	globalIdle := s.cfg.IdleTimeout()
+	// netstatsFallback is checked once per sweep, not per sandbox —
+	// the fallback applies to the entire tick (D3). If the most recent
+	// successful poll is older than 2 × poll interval, the docker
+	// stats subsystem is probably degraded for every sandbox on this
+	// node; trusting an absent floor as "idle" would cascade into
+	// stopping every warm sandbox. The next successful poll re-arms
+	// the netstats signal automatically.
+	netstatsFallback := s.netstatsPollIsStale(now)
+	if netstatsFallback {
+		s.logger.Warn("idle sweep using LastActiveAt fallback",
+			"reason", "netstats_poll_failed", "netstats_fallback", true)
+	}
 	for _, sandbox := range sandboxes {
-		switch lifecycleActionFor(sandbox, now, globalIdle) {
+		floor := s.activityFloorFor(sandbox, netstatsFallback)
+		switch lifecycleActionForWithFloor(sandbox, now, globalIdle, floor) {
 		case lifecycleDestroy:
 			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
@@ -2414,6 +2470,95 @@ const (
 	lifecycleDestroy
 )
 
+// activityFloorFor computes the timestamp the lifecycle sweep should
+// treat as the sandbox's most recent activity. Default is
+// sandbox.LastActiveAt; when HTTPWakeDirectBypassEnabled and the
+// netstats poller has a recorded non-zero BytesIn delta more recent
+// than LastActiveAt, the netstats timestamp wins so warm traffic that
+// bypasses sandboxd does not get false-idle-stopped. When the most
+// recent netstats poll failed (netstatsFallback=true), we fall back
+// to LastActiveAt alone for this tick to avoid stopping busy sandboxes
+// on a docker-stats outage (D3).
+func (s *Service) activityFloorFor(sandbox *models.Sandbox, netstatsFallback bool) time.Time {
+	if sandbox == nil {
+		return time.Time{}
+	}
+	floor := sandbox.LastActiveAt
+	if !s.cfg.HTTPWakeDirectBypassEnabled || netstatsFallback {
+		return floor
+	}
+	if observed := s.netstatsRecentBytesInAt(sandbox.ID); !observed.IsZero() && observed.After(floor) {
+		return observed
+	}
+	return floor
+}
+
+// netstatsPollIsStale reports whether the most recent successful
+// netstats poll is older than 2 × NetstatsPollInterval — the D3
+// signal that the docker stats subsystem is degraded and the sweep
+// must fall back to LastActiveAt rather than treat an absent floor
+// as "idle." Returns false when the bypass is off (the floor is not
+// used either way) or when the poller has never recorded a tick (the
+// daemon may have just booted; treating that as stale would prematurely
+// false-stop warm sandboxes during the first sweep after a restart —
+// the start path itself updates LastActiveAt, so falling back is the
+// correct conservative answer).
+func (s *Service) netstatsPollIsStale(now time.Time) bool {
+	if !s.cfg.HTTPWakeDirectBypassEnabled {
+		return false
+	}
+	if s.cfg.NetstatsPollInterval <= 0 {
+		return true
+	}
+	last := s.netstatsLastTick.Load()
+	if last == 0 {
+		return true
+	}
+	return now.Sub(time.Unix(0, last)) > 2*s.cfg.NetstatsPollInterval
+}
+
+// netstatsRecentBytesInAt returns the unix-nano timestamp of the most
+// recent non-zero BytesIn sample observed for the sandbox, or the
+// zero time if no observation has been recorded yet. Cheap read-lock
+// lookup populated by the netstats poller sink.
+func (s *Service) netstatsRecentBytesInAt(id string) time.Time {
+	s.netstatsActivityMu.RLock()
+	ts, ok := s.netstatsActivity[id]
+	s.netstatsActivityMu.RUnlock()
+	if !ok || ts == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ts).UTC()
+}
+
+// recordNetstatsActivity is called by the netstats sink for every
+// non-zero BytesIn sample. SampledAt comes from the docker stats
+// reader so timestamps are consistent with the rest of the
+// observability surface.
+func (s *Service) recordNetstatsActivity(id string, sampledAt time.Time) {
+	if id == "" || sampledAt.IsZero() {
+		return
+	}
+	s.netstatsActivityMu.Lock()
+	if s.netstatsActivity == nil {
+		s.netstatsActivity = make(map[string]int64)
+	}
+	s.netstatsActivity[id] = sampledAt.UnixNano()
+	s.netstatsActivityMu.Unlock()
+}
+
+// forgetNetstatsActivity drops a sandbox's recorded activity floor.
+// Called when a sandbox is destroyed so the map does not leak entries
+// for ids the rest of the daemon has forgotten.
+func (s *Service) forgetNetstatsActivity(id string) {
+	if id == "" {
+		return
+	}
+	s.netstatsActivityMu.Lock()
+	delete(s.netstatsActivity, id)
+	s.netstatsActivityMu.Unlock()
+}
+
 // lifecycleActionFor decides what the sweep should do for one sandbox given
 // the current time and the operator's global idle fallback. Pure function:
 // no DB, no Docker, easy to exhaustively test.
@@ -2429,10 +2574,24 @@ const (
 //     stop. Backwards-compat with the pre-Lifecycle behavior.
 //  5. Otherwise → none.
 func lifecycleActionFor(sb *models.Sandbox, now time.Time, globalIdle time.Duration) lifecycleAction {
+	return lifecycleActionForWithFloor(sb, now, globalIdle, time.Time{})
+}
+
+// lifecycleActionForWithFloor is lifecycleActionFor with an explicit
+// activity-floor timestamp injected by the sweep (e.g. the netstats
+// poller's most recent BytesIn observation under bypass-on). When
+// activityFloor is later than sb.LastActiveAt, idle is measured from
+// activityFloor; otherwise the function behaves identically to
+// lifecycleActionFor. Pure: callers compute the floor.
+func lifecycleActionForWithFloor(sb *models.Sandbox, now time.Time, globalIdle time.Duration, activityFloor time.Time) lifecycleAction {
 	if sb == nil || sb.Status == models.SandboxStatusDestroyed {
 		return lifecycleNone
 	}
-	idle := now.Sub(sb.LastActiveAt)
+	floor := sb.LastActiveAt
+	if !activityFloor.IsZero() && activityFloor.After(floor) {
+		floor = activityFloor
+	}
+	idle := now.Sub(floor)
 	age := now.Sub(sb.CreatedAt)
 
 	l := sb.Lifecycle

@@ -222,10 +222,24 @@ func (s *Service) tearDownPortRoutesForStop(ctx context.Context, sandbox *models
 		wakeRouteAttempted bool
 		wakeRouteInstalled bool
 	)
+	// Pre-stop arming runs while sandbox.Status is still Started, but we
+	// want the wake-aware shape installed *now* (before docker.Stop
+	// fires). chooseRouteShape decides the shape from sandbox.Status, so
+	// pass a synthetic post-stop view for arming. Under bypass-off this
+	// is a no-op effectively (serverless always returns Wake regardless
+	// of status); under bypass-on it is the load-bearing piece that
+	// keeps wake-first ordering correct.
+	var armView *models.Sandbox
+	if arm {
+		view := *sandbox
+		view.Status = models.SandboxStatusStopped
+		view.WakeArmed = true
+		armView = &view
+	}
 	for _, port := range sandbox.ExposedPorts {
 		if arm {
 			wakeRouteAttempted = true
-			if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+			if err := s.upsertExposedPortRoute(ctx, armView, port); err != nil {
 				s.logger.Warn("install wake route on stop failed",
 					"sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 			} else {
@@ -313,9 +327,18 @@ func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *mod
 		exposedPortsSeen   int
 		wakeRouteInstalled bool
 	)
+	// Same synthetic-view trick as tearDownPortRoutesForStop: this is
+	// the reconstruction / re-assertion path, so we want the WAKE shape
+	// regardless of whether the row's WakeArmed bit is currently true
+	// (re-assert case) or false (reconstruct case). chooseRouteShape
+	// would otherwise return RouteShapeNone for Stopped+!WakeArmed
+	// under bypass-on and delete both routes — the opposite of the
+	// reconstruction intent. Status is already Stopped here.
+	armView := *sandbox
+	armView.WakeArmed = true
 	for _, port := range sandbox.ExposedPorts {
 		exposedPortsSeen++
-		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+		if err := s.upsertExposedPortRoute(ctx, &armView, port); err != nil {
 			s.logger.Warn("reconstruct wake route failed",
 				"sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 			continue
@@ -620,4 +643,55 @@ func (m stopMode) String() string {
 	default:
 		return fmt.Sprintf("stopMode(%d)", int(m))
 	}
+}
+
+// ForceReconcileHTTPWakeShape republishes the HTTP route for every
+// serverless sandbox's HTTP exposures using the current
+// HTTPWakeDirectBypassEnabled value. Called exactly once at daemon
+// startup when the rollback marker shows the previous run had bypass=true
+// and the current run has bypass=false: without this, every serverless
+// sandbox that was last written under bypass=true keeps its direct route
+// pointing straight at the container IP, bypassing the wake-aware
+// ingress proxy entirely — i.e. the rollback knob would not actually
+// roll back. Conversely, on a fresh enable (false→true) routes will be
+// rewritten lazily on the next Start/Stop, so no force-pass is needed in
+// that direction (D5 of plans/warm-direct-route-bypass.md).
+//
+// Idempotent: chooseRouteShape is a pure function of (cfg, sandbox), so
+// repeated calls converge to the same route set. Best-effort per
+// sandbox — one failed Caddy write logs and the loop continues so a
+// single broken row does not block the rest from being rolled back.
+func (s *Service) ForceReconcileHTTPWakeShape(ctx context.Context) error {
+	if !s.cfg.EnableServerless {
+		return nil
+	}
+	sandboxes, err := s.store.List(ctx)
+	if err != nil {
+		return fmt.Errorf("force reconcile http wake shape: list sandboxes: %w", err)
+	}
+	var (
+		visited int
+		failed  int
+	)
+	for _, sandbox := range sandboxes {
+		if sandbox == nil || !sandbox.Lifecycle.Serverless {
+			continue
+		}
+		for _, port := range sandbox.ExposedPorts {
+			if port.Protocol != "" && port.Protocol != models.ExposedPortProtocolHTTP {
+				continue
+			}
+			visited++
+			if err := s.installHTTPPortRoute(ctx, sandbox, port.Port); err != nil {
+				failed++
+				s.logger.Warn("force reconcile http wake shape failed for port",
+					"sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+			}
+		}
+	}
+	s.logger.Info("force reconcile http wake shape complete",
+		"visited", visited, "failed", failed,
+		"bypass_enabled", s.cfg.HTTPWakeDirectBypassEnabled,
+	)
+	return nil
 }

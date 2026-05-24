@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -259,6 +260,33 @@ func main() {
 		}
 		if cfg.IsIngress() {
 			svc.StartClusterIngressReconcile(ctx)
+		}
+	}
+
+	// Bypass-flip rollback marker (D5 of plans/warm-direct-route-bypass.md).
+	// HTTP routes installed under SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED=true point
+	// straight at the container IP. Toggling the flag back to false does not
+	// rewrite those routes on its own — a running serverless sandbox would
+	// keep bypassing the wake-aware ingress proxy forever, defeating the
+	// rollback. The marker file at ${dir(DBPath)}/bypass_last_enabled records
+	// what the previous run used; if that says true and we now see false,
+	// force one pass that republishes every serverless HTTP route through
+	// installHTTPPortRoute (which reads the new cfg value via chooseRouteShape).
+	// Worker-only: pure ingress/server nodes own no caddy routes for sandboxes.
+	if cfg.IsWorker() {
+		markerPath := filepath.Join(filepath.Dir(cfg.DBPath), "bypass_last_enabled")
+		prevEnabled := readBypassMarker(markerPath)
+		if prevEnabled && !cfg.HTTPWakeDirectBypassEnabled {
+			logger.Info("bypass rollback detected; forcing http wake-shape reconcile",
+				"marker_path", markerPath,
+			)
+			if err := svc.ForceReconcileHTTPWakeShape(ctx); err != nil {
+				logger.Warn("force reconcile http wake shape failed", "error", err)
+			}
+		}
+		if err := writeBypassMarker(markerPath, cfg.HTTPWakeDirectBypassEnabled); err != nil {
+			logger.Warn("write bypass marker failed; rollback detection may misfire next boot",
+				"marker_path", markerPath, "error", err)
 		}
 	}
 
@@ -648,4 +676,34 @@ func bytesTrimSpace(b []byte) []byte {
 
 func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// readBypassMarker returns true iff the marker file exists AND its content
+// is "true". A missing or unreadable marker reads as false — first boot
+// after a daemon upgrade looks identical to "previous run had bypass off",
+// which is the safer default (no force-reconcile, no surprise route
+// churn). The marker is plain text, not JSON or expvar, so an operator
+// can `cat` it during incident response without booting the daemon.
+func readBypassMarker(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return string(bytesTrimSpace(data)) == "true"
+}
+
+// writeBypassMarker persists the current bypass flag for the next boot's
+// rollback check. Uses a tmp-then-rename so a daemon crash mid-write
+// cannot leave a truncated marker that would later be misread as
+// `false` (and silently mask a true→false flip on the next boot).
+func writeBypassMarker(path string, enabled bool) error {
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(value+"\n"), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
