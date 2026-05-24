@@ -209,6 +209,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	// Mirror the API DestroySandbox path: drop the warm-preflight cache
 	// so the ingress proxy stops treating this id as Started.
 	s.invalidateWarm(sandbox.ID)
+	s.forgetNetstatsActivity(sandbox.ID)
 
 	// Best-effort teardown. Order matches DestroySandbox (caddy → mounts →
 	// store.Delete → admitter → maybeRemoveImage); container destroy is

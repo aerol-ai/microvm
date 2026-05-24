@@ -39,8 +39,9 @@ var ErrNotRunning = errors.New("netstats: container process not present")
 // container start — the poller computes deltas itself so it can survive
 // container restarts without double-counting.
 type Counters struct {
-	BytesIn  int64 // container rx (ingress to sandbox)
-	BytesOut int64 // container tx (egress from sandbox)
+	BytesIn   int64 // container rx (ingress to sandbox)
+	BytesOut  int64 // container tx (egress from sandbox)
+	ActiveTCP bool  // at least one established TCP socket in the netns
 }
 
 // Reader reads /proc/<pid>/net/dev. The fs.FS indirection exists so tests
@@ -74,7 +75,16 @@ func (r *Reader) Read(pid int) (Counters, error) {
 	}
 	defer data.Close()
 
-	return parseNetDev(data)
+	counters, err := parseNetDev(data)
+	if err != nil {
+		return Counters{}, err
+	}
+	active, err := r.readActiveTCP(pid)
+	if err != nil {
+		return Counters{}, err
+	}
+	counters.ActiveTCP = active
+	return counters, nil
 }
 
 // openNetDev returns a closer-backed reader for /proc/<pid>/net/dev.
@@ -84,14 +94,42 @@ type readCloser interface {
 }
 
 func (r *Reader) openNetDev(pid int) (readCloser, error) {
+	return r.openProcNet(pid, "dev")
+}
+
+func (r *Reader) openProcNet(pid int, name string) (readCloser, error) {
 	if r.fsys != nil {
-		f, err := r.fsys.Open(fmt.Sprintf("%d/net/dev", pid))
+		f, err := r.fsys.Open(fmt.Sprintf("%d/net/%s", pid, name))
 		if err != nil {
 			return nil, err
 		}
 		return f.(readCloser), nil
 	}
-	return os.Open(fmt.Sprintf("/proc/%d/net/dev", pid))
+	return os.Open(fmt.Sprintf("/proc/%d/net/%s", pid, name))
+}
+
+func (r *Reader) readActiveTCP(pid int) (bool, error) {
+	for _, name := range []string{"tcp", "tcp6"} {
+		data, err := r.openProcNet(pid, name)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		active, parseErr := parseProcNetTCP(data)
+		closeErr := data.Close()
+		if parseErr != nil {
+			return false, parseErr
+		}
+		if closeErr != nil {
+			return false, closeErr
+		}
+		if active {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // parseNetDev sums non-loopback rx/tx_bytes columns from a /proc/net/dev
@@ -138,4 +176,21 @@ func parseNetDev(r readCloser) (Counters, error) {
 		return Counters{}, err
 	}
 	return c, nil
+}
+
+func parseProcNetTCP(r readCloser) (bool, error) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 4 || fields[0] == "sl" {
+			continue
+		}
+		if fields[3] == "01" {
+			return true, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }

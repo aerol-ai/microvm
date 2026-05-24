@@ -19,6 +19,10 @@ const sampleProcNetDev = `Inter-|   Receive                                     
   eth0:    9000       18    0    0    0     0          0         0     5000       11    0    0    0     0       0          0
 `
 
+const sampleProcNetTCP = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 0200000A:BEEF 01 00000000:00000000 00:00000000 00000000   100        0 12345 1 0000000000000000 20 4 30 10 -1
+`
+
 func TestParseNetDevExcludesLoopback(t *testing.T) {
 	fsys := fstest.MapFS{
 		"42/net/dev": &fstest.MapFile{Data: []byte(sampleProcNetDev)},
@@ -30,6 +34,21 @@ func TestParseNetDevExcludesLoopback(t *testing.T) {
 	}
 	if got.BytesIn != 9000 || got.BytesOut != 5000 {
 		t.Fatalf("unexpected counters: %+v", got)
+	}
+}
+
+func TestReadMarksEstablishedTCPActive(t *testing.T) {
+	fsys := fstest.MapFS{
+		"42/net/dev": &fstest.MapFile{Data: []byte(sampleProcNetDev)},
+		"42/net/tcp": &fstest.MapFile{Data: []byte(sampleProcNetTCP)},
+	}
+	r := NewReaderFS(fsys)
+	got, err := r.Read(42)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !got.ActiveTCP {
+		t.Fatalf("ActiveTCP = false, want true")
 	}
 }
 
@@ -114,6 +133,27 @@ func TestPollerEstablishesBaselineThenEmitsDelta(t *testing.T) {
 	second := sink.batches[1][0]
 	if second.BytesIn != 3000 || second.BytesOut != 2500 {
 		t.Fatalf("expected delta 3000/2500, got %+v", second)
+	}
+}
+
+func TestPollerPublishesActiveTCPOnBaseline(t *testing.T) {
+	mfs := fstest.MapFS{
+		"100/net/dev": &fstest.MapFile{Data: []byte(sampleProcNetDev)},
+		"100/net/tcp": &fstest.MapFile{Data: []byte(sampleProcNetTCP)},
+	}
+	reader := NewReaderFS(mfs)
+	lookup := &fakeLookup{pids: map[string]int{"sb-1": 100}}
+	lister := &fakeLister{targets: []Target{{SandboxID: "sb-1", ContainerRef: "sb-1"}}}
+	sink := &fakeSink{}
+
+	p := NewPoller(slog.Default(), reader, lookup, lister, sink, time.Second)
+	p.tick(context.Background(), time.Unix(1000, 0))
+	if len(sink.batches) != 1 || len(sink.batches[0]) != 1 {
+		t.Fatalf("expected 1 sample on first tick, got %#v", sink.batches)
+	}
+	first := sink.batches[0][0]
+	if first.BytesIn != 0 || first.BytesOut != 0 || !first.ActiveTCP {
+		t.Fatalf("first tick = %+v, want zero deltas with ActiveTCP", first)
 	}
 }
 

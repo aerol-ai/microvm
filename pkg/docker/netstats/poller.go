@@ -43,11 +43,14 @@ type SampleSink interface {
 // is stored as the baseline so subsequent ticks compute meaningful diffs.
 // This makes the poller restart-safe: container restart → new PID → fresh
 // baseline → no spurious giant delta from the cumulative counter resetting
-// to a small number.
+// to a small number. ActiveTCP is the current socket-state observation, not a
+// delta, so the first sample can still carry "this sandbox has an established
+// TCP connection" even while byte deltas are zero.
 type Sample struct {
 	SandboxID string
 	BytesIn   int64
 	BytesOut  int64
+	ActiveTCP bool
 	SampledAt time.Time
 }
 
@@ -171,6 +174,7 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 			SandboxID: t.SandboxID,
 			BytesIn:   delta.BytesIn,
 			BytesOut:  delta.BytesOut,
+			ActiveTCP: delta.ActiveTCP,
 			SampledAt: now,
 		})
 	}
@@ -193,11 +197,12 @@ func (p *Poller) diffAndUpdate(sandboxID string, pid int, current Counters) Coun
 	prev, ok := p.baselines[sandboxID]
 	p.baselines[sandboxID] = baseline{pid: pid, counters: current}
 	if !ok || prev.pid != pid {
-		return Counters{}
+		return Counters{ActiveTCP: current.ActiveTCP}
 	}
 	return Counters{
-		BytesIn:  nonNegative(current.BytesIn - prev.counters.BytesIn),
-		BytesOut: nonNegative(current.BytesOut - prev.counters.BytesOut),
+		BytesIn:   nonNegative(current.BytesIn - prev.counters.BytesIn),
+		BytesOut:  nonNegative(current.BytesOut - prev.counters.BytesOut),
+		ActiveTCP: current.ActiveTCP,
 	}
 }
 

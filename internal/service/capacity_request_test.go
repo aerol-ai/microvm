@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -67,6 +68,41 @@ func TestCreateSandboxRejectsInvalidLargeClusterTopology(t *testing.T) {
 	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{Image: "alpine"})
 	if !errors.Is(err, cluster.ErrInvalidTopology) {
 		t.Fatalf("CreateSandbox error = %v, want ErrInvalidTopology", err)
+	}
+}
+
+func TestClusterTopologyRequiresShardAwareIngressForLargeIngressTier(t *testing.T) {
+	members := []cluster.Member{
+		{NodeID: "server-1", Role: config.NodeRoleServer, Alive: true},
+		{NodeID: "server-2", Role: config.NodeRoleServer, Alive: true},
+		{NodeID: "server-3", Role: config.NodeRoleServer, Alive: true},
+		{NodeID: "worker-1", Role: config.NodeRoleWorker, Alive: true},
+		{NodeID: "worker-2", Role: config.NodeRoleWorker, Alive: true},
+		{NodeID: "worker-3", Role: config.NodeRoleWorker, Alive: true},
+	}
+	for i := 0; i < cluster.MaxReplicatedIngressRouteNodes+1; i++ {
+		members = append(members, cluster.Member{
+			NodeID: fmt.Sprintf("ingress-%02d", i),
+			Role:   config.NodeRoleIngress,
+			Alive:  true,
+		})
+	}
+
+	svc := New(
+		config.Config{EnableCluster: true, NodeRole: config.NodeRoleWorker},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil, nil, nil, nil, nil, nil, nil,
+	)
+	svc.AttachCluster(&topologyCluster{Noop: cluster.NewNoop("worker-1", "http://worker-1"), members: members})
+
+	err := svc.ClusterTopologyError()
+	if !errors.Is(err, cluster.ErrInvalidTopology) {
+		t.Fatalf("ClusterTopologyError = %v, want ErrInvalidTopology", err)
+	}
+
+	svc.cfg.ClusterShardAwareIngress = true
+	if err := svc.ClusterTopologyError(); err != nil {
+		t.Fatalf("ClusterTopologyError with shard-aware ingress = %v, want nil", err)
 	}
 }
 

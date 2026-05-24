@@ -121,13 +121,13 @@ type Service struct {
 	netstatsPoller   *netstats.Poller
 	netstatsLastTick atomic.Int64 // unix nanos; last successful tick for /usage staleness reporting
 
-	// netstatsActivity is the per-sandbox "last non-zero BytesIn delta"
-	// timestamp (unix nanos), populated by the netstats poller sink.
-	// The idle sweep uses it as the activity floor under
-	// HTTPWakeDirectBypassEnabled so warm traffic that never reaches
-	// sandboxd (Caddy → container direct) still keeps the sweep from
-	// stopping a busy sandbox. RWMutex because the sweep reads more
-	// often than the poller writes (default 60s vs 10s). See
+	// netstatsActivity is the per-sandbox "last observed network activity"
+	// timestamp (unix nanos), populated by the netstats poller sink from
+	// non-zero byte deltas and established TCP sockets. The idle sweep uses it
+	// as the activity floor under direct-route bypass so warm traffic that
+	// never reaches sandboxd (Caddy → container direct) still keeps the sweep
+	// from stopping a busy sandbox. RWMutex because the sweep reads more often
+	// than the poller writes (default 60s vs 10s). See
 	// plans/warm-direct-route-bypass.md C2.
 	netstatsActivityMu sync.RWMutex
 	netstatsActivity   map[string]int64
@@ -361,7 +361,37 @@ func (s *Service) ClusterTopologyError() error {
 	if c == nil {
 		return nil
 	}
-	return cluster.LargeClusterTopologyError(c.Members())
+	return s.clusterTopologyErrorFor(c.Members())
+}
+
+// clusterTopologyErrorFor evaluates the production-topology contract against a
+// caller-supplied member snapshot. Extracted so Health() and the reconcile
+// loop can run the same shard-aware-ingress check without re-fetching members
+// or duplicating the threshold logic.
+func (s *Service) clusterTopologyErrorFor(members []cluster.Member) error {
+	if err := cluster.LargeClusterTopologyError(members); err != nil {
+		return err
+	}
+	if !s.cfg.ClusterShardAwareIngress {
+		ingress := 0
+		for _, m := range members {
+			if m.Alive && strings.TrimSpace(m.NodeID) != "" && cluster.CanServeIngressRole(m.Role) {
+				ingress++
+			}
+		}
+		if ingress > cluster.MaxReplicatedIngressRouteNodes {
+			return fmt.Errorf("%w: clusters with more than %d live ingress nodes shard public routes; set SB_CLUSTER_SHARD_AWARE_INGRESS=true only when the upstream router uses /v1/cluster/ingress-route/{id} or an equivalent shard-aware routing path",
+				cluster.ErrInvalidTopology, cluster.MaxReplicatedIngressRouteNodes)
+		}
+	}
+	return nil
+}
+
+func (s *Service) validateLifecycle(l models.Lifecycle) error {
+	if s.anyBypassEnabled() {
+		return l.ValidateWithBypassFloor(s.cfg.NetstatsPollInterval, s.cfg.ReconcileInterval)
+	}
+	return l.Validate()
 }
 
 // EnsureClusterReady blocks until the cluster has elected a leader, mirroring
@@ -619,7 +649,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	var lifecycle models.Lifecycle
 	if req.Lifecycle != nil {
-		if err := req.Lifecycle.Validate(); err != nil {
+		if err := s.validateLifecycle(*req.Lifecycle); err != nil {
 			return nil, fmt.Errorf("invalid lifecycle: %w", err)
 		}
 		lifecycle = *req.Lifecycle
@@ -1367,7 +1397,7 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 // The sweep picks up the new values on its next tick (within ~1 minute),
 // so a tightened deadline can fire as soon as the next sweep runs.
 func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifecycle) (*models.Sandbox, error) {
-	if err := l.Validate(); err != nil {
+	if err := s.validateLifecycle(l); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
 	priorSandbox, _ := s.store.Get(ctx, id)
@@ -2232,7 +2262,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		if c := s.Cluster(); c != nil {
 			members := c.Members()
 			clusterNodes = cluster.LiveMemberCount(members)
-			if err := cluster.LargeClusterTopologyError(members); err != nil {
+			if err := s.clusterTopologyErrorFor(members); err != nil {
 				clusterTopology = err.Error()
 				status = "degraded"
 			}
@@ -2290,6 +2320,21 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 }
 
 func (s *Service) Reconcile(ctx context.Context) error {
+	// Topology heartbeat: surface a cluster that has crossed the
+	// 10-ingress-node sharding threshold without operator opt-in to
+	// SB_CLUSTER_SHARD_AWARE_INGRESS. /health also reports this, but the
+	// reconcile log line makes it visible to anyone reading sandboxd logs
+	// (no metrics scrape required) and repeats on every cycle until fixed,
+	// which is the desired loud signal — sharded ingress + naive LB silently
+	// black-holes ~(N-1)/N of public traffic.
+	if s.cfg.EnableCluster {
+		if c := s.Cluster(); c != nil {
+			if err := s.clusterTopologyErrorFor(c.Members()); err != nil {
+				s.logger.Warn("cluster topology violation", "error", err.Error())
+			}
+		}
+	}
+
 	// Stale-ownership sweep first: if the cluster FSM says another node now
 	// owns one of our local sandboxes (typical after a flapped node returns
 	// to find its placements were reassigned during the outage), destroy the
@@ -2348,6 +2393,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				return err
 			}
 			s.forgetWakeFlight(sandbox.ID)
+			s.invalidateWarm(sandbox.ID)
+			s.forgetNetstatsActivity(sandbox.ID)
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
@@ -2591,9 +2638,9 @@ const (
 // activityFloorFor computes the timestamp the lifecycle sweep should
 // treat as the sandbox's most recent activity. Default is
 // sandbox.LastActiveAt; when any warm-direct bypass is enabled (HTTP or
-// L4) and the netstats poller has a recorded non-zero BytesIn delta
-// more recent than LastActiveAt, the netstats timestamp wins so warm
-// traffic that bypasses sandboxd does not get false-idle-stopped.
+// L4) and the netstats poller has recorded network activity more recent than
+// LastActiveAt, the netstats timestamp wins so warm traffic that bypasses
+// sandboxd does not get false-idle-stopped.
 // Netstats observes container interface bytes regardless of protocol,
 // so one floor covers HTTP + L4 with a single mechanism — the OR over
 // both flags is what makes Phase 2 (L4 bypass) safe to enable without
@@ -2608,7 +2655,7 @@ func (s *Service) activityFloorFor(sandbox *models.Sandbox, netstatsFallback boo
 	if !s.anyBypassEnabled() || netstatsFallback {
 		return floor
 	}
-	if observed := s.netstatsRecentBytesInAt(sandbox.ID); !observed.IsZero() && observed.After(floor) {
+	if observed := s.netstatsRecentActivityAt(sandbox.ID); !observed.IsZero() && observed.After(floor) {
 		return observed
 	}
 	return floor
@@ -2638,11 +2685,11 @@ func (s *Service) netstatsPollIsStale(now time.Time) bool {
 	return now.Sub(time.Unix(0, last)) > 2*s.cfg.NetstatsPollInterval
 }
 
-// netstatsRecentBytesInAt returns the unix-nano timestamp of the most
-// recent non-zero BytesIn sample observed for the sandbox, or the
-// zero time if no observation has been recorded yet. Cheap read-lock
-// lookup populated by the netstats poller sink.
-func (s *Service) netstatsRecentBytesInAt(id string) time.Time {
+// netstatsRecentActivityAt returns the unix-nano timestamp of the most recent
+// network activity observed for the sandbox, or the zero time if no observation
+// has been recorded yet. Cheap read-lock lookup populated by the netstats
+// poller sink.
+func (s *Service) netstatsRecentActivityAt(id string) time.Time {
 	s.netstatsActivityMu.RLock()
 	ts, ok := s.netstatsActivity[id]
 	s.netstatsActivityMu.RUnlock()
@@ -2653,9 +2700,9 @@ func (s *Service) netstatsRecentBytesInAt(id string) time.Time {
 }
 
 // recordNetstatsActivity is called by the netstats sink for every
-// non-zero BytesIn sample. SampledAt comes from the docker stats
-// reader so timestamps are consistent with the rest of the
-// observability surface.
+// activity observed by the netstats poller. SampledAt comes from the docker
+// stats reader so timestamps are consistent with the rest of the observability
+// surface.
 func (s *Service) recordNetstatsActivity(id string, sampledAt time.Time) {
 	if id == "" || sampledAt.IsZero() {
 		return

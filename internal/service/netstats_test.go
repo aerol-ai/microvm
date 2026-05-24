@@ -200,6 +200,45 @@ func TestNetstatsTargetsAndHandleSamples(t *testing.T) {
 	}
 }
 
+func TestNetstatsActivityIncludesOutboundAndActiveTCP(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	for _, id := range []string{"sb-outbound", "sb-active"} {
+		seedNetstatsSandbox(t, st, &models.Sandbox{
+			ID:          id,
+			Image:       "alpine:3.20",
+			Status:      models.SandboxStatusStarted,
+			ContainerID: "ctr-" + id,
+			ContainerIP: "10.0.0.20",
+			CPU:         1,
+			MemoryMB:    256,
+			DiskGB:      5,
+			OSUser:      "root",
+		})
+	}
+
+	sampledAt := time.Now().UTC()
+	netstatsServiceSink{svc: svc}.HandleSamples(ctx, []netstats.Sample{
+		{SandboxID: "sb-outbound", BytesOut: 12, SampledAt: sampledAt},
+		{SandboxID: "sb-active", ActiveTCP: true, SampledAt: sampledAt},
+	})
+
+	if got := svc.netstatsRecentActivityAt("sb-outbound"); !got.Equal(sampledAt) {
+		t.Fatalf("outbound activity = %v, want %v", got, sampledAt)
+	}
+	if got := svc.netstatsRecentActivityAt("sb-active"); !got.Equal(sampledAt) {
+		t.Fatalf("active TCP activity = %v, want %v", got, sampledAt)
+	}
+	active, err := st.Get(ctx, "sb-active")
+	if err != nil {
+		t.Fatalf("store.Get(active): %v", err)
+	}
+	if active.NetworkBytesIn != 0 || active.NetworkBytesOut != 0 {
+		t.Fatalf("active TCP zero-byte sample changed counters: in=%d out=%d", active.NetworkBytesIn, active.NetworkBytesOut)
+	}
+}
+
 func seedNetstatsSandbox(t *testing.T, st *storepkg.Store, sandbox *models.Sandbox) {
 	t.Helper()
 	now := time.Now().UTC()

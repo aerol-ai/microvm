@@ -549,3 +549,61 @@ The gate is a rollout switch, not a per-sandbox toggle — matches the
 - `plans/custom-domains-dns01.md` — per-host DNS-01 issuance so
   wildcard custom domains and apex domains without `ALIAS` support
   can work.
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | not run |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | not run |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open (PLAN) | 13 issues, 2 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | not run (no UI scope) |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | not run |
+
+**Outside Voice:** Codex unavailable (binary broken); fell back to Claude subagent. Surfaced 7 findings, 4 promoted to cross-model tension decisions (OV1A, OV4A, OV5A, OV7A).
+
+**CROSS-MODEL:** Outside voice agreed with all original architectural decisions (A1A, A2A, A3A, A4-resolve, A5A). Disagreed on TODO-3 — outside voice argued daemon-wide ACME budget enforcement is a v1 multi-tenant blocker, not a TODO. User accepted (OV5A); TODO-3 promoted to v1 scope.
+
+**UNRESOLVED:** 0 decisions left open.
+
+**Decisions locked (apply during implementation):**
+
+| ID | Decision |
+|---|---|
+| A1A | Rewrite §9 around `internal/service/ingress_delta.go` (delta-driven cluster ingress convergence) instead of direct `UpsertSandboxRouteToPeer` calls |
+| A2A | Cluster-wide hostname uniqueness enforced via placement FSM (Raft); `AddCustomDomain` becomes a Raft command, hostname→sandbox map in FSM state |
+| A3A | `ask` endpoint reads from local FSM state (collapsed into A2A); no separate cold-cache lookup mechanism |
+| A4-doc | certmagic-s3 shared cert storage already handles multi-node issuance via distributed lock — add §5 note + docs cross-link to `setup/multi-node-cert-sharing.md`; no new code |
+| A5A | `ask` handler colocates with wake-proxy code on `InternalIngressAddr` (no new `internal/ingress/` package) |
+| C1A | Add bounded LRU negative cache to `ask` handler (60s TTL, cap 10k, evict on successful `AddCustomDomain`) |
+| T1A | Required v1 E2E test using Pebble + localstack S3 + `/etc/hosts` override to verify full ACME flow |
+| P1A | Document expected reconcile fan-out ceiling; do not paginate in v1 |
+| OV1A | Add "Workload assumptions" section to plan: who uses this, what sandbox lifetime model it assumes |
+| OV4A | API + SDK gain per-domain status field: `{hostname, status: pending_dns\|issuing\|ready\|failed, error?}` |
+| OV5A | Daemon-wide ACME issuance token bucket lands in v1 (not v2 TODO); refuse at 80% of LE account limit with 429 |
+| OV7A | Hostname FSM entries are lifetime-bound to sandbox FSM placement; same Raft command that removes a sandbox releases its hostnames |
+| TODO-1A | Cert blob GC after removal → `TODOS.md` (deferred) |
+| TODO-3A | (Superseded by OV5A — promoted to v1) |
+
+**Plan revisions required before code:**
+
+1. Rewrite §9 cluster section around `ingress_delta.go` and `cluster.ForwardHTTP` (A1A).
+2. Add §10 "FSM hostname uniqueness" subsection (A2A + OV7A).
+3. Update §5 to cross-reference `setup/multi-node-cert-sharing.md` and note certmagic-s3 behavior (A4-doc).
+4. Change §5 handler path from `internal/ingress/tls_ask.go` to a sibling file in the wake-proxy package (A5A).
+5. Add §5b "ACME budget" subsection (OV5A).
+6. Add §11 "Workload assumptions" section (OV1A).
+7. Expand §2 Models with per-domain status field + state machine (OV4A).
+8. Update §10 "Tests" — add regression tests (tcp/tls + custom_domains rejection, FSM, ingress_delta, negative cache, validation completeness, API contract, E2E ACME).
+9. Move TODO-3 (daemon-wide ACME budget) out of "Risks & open questions" #3 into the v1 work breakdown.
+10. Add a one-line capacity note in §8 (P1A reconcile fan-out ceiling).
+11. Append "Critical observability" (Failure modes #3, #4) — expvar metrics + Prometheus alerts for `ask` call rate and certmagic-s3 lock duration — to v1 scope.
+
+**Failure-mode critical gaps (must close before ship, not just before merge):** 2
+- F3 — S3 lock held by dead node during ACME (no monitoring) → addressed by observability addition above
+- F4 — `ask` loopback listener crashes mid-process (no monitoring) → addressed by observability addition above
+
+**VERDICT:** ENG REVIEW COMPLETE (issues open). 13 plan revisions required before implementation starts. No second blocker found. CEO review and design review not applicable (backend/infra change with no UI surface). Re-run `/plan-eng-review` after the plan is updated to confirm closure, then run `/ship` when implementation lands.
+
