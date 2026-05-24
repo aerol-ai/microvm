@@ -9,6 +9,7 @@ import type {
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
+  IngressTarget,
   Lifecycle,
   ListOptions,
   MountSpecRedacted,
@@ -178,6 +179,20 @@ export class MicroVM {
 
   attachSession(sandboxID: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
     return this.client.attachSession(sandboxID, sessionID, options);
+  }
+
+  /**
+   * Cluster-level DNS helpers. Exposed as a namespaced accessor (rather
+   * than a flat `ingressDNS()` method) so call sites read like
+   * `microvm.dns.target()`, mirroring the per-sandbox `sandbox.customDomains`
+   * pattern. A fresh object is returned per access so the closures always
+   * see the current client even if MicroVM is later extended.
+   */
+  get dns(): { target(): Promise<IngressTarget> } {
+    const client = this.client;
+    return {
+      target: () => client.ingressDNS(),
+    };
   }
 
   private wrap(sandbox: SandboxData): Sandbox {

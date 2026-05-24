@@ -161,7 +161,7 @@ func TestRecreateSandboxKeepsCreatedSandboxWhenReplayFails(t *testing.T) {
 	svc.cfg.L4PortRangeStart = 30500
 	svc.cfg.L4PortRangeEnd = 30510
 	reserver := &hostPortReserveCluster{
-		Noop:     cluster.NewNoop("self", "http://self"),
+		Noop:     cluster.NewNoop("self", "http://self", ""),
 		reserved: map[int]bool{30505: true},
 	}
 	svc.AttachCluster(reserver)
@@ -194,7 +194,7 @@ func TestAllocateHostPortHonorsClusterReservationBeforeLocalStore(t *testing.T) 
 	svc.cfg.L4PortRangeStart = 22430
 	svc.cfg.L4PortRangeEnd = 22431
 	reserver := &hostPortReserveCluster{
-		Noop:     cluster.NewNoop("self", "http://self"),
+		Noop:     cluster.NewNoop("self", "http://self", ""),
 		reserved: map[int]bool{22430: true, 22431: true},
 	}
 	svc.AttachCluster(reserver)
@@ -250,7 +250,7 @@ func TestAllocateHostPortPreferredUnavailableParksInsteadOfReallocating(t *testi
 	svc.cfg.L4PortRangeEnd = 30999
 	const preferred = 30500
 	reserver := &hostPortReserveCluster{
-		Noop:     cluster.NewNoop("self", "http://self"),
+		Noop:     cluster.NewNoop("self", "http://self", ""),
 		reserved: map[int]bool{preferred: true},
 	}
 	svc.AttachCluster(reserver)

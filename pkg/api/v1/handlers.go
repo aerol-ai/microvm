@@ -260,6 +260,32 @@ func (h *handlers) listCustomDomains(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"custom_domains": domains})
 }
 
+// customDomainDNS returns the ready-to-paste DNS records for a sandbox's
+// attached custom domains plus the resolved ingress target. SDK consumers
+// surface this directly to end users so they don't have to read the
+// custom-domains docs to figure out what record to add at their DNS
+// provider. Same cluster-forwarding wrap as the other per-sandbox routes:
+// owner is the only node that holds the sandbox row.
+func (h *handlers) customDomainDNS(w http.ResponseWriter, r *http.Request) {
+	resp, err := h.deps.Service.CustomDomainDNS(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// ingressDNS returns the cluster's public ingress address(es) — the value
+// users must point custom-domain DNS records at. Read-only and not
+// sandbox-scoped; the same target serves every custom domain on the
+// cluster. No EnableCustomDomains gate: the underlying data is the
+// gossiped public host every node already advertises, and an SDK consumer
+// rendering "point your DNS here first" is useful even before they decide
+// whether to attach a domain.
+func (h *handlers) ingressDNS(w http.ResponseWriter, r *http.Request) {
+	apihttp.WriteJSON(w, http.StatusOK, h.deps.Service.IngressDNSTarget())
+}
+
 func (h *handlers) listMounts(w http.ResponseWriter, r *http.Request) {
 	mounts, err := h.deps.Service.ListMounts(r.Context(), r.PathValue("id"))
 	if err != nil {

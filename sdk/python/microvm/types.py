@@ -265,6 +265,55 @@ class CustomDomain(TypedDict, total=False):
     updatedAt: str
 
 
+class IngressTarget(TypedDict, total=False):
+    """DNS target a custom hostname should point at to reach this daemon.
+
+    Mirrors ``pkg/models.IngressTarget`` on the server. ``source`` is one of
+    ``"hostname"``, ``"ips"``, ``"mixed"``, or ``"unknown"`` and describes
+    the shape of the target (NOT how it was resolved):
+
+    - ``"hostname"`` — ``hostname`` is set; DNS for custom domains is a
+      CNAME to it.
+    - ``"ips"`` — ``ips`` is populated; DNS is one A/AAAA per IP.
+    - ``"mixed"`` — both fields populated (ingress nodes advertise a mix);
+      callers should prefer hostname for subdomains and IPs at apex.
+    - ``"unknown"`` — no usable target; callers should render an
+      operator-must-configure-ingress error rather than fake records.
+    """
+
+    hostname: str
+    ips: List[str]
+    source: str
+
+
+class DNSRecord(TypedDict, total=False):
+    """Single DNS record the operator should create for a custom hostname.
+
+    Mirrors ``pkg/models.DNSRecord`` on the server. ``notes`` is optional and
+    only set when the server has additional human-readable guidance to attach
+    (TTL recommendations, CNAME vs A choice rationale, etc.).
+    """
+
+    hostname: str
+    type: str
+    name: str
+    value: str
+    notes: str
+
+
+class CustomDomainDNSRecords(TypedDict, total=False):
+    """Response shape of ``GET /sandboxes/{id}/custom-domains/dns``.
+
+    Bundles the per-hostname records the operator needs to publish with the
+    underlying :class:`IngressTarget` that all hostnames ultimately resolve
+    to, so a caller can render a single instruction list without a follow-up
+    call to :meth:`MicroVM.dns_target`.
+    """
+
+    records: List[DNSRecord]
+    target: IngressTarget
+
+
 class SandboxSnapshot(TypedDict, total=False):
     name: str
     image: str

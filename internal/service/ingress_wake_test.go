@@ -45,7 +45,7 @@ func TestPlacementSubscriptionWiringSelectsOnWake(t *testing.T) {
 // select{}. Without this, the reconciler loop in single-node mode would
 // either receive a phantom wake or panic on a closed-channel design.
 func TestNoopSubscribePlacementNeverFires(t *testing.T) {
-	noop := cluster.NewNoop("self", "")
+	noop := cluster.NewNoop("self", "", "")
 	ch := noop.SubscribePlacement(context.Background())
 	if ch != nil {
 		t.Fatalf("Noop.SubscribePlacement returned %v, want nil", ch)

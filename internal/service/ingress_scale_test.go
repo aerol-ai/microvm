@@ -310,7 +310,7 @@ func TestReconcileClusterIngressFailoverStormBoundedBurst(t *testing.T) {
 			},
 		}
 	}
-	stub := &stubIngressCluster{Noop: cluster.NewNoop("self", "http://self"), placements: healthy}
+	stub := &stubIngressCluster{Noop: cluster.NewNoop("self", "http://self", ""), placements: healthy}
 	svc.AttachCluster(stub)
 
 	ctx := context.Background()

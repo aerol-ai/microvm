@@ -13,7 +13,7 @@ import (
 // EnableCluster=false mode every cluster operation must report self/no-op so
 // the API wrapper falls through to the existing local handlers.
 func TestNoopAlwaysSelf(t *testing.T) {
-	n := NewNoop("standalone", "http://localhost:21212")
+	n := NewNoop("standalone", "http://localhost:21212", "")
 
 	owner, err := n.OwnerOf("any-id")
 	if err != nil {
@@ -63,7 +63,7 @@ func TestNoopAlwaysSelf(t *testing.T) {
 // TestNoopForwardHTTPSignals500 makes the bug loud: if anything ever calls
 // ForwardHTTP in single-node mode, surface it rather than silently 200.
 func TestNoopForwardHTTPSignals500(t *testing.T) {
-	n := NewNoop("s", "http://s")
+	n := NewNoop("s", "http://s", "")
 	w := newRecorder()
 	n.ForwardHTTP(Endpoint{APIURL: "http://nowhere"}, w, nil)
 	if w.code != 500 {

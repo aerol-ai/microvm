@@ -43,7 +43,7 @@ func TestCreateSandboxClusterForwardSkipsLocalIdempotencyAndRuntime(t *testing.T
 	runtime := newFakeE2BRuntime()
 	svc, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: 2280})
 	fakeCluster := &e2bForwardCluster{
-		Noop:   cluster.NewNoop("router", "http://router"),
+		Noop:   cluster.NewNoop("router", "http://router", ""),
 		target: cluster.PlacementTarget{NodeID: "worker-a", APIURL: "http://worker-a:21212"},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -95,7 +95,7 @@ func (c *e2bOwnerForwardCluster) ForwardHTTP(target cluster.Endpoint, w http.Res
 func TestClusterForwardWrapForwardsE2BSandboxOperationsToOwner(t *testing.T) {
 	svc, _, _ := newE2BHandlerTestEnv(t)
 	fakeCluster := &e2bOwnerForwardCluster{
-		Noop:  cluster.NewNoop("router", "http://router"),
+		Noop:  cluster.NewNoop("router", "http://router", ""),
 		owner: cluster.OwnerInfo{NodeID: "worker-a", APIURL: "http://worker-a:21212"},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -125,7 +125,7 @@ func TestClusterForwardWrapForwardsE2BSandboxOperationsToOwner(t *testing.T) {
 func TestClusterForwardWrapReturnsGoneForOrphanedE2BPlacement(t *testing.T) {
 	svc, _, _ := newE2BHandlerTestEnv(t)
 	svc.AttachCluster(&e2bOwnerForwardCluster{
-		Noop:     cluster.NewNoop("router", "http://router"),
+		Noop:     cluster.NewNoop("router", "http://router", ""),
 		ownerErr: cluster.ErrOrphaned,
 	})
 	h := newHandlers(Deps{Service: svc})

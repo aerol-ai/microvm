@@ -253,8 +253,10 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		images:   newDefaultImageDistributionProvider(cfg.ImageDistributionAOCRHost),
 		// Default to Noop so callers don't have to nil-check the cluster
 		// reference. AttachCluster swaps in the real implementation when
-		// cluster mode is enabled at boot.
-		cluster: cluster.NewNoop("standalone", ""),
+		// cluster mode is enabled at boot. EffectivePublicHost() feeds the
+		// DNS-helper API (Noop.IngressTargets) — single-node deployments
+		// can answer "what should DNS point at" without any extra wiring.
+		cluster: cluster.NewNoop("standalone", "", cfg.EffectivePublicHost()),
 	}
 	s.ensureTouchCoalescer()
 	s.ensureCaddyCoalescer()

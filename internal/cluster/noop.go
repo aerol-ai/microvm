@@ -13,17 +13,22 @@ import (
 // if this node owns every sandbox and is the only cluster member. Used when
 // cfg.EnableCluster is false so callsites can be unconditional.
 type Noop struct {
-	nodeID string
-	apiURL string
+	nodeID     string
+	apiURL     string
+	publicHost string
 }
 
 // NewNoop returns a single-node Client. nodeID and apiURL are reported back
-// for observability but never actually used for routing.
-func NewNoop(nodeID, apiURL string) *Noop {
+// for observability but never actually used for routing. publicHost is the
+// operator-configured public ingress address (config.EffectivePublicHost)
+// that IngressTargets reports as the single-member target. Empty when the
+// daemon runs in IP-only mode (no SB_PUBLIC_HOST / SB_DOMAIN), which also
+// means custom domains are disabled.
+func NewNoop(nodeID, apiURL, publicHost string) *Noop {
 	if nodeID == "" {
 		nodeID = "standalone"
 	}
-	return &Noop{nodeID: nodeID, apiURL: apiURL}
+	return &Noop{nodeID: nodeID, apiURL: apiURL, publicHost: publicHost}
 }
 
 func (n *Noop) SelfNodeID() string { return n.nodeID }
@@ -93,7 +98,17 @@ func (n *Noop) ForwardHTTP(target Endpoint, w http.ResponseWriter, r *http.Reque
 func (n *Noop) AttachInternalHandler(h http.Handler) {}
 
 func (n *Noop) Members() []Member {
-	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}
+	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}}
+}
+
+// IngressTargets reports the single-node deployment's public address as the
+// DNS target. Empty publicHost (IP-only mode) returns the Unknown source so
+// the service layer can surface a clean 412 rather than fake records.
+func (n *Noop) IngressTargets() models.IngressTarget {
+	if n.publicHost == "" {
+		return models.IngressTarget{Source: models.IngressTargetSourceUnknown}
+	}
+	return composeIngressTarget([]string{n.publicHost})
 }
 
 func (n *Noop) Placements() []Placement { return nil }

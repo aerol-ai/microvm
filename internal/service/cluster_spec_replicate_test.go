@@ -60,7 +60,7 @@ func TestResizeSandboxWritesThroughToClusterSpec(t *testing.T) {
 	ctx := context.Background()
 	svc, _, st := newCapacityHarness(t, nil, nil)
 	stub := &specWriteThroughCluster{
-		Noop: cluster.NewNoop("self", "http://self"),
+		Noop: cluster.NewNoop("self", "http://self", ""),
 		spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 512, DiskGB: 1},
 	}
 	svc.AttachCluster(stub)
@@ -102,7 +102,7 @@ func TestUpdateLifecycleWritesThroughToClusterSpec(t *testing.T) {
 	ctx := context.Background()
 	svc, _, st := newCapacityHarness(t, nil, nil)
 	stub := &specWriteThroughCluster{
-		Noop: cluster.NewNoop("self", "http://self"),
+		Noop: cluster.NewNoop("self", "http://self", ""),
 		spec: &models.CreateSandboxRequest{Image: "alpine"},
 	}
 	svc.AttachCluster(stub)
@@ -143,7 +143,7 @@ func TestUpdateLifecycleWritesThroughToClusterSpec(t *testing.T) {
 func TestResizeSandboxSkipsWriteThroughWhenSpecNotRecorded(t *testing.T) {
 	ctx := context.Background()
 	svc, _, st := newCapacityHarness(t, nil, nil)
-	stub := &specWriteThroughCluster{Noop: cluster.NewNoop("self", "http://self")}
+	stub := &specWriteThroughCluster{Noop: cluster.NewNoop("self", "http://self", "")}
 	svc.AttachCluster(stub)
 
 	now := time.Now().UTC()

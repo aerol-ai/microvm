@@ -287,9 +287,14 @@ type Member struct {
 	InternalURL string `json:"internal_url,omitempty"`
 	// Role is the peer's gossiped SB_NODE_ROLE. Empty for older builds that
 	// pre-date the field; callers treat empty as the legacy "mixed" default.
-	Role     string            `json:"role,omitempty"`
-	Alive    bool              `json:"alive"`
-	Capacity capacity.Snapshot `json:"capacity"`
+	Role string `json:"role,omitempty"`
+	// PublicHost is the peer's gossiped public ingress address
+	// (config.EffectivePublicHost). Aggregated by Cluster.IngressTargets to
+	// answer the DNS-helper API. Empty for peers without a public host set
+	// or running pre-PublicHost builds.
+	PublicHost string            `json:"public_host,omitempty"`
+	Alive      bool              `json:"alive"`
+	Capacity   capacity.Snapshot `json:"capacity"`
 	// CapacityUpdatedUnix is when this node's last capacity heartbeat was
 	// observed by the scheduler. CapacityStale means the last heartbeat is
 	// missing or too old for placement admission.
@@ -564,6 +569,16 @@ type Client interface {
 
 	// Members returns a snapshot of all known cluster members.
 	Members() []Member
+
+	// IngressTargets aggregates live ingress-role nodes' gossiped PublicHost
+	// values into the set of public addresses users must point DNS at for
+	// custom domains. Hostnames and raw IPs are partitioned via net.ParseIP;
+	// duplicates are removed; output ordering is stable so the API response
+	// is byte-identical across calls when membership is unchanged. Source
+	// reflects whether the cluster published a hostname, IPs, both, or
+	// nothing usable (see models.IngressTargetSource*). Service-layer
+	// IngressDNSTarget wraps this; clients hit GET /v1/ingress/dns.
+	IngressTargets() models.IngressTarget
 
 	// Placements returns the local FSM's hot placement snapshot. Recovery
 	// payloads (Spec/secrets) are omitted; use PlacementOf/SpecOf for point

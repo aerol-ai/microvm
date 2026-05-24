@@ -175,6 +175,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		RaftAddr:       "",
 		InternalURL:    a.internalURL,
 		Role:           cfg.NodeRole,
+		PublicHost:     cfg.EffectivePublicHost(),
 		BootstrapPeers: cfg.BootstrapPeers,
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
@@ -566,6 +567,14 @@ func (a *Agent) Members() []Member {
 		return resp.Members
 	}
 	return a.gossip.members()
+}
+
+// IngressTargets aggregates live ingress-role members' PublicHost values.
+// Agents have no FSM but Members() already falls back to the local gossip
+// view when the control plane is unreachable, so the same aggregator works
+// for both cases.
+func (a *Agent) IngressTargets() models.IngressTarget {
+	return aggregateIngressTargets(a.Members())
 }
 
 func (a *Agent) Placements() []Placement {

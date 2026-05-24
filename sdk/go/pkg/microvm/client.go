@@ -296,6 +296,15 @@ func (c *Client) Health(ctx context.Context) (sdktypes.HealthStatus, error) {
 	return c.inner.Health(ctx)
 }
 
+// DNSTarget returns the cluster-published ingress target — the hostname
+// and/or IP set that custom-domain DNS records must point at. Source
+// disambiguates the shape ("hostname" / "ips" / "mixed" / "unknown"), so
+// callers don't have to inspect which fields are populated to know whether
+// to render a CNAME or A/AAAA setup hint.
+func (c *Client) DNSTarget(ctx context.Context) (sdktypes.IngressTarget, error) {
+	return c.inner.DNSTarget(ctx)
+}
+
 func (c *Client) ExecStream(ctx context.Context, id string, options sdktypes.ExecStreamOptions) (*ExecStreamHandle, error) {
 	handle, err := c.inner.ExecStream(ctx, id, options)
 	if err != nil {
@@ -397,6 +406,15 @@ func (s *Sandbox) RemoveCustomDomain(ctx context.Context, hostname string) error
 // after AddCustomDomain.
 func (s *Sandbox) ListCustomDomains(ctx context.Context) ([]sdktypes.CustomDomain, error) {
 	return s.client.inner.ListCustomDomains(ctx, s.ID)
+}
+
+// CustomDomainDNS returns the ready-to-paste DNS records the user must add at
+// their provider for every custom domain on this sandbox to reach the
+// cluster, plus the raw ingress target the records were derived from. One
+// row per (hostname × ingress address); branch on Target.Source to render a
+// "CNAME vs A/AAAA" hint.
+func (s *Sandbox) CustomDomainDNS(ctx context.Context) (sdktypes.CustomDomainDNSRecords, error) {
+	return s.client.inner.CustomDomainDNS(ctx, s.ID)
 }
 
 func (s *Sandbox) CreateSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {

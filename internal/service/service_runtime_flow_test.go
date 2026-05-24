@@ -504,7 +504,7 @@ func TestHealthReportsClusterTopologyDegraded(t *testing.T) {
 	svc, _, _ := newServiceRuntimeHarness(t, rt)
 	svc.cfg.EnableCluster = true
 	svc.AttachCluster(&topologyCluster{
-		Noop: cluster.NewNoop("node-01", "http://node-01"),
+		Noop: cluster.NewNoop("node-01", "http://node-01", ""),
 		members: []cluster.Member{
 			{NodeID: "server-1", Role: config.NodeRoleServer, Alive: true},
 			{NodeID: "server-2", Role: config.NodeRoleServer, Alive: true},
@@ -557,7 +557,7 @@ func TestHealthReportsShardAwareIngressViolation(t *testing.T) {
 		})
 	}
 	svc.AttachCluster(&topologyCluster{
-		Noop:    cluster.NewNoop("node-01", "http://node-01"),
+		Noop:    cluster.NewNoop("node-01", "http://node-01", ""),
 		members: members,
 	})
 
@@ -595,7 +595,7 @@ func TestEnsureClusterReadyCoversInitAndLeaderPaths(t *testing.T) {
 
 	t.Run("context canceled before leader election", func(t *testing.T) {
 		svc := &Service{}
-		svc.AttachCluster(&leaderCluster{Noop: cluster.NewNoop("self", "http://self"), leader: ""})
+		svc.AttachCluster(&leaderCluster{Noop: cluster.NewNoop("self", "http://self", ""), leader: ""})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if err := svc.EnsureClusterReady(ctx); !errors.Is(err, context.Canceled) {
@@ -605,7 +605,7 @@ func TestEnsureClusterReadyCoversInitAndLeaderPaths(t *testing.T) {
 
 	t.Run("leader available latches readiness", func(t *testing.T) {
 		svc := &Service{}
-		svc.AttachCluster(&leaderCluster{Noop: cluster.NewNoop("self", "http://self"), leader: "leader-1"})
+		svc.AttachCluster(&leaderCluster{Noop: cluster.NewNoop("self", "http://self", ""), leader: "leader-1"})
 		if err := svc.EnsureClusterReady(context.Background()); err != nil {
 			t.Fatalf("EnsureClusterReady() error = %v", err)
 		}

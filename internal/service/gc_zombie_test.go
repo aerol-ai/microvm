@@ -249,7 +249,7 @@ func TestGCZombieCaddyEntriesKeepsRemoteClusterIngressRoutes(t *testing.T) {
 		caddy:  caddyClient,
 	}
 	svc.AttachCluster(&stubIngressCluster{
-		Noop: cluster.NewNoop("self", "http://self"),
+		Noop: cluster.NewNoop("self", "http://self", ""),
 		placements: []cluster.Placement{{
 			SandboxID:   "remote",
 			OwnerNodeID: "other",
@@ -303,7 +303,7 @@ func TestReconcileClusterIngressGCsRoutesWhenPlacementGone(t *testing.T) {
 		caddy:  caddyClient,
 	}
 	svc.AttachCluster(&stubIngressCluster{
-		Noop:       cluster.NewNoop("self", "http://self"),
+		Noop:       cluster.NewNoop("self", "http://self", ""),
 		placements: nil,
 	})
 

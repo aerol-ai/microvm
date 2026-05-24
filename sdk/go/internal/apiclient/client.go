@@ -504,6 +504,26 @@ func (c *Client) ListCustomDomains(ctx context.Context, id string) ([]models.Cus
 	return response.CustomDomains, nil
 }
 
+// DNSTarget returns the cluster-published ingress target — the hostname or
+// IP set custom-domain DNS records should point at. The shape is stable
+// across deployments; callers branch on Source ("hostname" / "ips" / "mixed"
+// / "unknown") rather than guessing from which fields are populated.
+func (c *Client) DNSTarget(ctx context.Context) (models.IngressTarget, error) {
+	var response models.IngressTarget
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/ingress/dns", nil, &response)
+	return response, err
+}
+
+// CustomDomainDNS returns the ready-to-paste DNS records (one row per custom
+// domain × per ingress address) for a sandbox plus the underlying ingress
+// target the records were composed from. Lets callers render a DNS-setup UI
+// without having to combine ListCustomDomains and DNSTarget themselves.
+func (c *Client) CustomDomainDNS(ctx context.Context, id string) (models.CustomDomainDNSRecords, error) {
+	var response models.CustomDomainDNSRecords
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/custom-domains/dns", nil, &response)
+	return response, err
+}
+
 func (c *Client) Health(ctx context.Context) (HealthStatus, error) {
 	var response HealthStatus
 	err := c.doJSON(ctx, http.MethodGet, "/health", nil, &response)

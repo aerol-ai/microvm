@@ -120,6 +120,103 @@ func TestRemoveCustomDomainURLEncodesHostname(t *testing.T) {
 	}
 }
 
+// TestDNSTargetDecodesIngressTarget pins the GET /v1/ingress/dns wire shape.
+// The endpoint returns IngressTarget directly (not wrapped in an envelope),
+// so a future server-side wrapper change would break this — which is what we
+// want, since the SDK would silently return a zero value otherwise.
+func TestDNSTargetDecodesIngressTarget(t *testing.T) {
+	ctx := context.Background()
+	var seenPath string
+	var seenMethod string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		_ = json.NewEncoder(w).Encode(models.IngressTarget{
+			Hostname: "ingress.example.com",
+			IPs:      []string{"203.0.113.10", "203.0.113.11"},
+			Source:   models.IngressTargetSourceMixed,
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	target, err := client.DNSTarget(ctx)
+	if err != nil {
+		t.Fatalf("DNSTarget() error = %v", err)
+	}
+	if seenMethod != http.MethodGet {
+		t.Fatalf("method = %q, want GET", seenMethod)
+	}
+	if seenPath != "/v1/ingress/dns" {
+		t.Fatalf("path = %q, want /v1/ingress/dns", seenPath)
+	}
+	if target.Hostname != "ingress.example.com" {
+		t.Fatalf("Hostname = %q, want ingress.example.com", target.Hostname)
+	}
+	if len(target.IPs) != 2 || target.IPs[0] != "203.0.113.10" || target.IPs[1] != "203.0.113.11" {
+		t.Fatalf("IPs = %+v", target.IPs)
+	}
+	if target.Source != models.IngressTargetSourceMixed {
+		t.Fatalf("Source = %q, want %q", target.Source, models.IngressTargetSourceMixed)
+	}
+}
+
+// TestCustomDomainDNSDecodesRecordsAndTarget pins the per-sandbox DNS-helper
+// shape: a {records:[...], target:{...}} object, NOT an envelope keyed by a
+// noun. The two-field decode catches accidental field renames on either side.
+func TestCustomDomainDNSDecodesRecordsAndTarget(t *testing.T) {
+	ctx := context.Background()
+	var seenPath string
+	var seenMethod string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		_ = json.NewEncoder(w).Encode(models.CustomDomainDNSRecords{
+			Records: []models.DNSRecord{
+				{
+					Hostname: "api.acme.com",
+					Type:     models.DNSRecordTypeCNAME,
+					Name:     "api",
+					Value:    "ingress.example.com",
+					Notes:    "Cloudflare: gray cloud (DNS only).",
+				},
+			},
+			Target: models.IngressTarget{
+				Hostname: "ingress.example.com",
+				Source:   models.IngressTargetSourceHostname,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	got, err := client.CustomDomainDNS(ctx, "sb-dns")
+	if err != nil {
+		t.Fatalf("CustomDomainDNS() error = %v", err)
+	}
+	if seenMethod != http.MethodGet {
+		t.Fatalf("method = %q, want GET", seenMethod)
+	}
+	if seenPath != "/v1/sandboxes/sb-dns/custom-domains/dns" {
+		t.Fatalf("path = %q, want /v1/sandboxes/sb-dns/custom-domains/dns", seenPath)
+	}
+	if len(got.Records) != 1 {
+		t.Fatalf("len(Records) = %d, want 1", len(got.Records))
+	}
+	rec := got.Records[0]
+	if rec.Hostname != "api.acme.com" || rec.Type != models.DNSRecordTypeCNAME || rec.Name != "api" || rec.Value != "ingress.example.com" {
+		t.Fatalf("record fields drifted: %+v", rec)
+	}
+	if rec.Notes == "" {
+		t.Fatalf("Notes lost on decode")
+	}
+	if got.Target.Source != models.IngressTargetSourceHostname || got.Target.Hostname != "ingress.example.com" {
+		t.Fatalf("target drifted: %+v", got.Target)
+	}
+}
+
 // TestCreateForwardsCustomDomains proves the create-time custom_domains
 // field rides on the wire under its snake_case JSON name. Without this, a
 // silent rename (e.g. someone retypes the tag) means CreateSandbox attaches

@@ -85,7 +85,7 @@ func TestClusterCreateWrapPinsForwardedCreateToSelectedTarget(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:   cluster.NewNoop("node-a", "http://node-a"),
+		Noop:   cluster.NewNoop("node-a", "http://node-a", ""),
 		target: cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -135,7 +135,7 @@ func TestClusterCreateWrapDoesNotPutSecretPayloadInRouterReservation(t *testing.
 	// another worker's secret material locally.
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:   cluster.NewNoop("router", "http://router"),
+		Noop:   cluster.NewNoop("router", "http://router", ""),
 		target: cluster.PlacementTarget{NodeID: "worker-a", APIURL: "http://worker-a:21212", IsSelf: false},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -176,7 +176,7 @@ func TestClusterCreateWrapReturns503WhenReserveFails(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:       cluster.NewNoop("node-a", "http://node-a"),
+		Noop:       cluster.NewNoop("node-a", "http://node-a", ""),
 		target:     cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
 		reserveErr: errors.New("raft commit timed out"),
 	}
@@ -204,7 +204,7 @@ func TestClusterCreateWrapReturns409OnReservationNameConflict(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:       cluster.NewNoop("node-a", "http://node-a"),
+		Noop:       cluster.NewNoop("node-a", "http://node-a", ""),
 		target:     cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
 		reserveErr: cluster.ErrNameConflict,
 	}
@@ -227,7 +227,7 @@ func TestClusterCreateWrapReturns429OnCreateBackpressure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:       cluster.NewNoop("node-a", "http://node-a"),
+		Noop:       cluster.NewNoop("node-a", "http://node-a", ""),
 		target:     cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
 		reserveErr: cluster.ErrCreateBackpressure,
 	}
@@ -253,7 +253,7 @@ func TestClusterCreateWrapReturns503WhenNoWorkerCanOwnSandbox(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:      cluster.NewNoop("node-a", "http://node-a"),
+		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
 		selectErr: cluster.ErrNoPlacementTarget,
 	}
 	svc.AttachCluster(fakeCluster)
@@ -278,7 +278,7 @@ func TestClusterCreateWrapKeepsLocalOnlyImagesOnReceivingNode(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:   cluster.NewNoop("server-a", "http://server-a"),
+		Noop:   cluster.NewNoop("server-a", "http://server-a", ""),
 		target: cluster.PlacementTarget{NodeID: "worker-b", APIURL: "http://worker-b:21212", IsSelf: false},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -313,7 +313,7 @@ func TestClusterCreateWrapForwardedRequiresCreateIDHeader(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:   cluster.NewNoop("node-a", "http://node-a"),
+		Noop:   cluster.NewNoop("node-a", "http://node-a", ""),
 		target: cluster.PlacementTarget{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -340,7 +340,7 @@ func TestClusterCreateWrapRejectsCreateForwardedToWrongNode(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &createForwardCluster{
-		Noop:   cluster.NewNoop("node-a", "http://node-a"),
+		Noop:   cluster.NewNoop("node-a", "http://node-a", ""),
 		target: cluster.PlacementTarget{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -387,7 +387,7 @@ func TestClusterListWrapRejectsOversizedFanoutWithoutChangingResponseShape(t *te
 		})
 	}
 	svc.AttachCluster(&membersStubCluster{
-		Noop:    cluster.NewNoop("node-a", "http://node-a:21212"),
+		Noop:    cluster.NewNoop("node-a", "http://node-a:21212", ""),
 		members: members,
 	})
 	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
@@ -418,7 +418,7 @@ func TestClusterIngressRouteReturnsReplicatedOwnersForSmallIngressTier(t *testin
 		{NodeID: "ing-dead", APIURL: "http://ing-dead:21212", DataPlaneHost: "ing-dead.internal", Alive: false, Role: config.NodeRoleIngress},
 	}
 	svc.AttachCluster(&membersStubCluster{
-		Noop:    cluster.NewNoop("ing-a", "http://ing-a:21212"),
+		Noop:    cluster.NewNoop("ing-a", "http://ing-a:21212", ""),
 		members: members,
 	})
 	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
@@ -538,7 +538,7 @@ func TestClusterPlacementConvergedWhenOwnerIsSelf(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fake := &placementOfStubCluster{
-		Noop:  cluster.NewNoop("node-a", "http://node-a"),
+		Noop:  cluster.NewNoop("node-a", "http://node-a", ""),
 		owner: cluster.OwnerInfo{NodeID: "node-a", APIURL: "http://node-a", IsSelf: true},
 		placement: cluster.Placement{
 			SandboxID:   "sb-self",
@@ -588,7 +588,7 @@ func TestClusterPlacementNotConvergedWhenInstalledVersionTrailsPlacement(t *test
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fake := &placementOfStubCluster{
-		Noop:  cluster.NewNoop("node-a", "http://node-a"),
+		Noop:  cluster.NewNoop("node-a", "http://node-a", ""),
 		owner: cluster.OwnerInfo{NodeID: "node-b", APIURL: "http://node-b:21212", IsSelf: false},
 		placement: cluster.Placement{
 			SandboxID:   "sb-lagging",
@@ -633,7 +633,7 @@ func TestClusterPlacementReturnsOrphanedFlag(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fake := &placementOfStubCluster{
-		Noop:     cluster.NewNoop("node-a", "http://node-a"),
+		Noop:     cluster.NewNoop("node-a", "http://node-a", ""),
 		ownerErr: cluster.ErrOrphaned,
 		placement: cluster.Placement{
 			SandboxID:           "sb-orphan",
@@ -681,7 +681,7 @@ func TestClusterForwardWrapReturns410OnOrphanedPlacement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fake := &ownerOfStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
 		err:  cluster.ErrOrphaned,
 	}
 	svc.AttachCluster(fake)
@@ -719,7 +719,7 @@ func TestClusterForwardWrapReturns503AndBumpsMissCounterOnUnresolvedOwner(t *tes
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fake := &ownerOfStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
 		owner: cluster.OwnerInfo{
 			NodeID:      "node-b",
 			APIURL:      "",
@@ -817,7 +817,7 @@ func drainTestHandler(t *testing.T, stub *drainStubCluster) *handlers {
 // request flips the FSM and returns 204 with no body. Without this, a typo in
 // the handler-to-client call (e.g. inverted bool) would slip through.
 func TestClusterDrainNodeReturns204AndCallsSet(t *testing.T) {
-	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 	h := drainTestHandler(t, stub)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/nodes/node-b/drain", nil)
@@ -836,7 +836,7 @@ func TestClusterDrainNodeReturns204AndCallsSet(t *testing.T) {
 // TestClusterUncordonNodeReturns204AndCallsSet mirrors the drain test on the
 // reverse edge so a future refactor can't silently make uncordon a no-op.
 func TestClusterUncordonNodeReturns204AndCallsSet(t *testing.T) {
-	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 	h := drainTestHandler(t, stub)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/nodes/node-b/uncordon", nil)
@@ -858,7 +858,7 @@ func TestClusterUncordonNodeReturns204AndCallsSet(t *testing.T) {
 // leadership flip as a hard failure.
 func TestClusterDrainNodeReturns503OnNotLeader(t *testing.T) {
 	stub := &drainStubCluster{
-		Noop:   cluster.NewNoop("node-a", "http://node-a"),
+		Noop:   cluster.NewNoop("node-a", "http://node-a", ""),
 		setErr: cluster.ErrNotLeader,
 	}
 	h := drainTestHandler(t, stub)
@@ -877,7 +877,7 @@ func TestClusterDrainNodeReturns503OnNotLeader(t *testing.T) {
 // stripped the {id} segment: the handler must 400 instead of forwarding an
 // empty drain to the FSM (which would itself reject it but with worse UX).
 func TestClusterDrainNodeRejectsEmptyID(t *testing.T) {
-	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 	h := drainTestHandler(t, stub)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/cluster/nodes//drain", nil)
@@ -894,7 +894,7 @@ func TestClusterDrainNodeRejectsEmptyID(t *testing.T) {
 }
 
 func TestClusterRemoveMemberReturns204AndCallsRemove(t *testing.T) {
-	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a")}
+	stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 	h := drainTestHandler(t, stub)
 
 	req := httptest.NewRequest(http.MethodDelete, "/v1/cluster/members/node-b?force=true", nil)
@@ -923,7 +923,7 @@ func TestClusterRemoveMemberMapsLifecycleErrors(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a"), removeErr: tc.err}
+			stub := &drainStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", ""), removeErr: tc.err}
 			h := drainTestHandler(t, stub)
 
 			req := httptest.NewRequest(http.MethodDelete, "/v1/cluster/members/node-b", nil)
@@ -997,7 +997,7 @@ func newOrphanOpsService(t *testing.T, stub *orphanOpsStubCluster, seedLocal boo
 
 func TestClusterReclaimOrphanLocalRequiresLocalRowAndPreviousOwner(t *testing.T) {
 	stub := &orphanOpsStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
 		placement: cluster.Placement{
 			SandboxID:           "sb-orphan",
 			OwnerState:          cluster.PlacementOwnerStateOrphaned,
@@ -1024,7 +1024,7 @@ func TestClusterReclaimOrphanLocalRequiresLocalRowAndPreviousOwner(t *testing.T)
 
 func TestClusterReclaimOrphanLocalRejectsOtherPreviousOwner(t *testing.T) {
 	stub := &orphanOpsStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
 		placement: cluster.Placement{
 			SandboxID:           "sb-orphan",
 			OwnerState:          cluster.PlacementOwnerStateOrphaned,
@@ -1051,7 +1051,7 @@ func TestClusterReclaimOrphanLocalRejectsOtherPreviousOwner(t *testing.T) {
 
 func TestClusterDeleteOrphanDeletesOnlyOrphanPlacement(t *testing.T) {
 	stub := &orphanOpsStubCluster{
-		Noop: cluster.NewNoop("node-a", "http://node-a"),
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
 		placement: cluster.Placement{
 			SandboxID:           "sb-orphan",
 			OwnerState:          cluster.PlacementOwnerStateOrphaned,
@@ -1081,7 +1081,7 @@ func TestClusterDeleteOrphanDeletesOnlyOrphanPlacement(t *testing.T) {
 // /drain-state endpoint.
 func TestClusterMembersIncludesDrainedField(t *testing.T) {
 	stub := &drainStubCluster{
-		Noop:        cluster.NewNoop("node-a", "http://node-a"),
+		Noop:        cluster.NewNoop("node-a", "http://node-a", ""),
 		drainedView: map[string]bool{"node-b": true},
 	}
 	h := drainTestHandler(t, stub)

@@ -40,7 +40,7 @@ func TestClusterAwareDomainResolver_ClusterHitSkipsStore(t *testing.T) {
 
 	resolver := clusterAwareDomainResolver{
 		cluster: &stubClusterResolver{
-			Noop: cluster.NewNoop("test", "http://test"),
+			Noop: cluster.NewNoop("test", "http://test", ""),
 			hits: map[string]string{"api.acme.com": "sb-from-cluster"},
 		},
 		store: st,
@@ -83,7 +83,7 @@ func TestClusterAwareDomainResolver_NoopFallsBackToStore(t *testing.T) {
 	}
 
 	resolver := clusterAwareDomainResolver{
-		cluster: cluster.NewNoop("test", "http://test"),
+		cluster: cluster.NewNoop("test", "http://test", ""),
 		store:   st,
 	}
 
@@ -109,7 +109,7 @@ func TestClusterAwareDomainResolver_MissReturnsErrNotFound(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	resolver := clusterAwareDomainResolver{
-		cluster: cluster.NewNoop("test", "http://test"),
+		cluster: cluster.NewNoop("test", "http://test", ""),
 		store:   st,
 	}
 

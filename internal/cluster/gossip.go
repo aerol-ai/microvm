@@ -41,6 +41,14 @@ type nodeMeta struct {
 	// worker/ingress. Empty (older builds) is treated as "mixed" to preserve
 	// rolling-upgrade compatibility.
 	Role string `json:"role,omitempty"`
+	// PublicHost is the operator-configured public address users point DNS at
+	// — SB_INGRESS_ADVERTISE_HOST in cluster mode, SB_PUBLIC_HOST single-node
+	// (see config.EffectivePublicHost). Aggregated across live ingress nodes
+	// by Cluster.IngressTargets so the DNS-helper API can return the actual
+	// CNAME / A targets without separate operator config. Empty for peers
+	// running pre-PublicHost builds or with no public host set (IP-mode
+	// deployments where custom domains are disabled anyway).
+	PublicHost string `json:"public_host,omitempty"`
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
@@ -57,9 +65,10 @@ type gossipDelegate struct {
 	raftAddr      string
 	internalURL   string
 	role          string
+	publicHost    string
 }
 
-func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, internalURL, role string, admitter *capacity.Admitter) *gossipDelegate {
+func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, internalURL, role, publicHost string, admitter *capacity.Admitter) *gossipDelegate {
 	d := &gossipDelegate{
 		admitter:      admitter,
 		nodeID:        nodeID,
@@ -69,6 +78,7 @@ func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, intern
 		raftAddr:      raftAddr,
 		internalURL:   internalURL,
 		role:          role,
+		publicHost:    publicHost,
 	}
 	d.refreshMeta()
 	return d
@@ -77,7 +87,7 @@ func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, intern
 // refreshMeta rebuilds the encoded metadata blob. memberlist's NodeMeta()
 // must return a stable byte slice, so we double-buffer.
 func (d *gossipDelegate) refreshMeta() {
-	meta := nodeMeta{NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role}
+	meta := nodeMeta{NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost}
 	enc, err := json.Marshal(meta)
 	if err != nil {
 		// nodeMeta has only string fields; json.Marshal cannot fail. Keep the
@@ -102,6 +112,9 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 		// cannot decode partial JSON. Drop display/convenience fields first,
 		// but preserve raft join identity as long as it fits.
 		fallbacks := []nodeMeta{
+			// PublicHost dropped first — DNS-helper feature degrades cleanly
+			// (the node just doesn't show up as a target) whereas
+			// raft/identity loss breaks voter join and cross-node routing.
 			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role},
 			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role},
 			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role},
@@ -301,6 +314,12 @@ type gossipSetupConfig struct {
 	RaftAddr      string
 	InternalURL   string
 	Role          string
+	// PublicHost is the operator-configured public ingress address
+	// (config.EffectivePublicHost). Used by the DNS-helper API to tell
+	// users what to point their custom-domain DNS records at. Empty
+	// values are dropped from aggregation — they only happen in IP-mode
+	// deployments where custom domains are disabled anyway.
+	PublicHost string
 	// NodeName is the operator-friendly display label (SB_NODE_NAME). Empty
 	// is acceptable; the delegate ships an empty value and dashboard
 	// consumers fall back to NodeID.
@@ -336,7 +355,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		mlCfg.AdvertisePort = aport
 	}
 
-	delegate := newGossipDelegate(cfg.NodeID, cfg.NodeName, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, admitter)
+	delegate := newGossipDelegate(cfg.NodeID, cfg.NodeName, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, cfg.PublicHost, admitter)
 	memberIndex := newGossipMemberIndex()
 	mlCfg.Delegate = delegate
 	mlCfg.Events = &indexedEventDelegate{index: memberIndex, next: cfg.Events}
@@ -459,6 +478,7 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.RaftAddr = meta.RaftAddr
 			m.InternalURL = meta.InternalURL
 			m.Role = meta.Role
+			m.PublicHost = meta.PublicHost
 			// m.Capacity stays zero here — capacity no longer travels in
 			// nodeMeta (see the type comment). Cluster.Members and
 			// SelectPlacement overlay fresh capacity leases later.
@@ -490,6 +510,7 @@ func (g *gossipNode) selfMember() Member {
 		RaftAddr:      meta.RaftAddr,
 		InternalURL:   meta.InternalURL,
 		Role:          meta.Role,
+		PublicHost:    meta.PublicHost,
 		Alive:         true,
 		Capacity:      snap,
 	}
