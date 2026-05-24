@@ -1,0 +1,41 @@
+#!/bin/sh
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if ! command -v gofmt >/dev/null 2>&1; then
+	echo "pre-commit: gofmt is required but was not found in PATH" >&2
+	exit 1
+fi
+
+staged_go_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go')
+
+if [ -z "$staged_go_files" ]; then
+	exit 0
+fi
+
+partially_staged_files=""
+printf '%s\n' "$staged_go_files" | while IFS= read -r file; do
+	[ -z "$file" ] && continue
+	if ! git diff --quiet -- "$file"; then
+		printf '%s\n' "$file"
+	fi
+done > /tmp/aerolvm-go-pre-commit-partial.$$ 
+
+partially_staged_files=$(cat /tmp/aerolvm-go-pre-commit-partial.$$)
+rm -f /tmp/aerolvm-go-pre-commit-partial.$$
+
+if [ -n "$partially_staged_files" ]; then
+	echo "pre-commit: refusing to auto-format partially staged Go files:" >&2
+	printf '  %s\n' "$partially_staged_files" >&2
+	echo "pre-commit: stage or stash the remaining hunks, then retry." >&2
+	exit 1
+fi
+
+printf '%s\n' "$staged_go_files" | while IFS= read -r file; do
+	[ -z "$file" ] && continue
+	gofmt -w "$file"
+	git add "$file"
+done

@@ -1,10 +1,15 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt test build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean
+.PHONY: fmt install-git-hooks test build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean
 
 fmt:
 	$(GO) fmt ./...
+
+install-git-hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/pre-commit
+	@printf '%s\n' 'Installed git hooks from .githooks/'
 
 test:
 	$(GO) test ./...

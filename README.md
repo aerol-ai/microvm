@@ -83,11 +83,14 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
 ## Develop and Test
 
 ```bash
+make install-git-hooks
 make build
 make test
 make docs-install
 make docs-dev
 ```
+
+Run `make install-git-hooks` once per clone to enable the repo-managed pre-commit hook. It formats staged Go files with `gofmt` and re-stages them before the commit completes.
 
 ## License
 
