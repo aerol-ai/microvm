@@ -1297,6 +1297,146 @@ func TestStoreCases(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "pending_image_gc_upsert_refreshes_scheduled_at",
+			run: func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state.db")
+				st, err := Open(path)
+				if err != nil {
+					t.Fatalf("Open() error = %v", err)
+				}
+				defer st.Close()
+
+				early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+				later := early.Add(2 * time.Hour)
+
+				if err := st.SchedulePendingImageGC(ctx, "img:1", early); err != nil {
+					t.Fatalf("schedule early: %v", err)
+				}
+				if err := st.SchedulePendingImageGC(ctx, "img:1", later); err != nil {
+					t.Fatalf("schedule later: %v", err)
+				}
+
+				// Cutoff between the two: must NOT return the row, because
+				// the upsert refreshed scheduled_at to `later`.
+				between := early.Add(time.Hour)
+				due, err := st.ListPendingImageGCDue(ctx, between)
+				if err != nil {
+					t.Fatalf("ListPendingImageGCDue() error = %v", err)
+				}
+				if len(due) != 0 {
+					t.Fatalf("expected no due rows after upsert refresh, got %v", due)
+				}
+
+				// Cutoff after later: row is due.
+				due, err = st.ListPendingImageGCDue(ctx, later.Add(time.Minute))
+				if err != nil {
+					t.Fatalf("ListPendingImageGCDue() error = %v", err)
+				}
+				if len(due) != 1 || due[0] != "img:1" {
+					t.Fatalf("expected [img:1], got %v", due)
+				}
+			},
+		},
+		{
+			name: "pending_image_gc_list_honors_cutoff_and_ordering",
+			run: func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state.db")
+				st, err := Open(path)
+				if err != nil {
+					t.Fatalf("Open() error = %v", err)
+				}
+				defer st.Close()
+
+				base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+				rows := []struct {
+					image string
+					at    time.Time
+				}{
+					{"img:newest", base.Add(30 * time.Minute)},
+					{"img:oldest", base},
+					{"img:middle", base.Add(15 * time.Minute)},
+					{"img:future", base.Add(2 * time.Hour)},
+				}
+				for _, r := range rows {
+					if err := st.SchedulePendingImageGC(ctx, r.image, r.at); err != nil {
+						t.Fatalf("schedule %s: %v", r.image, err)
+					}
+				}
+
+				due, err := st.ListPendingImageGCDue(ctx, base.Add(time.Hour))
+				if err != nil {
+					t.Fatalf("ListPendingImageGCDue() error = %v", err)
+				}
+				want := []string{"img:oldest", "img:middle", "img:newest"}
+				if len(due) != len(want) {
+					t.Fatalf("got %v, want %v", due, want)
+				}
+				for i := range want {
+					if due[i] != want[i] {
+						t.Fatalf("position %d: got %q want %q (full=%v)", i, due[i], want[i], due)
+					}
+				}
+			},
+		},
+		{
+			name: "pending_image_gc_delete_is_idempotent",
+			run: func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state.db")
+				st, err := Open(path)
+				if err != nil {
+					t.Fatalf("Open() error = %v", err)
+				}
+				defer st.Close()
+
+				when := time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC)
+				if err := st.SchedulePendingImageGC(ctx, "img:1", when); err != nil {
+					t.Fatalf("schedule: %v", err)
+				}
+				if err := st.DeletePendingImageGC(ctx, "img:1"); err != nil {
+					t.Fatalf("first delete: %v", err)
+				}
+				if err := st.DeletePendingImageGC(ctx, "img:1"); err != nil {
+					t.Fatalf("second delete: %v", err)
+				}
+				if err := st.DeletePendingImageGC(ctx, "img:never-scheduled"); err != nil {
+					t.Fatalf("delete missing: %v", err)
+				}
+				if err := st.DeletePendingImageGC(ctx, ""); err != nil {
+					t.Fatalf("delete empty: %v", err)
+				}
+
+				due, err := st.ListPendingImageGCDue(ctx, when.Add(time.Hour))
+				if err != nil {
+					t.Fatalf("ListPendingImageGCDue() error = %v", err)
+				}
+				if len(due) != 0 {
+					t.Fatalf("expected empty after delete, got %v", due)
+				}
+			},
+		},
+		{
+			name: "pending_image_gc_schedule_empty_image_noop",
+			run: func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state.db")
+				st, err := Open(path)
+				if err != nil {
+					t.Fatalf("Open() error = %v", err)
+				}
+				defer st.Close()
+
+				if err := st.SchedulePendingImageGC(ctx, "", time.Now().UTC()); err != nil {
+					t.Fatalf("schedule empty: %v", err)
+				}
+				due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+				if err != nil {
+					t.Fatalf("ListPendingImageGCDue() error = %v", err)
+				}
+				if len(due) != 0 {
+					t.Fatalf("empty image must not insert a row, got %v", due)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {

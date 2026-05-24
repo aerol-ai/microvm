@@ -64,6 +64,18 @@ default_volume_type       = "gp3"
 # image_pull_max_concurrent  = 4
 # image_pull_failure_backoff = "30s"
 
+# Image-GC whitelist: repositories or refs the GC janitors must never remove.
+# Empty (default) means every image is eligible. Three match shapes:
+#   - exact ref                ("alpine:latest" — only that tag survives)
+#   - repo, tag/digest agnostic ("ubuntu" — every tag and digest of ubuntu)
+#   - registry/org prefix       (trailing "/" — "ghcr.io/myorg/" matches all)
+# Written into cluster.env as SB_IMAGE_GC_WHITELIST (comma-joined).
+# image_gc_whitelist = [
+#   "alpine",            # always keep alpine cached, any tag
+#   "ubuntu:22.04",      # only that specific tag
+#   "ghcr.io/myorg/",    # everything from this org
+# ]
+
 # --- Cloudflare DNS behavior ------------------------------------------------
 
 # create_wildcard_record = true   # *.<domain_name> in addition to the apex

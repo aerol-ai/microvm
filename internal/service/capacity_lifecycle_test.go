@@ -800,7 +800,10 @@ func TestDestroyEventIdempotentRelease(t *testing.T) {
 // TestImageGCSkippedWhenAnotherSandboxReferences: destroying one sandbox
 // must NOT remove the image if another sandbox (any non-destroyed status)
 // still references it. Otherwise a Stop+Destroy on one container would yank
-// the image out from under a sibling that's about to start.
+// the image out from under a sibling that's about to start. Under deferred
+// GC the destroy still schedules a pending_image_gc row — the protection
+// is in the janitor's HasActiveImageRef re-check at sweep time, exercised
+// below.
 func TestImageGCSkippedWhenAnotherSandboxReferences(t *testing.T) {
 	ctx := context.Background()
 	svc, admitter, st := newCapacityHarness(t, nil, nil)
@@ -809,6 +812,7 @@ func TestImageGCSkippedWhenAnotherSandboxReferences(t *testing.T) {
 	imageRemoved := 0
 	rt2 := &countingFakeRuntime{fakeCapacityRuntime: *rt, removed: &imageRemoved}
 	svc.docker = rt2
+	svc.cfg.ImageBuildGCTTL = 0 // make every scheduled row immediately due
 
 	const survivor = "sb-survivor"
 	const doomed = "sb-doomed"
@@ -824,8 +828,19 @@ func TestImageGCSkippedWhenAnotherSandboxReferences(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("destroy event: %v", err)
 	}
+	// Run the janitor with the survivor still active — must NOT call
+	// RemoveImage; the row should be dropped on the back of the
+	// reference re-check.
+	svc.runPendingImageGC(ctx)
 	if imageRemoved != 0 {
 		t.Fatalf("image GC ran while sibling still references image: hits=%d", imageRemoved)
+	}
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListPendingImageGCDue: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("janitor should have dropped the row for the still-referenced image, got %v", due)
 	}
 	// Survivor still in the admitter.
 	if snap := admitter.Snapshot(); snap.SandboxesActive != 1 {
@@ -834,9 +849,11 @@ func TestImageGCSkippedWhenAnotherSandboxReferences(t *testing.T) {
 }
 
 // TestImageGCRunsWhenLastReferenceDestroyed: the inverse — when no other
-// sandbox references the image, the destroy event must trigger image
-// removal. Pre-fix store.Delete-after-RemoveImage would have skipped the GC
-// because HasActiveImageRef saw the doomed row at status=started.
+// sandbox references the image, the destroy event schedules the image
+// for GC and the next janitor sweep removes it. Pre-fix
+// store.Delete-after-RemoveImage would have skipped the GC because
+// HasActiveImageRef saw the doomed row at status=started; the same
+// ordering still matters for the janitor's re-check.
 func TestImageGCRunsWhenLastReferenceDestroyed(t *testing.T) {
 	ctx := context.Background()
 	svc, admitter, st := newCapacityHarness(t, nil, nil)
@@ -844,6 +861,7 @@ func TestImageGCRunsWhenLastReferenceDestroyed(t *testing.T) {
 	imageRemoved := 0
 	rt := svc.docker.(*fakeCapacityRuntime)
 	svc.docker = &countingFakeRuntime{fakeCapacityRuntime: *rt, removed: &imageRemoved}
+	svc.cfg.ImageBuildGCTTL = 0
 
 	const id = "sb-only-ref"
 	seedSandbox(t, st, id, models.SandboxStatusStarted, 1, 1024)
@@ -856,8 +874,20 @@ func TestImageGCRunsWhenLastReferenceDestroyed(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("destroy event: %v", err)
 	}
+	// Destroy never removes inline anymore — the janitor does the work.
+	if imageRemoved != 0 {
+		t.Fatalf("RemoveImage must not be called inline by destroy, hits=%d", imageRemoved)
+	}
+	svc.runPendingImageGC(ctx)
 	if imageRemoved != 1 {
-		t.Fatalf("expected image GC to fire exactly once, got %d", imageRemoved)
+		t.Fatalf("expected janitor to remove image exactly once, got %d", imageRemoved)
+	}
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListPendingImageGCDue: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("ledger should be drained after successful GC, got %v", due)
 	}
 }
 
@@ -872,6 +902,7 @@ func TestImageGCSkippedWhenStoppedSiblingReferences(t *testing.T) {
 	imageRemoved := 0
 	rt := svc.docker.(*fakeCapacityRuntime)
 	svc.docker = &countingFakeRuntime{fakeCapacityRuntime: *rt, removed: &imageRemoved}
+	svc.cfg.ImageBuildGCTTL = 0
 
 	seedSandbox(t, st, "sb-stopped-sibling", models.SandboxStatusStopped, 1, 1024)
 	const doomed = "sb-doomed-2"
@@ -885,6 +916,9 @@ func TestImageGCSkippedWhenStoppedSiblingReferences(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("destroy event: %v", err)
 	}
+	// Janitor must respect the stopped sibling's reference and drop the
+	// scheduled row without calling RemoveImage.
+	svc.runPendingImageGC(ctx)
 	if imageRemoved != 0 {
 		t.Fatalf("image GC ran with stopped sibling holding the image: hits=%d", imageRemoved)
 	}

@@ -1129,7 +1129,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		s.admitter.Release(id)
 	}
 	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
-	s.maybeRemoveImage(ctx, sandbox.Image)
+	s.schedulePendingImageGC(ctx, sandbox.Image)
 	return nil
 }
 
@@ -2426,11 +2426,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
 				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
 			}
-			// store.Delete must happen BEFORE maybeRemoveImage: HasActiveImageRef
-			// queries the sandboxes table and treats any non-destroyed row as a
-			// live reference. While our row still exists with its pre-destroy
-			// status (typically "started"), the image GC would always skip,
-			// leaking image layers across reconcile cycles.
+			// store.Delete must happen BEFORE schedulePendingImageGC. The
+			// pending-image janitor uses HasActiveImageRef to decide whether
+			// to actually call docker.RemoveImage at sweep time; a stale row
+			// with status "started" sitting in sandboxes would make every
+			// sweep skip this image, leaking layers across reconcile cycles
+			// until something else changed.
 			if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
@@ -2441,7 +2442,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.admitter.Release(sandbox.ID)
 			}
 			s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "reconcile-destroyed")
-			s.maybeRemoveImage(ctx, sandbox.Image)
+			s.schedulePendingImageGC(ctx, sandbox.Image)
 			s.logger.Info("audit reconcile destroyed",
 				"sandbox_id", sandbox.ID,
 				"image", sandbox.Image,
@@ -3060,6 +3061,9 @@ func (s *Service) runBuiltImageGC(ctx context.Context, list builtImageListFn) {
 		if img.LastTagTime.After(cutoff) {
 			continue
 		}
+		if s.imageGCWhitelisted(img.Tag) {
+			continue
+		}
 		referenced, err := s.store.HasActiveImageRef(ctx, img.Tag)
 		if err != nil {
 			s.logger.Warn("built-image gc ref check failed", "tag", img.Tag, "error", err)
@@ -3073,6 +3077,92 @@ func (s *Service) runBuiltImageGC(ctx context.Context, list builtImageListFn) {
 			continue
 		}
 		s.logger.Info("audit built image gc removed", "tag", img.Tag, "last_tag_time", img.LastTagTime)
+	}
+}
+
+// StartPendingImageGC launches the periodic janitor that removes images
+// scheduled by destroy paths (DestroySandbox, reconcile destroyed-branch,
+// handleDestroyEvent). It piggybacks on ImageBuildGCEnabled / Interval /
+// TTL: same enable switch, same cadence, same TTL — so an operator who
+// wants to disable image GC entirely flips one knob, and tightening the
+// TTL applies to both pulled images (this janitor) and built images
+// (StartBuiltImageGC). No-op when disabled or Interval <= 0.
+func (s *Service) StartPendingImageGC(ctx context.Context) {
+	if !s.cfg.ImageBuildGCEnabled {
+		return
+	}
+	interval := s.cfg.ImageBuildGCInterval
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				s.runPendingImageGC(sweepCtx)
+				cancel()
+			}
+		}
+	}()
+}
+
+// runPendingImageGC is one pass of the pending-image janitor. Reads
+// ledger rows older than ImageBuildGCTTL, re-checks HasActiveImageRef
+// (in case a new sandbox grabbed the image after scheduling), and
+// removes the image from Docker. Idempotent: a failed RemoveImage
+// leaves the row so the next tick retries; a successful one (or a
+// "referenced now" outcome) deletes the row so we don't keep
+// re-attempting. Failures are logged, never returned — the janitor
+// must not block on a bad row.
+func (s *Service) runPendingImageGC(ctx context.Context) {
+	cutoff := time.Now().UTC().Add(-s.cfg.ImageBuildGCTTL)
+	images, err := s.store.ListPendingImageGCDue(ctx, cutoff)
+	if err != nil {
+		s.logger.Warn("pending image gc list failed", "error", err)
+		return
+	}
+	for _, image := range images {
+		if s.imageGCWhitelisted(image) {
+			// Operator whitelisted this image after the row landed.
+			// Drop it so the ledger doesn't carry it forever; the
+			// destroy path's short-circuit keeps new rows out.
+			if err := s.store.DeletePendingImageGC(ctx, image); err != nil {
+				s.logger.Warn("pending image gc whitelist row clear failed", "image", image, "error", err)
+			}
+			continue
+		}
+		referenced, err := s.store.HasActiveImageRef(ctx, image)
+		if err != nil {
+			s.logger.Warn("pending image gc ref check failed", "image", image, "error", err)
+			continue
+		}
+		if referenced {
+			// Image came back into use between scheduling and now.
+			// Drop the row; if it goes idle again the destroy path
+			// will re-schedule with a fresh timestamp.
+			if err := s.store.DeletePendingImageGC(ctx, image); err != nil {
+				s.logger.Warn("pending image gc row clear failed", "image", image, "error", err)
+			}
+			continue
+		}
+		if err := s.docker.RemoveImage(ctx, image); err != nil {
+			// Leave the row in place so the next tick retries. Note
+			// docker.RemoveImage returns nil for 404/409, so the
+			// "image vanished" and "still in use by an unknown
+			// container" cases fall through to the delete below.
+			s.logger.Warn("pending image gc remove failed", "image", image, "error", err)
+			continue
+		}
+		if err := s.store.DeletePendingImageGC(ctx, image); err != nil {
+			s.logger.Warn("pending image gc row delete failed", "image", image, "error", err)
+			continue
+		}
+		s.logger.Info("audit pending image gc removed", "image", image)
 	}
 }
 
@@ -3402,29 +3492,65 @@ func imageStillReferenced(sandboxes []*models.Sandbox, image string) bool {
 	return false
 }
 
-// maybeRemoveImage deletes the given image from Docker if no non-destroyed
-// sandbox still references it. Best-effort: store and Docker errors are
-// logged, never returned, because image GC must not block the sandbox
-// lifecycle path that called us. Uses Store.HasActiveImageRef so the cost
-// is one indexed query rather than a full table scan, even when there are
-// 10k+ destroyed rows in history.
-func (s *Service) maybeRemoveImage(ctx context.Context, image string) {
+// schedulePendingImageGC records the image in the pending_image_gc
+// ledger so the runPendingImageGC janitor can sweep it after
+// ImageBuildGCTTL. Replaces the previous inline-delete path: a destroyed
+// sandbox no longer yanks its image from the daemon immediately, which
+// kept a destroy/recreate loop on the same image re-pulling on every
+// cycle. Best-effort: errors are logged, never returned, because image
+// GC must not block the sandbox lifecycle path that called us. If the
+// ledger write fails (rare — SQLite is local), the image leaks until
+// another destroy of a sandbox sharing the image re-schedules it.
+func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
 	if image == "" {
 		return
 	}
-	stillUsed, err := s.store.HasActiveImageRef(ctx, image)
-	if err != nil {
-		s.logger.Warn("image gc reference check failed", "image", image, "error", err)
+	// Short-circuit on whitelist so the ledger doesn't accumulate rows
+	// the janitor would only ever skip. Cheap O(N) scan over a small,
+	// operator-curated list — much smaller than the per-tick scan cost.
+	if s.imageGCWhitelisted(image) {
 		return
 	}
-	if stillUsed {
+	if err := s.store.SchedulePendingImageGC(ctx, image, time.Now().UTC()); err != nil {
+		s.logger.Warn("schedule pending image gc failed", "image", image, "error", err)
 		return
 	}
-	if err := s.docker.RemoveImage(ctx, image); err != nil {
-		s.logger.Warn("image gc remove failed", "image", image, "error", err)
-		return
+	s.logger.Info("audit image scheduled for gc", "image", image)
+}
+
+// imageGCWhitelisted reports whether image is protected from both
+// janitors by cfg.ImageGCWhitelist. Three match shapes:
+//   - exact ref equality (entry == image)
+//   - repo equality, tag/digest agnostic (entry has no ':' / '@', and image
+//     starts with entry followed by ':' or '@')
+//   - registry/org prefix when entry ends in '/'
+//
+// Anchored boundaries on every shape so a "ubuntu" entry can't accidentally
+// shield "ubuntu-base" — the operator gets exactly what they typed.
+func (s *Service) imageGCWhitelisted(image string) bool {
+	if image == "" || len(s.cfg.ImageGCWhitelist) == 0 {
+		return false
 	}
-	s.logger.Info("audit image removed", "image", image)
+	for _, entry := range s.cfg.ImageGCWhitelist {
+		if entry == "" {
+			continue
+		}
+		if entry == image {
+			return true
+		}
+		if strings.HasSuffix(entry, "/") {
+			if strings.HasPrefix(image, entry) {
+				return true
+			}
+			continue
+		}
+		if !strings.ContainsAny(entry, ":@") {
+			if strings.HasPrefix(image, entry+":") || strings.HasPrefix(image, entry+"@") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // syncAllowedPorts pushes the sandbox's current set of exposed ports to

@@ -216,6 +216,24 @@ func TestBuiltImageGCRemovesAfterDestroyedReference(t *testing.T) {
 	}
 }
 
+// Whitelisted built images must survive the sweep even when they are old
+// AND unreferenced — the operator opted them out explicitly.
+func TestBuiltImageGCSkipsWhitelistedImage(t *testing.T) {
+	svc, _, removed := newBuiltImageGCHarness(t, time.Hour)
+	svc.cfg.ImageGCWhitelist = []string{"aerolvm-build/"}
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	list := func(context.Context) ([]docker.BuiltImage, error) {
+		return []docker.BuiltImage{
+			{Tag: "aerolvm-build/keep:latest", LastTagTime: old}, // whitelisted prefix -> skip
+			{Tag: "aerolvm-build/burn:latest", LastTagTime: old}, // also matches prefix -> skip
+		}, nil
+	}
+	svc.runBuiltImageGC(context.Background(), list)
+	if len(*removed) != 0 {
+		t.Fatalf("whitelisted built images must NOT be removed, got %+v", *removed)
+	}
+}
+
 func TestBuiltImageGCSwallowsListError(t *testing.T) {
 	svc, _, removed := newBuiltImageGCHarness(t, time.Hour)
 	list := func(context.Context) ([]docker.BuiltImage, error) {
