@@ -50,6 +50,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_IMAGE_PULL_MAX_CONCURRENT",
 			"SB_IMAGE_PULL_FAILURE_BACKOFF",
 			"SB_DATA_PLANE_ADVERTISE_HOST",
+			"SB_CLUSTER_SHARD_AWARE_INGRESS",
 			"SB_NODE_ROLE",
 			"SB_ENABLE_CLUSTER",
 			"SB_CLUSTER_BOOTSTRAP",
@@ -62,6 +63,10 @@ func TestLoadCases(t *testing.T) {
 			"SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX",
 			"SB_L4_WAKE_MAX_ACTIVE_GLOBAL",
 			"SB_HTTP_WAKE_MAX_BUFFER",
+			"SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED",
+			"SB_L4_WAKE_DIRECT_BYPASS_ENABLED",
+			"SB_NETSTATS_POLL_INTERVAL",
+			"SB_RECONCILE_INTERVAL",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -442,6 +447,32 @@ func TestLoadCases(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "direct_bypass_requires_netstats_poll_interval",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED", "true")
+				t.Setenv("SB_NETSTATS_POLL_INTERVAL", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_NETSTATS_POLL_INTERVAL") {
+					t.Fatalf("expected netstats poll interval error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "direct_bypass_requires_reconcile_interval",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_L4_WAKE_DIRECT_BYPASS_ENABLED", "true")
+				t.Setenv("SB_RECONCILE_INTERVAL", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_RECONCILE_INTERVAL") {
+					t.Fatalf("expected reconcile interval error, got %v", err)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -661,6 +692,18 @@ func TestNodeRoleCases(t *testing.T) {
 		}
 		if cfg.IngressAdvertiseHost != "ingress.example.com" {
 			t.Fatalf("IngressAdvertiseHost = %q, want host-only normalization", cfg.IngressAdvertiseHost)
+		}
+	})
+
+	t.Run("cluster_shard_aware_ingress_opt_in_loads", func(t *testing.T) {
+		setClusterDefaults(t)
+		t.Setenv("SB_CLUSTER_SHARD_AWARE_INGRESS", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.ClusterShardAwareIngress {
+			t.Fatal("ClusterShardAwareIngress = false, want true")
 		}
 	})
 

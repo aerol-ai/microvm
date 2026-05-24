@@ -30,10 +30,11 @@ import (
 //     hammered, but parallel callers Enqueueing into different (id,
 //     port) keys do not block each other.
 //
-//   - Flush forces immediate drain + execution and waits for it. Use
-//     for ordering-critical callsites that need a write visible to
-//     Caddy before continuing (e.g. pre-stop wake install must be
-//     observable to incoming requests before docker.Stop fires).
+//   - Flush waits for the coalesce window, drains, and waits for the result.
+//     Use for ordering-critical callsites that need a write visible to Caddy
+//     before continuing (e.g. pre-stop wake install must be observable to
+//     incoming requests before docker.Stop fires) while still letting a burst
+//     of concurrent callers collapse into one admin write.
 //
 // The coalescer is callback-based — callers supply a `do func() error`
 // that performs the actual Caddy admin write. This keeps the
@@ -121,15 +122,26 @@ func (c *caddyCoalescer) Enqueue(id string, port int, do func() error) {
 	c.enqueue(id, port, do, nil)
 }
 
-// Flush enqueues do AND drains immediately, returning the result of
-// do. Use this for ordering-critical callsites. ctx bounds how long
-// the caller is willing to wait; on ctx cancellation the op is left
-// in the pending map and the tick goroutine will eventually execute
-// it, but the caller stops waiting.
+// Flush enqueues do, waits for one coalesce window, drains, and returns the
+// result of do. Use this for ordering-critical callsites. ctx bounds how long
+// the caller is willing to wait; on ctx cancellation the op is left in the
+// pending map and the tick goroutine will eventually execute it, but the caller
+// stops waiting.
 func (c *caddyCoalescer) Flush(ctx context.Context, id string, port int, do func() error) error {
 	ch := make(chan error, 1)
 	c.enqueue(id, port, do, ch)
-	go c.drain()
+
+	timer := time.NewTimer(c.tick)
+	defer timer.Stop()
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		go c.drain()
+	}
+
 	select {
 	case err := <-ch:
 		return err

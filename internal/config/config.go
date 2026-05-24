@@ -388,7 +388,13 @@ type Config struct {
 	// itself does not run any load balancer; that's a deployment decision.
 	// See plans/data-plane-load-balancer.md.
 	// SB_INGRESS_ADVERTISE_HOST.
-	IngressAdvertiseHost          string
+	IngressAdvertiseHost string
+	// ClusterShardAwareIngress confirms that the public ingress router is
+	// shard-aware when the live ingress tier is larger than
+	// cluster.MaxReplicatedIngressRouteNodes. Above that size, each ingress
+	// node only owns a subset of sandbox routes; a random LB must not spray
+	// sandbox traffic across every ingress node. SB_CLUSTER_SHARD_AWARE_INGRESS.
+	ClusterShardAwareIngress      bool
 	ClusterRaftCommitTimeout      time.Duration
 	ClusterCapacityGossipInterval time.Duration
 	// ClusterMaxAutoVoters caps gossip-driven Raft voter promotion. Additional
@@ -710,6 +716,7 @@ func Load() (Config, error) {
 		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
@@ -973,6 +980,14 @@ func Load() (Config, error) {
 		}
 		if cfg.WakeStartConcurrency <= 0 {
 			return Config{}, errors.New("SB_WAKE_START_CONCURRENCY must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeDirectBypassEnabled || cfg.L4WakeDirectBypassEnabled {
+			if cfg.NetstatsPollInterval <= 0 {
+				return Config{}, errors.New("SB_NETSTATS_POLL_INTERVAL must be > 0 when direct-route bypass is enabled")
+			}
+			if cfg.ReconcileInterval <= 0 {
+				return Config{}, errors.New("SB_RECONCILE_INTERVAL must be > 0 when direct-route bypass is enabled")
+			}
 		}
 	}
 

@@ -245,7 +245,7 @@ func (l Lifecycle) ValidateWithBypassFloor(pollInterval, reconcileInterval time.
 	floor := 2*pollInterval + reconcileInterval
 	if l.StopIfIdleFor < floor {
 		return fmt.Errorf(
-			"stop_if_idle_for (%s) is below the %s floor required by SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED=true (2 × netstats poll interval + reconcile interval); raise stop_if_idle_for or disable the bypass",
+			"stop_if_idle_for (%s) is below the %s floor required by direct-route bypass (2 × netstats poll interval + reconcile interval); raise stop_if_idle_for or disable SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED/SB_L4_WAKE_DIRECT_BYPASS_ENABLED",
 			l.StopIfIdleFor, floor,
 		)
 	}

@@ -96,11 +96,7 @@ func TestCoalescerDistinctKeysIndependent(t *testing.T) {
 // TestCoalescerFlushWaitsForResult: Flush is the ordering-critical API
 // — it must block until the op runs and return its error verbatim.
 func TestCoalescerFlushWaitsForResult(t *testing.T) {
-	// Use a long tick so we prove Flush is driving the drain, not the
-	// ticker.
-	c := newCaddyCoalescer(quietLogger(), time.Hour)
-	go c.Run(t.Context())
-	defer c.Stop()
+	c := newCaddyCoalescer(quietLogger(), 5*time.Millisecond)
 
 	want := errors.New("write rejected by caddy")
 	err := c.Flush(context.Background(), "sb-flush", 8080, func() error {
@@ -114,26 +110,35 @@ func TestCoalescerFlushWaitsForResult(t *testing.T) {
 // TestCoalescerFlushRespectsCtx: a cancelled ctx unblocks the Flush
 // caller while leaving the op queued for the tick.
 func TestCoalescerFlushRespectsCtx(t *testing.T) {
-	c := newCaddyCoalescer(quietLogger(), time.Hour)
-	go c.Run(t.Context())
-	defer c.Stop()
+	c := newCaddyCoalescer(quietLogger(), 5*time.Millisecond)
 
 	// Block the do func until release fires, so the drain triggered by
 	// Flush is in-flight when the ctx is cancelled. Without this the
 	// tight drain races the ctx cancellation.
 	release := make(chan struct{})
+	started := make(chan struct{})
 	executed := make(chan struct{})
 	op := func() error {
+		close(started)
 		<-release
 		close(executed)
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	err := c.Flush(ctx, "sb-ctx", 8080, op)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Flush returned %v, want DeadlineExceeded", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.Flush(ctx, "sb-ctx", 8080, op)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("op never started")
+	}
+	cancel()
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Flush returned %v, want Canceled", err)
 	}
 	// The op eventually runs; release it so the test can exit cleanly.
 	close(release)
@@ -141,6 +146,52 @@ func TestCoalescerFlushRespectsCtx(t *testing.T) {
 	case <-executed:
 	case <-time.After(time.Second):
 		t.Fatalf("op never executed after ctx cancellation")
+	}
+}
+
+func TestCoalescerFlushUsesCoalesceWindow(t *testing.T) {
+	c := newCaddyCoalescer(quietLogger(), 200*time.Millisecond)
+
+	staleErr := errors.New("stale op ran")
+	firstDone := make(chan error, 1)
+	var calls atomic.Int64
+	go func() {
+		firstDone <- c.Flush(context.Background(), "sb-window", 8080, func() error {
+			calls.Add(1)
+			return staleErr
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for c.pendingSize() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if c.pendingSize() == 0 {
+		t.Fatal("first Flush did not enqueue")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("Flush drained before the coalesce window: calls=%d", got)
+	}
+
+	want := errors.New("latest op")
+	err := c.Flush(context.Background(), "sb-window", 8080, func() error {
+		calls.Add(1)
+		return want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("latest Flush returned %v, want %v", err, want)
+	}
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("superseded Flush returned %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("superseded Flush did not return")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls=%d, want latest op only", got)
 	}
 }
 

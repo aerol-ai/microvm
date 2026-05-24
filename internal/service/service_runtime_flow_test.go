@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -531,6 +532,56 @@ func TestHealthReportsClusterTopologyDegraded(t *testing.T) {
 	}
 	if health.ClusterNodes != 11 {
 		t.Fatalf("cluster nodes = %d, want 11 live members", health.ClusterNodes)
+	}
+}
+
+func TestHealthReportsShardAwareIngressViolation(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, _, _ := newServiceRuntimeHarness(t, rt)
+	svc.cfg.EnableCluster = true
+
+	members := []cluster.Member{
+		{NodeID: "server-1", Role: config.NodeRoleServer, Alive: true},
+		{NodeID: "server-2", Role: config.NodeRoleServer, Alive: true},
+		{NodeID: "server-3", Role: config.NodeRoleServer, Alive: true},
+		{NodeID: "worker-1", Role: config.NodeRoleWorker, Alive: true},
+		{NodeID: "worker-2", Role: config.NodeRoleWorker, Alive: true},
+		{NodeID: "worker-3", Role: config.NodeRoleWorker, Alive: true},
+	}
+	for i := 0; i < cluster.MaxReplicatedIngressRouteNodes+1; i++ {
+		members = append(members, cluster.Member{
+			NodeID: fmt.Sprintf("ingress-%02d", i),
+			Role:   config.NodeRoleIngress,
+			Alive:  true,
+		})
+	}
+	svc.AttachCluster(&topologyCluster{
+		Noop:    cluster.NewNoop("node-01", "http://node-01"),
+		members: members,
+	})
+
+	health, err := svc.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() error = %v", err)
+	}
+	if health.Status != "degraded" {
+		t.Fatalf("health status = %q, want degraded", health.Status)
+	}
+	if !strings.Contains(health.ClusterTopology, "SB_CLUSTER_SHARD_AWARE_INGRESS") {
+		t.Fatalf("cluster topology = %q, want shard-aware-ingress error", health.ClusterTopology)
+	}
+
+	svc.cfg.ClusterShardAwareIngress = true
+	health, err = svc.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() with shard-aware flag error = %v", err)
+	}
+	if health.Status == "degraded" {
+		t.Fatalf("health status with shard-aware flag = %q, want ok", health.Status)
+	}
+	if health.ClusterTopology != "ok" {
+		t.Fatalf("cluster topology with shard-aware flag = %q, want ok", health.ClusterTopology)
 	}
 }
 
