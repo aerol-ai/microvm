@@ -248,12 +248,13 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	return nil
 }
 
-// RemoveCustomDomain detaches a hostname. Order is caddy-first then store —
-// the inverse of Add — so an interrupted call leaves a still-routable host
-// the reconciler can either keep (matches the store) or strip on the next
-// pass. Cross-sandbox removal returns store.ErrNotFound (the store layer
-// scopes the DELETE to (sandbox, hostname)), so a tenant cannot rip a domain
-// out of someone else's route by guessing the hostname.
+// RemoveCustomDomain detaches a hostname. Order is store-first then Caddy.
+// If the store delete succeeds but the Caddy patch fails, the hostname is
+// gone from the store while Caddy may still serve it until the next
+// reconcile pass converges routing. Cross-sandbox removal returns
+// store.ErrNotFound (the store layer scopes the DELETE to (sandbox,
+// hostname)), so a tenant cannot rip a domain out of someone else's route
+// by guessing the hostname.
 func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
 	canonical, err := models.NormalizeCustomDomain(hostname, s.cfg.Domain)
 	if err != nil {
