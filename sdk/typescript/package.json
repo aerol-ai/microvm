@@ -21,7 +21,7 @@
     "test": "tsc -p tsconfig.test.json --outDir dist-test && node --test dist-test/*.test.js dist-test/internal/*.test.js"
   },
   "devDependencies": {
-    "@types/node": "^25.8.0",
+    "@types/node": "^25.9.1",
     "typescript": "^6.0.3",
     "tsx": "^4.22.3"
   }
