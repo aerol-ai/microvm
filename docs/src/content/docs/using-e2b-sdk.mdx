@@ -1,0 +1,63 @@
+---
+title: Using E2B SDK
+description: Point the official E2B SDK at AerolVM's /e2b compatibility facade.
+---
+
+AerolVM exposes an E2B-compatible control plane under `/e2b` and a runtime proxy under `/e2b/runtime`, so existing E2B SDK code can point at an AerolVM server without switching SDKs. The main change is configuring both E2B endpoints to use AerolVM's path-based routes.
+
+## Required environment
+
+```bash
+export E2B_API_URL=https://sandbox.example.com/e2b
+export E2B_SANDBOX_URL=https://sandbox.example.com/e2b/runtime
+export E2B_API_KEY="$SB_PAT_TOKEN"
+```
+
+`E2B_SANDBOX_URL` is required for AerolVM compatibility mode. Without it, the E2B SDK tries to build runtime URLs like `https://49983-<sandbox>.<domain>`, which do not match AerolVM's path-based runtime gateway.
+
+## JavaScript / TypeScript
+
+```bash
+npm install e2b
+```
+
+```ts
+import { Sandbox } from 'e2b'
+
+const sandbox = await Sandbox.create({ template: 'base' })
+const result = await sandbox.commands.run('echo "Hello from E2B on AerolVM"')
+
+console.log(result.stdout)
+await sandbox.kill()
+```
+
+## Python
+
+```bash
+pip install e2b
+```
+
+```python
+from e2b import Sandbox
+
+sandbox = Sandbox.create(template="base")
+result = sandbox.commands.run("echo 'Hello from E2B on AerolVM'")
+
+print(result.stdout)
+sandbox.kill()
+```
+
+## What works today
+
+- Create, list, fetch, connect, pause, timeout-update, and delete sandboxes.
+- Execute commands and use file APIs through the `/e2b/runtime` proxy.
+- Create, list, and delete snapshots/templates through the compatibility layer.
+- Preserve common E2B lifecycle metadata such as timeout and pause-on-idle settings.
+
+## Current gaps
+
+- Template builds are not part of the current facade; use AerolVM images or snapshots instead.
+- Volume mounts are not implemented in the E2B facade yet.
+- Traffic access tokens, metrics, logs, and E2B-style public-host routing are not part of this compatibility surface.
+
+If you already have E2B code in production, migration is usually an environment change rather than an SDK rewrite: set `E2B_API_URL`, `E2B_SANDBOX_URL`, and `E2B_API_KEY` to your AerolVM deployment and keep the same client code.

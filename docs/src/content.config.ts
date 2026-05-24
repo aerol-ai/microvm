@@ -85,10 +85,29 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       
       {
-        type: 'link',
-        href: '/sdk-setup',
+        type: 'group',
         label: 'SDK Setup',
-        description: 'Connect an SDK to your AerolVM server.',
+        homePageHref: '/sdk-setup',
+        entries: [
+          {
+            type: 'link',
+            href: '/sdk-setup',
+            label: 'Using AerolVM SDK',
+            description: 'Point the official AerolVM SDK facade.',
+          },
+          {
+            type: 'link',
+            href: '/using-daytona-sdk',
+            label: 'Using Daytona SDK',
+            description: 'Point the official Daytona SDK at AerolVM\'s /daytona compatibility facade.',
+          },
+          {
+            type: 'link',
+            href: '/using-e2b-sdk',
+            label: 'Using E2B SDK',
+            description: 'Point the official E2B SDK at AerolVM\'s /e2b compatibility facade.',
+          },
+        ],
       },
     ],
   },

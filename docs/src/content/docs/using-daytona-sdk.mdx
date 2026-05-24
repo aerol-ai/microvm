@@ -1,0 +1,66 @@
+---
+title: Using Daytona SDK
+description: Point the official Daytona SDK at AerolVM's /daytona compatibility facade.
+---
+
+AerolVM exposes a Daytona-compatible API under `/daytona`, so existing Daytona SDK clients can talk to AerolVM without rewriting their sandbox lifecycle code. Use your normal AerolVM PAT token as the Daytona `apiKey`, and point the client `apiUrl` at your AerolVM server with the `/daytona` suffix.
+
+## Install
+
+```bash
+npm install @daytona/sdk
+```
+
+## Configure the client
+
+```bash
+export SB_API_URL=https://sandbox.example.com
+export SB_PAT_TOKEN=your-token
+```
+
+```ts
+import { Daytona } from '@daytona/sdk'
+
+const daytona = new Daytona({
+  apiKey: `${process.env.SB_PAT_TOKEN}`,
+  apiUrl: `${process.env.SB_API_URL}/daytona`,
+  target: 'us',
+})
+
+const sandbox = await daytona.create()
+
+const response = await sandbox.process.executeCommand(
+  'echo "Hello from Daytona on AerolVM"',
+  undefined,
+  undefined,
+  10,
+)
+
+if (response.exitCode !== 0) {
+  throw new Error(response.result)
+}
+
+console.log(response.result)
+await sandbox.delete()
+```
+
+## What works today
+
+- Create, list, fetch, start, stop, resize, and delete Daytona sandboxes.
+- Replace labels and manage Daytona-style autostop, autodelete, and autoarchive timers.
+- Create, list, fetch, and delete snapshots.
+- Use toolbox-backed process execution and file APIs through the Daytona SDK.
+- Resolve preview URLs through the Daytona facade.
+
+## Current gaps
+
+- Daytona volume routes are recognized, but they currently return `405 Not Implemented` because AerolVM does not expose a Daytona volume backend yet.
+- The compatibility layer is API-compatible, not infrastructure-compatible. Daytona control-plane features outside the routed `/daytona` surface still need AerolVM-native equivalents.
+
+## Examples
+
+The public examples repository includes end-to-end Daytona examples that target AerolVM directly:
+
+- [daytona-examples](https://github.com/aerol-ai/aerolvm-examples/tree/main/daytona-examples)
+
+If you are migrating an existing Daytona app, the main change is the base URL: point the SDK at `https://your-host/daytona` and keep using your AerolVM PAT token.

@@ -1,8 +1,9 @@
 ---
 title: SDK Setup
+description: Connect AerolVM's native SDKs or compatible Daytona and E2B clients to your server.
 ---
 
-All AerolVM SDKs connect to the same REST API using a PAT token set during server installation.
+All AerolVM SDKs connect to the same REST API using a PAT token set during server installation. AerolVM also exposes compatibility facades for the Daytona SDK and E2B SDK, so existing clients can point at the same server without a rewrite.
 
 ## Configuration
 
@@ -10,6 +11,20 @@ All AerolVM SDKs connect to the same REST API using a PAT token set during serve
 |---|---|---|
 | `SB_PAT_TOKEN` | Yes | The token set with `--pat-token` during installation. |
 | `SB_API_URL` | No | Server base URL. Defaults to `http://127.0.0.1:21212` if omitted. |
+
+## Compatibility SDKs
+
+### Daytona
+
+AerolVM exposes a Daytona-compatible API under `/daytona`. Use the official Daytona SDK with your normal AerolVM PAT token and point its `apiUrl` at `https://your-host/daytona`.
+
+See [Using Daytona SDK](/using-daytona-sdk) for setup details and example code.
+
+### E2B
+
+AerolVM also exposes an E2B-compatible control plane under `/e2b` and a runtime proxy under `/e2b/runtime`. Existing E2B SDK code usually only needs environment variable changes.
+
+See [Using E2B SDK](/using-e2b-sdk) for the required environment variables, examples, and current compatibility limits.
 
 ## TypeScript
 
@@ -48,31 +63,6 @@ sandbox = client.create(image='ubuntu:22.04')
 print(sandbox['public_url'])
 sandbox.destroy()
 ```
-
-## E2B Python SDK Compatibility
-
-AerolVM also exposes a compatibility facade for the unmodified E2B Python SDK. Point both the E2B control plane and runtime plane at the AerolVM `/e2b` routes:
-
-```bash
-pip install e2b
-
-export E2B_API_URL=https://sandbox.example.com/e2b
-export E2B_SANDBOX_URL=https://sandbox.example.com/e2b/runtime
-export E2B_API_KEY="$SB_PAT_TOKEN"
-```
-
-```py
-from e2b import Sandbox
-
-sandbox = Sandbox.create(template="base")
-result = sandbox.commands.run("python --version")
-print(result.stdout)
-sandbox.kill()
-```
-
-`E2B_SANDBOX_URL` is required for this compatibility mode. Without it, the E2B SDK builds runtime URLs like `https://49983-<sandbox>.<domain>`, which are not the path-based AerolVM runtime gateway.
-
-This facade supports the core create, list, connect, pause, kill, file, command, and snapshot flows. E2B template builds, volumes, traffic access tokens, metrics, logs, and E2B-style public host routing are not part of this first compatibility surface.
 
 ## Go
 
