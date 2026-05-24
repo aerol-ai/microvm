@@ -127,6 +127,20 @@ type Service struct {
 	wakeFlightsMu sync.Mutex
 	wakeFlights   map[string]*wakeFlight
 
+	// touchCoalescer debounces last_active_at flushes per sandbox so a
+	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
+	// runtime proxies, SSH gateway) does not become one SQLite UPDATE
+	// per request. Without this, a single sandbox at 1000 RPS would
+	// queue 1000 UPDATEs/sec behind every other store write — a single
+	// hot serverless sandbox could starve the create/start/stop path
+	// across the rest of the node. See touch_coalescer.go.
+	//
+	// Lazily initialized via touchCoalescerOnce so test harnesses that
+	// build &Service{...} literals (newCapacityHarness, the cluster
+	// fixtures, etc.) don't need updating.
+	touchCoalescer     *touchCoalescer
+	touchCoalescerOnce sync.Once
+
 	// ingressLastHash is the hash of the placement view that the last
 	// successful cluster-ingress reconcile installed. The reconciler hashes
 	// the next view and skips work when unchanged — this is the cheap idle
@@ -142,7 +156,7 @@ type Service struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
-	return &Service{
+	s := &Service{
 		cfg:      cfg,
 		logger:   logger,
 		store:    db,
@@ -158,6 +172,21 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		// cluster mode is enabled at boot.
 		cluster: cluster.NewNoop("standalone", ""),
 	}
+	s.ensureTouchCoalescer()
+	return s
+}
+
+// ensureTouchCoalescer is the lazy init path TouchSandbox uses. Direct
+// &Service{...} literals in test harnesses skip New(), so the coalescer
+// has to come up on first use. The flush closure dereferences s.store
+// at call time so harnesses that swap the store after construction
+// (e.g. newServerlessHarness) still route through the right writer.
+func (s *Service) ensureTouchCoalescer() {
+	s.touchCoalescerOnce.Do(func() {
+		s.touchCoalescer = newTouchCoalescer(touchDebounceInterval, func(ctx context.Context, id string, at time.Time) error {
+			return s.store.Touch(ctx, id, at)
+		})
+	})
 }
 
 // AttachCluster swaps in a cluster.Client. Called from cmd/sandboxd/main after
@@ -1786,8 +1815,15 @@ func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) 
 	return PortEndpoint{URL: fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, port)}, nil
 }
 
+// TouchSandbox bumps last_active_at for id with per-sandbox debounce.
+// The wake-aware ingress proxy and the toolbox/session/runtime proxies
+// call this on every request, so it must be cheap under high
+// per-sandbox RPS — see touch_coalescer.go for the rationale and the
+// debounce window. Callers that need a guaranteed immediate flush
+// (lifecycle transitions, tests) should drop to s.store.Touch directly.
 func (s *Service) TouchSandbox(ctx context.Context, id string) error {
-	return s.store.Touch(ctx, id, time.Now().UTC())
+	s.ensureTouchCoalescer()
+	return s.touchCoalescer.Touch(ctx, id)
 }
 
 // IsSandboxStarted is the preflight check the wake-aware ingress proxy
