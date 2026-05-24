@@ -127,7 +127,9 @@ func TestReconcileReappliesNetworkBlockAllWithCurrentContainerIP(t *testing.T) {
 		},
 	}
 	svc := &Service{
-		cfg:    config.Config{},
+		// schedulePendingImageGC checks ImageBuildGCEnabled — leave it on
+		// so the destroy branches produce the expected ledger rows.
+		cfg:    config.Config{ImageBuildGCEnabled: true},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:  st,
 		docker: rt,
@@ -218,7 +220,9 @@ func TestReconcileDestroyedRowFreesHostPort(t *testing.T) {
 	rt := &fakeReconcileRuntime{managed: map[string]*models.SandboxRuntimeState{}}
 
 	svc := &Service{
-		cfg:      config.Config{},
+		// Reconcile's destroyed-branch goes through schedulePendingImageGC,
+		// which checks ImageBuildGCEnabled before writing the ledger row.
+		cfg:      config.Config{ImageBuildGCEnabled: true},
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    st,
 		docker:   rt,
@@ -302,9 +306,21 @@ func TestReconcileDestroyedRowFreesHostPort(t *testing.T) {
 		t.Fatalf("admitter not released: snapshot=%+v", snap)
 	}
 
-	// Image GC was attempted exactly once — no other sandbox referenced it.
-	if got := rt.removeImageHits.Load(); got != 1 {
-		t.Fatalf("RemoveImage hits = %d, want 1", got)
+	// Image GC was scheduled, not executed inline: the destroy path now
+	// records the image in pending_image_gc for the janitor to sweep
+	// after ImageBuildGCTTL. The successor created above with the same
+	// image is exactly the case the deferral protects — yanking the
+	// image inline would have forced a re-pull on every destroy/recreate
+	// cycle.
+	if got := rt.removeImageHits.Load(); got != 0 {
+		t.Fatalf("RemoveImage must NOT be called inline, hits = %d", got)
+	}
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
+	if err != nil {
+		t.Fatalf("ListPendingImageGCDue: %v", err)
+	}
+	if len(due) != 1 || due[0].Image != image {
+		t.Fatalf("expected pending_image_gc to contain %q, got %v", image, due)
 	}
 }
 
@@ -347,7 +363,9 @@ func TestDestroyEventFreesHostPort(t *testing.T) {
 	rt := &fakeReconcileRuntime{managed: map[string]*models.SandboxRuntimeState{}}
 
 	svc := &Service{
-		cfg:      config.Config{},
+		// Reconcile's destroyed-branch goes through schedulePendingImageGC,
+		// which checks ImageBuildGCEnabled before writing the ledger row.
+		cfg:      config.Config{ImageBuildGCEnabled: true},
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    st,
 		docker:   rt,
@@ -428,8 +446,17 @@ func TestDestroyEventFreesHostPort(t *testing.T) {
 	if snap := admitter.Snapshot(); snap.SandboxesActive != 0 {
 		t.Fatalf("admitter not released: %+v", snap)
 	}
-	if got := rt.removeImageHits.Load(); got != 1 {
-		t.Fatalf("RemoveImage hits = %d, want 1", got)
+	// Image scheduled for deferred GC, not removed inline (see the
+	// reconcile-branch test above for the rationale).
+	if got := rt.removeImageHits.Load(); got != 0 {
+		t.Fatalf("RemoveImage must NOT be called inline, hits = %d", got)
+	}
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
+	if err != nil {
+		t.Fatalf("ListPendingImageGCDue: %v", err)
+	}
+	if len(due) != 1 || due[0].Image != image {
+		t.Fatalf("expected pending_image_gc to contain %q, got %v", image, due)
 	}
 }
 
@@ -460,7 +487,9 @@ func TestDieEventDoesNotDeleteRow(t *testing.T) {
 
 	rt := &fakeReconcileRuntime{managed: map[string]*models.SandboxRuntimeState{}}
 	svc := &Service{
-		cfg:    config.Config{},
+		// schedulePendingImageGC checks ImageBuildGCEnabled — leave it on
+		// so the destroy branches produce the expected ledger rows.
+		cfg:    config.Config{ImageBuildGCEnabled: true},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:  st,
 		docker: rt,

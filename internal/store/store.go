@@ -229,6 +229,17 @@ func Open(path string) (*Store, error) {
 		// attachCustomDomainsBulk join. The PK on hostname already covers
 		// the ResolveCustomDomain hot path.
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_custom_domains_sandbox_id ON sandbox_custom_domains(sandbox_id);`,
+		// pending_image_gc is the ledger the image janitor sweeps. Destroy
+		// paths upsert (image, now); runPendingImageGC removes rows whose
+		// scheduled_at is older than ImageBuildGCTTL once HasActiveImageRef
+		// confirms nothing references the image. Image is the PK so repeat
+		// destroys of sandboxes sharing an image collapse to one row and
+		// the TTL clock resets to the most recent destroy.
+		`CREATE TABLE IF NOT EXISTS pending_image_gc (
+			image TEXT PRIMARY KEY,
+			scheduled_at DATETIME NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
 	}
 
 	for _, stmt := range stmts {
@@ -754,6 +765,151 @@ func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, erro
 		return false, fmt.Errorf("check image references: %w", err)
 	}
 	return true, nil
+}
+
+// SchedulePendingImageGC records (or refreshes) a pending image-deletion
+// row. UPSERT on the image PK means concurrent or repeated destroys
+// collapse to one row and the TTL clock restarts from the most recent
+// destroy — so a busy churn pattern on the same image keeps deferring
+// removal instead of racing the janitor. Empty image is a no-op.
+func (s *Store) SchedulePendingImageGC(ctx context.Context, image string, at time.Time) error {
+	if image == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO pending_image_gc(image, scheduled_at)
+		VALUES (?, ?)
+		ON CONFLICT(image) DO UPDATE SET scheduled_at = excluded.scheduled_at
+	`, image, at.UTC())
+	if err != nil {
+		return fmt.Errorf("schedule pending image gc: %w", err)
+	}
+	return nil
+}
+
+// PendingImageGCEntry is one row from the pending_image_gc ledger.
+// scheduled_at travels with the image so the janitor can pin its
+// remove/delete decision to the exact row it observed — see
+// DeletePendingImageGCIfScheduledAt for the refresh-race rationale.
+type PendingImageGCEntry struct {
+	Image       string
+	ScheduledAt time.Time
+}
+
+// ListPendingImageGCDue returns rows whose scheduled_at is at or before
+// cutoff (the janitor passes now - ImageBuildGCTTL). Ordered by
+// scheduled_at so the oldest entries get GC'd first within a sweep.
+// `limit` caps the batch so a backlog (janitor disabled for a while
+// then re-enabled, or just thousands of destroyed sandboxes sharing a
+// few images) doesn't fan out into one huge serial Docker spike per
+// tick — pass 0 for unbounded. scheduled_at is returned so the caller
+// can guard the conditional delete in DeletePendingImageGCIfScheduledAt.
+func (s *Store) ListPendingImageGCDue(ctx context.Context, cutoff time.Time, limit int) ([]PendingImageGCEntry, error) {
+	query := `
+		SELECT image, scheduled_at FROM pending_image_gc
+		WHERE scheduled_at <= ?
+		ORDER BY scheduled_at
+	`
+	args := []any{cutoff.UTC()}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list pending image gc due: %w", err)
+	}
+	defer rows.Close()
+	var out []PendingImageGCEntry
+	for rows.Next() {
+		var entry PendingImageGCEntry
+		if err := rows.Scan(&entry.Image, &entry.ScheduledAt); err != nil {
+			return nil, fmt.Errorf("scan pending image gc row: %w", err)
+		}
+		out = append(out, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending image gc rows: %w", err)
+	}
+	return out, nil
+}
+
+// DeletePendingImageGC removes the ledger row for an image
+// unconditionally. Used when the janitor decides the image is back in
+// use (HasActiveImageRef = true) and the row should be dropped
+// regardless of timestamp — the destroy path will re-schedule with a
+// fresh timestamp if the image goes idle again. Missing rows are not
+// an error.
+func (s *Store) DeletePendingImageGC(ctx context.Context, image string) error {
+	if image == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_image_gc WHERE image = ?`, image); err != nil {
+		return fmt.Errorf("delete pending image gc: %w", err)
+	}
+	return nil
+}
+
+// RefreshPendingImageGCIfExists pushes the row's scheduled_at forward
+// when (and only when) a row for image is already present. The Create
+// path calls this after store.Create succeeds, so a freshly-used image
+// that previously had a pending GC gets its deadline reset from "now"
+// instead of inheriting the original destroy's old timestamp.
+//
+// UPDATE-only (not UPSERT) on purpose: a row should only ever exist
+// when a destroy has scheduled an image for cleanup. We do NOT want
+// the create path inserting one — that would turn pending_image_gc
+// into a one-row-per-image-ever-used table. The row-count stays
+// bounded by "images destroyed in the last TTL window". Returns
+// whether a row was touched, so callers can distinguish "deadline
+// pushed forward" from "no pending GC, nothing to push".
+func (s *Store) RefreshPendingImageGCIfExists(ctx context.Context, image string, at time.Time) (bool, error) {
+	if image == "" {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE pending_image_gc
+		SET scheduled_at = ?
+		WHERE image = ?
+	`, at.UTC(), image)
+	if err != nil {
+		return false, fmt.Errorf("refresh pending image gc: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// DeletePendingImageGCIfScheduledAt removes the row only if its
+// scheduled_at still matches `at` — i.e. nobody has refreshed the row
+// since the janitor observed it. Returns whether the delete actually
+// happened so the caller can detect the refresh race.
+//
+// Why this exists: the sweep does (list, [check active, remove image,
+// delete row]). If a destroy of another sandbox sharing the image
+// upserts the row with a fresh timestamp between the list and the
+// delete, an unconditional delete would silently throw away the
+// extended TTL that destroy was supposed to buy. The janitor uses this
+// to keep the "TTL clock restarts from the most recent destroy"
+// contract under churn.
+func (s *Store) DeletePendingImageGCIfScheduledAt(ctx context.Context, image string, at time.Time) (bool, error) {
+	if image == "" {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM pending_image_gc
+		WHERE image = ? AND scheduled_at = ?
+	`, image, at.UTC())
+	if err != nil {
+		return false, fmt.Errorf("conditional delete pending image gc: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected: %w", err)
+	}
+	return n > 0, nil
 }
 
 // UpdateTags replaces sandboxes.tags_json on the row matching id and bumps

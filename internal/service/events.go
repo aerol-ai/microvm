@@ -212,10 +212,10 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	s.forgetNetstatsActivity(sandbox.ID)
 
 	// Best-effort teardown. Order matches DestroySandbox (caddy → mounts →
-	// store.Delete → admitter → maybeRemoveImage); container destroy is
-	// skipped because the event itself means the container is already gone.
-	// Failures here are picked up by gcZombieCaddyEntries / mounts.Sweep on
-	// the next reconcile pass.
+	// store.Delete → admitter → schedulePendingImageGC); container destroy
+	// is skipped because the event itself means the container is already
+	// gone. Failures here are picked up by gcZombieCaddyEntries /
+	// mounts.Sweep on the next reconcile pass.
 	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
 	}
@@ -233,10 +233,11 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 
-	// store.Delete must happen BEFORE maybeRemoveImage: HasActiveImageRef
-	// queries the sandboxes table and treats any non-destroyed row as a live
-	// reference. Deleting first lets the image GC see the correct state.
-	// ErrNotFound is benign — the API-driven destroy path may have raced us.
+	// store.Delete must happen BEFORE schedulePendingImageGC. The
+	// pending-image janitor uses HasActiveImageRef at sweep time; a stale
+	// non-destroyed row here would make every future sweep skip this
+	// image. ErrNotFound is benign — the API-driven destroy path may have
+	// raced us.
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
@@ -245,7 +246,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		s.admitter.Release(sandbox.ID)
 	}
 	s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "docker-destroy-event")
-	s.maybeRemoveImage(ctx, sandbox.Image)
+	s.schedulePendingImageGC(ctx, sandbox.Image)
 
 	s.logger.Info("audit sandbox destroyed via docker event",
 		"sandbox_id", sandbox.ID,

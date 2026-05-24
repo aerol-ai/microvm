@@ -341,8 +341,18 @@ func TestServiceLifecycleStopStartDestroyAndHealth(t *testing.T) {
 	if len(rt.destroyIDs) != 1 || rt.destroyIDs[0] != resp.ID {
 		t.Fatalf("runtime destroy ids = %v, want [%s]", rt.destroyIDs, resp.ID)
 	}
-	if len(rt.removeImages) != 1 || rt.removeImages[0] != resp.Image {
-		t.Fatalf("removed images = %v, want [%s]", rt.removeImages, resp.Image)
+	// Inline image removal was replaced by a pending_image_gc schedule
+	// in DestroySandbox; the janitor (StartPendingImageGC) handles the
+	// actual docker.RemoveImage after ImageBuildGCTTL.
+	if len(rt.removeImages) != 0 {
+		t.Fatalf("RemoveImage must NOT run inline on destroy, got %v", rt.removeImages)
+	}
+	due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
+	if err != nil {
+		t.Fatalf("ListPendingImageGCDue: %v", err)
+	}
+	if len(due) != 1 || due[0].Image != resp.Image {
+		t.Fatalf("pending_image_gc = %v, want [%s]", due, resp.Image)
 	}
 	if _, err := st.Get(ctx, resp.ID); !errors.Is(err, storepkg.ErrNotFound) {
 		t.Fatalf("sandbox still present after destroy: %v", err)
@@ -865,6 +875,9 @@ func newServiceRuntimeHarness(t *testing.T, rt *recordingRuntime) (*Service, *st
 			ToolboxPort:       4321,
 			EnableCaddy:       false,
 			HTTPClientTimeout: time.Second,
+			// Required for the destroy-side assertion that DestroySandbox
+			// enqueues a pending_image_gc row.
+			ImageBuildGCEnabled: true,
 		},
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    st,

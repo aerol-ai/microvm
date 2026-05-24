@@ -355,6 +355,20 @@ variable "image_pull_failure_backoff" {
   }
 }
 
+variable "image_gc_whitelist" {
+  description = <<-EOT
+    Image repositories or refs the GC janitors must never remove. Three
+    match shapes:
+      - exact ref ("alpine:latest" — only that tag survives)
+      - repo, tag/digest agnostic ("ubuntu" — every tag/digest of ubuntu)
+      - registry/org prefix when the entry ends in "/" ("ghcr.io/myorg/")
+    Written as SB_IMAGE_GC_WHITELIST (comma-joined). Empty list (default)
+    preserves today's behavior — every image is eligible for GC.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 ###############################################################################
 # Cloudflare DNS
 ###############################################################################

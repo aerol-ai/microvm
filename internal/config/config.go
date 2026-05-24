@@ -518,27 +518,52 @@ type Config struct {
 	// generous; we bound it only to keep a runaway build from permanently
 	// parking the HTTP handler.
 	ImageBuildTimeout time.Duration
-	// ImageBuildGCEnabled toggles the periodic janitor that sweeps
-	// locally-built images (BuiltImageNamespace, i.e. "aerolvm-build/*")
-	// that are no longer referenced by any active sandbox AND were created
-	// more than ImageBuildGCTTL ago. Without this, images produced by
-	// standalone POST /v1/images/build calls or by builds whose followup
-	// CreateSandbox failed accumulate forever — service.maybeRemoveImage
-	// only runs on sandbox destroy and so can't see images that never had
-	// a sandbox row.
+	// ImageBuildGCEnabled toggles BOTH image janitors: the built-image
+	// sweep (locally-built BuiltImageNamespace tags older than the TTL
+	// with no active reference) and the pending-image sweep (entries in
+	// the pending_image_gc ledger scheduled by sandbox destroy paths,
+	// older than the TTL with no active reference). Without the former,
+	// images produced by standalone POST /v1/images/build calls — or
+	// builds whose followup CreateSandbox failed — accumulate forever.
+	// Without the latter, every sandbox destroy leaks its image until
+	// the daemon is restarted. Disabling both with one switch matches
+	// how operators reason about "image GC" as a single subsystem.
 	ImageBuildGCEnabled bool
-	// ImageBuildGCInterval is how often the janitor ticker fires. Default
-	// 10m: cheap enough (one filtered /images/json call + one indexed store
-	// lookup per match) that running it more often would only matter if
-	// builds were churning faster than the TTL — which would itself be a
-	// signal something is wrong upstream.
+	// ImageBuildGCInterval is how often each janitor ticker fires.
+	// Default 10m: cheap enough (one filtered /images/json call + one
+	// indexed store lookup per built-image match for one janitor; one
+	// indexed range scan over pending_image_gc for the other) that
+	// running more often would only matter under churn that itself
+	// indicates an upstream problem.
 	ImageBuildGCInterval time.Duration
-	// ImageBuildGCTTL is the minimum age a built image must reach before
-	// it becomes eligible for removal. Default 1h: comfortably longer than
-	// any reasonable retry/network-blip between build and create, so a
-	// transient hiccup doesn't have the janitor yanking an image a client
-	// is about to use.
+	// ImageBuildGCTTL is the minimum age before an image becomes
+	// eligible for removal: for built images, measured from the
+	// daemon's LastTagTime; for pending images, from the destroy
+	// timestamp recorded in pending_image_gc.scheduled_at (which is
+	// also refreshed forward by the create path's
+	// RefreshPendingImageGCIfExists, so the clock restarts on most
+	// recent use, not first destroy). Default 24h: wide enough that a
+	// destroy/recreate cycle measured in hours doesn't pay a fresh
+	// registry pull, while still bounded so a build-only host
+	// (sandboxes never recreated) eventually reclaims disk. Tighten via
+	// SB_IMAGE_BUILD_GC_TTL when disk pressure outweighs warm-start
+	// latency.
 	ImageBuildGCTTL time.Duration
+	// ImageGCWhitelist is a list of image repositories or refs the janitors
+	// must never remove. Three match shapes are honored against the image
+	// string the sandbox stored (the same string passed to docker pull):
+	//   1. exact ref equality                 ("alpine:latest" == "alpine:latest")
+	//   2. repo equality, tag/digest agnostic ("ubuntu" matches "ubuntu:22.04",
+	//      "ubuntu@sha256:...")
+	//   3. registry/org prefix when the entry ends in "/"
+	//      ("ghcr.io/myorg/" matches every image under that path; useful for
+	//      "always keep my private builds cached")
+	// Loaded from SB_IMAGE_GC_WHITELIST as a comma-separated list. An empty
+	// list (the default) preserves today's behavior — every image is
+	// eligible for GC. Whitelisted images also short-circuit the
+	// pending_image_gc ledger insert so the ledger doesn't accumulate rows
+	// the janitor would only ever skip.
+	ImageGCWhitelist []string
 	// ImageDistributionAOCRHost is the registry host treated as the optional
 	// managed AOCR image-distribution provider. Empty configs constructed in
 	// tests fall back to the product default in the service layer.
@@ -778,7 +803,8 @@ func Load() (Config, error) {
 		ImageBuildTimeout:                getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
 		ImageBuildGCEnabled:              getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
 		ImageBuildGCInterval:             getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", 24*time.Hour),
+		ImageGCWhitelist:                 parseImageGCWhitelist(os.Getenv("SB_IMAGE_GC_WHITELIST")),
 		ImageDistributionAOCRHost:        strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
 		ImagePullMaxConcurrent:           getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
 		ImagePullFailureBackoff:          getEnvDuration("SB_IMAGE_PULL_FAILURE_BACKOFF", 30*time.Second),
@@ -1230,6 +1256,21 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 
 func normalizeHost(value string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(value, "https://"), "http://"))
+}
+
+// parseImageGCWhitelist splits a comma-separated SB_IMAGE_GC_WHITELIST into
+// trimmed entries. Empty / blank entries are dropped so a stray trailing
+// comma in the env file doesn't smuggle in an empty string that matches
+// every image. Returns a non-nil zero-length slice on empty input so the
+// service layer can range over it unconditionally.
+func parseImageGCWhitelist(raw string) []string {
+	out := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		if entry := strings.TrimSpace(part); entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // parseMirrorUpstreams parses the comma-separated host=shortname list for

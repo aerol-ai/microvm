@@ -66,6 +66,7 @@ resource "aws_instance" "seed" {
     otel_service_name          = var.otel_service_name
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff
+    image_gc_whitelist         = join(",", var.image_gc_whitelist)
     extra_user_data            = local.seed_node.extra_user_data
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
@@ -163,6 +164,7 @@ resource "aws_instance" "joiner" {
     otel_service_name          = var.otel_service_name
     image_pull_max_concurrent  = var.image_pull_max_concurrent
     image_pull_failure_backoff = var.image_pull_failure_backoff
+    image_gc_whitelist         = join(",", var.image_gc_whitelist)
     extra_user_data            = each.value.extra_user_data
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
