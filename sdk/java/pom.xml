@@ -5,7 +5,7 @@
 
   <groupId>ai.aerol</groupId>
   <artifactId>aerolvm-sdk</artifactId>
-  <version>v0.3.1</version>
+  <version>0.3.1</version>
   <name>Aerol.ai MicroVM Java SDK</name>
   <description>A Java client for the Aerol.ai MicroVM sandbox API.</description>
   <url>https://github.com/aerol-ai/microvm</url>
