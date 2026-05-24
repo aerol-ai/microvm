@@ -23,6 +23,47 @@ func (s *stubStaleCluster) OwnerOf(_ string) (cluster.OwnerInfo, error) {
 	return cluster.OwnerInfo{NodeID: s.otherNode, APIURL: s.otherURL, IsSelf: false}, nil
 }
 
+type recordingOwnershipCluster struct {
+	*cluster.Noop
+	placements map[string]cluster.Placement
+	asserted   [][]cluster.LocalSandboxState
+}
+
+func (r *recordingOwnershipCluster) PlacementOf(id string) (cluster.Placement, bool) {
+	p, ok := r.placements[id]
+	return p, ok
+}
+
+func (r *recordingOwnershipCluster) AssertOwnership(_ context.Context, local []cluster.LocalSandboxState) error {
+	cp := append([]cluster.LocalSandboxState(nil), local...)
+	r.asserted = append(r.asserted, cp)
+	for _, st := range local {
+		r.placements[st.ID] = cluster.Placement{
+			SandboxID:           st.ID,
+			OwnerNodeID:         r.SelfNodeID(),
+			OwnerAPIURL:         r.SelfAPIURL(),
+			Spec:                st.Spec,
+			ExposedPortRoutes:   st.ExposedPorts,
+			ExposedPorts:        legacyPortProtocols(st.ExposedPorts),
+			State:               cluster.PlacementStatePlaced,
+			OwnerState:          cluster.PlacementOwnerStateActive,
+			OrphanedOwnerNodeID: "",
+		}
+	}
+	return nil
+}
+
+func legacyPortProtocols(routes map[int]cluster.ExposedPortRoute) map[int]string {
+	if len(routes) == 0 {
+		return nil
+	}
+	out := make(map[int]string, len(routes))
+	for port, route := range routes {
+		out[port] = route.Protocol
+	}
+	return out
+}
+
 // TestReplayReservationsThenStaleOwnershipReleasesCapacity is the boot-time
 // interaction test for the rejoin-after-outage case: a node returns to find
 // the cluster has reassigned one of its sandboxes to a peer. ReplayReservations
@@ -132,5 +173,59 @@ func TestReconcileStaleOwnershipKeepsLocalSandboxWhenSelfOwns(t *testing.T) {
 	}
 	if snap := admitter.Snapshot(); snap.SandboxesActive != 1 {
 		t.Fatalf("admitter lost the reservation: %+v", snap)
+	}
+}
+
+func TestReconcileBackfillsMissingPlacementForManagedLocalSandbox(t *testing.T) {
+	ctx := context.Background()
+	const sandboxID = "sb-local-missing-placement"
+	const containerID = "ctr-local-missing-placement"
+	svc, _, st := newCapacityHarness(t, map[string]*models.SandboxRuntimeState{
+		sandboxID: {
+			SandboxID:   sandboxID,
+			ContainerID: containerID,
+			ContainerIP: "10.0.0.41",
+			Status:      models.SandboxStatusStarted,
+		},
+	}, nil)
+	svc.cfg.EnableCluster = true
+	recorder := &recordingOwnershipCluster{
+		Noop:       cluster.NewNoop("self", "http://self"),
+		placements: map[string]cluster.Placement{},
+	}
+	svc.AttachCluster(recorder)
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:           sandboxID,
+		Image:        "ubuntu:22.04",
+		Status:       models.SandboxStatusStarted,
+		ContainerID:  containerID,
+		ContainerIP:  "10.0.0.41",
+		CPU:          1,
+		MemoryMB:     1024,
+		Runtime:      models.RuntimeDocker,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	if len(recorder.asserted) != 1 || len(recorder.asserted[0]) != 1 {
+		t.Fatalf("AssertOwnership calls = %+v, want one local sandbox replay", recorder.asserted)
+	}
+	if got := recorder.asserted[0][0]; got.ID != sandboxID || got.Spec == nil || got.Spec.Image != "ubuntu:22.04" {
+		t.Fatalf("replayed state = %+v", got)
+	}
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if len(recorder.asserted) != 1 {
+		t.Fatalf("ownership replay was not idempotent; calls = %d", len(recorder.asserted))
 	}
 }

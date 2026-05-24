@@ -2147,6 +2147,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return err
 	}
 
+	s.reconcileLocalClusterOwnership(ctx, known, managed)
+
 	knownIDs := make(map[string]struct{}, len(known))
 	for _, sandbox := range known {
 		knownIDs[sandbox.ID] = struct{}{}

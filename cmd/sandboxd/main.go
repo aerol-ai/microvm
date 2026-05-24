@@ -248,17 +248,13 @@ func main() {
 
 	// Cluster ownership replay. After local reservations are restored, tell
 	// the cluster which sandboxes this node owns so the FSM stays consistent
-	// across restarts. Best-effort: a missing leader on cold start is logged
-	// and recovered by the next reconcile or the next mutating call. Only
-	// worker (and mixed) nodes can own sandboxes — pure server/ingress nodes
-	// have nothing to assert.
+	// across restarts. Best-effort: a missing leader on cold start is retried
+	// in the background. Only worker (and mixed) nodes can own sandboxes —
+	// pure server/ingress nodes have nothing to assert.
 	if cfg.EnableCluster {
 		if cfg.IsWorker() {
-			states, err := localSandboxStates(ctx, svc, logger)
-			if err != nil {
-				logger.Warn("cluster: could not list local sandbox states for ownership replay", "error", err)
-			} else if err := svc.Cluster().AssertOwnership(ctx, states); err != nil {
-				logger.Warn("cluster: AssertOwnership returned error at boot; reconcile will retry", "error", err)
+			if !replayClusterOwnership(ctx, svc, logger) {
+				startClusterOwnershipReplayRetry(ctx, svc, logger)
 			}
 		}
 		if cfg.IsIngress() {
@@ -394,98 +390,37 @@ func main() {
 	}
 }
 
-// localSandboxStates returns boot-replay payloads for every sandbox in the
-// local store. Each entry carries the persisted Sandbox's identity, a derived
-// CreateSandboxRequest, and the set of currently-exposed (port, protocol)
-// intents — enough for AssertOwnership to backfill spec + ports for sandboxes
-// that pre-date the spec-replication features.
-//
-// Registry credentials are unsealed via svc.UnsealRegistry so the backfilled
-// spec carries the original auth — required for failover to re-pull a private
-// image on a new owner. A decrypt failure on a single sandbox is logged and
-// the spec falls back to nil-Registry rather than aborting boot for the
-// whole fleet.
-func localSandboxStates(ctx context.Context, svc *service.Service, logger *slog.Logger) ([]cluster.LocalSandboxState, error) {
-	sandboxes, err := svc.ListSandboxes(ctx, nil)
+func replayClusterOwnership(ctx context.Context, svc *service.Service, logger *slog.Logger) bool {
+	count, err := svc.ReplayClusterOwnership(ctx)
 	if err != nil {
-		return nil, err
+		logger.Warn("cluster: ownership replay failed; will retry", "error", err)
+		return false
 	}
-	out := make([]cluster.LocalSandboxState, 0, len(sandboxes))
-	for _, sb := range sandboxes {
-		if sb == nil || sb.ID == "" {
-			continue
-		}
-		spec := specFromSandbox(svc, sb, logger)
-		// Store credentials behind a secret ref and redact the spec BEFORE
-		// handing it to the cluster — the cluster layer never sees plaintext
-		// registry passwords. On secret-store failure we still ship the
-		// placement (without secrets) so the cluster knows about the sandbox;
-		// the next failover-recreate will be unable to pull a private image,
-		// which the recreator logs loudly, but losing replication entirely
-		// would be worse.
-		var secrets cluster.PlacementSecrets
-		if spec != nil {
-			recipient := ""
-			if c := svc.Cluster(); c != nil {
-				recipient = c.SelfNodeID()
-			}
-			s, err := svc.PutClusterSecretsForRecipient(ctx, sb.ID, *spec, recipient)
-			if err != nil {
-				logger.Warn("cluster: store secret ref at boot replay failed; placement will ship without secret ref",
-					"sandbox_id", sb.ID, "err", err)
-			} else {
-				secrets = s
-				redacted := service.RedactClusterSecrets(*spec)
-				spec = &redacted
-			}
-		}
-		out = append(out, cluster.LocalSandboxState{
-			ID:           sb.ID,
-			Spec:         spec,
-			Secrets:      secrets,
-			ExposedPorts: portsFromSandbox(sb),
-		})
+	if count > 0 {
+		logger.Info("cluster: ownership replay completed", "sandboxes", count)
 	}
-	return out, nil
+	return true
 }
 
-// specFromSandbox derives a CreateSandboxRequest from a persisted Sandbox row.
-// Used only for the pre-cluster backfill path — new sandboxes get their full
-// spec replicated at create time via clusterCreateWrap.
-func specFromSandbox(svc *service.Service, sb *models.Sandbox, logger *slog.Logger) *models.CreateSandboxRequest {
-	if sb == nil {
-		return nil
-	}
-	spec := &models.CreateSandboxRequest{
-		Image:            sb.Image,
-		CPU:              sb.CPU,
-		MemoryMB:         sb.MemoryMB,
-		DiskGB:           sb.DiskGB,
-		Env:              sb.Env,
-		OSUser:           sb.OSUser,
-		NetworkBlockAll:  sb.NetworkBlockAll,
-		ContainerCommand: sb.ContainerCommand,
-		Runtime:          sb.Runtime,
-		GPUs:             sb.GPUs,
-		Failover:         sb.Failover,
-	}
-	// Lifecycle on Sandbox is value-typed; spec wants a pointer so the JSON
-	// "omitempty" stays meaningful for fresh creates that didn't pass one.
-	lc := sb.Lifecycle
-	spec.Lifecycle = &lc
-
-	// Sealed only when the original create supplied a private registry. A
-	// decrypt failure here is non-fatal: we keep the spec but drop Registry,
-	// matching the legacy behaviour where the new owner relies on its image
-	// cache. Loud-warn so the misconfiguration shows up in logs.
-	auth, err := svc.UnsealRegistry(sb.RegistryAuthSealed)
-	if err != nil {
-		logger.Warn("cluster: unseal registry auth failed; spec backfill will omit credentials",
-			"sandbox_id", sb.ID, "err", err)
-	} else {
-		spec.Registry = auth
-	}
-	return spec
+func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
+	logger.Warn("cluster: scheduling ownership replay retry")
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				replayCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				ok := replayClusterOwnership(replayCtx, svc, logger)
+				cancel()
+				if ok {
+					return
+				}
+			}
+		}
+	}()
 }
 
 // configureMirror loads the upstream wrap-key ring (if a path is set) and
@@ -713,25 +648,4 @@ func bytesTrimSpace(b []byte) []byte {
 
 func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
-}
-
-// portsFromSandbox extracts the routing intents the sandbox currently has
-// exposed. Raw TCP includes HostPort so cluster ingress can keep a stable
-// public port across owner-aware routers and failover recreates when possible.
-func portsFromSandbox(sb *models.Sandbox) map[int]cluster.ExposedPortRoute {
-	if sb == nil || len(sb.ExposedPorts) == 0 {
-		return nil
-	}
-	out := make(map[int]cluster.ExposedPortRoute, len(sb.ExposedPorts))
-	for _, p := range sb.ExposedPorts {
-		if p.Port <= 0 {
-			continue
-		}
-		out[p.Port] = cluster.ExposedPortRoute{
-			Protocol:  p.Protocol,
-			HostPort:  p.HostPort,
-			PublicURL: p.PublicURL,
-		}
-	}
-	return out
 }

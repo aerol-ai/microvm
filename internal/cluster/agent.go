@@ -433,6 +433,15 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 					firstErr = err
 				}
 			}
+		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned() && existing.Placement.IsReserved():
+			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			for port, route := range st.ExposedPorts {
+				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned():
 			if existing.Placement.Spec == nil && st.Spec != nil {
 				if err := a.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
