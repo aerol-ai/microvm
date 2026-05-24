@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -644,6 +645,19 @@ func IngressSandboxSNIRouteID(id string) string {
 
 func IngressPortSNIRouteID(id string, port int) string {
 	return ingressPortSNIRouteID(id, port)
+}
+
+// IngressCustomDomainSNIRouteID is the stable route ID for the per-custom-
+// hostname SNI passthrough route on non-owner ingress nodes (cluster mode,
+// domain mode). The hostname is hashed so the ID stays within Caddy's
+// route-ID size budget for very long custom hostnames and avoids embedding
+// punctuation that would have to be escaped in the @id slug. The pair
+// (sandboxID, hostname) yields a deterministic ID so the delta-driven
+// ingress reconciler can recognize an existing route and avoid churn.
+func IngressCustomDomainSNIRouteID(sandboxID, hostname string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strings.ToLower(hostname)))
+	return fmt.Sprintf("sandbox-%s-custom-%016x-ingress-sni", sandboxID, h.Sum64())
 }
 
 // EnsureOnDemandTLS idempotently installs the on-demand TLS automation
