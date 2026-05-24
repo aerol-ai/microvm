@@ -378,38 +378,72 @@ func main() {
 	}()
 
 	// Wake-aware HTTP ingress proxy: a loopback-only listener Caddy
-	// dials when forwarding a wake-aware port route. Only stood up
-	// when both the serverless feature and Caddy itself are enabled —
-	// without Caddy in front, nothing would route to this listener.
+	// dials when forwarding a wake-aware port route. Stood up when
+	// serverless OR custom-domains is enabled (and Caddy is in front —
+	// without Caddy nothing routes to this listener). Both features
+	// share the same mux so they share one loopback listener.
 	var ingressServer *http.Server
-	if cfg.EnableServerless && cfg.EnableCaddy {
+	if (cfg.EnableServerless || cfg.EnableCustomDomains) && cfg.EnableCaddy {
 		ingressMux := http.NewServeMux()
-		ingressproxy.RegisterRoutes(ingressMux, ingressproxy.Deps{
-			Resolver:             svc,
-			Logger:               logger,
-			MaxBufferBytes:       cfg.HTTPWakeMaxBuffer,
-			UpstreamReadyTimeout: cfg.HTTPWakeUpstreamReadyTimeout,
-			MaxPendingPerSandbox: cfg.HTTPWakeMaxPendingPerSandbox,
-			MaxPendingGlobal:     cfg.HTTPWakeMaxPendingGlobal,
-			MaxBufferBytesGlobal: cfg.HTTPWakeMaxBufferBytesGlobal,
-		})
+		if cfg.EnableServerless {
+			ingressproxy.RegisterRoutes(ingressMux, ingressproxy.Deps{
+				Resolver:             svc,
+				Logger:               logger,
+				MaxBufferBytes:       cfg.HTTPWakeMaxBuffer,
+				UpstreamReadyTimeout: cfg.HTTPWakeUpstreamReadyTimeout,
+				MaxPendingPerSandbox: cfg.HTTPWakeMaxPendingPerSandbox,
+				MaxPendingGlobal:     cfg.HTTPWakeMaxPendingGlobal,
+				MaxBufferBytesGlobal: cfg.HTTPWakeMaxBufferBytesGlobal,
+			})
+		}
+		// Caddy on-demand TLS ask callback (plans/custom-domains.md).
+		// db.ResolveCustomDomain is a PK lookup; the LRU negative cache
+		// in the handler keeps SNI floods from hitting SQLite per packet.
+		// Boot-time EnsureOnDemandTLS is best-effort — if Caddy is not
+		// yet reachable we log and continue; the next AddCustomDomain
+		// call surface still works because the handler is mounted, and
+		// an operator-driven reconcile can re-install the policy later.
+		if cfg.EnableCustomDomains {
+			askHandler := ingressproxy.NewTLSAskHandler(ingressproxy.TLSAskDeps{
+				Resolver:    db,
+				BaseDomain:  cfg.Domain,
+				NegCacheTTL: 60 * time.Second,
+				NegCacheCap: 10000,
+				Logger:      logger,
+			})
+			ingressproxy.RegisterTLSAsk(ingressMux, askHandler)
+			svc.AttachCustomDomainCacheEvicter(askHandler)
+			askURL := "http://" + cfg.InternalIngressAddr + ingressproxy.TLSAskPath
+			if err := caddyClient.EnsureOnDemandTLS(ctx, askURL, cfg.TLSOnDemandBurst, cfg.TLSOnDemandInterval); err != nil {
+				logger.Warn("failed to install caddy on-demand TLS policy; will retry on next reconcile",
+					"error", err, "ask_url", askURL)
+			} else {
+				logger.Info("caddy on-demand TLS policy installed",
+					"ask_url", askURL, "burst", cfg.TLSOnDemandBurst, "interval", cfg.TLSOnDemandInterval)
+			}
+		}
 		ingressServer = &http.Server{
 			Addr:              cfg.InternalIngressAddr,
 			Handler:           ingressMux,
 			ReadHeaderTimeout: 10 * time.Second,
 		}
-		logger.Info("wake-aware ingress proxy listening", "addr", cfg.InternalIngressAddr)
+		logger.Info("ingress proxy listening",
+			"addr", cfg.InternalIngressAddr,
+			"serverless", cfg.EnableServerless,
+			"custom_domains", cfg.EnableCustomDomains)
 		go func() {
 			if err := ingressServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("ingress proxy stopped unexpectedly", "error", err)
 				cancel()
 			}
 		}()
-		if err := svc.StartL4WakeProxy(ctx); err != nil {
-			logger.Error("l4 wake proxy failed to start", "error", err)
-			cancel()
-		} else {
-			logger.Info("wake-aware l4 proxy listening", "addr", cfg.InternalL4WakeAddr, "socket_dir", cfg.InternalL4WakeDir)
+		if cfg.EnableServerless {
+			if err := svc.StartL4WakeProxy(ctx); err != nil {
+				logger.Error("l4 wake proxy failed to start", "error", err)
+				cancel()
+			} else {
+				logger.Info("wake-aware l4 proxy listening", "addr", cfg.InternalL4WakeAddr, "socket_dir", cfg.InternalL4WakeDir)
+			}
 		}
 	}
 
