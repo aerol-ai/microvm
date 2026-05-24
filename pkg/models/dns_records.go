@@ -3,6 +3,8 @@ package models
 import (
 	"net"
 	"strings"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // cloudflareNote is the surfaced warning every record carries. With the
@@ -17,18 +19,22 @@ const cloudflareNote = "Cloudflare/CDN: set the record to DNS only (gray cloud).
 // the set of DNS records the user must create at their provider. Shape
 // rules:
 //
-//   - target.Hostname set (Source=hostname or mixed) → one CNAME per
-//     hostname. Apex hostnames (foo.com) get Name="@"; subdomains
-//     (api.foo.com) get Name="api". Apex CNAME assumes the provider
-//     supports flattening (Cloudflare, Route 53 alias, DNSimple ALIAS,
-//     DNSMadeEasy ANAME, etc.) — the doc page covers the fallback.
-//   - target.IPs populated (Source=ips or mixed) → one A or AAAA per IP per
-//     hostname, partitioned by net.ParseIP.To4().
+//   - Subdomains with target.Hostname available → one CNAME (smallest,
+//     survives IP changes, works at every provider).
+//   - Apex hostnames with target.IPs available → one A (and AAAA for IPv6)
+//     per IP. Apex prefers IPs over CNAME because CNAME-at-apex requires
+//     provider-specific flattening (Cloudflare, Route 53 alias, DNSimple
+//     ALIAS, etc.) and many providers reject it.
+//   - Apex hostnames with only target.Hostname (no IPs) → one CNAME with a
+//     note that the provider must support apex CNAME flattening.
+//   - Subdomains with only target.IPs → one A/AAAA per IP.
 //   - target empty / Source=unknown → returns nil. Callers render an
 //     operator-must-configure-ingress error rather than fake records.
 //
-// Mixed sources emit BOTH the CNAME and the A/AAAA records so apex
-// hostnames that can't flatten still have a workable option.
+// One strategy per hostname is required: a CNAME owner name cannot coexist
+// with A/AAAA records at the same name (RFC 1034 §3.6.2). DNS providers
+// reject the second row, so emitting both as "ready-to-paste" would just
+// trip the user up.
 func ComposeDNSRecords(hostnames []string, target IngressTarget) []DNSRecord {
 	if len(hostnames) == 0 {
 		return nil
@@ -43,7 +49,9 @@ func ComposeDNSRecords(hostnames []string, target IngressTarget) []DNSRecord {
 			continue
 		}
 		name := dnsRecordName(host)
-		if target.Hostname != "" {
+		isApex := name == "@"
+		useCNAME := target.Hostname != "" && (!isApex || len(target.IPs) == 0)
+		if useCNAME {
 			out = append(out, DNSRecord{
 				Hostname: host,
 				Type:     DNSRecordTypeCNAME,
@@ -51,6 +59,7 @@ func ComposeDNSRecords(hostnames []string, target IngressTarget) []DNSRecord {
 				Value:    target.Hostname,
 				Notes:    cloudflareNote,
 			})
+			continue
 		}
 		for _, ip := range target.IPs {
 			recType := DNSRecordTypeA
@@ -69,11 +78,19 @@ func ComposeDNSRecords(hostnames []string, target IngressTarget) []DNSRecord {
 	return out
 }
 
-// dnsRecordName returns "@" for apex (two-label) hostnames and the
-// leftmost label for subdomains. The split matches what DNS provider UIs
-// accept in their "Name" field — Cloudflare, Route 53, etc. all use "@"
-// for apex and the bare leftmost label for subdomain rows.
+// dnsRecordName returns "@" for apex hostnames and the leftmost label for
+// subdomains. Apex detection uses the Mozilla public suffix list so
+// `example.co.uk` and `example.com.au` are correctly recognized as zone
+// roots — a naive label-count check would label `example` as the
+// subdomain. Falls back to the label-count heuristic only when the host
+// has no public suffix (intranet TLDs, single-label hosts).
 func dnsRecordName(host string) string {
+	if etldPlus1, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		if host == etldPlus1 {
+			return "@"
+		}
+		return strings.TrimSuffix(host, "."+etldPlus1)
+	}
 	labels := strings.Split(host, ".")
 	if len(labels) <= 2 {
 		return "@"

@@ -28,11 +28,34 @@ func TestComposeDNSRecords_ApexCNAME(t *testing.T) {
 	}
 }
 
-func TestComposeDNSRecords_DeepSubdomainUsesLeftmostLabel(t *testing.T) {
+func TestComposeDNSRecords_DeepSubdomainUsesFullPrefix(t *testing.T) {
+	// DNS provider UIs (Cloudflare, Route 53, etc.) ask for the Name
+	// relative to the managed zone. For host "a.b.c.acme.com" in zone
+	// "acme.com", the correct Name is "a.b.c" — using just "a" would
+	// create the wrong row.
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
 	got := ComposeDNSRecords([]string{"a.b.c.acme.com"}, target)
-	if len(got) != 1 || got[0].Name != "a" {
-		t.Fatalf("expected Name=a for deep subdomain, got %+v", got)
+	if len(got) != 1 || got[0].Name != "a.b.c" {
+		t.Fatalf("expected Name=a.b.c for deep subdomain, got %+v", got)
+	}
+}
+
+func TestComposeDNSRecords_PublicSuffixApex(t *testing.T) {
+	// example.co.uk is the zone root under the .co.uk public suffix —
+	// the leftmost label "example" is NOT a subdomain. A naive
+	// label-count heuristic would mis-render this as Name="example".
+	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
+	got := ComposeDNSRecords([]string{"example.co.uk"}, target)
+	if len(got) != 1 || got[0].Name != "@" {
+		t.Fatalf("expected apex Name=@ for example.co.uk, got %+v", got)
+	}
+}
+
+func TestComposeDNSRecords_PublicSuffixSubdomain(t *testing.T) {
+	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
+	got := ComposeDNSRecords([]string{"api.example.co.uk"}, target)
+	if len(got) != 1 || got[0].Name != "api" {
+		t.Fatalf("expected Name=api for api.example.co.uk, got %+v", got)
 	}
 }
 
@@ -63,18 +86,44 @@ func TestComposeDNSRecords_MixedIPv4AndIPv6(t *testing.T) {
 	}
 }
 
-func TestComposeDNSRecords_MixedSourceEmitsBoth(t *testing.T) {
+func TestComposeDNSRecords_MixedSourceSubdomainPrefersCNAME(t *testing.T) {
+	// CNAME and A/AAAA cannot coexist at the same owner name (RFC 1034
+	// §3.6.2); DNS providers reject the second row. For subdomains we
+	// pick CNAME because it survives ingress IP changes.
 	target := IngressTarget{
 		Hostname: "ingress.example.com",
 		IPs:      []string{"203.0.113.10"},
 		Source:   IngressTargetSourceMixed,
 	}
 	got := ComposeDNSRecords([]string{"api.acme.com"}, target)
-	if len(got) != 2 {
-		t.Fatalf("expected CNAME + A, got %d records: %+v", len(got), got)
+	if len(got) != 1 {
+		t.Fatalf("expected single record, got %d: %+v", len(got), got)
 	}
-	if got[0].Type != DNSRecordTypeCNAME || got[1].Type != DNSRecordTypeA {
-		t.Fatalf("expected [CNAME, A], got [%s, %s]", got[0].Type, got[1].Type)
+	if got[0].Type != DNSRecordTypeCNAME || got[0].Value != "ingress.example.com" {
+		t.Fatalf("expected single CNAME to ingress.example.com, got %+v", got[0])
+	}
+}
+
+func TestComposeDNSRecords_MixedSourceApexPrefersIPs(t *testing.T) {
+	// At the apex we prefer A/AAAA over CNAME because CNAME-at-apex
+	// depends on provider-specific flattening (ALIAS / ANAME / alias
+	// records) and many providers reject it outright.
+	target := IngressTarget{
+		Hostname: "ingress.example.com",
+		IPs:      []string{"203.0.113.10", "2001:db8::1"},
+		Source:   IngressTargetSourceMixed,
+	}
+	got := ComposeDNSRecords([]string{"acme.com"}, target)
+	if len(got) != 2 {
+		t.Fatalf("expected A + AAAA at apex, got %d records: %+v", len(got), got)
+	}
+	for _, r := range got {
+		if r.Type == DNSRecordTypeCNAME {
+			t.Fatalf("apex must not emit CNAME alongside A/AAAA, got %+v", r)
+		}
+		if r.Name != "@" {
+			t.Fatalf("apex Name=%q, want @", r.Name)
+		}
 	}
 }
 
