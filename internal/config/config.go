@@ -141,6 +141,18 @@ type Config struct {
 	// routes. Caddy terminates TLS before proxying, so the socket path carries
 	// the sandbox/port identity that plaintext TCP no longer contains.
 	InternalL4WakeDir string
+	// L4WakeMaxPendingPerSandbox bounds L4 connections waiting for a single
+	// sandbox wake. Excess connections are closed before they wait on the
+	// per-sandbox wake single-flight.
+	L4WakeMaxPendingPerSandbox int
+	// L4WakeMaxPendingGlobal bounds all L4 connections waiting for wake on this
+	// node. It protects sandboxd from a fleet-wide cold-start burst.
+	L4WakeMaxPendingGlobal int
+	// L4WakeMaxActivePerSandbox bounds active L4 proxy connections per sandbox
+	// through the wake proxy after the sandbox is running.
+	L4WakeMaxActivePerSandbox int
+	// L4WakeMaxActiveGlobal bounds active L4 proxy connections on this node.
+	L4WakeMaxActiveGlobal int
 	// HTTPWakeMaxBuffer caps the request body buffered while a cold-start
 	// wake is in progress. Requests with bodies larger than this are
 	// rejected with 413 — see plan D2.
@@ -544,6 +556,10 @@ func Load() (Config, error) {
 		InternalIngressAddr:         getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
 		InternalL4WakeAddr:          getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
 		InternalL4WakeDir:           getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
+		L4WakeMaxPendingPerSandbox:  getEnvInt("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", 256),
+		L4WakeMaxPendingGlobal:      getEnvInt("SB_L4_WAKE_MAX_PENDING_GLOBAL", 4096),
+		L4WakeMaxActivePerSandbox:   getEnvInt("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", 4096),
+		L4WakeMaxActiveGlobal:       getEnvInt("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", 65536),
 		HTTPWakeMaxBuffer:           int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
 		SSHListenAddr:               getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:              getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
@@ -830,6 +846,18 @@ func Load() (Config, error) {
 		}
 		if strings.TrimSpace(cfg.InternalL4WakeDir) == "" {
 			return Config{}, errors.New("SB_INTERNAL_L4_WAKE_DIR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxPendingPerSandbox <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxPendingGlobal <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_PENDING_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxActivePerSandbox <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxActiveGlobal <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_ACTIVE_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
 		}
 		if cfg.HTTPWakeMaxBuffer <= 0 {
 			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER must be > 0 when SB_ENABLE_SERVERLESS=true")

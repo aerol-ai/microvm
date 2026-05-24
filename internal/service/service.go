@@ -90,6 +90,17 @@ type Service struct {
 	l4WakeMu   sync.Mutex
 	l4WakeTCP  net.Listener
 	l4WakeTLS  map[string]net.Listener
+	l4LimitMu  sync.Mutex
+	// pending counts L4 connections waiting for wake/target resolution.
+	// active counts connections already admitted to proxy bytes. Keeping both
+	// lets cold-start bursts shed excess work without blocking unrelated warm
+	// traffic accounting.
+	l4PendingGlobal       int
+	l4PendingBySandbox    map[string]int
+	l4ActiveGlobal        int
+	l4ActiveBySandbox     map[string]int
+	l4ActivityGenerations map[string]uint64
+	l4ActivitySeq         uint64
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the

@@ -20,6 +20,11 @@ const (
 	l4WakeProxyHeaderMaxBytes = 256
 	l4WakeDialTimeout         = 10 * time.Second
 	l4WakeActivityInterval    = 30 * time.Second
+
+	defaultL4WakeMaxPendingPerSandbox = 256
+	defaultL4WakeMaxPendingGlobal     = 4096
+	defaultL4WakeMaxActivePerSandbox  = 4096
+	defaultL4WakeMaxActiveGlobal      = 65536
 )
 
 // StartL4WakeProxy starts the loopback TCP wake listener used by raw-TCP
@@ -139,11 +144,24 @@ func (s *Service) WakeAwareL4PortTarget(ctx context.Context, id string, port int
 }
 
 func (s *Service) proxyL4WakeConn(ctx context.Context, id string, port int, downstream net.Conn, buffered *bufio.Reader) {
+	releasePending, ok := s.tryAcquireL4Pending(id)
+	if !ok {
+		s.logger.Warn("l4 wake pending limit exceeded", "sandbox_id", id, "port", port)
+		return
+	}
 	target, err := s.WakeAwareL4PortTarget(ctx, id, port)
+	releasePending()
 	if err != nil {
 		s.logger.Warn("l4 wake failed", "sandbox_id", id, "port", port, "error", err)
 		return
 	}
+
+	releaseActive, ok := s.tryAcquireL4Active(id)
+	if !ok {
+		s.logger.Warn("l4 wake active limit exceeded", "sandbox_id", id, "port", port)
+		return
+	}
+	defer releaseActive()
 
 	upstream, err := net.DialTimeout("tcp", target, l4WakeDialTimeout)
 	if err != nil {
@@ -153,9 +171,6 @@ func (s *Service) proxyL4WakeConn(ctx context.Context, id string, port int, down
 	defer upstream.Close()
 
 	_ = s.TouchSandbox(ctx, id)
-	touchCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go s.touchDuringL4Connection(touchCtx, id)
 
 	downstreamReader := io.Reader(downstream)
 	if buffered != nil {
@@ -170,19 +185,131 @@ func (s *Service) proxyL4WakeConn(ctx context.Context, id string, port int, down
 	_ = upstream.Close()
 }
 
-func (s *Service) touchDuringL4Connection(ctx context.Context, id string) {
+func (s *Service) tryAcquireL4Pending(id string) (func(), bool) {
+	perSandboxMax := s.l4WakeMaxPendingPerSandbox()
+	globalMax := s.l4WakeMaxPendingGlobal()
+
+	s.l4LimitMu.Lock()
+	defer s.l4LimitMu.Unlock()
+	if s.l4PendingBySandbox == nil {
+		s.l4PendingBySandbox = make(map[string]int)
+	}
+	if s.l4PendingBySandbox[id] >= perSandboxMax || s.l4PendingGlobal >= globalMax {
+		return nil, false
+	}
+	s.l4PendingBySandbox[id]++
+	s.l4PendingGlobal++
+	return func() {
+		s.releaseL4Pending(id)
+	}, true
+}
+
+func (s *Service) releaseL4Pending(id string) {
+	s.l4LimitMu.Lock()
+	defer s.l4LimitMu.Unlock()
+	if s.l4PendingBySandbox[id] <= 1 {
+		delete(s.l4PendingBySandbox, id)
+	} else {
+		s.l4PendingBySandbox[id]--
+	}
+	if s.l4PendingGlobal > 0 {
+		s.l4PendingGlobal--
+	}
+}
+
+func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
+	perSandboxMax := s.l4WakeMaxActivePerSandbox()
+	globalMax := s.l4WakeMaxActiveGlobal()
+	var (
+		startTicker bool
+		generation  uint64
+	)
+
+	s.l4LimitMu.Lock()
+	defer s.l4LimitMu.Unlock()
+	if s.l4ActiveBySandbox == nil {
+		s.l4ActiveBySandbox = make(map[string]int)
+	}
+	if s.l4ActivityGenerations == nil {
+		s.l4ActivityGenerations = make(map[string]uint64)
+	}
+	if s.l4ActiveBySandbox[id] >= perSandboxMax || s.l4ActiveGlobal >= globalMax {
+		return nil, false
+	}
+	if s.l4ActiveBySandbox[id] == 0 {
+		s.l4ActivityGenerations[id]++
+		generation = s.l4ActivityGenerations[id]
+		startTicker = true
+	}
+	s.l4ActiveBySandbox[id]++
+	s.l4ActiveGlobal++
+	if startTicker {
+		go s.touchDuringL4Activity(id, generation)
+	}
+	return func() {
+		s.releaseL4Active(id)
+	}, true
+}
+
+func (s *Service) releaseL4Active(id string) {
+	s.l4LimitMu.Lock()
+	defer s.l4LimitMu.Unlock()
+	if s.l4ActiveBySandbox[id] <= 1 {
+		delete(s.l4ActiveBySandbox, id)
+	} else {
+		s.l4ActiveBySandbox[id]--
+	}
+	if s.l4ActiveGlobal > 0 {
+		s.l4ActiveGlobal--
+	}
+}
+
+func (s *Service) touchDuringL4Activity(id string, generation uint64) {
 	ticker := time.NewTicker(l4WakeActivityInterval)
 	defer ticker.Stop()
 	for {
-		select {
-		case <-ctx.Done():
+		<-ticker.C
+		if !s.l4ActivityStillActive(id, generation) {
 			return
-		case <-ticker.C:
-			if err := s.TouchSandbox(ctx, id); err != nil {
-				s.logger.Warn("touch l4 wake connection failed", "sandbox_id", id, "error", err)
-			}
+		}
+		if err := s.TouchSandbox(context.Background(), id); err != nil {
+			s.logger.Warn("touch l4 wake connection failed", "sandbox_id", id, "error", err)
 		}
 	}
+}
+
+func (s *Service) l4ActivityStillActive(id string, generation uint64) bool {
+	s.l4LimitMu.Lock()
+	defer s.l4LimitMu.Unlock()
+	return s.l4ActiveBySandbox[id] > 0 && s.l4ActivityGenerations[id] == generation
+}
+
+func (s *Service) l4WakeMaxPendingPerSandbox() int {
+	if s.cfg.L4WakeMaxPendingPerSandbox > 0 {
+		return s.cfg.L4WakeMaxPendingPerSandbox
+	}
+	return defaultL4WakeMaxPendingPerSandbox
+}
+
+func (s *Service) l4WakeMaxPendingGlobal() int {
+	if s.cfg.L4WakeMaxPendingGlobal > 0 {
+		return s.cfg.L4WakeMaxPendingGlobal
+	}
+	return defaultL4WakeMaxPendingGlobal
+}
+
+func (s *Service) l4WakeMaxActivePerSandbox() int {
+	if s.cfg.L4WakeMaxActivePerSandbox > 0 {
+		return s.cfg.L4WakeMaxActivePerSandbox
+	}
+	return defaultL4WakeMaxActivePerSandbox
+}
+
+func (s *Service) l4WakeMaxActiveGlobal() int {
+	if s.cfg.L4WakeMaxActiveGlobal > 0 {
+		return s.cfg.L4WakeMaxActiveGlobal
+	}
+	return defaultL4WakeMaxActiveGlobal
 }
 
 func proxyCopyAndCloseWrite(dst net.Conn, src io.Reader, done chan<- struct{}) {

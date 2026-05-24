@@ -57,6 +57,10 @@ func TestLoadCases(t *testing.T) {
 			"SB_INTERNAL_INGRESS_ADDR",
 			"SB_INTERNAL_L4_WAKE_ADDR",
 			"SB_INTERNAL_L4_WAKE_DIR",
+			"SB_L4_WAKE_MAX_PENDING_PER_SANDBOX",
+			"SB_L4_WAKE_MAX_PENDING_GLOBAL",
+			"SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX",
+			"SB_L4_WAKE_MAX_ACTIVE_GLOBAL",
 			"SB_HTTP_WAKE_MAX_BUFFER",
 		}
 		for _, key := range keys {
@@ -137,6 +141,18 @@ func TestLoadCases(t *testing.T) {
 				if cfg.InternalL4WakeDir != "/run/sandboxd/l4wake" {
 					t.Fatalf("expected default InternalL4WakeDir=/run/sandboxd/l4wake, got %q", cfg.InternalL4WakeDir)
 				}
+				if cfg.L4WakeMaxPendingPerSandbox != 256 {
+					t.Fatalf("expected default L4WakeMaxPendingPerSandbox=256, got %d", cfg.L4WakeMaxPendingPerSandbox)
+				}
+				if cfg.L4WakeMaxPendingGlobal != 4096 {
+					t.Fatalf("expected default L4WakeMaxPendingGlobal=4096, got %d", cfg.L4WakeMaxPendingGlobal)
+				}
+				if cfg.L4WakeMaxActivePerSandbox != 4096 {
+					t.Fatalf("expected default L4WakeMaxActivePerSandbox=4096, got %d", cfg.L4WakeMaxActivePerSandbox)
+				}
+				if cfg.L4WakeMaxActiveGlobal != 65536 {
+					t.Fatalf("expected default L4WakeMaxActiveGlobal=65536, got %d", cfg.L4WakeMaxActiveGlobal)
+				}
 				if cfg.HTTPWakeMaxBuffer != 8*1024*1024 {
 					t.Fatalf("expected default HTTPWakeMaxBuffer=8MiB, got %d", cfg.HTTPWakeMaxBuffer)
 				}
@@ -166,6 +182,10 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:33333")
 				t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:33334")
 				t.Setenv("SB_INTERNAL_L4_WAKE_DIR", "/tmp/sandboxd-l4wake-test")
+				t.Setenv("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", "17")
+				t.Setenv("SB_L4_WAKE_MAX_PENDING_GLOBAL", "170")
+				t.Setenv("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", "1700")
+				t.Setenv("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", "17000")
 				t.Setenv("SB_HTTP_WAKE_MAX_BUFFER", "16777216")
 				cfg, err := Load()
 				if err != nil {
@@ -179,6 +199,18 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.InternalL4WakeDir != "/tmp/sandboxd-l4wake-test" {
 					t.Fatalf("expected InternalL4WakeDir override, got %q", cfg.InternalL4WakeDir)
+				}
+				if cfg.L4WakeMaxPendingPerSandbox != 17 {
+					t.Fatalf("expected L4WakeMaxPendingPerSandbox override, got %d", cfg.L4WakeMaxPendingPerSandbox)
+				}
+				if cfg.L4WakeMaxPendingGlobal != 170 {
+					t.Fatalf("expected L4WakeMaxPendingGlobal override, got %d", cfg.L4WakeMaxPendingGlobal)
+				}
+				if cfg.L4WakeMaxActivePerSandbox != 1700 {
+					t.Fatalf("expected L4WakeMaxActivePerSandbox override, got %d", cfg.L4WakeMaxActivePerSandbox)
+				}
+				if cfg.L4WakeMaxActiveGlobal != 17000 {
+					t.Fatalf("expected L4WakeMaxActiveGlobal override, got %d", cfg.L4WakeMaxActiveGlobal)
 				}
 				if cfg.HTTPWakeMaxBuffer != 16*1024*1024 {
 					t.Fatalf("expected HTTPWakeMaxBuffer override, got %d", cfg.HTTPWakeMaxBuffer)
