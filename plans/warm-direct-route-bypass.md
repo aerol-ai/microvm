@@ -279,6 +279,26 @@ LastBytesInDeltaAt)` as the activity floor. The netstats sink updates
 a per-sandbox "last delta" timestamp whenever a non-zero `BytesIn`
 sample arrives; the sweep reads it. No per-request work in sandboxd.
 
+**Netstats poll failure handling (D3):** if a netstats poll tick fails
+(docker stats API hiccup, container exiting, namespace teardown race),
+the sweep MUST NOT treat the absence of a recent BytesIn timestamp as
+"genuinely idle." On poll failure, the activity floor falls back to
+`LastActiveAt` *only* for that sweep tick; the next successful poll
+re-arms the netstats signal. This avoids a cascade where a transient
+docker stats outage prematurely stops every warm sandbox on a node.
+The fallback is logged at warn level with `netstats_fallback=true` so
+operators can spot prolonged docker stats degradation.
+
+**StopIfIdleFor floor (D4):** when `HTTPWakeDirectBypassEnabled=true`
+the netstats poll interval (10s) plus the reconcile interval (~30s)
+becomes the minimum granularity at which we can observe "no traffic."
+`models.Lifecycle.Validate` rejects `StopIfIdleFor` values smaller
+than `2 × NetstatsPollInterval + ReconcileInterval` when bypass is
+enabled, with a clear error message pointing the operator at the
+bypass tradeoff. Without this floor, a 30s `StopIfIdleFor` could fire
+between two netstats ticks and stop a sandbox that was actively
+serving traffic the whole time.
+
 ### C3 — Cold-start admission and circuit breaker still apply
 
 `acquirePending` / `acquireBuffer` / `wakeFlight` circuit breakers live
@@ -376,6 +396,17 @@ per minute) that doubles admin writes. Caddy admin is single-threaded
 for writes; we batch where possible (the reconciler already diffs
 against `ingressRouteCache`) and rely on the existing
 `ClusterCapacityGossipInterval`-style backoff.
+
+**Per-tick coalescer (D6, promoted to Phase 1):** rather than chase
+admin write reduction as a Phase 3 optimization, Phase 1 ships a
+per-tick coalescer that batches pending route writes into one admin
+request per tick (default 250ms, configurable via
+`SB_CADDY_COALESCE_INTERVAL`). This is the minimum work needed to
+keep the doubled write volume from regressing the per-write p99
+latency under churn — see Phase 4 perf decision D12. A Go benchmark
+(`caddy_coalescer_test.go::BenchmarkCoalescerThroughput`) gates the
+implementation so we have a quantified baseline before any Phase 3
+work begins.
 
 ### C10 — Backwards compatibility with non-serverless sandboxes
 
@@ -540,38 +571,68 @@ implicitly because they pass the sandbox row in.
 
 ### High level
 
-`installHTTPPortRoute` becomes:
+The status→shape decision is extracted into a single helper
+(`internal/service/route_shape.go`, **non-optional** per D7/D8) so
+every callsite that touches routes shares one source of truth:
+
+```go
+// internal/service/route_shape.go
+package service
+
+type RouteShape int
+
+const (
+    RouteShapeNone RouteShape = iota
+    RouteShapeDirect
+    RouteShapeWake
+)
+
+// chooseRouteShape is a pure function of the sandbox row and the
+// serverless mode. No side effects, no I/O — every callsite of
+// installHTTPPortRoute / installTCPPortRoute / installTLSPortRoute
+// funnels through this so reconcile, lifecycle, and event paths
+// cannot disagree on what shape "should" be live for a given row.
+func (s *Service) chooseRouteShape(sandbox *models.Sandbox) RouteShape {
+    if sandbox.Status == models.SandboxStatusDestroyed {
+        return RouteShapeNone
+    }
+    serverless := s.serverlessWakeEnabled(sandbox)
+    if !serverless {
+        return RouteShapeDirect
+    }
+    if sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != "" {
+        return RouteShapeDirect
+    }
+    if sandbox.Status == models.SandboxStatusStopped && sandbox.WakeArmed {
+        return RouteShapeWake
+    }
+    return RouteShapeNone
+}
+```
+
+Then `installHTTPPortRoute` becomes:
 
 ```go
 func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
-    serverless := s.serverlessWakeEnabled(sandbox)
-    warm := sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != ""
-
-    switch {
-    case serverless && warm:
-        // Direct shape, wake-aware fallback present nowhere.
-        // Install direct, then delete wake.
-        if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
+    switch s.chooseRouteShape(sandbox) {
+    case RouteShapeDirect:
+        if err := s.caddy.UpsertPortRouteWithRetry(ctx, sandbox.ID, sandbox.ContainerIP, port, s.cfg.HTTPWakeDirectRouteRetryDuration); err != nil {
             return err
         }
         _ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
         return nil
-    case serverless && !warm:
-        // Wake-aware shape, container is down (or coming up).
-        // Install wake, then delete direct.
+    case RouteShapeWake:
         if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port); err != nil {
             return err
         }
         _ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
         return nil
-    default:
-        // Non-serverless — direct shape, unchanged.
-        if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
-            return err
-        }
+    case RouteShapeNone:
+        _ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
         _ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
         return nil
     }
+    return nil
 }
 ```
 
@@ -760,13 +821,16 @@ func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandb
     switch {
     case serverless && warm:
         // Direct shape — TLS terminates at edge, proxies straight to container.
-        // The wake-listener socket is no longer needed; close it AFTER the
-        // route flip so a request landing mid-window still has a working
-        // socket if it happened to take the wake-aware path.
+        // The wake-listener socket is no longer needed, but D2 dictates we
+        // DELAY-CLOSE it for 5s after PATCH. A TLS handshake started against
+        // the wake-aware route may still be in flight when PATCH lands; a
+        // 5s grace window lets that handshake complete against the live
+        // socket before the listener goes away. After 5s, any new handshake
+        // is already using the direct upstream and the socket is dead weight.
         if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {
             return err
         }
-        s.closeTLSWakeListener(sandbox.ID, port)
+        s.scheduleTLSWakeListenerClose(sandbox.ID, port, 5*time.Second)
         return nil
     case serverless && !warm:
         // Wake-aware shape — create the per-exposure Unix socket FIRST
@@ -851,13 +915,14 @@ has been the default in production for at least two release cycles
 confirm it does not break under "warm bypass means I never see this
 connection" semantics.
 
-### Phase 3 — Caddy admin write reduction
+### Phase 3 — Further Caddy admin optimizations (deferred)
 
-Once the dust settles, look at whether the route-write doubling under
-high churn warrants a Caddy admin batching layer. The reconciler
-already diffs against an in-memory cache; this would be a per-tick
-buffering of pending writes. Out of scope for v1; tracked as a
-follow-up if Caddy admin shows up in flamegraphs.
+Per-tick coalescer is now in Phase 1 (per D6). Phase 3 is reserved for
+further optimizations that may become necessary if production
+flamegraphs surface Caddy admin as a hotspot beyond what the Phase 1
+coalescer can absorb: bulk PATCH endpoints, per-listener admin
+sharding, or admin-config snapshotting. None of these are committed
+work; each would require its own plan.
 
 ## Files to modify
 
@@ -865,12 +930,15 @@ follow-up if Caddy admin shows up in flamegraphs.
 
 | File | Change |
 |---|---|
-| `internal/service/service.go` | `installHTTPPortRoute` becomes status-aware. Idle sweep (`sweepIdleSandboxes` or equivalent) reads from a new activity-floor helper that consults `netstatsRecentBytesInAt`. Service struct gains `netstatsActivityMu sync.RWMutex` + `netstatsActivity map[string]int64` (id → last bytes-in delta unix nano). |
+| `internal/service/service.go` | `installHTTPPortRoute` becomes status-aware (delegates to `chooseRouteShape`). Idle sweep (`sweepIdleSandboxes`) reads from a new activity-floor helper that consults `netstatsRecentBytesInAt`. Service struct gains `netstatsActivityMu sync.RWMutex` + `netstatsActivity map[string]int64` (id → last bytes-in delta unix nano). Idle sweep also tracks the most recent netstats poll outcome (success/failure) so it can apply the D3 fallback (skip netstats floor, use `LastActiveAt` alone) on poll failure. |
+| `internal/service/route_shape.go` **(new, non-optional per D8)** | Defines `RouteShape` enum and the pure `chooseRouteShape(sandbox)` decision function. Every callsite (HTTP, TCP, TLS) routes through it. |
 | `internal/service/serverless.go` | `tearDownPortRoutesForStop` extends its install-then-delete pattern to cover the direct-shape teardown case (install wake, delete direct). On the start-side, after StartSandbox completes (in `EnsureSandboxAwakeForHTTP`), the convoy of waiters will see the now-warm route via reconcile or via the explicit route flip we trigger inside StartSandbox. |
 | `internal/service/events.go` | `markSandboxStopped` already calls `tearDownPortRoutesForStop`; needs to keep doing so but with the new direct-aware behavior. `handleStartEvent` (out-of-band docker start) republishes routes; must publish the direct shape now. |
-| `internal/service/scaleobs_sink.go` *(or wherever the netstats sink lives)* | The existing `HandleSamples` sink that updates `network_bytes_in` in the store gets a new side-effect: if `sample.BytesIn > 0`, write `s.netstatsActivity[id] = sample.SampledAt.UnixNano()`. |
-| `pkg/caddy/client.go` | `UpsertPortRoute` accepts an optional retry-budget setting (defaults preserve current behavior). Or — add `UpsertPortRouteWithRetry` for the explicit warm-bypass callsite to keep the existing one byte-for-byte. Prefer the latter for minimum blast radius. |
-| `internal/service/service.go` (`Reconcile` / `reconcileStaleOwnership`) | Reconcile's drift fix must call `installHTTPPortRoute` with the *current* sandbox row so the new status-aware code picks the right shape. May already be the case; verify. |
+| `internal/service/scaleobs_sink.go` *(or wherever the netstats sink lives)* | The existing `HandleSamples` sink that updates `network_bytes_in` in the store gets a new side-effect: if `sample.BytesIn > 0`, write `s.netstatsActivity[id] = sample.SampledAt.UnixNano()`. On poll failure (sink invoked with empty samples + error), set a poll-failure flag the sweep reads to apply the D3 fallback. |
+| `internal/service/caddy_coalescer.go` **(new, promoted from Phase 3 per D6)** | Per-tick batcher for Caddy admin writes. Default 250ms tick (configurable via `SB_CADDY_COALESCE_INTERVAL`). Coalesces pending route upserts/deletes for the same `(id, port)` so a rapid wake→stop→wake sequence produces one admin call, not three. |
+| `pkg/caddy/client.go` | Add `UpsertPortRouteWithRetry(ctx, id, ip, port, tryDuration)` for the explicit warm-bypass callsite (keeps existing `UpsertPortRoute` byte-for-byte for non-serverless paths). Direct-route JSON includes `load_balancing.try_duration` + `try_interval` when called via the new method. |
+| `pkg/models/lifecycle.go` | `Lifecycle.Validate` rejects `StopIfIdleFor` smaller than `2 × NetstatsPollInterval + ReconcileInterval` when `HTTPWakeDirectBypassEnabled=true` (per D4). Error message points operators at the bypass tradeoff and suggests either raising `StopIfIdleFor` or disabling bypass. |
+| `internal/service/service.go` (`Reconcile` / `reconcileStaleOwnership`) | Reconcile's drift fix MUST call `installHTTPPortRoute` with the *current* sandbox row so the new status-aware code picks the right shape (per D1 — elevated from "verify" to explicit work item). Regression test required (see Tests below). |
 | `internal/service/touch_coalescer.go` | No change. `TouchSandbox` still works; it just stops being the only signal. |
 
 ### Phase 1 — Cluster integration
@@ -884,8 +952,8 @@ follow-up if Caddy admin shows up in flamegraphs.
 
 | File | Change |
 |---|---|
-| `internal/config/config.go` | New field `HTTPWakeDirectBypassEnabled bool` (env `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED`). Default false in v1 of this plan so the change is opt-in; flip to true in a follow-up once Phase 1 has soaked. New field `HTTPWakeDirectRouteRetryDuration` (default 2s) controls the Caddy `load_balancing.try_duration` on the direct route. |
-| `cmd/sandboxd/main.go` | Thread the new config fields into `service.New` / wherever they're consumed. |
+| `internal/config/config.go` | New fields: `HTTPWakeDirectBypassEnabled bool` (env `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED`, default false in v1, opt-in); `HTTPWakeDirectRouteRetryDuration` (env `SB_HTTP_WAKE_DIRECT_ROUTE_RETRY_DURATION`, default 2s) controls Caddy `load_balancing.try_duration`; `CaddyCoalesceInterval` (env `SB_CADDY_COALESCE_INTERVAL`, default 250ms) controls the coalescer tick (per D12). Validation: when bypass enabled, refuse to start if `StopIfIdleFor` floor (D4) is violated in any existing serverless sandbox row. |
+| `cmd/sandboxd/main.go` | Thread the new config fields into `service.New` / wherever they're consumed. On detecting `HTTPWakeDirectBypassEnabled=false` at startup after a previous run had it `true`, schedule a force-reconcile pass (per D5) that republishes every serverless HTTP route as wake-aware regardless of current cache state. |
 | `packaging/sandboxd.service` | No change. |
 
 ### Phase 1 — Documentation
@@ -900,11 +968,14 @@ follow-up if Caddy admin shows up in flamegraphs.
 
 | File | Change |
 |---|---|
-| `internal/service/serverless_test.go` | New cases: `TestInstallHTTPPortRouteWarmInstallsDirect`, `TestInstallHTTPPortRouteStoppedInstallsWake`, `TestStopArmingFlipsDirectToWake`, `TestStartFlipsWakeToDirect`. Asserts ordering (direct upsert before wake delete on start; wake upsert before direct delete on stop). |
-| `internal/service/reconcile_test.go` (existing or new) | `TestReconcileDriftFixesShape` — store says Started but Caddy has wake route, reconcile installs direct. Mirror for the reverse case. |
-| `internal/service/wake_scale_test.go` | `TestIdleSweepUsesNetstatsFloor` — sandbox with stale `LastActiveAt` but recent netstats delta is NOT swept. Mirror for genuinely idle. |
-| `internal/service/events_test.go` (existing or new) | `TestDieEventInstallsWakeBeforeDirectDelete` — simulate die event, assert ordering on the caddy fake. |
-| `pkg/caddy/client_test.go` | New case: direct route JSON includes `load_balancing.try_duration` when the retry-budget upsert is used. |
+| `internal/service/route_shape_test.go` **(new)** | `TestChooseRouteShapeStartedReturnsDirect` (sandbox.Status=Started + ContainerIP set → RouteShapeDirect). `TestChooseRouteShapeStoppedArmedReturnsWake` (Stopped + WakeArmed=true → RouteShapeWake). `TestChooseRouteShapeStoppedUnarmedReturnsNone` (Stopped + WakeArmed=false → RouteShapeNone). `TestChooseRouteShapeDestroyedReturnsNone`. `TestChooseRouteShapeNonServerlessAlwaysDirect`. Table-driven; each row asserts the exact enum value, not just "is non-nil." |
+| `internal/service/serverless_test.go` | `TestInstallHTTPPortRouteWarmInstallsDirect` — fake caddy records call order, assert `UpsertPortRouteWithRetry` precedes `DeleteWakeHTTPPortRoute`. `TestInstallHTTPPortRouteStoppedInstallsWake` — assert `UpsertWakeHTTPPortRoute` precedes `DeletePortRoute`. `TestStopArmingFlipsDirectToWake` — fake clock, drive lifecycle Stop, assert wake is installed BEFORE the docker.Stop fake fires (uses recorded timestamps on the caddy fake). `TestStartFlipsWakeToDirect` — drive StartSandbox, assert direct route installed after ContainerIP is populated in the row. `TestRouteShapeNoneDeletesBoth` — Destroyed sandbox row → both caddy delete calls observed. |
+| `internal/service/reconcile_test.go` **(D1 — explicit work item)** | `TestReconcileDriftStartedHasWakeRouteInstallsDirect` — seed caddy fake with wake route, store row says Started → reconcile pass calls `UpsertPortRouteWithRetry` + `DeleteWakeHTTPPortRoute`. `TestReconcileDriftStoppedArmedHasDirectRouteInstallsWake` — mirror. `TestReconcileDriftStoppedUnarmedDeletesBoth`. `TestReconcileNoopWhenShapeMatches` — no caddy admin calls when cache + row agree. |
+| `internal/service/wake_scale_test.go` | `TestIdleSweepUsesNetstatsFloorWhenAvailable` — sandbox with `LastActiveAt` 10 min ago but netstats delta 30s ago → NOT swept. `TestIdleSweepFallsBackToLastActiveOnNetstatsPollFailure` (D3) — same fixture, but poll-failure flag set → falls back to `LastActiveAt` only, sandbox IS swept. `TestIdleSweepRespectsStopIfIdleForFloor` (D4) — `models.Lifecycle.Validate` rejects sub-floor values when bypass enabled. `TestInFlightColdRequestSurvivesRouteFlip` (D11, new) — start cold request through ingress proxy, trigger route flip mid-request, assert original request completes through the still-open connection while a *new* request lands on the direct route. |
+| `internal/service/events_test.go` | `TestDieEventInstallsWakeBeforeDirectDelete` — fake docker emits die event, assert ordering on the caddy fake (`UpsertWakeHTTPPortRoute` call timestamp < `DeletePortRoute` call timestamp). `TestDieEventDuringConcurrentRequests` — 10 in-flight requests against direct route, fire die event, assert no request observes a "neither route exists" window. |
+| `internal/service/caddy_coalescer_test.go` **(new, D12)** | `TestCoalescerCollapsesRapidFlips` — 5 wake→stop→wake transitions within one tick → one batched admin call. `TestCoalescerRespectsTickInterval` — fake clock, assert no admin call before tick elapses. `BenchmarkCoalescerThroughput` — Go benchmark, 10k flips/min input → record p50/p99 batched-write latency. Baseline assertion fails CI if p99 batched-write latency > 100ms. |
+| `pkg/caddy/client_test.go` | `TestUpsertPortRouteWithRetryIncludesTryDuration` — direct-route JSON includes `load_balancing.try_duration` = configured value, `try_interval` = 100ms. Existing `UpsertPortRoute` JSON regression test stays unchanged (asserts byte-for-byte same as today for non-serverless callers). |
+| `pkg/models/lifecycle_test.go` | `TestLifecycleValidateRejectsSubFloorStopIfIdleForWhenBypassEnabled` (D4) — table-driven across boundary values. Asserts error message mentions `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED` so operators can find the docs. |
 | `pkg/api/ingressproxy/handlers_test.go` | No change — the wake-aware path is still the cold path, still tested. |
 
 ### Phase 2 — TCP / TLS
@@ -934,7 +1005,8 @@ follow-up if Caddy admin shows up in flamegraphs.
 |---|---|
 | `plans/warm-direct-route-bypass.md` | This document. |
 | `docs/src/content/docs/serverless-direct-routing.mdx` | Operator-facing docs page covering: when the bypass kicks in, the new env vars, how to verify a warm sandbox is bypassed (via Caddy admin `/config/`), and how to roll back via `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED=false`. |
-| `internal/service/route_shape.go` | *(optional, decided in implementation)* A small helper file housing the status→shape decision so multiple callsites share one source of truth. Inline in `service.go` is also fine; this file would be created only if the decision branches grow beyond ~30 lines. |
+| `internal/service/route_shape.go` **(non-optional per D7/D8)** | Holds the `RouteShape` enum and the pure `chooseRouteShape(sandbox)` decision function. Required so HTTP, TCP, and TLS callsites share one decision rule and reconcile/lifecycle/event paths cannot drift. |
+| `internal/service/caddy_coalescer.go` **(new per D6)** | Per-tick Caddy admin write batcher. Default 250ms tick. See Phase 1 "Files to modify" entry above for behavior. |
 
 ## Rollout
 
@@ -946,10 +1018,23 @@ follow-up if Caddy admin shows up in flamegraphs.
    - p50 / p99 latency on a warm endpoint,
    - FD count on sandboxd,
    - 503 rate during a forced burst (idle → warm storm),
-   - 502 rate during a forced kill (warm container `docker kill`).
+   - 502 rate during a forced kill (warm container `docker kill`),
+   - Caddy admin per-write p99 latency under 1k flips/min (Phase 1
+     coalescer baseline from `BenchmarkCoalescerThroughput`).
 3. Flip the default to `true` in a follow-up commit once the canary
    profile is clean for at least a week.
-4. Stage Phase 2 (TCP / TLS) only after Phase 1 has been the default
+4. **Rollback path (D5):** flipping `SB_HTTP_WAKE_DIRECT_BYPASS_ENABLED`
+   from `true` back to `false` MUST trigger a force-reconcile pass at
+   sandboxd startup that republishes every serverless HTTP route as
+   wake-aware regardless of current Caddy cache state. Without this,
+   nodes that had previously installed direct routes would keep them
+   live until the next natural lifecycle transition, leaving the
+   rollback half-effective. Implementation: detect the
+   `true→false` transition via a marker file at
+   `${cfg.StateDir}/bypass_last_enabled` written at startup; if marker
+   says `true` and current cfg says `false`, run reconcile with a
+   `forceWakeShape=true` override on the first pass.
+5. Stage Phase 2 (TCP / TLS) only after Phase 1 has been the default
    for two release cycles.
 
 ## Non-goals
@@ -975,3 +1060,115 @@ follow-up if Caddy admin shows up in flamegraphs.
   plan must pass `/touch-tcp-pool`.
 - `agentic_docs/E2B-SDK-method-map.md` — confirms no SDK behavior
   change is required; the URL surface stays identical.
+
+## Deferred / TODOs
+
+These were considered during the engineering review and explicitly
+deferred — not work for v1, tracked here so they aren't lost.
+
+- **Per-sandbox `HTTPWakeDirectRouteRetryDuration` override (D5A).**
+  Today the Caddy `load_balancing.try_duration` is a single node-wide
+  config value (default 2s). A sandbox running an unusually
+  slow-binding service (e.g. a JVM container that takes 5s to bind
+  its listener after `docker start` returns) could benefit from a
+  per-sandbox override. Not worth the surface area in v1 — operators
+  can raise the node-wide value if needed. Revisit if real-world
+  cold-start retry data shows long-tail bind times that the global
+  default cannot accommodate.
+- **Activity floor from Caddy access logs.** As an alternative to the
+  netstats poller signal (Phase 1 C2), we could tail Caddy access
+  logs and update activity timestamps from request log lines. More
+  precise than 10s-granularity netstats polling but adds a log-stream
+  dependency and a parser. Defer; netstats is good enough for the
+  scale targets in this plan.
+- **Cluster-mode forward optimization.** With the bypass live, the
+  ingress node still forwards to the owner node for cross-node
+  placement (`internal/cluster/forward.go`). A future plan could
+  publish the owner's direct route on the ingress node's Caddy
+  directly, eliminating the ingress→owner hop too. Out of scope
+  here — Phase 1/2 already cut the *owner-side* hop, which is the
+  bigger CPU win.
+
+## GSTACK REVIEW REPORT
+
+**Reviewed:** 2026-05-24 by `/plan-eng-review`
+**Branch:** `proxy-serverless-wait`
+**Plan:** `plans/warm-direct-route-bypass.md`
+
+### Section 0 — Scope Challenge
+
+Passed without reduction. The 15 use cases reflect three distinct
+load profiles (preview surfaces, agent backends, data/streaming).
+Splitting HTTP-only and L4 into separate plans was considered and
+rejected: the design rationale (status-aware route shape) is
+identical for both protocols and the L4 mechanics are best documented
+alongside the HTTP mechanics so future readers see the full picture.
+Phase gating already isolates implementation risk.
+
+### Section 1 — Architecture (6 decisions)
+
+- **D1.** Reconcile drift fix is now an explicit Phase 1 work item
+  with a regression test (`reconcile_test.go::TestReconcileDrift*`).
+  Was previously soft-pedaled as "verify" — that wording is the
+  reason drift would have shipped uncaught.
+- **D2.** Phase 2 TLS socket close is delayed 5s after PATCH via a
+  new `scheduleTLSWakeListenerClose` primitive. Closes the
+  in-flight-handshake race that would otherwise drop a client
+  mid-TLS during a route flip.
+- **D3.** Netstats poll failure → activity floor falls back to
+  `LastActiveAt` only for that tick. Prevents a docker-stats outage
+  from cascading into a node-wide false-idle stop.
+- **D4.** `models.Lifecycle.Validate` enforces
+  `StopIfIdleFor ≥ 2 × NetstatsPollInterval + ReconcileInterval`
+  when bypass enabled. Sub-floor values can no longer slip in.
+- **D5.** Force-reconcile on `true → false` flip via state-dir marker.
+  Rollback is now mechanically complete, not "wait for natural
+  lifecycle transitions to clean up."
+- **D6.** Per-tick Caddy admin coalescer (default 250ms) promoted
+  from Phase 3 to Phase 1. Required to prevent the doubled write
+  volume from regressing per-write p99 under churn.
+
+### Section 2 — Code Quality (3 decisions)
+
+- **D7.** `chooseRouteShape()` helper with `RouteShape` enum extracts
+  the status→shape decision into a pure function shared by every
+  callsite (HTTP / TCP / TLS / reconcile / events).
+- **D8.** `internal/service/route_shape.go` is non-optional, not a
+  "decided in implementation" file. Reverting to inline-in-`service.go`
+  is now a rejected option, not an open one.
+- **D9.** Decision wording on lifecycle paths reviewed and tightened;
+  no new helpers needed beyond D7/D8.
+
+### Section 3 — Test Review (3 decisions)
+
+- **D10.** Every test entry now has concrete assertions, not
+  "tests this case." Reviewers will be able to see what passes vs.
+  fails before reading test bodies.
+- **D11.** New `TestInFlightColdRequestSurvivesRouteFlip` — the one
+  test path the original draft did not exercise.
+- **D12.** Go benchmark for coalescer with CI-failing p99 baseline.
+
+### Section 4 — Performance (1 decision)
+
+- **D12** (overlap with §3) — coalescer tick default 250ms,
+  configurable via `SB_CADDY_COALESCE_INTERVAL`. Default chosen to
+  balance batching gain vs. per-flip latency.
+
+### Worktree parallelization
+
+Single lane. Phase 1 is tightly coupled around `installHTTPPortRoute`,
+the `Service` struct, and the activity-floor sweep — parallel branches
+buy no throughput and risk merge drift. Phase 2 and any Phase 3 work
+are naturally separate branches.
+
+### Outside Voice
+
+Skipped. The plan absorbed substantial challenge in this session (15
+use cases, 10 challenges, 12 edge cases, 13 review decisions). Codex
+pass would be redundant. Re-evaluate after Phase 1 lands and before
+Phase 2.
+
+### Test plan artifact
+
+Written to `~/.gstack/projects/aerol-ai-microvm/sumansaurabh-proxy-serverless-wait-eng-review-test-plan-20260524-145250.md`
+for `/qa` consumption.
