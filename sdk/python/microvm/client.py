@@ -1008,10 +1008,20 @@ def _from_api_custom_domains_response(response: Any) -> List[CustomDomain]:
     return [_from_api_custom_domain(item) for item in domains if isinstance(item, dict)]
 
 
+_INGRESS_TARGET_SOURCES = {"hostname", "ips", "mixed", "unknown"}
+
+
 def _from_api_ingress_target(payload: Any) -> IngressTarget:
+    # Wire contract: source ∈ {"hostname", "ips", "mixed", "unknown"}.
+    # Anything missing/unrecognized collapses to "unknown" so callers can
+    # branch on the documented enum without seeing "" or server typos.
     if not isinstance(payload, dict):
-        return {"source": ""}
-    result: IngressTarget = {"source": str(_first_of(payload, "source") or "")}
+        return {"source": "unknown"}
+    raw_source = _first_of(payload, "source")
+    source = str(raw_source) if raw_source else ""
+    if source not in _INGRESS_TARGET_SOURCES:
+        source = "unknown"
+    result: IngressTarget = {"source": source}
     hostname = _first_of(payload, "hostname")
     if hostname not in (None, ""):
         result["hostname"] = str(hostname)
@@ -1036,7 +1046,7 @@ def _from_api_dns_record(record: Dict[str, Any]) -> DNSRecord:
 
 def _from_api_custom_domain_dns_response(response: Any) -> CustomDomainDNSRecords:
     if not isinstance(response, dict):
-        return {"records": [], "target": {"source": ""}}
+        return {"records": [], "target": {"source": "unknown"}}
     records_raw = _first_of(response, "records") or []
     records: List[DNSRecord] = (
         [_from_api_dns_record(item) for item in records_raw if isinstance(item, dict)]
@@ -1044,7 +1054,7 @@ def _from_api_custom_domain_dns_response(response: Any) -> CustomDomainDNSRecord
         else []
     )
     target_raw = _first_of(response, "target")
-    target = _from_api_ingress_target(target_raw) if isinstance(target_raw, dict) else {"source": ""}
+    target = _from_api_ingress_target(target_raw) if isinstance(target_raw, dict) else {"source": "unknown"}
     return {"records": records, "target": target}
 
 

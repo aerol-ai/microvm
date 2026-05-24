@@ -268,10 +268,17 @@ class CustomDomain(TypedDict, total=False):
 class IngressTarget(TypedDict, total=False):
     """DNS target a custom hostname should point at to reach this daemon.
 
-    Mirrors ``pkg/models.IngressTarget`` on the server. Exactly one of
-    ``hostname`` (CNAME-style) or ``ips`` (A/AAAA-style) is populated in
-    practice; ``source`` describes how the target was resolved
-    (e.g. ``"config"``, ``"resolver"``, ``"unknown"``).
+    Mirrors ``pkg/models.IngressTarget`` on the server. ``source`` is one of
+    ``"hostname"``, ``"ips"``, ``"mixed"``, or ``"unknown"`` and describes
+    the shape of the target (NOT how it was resolved):
+
+    - ``"hostname"`` — ``hostname`` is set; DNS for custom domains is a
+      CNAME to it.
+    - ``"ips"`` — ``ips`` is populated; DNS is one A/AAAA per IP.
+    - ``"mixed"`` — both fields populated (ingress nodes advertise a mix);
+      callers should prefer hostname for subdomains and IPs at apex.
+    - ``"unknown"`` — no usable target; callers should render an
+      operator-must-configure-ingress error rather than fake records.
     """
 
     hostname: str

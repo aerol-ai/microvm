@@ -1044,32 +1044,43 @@ class DNSRecordsTests(unittest.TestCase):
         return FakeMicroVM(), captured
 
     def test_dns_target_hostname_source(self):
-        client, captured = self._client(body={"hostname": "ingress.example.com", "source": "config"})
+        client, captured = self._client(body={"hostname": "ingress.example.com", "source": "hostname"})
 
         target = client.dns_target()
 
         self.assertEqual(captured["calls"][0], ("GET", "/v1/ingress/dns", None))
         self.assertEqual(target["hostname"], "ingress.example.com")
-        self.assertEqual(target["source"], "config")
+        self.assertEqual(target["source"], "hostname")
         self.assertNotIn("ips", target)
 
     def test_dns_target_ips_source(self):
-        client, _ = self._client(body={"ips": ["198.51.100.10", "198.51.100.11"], "source": "resolver"})
+        client, _ = self._client(body={"ips": ["198.51.100.10", "198.51.100.11"], "source": "ips"})
 
         target = client.dns_target()
 
         self.assertEqual(target["ips"], ["198.51.100.10", "198.51.100.11"])
-        self.assertEqual(target["source"], "resolver")
+        self.assertEqual(target["source"], "ips")
         self.assertNotIn("hostname", target)
 
     def test_dns_target_empty_payload_yields_unknown_source(self):
-        # Daemon must still answer; absent fields decode to a minimal target so
-        # callers can branch on ``source`` without KeyError.
+        # Daemon must still answer; absent fields decode to a minimal target
+        # with source="unknown" so callers can branch on the documented enum
+        # without seeing "" or server typos.
         client, _ = self._client(body={})
 
         target = client.dns_target()
 
-        self.assertEqual(target, {"source": ""})
+        self.assertEqual(target, {"source": "unknown"})
+
+    def test_dns_target_unknown_source_value_normalises_to_unknown(self):
+        # Daemon advertises source ∈ {hostname, ips, mixed, unknown}.
+        # Defensive: any out-of-contract value collapses to "unknown" so
+        # callers' branching stays exhaustive.
+        client, _ = self._client(body={"source": "some-future-value"})
+
+        target = client.dns_target()
+
+        self.assertEqual(target["source"], "unknown")
 
     def test_custom_domain_dns_maps_records_and_target(self):
         client, captured = self._client(
@@ -1089,7 +1100,7 @@ class DNSRecordsTests(unittest.TestCase):
                         "value": "198.51.100.10",
                     },
                 ],
-                "target": {"hostname": "ingress.example.com", "source": "config"},
+                "target": {"hostname": "ingress.example.com", "source": "hostname"},
             },
         )
 
@@ -1103,10 +1114,10 @@ class DNSRecordsTests(unittest.TestCase):
         self.assertEqual(bundle["records"][1]["type"], "A")
         self.assertNotIn("notes", bundle["records"][1])
         self.assertEqual(bundle["target"]["hostname"], "ingress.example.com")
-        self.assertEqual(bundle["target"]["source"], "config")
+        self.assertEqual(bundle["target"]["source"], "hostname")
 
     def test_custom_domain_dns_empty_records_list(self):
-        client, _ = self._client(body={"records": [], "target": {"ips": ["198.51.100.10"], "source": "resolver"}})
+        client, _ = self._client(body={"records": [], "target": {"ips": ["198.51.100.10"], "source": "ips"}})
 
         bundle = client.custom_domain_dns("sb-1")
 
@@ -1119,7 +1130,7 @@ class DNSRecordsTests(unittest.TestCase):
                 "records": [
                     {"hostname": "api.acme.com", "type": "CNAME", "name": "api.acme.com", "value": "ingress.example.com"},
                 ],
-                "target": {"hostname": "ingress.example.com", "source": "config"},
+                "target": {"hostname": "ingress.example.com", "source": "hostname"},
             },
         )
         sandbox = client_module.Sandbox(client, {"id": "sb-1"})
@@ -1128,7 +1139,7 @@ class DNSRecordsTests(unittest.TestCase):
 
         self.assertEqual(captured["calls"][0], ("GET", "/v1/sandboxes/sb-1/custom-domains/dns", None))
         self.assertEqual(bundle["records"][0]["hostname"], "api.acme.com")
-        self.assertEqual(bundle["target"]["source"], "config")
+        self.assertEqual(bundle["target"]["source"], "hostname")
 
 
 if __name__ == "__main__":

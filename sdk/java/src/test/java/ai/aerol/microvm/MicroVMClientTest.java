@@ -1062,13 +1062,13 @@ class MicroVMClientTest {
             if (n == 1) {
                 writeJson(exchange, 200, mapOf(
                     "hostname", "ingress.acme.com",
-                    "source", "config"
+                    "source", "hostname"
                 ));
                 return;
             }
             writeJson(exchange, 200, mapOf(
                 "ips", List.of("203.0.113.10", "203.0.113.11"),
-                "source", "autodetect"
+                "source", "ips"
             ));
         });
 
@@ -1078,12 +1078,12 @@ class MicroVMClientTest {
             assertEquals("/v1/ingress/dns", seenPath.get());
             assertEquals("ingress.acme.com", hostnameTarget.hostname);
             assertEquals(null, hostnameTarget.ips);
-            assertEquals("config", hostnameTarget.source);
+            assertEquals("hostname", hostnameTarget.source);
 
             IngressTarget ipsTarget = client.dnsTarget();
             assertEquals(null, ipsTarget.hostname);
             assertEquals(List.of("203.0.113.10", "203.0.113.11"), ipsTarget.ips);
-            assertEquals("autodetect", ipsTarget.source);
+            assertEquals("ips", ipsTarget.source);
         } finally {
             server.stop(0);
         }
@@ -1114,7 +1114,7 @@ class MicroVMClientTest {
                 ),
                 "target", mapOf(
                     "hostname", "ingress.acme.com",
-                    "source", "config"
+                    "source", "hostname"
                 )
             ));
         });
@@ -1145,7 +1145,7 @@ class MicroVMClientTest {
 
             assertNotNull(result.target);
             assertEquals("ingress.acme.com", result.target.hostname);
-            assertEquals("config", result.target.source);
+            assertEquals("hostname", result.target.source);
         } finally {
             server.stop(0);
         }
@@ -1155,7 +1155,7 @@ class MicroVMClientTest {
     void customDomainDnsDefaultsRecordsToEmptyList() throws Exception {
         HttpServer server = startServer(exchange -> {
             writeJson(exchange, 200, mapOf(
-                "target", mapOf("source", "config", "hostname", "ingress.acme.com")
+                "target", mapOf("hostname", "ingress.acme.com", "source", "hostname")
             ));
         });
 

@@ -43,8 +43,16 @@ func (s *Service) CustomDomainDNS(ctx context.Context, sandboxID string) (models
 	for _, d := range domains {
 		hostnames = append(hostnames, d.Hostname)
 	}
+	// ComposeDNSRecords returns nil when there are no hostnames or no
+	// usable target. Normalise to an empty slice so the JSON shape is a
+	// stable `[]` — SDKs that type Records as `DNSRecord[]` would choke
+	// on `null` (TypeScript .map, Rust serde Vec, etc.).
+	records := models.ComposeDNSRecords(hostnames, target)
+	if records == nil {
+		records = []models.DNSRecord{}
+	}
 	return models.CustomDomainDNSRecords{
-		Records: models.ComposeDNSRecords(hostnames, target),
+		Records: records,
 		Target:  target,
 	}, nil
 }
