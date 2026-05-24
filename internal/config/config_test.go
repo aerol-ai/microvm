@@ -127,10 +127,10 @@ func TestLoadCases(t *testing.T) {
 				if !cfg.IsServer() || !cfg.IsWorker() || !cfg.IsIngress() {
 					t.Fatalf("expected mixed default to return true for all role predicates: %+v", cfg)
 				}
-				// SB_ENABLE_SERVERLESS defaults off so the wake path
-				// stays opt-in until the operator flips it on.
-				if cfg.EnableServerless {
-					t.Fatalf("expected EnableServerless to default to false, got true")
+				// SB_ENABLE_SERVERLESS defaults on so the wake path is
+				// armed out of the box; operators flip it off explicitly.
+				if !cfg.EnableServerless {
+					t.Fatalf("expected EnableServerless to default to true, got false")
 				}
 				if cfg.InternalIngressAddr != "127.0.0.1:21213" {
 					t.Fatalf("expected default InternalIngressAddr=127.0.0.1:21213, got %q", cfg.InternalIngressAddr)

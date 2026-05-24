@@ -143,7 +143,3 @@ The lifecycle update endpoint accepts the same field. Toggle `serverless` on or 
 ## Manual stop blocks wake
 
 Stopping the sandbox through the API is treated as an operator decision — `wake_armed` is cleared and exposed endpoints fail until the sandbox is explicitly started again. Only lifecycle-driven stops (idle timer, age, involuntary container exit) re-arm wake. Use this to take a serverless sandbox out of rotation without destroying it.
-
-## Operator gate
-
-Serverless is gated by `SB_ENABLE_SERVERLESS` (default `false`). Sandbox-level `serverless: true` is ignored until the operator turns the gate on. The cold-start HTTP ingress runs on `SB_INTERNAL_INGRESS_ADDR` (loopback-only, default `127.0.0.1:21213`) and buffers request bodies up to `SB_HTTP_WAKE_MAX_BUFFER` (default 8 MiB). Raw TCP wake uses `SB_INTERNAL_L4_WAKE_ADDR` (loopback-only, default `127.0.0.1:21214`). TLS-SNI wake uses Unix sockets under `SB_INTERNAL_L4_WAKE_DIR` (default `/run/sandboxd/l4wake`) because TLS is terminated by Caddy before sandboxd receives the plaintext stream. L4 burst protection is controlled by `SB_L4_WAKE_MAX_PENDING_PER_SANDBOX` (default 256), `SB_L4_WAKE_MAX_PENDING_GLOBAL` (default 4096), `SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX` (default 4096), and `SB_L4_WAKE_MAX_ACTIVE_GLOBAL` (default 65536).

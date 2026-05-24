@@ -121,13 +121,13 @@ type Config struct {
 	EnableEventMonitor bool
 	EnableSSHGateway   bool
 	// EnableServerless gates wake behavior for sandboxes created with
-	// Lifecycle.Serverless=true. When false (default), the serverless flag
-	// is accepted at the API surface (so SDK callers can pre-set it without
-	// 4xx churn) but the runtime never arms wake on stop and the
-	// control-plane proxies never call EnsureSandboxAwakeForHTTP — i.e. the
-	// sandbox behaves exactly as it did before the feature existed. Flip to
-	// true on a per-host basis to opt that host into wake-aware control-plane
-	// proxying. Acts as a rollout gate, not a per-sandbox toggle.
+	// Lifecycle.Serverless=true. Defaults to true so the wake path is on out
+	// of the box; flip to false on a per-host basis to opt that host out of
+	// wake-aware control-plane proxying (the serverless flag is still
+	// accepted at the API surface so SDK callers don't 4xx, but the runtime
+	// never arms wake on stop and the control-plane proxies never call
+	// EnsureSandboxAwakeForHTTP). Acts as a rollout gate, not a per-sandbox
+	// toggle.
 	EnableServerless bool
 	// InternalIngressAddr is the loopback-only listen address for the
 	// wake-aware HTTP ingress proxy. Caddy dials this address from
@@ -552,7 +552,7 @@ func Load() (Config, error) {
 		EnableNetworkRules:          getEnvBool("SB_ENABLE_NETWORK_RULES", true),
 		EnableEventMonitor:          getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:            getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
-		EnableServerless:            getEnvBool("SB_ENABLE_SERVERLESS", false),
+		EnableServerless:            getEnvBool("SB_ENABLE_SERVERLESS", true),
 		InternalIngressAddr:         getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
 		InternalL4WakeAddr:          getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
 		InternalL4WakeDir:           getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
