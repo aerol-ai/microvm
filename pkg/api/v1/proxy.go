@@ -31,7 +31,7 @@ func (h *handlers) sessionsProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) proxyToToolbox(w http.ResponseWriter, r *http.Request, path string) {
-	endpoint, err := h.deps.Service.ToolboxTarget(r.Context(), r.PathValue("id"))
+	endpoint, err := h.deps.Service.WakeAwareToolboxTarget(r.Context(), r.PathValue("id"))
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return

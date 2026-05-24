@@ -82,6 +82,13 @@ export interface Lifecycle {
   stopAtAge?: number;
   /** Duration in integer nanoseconds. */
   destroyAtAge?: number;
+  /**
+   * Opt the sandbox into HTTP wake-on-request: auto-stop when idle,
+   * resume on the next inbound HTTP request. Requires `stopIfIdleFor`
+   * to be set explicitly — the server rejects `serverless: true`
+   * without an idle window. TCP and TLS exposures stay always-on.
+   */
+  serverless?: boolean;
 }
 
 export type UpdateLifecycleOptions = Lifecycle;

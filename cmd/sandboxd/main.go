@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	api "github.com/aerol-ai/microvm/pkg/api"
+	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -342,6 +343,38 @@ func main() {
 		}
 	}()
 
+	// Wake-aware HTTP ingress proxy: a loopback-only listener Caddy
+	// dials when forwarding a wake-aware port route. Only stood up
+	// when both the serverless feature and Caddy itself are enabled —
+	// without Caddy in front, nothing would route to this listener.
+	var ingressServer *http.Server
+	if cfg.EnableServerless && cfg.EnableCaddy {
+		ingressMux := http.NewServeMux()
+		ingressproxy.RegisterRoutes(ingressMux, ingressproxy.Deps{
+			Resolver:       svc,
+			Logger:         logger,
+			MaxBufferBytes: cfg.HTTPWakeMaxBuffer,
+		})
+		ingressServer = &http.Server{
+			Addr:              cfg.InternalIngressAddr,
+			Handler:           ingressMux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		logger.Info("wake-aware ingress proxy listening", "addr", cfg.InternalIngressAddr)
+		go func() {
+			if err := ingressServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("ingress proxy stopped unexpectedly", "error", err)
+				cancel()
+			}
+		}()
+		if err := svc.StartL4WakeProxy(ctx); err != nil {
+			logger.Error("l4 wake proxy failed to start", "error", err)
+			cancel()
+		} else {
+			logger.Info("wake-aware l4 proxy listening", "addr", cfg.InternalL4WakeAddr, "socket_dir", cfg.InternalL4WakeDir)
+		}
+	}
+
 	<-ctx.Done()
 	logger.Info("shutting down sandboxd")
 
@@ -349,6 +382,11 @@ func main() {
 	defer shutdownCancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown failed", "error", err)
+	}
+	if ingressServer != nil {
+		if err := ingressServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("ingress proxy graceful shutdown failed", "error", err)
+		}
 	}
 }
 

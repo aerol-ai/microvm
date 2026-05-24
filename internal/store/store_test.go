@@ -1141,6 +1141,116 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			// Round-trip: Lifecycle.Serverless on the model lands in the
+			// serverless column and decodes back identically. Guards the
+			// boolean conversion at both ends of the Create/Get path.
+			name: "create_and_get_round_trips_serverless",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-serverless")
+				sandbox.Lifecycle = models.Lifecycle{
+					StopIfIdleFor: 5 * time.Minute,
+					Serverless:    true,
+				}
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if !got.Lifecycle.Serverless {
+					t.Fatalf("Lifecycle.Serverless = false, want true (round-trip)")
+				}
+				if got.Lifecycle.StopIfIdleFor != 5*time.Minute {
+					t.Fatalf("StopIfIdleFor mismatch: got %v want %v", got.Lifecycle.StopIfIdleFor, 5*time.Minute)
+				}
+				if got.WakeArmed {
+					t.Fatalf("WakeArmed = true on fresh create, want false")
+				}
+			},
+		},
+		{
+			// UpdateLifecycle full-replace semantics include the
+			// serverless field. wake_armed must NOT be touched: it
+			// transitions on stop/wake events, not on lifecycle edits.
+			name: "update_lifecycle_replaces_serverless_preserves_wake_armed",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-update-serverless")
+				sandbox.Lifecycle = models.Lifecycle{
+					StopIfIdleFor: time.Hour,
+					Serverless:    true,
+				}
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				if err := st.SetWakeArmed(ctx, sandbox.ID, true); err != nil {
+					t.Fatalf("SetWakeArmed() error = %v", err)
+				}
+				// Replace the lifecycle: drop serverless and clear idle
+				// timer. wake_armed should survive untouched.
+				if err := st.UpdateLifecycle(ctx, sandbox.ID, models.Lifecycle{
+					DestroyAtAge: 24 * time.Hour,
+				}); err != nil {
+					t.Fatalf("UpdateLifecycle() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Lifecycle.Serverless {
+					t.Fatalf("Lifecycle.Serverless = true after replace, want false")
+				}
+				if !got.WakeArmed {
+					t.Fatalf("WakeArmed should not be cleared by UpdateLifecycle")
+				}
+			},
+		},
+		{
+			// SetWakeArmed toggles independently of Upsert so a stop
+			// event and a runtime-state-machine update on the row do
+			// not race. Round-trip both directions.
+			name: "set_wake_armed_toggles_independently",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-wake-toggle")
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				if err := st.SetWakeArmed(ctx, sandbox.ID, true); err != nil {
+					t.Fatalf("SetWakeArmed(true) error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if !got.WakeArmed {
+					t.Fatalf("WakeArmed = false after SetWakeArmed(true)")
+				}
+				if err := st.SetWakeArmed(ctx, sandbox.ID, false); err != nil {
+					t.Fatalf("SetWakeArmed(false) error = %v", err)
+				}
+				got, err = st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.WakeArmed {
+					t.Fatalf("WakeArmed = true after SetWakeArmed(false)")
+				}
+			},
+		},
+		{
+			name: "set_wake_armed_returns_not_found_for_missing_id",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				err := st.SetWakeArmed(ctx, "missing", true)
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound, got %v", err)
+				}
+			},
+		},
+		{
 			name: "list_returns_all_ports_with_one_query_per_call",
 			run: func(t *testing.T) {
 				// Three sandboxes: one with two ports, one with one port, one
@@ -1239,6 +1349,8 @@ func TestStoreHelperCases(t *testing.T) {
 			sql.NullTime{}, // net_quota_exceeded_at
 			[]byte(nil),    // registry_auth_sealed
 			0,              // auto_import_pending
+			0,              // serverless
+			0,              // wake_armed
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

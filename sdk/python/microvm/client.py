@@ -890,6 +890,7 @@ def _to_api_lifecycle(lifecycle: Lifecycle) -> Dict[str, Any]:
             "destroy_if_idle_for": _first_of(lifecycle, "destroyIfIdleFor", "destroy_if_idle_for"),
             "stop_at_age": _first_of(lifecycle, "stopAtAge", "stop_at_age"),
             "destroy_at_age": _first_of(lifecycle, "destroyAtAge", "destroy_at_age"),
+            "serverless": _first_of(lifecycle, "serverless"),
         }
     )
 
@@ -1115,6 +1116,10 @@ def _from_api_lifecycle(lifecycle: Dict[str, Any]) -> Lifecycle:
     destroy_at_age = _first_of(lifecycle, "destroy_at_age", "destroyAtAge")
     if destroy_at_age is not None:
         result["destroyAtAge"] = int(destroy_at_age)
+
+    serverless = _first_of(lifecycle, "serverless")
+    if serverless:
+        result["serverless"] = True
 
     return result
 

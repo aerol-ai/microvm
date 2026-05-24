@@ -451,6 +451,41 @@ class ClientTests(unittest.TestCase):
             },
         )
 
+    def test_create_round_trips_serverless_lifecycle_flag(self):
+        client = RecordingMicroVM()
+        sandbox = client.create(
+            {
+                "image": "ubuntu:22.04",
+                "lifecycle": {
+                    "stopIfIdleFor": 300_000_000_000,
+                    "serverless": True,
+                },
+            }
+        )
+
+        self.assertEqual(
+            client.calls[0],
+            (
+                "POST",
+                "/v1/sandboxes",
+                {
+                    "image": "ubuntu:22.04",
+                    "mounts": [],
+                    "lifecycle": {
+                        "stop_if_idle_for": 300_000_000_000,
+                        "serverless": True,
+                    },
+                },
+            ),
+        )
+        self.assertEqual(
+            sandbox.lifecycle,
+            {
+                "stopIfIdleFor": 300_000_000_000,
+                "serverless": True,
+            },
+        )
+
     def test_create_snapshot_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         snapshot = client.create_snapshot("sb-1", "snapshots/demo:v1")

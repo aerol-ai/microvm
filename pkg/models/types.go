@@ -165,6 +165,13 @@ type Lifecycle struct {
 	DestroyIfIdleFor time.Duration `json:"destroy_if_idle_for,omitempty"`
 	StopAtAge        time.Duration `json:"stop_at_age,omitempty"`
 	DestroyAtAge     time.Duration `json:"destroy_at_age,omitempty"`
+	// Serverless opts the sandbox into HTTP-wake behavior: stops driven by
+	// lifecycle (idle timer / age) or involuntary exits arm the sandbox to
+	// be transparently restarted on the next inbound HTTP request. Manual
+	// StopSandbox calls clear the arming so the sandbox stays down.
+	// Requires StopIfIdleFor to be set explicitly; there is no implicit
+	// default — see Validate.
+	Serverless bool `json:"serverless,omitempty"`
 }
 
 // MaxLifecycleDuration caps each Lifecycle field. 30 days is generous for
@@ -202,6 +209,15 @@ func (l Lifecycle) Validate() error {
 	if l.StopAtAge > 0 && l.DestroyAtAge > 0 && l.DestroyAtAge < l.StopAtAge {
 		return errors.New("destroy_at_age must be >= stop_at_age")
 	}
+	// Serverless requires an explicit idle timer. We deliberately reject
+	// the request rather than substituting a default so the operator has
+	// to make a conscious choice about how long an idle sandbox should
+	// linger before stopping (and incurring a future wake-time cold
+	// start). A silent default would hide cost from the caller and make
+	// behavior depend on server build version.
+	if l.Serverless && l.StopIfIdleFor == 0 {
+		return errors.New("serverless requires stop_if_idle_for to be set explicitly")
+	}
 	return nil
 }
 
@@ -209,7 +225,7 @@ func (l Lifecycle) Validate() error {
 // Lifecycle inspection in the sweep when there's nothing to evaluate.
 func (l Lifecycle) IsZero() bool {
 	return l.StopIfIdleFor == 0 && l.DestroyIfIdleFor == 0 &&
-		l.StopAtAge == 0 && l.DestroyAtAge == 0
+		l.StopAtAge == 0 && l.DestroyAtAge == 0 && !l.Serverless
 }
 
 // UpdateLifecycleRequest is the body for PUT /v1/sandboxes/{id}/lifecycle.
@@ -488,6 +504,13 @@ type Sandbox struct {
 	// replicated via Raft, since each owner gets one opportunistic shot
 	// at the import per pull.
 	AutoImportPending bool `json:"-"`
+	// WakeArmed indicates the sandbox is currently in the stopped state
+	// because of a lifecycle-driven idle timeout or an involuntary exit
+	// while Lifecycle.Serverless was true. Wake-aware control-plane proxies
+	// transparently start the sandbox on the next inbound request when this
+	// is set. Cleared on manual StopSandbox and after a successful wake.
+	// Internal-only bookkeeping; never exposed over the wire.
+	WakeArmed bool `json:"-"`
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.

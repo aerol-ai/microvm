@@ -87,6 +87,20 @@ type Service struct {
 	l4Mu       sync.Mutex
 	l4Ready    atomic.Bool
 	snapshotMu sync.Mutex
+	l4WakeMu   sync.Mutex
+	l4WakeTCP  net.Listener
+	l4WakeTLS  map[string]net.Listener
+	l4LimitMu  sync.Mutex
+	// pending counts L4 connections waiting for wake/target resolution.
+	// active counts connections already admitted to proxy bytes. Keeping both
+	// lets cold-start bursts shed excess work without blocking unrelated warm
+	// traffic accounting.
+	l4PendingGlobal       int
+	l4PendingBySandbox    map[string]int
+	l4ActiveGlobal        int
+	l4ActiveBySandbox     map[string]int
+	l4ActivityGenerations map[string]uint64
+	l4ActivitySeq         uint64
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
@@ -105,6 +119,42 @@ type Service struct {
 	clusterMu    sync.Mutex
 	clusterReady atomic.Bool
 
+	// expectedStops tracks sandboxes whose stop was issued by sandboxd
+	// itself (manual API call or lifecycle sweep). The Docker /events
+	// stream surfaces every "die"/"stop" the same way regardless of who
+	// asked for it, so without this side-channel the event handler cannot
+	// tell whether a stop was the operator's intent (no wake) or an
+	// involuntary exit (arm wake on serverless sandboxes). Entries are
+	// consumed by markSandboxStopped; whatever is left at sweep time is
+	// implicitly involuntary (timeout cleanup runs from a janitor).
+	expectedStopsMu sync.Mutex
+	expectedStops   map[string]expectedStopRecord
+
+	// wakeFlights holds the per-sandbox single-flight + circuit-breaker
+	// state used by EnsureSandboxAwakeForHTTP. Same pattern as l4Ready,
+	// but per-sandbox: a wave of HTTP requests targeting a sleeping
+	// sandbox must collapse to one StartSandbox call, and a cold-start
+	// that keeps failing (admission rejected, image fetch fails) must
+	// not retry on every request indefinitely. Entries are created
+	// lazily on first wake; they live for the daemon lifetime to keep
+	// the breaker state stable across the 60s windows the policy uses.
+	wakeFlightsMu sync.Mutex
+	wakeFlights   map[string]*wakeFlight
+
+	// touchCoalescer debounces last_active_at flushes per sandbox so a
+	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
+	// runtime proxies, SSH gateway) does not become one SQLite UPDATE
+	// per request. Without this, a single sandbox at 1000 RPS would
+	// queue 1000 UPDATEs/sec behind every other store write — a single
+	// hot serverless sandbox could starve the create/start/stop path
+	// across the rest of the node. See touch_coalescer.go.
+	//
+	// Lazily initialized via touchCoalescerOnce so test harnesses that
+	// build &Service{...} literals (newCapacityHarness, the cluster
+	// fixtures, etc.) don't need updating.
+	touchCoalescer     *touchCoalescer
+	touchCoalescerOnce sync.Once
+
 	// ingressLastHash is the hash of the placement view that the last
 	// successful cluster-ingress reconcile installed. The reconciler hashes
 	// the next view and skips work when unchanged — this is the cheap idle
@@ -120,7 +170,7 @@ type Service struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
-	return &Service{
+	s := &Service{
 		cfg:      cfg,
 		logger:   logger,
 		store:    db,
@@ -136,6 +186,21 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		// cluster mode is enabled at boot.
 		cluster: cluster.NewNoop("standalone", ""),
 	}
+	s.ensureTouchCoalescer()
+	return s
+}
+
+// ensureTouchCoalescer is the lazy init path TouchSandbox uses. Direct
+// &Service{...} literals in test harnesses skip New(), so the coalescer
+// has to come up on first use. The flush closure dereferences s.store
+// at call time so harnesses that swap the store after construction
+// (e.g. newServerlessHarness) still route through the right writer.
+func (s *Service) ensureTouchCoalescer() {
+	s.touchCoalescerOnce.Do(func() {
+		s.touchCoalescer = newTouchCoalescer(touchDebounceInterval, func(ctx context.Context, id string, at time.Time) error {
+			return s.store.Touch(ctx, id, at)
+		})
+	})
 }
 
 // AttachCluster swaps in a cluster.Client. Called from cmd/sandboxd/main after
@@ -311,6 +376,12 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // this path; default sandboxes remain non-HA and are orphaned on owner death.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		// D1 reconstruction: on owner change, a Serverless && stopped row
+		// without wake_armed is the new owner's first chance to install
+		// wake routes and arm the bit. Done before port replay so the
+		// wake-aware route shape is in place when replayClusterExposedPorts
+		// touches HTTP exposures.
+		s.ReconstructWakeArmedIfNeeded(ctx, existing)
 		return s.replayClusterExposedPorts(ctx, id, exposedPorts)
 	}
 	nodeID := ""
@@ -805,6 +876,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox.ContainerID = state.ContainerID
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
+	sandbox.WakeArmed = false
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
 
@@ -842,43 +914,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	return refreshed, nil
 }
 
+// StopSandbox is the operator-initiated stop (API surface, manual). It is a
+// thin wrapper over stopSandboxInternal that pins the stop mode to manual:
+// wake_armed is always cleared, so a serverless sandbox stopped via this
+// path stays down until the operator explicitly starts it again.
+// See serverless.go for the full wake-arming policy.
 func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	sandbox, err := s.store.Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.docker.Stop(ctx, sandboxContainerRef(sandbox)); err != nil {
-		return nil, err
-	}
-	// Release the admitter slot now that the container is no longer running.
-	// A stopped sandbox holds no CPU/RAM on the host; keeping the reservation
-	// would let the host budget run out even though nothing is consuming it,
-	// and admins routinely use Stop+Start to free capacity for new work.
-	// StartSandbox re-Admits on the way back up. Release is idempotent so a
-	// concurrent die event running the same path is safe.
-	if s.admitter != nil {
-		s.admitter.Release(id)
-	}
-	if err := s.mounts.UnmountAll(id); err != nil {
-		s.logger.Warn("unmount on stop failed", "sandbox_id", id, "error", err)
-	}
-	// Drop the Caddy routes while the container is down so requests hit the
-	// fallback "sandbox not found" handler instead of a 502 from a stale
-	// upstream IP. StartSandbox re-upserts every route on the way back up.
-	for _, port := range sandbox.ExposedPorts {
-		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
-			s.logger.Warn("caddy port route cleanup on stop failed", "sandbox_id", id, "port", port.Port, "protocol", port.Protocol, "error", err)
-		}
-	}
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
-		s.logger.Warn("caddy route cleanup on stop failed", "sandbox_id", id, "error", err)
-	}
-	sandbox.Status = models.SandboxStatusStopped
-	sandbox.UpdatedAt = time.Now().UTC()
-	if err := s.store.Upsert(ctx, sandbox); err != nil {
-		return nil, err
-	}
-	return sandbox, nil
+	return s.stopSandboxInternal(ctx, id, stopModeManual)
 }
 
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
@@ -899,6 +941,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
+	s.forgetWakeFlight(id)
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
 	}
@@ -1210,6 +1253,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := l.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
+	priorSandbox, _ := s.store.Get(ctx, id)
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
 	}
@@ -1217,7 +1261,28 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
 		spec.Lifecycle = &lc
 	})
-	return s.store.Get(ctx, id)
+	updated, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// If Serverless flipped on a running sandbox, re-install exposed port
+	// routes in the matching shape. The install helpers own cleanup of the
+	// previous direct/wake shape, so this is the entire transition. We only do
+	// the work when something actually changed AND when the gate is on
+	// — gate-off keeps the legacy direct routes regardless.
+	if s.cfg.EnableServerless && priorSandbox != nil && updated != nil &&
+		priorSandbox.Lifecycle.Serverless != updated.Lifecycle.Serverless &&
+		updated.Status == models.SandboxStatusStarted {
+		for _, port := range updated.ExposedPorts {
+			if err := s.upsertExposedPortRoute(ctx, updated, port); err != nil {
+				if s.logger != nil {
+					s.logger.Warn("re-install port route after lifecycle change failed",
+						"sandbox_id", id, "port", port.Port, "err", err)
+				}
+			}
+		}
+	}
+	return updated, nil
 }
 
 // ExposePort publishes a sandbox container port through one of three caddy
@@ -1262,7 +1327,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	switch canonicalProto {
 	case models.ExposedPortProtocolHTTP:
 		publicURL := s.caddy.PortPublicURL(id, port)
-		if err := s.caddy.UpsertPortRoute(ctx, id, sandbox.ContainerIP, port); err != nil {
+		if err := s.installHTTPPortRoute(ctx, sandbox, port); err != nil {
 			return models.ExposePortResponse{}, err
 		}
 		exposure := models.ExposedPort{
@@ -1273,12 +1338,12 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			CreatedAt: now,
 		}
 		if err := s.store.UpsertPort(ctx, exposure); err != nil {
-			_ = s.caddy.DeletePortRoute(ctx, id, port)
+			_ = s.removeHTTPPortRoute(ctx, id, port)
 			return models.ExposePortResponse{}, err
 		}
 		if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, PublicURL: publicURL}); err != nil {
 			if existingBefore == nil {
-				_ = s.caddy.DeletePortRoute(ctx, id, port)
+				_ = s.removeHTTPPortRoute(ctx, id, port)
 				_ = s.store.DeletePort(ctx, id, port)
 			}
 			return models.ExposePortResponse{}, err
@@ -1300,7 +1365,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		// outright — the caller must unexpose first to switch protocols.
 		if existing := existingBefore; existing != nil {
 			if existing.HostPort > 0 {
-				if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, existing.HostPort); err != nil {
+				if err := s.installTCPPortRoute(ctx, sandbox, port, existing.HostPort); err != nil {
 					return models.ExposePortResponse{}, err
 				}
 				if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, HostPort: existing.HostPort, PublicURL: existing.PublicURL}); err != nil {
@@ -1319,7 +1384,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		if err != nil {
 			return models.ExposePortResponse{}, err
 		}
-		if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, hostPort); err != nil {
+		if err := s.installTCPPortRoute(ctx, sandbox, port, hostPort); err != nil {
 			// Only roll back rows we ourselves inserted. A reused row was
 			// installed by a concurrent caller and is not ours to delete.
 			if !reused {
@@ -1363,7 +1428,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			return models.ExposePortResponse{}, err
 		}
 		publicURL := s.caddy.TLSPublicEndpoint(id, port, s.caddy.L4TLSListen())
-		if err := s.caddy.UpsertTLSSNIRoute(ctx, id, sniHost, sandbox.ContainerIP, port); err != nil {
+		if err := s.installTLSPortRoute(ctx, sandbox, port); err != nil {
 			return models.ExposePortResponse{}, err
 		}
 		exposure := models.ExposedPort{
@@ -1374,12 +1439,12 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			CreatedAt: now,
 		}
 		if err := s.store.UpsertPort(ctx, exposure); err != nil {
-			_ = s.caddy.DeleteTLSSNIRoute(ctx, id, port)
+			_ = s.deleteTLSPortRoute(ctx, id, port)
 			return models.ExposePortResponse{}, err
 		}
 		if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, PublicURL: publicURL}); err != nil {
 			if existingBefore == nil {
-				_ = s.caddy.DeleteTLSSNIRoute(ctx, id, port)
+				_ = s.deleteTLSPortRoute(ctx, id, port)
 				_ = s.store.DeletePort(ctx, id, port)
 			}
 			return models.ExposePortResponse{}, err
@@ -1606,14 +1671,21 @@ func findExposure(sandbox *models.Sandbox, port int) *models.ExposedPort {
 // upsertExposedPortRoute republishes one exposure to caddy based on its
 // stored protocol. Used everywhere a sandbox transitions to running
 // (StartSandbox, Reconcile when a container is back, docker start events).
+//
+// For HTTP exposures, the route shape depends on whether the sandbox
+// opted into serverless wake (Lifecycle.Serverless + EnableServerless
+// rollout gate). Serverless sandboxes get the wake-aware route that
+// targets the loopback ingress proxy; everything else gets the legacy
+// direct-dial route. installHTTPPortRoute owns the transition logic so
+// the two shapes never coexist for the same (id, port).
 func (s *Service) upsertExposedPortRoute(ctx context.Context, sandbox *models.Sandbox, port models.ExposedPort) error {
 	switch port.Protocol {
 	case "", models.ExposedPortProtocolHTTP:
-		return s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port)
+		return s.installHTTPPortRoute(ctx, sandbox, port.Port)
 	case models.ExposedPortProtocolTCP:
-		return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port, port.HostPort)
+		return s.installTCPPortRoute(ctx, sandbox, port.Port, port.HostPort)
 	case models.ExposedPortProtocolTLS:
-		return s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, s.caddy.SNIHost(sandbox.ID, port.Port), sandbox.ContainerIP, port.Port)
+		return s.installTLSPortRoute(ctx, sandbox, port.Port)
 	default:
 		return fmt.Errorf("unknown protocol %q on exposed port %d", port.Protocol, port.Port)
 	}
@@ -1622,17 +1694,105 @@ func (s *Service) upsertExposedPortRoute(ctx context.Context, sandbox *models.Sa
 // deleteExposedPortRoute drops one exposure's caddy entity. Used everywhere
 // a sandbox transitions out of running (StopSandbox, DestroySandbox, exit
 // events, reconcile destroyed pass).
+//
+// For HTTP exposures we delete BOTH route shapes (direct + wake) because
+// either may exist depending on the sandbox's current serverless mode
+// — and for a wake-armed serverless sandbox transitioning to stopped,
+// removeHTTPPortRoute is also the right cleanup when the lifecycle
+// callsite is a destroy, not just a stop. Stop-but-armed callers must
+// skip this path entirely (see stopSandboxInternal).
 func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sandbox, port models.ExposedPort) error {
 	switch port.Protocol {
 	case "", models.ExposedPortProtocolHTTP:
-		return s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port)
+		return s.removeHTTPPortRoute(ctx, sandbox.ID, port.Port)
 	case models.ExposedPortProtocolTCP:
 		return s.caddy.DeleteTCPRoute(ctx, port.HostPort)
 	case models.ExposedPortProtocolTLS:
-		return s.caddy.DeleteTLSSNIRoute(ctx, sandbox.ID, port.Port)
+		return s.deleteTLSPortRoute(ctx, sandbox.ID, port.Port)
 	default:
 		return fmt.Errorf("unknown protocol %q on exposed port %d", port.Protocol, port.Port)
 	}
+}
+
+// installHTTPPortRoute writes the HTTP port route in the shape that
+// matches the sandbox's current serverless mode, and removes the other
+// shape afterwards. Install-then-delete ordering means there is never
+// a window where neither shape exists, so a request landing mid-flip
+// always hits one valid route.
+func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	if s.serverlessWakeEnabled(sandbox) {
+		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port); err != nil {
+			return err
+		}
+		// Best-effort: any leftover direct route from a pre-serverless
+		// state must go so Caddy doesn't keep two routes matching the
+		// same host. DeletePortRoute treats 404 as success.
+		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
+		return nil
+	}
+	if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
+		return err
+	}
+	_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
+	return nil
+}
+
+func (s *Service) installTCPPortRoute(ctx context.Context, sandbox *models.Sandbox, port, hostPort int) error {
+	if err := s.EnsureLayer4Ready(ctx); err != nil {
+		return err
+	}
+	if s.serverlessWakeEnabled(sandbox) {
+		return s.caddy.UpsertWakeTCPRoute(ctx, sandbox.ID, port, hostPort, s.cfg.InternalL4WakeAddr)
+	}
+	return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
+}
+
+func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	if err := s.EnsureLayer4Ready(ctx); err != nil {
+		return err
+	}
+	sniHost := s.caddy.SNIHost(sandbox.ID, port)
+	if s.serverlessWakeEnabled(sandbox) {
+		socketPath, err := s.ensureTLSWakeListener(sandbox.ID, port)
+		if err != nil {
+			return err
+		}
+		if err := s.caddy.UpsertWakeTLSSNIRoute(ctx, sandbox.ID, sniHost, socketPath, port); err != nil {
+			s.closeTLSWakeListener(sandbox.ID, port)
+			return err
+		}
+		return nil
+	}
+	if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {
+		return err
+	}
+	s.closeTLSWakeListener(sandbox.ID, port)
+	return nil
+}
+
+func (s *Service) deleteTLSPortRoute(ctx context.Context, id string, port int) error {
+	if err := s.caddy.DeleteTLSSNIRoute(ctx, id, port); err != nil {
+		return err
+	}
+	s.closeTLSWakeListener(id, port)
+	return nil
+}
+
+func (s *Service) serverlessWakeEnabled(sandbox *models.Sandbox) bool {
+	return sandbox != nil && s.cfg.EnableServerless && sandbox.Lifecycle.Serverless
+}
+
+// removeHTTPPortRoute drops both HTTP route shapes for a (sandbox, port).
+// Both calls are idempotent and treat 404 as success, so calling this
+// without knowing which shape is currently live is safe and cheap.
+func (s *Service) removeHTTPPortRoute(ctx context.Context, id string, port int) error {
+	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
+		return err
+	}
+	if err := s.caddy.DeleteWakeHTTPPortRoute(ctx, id, port); err != nil {
+		return err
+	}
+	return nil
 }
 
 // touchAllowedPorts is a small wrapper that refreshes the toolbox's allowlist
@@ -1666,8 +1826,82 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	}, nil
 }
 
+// WakeAwareToolboxTarget is the entry point every control-plane HTTP
+// proxy (v1 toolbox/sessions, daytona toolbox, e2b runtime) calls in
+// place of ToolboxTarget. It funnels every request through the wake
+// helper so a stopped serverless sandbox with wake_armed=true is
+// resurrected before the proxy attempts to dial the toolbox.
+//
+// Behavior is exactly ToolboxTarget for: running sandboxes, stopped
+// non-serverless sandboxes, and any case where cfg.EnableServerless
+// is off (rollout-gate contract). The two new sentinels
+// (ErrSandboxManuallyStopped, ErrWakeCircuitOpen) are surfaced
+// upstream so apihttp can map them to 409 and 503+Retry-After:60
+// respectively.
+func (s *Service) WakeAwareToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint, error) {
+	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, id); err != nil {
+		return ToolboxEndpoint{}, err
+	}
+	return s.ToolboxTarget(ctx, id)
+}
+
+// PortEndpoint is the upstream the ingress proxy dials for a wake-aware
+// exposed-port request. URL has the form http://{containerIP}:{port}.
+type PortEndpoint struct {
+	URL string
+}
+
+// WakeAwarePortTarget resolves a sandbox's exposed-port upstream URL,
+// ensuring the sandbox is awake first. Used by the loopback ingress proxy
+// when Caddy forwards a wake-aware HTTP port route. The same sentinels
+// EnsureSandboxAwakeForHTTP returns flow through here unchanged.
+func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) (PortEndpoint, error) {
+	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, id)
+	if err != nil {
+		return PortEndpoint{}, err
+	}
+	if sandbox == nil || sandbox.ContainerIP == "" {
+		// Re-read in case the wake path returned a stale snapshot from
+		// before StartSandbox attached the new container IP.
+		fresh, getErr := s.store.Get(ctx, id)
+		if getErr != nil {
+			return PortEndpoint{}, getErr
+		}
+		sandbox = fresh
+	}
+	if sandbox.ContainerIP == "" {
+		return PortEndpoint{}, errors.New("sandbox container IP is not available")
+	}
+	exposure := findExposure(sandbox, port)
+	if exposure == nil || (exposure.Protocol != "" && exposure.Protocol != models.ExposedPortProtocolHTTP) {
+		return PortEndpoint{}, fmt.Errorf("sandbox %s does not expose HTTP port %d", id, port)
+	}
+	return PortEndpoint{URL: fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, port)}, nil
+}
+
+// TouchSandbox bumps last_active_at for id with per-sandbox debounce.
+// The wake-aware ingress proxy and the toolbox/session/runtime proxies
+// call this on every request, so it must be cheap under high
+// per-sandbox RPS — see touch_coalescer.go for the rationale and the
+// debounce window. Callers that need a guaranteed immediate flush
+// (lifecycle transitions, tests) should drop to s.store.Touch directly.
 func (s *Service) TouchSandbox(ctx context.Context, id string) error {
-	return s.store.Touch(ctx, id, time.Now().UTC())
+	s.ensureTouchCoalescer()
+	return s.touchCoalescer.Touch(ctx, id)
+}
+
+// IsSandboxStarted is the preflight check the wake-aware ingress proxy
+// uses to skip request-body buffering for warm sandboxes. It returns
+// (true, nil) only when the sandbox row exists and its status is
+// Started; any other status (Stopped, Destroyed, in-flight create)
+// returns (false, nil). store.ErrNotFound is returned unwrapped so the
+// proxy can map it to 404 without a second store hit.
+func (s *Service) IsSandboxStarted(ctx context.Context, id string) (bool, error) {
+	sb, err := s.store.Get(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	return sb.Status == models.SandboxStatusStarted, nil
 }
 
 func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
@@ -1833,6 +2067,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
+			s.forgetWakeFlight(sandbox.ID)
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
@@ -1866,7 +2101,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.admitter.Release(sandbox.ID)
 			}
 		}
+		// D1 reconstruction: a serverless sandbox observed as stopped
+		// without wake_armed set is the cross-owner / post-restart case
+		// the plan calls out. Reinstall the wake route(s) and flip the
+		// bit so the next HTTP request can resurrect it. No-op for
+		// non-serverless rows and for sandboxes already armed.
+		if state.Status == models.SandboxStatusStopped {
+			s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
+		}
 		if state.Status == models.SandboxStatusStarted {
+			sandbox.WakeArmed = false
 			// Heal the per-IP egress DROP rule for sandboxes opted into
 			// NetworkBlockAll. Idempotent at the netrules layer (Exists check
 			// before insert), so this is safe to run on every reconcile pass.
@@ -2030,10 +2274,14 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
 			}
 		case lifecycleStop:
-			if _, err := s.StopSandbox(ctx, sandbox.ID); err != nil {
+			// Lifecycle stop: pass mode=stopModeLifecycle so serverless
+			// sandboxes arm wake (the next inbound HTTP request will
+			// resurrect the sandbox transparently).
+			if _, err := s.stopSandboxInternal(ctx, sandbox.ID, stopModeLifecycle); err != nil {
 				s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
-				s.logger.Info("audit lifecycle auto-stop", "sandbox_id", sandbox.ID)
+				s.logger.Info("audit lifecycle auto-stop",
+					formatStopAuditFields(sandbox.ID, stopModeLifecycle, s.shouldArmWake(sandbox, stopModeLifecycle))...)
 			}
 		}
 	}
@@ -2135,10 +2383,21 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		// but stopped sandboxes intentionally lack routes and should still
 		// not be GC'd here (they'll be rebuilt on Start).
 		expectedHTTP["sandbox-"+sb.ID] = struct{}{}
+		// Serverless sandboxes can have EITHER a direct port route (when
+		// started) or a wake-aware port route (when stopped+armed, and
+		// also when started under the wake-aware install path). The two
+		// shapes can briefly coexist during install-then-delete transitions
+		// in installHTTPPortRoute. Keep both @ids in the live set for any
+		// HTTP exposure on a serverless sandbox so the GC doesn't race
+		// the install cycle.
+		isServerless := s.cfg.EnableServerless && sb.Lifecycle.Serverless
 		for _, p := range sb.ExposedPorts {
 			switch p.Protocol {
 			case "", models.ExposedPortProtocolHTTP:
 				expectedHTTP[fmt.Sprintf("sandbox-%s-port-%d", sb.ID, p.Port)] = struct{}{}
+				if isServerless {
+					expectedHTTP[caddy.WakePortRouteID(sb.ID, p.Port)] = struct{}{}
+				}
 			case models.ExposedPortProtocolTCP:
 				if p.HostPort > 0 {
 					expectedTCPServers[fmt.Sprintf("tcp-port-%d", p.HostPort)] = struct{}{}

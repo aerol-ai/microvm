@@ -225,6 +225,53 @@ func TestTransportClientCases(t *testing.T) {
 	}
 }
 
+// TestCreateForwardsServerlessLifecycleFlag proves the Go SDK round-trips
+// the new Lifecycle.Serverless opt-in. The Go SDK delegates Lifecycle to
+// pkg/models, so the only surface check is that the field is serialized
+// over the wire with stop_if_idle_for and decoded back on the response.
+func TestCreateForwardsServerlessLifecycleFlag(t *testing.T) {
+	ctx := context.Background()
+	var seen models.CreateSandboxRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+			Sandbox: models.Sandbox{
+				ID:     "sb-serverless",
+				Image:  "ubuntu:22.04",
+				Status: models.SandboxStatusStarted,
+				Lifecycle: models.Lifecycle{
+					StopIfIdleFor: 5 * time.Minute,
+					Serverless:    true,
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	sandbox, _, err := client.Create(ctx, CreateOptions{
+		Image: "ubuntu:22.04",
+		Lifecycle: &models.Lifecycle{
+			StopIfIdleFor: 5 * time.Minute,
+			Serverless:    true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if seen.Lifecycle == nil || !seen.Lifecycle.Serverless {
+		t.Fatalf("wire payload Lifecycle.Serverless = false, want true")
+	}
+	if seen.Lifecycle.StopIfIdleFor != 5*time.Minute {
+		t.Fatalf("wire payload Lifecycle.StopIfIdleFor = %v, want 5m", seen.Lifecycle.StopIfIdleFor)
+	}
+	if !sandbox.Lifecycle.Serverless {
+		t.Fatalf("response sandbox Lifecycle.Serverless = false, want true")
+	}
+}
+
 // TestRegisterSnapshotSendsImagePath verifies the image-only happy path:
 // fields land on the wire under their snake_case names, the URL targets
 // /v1/snapshots, and the daemon's response is round-tripped back to the

@@ -8,6 +8,11 @@ public class Lifecycle {
     public Long destroyIfIdleFor;
     public Long stopAtAge;
     public Long destroyAtAge;
+    // serverless=true opts the sandbox into HTTP wake-on-request: auto-stop
+    // when idle, resume on the next inbound HTTP request. Requires
+    // stopIfIdleFor to be set; the server rejects serverless=true without
+    // an idle window.
+    public Boolean serverless;
 
     public Lifecycle setStopIfIdleFor(Long stopIfIdleFor) {
         this.stopIfIdleFor = stopIfIdleFor;
@@ -29,11 +34,17 @@ public class Lifecycle {
         return this;
     }
 
+    public Lifecycle setServerless(Boolean serverless) {
+        this.serverless = serverless;
+        return this;
+    }
+
     public Lifecycle copy() {
         return new Lifecycle()
             .setStopIfIdleFor(stopIfIdleFor)
             .setDestroyIfIdleFor(destroyIfIdleFor)
             .setStopAtAge(stopAtAge)
-            .setDestroyAtAge(destroyAtAge);
+            .setDestroyAtAge(destroyAtAge)
+            .setServerless(serverless);
     }
 }

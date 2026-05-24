@@ -27,7 +27,34 @@ const (
 	// fingerprints. Pick a stable string — changing it would
 	// disconnect in-flight retries from their original claims.
 	idempotencyScopeCreate = "e2b.create"
+	// metadataKeyServerless is the opt-in metadata key that flips a
+	// sandbox into AerolVM-native serverless mode (auto-stop on idle
+	// + wake on HTTP). E2B has no first-class serverless field, so
+	// callers smuggle the flag through metadata. The aerolvm.* prefix
+	// is namespaced so we can add more AerolVM-specific knobs later
+	// without colliding with user-supplied metadata.
+	//
+	// Note: this is NOT the same as E2B's autoResume — autoResume
+	// gates connect-time behavior (reconnect to a paused sandbox)
+	// and stays operative independently of serverless wake.
+	metadataKeyServerless = "aerolvm.serverless"
 )
+
+// serverlessFromMetadata reports whether the caller opted into
+// AerolVM serverless via metadata. Accepts the truthy values
+// "true", "1", "yes", "on" (case-insensitive); any other value
+// (or absence) is treated as false.
+func serverlessFromMetadata(metadata map[string]string) bool {
+	if metadata == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(metadata[metadataKeyServerless])) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // sandboxMeta is the in-memory shape the handlers use. Some fields are
 // derived from the native sandbox row (Metadata ← sandbox.Tags, the two

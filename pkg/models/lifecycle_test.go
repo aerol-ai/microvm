@@ -68,6 +68,21 @@ func TestLifecycleValidate(t *testing.T) {
 			name: "destroy_idle_alone_no_constraint",
 			l:    Lifecycle{DestroyIfIdleFor: time.Hour},
 		},
+		{
+			// Serverless requires an explicit idle timer — we reject
+			// rather than substitute a default so callers can't get
+			// surprised by an invisible policy choice.
+			name:    "serverless_without_idle_timer_rejected",
+			l:       Lifecycle{Serverless: true},
+			wantErr: "serverless requires stop_if_idle_for",
+		},
+		{
+			name: "serverless_with_idle_timer_is_valid",
+			l: Lifecycle{
+				Serverless:    true,
+				StopIfIdleFor: 5 * time.Minute,
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -98,5 +113,10 @@ func TestLifecycleIsZero(t *testing.T) {
 	}
 	if (Lifecycle{DestroyAtAge: time.Second}).IsZero() {
 		t.Fatal("Lifecycle with DestroyAtAge set should not be IsZero()")
+	}
+	// Serverless flag must keep the lifecycle live for the sweep so the
+	// sweep does not skip lifecycle inspection on a serverless sandbox.
+	if (Lifecycle{Serverless: true}).IsZero() {
+		t.Fatal("Lifecycle with Serverless=true should not be IsZero()")
 	}
 }

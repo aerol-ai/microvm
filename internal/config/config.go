@@ -114,12 +114,49 @@ type Config struct {
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
-	Runtime                     string
-	AutoReconcile               bool
-	EnableCaddy                 bool
-	EnableNetworkRules          bool
-	EnableEventMonitor          bool
-	EnableSSHGateway            bool
+	Runtime            string
+	AutoReconcile      bool
+	EnableCaddy        bool
+	EnableNetworkRules bool
+	EnableEventMonitor bool
+	EnableSSHGateway   bool
+	// EnableServerless gates wake behavior for sandboxes created with
+	// Lifecycle.Serverless=true. Defaults to true so the wake path is on out
+	// of the box; flip to false on a per-host basis to opt that host out of
+	// wake-aware control-plane proxying (the serverless flag is still
+	// accepted at the API surface so SDK callers don't 4xx, but the runtime
+	// never arms wake on stop and the control-plane proxies never call
+	// EnsureSandboxAwakeForHTTP). Acts as a rollout gate, not a per-sandbox
+	// toggle.
+	EnableServerless bool
+	// InternalIngressAddr is the loopback-only listen address for the
+	// wake-aware HTTP ingress proxy. Caddy dials this address from
+	// wake-aware HTTP port routes; it must NOT be exposed publicly.
+	InternalIngressAddr string
+	// InternalL4WakeAddr is the loopback-only TCP listener Caddy dials from
+	// wake-aware raw-TCP routes. Caddy sends PROXY protocol v1 so sandboxd can
+	// recover the public host_port and map the connection to an exposure.
+	InternalL4WakeAddr string
+	// InternalL4WakeDir holds per-exposure Unix sockets for wake-aware TLS-SNI
+	// routes. Caddy terminates TLS before proxying, so the socket path carries
+	// the sandbox/port identity that plaintext TCP no longer contains.
+	InternalL4WakeDir string
+	// L4WakeMaxPendingPerSandbox bounds L4 connections waiting for a single
+	// sandbox wake. Excess connections are closed before they wait on the
+	// per-sandbox wake single-flight.
+	L4WakeMaxPendingPerSandbox int
+	// L4WakeMaxPendingGlobal bounds all L4 connections waiting for wake on this
+	// node. It protects sandboxd from a fleet-wide cold-start burst.
+	L4WakeMaxPendingGlobal int
+	// L4WakeMaxActivePerSandbox bounds active L4 proxy connections per sandbox
+	// through the wake proxy after the sandbox is running.
+	L4WakeMaxActivePerSandbox int
+	// L4WakeMaxActiveGlobal bounds active L4 proxy connections on this node.
+	L4WakeMaxActiveGlobal int
+	// HTTPWakeMaxBuffer caps the request body buffered while a cold-start
+	// wake is in progress. Requests with bodies larger than this are
+	// rejected with 413 — see plan D2.
+	HTTPWakeMaxBuffer           int64
 	SSHListenAddr               string
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
@@ -515,6 +552,15 @@ func Load() (Config, error) {
 		EnableNetworkRules:          getEnvBool("SB_ENABLE_NETWORK_RULES", true),
 		EnableEventMonitor:          getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:            getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
+		EnableServerless:            getEnvBool("SB_ENABLE_SERVERLESS", true),
+		InternalIngressAddr:         getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
+		InternalL4WakeAddr:          getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
+		InternalL4WakeDir:           getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
+		L4WakeMaxPendingPerSandbox:  getEnvInt("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", 256),
+		L4WakeMaxPendingGlobal:      getEnvInt("SB_L4_WAKE_MAX_PENDING_GLOBAL", 4096),
+		L4WakeMaxActivePerSandbox:   getEnvInt("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", 4096),
+		L4WakeMaxActiveGlobal:       getEnvInt("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", 65536),
+		HTTPWakeMaxBuffer:           int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
 		SSHListenAddr:               getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:              getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:     strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
@@ -791,6 +837,39 @@ func Load() (Config, error) {
 		}
 	}
 
+	if cfg.EnableServerless {
+		if strings.TrimSpace(cfg.InternalIngressAddr) == "" {
+			return Config{}, errors.New("SB_INTERNAL_INGRESS_ADDR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if err := requireLoopbackAddr("SB_INTERNAL_INGRESS_ADDR", cfg.InternalIngressAddr); err != nil {
+			return Config{}, err
+		}
+		if strings.TrimSpace(cfg.InternalL4WakeAddr) == "" {
+			return Config{}, errors.New("SB_INTERNAL_L4_WAKE_ADDR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if err := requireLoopbackAddr("SB_INTERNAL_L4_WAKE_ADDR", cfg.InternalL4WakeAddr); err != nil {
+			return Config{}, err
+		}
+		if strings.TrimSpace(cfg.InternalL4WakeDir) == "" {
+			return Config{}, errors.New("SB_INTERNAL_L4_WAKE_DIR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxPendingPerSandbox <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxPendingGlobal <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_PENDING_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxActivePerSandbox <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.L4WakeMaxActiveGlobal <= 0 {
+			return Config{}, errors.New("SB_L4_WAKE_MAX_ACTIVE_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxBuffer <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -975,6 +1054,38 @@ func parseMirrorUpstreams(raw string) []MirrorUpstreamMapping {
 		out = append(out, MirrorUpstreamMapping{Host: host, Shortname: short})
 	}
 	return out
+}
+
+// requireLoopbackAddr rejects internal listen addrs that are not bound to a
+// loopback interface. The wake-aware HTTP/L4 ingress proxies carry no auth —
+// they trust that Caddy is the only client and assume reachability is limited
+// to localhost. An operator who overrides SB_INTERNAL_INGRESS_ADDR /
+// SB_INTERNAL_L4_WAKE_ADDR to 0.0.0.0 (or any routable interface) would
+// silently publish an unauthenticated endpoint that can wake any sandbox by
+// ID. Default values are loopback; this check enforces the field doc.
+//
+// Accepts: "localhost", any IPv4 127.0.0.0/8 address, "::1". Empty host
+// (":21213" form) is treated as wildcard and rejected — be explicit.
+func requireLoopbackAddr(envKey, value string) error {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("%s=%q must be host:port: %w", envKey, value, err)
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return fmt.Errorf("%s=%q must bind to a loopback interface (got wildcard); use 127.0.0.1 or localhost", envKey, value)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("%s=%q host %q must be a loopback IP or \"localhost\"", envKey, value, host)
+	}
+	if !ip.IsLoopback() {
+		return fmt.Errorf("%s=%q must bind to a loopback interface (got %s); the wake ingress carries no auth", envKey, value, ip)
+	}
+	return nil
 }
 
 func normalizeAdvertiseHost(value string) string {

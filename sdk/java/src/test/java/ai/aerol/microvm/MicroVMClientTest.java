@@ -308,6 +308,53 @@ class MicroVMClientTest {
     }
 
     @Test
+    void createRoundTripsServerlessLifecycleFlag() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-serverless",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "public_url", "https://sb-serverless.example.com",
+                "cpu", 1,
+                "memory_mb", 1024,
+                "disk_gb", 10,
+                "os_user", "root",
+                "network_block_all", false,
+                "toolbox_enabled", true,
+                "exposed_ports", List.of(),
+                "created_at", "2026-05-24T10:00:00Z",
+                "updated_at", "2026-05-24T10:00:00Z",
+                "last_active_at", "2026-05-24T10:00:00Z",
+                "lifecycle", mapOf(
+                    "stop_if_idle_for", 300_000_000_000L,
+                    "serverless", true
+                )
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = client.create(
+                new CreateOptions()
+                    .setImage("ubuntu:22.04")
+                    .setLifecycle(new Lifecycle()
+                        .setStopIfIdleFor(300_000_000_000L)
+                        .setServerless(Boolean.TRUE))
+            );
+
+            Map<String, Object> payload = requestBody.get();
+            Map<String, Object> lifecycle = castMap(payload.get("lifecycle"));
+            assertEquals(Boolean.TRUE, lifecycle.get("serverless"));
+            assertEquals(300_000_000_000L, ((Number) lifecycle.get("stop_if_idle_for")).longValue());
+            assertEquals(Boolean.TRUE, sandbox.lifecycle.serverless);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void createSnapshotMapsRequestAndResponseShapes() throws Exception {
         List<Map<String, Object>> requestBodies = new ArrayList<>();
         HttpServer server = startServer(exchange -> {

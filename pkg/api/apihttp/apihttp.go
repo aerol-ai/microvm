@@ -12,6 +12,7 @@ import (
 	"strconv"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -38,6 +39,21 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		WriteError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	// Wake-aware proxy sentinels (plans/serverless-sandbox-http-wake.md).
+	// 409 for manual-stop: the operator explicitly stopped the sandbox
+	// and the wake helper refused to auto-resume; the caller must
+	// StartSandbox first. 503+Retry-After:60 for circuit-open: the
+	// per-sandbox breaker has tripped after consecutive wake failures
+	// (D3); back off the full open window before retrying.
+	if errors.Is(err, service.ErrSandboxManuallyStopped) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrWakeCircuitOpen) {
+		w.Header().Set("Retry-After", "60")
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	if errors.Is(err, store.ErrSnapshotNameConflict) {

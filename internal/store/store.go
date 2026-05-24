@@ -89,6 +89,8 @@ func Open(path string) (*Store, error) {
 			net_quota_exceeded INTEGER NOT NULL DEFAULT 0,
 			net_quota_exceeded_at DATETIME,
 			auto_import_pending INTEGER NOT NULL DEFAULT 0,
+			serverless INTEGER NOT NULL DEFAULT 0,
+			wake_armed INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			last_active_at DATETIME NOT NULL
@@ -285,6 +287,16 @@ func Open(path string) (*Store, error) {
 		// The partial index below makes the reconciler scan cheap even when
 		// the steady-state count of pending rows is zero.
 		`ALTER TABLE sandboxes ADD COLUMN auto_import_pending INTEGER NOT NULL DEFAULT 0;`,
+		// serverless opts the sandbox into HTTP-wake behavior (see
+		// models.Lifecycle.Serverless). wake_armed is internal-only
+		// bookkeeping: it tracks whether the sandbox is currently stopped
+		// in a state where the next inbound HTTP request should
+		// transparently start it back up. Manual StopSandbox clears the
+		// flag; lifecycle-driven and involuntary stops set it when
+		// serverless is true. Defaults are 0 so warm-upgrade rows behave
+		// exactly as before.
+		`ALTER TABLE sandboxes ADD COLUMN serverless INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN wake_armed INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -378,8 +390,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
-			auto_import_pending
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			auto_import_pending,
+			serverless, wake_armed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -418,6 +431,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		nullableTime(sandbox.NetworkQuotaExceededAt),
 		nullableBlob(sandbox.RegistryAuthSealed),
 		boolToInt(sandbox.AutoImportPending),
+		boolToInt(sandbox.Lifecycle.Serverless),
+		boolToInt(sandbox.WakeArmed),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -480,8 +495,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
-			auto_import_pending
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			auto_import_pending,
+			serverless, wake_armed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -513,7 +529,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			net_bytes_in_limit = excluded.net_bytes_in_limit,
 			net_bytes_out_limit = excluded.net_bytes_out_limit,
 			registry_auth_sealed = excluded.registry_auth_sealed,
-			auto_import_pending = excluded.auto_import_pending
+			auto_import_pending = excluded.auto_import_pending,
+			serverless = excluded.serverless,
+			wake_armed = excluded.wake_armed
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -552,6 +570,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		nullableTime(sandbox.NetworkQuotaExceededAt),
 		nullableBlob(sandbox.RegistryAuthSealed),
 		boolToInt(sandbox.AutoImportPending),
+		boolToInt(sandbox.Lifecycle.Serverless),
+		boolToInt(sandbox.WakeArmed),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -573,7 +593,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
-			auto_import_pending
+			auto_import_pending,
+			serverless, wake_armed
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -606,7 +627,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
-			auto_import_pending
+			auto_import_pending,
+			serverless, wake_armed
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -728,10 +750,12 @@ func (s *Store) UpdateTags(ctx context.Context, id string, tags map[string]strin
 	return nil
 }
 
-// UpdateLifecycle replaces the four lifecycle timer fields on a sandbox row
-// and bumps updated_at. Other fields are untouched. Returns ErrNotFound if
-// no row matches id. The caller must validate the Lifecycle first; the
-// store does not re-validate (it would couple two layers for no gain).
+// UpdateLifecycle replaces the lifecycle fields on a sandbox row (the four
+// timers plus the serverless opt-in) and bumps updated_at. Other fields are
+// untouched. Returns ErrNotFound if no row matches id. The caller must
+// validate the Lifecycle first; the store does not re-validate (it would
+// couple two layers for no gain). wake_armed is intentionally NOT touched
+// here — it transitions on stop/wake events, not on lifecycle edits.
 func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecycle) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
@@ -739,6 +763,7 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		    destroy_if_idle_for_ns = ?,
 		    stop_at_age_ns = ?,
 		    destroy_at_age_ns = ?,
+		    serverless = ?,
 		    updated_at = ?
 		WHERE id = ?
 	`,
@@ -746,6 +771,7 @@ func (s *Store) UpdateLifecycle(ctx context.Context, id string, l models.Lifecyc
 		int64(l.DestroyIfIdleFor),
 		int64(l.StopAtAge),
 		int64(l.DestroyAtAge),
+		boolToInt(l.Serverless),
 		time.Now().UTC(),
 		id,
 	)
@@ -846,6 +872,32 @@ func (s *Store) ClearNetworkQuotaExceeded(ctx context.Context, id string) error 
 	`, time.Now().UTC(), id)
 	if err != nil {
 		return fmt.Errorf("clear sandbox network quota exceeded: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetWakeArmed toggles the wake_armed flag and bumps updated_at. The flag
+// is set when the sandbox stops in a way that should auto-resume on the
+// next inbound HTTP request (lifecycle idle / involuntary exit, both
+// while Lifecycle.Serverless is true). It is cleared on a manual stop and
+// after a successful wake. Returns ErrNotFound if no row matches id.
+//
+// This is a dedicated setter rather than going through Upsert so the
+// stop-event path and wake completion don't race the rest of the runtime
+// state on the row (status, container_id, container_ip, etc.).
+func (s *Store) SetWakeArmed(ctx context.Context, id string, armed bool) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET wake_armed = ?,
+		    updated_at = ?
+		WHERE id = ?
+	`, boolToInt(armed), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set wake_armed: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -1617,6 +1669,25 @@ func (s *Store) TryReserveHostPort(ctx context.Context, sandboxID string, contai
 	return ReserveHostPortResult{}, nil
 }
 
+// GetPortByHostPort returns the raw-TCP exposure bound to hostPort, or nil if
+// no exposure owns it. The L4 wake listener uses this to map Caddy's PROXY
+// protocol destination port back to a sandbox/container port.
+func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.ExposedPort, error) {
+	var exposure models.ExposedPort
+	err := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		FROM exposed_ports
+		WHERE host_port = ?
+	`, hostPort).Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get exposed port by host port: %w", err)
+	}
+	return &exposure, nil
+}
+
 // getPort returns the exposure row for (sandboxID, port), or nil if absent.
 func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort
@@ -1714,6 +1785,8 @@ func scanSandbox(scanner interface {
 	var netQuotaExceededAt sql.NullTime
 	var registryAuthSealed []byte
 	var autoImportPending int
+	var serverless int
+	var wakeArmed int
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -1753,6 +1826,8 @@ func scanSandbox(scanner interface {
 		&netQuotaExceededAt,
 		&registryAuthSealed,
 		&autoImportPending,
+		&serverless,
+		&wakeArmed,
 	)
 	if err != nil {
 		return nil, err
@@ -1764,6 +1839,7 @@ func scanSandbox(scanner interface {
 	}
 	sandbox.RegistryAuthSealed = nullableBlob(registryAuthSealed)
 	sandbox.AutoImportPending = autoImportPending == 1
+	sandbox.WakeArmed = wakeArmed == 1
 
 	if envJSON != "" {
 		if err := json.Unmarshal([]byte(envJSON), &sandbox.Env); err != nil {
@@ -1795,6 +1871,7 @@ func scanSandbox(scanner interface {
 		DestroyIfIdleFor: time.Duration(destroyIfIdleNs),
 		StopAtAge:        time.Duration(stopAtAgeNs),
 		DestroyAtAge:     time.Duration(destroyAtAgeNs),
+		Serverless:       serverless == 1,
 	}
 	if policy, err := models.NormalizeFailoverPolicy(failoverPolicy); err == nil && policy == models.FailoverPolicyRecreate {
 		sandbox.Failover = &models.Failover{Policy: policy}

@@ -117,20 +117,28 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 // the capacity reservation is legitimately held. Routes are torn down and
 // per-IP netrules cleared so a stopped sandbox doesn't leave dangling Caddy
 // upstreams pointing at an IP Docker may reassign on the next start.
+//
+// Wake-arming (D5 in plans/serverless-sandbox-http-wake.md): the event is
+// classified into one of the three stop modes by consulting the
+// expected-stop bookkeeping populated by stopSandboxInternal. Manual /
+// lifecycle stops carry their recorded mode (StopSandbox / lifecycle
+// sweep registered the expectation before docker.Stop); anything else
+// is treated as involuntary. A serverless sandbox stopped via lifecycle
+// or involuntarily arms wake_armed so the next inbound HTTP request can
+// transparently resurrect it.
+//
+// Ordering matters: route work runs BEFORE the row Upsert so the wake_armed
+// bit we persist reflects whether a wake route was actually installed. The
+// API stop path (stopSandboxInternal) already installed the wake route
+// before docker.Stop fired; tearDownPortRoutesForStop is the shared helper
+// that preserves it here (D5 install-then-delete) instead of wiping it.
+// Inverting these would re-introduce the bug where the API stop installs a
+// wake route and the subsequent die event silently deletes it.
 func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent) error {
 	previousIP := sandbox.ContainerIP
 
-	sandbox.Status = models.SandboxStatusStopped
-	sandbox.UpdatedAt = time.Now().UTC()
-	if event.Action == "oom" {
-		sandbox.LastError = "container killed by OOM"
-	} else if event.Action == "die" && event.ExitCode != 0 {
-		sandbox.LastError = fmt.Sprintf("container exited with code %d", event.ExitCode)
-	}
-
-	if err := s.store.Upsert(ctx, sandbox); err != nil {
-		return fmt.Errorf("update sandbox status: %w", err)
-	}
+	mode := s.classifyDockerStopEvent(sandbox.ID, event)
+	arm := s.shouldArmWake(sandbox, mode)
 
 	// Release the admitter slot — a stopped container holds no host CPU/RAM
 	// and the reservation would otherwise block new admissions until the
@@ -142,14 +150,12 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	}
 
 	// Tear down routes and per-IP netrules best-effort. Caddy upsert/delete
-	// helpers and netrules.ClearBlockAllEgress are all idempotent.
+	// helpers and netrules.ClearBlockAllEgress are all idempotent. The
+	// helper applies the D5 wake-arming exception for HTTP ports and
+	// demotes arm to false if every wake-route install attempt failed.
+	arm = s.tearDownPortRoutesForStop(ctx, sandbox, arm)
 	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
-	}
-	for _, port := range sandbox.ExposedPorts {
-		if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
-			s.logger.Warn("delete port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
-		}
 	}
 	if previousIP != "" {
 		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
@@ -157,11 +163,26 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 
+	sandbox.Status = models.SandboxStatusStopped
+	sandbox.UpdatedAt = time.Now().UTC()
+	sandbox.WakeArmed = arm
+	if event.Action == "oom" {
+		sandbox.LastError = "container killed by OOM"
+	} else if event.Action == "die" && event.ExitCode != 0 {
+		sandbox.LastError = fmt.Sprintf("container exited with code %d", event.ExitCode)
+	}
+
+	if err := s.store.Upsert(ctx, sandbox); err != nil {
+		return fmt.Errorf("update sandbox status: %w", err)
+	}
+
 	s.logger.Info("audit sandbox stopped via docker event",
 		"sandbox_id", sandbox.ID,
 		"action", event.Action,
 		"exit_code", event.ExitCode,
 		"status", string(sandbox.Status),
+		"stop_mode", mode.String(),
+		"wake_armed", arm,
 	)
 	return nil
 }
@@ -244,6 +265,11 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
+	// A successful start (whether driven by the API, a wake, or
+	// out-of-band `docker start`) means the sandbox is live again, so
+	// drop wake_armed. The next stop is the one that decides whether
+	// to re-arm.
+	sandbox.WakeArmed = false
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return fmt.Errorf("update sandbox runtime: %w", err)
 	}

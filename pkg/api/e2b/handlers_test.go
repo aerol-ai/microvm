@@ -606,3 +606,96 @@ func newE2BHandlerTestEnvWithRuntime(t *testing.T, runtime *fakeE2BRuntime, cfg 
 	})
 	return svc, st, mux
 }
+
+// TestE2BCreateAutoResumeDoesNotEnableServerless: per the plan, the
+// existing autoResume semantics (reconnect to a paused sandbox at
+// connect time) must NOT auto-enable AerolVM-native serverless.
+// Lifecycle.Serverless stays false unless the caller explicitly
+// opts in via the aerolvm.serverless metadata key.
+func TestE2BCreateAutoResumeDoesNotEnableServerless(t *testing.T) {
+	ctx := context.Background()
+	_, st, handler := newE2BHandlerTestEnv(t)
+
+	body := `{"templateID":"base","timeout":120,"autoPause":true,"autoResume":{"enabled":true}}`
+	req := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	}
+	var created sandboxResponse
+	if err := json.NewDecoder(rr.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	sb, err := st.Get(ctx, created.SandboxID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sb.Lifecycle.Serverless {
+		t.Fatalf("autoResume implicitly enabled Lifecycle.Serverless; must require explicit metadata opt-in")
+	}
+}
+
+// TestE2BCreateServerlessMetadataOptsIn: explicit
+// metadata["aerolvm.serverless"]="true" flips Lifecycle.Serverless
+// on, and the timeout is rewritten into StopIfIdleFor (the only
+// shape the native store accepts alongside Serverless=true).
+func TestE2BCreateServerlessMetadataOptsIn(t *testing.T) {
+	ctx := context.Background()
+	_, st, handler := newE2BHandlerTestEnv(t)
+
+	body := `{"templateID":"base","timeout":120,"autoPause":true,"autoResume":{"enabled":true},"metadata":{"aerolvm.serverless":"true"}}`
+	req := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	}
+	var created sandboxResponse
+	if err := json.NewDecoder(rr.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	sb, err := st.Get(ctx, created.SandboxID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if !sb.Lifecycle.Serverless {
+		t.Fatalf("Lifecycle.Serverless = false despite aerolvm.serverless=true metadata")
+	}
+	if sb.Lifecycle.StopIfIdleFor != 120*time.Second {
+		t.Fatalf("StopIfIdleFor = %v, want 120s (translated from timeout)", sb.Lifecycle.StopIfIdleFor)
+	}
+	if sb.Lifecycle.StopAtAge != 0 || sb.Lifecycle.DestroyAtAge != 0 {
+		t.Fatalf("serverless lifecycle must clear StopAtAge/DestroyAtAge; got Stop=%v Destroy=%v",
+			sb.Lifecycle.StopAtAge, sb.Lifecycle.DestroyAtAge)
+	}
+}
+
+// TestE2BServerlessMetadataAcceptsTruthyVariants documents the
+// truthy-value contract for the opt-in flag — case-insensitive
+// "true" / "1" / "yes" / "on" all enable serverless, everything
+// else (including the literal "false") leaves it disabled.
+func TestE2BServerlessMetadataAcceptsTruthyVariants(t *testing.T) {
+	cases := []struct {
+		value string
+		want  bool
+	}{
+		{"true", true},
+		{"TRUE", true},
+		{"1", true},
+		{"yes", true},
+		{"on", true},
+		{"false", false},
+		{"0", false},
+		{"", false},
+		{"maybe", false},
+	}
+	for _, tc := range cases {
+		got := serverlessFromMetadata(map[string]string{metadataKeyServerless: tc.value})
+		if got != tc.want {
+			t.Errorf("serverlessFromMetadata(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}

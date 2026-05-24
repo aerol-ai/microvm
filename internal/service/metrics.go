@@ -45,6 +45,21 @@ var (
 	clusterSecretLastOpenNanos   = expvar.NewInt("aerolvm_secret_decrypt_last_nanos")
 	clusterSecretOpenLatency     = scaleobs.NewDurationBuckets("aerolvm_secret_decrypt_latency_seconds_bucket")
 	clusterSecretRecipientDenies = expvar.NewInt("aerolvm_secret_recipient_denied_total")
+
+	// Wake metrics (D3 / C6 in plans/serverless-sandbox-http-wake.md).
+	// requests_total counts every EnsureSandboxAwakeForHTTP entry — both
+	// hot-path hits (already running) and cold starts; cold_starts_total
+	// is incremented only when we actually invoke StartSandbox. failures
+	// is keyed by classifyWakeError so operators can distinguish
+	// admission/capacity stalls from manual-stop refusals and circuit
+	// trips. wake_circuit_open is a gauge tracking how many sandboxes
+	// currently have an open breaker — recorded inline by the wake
+	// helper as ids enter/leave the open set.
+	wakeRequestsTotal   = expvar.NewInt("aerolvm_wake_requests_total")
+	wakeColdStartsTotal = expvar.NewInt("aerolvm_wake_cold_starts_total")
+	wakeFailuresTotal   = expvar.NewMap("aerolvm_wake_failures_total")
+	wakeDuration        = scaleobs.NewDurationBuckets("aerolvm_wake_duration_seconds_bucket")
+	wakeCircuitOpen     = expvar.NewInt("aerolvm_wake_circuit_open")
 )
 
 func beginSandboxCreateMetric() func(error) {
@@ -127,6 +142,57 @@ func beginClusterSecretOpen() func(error) {
 
 func recordClusterSecretKeyMismatch() {
 	clusterSecretKeyMismatches.Add(1)
+}
+
+// beginWakeMetric tags the start of an EnsureSandboxAwakeForHTTP call.
+// The returned closure must be called exactly once with (coldStart,
+// err). coldStart is true only when the helper actually invoked
+// StartSandbox under the single-flight (hot-path hits leave it false).
+// err is classified into a stable reason label so /debug/vars stays
+// queryable without leaking arbitrary error strings into metric keys.
+func beginWakeMetric() func(coldStart bool, err error) {
+	start := time.Now()
+	return func(coldStart bool, err error) {
+		wakeRequestsTotal.Add(1)
+		if coldStart {
+			wakeColdStartsTotal.Add(1)
+			wakeDuration.Observe(time.Since(start))
+		}
+		if err != nil {
+			scaleobs.Add(wakeFailuresTotal, classifyWakeError(err), 1)
+		}
+	}
+}
+
+// classifyWakeError maps a wake error to one of a small fixed set of
+// reason labels. The set is intentionally narrow: the wake helper has
+// only a handful of distinct failure modes (manual-stop refusal,
+// circuit-open, admission/capacity, start failure, timeout), and
+// keeping the label space bounded prevents an expvar map blowup if a
+// downstream error message ever varies.
+func classifyWakeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, ErrSandboxManuallyStopped):
+		return "manual_stopped"
+	case errors.Is(err, ErrWakeCircuitOpen):
+		return "circuit_open"
+	case errors.Is(err, capacity.ErrCapacityExceeded):
+		return "capacity"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "context deadline exceeded"), strings.Contains(msg, "timeout"), strings.Contains(msg, "timed out"):
+		return "timeout"
+	case strings.Contains(msg, "capacity"):
+		return "capacity"
+	default:
+		return "start_failed"
+	}
 }
 
 func classifyServiceMetricError(err error) string {

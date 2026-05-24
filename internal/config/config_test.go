@@ -53,6 +53,15 @@ func TestLoadCases(t *testing.T) {
 			"SB_NODE_ROLE",
 			"SB_ENABLE_CLUSTER",
 			"SB_CLUSTER_BOOTSTRAP",
+			"SB_ENABLE_SERVERLESS",
+			"SB_INTERNAL_INGRESS_ADDR",
+			"SB_INTERNAL_L4_WAKE_ADDR",
+			"SB_INTERNAL_L4_WAKE_DIR",
+			"SB_L4_WAKE_MAX_PENDING_PER_SANDBOX",
+			"SB_L4_WAKE_MAX_PENDING_GLOBAL",
+			"SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX",
+			"SB_L4_WAKE_MAX_ACTIVE_GLOBAL",
+			"SB_HTTP_WAKE_MAX_BUFFER",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -117,6 +126,154 @@ func TestLoadCases(t *testing.T) {
 				}
 				if !cfg.IsServer() || !cfg.IsWorker() || !cfg.IsIngress() {
 					t.Fatalf("expected mixed default to return true for all role predicates: %+v", cfg)
+				}
+				// SB_ENABLE_SERVERLESS defaults on so the wake path is
+				// armed out of the box; operators flip it off explicitly.
+				if !cfg.EnableServerless {
+					t.Fatalf("expected EnableServerless to default to true, got false")
+				}
+				if cfg.InternalIngressAddr != "127.0.0.1:21213" {
+					t.Fatalf("expected default InternalIngressAddr=127.0.0.1:21213, got %q", cfg.InternalIngressAddr)
+				}
+				if cfg.InternalL4WakeAddr != "127.0.0.1:21214" {
+					t.Fatalf("expected default InternalL4WakeAddr=127.0.0.1:21214, got %q", cfg.InternalL4WakeAddr)
+				}
+				if cfg.InternalL4WakeDir != "/run/sandboxd/l4wake" {
+					t.Fatalf("expected default InternalL4WakeDir=/run/sandboxd/l4wake, got %q", cfg.InternalL4WakeDir)
+				}
+				if cfg.L4WakeMaxPendingPerSandbox != 256 {
+					t.Fatalf("expected default L4WakeMaxPendingPerSandbox=256, got %d", cfg.L4WakeMaxPendingPerSandbox)
+				}
+				if cfg.L4WakeMaxPendingGlobal != 4096 {
+					t.Fatalf("expected default L4WakeMaxPendingGlobal=4096, got %d", cfg.L4WakeMaxPendingGlobal)
+				}
+				if cfg.L4WakeMaxActivePerSandbox != 4096 {
+					t.Fatalf("expected default L4WakeMaxActivePerSandbox=4096, got %d", cfg.L4WakeMaxActivePerSandbox)
+				}
+				if cfg.L4WakeMaxActiveGlobal != 65536 {
+					t.Fatalf("expected default L4WakeMaxActiveGlobal=65536, got %d", cfg.L4WakeMaxActiveGlobal)
+				}
+				if cfg.HTTPWakeMaxBuffer != 8*1024*1024 {
+					t.Fatalf("expected default HTTPWakeMaxBuffer=8MiB, got %d", cfg.HTTPWakeMaxBuffer)
+				}
+			},
+		},
+		{
+			name: "enable_serverless_override",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if !cfg.EnableServerless {
+					t.Fatalf("expected EnableServerless=true, got false")
+				}
+			},
+		},
+		{
+			name: "serverless_ingress_overrides",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:33333")
+				t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:33334")
+				t.Setenv("SB_INTERNAL_L4_WAKE_DIR", "/tmp/sandboxd-l4wake-test")
+				t.Setenv("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", "17")
+				t.Setenv("SB_L4_WAKE_MAX_PENDING_GLOBAL", "170")
+				t.Setenv("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", "1700")
+				t.Setenv("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", "17000")
+				t.Setenv("SB_HTTP_WAKE_MAX_BUFFER", "16777216")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.InternalIngressAddr != "127.0.0.1:33333" {
+					t.Fatalf("expected InternalIngressAddr override, got %q", cfg.InternalIngressAddr)
+				}
+				if cfg.InternalL4WakeAddr != "127.0.0.1:33334" {
+					t.Fatalf("expected InternalL4WakeAddr override, got %q", cfg.InternalL4WakeAddr)
+				}
+				if cfg.InternalL4WakeDir != "/tmp/sandboxd-l4wake-test" {
+					t.Fatalf("expected InternalL4WakeDir override, got %q", cfg.InternalL4WakeDir)
+				}
+				if cfg.L4WakeMaxPendingPerSandbox != 17 {
+					t.Fatalf("expected L4WakeMaxPendingPerSandbox override, got %d", cfg.L4WakeMaxPendingPerSandbox)
+				}
+				if cfg.L4WakeMaxPendingGlobal != 170 {
+					t.Fatalf("expected L4WakeMaxPendingGlobal override, got %d", cfg.L4WakeMaxPendingGlobal)
+				}
+				if cfg.L4WakeMaxActivePerSandbox != 1700 {
+					t.Fatalf("expected L4WakeMaxActivePerSandbox override, got %d", cfg.L4WakeMaxActivePerSandbox)
+				}
+				if cfg.L4WakeMaxActiveGlobal != 17000 {
+					t.Fatalf("expected L4WakeMaxActiveGlobal override, got %d", cfg.L4WakeMaxActiveGlobal)
+				}
+				if cfg.HTTPWakeMaxBuffer != 16*1024*1024 {
+					t.Fatalf("expected HTTPWakeMaxBuffer override, got %d", cfg.HTTPWakeMaxBuffer)
+				}
+			},
+		},
+		{
+			name: "serverless_rejects_zero_buffer",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_HTTP_WAKE_MAX_BUFFER", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_HTTP_WAKE_MAX_BUFFER") {
+					t.Fatalf("expected SB_HTTP_WAKE_MAX_BUFFER error, got %v", err)
+				}
+			},
+		},
+		{
+			// The wake ingress proxies carry no auth and trust that Caddy
+			// on localhost is their only client. Overriding the listen
+			// address to a routable interface would silently publish an
+			// unauthenticated endpoint that can wake any sandbox by ID;
+			// boot must refuse rather than start in that state.
+			name: "serverless_rejects_non_loopback_ingress_addr",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "0.0.0.0:21213")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_INTERNAL_INGRESS_ADDR") {
+					t.Fatalf("expected SB_INTERNAL_INGRESS_ADDR loopback error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "serverless_rejects_non_loopback_l4_wake_addr",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "192.168.1.10:21214")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_INTERNAL_L4_WAKE_ADDR") {
+					t.Fatalf("expected SB_INTERNAL_L4_WAKE_ADDR loopback error, got %v", err)
+				}
+			},
+		},
+		{
+			// "localhost" and ::1 are both legitimate loopback bindings;
+			// the validator must accept them so operators aren't forced
+			// into a specific spelling.
+			name: "serverless_accepts_localhost_and_ipv6_loopback",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_SERVERLESS", "true")
+				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "localhost:21213")
+				t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "[::1]:21214")
+				if _, err := Load(); err != nil {
+					t.Fatalf("Load() error = %v", err)
 				}
 			},
 		},

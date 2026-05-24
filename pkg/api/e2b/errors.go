@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
@@ -61,6 +62,18 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	}
 	if errors.Is(err, store.ErrNotFound) {
 		WriteError(w, http.StatusNotFound, "Not found")
+		return
+	}
+	// Wake-aware proxy sentinels — see apihttp.WriteStoreAwareError
+	// for the rationale; the E2B facade keeps its own writer for
+	// envelope-shape reasons, so we mirror the mapping here.
+	if errors.Is(err, service.ErrSandboxManuallyStopped) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrWakeCircuitOpen) {
+		w.Header().Set("Retry-After", "60")
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	if errors.Is(err, store.ErrSnapshotNameConflict) {
