@@ -16,7 +16,7 @@
     "@fontsource/inter": "^5.1.1",
     "@fontsource/space-mono": "^5.1.1",
     "astro": "6.3.7",
-    "sass": "^1.89.2",
+    "sass": "^1.100.0",
     "tailwindcss": "^4.3.0",
     "typescript": "^5.8.3"
   },
