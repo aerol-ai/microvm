@@ -476,12 +476,22 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned() && existing.Placement.IsReserved():
 			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
 			for port, route := range st.ExposedPorts {
 				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -496,6 +506,11 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 		case placementCanBeClaimedBy(existing.Placement, a.nodeID):
 			if err := a.ClaimOrphan(ctx, st.ID, st.Spec, st.Secrets); err != nil {
 				if firstErr == nil {
@@ -505,6 +520,11 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 			}
 			for port, route := range st.ExposedPorts {
 				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

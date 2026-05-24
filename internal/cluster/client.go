@@ -877,6 +877,11 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 
 		case existing.OwnerNodeID == c.nodeID && !existing.IsOrphaned() && existing.IsReserved():
 			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
@@ -887,11 +892,18 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 
 		case existing.OwnerNodeID == c.nodeID && !existing.IsOrphaned():
 			// We legitimately own it. Backfill any missing spec/secrets so
 			// future failover-recreate has everything it needs (closes the
-			// pre-cluster-sandbox limitation), then replay port intents.
+			// pre-cluster-sandbox limitation), then replay port + hostname
+			// intents. The FSM treats already-bound (sandbox, hostname) pairs
+			// as idempotent no-ops, so re-replaying every boot is cheap.
 			if existing.Spec == nil && st.Spec != nil {
 				if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 					firstErr = err
@@ -899,6 +911,11 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			for port, route := range st.ExposedPorts {
 				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -912,6 +929,16 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			for port, route := range st.ExposedPorts {
 				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			// Failover claim: the new owner replays hostnames from local
+			// truth. AddCustomDomain at the FSM is the uniqueness gate, so
+			// a hostname still claimed by a dead prior owner stays with the
+			// stale row until that row is reaped; the next AssertOwnership
+			// pass after reap succeeds.
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

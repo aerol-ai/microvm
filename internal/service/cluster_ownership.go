@@ -78,7 +78,10 @@ func (s *Service) clusterOwnershipNeedsReplay(c cluster.Client, sb *models.Sandb
 	if p.Spec == nil {
 		return true
 	}
-	return placementMissingLocalPorts(p, sb)
+	if placementMissingLocalPorts(p, sb) {
+		return true
+	}
+	return placementMissingLocalCustomHostnames(p, sb)
 }
 
 func placementCanBeClaimedBySelf(p cluster.Placement, self string) bool {
@@ -86,6 +89,29 @@ func placementCanBeClaimedBySelf(p cluster.Placement, self string) bool {
 		return false
 	}
 	return p.OrphanedOwnerNodeID == "" || p.OrphanedOwnerNodeID == self
+}
+
+// placementMissingLocalCustomHostnames returns true when the local sandbox
+// has bound hostnames the FSM placement doesn't yet list. This is the boot
+// catch-up signal: the FSM was added after the sandbox already had domains
+// (cluster mode flipped on, or PR #3 deploy), or a prior AssertOwnership
+// failed to ship them. Force a replay so the failover-recreate target has
+// the user's TLS matchers.
+func placementMissingLocalCustomHostnames(p cluster.Placement, sb *models.Sandbox) bool {
+	local := sandboxCustomHostnames(sb)
+	if len(local) == 0 {
+		return false
+	}
+	have := make(map[string]struct{}, len(p.CustomHostnames))
+	for _, h := range p.CustomHostnames {
+		have[h] = struct{}{}
+	}
+	for _, h := range local {
+		if _, ok := have[h]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func placementMissingLocalPorts(p cluster.Placement, sb *models.Sandbox) bool {
@@ -125,10 +151,11 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 		}
 	}
 	return cluster.LocalSandboxState{
-		ID:           sb.ID,
-		Spec:         spec,
-		Secrets:      secrets,
-		ExposedPorts: clusterPortsFromSandbox(sb),
+		ID:              sb.ID,
+		Spec:            spec,
+		Secrets:         secrets,
+		ExposedPorts:    clusterPortsFromSandbox(sb),
+		CustomHostnames: sandboxCustomHostnames(sb),
 	}
 }
 
