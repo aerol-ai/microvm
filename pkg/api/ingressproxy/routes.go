@@ -103,6 +103,15 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle(PathPrefix+"/{id}/{port}/{path...}", http.HandlerFunc(h.httpWake))
 }
 
+// RegisterTLSAsk mounts the on-demand TLS `ask` handler on mux. Called only
+// when SB_ENABLE_CUSTOM_DOMAINS=true. Kept separate from RegisterRoutes so
+// the wake-proxy listener stays usable when custom domains are off (and so
+// the caller controls construction of the TLSAskHandler, which the service
+// layer needs to hold a reference to for negative-cache eviction).
+func RegisterTLSAsk(mux *http.ServeMux, h *TLSAskHandler) {
+	mux.Handle(TLSAskPath, h)
+}
+
 type handlers struct {
 	deps  Deps
 	state *proxyState

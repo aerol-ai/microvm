@@ -60,6 +60,21 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, "snapshot name already in use")
 		return
 	}
+	// Custom-domain sentinels (plans/custom-domains.md). 412 distinguishes
+	// "this deployment can't do custom domains at all" (feature flag off /
+	// IP mode) from "your input is malformed" (400). 409 covers both the
+	// cross-sandbox hostname conflict and the IRON RULE (tcp/tls + custom
+	// domain on the same sandbox) and the per-sandbox cap.
+	if errors.Is(err, models.ErrCustomDomainNotSupported) {
+		WriteError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrCustomDomainProtocolConflict) ||
+		errors.Is(err, models.ErrCustomDomainPerSandboxCap) ||
+		errors.Is(err, store.ErrCustomDomainConflict) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	// Capacity rejections are 503 with a Retry-After hint so well-behaved
 	// clients (and load balancers) back off instead of treating it as a
 	// permanent 4xx. The error string already carries human-readable

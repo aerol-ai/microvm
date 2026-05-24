@@ -58,7 +58,15 @@ func (n *Noop) AddExposedPort(ctx context.Context, sandboxID string, port int, r
 }
 func (n *Noop) RemoveExposedPort(ctx context.Context, sandboxID string, port int) error { return nil }
 func (n *Noop) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute                { return nil }
-func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error             { return nil }
+func (n *Noop) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	return nil
+}
+func (n *Noop) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	return nil
+}
+func (n *Noop) CustomDomainsOf(sandboxID string) []string                   { return nil }
+func (n *Noop) ResolveCustomDomain(hostname string) (string, bool)          { return "", false }
+func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error { return nil }
 func (n *Noop) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	return nil
 }

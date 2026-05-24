@@ -468,6 +468,42 @@ func (c *Client) UnexposePort(ctx context.Context, id string, port int) error {
 	return c.doJSON(ctx, http.MethodDelete, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), nil, nil)
 }
 
+// customDomainsEnvelope mirrors the {"custom_domains":[...]} shape used by
+// both the add and list responses, so a single decoder handles both routes.
+type customDomainsEnvelope struct {
+	CustomDomains []models.CustomDomain `json:"custom_domains"`
+}
+
+// AddCustomDomain attaches an operator-provided public hostname to a sandbox.
+// Returns the full per-hostname row list so callers don't need a follow-up
+// GET to read the canonical (lowercased, dot-trimmed) hostname or initial
+// status. The server normalizes hostname; passing it verbatim is correct.
+func (c *Client) AddCustomDomain(ctx context.Context, id, hostname string) ([]models.CustomDomain, error) {
+	body := models.AddCustomDomainRequest{Hostname: hostname}
+	var response customDomainsEnvelope
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/custom-domains", body, &response); err != nil {
+		return nil, err
+	}
+	return response.CustomDomains, nil
+}
+
+// RemoveCustomDomain detaches a hostname. The hostname is URL-encoded so dots
+// and other DNS-legal characters survive the path round-trip; the server
+// re-normalizes (lowercase, trim trailing dot) before comparing.
+func (c *Client) RemoveCustomDomain(ctx context.Context, id, hostname string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+id+"/custom-domains/"+url.PathEscape(hostname), nil, nil)
+}
+
+// ListCustomDomains returns the per-hostname rows attached to a sandbox. Same
+// envelope shape as AddCustomDomain so one decoder serves both routes.
+func (c *Client) ListCustomDomains(ctx context.Context, id string) ([]models.CustomDomain, error) {
+	var response customDomainsEnvelope
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/custom-domains", nil, &response); err != nil {
+		return nil, err
+	}
+	return response.CustomDomains, nil
+}
+
 func (c *Client) Health(ctx context.Context) (HealthStatus, error) {
 	var response HealthStatus
 	err := c.doJSON(ctx, http.MethodGet, "/health", nil, &response)
@@ -497,6 +533,18 @@ func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, 
 
 func (s *Sandbox) ExposePort(ctx context.Context, port int, protocol string) (ExposeResult, error) {
 	return s.client.ExposePort(ctx, s.ID, port, protocol)
+}
+
+func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string) ([]models.CustomDomain, error) {
+	return s.client.AddCustomDomain(ctx, s.ID, hostname)
+}
+
+func (s *Sandbox) RemoveCustomDomain(ctx context.Context, hostname string) error {
+	return s.client.RemoveCustomDomain(ctx, s.ID, hostname)
+}
+
+func (s *Sandbox) ListCustomDomains(ctx context.Context) ([]models.CustomDomain, error) {
+	return s.client.ListCustomDomains(ctx, s.ID)
 }
 
 func (s *Sandbox) Start(ctx context.Context) error {

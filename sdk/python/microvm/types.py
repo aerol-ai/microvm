@@ -145,6 +145,10 @@ class CreateOptions(TypedDict, total=False):
     # Attach GPU resources to the sandbox. Omit for CPU-only workloads.
     # Not compatible with runtime="gvisor".
     gpus: GPUOptions
+    # Operator-provided public hostnames to attach to this sandbox at create
+    # time. Server-side cap: ``MaxCustomDomainsPerCreateRequest`` (5). Each
+    # host is normalized + validated; the server lowercases for you.
+    customDomains: List[str]
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -238,6 +242,29 @@ class ExposedPort(TypedDict, total=False):
     createdAt: str
 
 
+# Per-domain lifecycle state surfaced through the API. Mirrors
+# pkg/models/custom_domain.go::CustomDomainStatus on the server.
+# - "pending_dns": row exists, Caddy has not yet asked for the hostname.
+# - "issuing":     first ask hit, ACME flow started.
+# - "ready":       cert in shared storage, serving connections.
+# - "failed":      Caddy gave up on ACME for this host (see ``lastError``).
+CustomDomainStatus = Literal["pending_dns", "issuing", "ready", "failed"]
+
+
+class CustomDomain(TypedDict, total=False):
+    """Per-hostname row returned by the custom-domains endpoints.
+
+    Mirrors ``pkg/models.CustomDomain``. ``lastError`` is only present when
+    ``status == "failed"``.
+    """
+
+    hostname: str
+    status: CustomDomainStatus
+    lastError: str
+    createdAt: str
+    updatedAt: str
+
+
 class SandboxSnapshot(TypedDict, total=False):
     name: str
     image: str
@@ -290,6 +317,7 @@ class SandboxData(TypedDict, total=False):
     sshPublicKey: str
     sshPrivateKey: str
     exposedPorts: List[ExposedPort]
+    customDomains: List[CustomDomain]
     createdAt: str
     updatedAt: str
     lastActiveAt: str

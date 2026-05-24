@@ -183,6 +183,12 @@ pub struct CreateOptions {
     /// Not compatible with `runtime = "gvisor"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpus: Option<GPUOptions>,
+    /// Custom hostnames to attach to the sandbox at create time. Each entry
+    /// is server-normalized (lowercased, trailing dot stripped). Server-side
+    /// cap: `MaxCustomDomainsPerCreateRequest` (5). After create, manage the
+    /// list via [`Sandbox::add_custom_domain`] / [`Sandbox::remove_custom_domain`].
+    #[serde(rename = "custom_domains", skip_serializing_if = "Option::is_none")]
+    pub custom_domains: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -245,6 +251,44 @@ pub struct ExposedPort {
     pub public_url: String,
     #[serde(rename = "created_at")]
     pub created_at: String,
+}
+
+/// Per-domain lifecycle state surfaced through the API. Mirrors
+/// `pkg/models/custom_domain.go::CustomDomainStatus` on the server.
+/// - `PendingDns`: row exists, Caddy has not yet asked for the hostname.
+/// - `Issuing`: first ask hit, ACME flow started.
+/// - `Ready`: cert in shared storage, serving connections.
+/// - `Failed`: Caddy gave up on ACME for this host (see `last_error`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomDomainStatus {
+    PendingDns,
+    Issuing,
+    Ready,
+    Failed,
+}
+
+/// Per-hostname row returned by the custom-domains endpoints. Mirrors
+/// `pkg/models.CustomDomain`. `last_error` is only populated when
+/// `status == CustomDomainStatus::Failed`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomain {
+    pub hostname: String,
+    pub status: CustomDomainStatus,
+    #[serde(rename = "last_error", default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(rename = "created_at")]
+    pub created_at: String,
+    #[serde(rename = "updated_at")]
+    pub updated_at: String,
+}
+
+/// Wire envelope returned by the custom-domains endpoints — kept private;
+/// callers consume the public `Vec<CustomDomain>` instead.
+#[derive(Deserialize)]
+pub(crate) struct CustomDomainListWire {
+    #[serde(rename = "custom_domains", default)]
+    pub custom_domains: Vec<CustomDomain>,
 }
 
 /// Wire protocol an exposure publishes through.

@@ -1,6 +1,10 @@
 import { basename } from "node:path";
 
-import { PATH_PREFIX as V1_PATH_PREFIX } from "./api/v1/paths.js";
+import {
+  PATH_PREFIX as V1_PATH_PREFIX,
+  sandboxCustomDomainPath as v1SandboxCustomDomainPath,
+  sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
+} from "./api/v1/paths.js";
 import { Image } from "../Image.js";
 import type {
   BinaryLike,
@@ -8,6 +12,8 @@ import type {
   BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
+  CustomDomain,
+  CustomDomainStatus,
   ExecExitInfo,
   ExecRequest,
   ExecResult,
@@ -82,6 +88,18 @@ interface ApiExposePortResponse {
   public_url: string;
   host?: string;
   host_port?: number;
+}
+
+interface ApiCustomDomain {
+  hostname: string;
+  status: CustomDomainStatus;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ApiCustomDomainList {
+  custom_domains: ApiCustomDomain[];
 }
 
 interface ApiLifecycle {
@@ -487,6 +505,36 @@ export class APIClient {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}/ports/${port}`);
   }
 
+  /**
+   * Bind a custom hostname to a sandbox. The server lowercases the hostname
+   * and returns the post-add list of bindings (sorted by hostname). Calling
+   * with an already-registered hostname is idempotent and returns the
+   * existing list.
+   */
+  async addCustomDomain(id: string, hostname: string): Promise<CustomDomain[]> {
+    const response = await this.doJSON<ApiCustomDomainList>(
+      "POST",
+      v1SandboxCustomDomainsPath(this.versionPrefix, id),
+      { hostname },
+    );
+    return response.custom_domains.map(fromApiCustomDomain);
+  }
+
+  async listCustomDomains(id: string): Promise<CustomDomain[]> {
+    const response = await this.doJSON<ApiCustomDomainList>(
+      "GET",
+      v1SandboxCustomDomainsPath(this.versionPrefix, id),
+    );
+    return response.custom_domains.map(fromApiCustomDomain);
+  }
+
+  async removeCustomDomain(id: string, hostname: string): Promise<void> {
+    await this.doJSON<void>(
+      "DELETE",
+      v1SandboxCustomDomainPath(this.versionPrefix, id, hostname),
+    );
+  }
+
   async reconcile(): Promise<void> {
     await this.doJSON<unknown>("POST", this.versioned("/admin/reconcile"));
   }
@@ -658,6 +706,28 @@ export class SandboxResource implements Sandbox {
     await this.client.unexposePort(this.id, port);
   }
 
+  /**
+   * Per-sandbox custom-hostname bindings. Exposed as a namespaced accessor
+   * (rather than `addCustomDomain`/`removeCustomDomain`/`listCustomDomains`
+   * methods on the resource) so call sites read like
+   * `sandbox.customDomains.add("api.acme.com")`, mirroring the noun in the
+   * `/v1/.../custom-domains` URL space. A fresh object is returned per access
+   * so the closures always see the current `id` even after `refresh()`.
+   */
+  get customDomains(): {
+    add(hostname: string): Promise<CustomDomain[]>;
+    remove(hostname: string): Promise<void>;
+    list(): Promise<CustomDomain[]>;
+  } {
+    const client = this.client;
+    const id = this.id;
+    return {
+      add: (hostname: string) => client.addCustomDomain(id, hostname),
+      remove: (hostname: string) => client.removeCustomDomain(id, hostname),
+      list: () => client.listCustomDomains(id),
+    };
+  }
+
 	async createSnapshot(name: string): Promise<SandboxSnapshot> {
 		return this.client.createSnapshot(this.id, name);
 	}
@@ -724,6 +794,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     lifecycle: options.lifecycle ? toApiLifecycle(options.lifecycle) : undefined,
     failover: options.failover ? toApiFailover(options.failover) : undefined,
     runtime: options.runtime,
+    custom_domains: options.customDomains,
   };
 }
 
@@ -865,6 +936,16 @@ function fromApiSession(session: ApiSession): Session {
     recording: session.recording,
     bytes: session.bytes,
     attached: session.attached,
+  };
+}
+
+function fromApiCustomDomain(domain: ApiCustomDomain): CustomDomain {
+  return {
+    hostname: domain.hostname,
+    status: domain.status,
+    lastError: domain.last_error,
+    createdAt: domain.created_at,
+    updatedAt: domain.updated_at,
   };
 }
 

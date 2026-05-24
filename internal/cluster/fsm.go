@@ -23,18 +23,20 @@ import (
 type opCode uint8
 
 const (
-	opPlace             opCode = 1
-	opDelete            opCode = 2
-	opReassign          opCode = 3
-	opUpsertSpec        opCode = 4  // overwrite Placement.Spec without touching ownership
-	opAddExposedPort    opCode = 5  // record one (port, protocol) intent
-	opRemoveExposedPort opCode = 6  // drop one port intent
-	opReserve           opCode = 7  // hold capacity + name for a chosen owner before docker
-	opCancelReserve     opCode = 8  // release a pending reservation (rollback or TTL GC)
-	opSetNodeDrainState opCode = 9  // operator-set "exclude from placement" mark for a node
-	opOrphanOwner       opCode = 10 // atomically orphan all placements owned by a dead node
-	opClaimOrphan       opCode = 11 // reclaim an orphaned placement back to its previous owner
-	opReserveBatch      opCode = 12 // hold capacity + names for a create burst in one raft entry
+	opPlace              opCode = 1
+	opDelete             opCode = 2
+	opReassign           opCode = 3
+	opUpsertSpec         opCode = 4  // overwrite Placement.Spec without touching ownership
+	opAddExposedPort     opCode = 5  // record one (port, protocol) intent
+	opRemoveExposedPort  opCode = 6  // drop one port intent
+	opReserve            opCode = 7  // hold capacity + name for a chosen owner before docker
+	opCancelReserve      opCode = 8  // release a pending reservation (rollback or TTL GC)
+	opSetNodeDrainState  opCode = 9  // operator-set "exclude from placement" mark for a node
+	opOrphanOwner        opCode = 10 // atomically orphan all placements owned by a dead node
+	opClaimOrphan        opCode = 11 // reclaim an orphaned placement back to its previous owner
+	opReserveBatch       opCode = 12 // hold capacity + names for a create burst in one raft entry
+	opAddCustomDomain    opCode = 13 // bind one user hostname to a placement (cluster-wide unique)
+	opRemoveCustomDomain opCode = 14 // release one previously-bound hostname
 )
 
 // command is the wire format for one raft log entry. New writers externalize
@@ -78,6 +80,11 @@ type command struct {
 	// from SelectPlacement, false = uncordon). All other ops leave them zero.
 	NodeID  string `json:"node_id,omitempty"`
 	Drained bool   `json:"drained,omitempty"`
+	// Hostname carries the single custom-domain hostname for
+	// opAddCustomDomain/opRemoveCustomDomain. Callers MUST canonicalize
+	// (trim + lower-case) before encoding so the replicated index uses
+	// identical keys cluster-wide.
+	Hostname string `json:"hostname,omitempty"`
 
 	// Reservations is populated by opReserveBatch. The single opReserve fields
 	// above are retained for wire compatibility and the normal one-create path.
@@ -238,6 +245,13 @@ type placementFSM struct {
 	// no-drains steady state; cleared rows are deleted so the map size tracks
 	// active drains, not historical ones.
 	drainedNodes map[string]bool
+	// customHostnameIndex maps a canonical (lower-case, trimmed) hostname to
+	// the sandbox ID currently holding it. This is the cluster-wide TLS-ask
+	// answer source — ingress nodes that don't own a sandbox themselves can
+	// still resolve "is this hostname known?" in O(1) under the FSM read lock
+	// without scanning every placement. Rebuilt on Restore from the
+	// Placement.CustomHostnames slices so older snapshots still load cleanly.
+	customHostnameIndex map[string]string
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -308,6 +322,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationIDsByOwner: make(map[string]map[string]struct{}),
 		reservedIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
+		customHostnameIndex:          make(map[string]string),
 	}
 }
 
@@ -394,12 +409,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		secrets := applyCommandSecretUpdate(existing, exists, cmd)
 		var ports map[int]string
 		var portRoutes map[int]ExposedPortRoute
+		var customHostnames []string
 		if exists {
 			// Same preservation rule as Spec: opPlace is the "owner + spec"
 			// write and must not erase the port intents accumulated by
 			// opAddExposedPort calls between creates.
 			ports = existing.ExposedPorts
 			portRoutes = existing.ExposedPortRoutes
+			// Mirror the ExposedPorts preservation: a re-place / reservation
+			// promote must not drop user-bound hostnames that
+			// opAddCustomDomain installed earlier in the log.
+			customHostnames = existing.CustomHostnames
 		}
 		dataPlaneHost := cmd.OwnerDataPlaneHost
 		if dataPlaneHost == "" && exists {
@@ -431,6 +451,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			SealedSecrets:      secrets.LegacySealed,
 			ExposedPorts:       ports,
 			ExposedPortRoutes:  portRoutes,
+			CustomHostnames:    customHostnames,
 			// opPlace is the promotion path for reservations: writing the
 			// empty State here transitions a Reserved row back to Placed.
 			// ExpiresUnix is cleared by the zero-value as well so the GC
@@ -483,6 +504,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 		f.releaseShardLocked(cmd.SandboxID)
 		f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
+		f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
 		f.releasePendingReservationLocked(cmd.SandboxID)
 		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
@@ -493,6 +515,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
 			f.releaseShardLocked(cmd.SandboxID)
 			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
+			f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
 			f.releaseOwnerLocked(cmd.SandboxID, existing)
 			if existing.IsReserved() {
 				f.releasePendingReservationLocked(cmd.SandboxID)
@@ -572,6 +595,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			f.releaseNameLocked(id, placementName(existing))
 			f.releaseShardLocked(id)
+			f.releaseAllCustomHostnamesLocked(id, existing)
 			f.releasePendingReservationLocked(id)
 			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
 			f.deletePlacementRecoveryLocked(id)
@@ -736,6 +760,63 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
+		return nil
+	case opAddCustomDomain:
+		// Cluster-wide hostname uniqueness check. The service layer already
+		// rejects a same-sandbox duplicate locally, but two creates racing on
+		// different owners could both pass their local validation and end up
+		// at the FSM. The hostname index is the single tiebreaker — first
+		// committed log entry wins, the loser's owner returns
+		// ErrCustomHostnameConflict so the local row can roll back.
+		if cmd.SandboxID == "" || cmd.Hostname == "" {
+			return fmt.Errorf("placementFSM: opAddCustomDomain requires sandbox_id and hostname")
+		}
+		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+		if !exists {
+			// No row to attach the hostname to — the local create on the
+			// owner has either failed or hasn't promoted yet. Treat as no-op
+			// rather than error: the next AddCustomDomain after a successful
+			// create will redrive this safely (and the service layer never
+			// surfaces it to a user).
+			return nil
+		}
+		if owner, claimed := f.customHostnameIndex[cmd.Hostname]; claimed && owner != cmd.SandboxID {
+			return fmt.Errorf("%w: %q held by %s", ErrCustomHostnameConflict, cmd.Hostname, owner)
+		}
+		if existingHasHostname(existing, cmd.Hostname) {
+			// Idempotent re-add: the hostname is already on the placement
+			// and the index already points here. Skip the version bump.
+			return nil
+		}
+		existing.CustomHostnames = insertSortedHostname(existing.CustomHostnames, cmd.Hostname)
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+			return err
+		}
+		f.claimCustomHostnameLocked(cmd.SandboxID, cmd.Hostname)
+		return nil
+	case opRemoveCustomDomain:
+		if cmd.SandboxID == "" || cmd.Hostname == "" {
+			return fmt.Errorf("placementFSM: opRemoveCustomDomain requires sandbox_id and hostname")
+		}
+		existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+		if !exists {
+			// Stale replay against an already-deleted placement is harmless.
+			// Make sure the index doesn't still point at the now-gone id.
+			f.releaseCustomHostnameLocked(cmd.SandboxID, cmd.Hostname)
+			return nil
+		}
+		if !existingHasHostname(existing, cmd.Hostname) {
+			return nil
+		}
+		existing.CustomHostnames = removeHostname(existing.CustomHostnames, cmd.Hostname)
+		existing.Version = f.version
+		existing.UpdatedUnix = now
+		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
+			return err
+		}
+		f.releaseCustomHostnameLocked(cmd.SandboxID, cmd.Hostname)
 		return nil
 	case opSetNodeDrainState:
 		// Drain marks live in the FSM so an operator-issued drain persists past
@@ -1039,6 +1120,91 @@ func (f *placementFSM) releaseAllHostPortsLocked(sandboxID string, p Placement) 
 	for port, route := range exposedPortRoutesForPlacement(p) {
 		f.releaseHostPortLocked(sandboxID, port, route)
 	}
+}
+
+func (f *placementFSM) claimCustomHostnameLocked(sandboxID, hostname string) {
+	if sandboxID == "" || hostname == "" {
+		return
+	}
+	if f.customHostnameIndex == nil {
+		f.customHostnameIndex = make(map[string]string)
+	}
+	f.customHostnameIndex[hostname] = sandboxID
+}
+
+// releaseCustomHostnameLocked drops hostname from the secondary index when
+// sandboxID is the recorded owner. The owner guard prevents a stale release
+// from a since-orphaned-and-reclaimed sandbox from unmapping a new claim — the
+// same delete-then-place race that releaseNameLocked guards against.
+func (f *placementFSM) releaseCustomHostnameLocked(sandboxID, hostname string) {
+	if hostname == "" || f.customHostnameIndex == nil {
+		return
+	}
+	if owner, ok := f.customHostnameIndex[hostname]; ok && (sandboxID == "" || owner == sandboxID) {
+		delete(f.customHostnameIndex, hostname)
+	}
+}
+
+func (f *placementFSM) releaseAllCustomHostnamesLocked(sandboxID string, p Placement) {
+	for _, h := range p.CustomHostnames {
+		f.releaseCustomHostnameLocked(sandboxID, h)
+	}
+}
+
+// existingHasHostname reports whether hostname is already present in the
+// placement's hostname slice. Linear in the slice but the per-sandbox cap
+// (models.MaxCustomDomainsPerSandbox) bounds it tightly.
+func existingHasHostname(p Placement, hostname string) bool {
+	for _, h := range p.CustomHostnames {
+		if h == hostname {
+			return true
+		}
+	}
+	return false
+}
+
+// insertSortedHostname returns a new slice with hostname inserted in sorted
+// order. Sorted slices keep snapshot bytes deterministic across rebuilds and
+// give every node the same Caddy matcher order for free.
+func insertSortedHostname(existing []string, hostname string) []string {
+	if hostname == "" {
+		return existing
+	}
+	out := make([]string, 0, len(existing)+1)
+	inserted := false
+	for _, h := range existing {
+		if !inserted && hostname < h {
+			out = append(out, hostname)
+			inserted = true
+		}
+		if h == hostname {
+			// Defensive: existingHasHostname guards the caller, but if a
+			// stale path slipped through, return the unchanged sorted slice.
+			return existing
+		}
+		out = append(out, h)
+	}
+	if !inserted {
+		out = append(out, hostname)
+	}
+	return out
+}
+
+func removeHostname(existing []string, hostname string) []string {
+	for i, h := range existing {
+		if h != hostname {
+			continue
+		}
+		// Keep the slice sorted by splicing rather than swap-remove.
+		out := make([]string, 0, len(existing)-1)
+		out = append(out, existing[:i]...)
+		out = append(out, existing[i+1:]...)
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	return existing
 }
 
 func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port int, route ExposedPortRoute) error {
@@ -1402,6 +1568,37 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 		return Placement{}, false
 	}
 	return clonePlacement(p), true
+}
+
+// sandboxIDByCustomHostname returns the sandbox ID currently claiming
+// hostname in the replicated custom-domain index. hostname is matched
+// verbatim — callers are expected to canonicalize (lower-case, trim) before
+// looking up, matching how opAddCustomDomain stores it.
+func (f *placementFSM) sandboxIDByCustomHostname(hostname string) (string, bool) {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if hostname == "" {
+		return "", false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	id, ok := f.customHostnameIndex[hostname]
+	return id, ok
+}
+
+// customHostnamesForSandbox returns a sorted copy of the hostname set for
+// sandboxID, or nil when none. Callers must not mutate the returned slice;
+// it is cloned so a follow-up Apply doesn't perturb the snapshot a reader is
+// using.
+func (f *placementFSM) customHostnamesForSandbox(sandboxID string) []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	p, ok := f.placements[sandboxID]
+	if !ok || len(p.CustomHostnames) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.CustomHostnames))
+	copy(out, p.CustomHostnames)
+	return out
 }
 
 // sandboxIDByName returns the sandbox ID currently claiming name in the
@@ -1770,6 +1967,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
+	f.customHostnameIndex = make(map[string]string)
 	for id, p := range payload.Placements {
 		full := p
 		if full.SandboxID == "" {
@@ -1798,6 +1996,9 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		f.claimShardLocked(id)
 		for port, route := range exposedPortRoutesForPlacement(indexed) {
 			f.claimHostPortLocked(id, port, route)
+		}
+		for _, h := range indexed.CustomHostnames {
+			f.claimCustomHostnameLocked(id, h)
 		}
 		if indexed.IsReserved() {
 			f.claimPendingReservationLocked(id, indexed)
@@ -1877,6 +2078,9 @@ func cloneHotPlacement(p Placement) Placement {
 		}
 		p.ExposedPortRoutes = routes
 	}
+	if len(p.CustomHostnames) > 0 {
+		p.CustomHostnames = append([]string(nil), p.CustomHostnames...)
+	}
 	return p
 }
 
@@ -1902,6 +2106,9 @@ func clonePlacement(p Placement) Placement {
 			routes[k] = v
 		}
 		p.ExposedPortRoutes = routes
+	}
+	if len(p.CustomHostnames) > 0 {
+		p.CustomHostnames = append([]string(nil), p.CustomHostnames...)
 	}
 	return p
 }

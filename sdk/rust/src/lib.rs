@@ -23,13 +23,13 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 pub use image::Image;
 pub use types::CreateSandboxResponse;
-use types::ExposePortResponseWire;
+use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
-    BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions,
-    CreateSessionOptions, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, ExposeProtocol,
-    ExposeResult, ExposedPort, Failover, HealthStatus, Lifecycle, MountSpec, MountSpecRedacted,
-    MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth, ResizeOptions,
-    Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus,
+    BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions, CreateSessionOptions,
+    CustomDomain, CustomDomainStatus, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
+    ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, Lifecycle, MountSpec,
+    MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
+    ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus,
     SetNetworkLimitsOptions, UpdateLifecycleOptions,
 };
 
@@ -387,6 +387,24 @@ impl Sandbox {
 
     pub fn unexpose_port(&self, port: u16) -> Result<(), Error> {
         self.client.unexpose_port(&self.data.id, port)
+    }
+
+    /// Attach a custom hostname to this sandbox. Returns the post-add list
+    /// of bindings (sorted by hostname). Idempotent: calling with an
+    /// already-registered hostname returns the existing list.
+    pub fn add_custom_domain(&self, hostname: &str) -> Result<Vec<CustomDomain>, Error> {
+        self.client.add_custom_domain(&self.data.id, hostname)
+    }
+
+    /// List all custom hostnames currently bound to this sandbox.
+    pub fn list_custom_domains(&self) -> Result<Vec<CustomDomain>, Error> {
+        self.client.list_custom_domains(&self.data.id)
+    }
+
+    /// Detach a custom hostname from this sandbox. Idempotent: 204 on success
+    /// regardless of whether the hostname was registered.
+    pub fn remove_custom_domain(&self, hostname: &str) -> Result<(), Error> {
+        self.client.remove_custom_domain(&self.data.id, hostname)
     }
 
     pub fn start(&mut self) -> Result<&Self, Error> {
@@ -1109,6 +1127,48 @@ impl Client {
         )
     }
 
+    /// Register a custom hostname against `id`. Returns the post-add list of
+    /// bindings, sorted by hostname server-side. The hostname is forwarded
+    /// verbatim — the server lowercases and validates it.
+    pub fn add_custom_domain(
+        &self,
+        id: &str,
+        hostname: &str,
+    ) -> Result<Vec<CustomDomain>, Error> {
+        let body = serde_json::json!({ "hostname": hostname });
+        let wire = self.do_json::<Value, CustomDomainListWire>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/custom-domains", self.version_prefix(), id),
+            Some(&body),
+        )?;
+        Ok(wire.custom_domains)
+    }
+
+    /// Fetch the current list of custom hostnames bound to `id`.
+    pub fn list_custom_domains(&self, id: &str) -> Result<Vec<CustomDomain>, Error> {
+        let wire = self.do_json::<(), CustomDomainListWire>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/custom-domains", self.version_prefix(), id),
+            None,
+        )?;
+        Ok(wire.custom_domains)
+    }
+
+    /// Detach a custom hostname from `id`. The hostname is URL-encoded into
+    /// the path. Idempotent: returns Ok on 204 regardless of prior state.
+    pub fn remove_custom_domain(&self, id: &str, hostname: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!(
+                "{}/sandboxes/{}/custom-domains/{}",
+                self.version_prefix(),
+                id,
+                urlencoding::encode(hostname),
+            ),
+            None,
+        )
+    }
+
     fn full_url(&self, path: &str) -> String {
         format!("{}{}", self.api_url, path)
     }
@@ -1655,6 +1715,7 @@ mod tests {
             failover: None,
             runtime: None,
             gpus: None,
+            custom_domains: None,
         }
     }
 
@@ -2720,6 +2781,170 @@ mod tests {
             request2.starts_with("GET /v1/sandboxes HTTP/1.1\r\n"),
             "unexpected request: {}",
             request2
+        );
+    }
+
+    // Custom-domains: POST returns 201 with the post-add list envelope, body
+    // is `{"hostname": "..."}`, hostname is forwarded verbatim (server
+    // lowercases). Mirrors the TS/Python/Go SDK tests for the same endpoint.
+    #[test]
+    fn add_custom_domain_posts_hostname_and_returns_list() {
+        let body = serde_json::json!({
+            "custom_domains": [
+                {
+                    "hostname": "api.acme.com",
+                    "status": "pending_dns",
+                    "created_at": "2026-05-24T10:00:00Z",
+                    "updated_at": "2026-05-24T10:00:00Z"
+                }
+            ]
+        })
+        .to_string();
+        let (url, request_rx) =
+            spawn_response_server("201 Created", "application/json", body.into_bytes());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let domains = client
+            .add_custom_domain("sb-1", "api.acme.com")
+            .expect("add_custom_domain should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/custom-domains HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"hostname": "api.acme.com"})
+        );
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].hostname, "api.acme.com");
+        assert_eq!(domains[0].status, CustomDomainStatus::PendingDns);
+        assert!(domains[0].last_error.is_none());
+    }
+
+    #[test]
+    fn list_custom_domains_returns_envelope_contents() {
+        let body = serde_json::json!({
+            "custom_domains": [
+                {
+                    "hostname": "a.acme.com",
+                    "status": "ready",
+                    "created_at": "2026-05-24T10:00:00Z",
+                    "updated_at": "2026-05-24T10:00:00Z"
+                },
+                {
+                    "hostname": "b.acme.com",
+                    "status": "failed",
+                    "last_error": "no DNS",
+                    "created_at": "2026-05-24T10:00:00Z",
+                    "updated_at": "2026-05-24T10:00:00Z"
+                }
+            ]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let domains = client
+            .list_custom_domains("sb-1")
+            .expect("list_custom_domains should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("GET /v1/sandboxes/sb-1/custom-domains HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(domains.len(), 2);
+        assert_eq!(domains[0].status, CustomDomainStatus::Ready);
+        assert_eq!(domains[1].status, CustomDomainStatus::Failed);
+        assert_eq!(domains[1].last_error.as_deref(), Some("no DNS"));
+    }
+
+    // 204 No Content is the success path for DELETE — `do_json` already
+    // handles that case for `Result<(), Error>`. Hostname must be URL-encoded
+    // into the path so dots, hyphens, and uppercase survive intact.
+    #[test]
+    fn remove_custom_domain_url_encodes_and_accepts_no_content() {
+        let (url, request_rx) =
+            spawn_response_server("204 No Content", "application/json", Vec::new());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client
+            .remove_custom_domain("sb-1", "API.Acme.com")
+            .expect("remove_custom_domain should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        // urlencoding::encode preserves unreserved chars (letters, digits,
+        // '-', '_', '.', '~') so this hostname round-trips verbatim. The
+        // assertion still pins the encoded path so a regression that drops
+        // the helper or swaps in a stricter encoder is caught.
+        assert!(
+            request.starts_with(
+                "DELETE /v1/sandboxes/sb-1/custom-domains/API.Acme.com HTTP/1.1\r\n"
+            ),
+            "unexpected request: {}",
+            request
+        );
+    }
+
+    // 409 Conflict is the documented response when the hostname is already
+    // bound to a different sandbox. We just need to confirm it surfaces as an
+    // Api error carrying the server-supplied JSON `error` field — that's the
+    // contract handle_response promises for any 4xx.
+    #[test]
+    fn add_custom_domain_surfaces_409_conflict() {
+        let body = serde_json::json!({ "error": "hostname already in use" })
+            .to_string()
+            .into_bytes();
+        let (url, _request_rx) = spawn_response_server("409 Conflict", "application/json", body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client
+            .add_custom_domain("sb-1", "taken.acme.com")
+            .expect_err("add_custom_domain should fail on 409");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("409"),
+            "expected status in error: {}",
+            message
+        );
+        assert!(
+            message.contains("hostname already in use"),
+            "expected server message in error: {}",
+            message
+        );
+    }
+
+    // 412 Precondition Failed is what the server returns when the cluster
+    // hasn't finished bootstrapping TLS-on-demand yet. Same propagation path
+    // as 409 — we lock in the status code passes through.
+    #[test]
+    fn add_custom_domain_surfaces_412_precondition() {
+        let body = serde_json::json!({ "error": "tls-on-demand not ready" })
+            .to_string()
+            .into_bytes();
+        let (url, _request_rx) =
+            spawn_response_server("412 Precondition Failed", "application/json", body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client
+            .add_custom_domain("sb-1", "api.acme.com")
+            .expect_err("add_custom_domain should fail on 412");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("412"),
+            "expected status in error: {}",
+            message
+        );
+        assert!(
+            message.contains("tls-on-demand not ready"),
+            "expected server message in error: {}",
+            message
         );
     }
 }

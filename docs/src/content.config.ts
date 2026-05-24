@@ -210,6 +210,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'Port Allowlist',
         description: 'Require explicit exposure before public traffic reaches a sandbox port.',
       },
+      {
+        type: 'link',
+        href: '/custom-domains',
+        label: 'Custom Domains',
+        description: 'Attach arbitrary public hostnames to a sandbox with automatic per-host HTTPS via ACME.',
+      },
     ],
   },
   {

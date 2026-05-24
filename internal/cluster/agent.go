@@ -346,6 +346,49 @@ func (a *Agent) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute {
 	return exposedPortRoutesForPlacement(lookup.Placement)
 }
 
+// AddCustomDomain forwards to the cluster Apply pipe. hostname is canonicalized
+// here (the public Cluster wrapper does the same on the other path); the FSM
+// then enforces cluster-wide uniqueness.
+func (a *Agent) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if sandboxID == "" || hostname == "" {
+		return nil
+	}
+	return a.applyCommand(ctx, command{Op: opAddCustomDomain, SandboxID: sandboxID, Hostname: hostname})
+}
+
+func (a *Agent) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if sandboxID == "" || hostname == "" {
+		return nil
+	}
+	return a.applyCommand(ctx, command{Op: opRemoveCustomDomain, SandboxID: sandboxID, Hostname: hostname})
+}
+
+// CustomDomainsOf returns the hostnames bound to sandboxID. Agent doesn't run
+// the placement FSM locally, so this rides the same remote placement lookup
+// the existing ExposedPortsOf path uses — failure modes match: a transient
+// network blip yields nil, which the ingress reconciler treats as "no custom
+// matchers right now" until the placement subscription wakes a re-read.
+func (a *Agent) CustomDomainsOf(sandboxID string) []string {
+	lookup, ok, err := a.lookupPlacement(context.Background(), sandboxID)
+	if err != nil || !ok || len(lookup.Placement.CustomHostnames) == 0 {
+		return nil
+	}
+	out := make([]string, len(lookup.Placement.CustomHostnames))
+	copy(out, lookup.Placement.CustomHostnames)
+	return out
+}
+
+// ResolveCustomDomain returns ("", false) on agent nodes. A reverse-by-hostname
+// lookup endpoint isn't wired through yet (the TLS-ask handler is intended to
+// live alongside a node that runs raft locally — server/ingress roles).
+// See task #17 for adding a remote lookup if agent-role ingress becomes a
+// supported topology.
+func (a *Agent) ResolveCustomDomain(hostname string) (string, bool) {
+	return "", false
+}
+
 func (a *Agent) DeletePlacement(ctx context.Context, sandboxID string) error {
 	return a.applyCommand(ctx, command{Op: opDelete, SandboxID: sandboxID})
 }
@@ -433,12 +476,22 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 		case existing.Placement.OwnerNodeID == a.nodeID && !existing.Placement.IsOrphaned() && existing.Placement.IsReserved():
 			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 				firstErr = err
 			}
 			for port, route := range st.ExposedPorts {
 				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -453,6 +506,11 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 		case placementCanBeClaimedBy(existing.Placement, a.nodeID):
 			if err := a.ClaimOrphan(ctx, st.ID, st.Spec, st.Secrets); err != nil {
 				if firstErr == nil {
@@ -462,6 +520,11 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 			}
 			for port, route := range st.ExposedPorts {
 				if err := a.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			for _, hostname := range st.CustomHostnames {
+				if err := a.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

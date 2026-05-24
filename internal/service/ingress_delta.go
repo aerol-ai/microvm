@@ -73,16 +73,44 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 						return s.caddy.DeleteRouteByID(ctx, routeID)
 					},
 				}
+				// Per-custom-hostname SNI passthrough so cluster ingress on a
+				// non-owner node forwards `api.acme.com` straight to the owner's
+				// L4 TLS listener; the owner runs on-demand TLS and terminates
+				// locally. Hostnames come from the FSM (replicated by Raft) so
+				// every ingress node converges on the same matcher set without
+				// per-node state. Version is in the fingerprint so add/remove
+				// of a hostname triggers a single PATCH on the next delta tick.
+				for _, hostname := range p.CustomHostnames {
+					hostname := hostname
+					customRouteID := caddy.IngressCustomDomainSNIRouteID(p.SandboxID, hostname)
+					intents[ingressIntentKey(ingressSurfaceTLS, customRouteID)] = ingressRouteIntent{
+						key:         ingressIntentKey(ingressSurfaceTLS, customRouteID),
+						surface:     ingressSurfaceTLS,
+						routeID:     customRouteID,
+						fingerprint: ingressFingerprint("live-sni-custom", p.SandboxID, ownerHost, hostname, strconv.Itoa(tlsPeerPort), strconv.FormatUint(p.Version, 10)),
+						apply: func(ctx context.Context) error {
+							return s.caddy.UpsertSNIPassthroughRoute(ctx, customRouteID, hostname, ownerHost, tlsPeerPort)
+						},
+						delete: func(ctx context.Context) error {
+							return s.caddy.DeleteRouteByID(ctx, customRouteID)
+						},
+					}
+				}
 			}
 		} else {
 			routeID := "sandbox-" + p.SandboxID
+			// p.CustomHostnames is plumbed through for parity with
+			// UpsertSandboxRoute, but the IP-mode peer-forwarding path is
+			// path-based, not host-based; the service layer also rejects
+			// custom domains in IP mode, so this set is always empty today.
+			customHostnames := p.CustomHostnames
 			intents[ingressIntentKey(ingressSurfaceHTTP, routeID)] = ingressRouteIntent{
 				key:         ingressIntentKey(ingressSurfaceHTTP, routeID),
 				surface:     ingressSurfaceHTTP,
 				routeID:     routeID,
-				fingerprint: ingressFingerprint("live-http-sandbox", p.SandboxID, ownerHost, strconv.FormatUint(p.Version, 10)),
+				fingerprint: ingressFingerprint("live-http-sandbox", p.SandboxID, ownerHost, strings.Join(customHostnames, ","), strconv.FormatUint(p.Version, 10)),
 				apply: func(ctx context.Context) error {
-					return s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost)
+					return s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost, customHostnames)
 				},
 				delete: func(ctx context.Context) error {
 					return s.caddy.DeleteSandboxRoute(ctx, p.SandboxID)

@@ -206,6 +206,60 @@ func (h *handlers) unexposePort(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// addCustomDomain attaches a new operator-provided public hostname to a
+// sandbox. Body shape: {"hostname":"api.acme.com"}. Status codes follow the
+// custom-domain sentinels in pkg/api/apihttp.WriteStoreAwareError:
+// 412 = feature disabled / IP mode; 409 = hostname owned by another sandbox
+// or IRON RULE violation (tcp/tls coexistence); 400 = malformed hostname;
+// 404 = sandbox not found.
+func (h *handlers) addCustomDomain(w http.ResponseWriter, r *http.Request) {
+	var req models.AddCustomDomainRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	id := r.PathValue("id")
+	if err := h.deps.Service.AddCustomDomain(r.Context(), id, req.Hostname); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	// Return the full list back so callers don't need a follow-up GET to
+	// learn the canonical (lowercased, dot-trimmed) hostname or its initial
+	// status. Mirrors the createSandbox response shape.
+	domains, err := h.deps.Service.ListCustomDomains(r.Context(), id)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusCreated, map[string]any{"custom_domains": domains})
+}
+
+// removeCustomDomain detaches a hostname from a sandbox. {hostname} in the
+// path may be passed in any case — the service layer normalizes before
+// comparing. Cross-sandbox removal is rejected with 404 (the store scopes
+// the DELETE to (sandbox, hostname)).
+func (h *handlers) removeCustomDomain(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	hostname := r.PathValue("hostname")
+	if err := h.deps.Service.RemoveCustomDomain(r.Context(), id, hostname); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listCustomDomains returns the per-hostname rows attached to a sandbox.
+// Same shape the create response embeds in Sandbox.CustomDomains, so an SDK
+// can use one decoder for both surfaces.
+func (h *handlers) listCustomDomains(w http.ResponseWriter, r *http.Request) {
+	domains, err := h.deps.Service.ListCustomDomains(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"custom_domains": domains})
+}
+
 func (h *handlers) listMounts(w http.ResponseWriter, r *http.Request) {
 	mounts, err := h.deps.Service.ListMounts(r.Context(), r.PathValue("id"))
 	if err != nil {

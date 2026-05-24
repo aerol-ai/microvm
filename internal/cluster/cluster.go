@@ -122,6 +122,15 @@ var ErrMemberStillAlive = errors.New("cluster: raft member is still alive")
 // server and leaving the cluster with no quorum path.
 var ErrLastVoter = errors.New("cluster: cannot remove last raft voter")
 
+// ErrCustomHostnameConflict is returned when an opAddCustomDomain entry asks
+// the FSM to claim a hostname already held by a different sandbox. Maps to
+// the same 409 the local SQLite custom-domains insert returns — the FSM is
+// the cluster-wide tiebreaker that catches the race where two sandboxes on
+// different owners try to claim the same hostname concurrently. The
+// API/service layer surfaces this as models.ErrCustomDomainConflict after
+// reading the raft Apply result.
+var ErrCustomHostnameConflict = errors.New("cluster: custom hostname already in use")
+
 const (
 	// CreateBackpressureRetryAfterSeconds is the public Retry-After hint for
 	// queue/concurrency backpressure. Keep it short: these rejects are caused by
@@ -241,6 +250,17 @@ type Placement struct {
 	SealedSecrets     []byte                       `json:"sealed_secrets,omitempty"`
 	ExposedPorts      map[int]string               `json:"exposed_ports,omitempty"`
 	ExposedPortRoutes map[int]ExposedPortRoute     `json:"exposed_port_routes,omitempty"`
+	// CustomHostnames is the replicated set of user-bound hostnames pointing at
+	// this sandbox. Kept sorted and lower-cased so snapshot bytes are stable
+	// across rebuilds and every node derives the same Caddy matcher order. The
+	// FSM additionally maintains a hostname→sandboxID index so the TLS-ask
+	// resolver and ingress reconciler can look up ownership in O(1) from any
+	// node, including the ingress-only ones that don't run the local SQLite
+	// custom-domains table. Hostnames are added/removed via the
+	// opAddCustomDomain/opRemoveCustomDomain raft commands; opPlace preserves
+	// the existing slice the same way ExposedPorts is preserved so a
+	// re-place/reassign cannot erase domains a prior raft entry installed.
+	CustomHostnames []string `json:"custom_hostnames,omitempty"`
 	// State is empty for materialized placements (the historical schema) and
 	// PlacementStateReserved for capacity-only intents that have not yet been
 	// promoted by a successful local create. Reservations are eligible for
@@ -295,6 +315,13 @@ type LocalSandboxState struct {
 	Spec         *models.CreateSandboxRequest
 	Secrets      PlacementSecrets
 	ExposedPorts map[int]ExposedPortRoute
+	// CustomHostnames is the per-sandbox bound hostname set known to the
+	// local store. Carried through AssertOwnership so a sandbox created before
+	// the FSM learned about its hostnames (e.g. cluster mode enabled after the
+	// sandbox already had custom domains) backfills the replicated set on
+	// boot — without this a failover-recreate would lose the user's TLS
+	// matchers.
+	CustomHostnames []string
 }
 
 // PlacementTarget is returned by SelectPlacement.
@@ -448,6 +475,28 @@ type Client interface {
 	// ExposedPortsOf returns a copy of the replicated port route map for
 	// sandboxID, or nil if none. Used by the recreator and ingress reconciler.
 	ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute
+
+	// AddCustomDomain records intent that sandboxID owns hostname (already
+	// canonicalized lower-case) cluster-wide. Returns ErrCustomHostnameConflict
+	// when a different sandbox already holds it. Idempotent for the same
+	// (sandbox, hostname) pair so retries are safe.
+	AddCustomDomain(ctx context.Context, sandboxID, hostname string) error
+
+	// RemoveCustomDomain drops hostname from sandboxID's set. No-op when the
+	// hostname isn't claimed by this sandbox (the local row may already be
+	// gone after a Delete) so callers can retry without special-casing.
+	RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error
+
+	// CustomDomainsOf returns a copy of the replicated hostname set for
+	// sandboxID, or nil when no placement exists or the set is empty. The
+	// ingress reconciler uses it to populate Caddy matchers on every node.
+	CustomDomainsOf(sandboxID string) []string
+
+	// ResolveCustomDomain answers "which sandbox owns this hostname?" from
+	// the local FSM in O(1). Used by the TLS-ask handler on ingress nodes
+	// that may not own the sandbox row themselves. hostname is matched
+	// case-insensitively. Returns sandboxID, true when known.
+	ResolveCustomDomain(hostname string) (string, bool)
 
 	// DeletePlacement removes sandboxID from the FSM. Idempotent.
 	DeletePlacement(ctx context.Context, sandboxID string) error

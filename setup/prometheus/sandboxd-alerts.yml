@@ -230,3 +230,51 @@ groups:
           summary: "sandboxd secret decrypt errors are occurring"
           description: "Cluster recovery secret decrypts are failing. Verify credential encryption keys are identical on every node."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
+  - name: sandboxd.custom-domains
+    interval: 30s
+    rules:
+      # F3 — certmagic-s3 distributed lock held abnormally long. The lock is
+      # taken for the duration of the ACME flow; if a node dies mid-issuance
+      # the TTL drops it, but a masked partition can leave it stuck. >5m
+      # held indicates either LE backoff trouble or a stuck peer.
+      - alert: SandboxdACMELockStuck
+        expr: max(aerolvm_acme_lock_held_seconds) > 300
+        for: 2m
+        labels:
+          severity: warning
+          component: custom-domains
+        annotations:
+          summary: "sandboxd ACME issuance lock held > 5 minutes"
+          description: "A custom-domain ACME flow has held the certmagic-s3 lock for over 5 minutes. Issuance for the affected hostname is stalled until the lock releases."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
+      # F4 — the loopback ask listener can crash mid-process without taking
+      # the rest of sandboxd down. New HTTPS connections then fail TLS until
+      # restart. Absent asks while the process is up means the listener
+      # died. 2m gives the normal SNI traffic floor enough time to register.
+      - alert: SandboxdTLSAskListenerDown
+        expr: sum(rate(aerolvm_ask_requests_total[2m])) == 0 and on() up{job="sandboxd"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          component: custom-domains
+        annotations:
+          summary: "sandboxd TLS-ask listener has no traffic but process is up"
+          description: "No on-demand TLS ask requests have arrived in 2 minutes while sandboxd reports healthy. The internal ask listener may have crashed; new HTTPS handshakes for custom domains will fail until restart."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
+      # ACME budget burn — when the daemon-wide bucket throttles, a tenant
+      # is on track to exhaust the LE account limit for the whole cluster.
+      # 429s are silent at the user layer (Caddy retries); the operator
+      # needs the signal to intervene.
+      - alert: SandboxdACMEBudgetThrottling
+        expr: sum(rate(aerolvm_ask_requests_total{key="throttled"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: custom-domains
+        annotations:
+          summary: "sandboxd is throttling ACME issuance"
+          description: "The daemon-wide ACME budget is refusing new orders. Check sandboxd logs for the offending sandbox_id and investigate the misconfigured tenant."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"

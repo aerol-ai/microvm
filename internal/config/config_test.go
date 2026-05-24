@@ -67,6 +67,13 @@ func TestLoadCases(t *testing.T) {
 			"SB_L4_WAKE_DIRECT_BYPASS_ENABLED",
 			"SB_NETSTATS_POLL_INTERVAL",
 			"SB_RECONCILE_INTERVAL",
+			"SB_ENABLE_CUSTOM_DOMAINS",
+			"SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX",
+			"SB_TLS_ON_DEMAND_BURST",
+			"SB_TLS_ON_DEMAND_INTERVAL",
+			"SB_ACME_DAEMON_BUDGET_FRACTION",
+			"SB_ACME_DAEMON_BUDGET_WINDOW",
+			"SB_ACME_DAEMON_BUDGET_CAPACITY",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")
@@ -470,6 +477,114 @@ func TestLoadCases(t *testing.T) {
 				_, err := Load()
 				if err == nil || !strings.Contains(err.Error(), "SB_RECONCILE_INTERVAL") {
 					t.Fatalf("expected reconcile interval error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "custom_domains_default_off",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.EnableCustomDomains {
+					t.Fatalf("expected EnableCustomDomains default false, got true")
+				}
+				// Even with the gate off, the caps and TLS budget defaults
+				// should be populated so downstream code can read them
+				// without a feature-flag branch.
+				if cfg.CustomDomainsMaxPerSandbox != 25 {
+					t.Fatalf("expected default CustomDomainsMaxPerSandbox=25, got %d", cfg.CustomDomainsMaxPerSandbox)
+				}
+				if cfg.TLSOnDemandBurst != 5 {
+					t.Fatalf("expected default TLSOnDemandBurst=5, got %d", cfg.TLSOnDemandBurst)
+				}
+				if cfg.TLSOnDemandInterval != time.Minute {
+					t.Fatalf("expected default TLSOnDemandInterval=1m, got %s", cfg.TLSOnDemandInterval)
+				}
+			},
+		},
+		{
+			name: "custom_domains_requires_domain",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "true")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_DOMAIN") {
+					t.Fatalf("expected SB_DOMAIN required error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "custom_domains_enabled_with_domain",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "true")
+				t.Setenv("SB_DOMAIN", "aerol.cloud")
+				t.Setenv("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", "10")
+				t.Setenv("SB_TLS_ON_DEMAND_BURST", "3")
+				t.Setenv("SB_TLS_ON_DEMAND_INTERVAL", "30s")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if !cfg.EnableCustomDomains {
+					t.Fatalf("expected EnableCustomDomains=true")
+				}
+				if cfg.CustomDomainsMaxPerSandbox != 10 {
+					t.Fatalf("expected CustomDomainsMaxPerSandbox=10, got %d", cfg.CustomDomainsMaxPerSandbox)
+				}
+				if cfg.TLSOnDemandBurst != 3 {
+					t.Fatalf("expected TLSOnDemandBurst=3, got %d", cfg.TLSOnDemandBurst)
+				}
+				if cfg.TLSOnDemandInterval != 30*time.Second {
+					t.Fatalf("expected TLSOnDemandInterval=30s, got %s", cfg.TLSOnDemandInterval)
+				}
+			},
+		},
+		{
+			name: "custom_domains_rejects_zero_max_per_sandbox",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "true")
+				t.Setenv("SB_DOMAIN", "aerol.cloud")
+				t.Setenv("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX") {
+					t.Fatalf("expected SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "custom_domains_rejects_zero_tls_burst",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "true")
+				t.Setenv("SB_DOMAIN", "aerol.cloud")
+				t.Setenv("SB_TLS_ON_DEMAND_BURST", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_TLS_ON_DEMAND_BURST") {
+					t.Fatalf("expected SB_TLS_ON_DEMAND_BURST error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "custom_domains_rejects_zero_tls_interval",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "true")
+				t.Setenv("SB_DOMAIN", "aerol.cloud")
+				t.Setenv("SB_TLS_ON_DEMAND_INTERVAL", "0")
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), "SB_TLS_ON_DEMAND_INTERVAL") {
+					t.Fatalf("expected SB_TLS_ON_DEMAND_INTERVAL error, got %v", err)
 				}
 			},
 		},

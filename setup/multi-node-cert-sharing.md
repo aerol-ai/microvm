@@ -26,6 +26,13 @@ When **not** to pick this:
 This feature does NOT change SDK behaviour, sandbox URL shape, or the wire
 protocol. End users see no difference.
 
+> **Required for custom domains in multi-node clusters.** The per-hostname
+> ACME flow described in [Custom Domains](../docs/src/content/docs/custom-domains.mdx)
+> issues one cert per user-supplied hostname. Without shared S3 storage,
+> each ingress node would race to issue the same cert and burn through
+> Let's Encrypt's `new-orders` per-account budget. Enable this before
+> turning on `SB_ENABLE_CUSTOM_DOMAINS` on any cluster larger than one node.
+
 ---
 
 ## How it works
@@ -257,6 +264,18 @@ the plan.
 
 The economic cost of this feature is the operator's time to manage the
 encryption key, not the bucket itself.
+
+---
+
+## End-to-end verification
+
+The shared-storage cert-reuse guarantee is exercised end-to-end by
+`internal/service/custom_domains_e2e_test.go` (build tag `e2e`, run via
+`make test-acme-e2e`). It boots Pebble + localstack + Caddy in containers,
+runs sandboxd in-process, and asserts that a fresh Caddy pointed at the same
+S3 bucket reuses the cert rather than triggering a second ACME order. Requires
+a local Docker daemon; the first run pulls ~500 MB of images and builds Caddy
+via xcaddy (~30 s). Not in CI.
 
 ---
 

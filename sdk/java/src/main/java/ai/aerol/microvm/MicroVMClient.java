@@ -29,6 +29,7 @@ import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
+import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.ExecExitInfo;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
@@ -374,6 +375,61 @@ public class MicroVMClient {
         doNoContent("DELETE", sandboxPath(sandboxId) + "/ports/" + port, null);
     }
 
+    /**
+     * Attach an operator-supplied hostname to the sandbox's HTTP entrypoint.
+     * The server lowercases {@code hostname}, deduplicates against existing
+     * entries (so retries are safe), and returns the full attached-domain
+     * set. Newly added rows start in {@link ai.aerol.microvm.model.CustomDomainStatus#PENDING_DNS};
+     * Caddy advances them to {@code issuing} / {@code ready} once the
+     * operator's DNS resolves to the cluster.
+     */
+    public List<CustomDomain> addCustomDomain(String sandboxId, String hostname) {
+        CustomDomainListResponse response = doJson(
+            "POST",
+            sandboxPath(sandboxId) + "/custom-domains",
+            new AddCustomDomainRequest(hostname),
+            CustomDomainListResponse.class
+        );
+        if (response == null || response.customDomains == null) {
+            return Collections.emptyList();
+        }
+        return response.customDomains;
+    }
+
+    public List<CustomDomain> listCustomDomains(String sandboxId) {
+        CustomDomainListResponse response = doJson(
+            "GET",
+            sandboxPath(sandboxId) + "/custom-domains",
+            null,
+            CustomDomainListResponse.class
+        );
+        if (response == null || response.customDomains == null) {
+            return Collections.emptyList();
+        }
+        return response.customDomains;
+    }
+
+    public void removeCustomDomain(String sandboxId, String hostname) {
+        doNoContent(
+            "DELETE",
+            sandboxPath(sandboxId) + "/custom-domains/" + encodePathSegment(hostname),
+            null
+        );
+    }
+
+    static class AddCustomDomainRequest {
+        public final String hostname;
+
+        AddCustomDomainRequest(String hostname) {
+            this.hostname = hostname;
+        }
+    }
+
+    private static final class CustomDomainListResponse {
+        @com.fasterxml.jackson.annotation.JsonProperty("custom_domains")
+        public List<CustomDomain> customDomains;
+    }
+
     static class ExposePortRequest {
         public final String protocol;
 
@@ -633,6 +689,7 @@ public class MicroVMClient {
         copy.failover = source.failover;
         copy.runtime = source.runtime;
         copy.gpus = source.gpus;
+        copy.customDomains = source.customDomains;
         return copy;
     }
 

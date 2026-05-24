@@ -19,6 +19,7 @@ from .types import (
     BuildImageResult,
     CreateOptions,
     CreateSessionOptions,
+    CustomDomain,
     ExecExitInfo,
     ExecRequest,
     ExecResult,
@@ -328,6 +329,15 @@ class Sandbox:
 
     def unexpose_port(self, port: int) -> None:
         self._client.unexpose_port(self.id, port)
+
+    def add_custom_domain(self, hostname: str) -> List[CustomDomain]:
+        return self._client.add_custom_domain(self.id, hostname)
+
+    def list_custom_domains(self) -> List[CustomDomain]:
+        return self._client.list_custom_domains(self.id)
+
+    def remove_custom_domain(self, hostname: str) -> None:
+        self._client.remove_custom_domain(self.id, hostname)
 
     def start(self) -> "Sandbox":
         updated = self._client.start(self.id)
@@ -658,6 +668,40 @@ class MicroVM:
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
+    def add_custom_domain(self, sandbox_id: str, hostname: str) -> List[CustomDomain]:
+        """Attach a public hostname to a sandbox.
+
+        Returns the post-attach list of :class:`CustomDomain` rows so callers
+        can read the initial ``status`` (typically ``"pending_dns"``) without
+        a follow-up GET. Server lowercases the hostname; case is preserved
+        as-passed.
+        """
+        response = self._do_json(
+            "POST",
+            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains"),
+            {"hostname": hostname},
+        )
+        return _from_api_custom_domains_response(response)
+
+    def list_custom_domains(self, sandbox_id: str) -> List[CustomDomain]:
+        response = self._do_json(
+            "GET",
+            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains"),
+            None,
+        )
+        return _from_api_custom_domains_response(response)
+
+    def remove_custom_domain(self, sandbox_id: str, hostname: str) -> None:
+        # URL-encode the hostname segment — DNS labels never need it in
+        # practice, but IDN/punycode hosts ("xn--…") and any operator-supplied
+        # garbage we still want to send must survive an exact round-trip.
+        encoded = urllib.parse.quote(hostname, safe="")
+        self._do_json(
+            "DELETE",
+            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains/{encoded}"),
+            None,
+        )
+
     def _resolve_image(self, image: Any) -> str:
         if isinstance(image, Image):
             return self.build_image(image)
@@ -813,6 +857,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "mounts": [_to_api_mount_spec(item) for item in (_first_of(options, "mounts") or [])],
             "lifecycle": _to_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else None,
             "failover": _to_api_failover(failover) if isinstance(failover, dict) else None,
+            "custom_domains": _first_of(options, "customDomains", "custom_domains"),
         }
     )
 
@@ -906,6 +951,28 @@ def _from_api_exec_result(result: Dict[str, Any]) -> ExecResult:
         "exitCode": int(_first_of(result, "exit_code", "exitCode") or 0),
         "durationMS": int(_first_of(result, "duration_ms", "durationMS") or 0),
     }
+
+
+def _from_api_custom_domain(domain: Dict[str, Any]) -> CustomDomain:
+    result: CustomDomain = {
+        "hostname": str(_first_of(domain, "hostname") or ""),
+        "status": str(_first_of(domain, "status") or "pending_dns"),  # type: ignore[typeddict-item]
+        "createdAt": str(_first_of(domain, "created_at", "createdAt") or ""),
+        "updatedAt": str(_first_of(domain, "updated_at", "updatedAt") or ""),
+    }
+    last_error = _first_of(domain, "last_error", "lastError")
+    if last_error not in (None, ""):
+        result["lastError"] = str(last_error)
+    return result
+
+
+def _from_api_custom_domains_response(response: Any) -> List[CustomDomain]:
+    if not isinstance(response, dict):
+        return []
+    domains = _first_of(response, "custom_domains", "customDomains") or []
+    if not isinstance(domains, list):
+        return []
+    return [_from_api_custom_domain(item) for item in domains if isinstance(item, dict)]
 
 
 def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
@@ -1095,6 +1162,9 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     container_command = _first_of(sandbox, "container_command", "containerCommand")
     if isinstance(container_command, list) and len(container_command) > 0:
         result["containerCommand"] = [str(item) for item in container_command]
+    custom_domains = _first_of(sandbox, "custom_domains", "customDomains")
+    if isinstance(custom_domains, list) and len(custom_domains) > 0:
+        result["customDomains"] = [_from_api_custom_domain(item) for item in custom_domains if isinstance(item, dict)]
     return result
 
 

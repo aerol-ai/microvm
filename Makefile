@@ -1,7 +1,7 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt install-git-hooks test build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean
+.PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean
 
 fmt:
 	$(GO) fmt ./...
@@ -13,6 +13,12 @@ install-git-hooks:
 
 test:
 	$(GO) test ./...
+
+# Operator-runnable ACME end-to-end test. Requires a local Docker daemon;
+# pulls Pebble + localstack images and builds Caddy via xcaddy on first run.
+# Not wired into CI — gated by the e2e build tag.
+test-acme-e2e:
+	$(GO) test -tags=e2e -count=1 -timeout=10m ./internal/service -run TestACME
 
 build: build-sandboxd build-toolboxd
 

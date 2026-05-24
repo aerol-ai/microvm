@@ -433,6 +433,13 @@ type CreateSandboxRequest struct {
 	// Crossing the limit installs an egress DROP rule via the same primitive
 	// NetworkBlockAll uses.
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
+	// CustomDomains attaches operator-provided public hostnames to the
+	// sandbox at create time. Each hostname must resolve (via DNS) to the
+	// cluster's ingress host before HTTPS can serve traffic — see
+	// plans/custom-domains.md. Bare strings on the wire; the response shape
+	// (Sandbox.CustomDomains) carries per-hostname status. Capped by
+	// MaxCustomDomainsPerCreateRequest.
+	CustomDomains []string `json:"custom_domains,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -542,6 +549,10 @@ type Sandbox struct {
 	// is set. Cleared on manual StopSandbox and after a successful wake.
 	// Internal-only bookkeeping; never exposed over the wire.
 	WakeArmed bool `json:"-"`
+	// CustomDomains carries the per-hostname rows for any operator-attached
+	// public hostnames. Status is server-managed (pending_dns → issuing →
+	// ready / failed). Nil when the sandbox has no custom domains.
+	CustomDomains []CustomDomain `json:"custom_domains,omitempty"`
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.

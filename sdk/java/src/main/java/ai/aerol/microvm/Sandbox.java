@@ -3,6 +3,7 @@ package ai.aerol.microvm;
 import java.util.List;
 
 import ai.aerol.microvm.model.CreateSessionOptions;
+import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
@@ -107,6 +108,18 @@ public class Sandbox extends SandboxData {
 
     public void unexposePort(int port) {
         client.unexposePort(id, port);
+    }
+
+    public List<CustomDomain> addCustomDomain(String hostname) {
+        return client.addCustomDomain(id, hostname);
+    }
+
+    public List<CustomDomain> listCustomDomains() {
+        return client.listCustomDomains(id);
+    }
+
+    public void removeCustomDomain(String hostname) {
+        client.removeCustomDomain(id, hostname);
     }
 
     public Sandbox start() {

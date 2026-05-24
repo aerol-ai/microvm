@@ -173,7 +173,7 @@ func TestRouteCases(t *testing.T) {
 				fake := newFakeCaddy(t)
 
 				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
-				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.2", 2280); err != nil {
+				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.2", 2280, nil); err != nil {
 					t.Fatalf("UpsertSandboxRoute() error = %v", err)
 				}
 				if len(fake.records) != 2 {
@@ -200,7 +200,7 @@ func TestRouteCases(t *testing.T) {
 				fake.routes["sandbox-abc"] = map[string]any{"@id": "sandbox-abc", "stale": true}
 
 				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
-				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.5", 2280); err != nil {
+				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.5", 2280, nil); err != nil {
 					t.Fatalf("UpsertSandboxRoute() error = %v", err)
 				}
 				if len(fake.records) != 1 {
@@ -221,7 +221,7 @@ func TestRouteCases(t *testing.T) {
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
 				client := &Client{enabled: true, publicHost: "203.0.113.10", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
-				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.2", 2280); err != nil {
+				if err := client.UpsertSandboxRoute(context.Background(), "abc", "10.0.0.2", 2280, nil); err != nil {
 					t.Fatalf("UpsertSandboxRoute() error = %v", err)
 				}
 				route, ok := fake.routes["sandbox-abc"]
@@ -236,7 +236,7 @@ func TestRouteCases(t *testing.T) {
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
 				client := &Client{enabled: true, publicHost: "203.0.113.10", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
-				if err := client.UpsertSandboxRouteToPeer(context.Background(), "abc", "10.0.0.9"); err != nil {
+				if err := client.UpsertSandboxRouteToPeer(context.Background(), "abc", "10.0.0.9", nil); err != nil {
 					t.Fatalf("UpsertSandboxRouteToPeer() error = %v", err)
 				}
 				route, ok := fake.routes["sandbox-abc"]

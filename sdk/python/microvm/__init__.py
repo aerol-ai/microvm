@@ -3,6 +3,8 @@ from .image import Image
 from .types import (
     BuildImagePushOptions,
     BuildImageResult,
+    CustomDomain,
+    CustomDomainStatus,
     ExposeProtocol,
     ExposeResult,
     Failover,
@@ -13,6 +15,8 @@ from .types import (
 __all__ = [
     "BuildImagePushOptions",
     "BuildImageResult",
+    "CustomDomain",
+    "CustomDomainStatus",
     "Image",
     "MicroVM",
     "ExposeProtocol",

@@ -111,6 +111,23 @@ func Open(path string) (*Store, error) {
 			created_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
 		);`,
+		// sandbox_custom_domains attaches operator-provided public hostnames
+		// to a sandbox. hostname is the PRIMARY KEY: a hostname maps to
+		// exactly one sandbox at a time, and the PK rejects concurrent
+		// inserts the same way the host_port partial unique index does for
+		// the L4 TCP pool. status is the per-domain lifecycle state
+		// (pending_dns → issuing → ready / failed) surfaced through the API;
+		// last_error carries the surfaced reason on failed. FK CASCADE so
+		// destroying the sandbox releases every hostname in the same write.
+		`CREATE TABLE IF NOT EXISTS sandbox_custom_domains (
+			hostname TEXT PRIMARY KEY,
+			sandbox_id TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending_dns',
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+		);`,
 		// cluster_secrets is the local secret-reference backend used by
 		// cluster placement state. Placement rows store only ref/version; this
 		// table stores the opaque encrypted payload and recipient metadata.
@@ -208,6 +225,10 @@ func Open(path string) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
+		// Lookups by sandbox_id for ListCustomDomains and for the
+		// attachCustomDomainsBulk join. The PK on hostname already covers
+		// the ResolveCustomDomain hot path.
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_custom_domains_sandbox_id ON sandbox_custom_domains(sandbox_id);`,
 	}
 
 	for _, stmt := range stmts {
@@ -613,6 +634,12 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	}
 	sandbox.ExposedPorts = ports
 
+	customDomains, err := s.loadCustomDomains(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	sandbox.CustomDomains = customDomains
+
 	return sandbox, nil
 }
 
@@ -658,6 +685,9 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	// a fast no-op because we skip the query entirely.
 	if len(sandboxes) > 0 {
 		if err := s.attachPortsBulk(ctx, byID); err != nil {
+			return nil, err
+		}
+		if err := s.attachCustomDomainsBulk(ctx, byID); err != nil {
 			return nil, err
 		}
 	}
@@ -1737,6 +1767,238 @@ func (s *Store) DeletePort(ctx context.Context, sandboxID string, port int) erro
 	_, err := s.db.ExecContext(ctx, `DELETE FROM exposed_ports WHERE sandbox_id = ? AND port = ?`, sandboxID, port)
 	if err != nil {
 		return fmt.Errorf("delete exposed port: %w", err)
+	}
+	return nil
+}
+
+// ErrCustomDomainConflict is returned by AddCustomDomain when the hostname
+// is already owned by a different sandbox. Surfaced through the API as 409.
+// Same hostname for the same sandbox is idempotent (not a conflict) — that
+// lets retries and reconcile re-converge without surfacing spurious errors.
+var ErrCustomDomainConflict = errors.New("custom domain hostname already taken")
+
+// CustomDomainRow is the per-row representation read out of
+// sandbox_custom_domains. ListAllCustomDomains returns these so the
+// reconcile loop and the cluster FSM hydration can walk the full set.
+type CustomDomainRow struct {
+	Hostname  string
+	SandboxID string
+	Status    models.CustomDomainStatus
+	LastError string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// AddCustomDomain inserts a hostname → sandbox mapping. Returns
+// ErrCustomDomainConflict when the hostname is already owned by a different
+// sandbox; returns nil when the same (hostname, sandbox) pair already exists
+// (idempotent — the caller may retry safely). New rows start in
+// CustomDomainPendingDNS; existing rows are left in whatever state they hold.
+func (s *Store) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	if sandboxID == "" {
+		return errors.New("sandbox id is required")
+	}
+	if hostname == "" {
+		return errors.New("hostname is required")
+	}
+	now := time.Now().UTC()
+	// INSERT OR IGNORE collapses the "same pair already exists" case into a
+	// silent no-op so we can disambiguate cross-sandbox conflict from
+	// idempotent re-add with one follow-up SELECT. Same shape as the host_port
+	// reservation path — see TryReserveHostPort for the canonical rationale.
+	res, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO sandbox_custom_domains (
+			hostname, sandbox_id, status, last_error, created_at, updated_at
+		) VALUES (?, ?, ?, '', ?, ?)
+	`, hostname, sandboxID, string(models.CustomDomainPendingDNS), now, now)
+	if err != nil {
+		return fmt.Errorf("insert sandbox_custom_domains: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 1 {
+		return nil
+	}
+	// IGNORE swallowed a PK conflict. The existing row may belong to the same
+	// sandbox (idempotent re-add) or a different one (true conflict).
+	var owner string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id FROM sandbox_custom_domains WHERE hostname = ?
+	`, hostname).Scan(&owner); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Row vanished between INSERT IGNORE and SELECT (cascade delete).
+			// Treat as conflict so the caller does not assume success.
+			return ErrCustomDomainConflict
+		}
+		return fmt.Errorf("disambiguate custom domain insert: %w", err)
+	}
+	if owner == sandboxID {
+		return nil
+	}
+	return ErrCustomDomainConflict
+}
+
+// RemoveCustomDomain deletes the (sandbox, hostname) row. Cross-sandbox
+// removal is rejected — the API gets ErrNotFound rather than silently
+// stealing a hostname from another sandbox.
+func (s *Store) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	if sandboxID == "" || hostname == "" {
+		return ErrNotFound
+	}
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM sandbox_custom_domains WHERE hostname = ? AND sandbox_id = ?
+	`, hostname, sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete sandbox_custom_domains: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListCustomDomains returns the canonical-ordered rows for one sandbox.
+// Empty slice (nil) when the sandbox has no custom domains.
+func (s *Store) ListCustomDomains(ctx context.Context, sandboxID string) ([]models.CustomDomain, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT hostname, status, last_error, created_at, updated_at
+		FROM sandbox_custom_domains
+		WHERE sandbox_id = ?
+		ORDER BY hostname ASC
+	`, sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("list custom domains: %w", err)
+	}
+	defer rows.Close()
+
+	var out []models.CustomDomain
+	for rows.Next() {
+		var cd models.CustomDomain
+		var status string
+		if err := rows.Scan(&cd.Hostname, &status, &cd.LastError, &cd.CreatedAt, &cd.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan custom domain: %w", err)
+		}
+		cd.Status = models.CustomDomainStatus(status)
+		out = append(out, cd)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate custom domains: %w", err)
+	}
+	return out, nil
+}
+
+// ListAllCustomDomains returns every row in the table. Used by the reconcile
+// loop's matcher-GC pass and by the cluster FSM hydration on cold start.
+// Ordered by hostname so reconcile diffs are stable across calls.
+func (s *Store) ListAllCustomDomains(ctx context.Context) ([]CustomDomainRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT hostname, sandbox_id, status, last_error, created_at, updated_at
+		FROM sandbox_custom_domains
+		ORDER BY hostname ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list all custom domains: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CustomDomainRow
+	for rows.Next() {
+		var r CustomDomainRow
+		var status string
+		if err := rows.Scan(&r.Hostname, &r.SandboxID, &status, &r.LastError, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan custom domain row: %w", err)
+		}
+		r.Status = models.CustomDomainStatus(status)
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate all custom domains: %w", err)
+	}
+	return out, nil
+}
+
+// ResolveCustomDomain is the hot path for the TLSAsk handler — single PK
+// lookup, no scan. Returns ErrNotFound for unknown hostnames so the handler
+// can fold it into a 403 without an error log on the success path.
+func (s *Store) ResolveCustomDomain(ctx context.Context, hostname string) (string, error) {
+	if hostname == "" {
+		return "", ErrNotFound
+	}
+	var sandboxID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id FROM sandbox_custom_domains WHERE hostname = ?
+	`, hostname).Scan(&sandboxID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("resolve custom domain: %w", err)
+	}
+	return sandboxID, nil
+}
+
+// SetCustomDomainStatus updates the per-domain state machine. Idempotent —
+// repeated calls with the same (status, lastError) are still write-once on
+// updated_at, which the caller may use as a heartbeat for "we saw an ask for
+// this host". Returns ErrNotFound when the hostname is unknown so a caller
+// observing an issuance failure for a since-removed host gets a clean signal.
+func (s *Store) SetCustomDomainStatus(ctx context.Context, hostname string, status models.CustomDomainStatus, lastError string) error {
+	if hostname == "" {
+		return ErrNotFound
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE sandbox_custom_domains
+		SET status = ?, last_error = ?, updated_at = ?
+		WHERE hostname = ?
+	`, string(status), lastError, time.Now().UTC(), hostname)
+	if err != nil {
+		return fmt.Errorf("update custom domain status: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// loadCustomDomains is the single-sandbox sibling of attachCustomDomainsBulk,
+// called from Get. Mirrors loadPorts's shape so callers can read the two
+// collections side-by-side without thinking about transaction nesting.
+func (s *Store) loadCustomDomains(ctx context.Context, sandboxID string) ([]models.CustomDomain, error) {
+	return s.ListCustomDomains(ctx, sandboxID)
+}
+
+// attachCustomDomainsBulk reads every sandbox_custom_domains row for any
+// sandbox in byID with one query and writes it onto the matching sandbox.
+// Same shape as attachPortsBulk: the table only carries rows for sandboxes
+// that have ever attached a custom domain, so the full-table scan is cheap
+// in practice. Switch to a chunked WHERE sandbox_id IN (...) if the table
+// ever crosses ~100k rows.
+func (s *Store) attachCustomDomainsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sandbox_id, hostname, status, last_error, created_at, updated_at
+		FROM sandbox_custom_domains
+		ORDER BY sandbox_id, hostname ASC
+	`)
+	if err != nil {
+		return fmt.Errorf("load custom domains: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sandboxID string
+		var cd models.CustomDomain
+		var status string
+		if err := rows.Scan(&sandboxID, &cd.Hostname, &status, &cd.LastError, &cd.CreatedAt, &cd.UpdatedAt); err != nil {
+			return fmt.Errorf("scan custom domain: %w", err)
+		}
+		cd.Status = models.CustomDomainStatus(status)
+		if sb, ok := byID[sandboxID]; ok {
+			sb.CustomDomains = append(sb.CustomDomains, cd)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate custom domains: %w", err)
 	}
 	return nil
 }

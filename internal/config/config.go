@@ -129,6 +129,45 @@ type Config struct {
 	// EnsureSandboxAwakeForHTTP). Acts as a rollout gate, not a per-sandbox
 	// toggle.
 	EnableServerless bool
+	// EnableCustomDomains gates the operator-attached public hostname
+	// feature. False (default) makes the v1 custom-domain routes return 412
+	// Precondition Failed and the install-time Caddy config push omit the
+	// on-demand TLS policy. Acts as a rollout switch, not a per-sandbox
+	// toggle — same shape as EnableServerless. Requires SB_DOMAIN to be
+	// set; the validator rejects EnableCustomDomains=true in IP mode.
+	EnableCustomDomains bool
+	// CustomDomainsMaxPerSandbox caps how many custom hostnames a single
+	// sandbox can carry. Bounds the Caddy host-list fan-out per route and
+	// the ACME burst when a sandbox is started for the first time. Default
+	// 25; the per-create-request cap (set in pkg/models) is stricter to
+	// avoid bursting issuance from one API call.
+	CustomDomainsMaxPerSandbox int
+	// TLSOnDemandBurst is the Caddy on-demand TLS policy's per-interval
+	// burst (matches the JSON shape `rate_limit.burst`). Bounds simultaneous
+	// ACME orders Caddy will start before throttling. Default 5; the
+	// daemon-wide ACME budget (acme_budget.go) is the second layer.
+	TLSOnDemandBurst int
+	// TLSOnDemandInterval is the Caddy on-demand TLS policy's refill
+	// interval (`rate_limit.interval`). Default 1m.
+	TLSOnDemandInterval time.Duration
+	// ACMEDaemonBudgetFraction is the high-water mark on the daemon-wide
+	// ACME issuance bucket — when usage crosses this fraction of Let's
+	// Encrypt's published `new-orders` limit (300 / 3h), TLSAsk returns
+	// 429 with Retry-After. 0.8 leaves headroom for cert renewals already
+	// in flight. A misbehaving tenant burning the quota gets logged with
+	// `sandbox_id` so the operator can intervene. The bucket is per-node;
+	// LE limits are per-account, and the certmagic-s3 distributed lock
+	// already serialises issuance across nodes.
+	ACMEDaemonBudgetFraction float64
+	// ACMEDaemonBudgetWindow is the LE rolling window. Default 3h —
+	// matches the public per-account `new-orders` cap. Exposed only so
+	// staging Pebble runs (T1A) can tighten it for tests; do not change
+	// in production without a corresponding ACME directory change.
+	ACMEDaemonBudgetWindow time.Duration
+	// ACMEDaemonBudgetCapacity is the LE per-account `new-orders` cap
+	// applied to the bucket. Default 300 — the published LE limit. See
+	// ACMEDaemonBudgetWindow note about overrides.
+	ACMEDaemonBudgetCapacity int
 	// InternalIngressAddr is the loopback-only listen address for the
 	// wake-aware HTTP ingress proxy. Caddy dials this address from
 	// wake-aware HTTP port routes; it must NOT be exposed publicly.
@@ -643,6 +682,13 @@ func Load() (Config, error) {
 		EnableEventMonitor:               getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                 getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                 getEnvBool("SB_ENABLE_SERVERLESS", true),
+		EnableCustomDomains:              getEnvBool("SB_ENABLE_CUSTOM_DOMAINS", false),
+		CustomDomainsMaxPerSandbox:       getEnvInt("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", models.MaxCustomDomainsPerSandbox),
+		TLSOnDemandBurst:                 getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
+		TLSOnDemandInterval:              getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
+		ACMEDaemonBudgetFraction:         getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
+		ACMEDaemonBudgetWindow:           getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
+		ACMEDaemonBudgetCapacity:         getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
 		InternalIngressAddr:              getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
 		InternalL4WakeAddr:               getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
 		InternalL4WakeDir:                getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
@@ -988,6 +1034,39 @@ func Load() (Config, error) {
 			if cfg.ReconcileInterval <= 0 {
 				return Config{}, errors.New("SB_RECONCILE_INTERVAL must be > 0 when direct-route bypass is enabled")
 			}
+		}
+	}
+
+	if cfg.EnableCustomDomains {
+		// Custom-domain ingress relies on a wildcard cert under Domain and a
+		// distinguishable apex to reject base-domain collisions. Without
+		// Domain set, NormalizeCustomDomain can't enforce the "not under base"
+		// rule and Caddy can't pick between wildcard vs on-demand TLS.
+		if strings.TrimSpace(cfg.Domain) == "" {
+			return Config{}, errors.New("SB_DOMAIN must be set when SB_ENABLE_CUSTOM_DOMAINS=true")
+		}
+		if cfg.CustomDomainsMaxPerSandbox <= 0 {
+			return Config{}, errors.New("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX must be > 0 when SB_ENABLE_CUSTOM_DOMAINS=true")
+		}
+		if cfg.TLSOnDemandBurst <= 0 {
+			return Config{}, errors.New("SB_TLS_ON_DEMAND_BURST must be > 0 when SB_ENABLE_CUSTOM_DOMAINS=true")
+		}
+		if cfg.TLSOnDemandInterval <= 0 {
+			return Config{}, errors.New("SB_TLS_ON_DEMAND_INTERVAL must be > 0 when SB_ENABLE_CUSTOM_DOMAINS=true")
+		}
+		// Budget bounds: a zero/negative fraction would mean "always refuse"
+		// or "never refuse", neither of which is a useful operating mode. A
+		// fraction >= 1 disables the safety margin against renewals already
+		// in flight and risks hitting LE's hard limit. Capacity and window
+		// must be positive or the bucket math divides by zero.
+		if cfg.ACMEDaemonBudgetFraction <= 0 || cfg.ACMEDaemonBudgetFraction >= 1 {
+			return Config{}, errors.New("SB_ACME_DAEMON_BUDGET_FRACTION must be in (0, 1) when SB_ENABLE_CUSTOM_DOMAINS=true")
+		}
+		if cfg.ACMEDaemonBudgetCapacity <= 0 {
+			return Config{}, errors.New("SB_ACME_DAEMON_BUDGET_CAPACITY must be > 0 when SB_ENABLE_CUSTOM_DOMAINS=true")
+		}
+		if cfg.ACMEDaemonBudgetWindow <= 0 {
+			return Config{}, errors.New("SB_ACME_DAEMON_BUDGET_WINDOW must be > 0 when SB_ENABLE_CUSTOM_DOMAINS=true")
 		}
 	}
 

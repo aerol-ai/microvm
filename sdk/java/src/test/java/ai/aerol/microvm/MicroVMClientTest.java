@@ -29,6 +29,8 @@ import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
+import ai.aerol.microvm.model.CustomDomain;
+import ai.aerol.microvm.model.CustomDomainStatus;
 import ai.aerol.microvm.model.ExecExitInfo;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
@@ -914,6 +916,134 @@ class MicroVMClientTest {
             client.list(null);
             assertEquals(null, seenQuery.get());
             assertEquals(3, calls.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void customDomainsAddListAndRemoveMapApiShapes() throws Exception {
+        AtomicReference<Map<String, Object>> addBody = new AtomicReference<>();
+        AtomicReference<String> deletePath = new AtomicReference<>();
+        AtomicInteger deleteCalls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("POST".equals(method) && "/v1/sandboxes/sb-1/custom-domains".equals(path)) {
+                addBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 201, mapOf(
+                    "custom_domains", List.of(mapOf(
+                        "hostname", "api.acme.com",
+                        "status", "pending_dns",
+                        "created_at", "2026-05-24T10:00:00Z",
+                        "updated_at", "2026-05-24T10:00:00Z"
+                    ))
+                ));
+                return;
+            }
+            if ("GET".equals(method) && "/v1/sandboxes/sb-1/custom-domains".equals(path)) {
+                writeJson(exchange, 200, mapOf(
+                    "custom_domains", List.of(
+                        mapOf(
+                            "hostname", "api.acme.com",
+                            "status", "ready",
+                            "created_at", "2026-05-24T10:00:00Z",
+                            "updated_at", "2026-05-24T10:05:00Z"
+                        ),
+                        mapOf(
+                            "hostname", "app.acme.com",
+                            "status", "failed",
+                            "last_error", "no DNS",
+                            "created_at", "2026-05-24T10:00:00Z",
+                            "updated_at", "2026-05-24T10:05:00Z"
+                        )
+                    )
+                ));
+                return;
+            }
+            if ("DELETE".equals(method) && path.startsWith("/v1/sandboxes/sb-1/custom-domains/")) {
+                deletePath.set(path);
+                deleteCalls.incrementAndGet();
+                writeResponse(exchange, 204, "application/json", new byte[0]);
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+
+            List<CustomDomain> added = sandbox.addCustomDomain("api.acme.com");
+            assertEquals(1, added.size());
+            assertEquals("api.acme.com", added.get(0).hostname);
+            assertEquals(CustomDomainStatus.PENDING_DNS, added.get(0).status);
+            assertEquals("api.acme.com", addBody.get().get("hostname"));
+
+            List<CustomDomain> listed = sandbox.listCustomDomains();
+            assertEquals(2, listed.size());
+            assertEquals(CustomDomainStatus.READY, listed.get(0).status);
+            assertEquals(CustomDomainStatus.FAILED, listed.get(1).status);
+            assertEquals("no DNS", listed.get(1).lastError);
+
+            // Hostname with a space-y / colon-y character to prove URL-encoding.
+            sandbox.removeCustomDomain("API.acme.com");
+            assertEquals("/v1/sandboxes/sb-1/custom-domains/API.acme.com", deletePath.get());
+
+            sandbox.removeCustomDomain("a b.example.com");
+            assertEquals("/v1/sandboxes/sb-1/custom-domains/a%20b.example.com", deletePath.get());
+
+            assertEquals(2, deleteCalls.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void addCustomDomainSurfacesServerError() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            writeJson(exchange, 409, mapOf("error", "hostname already attached to sandbox sb-other"));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException error = assertThrows(MicroVMException.class, () -> client.addCustomDomain("sb-1", "api.acme.com"));
+            assertTrue(error.getMessage().contains("already attached"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createIncludesCustomDomainsWhenSet() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-cd",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "public_url", "https://sb-cd.example.com",
+                "cpu", 1,
+                "memory_mb", 512,
+                "disk_gb", 10,
+                "os_user", "root",
+                "network_block_all", false,
+                "toolbox_enabled", true,
+                "exposed_ports", List.of(),
+                "created_at", "2026-05-24T10:00:00Z",
+                "updated_at", "2026-05-24T10:00:00Z",
+                "last_active_at", "2026-05-24T10:00:00Z"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            client.create(new CreateOptions()
+                .setImage("ubuntu:22.04")
+                .setCustomDomains(List.of("api.acme.com", "app.acme.com")));
+            assertEquals(List.of("api.acme.com", "app.acme.com"), requestBody.get().get("custom_domains"));
         } finally {
             server.stop(0);
         }

@@ -527,6 +527,46 @@ func (c *Cluster) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute {
 	return exposedPortRoutesForPlacement(p)
 }
 
+// AddCustomDomain replicates a sandbox→hostname binding through raft so every
+// node can answer the TLS-ask probe and install the matching Caddy matcher.
+// hostname is canonicalized (trim + lower) here so callers don't have to
+// remember to do it themselves — the local SQLite layer already trims.
+// Idempotent for the same (sandbox, hostname) pair; returns
+// ErrCustomHostnameConflict when the hostname is held by a different sandbox.
+func (c *Cluster) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if sandboxID == "" || hostname == "" {
+		return nil
+	}
+	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	return c.applyCommand(ctx, cmd)
+}
+
+// RemoveCustomDomain releases the binding. Idempotent — a stale call after a
+// successful DeletePlacement is a no-op.
+func (c *Cluster) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if sandboxID == "" || hostname == "" {
+		return nil
+	}
+	cmd := command{Op: opRemoveCustomDomain, SandboxID: sandboxID, Hostname: hostname}
+	return c.applyCommand(ctx, cmd)
+}
+
+// CustomDomainsOf returns a sorted copy of the hostnames bound to sandboxID,
+// or nil when none. Used by the ingress reconciler so a peer-owned sandbox
+// still gets its TLS matchers installed in the local Caddy.
+func (c *Cluster) CustomDomainsOf(sandboxID string) []string {
+	return c.fsm.customHostnamesForSandbox(sandboxID)
+}
+
+// ResolveCustomDomain answers the TLS-ask probe from the local FSM index in
+// O(1). Returns sandboxID, true when the hostname is bound somewhere in the
+// cluster; false otherwise. hostname is canonicalized inside the FSM.
+func (c *Cluster) ResolveCustomDomain(hostname string) (string, bool) {
+	return c.fsm.sandboxIDByCustomHostname(hostname)
+}
+
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
 func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	cmd := command{Op: opDelete, SandboxID: sandboxID}
@@ -837,6 +877,11 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 
 		case existing.OwnerNodeID == c.nodeID && !existing.IsOrphaned() && existing.IsReserved():
 			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
@@ -847,11 +892,18 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 					firstErr = err
 				}
 			}
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 
 		case existing.OwnerNodeID == c.nodeID && !existing.IsOrphaned():
 			// We legitimately own it. Backfill any missing spec/secrets so
 			// future failover-recreate has everything it needs (closes the
-			// pre-cluster-sandbox limitation), then replay port intents.
+			// pre-cluster-sandbox limitation), then replay port + hostname
+			// intents. The FSM treats already-bound (sandbox, hostname) pairs
+			// as idempotent no-ops, so re-replaying every boot is cheap.
 			if existing.Spec == nil && st.Spec != nil {
 				if err := c.UpsertSpec(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
 					firstErr = err
@@ -859,6 +911,11 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			for port, route := range st.ExposedPorts {
 				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -872,6 +929,16 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 			}
 			for port, route := range st.ExposedPorts {
 				if err := c.AddExposedPort(ctx, st.ID, port, route); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			// Failover claim: the new owner replays hostnames from local
+			// truth. AddCustomDomain at the FSM is the uniqueness gate, so
+			// a hostname still claimed by a dead prior owner stays with the
+			// stale row until that row is reaped; the next AssertOwnership
+			// pass after reap succeeds.
+			for _, hostname := range st.CustomHostnames {
+				if err := c.AddCustomDomain(ctx, st.ID, hostname); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}

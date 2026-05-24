@@ -1,0 +1,41 @@
+{
+  "admin": {"listen": "0.0.0.0:2019"},
+  "storage": {
+    "module": "s3",
+    "host": "{{.S3Endpoint}}",
+    "bucket": "{{.S3Bucket}}",
+    "access_id": "{{.AKID}}",
+    "secret_key": "{{.Secret}}",
+    "prefix": "caddy",
+    "insecure": true,
+    "use_iam_provider": false
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":443"],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [{"dial": "{{.UpstreamAddr}}"}]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [],
+        "on_demand": {
+          "rate_limit": {"interval": "5s", "burst": 5},
+          "ask": "http://placeholder/internal/tls-ask"
+        }
+      }
+    }
+  }
+}

@@ -41,6 +41,9 @@ func TestRegisterRoutesAllUseV1Prefix(t *testing.T) {
 		{method: http.MethodPost, path: "/v1/sandboxes/abc/snapshot"},
 		{method: http.MethodGet, path: "/v1/sandboxes/abc/sessions"},
 		{method: http.MethodGet, path: "/v1/sandboxes/abc/toolbox/foo"},
+		{method: http.MethodPost, path: "/v1/sandboxes/abc/custom-domains"},
+		{method: http.MethodGet, path: "/v1/sandboxes/abc/custom-domains"},
+		{method: http.MethodDelete, path: "/v1/sandboxes/abc/custom-domains/api.acme.com"},
 	}
 	for _, probe := range probes {
 		req, _ := http.NewRequest(probe.method, probe.path, nil)
