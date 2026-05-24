@@ -4,14 +4,12 @@ title: Custom Domains
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Attach an arbitrary public hostname (`api.acme.com`, `acme.com`) to a sandbox so traffic to that host reaches the sandbox's root service over HTTPS. Certificates are issued automatically per hostname via ACME HTTP-01 — the wildcard cert that covers `*.<SB_DOMAIN>` is **not** reused.
+Attach an arbitrary public hostname (`api.acme.com`, `acme.com`) to a sandbox so traffic to that host reaches the sandbox's root service over HTTPS. 
 
 ## Prerequisites
 
-1. **Domain mode is required.** The server must be started with `SB_DOMAIN` set. In IP / path-mode deployments the API returns `412 Precondition Failed`.
-2. **DNS must already point at the cluster's ingress host.** Create a `CNAME` (or `ALIAS` / `ANAME` for apex) from the custom hostname to the same target your sandbox URLs resolve to. AerolVM does not host DNS; if the record is missing when the first HTTPS request arrives, ACME issuance will fail and the domain stays in `issuing` until DNS is fixed.
-3. **Port 80 must be reachable from Let's Encrypt.** Issuance uses HTTP-01, so LE's validation servers need to reach `http://<host>/.well-known/acme-challenge/...` on the ingress. If a firewall blocks inbound `:80`, the status sticks at `issuing` and eventually flips to `failed`.
-4. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope — they reject with `409 Conflict` if a custom domain is configured.
+1. **DNS must already point at the cluster's ingress host.** Create a `CNAME` (or `ALIAS` / `ANAME` for apex) from the custom hostname to the same target your sandbox URLs resolve to. AerolVM does not host DNS; if the record is missing when the first HTTPS request arrives, ACME issuance will fail and the domain stays in `issuing` until DNS is fixed.
+2. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope — they reject with `409 Conflict` if a custom domain is configured.
 
 ### Cloudflare: turn the proxy off
 
