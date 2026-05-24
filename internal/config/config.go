@@ -682,7 +682,7 @@ func Load() (Config, error) {
 		EnableEventMonitor:               getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                 getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                 getEnvBool("SB_ENABLE_SERVERLESS", true),
-		EnableCustomDomains:              getEnvBool("SB_ENABLE_CUSTOM_DOMAINS", false),
+		EnableCustomDomains:              getEnvBool("SB_ENABLE_CUSTOM_DOMAINS", true),
 		CustomDomainsMaxPerSandbox:       getEnvInt("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", models.MaxCustomDomainsPerSandbox),
 		TLSOnDemandBurst:                 getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
 		TLSOnDemandInterval:              getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
