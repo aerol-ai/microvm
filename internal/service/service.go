@@ -2954,6 +2954,16 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 		}
 		if s.cfg.Domain != "" {
 			expectedTLSRoutes[caddy.IngressSandboxSNIRouteID(p.SandboxID)] = struct{}{}
+			// Per-custom-hostname SNI passthrough routes are installed by
+			// ingress_delta for every entry in p.CustomHostnames. Without
+			// them in the GC keep-set the zombie sweep (which collects all
+			// `sandbox-*` TLS @ids) would strip them on every reconcile
+			// pass and ingress_delta would re-install them on the next
+			// tick — visible as route flapping and a churn-storm of Caddy
+			// PATCHes.
+			for _, hostname := range p.CustomHostnames {
+				expectedTLSRoutes[caddy.IngressCustomDomainSNIRouteID(p.SandboxID, hostname)] = struct{}{}
+			}
 		} else {
 			expectedHTTP["sandbox-"+p.SandboxID] = struct{}{}
 		}

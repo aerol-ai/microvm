@@ -79,6 +79,16 @@ func RecordIssuanceCompleted(hostname string) {
 // expvar map. The expvar map publishes one Func per active hostname
 // that recomputes (now - started).Seconds() at scrape time — the gauge
 // is a snapshot, never a stored value.
+//
+// Bounded growth: RecordIssuanceCompleted is the canonical drain, but it
+// has no production caller yet (status reconciliation against certmagic
+// storage is a follow-up). To keep the gauge map from leaking one entry
+// per unique custom hostname ever observed, Started auto-expires entries
+// older than issuanceMaxAge on each insertion. An entry past the age is
+// strictly stale telemetry — a real ACME flow that took > 10 minutes is
+// already a Prometheus alert on aerolvm_acme_lock_held_seconds.
+const issuanceMaxAge = 10 * time.Minute
+
 type issuanceTracker struct {
 	mu        sync.Mutex
 	startedAt map[string]time.Time
@@ -110,6 +120,7 @@ func (t *issuanceTracker) Started(host string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.evictStaleLocked()
 	if _, ok := t.startedAt[host]; ok {
 		return
 	}
@@ -126,6 +137,22 @@ func (t *issuanceTracker) Started(host string) {
 		}
 		return t.now().Sub(started).Seconds()
 	}))
+}
+
+// evictStaleLocked drops entries older than issuanceMaxAge so the gauge
+// map stays bounded even without a hookup from the eventual ready/failed
+// transition. Caller must hold t.mu.
+func (t *issuanceTracker) evictStaleLocked() {
+	if len(t.startedAt) == 0 {
+		return
+	}
+	cutoff := t.now().Add(-issuanceMaxAge)
+	for host, started := range t.startedAt {
+		if started.Before(cutoff) {
+			delete(t.startedAt, host)
+			t.gauge.Delete(host)
+		}
+	}
 }
 
 func (t *issuanceTracker) completed(host string) {

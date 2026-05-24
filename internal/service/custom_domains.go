@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -123,6 +125,41 @@ var ErrCustomDomainProtocolConflict = models.ErrCustomDomainProtocolConflict
 // ErrCustomDomainPerSandboxCap — see pkg/models comment.
 var ErrCustomDomainPerSandboxCap = models.ErrCustomDomainPerSandboxCap
 
+// recordClusterCustomDomain replicates the (sandbox, hostname) binding into
+// the placement FSM so cluster-wide uniqueness, ingress-node TLS-ask lookup,
+// and failover replay all see it. Mirrors recordClusterExposedPort.
+// cluster.ErrCustomHostnameConflict is mapped to store.ErrCustomDomainConflict
+// so the API layer's existing 409 mapping covers both the local PK race and
+// the cluster-wide Raft tiebreaker without a second sentinel.
+func (s *Service) recordClusterCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.AddCustomDomain(commitCtx, sandboxID, hostname); err != nil {
+		if errors.Is(err, cluster.ErrCustomHostnameConflict) {
+			return store.ErrCustomDomainConflict
+		}
+		return fmt.Errorf("cluster: record custom domain: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) removeClusterCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.RemoveCustomDomain(commitCtx, sandboxID, hostname); err != nil {
+		return fmt.Errorf("cluster: remove custom domain: %w", err)
+	}
+	return nil
+}
+
 // AddCustomDomain attaches a new public hostname to an existing sandbox. The
 // caller is responsible for sandbox-scoped authorization (the API layer); this
 // helper validates the hostname against the deployment's base domain, enforces
@@ -176,12 +213,24 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 		return err
 	}
 
+	// Cluster-wide uniqueness gate. Without this two owners on different
+	// nodes can each accept the same hostname (local SQLite PK is per-node);
+	// the FSM is the cross-node tiebreaker. Run BEFORE the Caddy PATCH so a
+	// conflict rolls back cheaply — the local row goes away and Caddy was
+	// never told about the hostname. Noop returns nil so single-node mode
+	// short-circuits.
+	if err := s.recordClusterCustomDomain(ctx, sandboxID, canonical); err != nil {
+		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
+		return err
+	}
+
 	// Re-read so the caddy PATCH sees the full union (existing + new). The
 	// store inserts with pending_dns status; Caddy's on-demand TLS does not
 	// look at status, only hostname presence, so the new hostname is route-
 	// matchable immediately.
 	refreshed, err := s.store.Get(ctx, sandboxID)
 	if err != nil {
+		_ = s.removeClusterCustomDomain(ctx, sandboxID, canonical)
 		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
 		return fmt.Errorf("reload sandbox after custom-domain insert: %w", err)
 	}
@@ -191,6 +240,7 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 		// store on a partial failure rather than leaving an orphan row that
 		// the reconciler would have to clean up — the caller can simply
 		// retry the request.
+		_ = s.removeClusterCustomDomain(ctx, sandboxID, canonical)
 		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
 		return fmt.Errorf("install caddy route for custom domain %q: %w", canonical, err)
 	}
@@ -225,6 +275,18 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	}
 	if err := s.store.RemoveCustomDomain(ctx, sandboxID, canonical); err != nil {
 		return err
+	}
+	// Release the FSM claim so a future AddCustomDomain on a different
+	// sandbox is not blocked by a stale hostname binding the local store no
+	// longer backs. Idempotent in the cluster command, so a redundant remove
+	// from a reconcile pass is safe. Noop is a nil return in single-node.
+	if err := s.removeClusterCustomDomain(ctx, sandboxID, canonical); err != nil {
+		// Best-effort: log and proceed. The local row is already gone, and a
+		// stale FSM binding will be cleaned by the placement-teardown sweep
+		// on sandbox destroy or by an operator-initiated reconcile. Surfacing
+		// the error here would leave the caller unable to retry cleanly.
+		s.logger.Warn("custom-domain cluster release failed; reconcile will retry",
+			"sandbox_id", sandboxID, "hostname", canonical, "error", err)
 	}
 	refreshed, err := s.store.Get(ctx, sandboxID)
 	if err != nil {
@@ -286,16 +348,27 @@ func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID st
 		return nil
 	}
 	added := make([]string, 0, len(hostnames))
+	rollback := func() {
+		for _, prev := range added {
+			_ = s.removeClusterCustomDomain(ctx, sandboxID, prev)
+			_ = s.store.RemoveCustomDomain(ctx, sandboxID, prev)
+		}
+	}
 	for _, h := range hostnames {
 		if err := s.store.AddCustomDomain(ctx, sandboxID, h); err != nil {
-			// Roll back any rows inserted earlier in this call.
-			for _, prev := range added {
-				_ = s.store.RemoveCustomDomain(ctx, sandboxID, prev)
-			}
+			rollback()
 			if errors.Is(err, store.ErrCustomDomainConflict) {
 				return err
 			}
 			return fmt.Errorf("persist custom domain %q: %w", h, err)
+		}
+		// Replicate into the FSM before we consider this row added — a
+		// cross-node hostname conflict surfaces here, not later on a
+		// failover that's too late to roll back the caller's create call.
+		if err := s.recordClusterCustomDomain(ctx, sandboxID, h); err != nil {
+			_ = s.store.RemoveCustomDomain(ctx, sandboxID, h)
+			rollback()
+			return err
 		}
 		added = append(added, h)
 	}
