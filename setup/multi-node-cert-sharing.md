@@ -267,6 +267,18 @@ encryption key, not the bucket itself.
 
 ---
 
+## End-to-end verification
+
+The shared-storage cert-reuse guarantee is exercised end-to-end by
+`internal/service/custom_domains_e2e_test.go` (build tag `e2e`, run via
+`make test-acme-e2e`). It boots Pebble + localstack + Caddy in containers,
+runs sandboxd in-process, and asserts that a fresh Caddy pointed at the same
+S3 bucket reuses the cert rather than triggering a second ACME order. Requires
+a local Docker daemon; the first run pulls ~500 MB of images and builds Caddy
+via xcaddy (~30 s). Not in CI.
+
+---
+
 ## Reference
 
 - Plugin: [`github.com/ss098/certmagic-s3`](https://github.com/ss098/certmagic-s3)
