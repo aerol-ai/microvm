@@ -120,7 +120,7 @@ type Config struct {
 	EnableNetworkRules bool
 	EnableEventMonitor bool
 	EnableSSHGateway   bool
-	// EnableServerless gates HTTP-wake behavior for sandboxes created with
+	// EnableServerless gates wake behavior for sandboxes created with
 	// Lifecycle.Serverless=true. When false (default), the serverless flag
 	// is accepted at the API surface (so SDK callers can pre-set it without
 	// 4xx churn) but the runtime never arms wake on stop and the
@@ -133,6 +133,14 @@ type Config struct {
 	// wake-aware HTTP ingress proxy. Caddy dials this address from
 	// wake-aware HTTP port routes; it must NOT be exposed publicly.
 	InternalIngressAddr string
+	// InternalL4WakeAddr is the loopback-only TCP listener Caddy dials from
+	// wake-aware raw-TCP routes. Caddy sends PROXY protocol v1 so sandboxd can
+	// recover the public host_port and map the connection to an exposure.
+	InternalL4WakeAddr string
+	// InternalL4WakeDir holds per-exposure Unix sockets for wake-aware TLS-SNI
+	// routes. Caddy terminates TLS before proxying, so the socket path carries
+	// the sandbox/port identity that plaintext TCP no longer contains.
+	InternalL4WakeDir string
 	// HTTPWakeMaxBuffer caps the request body buffered while a cold-start
 	// wake is in progress. Requests with bodies larger than this are
 	// rejected with 413 — see plan D2.
@@ -534,6 +542,8 @@ func Load() (Config, error) {
 		EnableSSHGateway:            getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:            getEnvBool("SB_ENABLE_SERVERLESS", false),
 		InternalIngressAddr:         getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
+		InternalL4WakeAddr:          getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
+		InternalL4WakeDir:           getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
 		HTTPWakeMaxBuffer:           int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
 		SSHListenAddr:               getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:              getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
@@ -814,6 +824,12 @@ func Load() (Config, error) {
 	if cfg.EnableServerless {
 		if strings.TrimSpace(cfg.InternalIngressAddr) == "" {
 			return Config{}, errors.New("SB_INTERNAL_INGRESS_ADDR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if strings.TrimSpace(cfg.InternalL4WakeAddr) == "" {
+			return Config{}, errors.New("SB_INTERNAL_L4_WAKE_ADDR must be set when SB_ENABLE_SERVERLESS=true")
+		}
+		if strings.TrimSpace(cfg.InternalL4WakeDir) == "" {
+			return Config{}, errors.New("SB_INTERNAL_L4_WAKE_DIR must be set when SB_ENABLE_SERVERLESS=true")
 		}
 		if cfg.HTTPWakeMaxBuffer <= 0 {
 			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER must be > 0 when SB_ENABLE_SERVERLESS=true")

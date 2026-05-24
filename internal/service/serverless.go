@@ -183,14 +183,12 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 }
 
 // tearDownPortRoutesForStop drops the Caddy port routes for a stopping
-// sandbox. For HTTP ports on a wake-arming stop the direct route is
-// REPLACED with the wake-aware shape (install-then-delete ordering, so
-// no window without a matching route) so the next inbound request
-// resurrects the sandbox through the ingress proxy. All other ports
-// (HTTP without arm, TCP, TLS-SNI) are deleted outright.
+// sandbox. On a wake-arming stop, exposed HTTP/TCP/TLS routes are replaced
+// with their wake-aware shape so the next inbound connection resurrects the
+// sandbox. On non-arming stops all exposed routes are deleted outright.
 //
 // Returns the final arm value. The input is preserved unless arm=true
-// was passed, at least one HTTP wake-route install was attempted, and
+// was passed, at least one wake-route install was attempted, and
 // every attempt failed — in which case arm is demoted to false so
 // wake_armed and route state never disagree (D5 fallback).
 //
@@ -204,18 +202,13 @@ func (s *Service) tearDownPortRoutesForStop(ctx context.Context, sandbox *models
 		wakeRouteInstalled bool
 	)
 	for _, port := range sandbox.ExposedPorts {
-		isHTTP := port.Protocol == "" || port.Protocol == models.ExposedPortProtocolHTTP
-		if arm && isHTTP {
+		if arm {
 			wakeRouteAttempted = true
-			if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port.Port); err != nil {
-				s.logger.Warn("install wake HTTP route on stop failed",
-					"sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+			if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+				s.logger.Warn("install wake route on stop failed",
+					"sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 			} else {
 				wakeRouteInstalled = true
-			}
-			if err := s.caddy.DeletePortRoute(ctx, sandbox.ID, port.Port); err != nil {
-				s.logger.Warn("delete direct HTTP route on wake-arming stop failed",
-					"sandbox_id", sandbox.ID, "port", port.Port, "error", err)
 			}
 			continue
 		}
@@ -265,10 +258,10 @@ func (s *Service) shouldArmWake(sandbox *models.Sandbox, mode stopMode) bool {
 //   - sandbox is Lifecycle.Serverless
 //   - sandbox is in Stopped status
 //   - sandbox.WakeArmed is currently false
-//   - the sandbox has at least one HTTP exposed port (the only ingress
-//     surface the wake plan covers in phase 1)
+//   - the sandbox has at least one exposed port that can receive an inbound
+//     wake request or connection
 //
-// Caddy-first per D5: install wake routes for every HTTP exposure
+// Caddy-first per D5: install wake routes for every exposure
 // before flipping the store bit. If every wake route install fails we
 // leave wake_armed=false to keep route state and the bit in sync —
 // the next reconcile pass will retry.
@@ -290,23 +283,19 @@ func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *mod
 	}
 
 	var (
-		httpPortsSeen      int
+		exposedPortsSeen   int
 		wakeRouteInstalled bool
 	)
 	for _, port := range sandbox.ExposedPorts {
-		isHTTP := port.Protocol == "" || port.Protocol == models.ExposedPortProtocolHTTP
-		if !isHTTP {
-			continue
-		}
-		httpPortsSeen++
-		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port.Port); err != nil {
-			s.logger.Warn("reconstruct wake HTTP route failed",
-				"sandbox_id", sandbox.ID, "port", port.Port, "error", err)
+		exposedPortsSeen++
+		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+			s.logger.Warn("reconstruct wake route failed",
+				"sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 			continue
 		}
 		wakeRouteInstalled = true
 	}
-	if httpPortsSeen == 0 {
+	if exposedPortsSeen == 0 {
 		return
 	}
 	if !wakeRouteInstalled {
@@ -400,6 +389,12 @@ func (s *Service) wakeFlightFor(id string) *wakeFlight {
 	return w
 }
 
+func (s *Service) forgetWakeFlight(id string) {
+	s.wakeFlightsMu.Lock()
+	defer s.wakeFlightsMu.Unlock()
+	delete(s.wakeFlights, id)
+}
+
 // EnsureSandboxAwakeForHTTP is the single chokepoint the control-plane
 // HTTP proxies (v1 toolbox, daytona toolbox, e2b runtime) call before
 // resolving the toolbox endpoint. It returns the current sandbox row
@@ -487,6 +482,7 @@ func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*mo
 		return nil, startErr
 	}
 	flight.recordSuccess()
+	s.forgetWakeFlight(id)
 	finish(true, nil)
 	return started, nil
 }

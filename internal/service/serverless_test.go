@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -578,6 +580,102 @@ func TestWakeAwareToolboxTargetWakesAndResolves(t *testing.T) {
 	}
 	if runtime.startCount != 1 {
 		t.Fatalf("Start called %d times; want 1", runtime.startCount)
+	}
+}
+
+func TestL4WakeProxyWakesTCPExposure(t *testing.T) {
+	ctx := context.Background()
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream: %v", err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	upstreamPort := upstream.Addr().(*net.TCPAddr).Port
+	upstreamDone := make(chan error, 1)
+	go func() {
+		conn, err := upstream.Accept()
+		if err != nil {
+			upstreamDone <- err
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			upstreamDone <- err
+			return
+		}
+		if string(buf) != "ping" {
+			upstreamDone <- fmt.Errorf("upstream read %q, want ping", string(buf))
+			return
+		}
+		_, err = conn.Write([]byte("pong"))
+		upstreamDone <- err
+	}()
+
+	runtime := &fakeCapacityRuntime{
+		startResult: &models.SandboxRuntimeState{
+			ContainerID: "ctr-l4",
+			ContainerIP: "127.0.0.1",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, st := newServerlessHarness(t, runtime)
+	svc.cfg.EnableCaddy = true
+	svc.cfg.InternalL4WakeAddr = "127.0.0.1:0"
+	svc.cfg.InternalL4WakeDir = t.TempDir()
+	svc.caddy = caddy.New(config.Config{EnableCaddy: true, HTTPClientTimeout: time.Second})
+
+	wakeCtx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	if err := svc.StartL4WakeProxy(wakeCtx); err != nil {
+		t.Fatalf("StartL4WakeProxy: %v", err)
+	}
+	wakeAddr := svc.l4WakeTCP.Addr().String()
+	// The listener is the unit under test; route installation during
+	// StartSandbox can be a no-op here.
+	svc.caddy = caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second})
+
+	seedSleepingSandbox(t, st, "sb-l4")
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: "sb-l4",
+		Port:      upstreamPort,
+		Protocol:  models.ExposedPortProtocolTCP,
+		HostPort:  40123,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertPort: %v", err)
+	}
+
+	conn, err := net.Dial("tcp", wakeAddr)
+	if err != nil {
+		t.Fatalf("dial wake proxy: %v", err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "PROXY TCP4 198.51.100.10 203.0.113.20 50000 40123\r\nping"); err != nil {
+		t.Fatalf("write wake proxy: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read wake proxy response: %v", err)
+	}
+	if string(buf) != "pong" {
+		t.Fatalf("wake proxy response = %q, want pong", string(buf))
+	}
+	if err := <-upstreamDone; err != nil {
+		t.Fatalf("upstream handler: %v", err)
+	}
+	if runtime.startCount != 1 {
+		t.Fatalf("Start called %d times; want 1", runtime.startCount)
+	}
+	got, err := st.Get(ctx, "sb-l4")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.WakeArmed {
+		t.Fatalf("WakeArmed=true after L4 wake; want false")
 	}
 }
 

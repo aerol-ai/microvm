@@ -87,6 +87,9 @@ type Service struct {
 	l4Mu       sync.Mutex
 	l4Ready    atomic.Bool
 	snapshotMu sync.Mutex
+	l4WakeMu   sync.Mutex
+	l4WakeTCP  net.Listener
+	l4WakeTLS  map[string]net.Listener
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
@@ -860,6 +863,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox.ContainerID = state.ContainerID
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
+	sandbox.WakeArmed = false
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
 
@@ -924,6 +928,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
+	s.forgetWakeFlight(id)
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
 	}
@@ -1247,21 +1252,18 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err != nil {
 		return nil, err
 	}
-	// If Serverless flipped on a running sandbox, re-install HTTP port
-	// routes in the matching shape. installHTTPPortRoute already cleans
-	// up the other shape, so this is the entire transition. We only do
+	// If Serverless flipped on a running sandbox, re-install exposed port
+	// routes in the matching shape. The install helpers own cleanup of the
+	// previous direct/wake shape, so this is the entire transition. We only do
 	// the work when something actually changed AND when the gate is on
 	// — gate-off keeps the legacy direct routes regardless.
 	if s.cfg.EnableServerless && priorSandbox != nil && updated != nil &&
 		priorSandbox.Lifecycle.Serverless != updated.Lifecycle.Serverless &&
 		updated.Status == models.SandboxStatusStarted {
 		for _, port := range updated.ExposedPorts {
-			if port.Protocol != "" && port.Protocol != models.ExposedPortProtocolHTTP {
-				continue
-			}
-			if err := s.installHTTPPortRoute(ctx, updated, port.Port); err != nil {
+			if err := s.upsertExposedPortRoute(ctx, updated, port); err != nil {
 				if s.logger != nil {
-					s.logger.Warn("re-install HTTP port route after lifecycle change failed",
+					s.logger.Warn("re-install port route after lifecycle change failed",
 						"sandbox_id", id, "port", port.Port, "err", err)
 				}
 			}
@@ -1350,7 +1352,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		// outright — the caller must unexpose first to switch protocols.
 		if existing := existingBefore; existing != nil {
 			if existing.HostPort > 0 {
-				if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, existing.HostPort); err != nil {
+				if err := s.installTCPPortRoute(ctx, sandbox, port, existing.HostPort); err != nil {
 					return models.ExposePortResponse{}, err
 				}
 				if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, HostPort: existing.HostPort, PublicURL: existing.PublicURL}); err != nil {
@@ -1369,7 +1371,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		if err != nil {
 			return models.ExposePortResponse{}, err
 		}
-		if err := s.caddy.UpsertTCPRoute(ctx, id, sandbox.ContainerIP, port, hostPort); err != nil {
+		if err := s.installTCPPortRoute(ctx, sandbox, port, hostPort); err != nil {
 			// Only roll back rows we ourselves inserted. A reused row was
 			// installed by a concurrent caller and is not ours to delete.
 			if !reused {
@@ -1413,7 +1415,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			return models.ExposePortResponse{}, err
 		}
 		publicURL := s.caddy.TLSPublicEndpoint(id, port, s.caddy.L4TLSListen())
-		if err := s.caddy.UpsertTLSSNIRoute(ctx, id, sniHost, sandbox.ContainerIP, port); err != nil {
+		if err := s.installTLSPortRoute(ctx, sandbox, port); err != nil {
 			return models.ExposePortResponse{}, err
 		}
 		exposure := models.ExposedPort{
@@ -1424,12 +1426,12 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			CreatedAt: now,
 		}
 		if err := s.store.UpsertPort(ctx, exposure); err != nil {
-			_ = s.caddy.DeleteTLSSNIRoute(ctx, id, port)
+			_ = s.deleteTLSPortRoute(ctx, id, port)
 			return models.ExposePortResponse{}, err
 		}
 		if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, PublicURL: publicURL}); err != nil {
 			if existingBefore == nil {
-				_ = s.caddy.DeleteTLSSNIRoute(ctx, id, port)
+				_ = s.deleteTLSPortRoute(ctx, id, port)
 				_ = s.store.DeletePort(ctx, id, port)
 			}
 			return models.ExposePortResponse{}, err
@@ -1668,9 +1670,9 @@ func (s *Service) upsertExposedPortRoute(ctx context.Context, sandbox *models.Sa
 	case "", models.ExposedPortProtocolHTTP:
 		return s.installHTTPPortRoute(ctx, sandbox, port.Port)
 	case models.ExposedPortProtocolTCP:
-		return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port.Port, port.HostPort)
+		return s.installTCPPortRoute(ctx, sandbox, port.Port, port.HostPort)
 	case models.ExposedPortProtocolTLS:
-		return s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, s.caddy.SNIHost(sandbox.ID, port.Port), sandbox.ContainerIP, port.Port)
+		return s.installTLSPortRoute(ctx, sandbox, port.Port)
 	default:
 		return fmt.Errorf("unknown protocol %q on exposed port %d", port.Protocol, port.Port)
 	}
@@ -1693,7 +1695,7 @@ func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sa
 	case models.ExposedPortProtocolTCP:
 		return s.caddy.DeleteTCPRoute(ctx, port.HostPort)
 	case models.ExposedPortProtocolTLS:
-		return s.caddy.DeleteTLSSNIRoute(ctx, sandbox.ID, port.Port)
+		return s.deleteTLSPortRoute(ctx, sandbox.ID, port.Port)
 	default:
 		return fmt.Errorf("unknown protocol %q on exposed port %d", port.Protocol, port.Port)
 	}
@@ -1705,7 +1707,7 @@ func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sa
 // a window where neither shape exists, so a request landing mid-flip
 // always hits one valid route.
 func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
-	if s.cfg.EnableServerless && sandbox.Lifecycle.Serverless {
+	if s.serverlessWakeEnabled(sandbox) {
 		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port); err != nil {
 			return err
 		}
@@ -1720,6 +1722,51 @@ func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sand
 	}
 	_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
 	return nil
+}
+
+func (s *Service) installTCPPortRoute(ctx context.Context, sandbox *models.Sandbox, port, hostPort int) error {
+	if err := s.EnsureLayer4Ready(ctx); err != nil {
+		return err
+	}
+	if s.serverlessWakeEnabled(sandbox) {
+		return s.caddy.UpsertWakeTCPRoute(ctx, sandbox.ID, port, hostPort, s.cfg.InternalL4WakeAddr)
+	}
+	return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
+}
+
+func (s *Service) installTLSPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	if err := s.EnsureLayer4Ready(ctx); err != nil {
+		return err
+	}
+	sniHost := s.caddy.SNIHost(sandbox.ID, port)
+	if s.serverlessWakeEnabled(sandbox) {
+		socketPath, err := s.ensureTLSWakeListener(sandbox.ID, port)
+		if err != nil {
+			return err
+		}
+		if err := s.caddy.UpsertWakeTLSSNIRoute(ctx, sandbox.ID, sniHost, socketPath, port); err != nil {
+			s.closeTLSWakeListener(sandbox.ID, port)
+			return err
+		}
+		return nil
+	}
+	if err := s.caddy.UpsertTLSSNIRoute(ctx, sandbox.ID, sniHost, sandbox.ContainerIP, port); err != nil {
+		return err
+	}
+	s.closeTLSWakeListener(sandbox.ID, port)
+	return nil
+}
+
+func (s *Service) deleteTLSPortRoute(ctx context.Context, id string, port int) error {
+	if err := s.caddy.DeleteTLSSNIRoute(ctx, id, port); err != nil {
+		return err
+	}
+	s.closeTLSWakeListener(id, port)
+	return nil
+}
+
+func (s *Service) serverlessWakeEnabled(sandbox *models.Sandbox) bool {
+	return sandbox != nil && s.cfg.EnableServerless && sandbox.Lifecycle.Serverless
 }
 
 // removeHTTPPortRoute drops both HTTP route shapes for a (sandbox, port).
@@ -1811,6 +1858,10 @@ func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) 
 	}
 	if sandbox.ContainerIP == "" {
 		return PortEndpoint{}, errors.New("sandbox container IP is not available")
+	}
+	exposure := findExposure(sandbox, port)
+	if exposure == nil || (exposure.Protocol != "" && exposure.Protocol != models.ExposedPortProtocolHTTP) {
+		return PortEndpoint{}, fmt.Errorf("sandbox %s does not expose HTTP port %d", id, port)
 	}
 	return PortEndpoint{URL: fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, port)}, nil
 }
@@ -2003,6 +2054,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
+			s.forgetWakeFlight(sandbox.ID)
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
@@ -2045,6 +2097,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
 		}
 		if state.Status == models.SandboxStatusStarted {
+			sandbox.WakeArmed = false
 			// Heal the per-IP egress DROP rule for sandboxes opted into
 			// NetworkBlockAll. Idempotent at the netrules layer (Exists check
 			// before insert), so this is safe to run on every reconcile pass.

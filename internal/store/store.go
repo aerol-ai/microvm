@@ -1669,6 +1669,25 @@ func (s *Store) TryReserveHostPort(ctx context.Context, sandboxID string, contai
 	return ReserveHostPortResult{}, nil
 }
 
+// GetPortByHostPort returns the raw-TCP exposure bound to hostPort, or nil if
+// no exposure owns it. The L4 wake listener uses this to map Caddy's PROXY
+// protocol destination port back to a sandbox/container port.
+func (s *Store) GetPortByHostPort(ctx context.Context, hostPort int) (*models.ExposedPort, error) {
+	var exposure models.ExposedPort
+	err := s.db.QueryRowContext(ctx, `
+		SELECT sandbox_id, port, protocol, host_port, public_url, created_at
+		FROM exposed_ports
+		WHERE host_port = ?
+	`, hostPort).Scan(&exposure.SandboxID, &exposure.Port, &exposure.Protocol, &exposure.HostPort, &exposure.PublicURL, &exposure.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get exposed port by host port: %w", err)
+	}
+	return &exposure, nil
+}
+
 // getPort returns the exposure row for (sandboxID, port), or nil if absent.
 func (s *Store) getPort(ctx context.Context, sandboxID string, port int) (*models.ExposedPort, error) {
 	var exposure models.ExposedPort

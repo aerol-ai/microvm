@@ -551,6 +551,10 @@ func tlsRouteID(id string, port int) string {
 	return fmt.Sprintf("sandbox-%s-port-%d-tls", id, port)
 }
 
+func unixDialAddress(path string) string {
+	return "unix//" + strings.TrimPrefix(path, "/")
+}
+
 func ingressSandboxSNIRouteID(id string) string {
 	return fmt.Sprintf("sandbox-%s-ingress-sni", id)
 }
@@ -692,6 +696,48 @@ func (c *Client) UpsertTCPRoute(ctx context.Context, id, containerIP string, por
 	return nil
 }
 
+// UpsertWakeTCPRoute publishes a raw-TCP exposure in serverless mode. The
+// public listener stays on hostPort, but Caddy forwards to sandboxd's
+// loopback L4 wake listener and emits PROXY protocol v1 so sandboxd can map
+// the connection back to this hostPort before waking the sandbox.
+func (c *Client) UpsertWakeTCPRoute(ctx context.Context, id string, port, hostPort int, wakeAddr string) error {
+	if !c.enabled {
+		return nil
+	}
+	if hostPort <= 0 {
+		return errors.New("host port must be positive")
+	}
+	if strings.TrimSpace(wakeAddr) == "" {
+		return errors.New("wake address is required")
+	}
+	server := map[string]any{
+		"listen": []string{fmt.Sprintf(":%d", hostPort)},
+		"routes": []any{
+			map[string]any{
+				"@id": tcpRouteID(id, port),
+				"handle": []map[string]any{{
+					"handler":        "proxy",
+					"proxy_protocol": "v1",
+					"upstreams":      []map[string]any{{"dial": []string{wakeAddr}}},
+				}},
+			},
+		},
+	}
+	body, err := json.Marshal(server)
+	if err != nil {
+		return fmt.Errorf("marshal wake tcp server: %w", err)
+	}
+	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, tcpServerID(hostPort))
+	status, err := c.sendJSON(ctx, http.MethodPut, target, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("upsert wake tcp server failed: %d", status)
+	}
+	return nil
+}
+
 // UpsertTCPProxyRoute creates a raw-TCP ingress server bound to hostPort that
 // forwards to another node's hostPort. This is the non-owner half of stable
 // cluster TCP exposure: every node can accept tcp://cluster-host:hostPort, but
@@ -818,6 +864,61 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 	}
 	if status >= 400 {
 		return fmt.Errorf("insert tls sni route failed: %d", status)
+	}
+	return nil
+}
+
+// UpsertWakeTLSSNIRoute publishes a TLS-SNI exposure in serverless mode. Caddy
+// still terminates TLS at the edge, then proxies the plaintext stream to a
+// sandboxd-owned Unix socket whose path identifies the sandbox/container port.
+func (c *Client) UpsertWakeTLSSNIRoute(ctx context.Context, id, sniHost, socketPath string, port int) error {
+	if !c.enabled {
+		return nil
+	}
+	if strings.TrimSpace(socketPath) == "" {
+		return errors.New("wake socket path is required")
+	}
+	routeID := tlsRouteID(id, port)
+	route := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{{
+			"tls": map[string]any{"sni": []string{sniHost}},
+		}},
+		"handle": []map[string]any{
+			{
+				"handler":             "tls",
+				"connection_policies": []map[string]any{{}},
+			},
+			{
+				"handler":   "proxy",
+				"upstreams": []map[string]any{{"dial": []string{unixDialAddress(socketPath)}}},
+			},
+		},
+	}
+	body, err := json.Marshal(route)
+	if err != nil {
+		return fmt.Errorf("marshal wake tls sni route: %w", err)
+	}
+
+	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
+	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
+	if err != nil {
+		return err
+	}
+	if status < 400 {
+		return nil
+	}
+	if status != http.StatusNotFound {
+		return fmt.Errorf("patch wake tls sni route failed: %d", status)
+	}
+
+	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
+	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("insert wake tls sni route failed: %d", status)
 	}
 	return nil
 }

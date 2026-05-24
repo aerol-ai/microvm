@@ -367,6 +367,12 @@ func main() {
 				cancel()
 			}
 		}()
+		if err := svc.StartL4WakeProxy(ctx); err != nil {
+			logger.Error("l4 wake proxy failed to start", "error", err)
+			cancel()
+		} else {
+			logger.Info("wake-aware l4 proxy listening", "addr", cfg.InternalL4WakeAddr, "socket_dir", cfg.InternalL4WakeDir)
+		}
 	}
 
 	<-ctx.Done()

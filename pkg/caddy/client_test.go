@@ -469,6 +469,26 @@ func TestL4Cases(t *testing.T) {
 			},
 		},
 		{
+			name: "upsert_wake_tcp_route_targets_l4_wake_proxy_with_proxy_protocol",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertWakeTCPRoute(context.Background(), "abc", 5432, 37412, "127.0.0.1:21214"); err != nil {
+					t.Fatalf("UpsertWakeTCPRoute() error = %v", err)
+				}
+				server, ok := fake.l4Servers["tcp-port-37412"]
+				if !ok {
+					t.Fatalf("wake tcp server missing; servers=%+v", fake.l4Servers)
+				}
+				assertL4Listen(t, server, ":37412")
+				route := firstL4Route(t, server)
+				assertRouteField(t, route, "@id", "sandbox-abc-port-5432-tcp")
+				assertL4Dial(t, route, "127.0.0.1:21214")
+				assertL4ProxyProtocol(t, route, "v1")
+			},
+		},
+		{
 			name: "delete_tcp_route_removes_server",
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
@@ -547,6 +567,25 @@ func TestL4Cases(t *testing.T) {
 					t.Fatalf("PATCH should have replaced stale fields: %+v", route)
 				}
 				assertL4Dial(t, route, "10.0.0.7:5432")
+				assertHasTLSTerminator(t, route)
+			},
+		},
+		{
+			name: "upsert_wake_tls_sni_route_targets_unix_socket",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.layer4Exists = true
+				fake.l4Servers[tlsMuxServerID] = map[string]any{"listen": []any{":443"}, "routes": []any{}}
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertWakeTLSSNIRoute(context.Background(), "abc", "abc-5432.sandbox.example.com", "/run/sandboxd/l4wake/abc-5432.sock", 5432); err != nil {
+					t.Fatalf("UpsertWakeTLSSNIRoute() error = %v", err)
+				}
+				route, ok := fake.routes["sandbox-abc-port-5432-tls"]
+				if !ok {
+					t.Fatalf("wake tls route should be inserted; routes=%+v", fake.routes)
+				}
+				assertL4SNI(t, route, "abc-5432.sandbox.example.com")
+				assertL4Dial(t, route, "unix//run/sandboxd/l4wake/abc-5432.sock")
 				assertHasTLSTerminator(t, route)
 			},
 		},
@@ -729,6 +768,28 @@ func assertL4Dial(t *testing.T, route map[string]any, want string) {
 	if got, _ := dials[0].(string); got != want {
 		t.Fatalf("dial = %q, want %q", got, want)
 	}
+}
+
+func assertL4ProxyProtocol(t *testing.T, route map[string]any, want string) {
+	t.Helper()
+	handles, ok := route["handle"].([]any)
+	if !ok || len(handles) == 0 {
+		t.Fatalf("missing handle: %#v", route)
+	}
+	for _, h := range handles {
+		hm, _ := h.(map[string]any)
+		if hm == nil {
+			continue
+		}
+		if _, hasUpstreams := hm["upstreams"]; !hasUpstreams {
+			continue
+		}
+		if got, _ := hm["proxy_protocol"].(string); got != want {
+			t.Fatalf("proxy_protocol = %q, want %q", got, want)
+		}
+		return
+	}
+	t.Fatalf("no proxy handler in chain: %#v", route)
 }
 
 // assertHasTLSTerminator walks the route's handler chain and asserts that a

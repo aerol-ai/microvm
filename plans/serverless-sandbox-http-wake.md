@@ -830,9 +830,32 @@ main complexity is not waking a container; it is making wake semantics coexist
 with Caddy routing, lifecycle stop logic, docker event handling, reconcile,
 and cluster forwarding.
 
+## Follow-up: TCP/TLS wake-on-connect
+
+PR #112 implemented the HTTP wake plan above. The follow-up implementation
+extends the same `wake_armed` state machine to the layer4 surfaces:
+
+- raw TCP routes keep their public `host_port`, but the Caddy upstream becomes
+  `SB_INTERNAL_L4_WAKE_ADDR` with PROXY protocol v1 enabled. Sandboxd reads the
+  destination host port from the PROXY header, looks up the `exposed_ports`
+  row, wakes the sandbox if needed, then proxies the connection to
+  `containerIP:port`.
+- TLS-SNI routes keep Caddy TLS termination. Because the stream is plaintext
+  after termination and no longer carries SNI, sandboxd creates a per-exposure
+  Unix socket under `SB_INTERNAL_L4_WAKE_DIR`; the socket path identifies the
+  sandbox/port while Caddy continues to route by SNI.
+- started serverless sandboxes also use the wake-aware route shape. This keeps
+  activity accounting on the sandboxd side and avoids route rewrites at idle
+  time for the 100K-sandbox fleet case.
+- non-serverless sandboxes keep direct Caddy routes.
+
+This adds one shared TCP listener per node and one Unix listener per serverless
+TLS-SNI exposure. At 100K sandboxes across 2000 nodes, the steady-state socket
+count is proportional to local TLS exposures rather than global sandbox count;
+the TCP side remains O(1) listener state per node.
+
 ## What this plan does not close
 
-- raw TCP/TLS wake-on-connect (always-on in phase 1)
 - memory snapshot or near-zero cold starts (Docker stop/start only)
 - per-sandbox autoscaling beyond one instance
 - request bodies larger than 8 MiB during cold start (intentional D2 cliff)

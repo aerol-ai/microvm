@@ -55,6 +55,8 @@ func TestLoadCases(t *testing.T) {
 			"SB_CLUSTER_BOOTSTRAP",
 			"SB_ENABLE_SERVERLESS",
 			"SB_INTERNAL_INGRESS_ADDR",
+			"SB_INTERNAL_L4_WAKE_ADDR",
+			"SB_INTERNAL_L4_WAKE_DIR",
 			"SB_HTTP_WAKE_MAX_BUFFER",
 		}
 		for _, key := range keys {
@@ -129,6 +131,12 @@ func TestLoadCases(t *testing.T) {
 				if cfg.InternalIngressAddr != "127.0.0.1:21213" {
 					t.Fatalf("expected default InternalIngressAddr=127.0.0.1:21213, got %q", cfg.InternalIngressAddr)
 				}
+				if cfg.InternalL4WakeAddr != "127.0.0.1:21214" {
+					t.Fatalf("expected default InternalL4WakeAddr=127.0.0.1:21214, got %q", cfg.InternalL4WakeAddr)
+				}
+				if cfg.InternalL4WakeDir != "/run/sandboxd/l4wake" {
+					t.Fatalf("expected default InternalL4WakeDir=/run/sandboxd/l4wake, got %q", cfg.InternalL4WakeDir)
+				}
 				if cfg.HTTPWakeMaxBuffer != 8*1024*1024 {
 					t.Fatalf("expected default HTTPWakeMaxBuffer=8MiB, got %d", cfg.HTTPWakeMaxBuffer)
 				}
@@ -156,6 +164,8 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_PAT_TOKEN", "token")
 				t.Setenv("SB_ENABLE_SERVERLESS", "true")
 				t.Setenv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:33333")
+				t.Setenv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:33334")
+				t.Setenv("SB_INTERNAL_L4_WAKE_DIR", "/tmp/sandboxd-l4wake-test")
 				t.Setenv("SB_HTTP_WAKE_MAX_BUFFER", "16777216")
 				cfg, err := Load()
 				if err != nil {
@@ -163,6 +173,12 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.InternalIngressAddr != "127.0.0.1:33333" {
 					t.Fatalf("expected InternalIngressAddr override, got %q", cfg.InternalIngressAddr)
+				}
+				if cfg.InternalL4WakeAddr != "127.0.0.1:33334" {
+					t.Fatalf("expected InternalL4WakeAddr override, got %q", cfg.InternalL4WakeAddr)
+				}
+				if cfg.InternalL4WakeDir != "/tmp/sandboxd-l4wake-test" {
+					t.Fatalf("expected InternalL4WakeDir override, got %q", cfg.InternalL4WakeDir)
 				}
 				if cfg.HTTPWakeMaxBuffer != 16*1024*1024 {
 					t.Fatalf("expected HTTPWakeMaxBuffer override, got %d", cfg.HTTPWakeMaxBuffer)
