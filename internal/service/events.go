@@ -137,6 +137,13 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbox, event docker.DockerEvent) error {
 	previousIP := sandbox.ContainerIP
 
+	// Invalidate the warm-preflight cache the moment we observe the
+	// stop event — this is the tightest possible signal that the
+	// sandbox is no longer Started, since the Docker /events stream
+	// surfaces die/stop/oom sub-second after the container actually
+	// exits. The ingress proxy's IsSandboxStarted hot path will fall
+	// through to SQLite from here on for this id.
+	s.invalidateWarm(sandbox.ID)
 	mode := s.classifyDockerStopEvent(sandbox.ID, event)
 	arm := s.shouldArmWake(sandbox, mode)
 
@@ -198,6 +205,10 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 // stuck indefinitely.
 func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbox) error {
 	previousIP := sandbox.ContainerIP
+
+	// Mirror the API DestroySandbox path: drop the warm-preflight cache
+	// so the ingress proxy stops treating this id as Started.
+	s.invalidateWarm(sandbox.ID)
 
 	// Best-effort teardown. Order matches DestroySandbox (caddy → mounts →
 	// store.Delete → admitter → maybeRemoveImage); container destroy is

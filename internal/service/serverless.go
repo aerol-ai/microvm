@@ -144,6 +144,13 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 		return nil, err
 	}
 
+	// Drop the warm-preflight cache up front. From this moment on the
+	// ingress proxy must take the slow path (store hit → cold-start
+	// admission) for this sandbox; any in-flight request that fast-
+	// pathed before we invalidate races the actual stop, but the
+	// readiness probe / proxy error handler turn that into the same
+	// 503+Retry-After the cold-start race already produces.
+	s.invalidateWarm(id)
 	arm := s.shouldArmWake(sandbox, mode)
 	s.recordExpectedStop(id, mode)
 
@@ -500,7 +507,27 @@ func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*mo
 
 	startCtx, cancel := context.WithTimeout(ctx, wakeStartTimeout)
 	defer cancel()
+
+	// Acquire a cross-sandbox start slot AFTER the per-sandbox flight
+	// lock but BEFORE invoking StartSandbox. Holding flight.mu while
+	// waiting on the sem is safe: same-id waiters are already blocked
+	// on flight.mu and will be served by the cached result of this
+	// leader's start; the sem only serializes against starts for OTHER
+	// sandbox ids. Without this, the pending caps (HTTP+L4 ~8k combined)
+	// can release up to that many concurrent first-call wakes that all
+	// hit Docker /containers/create + /start and the Caddy admin API
+	// in lockstep.
+	releaseSem, semErr := s.acquireWakeStartSlot(startCtx)
+	if semErr != nil {
+		// Caller context cancelled or wake budget elapsed before a slot
+		// became available. Treat as a wake failure for the breaker so
+		// repeated sem starvation eventually trips the circuit.
+		flight.recordFailure(time.Now())
+		finish(true, semErr)
+		return nil, semErr
+	}
 	started, startErr := s.StartSandbox(startCtx, id)
+	releaseSem()
 	if startErr != nil {
 		flight.recordFailure(time.Now())
 		finish(true, startErr)

@@ -178,21 +178,34 @@ type Config struct {
 	// = 80 GB worst case without this). Required > 0 when serverless
 	// is on.
 	HTTPWakeMaxBufferBytesGlobal int64
-	SSHListenAddr                string
-	SSHHostKeyPath               string
-	CredentialEncryptionKey      string
-	CredentialEncryptionKeyPath  string
-	MountsRootPath               string
-	MountsCredentialsRuntimeDir  string
-	MountWaitTimeout             time.Duration
-	LogLevel                     string
-	ShutdownTimeout              time.Duration
-	HTTPClientTimeout            time.Duration
-	DockerRuntimeWaitTimeout     time.Duration
-	ToolboxWaitTimeout           time.Duration
-	ReconcileInterval            time.Duration
-	NetstatsPollInterval         time.Duration
-	UploadMaxBytes               int64
+	// WakeStartConcurrency caps concurrent StartSandbox invocations
+	// initiated by the wake path across the whole node. Inside the global
+	// HTTP+L4 pending caps, up to (HTTPWakeMaxPendingGlobal +
+	// L4WakeMaxPendingGlobal) different sandboxes may be in their cold-
+	// start window at once; without this cap they all hit Docker create /
+	// start and Caddy admin upserts simultaneously, overwhelming both. Per-
+	// sandbox single-flight (wakeFlights) prevents same-id duplication;
+	// this protects against cross-id storms. Default 64 — Docker daemon
+	// handles ~100 concurrent creates cleanly, Caddy admin API serializes
+	// writes but doesn't fall over. Operator-initiated StartSandbox calls
+	// (API surface) bypass this cap — only wake-driven starts are gated.
+	// Required > 0 when serverless is on.
+	WakeStartConcurrency        int
+	SSHListenAddr               string
+	SSHHostKeyPath              string
+	CredentialEncryptionKey     string
+	CredentialEncryptionKeyPath string
+	MountsRootPath              string
+	MountsCredentialsRuntimeDir string
+	MountWaitTimeout            time.Duration
+	LogLevel                    string
+	ShutdownTimeout             time.Duration
+	HTTPClientTimeout           time.Duration
+	DockerRuntimeWaitTimeout    time.Duration
+	ToolboxWaitTimeout          time.Duration
+	ReconcileInterval           time.Duration
+	NetstatsPollInterval        time.Duration
+	UploadMaxBytes              int64
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -586,6 +599,7 @@ func Load() (Config, error) {
 		HTTPWakeMaxPendingPerSandbox: getEnvInt("SB_HTTP_WAKE_MAX_PENDING_PER_SANDBOX", 256),
 		HTTPWakeMaxPendingGlobal:     getEnvInt("SB_HTTP_WAKE_MAX_PENDING_GLOBAL", 4096),
 		HTTPWakeMaxBufferBytesGlobal: int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL", 1024*1024*1024)),
+		WakeStartConcurrency:         getEnvInt("SB_WAKE_START_CONCURRENCY", 64),
 		SSHListenAddr:                getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
 		SSHHostKeyPath:               getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:      strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
@@ -901,6 +915,9 @@ func Load() (Config, error) {
 		}
 		if cfg.HTTPWakeMaxBufferBytesGlobal <= 0 {
 			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.WakeStartConcurrency <= 0 {
+			return Config{}, errors.New("SB_WAKE_START_CONCURRENCY must be > 0 when SB_ENABLE_SERVERLESS=true")
 		}
 	}
 

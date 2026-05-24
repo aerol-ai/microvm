@@ -141,6 +141,37 @@ type Service struct {
 	wakeFlightsMu sync.Mutex
 	wakeFlights   map[string]*wakeFlight
 
+	// wakeStartSem caps concurrent wake-driven StartSandbox calls
+	// across all sandboxes on this node. Per-sandbox single-flight
+	// (wakeFlights) already collapses same-id duplicates; this protects
+	// against cross-id storms — without it, the pending caps still admit
+	// up to ~8k different sandboxes into their cold-start window at once,
+	// and they all hit Docker create / start and Caddy admin in lockstep.
+	// Buffered chan; capacity = cfg.WakeStartConcurrency at init. Lazily
+	// created via wakeStartSemOnce so test harnesses building &Service{}
+	// directly need no rewiring. Operator-initiated StartSandbox (API
+	// surface) bypasses this — only the wake helper acquires.
+	wakeStartSem     chan struct{}
+	wakeStartSemOnce sync.Once
+
+	// warmCache is the short-TTL in-memory cache fronting IsSandboxStarted.
+	// Every warm serverless HTTP request currently pays a SQLite read here,
+	// and SQLite is single-writer in this process (MaxOpenConns=1), so at
+	// 100k QPS those reads serialize through one connection and become the
+	// bottleneck. The cache stores (id -> expiresAtUnixNano) for hits that
+	// were observed as Started; cold (Stopped/Destroyed/Error) results are
+	// NOT cached — only the hot path is optimized, and a cold sandbox
+	// always falls through to the source of truth. TTL is intentionally
+	// short (2s) so even an entirely missed invalidation self-heals
+	// quickly; we still install explicit invalidation hooks on every
+	// stop/destroy path to keep the staleness window sub-second under
+	// normal conditions. The worst-case failure of a stale-true hit is
+	// the proxy connecting to a not-yet-warm upstream and returning
+	// 503+Retry-After, which is identical to the cold-start race the
+	// readiness probe already handles.
+	warmCacheMu sync.RWMutex
+	warmCache   map[string]int64
+
 	// touchCoalescer debounces last_active_at flushes per sandbox so a
 	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
 	// runtime proxies, SSH gateway) does not become one SQLite UPDATE
@@ -870,6 +901,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		_ = s.mounts.UnmountAll(id)
 		releaseAdmission()
 		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+		s.invalidateWarm(id)
 		return nil, err
 	}
 
@@ -911,6 +943,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		return nil, err
 	}
 	s.syncAllowedPorts(ctx, refreshed)
+	// Populate the warm-preflight cache so the convoy of HTTP requests
+	// released by this wake skips the SQLite preflight on the way to
+	// the now-warm upstream. invalidateWarm fires from every stop /
+	// destroy path so a later transition out of Started invalidates.
+	if refreshed.Status == models.SandboxStatusStarted {
+		s.warmCacheSet(id)
+	}
 	return refreshed, nil
 }
 
@@ -942,6 +981,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		return err
 	}
 	s.forgetWakeFlight(id)
+	s.invalidateWarm(id)
 	if err := s.DeleteClusterSecrets(ctx, id); err != nil {
 		return err
 	}
@@ -1896,12 +1936,89 @@ func (s *Service) TouchSandbox(ctx context.Context, id string) error {
 // Started; any other status (Stopped, Destroyed, in-flight create)
 // returns (false, nil). store.ErrNotFound is returned unwrapped so the
 // proxy can map it to 404 without a second store hit.
+//
+// Hot path: a short-TTL cache (warmCache) lets repeated warm requests
+// to the same sandbox skip the SQLite read. The cache holds positives
+// only ("seen Started in the last warmCacheTTL"); a miss always falls
+// through to s.store.Get so cold/stopped/destroyed sandboxes never
+// short-circuit. Lifecycle transitions (StartSandbox success, every
+// stop path, every destroy path) explicitly invalidate the entry.
 func (s *Service) IsSandboxStarted(ctx context.Context, id string) (bool, error) {
+	if s.warmCacheHit(id) {
+		return true, nil
+	}
 	sb, err := s.store.Get(ctx, id)
 	if err != nil {
 		return false, err
 	}
-	return sb.Status == models.SandboxStatusStarted, nil
+	started := sb.Status == models.SandboxStatusStarted
+	if started {
+		s.warmCacheSet(id)
+	}
+	return started, nil
+}
+
+// warmCacheTTL is intentionally short (2s) so an entirely-missed
+// invalidation self-heals fast. The explicit invalidation hooks below
+// keep the normal staleness window sub-second; the TTL is the backstop
+// for the pathological case where an invalidation never fires.
+const warmCacheTTL = 2 * time.Second
+
+func (s *Service) warmCacheHit(id string) bool {
+	s.warmCacheMu.RLock()
+	exp, ok := s.warmCache[id]
+	s.warmCacheMu.RUnlock()
+	if !ok {
+		return false
+	}
+	return time.Now().UnixNano() < exp
+}
+
+func (s *Service) warmCacheSet(id string) {
+	exp := time.Now().Add(warmCacheTTL).UnixNano()
+	s.warmCacheMu.Lock()
+	if s.warmCache == nil {
+		s.warmCache = make(map[string]int64)
+	}
+	s.warmCache[id] = exp
+	s.warmCacheMu.Unlock()
+}
+
+// invalidateWarm drops id from the warm cache. Called from every state
+// transition that takes a sandbox out of Started: StartSandbox failure
+// paths, every stop path (manual, lifecycle, involuntary die/oom), and
+// every destroy path. Safe on a missing key.
+func (s *Service) invalidateWarm(id string) {
+	s.warmCacheMu.Lock()
+	delete(s.warmCache, id)
+	s.warmCacheMu.Unlock()
+}
+
+// acquireWakeStartSlot caps concurrent wake-driven StartSandbox
+// invocations across the node. Returns a release closure on success;
+// returns ctx.Err() if the caller's context is cancelled before a slot
+// becomes available. Lazily sized from cfg.WakeStartConcurrency on
+// first use so test harnesses (newCapacityHarness, cluster fixtures)
+// that build &Service{} directly don't have to thread the value
+// through. A zero or negative cfg value disables the cap entirely
+// (unbounded chan via nil send branch) to preserve pre-feature
+// behavior for tests.
+func (s *Service) acquireWakeStartSlot(ctx context.Context) (func(), error) {
+	s.wakeStartSemOnce.Do(func() {
+		cap := s.cfg.WakeStartConcurrency
+		if cap > 0 {
+			s.wakeStartSem = make(chan struct{}, cap)
+		}
+	})
+	if s.wakeStartSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case s.wakeStartSem <- struct{}{}:
+		return func() { <-s.wakeStartSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
