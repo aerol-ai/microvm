@@ -227,13 +227,14 @@ details[open] > summary { margin-bottom: 6px; }
             <th>Sandbox</th>
             <th>Owner</th>
             <th>State</th>
+            <th>Runtime</th>
             <th class="num">Version</th>
             <th>Created</th>
             <th>Updated</th>
             <th></th>
           </tr>
         </thead>
-        <tbody id="placements-tbody"><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
+        <tbody id="placements-tbody"><tr><td colspan="8" class="empty">loading…</td></tr></tbody>
       </table>
       <div class="pager">
         <button id="next-page-btn" type="button" disabled>Next page</button>
@@ -631,7 +632,7 @@ async function loadPlacements() {
       p = await apiJSON("/v1/cluster/sandbox-index" + q);
     } catch (err) {
       if (String(err.message).startsWith("503")) {
-        el("placements-tbody").innerHTML = `<tr><td colspan="7" class="empty">cluster not enabled on this node</td></tr>`;
+        el("placements-tbody").innerHTML = `<tr><td colspan="8" class="empty">cluster not enabled on this node</td></tr>`;
         el("placements-meta").textContent = "";
         el("page-info").textContent = "";
         el("next-page-btn").disabled = true;
@@ -645,21 +646,43 @@ async function loadPlacements() {
       : `${rows.length} on this page`;
 
     if (rows.length === 0) {
-      el("placements-tbody").innerHTML = `<tr><td colspan="7" class="empty">no placements${token ? " on this page" : ""}</td></tr>`;
+      el("placements-tbody").innerHTML = `<tr><td colspan="8" class="empty">no placements${token ? " on this page" : ""}</td></tr>`;
     } else {
       el("placements-tbody").innerHTML = rows.map((pl) => {
         const orphaned = pl.owner_state === "orphaned";
         const stateLabel = pl.state ? pl.state : (orphaned ? "orphaned" : "placed");
         const stateKind = orphaned ? "bad" : (pl.state === "reserved" ? "warn" : "ok");
+        // runtime_status comes from the per-node sandbox store overlay
+        // (cluster_handler.go). Empty means the row lives on another
+        // node, so the dashboard can't act on it from here.
+        const runtime = pl.runtime_status || "";
+        const isStarted = runtime === "started";
+        const isStopped = runtime === "stopped";
+        const runtimePill = runtime
+          ? pill(runtime, isStarted ? "ok" : isStopped ? "warn" : "bad")
+          : `<span class="muted">remote</span>`;
         let actions = "";
         if (orphaned) {
           actions = `
             <button data-action="reclaim" data-id="${escapeHTML(pl.sandbox_id)}">Reclaim local</button>
             <button class="danger" data-action="delete-orphan" data-id="${escapeHTML(pl.sandbox_id)}">Force delete</button>
           `;
-        } else {
+        } else if (isStopped) {
+          // Context-aware: a stopped sandbox cannot meaningfully be
+          // "Stopped" again. Offer Start (resume) + Delete instead.
+          actions = `
+            <button data-action="start-sandbox" data-id="${escapeHTML(pl.sandbox_id)}">Start</button>
+            <button class="danger" data-action="delete-sandbox" data-id="${escapeHTML(pl.sandbox_id)}">Delete</button>
+          `;
+        } else if (isStarted) {
           actions = `
             <button data-action="stop-sandbox" data-id="${escapeHTML(pl.sandbox_id)}">Stop</button>
+            <button class="danger" data-action="delete-sandbox" data-id="${escapeHTML(pl.sandbox_id)}">Delete</button>
+          `;
+        } else {
+          // Unknown runtime (remote placement, in-flux, destroyed
+          // row already gone): only delete is safe to expose.
+          actions = `
             <button class="danger" data-action="delete-sandbox" data-id="${escapeHTML(pl.sandbox_id)}">Delete</button>
           `;
         }
@@ -668,6 +691,7 @@ async function loadPlacements() {
             <td class="id">${escapeHTML(pl.sandbox_id)}</td>
             <td><span class="mono muted">${escapeHTML(pl.owner_node_id || "—")}</span></td>
             <td>${pill(stateLabel, stateKind)}</td>
+            <td>${runtimePill}</td>
             <td class="num">${fmtNum(pl.version)}</td>
             <td class="num" title="${escapeHTML(fmtUnix(pl.created_unix))}"><span class="muted">${fmtAge(pl.created_unix)}</span></td>
             <td class="num" title="${escapeHTML(fmtUnix(pl.updated_unix))}"><span class="muted">${fmtAge(pl.updated_unix)}</span></td>
@@ -680,7 +704,7 @@ async function loadPlacements() {
     el("next-page-btn").disabled = !p.next_page_token;
     state.nextPageToken = p.next_page_token || "";
   } catch (err) {
-    el("placements-tbody").innerHTML = `<tr><td colspan="7" class="error">${escapeHTML(err.message)}</td></tr>`;
+    el("placements-tbody").innerHTML = `<tr><td colspan="8" class="error">${escapeHTML(err.message)}</td></tr>`;
   }
 }
 
@@ -753,6 +777,8 @@ document.addEventListener("click", (e) => {
     postAction("POST", `/v1/cluster/orphans/${encodeURIComponent(id)}/reclaim-local`, "Reclaim orphan locally", id);
   } else if (action === "delete-orphan") {
     postAction("DELETE", `/v1/cluster/orphans/${encodeURIComponent(id)}`, "Force-delete orphan placement", id);
+  } else if (action === "start-sandbox") {
+    postAction("POST", `/v1/sandboxes/${encodeURIComponent(id)}/start`, "Start sandbox", id);
   } else if (action === "stop-sandbox") {
     postAction("POST", `/v1/sandboxes/${encodeURIComponent(id)}/stop`, "Stop sandbox", id);
   } else if (action === "delete-sandbox") {

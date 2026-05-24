@@ -256,29 +256,38 @@ func (s *Service) shouldArmWake(sandbox *models.Sandbox, mode stopMode) bool {
 }
 
 // ReconstructWakeArmedIfNeeded is the D1 reconstruction rule from
-// plans/serverless-sandbox-http-wake.md. A serverless sandbox can land
-// in `stopped + wake_armed=false` on a node that does not own the
-// arming history — typically after a cluster owner change (the old
-// owner's SQLite wake_armed bit doesn't migrate) or after a daemon
-// restart that lost the in-memory expected-stop bookkeeping and saw a
-// crash event arrive before the row got an armed value. In both cases
-// the conservative default is the same as the involuntary-stop policy:
-// arm wake so the next HTTP request resurrects the sandbox, instead of
-// leaving a stopped serverless sandbox permanently dark until an
-// operator notices.
+// plans/serverless-sandbox-http-wake.md, extended to also self-heal
+// Caddy state. A serverless sandbox can land in `stopped + wake_armed=false`
+// on a node that does not own the arming history — typically after a
+// cluster owner change (the old owner's SQLite wake_armed bit doesn't
+// migrate) or after a daemon restart that lost the in-memory expected-stop
+// bookkeeping and saw a crash event arrive before the row got an armed
+// value. In those cases the conservative default is the same as the
+// involuntary-stop policy: arm wake so the next HTTP request resurrects
+// the sandbox.
+//
+// It ALSO re-upserts wake routes when wake_armed=true is already set.
+// Caddy's admin-API routes are dynamic and do not survive a Caddy
+// restart (only certs persist via S3 storage), so the daemon must
+// treat wake_armed=true as a goal state to reassert against Caddy on
+// every reconcile pass, not as a witness that routes still exist.
+// Without this, a Caddy restart between auto-stop and the next wake
+// request leaves the wildcard 404 fallback serving requests forever
+// even though the DB looks correct.
 //
 // Reconstruction is a no-op unless ALL of:
 //   - cfg.EnableServerless is on
 //   - sandbox is Lifecycle.Serverless
 //   - sandbox is in Stopped status
-//   - sandbox.WakeArmed is currently false
 //   - the sandbox has at least one exposed port that can receive an inbound
 //     wake request or connection
 //
 // Caddy-first per D5: install wake routes for every exposure
 // before flipping the store bit. If every wake route install fails we
-// leave wake_armed=false to keep route state and the bit in sync —
-// the next reconcile pass will retry.
+// leave wake_armed unchanged (false stays false, true stays true) so
+// route state and the bit remain in sync — the next reconcile pass
+// will retry. The store write is skipped when wake_armed is already
+// true so steady-state reconcile passes do not churn the row.
 func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *models.Sandbox) {
 	if sandbox == nil {
 		return
@@ -290,9 +299,6 @@ func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *mod
 		return
 	}
 	if sandbox.Status != models.SandboxStatusStopped {
-		return
-	}
-	if sandbox.WakeArmed {
 		return
 	}
 
@@ -316,6 +322,11 @@ func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *mod
 		return
 	}
 
+	if sandbox.WakeArmed {
+		// Already armed; this pass only re-asserted the Caddy routes to
+		// heal post-restart state. No store write, no audit log.
+		return
+	}
 	if err := s.store.SetWakeArmed(ctx, sandbox.ID, true); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.logger.Warn("reconstruct wake_armed store update failed",
 			"sandbox_id", sandbox.ID, "error", err)

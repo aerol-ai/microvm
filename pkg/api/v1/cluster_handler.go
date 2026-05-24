@@ -576,6 +576,24 @@ func (h *handlers) clusterIngressRoute(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, route)
 }
 
+// sandboxIndexPlacement extends the cluster.Placement (FSM/Raft state) with
+// the local sandbox row's runtime status. The FSM tracks ownership and
+// scheduling intent; runtime status (started/stopped/destroyed) lives in
+// the per-node store. The dashboard needs runtime status to render
+// Start vs Stop action buttons, so the index handler overlays it here
+// rather than forcing the UI to fan out an extra GET per row.
+// RuntimeStatus is empty for placements owned by another node (we only
+// see this node's store) — the UI treats that as "view-only / remote".
+type sandboxIndexPlacement struct {
+	cluster.Placement
+	RuntimeStatus models.SandboxStatus `json:"runtime_status,omitempty"`
+}
+
+type sandboxIndexResponse struct {
+	Placements    []sandboxIndexPlacement `json:"placements"`
+	NextPageToken string                  `json:"next_page_token,omitempty"`
+}
+
 func (h *handlers) writeClusterSandboxIndex(w http.ResponseWriter, r *http.Request) {
 	if h.deps.Service == nil {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
@@ -595,10 +613,32 @@ func (h *handlers) writeClusterSandboxIndex(w http.ResponseWriter, r *http.Reque
 		},
 	}
 	resp := c.PlacementPage(req)
+
+	// One List call to build the id→status overlay so we don't issue N
+	// store.Get calls per page. ListSandboxes already returns local-only
+	// rows; placements pointing to another owner stay with empty runtime
+	// status and the UI treats them as remote.
+	statusByID := map[string]models.SandboxStatus{}
+	if locals, err := h.deps.Service.ListSandboxes(r.Context(), nil); err == nil {
+		for _, sb := range locals {
+			statusByID[sb.ID] = sb.Status
+		}
+	} else {
+		h.deps.Logger.Warn("sandbox-index: local list failed; runtime_status will be empty", "err", err)
+	}
+
+	out := sandboxIndexResponse{
+		Placements:    make([]sandboxIndexPlacement, len(resp.Placements)),
+		NextPageToken: resp.NextPageToken,
+	}
 	for i := range resp.Placements {
 		redactPlacementSecretFields(&resp.Placements[i])
+		out.Placements[i] = sandboxIndexPlacement{
+			Placement:     resp.Placements[i],
+			RuntimeStatus: statusByID[resp.Placements[i].SandboxID],
+		}
 	}
-	apihttp.WriteJSON(w, http.StatusOK, resp)
+	apihttp.WriteJSON(w, http.StatusOK, out)
 }
 
 func redactPlacementSecretFields(p *cluster.Placement) {
