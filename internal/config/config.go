@@ -539,10 +539,15 @@ type Config struct {
 	// ImageBuildGCTTL is the minimum age before an image becomes
 	// eligible for removal: for built images, measured from the
 	// daemon's LastTagTime; for pending images, from the destroy
-	// timestamp recorded in pending_image_gc.scheduled_at. Default 1h:
-	// comfortably longer than any reasonable retry/network-blip between
-	// build and create AND long enough that a destroy/recreate cycle on
-	// the same image doesn't pay a fresh registry pull every time.
+	// timestamp recorded in pending_image_gc.scheduled_at (which is
+	// also refreshed forward by the create path's
+	// RefreshPendingImageGCIfExists, so the clock restarts on most
+	// recent use, not first destroy). Default 24h: wide enough that a
+	// destroy/recreate cycle measured in hours doesn't pay a fresh
+	// registry pull, while still bounded so a build-only host
+	// (sandboxes never recreated) eventually reclaims disk. Tighten via
+	// SB_IMAGE_BUILD_GC_TTL when disk pressure outweighs warm-start
+	// latency.
 	ImageBuildGCTTL time.Duration
 	// ImageGCWhitelist is a list of image repositories or refs the janitors
 	// must never remove. Three match shapes are honored against the image
@@ -798,7 +803,7 @@ func Load() (Config, error) {
 		ImageBuildTimeout:                getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
 		ImageBuildGCEnabled:              getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
 		ImageBuildGCInterval:             getEnvDuration("SB_IMAGE_BUILD_GC_INTERVAL", 10*time.Minute),
-		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", time.Hour),
+		ImageBuildGCTTL:                  getEnvDuration("SB_IMAGE_BUILD_GC_TTL", 24*time.Hour),
 		ImageGCWhitelist:                 parseImageGCWhitelist(os.Getenv("SB_IMAGE_GC_WHITELIST")),
 		ImageDistributionAOCRHost:        strings.TrimSpace(getEnv("SB_IMAGE_DISTRIBUTION_AOCR_HOST", "aocr.aerol.ai")),
 		ImagePullMaxConcurrent:           getEnvInt("SB_IMAGE_PULL_MAX_CONCURRENT", 4),
