@@ -237,8 +237,9 @@ func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
 		return nil, false
 	}
 	if s.l4ActiveBySandbox[id] == 0 {
-		s.l4ActivityGenerations[id]++
-		generation = s.l4ActivityGenerations[id]
+		s.l4ActivitySeq++
+		generation = s.l4ActivitySeq
+		s.l4ActivityGenerations[id] = generation
 		startTicker = true
 	}
 	s.l4ActiveBySandbox[id]++
@@ -256,6 +257,7 @@ func (s *Service) releaseL4Active(id string) {
 	defer s.l4LimitMu.Unlock()
 	if s.l4ActiveBySandbox[id] <= 1 {
 		delete(s.l4ActiveBySandbox, id)
+		delete(s.l4ActivityGenerations, id)
 	} else {
 		s.l4ActiveBySandbox[id]--
 	}
