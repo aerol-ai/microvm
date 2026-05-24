@@ -28,7 +28,7 @@ func TestScaleGateIngressShardAssignmentAt10KMembers(t *testing.T) {
 			APIURL: fmt.Sprintf("http://10.1.%d.%d:21212", (i/256)%256, i%256),
 		})
 	}
-	stub := &stubIngressCluster{Noop: cluster.NewNoop("ing-05000", "http://self"), members: known}
+	stub := &stubIngressCluster{Noop: cluster.NewNoop("ing-05000", "http://self", ""), members: known}
 	filter := clusterIngressShardFilter(stub, "ing-05000")
 	if filter.ShardCount != cluster.DefaultPlacementShardCount {
 		t.Fatalf("shard count=%d, want %d", filter.ShardCount, cluster.DefaultPlacementShardCount)

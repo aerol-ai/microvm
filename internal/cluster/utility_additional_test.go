@@ -21,7 +21,7 @@ import (
 )
 
 func TestNoopAdditionalMethods(t *testing.T) {
-	n := NewNoop("", "http://localhost:21212")
+	n := NewNoop("", "http://localhost:21212", "")
 	if n.SelfNodeID() != "standalone" {
 		t.Fatalf("SelfNodeID() = %q, want standalone", n.SelfNodeID())
 	}

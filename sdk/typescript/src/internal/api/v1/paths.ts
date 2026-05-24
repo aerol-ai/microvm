@@ -26,3 +26,21 @@ export function sandboxCustomDomainsPath(prefix: string, id: string): string {
 export function sandboxCustomDomainPath(prefix: string, id: string, hostname: string): string {
   return `${prefix}/sandboxes/${id}/custom-domains/${encodeURIComponent(hostname)}`;
 }
+
+/**
+ * URL for the cluster's published ingress address(es), used by
+ * `microvm.dns.target()` to render the CNAME/A target a user must point
+ * custom-domain DNS at.
+ */
+export function ingressDNSPath(prefix: string): string {
+  return `${prefix}/ingress/dns`;
+}
+
+/**
+ * URL for the ready-to-paste DNS records of one sandbox's custom-domain
+ * bindings. Sibling of {@link sandboxCustomDomainsPath} — same `id` rules
+ * apply.
+ */
+export function sandboxCustomDomainDNSPath(prefix: string, id: string): string {
+  return `${prefix}/sandboxes/${id}/custom-domains/dns`;
+}

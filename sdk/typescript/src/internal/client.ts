@@ -2,6 +2,8 @@ import { basename } from "node:path";
 
 import {
   PATH_PREFIX as V1_PATH_PREFIX,
+  ingressDNSPath as v1IngressDNSPath,
+  sandboxCustomDomainDNSPath as v1SandboxCustomDomainDNSPath,
   sandboxCustomDomainPath as v1SandboxCustomDomainPath,
   sandboxCustomDomainsPath as v1SandboxCustomDomainsPath,
 } from "./api/v1/paths.js";
@@ -13,6 +15,7 @@ import type {
   CreateOptions,
   CreateSessionOptions,
   CustomDomain,
+  CustomDomainDNSRecords,
   CustomDomainStatus,
   ExecExitInfo,
   ExecRequest,
@@ -25,6 +28,7 @@ import type {
   ExposeResult,
   Failover,
   HealthStatus,
+  IngressTarget,
   Lifecycle,
   ListOptions,
   MountSpec,
@@ -535,6 +539,26 @@ export class APIClient {
     );
   }
 
+  /**
+   * Fetch the cluster's published ingress address(es) — the CNAME/A target
+   * a user must point custom-domain DNS at. Field names already match the
+   * SDK's camelCase shape on the wire, so no translation is needed.
+   */
+  async ingressDNS(): Promise<IngressTarget> {
+    return this.doJSON<IngressTarget>("GET", v1IngressDNSPath(this.versionPrefix));
+  }
+
+  /**
+   * Fetch the ready-to-paste DNS records for one sandbox's custom-domain
+   * bindings, along with the {@link IngressTarget} they were composed from.
+   */
+  async customDomainDNS(id: string): Promise<CustomDomainDNSRecords> {
+    return this.doJSON<CustomDomainDNSRecords>(
+      "GET",
+      v1SandboxCustomDomainDNSPath(this.versionPrefix, id),
+    );
+  }
+
   async reconcile(): Promise<void> {
     await this.doJSON<unknown>("POST", this.versioned("/admin/reconcile"));
   }
@@ -718,6 +742,7 @@ export class SandboxResource implements Sandbox {
     add(hostname: string): Promise<CustomDomain[]>;
     remove(hostname: string): Promise<void>;
     list(): Promise<CustomDomain[]>;
+    dns(): Promise<CustomDomainDNSRecords>;
   } {
     const client = this.client;
     const id = this.id;
@@ -725,6 +750,7 @@ export class SandboxResource implements Sandbox {
       add: (hostname: string) => client.addCustomDomain(id, hostname),
       remove: (hostname: string) => client.removeCustomDomain(id, hostname),
       list: () => client.listCustomDomains(id),
+      dns: () => client.customDomainDNS(id),
     };
   }
 

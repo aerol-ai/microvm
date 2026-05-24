@@ -352,7 +352,7 @@ func TestExposePortHTTPRollsBackOnClusterRecordFailure(t *testing.T) {
 	}
 	svc.caddy = caddy.New(svc.cfg)
 	svc.AttachCluster(&failingExposeCluster{
-		Noop:   cluster.NewNoop("node-1", "http://node-1"),
+		Noop:   cluster.NewNoop("node-1", "http://node-1", ""),
 		addErr: errors.New("cluster write failed"),
 	})
 

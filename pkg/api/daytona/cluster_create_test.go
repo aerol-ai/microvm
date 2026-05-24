@@ -48,7 +48,7 @@ func TestCreateSandboxClusterForwardBuildsOnTargetNotRouter(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &daytonaForwardCluster{
-		Noop:   cluster.NewNoop("router", "http://router"),
+		Noop:   cluster.NewNoop("router", "http://router", ""),
 		target: cluster.PlacementTarget{NodeID: "worker-a", APIURL: "http://worker-a:21212"},
 	}
 	svc.AttachCluster(fakeCluster)
@@ -118,7 +118,7 @@ func TestClusterForwardWrapResolvesDaytonaNameToOwner(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	fakeCluster := &daytonaOwnerForwardCluster{
-		Noop:      cluster.NewNoop("router", "http://router"),
+		Noop:      cluster.NewNoop("router", "http://router", ""),
 		ownerErr:  cluster.ErrUnknownSandbox,
 		nameID:    "sb-named",
 		nameOwner: cluster.OwnerInfo{NodeID: "worker-a", APIURL: "http://worker-a:21212"},
@@ -151,7 +151,7 @@ func TestClusterForwardWrapReturnsGoneForOrphanedDaytonaPlacement(t *testing.T) 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	svc.AttachCluster(&daytonaOwnerForwardCluster{
-		Noop:     cluster.NewNoop("router", "http://router"),
+		Noop:     cluster.NewNoop("router", "http://router", ""),
 		ownerErr: cluster.ErrOrphaned,
 	})
 	h := newHandlers(Deps{Service: svc, Logger: logger})

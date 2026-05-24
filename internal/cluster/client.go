@@ -249,6 +249,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		RaftAddr:       raftAdvertise,
 		InternalURL:    c.internalURL,
 		Role:           cfg.NodeRole,
+		PublicHost:     cfg.EffectivePublicHost(),
 		BootstrapPeers: cfg.BootstrapPeers,
 		GossipInterval: cfg.ClusterCapacityGossipInterval,
 		SecretKey:      secretKey,
@@ -1166,6 +1167,16 @@ func (c *Cluster) Members() []Member {
 		return nil
 	}
 	return c.membersWithCapacity()
+}
+
+// IngressTargets aggregates live ingress-role members' gossiped PublicHost
+// values. See aggregateIngressTargets for the partition / dedup / ordering
+// rules — those are pinned by ingress_targets_test.go.
+func (c *Cluster) IngressTargets() models.IngressTarget {
+	if c.gossip == nil {
+		return models.IngressTarget{Source: models.IngressTargetSourceUnknown}
+	}
+	return aggregateIngressTargets(c.gossip.members())
 }
 
 func (c *Cluster) membersWithCapacity() []Member {

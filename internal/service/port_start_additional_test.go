@@ -250,7 +250,7 @@ func TestExposePortHTTPReplacementKeepsExistingExposureOnClusterFailure(t *testi
 
 	svc.cfg = config.Config{EnableCaddy: true, CaddyAdminURL: server.URL, CaddyServerID: "srv0", Domain: "sandbox.example.com", HTTPClientTimeout: time.Second}
 	svc.caddy = caddy.New(svc.cfg)
-	svc.AttachCluster(&failingExposeCluster{Noop: cluster.NewNoop("node-1", "http://node-1"), addErr: errors.New("cluster write failed")})
+	svc.AttachCluster(&failingExposeCluster{Noop: cluster.NewNoop("node-1", "http://node-1", ""), addErr: errors.New("cluster write failed")})
 
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{ID: "sb-http-replace", Image: "alpine:3.20", Status: models.SandboxStatusStarted, ContainerID: "ctr-http-replace", ContainerIP: "10.0.0.70", Runtime: models.RuntimeDocker, CPU: 1, MemoryMB: 256, DiskGB: 5, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}); err != nil {
@@ -291,7 +291,7 @@ func TestExposePortTCPReusedReservationKeepsRouteOnClusterFailure(t *testing.T) 
 	svc.cfg = config.Config{EnableCaddy: true, CaddyAdminURL: server.URL, CaddyServerID: "srv0", Domain: "sandbox.example.com", HTTPClientTimeout: time.Second}
 	svc.caddy = caddy.New(svc.cfg)
 	svc.l4Ready.Store(true)
-	svc.AttachCluster(&failingExposeCluster{Noop: cluster.NewNoop("node-1", "http://node-1"), addErr: errors.New("cluster write failed")})
+	svc.AttachCluster(&failingExposeCluster{Noop: cluster.NewNoop("node-1", "http://node-1", ""), addErr: errors.New("cluster write failed")})
 
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{ID: "sb-tcp-replace", Image: "postgres:16", Status: models.SandboxStatusStarted, ContainerID: "ctr-tcp-replace", ContainerIP: "10.0.0.71", Runtime: models.RuntimeDocker, CPU: 1, MemoryMB: 256, DiskGB: 5, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}); err != nil {

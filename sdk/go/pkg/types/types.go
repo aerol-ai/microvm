@@ -87,6 +87,39 @@ const (
 	CustomDomainFailed     = models.CustomDomainFailed
 )
 
+// IngressTarget is the cluster-published address(es) DNS for a custom domain
+// must point at. Source disambiguates the shape: "hostname" — Hostname holds
+// a stable name to CNAME at; "ips" — IPs holds one or more raw IPs to A/AAAA
+// at; "mixed" — both are populated; "unknown" — neither is set, the cluster
+// has not gossiped a public address yet.
+type IngressTarget = models.IngressTarget
+
+// IngressTarget Source values.
+const (
+	IngressTargetSourceHostname = models.IngressTargetSourceHostname
+	IngressTargetSourceIPs      = models.IngressTargetSourceIPs
+	IngressTargetSourceMixed    = models.IngressTargetSourceMixed
+	IngressTargetSourceUnknown  = models.IngressTargetSourceUnknown
+)
+
+// DNSRecord is one ready-to-paste DNS row for a custom domain. Hostname is
+// the full hostname; Name is the leftmost label (or "@" for apex); Value is
+// the target. Notes carries provider-specific gotchas the daemon pre-renders.
+type DNSRecord = models.DNSRecord
+
+// DNS record types emitted in CustomDomainDNSRecords.
+const (
+	DNSRecordTypeCNAME = models.DNSRecordTypeCNAME
+	DNSRecordTypeA     = models.DNSRecordTypeA
+	DNSRecordTypeAAAA  = models.DNSRecordTypeAAAA
+)
+
+// CustomDomainDNSRecords is the response body for the per-sandbox
+// custom-domain DNS helper. Records is the flat list (one row per custom
+// domain × per ingress address); Target is the raw aggregation Records was
+// composed from, useful when callers want to render their own UI.
+type CustomDomainDNSRecords = models.CustomDomainDNSRecords
+
 // BuildImagePushOptions describes the per-request push directive for
 // Client.BuildImageWithOptions. Credentials are forwarded to the daemon
 // as a one-shot X-Registry-Auth header on the push call and are never

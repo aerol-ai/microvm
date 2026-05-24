@@ -98,6 +98,11 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Auth(wrap(http.HandlerFunc(h.addCustomDomain))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Auth(wrap(http.HandlerFunc(h.listCustomDomains))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/custom-domains/{hostname}", d.Auth(wrap(http.HandlerFunc(h.removeCustomDomain))))
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains/dns", d.Auth(wrap(http.HandlerFunc(h.customDomainDNS))))
+	// Ingress DNS target — not sandbox-scoped, so no clusterForwardWrap
+	// (any node can answer from its own gossip view). Auth still required:
+	// the response reveals cluster ingress topology.
+	mux.Handle("GET "+PathPrefix+"/ingress/dns", d.Auth(http.HandlerFunc(h.ingressDNS)))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))

@@ -403,7 +403,7 @@ type lifecyclePlacementCluster struct {
 
 func newLifecyclePlacementCluster(self bool) *lifecyclePlacementCluster {
 	return &lifecyclePlacementCluster{
-		Noop:  cluster.NewNoop("node-self", "http://self"),
+		Noop:  cluster.NewNoop("node-self", "http://self", ""),
 		owner: cluster.OwnerInfo{NodeID: "node-self", APIURL: "http://self", IsSelf: self},
 	}
 }

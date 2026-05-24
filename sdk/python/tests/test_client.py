@@ -1023,5 +1023,113 @@ class CustomDomainsTests(unittest.TestCase):
         self.assertEqual(payload["custom_domains"], ["api.acme.com", "edge.acme.com"])
 
 
+class DNSRecordsTests(unittest.TestCase):
+    """Covers the two DNS helper endpoints:
+
+    - ``GET /v1/ingress/dns``                                 → ``dns_target``
+    - ``GET /v1/sandboxes/{id}/custom-domains/dns``           → ``custom_domain_dns``
+    """
+
+    def _client(self, *, body=None):
+        captured = {"calls": []}
+
+        class FakeMicroVM(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                captured["calls"].append((method, path, payload))
+                return body or {}
+
+        return FakeMicroVM(), captured
+
+    def test_dns_target_hostname_source(self):
+        client, captured = self._client(body={"hostname": "ingress.example.com", "source": "config"})
+
+        target = client.dns_target()
+
+        self.assertEqual(captured["calls"][0], ("GET", "/v1/ingress/dns", None))
+        self.assertEqual(target["hostname"], "ingress.example.com")
+        self.assertEqual(target["source"], "config")
+        self.assertNotIn("ips", target)
+
+    def test_dns_target_ips_source(self):
+        client, _ = self._client(body={"ips": ["198.51.100.10", "198.51.100.11"], "source": "resolver"})
+
+        target = client.dns_target()
+
+        self.assertEqual(target["ips"], ["198.51.100.10", "198.51.100.11"])
+        self.assertEqual(target["source"], "resolver")
+        self.assertNotIn("hostname", target)
+
+    def test_dns_target_empty_payload_yields_unknown_source(self):
+        # Daemon must still answer; absent fields decode to a minimal target so
+        # callers can branch on ``source`` without KeyError.
+        client, _ = self._client(body={})
+
+        target = client.dns_target()
+
+        self.assertEqual(target, {"source": ""})
+
+    def test_custom_domain_dns_maps_records_and_target(self):
+        client, captured = self._client(
+            body={
+                "records": [
+                    {
+                        "hostname": "api.acme.com",
+                        "type": "CNAME",
+                        "name": "api.acme.com",
+                        "value": "ingress.example.com",
+                        "notes": "use proxied=false if behind Cloudflare",
+                    },
+                    {
+                        "hostname": "edge.acme.com",
+                        "type": "A",
+                        "name": "edge.acme.com",
+                        "value": "198.51.100.10",
+                    },
+                ],
+                "target": {"hostname": "ingress.example.com", "source": "config"},
+            },
+        )
+
+        bundle = client.custom_domain_dns("sb-1")
+
+        self.assertEqual(captured["calls"][0], ("GET", "/v1/sandboxes/sb-1/custom-domains/dns", None))
+        self.assertEqual(len(bundle["records"]), 2)
+        self.assertEqual(bundle["records"][0]["type"], "CNAME")
+        self.assertEqual(bundle["records"][0]["value"], "ingress.example.com")
+        self.assertEqual(bundle["records"][0]["notes"], "use proxied=false if behind Cloudflare")
+        self.assertEqual(bundle["records"][1]["type"], "A")
+        self.assertNotIn("notes", bundle["records"][1])
+        self.assertEqual(bundle["target"]["hostname"], "ingress.example.com")
+        self.assertEqual(bundle["target"]["source"], "config")
+
+    def test_custom_domain_dns_empty_records_list(self):
+        client, _ = self._client(body={"records": [], "target": {"ips": ["198.51.100.10"], "source": "resolver"}})
+
+        bundle = client.custom_domain_dns("sb-1")
+
+        self.assertEqual(bundle["records"], [])
+        self.assertEqual(bundle["target"]["ips"], ["198.51.100.10"])
+
+    def test_sandbox_custom_domain_dns_delegates_to_client(self):
+        client, captured = self._client(
+            body={
+                "records": [
+                    {"hostname": "api.acme.com", "type": "CNAME", "name": "api.acme.com", "value": "ingress.example.com"},
+                ],
+                "target": {"hostname": "ingress.example.com", "source": "config"},
+            },
+        )
+        sandbox = client_module.Sandbox(client, {"id": "sb-1"})
+
+        bundle = sandbox.custom_domain_dns()
+
+        self.assertEqual(captured["calls"][0], ("GET", "/v1/sandboxes/sb-1/custom-domains/dns", None))
+        self.assertEqual(bundle["records"][0]["hostname"], "api.acme.com")
+        self.assertEqual(bundle["target"]["source"], "config")
+
+
 if __name__ == "__main__":
     unittest.main()

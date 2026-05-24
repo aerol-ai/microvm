@@ -20,6 +20,8 @@ from .types import (
     CreateOptions,
     CreateSessionOptions,
     CustomDomain,
+    CustomDomainDNSRecords,
+    DNSRecord,
     ExecExitInfo,
     ExecRequest,
     ExecResult,
@@ -28,6 +30,7 @@ from .types import (
     ExposeResult,
     Failover,
     HealthStatus,
+    IngressTarget,
     Lifecycle,
     MountSpec,
     MountSpecRedacted,
@@ -338,6 +341,9 @@ class Sandbox:
 
     def remove_custom_domain(self, hostname: str) -> None:
         self._client.remove_custom_domain(self.id, hostname)
+
+    def custom_domain_dns(self) -> CustomDomainDNSRecords:
+        return self._client.custom_domain_dns(self.id)
 
     def start(self) -> "Sandbox":
         updated = self._client.start(self.id)
@@ -702,6 +708,33 @@ class MicroVM:
             None,
         )
 
+    def dns_target(self) -> IngressTarget:
+        """Return the DNS target operators should point custom hostnames at.
+
+        Surfaces the daemon's resolved ingress identity — typically a single
+        ``hostname`` (CNAME) or a list of ``ips`` (A/AAAA), plus a ``source``
+        tag describing how it was resolved. Use this when rendering generic
+        setup instructions; for per-sandbox per-hostname records call
+        :meth:`custom_domain_dns` instead.
+        """
+        response = self._do_json("GET", self._versioned("/ingress/dns"), None)
+        return _from_api_ingress_target(response)
+
+    def custom_domain_dns(self, sandbox_id: str) -> CustomDomainDNSRecords:
+        """Return the DNS records to publish for this sandbox's custom domains.
+
+        Returns one :class:`DNSRecord` per attached hostname (empty list if
+        no domains are attached) bundled with the underlying
+        :class:`IngressTarget`, so callers can render full DNS setup
+        instructions without a follow-up :meth:`dns_target` call.
+        """
+        response = self._do_json(
+            "GET",
+            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains/dns"),
+            None,
+        )
+        return _from_api_custom_domain_dns_response(response)
+
     def _resolve_image(self, image: Any) -> str:
         if isinstance(image, Image):
             return self.build_image(image)
@@ -973,6 +1006,46 @@ def _from_api_custom_domains_response(response: Any) -> List[CustomDomain]:
     if not isinstance(domains, list):
         return []
     return [_from_api_custom_domain(item) for item in domains if isinstance(item, dict)]
+
+
+def _from_api_ingress_target(payload: Any) -> IngressTarget:
+    if not isinstance(payload, dict):
+        return {"source": ""}
+    result: IngressTarget = {"source": str(_first_of(payload, "source") or "")}
+    hostname = _first_of(payload, "hostname")
+    if hostname not in (None, ""):
+        result["hostname"] = str(hostname)
+    ips = _first_of(payload, "ips")
+    if isinstance(ips, list) and len(ips) > 0:
+        result["ips"] = [str(item) for item in ips]
+    return result
+
+
+def _from_api_dns_record(record: Dict[str, Any]) -> DNSRecord:
+    result: DNSRecord = {
+        "hostname": str(_first_of(record, "hostname") or ""),
+        "type": str(_first_of(record, "type") or ""),
+        "name": str(_first_of(record, "name") or ""),
+        "value": str(_first_of(record, "value") or ""),
+    }
+    notes = _first_of(record, "notes")
+    if notes not in (None, ""):
+        result["notes"] = str(notes)
+    return result
+
+
+def _from_api_custom_domain_dns_response(response: Any) -> CustomDomainDNSRecords:
+    if not isinstance(response, dict):
+        return {"records": [], "target": {"source": ""}}
+    records_raw = _first_of(response, "records") or []
+    records: List[DNSRecord] = (
+        [_from_api_dns_record(item) for item in records_raw if isinstance(item, dict)]
+        if isinstance(records_raw, list)
+        else []
+    )
+    target_raw = _first_of(response, "target")
+    target = _from_api_ingress_target(target_raw) if isinstance(target_raw, dict) else {"source": ""}
+    return {"records": records, "target": target}
 
 
 def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:

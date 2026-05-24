@@ -30,7 +30,10 @@ import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
+import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.CustomDomainStatus;
+import ai.aerol.microvm.model.DnsRecord;
+import ai.aerol.microvm.model.IngressTarget;
 import ai.aerol.microvm.model.ExecExitInfo;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
@@ -1044,6 +1047,125 @@ class MicroVMClientTest {
                 .setImage("ubuntu:22.04")
                 .setCustomDomains(List.of("api.acme.com", "app.acme.com")));
             assertEquals(List.of("api.acme.com", "app.acme.com"), requestBody.get().get("custom_domains"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void dnsTargetReturnsHostnameOrIpsFromIngress() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getRawPath());
+            int n = calls.incrementAndGet();
+            if (n == 1) {
+                writeJson(exchange, 200, mapOf(
+                    "hostname", "ingress.acme.com",
+                    "source", "config"
+                ));
+                return;
+            }
+            writeJson(exchange, 200, mapOf(
+                "ips", List.of("203.0.113.10", "203.0.113.11"),
+                "source", "autodetect"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            IngressTarget hostnameTarget = client.dnsTarget();
+            assertEquals("/v1/ingress/dns", seenPath.get());
+            assertEquals("ingress.acme.com", hostnameTarget.hostname);
+            assertEquals(null, hostnameTarget.ips);
+            assertEquals("config", hostnameTarget.source);
+
+            IngressTarget ipsTarget = client.dnsTarget();
+            assertEquals(null, ipsTarget.hostname);
+            assertEquals(List.of("203.0.113.10", "203.0.113.11"), ipsTarget.ips);
+            assertEquals("autodetect", ipsTarget.source);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void customDomainDnsReturnsRecordsAndTarget() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenMethod.set(exchange.getRequestMethod());
+            seenPath.set(exchange.getRequestURI().getRawPath());
+            writeJson(exchange, 200, mapOf(
+                "records", List.of(
+                    mapOf(
+                        "hostname", "api.acme.com",
+                        "type", "CNAME",
+                        "name", "api.acme.com",
+                        "value", "ingress.acme.com",
+                        "notes", "primary"
+                    ),
+                    mapOf(
+                        "hostname", "app.acme.com",
+                        "type", "A",
+                        "name", "app.acme.com",
+                        "value", "203.0.113.10"
+                    )
+                ),
+                "target", mapOf(
+                    "hostname", "ingress.acme.com",
+                    "source", "config"
+                )
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+
+            CustomDomainDnsRecords result = sandbox.customDomainDns();
+            assertEquals("GET", seenMethod.get());
+            assertEquals("/v1/sandboxes/sb-1/custom-domains/dns", seenPath.get());
+            assertNotNull(result);
+            assertNotNull(result.records);
+            assertEquals(2, result.records.size());
+
+            DnsRecord first = result.records.get(0);
+            assertEquals("api.acme.com", first.hostname);
+            assertEquals("CNAME", first.type);
+            assertEquals("api.acme.com", first.name);
+            assertEquals("ingress.acme.com", first.value);
+            assertEquals("primary", first.notes);
+
+            DnsRecord second = result.records.get(1);
+            assertEquals("A", second.type);
+            assertEquals("203.0.113.10", second.value);
+            assertEquals(null, second.notes);
+
+            assertNotNull(result.target);
+            assertEquals("ingress.acme.com", result.target.hostname);
+            assertEquals("config", result.target.source);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void customDomainDnsDefaultsRecordsToEmptyList() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            writeJson(exchange, 200, mapOf(
+                "target", mapOf("source", "config", "hostname", "ingress.acme.com")
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            CustomDomainDnsRecords result = client.customDomainDns("sb-1");
+            assertNotNull(result.records);
+            assertTrue(result.records.isEmpty());
+            assertNotNull(result.target);
+            assertEquals("ingress.acme.com", result.target.hostname);
         } finally {
             server.stop(0);
         }

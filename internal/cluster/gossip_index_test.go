@@ -58,6 +58,7 @@ func TestNodeMetaFallbackPreservesRaftJoinFields(t *testing.T) {
 		"10.42.1.76:7000",
 		"https://10.42.1.76:7002",
 		config.NodeRoleMixed,
+		"ingress.example.com",
 		nil,
 	)
 	if len(d.encoded) <= memberlist.MetaMaxSize {

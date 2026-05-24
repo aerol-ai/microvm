@@ -26,11 +26,11 @@ pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions, CreateSessionOptions,
-    CustomDomain, CustomDomainStatus, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
-    ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, Lifecycle, MountSpec,
-    MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
-    ResizeOptions, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus,
-    SetNetworkLimitsOptions, UpdateLifecycleOptions,
+    CustomDomain, CustomDomainDnsRecords, CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest,
+    ExecResult, ExposeOptions, ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus,
+    IngressTarget, Lifecycle, MountSpec, MountSpecRedacted, MountType, NetworkUsage,
+    RegisterSnapshotOptions, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot,
+    Session, SessionList, SessionStatus, SetNetworkLimitsOptions, UpdateLifecycleOptions,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -405,6 +405,15 @@ impl Sandbox {
     /// regardless of whether the hostname was registered.
     pub fn remove_custom_domain(&self, hostname: &str) -> Result<(), Error> {
         self.client.remove_custom_domain(&self.data.id, hostname)
+    }
+
+    /// Fetch the ready-to-paste DNS records for every custom hostname
+    /// attached to this sandbox, along with the underlying [`IngressTarget`]
+    /// they resolve to. Returns an empty `records` list when no domains are
+    /// attached; the `target` is populated either way so callers can render
+    /// instructions before the first attach.
+    pub fn custom_domain_dns(&self) -> Result<CustomDomainDnsRecords, Error> {
+        self.client.custom_domain_dns(&self.data.id)
     }
 
     pub fn start(&mut self) -> Result<&Self, Error> {
@@ -1164,6 +1173,34 @@ impl Client {
                 self.version_prefix(),
                 id,
                 urlencoding::encode(hostname),
+            ),
+            None,
+        )
+    }
+
+    /// Cluster-wide ingress target advertised for DNS planning. Mirrors
+    /// `GET /v1/ingress/dns`. Returns an [`IngressTarget`] with `source =
+    /// "unknown"` when no ingress node has yet gossiped a public address —
+    /// callers should treat that as unusable rather than guessing.
+    pub fn dns_target(&self) -> Result<IngressTarget, Error> {
+        self.do_json::<(), IngressTarget>(
+            Method::GET,
+            &format!("{}/ingress/dns", self.version_prefix()),
+            None,
+        )
+    }
+
+    /// Ready-to-paste DNS records for every custom hostname currently bound
+    /// to `id`, plus the [`IngressTarget`] they were composed against. The
+    /// records list may be empty (no custom domains attached) but `target`
+    /// is always populated.
+    pub fn custom_domain_dns(&self, id: &str) -> Result<CustomDomainDnsRecords, Error> {
+        self.do_json::<(), CustomDomainDnsRecords>(
+            Method::GET,
+            &format!(
+                "{}/sandboxes/{}/custom-domains/dns",
+                self.version_prefix(),
+                id
             ),
             None,
         )
@@ -2946,5 +2983,130 @@ mod tests {
             "expected server message in error: {}",
             message
         );
+    }
+
+    // dns_target unwraps GET /v1/ingress/dns straight into IngressTarget —
+    // no envelope on this endpoint. Locks in the path, the hostname variant
+    // (most common production config), and that an empty `ips` field
+    // round-trips to an empty Vec rather than failing to deserialize.
+    #[test]
+    fn dns_target_returns_ingress_target() {
+        let body = serde_json::json!({
+            "hostname": "ingress.example.com",
+            "source": "hostname"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let target = client.dns_target().expect("dns_target should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("GET /v1/ingress/dns HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(target.hostname.as_deref(), Some("ingress.example.com"));
+        assert_eq!(target.source, "hostname");
+        assert!(target.ips.is_empty());
+    }
+
+    // The IPs-source variant: server returns ips array, hostname omitted.
+    // Confirms `hostname` deserializes to `None` when missing and the ips
+    // list round-trips intact.
+    #[test]
+    fn dns_target_returns_ips_variant() {
+        let body = serde_json::json!({
+            "ips": ["203.0.113.10", "2001:db8::1"],
+            "source": "ips"
+        })
+        .to_string();
+        let (url, _request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let target = client.dns_target().expect("dns_target should succeed");
+
+        assert!(target.hostname.is_none());
+        assert_eq!(target.source, "ips");
+        assert_eq!(target.ips, vec!["203.0.113.10", "2001:db8::1"]);
+    }
+
+    // custom_domain_dns returns the composed records + target. Locks in the
+    // path, the records list, the embedded target, and that `notes` is
+    // optional (omitted on most rows, present on Cloudflare-style hints).
+    #[test]
+    fn custom_domain_dns_returns_records_and_target() {
+        let body = serde_json::json!({
+            "records": [
+                {
+                    "hostname": "api.acme.com",
+                    "type": "CNAME",
+                    "name": "api",
+                    "value": "ingress.example.com"
+                },
+                {
+                    "hostname": "acme.com",
+                    "type": "CNAME",
+                    "name": "@",
+                    "value": "ingress.example.com",
+                    "notes": "Cloudflare: DNS only (gray cloud)"
+                }
+            ],
+            "target": {
+                "hostname": "ingress.example.com",
+                "source": "hostname"
+            }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let dns = client
+            .custom_domain_dns("sb-1")
+            .expect("custom_domain_dns should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("GET /v1/sandboxes/sb-1/custom-domains/dns HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(dns.records.len(), 2);
+        assert_eq!(dns.records[0].hostname, "api.acme.com");
+        assert_eq!(dns.records[0].record_type, "CNAME");
+        assert_eq!(dns.records[0].name, "api");
+        assert_eq!(dns.records[0].value, "ingress.example.com");
+        assert!(dns.records[0].notes.is_none());
+        assert_eq!(
+            dns.records[1].notes.as_deref(),
+            Some("Cloudflare: DNS only (gray cloud)")
+        );
+        assert_eq!(dns.target.hostname.as_deref(), Some("ingress.example.com"));
+        assert_eq!(dns.target.source, "hostname");
+    }
+
+    // Empty-records case: server returns `target` populated even when no
+    // custom domains are attached, so the UI can show DNS instructions
+    // before the first attach.
+    #[test]
+    fn custom_domain_dns_handles_empty_records() {
+        let body = serde_json::json!({
+            "records": [],
+            "target": {
+                "hostname": "ingress.example.com",
+                "source": "hostname"
+            }
+        })
+        .to_string();
+        let (url, _request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let dns = client
+            .custom_domain_dns("sb-1")
+            .expect("custom_domain_dns should succeed");
+
+        assert!(dns.records.is_empty());
+        assert_eq!(dns.target.hostname.as_deref(), Some("ingress.example.com"));
     }
 }

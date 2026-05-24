@@ -30,6 +30,8 @@ import ai.aerol.microvm.model.BuildImageResult;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
+import ai.aerol.microvm.model.CustomDomainDnsRecords;
+import ai.aerol.microvm.model.DnsRecord;
 import ai.aerol.microvm.model.ExecExitInfo;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
@@ -38,6 +40,7 @@ import ai.aerol.microvm.model.ExposeOptions;
 import ai.aerol.microvm.model.ExposeProtocol;
 import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.HealthStatus;
+import ai.aerol.microvm.model.IngressTarget;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpecRedacted;
 import ai.aerol.microvm.model.NetworkUsage;
@@ -415,6 +418,39 @@ public class MicroVMClient {
             sandboxPath(sandboxId) + "/custom-domains/" + encodePathSegment(hostname),
             null
         );
+    }
+
+    /**
+     * Resolve the cluster-wide ingress target operators should point custom
+     * domain DNS records at. Exactly one of {@link IngressTarget#hostname}
+     * (CNAME target) or {@link IngressTarget#ips} (A-record targets) will be
+     * populated, depending on the daemon's configured ingress source.
+     */
+    public IngressTarget dnsTarget() {
+        IngressTarget target = doJson("GET", versioned("/ingress/dns"), null, IngressTarget.class);
+        return target == null ? new IngressTarget() : target;
+    }
+
+    /**
+     * Render the DNS records the operator must publish to validate every
+     * custom domain attached to this sandbox. The returned
+     * {@link CustomDomainDnsRecords#target} mirrors {@link #dnsTarget()} so
+     * callers can render setup instructions without a second round trip.
+     */
+    public CustomDomainDnsRecords customDomainDns(String sandboxId) {
+        CustomDomainDnsRecords records = doJson(
+            "GET",
+            sandboxPath(sandboxId) + "/custom-domains/dns",
+            null,
+            CustomDomainDnsRecords.class
+        );
+        if (records == null) {
+            return new CustomDomainDnsRecords();
+        }
+        if (records.records == null) {
+            records.records = Collections.<DnsRecord>emptyList();
+        }
+        return records;
     }
 
     static class AddCustomDomainRequest {

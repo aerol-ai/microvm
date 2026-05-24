@@ -102,7 +102,7 @@ func TestReplayReservationsThenStaleOwnershipReleasesCapacity(t *testing.T) {
 
 	// Now attach a cluster client that reports the sandbox as owned by a peer.
 	svc.AttachCluster(&stubStaleCluster{
-		Noop:      cluster.NewNoop("self", "http://self"),
+		Noop:      cluster.NewNoop("self", "http://self", ""),
 		otherNode: "node-b",
 		otherURL:  "http://node-b",
 	})
@@ -163,7 +163,7 @@ func TestReconcileStaleOwnershipKeepsLocalSandboxWhenSelfOwns(t *testing.T) {
 	admitter.Reserve(sandboxID, capacity.Request{CPU: 1, MemoryMB: 1024})
 
 	// Noop cluster reports self for every id.
-	svc.AttachCluster(cluster.NewNoop("self", "http://self"))
+	svc.AttachCluster(cluster.NewNoop("self", "http://self", ""))
 
 	if err := svc.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -190,7 +190,7 @@ func TestReconcileBackfillsMissingPlacementForManagedLocalSandbox(t *testing.T) 
 	}, nil)
 	svc.cfg.EnableCluster = true
 	recorder := &recordingOwnershipCluster{
-		Noop:       cluster.NewNoop("self", "http://self"),
+		Noop:       cluster.NewNoop("self", "http://self", ""),
 		placements: map[string]cluster.Placement{},
 	}
 	svc.AttachCluster(recorder)

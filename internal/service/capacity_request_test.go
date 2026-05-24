@@ -49,7 +49,7 @@ func TestCreateSandboxRejectsInvalidLargeClusterTopology(t *testing.T) {
 		nil, nil, nil, nil, nil, nil, nil,
 	)
 	svc.AttachCluster(&topologyCluster{
-		Noop: cluster.NewNoop("node-01", "http://node-01"),
+		Noop: cluster.NewNoop("node-01", "http://node-01", ""),
 		members: []cluster.Member{
 			{NodeID: "server-1", Role: config.NodeRoleServer, Alive: true},
 			{NodeID: "server-2", Role: config.NodeRoleServer, Alive: true},
@@ -93,7 +93,7 @@ func TestClusterTopologyRequiresShardAwareIngressForLargeIngressTier(t *testing.
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		nil, nil, nil, nil, nil, nil, nil,
 	)
-	svc.AttachCluster(&topologyCluster{Noop: cluster.NewNoop("worker-1", "http://worker-1"), members: members})
+	svc.AttachCluster(&topologyCluster{Noop: cluster.NewNoop("worker-1", "http://worker-1", ""), members: members})
 
 	err := svc.ClusterTopologyError()
 	if !errors.Is(err, cluster.ErrInvalidTopology) {

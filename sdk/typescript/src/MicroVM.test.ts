@@ -856,3 +856,25 @@ test("Sandbox attachSession uses sandbox bearer subprotocol", async () => {
     globalThis.WebSocket = originalWebSocket;
   }
 });
+
+test("MicroVM.dns.target GETs /v1/ingress/dns and maps response", async () => {
+  let seenRequest: Request | undefined;
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return new Response(
+        JSON.stringify({ hostname: "ingress.example.com", source: "hostname" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  });
+
+  const target = await sdk.dns.target();
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  assert.ok(seenRequest.url.endsWith("/v1/ingress/dns"));
+  assert.equal(target.hostname, "ingress.example.com");
+  assert.equal(target.source, "hostname");
+});

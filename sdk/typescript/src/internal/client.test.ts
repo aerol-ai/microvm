@@ -1024,6 +1024,124 @@ test("internal client create forwards customDomains as snake_case", async () => 
   assert.deepEqual(body?.custom_domains, ["api.acme.com", "www.acme.com"]);
 });
 
+test("internal client ingressDNS GETs and returns target verbatim", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        hostname: "ingress.example.com",
+        source: "hostname",
+      });
+    },
+  });
+
+  const target = await client.ingressDNS();
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  assert.ok(seenRequest.url.endsWith("/v1/ingress/dns"));
+  assert.equal(target.hostname, "ingress.example.com");
+  assert.equal(target.source, "hostname");
+  assert.equal(target.ips, undefined);
+});
+
+test("internal client ingressDNS maps IPs source", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () =>
+      jsonResponse({ ips: ["203.0.113.10", "203.0.113.11"], source: "ips" }),
+  });
+
+  const target = await client.ingressDNS();
+  assert.equal(target.source, "ips");
+  assert.deepEqual(target.ips, ["203.0.113.10", "203.0.113.11"]);
+  assert.equal(target.hostname, undefined);
+});
+
+test("internal client customDomainDNS GETs and maps records + target", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        records: [
+          {
+            hostname: "api.acme.com",
+            type: "CNAME",
+            name: "api",
+            value: "ingress.example.com",
+          },
+          {
+            hostname: "acme.com",
+            type: "A",
+            name: "@",
+            value: "203.0.113.10",
+            notes: "Cloudflare users: set proxy status to DNS only (gray cloud).",
+          },
+        ],
+        target: {
+          hostname: "ingress.example.com",
+          ips: ["203.0.113.10"],
+          source: "mixed",
+        },
+      });
+    },
+  });
+
+  const result = await client.customDomainDNS("sb-cd");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  assert.ok(seenRequest.url.endsWith("/v1/sandboxes/sb-cd/custom-domains/dns"));
+  assert.equal(result.records.length, 2);
+  assert.equal(result.records[0].type, "CNAME");
+  assert.equal(result.records[0].value, "ingress.example.com");
+  assert.equal(result.records[1].type, "A");
+  assert.match(result.records[1].notes ?? "", /Cloudflare/);
+  assert.equal(result.target.source, "mixed");
+  assert.equal(result.target.hostname, "ingress.example.com");
+  assert.deepEqual(result.target.ips, ["203.0.113.10"]);
+});
+
+test("sandbox resource customDomains.dns delegates to client", async () => {
+  let dnsCalls = 0;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (req.url.endsWith("/v1/sandboxes/sb-cd")) {
+        return jsonResponse(apiSandbox("sb-cd"));
+      }
+      if (req.method === "GET" && req.url.endsWith("/custom-domains/dns")) {
+        dnsCalls++;
+        return jsonResponse({
+          records: [
+            {
+              hostname: "api.acme.com",
+              type: "CNAME",
+              name: "api",
+              value: "ingress.example.com",
+            },
+          ],
+          target: { hostname: "ingress.example.com", source: "hostname" },
+        });
+      }
+      throw new Error(`unexpected ${req.method} ${req.url}`);
+    },
+  });
+
+  const sandbox = await client.get("sb-cd");
+  const result = await sandbox.customDomains.dns();
+  assert.equal(dnsCalls, 1);
+  assert.equal(result.records[0].hostname, "api.acme.com");
+  assert.equal(result.target.source, "hostname");
+});
+
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,

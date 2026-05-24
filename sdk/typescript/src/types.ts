@@ -267,6 +267,59 @@ export interface CustomDomain {
 }
 
 /**
+ * Where the SDK derived the ingress address(es) from. Reflects how the
+ * operator deployed the cluster:
+ *   - "hostname": the cluster gossips a stable hostname (CNAME target).
+ *   - "ips":      one or more raw ingress IPs (one A/AAAA record per IP).
+ *   - "mixed":    some nodes gossip a hostname, others raw IPs — prefer
+ *                 the hostname but render both so apex domains still work.
+ *   - "unknown":  no ingress node has gossiped a public address yet; the
+ *                 target is unusable and callers should surface that, not
+ *                 guess.
+ */
+export type IngressTargetSource = "hostname" | "ips" | "mixed" | "unknown";
+
+/**
+ * The cluster's published ingress address(es) — the value that DNS for a
+ * custom domain must ultimately resolve to. Returned by `microvm.dns.target()`
+ * and embedded in {@link CustomDomainDNSRecords}.
+ */
+export interface IngressTarget {
+  hostname?: string;
+  ips?: string[];
+  source: IngressTargetSource;
+}
+
+/** DNS record types the daemon emits for custom-domain wiring. */
+export type DNSRecordType = "CNAME" | "A" | "AAAA";
+
+/**
+ * One ready-to-paste DNS record a user adds at their DNS provider to make a
+ * custom domain reach the cluster. `name` is the leftmost label (or "@" for
+ * apex) the way DNS UIs accept it. `notes` carries provider-specific gotchas
+ * the daemon pre-renders (e.g. Cloudflare "DNS only, gray cloud") when
+ * applicable.
+ */
+export interface DNSRecord {
+  hostname: string;
+  type: DNSRecordType;
+  name: string;
+  value: string;
+  notes?: string;
+}
+
+/**
+ * Response from `sandbox.customDomains.dns()`. `records` is the flat
+ * ready-to-paste list (one row per custom domain × per ingress address);
+ * `target` is the raw aggregation the records were composed from, included
+ * so callers can render their own UI without a second round trip.
+ */
+export interface CustomDomainDNSRecords {
+  records: DNSRecord[];
+  target: IngressTarget;
+}
+
+/**
  * Wire protocol an exposure publishes through:
  *   - "http": Caddy HTTP reverse proxy at https://<id>-<port>.<domain>.
  *   - "tcp":  raw caddy-l4 listener on a parent-host port.

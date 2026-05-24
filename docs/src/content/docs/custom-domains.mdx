@@ -124,6 +124,100 @@ The add call returns the post-attach list with the new row's `status` so callers
   </TabItem>
 </Tabs>
 
+## Discover DNS records from the SDK
+
+The static table in [DNS records to add](#dns-records-to-add) describes the
+shape of the records. The SDK can also return them already filled in for the
+cluster you're connected to, so a product built on top of AerolVM can advertise
+"add this exact row" without re-implementing the apex-vs-subdomain /
+CNAME-vs-A logic.
+
+Two entry points:
+
+- `dns.target()` — cluster-wide. Returns the ingress target (hostname or
+  IP set) that custom-domain DNS must point at. Useful **before** attaching a
+  domain, when rendering "point your DNS here first" instructions. `source`
+  is `"hostname"`, `"ips"`, `"mixed"`, or `"unknown"` — branch on it instead
+  of guessing from which field is populated.
+- `customDomains.dns()` — per-sandbox. Returns one ready-to-paste DNS row per
+  attached domain plus the same `target` embedded, so callers don't need a
+  follow-up `dns.target()` round trip.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const target = await microvm.dns.target();
+    // { hostname: "ingress.example.com", source: "hostname" }
+
+    const dns = await sandbox.customDomains.dns();
+    for (const r of dns.records) {
+      console.log(`${r.type} ${r.name} → ${r.value}`); // "CNAME api → ingress.example.com"
+      if (r.notes) console.log("  note:", r.notes);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    target = microvm.dns_target()
+    # {"hostname": "ingress.example.com", "source": "hostname"}
+
+    dns = sandbox.custom_domain_dns()
+    for r in dns["records"]:
+        print(f"{r['type']} {r['name']} → {r['value']}")
+        if r.get("notes"):
+            print("  note:", r["notes"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    target, err := client.DNSTarget(ctx)
+    if err != nil { log.Fatal(err) }
+    // target.Hostname == "ingress.example.com", target.Source == "hostname"
+
+    dns, err := sandbox.CustomDomainDNS(ctx)
+    if err != nil { log.Fatal(err) }
+    for _, r := range dns.Records {
+        fmt.Printf("%s %s → %s\n", r.Type, r.Name, r.Value)
+        if r.Notes != "" {
+            fmt.Println("  note:", r.Notes)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let target = client.dns_target()?;
+    // target.hostname == Some("ingress.example.com"), target.source == "hostname"
+
+    let dns = sandbox.custom_domain_dns()?;
+    for r in dns.records {
+        println!("{} {} → {}", r.record_type, r.name, r.value);
+        if let Some(note) = r.notes {
+            println!("  note: {}", note);
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    IngressTarget target = client.dnsTarget();
+    // target.hostname == "ingress.example.com", target.source == "hostname"
+
+    CustomDomainDnsRecords dns = sandbox.customDomainDns();
+    for (DnsRecord r : dns.records) {
+        System.out.println(r.type + " " + r.name + " → " + r.value);
+        if (r.notes != null) {
+            System.out.println("  note: " + r.notes);
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+When the cluster has no ingress address gossiped yet (boot, mis-configured
+deployment), `source` is `"unknown"` and `records` is empty — treat the
+target as unusable rather than guessing.
+
 ## Detach
 
 Detach removes the Caddy route and deletes the row. The issued certificate stays in Caddy's storage and ages out on renewal. Returns `404` if the hostname is not attached to this sandbox.

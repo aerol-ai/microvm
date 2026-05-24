@@ -4,6 +4,7 @@ import java.util.List;
 
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
+import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
@@ -120,6 +121,10 @@ public class Sandbox extends SandboxData {
 
     public void removeCustomDomain(String hostname) {
         client.removeCustomDomain(id, hostname);
+    }
+
+    public CustomDomainDnsRecords customDomainDns() {
+        return client.customDomainDns(id);
     }
 
     public Sandbox start() {

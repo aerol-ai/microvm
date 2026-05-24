@@ -291,6 +291,54 @@ pub(crate) struct CustomDomainListWire {
     pub custom_domains: Vec<CustomDomain>,
 }
 
+/// Cluster-published address(es) DNS for a custom domain must point at.
+/// Mirrors `pkg/models.IngressTarget` on the server.
+///
+/// - `source = "hostname"`: cluster advertises a stable hostname — DNS for
+///   custom domains is a CNAME to `hostname`.
+/// - `source = "ips"`: cluster advertises one or more raw IPs — DNS is one A
+///   (and AAAA for IPv6) record per entry in `ips`.
+/// - `source = "mixed"`: some ingress nodes gossip a hostname, others gossip
+///   raw IPs. Prefer the hostname; render both for apex domains without
+///   CNAME flattening.
+/// - `source = "unknown"`: no ingress node has gossiped a public address yet.
+///   Treat the target as unusable rather than guessing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IngressTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
+    pub source: String,
+}
+
+/// One DNS row a user must add at their provider to make a custom domain
+/// reach the cluster. Mirrors `pkg/models.DNSRecord`. `notes` carries
+/// provider-specific gotchas the server pre-renders (e.g. Cloudflare
+/// "DNS only, gray cloud" warning) when relevant.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DnsRecord {
+    pub hostname: String,
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub name: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Response body for `GET /v1/sandboxes/{id}/custom-domains/dns`. Mirrors
+/// `pkg/models.CustomDomainDNSRecords`. `records` is the flat ready-to-paste
+/// list (one row per custom domain × per ingress address); `target` is the
+/// raw aggregation the records were composed from, so callers can render
+/// their own UI without a second fetch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomainDnsRecords {
+    #[serde(default)]
+    pub records: Vec<DnsRecord>,
+    pub target: IngressTarget,
+}
+
 /// Wire protocol an exposure publishes through.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
