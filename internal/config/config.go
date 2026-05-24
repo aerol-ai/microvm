@@ -156,7 +156,41 @@ type Config struct {
 	// HTTPWakeMaxBuffer caps the request body buffered while a cold-start
 	// wake is in progress. Requests with bodies larger than this are
 	// rejected with 413 — see plan D2.
-	HTTPWakeMaxBuffer           int64
+	HTTPWakeMaxBuffer int64
+	// HTTPWakeUpstreamReadyTimeout bounds how long the ingress proxy
+	// holds a caller's request waiting for the in-container service to
+	// bind its TCP port after wake. Defaults to 30s; raise for workloads
+	// with slow startups (JVM, large Python imports).
+	HTTPWakeUpstreamReadyTimeout time.Duration
+	// HTTPWakeMaxPendingPerSandbox caps cold-start HTTP requests
+	// simultaneously holding the wake + readiness window for ONE
+	// sandbox. Counterpart of L4WakeMaxPendingPerSandbox. Excess is
+	// rejected with 503 + Retry-After. Required > 0 when serverless
+	// is on.
+	HTTPWakeMaxPendingPerSandbox int
+	// HTTPWakeMaxPendingGlobal caps cold-start HTTP requests
+	// simultaneously holding the wake + readiness window across ALL
+	// sandboxes on this node. Counterpart of L4WakeMaxPendingGlobal.
+	HTTPWakeMaxPendingGlobal int
+	// HTTPWakeMaxBufferBytesGlobal caps total bytes buffered across all
+	// in-flight cold-start requests at any moment. Prevents a flood of
+	// near-MaxBuffer cold POSTs from exhausting node memory (10k × 8 MiB
+	// = 80 GB worst case without this). Required > 0 when serverless
+	// is on.
+	HTTPWakeMaxBufferBytesGlobal int64
+	// WakeStartConcurrency caps concurrent StartSandbox invocations
+	// initiated by the wake path across the whole node. Inside the global
+	// HTTP+L4 pending caps, up to (HTTPWakeMaxPendingGlobal +
+	// L4WakeMaxPendingGlobal) different sandboxes may be in their cold-
+	// start window at once; without this cap they all hit Docker create /
+	// start and Caddy admin upserts simultaneously, overwhelming both. Per-
+	// sandbox single-flight (wakeFlights) prevents same-id duplication;
+	// this protects against cross-id storms. Default 64 — Docker daemon
+	// handles ~100 concurrent creates cleanly, Caddy admin API serializes
+	// writes but doesn't fall over. Operator-initiated StartSandbox calls
+	// (API surface) bypass this cap — only wake-driven starts are gated.
+	// Required > 0 when serverless is on.
+	WakeStartConcurrency        int
 	SSHListenAddr               string
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
@@ -531,58 +565,63 @@ func Load() (Config, error) {
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
 	cfg := Config{
-		PATToken:                    strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
-		APIHost:                     getEnv("SB_API_HOST", "0.0.0.0"),
-		APIPort:                     getEnvInt("SB_API_PORT", 21212),
-		Domain:                      normalizeHost(os.Getenv("SB_DOMAIN")),
-		PublicHost:                  normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
-		CaddyAdminURL:               getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
-		CaddyServerID:               getEnv("SB_CADDY_SERVER_ID", "srv0"),
-		DBPath:                      getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
-		DockerNetwork:               getEnv("SB_DOCKER_NETWORK", "bridge"),
-		ToolboxBinaryPath:           getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
-		ToolboxMountPath:            getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
-		ToolboxPort:                 getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
-		IdleTimeoutMinutes:          getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
-		ContainerPrivileged:         getEnvBool("SB_CONTAINER_PRIVILEGED", false),
-		ResourceLimitsOff:           getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
-		Runtime:                     getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
-		AutoReconcile:               getEnvBool("SB_AUTO_RECONCILE", true),
-		EnableCaddy:                 getEnvBool("SB_ENABLE_CADDY", true),
-		EnableNetworkRules:          getEnvBool("SB_ENABLE_NETWORK_RULES", true),
-		EnableEventMonitor:          getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
-		EnableSSHGateway:            getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
-		EnableServerless:            getEnvBool("SB_ENABLE_SERVERLESS", true),
-		InternalIngressAddr:         getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
-		InternalL4WakeAddr:          getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
-		InternalL4WakeDir:           getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
-		L4WakeMaxPendingPerSandbox:  getEnvInt("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", 256),
-		L4WakeMaxPendingGlobal:      getEnvInt("SB_L4_WAKE_MAX_PENDING_GLOBAL", 4096),
-		L4WakeMaxActivePerSandbox:   getEnvInt("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", 4096),
-		L4WakeMaxActiveGlobal:       getEnvInt("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", 65536),
-		HTTPWakeMaxBuffer:           int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
-		SSHListenAddr:               getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
-		SSHHostKeyPath:              getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
-		CredentialEncryptionKey:     strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
-		CredentialEncryptionKeyPath: getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
-		MountsRootPath:              getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
-		MountsCredentialsRuntimeDir: getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
-		MountWaitTimeout:            getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
-		LogLevel:                    strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
-		ShutdownTimeout:             getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
-		HTTPClientTimeout:           getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
-		DockerRuntimeWaitTimeout:    getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
-		ToolboxWaitTimeout:          getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
-		ReconcileInterval:           getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
-		NetstatsPollInterval:        getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
-		UploadMaxBytes:              int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
-		OTELMetricsEnabled:          getEnvBool("SB_OTEL_METRICS_ENABLED", false),
-		OTELMetricsEndpoint:         firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
-		OTELMetricsInterval:         getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
-		OTELTracesEnabled:           getEnvBool("SB_OTEL_TRACES_ENABLED", false),
-		OTELTracesEndpoint:          firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
-		OTELTracesSampleRatio:       getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
-		OTELServiceName:             getEnv("OTEL_SERVICE_NAME", "sandboxd"),
+		PATToken:                     strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
+		APIHost:                      getEnv("SB_API_HOST", "0.0.0.0"),
+		APIPort:                      getEnvInt("SB_API_PORT", 21212),
+		Domain:                       normalizeHost(os.Getenv("SB_DOMAIN")),
+		PublicHost:                   normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
+		CaddyAdminURL:                getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
+		CaddyServerID:                getEnv("SB_CADDY_SERVER_ID", "srv0"),
+		DBPath:                       getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
+		DockerNetwork:                getEnv("SB_DOCKER_NETWORK", "bridge"),
+		ToolboxBinaryPath:            getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
+		ToolboxMountPath:             getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
+		ToolboxPort:                  getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		IdleTimeoutMinutes:           getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		ContainerPrivileged:          getEnvBool("SB_CONTAINER_PRIVILEGED", false),
+		ResourceLimitsOff:            getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		Runtime:                      getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
+		AutoReconcile:                getEnvBool("SB_AUTO_RECONCILE", true),
+		EnableCaddy:                  getEnvBool("SB_ENABLE_CADDY", true),
+		EnableNetworkRules:           getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		EnableEventMonitor:           getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
+		EnableSSHGateway:             getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
+		EnableServerless:             getEnvBool("SB_ENABLE_SERVERLESS", true),
+		InternalIngressAddr:          getEnv("SB_INTERNAL_INGRESS_ADDR", "127.0.0.1:21213"),
+		InternalL4WakeAddr:           getEnv("SB_INTERNAL_L4_WAKE_ADDR", "127.0.0.1:21214"),
+		InternalL4WakeDir:            getEnv("SB_INTERNAL_L4_WAKE_DIR", "/run/sandboxd/l4wake"),
+		L4WakeMaxPendingPerSandbox:   getEnvInt("SB_L4_WAKE_MAX_PENDING_PER_SANDBOX", 256),
+		L4WakeMaxPendingGlobal:       getEnvInt("SB_L4_WAKE_MAX_PENDING_GLOBAL", 4096),
+		L4WakeMaxActivePerSandbox:    getEnvInt("SB_L4_WAKE_MAX_ACTIVE_PER_SANDBOX", 4096),
+		L4WakeMaxActiveGlobal:        getEnvInt("SB_L4_WAKE_MAX_ACTIVE_GLOBAL", 65536),
+		HTTPWakeMaxBuffer:            int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER", 8*1024*1024)),
+		HTTPWakeUpstreamReadyTimeout: getEnvDuration("SB_HTTP_WAKE_UPSTREAM_READY_TIMEOUT", 30*time.Second),
+		HTTPWakeMaxPendingPerSandbox: getEnvInt("SB_HTTP_WAKE_MAX_PENDING_PER_SANDBOX", 256),
+		HTTPWakeMaxPendingGlobal:     getEnvInt("SB_HTTP_WAKE_MAX_PENDING_GLOBAL", 4096),
+		HTTPWakeMaxBufferBytesGlobal: int64(getEnvInt("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL", 1024*1024*1024)),
+		WakeStartConcurrency:         getEnvInt("SB_WAKE_START_CONCURRENCY", 64),
+		SSHListenAddr:                getEnv("SB_SSH_LISTEN_ADDR", "0.0.0.0:2220"),
+		SSHHostKeyPath:               getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
+		CredentialEncryptionKey:      strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
+		CredentialEncryptionKeyPath:  getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
+		MountsRootPath:               getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
+		MountsCredentialsRuntimeDir:  getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
+		MountWaitTimeout:             getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
+		LogLevel:                     strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
+		ShutdownTimeout:              getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
+		HTTPClientTimeout:            getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
+		DockerRuntimeWaitTimeout:     getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
+		ToolboxWaitTimeout:           getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
+		ReconcileInterval:            getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
+		NetstatsPollInterval:         getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
+		UploadMaxBytes:               int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		OTELMetricsEnabled:           getEnvBool("SB_OTEL_METRICS_ENABLED", false),
+		OTELMetricsEndpoint:          firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
+		OTELMetricsInterval:          getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		OTELTracesEnabled:            getEnvBool("SB_OTEL_TRACES_ENABLED", false),
+		OTELTracesEndpoint:           firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+		OTELTracesSampleRatio:        getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
+		OTELServiceName:              getEnv("OTEL_SERVICE_NAME", "sandboxd"),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
@@ -867,6 +906,18 @@ func Load() (Config, error) {
 		}
 		if cfg.HTTPWakeMaxBuffer <= 0 {
 			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxPendingPerSandbox <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_PENDING_PER_SANDBOX must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxPendingGlobal <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_PENDING_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.HTTPWakeMaxBufferBytesGlobal <= 0 {
+			return Config{}, errors.New("SB_HTTP_WAKE_MAX_BUFFER_GLOBAL must be > 0 when SB_ENABLE_SERVERLESS=true")
+		}
+		if cfg.WakeStartConcurrency <= 0 {
+			return Config{}, errors.New("SB_WAKE_START_CONCURRENCY must be > 0 when SB_ENABLE_SERVERLESS=true")
 		}
 	}
 

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -19,6 +21,12 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
+
+// dialUpstream is overridable in tests; in production it is net.Dialer.DialContext.
+var dialUpstream = func(ctx context.Context, addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	return d.DialContext(ctx, "tcp", addr)
+}
 
 // httpWake serves /__ingress/http/{id}/{port}[/{path...}]. The flow:
 //
@@ -69,7 +77,59 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admission control on the cold-start path only. Warm requests pass
+	// straight through — they don't hold a wake slot and behave like a
+	// plain reverse proxy. The slot is released as soon as the readiness
+	// probe finishes (or fails); we do NOT keep it across the proxy hop,
+	// since at that point the sandbox is indistinguishable from a warm
+	// backend and shouldn't count against the wake-window budget.
+	var releasePending func()
+	if !started {
+		release, admitErr := h.state.acquirePending(id)
+		if admitErr != nil {
+			h.deps.Logger.Warn("wake admission rejected",
+				"sandbox_id", id, "port", port, "reason", admitErr.Error())
+			w.Header().Set("Retry-After", "2")
+			apihttp.WriteError(w, http.StatusServiceUnavailable, admitErr.Error())
+			return
+		}
+		releasePending = release
+		// Failsafe — if any branch below forgets to release, defer
+		// catches it on return. The closure is idempotent.
+		defer func() {
+			if releasePending != nil {
+				releasePending()
+			}
+		}()
+	}
+
 	if !started && !isUpgrade && r.Body != nil && r.ContentLength != 0 {
+		// Reserve from the global byte budget BEFORE buffering, so a
+		// flood of concurrent cold POSTs can't pin >cap bytes. The
+		// per-request cap (MaxBufferBytes) still applies; this is the
+		// cross-request cap. Use the declared ContentLength as the
+		// reservation when known; fall back to MaxBufferBytes when
+		// unknown (-1) since that's the upper bound bufferBody can
+		// produce.
+		reserve := r.ContentLength
+		if reserve < 0 || reserve > h.deps.MaxBufferBytes {
+			reserve = h.deps.MaxBufferBytes
+		}
+		releaseBuf, budgetErr := h.state.acquireBuffer(reserve)
+		if budgetErr != nil {
+			h.deps.Logger.Warn("wake buffer budget rejected",
+				"sandbox_id", id, "port", port,
+				"requested_bytes", reserve, "reason", budgetErr.Error())
+			w.Header().Set("Retry-After", "2")
+			apihttp.WriteError(w, http.StatusServiceUnavailable, budgetErr.Error())
+			return
+		}
+		// Hold the budget until the handler returns; the proxy reads
+		// from the in-memory buffer during ServeHTTP, so releasing
+		// earlier would let the global counter undershoot the real
+		// memory footprint.
+		defer releaseBuf()
+
 		buf, err := bufferBody(r.Body, h.deps.MaxBufferBytes)
 		if err != nil {
 			if errors.Is(err, errBodyTooLarge) {
@@ -98,6 +158,44 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "invalid sandbox target")
 		return
+	}
+
+	// Post-wake readiness probe. WakeAwarePortTarget returns as soon as
+	// Docker reports the container running, but the user's process inside
+	// (npm dev server, gunicorn, etc.) typically takes another moment to
+	// bind to its listening port. Without this hold the reverse proxy
+	// connects too early, gets ECONNREFUSED, and the client sees 502.
+	// We hold the caller's connection until the upstream accepts a TCP
+	// connection or the readiness budget is exhausted.
+	//
+	// Single-flighted per (sandbox, port): 10k concurrent waiters
+	// produce one probe loop, not 10k. Skipped when the sandbox was
+	// already started at preflight — a warm upstream is by definition
+	// already listening.
+	if !started {
+		readyTimeout := h.deps.UpstreamReadyTimeout
+		if readyTimeout <= 0 {
+			readyTimeout = defaultUpstreamReadyTimeout
+		}
+		probeErr := h.state.probeOnce(r.Context(), id, port, readyTimeout,
+			func(probeCtx context.Context, budget time.Duration) error {
+				return waitForUpstreamReady(probeCtx, target.Host, budget)
+			})
+		if probeErr != nil {
+			h.deps.Logger.Warn("upstream not ready after wake",
+				"sandbox_id", id, "port", port, "error", probeErr)
+			w.Header().Set("Retry-After", "2")
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox upstream not ready")
+			return
+		}
+	}
+
+	// Release the pending slot now: probe is done, sandbox is warm,
+	// the rest of the request is just a reverse proxy hop. Setting
+	// the local handle to nil prevents the defer from double-releasing.
+	if releasePending != nil {
+		releasePending()
+		releasePending = nil
 	}
 
 	// Reconstruct the path the user originally requested. Caddy rewrote
@@ -133,11 +231,81 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 		// (SSE, chunked, long-poll) reach the client as the sandbox
 		// emits them.
 		FlushInterval: -1,
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
-			apihttp.WriteError(w, http.StatusBadGateway, "sandbox unavailable")
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			// Reached when the upstream resets / closes mid-request, or
+			// when a warm-bypass request raced an in-progress shutdown.
+			// Either way the failure is transient from the caller's view
+			// — surface 503 + Retry-After so clients and load balancers
+			// retry rather than treating it as a permanent gateway fault.
+			h.deps.Logger.Warn("proxy to sandbox upstream failed",
+				"sandbox_id", id, "port", port, "error", err)
+			w.Header().Set("Retry-After", "2")
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox upstream unavailable")
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// waitForUpstreamReady polls addr (host:port) with TCP dials until it
+// accepts a connection, the caller's context is cancelled, or the
+// overall budget elapses. Returns nil as soon as a connection succeeds
+// (closed immediately). Returns the last dial error on budget timeout.
+//
+// Backoff starts at 100ms (with up to 50ms jitter to spread SYN bursts
+// when many waiters converge on the same upstream simultaneously) and
+// doubles to a 1s cap. A typical framework-process boot (Node, Python)
+// takes 1-5 seconds, so the first few retries are tight; the cap
+// prevents busy-looping once the boot drags into the multi-second
+// range.
+//
+// Retries on any dial error except caller cancellation / deadline.
+// Docker bridge networks during container start can briefly emit
+// EHOSTUNREACH, ENETUNREACH, or ECONNRESET in addition to the usual
+// ECONNREFUSED — narrowing the retry to only ECONNREFUSED would
+// surface those races to the client as immediate failures.
+func waitForUpstreamReady(ctx context.Context, addr string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	probeCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	// Per-call jitter on the very first delay (0-50 ms) so 10k waiters
+	// released by a single wake don't all dial at exactly t+100ms.
+	// Uses the global math/rand source — concurrent-safe since Go 1.20.
+	delay := 100*time.Millisecond + time.Duration(rand.Int63n(int64(50*time.Millisecond)))
+	const maxDelay = 1 * time.Second
+	var lastErr error
+	for {
+		if err := probeCtx.Err(); err != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return err
+		}
+		conn, err := dialUpstream(probeCtx, addr)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		// Caller cancellation / deadline are terminal — don't keep
+		// dialling against a dead caller. Everything else (connection
+		// refused, host unreachable, reset by peer) is treated as the
+		// "container is up but service not bound yet" signal.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		lastErr = err
+		select {
+		case <-probeCtx.Done():
+			return lastErr
+		case <-time.After(delay):
+		}
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
 }
 
 // writeWakeError maps a wake failure to the HTTP response the docs

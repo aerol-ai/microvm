@@ -54,20 +54,48 @@ type PortResolver interface {
 // shrink it to run in <1s.
 var activityTickInterval = 30 * time.Second
 
+// defaultUpstreamReadyTimeout bounds how long the handler will hold a
+// caller's HTTP request after wake while polling the in-container
+// service's TCP port. The wake helper itself returns as soon as
+// StartSandbox reports the container is running, but the user's
+// process inside the container (npm dev server, gunicorn, etc.)
+// typically needs another few seconds to bind to its listening port.
+// Without this hold the reverse proxy connects too early, gets
+// ECONNREFUSED, and the ErrorHandler returns 502.
+//
+// 30s leaves headroom for slow framework boots (Rails, Spring) without
+// holding a client connection indefinitely. Operators can override via
+// Deps.UpstreamReadyTimeout if their workloads are slower.
+var defaultUpstreamReadyTimeout = 30 * time.Second
+
 // Deps wires the ingress proxy to the rest of the daemon. Resolver
 // is required; MaxBufferBytes caps how much request body is buffered
-// while a cold-start wake is in flight.
+// while a cold-start wake is in flight; UpstreamReadyTimeout bounds
+// the post-wake TCP-readiness probe (zero → defaultUpstreamReadyTimeout).
+//
+// MaxPendingPerSandbox / MaxPendingGlobal / MaxBufferBytesGlobal cap
+// how many cold-start requests can simultaneously hold the wake window
+// and how much memory their buffered bodies may pin. Zero on any of
+// them disables that specific cap (intended for tests; production
+// wiring in cmd/sandboxd/main.go always sets all three).
 type Deps struct {
-	Resolver       PortResolver
-	Logger         *slog.Logger
-	MaxBufferBytes int64
+	Resolver             PortResolver
+	Logger               *slog.Logger
+	MaxBufferBytes       int64
+	UpstreamReadyTimeout time.Duration
+	MaxPendingPerSandbox int
+	MaxPendingGlobal     int
+	MaxBufferBytesGlobal int64
 }
 
 // RegisterRoutes mounts the ingress proxy routes onto mux. The mux is
 // expected to be served on a loopback-only listener (see pkg/api/server
 // wiring in cmd/sandboxd/main.go).
 func RegisterRoutes(mux *http.ServeMux, d Deps) {
-	h := &handlers{deps: d}
+	h := &handlers{
+		deps:  d,
+		state: newProxyState(d.MaxPendingPerSandbox, d.MaxPendingGlobal, d.MaxBufferBytesGlobal),
+	}
 	// {path...} captures everything after /__ingress/http/{id}/{port}/.
 	// We register the prefix shape twice so that requests landing at
 	// /__ingress/http/{id}/{port} (no trailing path) still match.
@@ -76,5 +104,6 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 }
 
 type handlers struct {
-	deps Deps
+	deps  Deps
+	state *proxyState
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,6 +21,18 @@ const (
 	l4WakeProxyHeaderMaxBytes = 256
 	l4WakeDialTimeout         = 10 * time.Second
 	l4WakeActivityInterval    = 30 * time.Second
+	// l4WakeUpstreamReadyTimeout bounds how long we keep retrying the
+	// upstream dial on ECONNREFUSED after wake. WakeAwareL4PortTarget
+	// returns as soon as the container is running, but the user's TCP
+	// process inside (SOCKS5 server, database, etc.) typically needs
+	// another moment to bind its listening port. Without retry the
+	// kernel returns ECONNREFUSED instantly and the client connection
+	// is closed. 30s leaves headroom for slow framework boots.
+	l4WakeUpstreamReadyTimeout = 30 * time.Second
+	// l4WakeUpstreamReadyBackoffStart / Max bound the retry cadence
+	// during the readiness window; matches the HTTP ingress probe.
+	l4WakeUpstreamReadyBackoffStart = 100 * time.Millisecond
+	l4WakeUpstreamReadyBackoffMax   = 1 * time.Second
 
 	defaultL4WakeMaxPendingPerSandbox = 256
 	defaultL4WakeMaxPendingGlobal     = 4096
@@ -143,6 +156,64 @@ func (s *Service) WakeAwareL4PortTarget(ctx context.Context, id string, port int
 	return net.JoinHostPort(sandbox.ContainerIP, strconv.Itoa(port)), nil
 }
 
+// dialL4Upstream connects to addr with retry on any transient dial
+// error. This is the L4 counterpart to the HTTP ingress upstream
+// readiness probe: the wake helper returns as soon as Docker reports
+// the container running, but the user's TCP process (SOCKS5 server,
+// database, etc.) typically needs another second or two to bind its
+// listening port. A single dial fails immediately on the kernel RST
+// and the caller's connection closes.
+//
+// Retries on any error except caller cancellation / deadline. Docker
+// bridge networks during container start can briefly emit
+// EHOSTUNREACH, ENETUNREACH, or ECONNRESET in addition to the usual
+// ECONNREFUSED — narrowing the retry to only ECONNREFUSED would
+// surface those races to the client. Initial backoff carries 0-50ms
+// jitter so a convoy of waiters released by one wake doesn't all
+// dial in lockstep. Overridable in tests.
+var dialL4Upstream = func(ctx context.Context, addr string, budget time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(budget)
+	dialCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	// Jitter the initial delay so 10k waiters released by a wake do
+	// not all dial at exactly t+100ms. math/rand global is
+	// concurrent-safe since Go 1.20.
+	delay := l4WakeUpstreamReadyBackoffStart + time.Duration(rand.Int63n(int64(50*time.Millisecond)))
+	var lastErr error
+	for {
+		if err := dialCtx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+		dialer := net.Dialer{Timeout: l4WakeDialTimeout}
+		conn, err := dialer.DialContext(dialCtx, "tcp", addr)
+		if err == nil {
+			return conn, nil
+		}
+		// Caller cancellation / deadline are terminal — don't keep
+		// dialling against a dead caller. Everything else is treated
+		// as the "container is up but service not bound yet" signal.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		lastErr = err
+		select {
+		case <-dialCtx.Done():
+			return nil, lastErr
+		case <-time.After(delay):
+		}
+		if delay < l4WakeUpstreamReadyBackoffMax {
+			delay *= 2
+			if delay > l4WakeUpstreamReadyBackoffMax {
+				delay = l4WakeUpstreamReadyBackoffMax
+			}
+		}
+	}
+}
+
 func (s *Service) proxyL4WakeConn(ctx context.Context, id string, port int, downstream net.Conn, buffered *bufio.Reader) {
 	releasePending, ok := s.tryAcquireL4Pending(id)
 	if !ok {
@@ -163,7 +234,7 @@ func (s *Service) proxyL4WakeConn(ctx context.Context, id string, port int, down
 	}
 	defer releaseActive()
 
-	upstream, err := net.DialTimeout("tcp", target, l4WakeDialTimeout)
+	upstream, err := dialL4Upstream(ctx, target, l4WakeUpstreamReadyTimeout)
 	if err != nil {
 		s.logger.Warn("dial l4 wake upstream failed", "sandbox_id", id, "port", port, "target", target, "error", err)
 		return

@@ -15,6 +15,12 @@ ExecStart=/usr/local/bin/sandboxd
 MountFlags=shared
 Restart=always
 RestartSec=5
+# At scale (~10k concurrent serverless wakes), sandboxd holds many FDs:
+# every pending HTTP request holds a downstream conn + probe socket
+# during the cold-start window, and every L4 wake holds a similar pair.
+# 1 M is the Linux soft default for systemd units and is well within
+# kernel-side caps.
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
