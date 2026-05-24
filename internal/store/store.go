@@ -850,6 +850,38 @@ func (s *Store) DeletePendingImageGC(ctx context.Context, image string) error {
 	return nil
 }
 
+// RefreshPendingImageGCIfExists pushes the row's scheduled_at forward
+// when (and only when) a row for image is already present. The Create
+// path calls this after store.Create succeeds, so a freshly-used image
+// that previously had a pending GC gets its deadline reset from "now"
+// instead of inheriting the original destroy's old timestamp.
+//
+// UPDATE-only (not UPSERT) on purpose: a row should only ever exist
+// when a destroy has scheduled an image for cleanup. We do NOT want
+// the create path inserting one — that would turn pending_image_gc
+// into a one-row-per-image-ever-used table. The row-count stays
+// bounded by "images destroyed in the last TTL window". Returns
+// whether a row was touched, so callers can distinguish "deadline
+// pushed forward" from "no pending GC, nothing to push".
+func (s *Store) RefreshPendingImageGCIfExists(ctx context.Context, image string, at time.Time) (bool, error) {
+	if image == "" {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE pending_image_gc
+		SET scheduled_at = ?
+		WHERE image = ?
+	`, at.UTC(), image)
+	if err != nil {
+		return false, fmt.Errorf("refresh pending image gc: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
 // DeletePendingImageGCIfScheduledAt removes the row only if its
 // scheduled_at still matches `at` — i.e. nobody has refreshed the row
 // since the janitor observed it. Returns whether the delete actually

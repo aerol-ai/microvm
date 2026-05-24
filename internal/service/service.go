@@ -810,6 +810,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 
+	// Push any pending GC deadline for this image forward — a fresh
+	// create proves the image is back in active use, so the next
+	// destroy should restart the full TTL clock instead of inheriting
+	// the previous destroy's old timestamp. UPDATE-only: never inserts
+	// a row, so images that have never been GC-scheduled stay out of
+	// the ledger. Best-effort: an error here doesn't break the create.
+	s.refreshPendingImageGCOnUse(ctx, sandbox.Image)
+
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
@@ -3525,6 +3533,37 @@ func imageStillReferenced(sandboxes []*models.Sandbox, image string) bool {
 // GC must not block the sandbox lifecycle path that called us. If the
 // ledger write fails (rare — SQLite is local), the image leaks until
 // another destroy of a sandbox sharing the image re-schedules it.
+// refreshPendingImageGCOnUse pushes any existing pending_image_gc row
+// for image forward to "now". Called from the create path so that
+// creating a new sandbox with an image that's pending GC restarts the
+// TTL window from the most recent use — matching the existing
+// "destroy refreshes the timestamp" semantics in reverse.
+//
+// UPDATE-only: this never inserts a row. Images that were never
+// destroyed (and so never scheduled) stay out of pending_image_gc
+// entirely. That keeps the table bounded by "images destroyed
+// recently" rather than ballooning to one row per image ever used.
+//
+// Best-effort and off the boot-path-critical sequence: an error
+// here is logged, not surfaced. The image still gets GC'd correctly
+// either way — at worst the deadline is the original destroy's
+// timestamp rather than this create's, which is the pre-existing
+// behavior the rest of the janitor already handles.
+func (s *Service) refreshPendingImageGCOnUse(ctx context.Context, image string) {
+	if image == "" {
+		return
+	}
+	if !s.cfg.ImageBuildGCEnabled {
+		return
+	}
+	if s.imageGCWhitelisted(image) {
+		return
+	}
+	if _, err := s.store.RefreshPendingImageGCIfExists(ctx, image, time.Now().UTC()); err != nil {
+		s.logger.Warn("refresh pending image gc failed", "image", image, "error", err)
+	}
+}
+
 func (s *Service) schedulePendingImageGC(ctx context.Context, image string) {
 	if image == "" {
 		return

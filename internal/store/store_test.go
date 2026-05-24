@@ -1528,6 +1528,64 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			// RefreshPendingImageGCIfExists is UPDATE-only. A fresh
+			// create from the service layer must NOT cause an insert,
+			// otherwise pending_image_gc would balloon to one row per
+			// image ever used.
+			name: "pending_image_gc_refresh_only_updates_existing_rows",
+			run: func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state.db")
+				st, err := Open(path)
+				if err != nil {
+					t.Fatalf("Open() error = %v", err)
+				}
+				defer st.Close()
+
+				// No row yet — refresh must report nothing touched and
+				// must not insert anything.
+				ok, err := st.RefreshPendingImageGCIfExists(ctx, "img:1", time.Now().UTC())
+				if err != nil {
+					t.Fatalf("refresh missing: %v", err)
+				}
+				if ok {
+					t.Fatalf("refresh on missing row must report false")
+				}
+				due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
+				if err != nil {
+					t.Fatalf("list after empty refresh: %v", err)
+				}
+				if len(due) != 0 {
+					t.Fatalf("refresh must not insert, got %v", due)
+				}
+
+				// Seed an old row; refresh moves scheduled_at forward.
+				orig := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+				pushed := orig.Add(2 * time.Hour)
+				if err := st.SchedulePendingImageGC(ctx, "img:1", orig); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				ok, err = st.RefreshPendingImageGCIfExists(ctx, "img:1", pushed)
+				if err != nil {
+					t.Fatalf("refresh existing: %v", err)
+				}
+				if !ok {
+					t.Fatalf("refresh on existing row must report true")
+				}
+				due, err = st.ListPendingImageGCDue(ctx, pushed.Add(time.Minute), 0)
+				if err != nil {
+					t.Fatalf("list after refresh: %v", err)
+				}
+				if len(due) != 1 || !due[0].ScheduledAt.Equal(pushed) {
+					t.Fatalf("scheduled_at = %v, want pushed = %v (got %v)", due[0].ScheduledAt, pushed, due)
+				}
+
+				// Empty image is a no-op.
+				if ok, err := st.RefreshPendingImageGCIfExists(ctx, "", time.Now().UTC()); err != nil || ok {
+					t.Fatalf("empty refresh: ok=%v err=%v", ok, err)
+				}
+			},
+		},
+		{
 			name: "pending_image_gc_schedule_empty_image_noop",
 			run: func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "state.db")

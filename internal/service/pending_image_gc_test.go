@@ -390,6 +390,65 @@ func TestImageGCWhitelistHandlesRegistryPort(t *testing.T) {
 	}
 }
 
+// refreshPendingImageGCOnUse fires from the create path. Its job is to
+// push the deadline forward on an EXISTING pending row so a freshly-
+// used image gets a fresh TTL window — but it must NEVER insert a new
+// row, or pending_image_gc would grow to one row per image ever used.
+func TestRefreshPendingImageGCOnUseUpdatesOnly(t *testing.T) {
+	svc, st, _, _ := newPendingImageGCHarness(t, time.Hour)
+
+	// No row yet: refresh is a no-op (no insert).
+	svc.refreshPendingImageGCOnUse(context.Background(), "alpine:latest")
+	if pending := listPending(t, st); len(pending) != 0 {
+		t.Fatalf("refresh must not insert, got %v", pending)
+	}
+
+	// Existing row: refresh pushes scheduled_at forward enough that
+	// the next sweep (at TTL=1h) no longer sees it as due. We seed at
+	// 2h ago, refresh, then run the sweep — the image must survive.
+	seedPending(t, st, "alpine:latest", time.Now().UTC().Add(-2*time.Hour))
+	svc.refreshPendingImageGCOnUse(context.Background(), "alpine:latest")
+	svc.runPendingImageGC(context.Background())
+
+	// Survives the sweep because the refresh pushed it inside the TTL window.
+	if pending := listPending(t, st); len(pending) != 1 || pending[0] != "alpine:latest" {
+		t.Fatalf("refreshed row must survive the next sweep, got %v", pending)
+	}
+}
+
+// Symmetric kill-switch / whitelist contracts: the create-path refresh
+// must respect the same operator toggles as the destroy-path schedule.
+// Otherwise an operator who turned off GC would see ledger writes
+// arriving from creates, which is exactly what they opted out of.
+func TestRefreshPendingImageGCOnUseRespectsToggles(t *testing.T) {
+	svc, st, _, _ := newPendingImageGCHarness(t, time.Hour)
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	seedPending(t, st, "alpine:latest", old)
+
+	// Whitelist short-circuit: refresh must not touch the row.
+	svc.cfg.ImageGCWhitelist = []string{"alpine"}
+	svc.refreshPendingImageGCOnUse(context.Background(), "alpine:latest")
+	entries, err := st.ListPendingImageGCDue(context.Background(), time.Now().UTC().Add(time.Hour), 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 1 || !entries[0].ScheduledAt.Equal(old) {
+		t.Fatalf("whitelisted refresh must not move scheduled_at, got %v", entries)
+	}
+
+	// Kill switch: same — refresh must be a no-op.
+	svc.cfg.ImageGCWhitelist = nil
+	svc.cfg.ImageBuildGCEnabled = false
+	svc.refreshPendingImageGCOnUse(context.Background(), "alpine:latest")
+	entries, err = st.ListPendingImageGCDue(context.Background(), time.Now().UTC().Add(time.Hour), 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 1 || !entries[0].ScheduledAt.Equal(old) {
+		t.Fatalf("disabled-GC refresh must not move scheduled_at, got %v", entries)
+	}
+}
+
 // StartPendingImageGC honors the operator kill switch.
 func TestStartPendingImageGCDisabledIsNoOp(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
