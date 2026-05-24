@@ -297,7 +297,7 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 		s.admitter.Reserve(sandbox.ID, capacityRequestFromSandbox(sandbox))
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
+	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
 		return fmt.Errorf("upsert sandbox route: %w", err)
 	}
 	for _, port := range sandbox.ExposedPorts {

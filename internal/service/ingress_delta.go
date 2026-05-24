@@ -82,7 +82,7 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 				routeID:     routeID,
 				fingerprint: ingressFingerprint("live-http-sandbox", p.SandboxID, ownerHost, strconv.FormatUint(p.Version, 10)),
 				apply: func(ctx context.Context) error {
-					return s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost)
+					return s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost, nil)
 				},
 				delete: func(ctx context.Context) error {
 					return s.caddy.DeleteSandboxRoute(ctx, p.SandboxID)

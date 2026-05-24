@@ -88,6 +88,16 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Auth(wrap(http.HandlerFunc(h.updateLifecycle))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(wrap(http.HandlerFunc(h.exposePort))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Auth(wrap(http.HandlerFunc(h.unexposePort))))
+	// Custom domains (plans/custom-domains.md). Gated server-side by
+	// SB_ENABLE_CUSTOM_DOMAINS — routes are always mounted (so a request
+	// hits a 412 rather than a 404 when the cluster has the feature off)
+	// and the service layer returns ErrCustomDomainNotSupported. Wrapped
+	// with clusterForwardWrap so a request addressing a remote-owned
+	// sandbox follows the same forward path as every other per-sandbox
+	// route — the owner is the only node with the row to mutate.
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Auth(wrap(http.HandlerFunc(h.addCustomDomain))))
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Auth(wrap(http.HandlerFunc(h.listCustomDomains))))
+	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/custom-domains/{hostname}", d.Auth(wrap(http.HandlerFunc(h.removeCustomDomain))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))

@@ -143,7 +143,14 @@ func (c *Client) TLSPublicEndpoint(id string, port int, l4Listen string) string 
 	return fmt.Sprintf("tls://%s-%d.%s:%s", id, port, c.domain, listenPort)
 }
 
-func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string, toolboxPort int) error {
+// UpsertSandboxRoute installs the HTTP ingress route for a sandbox owned by
+// this node. customHostnames is the operator-attached set of public hostnames
+// added under the custom-domains feature; when non-empty (and domain mode is
+// active) the host matcher includes both the default `{id}.{domain}` and each
+// custom hostname so a single route serves traffic for all of them. Order in
+// the list is irrelevant — Caddy treats `host` as a set match. nil/empty is
+// the legacy single-hostname behaviour.
+func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string, toolboxPort int, customHostnames []string) error {
 	if !c.enabled {
 		return nil
 	}
@@ -161,8 +168,12 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 	}
 
 	if c.domain != "" {
-		route["match"] = []map[string]any{{"host": []string{fmt.Sprintf("%s.%s", id, c.domain)}}}
+		hosts := []string{fmt.Sprintf("%s.%s", id, c.domain)}
+		hosts = append(hosts, normalizeCustomHostnames(customHostnames)...)
+		route["match"] = []map[string]any{{"host": hosts}}
 	} else {
+		// IP mode never serves a public hostname; custom domains are
+		// rejected at the service layer in that deployment shape.
 		route["match"] = []map[string]any{{"path": []string{fmt.Sprintf("/%s", id), fmt.Sprintf("/%s/*", id)}}}
 	}
 
@@ -173,10 +184,15 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 // sandbox owned by another node. Domain-mode clusters use caddy-l4 SNI
 // pass-through instead, because the local HTTPS app sits behind the :443
 // layer4 mux and remote proxying would require dynamic upstream TLS SNI.
-func (c *Client) UpsertSandboxRouteToPeer(ctx context.Context, id, peerHost string) error {
+//
+// customHostnames is accepted for API parity with UpsertSandboxRoute, but
+// only takes effect in domain mode; this peer-forwarding variant runs only
+// in IP mode where the host matcher is unused.
+func (c *Client) UpsertSandboxRouteToPeer(ctx context.Context, id, peerHost string, customHostnames []string) error {
 	if !c.enabled || c.domain != "" {
 		return nil
 	}
+	_ = customHostnames // see doc comment
 	routeID := sandboxRouteID(id)
 	route := map[string]any{
 		"@id": routeID,
@@ -193,6 +209,26 @@ func (c *Client) UpsertSandboxRouteToPeer(ctx context.Context, id, peerHost stri
 		"terminal": true,
 	}
 	return c.upsertRoute(ctx, routeID, route)
+}
+
+// normalizeCustomHostnames drops empty / whitespace-only entries and
+// lower-cases the rest. The service layer is expected to have already
+// validated the inputs via models.ValidateCustomDomainList; this is purely
+// belt-and-braces against accidentally pushing a junk matcher value to
+// Caddy (which would silently match nothing, hiding the upstream).
+func normalizeCustomHostnames(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, h := range in {
+		h = strings.TrimSpace(strings.ToLower(h))
+		if h == "" {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
 }
 
 func (c *Client) DeleteSandboxRoute(ctx context.Context, id string) error {
@@ -608,6 +644,126 @@ func IngressSandboxSNIRouteID(id string) string {
 
 func IngressPortSNIRouteID(id string, port int) string {
 	return ingressPortSNIRouteID(id, port)
+}
+
+// EnsureOnDemandTLS idempotently installs the on-demand TLS automation
+// settings used by the custom-domains feature. Safe to call on every
+// sandboxd start: the two writes target leaf paths and replace prior values
+// at those paths only, leaving any pre-existing wildcard policy and other
+// automation knobs untouched.
+//
+//   - PUT /config/apps/tls/automation/on_demand → rate limit + ask URL.
+//     Replacing the leaf on every boot makes config-driven changes to
+//     SB_TLS_ON_DEMAND_* take effect without a manual Caddy reload.
+//   - POST /config/apps/tls/automation/policies (with a catch-all policy
+//     {on_demand: true, issuers: [acme]}) only when no on-demand policy is
+//     present yet. Discovered by checking pathExists on automation/policies
+//     and re-walking the list; we never insert a duplicate.
+//
+// askURL must be reachable from Caddy — typically
+// http://127.0.0.1:<api-port>/internal/tls-ask (the InternalIngressAddr
+// listener mounts the handler via RegisterTLSAsk).
+//
+// The on-demand policy MUST land at the END of the policies list so the
+// existing wildcard policy (matching `*.$DOMAIN`) wins first; otherwise
+// Caddy attempts per-host issuance for hostnames the wildcard already
+// covers, burning the Let's Encrypt quota. POST appends, which gives us
+// that ordering when policies already contains the wildcard.
+func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int, interval time.Duration) error {
+	if !c.enabled {
+		return nil
+	}
+	if askURL == "" {
+		return errors.New("askURL required")
+	}
+	if burst <= 0 || interval <= 0 {
+		return errors.New("burst and interval must be > 0")
+	}
+
+	onDemand := map[string]any{
+		"rate_limit": map[string]any{
+			"interval": interval.String(),
+			"burst":    burst,
+		},
+		"ask": askURL,
+	}
+	onDemandBody, err := json.Marshal(onDemand)
+	if err != nil {
+		return fmt.Errorf("marshal on-demand block: %w", err)
+	}
+	// PUT replaces (or creates) the leaf. Caddy auto-creates intermediate
+	// paths if apps/tls or apps/tls/automation didn't exist.
+	status, err := c.sendJSON(ctx, http.MethodPut, c.baseURL+"/config/apps/tls/automation/on_demand", onDemandBody)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("install on-demand settings failed: %d", status)
+	}
+
+	hasPolicy, err := c.hasOnDemandPolicy(ctx)
+	if err != nil {
+		return err
+	}
+	if hasPolicy {
+		return nil
+	}
+	policy := map[string]any{
+		"on_demand": true,
+		"issuers":   []map[string]any{{"module": "acme"}},
+	}
+	policyBody, err := json.Marshal(policy)
+	if err != nil {
+		return fmt.Errorf("marshal on-demand policy: %w", err)
+	}
+	// POST appends to the array if it exists, or creates a one-element
+	// array if it doesn't. Either way the on-demand policy ends up last.
+	status, err = c.sendJSON(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/policies", policyBody)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("install on-demand policy failed: %d", status)
+	}
+	return nil
+}
+
+// hasOnDemandPolicy reports whether the policies list already contains an
+// entry with on_demand=true. Returns false (no error) when policies is
+// absent — that's the fresh-Caddy case the caller handles by appending.
+func (c *Client) hasOnDemandPolicy(ctx context.Context) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/config/apps/tls/automation/policies", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("get policies: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode >= 400 {
+		return false, fmt.Errorf("get policies failed: %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("read policies body: %w", err)
+	}
+	if strings.TrimSpace(string(body)) == "null" {
+		return false, nil
+	}
+	var policies []map[string]any
+	if err := json.Unmarshal(body, &policies); err != nil {
+		return false, fmt.Errorf("decode policies: %w", err)
+	}
+	for _, p := range policies {
+		if v, ok := p["on_demand"].(bool); ok && v {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // EnsureLayer4 idempotently bootstraps the layer4 app and (when tlsListen is

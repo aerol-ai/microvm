@@ -616,6 +616,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if req.Image == "" {
 		return nil, errors.New("image is required")
 	}
+	// Custom-domain validation runs early so an invalid or unsupported
+	// payload fails before admission/mounts/docker.Create burn resources.
+	// On success req.CustomDomains is rewritten with the canonical slice.
+	if err := s.validateCreateCustomDomains(&req); err != nil {
+		return nil, err
+	}
 
 	// Validate the requested runtime and resolve "" to the host default. We
 	// write the resolved value back into req so the runtime layer sees an
@@ -772,8 +778,22 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
 		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
 	}
+	// Populate the in-memory CustomDomains slice so the initial route
+	// matcher sees the full hostname union. Status is pending_dns until
+	// the first ACME ask flips it; the per-row store inserts happen below.
+	if len(req.CustomDomains) > 0 {
+		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))
+		for _, h := range req.CustomDomains {
+			sandbox.CustomDomains = append(sandbox.CustomDomains, models.CustomDomain{
+				Hostname:  h,
+				Status:    models.CustomDomainPendingDNS,
+				CreatedAt: now,
+				UpdatedAt: now,
+			})
+		}
+	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
+	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
 		_ = s.docker.Destroy(ctx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -797,6 +817,17 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			releaseAdmission()
 			return nil, fmt.Errorf("persist sandbox mounts: %w", err)
 		}
+	}
+
+	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
+		// Same rollback chain as a mount-persist failure. ErrCustomDomainConflict
+		// flows through unchanged so the API layer can map it to 409.
+		_ = s.store.Delete(ctx, sandbox.ID)
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.docker.Destroy(ctx, sandbox)
+		cleanupMounts()
+		releaseAdmission()
+		return nil, err
 	}
 
 	s.logger.Info("audit sandbox created",
@@ -1032,7 +1063,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
+	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
 		return nil, err
 	}
 	for _, port := range sandbox.ExposedPorts {
@@ -1458,6 +1489,15 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	canonicalProto, err := models.ValidExposedPortProtocol(protocol)
 	if err != nil {
 		return models.ExposePortResponse{}, err
+	}
+	// IRON RULE (plans/custom-domains.md): a sandbox with custom domains
+	// cannot also publish protocol=tcp/tls exposures. The L4 listener is
+	// SNI/port-routed only, with no way to honor a host-based match — a
+	// shared :443 listener would steer custom-domain traffic to the wrong
+	// container. Reject at the entry point rather than letting the L4 path
+	// install a half-broken route.
+	if (canonicalProto == models.ExposedPortProtocolTCP || canonicalProto == models.ExposedPortProtocolTLS) && hasCustomDomains(sandbox) {
+		return models.ExposePortResponse{}, ErrCustomDomainProtocolConflict
 	}
 
 	now := time.Now().UTC()
@@ -2463,7 +2503,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
 				s.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
 			}
-			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort); err != nil {
+			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
 				return err
 			}
 			for _, port := range sandbox.ExposedPorts {

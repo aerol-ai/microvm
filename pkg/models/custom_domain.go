@@ -66,6 +66,20 @@ var (
 	// ErrCustomDomainPerRequestCap is returned by ValidateCustomDomainList
 	// when the caller passes too many hostnames in a single create request.
 	ErrCustomDomainPerRequestCap = fmt.Errorf("at most %d custom_domains per create request", MaxCustomDomainsPerCreateRequest)
+	// ErrCustomDomainNotSupported is returned when a deployment cannot accept
+	// custom domains at all: the feature flag is off, or the daemon is running
+	// in IP mode (no SB_DOMAIN). Surfaced as HTTP 412 Precondition Failed so
+	// clients can distinguish "this cluster does not do custom domains" from
+	// "your input is malformed" (which is 400).
+	ErrCustomDomainNotSupported = errors.New("custom domains are not enabled on this deployment")
+	// ErrCustomDomainProtocolConflict is the IRON RULE violation: a sandbox
+	// with custom domains attached must not also expose protocol=tcp/tls
+	// ports, because the L4 listener has no way to honor a host-based match
+	// — the SNI would route to the wrong sandbox. Surfaced as 409 Conflict.
+	ErrCustomDomainProtocolConflict = errors.New("custom domains cannot coexist with tcp/tls exposed ports on the same sandbox")
+	// ErrCustomDomainPerSandboxCap is returned by AddCustomDomain when the
+	// sandbox already holds MaxCustomDomainsPerSandbox rows. Surfaced as 409.
+	ErrCustomDomainPerSandboxCap = fmt.Errorf("at most %d custom domains per sandbox", MaxCustomDomainsPerSandbox)
 )
 
 // NormalizeCustomDomain lowercases, strips a trailing dot, and validates the
