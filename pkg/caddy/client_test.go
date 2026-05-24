@@ -971,31 +971,33 @@ func newFakeCaddy(t *testing.T) *fakeCaddy {
 			}
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(fake.l4Servers[id])
-		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/"):
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/") && strings.HasSuffix(r.URL.Path, "/routes/0"):
+			// PUT /config/apps/layer4/servers/<id>/routes/0 — array insert at index 0.
 			rest := strings.TrimPrefix(r.URL.Path, "/config/apps/layer4/servers/")
-			// /config/apps/layer4/servers/<id>/routes/0 — insert into existing server.
-			if strings.HasSuffix(rest, "/routes/0") {
-				serverID := strings.TrimSuffix(rest, "/routes/0")
-				server, ok := fake.l4Servers[serverID]
-				if !ok {
-					http.Error(w, "not found", http.StatusNotFound)
-					return
-				}
-				route, err := decodeRoute(r.Body)
-				if err != nil {
-					t.Fatalf("decode l4 insert body: %v", err)
-				}
-				id, _ := route["@id"].(string)
-				if id != "" {
-					fake.routes[id] = route
-				}
-				routes, _ := server["routes"].([]any)
-				server["routes"] = append([]any{route}, routes...)
-				fake.l4Servers[serverID] = server
-				w.WriteHeader(http.StatusOK)
+			serverID := strings.TrimSuffix(rest, "/routes/0")
+			server, ok := fake.l4Servers[serverID]
+			if !ok {
+				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			// PUT /config/apps/layer4/servers/<id> — create or replace server.
+			route, err := decodeRoute(r.Body)
+			if err != nil {
+				t.Fatalf("decode l4 insert body: %v", err)
+			}
+			id, _ := route["@id"].(string)
+			if id != "" {
+				fake.routes[id] = route
+			}
+			routes, _ := server["routes"].([]any)
+			server["routes"] = append([]any{route}, routes...)
+			fake.l4Servers[serverID] = server
+			w.WriteHeader(http.StatusOK)
+		case (r.Method == http.MethodPost || r.Method == http.MethodPut) && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/"):
+			// POST /config/apps/layer4/servers/<id> — create or replace server
+			// (Caddy admin's "set or replace object" for a map-child path).
+			// PUT is also accepted here because EnsureLayer4 PUTs the tls-mux
+			// server when first creating it (guarded by pathExists).
+			rest := strings.TrimPrefix(r.URL.Path, "/config/apps/layer4/servers/")
 			body, err := decodeRoute(r.Body)
 			if err != nil {
 				t.Fatalf("decode l4 server body: %v", err)

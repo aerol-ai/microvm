@@ -659,8 +659,9 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string
 }
 
 // UpsertTCPRoute creates (or replaces) the layer4 server bound to hostPort.
-// One server per host-port allocation; PUT replaces the entire server config
-// in place, so re-running with a different upstream IP after a sandbox
+// One server per host-port allocation; POST is Caddy admin's "set or replace
+// object" for a map-child path (PUT errors with 409 when the path already
+// exists), so re-running with a different upstream IP after a sandbox
 // restart is the right way to refresh routing without poking at routes/0.
 func (c *Client) UpsertTCPRoute(ctx context.Context, id, containerIP string, port, hostPort int) error {
 	if !c.enabled {
@@ -686,7 +687,7 @@ func (c *Client) UpsertTCPRoute(ctx context.Context, id, containerIP string, por
 		return fmt.Errorf("marshal tcp server: %w", err)
 	}
 	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, tcpServerID(hostPort))
-	status, err := c.sendJSON(ctx, http.MethodPut, target, body)
+	status, err := c.sendJSON(ctx, http.MethodPost, target, body)
 	if err != nil {
 		return err
 	}
@@ -728,7 +729,7 @@ func (c *Client) UpsertWakeTCPRoute(ctx context.Context, id string, port, hostPo
 		return fmt.Errorf("marshal wake tcp server: %w", err)
 	}
 	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, tcpServerID(hostPort))
-	status, err := c.sendJSON(ctx, http.MethodPut, target, body)
+	status, err := c.sendJSON(ctx, http.MethodPost, target, body)
 	if err != nil {
 		return err
 	}
@@ -766,7 +767,7 @@ func (c *Client) UpsertTCPProxyRoute(ctx context.Context, id string, port, hostP
 		return fmt.Errorf("marshal tcp proxy server: %w", err)
 	}
 	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, tcpServerID(hostPort))
-	status, err := c.sendJSON(ctx, http.MethodPut, target, body)
+	status, err := c.sendJSON(ctx, http.MethodPost, target, body)
 	if err != nil {
 		return err
 	}

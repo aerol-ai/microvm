@@ -230,7 +230,7 @@ func (f *countingCaddyFake) handler() http.Handler {
 			delete(f.installedRoutes, id)
 			f.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPut && len(r.URL.Path) > len("/config/apps/layer4/servers/") && r.URL.Path[:len("/config/apps/layer4/servers/")] == "/config/apps/layer4/servers/":
+		case (r.Method == http.MethodPut || r.Method == http.MethodPost) && len(r.URL.Path) > len("/config/apps/layer4/servers/") && r.URL.Path[:len("/config/apps/layer4/servers/")] == "/config/apps/layer4/servers/":
 			sid := r.URL.Path[len("/config/apps/layer4/servers/"):]
 			f.mu.Lock()
 			f.installedL4[sid] = struct{}{}

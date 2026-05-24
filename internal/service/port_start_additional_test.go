@@ -136,7 +136,7 @@ func (f *routeAdminCaddyFake) handler(t *testing.T) http.Handler {
 		case strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/"):
 			serverID := strings.TrimPrefix(r.URL.Path, "/config/apps/layer4/servers/")
 			switch r.Method {
-			case http.MethodPut:
+			case http.MethodPut, http.MethodPost:
 				f.mu.Lock()
 				f.l4TCPServerIDs[serverID] = struct{}{}
 				f.mu.Unlock()
@@ -326,7 +326,7 @@ func TestExposePortTCPRollsBackReservedRowOnCaddyFailure(t *testing.T) {
 	rt := &recordingRuntime{}
 	svc, st, _ := newServiceRuntimeHarness(t, rt)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/tcp-port-") {
+		if (r.Method == http.MethodPut || r.Method == http.MethodPost) && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/tcp-port-") {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
