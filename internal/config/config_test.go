@@ -71,6 +71,9 @@ func TestLoadCases(t *testing.T) {
 			"SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX",
 			"SB_TLS_ON_DEMAND_BURST",
 			"SB_TLS_ON_DEMAND_INTERVAL",
+			"SB_ACME_DAEMON_BUDGET_FRACTION",
+			"SB_ACME_DAEMON_BUDGET_WINDOW",
+			"SB_ACME_DAEMON_BUDGET_CAPACITY",
 		}
 		for _, key := range keys {
 			t.Setenv(key, "")

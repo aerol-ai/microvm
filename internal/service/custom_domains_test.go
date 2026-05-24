@@ -215,15 +215,13 @@ func TestAddCustomDomain_CrossSandboxConflict(t *testing.T) {
 }
 
 func TestAddCustomDomain_PerSandboxCap(t *testing.T) {
+	const perSandboxCap = 2
 	svc, st := newCustomDomainsHarness(t, func(c *config.Config) {
-		c.CustomDomainsMaxPerSandbox = 2 // override so the test doesn't need 26 inserts
+		c.CustomDomainsMaxPerSandbox = perSandboxCap // exercise the SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX override path
 	})
 	mustCreateSandboxRow(t, st, "sb-1")
 	ctx := context.Background()
-	// The service uses models.MaxCustomDomainsPerSandbox (a compile-time
-	// const) rather than the cfg override today; this test drives the cap
-	// via the actual sentinel value. Drive enough hostnames to hit it.
-	for i := range models.MaxCustomDomainsPerSandbox {
+	for i := range perSandboxCap {
 		host := "h" + itoa(i) + ".acme.com"
 		if err := svc.AddCustomDomain(ctx, "sb-1", host); err != nil {
 			t.Fatalf("add %d (%s): %v", i, host, err)

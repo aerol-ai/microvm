@@ -269,7 +269,7 @@ groups:
       # 429s are silent at the user layer (Caddy retries); the operator
       # needs the signal to intervene.
       - alert: SandboxdACMEBudgetThrottling
-        expr: sum(rate(aerolvm_ask_requests_total{key1="throttled"}[5m])) > 0
+        expr: sum(rate(aerolvm_ask_requests_total{key="throttled"}[5m])) > 0
         for: 5m
         labels:
           severity: warning

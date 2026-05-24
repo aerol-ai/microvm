@@ -193,9 +193,9 @@ Each attached hostname carries a `status` that reflects where Caddy is in the pe
 
 | Status | When |
 |---|---|
-| `400 Bad Request` | Hostname is malformed, includes a port, or matches a TCP/TLS-only sandbox port. |
-| `409 Conflict` | The hostname is already attached to a different sandbox. Hostnames are globally unique across the cluster. |
-| `412 Precondition Failed` | The server runs in IP mode (`SB_DOMAIN` unset). Custom domains require domain mode. |
+| `400 Bad Request` | Hostname is malformed or includes a port. |
+| `409 Conflict` | The hostname is already attached to a different sandbox (hostnames are globally unique across the cluster), the sandbox already exposes a `tcp://` / `tls://` port (the IRON RULE — custom domains and L4 exposures can't coexist on one sandbox), or the per-sandbox cap is reached. |
+| `412 Precondition Failed` | Custom domains are disabled (`SB_ENABLE_CUSTOM_DOMAINS=false`) or the server runs in IP mode (`SB_DOMAIN` unset). |
 | `429 Too Many Requests` | The daemon-wide ACME issuance budget is exhausted (LE `new-orders` per-account limit nearing 80% of 300/3h). Honour `Retry-After` and try again. |
 
 ## Cluster mode

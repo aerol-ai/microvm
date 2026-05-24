@@ -193,8 +193,15 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	}
 	// Per-sandbox cap is enforced here rather than in the store so the error
 	// surfaces with the canonical sentinel; the store would otherwise just
-	// insert and the count check would race with concurrent adds.
-	if len(sandbox.CustomDomains) >= models.MaxCustomDomainsPerSandbox {
+	// insert and the count check would race with concurrent adds. Reads
+	// the operator-tunable cap from config (SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX)
+	// with the compile-time default as a safety floor when the config wasn't
+	// validated (tests, embedded callers).
+	maxDomains := s.cfg.CustomDomainsMaxPerSandbox
+	if maxDomains <= 0 {
+		maxDomains = models.MaxCustomDomainsPerSandbox
+	}
+	if len(sandbox.CustomDomains) >= maxDomains {
 		// Idempotent re-add of an existing hostname must NOT trip the cap —
 		// the same row already counts in the slice.
 		alreadyHeld := false
@@ -256,6 +263,13 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 // hostname)), so a tenant cannot rip a domain out of someone else's route
 // by guessing the hostname.
 func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+	// Mirror AddCustomDomain's deployment-capability gate. routes.go documents
+	// that disabled-feature / IP-mode deployments surface 412 here too — the
+	// route is mounted unconditionally so callers can tell "this cluster does
+	// not do custom domains" apart from "the route does not exist".
+	if !s.cfg.EnableCustomDomains || strings.TrimSpace(s.cfg.Domain) == "" {
+		return ErrCustomDomainNotSupported
+	}
 	canonical, err := models.NormalizeCustomDomain(hostname, s.cfg.Domain)
 	if err != nil {
 		return err
@@ -304,8 +318,14 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 }
 
 // ListCustomDomains returns the canonical rows for one sandbox. Empty slice
-// (nil) when none are attached.
+// (nil) when none are attached. Same deployment-capability gate as
+// Add/Remove: disabled-feature or IP-mode returns ErrCustomDomainNotSupported
+// (412) rather than an empty list, so callers can distinguish "this sandbox
+// has no domains" from "this cluster does not do custom domains".
 func (s *Service) ListCustomDomains(ctx context.Context, sandboxID string) ([]models.CustomDomain, error) {
+	if !s.cfg.EnableCustomDomains || strings.TrimSpace(s.cfg.Domain) == "" {
+		return nil, ErrCustomDomainNotSupported
+	}
 	if _, err := s.store.Get(ctx, sandboxID); err != nil {
 		return nil, err
 	}
