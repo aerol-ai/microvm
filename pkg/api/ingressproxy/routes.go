@@ -54,13 +54,29 @@ type PortResolver interface {
 // shrink it to run in <1s.
 var activityTickInterval = 30 * time.Second
 
+// defaultUpstreamReadyTimeout bounds how long the handler will hold a
+// caller's HTTP request after wake while polling the in-container
+// service's TCP port. The wake helper itself returns as soon as
+// StartSandbox reports the container is running, but the user's
+// process inside the container (npm dev server, gunicorn, etc.)
+// typically needs another few seconds to bind to its listening port.
+// Without this hold the reverse proxy connects too early, gets
+// ECONNREFUSED, and the ErrorHandler returns 502.
+//
+// 30s leaves headroom for slow framework boots (Rails, Spring) without
+// holding a client connection indefinitely. Operators can override via
+// Deps.UpstreamReadyTimeout if their workloads are slower.
+var defaultUpstreamReadyTimeout = 30 * time.Second
+
 // Deps wires the ingress proxy to the rest of the daemon. Resolver
 // is required; MaxBufferBytes caps how much request body is buffered
-// while a cold-start wake is in flight.
+// while a cold-start wake is in flight; UpstreamReadyTimeout bounds
+// the post-wake TCP-readiness probe (zero → defaultUpstreamReadyTimeout).
 type Deps struct {
-	Resolver       PortResolver
-	Logger         *slog.Logger
-	MaxBufferBytes int64
+	Resolver             PortResolver
+	Logger               *slog.Logger
+	MaxBufferBytes       int64
+	UpstreamReadyTimeout time.Duration
 }
 
 // RegisterRoutes mounts the ingress proxy routes onto mux. The mux is

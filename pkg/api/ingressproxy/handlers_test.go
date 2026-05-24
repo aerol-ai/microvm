@@ -421,6 +421,131 @@ func TestHTTPWakeUnknownStartErrorReturns503(t *testing.T) {
 	}
 }
 
+// TestHTTPWakeHoldsUntilUpstreamPortReady: the in-container service
+// often takes another second or two to bind its TCP port after the
+// container itself reports running. The handler must hold the caller's
+// request through that gap (TCP-probe loop) instead of letting the
+// reverse proxy race the bind and emit a 502. Models a cold sandbox
+// (started=false default) whose upstream becomes available ~150ms
+// into the request — the handler should succeed, not 502.
+func TestHTTPWakeHoldsUntilUpstreamPortReady(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	}))
+	defer upstream.Close()
+
+	// Substitute a dialer that refuses connections for the first 150ms
+	// then delegates to the real net.Dialer. Models the container being
+	// up but the user's process not yet listening on the port.
+	prev := dialUpstream
+	t.Cleanup(func() { dialUpstream = prev })
+	start := time.Now()
+	dialUpstream = func(ctx context.Context, addr string) (net.Conn, error) {
+		if time.Since(start) < 150*time.Millisecond {
+			return nil, errors.New("connection refused")
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
+	}
+
+	resolver := &fakeResolver{target: upstream.URL}
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Resolver:             resolver,
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBufferBytes:       1024,
+		UpstreamReadyTimeout: 2 * time.Second,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/sb-cold/3000/api", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (probe should have held until upstream bound); body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "ready" {
+		t.Fatalf("body = %q, want %q", got, "ready")
+	}
+}
+
+// TestHTTPWakeReturns503WhenUpstreamNeverReady: when the in-container
+// process never binds its port (or boots slower than the readiness
+// budget), the handler must surface 503 + Retry-After:2 rather than
+// holding the connection forever or returning the 502 the proxy's
+// ErrorHandler used to emit.
+func TestHTTPWakeReturns503WhenUpstreamNeverReady(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatalf("upstream should not be reached when port never binds")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	prev := dialUpstream
+	t.Cleanup(func() { dialUpstream = prev })
+	dialUpstream = func(_ context.Context, _ string) (net.Conn, error) {
+		return nil, errors.New("connection refused")
+	}
+
+	resolver := &fakeResolver{target: upstream.URL}
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Resolver:             resolver,
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBufferBytes:       1024,
+		UpstreamReadyTimeout: 200 * time.Millisecond,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/sb-stuck/3000/api", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+}
+
+// TestHTTPWakeWarmRequestSkipsReadinessProbe: a sandbox that was
+// already started at preflight is by definition listening — adding a
+// dial-probe to every warm request would cost a round-trip per call.
+// Models the warm path by setting a dialer that would block for 5s if
+// invoked; the test will fail (timeout or wrong status) if the probe
+// runs.
+func TestHTTPWakeWarmRequestSkipsReadinessProbe(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	prev := dialUpstream
+	t.Cleanup(func() { dialUpstream = prev })
+	dialUpstream = func(_ context.Context, _ string) (net.Conn, error) {
+		t.Fatalf("dialUpstream should not be called on the warm path")
+		return nil, errors.New("unreachable")
+	}
+
+	resolver := &fakeResolver{target: upstream.URL, started: true}
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Resolver:             resolver,
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBufferBytes:       1024,
+		UpstreamReadyTimeout: 5 * time.Second,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/sb-warm-skip/3000/api", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
 // TestHTTPWakeSSEResponseStreamsWithoutBuffering: D4 — FlushInterval=-1
 // must reach the client as upstream emits, even for slow streams. We
 // drive an upstream that flushes events spaced by 100ms and assert

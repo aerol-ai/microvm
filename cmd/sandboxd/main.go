@@ -351,9 +351,10 @@ func main() {
 	if cfg.EnableServerless && cfg.EnableCaddy {
 		ingressMux := http.NewServeMux()
 		ingressproxy.RegisterRoutes(ingressMux, ingressproxy.Deps{
-			Resolver:       svc,
-			Logger:         logger,
-			MaxBufferBytes: cfg.HTTPWakeMaxBuffer,
+			Resolver:             svc,
+			Logger:               logger,
+			MaxBufferBytes:       cfg.HTTPWakeMaxBuffer,
+			UpstreamReadyTimeout: cfg.HTTPWakeUpstreamReadyTimeout,
 		})
 		ingressServer = &http.Server{
 			Addr:              cfg.InternalIngressAddr,

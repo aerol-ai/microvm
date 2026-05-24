@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -19,6 +20,12 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
+
+// dialUpstream is overridable in tests; in production it is net.Dialer.DialContext.
+var dialUpstream = func(ctx context.Context, addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	return d.DialContext(ctx, "tcp", addr)
+}
 
 // httpWake serves /__ingress/http/{id}/{port}[/{path...}]. The flow:
 //
@@ -100,6 +107,31 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Post-wake readiness probe. WakeAwarePortTarget returns as soon as
+	// Docker reports the container running, but the user's process inside
+	// (npm dev server, gunicorn, etc.) typically takes another moment to
+	// bind to its listening port. Without this hold the reverse proxy
+	// connects too early, gets ECONNREFUSED, and the client sees 502.
+	// We hold the caller's connection until the upstream accepts a TCP
+	// connection or the readiness budget is exhausted.
+	//
+	// Skipped when the sandbox was already started at preflight — a warm
+	// upstream is by definition already listening, and adding a dial-probe
+	// to every warm request would cost an extra round-trip per call.
+	if !started {
+		readyTimeout := h.deps.UpstreamReadyTimeout
+		if readyTimeout <= 0 {
+			readyTimeout = defaultUpstreamReadyTimeout
+		}
+		if err := waitForUpstreamReady(r.Context(), target.Host, readyTimeout); err != nil {
+			h.deps.Logger.Warn("upstream not ready after wake",
+				"sandbox_id", id, "port", port, "error", err)
+			w.Header().Set("Retry-After", "2")
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox upstream not ready")
+			return
+		}
+	}
+
 	// Reconstruct the path the user originally requested. Caddy rewrote
 	// it to /__ingress/http/{id}/{port}{path}, so the captured {path}
 	// segment is the original path without its leading slash.
@@ -133,11 +165,63 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 		// (SSE, chunked, long-poll) reach the client as the sandbox
 		// emits them.
 		FlushInterval: -1,
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
-			apihttp.WriteError(w, http.StatusBadGateway, "sandbox unavailable")
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			// Reached when the upstream resets / closes mid-request, or
+			// when a warm-bypass request raced an in-progress shutdown.
+			// Either way the failure is transient from the caller's view
+			// — surface 503 + Retry-After so clients and load balancers
+			// retry rather than treating it as a permanent gateway fault.
+			h.deps.Logger.Warn("proxy to sandbox upstream failed",
+				"sandbox_id", id, "port", port, "error", err)
+			w.Header().Set("Retry-After", "2")
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox upstream unavailable")
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// waitForUpstreamReady polls addr (host:port) with TCP dials until it
+// accepts a connection, the caller's context is cancelled, or the
+// overall budget elapses. Returns nil as soon as a connection succeeds
+// (closed immediately). Returns the last dial error on budget timeout.
+//
+// Backoff starts at 100ms and doubles to a 1s cap. A typical
+// framework-process boot (Node, Python) takes 1-5 seconds, so the
+// first few retries are tight; the cap prevents busy-looping once
+// the boot drags into the multi-second range.
+func waitForUpstreamReady(ctx context.Context, addr string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	probeCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	delay := 100 * time.Millisecond
+	const maxDelay = 1 * time.Second
+	var lastErr error
+	for {
+		if probeCtx.Err() != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return probeCtx.Err()
+		}
+		conn, err := dialUpstream(probeCtx, addr)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+		select {
+		case <-probeCtx.Done():
+			return lastErr
+		case <-time.After(delay):
+		}
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
 }
 
 // writeWakeError maps a wake failure to the HTTP response the docs
