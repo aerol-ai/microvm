@@ -927,7 +927,7 @@ class MicroVMClientTest {
         AtomicReference<String> deletePath = new AtomicReference<>();
         AtomicInteger deleteCalls = new AtomicInteger();
         HttpServer server = startServer(exchange -> {
-            String path = exchange.getRequestURI().getPath();
+            String path = exchange.getRequestURI().getRawPath();
             String method = exchange.getRequestMethod();
             if ("POST".equals(method) && "/v1/sandboxes/sb-1/custom-domains".equals(path)) {
                 addBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
