@@ -31,29 +31,10 @@ sandboxd_alertmanager_config_dir: /etc/sandboxd/alertmanager
 sandboxd_runbook_dir: /etc/sandboxd/runbooks
 sandboxd_restart_after_ops_config: true
 
-# --- Observability / pull-storm controls -----------------------------------
-# OFF by default. To enable, set the matching keys in local.yml.
-sandboxd_otel_metrics_enabled: false
-sandboxd_otel_metrics_endpoint: ""
-sandboxd_otel_metrics_interval: "30s"
-sandboxd_otel_traces_enabled: false
-sandboxd_otel_traces_endpoint: ""
-sandboxd_otel_traces_sample_ratio: 0.05
-sandboxd_otel_service_name: "sandboxd"
-sandboxd_image_pull_max_concurrent: 4
-sandboxd_image_pull_failure_backoff: "30s"
-# Image GC whitelist. Comma-joined list passed to SB_IMAGE_GC_WHITELIST.
-# Entries can be exact image refs ("nginx:1.27"), repos ("nginx",
-# "myorg/web"), or registry-org prefixes ending in "/" ("ghcr.io/myorg/").
-# Empty string (default) = no whitelist; the janitor's normal scope applies.
-sandboxd_image_gc_whitelist: ""
-# Image GC janitor cadence. Mirrors sandboxd's defaults. Both knobs apply
-# to BOTH sweeps (built-image + pending-destroy). Shorten the TTL when
-# disk pressure outweighs the cost of re-pulling on destroy/recreate
-# cycles inside the window.
-sandboxd_image_build_gc_enabled: true
-sandboxd_image_build_gc_interval: "10m"
-sandboxd_image_build_gc_ttl: "24h"
+# --- Observability / image controls / mirror / auto-import -----------------
+# These now live in ../../../../config/cluster.yml (shared with Terraform).
+# Edit that file; configure-ops.yml loads it via vars_files. Only Ansible-
+# specific secret-delivery vars remain in this file (below) and in local.yml.
 
 # --- Local backup schedule -------------------------------------------------
 # OFF by default. To enable, set sandboxd_backup_enabled: true in local.yml.
@@ -66,39 +47,24 @@ sandboxd_backup_retention_days: 7
 # --- Node lifecycle defaults (playbooks/prepare-role-change.yml) -----------
 sandboxd_role_change_drain_timeout_s: 3600
 
-# --- Phase 4: Authenticated Mirror + Auto-Import ---------------------------
-# OFF by default (empty SB_MIRROR_HOST disables the whole feature).
-# To opt in, set the relevant keys in local.yml. Full operator reference:
-# sandbox-library/AUTHENTICATED_MIRROR.md.
+# --- Phase 4: Authenticated Mirror + Auto-Import (secret delivery only) ----
+# Mirror host, upstreams, auto-import toggle / hooks_url / cluster_id, and
+# retention/timeouts live in ../../../../config/cluster.yml (shared with
+# Terraform). The secret VALUES (upstream wrap key, cluster PAT) live in
+# ../../../../config/secrets.yml (also shared with Terraform; gitignored).
+# This block only carries the Ansible-specific plumbing for landing those
+# secrets on each host.
 #
-# These three are internal plumbing — the playbook templates them into
+# These two are internal plumbing — the playbook templates them into
 # SB_*_PATH env vars on each managed host. Do not override.
 sandboxd_secrets_dir: /etc/sandboxd/secrets
 sandboxd_upstream_wrap_key_path:       "{{ sandboxd_secrets_dir }}/upstream-wrap.key"
 sandboxd_auto_import_cluster_pat_path: "{{ sandboxd_secrets_dir }}/cluster-pat"
 
-# Secret delivery — pick ONE per secret, in local.yml:
-#   sandboxd_upstream_wrap_key_value: "<base64 wrap key>"        # inline (laptop)
-#   sandboxd_upstream_wrap_key_src:   "/path/on/control/node"    # file (Vault/SOPS)
-#   sandboxd_auto_import_cluster_pat_value: "<token>"
-#   sandboxd_auto_import_cluster_pat_src:   "/path/on/control/node"
-# If both _value and _src are set, _value wins. Both empty = feature off.
-sandboxd_upstream_wrap_key_value: ""
+# Optional Vault/SOPS workflow: deliver the secret from a file on the control
+# node instead of inlining it in config/secrets.yml. If a *_src path is set
+# AND the matching aocr.* key in config/secrets.yml is non-empty, the
+# config/secrets.yml value wins (it runs first). Both empty + secrets.yml
+# empty = feature off.
 sandboxd_upstream_wrap_key_src: ""
-sandboxd_auto_import_cluster_pat_value: ""
 sandboxd_auto_import_cluster_pat_src: ""
-
-# Mirror rewrite — set sandboxd_mirror_host in local.yml to opt in.
-sandboxd_mirror_host: ""
-sandboxd_mirror_push_host: ""
-sandboxd_mirror_upstreams: "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
-
-# Auto-import — sandboxd refuses to boot with enabled=true unless
-# hooks_url, cluster_id, and a cluster-pat (value or src) are all set.
-sandboxd_auto_import_enabled: false
-sandboxd_auto_import_hooks_url: ""
-sandboxd_auto_import_cluster_id: ""
-sandboxd_auto_import_retention_suffix: "--idle-7d"
-sandboxd_auto_import_request_timeout: "15s"
-sandboxd_auto_import_reconcile_interval: "5m"
-sandboxd_auto_import_max_in_flight: 4

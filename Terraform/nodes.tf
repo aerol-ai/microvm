@@ -42,10 +42,10 @@ resource "aws_instance" "seed" {
     node_name                  = "${var.cluster_name}-${local.seed_node.name}"
     role                       = local.seed_node.role
     is_seed                    = true
-    domain                     = var.domain_name
-    pat_token                  = var.pat_token
+    domain                     = local.domain_name
+    pat_token                  = local.pat_token
     cloudflare_api_token       = var.cloudflare_api_token
-    acme_email                 = var.acme_email
+    acme_email                 = local.acme_email
     with_gvisor                = local.seed_node.with_gvisor
     with_nvidia_gpu            = local.seed_node.with_nvidia_gpu
     with_amd_gpu               = local.seed_node.with_amd_gpu
@@ -57,19 +57,19 @@ resource "aws_instance" "seed" {
     cluster_init_script_url    = var.cluster_init_script_url
     cluster_join_script_url    = var.cluster_join_script_url
     seed_wait_max_seconds      = var.seed_wait_max_seconds
-    otel_metrics_enabled       = var.otel_metrics_enabled || var.otel_metrics_endpoint != ""
-    otel_metrics_endpoint      = var.otel_metrics_endpoint
-    otel_metrics_interval      = var.otel_metrics_interval
-    otel_traces_enabled        = var.otel_traces_enabled || var.otel_traces_endpoint != ""
-    otel_traces_endpoint       = var.otel_traces_endpoint
-    otel_traces_sample_ratio   = var.otel_traces_sample_ratio
-    otel_service_name          = var.otel_service_name
-    image_pull_max_concurrent  = var.image_pull_max_concurrent
-    image_pull_failure_backoff = var.image_pull_failure_backoff
-    image_gc_whitelist         = join(",", var.image_gc_whitelist)
-    image_build_gc_enabled     = var.image_build_gc_enabled
-    image_build_gc_interval    = var.image_build_gc_interval
-    image_build_gc_ttl         = var.image_build_gc_ttl
+    otel_metrics_enabled       = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
+    otel_metrics_endpoint      = local.cluster_ops.otel.metrics_endpoint
+    otel_metrics_interval      = local.cluster_ops.otel.metrics_interval
+    otel_traces_enabled        = local.cluster_ops.otel.traces_enabled || local.cluster_ops.otel.traces_endpoint != ""
+    otel_traces_endpoint       = local.cluster_ops.otel.traces_endpoint
+    otel_traces_sample_ratio   = local.cluster_ops.otel.traces_sample_ratio
+    otel_service_name          = local.cluster_ops.otel.service_name
+    image_pull_max_concurrent  = local.cluster_ops.image_pull.max_concurrent
+    image_pull_failure_backoff = local.cluster_ops.image_pull.failure_backoff
+    image_gc_whitelist         = join(",", local.cluster_ops.image_gc.whitelist)
+    image_build_gc_enabled     = local.cluster_ops.image_build_gc.enabled
+    image_build_gc_interval    = local.cluster_ops.image_build_gc.interval
+    image_build_gc_ttl         = local.cluster_ops.image_build_gc.ttl
     extra_user_data            = local.seed_node.extra_user_data
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled
@@ -143,10 +143,10 @@ resource "aws_instance" "joiner" {
     node_name                  = "${var.cluster_name}-${each.value.name}"
     role                       = each.value.role
     is_seed                    = false
-    domain                     = var.domain_name
-    pat_token                  = var.pat_token
+    domain                     = local.domain_name
+    pat_token                  = local.pat_token
     cloudflare_api_token       = var.cloudflare_api_token
-    acme_email                 = var.acme_email
+    acme_email                 = local.acme_email
     with_gvisor                = each.value.with_gvisor
     with_nvidia_gpu            = each.value.with_nvidia_gpu
     with_amd_gpu               = each.value.with_amd_gpu
@@ -158,19 +158,19 @@ resource "aws_instance" "joiner" {
     cluster_init_script_url    = var.cluster_init_script_url
     cluster_join_script_url    = var.cluster_join_script_url
     seed_wait_max_seconds      = var.seed_wait_max_seconds
-    otel_metrics_enabled       = var.otel_metrics_enabled || var.otel_metrics_endpoint != ""
-    otel_metrics_endpoint      = var.otel_metrics_endpoint
-    otel_metrics_interval      = var.otel_metrics_interval
-    otel_traces_enabled        = var.otel_traces_enabled || var.otel_traces_endpoint != ""
-    otel_traces_endpoint       = var.otel_traces_endpoint
-    otel_traces_sample_ratio   = var.otel_traces_sample_ratio
-    otel_service_name          = var.otel_service_name
-    image_pull_max_concurrent  = var.image_pull_max_concurrent
-    image_pull_failure_backoff = var.image_pull_failure_backoff
-    image_gc_whitelist         = join(",", var.image_gc_whitelist)
-    image_build_gc_enabled     = var.image_build_gc_enabled
-    image_build_gc_interval    = var.image_build_gc_interval
-    image_build_gc_ttl         = var.image_build_gc_ttl
+    otel_metrics_enabled       = local.cluster_ops.otel.metrics_enabled || local.cluster_ops.otel.metrics_endpoint != ""
+    otel_metrics_endpoint      = local.cluster_ops.otel.metrics_endpoint
+    otel_metrics_interval      = local.cluster_ops.otel.metrics_interval
+    otel_traces_enabled        = local.cluster_ops.otel.traces_enabled || local.cluster_ops.otel.traces_endpoint != ""
+    otel_traces_endpoint       = local.cluster_ops.otel.traces_endpoint
+    otel_traces_sample_ratio   = local.cluster_ops.otel.traces_sample_ratio
+    otel_service_name          = local.cluster_ops.otel.service_name
+    image_pull_max_concurrent  = local.cluster_ops.image_pull.max_concurrent
+    image_pull_failure_backoff = local.cluster_ops.image_pull.failure_backoff
+    image_gc_whitelist         = join(",", local.cluster_ops.image_gc.whitelist)
+    image_build_gc_enabled     = local.cluster_ops.image_build_gc.enabled
+    image_build_gc_interval    = local.cluster_ops.image_build_gc.interval
+    image_build_gc_ttl         = local.cluster_ops.image_build_gc.ttl
     extra_user_data            = each.value.extra_user_data
     # Shared S3-backed Caddy cert storage — see local.caddy_storage_s3.
     caddy_storage_s3_enabled        = local.caddy_storage_s3.enabled

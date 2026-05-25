@@ -4,11 +4,14 @@
 ###############################################################################
 
 # --- Required ---------------------------------------------------------------
+#
+# Cluster-wide values that both Terraform and Ansible read have moved out of
+# this file and into the shared SoT at ../config/:
+#   - pat_token              -> config/secrets.yml as cluster.pat_token
+#   - domain_name, acme_email -> config/cluster.yml under the ingress: section
+# Only the Terraform-provider credential (DNS API access) remains here.
 
-pat_token            = "REPLACE-with-shared-SB_PAT_TOKEN"
 cloudflare_api_token = "REPLACE-with-cloudflare-api-token" # Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01. Add Zone:Read if you want auto-zone-lookup below.
-domain_name          = "cluster.example.com"               # set empty to skip TLS and run in IP/path mode
-acme_email           = "ops@example.com"                   # Let's Encrypt contact email (expiry/revocation notices). Strongly recommended in domain mode; empty creates an anonymous ACME account with no notifications.
 
 # cloudflare_zone_id is optional. Leave it unset to auto-resolve the zone from
 # domain_name by stripping the first label ("cluster.example.com" -> "example.com").
@@ -47,42 +50,13 @@ default_volume_type       = "gp3"
 # default_idle_timeout_min = 0       # sandbox auto-stop minutes; 0 disables
 
 # --- Observability / operational hardening ----------------------------------
-
-# Prometheus scrapes every node at /v1/metrics with the shared PAT. Terraform
-# outputs private-IP scrape targets after apply.
 #
-# Native OTEL export is optional. Setting an endpoint enables the matching
-# exporter and writes the SB_OTEL_* values into cluster.env.
-# otel_metrics_endpoint = "http://otel-collector.internal:4318/v1/metrics"
-# otel_metrics_interval = "30s"
-# otel_traces_endpoint = "http://otel-collector.internal:4318/v1/traces"
-# otel_traces_sample_ratio = 0.05
-# otel_service_name     = "sandboxd"
-
-# Docker image-pull storm controls. These are written into cluster.env on every
-# node; defaults match sandboxd's runtime defaults.
-# image_pull_max_concurrent  = 4
-# image_pull_failure_backoff = "30s"
-
-# Image-GC whitelist: repositories or refs the GC janitors must never remove.
-# Empty (default) means every image is eligible. Three match shapes:
-#   - exact ref                ("alpine:latest" — only that tag survives)
-#   - repo, tag/digest agnostic ("ubuntu" — every tag and digest of ubuntu)
-#   - registry/org prefix       (trailing "/" — "ghcr.io/myorg/" matches all)
-# Written into cluster.env as SB_IMAGE_GC_WHITELIST (comma-joined).
-# image_gc_whitelist = [
-#   "alpine",            # always keep alpine cached, any tag
-#   "ubuntu:22.04",      # only that specific tag
-#   "ghcr.io/myorg/",    # everything from this org
-# ]
-
-# Image GC janitors — master switch and cadence. Both knobs apply to BOTH
-# sweeps (built images + pending-destroy images). Defaults match sandboxd:
-# enabled, fire every 10m, 24h minimum age. Shorten the TTL when disk
-# pressure outweighs the cost of re-pulling on destroy/recreate cycles.
-# image_build_gc_enabled  = true
-# image_build_gc_interval = "10m"
-# image_build_gc_ttl      = "24h"
+# All non-secret sandboxd ops env (OTEL, image-pull controls, image-GC
+# whitelist + janitor cadence, mirror host, auto-import toggles, ...) lives
+# in ../config/cluster.yml. AOCR secrets (upstream_wrap_key, cluster_pat)
+# live in ../config/secrets.yml (copy from secrets.example.yml — gitignored).
+# Both files are read by `terraform apply` and `ansible-playbook
+# playbooks/configure-ops.yml` so day-0 and day-2 stay in sync.
 
 # --- Cloudflare DNS behavior ------------------------------------------------
 
@@ -179,35 +153,6 @@ nodes = {
 #   Owner = "platform-team"
 # }
 
-# --- AOCR (authenticated mirror + auto-import) ------------------------------
-#
-# Day-0 wiring against an already-deployed AOCR (Phase 4 F17-F21). Off by
-# default; flip enabled = true to template SB_MIRROR_* / SB_AUTO_IMPORT_*
-# into cluster.env and install wrap-key + cluster-PAT secrets under
-# /etc/sandboxd/secrets/ on every node. See sandbox-library/AUTHENTICATED_MIRROR.md.
-#
-# Mirror-only mode (cache + credential wrapping, no Raft-coordinated
-# imports). Pulls flowing through SB_MIRROR_HOST get private upstream
-# credentials wrapped with upstream_wrap_key before they leave the node.
-# aocr = {
-#   enabled            = true
-#   mirror_host        = "mirror.aocr.aerol.ai"
-#   mirror_push_host   = "aocr.aerol.ai"
-#   upstream_wrap_key  = "REPLACE-with-base64-32-byte-key-from-aocr-secrets/upstream_wrap_key"
-# }
-#
-# Mirror + auto-import (full F21). hooks_url / cluster_id / cluster_pat are
-# required when auto_import_enabled = true (plan-time validation matches
-# sandboxd's startup guard). cluster_pat must equal the AOCR side's
-# INTERNAL_API_TOKEN (file aocr/secrets/internal_api_token).
-# aocr = {
-#   enabled             = true
-#   mirror_host         = "mirror.aocr.aerol.ai"
-#   mirror_push_host    = "aocr.aerol.ai"
-#   upstream_wrap_key   = "REPLACE-with-base64-32-byte-key"
-#   auto_import_enabled = true
-#   hooks_url           = "https://aocr.aerol.ai"
-#   cluster_id          = "prod-aerolvm-us-east-1"
-#   cluster_pat         = "REPLACE-with-internal-api-token"
-#   retention_suffix    = "--idle-90d"
-# }
+# AOCR secrets (upstream_wrap_key, cluster_pat) live in ../config/secrets.yml
+# — the shared SoT Ansible also reads. There is no aocr_secrets variable in
+# this file anymore; populate config/secrets.yml instead.

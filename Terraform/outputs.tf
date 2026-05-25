@@ -27,7 +27,7 @@ output "ingress_public_ips" {
 }
 
 output "ingress_hostname" {
-  value = var.domain_name
+  value = local.domain_name
 }
 
 output "bundle_bucket" {

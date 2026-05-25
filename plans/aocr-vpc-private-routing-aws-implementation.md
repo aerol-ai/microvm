@@ -4,6 +4,9 @@
 
 Draft - implementation-ready runbook.
 
+For an operator-focused step-by-step execution guide, see
+`plans/aocr-vpc-private-routing-aws-checklist.md`.
+
 ## Scope
 
 This file turns the higher-level design in `plans/aocr-vpc-private-routing.md` into an exact AWS implementation plan.

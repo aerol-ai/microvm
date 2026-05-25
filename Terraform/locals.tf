@@ -1,4 +1,26 @@
 locals {
+  # Operational env vars come from the shared SoT file that Ansible also
+  # reads (../config/cluster.yml). Both tools render identical SB_* values
+  # into /etc/sandboxd/cluster.env so day-0 (terraform apply) and day-2
+  # (ansible-playbook configure-ops.yml) can't drift. Tool-specific concerns
+  # — cluster topology, cloud creds — stay in terraform.tfvars.
+  cluster_ops = yamldecode(file("${path.module}/../config/cluster.yml"))
+
+  # Cluster SECRETS (shared SB_PAT_TOKEN + AOCR wrap key + cluster PAT) live
+  # in the parallel SoT file ../config/secrets.yml. Gitignored; operators
+  # bootstrap with `cp config/secrets.example.yml config/secrets.yml`.
+  # sensitive() marks the whole decoded tree so values stay redacted in plan
+  # / apply output and propagate through any references into resource args.
+  cluster_secrets = sensitive(yamldecode(file("${path.module}/../config/secrets.yml")))
+
+  # Shared cluster-identity values that both Terraform (day-0 cloud-init +
+  # DNS records) and Ansible (day-2 rotation) read from the SoT. Lifted into
+  # named locals so the rest of the .tf files don't sprinkle
+  # local.cluster_ops.ingress.* / local.cluster_secrets.cluster.* everywhere.
+  domain_name = local.cluster_ops.ingress.domain_name
+  acme_email  = local.cluster_ops.ingress.acme_email
+  pat_token   = local.cluster_secrets.cluster.pat_token
+
   # Normalise each node entry with its effective values (per-node overrides
   # win, then var.default_*). Doing this once here keeps nodes.tf / dns.tf
   # readable.
@@ -93,25 +115,102 @@ locals {
     )
   }
 
-  # AOCR (Phase 4 F17-F21) — resolved view for bootstrap.sh.tftpl. Same
-  # pattern as caddy_storage_s3: when enabled is false, every field
-  # collapses to its empty/default value so the template can splat the
-  # whole shape unconditionally and the `if aocr_enabled` block stays
-  # the only branch the renderer evaluates.
+  # AOCR (Phase 4 F17-F21) — resolved view for bootstrap.sh.tftpl. Non-secret
+  # config (mirror host, upstreams, auto-import toggle, cluster_id, ...)
+  # comes from the shared SoT in config/cluster.yml; secrets (wrap key,
+  # cluster PAT) come from the parallel SoT config/secrets.yml. Terraform
+  # delivers both via cloud-init. enabled is derived: any non-empty mirror
+  # host OR auto-import on is enough to activate the AOCR template section.
+  aocr_enabled = (
+    local.cluster_ops.mirror.host != ""
+    || local.cluster_ops.auto_import.enabled
+  )
   aocr = {
-    enabled             = var.aocr.enabled
-    mirror_host         = var.aocr.enabled ? var.aocr.mirror_host : ""
-    mirror_push_host    = var.aocr.enabled ? var.aocr.mirror_push_host : ""
-    mirror_upstreams    = var.aocr.enabled ? var.aocr.mirror_upstreams : ""
-    upstream_wrap_key   = var.aocr.enabled ? var.aocr.upstream_wrap_key : ""
-    auto_import_enabled = var.aocr.enabled && var.aocr.auto_import_enabled
-    hooks_url           = var.aocr.enabled ? var.aocr.hooks_url : ""
-    cluster_id          = var.aocr.enabled ? var.aocr.cluster_id : ""
-    cluster_pat         = var.aocr.enabled ? var.aocr.cluster_pat : ""
-    retention_suffix    = var.aocr.enabled ? var.aocr.retention_suffix : "--idle-90d"
-    request_timeout     = var.aocr.enabled ? var.aocr.request_timeout : "15s"
-    reconcile_interval  = var.aocr.enabled ? var.aocr.reconcile_interval : "5m"
-    max_in_flight       = var.aocr.enabled ? var.aocr.max_in_flight : 4
+    enabled             = local.aocr_enabled
+    mirror_host         = local.aocr_enabled ? local.cluster_ops.mirror.host : ""
+    mirror_push_host    = local.aocr_enabled ? local.cluster_ops.mirror.push_host : ""
+    mirror_upstreams    = local.aocr_enabled ? local.cluster_ops.mirror.upstreams : ""
+    upstream_wrap_key   = local.aocr_enabled ? local.cluster_secrets.aocr.upstream_wrap_key : ""
+    auto_import_enabled = local.aocr_enabled && local.cluster_ops.auto_import.enabled
+    hooks_url           = local.aocr_enabled ? local.cluster_ops.auto_import.hooks_url : ""
+    cluster_id          = local.aocr_enabled ? local.cluster_ops.auto_import.cluster_id : ""
+    cluster_pat         = local.aocr_enabled ? local.cluster_secrets.aocr.cluster_pat : ""
+    retention_suffix    = local.aocr_enabled ? local.cluster_ops.auto_import.retention_suffix : "--idle-90d"
+    request_timeout     = local.aocr_enabled ? local.cluster_ops.auto_import.request_timeout : "15s"
+    reconcile_interval  = local.aocr_enabled ? local.cluster_ops.auto_import.reconcile_interval : "5m"
+    max_in_flight       = local.aocr_enabled ? local.cluster_ops.auto_import.max_in_flight : 4
+  }
+}
+
+# Plan-time validation of values that come from local.cluster_ops. Terraform
+# does not allow `validation {}` blocks on locals directly, so we hang the
+# preconditions off a free terraform_data resource (no apply-time side
+# effects). All four mirror what var.aocr's validation blocks did before
+# config/cluster.yml became the source of those fields.
+resource "terraform_data" "validate_cluster_ops" {
+  lifecycle {
+    precondition {
+      condition = (
+        !local.cluster_ops.auto_import.enabled
+        || (
+          local.cluster_ops.auto_import.hooks_url != ""
+          && local.cluster_ops.auto_import.cluster_id != ""
+          && local.cluster_secrets.aocr.cluster_pat != ""
+        )
+      )
+      error_message = "When auto_import.enabled = true in config/cluster.yml, auto_import.hooks_url, auto_import.cluster_id, and aocr.cluster_pat in config/secrets.yml are all required (sandboxd refuses to boot otherwise)."
+    }
+
+    precondition {
+      condition = (
+        local.cluster_ops.auto_import.cluster_id == ""
+        || can(regex("^[A-Za-z0-9_-]{1,64}$", local.cluster_ops.auto_import.cluster_id))
+      )
+      error_message = "auto_import.cluster_id must match ^[A-Za-z0-9_-]{1,64}$ (matches AOCR ImportAPI validation)."
+    }
+
+    precondition {
+      condition = (
+        local.cluster_ops.auto_import.retention_suffix == ""
+        || can(regex("^--[a-z0-9]+(-[a-z0-9]+)*$", local.cluster_ops.auto_import.retention_suffix))
+      )
+      error_message = "auto_import.retention_suffix must start with '--' followed by lowercase alphanumerics, e.g. '--idle-90d'."
+    }
+
+    precondition {
+      condition = (
+        can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.otel.metrics_interval))
+        && can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.image_pull.failure_backoff))
+        && can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.image_build_gc.interval))
+        && can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.image_build_gc.ttl))
+        && can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.auto_import.request_timeout))
+        && can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.auto_import.reconcile_interval))
+      )
+      error_message = "Duration fields in config/cluster.yml must be Go durations such as 30s, 10m, 1h."
+    }
+
+    precondition {
+      condition = (
+        local.cluster_ops.otel.traces_sample_ratio >= 0
+        && local.cluster_ops.otel.traces_sample_ratio <= 1
+      )
+      error_message = "otel.traces_sample_ratio must be between 0 and 1."
+    }
+
+    precondition {
+      condition     = local.cluster_ops.image_pull.max_concurrent >= 0
+      error_message = "image_pull.max_concurrent must be >= 0."
+    }
+
+    precondition {
+      condition     = local.cluster_ops.auto_import.max_in_flight >= 1
+      error_message = "auto_import.max_in_flight must be >= 1."
+    }
+
+    precondition {
+      condition     = local.pat_token != ""
+      error_message = "cluster.pat_token in config/secrets.yml must be set (shared SB_PAT_TOKEN used by every node for operator/SDK API auth)."
+    }
   }
 }
 

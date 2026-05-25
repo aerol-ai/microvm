@@ -1,0 +1,92 @@
+# Single source of truth for sandboxd operational env vars across the cluster.
+#
+# Both Terraform (./Terraform/) and Ansible (./Ansible/) read this file and
+# render its values into /etc/sandboxd/cluster.env on every node. Edit here,
+# then apply with EITHER tool — they produce the same env file contents:
+#
+#   - terraform apply                               # day-0 / re-provision
+#   - ansible-playbook playbooks/configure-ops.yml  # day-2 / live rollout
+#
+# DO NOT put values in terraform.tfvars or Ansible local.yml that this file
+# already controls — the two tools would disagree on which to write and the
+# last one to run would silently clobber the other.
+#
+# Secrets split:
+#   - AOCR secrets (upstream wrap key, cluster PAT) live in ./secrets.yml,
+#     a parallel shared SoT also read by both Terraform and Ansible.
+#     Gitignored — bootstrap with `cp config/secrets.example.yml config/secrets.yml`.
+#   - Cloud creds (pat_token, cloudflare_api_token, ACME email, AWS profile)
+#     stay in Terraform/terraform.tfvars (Terraform-only — Ansible never
+#     re-provisions cloud infrastructure).
+# Those keys are intentionally NOT in this file.
+
+# --- Cluster identity / public ingress ------------------------------------
+# domain_name is the hostname advertised as the cluster ingress. Both an A
+# record (this name) and a wildcard *.<name> are created and pointed at every
+# ingress-bearing node's public IP. Set empty to skip TLS and run in IP/path
+# mode (Terraform-only; Ansible day-2 doesn't manage DNS).
+#
+# acme_email is the contact registered with Let's Encrypt — receives
+# cert-expiry warnings and is the identity LE uses for rate-limit triage.
+# Strongly recommended in domain mode; empty creates an anonymous ACME
+# account with no notifications.
+ingress:
+  domain_name: "vm.aerol.cloud"
+  acme_email:  "sumansaurabh@aerol.ai"
+
+# --- OTEL exporter --------------------------------------------------------
+# Enable by setting metrics_endpoint and/or traces_endpoint. The *_enabled
+# flags are auto-promoted to true when the matching endpoint is set, so you
+# rarely need to flip them by hand.
+otel:
+  metrics_enabled: false
+  metrics_endpoint: ""
+  metrics_interval: "30s"
+  traces_enabled: false
+  traces_endpoint: ""
+  traces_sample_ratio: 0.05
+  service_name: "sandboxd"
+
+# --- Docker image pull storm controls -------------------------------------
+image_pull:
+  max_concurrent: 4
+  failure_backoff: "30s"
+
+# --- Image GC: whitelist of refs the janitors must never delete -----------
+# Three match shapes:
+#   - exact ref                ("alpine:latest" — only that tag survives)
+#   - repo, tag/digest agnostic ("ubuntu" — every tag and digest of ubuntu)
+#   - registry/org prefix      (trailing "/" — "ghcr.io/myorg/" matches all)
+# Joined with "," when rendered as SB_IMAGE_GC_WHITELIST.
+image_gc:
+  whitelist:
+    - "sumanrocs/"
+
+# --- Image GC: janitor cadence (built-image + pending-destroy sweeps) -----
+# Both sweeps share these knobs. Default TTL 24h trades disk for warm-start
+# latency: shorter values reclaim disk faster but re-pull on destroy/recreate
+# cycles inside the window.
+image_build_gc:
+  enabled: true
+  interval: "10m"
+  ttl: "24h"
+
+# --- AOCR mirror (Phase 4) ------------------------------------------------
+# Empty host disables mirror rewriting entirely. Upstreams maps upstream
+# hostnames to repository prefixes inside the mirror.
+mirror:
+  host: "mirror.aocr.aerol.ai"
+  push_host: ""
+  upstreams: "docker.io=docker,ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
+
+# --- AOCR auto-import (Phase 4) -------------------------------------------
+# enabled=true requires hooks_url + cluster_id + a cluster PAT (delivered as
+# a secret separately — see header). Sandboxd refuses to boot otherwise.
+auto_import:
+  enabled: true
+  hooks_url: "https://aocr.aerol.ai"
+  cluster_id: "prod-aerolvm-us-east-1"
+  retention_suffix: "--idle-7d"
+  request_timeout: "15s"
+  reconcile_interval: "5m"
+  max_in_flight: 4
