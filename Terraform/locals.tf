@@ -3,8 +3,23 @@ locals {
   # reads (../config/cluster.yml). Both tools render identical SB_* values
   # into /etc/sandboxd/cluster.env so day-0 (terraform apply) and day-2
   # (ansible-playbook configure-ops.yml) can't drift. Tool-specific concerns
-  # — cluster topology, cloud creds, AOCR secrets — stay in terraform.tfvars.
+  # — cluster topology, cloud creds — stay in terraform.tfvars.
   cluster_ops = yamldecode(file("${path.module}/../config/cluster.yml"))
+
+  # Cluster SECRETS (shared SB_PAT_TOKEN + AOCR wrap key + cluster PAT) live
+  # in the parallel SoT file ../config/secrets.yml. Gitignored; operators
+  # bootstrap with `cp config/secrets.example.yml config/secrets.yml`.
+  # sensitive() marks the whole decoded tree so values stay redacted in plan
+  # / apply output and propagate through any references into resource args.
+  cluster_secrets = sensitive(yamldecode(file("${path.module}/../config/secrets.yml")))
+
+  # Shared cluster-identity values that both Terraform (day-0 cloud-init +
+  # DNS records) and Ansible (day-2 rotation) read from the SoT. Lifted into
+  # named locals so the rest of the .tf files don't sprinkle
+  # local.cluster_ops.ingress.* / local.cluster_secrets.cluster.* everywhere.
+  domain_name = local.cluster_ops.ingress.domain_name
+  acme_email  = local.cluster_ops.ingress.acme_email
+  pat_token   = local.cluster_secrets.cluster.pat_token
 
   # Normalise each node entry with its effective values (per-node overrides
   # win, then var.default_*). Doing this once here keeps nodes.tf / dns.tf
@@ -103,9 +118,9 @@ locals {
   # AOCR (Phase 4 F17-F21) — resolved view for bootstrap.sh.tftpl. Non-secret
   # config (mirror host, upstreams, auto-import toggle, cluster_id, ...)
   # comes from the shared SoT in config/cluster.yml; secrets (wrap key,
-  # cluster PAT) stay in var.aocr_secrets because Terraform delivers them
-  # via cloud-init. enabled is derived: any non-empty mirror host OR
-  # auto-import on is enough to activate the AOCR template section.
+  # cluster PAT) come from the parallel SoT config/secrets.yml. Terraform
+  # delivers both via cloud-init. enabled is derived: any non-empty mirror
+  # host OR auto-import on is enough to activate the AOCR template section.
   aocr_enabled = (
     local.cluster_ops.mirror.host != ""
     || local.cluster_ops.auto_import.enabled
@@ -115,11 +130,11 @@ locals {
     mirror_host         = local.aocr_enabled ? local.cluster_ops.mirror.host : ""
     mirror_push_host    = local.aocr_enabled ? local.cluster_ops.mirror.push_host : ""
     mirror_upstreams    = local.aocr_enabled ? local.cluster_ops.mirror.upstreams : ""
-    upstream_wrap_key   = local.aocr_enabled ? var.aocr_secrets.upstream_wrap_key : ""
+    upstream_wrap_key   = local.aocr_enabled ? local.cluster_secrets.aocr.upstream_wrap_key : ""
     auto_import_enabled = local.aocr_enabled && local.cluster_ops.auto_import.enabled
     hooks_url           = local.aocr_enabled ? local.cluster_ops.auto_import.hooks_url : ""
     cluster_id          = local.aocr_enabled ? local.cluster_ops.auto_import.cluster_id : ""
-    cluster_pat         = local.aocr_enabled ? var.aocr_secrets.cluster_pat : ""
+    cluster_pat         = local.aocr_enabled ? local.cluster_secrets.aocr.cluster_pat : ""
     retention_suffix    = local.aocr_enabled ? local.cluster_ops.auto_import.retention_suffix : "--idle-90d"
     request_timeout     = local.aocr_enabled ? local.cluster_ops.auto_import.request_timeout : "15s"
     reconcile_interval  = local.aocr_enabled ? local.cluster_ops.auto_import.reconcile_interval : "5m"
@@ -140,10 +155,10 @@ resource "terraform_data" "validate_cluster_ops" {
         || (
           local.cluster_ops.auto_import.hooks_url != ""
           && local.cluster_ops.auto_import.cluster_id != ""
-          && var.aocr_secrets.cluster_pat != ""
+          && local.cluster_secrets.aocr.cluster_pat != ""
         )
       )
-      error_message = "When auto_import.enabled = true in config/cluster.yml, auto_import.hooks_url, auto_import.cluster_id, and aocr_secrets.cluster_pat are all required (sandboxd refuses to boot otherwise)."
+      error_message = "When auto_import.enabled = true in config/cluster.yml, auto_import.hooks_url, auto_import.cluster_id, and aocr.cluster_pat in config/secrets.yml are all required (sandboxd refuses to boot otherwise)."
     }
 
     precondition {
@@ -190,6 +205,11 @@ resource "terraform_data" "validate_cluster_ops" {
     precondition {
       condition     = local.cluster_ops.auto_import.max_in_flight >= 1
       error_message = "auto_import.max_in_flight must be >= 1."
+    }
+
+    precondition {
+      condition     = local.pat_token != ""
+      error_message = "cluster.pat_token in config/secrets.yml must be set (shared SB_PAT_TOKEN used by every node for operator/SDK API auth)."
     }
   }
 }

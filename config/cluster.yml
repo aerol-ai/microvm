@@ -11,12 +11,28 @@
 # already controls — the two tools would disagree on which to write and the
 # last one to run would silently clobber the other.
 #
-# Secrets (PATs, wrap keys, cloud credentials) stay tool-specific:
-#   - Terraform/terraform.tfvars  : cloud creds, ACME, AOCR upstream wrap key,
-#                                   cluster PAT (delivered via cloud-init).
-#   - Ansible local.yml           : same secrets when applying day-2 (inline
-#                                   value or file path on the control node).
+# Secrets split:
+#   - AOCR secrets (upstream wrap key, cluster PAT) live in ./secrets.yml,
+#     a parallel shared SoT also read by both Terraform and Ansible.
+#     Gitignored — bootstrap with `cp config/secrets.example.yml config/secrets.yml`.
+#   - Cloud creds (pat_token, cloudflare_api_token, ACME email, AWS profile)
+#     stay in Terraform/terraform.tfvars (Terraform-only — Ansible never
+#     re-provisions cloud infrastructure).
 # Those keys are intentionally NOT in this file.
+
+# --- Cluster identity / public ingress ------------------------------------
+# domain_name is the hostname advertised as the cluster ingress. Both an A
+# record (this name) and a wildcard *.<name> are created and pointed at every
+# ingress-bearing node's public IP. Set empty to skip TLS and run in IP/path
+# mode (Terraform-only; Ansible day-2 doesn't manage DNS).
+#
+# acme_email is the contact registered with Let's Encrypt — receives
+# cert-expiry warnings and is the identity LE uses for rate-limit triage.
+# Strongly recommended in domain mode; empty creates an anonymous ACME
+# account with no notifications.
+ingress:
+  domain_name: "vm.bareflux.co"
+  acme_email:  "sumansaurabh@aerol.ai"
 
 # --- OTEL exporter --------------------------------------------------------
 # Enable by setting metrics_endpoint and/or traces_endpoint. The *_enabled

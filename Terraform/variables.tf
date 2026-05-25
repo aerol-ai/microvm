@@ -8,11 +8,10 @@ variable "cluster_name" {
   default     = "aerolvm"
 }
 
-variable "pat_token" {
-  description = "Shared SB_PAT_TOKEN used by every node. Same value flows to install.sh and is consumed by cluster forwarding."
-  type        = string
-  sensitive   = true
-}
+# pat_token has moved to ../config/secrets.yml as cluster.pat_token. It's a
+# cluster-wide secret (every node uses the same value), so the shared SoT
+# pattern applies — Ansible can roll a rotated value into /etc/sandboxd at
+# day-2 from the same file. See locals.tf:pat_token.
 
 ###############################################################################
 # AWS credentials / region
@@ -303,16 +302,10 @@ variable "cloudflare_zone_id" {
   default     = ""
 }
 
-variable "domain_name" {
-  description = "Hostname advertised as the cluster ingress. Both an A record (this name) and a wildcard *.<name> are created and pointed at every ingress-bearing node's public IP."
-  type        = string
-}
-
-variable "acme_email" {
-  description = "Contact email registered with Let's Encrypt. Receives cert-expiry warnings and is the identity LE uses for rate-limit triage. Strongly recommended in domain mode; empty creates an anonymous ACME account with no notifications."
-  type        = string
-  default     = ""
-}
+# domain_name and acme_email have moved to ../config/cluster.yml under the
+# ingress: section. Both feed into Caddy / DNS / sandboxd at runtime, so
+# Ansible reading from the same source lets day-2 reconfig stay in sync with
+# day-0 provisioning. See locals.tf:domain_name and locals.tf:acme_email.
 
 variable "create_wildcard_record" {
   description = "Whether to create a wildcard *.<domain_name> A record alongside the apex."
@@ -429,37 +422,11 @@ variable "caddy_shared_cert_storage" {
 ###############################################################################
 # AOCR (Aerol OCI Registry) — Authenticated mirror + auto-import (Phase 4 F17-F21)
 #
-# Day-0 wiring against an already-deployed AOCR. When enabled = false (the
-# default), nothing AOCR-related is templated and the bootstrap is identical
-# to the pre-Phase-4 path. See sandbox-library/AUTHENTICATED_MIRROR.md for
-# the full operator reference.
-#
-# upstream_wrap_key and cluster_pat are real secrets and end up both in
-# Terraform state and in the EC2 instance user_data — same handling as
-# pat_token and cloudflare_api_token. Marking the whole object sensitive
-# keeps them out of plan/apply output.
+# All AOCR config has moved out of variables.tf:
+#   - Non-secret knobs (mirror host, upstreams, auto_import toggle, cluster_id,
+#     hooks_url, retention/timeout) live in ../config/cluster.yml.
+#   - Secrets (upstream_wrap_key, cluster_pat) live in ../config/secrets.yml.
+# Both files are read at the top of locals.tf and Ansible's configure-ops.yml,
+# so day-0 (terraform apply) and day-2 (ansible-playbook) cannot drift.
+# See sandbox-library/AUTHENTICATED_MIRROR.md for the full operator reference.
 ###############################################################################
-
-variable "aocr_secrets" {
-  description = <<-EOT
-    AOCR credentials Terraform delivers via cloud-init. Only secrets live
-    here; everything else (mirror host, upstreams, auto_import toggle,
-    cluster_id, hooks_url, retention/timeout knobs) is in
-    ../config/cluster.yml because Ansible reads the same file at day-2.
-
-    upstream_wrap_key  Base64-encoded 32-byte AES-GCM key. Must equal an
-                       entry in AOCR's UPSTREAM_AUTH_WRAP_KEYS or private
-                       upstream pulls 401. Empty = wrapping disabled.
-    cluster_pat        Bearer token AOCR validates against its
-                       INTERNAL_API_TOKEN (secrets/internal_api_token on
-                       the AOCR side). Required when
-                       auto_import.enabled = true in cluster.yml — the
-                       precondition in locals.tf enforces this.
-  EOT
-  type = object({
-    upstream_wrap_key = optional(string, "")
-    cluster_pat       = optional(string, "")
-  })
-  sensitive = true
-  default   = {}
-}

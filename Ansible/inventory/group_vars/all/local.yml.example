@@ -4,16 +4,18 @@
 # Non-secret ops config (mirror host, auto-import toggle / hooks_url /
 # cluster_id, image_gc whitelist, OTEL endpoints, ...) lives in the shared
 # ../../../../config/cluster.yml and is read by both Ansible and Terraform.
-# Do NOT set those keys here — they belong in cluster.yml.
+# AOCR secret values (upstream_wrap_key, cluster_pat) live in the parallel
+# shared ../../../../config/secrets.yml (gitignored — copy from
+# secrets.example.yml). Do NOT set those keys here — they belong in their
+# respective shared files.
 
-# --- AOCR secret delivery --------------------------------------------------
-# Required when cluster.yml has mirror.host set and/or auto_import.enabled.
-# Pick inline OR file-on-control-node for each secret; if both are set, the
-# inline value wins.
+# --- AOCR secret delivery (Vault/SOPS workflow) ----------------------------
+# Optional: deliver the AOCR secrets from a file on the control node instead
+# of inlining them in config/secrets.yml. Useful for fleet rendering. If a
+# *_src path is set AND the matching aocr.* key in config/secrets.yml is
+# non-empty, the config/secrets.yml value wins.
 #
-# sandboxd_upstream_wrap_key_value:        "<base64 wrap key from aocr.sh>"
 # sandboxd_upstream_wrap_key_src:          "/path/on/control/node/wrap.key"
-# sandboxd_auto_import_cluster_pat_value:  "<internal_api_token from aocr.sh>"
 # sandboxd_auto_import_cluster_pat_src:    "/path/on/control/node/cluster.pat"
 
 # --- Local backup ----------------------------------------------------------

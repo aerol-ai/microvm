@@ -50,8 +50,10 @@ sandboxd_role_change_drain_timeout_s: 3600
 # --- Phase 4: Authenticated Mirror + Auto-Import (secret delivery only) ----
 # Mirror host, upstreams, auto-import toggle / hooks_url / cluster_id, and
 # retention/timeouts live in ../../../../config/cluster.yml (shared with
-# Terraform). This block only carries the Ansible-specific plumbing needed
-# to land the upstream wrap key and cluster PAT on each host.
+# Terraform). The secret VALUES (upstream wrap key, cluster PAT) live in
+# ../../../../config/secrets.yml (also shared with Terraform; gitignored).
+# This block only carries the Ansible-specific plumbing for landing those
+# secrets on each host.
 #
 # These two are internal plumbing — the playbook templates them into
 # SB_*_PATH env vars on each managed host. Do not override.
@@ -59,13 +61,10 @@ sandboxd_secrets_dir: /etc/sandboxd/secrets
 sandboxd_upstream_wrap_key_path:       "{{ sandboxd_secrets_dir }}/upstream-wrap.key"
 sandboxd_auto_import_cluster_pat_path: "{{ sandboxd_secrets_dir }}/cluster-pat"
 
-# Secret delivery — pick ONE per secret, in local.yml:
-#   sandboxd_upstream_wrap_key_value: "<base64 wrap key>"        # inline (laptop)
-#   sandboxd_upstream_wrap_key_src:   "/path/on/control/node"    # file (Vault/SOPS)
-#   sandboxd_auto_import_cluster_pat_value: "<token>"
-#   sandboxd_auto_import_cluster_pat_src:   "/path/on/control/node"
-# If both _value and _src are set, _value wins. Both empty = feature off.
-sandboxd_upstream_wrap_key_value: ""
+# Optional Vault/SOPS workflow: deliver the secret from a file on the control
+# node instead of inlining it in config/secrets.yml. If a *_src path is set
+# AND the matching aocr.* key in config/secrets.yml is non-empty, the
+# config/secrets.yml value wins (it runs first). Both empty + secrets.yml
+# empty = feature off.
 sandboxd_upstream_wrap_key_src: ""
-sandboxd_auto_import_cluster_pat_value: ""
 sandboxd_auto_import_cluster_pat_src: ""

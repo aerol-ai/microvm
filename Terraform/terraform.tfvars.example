@@ -4,11 +4,14 @@
 ###############################################################################
 
 # --- Required ---------------------------------------------------------------
+#
+# Cluster-wide values that both Terraform and Ansible read have moved out of
+# this file and into the shared SoT at ../config/:
+#   - pat_token              -> config/secrets.yml as cluster.pat_token
+#   - domain_name, acme_email -> config/cluster.yml under the ingress: section
+# Only the Terraform-provider credential (DNS API access) remains here.
 
-pat_token            = "REPLACE-with-shared-SB_PAT_TOKEN"
 cloudflare_api_token = "REPLACE-with-cloudflare-api-token" # Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01. Add Zone:Read if you want auto-zone-lookup below.
-domain_name          = "cluster.example.com"               # set empty to skip TLS and run in IP/path mode
-acme_email           = "ops@example.com"                   # Let's Encrypt contact email (expiry/revocation notices). Strongly recommended in domain mode; empty creates an anonymous ACME account with no notifications.
 
 # cloudflare_zone_id is optional. Leave it unset to auto-resolve the zone from
 # domain_name by stripping the first label ("cluster.example.com" -> "example.com").
@@ -50,9 +53,10 @@ default_volume_type       = "gp3"
 #
 # All non-secret sandboxd ops env (OTEL, image-pull controls, image-GC
 # whitelist + janitor cadence, mirror host, auto-import toggles, ...) lives
-# in ../config/cluster.yml. Edit that file; both `terraform apply` and
-# `ansible-playbook playbooks/configure-ops.yml` read from it, so day-0
-# and day-2 stay in sync. Only AOCR secrets remain in this file (below).
+# in ../config/cluster.yml. AOCR secrets (upstream_wrap_key, cluster_pat)
+# live in ../config/secrets.yml (copy from secrets.example.yml — gitignored).
+# Both files are read by `terraform apply` and `ansible-playbook
+# playbooks/configure-ops.yml` so day-0 and day-2 stay in sync.
 
 # --- Cloudflare DNS behavior ------------------------------------------------
 
@@ -149,16 +153,6 @@ nodes = {
 #   Owner = "platform-team"
 # }
 
-# --- AOCR secrets (authenticated mirror + auto-import) ----------------------
-#
-# Only credentials live here. The mirror host, upstreams, auto-import
-# toggle/hooks_url/cluster_id, retention/timeouts, etc. are in
-# ../config/cluster.yml (shared with Ansible). Setting the secrets without
-# flipping mirror.host / auto_import.enabled in cluster.yml is a no-op:
-# the bootstrap template only renders the AOCR section when one of those
-# is non-empty.
-#
-# aocr_secrets = {
-#   upstream_wrap_key = "REPLACE-with-base64-32-byte-key-from-aocr-secrets/upstream_wrap_key"
-#   cluster_pat       = "REPLACE-with-internal-api-token"
-# }
+# AOCR secrets (upstream_wrap_key, cluster_pat) live in ../config/secrets.yml
+# — the shared SoT Ansible also reads. There is no aocr_secrets variable in
+# this file anymore; populate config/secrets.yml instead.

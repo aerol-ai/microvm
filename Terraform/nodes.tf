@@ -42,10 +42,10 @@ resource "aws_instance" "seed" {
     node_name                  = "${var.cluster_name}-${local.seed_node.name}"
     role                       = local.seed_node.role
     is_seed                    = true
-    domain                     = var.domain_name
-    pat_token                  = var.pat_token
+    domain                     = local.domain_name
+    pat_token                  = local.pat_token
     cloudflare_api_token       = var.cloudflare_api_token
-    acme_email                 = var.acme_email
+    acme_email                 = local.acme_email
     with_gvisor                = local.seed_node.with_gvisor
     with_nvidia_gpu            = local.seed_node.with_nvidia_gpu
     with_amd_gpu               = local.seed_node.with_amd_gpu
@@ -143,10 +143,10 @@ resource "aws_instance" "joiner" {
     node_name                  = "${var.cluster_name}-${each.value.name}"
     role                       = each.value.role
     is_seed                    = false
-    domain                     = var.domain_name
-    pat_token                  = var.pat_token
+    domain                     = local.domain_name
+    pat_token                  = local.pat_token
     cloudflare_api_token       = var.cloudflare_api_token
-    acme_email                 = var.acme_email
+    acme_email                 = local.acme_email
     with_gvisor                = each.value.with_gvisor
     with_nvidia_gpu            = each.value.with_nvidia_gpu
     with_amd_gpu               = each.value.with_amd_gpu

@@ -7,6 +7,9 @@ dist-test/
 *.db-wal
 Terraform/.terraform.lock.hcl
 *.log
+# Shared cluster secrets (read by both Terraform and Ansible). The committed
+# sibling is config/secrets.example.yml.
+config/secrets.yml
 node_modules/
 sdk/typescript/node_modules
 docs/.astro/

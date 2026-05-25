@@ -42,76 +42,72 @@ The wrap key and the internal API token are real secrets. Treat them like
 
 ## Terraform setup
 
-Add an `aocr = { ... }` block to your `terraform.tfvars`. Everything else
-in the cluster's Terraform stays unchanged — when `enabled = false` (the
-default) no AOCR resources are templated.
+AOCR config is split across two shared SoT files at the repo root that
+both Terraform and Ansible read:
+
+- `config/cluster.yml` (committed) holds the non-secret knobs: mirror host,
+  upstreams, auto-import toggle / hooks_url / cluster_id, retention suffix,
+  timeouts, max-in-flight.
+- `config/secrets.yml` (gitignored — `cp config/secrets.example.yml config/secrets.yml`
+  on first checkout) holds the two AOCR secrets: `aocr.upstream_wrap_key`
+  and `aocr.cluster_pat`.
+
+Nothing AOCR-specific lives in `terraform.tfvars` anymore.
 
 ### Modes
 
-**Off (default).** Omit the block entirely, or:
+**Off (default).** Leave `mirror.host` empty and `auto_import.enabled = false`
+in `config/cluster.yml`. The bootstrap template skips the AOCR section.
 
-```hcl
-aocr = {
-  enabled = false
-}
+**Mirror-only — cached + wrapped private pulls.**
+
+```yaml
+# config/cluster.yml
+mirror:
+  host: "mirror.aocr.example.com"
+  upstreams: "docker.io=docker,ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
 ```
 
-**Mirror-only — cached + wrapped private pulls.** Three fields:
-
-```hcl
-aocr = {
-  enabled           = true
-  mirror_host       = "mirror.aocr.example.com"
-  upstream_wrap_key = "BASE64_32_BYTES_FROM_aocr.sh/secrets/upstream_wrap_key"
-}
+```yaml
+# config/secrets.yml  (gitignored)
+aocr:
+  upstream_wrap_key: "BASE64_32_BYTES_FROM_aocr.sh/secrets/upstream_wrap_key"
+  cluster_pat:       ""
 ```
 
 Pulls of `ghcr.io/...`, `gcr.io/...`, `quay.io/...`, and `registry.k8s.io/...`
 flow through the mirror. Private pulls use wrapped credentials.
 
-**Mirror + auto-import (full F21).** Four more fields. Plan-time
-validation rejects `auto_import_enabled = true` without all three of
-`hooks_url`, `cluster_id`, and `cluster_pat`:
+**Mirror + auto-import (full F21).** Plan-time validation rejects
+`auto_import.enabled = true` without all three of `auto_import.hooks_url`,
+`auto_import.cluster_id`, and `aocr.cluster_pat`:
 
-```hcl
-aocr = {
-  enabled             = true
-  mirror_host         = "mirror.aocr.example.com"
-  upstream_wrap_key   = "BASE64_32_BYTES_FROM_aocr.sh/secrets/upstream_wrap_key"
-  auto_import_enabled = true
-  hooks_url           = "https://aocr.example.com"   # AOCR hooks service root, no trailing slash
-  cluster_id          = "prod-aerolvm-us-east-1"
-  cluster_pat         = "TOKEN_FROM_aocr.sh/secrets/internal_api_token"
-  retention_suffix    = "--idle-90d"                 # optional; default --idle-90d
-}
+```yaml
+# config/cluster.yml
+mirror:
+  host: "mirror.aocr.example.com"
+  upstreams: "docker.io=docker,ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
+
+auto_import:
+  enabled: true
+  hooks_url: "https://aocr.example.com"     # AOCR hooks service root, no trailing slash
+  cluster_id: "prod-aerolvm-us-east-1"
+  retention_suffix: "--idle-90d"             # optional; default --idle-90d
+```
+
+```yaml
+# config/secrets.yml  (gitignored)
+aocr:
+  upstream_wrap_key: "BASE64_32_BYTES_FROM_aocr.sh/secrets/upstream_wrap_key"
+  cluster_pat:       "TOKEN_FROM_aocr.sh/secrets/internal_api_token"
 ```
 
 After this, each successful private pull triggers a re-mount under
 `cluster/prod-aerolvm-us-east-1/_imported/<host>/<repo>:<tag>--idle-90d`
 on the AOCR side, fully decoupled from the original upstream credential.
 
-### All available fields
-
-```hcl
-aocr = {
-  enabled             = bool          # required
-  mirror_host         = string        # default ""
-  mirror_push_host    = string        # default ""; leave empty unless AOCR exposes a separate push vhost
-  mirror_upstreams    = string        # default "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
-  upstream_wrap_key   = string        # default ""; base64 32-byte AES-GCM key
-  auto_import_enabled = bool          # default false
-  hooks_url           = string        # default ""
-  cluster_id          = string        # default ""; must match ^[A-Za-z0-9_-]{1,64}$
-  cluster_pat         = string        # default ""
-  retention_suffix    = string        # default "--idle-90d"
-  request_timeout     = string        # default "15s" (Go duration)
-  reconcile_interval  = string        # default "5m" (Go duration)
-  max_in_flight       = number        # default 4
-}
-```
-
-The whole variable is marked `sensitive = true`, so plan/apply output
-won't print the wrap key or PAT.
+`config/secrets.yml` is loaded via `sensitive(yamldecode(...))` so plan/apply
+output won't print the wrap key or PAT.
 
 ### Apply
 
@@ -135,31 +131,25 @@ in `systemctl show sandboxd` or process listings.
 
 ## Ansible setup
 
-If you provision with Ansible instead of (or alongside) Terraform, set
-the same values in `Ansible/inventory/group_vars/all/local.yml` (gitignored
-per-operator overrides, auto-loaded after the committed `defaults.yml`)
-and run `configure-ops.yml`.
+Ansible reads the **same** `config/cluster.yml` and `config/secrets.yml`
+files Terraform uses, so the YAML blocks under [Terraform setup](#terraform-setup)
+above are also the Ansible config — there is no separate inline-value var
+to set in `local.yml` anymore.
 
-Inline-value mode (single operator / laptop):
+For fleet / Vault-rendered workflows, leave `aocr.upstream_wrap_key` /
+`aocr.cluster_pat` empty in `config/secrets.yml` and point at staged file
+paths from `Ansible/inventory/group_vars/all/local.yml`:
 
 ```yaml
 # inventory/group_vars/all/local.yml — gitignored
-sandboxd_mirror_host:                    "mirror.aocr.example.com"
-sandboxd_upstream_wrap_key_value:        "<base64 wrap key>"
-
-sandboxd_auto_import_enabled:            true
-sandboxd_auto_import_hooks_url:          "https://aocr.example.com"
-sandboxd_auto_import_cluster_id:         "prod-aerolvm-us-east-1"
-sandboxd_auto_import_cluster_pat_value:  "<internal API token>"
-# sandboxd_auto_import_retention_suffix: "--idle-90d"   # default
+sandboxd_upstream_wrap_key_src:          "/home/you/aerol-secrets/upstream_wrap_key"
+sandboxd_auto_import_cluster_pat_src:    "/home/you/aerol-secrets/cluster_pat"
 ```
 
-Control-node file mode (fleet / Vault-rendered) — swap `_value` for `_src`
-and point at a file path on the Ansible control node. The playbook writes
-the bytes to `/etc/sandboxd/secrets/upstream-wrap.key` and
-`/etc/sandboxd/secrets/cluster-pat` on each managed host at `mode 0600`
+The playbook writes the bytes to `/etc/sandboxd/secrets/upstream-wrap.key`
+and `/etc/sandboxd/secrets/cluster-pat` on each managed host at `mode 0600`
 either way. See [`Ansible/README.md` § Step 2](../../Ansible/README.md#step-2--choose-how-to-hand-the-secrets-to-the-play)
-for the full file-layout pattern and both modes.
+for the full file-layout pattern.
 
 Then:
 
@@ -170,8 +160,8 @@ ansible-playbook Ansible/playbooks/configure-ops.yml
 Sandboxd restarts on each host as the env file changes (controlled by
 `sandboxd_restart_after_ops_config`).
 
-The full list of `sandboxd_mirror_*` / `sandboxd_auto_import_*` defaults
-lives in [`Ansible/inventory/group_vars/all/defaults.yml`](../../Ansible/inventory/group_vars/all/defaults.yml).
+The full list of plumbing defaults lives in
+[`Ansible/inventory/group_vars/all/defaults.yml`](../../Ansible/inventory/group_vars/all/defaults.yml).
 
 ---
 

@@ -296,15 +296,18 @@ chmod 0600 ~/aerol-secrets/*
 If your fleet renders these via Vault or another mechanism, point `_src`
 at whatever path that pipeline writes to.
 
-> If both `_value` and `_src` are set for the same secret, the inline
-> `_value` wins. Leaving both empty skips the copy entirely — sandboxd
-> boots without the secret and the corresponding feature is disabled.
+> If a `*_src` path is set AND the matching `aocr.*` key in
+> `config/secrets.yml` is non-empty, the `config/secrets.yml` value wins.
+> Leaving both empty skips the copy entirely — sandboxd boots without the
+> secret and the corresponding feature is disabled.
 
 ### Step 3 — Fill in the vars
 
 Non-secret AOCR config (mirror host, auto-import toggle / hooks_url /
 cluster_id, retention/timeouts) lives in the shared `../config/cluster.yml`.
-Edit that file once; both Terraform (day-0) and Ansible (day-2) read it.
+AOCR secret values live in the parallel shared `../config/secrets.yml`
+(gitignored — bootstrap with `cp ../config/secrets.example.yml ../config/secrets.yml`).
+Edit those two files once; both Terraform (day-0) and Ansible (day-2) read them.
 
 ```yaml
 # ../config/cluster.yml
@@ -319,17 +322,17 @@ auto_import:
   retention_suffix: "--idle-7d"
 ```
 
-Secrets stay in your gitignored override file (e.g. `group_vars/all/local.yml`)
-because cluster.yml is committable and they are not.
-
-**Option A — inline values (laptop):**
-
 ```yaml
-sandboxd_upstream_wrap_key_value:        "<paste upstream_wrap_key>"
-sandboxd_auto_import_cluster_pat_value:  "<paste internal_api_token>"
+# ../config/secrets.yml  (gitignored — copy from secrets.example.yml)
+aocr:
+  upstream_wrap_key: "<paste upstream_wrap_key>"
+  cluster_pat:       "<paste internal_api_token>"
 ```
 
-**Option B — control-node file paths (fleet):**
+**Optional — control-node file paths (Vault/SOPS workflow):** if your fleet
+renders the secrets to files instead, leave the matching keys in
+`config/secrets.yml` empty and point at the rendered files from
+`group_vars/all/local.yml`:
 
 ```yaml
 sandboxd_upstream_wrap_key_src:          "/home/you/aerol-secrets/upstream_wrap_key"
@@ -378,8 +381,11 @@ curl -sf -H "Authorization: Bearer $(cat aocr.sh/secrets/auth_pat_token)" \
 
 ### What each var means
 
-The non-secret keys live in `../config/cluster.yml` (shared SoT). The two
-secret-delivery pairs are Ansible-side because they cannot be committed.
+Non-secret keys live in `../config/cluster.yml` (shared SoT, committable).
+Secret values live in `../config/secrets.yml` (shared SoT, gitignored). The
+two `*_src` vars in `group_vars/all/local.yml` are an Ansible-only fallback
+for Vault/SOPS rendering — not needed if `config/secrets.yml` holds the
+values directly.
 
 **`../config/cluster.yml` — `mirror.*` / `auto_import.*`:**
 
@@ -397,28 +403,33 @@ secret-delivery pairs are Ansible-side because they cannot be committed.
 file have sensible defaults — only tune if recovery storms or remote latency
 warrant it.
 
-**Ansible local override (gitignored) — secret delivery only:**
+**`../config/secrets.yml` — `aocr.*` (gitignored):**
+
+| Key | Purpose | Where the value comes from |
+|---|---|---|
+| `aocr.upstream_wrap_key` | Base64 32-byte AES-GCM key. Written to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: content:` (no_log). Sandboxd wraps per-pull upstream creds with this; only AOCR's mirror can unwrap. Without it, private upstream pulls 401 at the mirror. | AOCR side — `aocr_auth_upstream_wrap_key` from `secrets.yml`, or `cat secrets/upstream_wrap_key` |
+| `aocr.cluster_pat` | Bearer token sandboxd presents on `POST /v1/internal/imports`. Written to `/etc/sandboxd/secrets/cluster-pat` via `copy: content:` (no_log). Despite the name, this is AOCR's `internal_api_token`, not the UUID-keyed cluster PAT used by `auth/src/clusterPat.ts` (different concept; see `aocr_aerol_stitch.md`). | AOCR side — `aocr_internal_api_token` or `cat secrets/internal_api_token` |
+
+**Ansible local override (gitignored) — Vault/SOPS fallback only:**
 
 | Var | Purpose | Where the value comes from |
 |---|---|---|
-| `sandboxd_upstream_wrap_key_value` | **Inline** base64 32-byte AES-GCM key. Written to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: content:` (no_log). Use this OR `_src`, not both (inline wins). | AOCR side — `aocr_auth_upstream_wrap_key` from `secrets.yml`, or `cat secrets/upstream_wrap_key` |
-| `sandboxd_upstream_wrap_key_src` | Path on the **control node** to a file holding the key. The play copies it to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: src:`. Use this when Vault/SOPS/Secrets Manager renders the file. Sandboxd wraps per-pull upstream creds with this; only AOCR's mirror can unwrap. Without either var, private upstream pulls 401 at the mirror. | AOCR side — `secrets/upstream_wrap_key` (auto-generated on first AOCR deploy) |
-| `sandboxd_auto_import_cluster_pat_value` | **Inline** bearer token sandboxd presents on `POST /v1/internal/imports`. Written to `/etc/sandboxd/secrets/cluster-pat` via `copy: content:` (no_log). Use this OR `_src`, not both (inline wins). | AOCR side — `aocr_internal_api_token` or `cat secrets/internal_api_token` |
-| `sandboxd_auto_import_cluster_pat_src` | Path on the **control node** to a file holding the same token. Use this when Vault/SOPS/Secrets Manager renders the file. Despite the name, this is AOCR's `internal_api_token`, not the UUID-keyed cluster PAT used by `auth/src/clusterPat.ts` (different concept; see `aocr_aerol_stitch.md`). | AOCR side — `secrets/internal_api_token` |
+| `sandboxd_upstream_wrap_key_src` | Path on the **control node** to a file holding the wrap key. The play copies it to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: src:`. Use when Vault/SOPS/Secrets Manager renders the file. If `aocr.upstream_wrap_key` in `config/secrets.yml` is also set, secrets.yml wins. | AOCR side — `secrets/upstream_wrap_key` (auto-generated on first AOCR deploy) |
+| `sandboxd_auto_import_cluster_pat_src` | Path on the **control node** to a file holding the cluster PAT. Same precedence rules as the wrap key. | AOCR side — `secrets/internal_api_token` |
 
 ### Rotating secrets
 
 - **Wrap key.** Add the new key alongside the old one in AOCR's
   `UPSTREAM_AUTH_WRAP_KEYS` (comma-separated), then update the cluster
-  side: either replace `sandboxd_upstream_wrap_key_value` in your override
-  file (inline mode) or overwrite the file at
-  `sandboxd_upstream_wrap_key_src` (file mode). Rerun `configure-ops.yml`.
-  After every node has rotated, drop the old key from AOCR.
+  side: replace `aocr.upstream_wrap_key` in `../config/secrets.yml`
+  (default) or overwrite the file at `sandboxd_upstream_wrap_key_src`
+  (Vault/SOPS mode). Rerun `configure-ops.yml`. After every node has
+  rotated, drop the old key from AOCR.
 - **Internal API token / cluster PAT.** Rotate AOCR's `INTERNAL_API_TOKEN`,
-  then update `sandboxd_auto_import_cluster_pat_value` (inline) or
-  overwrite the file at `sandboxd_auto_import_cluster_pat_src` (file), and
-  rerun `configure-ops.yml`. Auto-imports queued under the old token will
-  fail and the local reconciler will retry under the new one.
+  then update `aocr.cluster_pat` in `../config/secrets.yml` (default) or
+  overwrite the file at `sandboxd_auto_import_cluster_pat_src` (Vault/SOPS
+  mode), and rerun `configure-ops.yml`. Auto-imports queued under the old
+  token will fail and the local reconciler will retry under the new one.
 
 ### TL;DR
 
@@ -426,10 +437,10 @@ warrant it.
    inline in `aocr.sh/ansible/inventory/group_vars/all/secrets.yml`).
 2. Set `mirror.host` and `auto_import.*` in `../config/cluster.yml` (shared
    with Terraform — committable, no secrets).
-3. Pick one delivery mode per secret in your gitignored
-   `group_vars/all/local.yml`:
-   - **Inline** — set `sandboxd_*_value`.
-   - **Control-node file** — set `sandboxd_*_src` to a path you stage.
+3. Set `aocr.upstream_wrap_key` and `aocr.cluster_pat` in
+   `../config/secrets.yml` (copy from `secrets.example.yml`, gitignored,
+   shared with Terraform). For Vault/SOPS rendering, leave those empty and
+   point `sandboxd_*_src` at staged paths in `group_vars/all/local.yml`.
 4. `ansible-playbook playbooks/configure-ops.yml`.
 5. Verify with `grep` / `ls` on a node and `curl /v1/images` on AOCR.
 
