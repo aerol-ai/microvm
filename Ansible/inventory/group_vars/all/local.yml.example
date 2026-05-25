@@ -1,18 +1,20 @@
 # Copy to local.yml (gitignored) and fill in your values.
-# Loaded automatically after main.yml; only set keys you want to override.
-
-# --- AOCR stitch (mirror + auto-import) ------------------------------------
-# sandboxd_mirror_host:                    "mirror.<your-aocr-domain>"
-# sandboxd_upstream_wrap_key_value:        "<base64 wrap key from aocr.sh>"
+# Loaded automatically after defaults.yml; only set keys you want to override.
 #
-# sandboxd_auto_import_enabled:            true
-# sandboxd_auto_import_hooks_url:          "https://<your-aocr-domain>"
-# sandboxd_auto_import_cluster_id:         "<label, e.g. prod-aerolvm-us-east-1>"
-# sandboxd_auto_import_cluster_pat_value:  "<internal_api_token from aocr.sh>"
+# Non-secret ops config (mirror host, auto-import toggle / hooks_url /
+# cluster_id, image_gc whitelist, OTEL endpoints, ...) lives in the shared
+# ../../../../config/cluster.yml and is read by both Ansible and Terraform.
+# Do NOT set those keys here — they belong in cluster.yml.
 
-# --- Observability ---------------------------------------------------------
-# sandboxd_otel_metrics_enabled:  true
-# sandboxd_otel_metrics_endpoint: "http://otel-collector:4318/v1/metrics"
+# --- AOCR secret delivery --------------------------------------------------
+# Required when cluster.yml has mirror.host set and/or auto_import.enabled.
+# Pick inline OR file-on-control-node for each secret; if both are set, the
+# inline value wins.
+#
+# sandboxd_upstream_wrap_key_value:        "<base64 wrap key from aocr.sh>"
+# sandboxd_upstream_wrap_key_src:          "/path/on/control/node/wrap.key"
+# sandboxd_auto_import_cluster_pat_value:  "<internal_api_token from aocr.sh>"
+# sandboxd_auto_import_cluster_pat_src:    "/path/on/control/node/cluster.pat"
 
 # --- Local backup ----------------------------------------------------------
 # sandboxd_backup_enabled: true

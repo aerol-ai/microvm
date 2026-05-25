@@ -281,121 +281,11 @@ variable "default_idle_timeout_min" {
 # Observability and operational hardening
 ###############################################################################
 
-variable "otel_metrics_enabled" {
-  description = "Enable sandboxd's native OTLP/HTTP metrics exporter. Automatically true when otel_metrics_endpoint is non-empty."
-  type        = bool
-  default     = false
-}
-
-variable "otel_metrics_endpoint" {
-  description = "OTLP/HTTP metrics endpoint written as SB_OTEL_METRICS_ENDPOINT, for example http://otel-collector:4318/v1/metrics. Empty disables endpoint-specific config."
-  type        = string
-  default     = ""
-}
-
-variable "otel_metrics_interval" {
-  description = "sandboxd OTEL metrics export interval written as SB_OTEL_METRICS_INTERVAL."
-  type        = string
-  default     = "30s"
-
-  validation {
-    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.otel_metrics_interval))
-    error_message = "otel_metrics_interval must be a Go duration such as 30s, 1m, or 500ms."
-  }
-}
-
-variable "otel_traces_enabled" {
-  description = "Enable sandboxd's native OTLP/HTTP trace exporter. Automatically true when otel_traces_endpoint is non-empty."
-  type        = bool
-  default     = false
-}
-
-variable "otel_traces_endpoint" {
-  description = "OTLP/HTTP traces endpoint written as SB_OTEL_TRACES_ENDPOINT, for example http://otel-collector:4318/v1/traces. Empty disables endpoint-specific config."
-  type        = string
-  default     = ""
-}
-
-variable "otel_traces_sample_ratio" {
-  description = "Parent-based trace sample ratio written as SB_OTEL_TRACES_SAMPLE_RATIO. 0 disables local sampling; 1 samples every root trace."
-  type        = number
-  default     = 0.05
-
-  validation {
-    condition     = var.otel_traces_sample_ratio >= 0 && var.otel_traces_sample_ratio <= 1
-    error_message = "otel_traces_sample_ratio must be between 0 and 1."
-  }
-}
-
-variable "otel_service_name" {
-  description = "OTEL_SERVICE_NAME written into sandboxd env."
-  type        = string
-  default     = "sandboxd"
-}
-
-variable "image_pull_max_concurrent" {
-  description = "Per-worker cap on concurrent Docker image pulls. 0 disables the cap."
-  type        = number
-  default     = 4
-
-  validation {
-    condition     = var.image_pull_max_concurrent >= 0
-    error_message = "image_pull_max_concurrent must be >= 0."
-  }
-}
-
-variable "image_pull_failure_backoff" {
-  description = "Per-image/auth retry suppression after a failed pull, written as SB_IMAGE_PULL_FAILURE_BACKOFF. Use 0s to disable."
-  type        = string
-  default     = "30s"
-
-  validation {
-    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.image_pull_failure_backoff))
-    error_message = "image_pull_failure_backoff must be a Go duration such as 30s, 1m, or 0s."
-  }
-}
-
-variable "image_gc_whitelist" {
-  description = <<-EOT
-    Image repositories or refs the GC janitors must never remove. Three
-    match shapes:
-      - exact ref ("alpine:latest" — only that tag survives)
-      - repo, tag/digest agnostic ("ubuntu" — every tag/digest of ubuntu)
-      - registry/org prefix when the entry ends in "/" ("ghcr.io/myorg/")
-    Written as SB_IMAGE_GC_WHITELIST (comma-joined). Empty list (default)
-    preserves today's behavior — every image is eligible for GC.
-  EOT
-  type        = list(string)
-  default     = []
-}
-
-variable "image_build_gc_enabled" {
-  description = "Master switch for BOTH image janitors (built-image sweep + pending-image sweep). Written as SB_IMAGE_BUILD_GC_ENABLED. true (default) matches the sandboxd default; flip to false to disable both sweeps without unsetting the interval/TTL knobs."
-  type        = bool
-  default     = true
-}
-
-variable "image_build_gc_interval" {
-  description = "How often each image janitor ticker fires, written as SB_IMAGE_BUILD_GC_INTERVAL. Go duration."
-  type        = string
-  default     = "10m"
-
-  validation {
-    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.image_build_gc_interval))
-    error_message = "image_build_gc_interval must be a Go duration such as 30s, 10m, or 1h."
-  }
-}
-
-variable "image_build_gc_ttl" {
-  description = "Minimum age before an image becomes eligible for GC removal (both built images and pending-destroy images). Written as SB_IMAGE_BUILD_GC_TTL. Go duration. Default 24h trades disk for warm-start latency: shorter values reclaim disk faster but re-pull on destroy/recreate cycles inside the window."
-  type        = string
-  default     = "24h"
-
-  validation {
-    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.image_build_gc_ttl))
-    error_message = "image_build_gc_ttl must be a Go duration such as 1h, 24h, or 7d expressed as 168h."
-  }
-}
+# Observability, image-pull controls, image-GC, mirror/auto-import config —
+# everything except secrets — lives in ../config/cluster.yml. That file is
+# the single source of truth both Terraform and Ansible read from, so
+# day-0 (terraform apply) and day-2 (configure-ops.yml) cannot drift.
+# See locals.tf:cluster_ops and resource.terraform_data.validate_cluster_ops.
 
 ###############################################################################
 # Cloudflare DNS
@@ -550,107 +440,26 @@ variable "caddy_shared_cert_storage" {
 # keeps them out of plan/apply output.
 ###############################################################################
 
-variable "aocr" {
+variable "aocr_secrets" {
   description = <<-EOT
-    Connect this cluster to an already-deployed AOCR.
+    AOCR credentials Terraform delivers via cloud-init. Only secrets live
+    here; everything else (mirror host, upstreams, auto_import toggle,
+    cluster_id, hooks_url, retention/timeout knobs) is in
+    ../config/cluster.yml because Ansible reads the same file at day-2.
 
-    enabled              Master switch. When false, no AOCR env or secret
-                         files are templated.
-    mirror_host          Mirror vhost for cached pulls (e.g.
-                         "mirror.aocr.aerol.ai"). Empty disables rewrite
-                         even when enabled = true (auto-import can still
-                         run on its own).
-    mirror_push_host     Push vhost for the same AOCR cluster (e.g.
-                         "aocr.aerol.ai"). Refs already pointing here are
-                         left alone so they are not double-rewritten.
-    mirror_upstreams     Comma-separated host=short map of upstreams the
-                         mirror handles. Default covers ghcr/gcr/quay/k8s.
-    upstream_wrap_key    Base64-encoded 32-byte AES-GCM key. Must equal
-                         the active key in AOCR's UPSTREAM_AUTH_WRAP_KEYS
-                         (use the value from secrets/upstream_wrap_key
-                         emitted by the AOCR Ansible playbook). Empty
-                         disables credential wrapping; private pulls 401.
-    auto_import_enabled  Turn on post-pull auto-import (F21). When true,
-                         hooks_url + cluster_id + cluster_pat are required
-                         (plan-time validation mirrors sandboxd's startup
-                         guard).
-    hooks_url            AOCR hooks service root, no trailing slash, e.g.
-                         "https://aocr.aerol.ai".
-    cluster_id           This cluster's ID on the AOCR side.
-    cluster_pat          Bearer token AOCR validates against its
-                         INTERNAL_API_TOKEN. Same value as
-                         aocr_internal_api_token on the AOCR side
-                         (secrets/internal_api_token).
-    retention_suffix     Tag suffix imported tags get in the cluster
-                         namespace (e.g. "--idle-90d"); drives reaper
-                         eviction window.
-    request_timeout      Per-call timeout for the ImportAPI POST.
-    reconcile_interval   Ticker period for the local auto_import_pending
-                         reconciler.
-    max_in_flight        Fan-out cap for one reconciler sweep.
+    upstream_wrap_key  Base64-encoded 32-byte AES-GCM key. Must equal an
+                       entry in AOCR's UPSTREAM_AUTH_WRAP_KEYS or private
+                       upstream pulls 401. Empty = wrapping disabled.
+    cluster_pat        Bearer token AOCR validates against its
+                       INTERNAL_API_TOKEN (secrets/internal_api_token on
+                       the AOCR side). Required when
+                       auto_import.enabled = true in cluster.yml — the
+                       precondition in locals.tf enforces this.
   EOT
   type = object({
-    enabled             = bool
-    mirror_host         = optional(string, "")
-    mirror_push_host    = optional(string, "")
-    mirror_upstreams    = optional(string, "ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s")
-    upstream_wrap_key   = optional(string, "")
-    auto_import_enabled = optional(bool, false)
-    hooks_url           = optional(string, "")
-    cluster_id          = optional(string, "")
-    cluster_pat         = optional(string, "")
-    retention_suffix    = optional(string, "--idle-90d")
-    request_timeout     = optional(string, "15s")
-    reconcile_interval  = optional(string, "5m")
-    max_in_flight       = optional(number, 4)
+    upstream_wrap_key = optional(string, "")
+    cluster_pat       = optional(string, "")
   })
   sensitive = true
-  default = {
-    enabled = false
-  }
-
-  validation {
-    condition = (
-      !var.aocr.enabled
-      || !var.aocr.auto_import_enabled
-      || (
-        var.aocr.hooks_url != ""
-        && var.aocr.cluster_id != ""
-        && var.aocr.cluster_pat != ""
-      )
-    )
-    error_message = "When aocr.auto_import_enabled = true, aocr.hooks_url, aocr.cluster_id, and aocr.cluster_pat are all required."
-  }
-
-  validation {
-    condition = (
-      !var.aocr.enabled
-      || var.aocr.cluster_id == ""
-      || can(regex("^[A-Za-z0-9_-]{1,64}$", var.aocr.cluster_id))
-    )
-    error_message = "aocr.cluster_id must match ^[A-Za-z0-9_-]{1,64}$ (matches AOCR ImportAPI validation)."
-  }
-
-  validation {
-    condition = (
-      var.aocr.retention_suffix == ""
-      || can(regex("^--[a-z0-9]+(-[a-z0-9]+)*$", var.aocr.retention_suffix))
-    )
-    error_message = "aocr.retention_suffix must start with '--' followed by lowercase alphanumerics, e.g. '--idle-90d'."
-  }
-
-  validation {
-    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.aocr.request_timeout))
-    error_message = "aocr.request_timeout must be a Go duration such as 15s or 1m."
-  }
-
-  validation {
-    condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", var.aocr.reconcile_interval))
-    error_message = "aocr.reconcile_interval must be a Go duration such as 5m or 30s."
-  }
-
-  validation {
-    condition     = var.aocr.max_in_flight >= 1
-    error_message = "aocr.max_in_flight must be >= 1."
-  }
+  default   = {}
 }
