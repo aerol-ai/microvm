@@ -31,7 +31,7 @@
 # Strongly recommended in domain mode; empty creates an anonymous ACME
 # account with no notifications.
 ingress:
-  domain_name: "vm.bareflux.co"
+  domain_name: "vm.aerol.cloud"
   acme_email:  "sumansaurabh@aerol.ai"
 
 # --- OTEL exporter --------------------------------------------------------
