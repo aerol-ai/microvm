@@ -149,14 +149,39 @@ func main() {
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = cfg.HostSupportedRuntimes
-	admitter := capacity.New(host, capacity.Limits{
+	// Phase 5: the per-VMM RSS sampler is constructed up front when
+	// firecracker is enabled so admission can be wired against it from
+	// the start (capacity holds the RSSSource by reference, not value).
+	// The sampler's Run goroutine is started later inside the
+	// EnableFirecracker block, after the driver is constructed —
+	// keeping the goroutine lifecycle next to the rest of the
+	// firecracker boot block. On docker-only hosts the sampler is nil
+	// and capacity falls back to nominal accounting (the watermark
+	// check is gated on rss != nil).
+	//
+	// rssSource is a typed nil-safe wrapper: if we passed the
+	// *RSSSampler directly into the interface arg, a nil pointer would
+	// satisfy the interface (non-nil interface, nil value) and the
+	// admitter's `rss != nil` guard would lie — a watermark check
+	// would then dereference the nil pointer and panic. Materialising
+	// the interface as a true nil keeps that gate honest.
+	var (
+		rssSampler *fcruntime.RSSSampler
+		rssSource  capacity.RSSSource
+	)
+	if cfg.EnableFirecracker {
+		rssSampler = fcruntime.NewRSSSampler(logger)
+		rssSource = rssSampler
+	}
+	admitter := capacity.NewWithRSSSource(host, capacity.Limits{
 		CPUReservationRatio:       cfg.CPUReservationRatio,
 		MemoryReservationRatio:    cfg.MemoryReservationRatio,
 		DiskReservationRatio:      cfg.DiskReservationRatio,
 		MemoryFloorRatio:          cfg.MemoryFloorRatio,
 		CPUOverProvisionFactor:    cfg.CPUOverProvisionFactor,
 		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
-	}, capacity.NewProcMeminfoProbe())
+		RSSWatermarkRatio:         cfg.FirecrackerRSSWatermarkRatio,
+	}, capacity.NewProcMeminfoProbe(), rssSource)
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
@@ -172,6 +197,7 @@ func main() {
 		"memory_floor_ratio", cfg.MemoryFloorRatio,
 		"cpu_overprovision_factor", cfg.CPUOverProvisionFactor,
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
+		"rss_watermark_ratio", cfg.FirecrackerRSSWatermarkRatio,
 	)
 
 	// dockerClient is passed twice: as the runtime.Runtime driver (the
@@ -213,6 +239,17 @@ func main() {
 			logger.Error("firecracker oci builder init failed", "error", err)
 			os.Exit(1)
 		}
+		// Phase 5: start the per-VMM RSS sampler now that we know
+		// firecracker is on. Run is a blocking ticker loop, so it goes in
+		// a goroutine; ctx cancellation (SIGINT/SIGTERM at top of main)
+		// stops it. Interval ≤ 0 makes Run return immediately, which is
+		// the safe behaviour if an operator zeroes the env var — the
+		// sampler then never flips Ready() and admission stays on
+		// nominal accounting.
+		go rssSampler.Run(ctx, cfg.FirecrackerRSSSamplerInterval)
+		logger.Info("firecracker rss sampler started",
+			"interval", cfg.FirecrackerRSSSamplerInterval,
+			"watermark_ratio", cfg.FirecrackerRSSWatermarkRatio)
 		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
 		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})

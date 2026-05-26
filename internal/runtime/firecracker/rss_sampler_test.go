@@ -146,10 +146,26 @@ func TestRSSSampler_TotalZeroBeforeFirstSample(t *testing.T) {
 	withFakeRSS(t, map[int]int64{1: pagesForMB(100)}, nil)
 	s := NewRSSSampler(nil)
 	s.Register("a", 1)
-	// No sampleOnce yet — admission should see 0 so PR 5-B can gate the
-	// RSS check on "has data" and not pretend a cold daemon is empty.
+	// No sampleOnce yet — admission should see 0 AND !Ready so PR 5-B
+	// gates the RSS check and falls back to nominal accounting on a
+	// cold-start daemon.
 	if got := s.TotalRSSMB(); got != 0 {
 		t.Fatalf("TotalRSSMB before first sample = %d, want 0", got)
+	}
+	if s.Ready() {
+		t.Fatal("Ready() = true before first sample, want false")
+	}
+}
+
+func TestRSSSampler_ReadyAfterFirstSample(t *testing.T) {
+	// First sample with no pids: Ready must still flip — admission
+	// should treat "sampler ran, host has no firecracker VMMs" as a
+	// valid 0-RSS reading, not as "no data, fall back to nominal".
+	withFakeRSS(t, nil, nil)
+	s := NewRSSSampler(nil)
+	s.sampleOnce()
+	if !s.Ready() {
+		t.Fatal("Ready() = false after sampleOnce on empty registry, want true")
 	}
 }
 

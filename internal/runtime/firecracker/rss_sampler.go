@@ -72,6 +72,12 @@ type RSSSampler struct {
 	samples map[string]int // logical id → last-sampled MB; cleared on Unregister
 
 	total atomic.Int64
+	// ready flips to true at the end of the first sampleOnce. Admission
+	// (PR 5-B) checks this before consulting TotalRSSMB so a cold-start
+	// daemon doesn't admit infinitely on the assumption that "0 RSS"
+	// means "host is empty" — pre-tick the sampler has no opinion yet,
+	// and the safer default is to fall back to nominal accounting.
+	ready atomic.Bool
 }
 
 // NewRSSSampler returns a sampler with empty registries and zero
@@ -126,12 +132,19 @@ func (s *RSSSampler) Unregister(id string) {
 }
 
 // TotalRSSMB returns the most recent aggregate. Reads the atomic
-// once. Returns 0 before the first sampleOnce — PR 5-B's admission
-// code is expected to gate the RSS check on having sample data
-// (`sampler != nil && sampleCount > 0`) so a cold-start daemon
-// doesn't admit infinitely.
+// once. Returns 0 before the first sampleOnce; pair with Ready() to
+// distinguish "no data yet" from "genuinely 0 MB resident".
 func (s *RSSSampler) TotalRSSMB() int {
 	return int(s.total.Load())
+}
+
+// Ready reports whether sampleOnce has run at least once. Admission
+// uses this to gate the RSS check: pre-tick, capacity falls back to
+// nominal accounting because TotalRSSMB() returning 0 would otherwise
+// look indistinguishable from "host is empty" and break overcommit
+// safety the moment the operator sets a non-zero watermark ratio.
+func (s *RSSSampler) Ready() bool {
+	return s.ready.Load()
 }
 
 // Run drives sampleOnce on a fixed interval until ctx is done.
@@ -160,6 +173,12 @@ func (s *RSSSampler) Run(ctx context.Context, interval time.Duration) {
 // malformed) are logged at debug and recorded as 0 — one dead VMM
 // must not poison admission across the host.
 func (s *RSSSampler) sampleOnce() {
+	// Ready is flipped on every call, not just the first. Cheap, and
+	// keeps the "first tick after a config reload" invariant the same
+	// as the "first tick after boot" invariant — admission only ever
+	// needs to know "has at least one sample window completed".
+	defer s.ready.Store(true)
+
 	s.mu.Lock()
 	if len(s.pids) == 0 {
 		// Common case at cold start: keep the total at whatever it

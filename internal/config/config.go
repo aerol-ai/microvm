@@ -551,6 +551,28 @@ type Config struct {
 	// boot. SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL.
 	FirecrackerVMMPoolRefillInterval time.Duration
 
+	// FirecrackerRSSSamplerInterval is the cadence at which the Phase 5
+	// per-VMM RSS sampler walks /proc/<pid>/statm for every registered
+	// firecracker process and recomputes the aggregate admission reads.
+	// Default 1s — matches the plan ("statm is fine at ~1Hz") and is
+	// orders of magnitude cheaper than the firecracker spawn budget on
+	// any host that can run them at all. Only consulted when
+	// EnableFirecracker is true; the sampler is not constructed
+	// otherwise. SB_FIRECRACKER_RSS_SAMPLER_INTERVAL.
+	FirecrackerRSSSamplerInterval time.Duration
+	// FirecrackerRSSWatermarkRatio is the Phase 5 effective-memory
+	// safety floor as a fraction of host RAM. Admission refuses a new
+	// create when (HostMem - sum-of-VMM-RSS - request) would drop below
+	// this watermark. 0 disables the axis (the default) — operators opt
+	// in by setting the env var. Typical setting is 0.10 (keep 10% of
+	// RAM in reserve as RSS-spike headroom); higher means safer but less
+	// dense, lower means denser but more sensitive to bursts. The check
+	// is also gated on the sampler having produced at least one
+	// observation, so a cold-start daemon falls back to nominal
+	// accounting rather than admitting infinitely on the assumption that
+	// "0 RSS" means "host is empty". SB_FIRECRACKER_RSS_WATERMARK_RATIO.
+	FirecrackerRSSWatermarkRatio float64
+
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
 	// picks a random candidate first; collisions fall back to a deterministic
@@ -1069,6 +1091,8 @@ func Load() (Config, error) {
 		FirecrackerVMMPoolGCInterval:     getEnvDuration("SB_FIRECRACKER_VMM_POOL_GC_INTERVAL", 5*time.Minute),
 		FirecrackerVMMPoolGCTTL:          getEnvDuration("SB_FIRECRACKER_VMM_POOL_GC_TTL", 1*time.Hour),
 		FirecrackerVMMPoolRefillInterval: getEnvDuration("SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL", 5*time.Second),
+		FirecrackerRSSSamplerInterval:    getEnvDuration("SB_FIRECRACKER_RSS_SAMPLER_INTERVAL", 1*time.Second),
+		FirecrackerRSSWatermarkRatio:     getEnvFloat("SB_FIRECRACKER_RSS_WATERMARK_RATIO", 0),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
