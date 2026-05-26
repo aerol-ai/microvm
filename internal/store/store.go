@@ -2067,6 +2067,47 @@ func (s *Store) UpdateTemplateSnapshotFailed(ctx context.Context, id, snapshotEr
 	return nil
 }
 
+// MarkTemplateUnhealthy is the Phase 6 PR-A transition for "snapshot
+// was ready, now corrupt at load time". The WHERE status='ready' guard
+// is the idempotency primitive: many concurrent Creates can hit the
+// same corrupt snapshot in a burst, and only the first call's UPDATE
+// affects a row — subsequent calls return (false, nil). Callers gate
+// the async rebuild kick on changed=true so exactly one rebuild fires
+// per corruption event.
+//
+// has_snapshot is cleared in the same row update so the resolver and
+// the warm-pool lister both see HasSnapshot=false on the next read —
+// the cold-boot fallback fires until the rebuild succeeds. The
+// snapshot artifact paths are kept on the row for forensic inspection;
+// the rebuild overwrites them in place.
+//
+// snapshot_error captures the corruption reason for operator-facing
+// surfaces (the GET /v1/templates/{id} payload, future runbooks). The
+// status itself is the alertable signal; the message is the
+// human-readable detail.
+func (s *Store) MarkTemplateUnhealthy(ctx context.Context, id, reason string) (bool, error) {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, snapshot_error = ?, has_snapshot = 0, updated_at = ?
+		WHERE id = ? AND status = ?
+	`,
+		string(models.TemplateStatusUnhealthy),
+		reason,
+		now,
+		strings.TrimSpace(id),
+		string(models.TemplateStatusReady),
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark template unhealthy: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark template unhealthy rows affected: %w", err)
+	}
+	return affected == 1, nil
+}
+
 func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_templates WHERE id = ?`, strings.TrimSpace(id))
 	if err != nil {

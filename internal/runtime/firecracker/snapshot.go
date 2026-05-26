@@ -482,6 +482,12 @@ func parseSnapshotChecksum(s string) (memHex, stateHex string, err error) {
 // the snapshot phase paid at write time. Operators benchmarking raw
 // load latency can disable verification via
 // SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD=false.
+//
+// Mismatches wrap models.ErrSnapshotCorrupt so the service-layer
+// intercept can recognise corruption and kick a rebuild. File-I/O
+// failures (hash memory/state) stay unwrapped — they are transient
+// (open() race, disk hiccup) and a rebuild-on-transient would churn
+// healthy templates.
 func verifySnapshotChecksum(memPath, statePath, expected string) error {
 	wantMem, wantState, err := parseSnapshotChecksum(expected)
 	if err != nil {
@@ -492,16 +498,16 @@ func verifySnapshotChecksum(memPath, statePath, expected string) error {
 		return fmt.Errorf("hash memory: %w", err)
 	}
 	if gotMem != wantMem {
-		return fmt.Errorf("snapshot checksum mismatch: memory file %s digest=%s expected=%s",
-			memPath, gotMem, wantMem)
+		return fmt.Errorf("memory file %s digest=%s expected=%s: %w",
+			memPath, gotMem, wantMem, models.ErrSnapshotCorrupt)
 	}
 	gotState, _, err := hashFile(statePath)
 	if err != nil {
 		return fmt.Errorf("hash state: %w", err)
 	}
 	if gotState != wantState {
-		return fmt.Errorf("snapshot checksum mismatch: state file %s digest=%s expected=%s",
-			statePath, gotState, wantState)
+		return fmt.Errorf("state file %s digest=%s expected=%s: %w",
+			statePath, gotState, wantState, models.ErrSnapshotCorrupt)
 	}
 	return nil
 }

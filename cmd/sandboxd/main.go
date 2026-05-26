@@ -262,6 +262,14 @@ func main() {
 		// the same "no data, allow" cold-start behaviour the watermark
 		// check already protects against.
 		fcDriver.SetRSSSampler(rssSampler)
+		// Phase 6 PR-A: warm-spawn corruption notifier. WarmSpawn runs
+		// outside any service-side call, so the runtime needs a back-
+		// channel to flip a corrupt template to unhealthy + kick rebuild.
+		// *Service satisfies firecracker.TemplateHealthNotifier
+		// structurally (one method, MarkSnapshotCorrupt). Wiring is
+		// unconditional when firecracker is enabled — the cold-load path
+		// has its own service-side intercept and doesn't depend on this.
+		fcDriver.SetTemplateHealthNotifier(svc)
 		// Template pipeline (plans/snapshot-clone-fast-boot.md Phase 2):
 		// templateBuilderAdapter reuses the same *oci.Builder the per-
 		// create path uses, so a template build and a non-template
@@ -1103,11 +1111,16 @@ func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcru
 	if err != nil {
 		return nil, err
 	}
-	// Both ready and ready_no_snapshot expose a usable rootfs; only the
-	// former carries snapshot artifacts. Reject anything else — a
-	// pending/building/failed template has no rootfs the driver can
-	// boot from.
-	if t.Status != models.TemplateStatusReady && t.Status != models.TemplateStatusReadyNoSnapshot {
+	// ready and ready_no_snapshot expose a usable rootfs; only the
+	// former carries snapshot artifacts. unhealthy (Phase 6 PR-A) is
+	// "snapshot worked once and is now corrupt" — has_snapshot is cleared
+	// by MarkTemplateUnhealthy so the driver naturally falls back to
+	// cold-build at driver.go:577 until the async rebuild restores
+	// status=ready. Anything else (pending/building/failed) has no
+	// rootfs the driver can boot from.
+	if t.Status != models.TemplateStatusReady &&
+		t.Status != models.TemplateStatusReadyNoSnapshot &&
+		t.Status != models.TemplateStatusUnhealthy {
 		return nil, fmt.Errorf("template %q is %s, not ready", id, t.Status)
 	}
 	if t.RootfsPath == "" {

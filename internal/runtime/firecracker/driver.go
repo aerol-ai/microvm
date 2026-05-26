@@ -94,6 +94,15 @@ type Driver struct {
 	// the same sampler via the RSSSource interface; main.go is
 	// responsible for ensuring both halves point at the same instance.
 	sampler *RSSSampler
+	// healthNotifier is the Phase 6 PR-A reverse seam used by the
+	// warm-spawn path to tell the service layer that a snapshot is
+	// corrupt at load time. Optional: nil disables warm-path
+	// notification (the cold-load path goes through
+	// service.createFirecrackerSandbox directly and detects corruption
+	// itself via errors.Is). Set by main.go's SetTemplateHealthNotifier
+	// wiring. See internal/runtime/firecracker/health.go for the
+	// interface contract.
+	healthNotifier TemplateHealthNotifier
 
 	// spawn is the seam Create uses to construct a VMMHandle for a
 	// sandbox. Default impl wraps newVMM (which is the production

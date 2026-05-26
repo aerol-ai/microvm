@@ -307,6 +307,87 @@ func TestSnapshotChecksum_RoundTrip(t *testing.T) {
 	}
 	if err := verifySnapshotChecksum(memPath, statePath, combined); err == nil {
 		t.Error("verify on mutated memory: expected error, got nil")
+	} else if !errors.Is(err, models.ErrSnapshotCorrupt) {
+		// Phase 6 PR-A: checksum-mismatch errors MUST wrap
+		// models.ErrSnapshotCorrupt so the service-layer intercept (and
+		// the warmspawn notifier) can errors.Is against it without
+		// importing the runtime package. File-I/O errors stay unwrapped
+		// — those aren't deterministic corruption signals.
+		t.Errorf("verify on mutated memory: err=%v, want errors.Is(ErrSnapshotCorrupt)", err)
+	}
+}
+
+// TestVerifySnapshotChecksum_StateMismatchIsCorrupt mirrors the memory-
+// mismatch arm above for the state file half. Both halves of the
+// combined checksum must surface the sentinel — the service-side
+// intercept only checks errors.Is(err, ErrSnapshotCorrupt) and would
+// silently miss state-file corruption otherwise.
+func TestVerifySnapshotChecksum_StateMismatchIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	memPath := filepath.Join(dir, "snap.memory")
+	statePath := filepath.Join(dir, "snap.state")
+	if err := os.WriteFile(memPath, []byte("memory-contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte("state-contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	memHex, _, err := hashFile(memPath)
+	if err != nil {
+		t.Fatalf("hashFile mem: %v", err)
+	}
+	stateHex, _, err := hashFile(statePath)
+	if err != nil {
+		t.Fatalf("hashFile state: %v", err)
+	}
+	combined := formatSnapshotChecksum(memHex, stateHex)
+
+	if err := os.WriteFile(statePath, []byte("STATE-CORRUPTED"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = verifySnapshotChecksum(memPath, statePath, combined)
+	if err == nil {
+		t.Fatal("verify on mutated state: expected error, got nil")
+	}
+	if !errors.Is(err, models.ErrSnapshotCorrupt) {
+		t.Errorf("verify on mutated state: err=%v, want errors.Is(ErrSnapshotCorrupt)", err)
+	}
+}
+
+// TestVerifySnapshotChecksum_MissingFileIsNotCorrupt guards the
+// "file-I/O failure stays unwrapped" half of the contract. A missing
+// snapshot file is not deterministic corruption — it might mean the
+// template was partially deleted, or the on-disk layout changed mid-
+// boot. Mapping it to ErrSnapshotCorrupt would auto-rebuild templates
+// the operator just `mv`d to a holding directory.
+func TestVerifySnapshotChecksum_MissingFileIsNotCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	memPath := filepath.Join(dir, "snap.memory")
+	statePath := filepath.Join(dir, "snap.state")
+	if err := os.WriteFile(memPath, []byte("memory-contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte("state-contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	memHex, _, err := hashFile(memPath)
+	if err != nil {
+		t.Fatalf("hashFile mem: %v", err)
+	}
+	stateHex, _, err := hashFile(statePath)
+	if err != nil {
+		t.Fatalf("hashFile state: %v", err)
+	}
+	combined := formatSnapshotChecksum(memHex, stateHex)
+	if err := os.Remove(statePath); err != nil {
+		t.Fatalf("remove state: %v", err)
+	}
+	err = verifySnapshotChecksum(memPath, statePath, combined)
+	if err == nil {
+		t.Fatal("verify on missing state: expected error, got nil")
+	}
+	if errors.Is(err, models.ErrSnapshotCorrupt) {
+		t.Errorf("verify on missing state: err=%v, must NOT wrap ErrSnapshotCorrupt", err)
 	}
 }
 

@@ -1021,6 +1021,16 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// driver releases everything it acquired before returning.
 	state, err := s.firecracker.Create(ctx, req, sandboxID, toolboxToken, nil)
 	if err != nil {
+		// Phase 6 PR-A: cold-load corruption intercept. The driver's
+		// configureVMMForLoad path verifies the snapshot checksum and
+		// returns ErrSnapshotCorrupt-wrapping errors on mismatch; surface
+		// that to the template-health code so the row transitions out of
+		// ready and the rebuild kicks. Best-effort (MarkSnapshotCorrupt is
+		// idempotent and swallows its own errors after logging); the
+		// caller still gets the original Create failure.
+		if errors.Is(err, models.ErrSnapshotCorrupt) && strings.TrimSpace(req.TemplateID) != "" {
+			_ = s.MarkSnapshotCorrupt(ctx, req.TemplateID, err.Error())
+		}
 		releaseAdmission()
 		return nil, err
 	}

@@ -76,6 +76,16 @@ const (
 // an actionable error instead of a generic 500.
 var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
 
+// ErrSnapshotCorrupt is returned by the Firecracker runtime when a snapshot
+// fails its checksum verification at load time — the on-disk artifact does
+// not match the checksum that was stamped at capture. Phase 6 PR-A's
+// service-layer intercept tests for this with errors.Is to mark the
+// template UNHEALTHY and kick an async snapshot rebuild; the next Create
+// on the same template falls back to the cold-boot path until rebuild
+// completes. Lives here (rather than in internal/runtime/firecracker) so
+// the service layer can reference it without importing the runtime.
+var ErrSnapshotCorrupt = errors.New("snapshot integrity verification failed")
+
 // GPUVendor identifies the GPU hardware vendor for sandbox GPU allocation.
 type GPUVendor string
 
@@ -879,7 +889,14 @@ type IdempotentRequestRecord struct {
 // snapshot phase failed (CID alloc, snapshotter error) — sandboxes can
 // still cold-boot from this template, just without fast-boot. failed
 // means even the rootfs phase did not complete; LastError carries the
-// reason for the operator to inspect.
+// reason for the operator to inspect. unhealthy is the Phase 6 PR-A
+// terminal state for "snapshot was ready and worked at least once, then
+// a load-time checksum mismatch proved the on-disk artifact is corrupt"
+// — distinct from ready_no_snapshot (which is build-time degradation)
+// so operators can alert on the runtime regression specifically. Cold-
+// boot still works against unhealthy because the rootfs is unaffected;
+// the service layer kicks an async rebuild that transitions back to
+// ready once the snapshot phase succeeds.
 type TemplateStatus string
 
 const (
@@ -889,6 +906,7 @@ const (
 	TemplateStatusReady           TemplateStatus = "ready"
 	TemplateStatusReadyNoSnapshot TemplateStatus = "ready_no_snapshot"
 	TemplateStatusFailed          TemplateStatus = "failed"
+	TemplateStatusUnhealthy       TemplateStatus = "unhealthy"
 )
 
 // Template is the persisted record for a Firecracker rootfs template.

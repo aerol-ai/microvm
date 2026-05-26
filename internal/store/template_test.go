@@ -342,3 +342,127 @@ func TestUpdateTemplateSnapshotFailed(t *testing.T) {
 		t.Errorf("snapshot paths populated on failure: mem=%q state=%q", got.SnapshotMemoryPath, got.SnapshotStatePath)
 	}
 }
+
+// TestMarkTemplateUnhealthy_IdempotentTransition pins the
+// concurrency primitive Phase 6 PR-A's MarkSnapshotCorrupt depends
+// on: the helper transitions a ready row exactly once and returns
+// (false, nil) on every subsequent call. The rebuild kick is gated
+// on the (true, nil) return so the rest of the system gets
+// "exactly one rebuild per corruption event" for free.
+func TestMarkTemplateUnhealthy_IdempotentTransition(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	now := time.Now().UTC().Round(time.Second)
+	tpl := &models.Template{
+		ID: "tpl-mark-unhealthy", Image: "docker://alpine:3.19",
+		Status:             models.TemplateStatusReady,
+		RootfsPath:         "/var/lib/sandboxd/templates/tpl-mark-unhealthy/rootfs.ext4",
+		SnapshotMemoryPath: "/var/lib/sandboxd/templates/tpl-mark-unhealthy/snapshot/memory.bin",
+		SnapshotStatePath:  "/var/lib/sandboxd/templates/tpl-mark-unhealthy/snapshot/state.bin",
+		SnapshotChecksum:   "sha256:dead|sha256:beef",
+		HasSnapshot:        true,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	// First observer must transition.
+	changed, err := st.MarkTemplateUnhealthy(ctx, tpl.ID, "memory file digest mismatch")
+	if err != nil {
+		t.Fatalf("MarkTemplateUnhealthy (first): %v", err)
+	}
+	if !changed {
+		t.Fatal("first MarkTemplateUnhealthy returned changed=false; the WHERE status='ready' guard should have hit")
+	}
+
+	got, err := st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.Status != models.TemplateStatusUnhealthy {
+		t.Errorf("status = %s, want unhealthy", got.Status)
+	}
+	if got.HasSnapshot {
+		t.Errorf("HasSnapshot = true; mark-unhealthy must clear it so the resolver+lister see has_snapshot=false")
+	}
+	if got.SnapshotError != "memory file digest mismatch" {
+		t.Errorf("SnapshotError = %q, want %q", got.SnapshotError, "memory file digest mismatch")
+	}
+	// Snapshot paths preserved for forensic inspection — the rebuild
+	// overwrites them in place.
+	if got.SnapshotMemoryPath == "" || got.SnapshotStatePath == "" {
+		t.Errorf("snapshot paths cleared; rebuild needs them to know where to write")
+	}
+
+	// Subsequent observers must return changed=false with no error.
+	// This is the per-event-deduplication primitive the rebuild kick
+	// is gated on.
+	changed, err = st.MarkTemplateUnhealthy(ctx, tpl.ID, "another reason")
+	if err != nil {
+		t.Fatalf("MarkTemplateUnhealthy (second): %v", err)
+	}
+	if changed {
+		t.Fatal("second MarkTemplateUnhealthy returned changed=true; would fire a duplicate rebuild")
+	}
+	// And the snapshot_error from the second call must NOT clobber the
+	// first one — the WHERE clause filtered the row out, so the row's
+	// SnapshotError is whatever the first call set.
+	got, err = st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate after second mark: %v", err)
+	}
+	if got.SnapshotError != "memory file digest mismatch" {
+		t.Errorf("SnapshotError mutated by no-op call: got %q", got.SnapshotError)
+	}
+}
+
+// TestMarkTemplateUnhealthy_NoopOnNonReadyStates documents the
+// state-machine surface: only `ready` is a valid input — pending,
+// building_rootfs, snapshotting, ready_no_snapshot, failed, and an
+// already-unhealthy row must all return (false, nil) and not mutate
+// the status. Without this, a concurrent build pipeline could be
+// yanked out of building_rootfs by a corruption observer who lost
+// the race against the row's transition.
+func TestMarkTemplateUnhealthy_NoopOnNonReadyStates(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	nonReadyStates := []models.TemplateStatus{
+		models.TemplateStatusPending,
+		models.TemplateStatusBuildingRootfs,
+		models.TemplateStatusSnapshotting,
+		models.TemplateStatusReadyNoSnapshot,
+		models.TemplateStatusFailed,
+		models.TemplateStatusUnhealthy,
+	}
+	for _, state := range nonReadyStates {
+		t.Run(string(state), func(t *testing.T) {
+			id := "tpl-" + string(state)
+			tpl := &models.Template{
+				ID: id, Image: "docker://alpine:3.19",
+				Status: state, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := st.CreateTemplate(ctx, tpl); err != nil {
+				t.Fatalf("CreateTemplate: %v", err)
+			}
+			changed, err := st.MarkTemplateUnhealthy(ctx, id, "should be ignored")
+			if err != nil {
+				t.Fatalf("MarkTemplateUnhealthy: %v", err)
+			}
+			if changed {
+				t.Errorf("changed=true on state=%s; only ready should transition", state)
+			}
+			got, err := st.GetTemplate(ctx, id)
+			if err != nil {
+				t.Fatalf("GetTemplate: %v", err)
+			}
+			if got.Status != state {
+				t.Errorf("status mutated: %s → %s (must be no-op)", state, got.Status)
+			}
+		})
+	}
+}
