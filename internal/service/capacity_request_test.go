@@ -29,6 +29,36 @@ func TestCapacityRequestFromSandboxIncludesAllPlacementAxes(t *testing.T) {
 	}
 }
 
+func TestCapacityRequestFirecrackerOverlayCountsAsDisk(t *testing.T) {
+	create := capacityRequestFromCreate(models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		Runtime:       models.RuntimeFirecracker,
+		OverlaySizeGB: 20,
+	})
+	if create.DiskGB != 25 {
+		t.Fatalf("create capacity DiskGB = %d, want 25", create.DiskGB)
+	}
+
+	sb := &models.Sandbox{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		Runtime:       models.RuntimeFirecracker,
+		OverlaySizeGB: 20,
+	}
+	got := capacityRequestFromSandbox(sb)
+	if got.DiskGB != 25 {
+		t.Fatalf("sandbox capacity DiskGB = %d, want 25", got.DiskGB)
+	}
+
+	docker := capacityRequestFromCreate(models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		Runtime:       models.RuntimeDocker,
+		OverlaySizeGB: 20,
+	})
+	if docker.DiskGB != 5 {
+		t.Fatalf("docker capacity DiskGB = %d, want overlay ignored", docker.DiskGB)
+	}
+}
+
 func TestCreateSandboxRejectsPureServerClusterNode(t *testing.T) {
 	svc := New(
 		config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer},

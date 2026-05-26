@@ -692,7 +692,7 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	return capacity.Request{
 		CPU:        req.CPU,
 		MemoryMB:   req.MemoryMB,
-		DiskGB:     req.DiskGB,
+		DiskGB:     diskGBForCapacity(req.DiskGB, req.Runtime, req.OverlaySizeGB),
 		Runtime:    req.Runtime,
 		GPUs:       gpuCountForCapacity(req.GPUs),
 		GPUVendor:  gpuVendorForCapacity(req.GPUs),
@@ -707,12 +707,19 @@ func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 	return capacity.Request{
 		CPU:        sandbox.CPU,
 		MemoryMB:   sandbox.MemoryMB,
-		DiskGB:     sandbox.DiskGB,
+		DiskGB:     diskGBForCapacity(sandbox.DiskGB, sandbox.Runtime, sandbox.OverlaySizeGB),
 		Runtime:    sandbox.Runtime,
 		GPUs:       gpuCountForCapacity(sandbox.GPUs),
 		GPUVendor:  gpuVendorForCapacity(sandbox.GPUs),
 		TemplateID: sandbox.TemplateID,
 	}
+}
+
+func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
+	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+		return base + overlaySizeGB
+	}
+	return base
 }
 
 func gpuCountForCapacity(req *models.GPURequest) int {

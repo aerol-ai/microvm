@@ -3,8 +3,11 @@ package cluster
 import (
 	"errors"
 	"math"
+	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -176,6 +179,54 @@ func TestNodeFitsRejectsUnsupportedRuntime(t *testing.T) {
 	}
 	if !nodeFits(dockerOnly, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: "docker"}, capacity.Request{}) {
 		t.Fatal("docker request must fit on docker-only host")
+	}
+}
+
+func TestSelectPlacementSkipsDockerOnlyWorkersForFirecrackerAt100Nodes(t *testing.T) {
+	index := newGossipMemberIndex()
+	var members []Member
+	for i := 0; i < 3; i++ {
+		members = append(members, Member{
+			NodeID: "server-" + string(rune('a'+i)),
+			APIURL: "http://server",
+			Alive:  true,
+			Role:   config.NodeRoleServer,
+		})
+	}
+	for i := 0; i < 10; i++ {
+		members = append(members, Member{
+			NodeID: "ingress-" + string(rune('a'+i)),
+			APIURL: "http://ingress",
+			Alive:  true,
+			Role:   config.NodeRoleIngress,
+		})
+	}
+	for i := 0; i < 30; i++ {
+		members = append(members, runtimeWorker("docker-worker-", i, []string{models.RuntimeDocker}))
+	}
+	for i := 0; i < 57; i++ {
+		members = append(members, runtimeWorker("fc-worker-", i, []string{models.RuntimeDocker, models.RuntimeFirecracker}))
+	}
+	index.replace(members)
+
+	c := &Cluster{
+		nodeID: "server-a",
+		apiURL: "http://server-a",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: index},
+	}
+
+	for i := 0; i < 200; i++ {
+		target, err := c.SelectPlacement(capacity.Request{
+			CPU: 1, MemoryMB: 100,
+			Runtime: models.RuntimeFirecracker,
+		})
+		if err != nil {
+			t.Fatalf("SelectPlacement iteration %d: %v", i, err)
+		}
+		if !strings.HasPrefix(target.NodeID, "fc-worker-") {
+			t.Fatalf("SelectPlacement chose %q, want only firecracker-capable workers", target.NodeID)
+		}
 	}
 }
 
@@ -372,10 +423,60 @@ func TestNodeFitsNoTemplateRequestSkipsGate(t *testing.T) {
 func TestCapacityRequestFromSpecCarriesTemplateID(t *testing.T) {
 	spec := &models.CreateSandboxRequest{
 		CPU: 1, MemoryMB: 512, DiskGB: 5,
-		Runtime: "firecracker", TemplateID: "tpl-fc-1",
+		Runtime: models.RuntimeFirecracker, TemplateID: "tpl-fc-1",
 	}
 	got := capacityRequestFromSpec(spec)
 	if got.TemplateID != "tpl-fc-1" {
 		t.Fatalf("capacityRequestFromSpec.TemplateID = %q, want %q", got.TemplateID, "tpl-fc-1")
+	}
+}
+
+func TestCapacityRequestFromSpecFirecrackerOverlayCountsAsDisk(t *testing.T) {
+	got := capacityRequestFromSpec(&models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		Runtime:       models.RuntimeFirecracker,
+		OverlaySizeGB: 20,
+	})
+	if got.DiskGB != 25 {
+		t.Fatalf("capacityRequestFromSpec DiskGB = %d, want 25", got.DiskGB)
+	}
+}
+
+func TestCapacityRequestFromSpecTemplateIDImpliesFirecracker(t *testing.T) {
+	spec := &models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		TemplateID: " tpl-fc-1 ",
+	}
+	got := capacityRequestFromSpec(spec)
+	if got.Runtime != models.RuntimeFirecracker || got.TemplateID != "tpl-fc-1" {
+		t.Fatalf("capacityRequestFromSpec = %+v, want runtime=firecracker template_id=tpl-fc-1", got)
+	}
+
+	dockerOnly := Member{NodeID: "docker-only", APIURL: "http://d", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		SupportedRuntimes: []string{models.RuntimeDocker},
+	}}
+	if nodeFits(dockerOnly, got, capacity.Request{}) {
+		t.Fatal("template-backed Firecracker request must not fit on a docker-only host")
+	}
+}
+
+func runtimeWorker(prefix string, i int, runtimes []string) Member {
+	return Member{
+		NodeID: prefix + strconv.Itoa(i),
+		APIURL: "http://" + prefix + strconv.Itoa(i),
+		Alive:  true,
+		Role:   config.NodeRoleWorker,
+		Capacity: capacity.Snapshot{
+			HostCPUCores:      16,
+			HostMemoryTotalMB: 65536,
+			CPUBudget:         16,
+			MemoryBudgetMB:    65536,
+			AvailableCPU:      16,
+			AvailableMemoryMB: 65536,
+			SupportedRuntimes: runtimes,
+			CanAdmit:          true,
+		},
 	}
 }

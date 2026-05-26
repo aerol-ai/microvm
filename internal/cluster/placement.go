@@ -34,12 +34,17 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	if disk <= 0 {
 		disk = models.DefaultDiskGB
 	}
+	runtimeName := strings.TrimSpace(spec.Runtime)
+	templateID := strings.TrimSpace(spec.TemplateID)
+	if templateID != "" && runtimeName == "" {
+		runtimeName = models.RuntimeFirecracker
+	}
 	out := capacity.Request{
 		CPU:        cpu,
 		MemoryMB:   mem,
-		DiskGB:     disk,
-		Runtime:    spec.Runtime,
-		TemplateID: spec.TemplateID,
+		DiskGB:     diskGBForCapacity(disk, runtimeName, spec.OverlaySizeGB),
+		Runtime:    runtimeName,
+		TemplateID: templateID,
 	}
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
@@ -50,6 +55,13 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 		out.GPUVendor = string(spec.GPUs.Vendor)
 	}
 	return out
+}
+
+func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
+	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+		return base + overlaySizeGB
+	}
+	return base
 }
 
 // SelectPlacement chooses an owner node for a new sandbox using power-of-two-

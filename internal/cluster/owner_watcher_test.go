@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -224,11 +226,53 @@ func TestEvictThenWatcherEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSelectRecreationTargetExcludingSkipsNonOwnersAndDrainedNodes(t *testing.T) {
+	index := newGossipMemberIndex()
+	index.replace([]Member{
+		recreateCandidate("ingress-only", config.NodeRoleIngress, 64),
+		recreateCandidate("drained-worker", config.NodeRoleWorker, 96),
+		recreateCandidate("worker-ok", config.NodeRoleWorker, 32),
+	})
+	c := &Cluster{
+		nodeID: "self",
+		apiURL: "http://self",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: index},
+	}
+	c.fsm.drainedNodes["drained-worker"] = true
+
+	target, ok := c.selectRecreationTargetExcluding(failoverRecreateSpec(), "self")
+	if !ok {
+		t.Fatal("expected a recreation target")
+	}
+	if target.NodeID != "worker-ok" {
+		t.Fatalf("target = %+v, want worker-ok", target)
+	}
+}
+
 func failoverRecreateSpec() *models.CreateSandboxRequest {
 	return &models.CreateSandboxRequest{
 		Image:    "alpine",
 		CPU:      1,
 		MemoryMB: 512,
 		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+}
+
+func recreateCandidate(nodeID, role string, freeCPU float64) Member {
+	return Member{
+		NodeID: nodeID,
+		APIURL: "http://" + nodeID,
+		Alive:  true,
+		Role:   role,
+		Capacity: capacity.Snapshot{
+			HostCPUCores:      128,
+			HostMemoryTotalMB: 65536,
+			CPUBudget:         128,
+			MemoryBudgetMB:    65536,
+			AvailableCPU:      freeCPU,
+			AvailableMemoryMB: 65536,
+			CanAdmit:          true,
+		},
 	}
 }

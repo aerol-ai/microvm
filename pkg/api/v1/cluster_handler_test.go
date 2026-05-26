@@ -30,6 +30,7 @@ type createForwardCluster struct {
 	forwardedTarget    string
 	forwardedCreateID  string
 	selectPlacementHit int
+	selectRequests     []capacity.Request
 	selectErr          error
 
 	reserveErr   error
@@ -45,8 +46,9 @@ type reserveCall struct {
 	ttl       time.Duration
 }
 
-func (c *createForwardCluster) SelectPlacement(capacity.Request) (cluster.PlacementTarget, error) {
+func (c *createForwardCluster) SelectPlacement(req capacity.Request) (cluster.PlacementTarget, error) {
 	c.selectPlacementHit++
+	c.selectRequests = append(c.selectRequests, req)
 	if c.selectErr != nil {
 		return cluster.PlacementTarget{}, c.selectErr
 	}
@@ -125,6 +127,67 @@ func TestClusterCreateWrapPinsForwardedCreateToSelectedTarget(t *testing.T) {
 	}
 	if len(fakeCluster.cancelCalls) != 0 {
 		t.Fatalf("CancelReservation called %d times on success; want 0", len(fakeCluster.cancelCalls))
+	}
+}
+
+func TestClusterCreateWrapTemplateIDImpliesFirecrackerPlacement(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("router", "http://router", ""),
+		target: cluster.PlacementTarget{NodeID: "worker-fc", APIURL: "http://worker-fc:21212", IsSelf: false},
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine","disk_gb":2,"overlay_size_gb":8,"template_id":" tpl-fc "}`))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	if len(fakeCluster.selectRequests) != 1 {
+		t.Fatalf("SelectPlacement requests = %d, want 1", len(fakeCluster.selectRequests))
+	}
+	got := fakeCluster.selectRequests[0]
+	if got.Runtime != models.RuntimeFirecracker || got.TemplateID != "tpl-fc" || got.DiskGB != 10 {
+		t.Fatalf("placement request = %+v, want runtime=firecracker template_id=tpl-fc disk_gb=10", got)
+	}
+	if len(fakeCluster.reserveCalls) != 1 || fakeCluster.reserveCalls[0].redacted == nil {
+		t.Fatalf("ReserveOnTarget calls = %+v, want redacted spec", fakeCluster.reserveCalls)
+	}
+	redacted := fakeCluster.reserveCalls[0].redacted
+	if redacted.Runtime != models.RuntimeFirecracker || redacted.TemplateID != "tpl-fc" {
+		t.Fatalf("reserved spec runtime/template = %q/%q, want firecracker/tpl-fc", redacted.Runtime, redacted.TemplateID)
+	}
+}
+
+func TestClusterCreateWrapRejectsTemplateIDWithDockerRuntimeBeforePlacement(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	fakeCluster := &createForwardCluster{
+		Noop:   cluster.NewNoop("router", "http://router", ""),
+		target: cluster.PlacementTarget{NodeID: "worker-a", APIURL: "http://worker-a:21212", IsSelf: false},
+	}
+	svc.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine","runtime":"docker","template_id":"tpl-fc"}`))
+	rr := httptest.NewRecorder()
+	h.clusterCreateWrap(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	if fakeCluster.selectPlacementHit != 0 {
+		t.Fatalf("SelectPlacement calls = %d, want 0", fakeCluster.selectPlacementHit)
+	}
+	if len(fakeCluster.reserveCalls) != 0 {
+		t.Fatalf("ReserveOnTarget calls = %d, want 0", len(fakeCluster.reserveCalls))
+	}
+	if !strings.Contains(rr.Body.String(), "template_id requires runtime") {
+		t.Fatalf("body = %q, want template_id runtime validation", rr.Body.String())
 	}
 }
 
