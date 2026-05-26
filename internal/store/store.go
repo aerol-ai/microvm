@@ -277,6 +277,67 @@ func Open(path string) (*Store, error) {
 		// starting at 3 (CIDs 0/1/2 are reserved by the virtio-vsock spec).
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_tap_pool_vsock_cid
 			ON firecracker_tap_pool(vsock_cid);`,
+		// firecracker_vmm_pool is the Phase 4 warm-VMM pool: one row per
+		// pre-spawned, snapshot-loaded, paused Firecracker process kept
+		// ready to be PATCH'd onto a per-sandbox TAP + overlay and Resumed.
+		// The row IS the slot's source of truth — status transitions live
+		// here, not in goroutine state, so a daemon restart can rediscover
+		// what's spawning vs. loaded vs. allocated without trawling /proc.
+		//
+		// Lifecycle (see plans/snapshot-clone-fast-boot.md §"Piece 4 — The
+		// VMM pool" and the PR-A foundation plan):
+		//
+		//   INSERT 'spawning' → 'loaded'    (refill goroutine, PR 4-B)
+		//                     → 'released'  (spawner failed)
+		//   'loaded'          → 'allocated' (sandbox create claims it)
+		//   'allocated'       → 'released'  (sandbox destroyed)
+		//   'released'        → row deleted (GC sweep after TTL)
+		//
+		// sandbox_id is NULL except in 'allocated'. The partial unique
+		// index below enforces exactly one allocated slot per sandbox —
+		// the load-bearing idempotency primitive for the snapshot-clone
+		// boot path, mirroring firecracker_tap_pool's idx_..._sandbox in
+		// shape and purpose (pr-review.md §5).
+		//
+		// template_id is the snapshot lineage, not a foreign key
+		// constraint — a soft reference so the template-GC sweep can
+		// proceed while loaded slots remain in flight; the pool GC drops
+		// stragglers separately.
+		`CREATE TABLE IF NOT EXISTS firecracker_vmm_pool (
+			id TEXT PRIMARY KEY,
+			template_id TEXT NOT NULL,
+			status TEXT NOT NULL,
+			sandbox_id TEXT,
+			api_socket TEXT NOT NULL DEFAULT '',
+			run_dir TEXT NOT NULL DEFAULT '',
+			vsock_cid INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			loaded_at DATETIME,
+			allocated_at DATETIME,
+			released_at DATETIME,
+			last_error TEXT NOT NULL DEFAULT ''
+		);`,
+		// Partial unique on sandbox_id — exactly one 'allocated' row per
+		// sandbox at a time. Two concurrent Allocate calls race to UPDATE
+		// a free 'loaded' row, and the index rejects a second claim under
+		// the same sandbox_id. SQLite's single writer serializes the
+		// contest; the index keeps correctness if a future change moves
+		// us off it. Mirrors idx_firecracker_tap_pool_sandbox exactly.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_vmm_pool_sandbox
+			ON firecracker_vmm_pool(sandbox_id) WHERE sandbox_id IS NOT NULL;`,
+		// Compound index on (template_id, status) drives the two hot
+		// reads: "give me one loaded row for this template" (Allocate)
+		// and "how many non-released rows does this template have?"
+		// (refill goroutine in PR 4-B). Without this, both become full
+		// scans once the pool grows past a handful of slots.
+		`CREATE INDEX IF NOT EXISTS idx_firecracker_vmm_pool_template_status
+			ON firecracker_vmm_pool(template_id, status);`,
+		// Partial index on released_at keeps the GC sweep cheap even when
+		// the steady-state count of released rows is zero. Predicate is
+		// the GC selector verbatim so SQLite can use the index without a
+		// post-filter.
+		`CREATE INDEX IF NOT EXISTS idx_firecracker_vmm_pool_released_at
+			ON firecracker_vmm_pool(released_at) WHERE status = 'released';`,
 		// firecracker_templates is the Phase 2 catalogue: one row per
 		// pre-built rootfs.ext4 the operator has registered via
 		// POST /v1/templates. The build is async — the row lands in
@@ -3297,3 +3358,510 @@ func (s *Store) GetFirecrackerTapPoolStats(ctx context.Context) (FirecrackerTapP
 // this into a 503-ish admission error upstream — operators see "pool
 // exhausted" before the customer sees a confusing timeout.
 var ErrNoFreeFirecrackerTapSlot = errors.New("firecracker tap pool: no free slot")
+
+// Firecracker warm-VMM pool status constants. Kept as bare strings
+// rather than a typed enum because SQLite stores them as TEXT and the
+// store-layer queries WHERE status='...' literals — a typed wrapper
+// would just force every call site to string()-coerce. The state
+// machine is documented inline in the CREATE TABLE statement above.
+const (
+	FirecrackerVMMSlotStatusSpawning  = "spawning"
+	FirecrackerVMMSlotStatusLoaded    = "loaded"
+	FirecrackerVMMSlotStatusAllocated = "allocated"
+	FirecrackerVMMSlotStatusReleased  = "released"
+)
+
+// FirecrackerVMMSlot is one row of firecracker_vmm_pool. Mirrors the
+// table shape; nullable DATETIME columns map to zero-valued time.Time
+// when absent so the policy wrapper (internal/pool/vmm) doesn't have
+// to plumb sql.NullTime through its API.
+type FirecrackerVMMSlot struct {
+	ID          string
+	TemplateID  string
+	Status      string
+	SandboxID   string
+	APISocket   string
+	RunDir      string
+	VsockCID    uint32
+	CreatedAt   time.Time
+	LoadedAt    time.Time
+	AllocatedAt time.Time
+	ReleasedAt  time.Time
+	LastError   string
+}
+
+// FirecrackerVMMPoolStats is the per-template breakdown by status used
+// by /healthz and PR 4-B's refill goroutine to decide how many new
+// slots to spawn. Total is the count of all non-deleted rows for the
+// template; the sum of the per-status counters equals Total.
+type FirecrackerVMMPoolStats struct {
+	Total     int
+	Spawning  int
+	Loaded    int
+	Allocated int
+	Released  int
+}
+
+// ErrNoFreeFirecrackerVMMSlot is returned by AllocateFirecrackerVMMSlot
+// when no 'loaded' slot exists for the requested template. PR 4-B's
+// caller treats this as the cold-spawn fallback signal, not an error
+// state — the pool being momentarily empty is the expected behavior
+// under load between spawn-and-load passes.
+var ErrNoFreeFirecrackerVMMSlot = errors.New("firecracker vmm pool: no loaded slot")
+
+// InsertFirecrackerVMMSlot reserves a new row in status='spawning'.
+// PR 4-B's refill goroutine calls this BEFORE launching firecracker so
+// a crash mid-spawn leaves a 'spawning' row the GC sweep can clean up
+// rather than a silently-leaked process with no row to find it by.
+//
+// Validation is strict because a malformed insert is always a bug in
+// the caller — the refill goroutine should hand us a freshly-generated
+// id and an actual template id, not the zero value.
+func (s *Store) InsertFirecrackerVMMSlot(ctx context.Context, slot FirecrackerVMMSlot, now time.Time) error {
+	if strings.TrimSpace(slot.ID) == "" {
+		return errors.New("insert firecracker vmm slot: id is required")
+	}
+	if strings.TrimSpace(slot.TemplateID) == "" {
+		return errors.New("insert firecracker vmm slot: template_id is required")
+	}
+	// The pool's external API never inserts a row in any other state —
+	// the spawner is the only thing that knows when the snapshot is
+	// loaded, and it transitions the row via MarkFirecrackerVMMSlotLoaded.
+	// Reject anything else loudly so a future caller can't sneak a
+	// pre-loaded row past the spawner.
+	if slot.Status != "" && slot.Status != FirecrackerVMMSlotStatusSpawning {
+		return fmt.Errorf("insert firecracker vmm slot: status must be %q (got %q)",
+			FirecrackerVMMSlotStatusSpawning, slot.Status)
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO firecracker_vmm_pool
+			(id, template_id, status, created_at)
+		VALUES (?, ?, ?, ?)
+	`, slot.ID, slot.TemplateID, FirecrackerVMMSlotStatusSpawning, now.UTC())
+	if err != nil {
+		return fmt.Errorf("insert firecracker vmm slot: %w", err)
+	}
+	return nil
+}
+
+// MarkFirecrackerVMMSlotLoaded flips 'spawning' → 'loaded' and stamps
+// the per-slot artifact paths the allocator will hand to the sandbox
+// create path. The WHERE clause asserts the current state so a retried
+// call (or a racing GC) can't accidentally walk a slot backwards from
+// 'allocated' to 'loaded'. apiSocket and runDir live in the row so
+// PR 4-B's runtime adapter can adopt a pre-spawned firecracker process
+// across daemon restarts without re-deriving them.
+func (s *Store) MarkFirecrackerVMMSlotLoaded(ctx context.Context, slotID, apiSocket, runDir string, vsockCID uint32, now time.Time) error {
+	if strings.TrimSpace(slotID) == "" {
+		return errors.New("mark firecracker vmm slot loaded: slot id is required")
+	}
+	if strings.TrimSpace(apiSocket) == "" || strings.TrimSpace(runDir) == "" {
+		return errors.New("mark firecracker vmm slot loaded: api_socket and run_dir are required")
+	}
+	if vsockCID < 3 {
+		// Same guard as the TAP pool's seed: 0/1/2 are reserved and a
+		// snapshot keyed on one of those CIDs is corrupt by definition.
+		return fmt.Errorf("mark firecracker vmm slot loaded: vsock_cid must be >= 3 (got %d)", vsockCID)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, api_socket = ?, run_dir = ?, vsock_cid = ?, loaded_at = ?
+		WHERE id = ? AND status = ?
+	`, FirecrackerVMMSlotStatusLoaded, apiSocket, runDir, vsockCID, now.UTC(),
+		slotID, FirecrackerVMMSlotStatusSpawning)
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot loaded: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot loaded (affected): %w", err)
+	}
+	if n == 0 {
+		// Zero rows means either the slot id doesn't exist or it's no
+		// longer in 'spawning'. Both are caller-side bugs the spawner
+		// should surface rather than retry silently.
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkFirecrackerVMMSlotFailed records that the spawner could not
+// produce a paused-and-loaded VMM for this slot and moves the row
+// directly to 'released' so the GC sweep cleans it up after the TTL.
+// Skipping the 'loaded' intermediate is intentional: a failed slot was
+// never claimable, and a transient 'loaded' state on a row whose VMM
+// is actually missing would let the next Allocate hand out a dead
+// process. last_error is preserved on the row for operator triage.
+func (s *Store) MarkFirecrackerVMMSlotFailed(ctx context.Context, slotID, errMsg string, now time.Time) error {
+	if strings.TrimSpace(slotID) == "" {
+		return errors.New("mark firecracker vmm slot failed: slot id is required")
+	}
+	// last_error gets truncated to keep an unbounded spawner stderr
+	// from blowing up the row size. 1 KiB is enough to capture a
+	// firecracker boot panic line + the call site.
+	const errCap = 1024
+	if len(errMsg) > errCap {
+		errMsg = errMsg[:errCap]
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, last_error = ?, released_at = ?
+		WHERE id = ? AND status = ?
+	`, FirecrackerVMMSlotStatusReleased, errMsg, now.UTC(),
+		slotID, FirecrackerVMMSlotStatusSpawning)
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot failed: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot failed (affected): %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// AllocateFirecrackerVMMSlot claims one 'loaded' slot for templateID +
+// sandboxID. Idempotent: if sandboxID already owns a slot, that slot
+// is returned without re-allocation (the partial unique index makes a
+// duplicate claim a hard error, but the pre-check yields a cleaner
+// happy path). If no 'loaded' slot for templateID exists, returns
+// ErrNoFreeFirecrackerVMMSlot — PR 4-B's caller falls back to cold
+// spawn rather than failing the create.
+//
+// The allocator shape is lifted from AllocateFirecrackerTapSlot:
+// SELECT one free row, UPDATE WHERE row is still free. The UPDATE's
+// WHERE re-checks status='loaded' AND sandbox_id IS NULL so a race
+// against a concurrent allocator updates RowsAffected=0 and we loop.
+// SQLite's single writer makes the contest rare, but the loop keeps
+// correctness if the locking model ever changes.
+func (s *Store) AllocateFirecrackerVMMSlot(ctx context.Context, templateID, sandboxID string, now time.Time) (*FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(templateID) == "" {
+		return nil, errors.New("allocate firecracker vmm slot: template_id is required")
+	}
+	if strings.TrimSpace(sandboxID) == "" {
+		return nil, errors.New("allocate firecracker vmm slot: sandbox_id is required")
+	}
+	if existing, err := s.GetFirecrackerVMMSlotBySandbox(ctx, sandboxID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		var candidate FirecrackerVMMSlot
+		var loadedAt sql.NullTime
+		row := s.db.QueryRowContext(ctx, `
+			SELECT id, template_id, status, api_socket, run_dir, vsock_cid, created_at, loaded_at
+			FROM firecracker_vmm_pool
+			WHERE template_id = ? AND status = ? AND sandbox_id IS NULL
+			ORDER BY loaded_at ASC
+			LIMIT 1
+		`, templateID, FirecrackerVMMSlotStatusLoaded)
+		if err := row.Scan(&candidate.ID, &candidate.TemplateID, &candidate.Status,
+			&candidate.APISocket, &candidate.RunDir, &candidate.VsockCID,
+			&candidate.CreatedAt, &loadedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrNoFreeFirecrackerVMMSlot
+			}
+			return nil, fmt.Errorf("allocate firecracker vmm slot (select): %w", err)
+		}
+		if loadedAt.Valid {
+			candidate.LoadedAt = loadedAt.Time
+		}
+
+		res, err := s.db.ExecContext(ctx, `
+			UPDATE firecracker_vmm_pool
+			SET status = ?, sandbox_id = ?, allocated_at = ?
+			WHERE id = ? AND status = ? AND sandbox_id IS NULL
+		`, FirecrackerVMMSlotStatusAllocated, sandboxID, now.UTC(),
+			candidate.ID, FirecrackerVMMSlotStatusLoaded)
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker vmm slot (update): %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker vmm slot (affected): %w", err)
+		}
+		if n == 1 {
+			candidate.Status = FirecrackerVMMSlotStatusAllocated
+			candidate.SandboxID = sandboxID
+			candidate.AllocatedAt = now.UTC()
+			return &candidate, nil
+		}
+		// Lost the race; loop and pick another 'loaded' row.
+	}
+	return nil, errors.New("allocate firecracker vmm slot: pool contested after 8 attempts (likely allocator livelock)")
+}
+
+// ReleaseFirecrackerVMMSlot moves a sandbox's slot from 'allocated' to
+// 'released'. Idempotent in two senses: releasing a sandbox that never
+// owned a slot is a no-op (RowsAffected=0 returns nil), and releasing a
+// slot already in 'released' is a no-op for the same reason. The
+// WHERE-on-status keeps a malformed retry from resurrecting a slot
+// that the spawner failed and already marked released.
+func (s *Store) ReleaseFirecrackerVMMSlot(ctx context.Context, sandboxID string, now time.Time) error {
+	if strings.TrimSpace(sandboxID) == "" {
+		return errors.New("release firecracker vmm slot: sandbox_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, sandbox_id = NULL, released_at = ?
+		WHERE sandbox_id = ? AND status = ?
+	`, FirecrackerVMMSlotStatusReleased, now.UTC(), sandboxID, FirecrackerVMMSlotStatusAllocated)
+	if err != nil {
+		return fmt.Errorf("release firecracker vmm slot: %w", err)
+	}
+	return nil
+}
+
+// GetFirecrackerVMMSlotBySandbox returns the slot currently claimed by
+// sandboxID, or nil if it owns none. Used by the idempotent Allocate
+// pre-check and by PR 4-B's destroy path to find the slot whose VMM
+// process needs to be torn down.
+func (s *Store) GetFirecrackerVMMSlotBySandbox(ctx context.Context, sandboxID string) (*FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return nil, errors.New("get firecracker vmm slot: sandbox_id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, template_id, status, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	slot, err := scanFirecrackerVMMSlot(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get firecracker vmm slot: %w", err)
+	}
+	slot.SandboxID = sandboxID
+	return slot, nil
+}
+
+// GetFirecrackerVMMSlotByID returns the slot row whose id matches, or
+// nil if not found. Lets PR 4-B's refill goroutine re-read its own
+// freshly-inserted row to inspect the row's authoritative status
+// (the daemon may have raced a GC between InsertFirecrackerVMMSlot and
+// the spawner attempt). Unlike GetFirecrackerVMMSlotBySandbox, the
+// row's sandbox_id is unknown to the caller — we project the column
+// explicitly so an 'allocated' slot reads back with its claimant.
+func (s *Store) GetFirecrackerVMMSlotByID(ctx context.Context, slotID string) (*FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(slotID) == "" {
+		return nil, errors.New("get firecracker vmm slot by id: slot id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE id = ?
+	`, slotID)
+	var (
+		slot                              FirecrackerVMMSlot
+		sandboxID                         sql.NullString
+		loadedAt, allocatedAt, releasedAt sql.NullTime
+	)
+	if err := row.Scan(&slot.ID, &slot.TemplateID, &slot.Status, &sandboxID,
+		&slot.APISocket, &slot.RunDir, &slot.VsockCID,
+		&slot.CreatedAt, &loadedAt, &allocatedAt, &releasedAt, &slot.LastError); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get firecracker vmm slot by id: %w", err)
+	}
+	if sandboxID.Valid {
+		slot.SandboxID = sandboxID.String
+	}
+	if loadedAt.Valid {
+		slot.LoadedAt = loadedAt.Time
+	}
+	if allocatedAt.Valid {
+		slot.AllocatedAt = allocatedAt.Time
+	}
+	if releasedAt.Valid {
+		slot.ReleasedAt = releasedAt.Time
+	}
+	return &slot, nil
+}
+
+// ListFirecrackerVMMSlotsForRefill returns every non-released slot
+// owned by templateID. PR 4-B's refill goroutine calls this once per
+// tick to compute "desired_depth - len(non_released)" — the spawn
+// budget for the next pass. Released rows are excluded so a slow GC
+// doesn't inflate the count and starve refills.
+func (s *Store) ListFirecrackerVMMSlotsForRefill(ctx context.Context, templateID string) ([]FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(templateID) == "" {
+		return nil, errors.New("list firecracker vmm slots: template_id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE template_id = ? AND status <> ?
+		ORDER BY created_at ASC
+	`, templateID, FirecrackerVMMSlotStatusReleased)
+	if err != nil {
+		return nil, fmt.Errorf("list firecracker vmm slots: %w", err)
+	}
+	defer rows.Close()
+	return collectFirecrackerVMMSlots(rows)
+}
+
+// ListReleasedFirecrackerVMMSlots is the GC sweep selector: every row
+// in status='released' whose released_at is older than olderThan. The
+// partial index on released_at WHERE status='released' covers this
+// query exactly so the sweep is cheap even when the steady-state
+// count is zero.
+func (s *Store) ListReleasedFirecrackerVMMSlots(ctx context.Context, olderThan time.Time) ([]FirecrackerVMMSlot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE status = ? AND released_at IS NOT NULL AND released_at <= ?
+		ORDER BY released_at ASC
+	`, FirecrackerVMMSlotStatusReleased, olderThan.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list released firecracker vmm slots: %w", err)
+	}
+	defer rows.Close()
+	return collectFirecrackerVMMSlots(rows)
+}
+
+// DeleteFirecrackerVMMSlot drops the row. PR 4-B's GC sweep calls this
+// after the VMM process for the slot is confirmed gone, so there is
+// no on-disk runDir or live socket the row was the last reference to.
+// Returns ErrNotFound when the row was already deleted — idempotent on
+// double-call.
+func (s *Store) DeleteFirecrackerVMMSlot(ctx context.Context, slotID string) error {
+	if strings.TrimSpace(slotID) == "" {
+		return errors.New("delete firecracker vmm slot: slot id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_vmm_pool WHERE id = ?`, slotID)
+	if err != nil {
+		return fmt.Errorf("delete firecracker vmm slot: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete firecracker vmm slot (affected): %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetFirecrackerVMMPoolStats returns per-template occupancy by status.
+// Single GROUP BY scan covered by idx_firecracker_vmm_pool_template_status.
+// /healthz and PR 4-C's metrics exporter both call this; PR 4-B's
+// refill goroutine prefers ListFirecrackerVMMSlotsForRefill which
+// gives it the row ids it may want to act on.
+func (s *Store) GetFirecrackerVMMPoolStats(ctx context.Context, templateID string) (FirecrackerVMMPoolStats, error) {
+	var stats FirecrackerVMMPoolStats
+	if strings.TrimSpace(templateID) == "" {
+		return stats, errors.New("firecracker vmm pool stats: template_id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT status, COUNT(*)
+		FROM firecracker_vmm_pool
+		WHERE template_id = ?
+		GROUP BY status
+	`, templateID)
+	if err != nil {
+		return stats, fmt.Errorf("firecracker vmm pool stats: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return stats, fmt.Errorf("firecracker vmm pool stats (scan): %w", err)
+		}
+		switch status {
+		case FirecrackerVMMSlotStatusSpawning:
+			stats.Spawning = count
+		case FirecrackerVMMSlotStatusLoaded:
+			stats.Loaded = count
+		case FirecrackerVMMSlotStatusAllocated:
+			stats.Allocated = count
+		case FirecrackerVMMSlotStatusReleased:
+			stats.Released = count
+		}
+		stats.Total += count
+	}
+	if err := rows.Err(); err != nil {
+		return stats, fmt.Errorf("firecracker vmm pool stats (rows): %w", err)
+	}
+	return stats, nil
+}
+
+// scanFirecrackerVMMSlot decodes a single row from any SELECT that
+// returns the canonical 11-column projection. Centralized so the
+// nullable-DATETIME and nullable-sandbox-id handling is in one place;
+// every caller projects the same columns in the same order.
+func scanFirecrackerVMMSlot(row interface {
+	Scan(...any) error
+}) (*FirecrackerVMMSlot, error) {
+	var (
+		slot                              FirecrackerVMMSlot
+		sandboxID                         sql.NullString
+		loadedAt, allocatedAt, releasedAt sql.NullTime
+	)
+	if err := row.Scan(&slot.ID, &slot.TemplateID, &slot.Status,
+		&slot.APISocket, &slot.RunDir, &slot.VsockCID,
+		&slot.CreatedAt, &loadedAt, &allocatedAt, &releasedAt, &slot.LastError); err != nil {
+		return nil, err
+	}
+	if sandboxID.Valid {
+		slot.SandboxID = sandboxID.String
+	}
+	if loadedAt.Valid {
+		slot.LoadedAt = loadedAt.Time
+	}
+	if allocatedAt.Valid {
+		slot.AllocatedAt = allocatedAt.Time
+	}
+	if releasedAt.Valid {
+		slot.ReleasedAt = releasedAt.Time
+	}
+	return &slot, nil
+}
+
+// collectFirecrackerVMMSlots walks a *sql.Rows from the list queries.
+// These project the full 12-column shape — including sandbox_id —
+// because list callers can't recover the value from a WHERE clause
+// the way GetFirecrackerVMMSlotBySandbox does. Centralized so the
+// nullable-column handling stays in one place.
+func collectFirecrackerVMMSlots(rows *sql.Rows) ([]FirecrackerVMMSlot, error) {
+	var out []FirecrackerVMMSlot
+	for rows.Next() {
+		var (
+			slot                              FirecrackerVMMSlot
+			sandboxID                         sql.NullString
+			loadedAt, allocatedAt, releasedAt sql.NullTime
+		)
+		if err := rows.Scan(&slot.ID, &slot.TemplateID, &slot.Status, &sandboxID,
+			&slot.APISocket, &slot.RunDir, &slot.VsockCID,
+			&slot.CreatedAt, &loadedAt, &allocatedAt, &releasedAt, &slot.LastError); err != nil {
+			return nil, fmt.Errorf("scan firecracker vmm slot row: %w", err)
+		}
+		if sandboxID.Valid {
+			slot.SandboxID = sandboxID.String
+		}
+		if loadedAt.Valid {
+			slot.LoadedAt = loadedAt.Time
+		}
+		if allocatedAt.Valid {
+			slot.AllocatedAt = allocatedAt.Time
+		}
+		if releasedAt.Valid {
+			slot.ReleasedAt = releasedAt.Time
+		}
+		out = append(out, slot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iter firecracker vmm slot rows: %w", err)
+	}
+	return out, nil
+}

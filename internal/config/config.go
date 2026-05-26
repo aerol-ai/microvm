@@ -511,6 +511,46 @@ type Config struct {
 	// SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT.
 	FirecrackerSnapshotPostResumeTimeout time.Duration
 
+	// FirecrackerVMMPoolEnabled gates the Phase 4 warm-VMM pool. In
+	// PR 4-A (this commit) the field is plumbed through but nothing
+	// consumes it yet — the pool primitive lands as an inert
+	// substrate. PR 4-B's runtime adapter and refill goroutine flip
+	// the default on once the integration is wired. Off by default
+	// here so a daemon rebuilt from this branch behaves identically
+	// to today. SB_FIRECRACKER_VMM_POOL_ENABLED.
+	FirecrackerVMMPoolEnabled bool
+	// FirecrackerVMMPoolDepthDefault is the warm-slot floor PR 4-B's
+	// refill goroutine will use for any template without an explicit
+	// per-template override. 0 (the default) means "do not warm any
+	// template by default" — operators opt in per template once the
+	// per-template knob arrives in PR 4-C or via a future
+	// POST /v1/templates payload field. SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT.
+	FirecrackerVMMPoolDepthDefault int
+	// FirecrackerVMMPoolGCInterval is the cadence at which PR 4-B's
+	// GC sweep walks the 'released' rows whose released_at is older
+	// than FirecrackerVMMPoolGCTTL, tears the firecracker process
+	// down (if still alive), and drops the row. Default 5m — slow
+	// enough that an aggressive refresh doesn't churn SQLite, fast
+	// enough that a steady-state stream of releases doesn't pile
+	// stale rows up. SB_FIRECRACKER_VMM_POOL_GC_INTERVAL.
+	FirecrackerVMMPoolGCInterval time.Duration
+	// FirecrackerVMMPoolGCTTL is how long a slot stays in 'released'
+	// before the GC sweep drops the row. The window exists so PR 4-B's
+	// destroy path can observe a sandbox's release, finish tearing
+	// down the VMM process, and update its in-memory bookkeeping
+	// before the row disappears from under it. Default 1h.
+	// SB_FIRECRACKER_VMM_POOL_GC_TTL.
+	FirecrackerVMMPoolGCTTL time.Duration
+	// FirecrackerVMMPoolRefillInterval is the cadence at which the
+	// refill goroutine walks every warmable template and tops the
+	// per-template slot count up to its configured depth. Default 5s —
+	// short enough that a burst of Acquire-and-destroy churn refills
+	// before the next request arrives, long enough that an idle daemon
+	// isn't spawning serially. The first refill always fires at t=0
+	// regardless of this value so the pool warms up promptly after
+	// boot. SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL.
+	FirecrackerVMMPoolRefillInterval time.Duration
+
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
 	// picks a random candidate first; collisions fall back to a deterministic
@@ -1020,6 +1060,15 @@ func Load() (Config, error) {
 		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
 		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),
 		FirecrackerSnapshotPostResumeTimeout: getEnvDuration("SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT", 2*time.Second),
+
+		// Phase 4 PR-A — warm-VMM pool. Inert in this commit: nothing
+		// reads these knobs yet. They land here so PR 4-B's wiring is
+		// a pure addition without schema or config churn.
+		FirecrackerVMMPoolEnabled:        getEnvBool("SB_FIRECRACKER_VMM_POOL_ENABLED", false),
+		FirecrackerVMMPoolDepthDefault:   getEnvInt("SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT", 0),
+		FirecrackerVMMPoolGCInterval:     getEnvDuration("SB_FIRECRACKER_VMM_POOL_GC_INTERVAL", 5*time.Minute),
+		FirecrackerVMMPoolGCTTL:          getEnvDuration("SB_FIRECRACKER_VMM_POOL_GC_TTL", 1*time.Hour),
+		FirecrackerVMMPoolRefillInterval: getEnvDuration("SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL", 5*time.Second),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true

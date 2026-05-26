@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
+	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -241,6 +242,59 @@ func main() {
 			"tap_base_cidr", cfg.FirecrackerTapBaseCIDR,
 			"tap_pool_size", cfg.FirecrackerTapPoolSize,
 			"use_jailer", cfg.UseJailer)
+
+		// Phase 4 warm-VMM pool wiring. Gated on FirecrackerVMMPoolEnabled
+		// so a daemon rebuilt from this branch with the flag unset behaves
+		// identically to today — every snapshot-load Create still pays the
+		// spawn + LoadSnapshot wall-clock. With the flag on, the refill
+		// goroutine keeps DepthDefault paused-and-loaded VMMs per
+		// warmable template, and Driver.Create's tryAcquireWarm consumes
+		// them ahead of the cold-spawn fallback.
+		//
+		// Three adapters bridge the import-cycle wall:
+		//
+		//   - PoolSpawner satisfies vmmpool.Spawner against the driver's
+		//     WarmSpawn (firecracker package depends on vmmpool, not vice
+		//     versa).
+		//
+		//   - vmmTemplateListerAdapter satisfies vmmpool.TemplateLister by
+		//     reading the service's template list and projecting only the
+		//     fields the refill loop needs.
+		//
+		//   - fcDriver.SetWarmPool wires the runtime's Acquire path
+		//     against the same Pool.
+		//
+		// The refill goroutine runs for the lifetime of the daemon; ctx
+		// cancellation from the SIGINT/SIGTERM handler at the top of main
+		// is what stops it. vmmPool.Close on graceful shutdown drains any
+		// still-warm handles so the host doesn't get orphan firecracker
+		// processes.
+		if cfg.FirecrackerVMMPoolEnabled {
+			vmmPool := vmmpool.New(db, logger)
+			vmmPool.SetDefaultDepth(cfg.FirecrackerVMMPoolDepthDefault)
+			fcDriver.SetWarmPool(vmmPool)
+			lister := &vmmTemplateListerAdapter{svc: svc}
+			spawner := fcruntime.NewPoolSpawner(fcDriver)
+			refillCfg := vmmpool.RefillConfig{
+				RefillInterval: cfg.FirecrackerVMMPoolRefillInterval,
+				GCInterval:     cfg.FirecrackerVMMPoolGCInterval,
+				GCTTL:          cfg.FirecrackerVMMPoolGCTTL,
+				SpawnTimeout:   30 * time.Second,
+			}
+			go vmmPool.Run(ctx, refillCfg, lister, spawner)
+			defer func() {
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer shutdownCancel()
+				if drained := vmmPool.Close(shutdownCtx, 5*time.Second); drained > 0 {
+					logger.Info("firecracker vmm pool drained on shutdown", "handles", drained)
+				}
+			}()
+			logger.Info("firecracker vmm pool enabled",
+				"depth_default", cfg.FirecrackerVMMPoolDepthDefault,
+				"refill_interval", cfg.FirecrackerVMMPoolRefillInterval,
+				"gc_interval", cfg.FirecrackerVMMPoolGCInterval,
+				"gc_ttl", cfg.FirecrackerVMMPoolGCTTL)
+		}
 	}
 
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
@@ -1078,4 +1132,42 @@ func (a *firecrackerCIDAllocatorAdapter) AllocateForTemplate(ctx context.Context
 
 func (a *firecrackerCIDAllocatorAdapter) ReleaseForTemplate(ctx context.Context, templateID string) error {
 	return a.pool.Release(ctx, "template:"+templateID)
+}
+
+// vmmTemplateListerAdapter satisfies vmmpool.TemplateLister by walking
+// the service's template list and projecting only the snapshot
+// artifacts the refill goroutine needs. Filters to templates whose
+// snapshot is actually loadable (status=ready AND HasSnapshot AND
+// non-empty artifact paths) so the refill loop never wastes a Spawn
+// on a row the runtime would reject.
+//
+// The vmmpool package can't import internal/service (cycle: service
+// would then import vmmpool through the runtime adapter), so this
+// daemon-level adapter brokers the call.
+type vmmTemplateListerAdapter struct {
+	svc *service.Service
+}
+
+func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([]vmmpool.TemplateWarmInput, error) {
+	templates, err := a.svc.ListTemplates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]vmmpool.TemplateWarmInput, 0, len(templates))
+	for _, t := range templates {
+		if t.Status != models.TemplateStatusReady || !t.HasSnapshot {
+			continue
+		}
+		if t.SnapshotMemoryPath == "" || t.SnapshotStatePath == "" {
+			continue
+		}
+		out = append(out, vmmpool.TemplateWarmInput{
+			TemplateID:         t.ID,
+			SnapshotMemoryPath: t.SnapshotMemoryPath,
+			SnapshotStatePath:  t.SnapshotStatePath,
+			SnapshotChecksum:   t.SnapshotChecksum,
+			VsockCID:           t.SnapshotVsockCID,
+		})
+	}
+	return out, nil
 }

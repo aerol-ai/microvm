@@ -78,6 +78,13 @@ type Driver struct {
 	// main.go via SetTemplateResolver once the template service is
 	// constructed. Tests stub it to return a fake rootfs path.
 	templates TemplateResolver
+	// warmPool is the Phase 4 PR-B warm-VMM pool. Optional: when nil,
+	// every snapshot-load Create runs the cold-spawn + LoadSnapshot
+	// path; when non-nil, Create.tryAcquireWarm consults the pool
+	// before falling back. Production wires this to
+	// *internal/pool/vmm.Pool via SetWarmPool from main.go; tests
+	// inject a fake satisfying the WarmPool interface.
+	warmPool WarmPool
 
 	// spawn is the seam Create uses to construct a VMMHandle for a
 	// sandbox. Default impl wraps newVMM (which is the production
@@ -417,6 +424,33 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		"sandbox_id", allocID, "tap", slot.TapName,
 		"guest_ip", slot.GuestIP, "vsock_cid", slot.VsockCID)
 
+	// Step 1b: Phase 4 warm-VMM pool fast path. Resolve the template
+	// early (before cold-spawn) so a pool hit avoids spending the
+	// firecracker process + LoadSnapshot wall-clock — that's the
+	// ~150ms+ this whole pool exists to skip. On a miss (no template,
+	// no snapshot, no pool slot) we fall through to the cold-spawn
+	// path unchanged.
+	//
+	// Template resolution is the only step we move earlier; the rest
+	// of Create still expects to resolve+stage inside its existing
+	// structure, so we keep the resolved snapshotInfo handy and reuse
+	// it below rather than re-resolving.
+	var earlySnap *TemplateResolution
+	if req.TemplateID != "" && d.templates != nil {
+		earlySnap, err = d.templates.Resolve(ctx, req.TemplateID)
+		if err != nil {
+			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
+		}
+	}
+	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, slot, ""); err != nil {
+		return nil, err
+	} else if hit {
+		// Warm path committed the TAP slot to the sandbox; suppress
+		// the deferred TAP release.
+		released = true
+		return state, nil
+	}
+
 	// Step 2: spawn the VMM (creates the runDir we need before staging
 	// the rootfs). We spawn but do NOT yet Start — the rootfs must be
 	// in place inside the runDir before firecracker boots.
@@ -471,10 +505,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("firecracker runtime: template resolver not registered (main.go must call SetTemplateResolver): %w",
 				models.ErrRuntimeNotImplemented)
 		}
-		src, err := d.templates.Resolve(ctx, req.TemplateID)
-		if err != nil {
-			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
-		}
+		// Reuse the resolution from Step 1b's warm-pool eligibility
+		// check. earlySnap is non-nil here because the warm path's
+		// eligibility test required req.TemplateID != "" AND
+		// d.templates != nil, exactly the same gate as this branch.
+		// Re-resolving would double the template-store I/O on every
+		// snapshot-load Create.
+		src := earlySnap
 		if err := linkOrCopyRootfs(src.RootfsPath, rootfsPath); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: template stage: %w", err)
 		}
@@ -1063,6 +1100,23 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		}
 		if err := d.pool.Release(ctx, sandboxID); err != nil {
 			d.logger.Warn("firecracker destroy: pool release failed",
+				"sandbox_id", sandboxID, "error", err)
+			rememberErr(err)
+		}
+	}
+
+	// Warm-VMM pool release (Phase 4 PR-B). Idempotent on sandboxes
+	// that never went through the pool — Release with no row to
+	// update is a no-op at the store layer (the WHERE filter just
+	// matches zero rows). For sandboxes that DID acquire a warm slot,
+	// this moves the row from 'allocated' to 'released'; the GC sweep
+	// will drop the row after the TTL. The handle.Shutdown above
+	// already brought the firecracker process down, so the pool's GC
+	// drain on this row is a no-op for the in-memory handle map (it
+	// was emptied at AcquireWithHandle time).
+	if d.warmPool != nil {
+		if err := d.warmPool.Release(ctx, sandboxID, time.Now().UTC()); err != nil {
+			d.logger.Warn("firecracker destroy: warm pool release failed",
 				"sandbox_id", sandboxID, "error", err)
 			rememberErr(err)
 		}
