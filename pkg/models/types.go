@@ -86,6 +86,25 @@ var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this b
 // the service layer can reference it without importing the runtime.
 var ErrSnapshotCorrupt = errors.New("snapshot integrity verification failed")
 
+// ErrTemplateNotRebuildable is returned by RequestTemplateRebuild when the
+// row is in a state where re-running the snapshot phase is unsafe or
+// unsupported:
+//
+//   - pending / building_rootfs / snapshotting: the initial build is in
+//     flight; the goroutine owns the row's state machine and a concurrent
+//     rebuild would race the goroutine's status writes.
+//   - ready_no_snapshot: the snapshot phase failed during initial build and
+//     the row has no usable snapshot artifact to re-derive from. A full
+//     from-scratch rebuild requires source-image access (deferred — see
+//     internal/service/template_health.go comments).
+//   - failed: terminal state from a failed initial build; operator must
+//     delete + recreate.
+//
+// apihttp.WriteStoreAwareError maps this to 412 Precondition Failed so the
+// operator's tooling can distinguish "row not in a rebuildable state" from
+// "row missing" (404) and "invalid request" (400).
+var ErrTemplateNotRebuildable = errors.New("template not eligible for rebuild")
+
 // GPUVendor identifies the GPU hardware vendor for sandbox GPU allocation.
 type GPUVendor string
 

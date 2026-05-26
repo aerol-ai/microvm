@@ -341,6 +341,53 @@ func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+id, nil, nil)
 }
 
+// CreateTemplate registers a Firecracker rootfs template. Returns a 202-shape
+// row with status="pending"; callers poll GetTemplate until the row reaches
+// "ready" (fast-boot available) or "ready_no_snapshot" (cold boot only).
+// Idempotent when opts.ID is supplied — a duplicate ID is rejected with 409
+// so retried CI steps don't register two rows for the same logical template.
+func (c *Client) CreateTemplate(ctx context.Context, opts models.CreateTemplateRequest) (models.Template, error) {
+	if strings.TrimSpace(opts.Image) == "" {
+		return models.Template{}, errors.New("image is required")
+	}
+	var response models.Template
+	err := c.doJSON(ctx, http.MethodPost, c.versioned("/templates"), opts, &response)
+	return response, err
+}
+
+func (c *Client) ListTemplates(ctx context.Context) ([]models.Template, error) {
+	var response []models.Template
+	if err := c.doJSON(ctx, http.MethodGet, c.versioned("/templates"), nil, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (c *Client) GetTemplate(ctx context.Context, id string) (models.Template, error) {
+	var response models.Template
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/templates/"+id, nil, &response)
+	return response, err
+}
+
+func (c *Client) DeleteTemplate(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/templates/"+id, nil, nil)
+}
+
+// RebuildTemplate kicks an operator-triggered snapshot rebuild. Idempotent
+// under concurrent retry — the daemon's CAS collapses N parallel calls for
+// the same ready template into one rebuild kick. Returns the row in its
+// post-transition state (typically "unhealthy"); poll GetTemplate to observe
+// the transition back to "ready".
+//
+// Returns an HTTP error (status 412) when the template is in a state where
+// rebuild is unsafe (build in flight) or unsupported (ready_no_snapshot,
+// failed — those need delete+recreate today).
+func (c *Client) RebuildTemplate(ctx context.Context, id string) (models.Template, error) {
+	var response models.Template
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/templates/"+id+"/rebuild", nil, &response)
+	return response, err
+}
+
 func (c *Client) Reconcile(ctx context.Context) error {
 	return c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/admin/reconcile", nil, nil)
 }

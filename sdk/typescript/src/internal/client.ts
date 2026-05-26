@@ -14,6 +14,7 @@ import type {
   BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
+  CreateTemplateOptions,
   CustomDomain,
   CustomDomainDNSRecords,
   CustomDomainStatus,
@@ -42,6 +43,9 @@ import type {
   Session,
   SessionAttachHandle,
   SessionAttachOptions,
+  Template,
+  TemplatePushState,
+  TemplateStatus,
 } from "../types.js";
 
 type FetchLike = typeof fetch;
@@ -146,6 +150,24 @@ interface ApiSandbox {
 
 interface ApiCreateSandboxResponse extends ApiSandbox {
   ssh_private_key?: string;
+}
+
+interface ApiTemplate {
+  id: string;
+  image: string;
+  status: TemplateStatus;
+  rootfs_size_bytes?: number;
+  min_size_mib?: number;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+  ready_at?: string;
+  snapshot_size_bytes?: number;
+  snapshot_error?: string;
+  has_snapshot: boolean;
+  has_overlay: boolean;
+  push_state?: TemplatePushState;
+  push_error?: string;
 }
 
 interface ApiSandboxSnapshot {
@@ -587,6 +609,36 @@ export class APIClient {
     return fromApiNetworkUsage(response);
   }
 
+  async createTemplate(options: CreateTemplateOptions): Promise<Template> {
+    const response = await this.doJSON<ApiTemplate>("POST", this.versioned("/templates"), {
+      id: options.id,
+      image: options.image,
+      min_size_mib: options.minSizeMiB,
+    });
+    return fromApiTemplate(response);
+  }
+
+  async listTemplates(): Promise<Template[]> {
+    const response = await this.doJSON<ApiTemplate[]>("GET", this.versioned("/templates"));
+    // The daemon returns `null` rather than `[]` when the table is empty;
+    // normalize so callers always get an array.
+    return (response ?? []).map(fromApiTemplate);
+  }
+
+  async getTemplate(id: string): Promise<Template> {
+    const response = await this.doJSON<ApiTemplate>("GET", `${this.versionPrefix}/templates/${id}`);
+    return fromApiTemplate(response);
+  }
+
+  async deleteTemplate(id: string): Promise<void> {
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/templates/${id}`);
+  }
+
+  async rebuildTemplate(id: string): Promise<Template> {
+    const response = await this.doJSON<ApiTemplate>("POST", `${this.versionPrefix}/templates/${id}/rebuild`);
+    return fromApiTemplate(response);
+  }
+
   private wrap(sandbox: ApiSandbox): SandboxResource {
     return new SandboxResource(this, fromApiSandbox(sandbox));
   }
@@ -927,6 +979,26 @@ function fromApiCreateSandboxResponse(response: ApiCreateSandboxResponse): Sandb
   return {
     ...fromApiSandbox(response),
     sshPrivateKey: response.ssh_private_key,
+  };
+}
+
+function fromApiTemplate(template: ApiTemplate): Template {
+  return {
+    id: template.id,
+    image: template.image,
+    status: template.status,
+    rootfsSizeBytes: template.rootfs_size_bytes,
+    minSizeMiB: template.min_size_mib,
+    lastError: template.last_error,
+    createdAt: template.created_at,
+    updatedAt: template.updated_at,
+    readyAt: template.ready_at,
+    snapshotSizeBytes: template.snapshot_size_bytes,
+    snapshotError: template.snapshot_error,
+    hasSnapshot: template.has_snapshot,
+    hasOverlay: template.has_overlay,
+    pushState: template.push_state,
+    pushError: template.push_error,
   };
 }
 

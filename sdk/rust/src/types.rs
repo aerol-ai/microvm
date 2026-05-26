@@ -630,6 +630,92 @@ pub struct NetworkUsage {
     pub last_sampled_at: Option<String>,
 }
 
+/// Lifecycle states for a Firecracker rootfs template. See the daemon-side
+/// plan `snapshot-clone-fast-boot.md` for the state machine.
+///
+/// - `Pending` / `BuildingRootfs` / `Snapshotting`: build pipeline in
+///   flight; sandbox creations against this template will not see fast-boot
+///   until the row reaches `Ready`.
+/// - `Ready`: cold boot + fast snapshot clone both available.
+/// - `ReadyNoSnapshot`: cold boot works; the snapshot phase failed and
+///   `snapshot_error` carries the cause.
+/// - `Unhealthy`: snapshot was detected as corrupt; a rebuild is in flight
+///   (or pending the next daemon restart).
+/// - `Failed`: terminal state from a failed initial build; the row must be
+///   deleted and recreated.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateStatus {
+    Pending,
+    BuildingRootfs,
+    Snapshotting,
+    Ready,
+    ReadyNoSnapshot,
+    Failed,
+    Unhealthy,
+}
+
+/// Background-push state for a template's artifacts.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplatePushState {
+    Active,
+    Pending,
+    Pushing,
+    Error,
+}
+
+/// A Firecracker rootfs template. Created once from an OCI image and
+/// boot-shared across many sandboxes. Construct one with
+/// [`Client::create_template`]; poll [`Client::get_template`] until
+/// `status` reaches `Ready` (fast-boot) or `ReadyNoSnapshot` (cold boot
+/// only).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Template {
+    pub id: String,
+    pub image: String,
+    pub status: TemplateStatus,
+    #[serde(rename = "rootfs_size_bytes", skip_serializing_if = "Option::is_none")]
+    pub rootfs_size_bytes: Option<i64>,
+    #[serde(rename = "min_size_mib", skip_serializing_if = "Option::is_none")]
+    pub min_size_mib: Option<u32>,
+    #[serde(rename = "last_error", skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(rename = "created_at")]
+    pub created_at: String,
+    #[serde(rename = "updated_at")]
+    pub updated_at: String,
+    #[serde(rename = "ready_at", skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
+    #[serde(
+        rename = "snapshot_size_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub snapshot_size_bytes: Option<i64>,
+    #[serde(rename = "snapshot_error", skip_serializing_if = "Option::is_none")]
+    pub snapshot_error: Option<String>,
+    #[serde(rename = "has_snapshot")]
+    pub has_snapshot: bool,
+    #[serde(rename = "has_overlay")]
+    pub has_overlay: bool,
+    #[serde(rename = "push_state", skip_serializing_if = "Option::is_none")]
+    pub push_state: Option<TemplatePushState>,
+    #[serde(rename = "push_error", skip_serializing_if = "Option::is_none")]
+    pub push_error: Option<String>,
+}
+
+/// Request body for [`Client::create_template`]. An explicit `id` lets
+/// retried CI steps be idempotent: a duplicate id is rejected with 409 so
+/// you don't end up with two rows for the same logical template.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CreateTemplateOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub image: String,
+    #[serde(rename = "min_size_mib", skip_serializing_if = "Option::is_none")]
+    pub min_size_mib: Option<u32>,
+}
+
 /// Patch body for [`Client::set_network_limits`]. Each field is `Option`-wrapped
 /// so an unset key serializes as missing (server reads as "leave alone");
 /// `Some(0)` means unlimited.

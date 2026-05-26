@@ -491,3 +491,74 @@ export interface HealthStatus {
 }
 
 export type BinaryLike = Uint8Array | ArrayBuffer | Blob | string;
+
+/**
+ * Lifecycle states reported by a Firecracker rootfs template. See
+ * `plans/snapshot-clone-fast-boot.md` for the state machine.
+ *
+ * - `pending`, `building_rootfs`, `snapshotting`: the build pipeline is in
+ *   flight; no sandbox creation against this template will succeed yet.
+ * - `ready`: cold boot + fast snapshot clone both available.
+ * - `ready_no_snapshot`: cold boot works; snapshot phase failed and
+ *   sandboxes will not get the fast-boot path until a rebuild succeeds.
+ * - `unhealthy`: snapshot was detected as corrupt; an async rebuild is in
+ *   flight (or pending the next daemon restart).
+ * - `failed`: terminal state from a failed initial build; the row must be
+ *   deleted and recreated.
+ */
+export type TemplateStatus =
+  | "pending"
+  | "building_rootfs"
+  | "snapshotting"
+  | "ready"
+  | "ready_no_snapshot"
+  | "failed"
+  | "unhealthy";
+
+/**
+ * Background-push state for the template's artifacts (rootfs.ext4 +
+ * snapshot.*). "active" means push succeeded or push is disabled; "pending"
+ * / "pushing" are in-flight states; "error" carries `pushError` for the
+ * last failure.
+ */
+export type TemplatePushState = "active" | "pending" | "pushing" | "error";
+
+/**
+ * A Firecracker rootfs template. Created once from an OCI image and
+ * boot-shared across many sandboxes. Use {@link MicroVM.createTemplate} to
+ * register one, then pass its {@link Template.id} on subsequent sandbox
+ * `create` calls (when the sandbox runtime is `firecracker`).
+ */
+export interface Template {
+  id: string;
+  image: string;
+  status: TemplateStatus;
+  rootfsSizeBytes?: number;
+  /** Optional floor for the ext4 image size, in MiB. */
+  minSizeMiB?: number;
+  /** Last build-pipeline error, populated when `status` is `failed`. */
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  /** First time the template reached `ready` / `ready_no_snapshot`. */
+  readyAt?: string;
+  snapshotSizeBytes?: number;
+  /** Populated when `status` is `ready_no_snapshot` — why the snapshot phase failed. */
+  snapshotError?: string;
+  /** True when the template has a usable snapshot for fast-boot. */
+  hasSnapshot: boolean;
+  /** True when the template was built with a per-sandbox writable overlay placeholder. */
+  hasOverlay: boolean;
+  pushState?: TemplatePushState;
+  /** Populated when `pushState` is `error` — the last push failure. */
+  pushError?: string;
+}
+
+export interface CreateTemplateOptions {
+  /** Optional explicit ID. Empty means the daemon generates one. Supplying an explicit ID lets retries be idempotent — a duplicate ID returns 409. */
+  id?: string;
+  /** skopeo-style image reference, e.g. `"docker://python:3.11"`. */
+  image: string;
+  /** Optional floor for the ext4 image size, in MiB. */
+  minSizeMiB?: number;
+}

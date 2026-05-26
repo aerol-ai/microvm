@@ -411,3 +411,48 @@ class HealthStatus(TypedDict):
 class MicroVMConfig(TypedDict, total=False):
     apiUrl: str
     patToken: str
+
+
+# Firecracker rootfs templates. The lifecycle mirrors the daemon's
+# state machine; see plans/snapshot-clone-fast-boot.md for the
+# transitions. A template is created once from an OCI image and
+# boot-shared across many sandboxes; the SDK exposes CRUD + rebuild on
+# the MicroVM client so application code can drive the pipeline.
+TemplateStatus = Literal[
+    "pending",
+    "building_rootfs",
+    "snapshotting",
+    "ready",
+    "ready_no_snapshot",
+    "failed",
+    "unhealthy",
+]
+
+
+TemplatePushState = Literal["active", "pending", "pushing", "error"]
+
+
+class CreateTemplateOptions(TypedDict, total=False):
+    # Optional explicit ID — supplying one lets retries be idempotent
+    # (a duplicate ID returns 409). Omit to let the daemon generate.
+    id: str
+    image: str  # required: skopeo-style ref, e.g. "docker://python:3.11"
+    minSizeMiB: int  # optional ext4 floor
+
+
+class Template(TypedDict, total=False):
+    id: str
+    image: str
+    status: TemplateStatus
+    rootfsSizeBytes: int
+    minSizeMiB: int
+    lastError: str
+    createdAt: str
+    updatedAt: str
+    readyAt: str
+    snapshotSizeBytes: int
+    snapshotError: str
+    hasSnapshot: bool
+    hasOverlay: bool
+    pushState: TemplatePushState
+    pushError: str

@@ -329,12 +329,17 @@ func TestStartTemplateGC_DisabledIsNoOp(t *testing.T) {
 // phase. Records the request, writes a few bytes to the snapshot
 // artifact paths so the row's snapshot_size_bytes is non-zero, and
 // signals on the done channel so tests can wait without sleeping.
+// When `block` is non-nil it gates SnapshotTemplate's return — the
+// test releases all in-flight rebuilds by closing the channel. This
+// lets concurrency tests pin "rebuild stays in flight while N callers
+// race" without depending on goroutine timing.
 type fakeTemplateSnapshotter struct {
 	mu      sync.Mutex
 	calls   int
 	lastReq TemplateSnapshotRequest
 	err     error
 	done    chan struct{}
+	block   chan struct{}
 }
 
 func (f *fakeTemplateSnapshotter) SnapshotTemplate(_ context.Context, req TemplateSnapshotRequest) (*TemplateSnapshotResult, error) {
@@ -342,12 +347,16 @@ func (f *fakeTemplateSnapshotter) SnapshotTemplate(_ context.Context, req Templa
 	f.calls++
 	f.lastReq = req
 	err := f.err
+	block := f.block
 	f.mu.Unlock()
 	defer func() {
 		if f.done != nil {
 			f.done <- struct{}{}
 		}
 	}()
+	if block != nil {
+		<-block
+	}
 	if err != nil {
 		return nil, err
 	}

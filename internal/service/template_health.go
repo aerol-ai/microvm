@@ -135,6 +135,58 @@ func (s *Service) RekickUnhealthyTemplatesAtStart(ctx context.Context) {
 	}
 }
 
+// RequestTemplateRebuild is the operator-triggered entry point for
+// re-running the snapshot phase of a template. It is the service-layer
+// half of POST /v1/templates/{id}/rebuild.
+//
+// State semantics:
+//
+//   - ready: delegate to MarkSnapshotCorrupt(reason="operator-requested").
+//     The store-side CAS (UPDATE...WHERE status='ready') makes the
+//     transition idempotent under concurrent operator requests — N
+//     parallel callers collapse to one ready→unhealthy transition and one
+//     rebuild kick. The N-1 callers that lose the race see the post-
+//     transition row on the re-read below and get a successful 202.
+//   - unhealthy: a rebuild is already in flight (or will be re-kicked by
+//     RekickUnhealthyTemplatesAtStart on next daemon restart). Returning
+//     the row as-is is the simplest UX — operator polls GET /v1/templates/{id}
+//     for the transition back to ready.
+//   - anything else: ErrTemplateNotRebuildable. See the sentinel's
+//     docstring for the reasoning per state.
+//
+// The 202-with-current-template response shape mirrors the rest of the
+// async template lifecycle (POST /v1/templates also returns 202 with a
+// PENDING row), so SDK callers can reuse their existing "poll until
+// status=ready" code path.
+func (s *Service) RequestTemplateRebuild(ctx context.Context, templateID string) (*models.Template, error) {
+	if templateID == "" {
+		return nil, errors.New("template id is required")
+	}
+	tpl, err := s.store.GetTemplate(ctx, templateID)
+	if err != nil {
+		return nil, err
+	}
+	switch tpl.Status {
+	case models.TemplateStatusReady:
+		if err := s.MarkSnapshotCorrupt(ctx, templateID, "operator-requested"); err != nil {
+			return nil, err
+		}
+		// Re-read so the response reflects the post-transition state.
+		// MarkSnapshotCorrupt's CAS may have lost to a concurrent caller,
+		// in which case the row is unhealthy already — that's still the
+		// correct answer to return.
+		return s.store.GetTemplate(ctx, templateID)
+	case models.TemplateStatusUnhealthy:
+		// Already in the rebuild pipeline; no second kick. The rebuild
+		// either ran in this process (and we'll see ready on the next
+		// poll) or will run on the next daemon restart via
+		// RekickUnhealthyTemplatesAtStart.
+		return tpl, nil
+	default:
+		return nil, fmt.Errorf("%w: current status=%s", models.ErrTemplateNotRebuildable, tpl.Status)
+	}
+}
+
 // kickSnapshotRebuild spawns the rebuild goroutine. Detached context
 // + bounded timeout match kickTemplateBuild — the rebuild outlives
 // the request that triggered it (which has already returned a 500 to

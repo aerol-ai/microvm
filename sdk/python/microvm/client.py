@@ -19,6 +19,7 @@ from .types import (
     BuildImageResult,
     CreateOptions,
     CreateSessionOptions,
+    CreateTemplateOptions,
     CustomDomain,
     CustomDomainDNSRecords,
     DNSRecord,
@@ -42,6 +43,7 @@ from .types import (
     Session,
     SessionAttachOptions,
     SetNetworkLimitsOptions,
+    Template,
 )
 
 STREAM_PREFIX_STDOUT = 0x01
@@ -542,6 +544,63 @@ class MicroVM:
 
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
+
+    def create_template(self, options: CreateTemplateOptions) -> Template:
+        """Register a Firecracker rootfs template.
+
+        Returns a row in ``status: "pending"`` and kicks the daemon's
+        async build. Poll :meth:`get_template` until ``status`` reaches
+        ``"ready"`` (fast-boot available) or ``"ready_no_snapshot"``
+        (cold boot only).
+
+        Idempotent when ``options["id"]`` is set: a duplicate ID
+        returns 409 so a retried CI step does not create two rows.
+        """
+        body: Dict[str, Any] = {}
+        tpl_id = str(_first_of(options, "id") or "").strip()
+        if tpl_id:
+            body["id"] = tpl_id
+        image = str(_first_of(options, "image") or "").strip()
+        if not image:
+            raise MicroVMError("image is required")
+        body["image"] = image
+        min_size = _first_of(options, "minSizeMiB", "min_size_mib")
+        if min_size is not None:
+            body["min_size_mib"] = int(min_size)
+        response = self._do_json("POST", self._versioned("/templates"), body)
+        return _from_api_template(response)
+
+    def list_templates(self) -> List[Template]:
+        response = self._do_json("GET", self._versioned("/templates"), None)
+        if response is None:
+            return []
+        if not isinstance(response, list):
+            raise MicroVMError("expected JSON array from /v1/templates")
+        return [_from_api_template(item) for item in response]
+
+    def get_template(self, template_id: str) -> Template:
+        response = self._do_json("GET", f"{self._version_prefix}/templates/{template_id}", None)
+        return _from_api_template(response)
+
+    def delete_template(self, template_id: str) -> None:
+        self._do_json("DELETE", f"{self._version_prefix}/templates/{template_id}", None)
+
+    def rebuild_template(self, template_id: str) -> Template:
+        """Re-run the snapshot phase against an existing template.
+
+        Idempotent under concurrent retry — the daemon's CAS collapses
+        N parallel calls for the same ``ready`` template to one rebuild
+        kick. Returns the row in its post-transition state (typically
+        ``unhealthy``); poll :meth:`get_template` for the transition
+        back to ``ready``.
+
+        Raises :class:`MicroVMHTTPError` with status 412 when the
+        template is in a state where rebuild is not safe (build in
+        flight) or not supported (``ready_no_snapshot``/``failed`` —
+        those need delete+recreate today).
+        """
+        response = self._do_json("POST", f"{self._version_prefix}/templates/{template_id}/rebuild", None)
+        return _from_api_template(response)
 
     def resize(self, sandbox_id: str, options: ResizeOptions) -> Sandbox:
         sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options))
@@ -1065,6 +1124,45 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
         "publicURL": str(_first_of(port, "public_url", "publicURL") or ""),
         "createdAt": str(_first_of(port, "created_at", "createdAt") or ""),
     }
+
+
+def _from_api_template(template: Any) -> Template:
+    if not isinstance(template, dict):
+        raise MicroVMError("expected JSON object for template")
+    result: Template = {
+        "id": str(_first_of(template, "id") or ""),
+        "image": str(_first_of(template, "image") or ""),
+        "status": str(_first_of(template, "status") or ""),  # type: ignore[typeddict-item]
+        "createdAt": str(_first_of(template, "created_at", "createdAt") or ""),
+        "updatedAt": str(_first_of(template, "updated_at", "updatedAt") or ""),
+        "hasSnapshot": bool(_first_of(template, "has_snapshot", "hasSnapshot") or False),
+        "hasOverlay": bool(_first_of(template, "has_overlay", "hasOverlay") or False),
+    }
+    rootfs_size = _first_of(template, "rootfs_size_bytes", "rootfsSizeBytes")
+    if rootfs_size is not None:
+        result["rootfsSizeBytes"] = int(rootfs_size)
+    min_size = _first_of(template, "min_size_mib", "minSizeMiB")
+    if min_size is not None:
+        result["minSizeMiB"] = int(min_size)
+    last_error = _first_of(template, "last_error", "lastError")
+    if last_error not in (None, ""):
+        result["lastError"] = str(last_error)
+    ready_at = _first_of(template, "ready_at", "readyAt")
+    if ready_at not in (None, ""):
+        result["readyAt"] = str(ready_at)
+    snap_size = _first_of(template, "snapshot_size_bytes", "snapshotSizeBytes")
+    if snap_size is not None:
+        result["snapshotSizeBytes"] = int(snap_size)
+    snap_err = _first_of(template, "snapshot_error", "snapshotError")
+    if snap_err not in (None, ""):
+        result["snapshotError"] = str(snap_err)
+    push_state = _first_of(template, "push_state", "pushState")
+    if push_state not in (None, ""):
+        result["pushState"] = str(push_state)  # type: ignore[typeddict-item]
+    push_err = _first_of(template, "push_error", "pushError")
+    if push_err not in (None, ""):
+        result["pushError"] = str(push_err)
+    return result
 
 
 def _from_api_sandbox_snapshot(snapshot: Dict[str, Any]) -> SandboxSnapshot:

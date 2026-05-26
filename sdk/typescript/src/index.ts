@@ -9,6 +9,7 @@ export type {
   BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
+  CreateTemplateOptions,
   CustomDomain,
   CustomDomainDNSRecords,
   CustomDomainStatus,
@@ -40,5 +41,8 @@ export type {
   SessionAttachHandle,
   SessionAttachOptions,
   SessionStatus,
+  Template,
+  TemplatePushState,
+  TemplateStatus,
   UpdateLifecycleOptions,
 } from "./types.js";

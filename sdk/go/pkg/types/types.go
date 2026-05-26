@@ -17,6 +17,30 @@ type ExposedPort = models.ExposedPort
 type ExposeResult = models.ExposePortResponse
 type SandboxSnapshot = models.SandboxSnapshot
 
+// Template is the server's Firecracker rootfs template row. Re-exported
+// verbatim from pkg/models so the SDK stays aligned with the wire format.
+type Template = models.Template
+
+// CreateTemplateOptions is the request body for Client.CreateTemplate.
+// Supplying an explicit ID lets retries be idempotent — a duplicate ID
+// returns 409 so a re-run CI step does not register two rows for the same
+// logical template.
+type CreateTemplateOptions = models.CreateTemplateRequest
+
+// TemplateStatus is the lifecycle of a Firecracker rootfs template.
+// See plans/snapshot-clone-fast-boot.md for the state machine.
+type TemplateStatus = models.TemplateStatus
+
+const (
+	TemplateStatusPending         = models.TemplateStatusPending
+	TemplateStatusBuildingRootfs  = models.TemplateStatusBuildingRootfs
+	TemplateStatusSnapshotting    = models.TemplateStatusSnapshotting
+	TemplateStatusReady           = models.TemplateStatusReady
+	TemplateStatusReadyNoSnapshot = models.TemplateStatusReadyNoSnapshot
+	TemplateStatusFailed          = models.TemplateStatusFailed
+	TemplateStatusUnhealthy       = models.TemplateStatusUnhealthy
+)
+
 // ExposeProtocol selects the wire surface an exposure publishes through.
 type ExposeProtocol string
 

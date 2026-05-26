@@ -393,6 +393,207 @@ func TestRekickUnhealthyTemplatesAtStart_EmptyStoreIsNoop(t *testing.T) {
 	}
 }
 
+// TestRequestTemplateRebuild_ReadyTransitionsAndKicks proves the happy
+// path: an operator-triggered rebuild against a ready template flips it
+// to unhealthy and kicks exactly one rebuild via the existing
+// MarkSnapshotCorrupt path. The returned row reflects the
+// post-transition state so the SDK can poll-until-ready against the
+// 202 response directly.
+func TestRequestTemplateRebuild_ReadyTransitionsAndKicks(t *testing.T) {
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-op-rebuild")
+
+	snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 4)}
+	svc.SetTemplateSnapshotter(snap)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+	got, err := svc.RequestTemplateRebuild(context.Background(), tpl.ID)
+	if err != nil {
+		t.Fatalf("RequestTemplateRebuild: %v", err)
+	}
+	if got == nil {
+		t.Fatal("RequestTemplateRebuild returned nil template")
+	}
+	// MarkSnapshotCorrupt may have already been overtaken by the
+	// rebuild goroutine flipping the row to snapshotting/ready by the
+	// time we re-read. The contract is "row is no longer ready" — the
+	// rebuild is in flight.
+	if got.Status == models.TemplateStatusReady {
+		t.Errorf("status = ready after rebuild request; expected unhealthy/snapshotting/ready_no_snapshot or post-rebuild ready")
+	}
+
+	select {
+	case <-snap.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rebuild did not fire; operator request must trigger snapshotter")
+	}
+	snap.mu.Lock()
+	calls := snap.calls
+	snap.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("snapshotter calls = %d, want 1 (operator request fires one rebuild)", calls)
+	}
+}
+
+// TestRequestTemplateRebuild_ConcurrentCallersCollapseToOneRebuild pins
+// the idempotency contract: while a rebuild is in flight, N concurrent
+// operator retries produce exactly one rebuild kick. The CAS in
+// MarkTemplateUnhealthy is the gating primitive — the losers of the
+// race see unhealthy/snapshotting on their re-read and either return
+// 202 (unhealthy arm) or ErrTemplateNotRebuildable (snapshotting arm).
+// Either is correct UX; none of the losers may trigger a second kick.
+//
+// We block the snapshotter via `snap.block` so the rebuild stays in
+// flight until the test releases it — without that, a fast rebuild
+// would complete between racing callers and each cycle would
+// legitimately kick a fresh rebuild, breaking the determinism we want
+// to assert here.
+func TestRequestTemplateRebuild_ConcurrentCallersCollapseToOneRebuild(t *testing.T) {
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-op-conc")
+
+	snap := &fakeTemplateSnapshotter{
+		done:  make(chan struct{}, 16),
+		block: make(chan struct{}),
+	}
+	svc.SetTemplateSnapshotter(snap)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+	const N = 16
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for range N {
+		go func() {
+			defer wg.Done()
+			// All callers must complete without panic; success or
+			// ErrTemplateNotRebuildable (race against snapshotting
+			// transition) are both correct outcomes.
+			_, _ = svc.RequestTemplateRebuild(context.Background(), tpl.ID)
+		}()
+	}
+	wg.Wait()
+
+	// Snapshotter is now blocked inside its first call. Confirm no
+	// additional kicks land within a brief grace window — the row is
+	// either unhealthy or snapshotting, so any further RequestTemplateRebuild
+	// would fail the CAS or fall into the snapshotting/not-rebuildable arm.
+	time.Sleep(75 * time.Millisecond)
+	snap.mu.Lock()
+	calls := snap.calls
+	snap.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("snapshotter calls = %d, want 1 (N operator requests collapse to one rebuild while in flight)", calls)
+	}
+
+	// Release the blocked snapshotter and drain.
+	close(snap.block)
+	select {
+	case <-snap.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rebuild never drained after release")
+	}
+}
+
+// TestRequestTemplateRebuild_UnhealthyIsNoopReturnsRow proves the
+// already-unhealthy arm. A second operator request against an
+// already-unhealthy template must NOT kick a second rebuild — the first
+// rebuild is in flight (or will be re-kicked by the startup scanner) —
+// and must return the row so the operator's UI can keep polling.
+func TestRequestTemplateRebuild_UnhealthyIsNoopReturnsRow(t *testing.T) {
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-op-unhealthy")
+	if _, err := st.MarkTemplateUnhealthy(context.Background(), tpl.ID, "test setup"); err != nil {
+		t.Fatalf("MarkTemplateUnhealthy: %v", err)
+	}
+
+	snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 4)}
+	svc.SetTemplateSnapshotter(snap)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+	got, err := svc.RequestTemplateRebuild(context.Background(), tpl.ID)
+	if err != nil {
+		t.Fatalf("RequestTemplateRebuild on unhealthy: %v", err)
+	}
+	if got == nil || got.Status != models.TemplateStatusUnhealthy {
+		t.Errorf("got status = %v, want unhealthy", got)
+	}
+	select {
+	case <-snap.done:
+		t.Fatal("rebuild was kicked despite row already unhealthy; should defer to existing in-flight rebuild")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestRequestTemplateRebuild_RejectsNonRebuildableStates pins the
+// 412 contract: states where rebuild is unsafe (build in flight) or
+// unsupported (ready_no_snapshot — needs source-image access; failed —
+// needs delete+recreate) must surface ErrTemplateNotRebuildable so
+// the operator's tooling can distinguish them from 404.
+func TestRequestTemplateRebuild_RejectsNonRebuildableStates(t *testing.T) {
+	for _, status := range []models.TemplateStatus{
+		models.TemplateStatusPending,
+		models.TemplateStatusBuildingRootfs,
+		models.TemplateStatusSnapshotting,
+		models.TemplateStatusReadyNoSnapshot,
+		models.TemplateStatusFailed,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			svc, st, templatesDir := newHealthHarness(t)
+			tpl := seedReadyTemplate(t, st, templatesDir, "tpl-state-"+string(status))
+			// Force the row into the test's target state. Use
+			// UpdateTemplateStatus rather than MarkTemplateUnhealthy so
+			// each subtest is isolated.
+			if err := st.UpdateTemplateStatus(context.Background(), tpl.ID,
+				status, tpl.RootfsPath, "", tpl.RootfsSizeBytes); err != nil {
+				t.Fatalf("force status %s: %v", status, err)
+			}
+
+			snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 1)}
+			svc.SetTemplateSnapshotter(snap)
+			svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+			_, err := svc.RequestTemplateRebuild(context.Background(), tpl.ID)
+			if err == nil {
+				t.Fatalf("status=%s: RequestTemplateRebuild returned nil err; must refuse", status)
+			}
+			if !errors.Is(err, models.ErrTemplateNotRebuildable) {
+				t.Errorf("status=%s: err = %v, want errors.Is(_, ErrTemplateNotRebuildable)", status, err)
+			}
+			select {
+			case <-snap.done:
+				t.Errorf("status=%s: snapshotter fired despite refusal", status)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// TestRequestTemplateRebuild_MissingTemplatePropagatesNotFound proves
+// the 404 mapping: a missing template ID returns a store.ErrNotFound
+// that apihttp.WriteStoreAwareError maps to 404. Without this the
+// handler would return 400 and operator tooling couldn't tell missing
+// from malformed.
+func TestRequestTemplateRebuild_MissingTemplatePropagatesNotFound(t *testing.T) {
+	svc, _, _ := newHealthHarness(t)
+	_, err := svc.RequestTemplateRebuild(context.Background(), "tpl-missing")
+	if err == nil {
+		t.Fatal("RequestTemplateRebuild on missing template returned nil; must error")
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("err = %v, want errors.Is(_, store.ErrNotFound) so the handler maps to 404", err)
+	}
+}
+
+// TestRequestTemplateRebuild_EmptyIDRejected guards the API surface:
+// a missing path value (would happen only on a malformed router
+// registration) must not nil-deref into the store.
+func TestRequestTemplateRebuild_EmptyIDRejected(t *testing.T) {
+	svc, _, _ := newHealthHarness(t)
+	if _, err := svc.RequestTemplateRebuild(context.Background(), ""); err == nil {
+		t.Error("RequestTemplateRebuild with empty id returned nil; must reject")
+	}
+}
+
 // TestRekickUnhealthyTemplatesAtStart_NoOpWithoutWiring proves the
 // guard: if the daemon hasn't attached a snapshotter (e.g.
 // EnableFirecracker true but template subsystem partially wired) the

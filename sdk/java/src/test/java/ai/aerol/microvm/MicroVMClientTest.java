@@ -47,8 +47,11 @@ import ai.aerol.microvm.model.RegisterSnapshotOptions;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
+import ai.aerol.microvm.model.CreateTemplateOptions;
 import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
+import ai.aerol.microvm.model.Template;
+import ai.aerol.microvm.model.TemplateStatus;
 
 class MicroVMClientTest {
     @Test
@@ -1166,6 +1169,143 @@ class MicroVMClientTest {
             assertTrue(result.records.isEmpty());
             assertNotNull(result.target);
             assertEquals("ingress.acme.com", result.target.hostname);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createTemplatePostsAndMapsResponse() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod());
+            assertEquals("/v1/templates", exchange.getRequestURI().getPath());
+            body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 202, mapOf(
+                "id", "tpl-java",
+                "image", "docker://python:3.11",
+                "status", "pending",
+                "min_size_mib", 512,
+                "created_at", "2026-05-27T10:00:00Z",
+                "updated_at", "2026-05-27T10:00:00Z",
+                "has_snapshot", false,
+                "has_overlay", false
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Template tpl = client.createTemplate(new CreateTemplateOptions()
+                .setId("tpl-java")
+                .setImage("docker://python:3.11")
+                .setMinSizeMib(512));
+            assertEquals("tpl-java", tpl.id);
+            assertEquals(TemplateStatus.PENDING, tpl.status);
+            assertEquals(Integer.valueOf(512), tpl.minSizeMib);
+            assertEquals("tpl-java", body.get().get("id"));
+            assertEquals("docker://python:3.11", body.get().get("image"));
+            assertEquals(512, ((Number) body.get().get("min_size_mib")).intValue());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createTemplateRejectsEmptyImage() {
+        MicroVMClient client = new MicroVMClient(
+            new MicroVMConfig().setApiUrl("http://127.0.0.1:1").setPatToken("pat-token"),
+            HttpClient.newHttpClient(),
+            new FakeWebSocketConnector(),
+            name -> null
+        );
+        assertThrows(MicroVMException.class, () -> client.createTemplate(new CreateTemplateOptions()));
+    }
+
+    @Test
+    void listTemplatesMapsRows() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            assertEquals("GET", exchange.getRequestMethod());
+            assertEquals("/v1/templates", exchange.getRequestURI().getPath());
+            writeJson(exchange, 200, List.of(
+                mapOf(
+                    "id", "tpl-1",
+                    "image", "docker://alpine:3.19",
+                    "status", "ready",
+                    "created_at", "2026-05-27T10:00:00Z",
+                    "updated_at", "2026-05-27T10:05:00Z",
+                    "ready_at", "2026-05-27T10:04:00Z",
+                    "has_snapshot", true,
+                    "has_overlay", false,
+                    "push_state", "active"
+                )
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            List<Template> rows = client.listTemplates();
+            assertEquals(1, rows.size());
+            assertEquals("tpl-1", rows.get(0).id);
+            assertEquals(TemplateStatus.READY, rows.get(0).status);
+            assertTrue(rows.get(0).hasSnapshot);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void rebuildTemplatePostsToRebuildPathAndReturnsUnhealthyRow() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            assertEquals("POST", exchange.getRequestMethod());
+            writeJson(exchange, 202, mapOf(
+                "id", "tpl-r",
+                "image", "docker://alpine:3.19",
+                "status", "unhealthy",
+                "created_at", "2026-05-27T10:00:00Z",
+                "updated_at", "2026-05-27T10:10:00Z",
+                "has_snapshot", true,
+                "has_overlay", false
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Template tpl = client.rebuildTemplate("tpl-r");
+            assertEquals("/v1/templates/tpl-r/rebuild", seenPath.get());
+            assertEquals(TemplateStatus.UNHEALTHY, tpl.status);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void rebuildTemplate412SurfacesAsException() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            writeJson(exchange, 412, mapOf("error", "template not eligible for rebuild: current status=pending"));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException ex = assertThrows(MicroVMException.class, () -> client.rebuildTemplate("tpl-pending"));
+            assertTrue(ex.getMessage().contains("not eligible for rebuild"),
+                "exception message = " + ex.getMessage());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void deleteTemplateSendsDelete() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenMethod.set(exchange.getRequestMethod());
+            seenPath.set(exchange.getRequestURI().getPath());
+            exchange.sendResponseHeaders(204, -1);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            client.deleteTemplate("tpl-x");
+            assertEquals("DELETE", seenMethod.get());
+            assertEquals("/v1/templates/tpl-x", seenPath.get());
         } finally {
             server.stop(0);
         }

@@ -58,3 +58,18 @@ func (h *handlers) deleteTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// rebuildTemplate is the operator-triggered snapshot rebuild
+// (plans/snapshot-clone-fast-boot.md Phase 6 follow-up). Idempotent under
+// concurrent retry: the CAS in MarkSnapshotCorrupt ensures N parallel
+// callers against the same ready template collapse to one rebuild kick.
+// 202 mirrors the create-template shape so SDK callers reuse their
+// existing "poll status until ready" code path.
+func (h *handlers) rebuildTemplate(w http.ResponseWriter, r *http.Request) {
+	tpl, err := h.deps.Service.RequestTemplateRebuild(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusAccepted, tpl)
+}

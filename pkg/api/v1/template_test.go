@@ -155,6 +155,97 @@ func TestV1ListTemplates_ReturnsRows(t *testing.T) {
 	}
 }
 
+// TestV1RebuildTemplate_ReadyReturns202 pins the operator-rebuild
+// contract: POST against a ready template returns 202 + the (now
+// unhealthy or post-rebuild) row. The service-layer concurrency tests
+// cover idempotency; this test pins the HTTP shape and routing.
+func TestV1RebuildTemplate_ReadyReturns202(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+
+	// Seed a ready template directly so we don't have to drive the full
+	// build pipeline. Snapshot paths are populated so the row passes
+	// MarkSnapshotCorrupt's preconditions.
+	tpl := &models.Template{
+		ID:                 "tpl-rebuild",
+		Image:              "docker://alpine:3.19",
+		Status:             models.TemplateStatusReady,
+		RootfsPath:         filepath.Join(t.TempDir(), "rootfs.ext4"),
+		RootfsSizeBytes:    6,
+		SnapshotMemoryPath: filepath.Join(t.TempDir(), "snapshot.memory"),
+		SnapshotStatePath:  filepath.Join(t.TempDir(), "snapshot.state"),
+		SnapshotSizeBytes:  8,
+		SnapshotChecksum:   "sha256:dead|sha256:beef",
+		SnapshotVsockCID:   42,
+		HasSnapshot:        true,
+		CreatedAt:          time.Now().UTC(),
+		UpdatedAt:          time.Now().UTC(),
+	}
+	if err := env.store.CreateTemplate(context.Background(), tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/templates/"+tpl.ID+"/rebuild", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp models.Template
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// We don't bind the response status here because the harness has no
+	// snapshotter wired — MarkSnapshotCorrupt flips the row to unhealthy
+	// but the kicked rebuild goroutine will fail without wiring. The
+	// HTTP-level invariant is "row no longer ready" + 202.
+	if resp.ID != tpl.ID {
+		t.Errorf("resp.ID = %q, want %q", resp.ID, tpl.ID)
+	}
+	if resp.Status == models.TemplateStatusReady {
+		t.Errorf("status = ready after rebuild; want unhealthy or downstream state")
+	}
+}
+
+// TestV1RebuildTemplate_MissingReturns404 pins the well-known 404
+// mapping. The handler routes through WriteStoreAwareError which maps
+// store.ErrNotFound to 404; a regression would silently turn this
+// into a 400.
+func TestV1RebuildTemplate_MissingReturns404(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/templates/tpl-nope/rebuild", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestV1RebuildTemplate_NotEligibleReturns412 pins the new sentinel
+// mapping. A pending template (or any non-{ready,unhealthy} state)
+// surfaces ErrTemplateNotRebuildable, which WriteStoreAwareError maps
+// to 412 Precondition Failed. Without this mapping an operator's
+// "rebuild that template" tooling would see 400 and not be able to
+// distinguish "row not eligible" from "malformed request".
+func TestV1RebuildTemplate_NotEligibleReturns412(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	tpl := &models.Template{
+		ID: "tpl-pending", Image: "docker://alpine:3.19",
+		Status:    models.TemplateStatusPending,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := env.store.CreateTemplate(context.Background(), tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/templates/"+tpl.ID+"/rebuild", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 // TestV1DeleteTemplate_InUseReturns409 pins the API contract for the
 // ErrTemplateInUse sentinel (added in apihttp.WriteStoreAwareError):
 // an active sandbox holding template_id forces the operator to

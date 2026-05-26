@@ -71,6 +71,15 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
+	// Phase 6 operator-triggered rebuild (POST /v1/templates/{id}/rebuild).
+	// 412 distinguishes "row is in a state where rebuild can't be honoured"
+	// (busy / no snapshot to re-derive / terminal failed) from "row
+	// missing" (404). The wrapped error string carries the offending
+	// status so operators don't have to do a second GET.
+	if errors.Is(err, models.ErrTemplateNotRebuildable) {
+		WriteError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
 	// Custom-domain sentinels (plans/custom-domains.md). 412 distinguishes
 	// "this deployment can't do custom domains at all" (feature flag off /
 	// IP mode) from "your input is malformed" (400). 409 covers both the

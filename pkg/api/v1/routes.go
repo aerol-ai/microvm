@@ -115,6 +115,11 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.listTemplates)))
 	mux.Handle("GET "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.getTemplate)))
 	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.deleteTemplate)))
+	// Operator-triggered snapshot rebuild (Phase 6 follow-up). Idempotent
+	// under concurrent retry — see RequestTemplateRebuild for the CAS
+	// gate. No clusterForwardWrap: templates are per-host artifacts and
+	// a rebuild only makes sense on the node that owns the rootfs.
+	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", d.Auth(http.HandlerFunc(h.rebuildTemplate)))
 
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
