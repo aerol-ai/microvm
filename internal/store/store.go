@@ -486,6 +486,18 @@ func Open(path string) (*Store, error) {
 		// overlay.ext4 was allocated in the per-sandbox runDir.
 		`ALTER TABLE firecracker_templates ADD COLUMN has_overlay INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN overlay_size_gb INTEGER NOT NULL DEFAULT 0;`,
+		// Phase 6 PR 6-B.1 — background push of Firecracker template
+		// artifacts to AOCR. Mirrors the sandbox_snapshots push_state
+		// migration above (ALTER ... ADD push_state at line ~444). Default
+		// 'active' so warm-upgrade rows (built before this feature existed)
+		// are treated as terminal — the reconciler ignores them. New rows
+		// that need push start at 'pending' and transition through
+		// 'pushing' to 'active' or 'error'. registry_ref + push_digest are
+		// populated on success and read by PR 6-B.2's consumer-side pull.
+		`ALTER TABLE firecracker_templates ADD COLUMN push_state TEXT NOT NULL DEFAULT 'active';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN registry_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN push_digest TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -1866,14 +1878,23 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 	if template.ReadyAt != nil {
 		readyAt = template.ReadyAt.UTC()
 	}
+	// push_state defaults to "active" when the caller leaves it blank so
+	// CreateTemplate stays backward-compatible with code paths that don't
+	// know about the Phase 6 PR 6-B.1 push pipeline. The build success
+	// hook in template.go flips it to "pending" after the row is in
+	// status=ready, so the reconciler never sees a half-built row.
+	pushState := strings.TrimSpace(template.PushState)
+	if pushState == "" {
+		pushState = models.TemplatePushStateActive
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO firecracker_templates (
 			id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		id,
 		image,
@@ -1893,6 +1914,10 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 		template.SnapshotError,
 		boolToInt(template.HasSnapshot),
 		boolToInt(template.HasOverlay),
+		pushState,
+		template.PushError,
+		strings.TrimSpace(template.RegistryRef),
+		strings.TrimSpace(template.PushDigest),
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -1909,7 +1934,7 @@ func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, e
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay
+			has_overlay, push_state, push_error, registry_ref, push_digest
 		FROM firecracker_templates
 		WHERE id = ?
 	`, strings.TrimSpace(id))
@@ -1929,7 +1954,7 @@ func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay
+			has_overlay, push_state, push_error, registry_ref, push_digest
 		FROM firecracker_templates
 		ORDER BY created_at DESC, id ASC
 	`)
@@ -2108,6 +2133,131 @@ func (s *Store) MarkTemplateUnhealthy(ctx context.Context, id, reason string) (b
 	return affected == 1, nil
 }
 
+// MarkTemplatePushPending is the kickTemplateBuild success-path seam
+// for Phase 6 PR 6-B.1. Idempotent and state-guarded: the WHERE clause
+// only flips rows whose push_state is currently "active", so a row
+// that the reconciler is already working on (pending|pushing) is left
+// alone. push_error is cleared because a freshly-built artifact is a
+// fresh attempt — any prior failure no longer applies.
+//
+// Returns (true, nil) when the row moved, (false, nil) when the row
+// did not exist OR was already pending/pushing/error. Callers can
+// gate their reconciler-kick on changed=true so a no-op transition
+// doesn't fire an extra reconciler tick.
+func (s *Store) MarkTemplatePushPending(ctx context.Context, id string) (bool, error) {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET push_state = ?, push_error = '', updated_at = ?
+		WHERE id = ? AND push_state = ?
+	`,
+		models.TemplatePushStatePending,
+		now,
+		strings.TrimSpace(id),
+		models.TemplatePushStateActive,
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark template push pending: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark template push pending rows affected: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// ListTemplatesPendingPush returns the templates the reconciler should
+// retry: push_state IN ('pending', 'error'). 'pushing' is intentionally
+// excluded so a row currently being processed by another reconciler
+// tick is not re-claimed before its terminal state lands. Mirrors
+// ListSnapshotsPendingPush exactly.
+//
+// The status precondition (must be ready) keeps half-built templates
+// from sneaking into the push queue if someone manually flipped
+// push_state. The reconciler enforces the same guard defensively, but
+// filtering at the source means we never even materialize the row.
+func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE push_state IN ('pending', 'error') AND status = ?
+		ORDER BY created_at ASC, id ASC
+	`, string(models.TemplateStatusReady))
+	if err != nil {
+		return nil, fmt.Errorf("list templates pending push: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// SetTemplatePushState is a narrow single-column update used by the
+// push reconciler. errMsg is overwritten unconditionally (including
+// to empty on success transitions) so callers don't have to remember
+// to clear it. Mirrors SetSnapshotPushState.
+func (s *Store) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET push_state = ?, push_error = ?, updated_at = ?
+		WHERE id = ?
+	`, strings.TrimSpace(state), errMsg, now, strings.TrimSpace(id))
+	if err != nil {
+		return fmt.Errorf("set template push state: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTemplatePushDistribution stamps the registry destination
+// metadata after a successful AOCR push. ref is the canonical repo:tag
+// the daemon pushed; digest is the manifest digest the registry
+// surfaced via the push stream's `aux` payload (may be empty). Called
+// from the reconciler success path together with SetTemplatePushState.
+//
+// Written in one statement so a crash between the two fields cannot
+// land a half-filled row — the consumer-side pull in PR 6-B.2 sees
+// either both fields populated or both empty.
+func (s *Store) UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET registry_ref = ?, push_digest = ?, updated_at = ?
+		WHERE id = ?
+	`,
+		strings.TrimSpace(ref),
+		strings.TrimSpace(digest),
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template push distribution: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_templates WHERE id = ?`, strings.TrimSpace(id))
 	if err != nil {
@@ -2162,7 +2312,7 @@ func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay
+			has_overlay, push_state, push_error, registry_ref, push_digest
 		FROM firecracker_templates
 		WHERE status NOT IN (?, ?, ?) AND updated_at < ? AND id NOT IN (
 			SELECT template_id FROM sandboxes WHERE template_id <> ''
@@ -2974,6 +3124,10 @@ func scanTemplate(scanner interface {
 		&template.SnapshotError,
 		&hasSnapshot,
 		&hasOverlay,
+		&template.PushState,
+		&template.PushError,
+		&template.RegistryRef,
+		&template.PushDigest,
 	)
 	if err != nil {
 		return nil, err

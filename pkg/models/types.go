@@ -909,6 +909,22 @@ const (
 	TemplateStatusUnhealthy       TemplateStatus = "unhealthy"
 )
 
+// TemplatePushState tracks the lifecycle of the optional background push of a
+// Firecracker template's artifacts (rootfs.ext4 + snapshot.memory + snapshot.state
+// + manifest.json) to the AOCR registry under `cluster/<id>/templates/<tid>:latest`.
+// Mirrors SnapshotPushState* — operators see one push-state vocabulary across
+// snapshots and templates.
+//
+// "active" is the terminal value (push succeeded OR push is disabled / not
+// applicable on this node). New rows on a daemon with push disabled stay
+// "active" forever; the reconciler only picks "pending" and "error".
+const (
+	TemplatePushStateActive  = "active"
+	TemplatePushStatePending = "pending"
+	TemplatePushStatePushing = "pushing"
+	TemplatePushStateError   = "error"
+)
+
 // Template is the persisted record for a Firecracker rootfs template.
 // See plans/snapshot-clone-fast-boot.md Phase 2: an image is converted
 // once into a rootfs.ext4 and many sandboxes can boot from it without
@@ -951,6 +967,27 @@ type Template struct {
 	// post-load — only PATCH an existing one's backing path. Operators
 	// rebuild the template via POST /v1/templates to upgrade.
 	HasOverlay bool `json:"has_overlay"`
+	// PushState reflects the AOCR-push lifecycle for this template's
+	// artifacts (Phase 6 PR 6-B.1). See the TemplatePushState* constants.
+	// When push is disabled (or this is a warm-upgrade row) the value is
+	// "active" from the moment the row is inserted, matching pre-feature
+	// behaviour. Otherwise it transitions pending → pushing → active|error
+	// driven by TemplateArtifactPushReconciler.
+	PushState string `json:"push_state,omitempty"`
+	// PushError is populated only when PushState is "error" — the last
+	// error the reconciler saw, surfaced to operator-facing API responses.
+	PushError string `json:"push_error,omitempty"`
+	// RegistryRef is the canonical destination ref the push pipeline
+	// wrote (`<host>/cluster/<id>/templates/<tid>:latest`). Populated
+	// after a successful push; empty until then. Read by consumer-side
+	// code in PR 6-B.2 to know where peers can pull the template from.
+	RegistryRef string `json:"registry_ref,omitempty"`
+	// PushDigest is the manifest digest (`sha256:...`) the registry
+	// assigned to the pushed tag, as reported by the Docker push stream's
+	// `aux` payload. Empty when the daemon did not surface one — older
+	// daemons or registries that don't return a manifest digest leave
+	// this blank.
+	PushDigest string `json:"push_digest,omitempty"`
 }
 
 // CreateTemplateRequest is the body for POST /v1/templates. ID is

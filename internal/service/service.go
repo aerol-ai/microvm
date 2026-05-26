@@ -110,6 +110,15 @@ type Service struct {
 	// next reconciler tick.
 	snapshotPusher         *SnapshotPusher
 	snapshotPushReconciler *SnapshotPushReconciler
+	// templateArtifactPusher + templateArtifactPushReconciler are non-nil
+	// only when cfg.SnapshotPushEnabled is true AND a templates dir is
+	// configured. Mirror the snapshot push wiring: the build success path
+	// checks templateArtifactPusher for nil to decide whether to mark a
+	// new row as "pending" vs straight-to-"active", and kicks the
+	// reconciler once (best-effort, in a goroutine) so callers don't
+	// always wait for the next reconciler tick.
+	templateArtifactPusher         *TemplateArtifactPusher
+	templateArtifactPushReconciler *TemplateArtifactPushReconciler
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -388,6 +397,27 @@ func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *Snaps
 // wrapper should no-op cleanly in that case.
 func (s *Service) SnapshotPushReconciler() *SnapshotPushReconciler {
 	return s.snapshotPushReconciler
+}
+
+// AttachTemplateArtifactPusher wires in the optional AOCR template push
+// pipeline (Phase 6 PR 6-B.1). pusher must be non-nil to activate the
+// feature; a nil pusher leaves new template rows in push_state='active'
+// forever (the reconciler only picks 'pending'/'error') — backward-
+// compatible with single-node deployments and with cfg.EnableCluster=false.
+// reconciler may be nil for tests that assert on initial persisted state.
+// Called once from main() after cfg.SnapshotPushEnabled validation.
+func (s *Service) AttachTemplateArtifactPusher(pusher *TemplateArtifactPusher, reconciler *TemplateArtifactPushReconciler) {
+	if pusher == nil {
+		return
+	}
+	s.templateArtifactPusher = pusher
+	s.templateArtifactPushReconciler = reconciler
+}
+
+// TemplateArtifactPushReconciler exposes the reconciler so main.go can
+// drive it from a ticker. Returns nil when template push is disabled.
+func (s *Service) TemplateArtifactPushReconciler() *TemplateArtifactPushReconciler {
+	return s.templateArtifactPushReconciler
 }
 
 // Cluster returns the attached cluster.Client. Always non-nil.
@@ -1582,6 +1612,47 @@ func (s *Service) kickSnapshotPushReconciler(snapshot *models.SandboxSnapshot) {
 		if _, err := s.snapshotPushReconciler.RunOnce(ctx); err != nil && s.logger != nil {
 			s.logger.Warn("snapshot push: post-create reconciler tick failed",
 				"snapshot", snapshot.Name, "error", err)
+		}
+	}()
+}
+
+// markTemplateForPush is the kickTemplateBuild success-path seam for
+// Phase 6 PR 6-B.1. Best-effort: when the pusher isn't wired (cluster
+// off / push disabled) the call is a no-op so the build path stays
+// byte-identical to today. The store helper is state-guarded — a row
+// already in pending/pushing/error is left alone.
+func (s *Service) markTemplateForPush(ctx context.Context, templateID string) bool {
+	if s.templateArtifactPusher == nil {
+		return false
+	}
+	changed, err := s.store.MarkTemplatePushPending(ctx, templateID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("template push: mark pending failed",
+				"template", templateID, "error", err)
+		}
+		return false
+	}
+	return changed
+}
+
+// kickTemplateArtifactPushReconciler runs the reconciler once in a
+// background goroutine after the build path just flipped a template
+// row to push_state=pending. Pure latency optimization — without it,
+// the operator waits up to one reconciler tick before the AOCR push
+// starts. Detached context + 15-minute timeout mirror
+// kickSnapshotPushReconciler: a hung Docker import / push cannot pin
+// the goroutine forever.
+func (s *Service) kickTemplateArtifactPushReconciler(templateID string) {
+	if s.templateArtifactPushReconciler == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+		if _, err := s.templateArtifactPushReconciler.RunOnce(ctx); err != nil && s.logger != nil {
+			s.logger.Warn("template push: post-build reconciler tick failed",
+				"template", templateID, "error", err)
 		}
 	}()
 }

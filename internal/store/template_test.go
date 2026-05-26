@@ -466,3 +466,243 @@ func TestMarkTemplateUnhealthy_NoopOnNonReadyStates(t *testing.T) {
 		})
 	}
 }
+
+// TestMarkTemplatePushPending_OnlyFromActive pins the state-guarded
+// transition the kickTemplateBuild success path depends on. The push
+// kick is gated on (changed=true, err=nil): if a row is already
+// pending or pushing, MarkTemplatePushPending must not flip it again,
+// otherwise the reconciler would race itself or double-clear an
+// in-flight push_error message that the operator was inspecting.
+func TestMarkTemplatePushPending_OnlyFromActive(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	mk := func(id, pushState string) {
+		t.Helper()
+		tpl := &models.Template{
+			ID: id, Image: "docker://alpine:3.19",
+			Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now,
+			PushState: pushState,
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate %s: %v", id, err)
+		}
+	}
+
+	mk("tpl-active", models.TemplatePushStateActive)
+	mk("tpl-pending", models.TemplatePushStatePending)
+	mk("tpl-pushing", models.TemplatePushStatePushing)
+	mk("tpl-error", models.TemplatePushStateError)
+
+	// active → pending: the only allowed transition.
+	changed, err := st.MarkTemplatePushPending(ctx, "tpl-active")
+	if err != nil {
+		t.Fatalf("MarkTemplatePushPending(active): %v", err)
+	}
+	if !changed {
+		t.Fatal("changed=false on active→pending; reconciler kick would never fire")
+	}
+	got, err := st.GetTemplate(ctx, "tpl-active")
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.PushState != models.TemplatePushStatePending {
+		t.Errorf("PushState = %q, want pending", got.PushState)
+	}
+
+	// Calling it again on the now-pending row is a no-op.
+	changed, err = st.MarkTemplatePushPending(ctx, "tpl-active")
+	if err != nil {
+		t.Fatalf("MarkTemplatePushPending(pending): %v", err)
+	}
+	if changed {
+		t.Error("changed=true on pending→pending; would fire a duplicate reconciler kick")
+	}
+
+	// pushing/error rows must also be left alone — only active triggers.
+	for _, id := range []string{"tpl-pending", "tpl-pushing", "tpl-error"} {
+		changed, err := st.MarkTemplatePushPending(ctx, id)
+		if err != nil {
+			t.Fatalf("MarkTemplatePushPending(%s): %v", id, err)
+		}
+		if changed {
+			t.Errorf("changed=true on %s; only active should transition", id)
+		}
+	}
+
+	// Unknown id is a clean no-op, not an error — mirrors how
+	// MarkTemplateUnhealthy treats missing rows (the reconciler runs
+	// async and a row may have been GC'd between schedule and execute).
+	changed, err = st.MarkTemplatePushPending(ctx, "tpl-does-not-exist")
+	if err != nil {
+		t.Fatalf("MarkTemplatePushPending(missing): %v", err)
+	}
+	if changed {
+		t.Error("changed=true on missing row")
+	}
+}
+
+// TestListTemplatesPendingPush_FiltersStates pins the reconciler's
+// retry queue. Rows in push_state IN ('pending','error') AND
+// status='ready' must be returned; everything else must be filtered
+// out. Without the status='ready' guard, a half-built template
+// (push_state somehow muddled) could be picked up before its bytes
+// exist on disk — the pusher would then read partial files.
+func TestListTemplatesPendingPush_FiltersStates(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	mk := func(id string, status models.TemplateStatus, pushState string) {
+		t.Helper()
+		tpl := &models.Template{
+			ID: id, Image: "docker://alpine:3.19",
+			Status: status, CreatedAt: now, UpdatedAt: now,
+			PushState: pushState,
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate %s: %v", id, err)
+		}
+	}
+
+	mk("tpl-ready-pending", models.TemplateStatusReady, models.TemplatePushStatePending)
+	mk("tpl-ready-error", models.TemplateStatusReady, models.TemplatePushStateError)
+	mk("tpl-ready-active", models.TemplateStatusReady, models.TemplatePushStateActive)
+	mk("tpl-ready-pushing", models.TemplateStatusReady, models.TemplatePushStatePushing)
+	mk("tpl-building-pending", models.TemplateStatusBuildingRootfs, models.TemplatePushStatePending)
+	mk("tpl-failed-error", models.TemplateStatusFailed, models.TemplatePushStateError)
+	mk("tpl-unhealthy-pending", models.TemplateStatusUnhealthy, models.TemplatePushStatePending)
+
+	rows, err := st.ListTemplatesPendingPush(ctx)
+	if err != nil {
+		t.Fatalf("ListTemplatesPendingPush: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, r := range rows {
+		gotIDs[r.ID] = true
+	}
+	want := map[string]bool{
+		"tpl-ready-pending": true,
+		"tpl-ready-error":   true,
+	}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("ListTemplatesPendingPush returned %v, want exactly %v", gotIDs, want)
+	}
+	for id := range want {
+		if !gotIDs[id] {
+			t.Errorf("missing expected id %q from result", id)
+		}
+	}
+	for id := range gotIDs {
+		if !want[id] {
+			t.Errorf("unexpected id %q in result", id)
+		}
+	}
+}
+
+// TestSetTemplatePushState_PersistsError pins the reconciler's failure
+// arm. The push_error column has to survive a round-trip read so the
+// operator inspecting GET /v1/templates/{id} sees the real error
+// message — without that, debugging registry-side issues means scraping
+// the daemon log.
+func TestSetTemplatePushState_PersistsError(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	tpl := &models.Template{
+		ID: "tpl-set-state", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now,
+		PushState: models.TemplatePushStatePending,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	if err := st.SetTemplatePushState(ctx, tpl.ID, models.TemplatePushStateError, "registry 502 bad gateway"); err != nil {
+		t.Fatalf("SetTemplatePushState: %v", err)
+	}
+	got, err := st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.PushState != models.TemplatePushStateError {
+		t.Errorf("PushState = %q, want error", got.PushState)
+	}
+	if got.PushError != "registry 502 bad gateway" {
+		t.Errorf("PushError = %q, want %q", got.PushError, "registry 502 bad gateway")
+	}
+
+	// A subsequent transition back to active must clear the error
+	// message — otherwise a stale failure string lingers forever on a
+	// healthy row and confuses operators.
+	if err := st.SetTemplatePushState(ctx, tpl.ID, models.TemplatePushStateActive, ""); err != nil {
+		t.Fatalf("SetTemplatePushState(active): %v", err)
+	}
+	got, err = st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate after clear: %v", err)
+	}
+	if got.PushState != models.TemplatePushStateActive {
+		t.Errorf("PushState = %q, want active", got.PushState)
+	}
+	if got.PushError != "" {
+		t.Errorf("PushError = %q, want empty after success transition", got.PushError)
+	}
+
+	// Missing row surfaces ErrNotFound so the reconciler can log+skip
+	// instead of looping forever on a GC'd id.
+	if err := st.SetTemplatePushState(ctx, "tpl-missing", models.TemplatePushStateError, "x"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetTemplatePushState(missing) error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestUpdateTemplatePushDistribution_AtomicWithRefAndDigest pins the
+// "ref and digest land together" guarantee the PR 6-B.2 puller depends
+// on. If a crash between two UPDATE statements could leave one set and
+// the other empty, the consumer would see a tag it can't dereference
+// or a digest it can't fetch. One statement, one fsync window.
+func TestUpdateTemplatePushDistribution_AtomicWithRefAndDigest(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	tpl := &models.Template{
+		ID: "tpl-dist", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now,
+		PushState: models.TemplatePushStatePushing,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	const (
+		ref    = "registry.aerol.ai/cluster/c-42/templates/tpl-dist:latest"
+		digest = "sha256:abc123def456"
+	)
+	if err := st.UpdateTemplatePushDistribution(ctx, tpl.ID, ref, digest); err != nil {
+		t.Fatalf("UpdateTemplatePushDistribution: %v", err)
+	}
+	got, err := st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.RegistryRef != ref {
+		t.Errorf("RegistryRef = %q, want %q", got.RegistryRef, ref)
+	}
+	if got.PushDigest != digest {
+		t.Errorf("PushDigest = %q, want %q", got.PushDigest, digest)
+	}
+	// push_state must NOT be touched here — the reconciler calls
+	// SetTemplatePushState separately so an operator who watches the
+	// row in the brief window between writes still sees `pushing`,
+	// not a confused mid-state.
+	if got.PushState != models.TemplatePushStatePushing {
+		t.Errorf("PushState mutated by UpdateTemplatePushDistribution: got %q, want pushing", got.PushState)
+	}
+
+	if err := st.UpdateTemplatePushDistribution(ctx, "tpl-missing", ref, digest); !errors.Is(err, ErrNotFound) {
+		t.Errorf("UpdateTemplatePushDistribution(missing) error = %v, want ErrNotFound", err)
+	}
+}

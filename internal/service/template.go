@@ -359,6 +359,15 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		if uerr := s.store.UpdateTemplateStatus(ctx, id, models.TemplateStatusReady, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 			s.logger.Warn("template build: final status update failed", "template_id", id, "error", uerr)
 		}
+		// Phase 6 PR 6-B.1: flag the just-built template for AOCR push so
+		// peer nodes can pull it (consumer side lands in PR 6-B.2). When
+		// the pusher isn't wired (single-node / push disabled) both calls
+		// are cheap no-ops, keeping single-node behavior byte-identical.
+		// Order matters: mark-then-kick so the reconciler tick sees the
+		// row in push_state=pending instead of racing the UPDATE.
+		if s.markTemplateForPush(ctx, id) {
+			s.kickTemplateArtifactPushReconciler(id)
+		}
 		// manifest.json is operator-facing debug aid; truth of record
 		// lives in the SQLite row, so write failures are logged-and-go.
 		if mErr := writeTemplateManifest(filepath.Join(dir, templateManifestFilename), templateManifest{

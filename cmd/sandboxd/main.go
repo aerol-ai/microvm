@@ -495,6 +495,7 @@ func main() {
 		svc.StartPendingImageGC(ctx)
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
+		startTemplateArtifactPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
 		if cfg.AutoImportEnabled {
 			// Wire the post-pull trigger: when the docker client finishes a
 			// successful pull that BOTH used the mirror AND carried private
@@ -880,6 +881,76 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 					continue
 				}
 				logger.Info("snapshot push reconcile sweep",
+					"scanned", stats.Scanned,
+					"succeeded", stats.Succeeded,
+					"failed", stats.Failed,
+					"skipped", stats.Skipped,
+				)
+			}
+		}
+	}()
+}
+
+// startTemplateArtifactPushReconciler builds the optional AOCR template
+// artifact pusher + reconciler (Phase 6 PR 6-B.1) and starts a ticker
+// goroutine if the feature is enabled. Gated on EnableFirecracker AND
+// SnapshotPushEnabled — templates only exist on Firecracker nodes, and
+// the push pipeline reuses the snapshot-push auth/host/cluster config
+// (no new config surface). When either gate is off we log and return;
+// the template build path stays byte-identical to today.
+//
+// Reuses SnapshotPushReconcileInterval and SnapshotPushMaxInFlight as
+// the cadence and fanout knobs — operator-tunable template-specific
+// cadence is out of scope for this PR. A separate ticker keeps the
+// two reconcilers independent so a stuck template push can't starve
+// snapshot pushes.
+func startTemplateArtifactPushReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service, dockerClient *docker.Client) {
+	if !cfg.EnableFirecracker || !cfg.SnapshotPushEnabled {
+		return
+	}
+	host := strings.TrimSpace(cfg.MirrorPushHost)
+	if host == "" {
+		host = strings.TrimSpace(cfg.ImageDistributionAOCRHost)
+	}
+	pusher, err := service.NewTemplateArtifactPusher(service.SnapshotPushConfig{
+		Enabled:   true,
+		Host:      host,
+		ClusterID: cfg.AutoImportClusterID,
+		PATPath:   cfg.AutoImportClusterPATPath,
+	}, dockerClient, cfg.FirecrackerTemplatesDir, logger)
+	if err != nil {
+		logger.Warn("template push: pusher build failed; feature stays off",
+			"error", err)
+		return
+	}
+	r := service.NewTemplateArtifactPushReconciler(pusher, db, logger, cfg.SnapshotPushMaxInFlight)
+	if r == nil {
+		return
+	}
+	svc.AttachTemplateArtifactPusher(pusher, r)
+	logger.Info("template push reconciler started",
+		"host", host,
+		"cluster_id", cfg.AutoImportClusterID,
+		"interval", cfg.SnapshotPushReconcileInterval,
+		"max_in_flight", cfg.SnapshotPushMaxInFlight,
+	)
+	go func() {
+		t := time.NewTicker(cfg.SnapshotPushReconcileInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				stats, err := r.RunOnce(ctx)
+				if err != nil {
+					logger.Warn("template push reconcile sweep failed", "error", err)
+					continue
+				}
+				if stats.Scanned == 0 {
+					continue
+				}
+				logger.Info("template push reconcile sweep",
 					"scanned", stats.Scanned,
 					"succeeded", stats.Succeeded,
 					"failed", stats.Failed,
