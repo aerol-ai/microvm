@@ -85,6 +85,15 @@ type Driver struct {
 	// *internal/pool/vmm.Pool via SetWarmPool from main.go; tests
 	// inject a fake satisfying the WarmPool interface.
 	warmPool WarmPool
+	// sampler is the Phase 5 (PR 5-C) per-VMM RSS sampler. Optional:
+	// when nil, none of the lifecycle paths (Create / WarmSpawn /
+	// tryAcquireWarm / Destroy) touch the sampler — the field is a
+	// concrete pointer rather than an interface so a nil check is a
+	// real nil-pointer check, not the typed-nil pitfall capacity's
+	// RSSSource wiring already documented in main.go. Capacity sees
+	// the same sampler via the RSSSource interface; main.go is
+	// responsible for ensuring both halves point at the same instance.
+	sampler *RSSSampler
 
 	// spawn is the seam Create uses to construct a VMMHandle for a
 	// sandbox. Default impl wraps newVMM (which is the production
@@ -280,6 +289,37 @@ func (d *Driver) SetClientFactory(f vmmClientFactory) { d.newClient = f }
 // leaves the driver in Phase 1 mode (every Create runs skopeo+umoci+
 // mkfs).
 func (d *Driver) SetTemplateResolver(t TemplateResolver) { d.templates = t }
+
+// SetRSSSampler injects the Phase 5 per-VMM RSS sampler. When non-nil
+// the driver Registers each spawned VMM's PID (cold sandboxes by
+// sandbox ID, warm pool slots by slot ID, then re-keyed to sandbox ID
+// on warm acquire) and Unregisters on Destroy / warm Shutdown.
+// nil leaves admission on nominal accounting — same as a daemon built
+// without Phase 5. Tests that exercise lifecycle ordering can use this
+// to inspect Register/Unregister calls via the sampler's TotalRSSMB.
+func (d *Driver) SetRSSSampler(s *RSSSampler) { d.sampler = s }
+
+// rssRegister is the nil-safe Register helper. Centralised so the
+// Create / WarmSpawn / tryAcquireWarm sites can stay one-liners — the
+// alternative was repeating "if d.sampler != nil && pid > 0" at every
+// call site, which would invite someone to forget the pid > 0 check
+// (the sampler already rejects, but a misleading "register failed"
+// log line at the call site would still cost time).
+func (d *Driver) rssRegister(id string, pid int) {
+	if d.sampler == nil || pid <= 0 {
+		return
+	}
+	d.sampler.Register(id, pid)
+}
+
+// rssUnregister is the nil-safe Unregister helper. Same rationale as
+// rssRegister.
+func (d *Driver) rssUnregister(id string) {
+	if d.sampler == nil {
+		return
+	}
+	d.sampler.Unregister(id)
+}
 
 // TemplateResolver maps a template ID to a *TemplateResolution describing
 // where the prepared artifacts live on disk. Implementations are
@@ -702,6 +742,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.vmms[allocID] = handle
 	d.mu.Unlock()
 
+	// Phase 5: tell the RSS sampler about the new VMM so the next
+	// sampleOnce includes it in the host-pressure aggregate. Done
+	// AFTER the map writes so a sampler tick that races us doesn't
+	// see a registered pid the rest of the driver thinks doesn't
+	// exist yet. Nil-safe via rssRegister — daemons without Phase 5
+	// take no penalty.
+	d.rssRegister(allocID, handle.Pid())
+
 	return &models.SandboxRuntimeState{
 		SandboxID: allocID,
 		// ContainerID is reused as the human-readable identity of the
@@ -1062,6 +1110,12 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	delete(d.vmms, sandboxID)
 	delete(d.clients, sandboxID)
 	d.mu.Unlock()
+
+	// Phase 5: tell the RSS sampler the VMM is gone so the next
+	// sampleOnce drops its contribution to the host-pressure
+	// aggregate. Unregister before Shutdown so a slow Shutdown can't
+	// leave the sampler reading a dying pid for one extra tick.
+	d.rssUnregister(sandboxID)
 
 	var firstErr error
 	rememberErr := func(err error) {

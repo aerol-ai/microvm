@@ -238,6 +238,15 @@ func (d *Driver) tryAcquireWarm(
 	d.vmms[sandboxID] = wrapped
 	d.mu.Unlock()
 
+	// Phase 5: re-key the RSS sampler entry from the warm slot's id
+	// to the claiming sandbox's id. WarmSpawn registered the slot
+	// under slot.ID so its RSS counted toward host pressure while it
+	// sat in the pool; now that a sandbox owns it, sampler metrics
+	// (and Destroy's eventual Unregister(sandboxID)) need to follow
+	// the sandbox. The pid is unchanged — same firecracker process.
+	d.rssUnregister(slot.ID)
+	d.rssRegister(sandboxID, handle.Pid())
+
 	committed = true
 	return &models.SandboxRuntimeState{
 		SandboxID:   sandboxID,
@@ -263,6 +272,7 @@ type warmDestroyHandle struct {
 
 func (h *warmDestroyHandle) APISocket() string             { return h.apiSocket }
 func (h *warmDestroyHandle) RunDir() string                { return h.runDir }
+func (h *warmDestroyHandle) Pid() int                      { return h.spawned.Pid() }
 func (h *warmDestroyHandle) Start(_ context.Context) error { return nil }
 func (h *warmDestroyHandle) WaitSocket(_ context.Context, _ time.Duration) error {
 	return nil

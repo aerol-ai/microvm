@@ -64,6 +64,12 @@ type WarmHandle interface {
 	APISocket() string
 	RunDir() string
 	Shutdown(ctx context.Context, grace time.Duration) error
+	// Pid is the host PID of the paused firecracker process. PR 5-C
+	// needs this so PoolSpawner can hand it to the RSS sampler (warm
+	// slots count toward host memory pressure even before they're
+	// claimed by a sandbox). See VMMHandle.Pid for the 0-sentinel
+	// contract.
+	Pid() int
 }
 
 // WarmSpawn produces a paused, snapshot-loaded firecracker process
@@ -184,21 +190,43 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 		"slot_id", req.SlotID, "template_id", req.TemplateID,
 		"api_socket", handle.APISocket(), "vsock_cid", req.VsockCID)
 
+	// Phase 5: register the warm slot with the RSS sampler under its
+	// slot ID. The slot's firecracker process counts toward host memory
+	// pressure from this moment, even before any sandbox claims it.
+	// tryAcquireWarm re-keys (slotID → sandboxID) on hit; the GC-driven
+	// Shutdown path uses warmHandle.Shutdown to clean up the slotID
+	// entry. Nil-safe via rssRegister.
+	d.rssRegister(req.SlotID, handle.Pid())
+
 	cleanupNeeded = false
-	return &warmHandle{handle: handle}, nil
+	return &warmHandle{handle: handle, driver: d, slotID: req.SlotID}, nil
 }
 
 // warmHandle wraps a VMMHandle and exposes only the narrow surface
 // the pool consumes. Embedding rather than re-implementing keeps the
 // production handle as the single source of truth for Shutdown
 // semantics; the pool just sees APISocket / RunDir / Shutdown.
+//
+// driver + slotID are non-nil only on instances produced by WarmSpawn
+// — Shutdown uses them to drop the slot's RSS sampler entry. On the
+// GC-driven path the pool calls Shutdown directly without going
+// through Driver.Destroy, so the sampler bookkeeping has to live here.
+// After tryAcquireWarm re-keys the entry (slotID → sandboxID), an
+// eventual Shutdown's Unregister(slotID) is a no-op (the sampler
+// treats unknown ids as a no-op).
 type warmHandle struct {
 	handle VMMHandle
+	driver *Driver
+	slotID string
 }
 
 func (w *warmHandle) APISocket() string { return w.handle.APISocket() }
 func (w *warmHandle) RunDir() string    { return w.handle.RunDir() }
+func (w *warmHandle) Pid() int          { return w.handle.Pid() }
 func (w *warmHandle) Shutdown(ctx context.Context, grace time.Duration) error {
+	if w.driver != nil {
+		w.driver.rssUnregister(w.slotID)
+	}
 	if err := w.handle.Shutdown(ctx, grace); err != nil {
 		return err
 	}

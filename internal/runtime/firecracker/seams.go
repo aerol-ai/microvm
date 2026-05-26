@@ -121,6 +121,14 @@ type VMMHandle interface {
 	Kill() error
 	Cleanup() error
 	StderrTail() string
+	// Pid returns the firecracker process PID, or 0 if the process has
+	// not started or has already exited. Phase 5 (PR 5-C) needs this so
+	// Driver.Create can register the running VMM with the RSS sampler
+	// for the effective-memory admission axis. 0 is a safe sentinel:
+	// the sampler rejects non-positive PIDs in Register, so a
+	// not-yet-started handle (or a test fake that doesn't model
+	// processes) silently skips registration.
+	Pid() int
 }
 
 // vmmSpawner is the seam Driver.Create uses to construct a VMMHandle.

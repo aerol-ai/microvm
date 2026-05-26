@@ -255,6 +255,13 @@ func main() {
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
 		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
+		// Phase 5: hand the sampler to the driver so Create / WarmSpawn
+		// / tryAcquireWarm / Destroy can Register/Unregister per-VMM
+		// pids. Without this call the sampler stays empty and the
+		// effective-memory admission axis would always read 0 RSS —
+		// the same "no data, allow" cold-start behaviour the watermark
+		// check already protects against.
+		fcDriver.SetRSSSampler(rssSampler)
 		// Template pipeline (plans/snapshot-clone-fast-boot.md Phase 2):
 		// templateBuilderAdapter reuses the same *oci.Builder the per-
 		// create path uses, so a template build and a non-template

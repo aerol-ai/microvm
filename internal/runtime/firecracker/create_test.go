@@ -263,6 +263,7 @@ type fakeVMM struct {
 	id          string
 	runDir      string
 	apiSocket   string
+	pid         int
 	startErr    error
 	waitErr     error
 	shutdownErr error
@@ -276,6 +277,7 @@ type fakeVMM struct {
 
 func (v *fakeVMM) APISocket() string             { return v.apiSocket }
 func (v *fakeVMM) RunDir() string                { return v.runDir }
+func (v *fakeVMM) Pid() int                      { return v.pid }
 func (v *fakeVMM) StderrTail() string            { return v.stderrTl }
 func (v *fakeVMM) Start(_ context.Context) error { v.started = true; return v.startErr }
 func (v *fakeVMM) WaitSocket(_ context.Context, _ time.Duration) error {

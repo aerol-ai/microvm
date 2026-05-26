@@ -58,6 +58,13 @@ type SpawnedHandle interface {
 	APISocket() string
 	RunDir() string
 	Shutdown(ctx context.Context, grace time.Duration) error
+	// Pid returns the host PID of the spawned firecracker process, or
+	// 0 if the supervisor doesn't track one (test fakes, or a handle
+	// whose process has exited). Phase 5 (PR 5-C) consumes this on the
+	// Acquire side so the runtime can re-key the RSS sampler from
+	// slotID to sandboxID without crossing the import-cycle wall to
+	// inspect the underlying *firecracker.vmm directly.
+	Pid() int
 }
 
 // Spawner is the seam the pool depends on for producing

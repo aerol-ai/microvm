@@ -259,6 +259,7 @@ type stubHandle struct {
 
 func (h *stubHandle) APISocket() string                                 { return h.api }
 func (h *stubHandle) RunDir() string                                    { return h.run }
+func (h *stubHandle) Pid() int                                          { return 0 }
 func (h *stubHandle) Shutdown(_ context.Context, _ time.Duration) error { return nil }
 
 // errFakeSpawn is the sentinel test error for the spawn-failure case.

@@ -61,11 +61,13 @@ type fakeSpawnedHandle struct {
 	mu        sync.Mutex
 	apiSocket string
 	runDir    string
+	pid       int
 	shutdowns int
 }
 
 func (h *fakeSpawnedHandle) APISocket() string { return h.apiSocket }
 func (h *fakeSpawnedHandle) RunDir() string    { return h.runDir }
+func (h *fakeSpawnedHandle) Pid() int          { return h.pid }
 func (h *fakeSpawnedHandle) Shutdown(_ context.Context, _ time.Duration) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()

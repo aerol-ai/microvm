@@ -64,6 +64,7 @@ type fakeHandle struct {
 
 func (h *fakeHandle) APISocket() string { return h.apiSocket }
 func (h *fakeHandle) RunDir() string    { return h.runDir }
+func (h *fakeHandle) Pid() int          { return 0 }
 func (h *fakeHandle) Shutdown(_ context.Context, _ time.Duration) error {
 	h.parent.shutdownCnt.Add(1)
 	return nil
