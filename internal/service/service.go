@@ -398,6 +398,42 @@ func (s *Service) SetFirecrackerRuntime(r runtime.Runtime) {
 	s.firecracker = r
 }
 
+func (s *Service) isFirecrackerSandbox(sandbox *models.Sandbox) bool {
+	return sandbox != nil && sandbox.Runtime == models.RuntimeFirecracker
+}
+
+func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, error) {
+	if s.isFirecrackerSandbox(sandbox) {
+		if s.firecracker == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered: %w",
+				models.RuntimeFirecracker, models.ErrRuntimeNotImplemented)
+		}
+		return s.firecracker, nil
+	}
+	return s.docker, nil
+}
+
+func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
+	if s.isFirecrackerSandbox(sandbox) {
+		return sandbox.ID
+	}
+	return sandboxContainerRef(sandbox)
+}
+
+func mergeManagedRuntimes(maps ...map[string]*models.SandboxRuntimeState) map[string]*models.SandboxRuntimeState {
+	total := 0
+	for _, m := range maps {
+		total += len(m)
+	}
+	out := make(map[string]*models.SandboxRuntimeState, total)
+	for _, m := range maps {
+		for id, state := range m {
+			out[id] = state
+		}
+	}
+	return out
+}
+
 // AttachSnapshotPusher wires in the optional AOCR snapshot-push pipeline.
 // pusher must be non-nil to activate the feature; a nil pusher is a no-op
 // and leaves the service in legacy local-only snapshot mode. reconciler may
@@ -730,6 +766,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	chosenRuntime, err := models.ValidRuntime(req.Runtime)
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(req.TemplateID) != "" {
+		req.TemplateID = strings.TrimSpace(req.TemplateID)
+		if chosenRuntime != "" && chosenRuntime != models.RuntimeFirecracker {
+			return nil, fmt.Errorf("template_id requires runtime %q (got %q)",
+				models.RuntimeFirecracker, chosenRuntime)
+		}
+		chosenRuntime = models.RuntimeFirecracker
 	}
 	if chosenRuntime == "" {
 		chosenRuntime = s.cfg.Runtime
@@ -1126,7 +1170,8 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		// TemplateID is persisted so the GC's IsTemplateReferenced probe
 		// finds this row and so failover re-creates the sandbox from the
 		// same template rather than re-resolving from the request.
-		TemplateID: strings.TrimSpace(req.TemplateID),
+		TemplateID:    strings.TrimSpace(req.TemplateID),
+		OverlaySizeGB: req.OverlaySizeGB,
 	}
 	if len(req.CustomDomains) > 0 {
 		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))
@@ -1363,7 +1408,12 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 
-	state, err := s.docker.Start(ctx, sandboxContainerRef(sandbox))
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		releaseAdmission()
+		return nil, err
+	}
+	state, err := rt.Start(ctx, s.runtimeRef(sandbox))
 	if err != nil {
 		_ = s.mounts.UnmountAll(id)
 		releaseAdmission()
@@ -1384,8 +1434,8 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	// otherwise come back without network isolation. Fail closed: if we can't
 	// reinstall the rule, stop the container and surface the error.
 	if sandbox.NetworkBlockAll {
-		if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
-			_ = s.docker.Stop(ctx, sandboxContainerRef(sandbox))
+		if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
@@ -1438,7 +1488,11 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
 	_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-	if err := s.docker.Destroy(ctx, sandbox); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return err
+	}
+	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
 	if err := s.mounts.UnmountAll(id); err != nil {
@@ -1571,7 +1625,11 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 
-	imageID, err := s.docker.CreateSnapshot(ctx, sandboxContainerRef(sandbox), name)
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return nil, false, err
+	}
+	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), name)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1753,7 +1811,14 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 		}
 	}
 
-	if err := s.docker.Resize(ctx, sandboxContainerRef(sandbox), req); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		if s.admitter != nil {
+			s.admitter.Reserve(id, capacityRequestFromSandbox(sandbox))
+		}
+		return nil, err
+	}
+	if err := rt.Resize(ctx, s.runtimeRef(sandbox), req); err != nil {
 		// Restore the prior reservation; the resize did not actually take
 		// effect on the container, so accounting must reflect the unchanged
 		// footprint.
@@ -2815,10 +2880,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return err
 	}
 
-	managed, err := s.docker.ListManaged(ctx)
+	dockerManaged, err := s.docker.ListManaged(ctx)
 	if err != nil {
 		return err
 	}
+	firecrackerManaged := map[string]*models.SandboxRuntimeState{}
+	if s.firecracker != nil {
+		firecrackerManaged, err = s.firecracker.ListManaged(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	managed := mergeManagedRuntimes(dockerManaged, firecrackerManaged)
 
 	s.reconcileLocalClusterOwnership(ctx, known, managed)
 
@@ -2829,7 +2902,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
-		state, ok := managed[sandbox.ID]
+		runtimeManaged := dockerManaged
+		if s.isFirecrackerSandbox(sandbox) {
+			runtimeManaged = firecrackerManaged
+		}
+		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
 			// Container is gone (manual `docker rm`, OOM kill, host reboot,
 			// previous reconcile pass already destroyed it via events). Tear
@@ -2839,14 +2916,25 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// host_port doesn't filter by sandbox status, so a destroyed-but-
 			// retained row would otherwise hold its host_port slot forever.
 			//
-			// docker.Destroy is intentionally skipped: the container is the
-			// reason we're in this branch. Caddy / mounts / admitter / image
-			// cleanup is best-effort and mirrors DestroySandbox's order;
-			// failures here are picked up by gcZombieCaddyEntries on a later
-			// pass and by the mounts.Sweep at the end of Reconcile.
+			// Docker Destroy is intentionally skipped: the container is the
+			// reason we're in this branch. Firecracker still gets Destroy so
+			// driver-owned bookkeeping (TAP/VMM slot/run dir) is reconciled
+			// before the store row disappears. Caddy / mounts / admitter /
+			// image cleanup is best-effort and mirrors DestroySandbox's
+			// order; failures here are picked up by gcZombieCaddyEntries on
+			// a later pass and by the mounts.Sweep at the end of Reconcile.
 			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+			}
+			if s.isFirecrackerSandbox(sandbox) {
+				rt, err := s.runtimeForSandbox(sandbox)
+				if err != nil {
+					return err
+				}
+				if err := rt.Destroy(ctx, sandbox); err != nil {
+					return err
+				}
 			}
 			if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
 				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
@@ -2912,7 +3000,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// Catches host-side state loss: iptables flush, daemon restart
 			// rebuilding chains, or a missed Create/Start install.
 			if sandbox.NetworkBlockAll {
-				if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+				rt, err := s.runtimeForSandbox(sandbox)
+				if err != nil {
+					return err
+				}
+				if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
 					s.logger.Warn("reconcile reapply network block failed",
 						"sandbox_id", sandbox.ID,
 						"ip", sandbox.ContainerIP,
@@ -2956,25 +3048,38 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 	}
 
-	// Orphan containers: managed by us but no DB row. Remove them so leaked
-	// state from a crashed create or a wiped DB doesn't accumulate.
-	for sandboxID, state := range managed {
-		if _, ok := knownIDs[sandboxID]; ok {
-			continue
-		}
-		s.logger.Warn("removing orphan container",
-			"sandbox_id", sandboxID,
-			"container_id", state.ContainerID,
-		)
-		stub := &models.Sandbox{ContainerID: state.ContainerID, ContainerIP: state.ContainerIP}
-		if err := s.docker.Destroy(ctx, stub); err != nil {
-			s.logger.Warn("orphan container removal failed",
+	// Orphan runtime instances: managed by us but no DB row. Remove them so
+	// leaked state from a crashed create or a wiped DB doesn't accumulate.
+	removeOrphans := func(rt runtime.Runtime, runtimeName string, items map[string]*models.SandboxRuntimeState) {
+		for sandboxID, state := range items {
+			if _, ok := knownIDs[sandboxID]; ok {
+				continue
+			}
+			s.logger.Warn("removing orphan runtime instance",
 				"sandbox_id", sandboxID,
-				"error", err,
+				"runtime", runtimeName,
+				"container_id", state.ContainerID,
 			)
+			stub := &models.Sandbox{
+				ID:          sandboxID,
+				ContainerID: state.ContainerID,
+				ContainerIP: state.ContainerIP,
+				Runtime:     runtimeName,
+			}
+			if err := rt.Destroy(ctx, stub); err != nil {
+				s.logger.Warn("orphan runtime removal failed",
+					"sandbox_id", sandboxID,
+					"runtime", runtimeName,
+					"error", err,
+				)
+			}
+			_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
+			_ = s.mounts.UnmountAll(sandboxID)
 		}
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
-		_ = s.mounts.UnmountAll(sandboxID)
+	}
+	removeOrphans(s.docker, models.RuntimeDocker, dockerManaged)
+	if s.firecracker != nil {
+		removeOrphans(s.firecracker, models.RuntimeFirecracker, firecrackerManaged)
 	}
 
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already
@@ -4064,7 +4169,12 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	for _, p := range sandbox.ExposedPorts {
 		ports = append(ports, p.Port)
 	}
-	if err := s.docker.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		s.logger.Warn("failed to resolve runtime for allowed ports sync", "sandbox_id", sandbox.ID, "error", err)
+		return
+	}
+	if err := rt.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
 }

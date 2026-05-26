@@ -153,6 +153,50 @@ func TestTemplates_IsReferenced(t *testing.T) {
 	}
 }
 
+// TestTemplates_IsReferencedByVMM covers the second reference graph for
+// templates: warm Firecracker VMM slots. A slot row still names the
+// template even after the sandbox reference is gone, so template delete/GC
+// must wait for VMM-pool GC to remove that row first.
+func TestTemplates_IsReferencedByVMM(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+
+	tpl := &models.Template{
+		ID:        "tpl-vmm-ref",
+		Image:     "docker://alpine:3.19",
+		Status:    models.TemplateStatusReady,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	ref, err := st.IsTemplateReferencedByVMM(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("IsTemplateReferencedByVMM before slot: %v", err)
+	}
+	if ref {
+		t.Fatalf("IsTemplateReferencedByVMM before slot = true, want false")
+	}
+
+	if err := st.InsertFirecrackerVMMSlot(ctx, FirecrackerVMMSlot{
+		ID:         "vmms-ref",
+		TemplateID: tpl.ID,
+	}, now); err != nil {
+		t.Fatalf("InsertFirecrackerVMMSlot: %v", err)
+	}
+
+	ref, err = st.IsTemplateReferencedByVMM(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("IsTemplateReferencedByVMM after slot: %v", err)
+	}
+	if !ref {
+		t.Fatalf("IsTemplateReferencedByVMM after slot = false, want true")
+	}
+}
+
 // TestTemplates_GCQuery exercises the janitor's "what's eligible"
 // query. Pending rows never qualify (build is in flight), referenced
 // rows never qualify (live sandbox owns the file), and only rows older
@@ -192,6 +236,15 @@ func TestTemplates_GCQuery(t *testing.T) {
 	sb.TemplateID = "tpl-busy"
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("Create busy sandbox: %v", err)
+	}
+	// Stale ready row WITH a warm-VMM pool slot — should NOT qualify
+	// until VMM-pool GC has removed the slot row.
+	mustInsert("tpl-warm", models.TemplateStatusReady, now.Add(-48*time.Hour))
+	if err := st.InsertFirecrackerVMMSlot(ctx, FirecrackerVMMSlot{
+		ID:         "vmms-warm",
+		TemplateID: "tpl-warm",
+	}, now); err != nil {
+		t.Fatalf("InsertFirecrackerVMMSlot: %v", err)
 	}
 
 	cutoff := now.Add(-24 * time.Hour)

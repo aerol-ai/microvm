@@ -2420,6 +2420,31 @@ func (s *Store) IsTemplateReferenced(ctx context.Context, id string) (bool, erro
 	return true, nil
 }
 
+// IsTemplateReferencedByVMM reports whether any warm-VMM pool row still
+// names this template. This intentionally includes released rows: even a
+// released row is still persistent state that references the template, and
+// template GC should not leave dangling pool rows behind. Once the VMM-pool
+// GC deletes the row, template GC can remove the template on a later pass.
+func (s *Store) IsTemplateReferencedByVMM(ctx context.Context, id string) (bool, error) {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return false, nil
+	}
+	var present int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM firecracker_vmm_pool
+		WHERE template_id = ?
+		LIMIT 1
+	`, trimmed).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check template vmm references: %w", err)
+	}
+	return true, nil
+}
+
 // ListGCEligibleTemplates returns ready/failed templates not referenced by
 // any sandbox and last touched before olderThan. Pending rows are skipped
 // — they have an in-flight build goroutine that owns the row's terminal
@@ -2440,6 +2465,8 @@ func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time
 		FROM firecracker_templates
 		WHERE status NOT IN (?, ?, ?) AND updated_at < ? AND id NOT IN (
 			SELECT template_id FROM sandboxes WHERE template_id <> ''
+		) AND id NOT IN (
+			SELECT template_id FROM firecracker_vmm_pool WHERE template_id <> ''
 		)
 		ORDER BY updated_at ASC
 	`,

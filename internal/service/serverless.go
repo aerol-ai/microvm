@@ -154,7 +154,12 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	arm := s.shouldArmWake(sandbox, mode)
 	s.recordExpectedStop(id, mode)
 
-	if err := s.docker.Stop(ctx, sandboxContainerRef(sandbox)); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		s.consumeExpectedStop(id)
+		return nil, err
+	}
+	if err := rt.Stop(ctx, s.runtimeRef(sandbox)); err != nil {
 		// Stop failed → drop the expectation so a later involuntary
 		// exit is correctly classified rather than masked.
 		s.consumeExpectedStop(id)

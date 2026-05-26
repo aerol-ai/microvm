@@ -446,6 +446,13 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string) error {
 	if referenced {
 		return store.ErrTemplateInUse
 	}
+	vmmReferenced, err := s.store.IsTemplateReferencedByVMM(ctx, id)
+	if err != nil {
+		return err
+	}
+	if vmmReferenced {
+		return store.ErrTemplateInUse
+	}
 	// Release the per-template CID reservation before dropping the row.
 	// The allocator is keyed on the template id, so a delete-then-recreate
 	// cycle gets a fresh slot (idempotent re-reservation against a stale
@@ -522,6 +529,14 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 			continue
 		}
 		if referenced {
+			continue
+		}
+		vmmReferenced, err := s.store.IsTemplateReferencedByVMM(ctx, t.ID)
+		if err != nil {
+			s.logger.Warn("template gc vmm reference check failed", "template_id", t.ID, "error", err)
+			continue
+		}
+		if vmmReferenced {
 			continue
 		}
 		// Release the per-template CID before the row goes. Same shape as

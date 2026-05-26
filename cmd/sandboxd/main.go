@@ -149,6 +149,12 @@ func main() {
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = cfg.HostSupportedRuntimes
+	if len(host.SupportedRuntimes) == 0 {
+		host.SupportedRuntimes = []string{models.RuntimeDocker}
+	}
+	if cfg.EnableFirecracker {
+		host.SupportedRuntimes = appendRuntimeIfMissing(host.SupportedRuntimes, models.RuntimeFirecracker)
+	}
 	// Phase 5: the per-VMM RSS sampler is constructed up front when
 	// firecracker is enabled so admission can be wired against it from
 	// the start (capacity holds the RSSSource by reference, not value).
@@ -1171,6 +1177,19 @@ func readBypassMarker(path string) bool {
 		return false
 	}
 	return string(bytesTrimSpace(data)) == "true"
+}
+
+func appendRuntimeIfMissing(runtimes []string, runtimeName string) []string {
+	runtimeName = strings.TrimSpace(runtimeName)
+	if runtimeName == "" {
+		return runtimes
+	}
+	for _, existing := range runtimes {
+		if strings.TrimSpace(existing) == runtimeName {
+			return runtimes
+		}
+	}
+	return append(runtimes, runtimeName)
 }
 
 // writeBypassMarker persists the current bypass flag for the next boot's

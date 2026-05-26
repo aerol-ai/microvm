@@ -240,6 +240,37 @@ func TestDeleteTemplate_InUseRejected(t *testing.T) {
 	}
 }
 
+func TestDeleteTemplate_VMMReferenceRejected(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newTemplateHarness(t)
+	now := time.Now().UTC()
+
+	tpl := &models.Template{
+		ID:         "tpl-vmm-busy",
+		Image:      "docker://alpine:3.19",
+		Status:     models.TemplateStatusReady,
+		RootfsPath: filepath.Join(t.TempDir(), "rootfs.ext4"),
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	if err := st.InsertFirecrackerVMMSlot(ctx, store.FirecrackerVMMSlot{
+		ID:         "vmms-busy",
+		TemplateID: tpl.ID,
+	}, now); err != nil {
+		t.Fatalf("InsertFirecrackerVMMSlot: %v", err)
+	}
+
+	if err := svc.DeleteTemplate(ctx, tpl.ID); !errors.Is(err, store.ErrTemplateInUse) {
+		t.Fatalf("DeleteTemplate vmm-ref error = %v, want ErrTemplateInUse", err)
+	}
+	if _, err := st.GetTemplate(ctx, tpl.ID); err != nil {
+		t.Fatalf("template row should survive VMM reference: %v", err)
+	}
+}
+
 // TestDeleteTemplate_PendingRejected pins the goroutine-race guard:
 // deleting a row while the build goroutine is still writing to its dir
 // would leak a half-built rootfs the operator believes is gone.
@@ -288,6 +319,21 @@ func TestRunTemplateGC_RemovesEligible(t *testing.T) {
 	}
 	mustInsert("tpl-stale", stalePath, now.Add(-48*time.Hour))
 	mustInsert("tpl-fresh", "/var/lib/aerolvm/templates/tpl-fresh/rootfs.ext4", now.Add(-1*time.Hour))
+	warmDir := filepath.Join(templatesDir, "tpl-warm")
+	if err := os.MkdirAll(warmDir, 0o755); err != nil {
+		t.Fatalf("mkdir warmDir: %v", err)
+	}
+	warmPath := filepath.Join(warmDir, "rootfs.ext4")
+	if err := os.WriteFile(warmPath, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write warm rootfs: %v", err)
+	}
+	mustInsert("tpl-warm", warmPath, now.Add(-48*time.Hour))
+	if err := st.InsertFirecrackerVMMSlot(ctx, store.FirecrackerVMMSlot{
+		ID:         "vmms-warm",
+		TemplateID: "tpl-warm",
+	}, now); err != nil {
+		t.Fatalf("InsertFirecrackerVMMSlot: %v", err)
+	}
 
 	svc.cfg.FirecrackerTemplateGCTTL = 24 * time.Hour
 	svc.runTemplateGC(ctx, now)
@@ -303,6 +349,12 @@ func TestRunTemplateGC_RemovesEligible(t *testing.T) {
 	}
 	if _, err := st.GetTemplate(ctx, "tpl-fresh"); err != nil {
 		t.Fatalf("fresh row should survive: err=%v", err)
+	}
+	if _, err := os.Stat(warmPath); err != nil {
+		t.Fatalf("VMM-referenced rootfs should survive: %v", err)
+	}
+	if _, err := st.GetTemplate(ctx, "tpl-warm"); err != nil {
+		t.Fatalf("VMM-referenced row should survive: %v", err)
 	}
 }
 

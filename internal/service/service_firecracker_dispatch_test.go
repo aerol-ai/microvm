@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -20,8 +21,9 @@ import (
 // stubs) and (b) explicitly modeling the firecracker double's contract
 // keeps the test description honest about what's being asserted.
 type fireRecordingRuntime struct {
-	calls int
-	err   error
+	calls         int
+	err           error
+	lastCreateReq models.CreateSandboxRequest
 	// ok, when non-nil, is the SandboxRuntimeState the fake returns
 	// (with state.SandboxID overwritten by the per-call sandboxID so
 	// the service layer's row build sees the right id). Lets one fake
@@ -32,7 +34,7 @@ type fireRecordingRuntime struct {
 
 func (r *fireRecordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	r.calls++
-	_ = req
+	r.lastCreateReq = req
 	if r.ok != nil {
 		out := *r.ok
 		out.SandboxID = sandboxID
@@ -223,6 +225,92 @@ func TestFirecrackerDispatch_HappyPathBuildsResponse(t *testing.T) {
 	}
 }
 
+func TestFirecrackerDispatch_TemplateIDImpliesRuntimeAndPersistsOptions(t *testing.T) {
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fctpl/api.sock",
+			ContainerIP: "172.16.0.3",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(rt)
+
+	resp, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:         "alpine:3.20",
+		TemplateID:    " tpl-fast ",
+		OverlaySizeGB: 12,
+		CPU:           1,
+		MemoryMB:      256,
+		DiskGB:        1,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("driver.Create calls = %d, want 1", rt.calls)
+	}
+	if rt.lastCreateReq.Runtime != models.RuntimeFirecracker {
+		t.Fatalf("driver request runtime = %q, want firecracker", rt.lastCreateReq.Runtime)
+	}
+	if rt.lastCreateReq.TemplateID != "tpl-fast" {
+		t.Fatalf("driver request template_id = %q, want tpl-fast", rt.lastCreateReq.TemplateID)
+	}
+	if resp.Sandbox.Runtime != models.RuntimeFirecracker {
+		t.Fatalf("response runtime = %q, want firecracker", resp.Sandbox.Runtime)
+	}
+	if resp.Sandbox.TemplateID != "tpl-fast" {
+		t.Fatalf("response template_id = %q, want tpl-fast", resp.Sandbox.TemplateID)
+	}
+	if resp.Sandbox.OverlaySizeGB != 12 {
+		t.Fatalf("response overlay_size_gb = %d, want 12", resp.Sandbox.OverlaySizeGB)
+	}
+
+	stored, err := st.Get(context.Background(), resp.Sandbox.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if stored.Runtime != models.RuntimeFirecracker {
+		t.Fatalf("stored runtime = %q, want firecracker", stored.Runtime)
+	}
+	if stored.TemplateID != "tpl-fast" {
+		t.Fatalf("stored template_id = %q, want tpl-fast", stored.TemplateID)
+	}
+	if stored.OverlaySizeGB != 12 {
+		t.Fatalf("stored overlay_size_gb = %d, want 12", stored.OverlaySizeGB)
+	}
+}
+
+func TestFirecrackerDispatch_TemplateIDRejectsExplicitDockerRuntime(t *testing.T) {
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fctpl/api.sock",
+			ContainerIP: "172.16.0.3",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.SetFirecrackerRuntime(rt)
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:      "alpine:3.20",
+		Runtime:    models.RuntimeDocker,
+		TemplateID: "tpl-fast",
+	})
+	if err == nil {
+		t.Fatal("expected template_id + runtime=docker rejection")
+	}
+	if !strings.Contains(err.Error(), "template_id requires runtime") {
+		t.Fatalf("error = %v, want template_id runtime guidance", err)
+	}
+	if rt.calls != 0 {
+		t.Fatalf("driver.Create calls = %d, want 0", rt.calls)
+	}
+}
+
 // TestFirecrackerDispatch_RejectsMountsForNow confirms the explicit
 // Phase 1 rejection of mounts on the firecracker path. Once virtio-fs
 // support lands, this test becomes a positive coverage point.
@@ -245,5 +333,195 @@ func TestFirecrackerDispatch_RejectsMountsForNow(t *testing.T) {
 	}
 	if rt.calls != 0 {
 		t.Errorf("driver should not be called when mounts are rejected; calls=%d", rt.calls)
+	}
+}
+
+func TestFirecrackerLifecycle_RoutesStopAndDestroyToFirecrackerRuntime(t *testing.T) {
+	ctx := context.Background()
+	dockerRT := &recordingRuntime{}
+	fireRT := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, dockerRT)
+	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(fireRT)
+
+	starting := firecrackerSandboxForTest("sb-fc-start")
+	starting.Status = models.SandboxStatusStopped
+	if err := st.Create(ctx, starting); err != nil {
+		t.Fatalf("Create start sandbox: %v", err)
+	}
+	if _, err := svc.StartSandbox(ctx, starting.ID); err != nil {
+		t.Fatalf("StartSandbox: %v", err)
+	}
+	if len(fireRT.startRefs) != 1 || fireRT.startRefs[0] != starting.ID {
+		t.Fatalf("firecracker start refs = %v, want [%s]", fireRT.startRefs, starting.ID)
+	}
+	if len(dockerRT.startRefs) != 0 {
+		t.Fatalf("docker start refs = %v, want none", dockerRT.startRefs)
+	}
+
+	stopping := firecrackerSandboxForTest("sb-fc-stop")
+	if err := st.Create(ctx, stopping); err != nil {
+		t.Fatalf("Create stop sandbox: %v", err)
+	}
+	if _, err := svc.StopSandbox(ctx, stopping.ID); err != nil {
+		t.Fatalf("StopSandbox: %v", err)
+	}
+	if len(fireRT.stopRefs) != 1 || fireRT.stopRefs[0] != stopping.ID {
+		t.Fatalf("firecracker stop refs = %v, want [%s]", fireRT.stopRefs, stopping.ID)
+	}
+	if len(dockerRT.stopRefs) != 0 {
+		t.Fatalf("docker stop refs = %v, want none", dockerRT.stopRefs)
+	}
+
+	destroying := firecrackerSandboxForTest("sb-fc-destroy")
+	if err := st.Create(ctx, destroying); err != nil {
+		t.Fatalf("Create destroy sandbox: %v", err)
+	}
+	if err := svc.DestroySandbox(ctx, destroying.ID); err != nil {
+		t.Fatalf("DestroySandbox: %v", err)
+	}
+	if len(fireRT.destroyIDs) != 1 || fireRT.destroyIDs[0] != destroying.ID {
+		t.Fatalf("firecracker destroy IDs = %v, want [%s]", fireRT.destroyIDs, destroying.ID)
+	}
+	if len(dockerRT.destroyIDs) != 0 {
+		t.Fatalf("docker destroy IDs = %v, want none", dockerRT.destroyIDs)
+	}
+	if _, err := st.Get(ctx, destroying.ID); err == nil {
+		t.Fatalf("destroyed sandbox row still exists")
+	}
+}
+
+func TestFirecrackerReconcile_MissingRuntimeStateDestroysViaFirecracker(t *testing.T) {
+	ctx := context.Background()
+	dockerRT := &recordingRuntime{managed: map[string]*models.SandboxRuntimeState{}}
+	fireRT := &recordingRuntime{managed: map[string]*models.SandboxRuntimeState{}}
+	svc, st, _ := newServiceRuntimeHarness(t, dockerRT)
+	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(fireRT)
+
+	sb := firecrackerSandboxForTest("sb-fc-missing")
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(fireRT.destroyIDs) != 1 || fireRT.destroyIDs[0] != sb.ID {
+		t.Fatalf("firecracker destroy IDs = %v, want [%s]", fireRT.destroyIDs, sb.ID)
+	}
+	if len(dockerRT.destroyIDs) != 0 {
+		t.Fatalf("docker destroy IDs = %v, want none", dockerRT.destroyIDs)
+	}
+	if _, err := st.Get(ctx, sb.ID); err == nil {
+		t.Fatalf("reconciled missing sandbox row still exists")
+	}
+}
+
+type snapshotRecordingRuntime struct {
+	recordingRuntime
+	snapshotRefs  []string
+	snapshotNames []string
+}
+
+func (r *snapshotRecordingRuntime) CreateSnapshot(_ context.Context, ref, name string) (string, error) {
+	r.snapshotRefs = append(r.snapshotRefs, ref)
+	r.snapshotNames = append(r.snapshotNames, name)
+	return "image-" + name, nil
+}
+
+func TestFirecrackerSnapshot_RoutesCommitToFirecrackerRuntime(t *testing.T) {
+	ctx := context.Background()
+	dockerRT := &recordingRuntime{}
+	fireRT := &snapshotRecordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, dockerRT)
+	svc.cfg.EnableFirecracker = true
+	svc.SetFirecrackerRuntime(fireRT)
+
+	sb := firecrackerSandboxForTest("sb-fc-snapshot")
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+
+	snapshot, created, err := svc.CreateSnapshotWithOwnership(ctx, sb.ID, models.CreateSandboxSnapshotRequest{Name: "e2b/fc:default"})
+	if err != nil {
+		t.Fatalf("CreateSnapshotWithOwnership: %v", err)
+	}
+	if !created {
+		t.Fatal("snapshot should be newly created")
+	}
+	if snapshot.SourceSandboxID != sb.ID {
+		t.Fatalf("snapshot source = %q, want %q", snapshot.SourceSandboxID, sb.ID)
+	}
+	if len(fireRT.snapshotRefs) != 1 || fireRT.snapshotRefs[0] != sb.ID {
+		t.Fatalf("firecracker snapshot refs = %v, want [%s]", fireRT.snapshotRefs, sb.ID)
+	}
+	if len(fireRT.snapshotNames) != 1 || fireRT.snapshotNames[0] != "e2b/fc:default" {
+		t.Fatalf("firecracker snapshot names = %v, want [e2b/fc:default]", fireRT.snapshotNames)
+	}
+}
+
+type resizeRecordingRuntime struct {
+	recordingRuntime
+	resizeRefs []string
+	resizes    []models.ResizeSandboxRequest
+}
+
+func (r *resizeRecordingRuntime) Resize(_ context.Context, ref string, req models.ResizeSandboxRequest) error {
+	r.resizeRefs = append(r.resizeRefs, ref)
+	r.resizes = append(r.resizes, req)
+	return nil
+}
+
+func TestFirecrackerResize_RoutesToFirecrackerRuntime(t *testing.T) {
+	ctx := context.Background()
+	dockerRT := &recordingRuntime{}
+	fireRT := &resizeRecordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, dockerRT)
+	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(fireRT)
+
+	sb := firecrackerSandboxForTest("sb-fc-resize")
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+
+	got, err := svc.ResizeSandbox(ctx, sb.ID, models.ResizeSandboxRequest{CPU: 2, MemoryMB: 512, DiskGB: 2})
+	if err != nil {
+		t.Fatalf("ResizeSandbox: %v", err)
+	}
+	if len(fireRT.resizeRefs) != 1 || fireRT.resizeRefs[0] != sb.ID {
+		t.Fatalf("firecracker resize refs = %v, want [%s]", fireRT.resizeRefs, sb.ID)
+	}
+	if got.CPU != 2 || got.MemoryMB != 512 || got.DiskGB != 2 {
+		t.Fatalf("resized sandbox resources = cpu:%v mem:%d disk:%d, want 2/512/2", got.CPU, got.MemoryMB, got.DiskGB)
+	}
+}
+
+func firecrackerSandboxForTest(id string) *models.Sandbox {
+	now := time.Now().UTC()
+	return &models.Sandbox{
+		ID:              id,
+		Image:           "alpine:3.20",
+		Status:          models.SandboxStatusStarted,
+		ContainerID:     "/var/run/sb/" + id + "/api.sock",
+		ContainerIP:     "172.16.0.9",
+		CPU:             1,
+		MemoryMB:        256,
+		DiskGB:          1,
+		OSUser:          "root",
+		Env:             map[string]string{},
+		ToolboxEnabled:  true,
+		ToolboxToken:    "token",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		LastActiveAt:    now,
+		Runtime:         models.RuntimeFirecracker,
+		TemplateID:      "tpl-fast",
+		OverlaySizeGB:   4,
+		NetworkBlockAll: false,
 	}
 }
