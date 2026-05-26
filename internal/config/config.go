@@ -345,6 +345,46 @@ type Config struct {
 	// don't need new env to keep accepting placements.
 	HostSupportedRuntimes []string
 
+	// EnableFirecracker opts this host in to the native Firecracker runtime
+	// (see plans/snapshot-clone-fast-boot.md). False (the default) makes
+	// `sandboxd` behave exactly as it does today: the Docker driver is the
+	// only registered runtime and create requests with runtime="firecracker"
+	// are rejected at the service layer with ErrRuntimeNotImplemented.
+	//
+	// When true, the Firecracker driver is constructed alongside the Docker
+	// driver and dispatched per-sandbox by request.Runtime. Both gates
+	// (this flag AND request.Runtime=="firecracker") must be on for a
+	// sandbox to land on the new path. Existing Docker/gVisor sandboxes
+	// are untouched. SB_ENABLE_FIRECRACKER.
+	EnableFirecracker bool
+	// FirecrackerBinary is the absolute path to the `firecracker` VMM
+	// binary on this host. Required only when EnableFirecracker is true.
+	// Default /usr/local/bin/firecracker matches a typical install.
+	// SB_FIRECRACKER_BINARY.
+	FirecrackerBinary string
+	// JailerBinary is the absolute path to the `jailer` helper that
+	// chroots and cgroups the VMM process. Required only when
+	// EnableFirecracker is true. SB_JAILER_BINARY.
+	JailerBinary string
+	// FirecrackerKernelImage is the absolute path to the uncompressed
+	// guest kernel image (`vmlinux`) the Firecracker driver boots template
+	// VMs with. One kernel per host is sufficient for Phase 1; future
+	// phases may add per-template kernel selection. Required only when
+	// EnableFirecracker is true. SB_FIRECRACKER_KERNEL.
+	FirecrackerKernelImage string
+	// FirecrackerRunDir is the parent directory that holds per-sandbox
+	// runtime state (API sockets, jailer chroots, vsock UDS). Each
+	// sandbox lives under <FirecrackerRunDir>/<sandbox-id>/. tmpfs is
+	// recommended. Default /run/sandboxd/firecracker.
+	// SB_FIRECRACKER_RUN_DIR.
+	FirecrackerRunDir string
+	// FirecrackerTemplatesDir is the parent directory where template
+	// artifacts (kernel symlinks, rootfs.ext4, snapshot.memory,
+	// snapshot.state, manifest.json) are persisted. Survives daemon
+	// restarts. Default /var/lib/sandboxd/firecracker/templates.
+	// SB_FIRECRACKER_TEMPLATES_DIR.
+	FirecrackerTemplatesDir string
+
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
 	// picks a random candidate first; collisions fall back to a deterministic
@@ -823,6 +863,13 @@ func Load() (Config, error) {
 		SnapshotPushEnabled:              getEnvBool("SB_SNAPSHOT_PUSH_ENABLED", false),
 		SnapshotPushReconcileInterval:    getEnvDuration("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL", 5*time.Minute),
 		SnapshotPushMaxInFlight:          getEnvInt("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT", 2),
+
+		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
+		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
+		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
+		FirecrackerKernelImage:  strings.TrimSpace(os.Getenv("SB_FIRECRACKER_KERNEL")),
+		FirecrackerRunDir:       getEnv("SB_FIRECRACKER_RUN_DIR", "/run/sandboxd/firecracker"),
+		FirecrackerTemplatesDir: getEnv("SB_FIRECRACKER_TEMPLATES_DIR", "/var/lib/sandboxd/firecracker/templates"),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -900,11 +947,45 @@ func Load() (Config, error) {
 	// SB_CONTAINER_RUNTIME must be one of the runtimes we know how to drive.
 	// We reject "" here too: the caller substitutes the host default when a
 	// per-sandbox value is empty, but the host default itself must always be
-	// explicit. "kata" is a valid identifier but not implemented yet — we
-	// allow it as the host default so operators can pre-stage config, and
-	// reject individual create requests until the runtime is wired up.
+	// explicit. "kata" and "firecracker" are valid identifiers but the host
+	// default cannot resolve to a runtime the daemon won't actually drive:
+	// we reject those at the env layer so misconfiguration surfaces at boot
+	// rather than on every create call. Operators wanting Firecracker keep
+	// SB_CONTAINER_RUNTIME=docker as the host default and select Firecracker
+	// per-sandbox via the API (see plans/snapshot-clone-fast-boot.md).
 	if _, err := models.ValidRuntime(cfg.Runtime); err != nil || cfg.Runtime == "" {
-		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s)", cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata)
+		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s, %s)",
+			cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata, models.RuntimeFirecracker)
+	}
+	if cfg.Runtime == models.RuntimeFirecracker {
+		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select Firecracker per-sandbox via the API once SB_ENABLE_FIRECRACKER=true",
+			cfg.Runtime, models.RuntimeDocker)
+	}
+
+	// Firecracker host-side wiring is opt-in. The flag exists to gate the
+	// driver registration in cmd/sandboxd/main.go; when it's off the
+	// service rejects firecracker creates with ErrRuntimeNotImplemented.
+	// When it's on, the binaries and the kernel must actually exist so we
+	// fail at boot rather than on the first create — same model as
+	// EnableSSHGateway. The paths are not stat()-ed here on purpose: the
+	// runtime driver's Ping() does that and the daemon surfaces the result
+	// via /healthz, which is the right place for operators to look.
+	if cfg.EnableFirecracker {
+		if cfg.FirecrackerBinary == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_BINARY is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.JailerBinary == "" {
+			return Config{}, errors.New("SB_JAILER_BINARY is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerKernelImage == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_KERNEL is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerRunDir == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_RUN_DIR is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerTemplatesDir == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_TEMPLATES_DIR is required when SB_ENABLE_FIRECRACKER=true")
+		}
 	}
 
 	// L4 port pool sanity. Out-of-range or inverted bounds would silently

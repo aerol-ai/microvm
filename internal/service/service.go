@@ -644,6 +644,29 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	// "firecracker" is the second runtime being added alongside Docker per
+	// plans/snapshot-clone-fast-boot.md. ValidRuntime accepts the
+	// identifier so SDK callers and dashboards can ship support ahead of
+	// the host-side implementation; this branch is the dispatch point.
+	//
+	// Two operator-troubleshooting shapes:
+	//   - SB_ENABLE_FIRECRACKER=false: the host has not opted in. Tell
+	//     them which env var to flip and which plan describes the path.
+	//   - SB_ENABLE_FIRECRACKER=true: the driver is installed but the
+	//     Create lifecycle is still skeleton (Phase 1 in progress).
+	//
+	// Both return ErrRuntimeNotImplemented so apihttp.WriteStoreAwareError
+	// surfaces the right HTTP status; the message text differs to point
+	// at the actual blocker. When the real Create lands, this branch is
+	// replaced with a call into the Firecracker driver.
+	if chosenRuntime == models.RuntimeFirecracker {
+		if !s.cfg.EnableFirecracker {
+			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_FIRECRACKER=true on this host (see plans/snapshot-clone-fast-boot.md): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		return nil, fmt.Errorf("runtime %q: Phase 1 in progress (see plans/snapshot-clone-fast-boot.md): %w",
+			chosenRuntime, models.ErrRuntimeNotImplemented)
+	}
 	req.Runtime = chosenRuntime
 
 	if len(req.Mounts) > models.MaxMountsPerSandbox {

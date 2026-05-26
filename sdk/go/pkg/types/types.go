@@ -63,9 +63,10 @@ const (
 )
 
 const (
-	RuntimeDocker = models.RuntimeDocker
-	RuntimeGvisor = models.RuntimeGvisor
-	RuntimeKata   = models.RuntimeKata
+	RuntimeDocker      = models.RuntimeDocker
+	RuntimeGvisor      = models.RuntimeGvisor
+	RuntimeKata        = models.RuntimeKata
+	RuntimeFirecracker = models.RuntimeFirecracker
 )
 
 type NetworkUsage = models.NetworkUsage

@@ -57,6 +57,17 @@ const (
 	RuntimeDocker = "docker" // Docker's standard runc-backed runtime.
 	RuntimeGvisor = "gvisor" // gVisor (runsc). User-space kernel for untrusted workloads.
 	RuntimeKata   = "kata"   // Reserved: Kata Containers. Not yet implemented; rejected at create time.
+	// RuntimeFirecracker selects the native Firecracker microVM runtime
+	// (no Docker in the path). Plumbed through ValidRuntime so the API
+	// accepts the identifier ahead of the implementation; CreateSandbox
+	// rejects with ErrRuntimeNotImplemented until the per-host operator
+	// opts in via SB_ENABLE_FIRECRACKER=true AND the driver has actually
+	// landed. See plans/snapshot-clone-fast-boot.md.
+	//
+	// Distinct from RuntimeKata, which stays reserved for Kata Containers
+	// (a different shape — Kata-with-Firecracker abstracts the snapshot
+	// API away and is not what this constant refers to).
+	RuntimeFirecracker = "firecracker"
 )
 
 // ErrRuntimeNotImplemented is returned when a runtime is recognized as a valid
@@ -120,10 +131,11 @@ func (g *GPURequest) Validate() error {
 // the runtime layer, we should already know the value is one we can act on.
 func ValidRuntime(value string) (string, error) {
 	switch value {
-	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata:
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker:
 		return value, nil
 	default:
-		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s)", value, RuntimeDocker, RuntimeGvisor, RuntimeKata)
+		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s)",
+			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker)
 	}
 }
 
@@ -144,6 +156,13 @@ func ResolveOCIRuntime(value string) (string, error) {
 	case RuntimeGvisor:
 		return "runsc", nil
 	case RuntimeKata:
+		return "", ErrRuntimeNotImplemented
+	case RuntimeFirecracker:
+		// Firecracker is a hypervisor, not an OCI runtime that Docker can
+		// shell out to. Reaching this branch means the service layer failed
+		// to dispatch the request away from the Docker driver — return
+		// ErrRuntimeNotImplemented so the failure is observable rather than
+		// silently coerced to a Docker default.
 		return "", ErrRuntimeNotImplemented
 	default:
 		return "", fmt.Errorf("unsupported runtime %q", value)
