@@ -277,6 +277,30 @@ func Open(path string) (*Store, error) {
 		// starting at 3 (CIDs 0/1/2 are reserved by the virtio-vsock spec).
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_tap_pool_vsock_cid
 			ON firecracker_tap_pool(vsock_cid);`,
+		// firecracker_templates is the Phase 2 catalogue: one row per
+		// pre-built rootfs.ext4 the operator has registered via
+		// POST /v1/templates. The build is async — the row lands in
+		// status='pending' first and the background goroutine transitions
+		// it to 'ready' (with rootfs_size_bytes populated and ready_at
+		// stamped) or 'failed' (with last_error). The GC sweep drops rows
+		// that are no longer referenced by any sandbox and have been idle
+		// past FirecrackerTemplateGCTTL — see ListGCEligibleTemplates.
+		`CREATE TABLE IF NOT EXISTS firecracker_templates (
+			id TEXT PRIMARY KEY,
+			image TEXT NOT NULL,
+			status TEXT NOT NULL,
+			rootfs_path TEXT NOT NULL DEFAULT '',
+			rootfs_size_bytes INTEGER NOT NULL DEFAULT 0,
+			min_size_mib INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			ready_at DATETIME
+		);`,
+		// Drives the GC sweep's "find rows older than X" query without a
+		// full scan once the catalogue grows beyond a handful of entries.
+		`CREATE INDEX IF NOT EXISTS idx_firecracker_templates_updated_at
+			ON firecracker_templates(updated_at);`,
 	}
 
 	for _, stmt := range stmts {
@@ -366,6 +390,12 @@ func Open(path string) (*Store, error) {
 		// exactly as before.
 		`ALTER TABLE sandboxes ADD COLUMN serverless INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN wake_armed INTEGER NOT NULL DEFAULT 0;`,
+		// Phase 2 — Firecracker template lineage. Default '' so warm-upgrade
+		// rows (including every Docker sandbox) read as "no template
+		// reference" without further migration. The partial index below is
+		// what the template GC uses to answer "is anyone still using this
+		// template?" without scanning the whole sandboxes table.
+		`ALTER TABLE sandboxes ADD COLUMN template_id TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -389,6 +419,16 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_auto_import_pending ON sandboxes(id) WHERE auto_import_pending = 1;`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes auto_import_pending index: %w", err)
+	}
+
+	// Partial index on the new template_id column. The template GC and
+	// DELETE-template both call IsTemplateReferenced (a SELECT 1 ... WHERE
+	// template_id = ? LIMIT 1) which becomes an index probe instead of a
+	// table scan. Predicate keeps the index empty for Docker sandboxes and
+	// for Firecracker sandboxes built from ad-hoc images.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_template_id ON sandboxes(template_id) WHERE template_id <> '';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes template_id index: %w", err)
 	}
 
 	// SQLite materialized the DB file (and the WAL/SHM sidecars on the
@@ -460,8 +500,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			serverless, wake_armed,
+			template_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -502,6 +543,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.AutoImportPending),
 		boolToInt(sandbox.Lifecycle.Serverless),
 		boolToInt(sandbox.WakeArmed),
+		strings.TrimSpace(sandbox.TemplateID),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -565,8 +607,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			serverless, wake_armed,
+			template_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -600,7 +643,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			registry_auth_sealed = excluded.registry_auth_sealed,
 			auto_import_pending = excluded.auto_import_pending,
 			serverless = excluded.serverless,
-			wake_armed = excluded.wake_armed
+			wake_armed = excluded.wake_armed,
+			template_id = excluded.template_id
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -641,6 +685,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.AutoImportPending),
 		boolToInt(sandbox.Lifecycle.Serverless),
 		boolToInt(sandbox.WakeArmed),
+		strings.TrimSpace(sandbox.TemplateID),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -663,7 +708,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
+			serverless, wake_armed,
+			template_id
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -703,7 +749,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
+			serverless, wake_armed,
+			template_id
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -1697,6 +1744,210 @@ func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
 	return nil
 }
 
+// CreateTemplate inserts a freshly-allocated template row. Callers set
+// status=pending and an empty rootfs_path; the build goroutine flips both
+// via UpdateTemplateStatus once mkfs returns. A PK collision becomes
+// ErrTemplateIDConflict so an operator pipeline that retries POST with an
+// explicit ID gets a 409 instead of a 500.
+func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) error {
+	if template == nil {
+		return errors.New("create template: nil template")
+	}
+	id := strings.TrimSpace(template.ID)
+	if id == "" {
+		return errors.New("create template: id is required")
+	}
+	image := strings.TrimSpace(template.Image)
+	if image == "" {
+		return errors.New("create template: image is required")
+	}
+	status := string(template.Status)
+	if status == "" {
+		status = string(models.TemplateStatusPending)
+	}
+	var readyAt any
+	if template.ReadyAt != nil {
+		readyAt = template.ReadyAt.UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO firecracker_templates (
+			id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		id,
+		image,
+		status,
+		strings.TrimSpace(template.RootfsPath),
+		template.RootfsSizeBytes,
+		template.MinSizeMiB,
+		template.LastError,
+		template.CreatedAt.UTC(),
+		template.UpdatedAt.UTC(),
+		readyAt,
+	)
+	if err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			return ErrTemplateIDConflict
+		}
+		return fmt.Errorf("create template: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at
+		FROM firecracker_templates
+		WHERE id = ?
+	`, strings.TrimSpace(id))
+	template, err := scanTemplate(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get template: %w", err)
+	}
+	return template, nil
+}
+
+func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at
+		FROM firecracker_templates
+		ORDER BY created_at DESC, id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list templates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// UpdateTemplateStatus is the single seam the build goroutine uses to
+// transition pending → ready / failed. rootfsPath, sizeBytes, and
+// lastError are overwritten unconditionally (including to empty on the
+// success path) so a retried build that succeeds doesn't have to remember
+// to clear stale error text. ready_at is stamped only on the ready
+// transition — the GC sweep treats "no ready_at" as "never finished
+// building" and leaves the row alone for the build goroutine to finish
+// or fail.
+func (s *Store) UpdateTemplateStatus(ctx context.Context, id string, status models.TemplateStatus, rootfsPath, lastError string, sizeBytes int64) error {
+	now := time.Now().UTC()
+	var readyAt any
+	if status == models.TemplateStatusReady {
+		readyAt = now
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, rootfs_path = ?, rootfs_size_bytes = ?, last_error = ?,
+			updated_at = ?, ready_at = COALESCE(?, ready_at)
+		WHERE id = ?
+	`,
+		string(status),
+		strings.TrimSpace(rootfsPath),
+		sizeBytes,
+		lastError,
+		now,
+		readyAt,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_templates WHERE id = ?`, strings.TrimSpace(id))
+	if err != nil {
+		return fmt.Errorf("delete template: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// IsTemplateReferenced reports whether any sandbox row still names this
+// template_id. Used by DeleteTemplate (so an operator gets a 409 instead
+// of yanking the rootfs out from under a live sandbox) and by the GC
+// sweep (so it skips rows that are still in use). Backed by the partial
+// index idx_sandboxes_template_id — constant cost regardless of the
+// destroyed-row history.
+func (s *Store) IsTemplateReferenced(ctx context.Context, id string) (bool, error) {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return false, nil
+	}
+	var present int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM sandboxes
+		WHERE template_id = ?
+		LIMIT 1
+	`, trimmed).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check template references: %w", err)
+	}
+	return true, nil
+}
+
+// ListGCEligibleTemplates returns ready/failed templates not referenced by
+// any sandbox and last touched before olderThan. Pending rows are skipped
+// — they have an in-flight build goroutine that owns the row's terminal
+// transition. The anti-join against sandboxes uses the
+// idx_sandboxes_template_id partial index so the subquery is cheap.
+func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at
+		FROM firecracker_templates
+		WHERE status <> ? AND updated_at < ? AND id NOT IN (
+			SELECT template_id FROM sandboxes WHERE template_id <> ''
+		)
+		ORDER BY updated_at ASC
+	`, string(models.TemplateStatusPending), olderThan.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list gc-eligible templates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
 // ListSnapshotsPendingPush returns snapshots the reconciler should retry —
 // 'pending' is the brand-new state set by the snapshot-create path, 'error'
 // is what a failed previous attempt left behind. 'pushing' is intentionally
@@ -2283,6 +2534,7 @@ func scanSandbox(scanner interface {
 		&autoImportPending,
 		&serverless,
 		&wakeArmed,
+		&sandbox.TemplateID,
 	)
 	if err != nil {
 		return nil, err
@@ -2450,6 +2702,35 @@ func scanSnapshot(scanner interface {
 	return &snapshot, nil
 }
 
+func scanTemplate(scanner interface {
+	Scan(dest ...any) error
+}) (*models.Template, error) {
+	var template models.Template
+	var readyAt sql.NullTime
+	err := scanner.Scan(
+		&template.ID,
+		&template.Image,
+		&template.Status,
+		&template.RootfsPath,
+		&template.RootfsSizeBytes,
+		&template.MinSizeMiB,
+		&template.LastError,
+		&template.CreatedAt,
+		&template.UpdatedAt,
+		&readyAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	template.CreatedAt = template.CreatedAt.UTC()
+	template.UpdatedAt = template.UpdatedAt.UTC()
+	if readyAt.Valid {
+		t := readyAt.Time.UTC()
+		template.ReadyAt = &t
+	}
+	return &template, nil
+}
+
 func marshalJSON(value any, fallback string) (string, error) {
 	if value == nil {
 		return fallback, nil
@@ -2516,6 +2797,18 @@ var ErrNotFound = errors.New("sandbox not found")
 var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
+
+// ErrTemplateIDConflict is returned by CreateTemplate when a row with the
+// caller-supplied ID already exists. Operators that retry POST /v1/templates
+// with an explicit id get a 409 instead of a 500 — the standard idempotency
+// shape the v1 API uses everywhere else.
+var ErrTemplateIDConflict = errors.New("template id already in use")
+
+// ErrTemplateInUse is the service-layer sentinel for "cannot delete: an
+// active sandbox still names this template_id". DeleteTemplate returns it
+// after IsTemplateReferenced returns true; the API translates it to 409.
+// Held in the store package only because the SQL probe lives here.
+var ErrTemplateInUse = errors.New("template is referenced by an active sandbox")
 
 // ClusterSecretRecord is an opaque cluster-secret payload addressed by ref.
 // The store never decrypts SealedPayload; service owns the envelope format.

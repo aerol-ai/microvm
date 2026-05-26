@@ -60,6 +60,17 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, "snapshot name already in use")
 		return
 	}
+	// Firecracker template sentinels (plans/snapshot-clone-fast-boot.md
+	// Phase 2). 409 on both: ErrTemplateIDConflict surfaces a PK collision
+	// when an operator POSTs the same explicit id twice (idempotency
+	// signal — the row already exists), and ErrTemplateInUse blocks a
+	// DELETE while a sandbox still references the template (forces the
+	// operator to destroy the sandbox first rather than yank rootfs out
+	// from under a live Firecracker guest).
+	if errors.Is(err, store.ErrTemplateIDConflict) || errors.Is(err, store.ErrTemplateInUse) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	// Custom-domain sentinels (plans/custom-domains.md). 412 distinguishes
 	// "this deployment can't do custom domains at all" (feature flag off /
 	// IP mode) from "your input is malformed" (400). 409 covers both the

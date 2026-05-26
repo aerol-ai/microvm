@@ -108,6 +108,14 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
 
+	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
+	// Phase 2). No clusterForwardWrap — templates are per-host artifacts;
+	// cross-node placement awareness is Phase 6 territory.
+	mux.Handle("POST "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.createTemplate)))
+	mux.Handle("GET "+PathPrefix+"/templates", d.Auth(http.HandlerFunc(h.listTemplates)))
+	mux.Handle("GET "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.getTemplate)))
+	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.deleteTemplate)))
+
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
 	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.Auth(wrap(http.HandlerFunc(h.sessionsProxy))))

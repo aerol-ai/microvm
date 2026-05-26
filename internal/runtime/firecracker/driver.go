@@ -35,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -69,6 +70,12 @@ type Driver struct {
 	rootfs    RootfsBuilder
 	tapHost   TapHost
 	vsockDial VsockDialer
+	// templates resolves a CreateSandboxRequest.TemplateID to the
+	// host path of a pre-built rootfs.ext4. Optional: when nil, every
+	// Create runs the OCI build pipeline (Phase 1 behavior). Set by
+	// main.go via SetTemplateResolver once the template service is
+	// constructed. Tests stub it to return a fake rootfs path.
+	templates TemplateResolver
 
 	// spawn is the seam Create uses to construct a VMMHandle for a
 	// sandbox. Default impl wraps newVMM (which is the production
@@ -229,6 +236,23 @@ func (d *Driver) SetSpawner(s vmmSpawner) { d.spawn = s }
 // Tests use this to swap in a fake client recording every REST call.
 func (d *Driver) SetClientFactory(f vmmClientFactory) { d.newClient = f }
 
+// SetTemplateResolver injects the Phase 2 template→rootfs lookup. When
+// non-nil, Create with req.TemplateID != "" hard-links the resolved
+// rootfs into the per-sandbox runDir and skips the OCI pipeline. Nil
+// leaves the driver in Phase 1 mode (every Create runs skopeo+umoci+
+// mkfs).
+func (d *Driver) SetTemplateResolver(t TemplateResolver) { d.templates = t }
+
+// TemplateResolver maps a template ID to the absolute host path of the
+// prepared rootfs.ext4. Implementations are responsible for asserting
+// that the template is in a usable state (status=ready) — a non-nil
+// path returned with status=pending/failed would crash the VMM at
+// boot. The interface lives in this package (rather than re-exporting
+// the service-layer one) so the runtime package has no service import.
+type TemplateResolver interface {
+	Resolve(ctx context.Context, templateID string) (rootfsPath string, err error)
+}
+
 // methodNotImplemented produces the canonical "not yet implemented" error
 // for a Runtime method, wrapping models.ErrRuntimeNotImplemented so
 // pkg/api/apihttp.WriteStoreAwareError can keep mapping it to the right
@@ -346,33 +370,60 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}()
 
-	// Step 3: build the rootfs.ext4 inside the runDir. Placing it
-	// inside the runDir means the jailer chroot already covers it
-	// (the jailer copies/hardlinks files under root/), so production
-	// paths don't need a second copy step.
+	// Step 3: provision the rootfs.ext4 inside the runDir.
+	//
+	// Two paths:
+	//
+	//   - Template hit (Phase 2): req.TemplateID is set and the resolver
+	//     returns the host path of a pre-built rootfs. We hard-link
+	//     (cheap, same filesystem in the canonical layout) so the
+	//     jailer chroot covers it. EXDEV → copy fallback so a
+	//     differently-mounted TemplatesDir still works. No OCI pipeline
+	//     runs on this Create. This is the boot-path-latency win the
+	//     plan calls for.
+	//
+	//   - Ad-hoc (Phase 1): no TemplateID; run the OCI pipeline as
+	//     before. Builds rootfs straight into the runDir so the jailer
+	//     chroot already covers it.
 	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
-	rootfsResult, err := d.rootfs.Build(ctx, RootfsBuildRequest{
-		ImageRef: ociImageRefFor(req.Image),
-		OutPath:  rootfsPath,
-		// MinSizeMiB carries the user's disk request through to mkfs;
-		// the OCI builder rounds up to the larger of the image and
-		// this floor. Zero (the wire default) means "use whatever the
-		// unpacked rootfs needs".
-		MinSizeMiB: req.DiskGB * 1024,
-		Tag:        "latest",
-	})
-	if err != nil {
-		return nil, fmt.Errorf("firecracker runtime: rootfs build: %w", err)
-	}
-	defer func() {
-		// Clean up the OCI staging directory regardless of success: the
-		// rootfs.ext4 has been written into the runDir; we don't need
-		// the unpacked OCI bundle after that.
-		if cErr := rootfsResult.Cleanup(); cErr != nil {
-			d.logger.Warn("firecracker: rootfs staging cleanup failed",
-				"sandbox_id", allocID, "error", cErr)
+	if req.TemplateID != "" {
+		if d.templates == nil {
+			return nil, fmt.Errorf("firecracker runtime: template resolver not registered (main.go must call SetTemplateResolver): %w",
+				models.ErrRuntimeNotImplemented)
 		}
-	}()
+		src, err := d.templates.Resolve(ctx, req.TemplateID)
+		if err != nil {
+			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
+		}
+		if err := linkOrCopyRootfs(src, rootfsPath); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: template stage: %w", err)
+		}
+		d.logger.Info("firecracker create: staged template rootfs",
+			"sandbox_id", allocID, "template_id", req.TemplateID, "src", src)
+	} else {
+		rootfsResult, err := d.rootfs.Build(ctx, RootfsBuildRequest{
+			ImageRef: ociImageRefFor(req.Image),
+			OutPath:  rootfsPath,
+			// MinSizeMiB carries the user's disk request through to mkfs;
+			// the OCI builder rounds up to the larger of the image and
+			// this floor. Zero (the wire default) means "use whatever the
+			// unpacked rootfs needs".
+			MinSizeMiB: req.DiskGB * 1024,
+			Tag:        "latest",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("firecracker runtime: rootfs build: %w", err)
+		}
+		defer func() {
+			// Clean up the OCI staging directory regardless of success: the
+			// rootfs.ext4 has been written into the runDir; we don't need
+			// the unpacked OCI bundle after that.
+			if cErr := rootfsResult.Cleanup(); cErr != nil {
+				d.logger.Warn("firecracker: rootfs staging cleanup failed",
+					"sandbox_id", allocID, "error", cErr)
+			}
+		}()
+	}
 
 	// Step 4: bring the host-side TAP up. After this point, error
 	// returns must call tapHost.Remove. The flag-and-defer pattern
@@ -408,7 +459,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// docs: machine-config and boot-source before drives; drives and
 	// network-interfaces before InstanceStart.
 	client := d.newClient(handle.APISocket())
-	if err := d.configureVMM(ctx, client, req, rootfsResult.RootfsPath, slot); err != nil {
+	if err := d.configureVMM(ctx, client, req, rootfsPath, slot); err != nil {
 		return nil, err
 	}
 
@@ -940,4 +991,52 @@ func (d *Driver) ClearNetworkBlockIngress(_ string) error {
 
 func (d *Driver) ClearNetworkBlockEgress(_ string) error {
 	return methodNotImplemented("ClearNetworkBlockEgress")
+}
+
+// linkOrCopyRootfs makes dst point at the same bytes as src. Hard-link
+// first because it's O(1) and shares the underlying inode — the common
+// case where TemplatesDir and RunDir are on the same filesystem (the
+// installer's canonical layout). EXDEV (cross-device link) falls back
+// to a streamed copy so a TemplatesDir on a different mount still
+// works. The dst directory must already exist (the jailer/vmm setup
+// path creates the runDir before Create reaches this helper).
+//
+// Per-sandbox writes don't go through this file — Phase 2 has no
+// per-sandbox overlay yet, so the template rootfs is treated as the
+// canonical disk. Phase 3 adds the overlay drive and the template
+// rootfs becomes read-only in the guest. Until then, in-VM writes
+// modify the host-side inode the link points at; the Phase 2 service
+// rejects deletion-while-referenced so a guest can't pull the rootfs
+// out from under another guest.
+func linkOrCopyRootfs(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EXDEV) && !errors.Is(err, os.ErrPermission) {
+		// EXDEV → fall through to copy. ErrPermission also falls through
+		// because filesystems like overlayfs and some FUSE mounts reject
+		// link() with EPERM even within a single mount; copy is the
+		// only path that always works.
+		// Any other error (target exists, source missing, etc.) is a real
+		// failure the caller should surface.
+		return fmt.Errorf("link template rootfs: %w", err)
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open template rootfs: %w", err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create staged rootfs: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return fmt.Errorf("copy template rootfs: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close staged rootfs: %w", err)
+	}
+	return nil
 }

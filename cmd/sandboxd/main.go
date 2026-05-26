@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -216,6 +217,15 @@ func main() {
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
 		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
+		// Template pipeline (plans/snapshot-clone-fast-boot.md Phase 2):
+		// templateBuilderAdapter reuses the same *oci.Builder the per-
+		// create path uses, so a template build and a non-template
+		// CreateSandbox share OCI binaries, workdir, and validation
+		// constraints. templateResolverAdapter lets the driver look up
+		// the template's rootfs path through the service layer without
+		// the runtime package importing internal/service.
+		svc.SetTemplateBuilder(&templateBuilderAdapter{inner: ociBuilder})
+		fcDriver.SetTemplateResolver(&templateResolverAdapter{svc: svc})
 		svc.SetFirecrackerRuntime(fcDriver)
 		logger.Info("firecracker runtime enabled",
 			"tap_base_cidr", cfg.FirecrackerTapBaseCIDR,
@@ -361,6 +371,11 @@ func main() {
 		svc.StartLifecycleSweep(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
+		// Firecracker template janitor (plans/snapshot-clone-fast-boot.md
+		// Phase 2). No-op when SB_ENABLE_FIRECRACKER=false or the GC
+		// enable knob is off; per-tick cancellation is wired off ctx like
+		// the other long-running sweeps above.
+		svc.StartTemplateGC(ctx)
 		svc.StartPendingImageGC(ctx)
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
@@ -936,4 +951,55 @@ func adaptTapSlot(s *tap.Slot) *fcruntime.TapSlot {
 		GuestIP:  s.GuestIP,
 		VsockCID: s.VsockCID,
 	}
+}
+
+// templateBuilderAdapter wraps *pkg/oci.Builder so it satisfies
+// service.TemplateBuilder. Same import-cycle isolation reason as the
+// rootfs adapter above — internal/service does not import pkg/oci, so
+// the translation lives at the wiring layer where both packages are
+// already in scope.
+type templateBuilderAdapter struct {
+	inner *oci.Builder
+}
+
+func (a *templateBuilderAdapter) Build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
+	res, err := a.inner.Build(ctx, oci.BuildRequest{
+		ImageRef:   req.ImageRef,
+		OutPath:    req.OutPath,
+		MinSizeMiB: req.MinSizeMiB,
+		Tag:        req.Tag,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &service.TemplateBuildResult{
+		RootfsPath: res.RootfsPath,
+		StagingDir: res.StagingDir,
+		SizeBytes:  res.SizeBytes,
+	}, nil
+}
+
+// templateResolverAdapter satisfies fcruntime.TemplateResolver by
+// looking up the template row through the service layer. The runtime
+// driver can't import internal/service directly (cycle: service depends
+// on the runtime package), so the daemon-level wiring layer brokers the
+// call. A template that hasn't reached READY is rejected here rather
+// than at the driver so the driver returns a structured error to the
+// API caller instead of staging a half-built rootfs.
+type templateResolverAdapter struct {
+	svc *service.Service
+}
+
+func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (string, error) {
+	t, err := a.svc.GetTemplate(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if t.Status != models.TemplateStatusReady {
+		return "", fmt.Errorf("template %q is %s, not ready", id, t.Status)
+	}
+	if t.RootfsPath == "" {
+		return "", fmt.Errorf("template %q is ready but has no rootfs path", id)
+	}
+	return t.RootfsPath, nil
 }

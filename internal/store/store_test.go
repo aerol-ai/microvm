@@ -1888,6 +1888,7 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // auto_import_pending
 			0,              // serverless
 			0,              // wake_armed
+			"",             // template_id
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

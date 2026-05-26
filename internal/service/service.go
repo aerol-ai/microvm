@@ -74,6 +74,13 @@ type Service struct {
 	// type-system payoff, and (b) the docker field stays the unconditional
 	// Default-runtime fast path for the >>99% docker case.
 	firecracker runtime.Runtime
+	// templateBuilder is the Phase 2 OCI→ext4 builder used by the
+	// template lifecycle (internal/service/template.go). Nil unless main
+	// has called SetTemplateBuilder — which only happens when
+	// cfg.EnableFirecracker is true. CreateTemplate rejects with a
+	// not-configured error when this is nil so the handler can return
+	// 503 rather than panicking.
+	templateBuilder TemplateBuilder
 	// events is the concrete Docker client for the daemon /events stream and
 	// any other Docker-API-shaped surface that intentionally stays outside
 	// the runtime abstraction. Today both fields point at the same instance.
@@ -1042,6 +1049,10 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		RegistryAuthSealed:   sealedRegistry,
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
 		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
+		// TemplateID is persisted so the GC's IsTemplateReferenced probe
+		// finds this row and so failover re-creates the sandbox from the
+		// same template rather than re-resolving from the request.
+		TemplateID: strings.TrimSpace(req.TemplateID),
 	}
 	if len(req.CustomDomains) > 0 {
 		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))

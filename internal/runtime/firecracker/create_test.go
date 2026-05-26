@@ -658,6 +658,133 @@ func TestCreate_RegistersHandleAndClient(t *testing.T) {
 	}
 }
 
+// fakeTemplateResolver returns a pre-staged rootfs path. Tests inject
+// this via SetTemplateResolver to exercise the Phase 2 template-hit
+// path without standing up a real template service. resolveErr lets a
+// test simulate a missing or non-ready template.
+type fakeTemplateResolver struct {
+	mu         sync.Mutex
+	calls      int
+	lastID     string
+	rootfsPath string
+	resolveErr error
+}
+
+func (r *fakeTemplateResolver) Resolve(_ context.Context, id string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.lastID = id
+	if r.resolveErr != nil {
+		return "", r.resolveErr
+	}
+	return r.rootfsPath, nil
+}
+
+// TestCreate_TemplateHit is the Phase 2 fast-path: req.TemplateID set,
+// resolver returns a pre-built rootfs, the driver MUST NOT invoke the
+// OCI pipeline. The drive that lands on the firecracker REST surface
+// must point at the per-sandbox runDir copy (not the shared template
+// file), so a future overlay layer can mutate per-sandbox state without
+// corrupting the template.
+func TestCreate_TemplateHit(t *testing.T) {
+	f := newDriverFixture(t)
+
+	// Pre-stage a "template" rootfs on the host. Hard-link into the per-
+	// sandbox runDir is the production behavior; for the test we just
+	// need a real file the resolver can point at.
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := os.WriteFile(templateRootfs, []byte("TEMPLATE-ROOTFS"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+
+	resolver := &fakeTemplateResolver{rootfsPath: templateRootfs}
+	f.driver.SetTemplateResolver(resolver)
+
+	state, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image:      "alpine:3.20",
+		CPU:        1,
+		MemoryMB:   128,
+		DiskGB:     1,
+		TemplateID: "tpl-prebuilt",
+	}, "sb-tpl-hit", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create with template: %v", err)
+	}
+	if state.Status != models.SandboxStatusStarted {
+		t.Errorf("Status = %q, want started", state.Status)
+	}
+	// The OCI builder MUST NOT have run — that's the whole point of the
+	// template fast path.
+	if f.rootfs.builds != 0 {
+		t.Errorf("rootfs.Build called %d times, want 0 on template hit", f.rootfs.builds)
+	}
+	if resolver.calls != 1 || resolver.lastID != "tpl-prebuilt" {
+		t.Errorf("resolver calls=%d lastID=%q, want 1/tpl-prebuilt", resolver.calls, resolver.lastID)
+	}
+	// The drive the REST surface saw points at the per-sandbox runDir
+	// rootfs (linkOrCopyRootfs staged it there), not the shared template
+	// file. Guards against accidentally pointing Firecracker at the
+	// template — a regression there would have multiple sandboxes
+	// sharing writeable state.
+	rootDrive, ok := f.client.drives[rootDriveID]
+	if !ok {
+		t.Fatal("no root drive registered")
+	}
+	if rootDrive.PathOnHost == templateRootfs {
+		t.Errorf("drive pointed at template file %q; must point at per-sandbox copy", rootDrive.PathOnHost)
+	}
+	if filepath.Base(rootDrive.PathOnHost) != "rootfs.ext4" {
+		t.Errorf("drive path basename = %q, want rootfs.ext4", filepath.Base(rootDrive.PathOnHost))
+	}
+}
+
+// TestCreate_TemplateRequiresResolver confirms a TemplateID-bearing
+// request with no resolver wired is rejected with
+// ErrRuntimeNotImplemented — distinguishes "operator hasn't set this
+// node up for templates" from a generic 500.
+func TestCreate_TemplateRequiresResolver(t *testing.T) {
+	f := newDriverFixture(t)
+	// Intentionally NOT calling SetTemplateResolver.
+	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image: "alpine:3.20", CPU: 1, MemoryMB: 128, TemplateID: "tpl-no-resolver",
+	}, "sb-no-resolver", "tok", nil)
+	if err == nil {
+		t.Fatal("expected error without resolver")
+	}
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Errorf("err should wrap ErrRuntimeNotImplemented, got %v", err)
+	}
+	// Cleanup contract: no pool slot, no tap.
+	if f.pool.release != f.pool.alloc {
+		t.Errorf("pool alloc=%d release=%d; cleanup violated", f.pool.alloc, f.pool.release)
+	}
+}
+
+// TestCreate_TemplateResolveErrorReleasesSlot mirrors the rootfs-
+// build-failure cleanup contract for the template path: a resolver
+// error (template not ready, deleted, etc.) must release the pool slot
+// and clean up the VMM. Otherwise a flaky resolver drains the pool.
+func TestCreate_TemplateResolveErrorReleasesSlot(t *testing.T) {
+	f := newDriverFixture(t)
+	resolver := &fakeTemplateResolver{resolveErr: errors.New("template tpl-x is pending, not ready")}
+	f.driver.SetTemplateResolver(resolver)
+
+	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image: "alpine:3.20", CPU: 1, MemoryMB: 128, TemplateID: "tpl-x",
+	}, "sb-tpl-bad", "tok", nil)
+	if err == nil {
+		t.Fatal("expected resolver error")
+	}
+	if f.pool.alloc != 1 || f.pool.release != 1 {
+		t.Errorf("pool alloc=%d release=%d, want 1/1", f.pool.alloc, f.pool.release)
+	}
+	if f.rootfs.builds != 0 {
+		t.Errorf("rootfs.Build called %d times on template error; want 0", f.rootfs.builds)
+	}
+}
+
 // contains is a tiny strings.Contains shim — pulling strings.Contains
 // here would have to flow through the import block, and we already
 // use this same helper in the host_test for the same reason.

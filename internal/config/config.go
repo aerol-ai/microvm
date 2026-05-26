@@ -431,6 +431,25 @@ type Config struct {
 	// SB_FIRECRACKER_IP_BINARY.
 	FirecrackerIPBinary string
 
+	// FirecrackerTemplateGCEnabled gates the background sweep that drops
+	// templates with no referencing sandbox and updated_at older than
+	// FirecrackerTemplateGCTTL. Default true — disabling it means stale
+	// templates accumulate on disk indefinitely, which is fine for dev
+	// hosts but a footgun in production. SB_FIRECRACKER_TEMPLATE_GC_ENABLED.
+	FirecrackerTemplateGCEnabled bool
+	// FirecrackerTemplateGCInterval is the sweep cadence. Default 1h —
+	// matches the order-of-magnitude of the TTL so the sweep runs ~7 times
+	// per default TTL window. SB_FIRECRACKER_TEMPLATE_GC_INTERVAL.
+	FirecrackerTemplateGCInterval time.Duration
+	// FirecrackerTemplateGCTTL is the unreferenced-template grace window
+	// before the sweep reclaims a template's row and on-disk artifacts.
+	// Default 168h (7 days) per plans/snapshot-clone-fast-boot.md Phase 2.
+	// Updated_at is the clock — building a sandbox from a template touches
+	// nothing on the template row, so a template that is being used but
+	// has no sandbox right now still ages out. Operators that want
+	// long-lived templates should bump this. SB_FIRECRACKER_TEMPLATE_GC_TTL.
+	FirecrackerTemplateGCTTL time.Duration
+
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
 	// picks a random candidate first; collisions fall back to a deterministic
@@ -926,6 +945,10 @@ func Load() (Config, error) {
 		FirecrackerUmociBin:     getEnv("SB_FIRECRACKER_UMOCI_BIN", "/usr/bin/umoci"),
 		FirecrackerMkfs4Bin:     getEnv("SB_FIRECRACKER_MKFS_BIN", "/sbin/mkfs.ext4"),
 		FirecrackerIPBinary:     strings.TrimSpace(os.Getenv("SB_FIRECRACKER_IP_BINARY")),
+
+		FirecrackerTemplateGCEnabled:  getEnvBool("SB_FIRECRACKER_TEMPLATE_GC_ENABLED", true),
+		FirecrackerTemplateGCInterval: getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_INTERVAL", 1*time.Hour),
+		FirecrackerTemplateGCTTL:      getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_TTL", 168*time.Hour),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true

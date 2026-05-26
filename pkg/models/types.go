@@ -459,6 +459,15 @@ type CreateSandboxRequest struct {
 	// (Sandbox.CustomDomains) carries per-hostname status. Capped by
 	// MaxCustomDomainsPerCreateRequest.
 	CustomDomains []string `json:"custom_domains,omitempty"`
+	// TemplateID, when set alongside Runtime="firecracker", skips the
+	// per-create OCI→ext4 build and reuses a previously prepared
+	// rootfs.ext4 from a Firecracker template (POST /v1/templates). The
+	// template must be in status="ready" or Create rejects with a
+	// not-ready error. Ignored on the Docker path — templates are a
+	// Firecracker-only concept (see plans/snapshot-clone-fast-boot.md
+	// Phase 2). Pre-snapshot phase: the rootfs is the only artifact a
+	// template provides; Phase 3 layers snapshot.memory/state on top.
+	TemplateID string `json:"template_id,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -572,6 +581,13 @@ type Sandbox struct {
 	// public hostnames. Status is server-managed (pending_dns → issuing →
 	// ready / failed). Nil when the sandbox has no custom domains.
 	CustomDomains []CustomDomain `json:"custom_domains,omitempty"`
+	// TemplateID records the Firecracker template this sandbox was created
+	// from, when one was supplied. Empty for Docker sandboxes and for
+	// Firecracker sandboxes built from an ad-hoc Image. The Phase 2 template
+	// GC reads this column via IsTemplateReferenced to decide whether a
+	// template is still in use; the firecracker driver also reads it on
+	// recreate so failover stays on the same rootfs.
+	TemplateID string `json:"template_id,omitempty"`
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.
@@ -833,4 +849,57 @@ type IdempotentRequestRecord struct {
 	ReplayUntil time.Time
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+// TemplateStatus tracks a Firecracker template through its async build.
+// pending is the wire-visible state from POST /v1/templates until the
+// background goroutine finishes; ready means rootfs.ext4 is on disk and
+// the template is usable as the source of CreateSandboxRequest.TemplateID;
+// failed carries the build error in LastError for the operator to inspect
+// (the row is kept so the GC sweep — not the API — owns cleanup).
+type TemplateStatus string
+
+const (
+	TemplateStatusPending TemplateStatus = "pending"
+	TemplateStatusReady   TemplateStatus = "ready"
+	TemplateStatusFailed  TemplateStatus = "failed"
+)
+
+// Template is the persisted record for a Firecracker rootfs template.
+// See plans/snapshot-clone-fast-boot.md Phase 2: an image is converted
+// once into a rootfs.ext4 and many sandboxes can boot from it without
+// re-running the skopeo+umoci+mkfs pipeline.
+//
+// RootfsPath is the absolute on-disk location of the prepared
+// rootfs.ext4 (`<FirecrackerTemplatesDir>/<id>/rootfs.ext4`). It is
+// json:"-" — the path is a server-internal detail that should not leak
+// to API callers; clients reference templates by ID. Phase 3 will add
+// SnapshotMemoryPath / SnapshotStatePath fields alongside it as
+// snapshot/resume becomes the boot mechanism.
+type Template struct {
+	ID              string         `json:"id"`
+	Image           string         `json:"image"`
+	Status          TemplateStatus `json:"status"`
+	RootfsPath      string         `json:"-"`
+	RootfsSizeBytes int64          `json:"rootfs_size_bytes,omitempty"`
+	MinSizeMiB      int            `json:"min_size_mib,omitempty"`
+	LastError       string         `json:"last_error,omitempty"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	ReadyAt         *time.Time     `json:"ready_at,omitempty"`
+}
+
+// CreateTemplateRequest is the body for POST /v1/templates. ID is
+// optional — empty means "service generates one"; supplying an explicit
+// ID lets a deploy pipeline assert idempotency across retries (the
+// store rejects a duplicate ID with ErrTemplateIDConflict → API 409).
+// Image is the skopeo-style ref ("docker://python:3.11",
+// "oci-archive:/path.tar", etc.) passed through verbatim to
+// pkg/oci.Builder. MinSizeMiB is an optional floor for the ext4 image —
+// useful when the unpacked rootfs is small but the operator expects
+// guests to write substantially more.
+type CreateTemplateRequest struct {
+	ID         string `json:"id,omitempty"`
+	Image      string `json:"image"`
+	MinSizeMiB int    `json:"min_size_mib,omitempty"`
 }
