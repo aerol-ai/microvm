@@ -226,6 +226,18 @@ func (v *vmm) WaitSocket(ctx context.Context, timeout time.Duration) error {
 	}
 	deadline := time.Now().Add(timeout)
 	for {
+		// Check process exit BEFORE the Stat. Under heavy parallelism
+		// (lots of subprocess tests running concurrently) the goroutine
+		// that closes waitCh can race the deadline check below; without
+		// this non-blocking probe the select could fall through to the
+		// 20 ms timer, the deadline could trip on the next iteration,
+		// and we'd misreport a clean "process exited" as a timeout.
+		select {
+		case <-v.waitCh:
+			return fmt.Errorf("vmm: firecracker exited before API socket bound: %w (stderr tail: %s)",
+				v.waitErr, v.stderr.String())
+		default:
+		}
 		if _, err := os.Stat(v.apiSocket); err == nil {
 			return nil
 		}

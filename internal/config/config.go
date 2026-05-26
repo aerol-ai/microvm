@@ -407,6 +407,15 @@ type Config struct {
 	// SB_JAILER_UID / SB_JAILER_GID.
 	JailerUID int
 	JailerGID int
+	// FirecrackerTapBaseCIDR carves into /30 subnets, one per pool slot;
+	// FirecrackerTapPoolSize is the number of /30s to lay out. Together
+	// they cap concurrent Firecracker sandboxes on this host. Defaults
+	// (172.16.0.0/20, 256) accommodate a ~256-sandbox host with room to
+	// grow; production hosts override to match their networking plan.
+	// See internal/network/tap.SeedConfig for the layout math.
+	// SB_FIRECRACKER_TAP_BASE_CIDR / SB_FIRECRACKER_TAP_POOL_SIZE.
+	FirecrackerTapBaseCIDR string
+	FirecrackerTapPoolSize int
 
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
@@ -897,6 +906,8 @@ func Load() (Config, error) {
 		JailerChrootBase:        getEnv("SB_JAILER_CHROOT_BASE", "/srv/jailer"),
 		JailerUID:               getEnvInt("SB_JAILER_UID", 1000),
 		JailerGID:               getEnvInt("SB_JAILER_GID", 1000),
+		FirecrackerTapBaseCIDR:  getEnv("SB_FIRECRACKER_TAP_BASE_CIDR", "172.16.0.0/20"),
+		FirecrackerTapPoolSize:  getEnvInt("SB_FIRECRACKER_TAP_POOL_SIZE", 256),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -1020,6 +1031,12 @@ func Load() (Config, error) {
 			if cfg.JailerUID < 0 || cfg.JailerGID < 0 {
 				return Config{}, fmt.Errorf("SB_JAILER_UID/SB_JAILER_GID must be >= 0 (got %d/%d)", cfg.JailerUID, cfg.JailerGID)
 			}
+		}
+		if cfg.FirecrackerTapBaseCIDR == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_TAP_BASE_CIDR is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerTapPoolSize <= 0 {
+			return Config{}, fmt.Errorf("SB_FIRECRACKER_TAP_POOL_SIZE must be > 0 (got %d)", cfg.FirecrackerTapPoolSize)
 		}
 	}
 

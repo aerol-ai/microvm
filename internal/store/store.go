@@ -240,6 +240,43 @@ func Open(path string) (*Store, error) {
 			scheduled_at DATETIME NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
+		// firecracker_tap_pool is the pre-populated network-slot pool for
+		// the native Firecracker runtime. Each row is one "slot" — a
+		// (TAP-device, host-IP, guest-IP, /30 CIDR, vsock-CID) tuple. The
+		// daemon seeds the table at boot from SB_FIRECRACKER_TAP_BASE_CIDR
+		// / SB_FIRECRACKER_TAP_POOL_SIZE; sandbox creates claim one slot,
+		// destroys release it. The seed is idempotent (INSERT OR IGNORE
+		// on tap_name PK) so warm restarts do not re-shuffle assignments.
+		//
+		// sandbox_id is NULL when the slot is free, set to the owning
+		// sandbox when claimed. The partial unique index below enforces
+		// exactly one allocated slot per sandbox — the load-bearing
+		// idempotency primitive for the Firecracker boot path (mirrors
+		// the host_port partial unique index in shape and purpose; see
+		// pr-review.md §5 + plans/snapshot-clone-fast-boot.md).
+		`CREATE TABLE IF NOT EXISTS firecracker_tap_pool (
+			tap_name TEXT PRIMARY KEY,
+			cidr TEXT NOT NULL,
+			host_ip TEXT NOT NULL,
+			guest_ip TEXT NOT NULL,
+			vsock_cid INTEGER NOT NULL,
+			sandbox_id TEXT,
+			created_at DATETIME NOT NULL,
+			allocated_at DATETIME
+		);`,
+		// Partial unique index — exactly one row per sandbox at a time.
+		// Two concurrent Allocate calls race to UPDATE a free slot, and
+		// the index rejects a second claim under the same sandbox_id.
+		// SQLite's single writer serializes the contest; the index
+		// guarantees correctness if a future change ever moves us off it.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_tap_pool_sandbox
+			ON firecracker_tap_pool(sandbox_id) WHERE sandbox_id IS NOT NULL;`,
+		// vsock CIDs are globally unique per host (the AF_VSOCK guest_cid
+		// space is host-flat). Unique-not-partial because every row carries
+		// a non-null CID — the pool is pre-allocated with monotonic CIDs
+		// starting at 3 (CIDs 0/1/2 are reserved by the virtio-vsock spec).
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_tap_pool_vsock_cid
+			ON firecracker_tap_pool(vsock_cid);`,
 	}
 
 	for _, stmt := range stmts {
@@ -2612,3 +2649,202 @@ func (s *Store) DeleteMounts(ctx context.Context, sandboxID string) error {
 	}
 	return nil
 }
+
+// FirecrackerTapSlot is one pre-seeded row of the firecracker_tap_pool.
+// Mirrors the table shape. SandboxID is empty when the slot is free,
+// set to the owning sandbox when allocated; AllocatedAt is the zero
+// time when free.
+type FirecrackerTapSlot struct {
+	TapName     string
+	CIDR        string
+	HostIP      string
+	GuestIP     string
+	VsockCID    uint32
+	SandboxID   string
+	CreatedAt   time.Time
+	AllocatedAt time.Time
+}
+
+// SeedFirecrackerTapSlot inserts one slot row into the pool. Idempotent:
+// the tap_name PRIMARY KEY makes re-seeding with the same name a no-op,
+// so the daemon's boot path can call this for every configured slot
+// without coordinating across restarts. Two distinct slots with the
+// same vsock_cid would trip the unique index — callers must precompute
+// non-colliding CIDs (the wrapper in internal/network/tap does this).
+func (s *Store) SeedFirecrackerTapSlot(ctx context.Context, slot FirecrackerTapSlot, now time.Time) error {
+	if slot.TapName == "" || slot.CIDR == "" || slot.HostIP == "" || slot.GuestIP == "" {
+		return errors.New("seed firecracker tap slot: tap_name/cidr/host_ip/guest_ip are required")
+	}
+	if slot.VsockCID < 3 {
+		// CIDs 0/1/2 are reserved by the virtio-vsock spec (hypervisor,
+		// host, any). Catch this at the store layer because allocations
+		// flow through here and a buggy seed would only fail on the
+		// first sandbox create otherwise.
+		return fmt.Errorf("seed firecracker tap slot: vsock_cid must be >= 3 (got %d)", slot.VsockCID)
+	}
+	// ON CONFLICT(tap_name) DO NOTHING is narrower than INSERT OR IGNORE:
+	// it only swallows tap_name PK conflicts (the idempotent re-seed
+	// case). A duplicate vsock_cid on a different tap_name surfaces as
+	// a UNIQUE constraint error, which is the desired loud failure —
+	// the seed config is wrong and the operator should fix it before
+	// the first sandbox create discovers the clash.
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO firecracker_tap_pool
+			(tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(tap_name) DO NOTHING
+	`, slot.TapName, slot.CIDR, slot.HostIP, slot.GuestIP, slot.VsockCID, now.UTC())
+	if err != nil {
+		return fmt.Errorf("seed firecracker tap slot: %w", err)
+	}
+	return nil
+}
+
+// AllocateFirecrackerTapSlot claims a free slot for sandboxID and
+// returns it. Idempotent: if sandboxID already owns a slot, that slot
+// is returned without changes (the partial unique index guarantees at
+// most one). If no slot is free, returns ErrNoFreeFirecrackerTapSlot.
+//
+// The implementation is a two-step inside the SQLite single-writer
+// window:
+//
+//  1. SELECT a row WHERE sandbox_id IS NULL LIMIT 1.
+//  2. UPDATE that row SET sandbox_id = ?, allocated_at = ? WHERE
+//     tap_name = ? AND sandbox_id IS NULL.
+//
+// The WHERE clause on UPDATE re-checks sandbox_id IS NULL so a race
+// with a concurrent allocate of the same row updates RowsAffected=0
+// and we loop. SQLite's single-writer model makes this contest rare
+// in practice but the code stays correct under any future change.
+func (s *Store) AllocateFirecrackerTapSlot(ctx context.Context, sandboxID string, now time.Time) (*FirecrackerTapSlot, error) {
+	if sandboxID == "" {
+		return nil, errors.New("allocate firecracker tap slot: sandbox_id is required")
+	}
+	// Idempotency check first — if the sandbox already owns a slot,
+	// return it. Doing this before the allocate loop avoids a
+	// pessimistic UPDATE attempt that the partial unique index would
+	// reject (which would also work, but produces a noisier error).
+	if existing, err := s.GetFirecrackerTapSlotBySandbox(ctx, sandboxID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
+	}
+
+	// Bounded retry — under the SQLite single-writer model the contest
+	// resolves in one or two passes. The cap exists to prevent a buggy
+	// caller from spinning forever if every UPDATE fights for the same
+	// row; in practice the loop fires at most twice.
+	for attempt := 0; attempt < 8; attempt++ {
+		var candidate FirecrackerTapSlot
+		row := s.db.QueryRowContext(ctx, `
+			SELECT tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at
+			FROM firecracker_tap_pool
+			WHERE sandbox_id IS NULL
+			ORDER BY tap_name ASC
+			LIMIT 1
+		`)
+		if err := row.Scan(&candidate.TapName, &candidate.CIDR, &candidate.HostIP, &candidate.GuestIP, &candidate.VsockCID, &candidate.CreatedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrNoFreeFirecrackerTapSlot
+			}
+			return nil, fmt.Errorf("allocate firecracker tap slot (select): %w", err)
+		}
+
+		res, err := s.db.ExecContext(ctx, `
+			UPDATE firecracker_tap_pool
+			SET sandbox_id = ?, allocated_at = ?
+			WHERE tap_name = ? AND sandbox_id IS NULL
+		`, sandboxID, now.UTC(), candidate.TapName)
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker tap slot (update): %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker tap slot (affected): %w", err)
+		}
+		if n == 1 {
+			candidate.SandboxID = sandboxID
+			candidate.AllocatedAt = now.UTC()
+			return &candidate, nil
+		}
+		// Lost the race; loop and pick another free slot.
+	}
+	return nil, errors.New("allocate firecracker tap slot: pool contested after 8 attempts (likely allocator livelock)")
+}
+
+// ReleaseFirecrackerTapSlot returns a sandbox's slot to the pool by
+// clearing sandbox_id + allocated_at. Idempotent: releasing a sandbox
+// that owns no slot is a no-op.
+func (s *Store) ReleaseFirecrackerTapSlot(ctx context.Context, sandboxID string) error {
+	if sandboxID == "" {
+		return errors.New("release firecracker tap slot: sandbox_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_tap_pool
+		SET sandbox_id = NULL, allocated_at = NULL
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("release firecracker tap slot: %w", err)
+	}
+	return nil
+}
+
+// GetFirecrackerTapSlotBySandbox returns the slot currently owned by
+// sandboxID, or nil if it owns none. Used by both the idempotent
+// allocate path and the runtime driver's Inspect/Destroy paths.
+func (s *Store) GetFirecrackerTapSlotBySandbox(ctx context.Context, sandboxID string) (*FirecrackerTapSlot, error) {
+	if sandboxID == "" {
+		return nil, errors.New("get firecracker tap slot: sandbox_id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at, allocated_at
+		FROM firecracker_tap_pool
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	var slot FirecrackerTapSlot
+	var allocated sql.NullTime
+	if err := row.Scan(&slot.TapName, &slot.CIDR, &slot.HostIP, &slot.GuestIP, &slot.VsockCID, &slot.CreatedAt, &allocated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get firecracker tap slot: %w", err)
+	}
+	if allocated.Valid {
+		slot.AllocatedAt = allocated.Time
+	}
+	slot.SandboxID = sandboxID
+	return &slot, nil
+}
+
+// FirecrackerTapPoolStats reports the current pool occupancy. Used by
+// /healthz and the admission controller — a near-empty pool blocks new
+// Firecracker creates upstream of the failing Allocate call, which is
+// a better operator experience than discovering the exhaustion on the
+// next user request.
+type FirecrackerTapPoolStats struct {
+	Total     int
+	Allocated int
+	Free      int
+}
+
+func (s *Store) GetFirecrackerTapPoolStats(ctx context.Context) (FirecrackerTapPoolStats, error) {
+	var stats FirecrackerTapPoolStats
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COUNT(CASE WHEN sandbox_id IS NOT NULL THEN 1 END)
+		FROM firecracker_tap_pool
+	`)
+	if err := row.Scan(&stats.Total, &stats.Allocated); err != nil {
+		return stats, fmt.Errorf("firecracker tap pool stats: %w", err)
+	}
+	stats.Free = stats.Total - stats.Allocated
+	return stats, nil
+}
+
+// ErrNoFreeFirecrackerTapSlot is returned by AllocateFirecrackerTapSlot
+// when every slot is claimed. The Firecracker create path translates
+// this into a 503-ish admission error upstream — operators see "pool
+// exhausted" before the customer sees a confusing timeout.
+var ErrNoFreeFirecrackerTapSlot = errors.New("firecracker tap pool: no free slot")

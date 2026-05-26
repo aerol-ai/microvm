@@ -14,7 +14,9 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
+	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -175,6 +177,32 @@ func main() {
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+
+	// Native Firecracker runtime is opt-in per host. When enabled, we
+	// seed the per-host network slot pool from
+	// SB_FIRECRACKER_TAP_BASE_CIDR / SB_FIRECRACKER_TAP_POOL_SIZE and
+	// register the driver with the service. Seed is idempotent; a warm
+	// restart preserves existing slot↔sandbox assignments. Errors here
+	// are fatal at boot — the config validator already required the
+	// fields, so any failure is operational (CIDR doesn't fit the pool,
+	// SQLite write failed) and worth crashing for rather than swallowing.
+	if cfg.EnableFirecracker {
+		pool := tap.New(db)
+		if err := pool.Seed(context.Background(), tap.SeedConfig{
+			BaseCIDR: cfg.FirecrackerTapBaseCIDR,
+			PoolSize: cfg.FirecrackerTapPoolSize,
+		}, time.Now()); err != nil {
+			logger.Error("firecracker tap pool seed failed", "error", err)
+			os.Exit(1)
+		}
+		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
+		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
+		svc.SetFirecrackerRuntime(fcDriver)
+		logger.Info("firecracker runtime enabled",
+			"tap_base_cidr", cfg.FirecrackerTapBaseCIDR,
+			"tap_pool_size", cfg.FirecrackerTapPoolSize,
+			"use_jailer", cfg.UseJailer)
+	}
 
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
@@ -803,4 +831,48 @@ func writeBypassMarker(path string, enabled bool) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// firecrackerPoolAdapter wraps a *tap.Pool so it satisfies the
+// fcruntime.TapPool interface. The interface and the concrete pool are
+// in different packages on purpose (the firecracker runtime test binary
+// stays light — it doesn't need a real SQLite store), and this thin
+// adapter is the single conversion point between the two Slot shapes.
+// Adding/renaming a Slot field requires touching both ends; the linter
+// will catch a mismatch at compile time.
+type firecrackerPoolAdapter struct {
+	inner *tap.Pool
+}
+
+func (a *firecrackerPoolAdapter) Allocate(ctx context.Context, sandboxID string, now time.Time) (*fcruntime.TapSlot, error) {
+	s, err := a.inner.Allocate(ctx, sandboxID, now)
+	if err != nil {
+		return nil, err
+	}
+	return adaptTapSlot(s), nil
+}
+
+func (a *firecrackerPoolAdapter) Release(ctx context.Context, sandboxID string) error {
+	return a.inner.Release(ctx, sandboxID)
+}
+
+func (a *firecrackerPoolAdapter) Get(ctx context.Context, sandboxID string) (*fcruntime.TapSlot, error) {
+	s, err := a.inner.Get(ctx, sandboxID)
+	if err != nil || s == nil {
+		return nil, err
+	}
+	return adaptTapSlot(s), nil
+}
+
+func adaptTapSlot(s *tap.Slot) *fcruntime.TapSlot {
+	if s == nil {
+		return nil
+	}
+	return &fcruntime.TapSlot{
+		TapName:  s.TapName,
+		CIDR:     s.CIDR,
+		HostIP:   s.HostIP,
+		GuestIP:  s.GuestIP,
+		VsockCID: s.VsockCID,
+	}
 }

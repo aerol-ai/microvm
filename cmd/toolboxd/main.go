@@ -120,6 +120,25 @@ func main() {
 
 	go forwardShutdownSignals(logger, httpServer)
 
+	// Start the vsock listener alongside HTTP. On Linux guests with a
+	// virtio-vsock device this binds (CID 3, port 1024) and accepts
+	// control-plane signals from the host (pre-snapshot / post-resume).
+	// On any other OS, or on a Linux host without AF_VSOCK support, the
+	// listener constructor returns an error — we log it at WARN and keep
+	// HTTP running. Vsock is additive; its absence does not block sandbox
+	// operation, only the snapshot lifecycle hooks.
+	vsockHandler := newLoggingVsockHandler(logger)
+	if vs, err := newVsockServer(defaultVsockPort, vsockHandler, logger); err != nil {
+		logger.Warn("vsock listener disabled", "error", err)
+	} else {
+		go func() {
+			if err := vs.Serve(context.Background()); err != nil {
+				logger.Warn("vsock serve exited", "error", err)
+			}
+		}()
+		defer vs.Close()
+	}
+
 	logger.Info("toolboxd listening", "addr", addr, "sandbox_id", srv.sandboxID, "version", version.Version)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("toolboxd failed", "error", err)

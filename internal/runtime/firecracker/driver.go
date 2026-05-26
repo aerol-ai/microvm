@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
@@ -50,9 +51,36 @@ import (
 type Driver struct {
 	cfg    Config
 	logger *slog.Logger
+	// pool is the per-host TAP+IP+vsock-CID allocator. Non-nil only when
+	// SetPool has been called from main.go. The unit tests that don't
+	// need pool semantics (Ping, ListManaged, Destroy(nil)) leave it nil
+	// and the methods cope. Create requires pool to be set.
+	pool TapPool
 
 	mu      sync.Mutex
 	clients map[string]*firecracker.Client // sandbox-id -> API client
+}
+
+// TapPool is the interface Driver depends on for network allocation.
+// Defined here rather than referencing *tap.Pool directly so the runtime
+// package has no import dependency on internal/network/tap (which would
+// drag the store into the runtime's test binary). main.go injects the
+// real *tap.Pool, which satisfies the interface structurally.
+type TapPool interface {
+	Allocate(ctx context.Context, sandboxID string, now time.Time) (*TapSlot, error)
+	Release(ctx context.Context, sandboxID string) error
+	Get(ctx context.Context, sandboxID string) (*TapSlot, error)
+}
+
+// TapSlot mirrors internal/network/tap.Slot. Re-declared here to keep
+// the import-cycle wall up; main.go's adapter converts between the two
+// shapes.
+type TapSlot struct {
+	TapName  string
+	CIDR     string
+	HostIP   string
+	GuestIP  string
+	VsockCID uint32
 }
 
 // Config is the subset of internal/config.Config the driver actually uses.
@@ -132,6 +160,14 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 	}
 }
 
+// SetPool injects the network-allocation pool. Called once by main.go
+// after both the store and the pool have been constructed, before the
+// driver is registered with the service. Passing nil clears the
+// dependency (used by tests that exercise non-Create methods).
+func (d *Driver) SetPool(p TapPool) {
+	d.pool = p
+}
+
 // methodNotImplemented produces the canonical "not yet implemented" error
 // for a Runtime method, wrapping models.ErrRuntimeNotImplemented so
 // pkg/api/apihttp.WriteStoreAwareError can keep mapping it to the right
@@ -152,9 +188,81 @@ func methodNotImplemented(method string) error {
 // PATCH the per-sandbox overlay and TAP onto it, issue Action Resume,
 // return.
 //
-// Both paths land here; neither exists yet.
-func (d *Driver) Create(_ context.Context, _ models.CreateSandboxRequest, _, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
-	return nil, methodNotImplemented("Create")
+// Current implementation status (per plans/snapshot-clone-fast-boot.md
+// Phase 1.x):
+//
+//   - ✓ TAP/IP/vsock-CID slot allocation from the pool
+//   - ✓ Kernel-image existence check
+//   - ✗ Host-side TAP device creation (`ip link add ...`)
+//   - ✗ Rootfs.ext4 build / staging (pkg/oci wires here)
+//   - ✗ VMM spawn + REST orchestration
+//   - ✗ Vsock handshake with in-guest toolbox
+//
+// The implemented steps execute against real state (the SQLite-backed
+// pool, the real kernel-file stat). The unimplemented steps return
+// ErrRuntimeNotImplemented; the implemented allocations are released
+// before the error returns. This is enough integration to prove the
+// dispatch + allocation contract; the missing pieces land in
+// follow-ups.
+func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	if d.pool == nil {
+		return nil, fmt.Errorf("firecracker runtime: TAP pool not registered (main.go must call SetPool): %w",
+			models.ErrRuntimeNotImplemented)
+	}
+	if d.cfg.KernelImage == "" {
+		return nil, fmt.Errorf("firecracker runtime: KernelImage not configured (SB_FIRECRACKER_KERNEL): %w",
+			models.ErrRuntimeNotImplemented)
+	}
+	if _, err := os.Stat(d.cfg.KernelImage); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: kernel %q unreachable: %w",
+			d.cfg.KernelImage, err)
+	}
+	// CreateSandbox passes the empty string for sandboxID in the firecracker
+	// dispatch today — the docker path generates the ID earlier in
+	// createSandbox. When the firecracker branch grows the full Sandbox row
+	// build, sandboxID will be set; until then synthesize a placeholder so
+	// the pool allocation has a key. This temporary id is released along
+	// with the slot before Create returns its ErrRuntimeNotImplemented.
+	allocID := sandboxID
+	if allocID == "" {
+		allocID = fmt.Sprintf("fc-phase1-%d", time.Now().UnixNano())
+	}
+
+	slot, err := d.pool.Allocate(ctx, allocID, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("firecracker runtime: tap allocate: %w", err)
+	}
+	// Cleanup contract: every error path beyond this point must release
+	// the slot. Defer makes that mechanical so future additions (rootfs
+	// stage, vmm spawn, REST calls) don't have to remember.
+	released := false
+	defer func() {
+		if !released {
+			if relErr := d.pool.Release(ctx, allocID); relErr != nil {
+				d.logger.Warn("firecracker: pool release after error failed",
+					"sandbox_id", allocID, "tap", slot.TapName, "error", relErr)
+			}
+		}
+	}()
+
+	d.logger.Info("firecracker create: allocated network slot",
+		"sandbox_id", allocID,
+		"tap", slot.TapName,
+		"guest_ip", slot.GuestIP,
+		"vsock_cid", slot.VsockCID)
+
+	// Phase 1 stop here. Future steps in order:
+	//   - rootfs.ext4 staging via pkg/oci
+	//   - host-side TAP device + iptables rules
+	//   - newVMM + Start + WaitSocket
+	//   - REST: PutMachineConfig, PutBootSource, PutDrive, PutNetworkInterface, PutVsock
+	//   - Action InstanceStart
+	//   - vsock handshake with toolbox
+	//   - build *models.SandboxRuntimeState
+	// Returning ErrRuntimeNotImplemented here keeps the service layer's
+	// dispatch contract intact while the wiring lands.
+	return nil, fmt.Errorf("firecracker runtime: TAP slot %s allocated for %s, VMM spawn not yet wired (see plans/snapshot-clone-fast-boot.md Phase 1.x): %w",
+		slot.TapName, allocID, models.ErrRuntimeNotImplemented)
 }
 
 // Start boots a previously-stopped Firecracker VMM. The model diverges

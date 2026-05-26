@@ -62,6 +62,18 @@ type Service struct {
 	// the type is runtime.Runtime so a non-Docker driver can be slotted in
 	// without touching service code.
 	docker runtime.Runtime
+	// firecracker is the second registered runtime (native Firecracker, per
+	// plans/snapshot-clone-fast-boot.md). Nil unless main.go has called
+	// SetFirecrackerRuntime — which only happens when cfg.EnableFirecracker
+	// is true. The CreateSandbox dispatch checks this field for
+	// runtime="firecracker" requests; nil here falls back to the
+	// "SB_ENABLE_FIRECRACKER required" operator-facing error.
+	//
+	// Kept as a separate field rather than a runtime-by-name map because
+	// (a) we have exactly two runtimes and a map adds indirection without
+	// type-system payoff, and (b) the docker field stays the unconditional
+	// Default-runtime fast path for the >>99% docker case.
+	firecracker runtime.Runtime
 	// events is the concrete Docker client for the daemon /events stream and
 	// any other Docker-API-shaped surface that intentionally stays outside
 	// the runtime abstraction. Today both fields point at the same instance.
@@ -321,6 +333,21 @@ func (s *Service) AttachCluster(c cluster.Client) {
 	s.clusterMu.Lock()
 	defer s.clusterMu.Unlock()
 	s.cluster = c
+}
+
+// SetFirecrackerRuntime registers the second runtime driver. Called by
+// main.go after construction, only when cfg.EnableFirecracker is true.
+// Passing nil clears the registration (used by tests). Once set, the
+// CreateSandbox dispatch routes runtime="firecracker" requests through
+// this driver instead of returning a "not enabled" error.
+//
+// Why a setter rather than a New() parameter: the existing service.New
+// signature is consumed by ~20 test files, and growing it to carry a
+// nil-able second runtime would force a fan-out edit across every one.
+// A setter keeps the constructor stable and confines the wire-up to
+// main.go where the daemon-config flag actually lives.
+func (s *Service) SetFirecrackerRuntime(r runtime.Runtime) {
+	s.firecracker = r
 }
 
 // AttachSnapshotPusher wires in the optional AOCR snapshot-push pipeline.
@@ -664,8 +691,34 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_FIRECRACKER=true on this host (see plans/snapshot-clone-fast-boot.md): %w",
 				chosenRuntime, models.ErrRuntimeNotImplemented)
 		}
-		return nil, fmt.Errorf("runtime %q: Phase 1 in progress (see plans/snapshot-clone-fast-boot.md): %w",
-			chosenRuntime, models.ErrRuntimeNotImplemented)
+		if s.firecracker == nil {
+			// EnableFirecracker is on but the driver was not registered.
+			// This is a daemon-configuration bug rather than an operator
+			// misconfiguration — main.go should always register the
+			// driver when the env var is set. Surface a distinct message
+			// so the operator can tell the two apart in logs.
+			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_FIRECRACKER=true but main.go did not call SetFirecrackerRuntime): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		// Dispatch to the registered Firecracker driver. Phase 1 of the
+		// driver still returns ErrRuntimeNotImplemented for the unfinished
+		// final steps (REST orchestration, sandbox row build, caddy
+		// attach). The error short-circuits before we'd need to translate
+		// SandboxRuntimeState → CreateSandboxResponse — when full Create
+		// lands, this branch grows the same post-Create scaffolding the
+		// docker path has (rows, mounts, caddy, snapshot push).
+		//
+		// Cleanup contract: the driver's Create releases any half-allocated
+		// state (TAP slot, vsock CID, runDir) before returning the error.
+		// The service layer adds no caddy/store side effects to roll back
+		// at this point, so failure-path consistency (pr-review.md §4) is
+		// trivially satisfied.
+		req.Runtime = chosenRuntime
+		// Pass nil binds — the driver's mount support is a future axis
+		// (the host's bind-mount story is Docker-shaped; Firecracker
+		// guests will use virtio-fs or per-snapshot rootfs hard-links).
+		_, err := s.firecracker.Create(ctx, req, "", "", nil)
+		return nil, err
 	}
 	req.Runtime = chosenRuntime
 
