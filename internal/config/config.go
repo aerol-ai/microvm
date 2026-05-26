@@ -384,6 +384,29 @@ type Config struct {
 	// restarts. Default /var/lib/sandboxd/firecracker/templates.
 	// SB_FIRECRACKER_TEMPLATES_DIR.
 	FirecrackerTemplatesDir string
+	// UseJailer wraps each Firecracker process in `jailer` for chroot +
+	// cgroups + drop-priv. True is the only sane production setting; the
+	// flag exists because the jailer needs root, a real user account
+	// (JailerUID/GID), and a writable chroot tree — dev boxes and CI
+	// without those bits boot Firecracker directly. Default true to make
+	// "ship it" the path of least resistance; operators flip it off on
+	// laptops. SB_FIRECRACKER_USE_JAILER.
+	UseJailer bool
+	// JailerChrootBase is the parent directory under which jailer creates
+	// each sandbox's chroot (canonical layout: <base>/firecracker/<id>/root/).
+	// Should be on a filesystem that supports the file types the guest
+	// needs to see (no overlayfs underneath the rootfs.ext4 path). Default
+	// /srv/jailer matches the jailer docs. SB_JAILER_CHROOT_BASE.
+	JailerChrootBase string
+	// JailerUID / JailerGID are the UID/GID the firecracker process drops
+	// to inside the jail. The pair must exist on the host before the
+	// daemon starts (jailer setresuid()s into them; a nonexistent UID is
+	// accepted on Linux but is a security smell — assume the operator has
+	// created a `firecracker` system user). Defaults 1000/1000 are
+	// nominal; production setups override.
+	// SB_JAILER_UID / SB_JAILER_GID.
+	JailerUID int
+	JailerGID int
 
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
@@ -870,6 +893,10 @@ func Load() (Config, error) {
 		FirecrackerKernelImage:  strings.TrimSpace(os.Getenv("SB_FIRECRACKER_KERNEL")),
 		FirecrackerRunDir:       getEnv("SB_FIRECRACKER_RUN_DIR", "/run/sandboxd/firecracker"),
 		FirecrackerTemplatesDir: getEnv("SB_FIRECRACKER_TEMPLATES_DIR", "/var/lib/sandboxd/firecracker/templates"),
+		UseJailer:               getEnvBool("SB_FIRECRACKER_USE_JAILER", true),
+		JailerChrootBase:        getEnv("SB_JAILER_CHROOT_BASE", "/srv/jailer"),
+		JailerUID:               getEnvInt("SB_JAILER_UID", 1000),
+		JailerGID:               getEnvInt("SB_JAILER_GID", 1000),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -985,6 +1012,14 @@ func Load() (Config, error) {
 		}
 		if cfg.FirecrackerTemplatesDir == "" {
 			return Config{}, errors.New("SB_FIRECRACKER_TEMPLATES_DIR is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.UseJailer {
+			if cfg.JailerChrootBase == "" {
+				return Config{}, errors.New("SB_JAILER_CHROOT_BASE is required when SB_FIRECRACKER_USE_JAILER=true")
+			}
+			if cfg.JailerUID < 0 || cfg.JailerGID < 0 {
+				return Config{}, fmt.Errorf("SB_JAILER_UID/SB_JAILER_GID must be >= 0 (got %d/%d)", cfg.JailerUID, cfg.JailerGID)
+			}
 		}
 	}
 

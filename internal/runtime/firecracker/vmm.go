@@ -86,7 +86,11 @@ func newVMM(cfg Config, sandboxID string, logger *slog.Logger) (*vmm, error) {
 	if cfg.FirecrackerBinary == "" {
 		return nil, errors.New("vmm: FirecrackerBinary not configured")
 	}
-	if cfg.RunDir == "" {
+	// RunDir is only consulted in direct-spawn mode; jailer mode roots
+	// the per-sandbox tree under JailerChrootBase instead (see jailer.go).
+	// Requiring RunDir unconditionally would force operators on production
+	// hosts to set a flag they never read.
+	if !cfg.UseJailer && cfg.RunDir == "" {
 		return nil, errors.New("vmm: RunDir not configured")
 	}
 	if err := validateSandboxID(sandboxID); err != nil {
@@ -96,14 +100,18 @@ func newVMM(cfg Config, sandboxID string, logger *slog.Logger) (*vmm, error) {
 		logger = slog.Default()
 	}
 	runDir := filepath.Join(cfg.RunDir, sandboxID)
-	return &vmm{
+	v := &vmm{
 		sandboxID: sandboxID,
 		runDir:    runDir,
 		apiSocket: filepath.Join(runDir, "api.sock"),
 		logPath:   filepath.Join(runDir, "firecracker.log"),
 		cfg:       cfg,
 		logger:    logger,
-	}, nil
+	}
+	if err := v.applyJailerLayout(); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // validateSandboxID enforces the same shape the rest of the daemon uses
@@ -158,7 +166,16 @@ func (v *vmm) Start(ctx context.Context) error {
 	// other reason.
 	_ = os.Remove(v.apiSocket)
 
-	cmd := exec.CommandContext(ctx, v.cfg.FirecrackerBinary, v.buildArgs()...)
+	// Spawn directly or via jailer. The argv shape differs (jailer wraps
+	// the firecracker invocation with chroot/cgroup/drop-priv flags) but
+	// every later step — WaitSocket, Shutdown, capped stderr — is
+	// identical because both spawns land an exec.Cmd we own.
+	binary, args := v.cfg.FirecrackerBinary, v.buildArgs()
+	if v.cfg.UseJailer {
+		binary = v.cfg.JailerBinary
+		args = v.jailerArgv()
+	}
+	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = v.runDir
 	v.stderr = newCappedBuffer(stderrTailCap)
 	// Merge stdout + stderr into one capped buffer. Firecracker writes its
@@ -325,11 +342,17 @@ func (v *vmm) Cleanup() error {
 	if v.runDir == "" {
 		return nil
 	}
-	if !strings.HasPrefix(v.runDir, v.cfg.RunDir) {
-		// Defense in depth: validateSandboxID should already prevent this,
-		// but a bug elsewhere should never cause RemoveAll on a path
-		// outside the configured RunDir.
-		return fmt.Errorf("vmm: refusing to clean up path outside RunDir: %s", v.runDir)
+	// Defense in depth: validateSandboxID should already prevent path
+	// injection, but a bug elsewhere should never cause RemoveAll on a
+	// path outside whichever configured root owns this VMM. The owning
+	// root depends on jailer mode — direct mode roots at Config.RunDir,
+	// jailer mode roots at Config.JailerChrootBase.
+	root := v.cfg.RunDir
+	if v.cfg.UseJailer {
+		root = v.cfg.JailerChrootBase
+	}
+	if !strings.HasPrefix(v.runDir, root) {
+		return fmt.Errorf("vmm: refusing to clean up path outside %q: %s", root, v.runDir)
 	}
 	return os.RemoveAll(v.runDir)
 }

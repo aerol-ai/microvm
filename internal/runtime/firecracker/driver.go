@@ -82,6 +82,20 @@ type Config struct {
 	// rootfs.ext4, snapshot.memory, snapshot.state, manifest.json). Lives
 	// across daemon restarts.
 	TemplatesDir string
+	// UseJailer flips the spawn from `firecracker` directly to `jailer`,
+	// which chroots+cgroups+drops-priv into JailerUID/JailerGID. Production
+	// hosts always set this; dev/CI without root leave it false. When
+	// true, vmm.go re-roots a sandbox's runDir under JailerChrootBase
+	// rather than RunDir; see jailer.go for the path math.
+	UseJailer bool
+	// JailerChrootBase is the parent directory under which jailer creates
+	// each sandbox's chroot. Canonical layout is
+	// <JailerChrootBase>/firecracker/<sandbox-id>/root/.
+	JailerChrootBase string
+	// JailerUID / JailerGID are the UID/GID the firecracker process drops
+	// into inside the jail. Must already exist on the host.
+	JailerUID int
+	JailerGID int
 }
 
 // FromDaemonConfig copies the Firecracker-relevant fields out of the full
@@ -95,6 +109,10 @@ func FromDaemonConfig(c config.Config) Config {
 		KernelImage:       c.FirecrackerKernelImage,
 		RunDir:            c.FirecrackerRunDir,
 		TemplatesDir:      c.FirecrackerTemplatesDir,
+		UseJailer:         c.UseJailer,
+		JailerChrootBase:  c.JailerChrootBase,
+		JailerUID:         c.JailerUID,
+		JailerGID:         c.JailerGID,
 	}
 }
 
