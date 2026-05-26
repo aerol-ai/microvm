@@ -852,17 +852,24 @@ type IdempotentRequestRecord struct {
 }
 
 // TemplateStatus tracks a Firecracker template through its async build.
-// pending is the wire-visible state from POST /v1/templates until the
-// background goroutine finishes; ready means rootfs.ext4 is on disk and
-// the template is usable as the source of CreateSandboxRequest.TemplateID;
-// failed carries the build error in LastError for the operator to inspect
-// (the row is kept so the GC sweep — not the API — owns cleanup).
+// pending is the wire-visible state immediately after POST /v1/templates
+// (matches Phase 2 — clients that simply poll for ready keep working).
+// building_rootfs and snapshotting are intermediate states the Phase 3
+// two-phase build goroutine walks through. ready means rootfs+snapshot
+// are both on disk; ready_no_snapshot means rootfs is fine but the
+// snapshot phase failed (CID alloc, snapshotter error) — sandboxes can
+// still cold-boot from this template, just without fast-boot. failed
+// means even the rootfs phase did not complete; LastError carries the
+// reason for the operator to inspect.
 type TemplateStatus string
 
 const (
-	TemplateStatusPending TemplateStatus = "pending"
-	TemplateStatusReady   TemplateStatus = "ready"
-	TemplateStatusFailed  TemplateStatus = "failed"
+	TemplateStatusPending         TemplateStatus = "pending"
+	TemplateStatusBuildingRootfs  TemplateStatus = "building_rootfs"
+	TemplateStatusSnapshotting    TemplateStatus = "snapshotting"
+	TemplateStatusReady           TemplateStatus = "ready"
+	TemplateStatusReadyNoSnapshot TemplateStatus = "ready_no_snapshot"
+	TemplateStatusFailed          TemplateStatus = "failed"
 )
 
 // Template is the persisted record for a Firecracker rootfs template.
@@ -873,20 +880,32 @@ const (
 // RootfsPath is the absolute on-disk location of the prepared
 // rootfs.ext4 (`<FirecrackerTemplatesDir>/<id>/rootfs.ext4`). It is
 // json:"-" — the path is a server-internal detail that should not leak
-// to API callers; clients reference templates by ID. Phase 3 will add
-// SnapshotMemoryPath / SnapshotStatePath fields alongside it as
-// snapshot/resume becomes the boot mechanism.
+// to API callers; clients reference templates by ID.
+//
+// Snapshot* fields are populated by the Phase 3 second build phase.
+// HasSnapshot is the API-facing "this template fast-boots" flag — the
+// path/checksum/CID fields stay json:"-" because they are pure server
+// detail. SnapshotError carries the reason a template ended up
+// ready_no_snapshot (rootfs is usable, snapshot phase failed) so the
+// operator does not have to grep daemon logs.
 type Template struct {
-	ID              string         `json:"id"`
-	Image           string         `json:"image"`
-	Status          TemplateStatus `json:"status"`
-	RootfsPath      string         `json:"-"`
-	RootfsSizeBytes int64          `json:"rootfs_size_bytes,omitempty"`
-	MinSizeMiB      int            `json:"min_size_mib,omitempty"`
-	LastError       string         `json:"last_error,omitempty"`
-	CreatedAt       time.Time      `json:"created_at"`
-	UpdatedAt       time.Time      `json:"updated_at"`
-	ReadyAt         *time.Time     `json:"ready_at,omitempty"`
+	ID                 string         `json:"id"`
+	Image              string         `json:"image"`
+	Status             TemplateStatus `json:"status"`
+	RootfsPath         string         `json:"-"`
+	RootfsSizeBytes    int64          `json:"rootfs_size_bytes,omitempty"`
+	MinSizeMiB         int            `json:"min_size_mib,omitempty"`
+	LastError          string         `json:"last_error,omitempty"`
+	CreatedAt          time.Time      `json:"created_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
+	ReadyAt            *time.Time     `json:"ready_at,omitempty"`
+	SnapshotMemoryPath string         `json:"-"`
+	SnapshotStatePath  string         `json:"-"`
+	SnapshotSizeBytes  int64          `json:"snapshot_size_bytes,omitempty"`
+	SnapshotChecksum   string         `json:"-"`
+	SnapshotVsockCID   uint32         `json:"-"`
+	SnapshotError      string         `json:"snapshot_error,omitempty"`
+	HasSnapshot        bool           `json:"has_snapshot"`
 }
 
 // CreateTemplateRequest is the body for POST /v1/templates. ID is

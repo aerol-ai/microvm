@@ -155,6 +155,11 @@ type fakeVsockDialer struct {
 	err         error
 	guestRespOk bool
 	guestError  string
+	// lastCID captures the CID the driver dialed on the most recent
+	// attempt. The snapshot-load path dials the template's reserved CID
+	// rather than the per-sandbox slot CID; without this we can't tell
+	// the driver actually routed the handshake to the right place.
+	lastCID uint32
 	// retryUntil >0 means return err for the first `retryUntil-1` Dial
 	// calls (simulating the post-InstanceStart race) and succeed on
 	// the `retryUntil`th. Lets us assert the driver's retry loop.
@@ -165,10 +170,11 @@ func newFakeVsockDialer() *fakeVsockDialer {
 	return &fakeVsockDialer{guestRespOk: true}
 }
 
-func (d *fakeVsockDialer) Dial(_ context.Context, _, _ uint32) (io.ReadWriteCloser, error) {
+func (d *fakeVsockDialer) Dial(_ context.Context, cid, _ uint32) (io.ReadWriteCloser, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.dials++
+	d.lastCID = cid
 	if d.retryUntil > 0 && d.dials < d.retryUntil {
 		return nil, errors.New("vsock: connection refused (fake)")
 	}
@@ -261,12 +267,25 @@ type fakeClient struct {
 	actions  []string
 	instance *firecracker.InstanceInfo
 
-	machineErr error
-	bootErr    error
-	driveErr   error
-	nicErr     error
-	vsockErr   error
-	actionErr  error
+	snapshotCreate *firecracker.SnapshotCreate
+	snapshotLoad   *firecracker.SnapshotLoad
+
+	// restOrder captures every PUT / Action / Snapshot call in the order
+	// the driver issued them. Order is load-bearing for firecracker:
+	// machine-config + boot-source MUST land before drives + nics, and
+	// CreateSnapshot is only valid after Action(Pause). The snapshot
+	// test asserts the full sequence; the cold-boot tests usually just
+	// assert end-state, but the slice is cheap and harmless to share.
+	restOrder []string
+
+	machineErr        error
+	bootErr           error
+	driveErr          error
+	nicErr            error
+	vsockErr          error
+	actionErr         error
+	snapshotCreateErr error
+	snapshotLoadErr   error
 }
 
 func newFakeClient() *fakeClient {
@@ -281,6 +300,7 @@ func (c *fakeClient) PutMachineConfig(_ context.Context, cfg firecracker.Machine
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.mc = &cfg
+	c.restOrder = append(c.restOrder, "PutMachineConfig")
 	return c.machineErr
 }
 
@@ -288,6 +308,7 @@ func (c *fakeClient) PutBootSource(_ context.Context, src firecracker.BootSource
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.bs = &src
+	c.restOrder = append(c.restOrder, "PutBootSource")
 	return c.bootErr
 }
 
@@ -295,6 +316,7 @@ func (c *fakeClient) PutDrive(_ context.Context, id string, drv firecracker.Driv
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.drives[id] = drv
+	c.restOrder = append(c.restOrder, "PutDrive:"+id)
 	return c.driveErr
 }
 
@@ -302,6 +324,7 @@ func (c *fakeClient) PutNetworkInterface(_ context.Context, id string, iface fir
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.nics[id] = iface
+	c.restOrder = append(c.restOrder, "PutNetworkInterface:"+id)
 	return c.nicErr
 }
 
@@ -309,6 +332,7 @@ func (c *fakeClient) PutVsock(_ context.Context, v firecracker.Vsock) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.vsock = &v
+	c.restOrder = append(c.restOrder, "PutVsock")
 	return c.vsockErr
 }
 
@@ -316,6 +340,7 @@ func (c *fakeClient) Action(_ context.Context, a firecracker.Action) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.actions = append(c.actions, a.ActionType)
+	c.restOrder = append(c.restOrder, "Action:"+a.ActionType)
 	return c.actionErr
 }
 
@@ -323,6 +348,35 @@ func (c *fakeClient) InstanceInfo(_ context.Context) (*firecracker.InstanceInfo,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.instance, nil
+}
+
+func (c *fakeClient) CreateSnapshot(_ context.Context, req firecracker.SnapshotCreate) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snapshotCreate = &req
+	c.restOrder = append(c.restOrder, "CreateSnapshot")
+	// Touch the output files so the SnapshotTemplate post-pass that
+	// hashes them finds something to read. Failure to write is fatal
+	// here — the test depends on the artifacts existing.
+	if c.snapshotCreateErr == nil {
+		for _, path := range []string{req.SnapshotPath, req.MemFilePath} {
+			if path == "" {
+				continue
+			}
+			if err := os.WriteFile(path, []byte("fake-snapshot-"+filepath.Base(path)), 0o600); err != nil {
+				return err
+			}
+		}
+	}
+	return c.snapshotCreateErr
+}
+
+func (c *fakeClient) LoadSnapshot(_ context.Context, req firecracker.SnapshotLoad) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snapshotLoad = &req
+	c.restOrder = append(c.restOrder, "LoadSnapshot")
+	return c.snapshotLoadErr
 }
 
 // driverFixture is the standard test setup: a Driver wired with all
@@ -658,27 +712,40 @@ func TestCreate_RegistersHandleAndClient(t *testing.T) {
 	}
 }
 
-// fakeTemplateResolver returns a pre-staged rootfs path. Tests inject
-// this via SetTemplateResolver to exercise the Phase 2 template-hit
-// path without standing up a real template service. resolveErr lets a
-// test simulate a missing or non-ready template.
+// fakeTemplateResolver returns a pre-staged rootfs path (and optional
+// snapshot artifact paths) for the Phase 2/3 template-hit paths. Tests
+// inject this via SetTemplateResolver to exercise the template branches
+// without standing up a real template service. resolveErr lets a test
+// simulate a missing or non-ready template.
 type fakeTemplateResolver struct {
-	mu         sync.Mutex
-	calls      int
-	lastID     string
-	rootfsPath string
-	resolveErr error
+	mu                 sync.Mutex
+	calls              int
+	lastID             string
+	rootfsPath         string
+	hasSnapshot        bool
+	snapshotMemoryPath string
+	snapshotStatePath  string
+	snapshotChecksum   string
+	snapshotVsockCID   uint32
+	resolveErr         error
 }
 
-func (r *fakeTemplateResolver) Resolve(_ context.Context, id string) (string, error) {
+func (r *fakeTemplateResolver) Resolve(_ context.Context, id string) (*TemplateResolution, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
 	r.lastID = id
 	if r.resolveErr != nil {
-		return "", r.resolveErr
+		return nil, r.resolveErr
 	}
-	return r.rootfsPath, nil
+	return &TemplateResolution{
+		RootfsPath:         r.rootfsPath,
+		HasSnapshot:        r.hasSnapshot,
+		SnapshotMemoryPath: r.snapshotMemoryPath,
+		SnapshotStatePath:  r.snapshotStatePath,
+		SnapshotChecksum:   r.snapshotChecksum,
+		SnapshotVsockCID:   r.snapshotVsockCID,
+	}, nil
 }
 
 // TestCreate_TemplateHit is the Phase 2 fast-path: req.TemplateID set,
@@ -738,6 +805,20 @@ func TestCreate_TemplateHit(t *testing.T) {
 	if filepath.Base(rootDrive.PathOnHost) != "rootfs.ext4" {
 		t.Errorf("drive path basename = %q, want rootfs.ext4", filepath.Base(rootDrive.PathOnHost))
 	}
+	// HasSnapshot=false on the resolver MUST keep the cold-boot path:
+	// LoadSnapshot is never called, the action is InstanceStart, and the
+	// vsock handshake dials the per-sandbox slot CID. The contrast with
+	// TestCreate_SnapshotLoadPath is the whole point of asserting these
+	// inverses here.
+	if f.client.snapshotLoad != nil {
+		t.Errorf("LoadSnapshot called on cold-boot template hit: %+v", f.client.snapshotLoad)
+	}
+	if len(f.client.actions) != 1 || f.client.actions[0] != firecracker.ActionInstanceStart {
+		t.Errorf("actions = %v, want [InstanceStart] on cold-boot template hit", f.client.actions)
+	}
+	if f.vsock.lastCID != 3 {
+		t.Errorf("vsock dial CID = %d, want 3 (slot CID) on cold-boot path", f.vsock.lastCID)
+	}
 }
 
 // TestCreate_TemplateRequiresResolver confirms a TemplateID-bearing
@@ -782,6 +863,202 @@ func TestCreate_TemplateResolveErrorReleasesSlot(t *testing.T) {
 	}
 	if f.rootfs.builds != 0 {
 		t.Errorf("rootfs.Build called %d times on template error; want 0", f.rootfs.builds)
+	}
+}
+
+// TestCreate_SnapshotLoadPath is the Phase 3 fast-boot regression test:
+// resolver returns HasSnapshot=true, so the driver MUST skip
+// configureVMM (no PutMachineConfig, no PutBootSource, no PutDrive,
+// no PutNetworkInterface, no PutVsock) and instead issue LoadSnapshot
+// + Action(Resume). The vsock handshake must dial the template's
+// reserved CID (baked into the snapshot at build time), NOT the
+// per-sandbox slot CID — a regression there silently hangs the
+// handshake until deadline because the guest is listening on the
+// template CID.
+func TestCreate_SnapshotLoadPath(t *testing.T) {
+	f := newDriverFixture(t)
+
+	// Pre-stage template rootfs + snapshot artifact paths. The driver
+	// does not read the snapshot files on this test (SnapshotVerifyOnLoad
+	// is off by default in the fixture; the fakeClient's LoadSnapshot is
+	// a no-op record), but the paths flow through to the LoadSnapshot
+	// request body so we can assert they're wired correctly.
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := os.WriteFile(templateRootfs, []byte("TEMPLATE-ROOTFS"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+	snapMem := filepath.Join(tplDir, "snapshot.memory")
+	snapState := filepath.Join(tplDir, "snapshot.state")
+	// Files do not need real content for the load-path assertions, but
+	// touch them so any future "stat before load" check the driver might
+	// adopt does not break the test.
+	if err := os.WriteFile(snapMem, []byte("MEM"), 0o600); err != nil {
+		t.Fatalf("write snap mem: %v", err)
+	}
+	if err := os.WriteFile(snapState, []byte("STATE"), 0o600); err != nil {
+		t.Fatalf("write snap state: %v", err)
+	}
+
+	const templateCID uint32 = 200
+	resolver := &fakeTemplateResolver{
+		rootfsPath:         templateRootfs,
+		hasSnapshot:        true,
+		snapshotMemoryPath: snapMem,
+		snapshotStatePath:  snapState,
+		// Empty checksum so configureVMMForLoad skips verification
+		// regardless of the SnapshotVerifyOnLoad config knob. The
+		// verifySnapshotChecksum path has its own test seam.
+		snapshotChecksum: "",
+		snapshotVsockCID: templateCID,
+	}
+	f.driver.SetTemplateResolver(resolver)
+
+	state, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image:      "alpine:3.20",
+		CPU:        1,
+		MemoryMB:   128,
+		DiskGB:     1,
+		TemplateID: "tpl-snap",
+	}, "sb-snap-load", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create with snapshot template: %v", err)
+	}
+	if state.Status != models.SandboxStatusStarted {
+		t.Errorf("Status = %q, want started", state.Status)
+	}
+
+	// LoadSnapshot MUST have been called with the template's artifact
+	// paths and EnableDiffSnapshots true (the snapshot may be a base
+	// for a future diff snapshot at sandbox-stop time).
+	if f.client.snapshotLoad == nil {
+		t.Fatal("LoadSnapshot was not called on snapshot-load path")
+	}
+	if f.client.snapshotLoad.SnapshotPath != snapState {
+		t.Errorf("LoadSnapshot.SnapshotPath = %q, want %q", f.client.snapshotLoad.SnapshotPath, snapState)
+	}
+	if f.client.snapshotLoad.MemBackend == nil ||
+		f.client.snapshotLoad.MemBackend.BackendPath != snapMem ||
+		f.client.snapshotLoad.MemBackend.BackendType != "File" {
+		t.Errorf("LoadSnapshot.MemBackend wrong: %+v", f.client.snapshotLoad.MemBackend)
+	}
+	if !f.client.snapshotLoad.EnableDiffSnapshots {
+		t.Error("LoadSnapshot.EnableDiffSnapshots = false, want true")
+	}
+	if f.client.snapshotLoad.ResumeVM {
+		t.Error("LoadSnapshot.ResumeVM = true; driver must Resume explicitly so PR-B can hook PATCH-then-Resume")
+	}
+
+	// configureVMM MUST NOT have run — every one of its REST calls
+	// must be absent. A regression here would re-do cold-boot setup
+	// on top of a restored snapshot, either failing the firecracker
+	// REST contract or silently double-configuring.
+	if f.client.mc != nil {
+		t.Errorf("PutMachineConfig was called on snapshot-load path: %+v", f.client.mc)
+	}
+	if f.client.bs != nil {
+		t.Errorf("PutBootSource was called on snapshot-load path: %+v", f.client.bs)
+	}
+	if len(f.client.drives) != 0 {
+		t.Errorf("PutDrive was called on snapshot-load path: %+v", f.client.drives)
+	}
+	if len(f.client.nics) != 0 {
+		t.Errorf("PutNetworkInterface was called on snapshot-load path: %+v", f.client.nics)
+	}
+	if f.client.vsock != nil {
+		t.Errorf("PutVsock was called on snapshot-load path: %+v", f.client.vsock)
+	}
+
+	// Resume only, never InstanceStart. The action list is the wire
+	// trace; assert ordering and content.
+	if len(f.client.actions) != 1 || f.client.actions[0] != firecracker.ActionResume {
+		t.Errorf("actions = %v, want [Resume] on snapshot-load path", f.client.actions)
+	}
+
+	// The vsock handshake MUST dial the template's CID, not the
+	// slot's CID. Dialing slot CID (3) would race a guest that's
+	// listening on template CID (200) and hang the handshake.
+	if f.vsock.lastCID != templateCID {
+		t.Errorf("vsock dial CID = %d, want %d (template CID); slot CID = 3",
+			f.vsock.lastCID, templateCID)
+	}
+
+	// Cleanup contract sanity: slot still owned by sandbox, TAP up,
+	// VMM running. A snapshot-load Create has the same post-conditions
+	// as a cold-boot Create.
+	if f.pool.alloc != 1 || f.pool.release != 0 {
+		t.Errorf("pool alloc=%d release=%d, want 1/0 on success", f.pool.alloc, f.pool.release)
+	}
+	if f.tapHost.ensureCalls != 1 || f.tapHost.removeCalls != 0 {
+		t.Errorf("tap ensure=%d remove=%d, want 1/0 on success", f.tapHost.ensureCalls, f.tapHost.removeCalls)
+	}
+	if !f.vmm.started || f.vmm.shutdown {
+		t.Errorf("vmm started=%v shutdown=%v, want true/false", f.vmm.started, f.vmm.shutdown)
+	}
+	if _, ok := f.driver.vmms["sb-snap-load"]; !ok {
+		t.Error("vmm not registered after snapshot-load Create")
+	}
+}
+
+// TestCreate_SnapshotLoadPath_VerifyMismatchRefusesLoad guards the
+// integrity check: when SnapshotVerifyOnLoad is on and the persisted
+// checksum doesn't match the on-disk bytes, the driver must refuse to
+// call LoadSnapshot at all. A misorder that loads first and verifies
+// after would let firecracker mmap corrupt memory.
+func TestCreate_SnapshotLoadPath_VerifyMismatchRefusesLoad(t *testing.T) {
+	f := newDriverFixture(t)
+	f.driver.cfg.SnapshotVerifyOnLoad = true
+
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := os.WriteFile(templateRootfs, []byte("TEMPLATE-ROOTFS"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+	snapMem := filepath.Join(tplDir, "snapshot.memory")
+	snapState := filepath.Join(tplDir, "snapshot.state")
+	if err := os.WriteFile(snapMem, []byte("MEM-BYTES"), 0o600); err != nil {
+		t.Fatalf("write snap mem: %v", err)
+	}
+	if err := os.WriteFile(snapState, []byte("STATE-BYTES"), 0o600); err != nil {
+		t.Fatalf("write snap state: %v", err)
+	}
+
+	// Deliberately wrong checksum — the actual file SHA256 will differ.
+	resolver := &fakeTemplateResolver{
+		rootfsPath:         templateRootfs,
+		hasSnapshot:        true,
+		snapshotMemoryPath: snapMem,
+		snapshotStatePath:  snapState,
+		snapshotChecksum:   "sha256:" + "0000000000000000000000000000000000000000000000000000000000000000" + "|sha256:" + "0000000000000000000000000000000000000000000000000000000000000000",
+		snapshotVsockCID:   200,
+	}
+	f.driver.SetTemplateResolver(resolver)
+
+	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image: "alpine:3.20", CPU: 1, MemoryMB: 128, DiskGB: 1, TemplateID: "tpl-bad-sum",
+	}, "sb-bad-sum", "tok", nil)
+	if err == nil {
+		t.Fatal("expected integrity error")
+	}
+	if !contains(err.Error(), "snapshot integrity") {
+		t.Errorf("error should mention snapshot integrity, got: %v", err)
+	}
+	// LoadSnapshot MUST NOT have been called — the whole point of
+	// host-side verification is to refuse the load before firecracker
+	// touches the artifacts.
+	if f.client.snapshotLoad != nil {
+		t.Errorf("LoadSnapshot was called despite checksum mismatch: %+v", f.client.snapshotLoad)
+	}
+	// And the cleanup contract still holds: pool slot released, TAP
+	// removed, VMM shut down. The half-built sandbox does not leak.
+	if f.pool.release != 1 {
+		t.Errorf("pool release = %d, want 1 on integrity error", f.pool.release)
+	}
+	if f.tapHost.removeCalls != 1 {
+		t.Errorf("tap remove = %d, want 1 on integrity error", f.tapHost.removeCalls)
+	}
+	if !f.vmm.shutdown {
+		t.Error("vmm should have been shut down on integrity error")
 	}
 }
 

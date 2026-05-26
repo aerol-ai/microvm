@@ -226,6 +226,16 @@ func main() {
 		// the runtime package importing internal/service.
 		svc.SetTemplateBuilder(&templateBuilderAdapter{inner: ociBuilder})
 		fcDriver.SetTemplateResolver(&templateResolverAdapter{svc: svc})
+		// Phase 3 snapshot pipeline: the snapshotter is the driver
+		// itself (it owns the transient VMM seams); the CID allocator
+		// wraps the same TAP pool used for per-sandbox slots, keyed by
+		// "template:<id>" so the pool's per-id PK gives idempotent
+		// reservation across daemon restarts. Wiring both unlocks the
+		// transition into status=snapshotting and the eventual ready
+		// terminal state; leaving either nil keeps templates at
+		// ready_no_snapshot (cold-boot only).
+		svc.SetTemplateSnapshotter(&firecrackerTemplateSnapshotterAdapter{driver: fcDriver})
+		svc.SetTemplateCIDAllocator(&firecrackerCIDAllocatorAdapter{pool: pool})
 		svc.SetFirecrackerRuntime(fcDriver)
 		logger.Info("firecracker runtime enabled",
 			"tap_base_cidr", cfg.FirecrackerTapBaseCIDR,
@@ -990,16 +1000,81 @@ type templateResolverAdapter struct {
 	svc *service.Service
 }
 
-func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (string, error) {
+func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcruntime.TemplateResolution, error) {
 	t, err := a.svc.GetTemplate(ctx, id)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if t.Status != models.TemplateStatusReady {
-		return "", fmt.Errorf("template %q is %s, not ready", id, t.Status)
+	// Both ready and ready_no_snapshot expose a usable rootfs; only the
+	// former carries snapshot artifacts. Reject anything else — a
+	// pending/building/failed template has no rootfs the driver can
+	// boot from.
+	if t.Status != models.TemplateStatusReady && t.Status != models.TemplateStatusReadyNoSnapshot {
+		return nil, fmt.Errorf("template %q is %s, not ready", id, t.Status)
 	}
 	if t.RootfsPath == "" {
-		return "", fmt.Errorf("template %q is ready but has no rootfs path", id)
+		return nil, fmt.Errorf("template %q is %s but has no rootfs path", id, t.Status)
 	}
-	return t.RootfsPath, nil
+	return &fcruntime.TemplateResolution{
+		RootfsPath:         t.RootfsPath,
+		HasSnapshot:        t.HasSnapshot,
+		SnapshotMemoryPath: t.SnapshotMemoryPath,
+		SnapshotStatePath:  t.SnapshotStatePath,
+		SnapshotChecksum:   t.SnapshotChecksum,
+		SnapshotVsockCID:   t.SnapshotVsockCID,
+	}, nil
+}
+
+// firecrackerTemplateSnapshotterAdapter satisfies
+// service.TemplateSnapshotter by forwarding to *fcruntime.Driver. The
+// snapshotter and the runtime driver share the same VMM/network seams,
+// so it's the natural home for the transient-VMM lifecycle that snapshot
+// capture needs; the adapter exists only so the service package never
+// imports the runtime package directly (which would be a cycle through
+// service.SetFirecrackerRuntime).
+type firecrackerTemplateSnapshotterAdapter struct {
+	driver *fcruntime.Driver
+}
+
+func (a *firecrackerTemplateSnapshotterAdapter) SnapshotTemplate(ctx context.Context, req service.TemplateSnapshotRequest) (*service.TemplateSnapshotResult, error) {
+	res, err := a.driver.SnapshotTemplate(ctx, fcruntime.TemplateSnapshotRequest{
+		TemplateID:    req.TemplateID,
+		RootfsPath:    req.RootfsPath,
+		OutMemoryPath: req.OutMemoryPath,
+		OutStatePath:  req.OutStatePath,
+		GuestCID:      req.GuestCID,
+		MemoryMB:      req.MemoryMB,
+		VCPU:          req.VCPU,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &service.TemplateSnapshotResult{
+		MemorySizeBytes: res.MemorySizeBytes,
+		StateSizeBytes:  res.StateSizeBytes,
+		Checksum:        res.Checksum,
+	}, nil
+}
+
+// firecrackerCIDAllocatorAdapter satisfies service.TemplateCIDAllocator
+// by reusing the per-sandbox TAP pool with a synthetic "template:<id>"
+// sandbox key. The pool's per-id PK gives idempotent reservation: a
+// second AllocateForTemplate on the same id returns the same CID rather
+// than burning a slot. PR-A's "one clone per template per host" limit
+// is what makes this safe — a future per-template CID pool lands in
+// Phase 4 alongside the warm pool.
+type firecrackerCIDAllocatorAdapter struct {
+	pool *tap.Pool
+}
+
+func (a *firecrackerCIDAllocatorAdapter) AllocateForTemplate(ctx context.Context, templateID string) (uint32, error) {
+	slot, err := a.pool.Allocate(ctx, "template:"+templateID, time.Now())
+	if err != nil {
+		return 0, err
+	}
+	return slot.VsockCID, nil
+}
+
+func (a *firecrackerCIDAllocatorAdapter) ReleaseForTemplate(ctx context.Context, templateID string) error {
+	return a.pool.Release(ctx, "template:"+templateID)
 }

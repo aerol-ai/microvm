@@ -136,9 +136,12 @@ type vmmSpawner func(cfg Config, sandboxID string) (VMMHandle, error)
 // recording all REST calls without needing a UDS at all.
 type vmmClientFactory func(socketPath string) VMMClient
 
-// VMMClient is the subset of *pkg/firecracker.Client Driver.Create
-// uses. Adding a method here is the discipline gate for "yes, this
-// orchestration step is part of the driver" — keep it tight.
+// VMMClient is the subset of *pkg/firecracker.Client Driver.Create and
+// Driver.SnapshotTemplate use. Adding a method here is the discipline
+// gate for "yes, this orchestration step is part of the driver" — keep
+// it tight. CreateSnapshot / LoadSnapshot are the Phase 3 additions for
+// the template snapshot capture and the per-sandbox snapshot-load fast
+// boot paths respectively.
 type VMMClient interface {
 	PutMachineConfig(ctx context.Context, cfg firecracker.MachineConfig) error
 	PutBootSource(ctx context.Context, src firecracker.BootSource) error
@@ -147,6 +150,8 @@ type VMMClient interface {
 	PutVsock(ctx context.Context, v firecracker.Vsock) error
 	Action(ctx context.Context, a firecracker.Action) error
 	InstanceInfo(ctx context.Context) (*firecracker.InstanceInfo, error)
+	CreateSnapshot(ctx context.Context, req firecracker.SnapshotCreate) error
+	LoadSnapshot(ctx context.Context, req firecracker.SnapshotLoad) error
 }
 
 // defaultVsockPort is the in-guest port the toolbox listens on. Must

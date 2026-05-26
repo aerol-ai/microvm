@@ -156,6 +156,12 @@ type Config struct {
 	// into inside the jail. Must already exist on the host.
 	JailerUID int
 	JailerGID int
+	// SnapshotVerifyOnLoad gates SHA256 verification of snapshot.memory
+	// and snapshot.state immediately before each LoadSnapshot. Default
+	// true on production daemons; bypass only for benchmarking the raw
+	// load-cost of a known-good snapshot. Mirrors
+	// internal/config.Config.FirecrackerSnapshotVerifyOnLoad.
+	SnapshotVerifyOnLoad bool
 }
 
 // FromDaemonConfig copies the Firecracker-relevant fields out of the full
@@ -164,15 +170,16 @@ type Config struct {
 // is the only caller.
 func FromDaemonConfig(c config.Config) Config {
 	return Config{
-		FirecrackerBinary: c.FirecrackerBinary,
-		JailerBinary:      c.JailerBinary,
-		KernelImage:       c.FirecrackerKernelImage,
-		RunDir:            c.FirecrackerRunDir,
-		TemplatesDir:      c.FirecrackerTemplatesDir,
-		UseJailer:         c.UseJailer,
-		JailerChrootBase:  c.JailerChrootBase,
-		JailerUID:         c.JailerUID,
-		JailerGID:         c.JailerGID,
+		FirecrackerBinary:    c.FirecrackerBinary,
+		JailerBinary:         c.JailerBinary,
+		KernelImage:          c.FirecrackerKernelImage,
+		RunDir:               c.FirecrackerRunDir,
+		TemplatesDir:         c.FirecrackerTemplatesDir,
+		UseJailer:            c.UseJailer,
+		JailerChrootBase:     c.JailerChrootBase,
+		JailerUID:            c.JailerUID,
+		JailerGID:            c.JailerGID,
+		SnapshotVerifyOnLoad: c.FirecrackerSnapshotVerifyOnLoad,
 	}
 }
 
@@ -243,14 +250,32 @@ func (d *Driver) SetClientFactory(f vmmClientFactory) { d.newClient = f }
 // mkfs).
 func (d *Driver) SetTemplateResolver(t TemplateResolver) { d.templates = t }
 
-// TemplateResolver maps a template ID to the absolute host path of the
-// prepared rootfs.ext4. Implementations are responsible for asserting
-// that the template is in a usable state (status=ready) — a non-nil
-// path returned with status=pending/failed would crash the VMM at
-// boot. The interface lives in this package (rather than re-exporting
-// the service-layer one) so the runtime package has no service import.
+// TemplateResolver maps a template ID to a *TemplateResolution describing
+// where the prepared artifacts live on disk. Implementations are
+// responsible for asserting that the template is in a usable state
+// (status=ready or ready_no_snapshot) — a non-nil path returned with
+// status=pending/failed would crash the VMM at boot. The interface lives
+// in this package (rather than re-exporting the service-layer one) so the
+// runtime package has no service import.
 type TemplateResolver interface {
-	Resolve(ctx context.Context, templateID string) (rootfsPath string, err error)
+	Resolve(ctx context.Context, templateID string) (*TemplateResolution, error)
+}
+
+// TemplateResolution is the richer return shape the driver needs to
+// pick between the cold-boot (link rootfs + boot) and snapshot-load
+// (LoadSnapshot + Resume) paths in Create. HasSnapshot=false signals
+// the driver to fall back to cold-boot — the rootfs is usable on its
+// own, snapshot artifacts are not present. When HasSnapshot=true,
+// SnapshotMemoryPath / SnapshotStatePath / SnapshotVsockCID are
+// required; SnapshotChecksum is optional (used for integrity
+// verification when SnapshotVerifyOnLoad is on).
+type TemplateResolution struct {
+	RootfsPath         string
+	SnapshotMemoryPath string
+	SnapshotStatePath  string
+	SnapshotChecksum   string
+	SnapshotVsockCID   uint32
+	HasSnapshot        bool
 }
 
 // methodNotImplemented produces the canonical "not yet implemented" error
@@ -386,6 +411,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	//     before. Builds rootfs straight into the runDir so the jailer
 	//     chroot already covers it.
 	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
+	// Snapshot-load path is opt-in per template. When the resolver returns
+	// HasSnapshot=true we skip configureVMM + InstanceStart and instead
+	// issue LoadSnapshot + Resume on the same paused VMM. The pool slot
+	// is still allocated (for TAP) but slot.VsockCID is unused — the
+	// guest's CID was baked into the template snapshot at build time and
+	// the host dials *that* CID to handshake.
+	var (
+		snapshotLoadPath bool
+		snapshotInfo     *TemplateResolution
+	)
 	if req.TemplateID != "" {
 		if d.templates == nil {
 			return nil, fmt.Errorf("firecracker runtime: template resolver not registered (main.go must call SetTemplateResolver): %w",
@@ -395,11 +430,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if err != nil {
 			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
 		}
-		if err := linkOrCopyRootfs(src, rootfsPath); err != nil {
+		if err := linkOrCopyRootfs(src.RootfsPath, rootfsPath); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: template stage: %w", err)
 		}
-		d.logger.Info("firecracker create: staged template rootfs",
-			"sandbox_id", allocID, "template_id", req.TemplateID, "src", src)
+		if src.HasSnapshot {
+			snapshotLoadPath = true
+			snapshotInfo = src
+			d.logger.Info("firecracker create: snapshot-load path",
+				"sandbox_id", allocID, "template_id", req.TemplateID,
+				"template_cid", src.SnapshotVsockCID,
+				"unused_slot_cid", slot.VsockCID)
+		} else {
+			d.logger.Info("firecracker create: staged template rootfs (cold-boot)",
+				"sandbox_id", allocID, "template_id", req.TemplateID, "src", src.RootfsPath)
+		}
 	} else {
 		rootfsResult, err := d.rootfs.Build(ctx, RootfsBuildRequest{
 			ImageRef: ociImageRefFor(req.Image),
@@ -457,25 +501,52 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	// Step 6: REST orchestration. Order matters per the firecracker
 	// docs: machine-config and boot-source before drives; drives and
-	// network-interfaces before InstanceStart.
+	// network-interfaces before InstanceStart. The snapshot-load path
+	// only issues machine-config + LoadSnapshot — everything else is
+	// restored from the snapshot state file.
 	client := d.newClient(handle.APISocket())
-	if err := d.configureVMM(ctx, client, req, rootfsPath, slot); err != nil {
-		return nil, err
+	if snapshotLoadPath {
+		if err := d.configureVMMForLoad(ctx, client, snapshotInfo); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := d.configureVMM(ctx, client, req, rootfsPath, slot); err != nil {
+			return nil, err
+		}
 	}
 
-	// Step 7: InstanceStart.
-	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
-		return nil, fmt.Errorf("firecracker runtime: action InstanceStart: %w", err)
+	// Step 7: Resume the restored VMM (snapshot-load) OR InstanceStart
+	// a freshly-configured one (cold-boot). LoadSnapshot above left the
+	// VMM paused (ResumeVM=false) so the driver retains control over
+	// when execution actually begins — a Phase 4 (PR-B) hook to PATCH
+	// per-sandbox state before resume slots in here.
+	if snapshotLoadPath {
+		if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionResume}); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: action Resume: %w", err)
+		}
+	} else {
+		if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: action InstanceStart: %w", err)
+		}
 	}
 
 	// Step 8: vsock handshake. The toolbox-in-guest listens on
-	// (cid=slot.VsockCID, port=1024); we dial from the host. A failed
+	// (cid=<guestCID>, port=1024); we dial from the host. A failed
 	// handshake here means the guest didn't boot far enough to expose
 	// the listener — either the kernel cmdline is wrong, the init
 	// binary didn't run, or the vsock device wasn't attached
 	// correctly. Surface the error verbatim; the operator's first
 	// debug step is to check the firecracker.log for boot diagnostics.
-	if err := d.vsockHandshake(ctx, slot.VsockCID); err != nil {
+	//
+	// On the snapshot-load path the guest's CID is the template's
+	// reserved CID (baked into the snapshot at build time), NOT the
+	// per-sandbox slot CID. Dialing the slot CID would race a guest
+	// that's listening on the template CID and hang until deadline.
+	handshakeCID := slot.VsockCID
+	if snapshotLoadPath {
+		handshakeCID = snapshotInfo.SnapshotVsockCID
+	}
+	if err := d.vsockHandshake(ctx, handshakeCID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: vsock handshake: %w", err)
 	}
 
@@ -561,6 +632,47 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 		UDSPath:  hostVsockUDSName, // chroot-relative; jailer resolves it
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutVsock: %w", err)
+	}
+	return nil
+}
+
+// configureVMMForLoad is the snapshot-load sibling of configureVMM.
+// Per the firecracker docs, the ONLY pre-LoadSnapshot REST call allowed
+// is PutLogger (optional, debug-only); everything else — machine
+// config, boot source, drives, network interfaces, vsock — comes from
+// the snapshot state file. Restating any of those would be rejected
+// by the API.
+//
+// Integrity verification happens here, on the host, before the load
+// request is issued. A mismatch surfaces immediately as an error
+// rather than letting firecracker mmap a corrupt snapshot.memory and
+// fault later. The check is gated by SnapshotVerifyOnLoad so operators
+// can bypass it for raw-load-cost benchmarking.
+//
+// EnableDiffSnapshots=true is set unconditionally: it costs nothing
+// on the first load and is required for PR-B's per-clone CoW
+// (writes hit a dirty bitmap rather than the shared memory file).
+// ResumeVM=false keeps the clone paused so Create's caller controls
+// when the guest's vCPUs actually start ticking.
+func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap *TemplateResolution) error {
+	if snap == nil {
+		return fmt.Errorf("firecracker runtime: configureVMMForLoad called with nil resolution")
+	}
+	if d.cfg.SnapshotVerifyOnLoad && snap.SnapshotChecksum != "" {
+		if err := verifySnapshotChecksum(snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum); err != nil {
+			return fmt.Errorf("firecracker runtime: snapshot integrity: %w", err)
+		}
+	}
+	if err := client.LoadSnapshot(ctx, firecracker.SnapshotLoad{
+		SnapshotPath: snap.SnapshotStatePath,
+		MemBackend: &firecracker.MemoryBackend{
+			BackendType: "File",
+			BackendPath: snap.SnapshotMemoryPath,
+		},
+		EnableDiffSnapshots: true,
+		ResumeVM:            false,
+	}); err != nil {
+		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
 	return nil
 }

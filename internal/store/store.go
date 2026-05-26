@@ -295,7 +295,14 @@ func Open(path string) (*Store, error) {
 			last_error TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
-			ready_at DATETIME
+			ready_at DATETIME,
+			snapshot_memory_path TEXT NOT NULL DEFAULT '',
+			snapshot_state_path TEXT NOT NULL DEFAULT '',
+			snapshot_size_bytes INTEGER NOT NULL DEFAULT 0,
+			snapshot_checksum TEXT NOT NULL DEFAULT '',
+			snapshot_vsock_cid INTEGER NOT NULL DEFAULT 0,
+			snapshot_error TEXT NOT NULL DEFAULT '',
+			has_snapshot INTEGER NOT NULL DEFAULT 0
 		);`,
 		// Drives the GC sweep's "find rows older than X" query without a
 		// full scan once the catalogue grows beyond a handful of entries.
@@ -396,6 +403,18 @@ func Open(path string) (*Store, error) {
 		// what the template GC uses to answer "is anyone still using this
 		// template?" without scanning the whole sandboxes table.
 		`ALTER TABLE sandboxes ADD COLUMN template_id TEXT NOT NULL DEFAULT '';`,
+		// Phase 3 — snapshot-clone fast-boot columns. All default to the
+		// "no snapshot" zero values so a warm-upgraded Phase 2 row reads as
+		// HasSnapshot=false and the runtime falls back to cold-boot. The
+		// snapshot phase writes them via UpdateTemplateSnapshotReady once
+		// snapshot.memory + snapshot.state are on disk.
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_memory_path TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_state_path TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_size_bytes INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_checksum TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_vsock_cid INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_error TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN has_snapshot INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -1772,8 +1791,10 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO firecracker_templates (
 			id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
-			last_error, created_at, updated_at, ready_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		id,
 		image,
@@ -1785,6 +1806,13 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 		template.CreatedAt.UTC(),
 		template.UpdatedAt.UTC(),
 		readyAt,
+		strings.TrimSpace(template.SnapshotMemoryPath),
+		strings.TrimSpace(template.SnapshotStatePath),
+		template.SnapshotSizeBytes,
+		strings.TrimSpace(template.SnapshotChecksum),
+		template.SnapshotVsockCID,
+		template.SnapshotError,
+		boolToInt(template.HasSnapshot),
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -1798,7 +1826,9 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
-			last_error, created_at, updated_at, ready_at
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
 		FROM firecracker_templates
 		WHERE id = ?
 	`, strings.TrimSpace(id))
@@ -1815,7 +1845,9 @@ func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, e
 func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
-			last_error, created_at, updated_at, ready_at
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
 		FROM firecracker_templates
 		ORDER BY created_at DESC, id ASC
 	`)
@@ -1838,18 +1870,23 @@ func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
 	return items, nil
 }
 
-// UpdateTemplateStatus is the single seam the build goroutine uses to
-// transition pending → ready / failed. rootfsPath, sizeBytes, and
-// lastError are overwritten unconditionally (including to empty on the
-// success path) so a retried build that succeeds doesn't have to remember
-// to clear stale error text. ready_at is stamped only on the ready
-// transition — the GC sweep treats "no ready_at" as "never finished
-// building" and leaves the row alone for the build goroutine to finish
-// or fail.
+// UpdateTemplateStatus is the rootfs-phase seam the build goroutine uses
+// to transition between pending / building_rootfs / ready / ready_no_snapshot
+// / failed. rootfsPath, sizeBytes, and lastError are overwritten
+// unconditionally (including to empty on the success path) so a retried
+// build that succeeds doesn't have to remember to clear stale error text.
+// ready_at is stamped on the ready and ready_no_snapshot transitions
+// (both are terminal-and-usable states); the GC sweep treats "no ready_at"
+// as "never finished building" and leaves the row alone for the build
+// goroutine to finish or fail.
+//
+// The snapshot phase uses UpdateTemplateSnapshotReady / Failed instead so
+// the snapshot columns and the ready transition land in one row update —
+// readers never observe "status=ready but has_snapshot=0".
 func (s *Store) UpdateTemplateStatus(ctx context.Context, id string, status models.TemplateStatus, rootfsPath, lastError string, sizeBytes int64) error {
 	now := time.Now().UTC()
 	var readyAt any
-	if status == models.TemplateStatusReady {
+	if status == models.TemplateStatusReady || status == models.TemplateStatusReadyNoSnapshot {
 		readyAt = now
 	}
 	result, err := s.db.ExecContext(ctx, `
@@ -1868,6 +1905,73 @@ func (s *Store) UpdateTemplateStatus(ctx context.Context, id string, status mode
 	)
 	if err != nil {
 		return fmt.Errorf("update template status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTemplateSnapshotReady is the terminal-success seam for the
+// snapshot phase. Writes the snapshot artifact metadata and flips
+// status=ready / has_snapshot=1 in one UPDATE so a concurrent reader
+// (CreateSandbox racing the build goroutine) never observes
+// "status=ready but the snapshot fields are still zero". snapshot_error
+// is unconditionally cleared so a retried build that finally succeeds
+// doesn't carry a stale message.
+func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, statePath string, sizeBytes int64, checksum string, vsockCID uint32) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, snapshot_memory_path = ?, snapshot_state_path = ?,
+			snapshot_size_bytes = ?, snapshot_checksum = ?, snapshot_vsock_cid = ?,
+			snapshot_error = '', has_snapshot = 1,
+			updated_at = ?, ready_at = COALESCE(?, ready_at)
+		WHERE id = ?
+	`,
+		string(models.TemplateStatusReady),
+		strings.TrimSpace(memPath),
+		strings.TrimSpace(statePath),
+		sizeBytes,
+		strings.TrimSpace(checksum),
+		vsockCID,
+		now,
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template snapshot ready: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTemplateSnapshotFailed records the snapshot-phase error and flips
+// status to ready_no_snapshot. The rootfs columns are untouched — the
+// caller has already populated them via UpdateTemplateStatus during the
+// rootfs phase, and the cold-boot fallback still needs the rootfs path
+// intact. has_snapshot stays 0 (column default) so readers correctly skip
+// the snapshot-load path.
+func (s *Store) UpdateTemplateSnapshotFailed(ctx context.Context, id, snapshotError string) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, snapshot_error = ?, has_snapshot = 0,
+			updated_at = ?, ready_at = COALESCE(?, ready_at)
+		WHERE id = ?
+	`,
+		string(models.TemplateStatusReadyNoSnapshot),
+		snapshotError,
+		now,
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template snapshot failed: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err == nil && affected == 0 {
@@ -1920,15 +2024,27 @@ func (s *Store) IsTemplateReferenced(ctx context.Context, id string) (bool, erro
 // transition. The anti-join against sandboxes uses the
 // idx_sandboxes_template_id partial index so the subquery is cheap.
 func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time) ([]*models.Template, error) {
+	// Phase 3: in-flight statuses now include building_rootfs and
+	// snapshotting on top of the original pending. All three mean
+	// "build goroutine still owns this row, do not GC" — same reason
+	// as pending. We explicitly enumerate so a stray status string
+	// (older build, manual SQL) doesn't get silently swept.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
-			last_error, created_at, updated_at, ready_at
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
 		FROM firecracker_templates
-		WHERE status <> ? AND updated_at < ? AND id NOT IN (
+		WHERE status NOT IN (?, ?, ?) AND updated_at < ? AND id NOT IN (
 			SELECT template_id FROM sandboxes WHERE template_id <> ''
 		)
 		ORDER BY updated_at ASC
-	`, string(models.TemplateStatusPending), olderThan.UTC())
+	`,
+		string(models.TemplateStatusPending),
+		string(models.TemplateStatusBuildingRootfs),
+		string(models.TemplateStatusSnapshotting),
+		olderThan.UTC(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("list gc-eligible templates: %w", err)
 	}
@@ -2707,6 +2823,7 @@ func scanTemplate(scanner interface {
 }) (*models.Template, error) {
 	var template models.Template
 	var readyAt sql.NullTime
+	var hasSnapshot int
 	err := scanner.Scan(
 		&template.ID,
 		&template.Image,
@@ -2718,6 +2835,13 @@ func scanTemplate(scanner interface {
 		&template.CreatedAt,
 		&template.UpdatedAt,
 		&readyAt,
+		&template.SnapshotMemoryPath,
+		&template.SnapshotStatePath,
+		&template.SnapshotSizeBytes,
+		&template.SnapshotChecksum,
+		&template.SnapshotVsockCID,
+		&template.SnapshotError,
+		&hasSnapshot,
 	)
 	if err != nil {
 		return nil, err
@@ -2728,6 +2852,7 @@ func scanTemplate(scanner interface {
 		t := readyAt.Time.UTC()
 		template.ReadyAt = &t
 	}
+	template.HasSnapshot = hasSnapshot != 0
 	return &template, nil
 }
 

@@ -88,12 +88,16 @@ func newTemplateHarness(t *testing.T) (*Service, *store.Store, string) {
 	return svc, st, templatesDir
 }
 
-// TestCreateTemplate_HappyPath confirms the async transition PENDING →
-// READY: POST returns immediately with a pending row, the background
-// goroutine fires the builder, status flips and rootfs_size_bytes is
-// populated. The size assertion pins the os.Stat round trip, not just
-// the in-memory result struct.
-func TestCreateTemplate_HappyPath(t *testing.T) {
+// TestCreateTemplate_RootfsOnlyHappyPath confirms the async transition
+// PENDING → BUILDING_ROOTFS → READY_NO_SNAPSHOT for a node without a
+// snapshotter wired: POST returns immediately with a pending row, the
+// background goroutine fires the builder, status flips and
+// rootfs_size_bytes is populated. The terminal status is
+// ready_no_snapshot (not ready) because no snapshot phase ran — the
+// rootfs is on disk and cold-bootable, but no snapshot artifacts exist.
+// The full two-phase ready transition is covered by
+// TestCreateTemplate_TwoStageHappyPath.
+func TestCreateTemplate_RootfsOnlyHappyPath(t *testing.T) {
 	ctx := context.Background()
 	svc, st, templatesDir := newTemplateHarness(t)
 
@@ -126,19 +130,22 @@ func TestCreateTemplate_HappyPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetTemplate: %v", err)
 		}
-		if got.Status == models.TemplateStatusReady {
+		if got.Status == models.TemplateStatusReadyNoSnapshot {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got.Status != models.TemplateStatusReady {
-		t.Fatalf("post-build status = %s, want ready", got.Status)
+	if got.Status != models.TemplateStatusReadyNoSnapshot {
+		t.Fatalf("post-build status = %s, want ready_no_snapshot", got.Status)
 	}
 	if got.RootfsPath == "" {
 		t.Fatalf("post-build RootfsPath empty")
 	}
 	if got.RootfsSizeBytes == 0 {
 		t.Fatalf("post-build size = 0")
+	}
+	if got.HasSnapshot {
+		t.Fatalf("post-build HasSnapshot = true, want false (no snapshotter)")
 	}
 	if builder.lastReq.OutPath != filepath.Join(templatesDir, "tpl-happy", "rootfs.ext4") {
 		t.Fatalf("builder OutPath = %q, want under templates dir", builder.lastReq.OutPath)
@@ -316,4 +323,271 @@ func TestStartTemplateGC_DisabledIsNoOp(t *testing.T) {
 	svc.cfg.EnableFirecracker = true
 	svc.cfg.FirecrackerTemplateGCInterval = 0
 	svc.StartTemplateGC(ctx) // zero interval must early-out
+}
+
+// fakeTemplateSnapshotter is the test stub for the Phase 3 snapshot
+// phase. Records the request, writes a few bytes to the snapshot
+// artifact paths so the row's snapshot_size_bytes is non-zero, and
+// signals on the done channel so tests can wait without sleeping.
+type fakeTemplateSnapshotter struct {
+	mu      sync.Mutex
+	calls   int
+	lastReq TemplateSnapshotRequest
+	err     error
+	done    chan struct{}
+}
+
+func (f *fakeTemplateSnapshotter) SnapshotTemplate(_ context.Context, req TemplateSnapshotRequest) (*TemplateSnapshotResult, error) {
+	f.mu.Lock()
+	f.calls++
+	f.lastReq = req
+	err := f.err
+	f.mu.Unlock()
+	defer func() {
+		if f.done != nil {
+			f.done <- struct{}{}
+		}
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if werr := os.WriteFile(req.OutMemoryPath, []byte("MEMORY"), 0o600); werr != nil {
+		return nil, werr
+	}
+	if werr := os.WriteFile(req.OutStatePath, []byte("STATE"), 0o600); werr != nil {
+		return nil, werr
+	}
+	return &TemplateSnapshotResult{
+		MemorySizeBytes: 6,
+		StateSizeBytes:  5,
+		Checksum:        "sha256:dead|sha256:beef",
+	}, nil
+}
+
+// fakeCIDAllocator records calls and returns either a canned CID or an
+// error. The pool's per-id idempotency isn't modelled here; tests that
+// need it can drive Allocate twice and compare the returned CIDs.
+type fakeCIDAllocator struct {
+	mu          sync.Mutex
+	allocCalls  int
+	releaseIDs  []string
+	cid         uint32
+	allocateErr error
+}
+
+func (a *fakeCIDAllocator) AllocateForTemplate(_ context.Context, _ string) (uint32, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.allocCalls++
+	if a.allocateErr != nil {
+		return 0, a.allocateErr
+	}
+	return a.cid, nil
+}
+
+func (a *fakeCIDAllocator) ReleaseForTemplate(_ context.Context, id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.releaseIDs = append(a.releaseIDs, id)
+	return nil
+}
+
+// waitForStatus polls the row until it reaches `want` or the deadline
+// expires. Returns the last-read row regardless. Used so the snapshot
+// tests don't have to coordinate two `done` channels (builder + snapshotter).
+func waitForStatus(t *testing.T, st *store.Store, id string, want models.TemplateStatus, dl time.Duration) *models.Template {
+	t.Helper()
+	deadline := time.Now().Add(dl)
+	var got *models.Template
+	for time.Now().Before(deadline) {
+		var err error
+		got, err = st.GetTemplate(context.Background(), id)
+		if err == nil && got != nil && got.Status == want {
+			return got
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return got
+}
+
+// TestCreateTemplate_TwoStageHappyPath drives both phases: builder OK,
+// allocator returns a CID, snapshotter OK. Terminal status MUST be
+// ready (not ready_no_snapshot), has_snapshot=true, snapshot fields
+// populated. Confirms the snapshot phase sees the rootfs path the
+// builder produced and the CID the allocator returned.
+func TestCreateTemplate_TwoStageHappyPath(t *testing.T) {
+	ctx := context.Background()
+	svc, st, templatesDir := newTemplateHarness(t)
+	svc.cfg.FirecrackerSnapshotEnabled = true
+	svc.cfg.FirecrackerTemplateMemoryMB = 512
+	svc.cfg.FirecrackerTemplateVCPU = 1
+
+	svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+	snap := &fakeTemplateSnapshotter{}
+	svc.SetTemplateSnapshotter(snap)
+	alloc := &fakeCIDAllocator{cid: 42}
+	svc.SetTemplateCIDAllocator(alloc)
+
+	tpl, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "tpl-two", Image: "docker://alpine:3.19"})
+	if err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	if tpl.Status != models.TemplateStatusPending {
+		t.Fatalf("initial status = %s, want pending", tpl.Status)
+	}
+
+	got := waitForStatus(t, st, tpl.ID, models.TemplateStatusReady, 5*time.Second)
+	if got == nil || got.Status != models.TemplateStatusReady {
+		t.Fatalf("post-build status = %v, want ready", got)
+	}
+	if !got.HasSnapshot {
+		t.Errorf("HasSnapshot = false, want true")
+	}
+	if got.SnapshotMemoryPath != filepath.Join(templatesDir, "tpl-two", snapshotMemoryFilename) {
+		t.Errorf("SnapshotMemoryPath = %q", got.SnapshotMemoryPath)
+	}
+	if got.SnapshotStatePath != filepath.Join(templatesDir, "tpl-two", snapshotStateFilename) {
+		t.Errorf("SnapshotStatePath = %q", got.SnapshotStatePath)
+	}
+	if got.SnapshotChecksum != "sha256:dead|sha256:beef" {
+		t.Errorf("SnapshotChecksum = %q", got.SnapshotChecksum)
+	}
+	if got.SnapshotVsockCID != 42 {
+		t.Errorf("SnapshotVsockCID = %d, want 42", got.SnapshotVsockCID)
+	}
+	if got.SnapshotSizeBytes != 11 { // 6 (mem) + 5 (state)
+		t.Errorf("SnapshotSizeBytes = %d, want 11", got.SnapshotSizeBytes)
+	}
+	// Snapshotter saw the rootfs the builder produced and the CID the
+	// allocator returned.
+	if snap.lastReq.RootfsPath == "" {
+		t.Errorf("snapshotter RootfsPath empty")
+	}
+	if snap.lastReq.GuestCID != 42 {
+		t.Errorf("snapshotter GuestCID = %d, want 42", snap.lastReq.GuestCID)
+	}
+	if snap.lastReq.MemoryMB != 512 || snap.lastReq.VCPU != 1 {
+		t.Errorf("snapshotter resources = %d MiB / %d vCPU, want 512/1", snap.lastReq.MemoryMB, snap.lastReq.VCPU)
+	}
+	// manifest.json must be on disk for operator debugging.
+	if _, err := os.Stat(filepath.Join(templatesDir, "tpl-two", templateManifestFilename)); err != nil {
+		t.Errorf("manifest.json not written: %v", err)
+	}
+}
+
+// TestCreateTemplate_SnapshotFailFallsBackToReadyNoSnapshot is the
+// degraded path: builder OK, allocator OK, snapshotter returns error.
+// Terminal status MUST be ready_no_snapshot, snapshot_error populated,
+// CID released so a future retry can re-allocate, rootfs untouched.
+func TestCreateTemplate_SnapshotFailFallsBackToReadyNoSnapshot(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newTemplateHarness(t)
+	svc.cfg.FirecrackerSnapshotEnabled = true
+
+	svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{err: errors.New("vmm boot timed out")})
+	alloc := &fakeCIDAllocator{cid: 17}
+	svc.SetTemplateCIDAllocator(alloc)
+
+	tpl, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "tpl-snapfail", Image: "docker://alpine:3.19"})
+	if err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	got := waitForStatus(t, st, tpl.ID, models.TemplateStatusReadyNoSnapshot, 5*time.Second)
+	if got == nil || got.Status != models.TemplateStatusReadyNoSnapshot {
+		t.Fatalf("post-build status = %v, want ready_no_snapshot", got)
+	}
+	if got.HasSnapshot {
+		t.Errorf("HasSnapshot = true, want false on snapshot failure")
+	}
+	if got.SnapshotError == "" {
+		t.Errorf("SnapshotError empty, want populated")
+	}
+	if got.RootfsPath == "" {
+		t.Errorf("RootfsPath empty, rootfs phase succeeded")
+	}
+	// CID must be released exactly once — the next CreateTemplate retry
+	// would otherwise drain the pool.
+	alloc.mu.Lock()
+	defer alloc.mu.Unlock()
+	if len(alloc.releaseIDs) != 1 || alloc.releaseIDs[0] != tpl.ID {
+		t.Errorf("releaseIDs = %v, want [%q]", alloc.releaseIDs, tpl.ID)
+	}
+}
+
+// TestCreateTemplate_CIDAllocFailFallsBackToReadyNoSnapshot is the
+// path where the snapshot phase never even starts: builder OK,
+// allocator returns error. Terminal status MUST be ready_no_snapshot,
+// snapshot_error populated with the allocator error, snapshotter MUST
+// NOT have been called (no CID = no VMM).
+func TestCreateTemplate_CIDAllocFailFallsBackToReadyNoSnapshot(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newTemplateHarness(t)
+	svc.cfg.FirecrackerSnapshotEnabled = true
+
+	svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+	snap := &fakeTemplateSnapshotter{}
+	svc.SetTemplateSnapshotter(snap)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{allocateErr: errors.New("pool exhausted")})
+
+	tpl, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "tpl-cidfail", Image: "docker://alpine:3.19"})
+	if err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	got := waitForStatus(t, st, tpl.ID, models.TemplateStatusReadyNoSnapshot, 5*time.Second)
+	if got == nil || got.Status != models.TemplateStatusReadyNoSnapshot {
+		t.Fatalf("post-build status = %v, want ready_no_snapshot", got)
+	}
+	if got.HasSnapshot {
+		t.Errorf("HasSnapshot = true, want false")
+	}
+	if got.SnapshotError == "" || !contains(got.SnapshotError, "pool exhausted") {
+		t.Errorf("SnapshotError = %q, want to include 'pool exhausted'", got.SnapshotError)
+	}
+	snap.mu.Lock()
+	defer snap.mu.Unlock()
+	if snap.calls != 0 {
+		t.Errorf("snapshotter calls = %d, want 0 (cid alloc failed first)", snap.calls)
+	}
+}
+
+// TestDeleteTemplate_ReleasesCID pins the cleanup contract: deleting a
+// template with has_snapshot=true releases the per-template CID, so a
+// later CreateTemplate against the same id can re-reserve it.
+func TestDeleteTemplate_ReleasesCID(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newTemplateHarness(t)
+
+	if err := st.CreateTemplate(ctx, &models.Template{
+		ID: "tpl-cid-del", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusReady,
+		// Provide a fake rootfs path under a tmp dir we own so the
+		// service's RemoveAll cleanup doesn't try to nuke /tmp/tpl-foo.
+		RootfsPath:       filepath.Join(t.TempDir(), "rootfs.ext4"),
+		HasSnapshot:      true,
+		SnapshotVsockCID: 99,
+		CreatedAt:        time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	alloc := &fakeCIDAllocator{}
+	svc.SetTemplateCIDAllocator(alloc)
+
+	if err := svc.DeleteTemplate(ctx, "tpl-cid-del"); err != nil {
+		t.Fatalf("DeleteTemplate: %v", err)
+	}
+	alloc.mu.Lock()
+	defer alloc.mu.Unlock()
+	if len(alloc.releaseIDs) != 1 || alloc.releaseIDs[0] != "tpl-cid-del" {
+		t.Errorf("releaseIDs = %v, want [tpl-cid-del]", alloc.releaseIDs)
+	}
+}
+
+func contains(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

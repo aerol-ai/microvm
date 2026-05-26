@@ -450,6 +450,39 @@ type Config struct {
 	// long-lived templates should bump this. SB_FIRECRACKER_TEMPLATE_GC_TTL.
 	FirecrackerTemplateGCTTL time.Duration
 
+	// FirecrackerSnapshotEnabled gates the Phase 3 snapshot phase of the
+	// template build pipeline. Default true. When false, templates stop
+	// after rootfs.ext4 lands on disk and every Create uses the cold-boot
+	// path. Useful for hosts where the snapshotter is misbehaving and
+	// operators need to keep templates building.
+	// SB_FIRECRACKER_SNAPSHOT_ENABLED.
+	FirecrackerSnapshotEnabled bool
+	// FirecrackerTemplateBuildTimeout caps the total wall-clock budget for
+	// the async template build goroutine (rootfs build + optional snapshot
+	// phase combined). Default 45 min — comfortably above every
+	// real-world skopeo+umoci+mkfs+snapshot pipeline we've measured on
+	// the fattest CUDA bases. The cap exists to bound stuck builds (a
+	// wedged subprocess or a hung VMM), not to fail healthy ones.
+	// SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT.
+	FirecrackerTemplateBuildTimeout time.Duration
+	// FirecrackerTemplateMemoryMB / FirecrackerTemplateVCPU configure the
+	// transient VMM used to capture a template snapshot. Defaults
+	// 512 MiB / 1 vCPU keep snapshot.memory small — larger values
+	// inflate the on-disk artifact without changing what a clone can
+	// do (the clone's effective resources are pinned by the snapshot
+	// state, which equals these). Treat as a tuning knob only flipped
+	// when the template's init phase OOMs during the snapshot capture.
+	// SB_FIRECRACKER_TEMPLATE_MEMORY_MB / SB_FIRECRACKER_TEMPLATE_VCPU.
+	FirecrackerTemplateMemoryMB int
+	FirecrackerTemplateVCPU     int
+	// FirecrackerSnapshotVerifyOnLoad gates SHA256 verification of
+	// snapshot.memory + snapshot.state before each LoadSnapshot. Default
+	// true — paying ~one-pass-over-the-file at boot is preferable to
+	// resuming from a corrupted snapshot, which surfaces as silent guest
+	// memory damage hours later. Bypass only for benchmarking the raw
+	// load path. SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD.
+	FirecrackerSnapshotVerifyOnLoad bool
+
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
 	// picks a random candidate first; collisions fall back to a deterministic
@@ -949,6 +982,12 @@ func Load() (Config, error) {
 		FirecrackerTemplateGCEnabled:  getEnvBool("SB_FIRECRACKER_TEMPLATE_GC_ENABLED", true),
 		FirecrackerTemplateGCInterval: getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_INTERVAL", 1*time.Hour),
 		FirecrackerTemplateGCTTL:      getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_TTL", 168*time.Hour),
+
+		FirecrackerSnapshotEnabled:      getEnvBool("SB_FIRECRACKER_SNAPSHOT_ENABLED", true),
+		FirecrackerTemplateBuildTimeout: getEnvDuration("SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT", 45*time.Minute),
+		FirecrackerTemplateMemoryMB:     getEnvInt("SB_FIRECRACKER_TEMPLATE_MEMORY_MB", 512),
+		FirecrackerTemplateVCPU:         getEnvInt("SB_FIRECRACKER_TEMPLATE_VCPU", 1),
+		FirecrackerSnapshotVerifyOnLoad: getEnvBool("SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD", true),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true

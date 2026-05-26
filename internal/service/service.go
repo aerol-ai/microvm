@@ -81,6 +81,18 @@ type Service struct {
 	// not-configured error when this is nil so the handler can return
 	// 503 rather than panicking.
 	templateBuilder TemplateBuilder
+	// templateSnapshotter is the Phase 3 snapshot-capture seam. Nil
+	// disables the second build phase: rootfs builds still complete and
+	// templates end in status=ready_no_snapshot (cold-boot only). Wired
+	// from main.go to an adapter around *firecracker.Driver.
+	templateSnapshotter TemplateSnapshotter
+	// templateCIDAllocator reserves the per-template host-side AF_VSOCK
+	// CID that gets baked into the snapshot.state file at build time and
+	// re-used by every clone load. Wired to the same TapPool used for
+	// sandbox slot allocation via the "template:" + id synthetic sandbox
+	// id (the pool's per-id uniqueness gate gives us idempotent
+	// reservation). Nil here also disables the snapshot phase.
+	templateCIDAllocator TemplateCIDAllocator
 	// events is the concrete Docker client for the daemon /events stream and
 	// any other Docker-API-shaped surface that intentionally stays outside
 	// the runtime abstraction. Today both fields point at the same instance.

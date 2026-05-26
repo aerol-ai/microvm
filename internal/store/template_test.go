@@ -207,3 +207,135 @@ func TestTemplates_GCQuery(t *testing.T) {
 		t.Fatalf("ListGCEligibleTemplates() = %v, want exactly [tpl-stale]", ids)
 	}
 }
+
+// TestTemplates_GCQuery_ExcludesBuildingRootfs pins the Phase 3 widening
+// of the gc-eligible filter: building_rootfs and snapshotting must be
+// treated like pending — the build goroutine still owns the dir, and
+// the janitor must not race it.
+func TestTemplates_GCQuery_ExcludesBuildingRootfs(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	mustInsert := func(id string, status models.TemplateStatus) {
+		t.Helper()
+		if err := st.CreateTemplate(ctx, &models.Template{
+			ID: id, Image: "x", Status: status,
+			CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now.Add(-48 * time.Hour),
+		}); err != nil {
+			t.Fatalf("CreateTemplate %s: %v", id, err)
+		}
+	}
+	mustInsert("tpl-rootfs", models.TemplateStatusBuildingRootfs)
+	mustInsert("tpl-snap", models.TemplateStatusSnapshotting)
+	mustInsert("tpl-ready", models.TemplateStatusReady)
+	mustInsert("tpl-rno", models.TemplateStatusReadyNoSnapshot)
+
+	rows, err := st.ListGCEligibleTemplates(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("ListGCEligibleTemplates: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, r := range rows {
+		ids[r.ID] = true
+	}
+	if ids["tpl-rootfs"] || ids["tpl-snap"] {
+		t.Errorf("intermediate-state templates leaked into GC list: %v", ids)
+	}
+	if !ids["tpl-ready"] || !ids["tpl-rno"] {
+		t.Errorf("terminal-state templates missing from GC list: %v", ids)
+	}
+}
+
+// TestUpdateTemplateSnapshotReady pins the round-trip on every
+// snapshot column the Phase 3 store schema introduced. A read after
+// write must see exactly what we wrote — a regression here cascades
+// into the driver picking up stale paths or zero checksums and
+// silently cold-booting instead of snapshot-loading.
+func TestUpdateTemplateSnapshotReady(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	now := time.Now().UTC().Round(time.Second)
+	tpl := &models.Template{
+		ID: "tpl-snap-ok", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusSnapshotting, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	if err := st.UpdateTemplateSnapshotReady(ctx, tpl.ID,
+		"/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.memory",
+		"/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.state",
+		1<<24, "sha256:deadbeef|sha256:cafef00d", 42,
+	); err != nil {
+		t.Fatalf("UpdateTemplateSnapshotReady: %v", err)
+	}
+
+	got, err := st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if !got.HasSnapshot {
+		t.Errorf("HasSnapshot = false, want true")
+	}
+	if got.SnapshotMemoryPath != "/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.memory" {
+		t.Errorf("SnapshotMemoryPath = %q", got.SnapshotMemoryPath)
+	}
+	if got.SnapshotStatePath != "/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.state" {
+		t.Errorf("SnapshotStatePath = %q", got.SnapshotStatePath)
+	}
+	if got.SnapshotSizeBytes != 1<<24 {
+		t.Errorf("SnapshotSizeBytes = %d, want %d", got.SnapshotSizeBytes, 1<<24)
+	}
+	if got.SnapshotChecksum != "sha256:deadbeef|sha256:cafef00d" {
+		t.Errorf("SnapshotChecksum = %q", got.SnapshotChecksum)
+	}
+	if got.SnapshotVsockCID != 42 {
+		t.Errorf("SnapshotVsockCID = %d, want 42", got.SnapshotVsockCID)
+	}
+	// snapshot_error must be cleared on a successful capture — a stale
+	// error string from a prior failed attempt would confuse operators
+	// inspecting the row.
+	if got.SnapshotError != "" {
+		t.Errorf("SnapshotError = %q, want empty after success", got.SnapshotError)
+	}
+}
+
+// TestUpdateTemplateSnapshotFailed pins the negative path: the
+// snapshot_error column is populated, snapshot fields stay zero/empty,
+// has_snapshot stays false. The terminal status (ready_no_snapshot)
+// is set by a separate UpdateTemplateStatus call — this test focuses
+// only on what the failure helper itself writes.
+func TestUpdateTemplateSnapshotFailed(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	now := time.Now().UTC().Round(time.Second)
+	tpl := &models.Template{
+		ID: "tpl-snap-bad", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusSnapshotting, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	if err := st.UpdateTemplateSnapshotFailed(ctx, tpl.ID, "vmm boot timed out"); err != nil {
+		t.Fatalf("UpdateTemplateSnapshotFailed: %v", err)
+	}
+
+	got, err := st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.SnapshotError != "vmm boot timed out" {
+		t.Errorf("SnapshotError = %q, want %q", got.SnapshotError, "vmm boot timed out")
+	}
+	if got.HasSnapshot {
+		t.Errorf("HasSnapshot = true, want false on failure")
+	}
+	if got.SnapshotMemoryPath != "" || got.SnapshotStatePath != "" {
+		t.Errorf("snapshot paths populated on failure: mem=%q state=%q", got.SnapshotMemoryPath, got.SnapshotStatePath)
+	}
+}
