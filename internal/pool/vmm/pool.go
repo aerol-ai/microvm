@@ -241,14 +241,21 @@ func (p *Pool) Acquire(ctx context.Context, templateID, sandboxID string, now ti
 // firecracker process via the next daemon-restart scan). Returns
 // ErrNoLoadedSlot.
 func (p *Pool) AcquireWithHandle(ctx context.Context, templateID, sandboxID string, now time.Time) (*Slot, SpawnedHandle, error) {
+	start := time.Now()
 	slot, err := p.Acquire(ctx, templateID, sandboxID, now)
 	if err != nil {
+		if errors.Is(err, ErrNoLoadedSlot) {
+			recordAcquireOutcome(acquireOutcomeMiss, time.Since(start))
+		} else {
+			recordAcquireOutcome(metricsClassifyAcquireError(err), time.Since(start))
+		}
 		return nil, nil, err
 	}
 	p.handlesMu.Lock()
 	handle, ok := p.handles[slot.ID]
 	if ok {
 		delete(p.handles, slot.ID)
+		handlesInMemory.Add(-1)
 	}
 	p.handlesMu.Unlock()
 	if !ok {
@@ -262,8 +269,10 @@ func (p *Pool) AcquireWithHandle(ctx context.Context, templateID, sandboxID stri
 			p.logger.Warn("vmm pool: orphan release failed",
 				"slot_id", slot.ID, "sandbox_id", sandboxID, "error", relErr)
 		}
+		recordAcquireOutcome(acquireOutcomeOrphan, time.Since(start))
 		return nil, nil, ErrNoLoadedSlot
 	}
+	recordAcquireOutcome(acquireOutcomeHit, time.Since(start))
 	return slot, handle, nil
 }
 
@@ -277,6 +286,9 @@ func (p *Pool) registerHandle(slotID string, h SpawnedHandle) {
 		return
 	}
 	p.handlesMu.Lock()
+	if _, dup := p.handles[slotID]; !dup {
+		handlesInMemory.Add(1)
+	}
 	p.handles[slotID] = h
 	p.handlesMu.Unlock()
 }
@@ -290,6 +302,7 @@ func (p *Pool) takeHandle(slotID string) (SpawnedHandle, bool) {
 	h, ok := p.handles[slotID]
 	if ok {
 		delete(p.handles, slotID)
+		handlesInMemory.Add(-1)
 	}
 	return h, ok
 }
@@ -310,6 +323,7 @@ func (p *Pool) Close(ctx context.Context, grace time.Duration) int {
 	p.handlesMu.Lock()
 	handles := p.handles
 	p.handles = make(map[string]SpawnedHandle)
+	handlesInMemory.Add(-int64(len(handles)))
 	p.handlesMu.Unlock()
 	drained := 0
 	for slotID, h := range handles {
@@ -456,6 +470,7 @@ func (p *Pool) ReapReleased(ctx context.Context, cutoff time.Time) (int, error) 
 		}
 		deleted++
 	}
+	recordReaped(deleted)
 	return deleted, nil
 }
 

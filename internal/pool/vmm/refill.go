@@ -157,9 +157,13 @@ func (p *Pool) runRefillOnce(ctx context.Context, lister TemplateLister, spawner
 		// next ticker.C delivery will pick up the work; if the
 		// previous tick was wedged, it stays wedged but doesn't
 		// fan out.
+		recordRefillTickDropped()
 		return
 	}
 	defer busy.Store(false)
+
+	tickStart := time.Now()
+	defer func() { recordRefillTick(time.Since(tickStart)) }()
 
 	templates, err := lister.ListWarmableTemplates(ctx)
 	if err != nil {
@@ -171,6 +175,23 @@ func (p *Pool) runRefillOnce(ctx context.Context, lister TemplateLister, spawner
 			return
 		}
 		p.refillTemplate(ctx, tpl, spawner, spawnTimeout)
+	}
+	// Publish current per-template depth gauges at the end of the
+	// tick so dashboards see the post-refill state, not the pre-
+	// refill snapshot. The query is a single GROUP BY per template
+	// behind the template_status index, so the cost is negligible
+	// compared to the spawns we just issued.
+	for _, tpl := range templates {
+		if ctx.Err() != nil {
+			return
+		}
+		stats, err := p.Stats(ctx, tpl.TemplateID)
+		if err != nil {
+			p.logger.Warn("vmm pool: publish stats query failed",
+				"template_id", tpl.TemplateID, "error", err)
+			continue
+		}
+		publishSlotStats(tpl.TemplateID, stats)
 	}
 }
 
@@ -200,6 +221,7 @@ func (p *Pool) refillTemplate(ctx context.Context, tpl TemplateWarmInput, spawne
 	if budget <= 0 {
 		return
 	}
+	recordRefillShortfall(tpl.TemplateID, budget)
 	p.logger.Info("vmm pool: refill tick",
 		"template_id", tpl.TemplateID, "desired", desired,
 		"have", len(have), "budget", budget)
@@ -237,6 +259,7 @@ func (p *Pool) spawnOne(parentCtx context.Context, tpl TemplateWarmInput, spawne
 
 	spawnCtx, cancel := context.WithTimeout(parentCtx, spawnTimeout)
 	defer cancel()
+	spawnStart := time.Now()
 	handle, err := spawner.Spawn(spawnCtx, slotID, SnapshotInputs{
 		TemplateID:         tpl.TemplateID,
 		SnapshotMemoryPath: tpl.SnapshotMemoryPath,
@@ -244,7 +267,9 @@ func (p *Pool) spawnOne(parentCtx context.Context, tpl TemplateWarmInput, spawne
 		SnapshotChecksum:   tpl.SnapshotChecksum,
 		VsockCID:           tpl.VsockCID,
 	})
+	recordSpawnLatency(time.Since(spawnStart))
 	if err != nil {
+		recordSpawnOutcome(spawnOutcomeSpawnError)
 		// Spawn failed: mark released with the error preserved.
 		if mErr := p.RecordFailed(parentCtx, slotID, err.Error(), time.Now().UTC()); mErr != nil {
 			p.logger.Warn("vmm pool: mark failed after spawn error failed",
@@ -266,6 +291,7 @@ func (p *Pool) spawnOne(parentCtx context.Context, tpl TemplateWarmInput, spawne
 	// spawn already succeeded; we don't want a slow SQLite write to
 	// race the spawn timeout we just released.
 	if err := p.RecordLoaded(parentCtx, slotID, handle.APISocket(), handle.RunDir(), tpl.VsockCID, time.Now().UTC()); err != nil {
+		recordSpawnOutcome(spawnOutcomeRecordError)
 		// Loaded-record failed but the VMM process is up. Tear it
 		// down — leaving a process whose row says 'spawning' would
 		// confuse the GC sweep (and worse, the next Acquire is
@@ -277,6 +303,7 @@ func (p *Pool) spawnOne(parentCtx context.Context, tpl TemplateWarmInput, spawne
 		_ = p.RecordFailed(parentCtx, slotID, "record loaded failed: "+err.Error(), time.Now().UTC())
 		return
 	}
+	recordSpawnOutcome(spawnOutcomeSuccess)
 
 	// Park the handle alongside the row so AcquireWithHandle can
 	// retrieve it. Order matters: register AFTER RecordLoaded so the
