@@ -468,6 +468,18 @@ type CreateSandboxRequest struct {
 	// Phase 2). Pre-snapshot phase: the rootfs is the only artifact a
 	// template provides; Phase 3 layers snapshot.memory/state on top.
 	TemplateID string `json:"template_id,omitempty"`
+	// OverlaySizeGB, when > 0 and Runtime="firecracker", attaches a
+	// per-sandbox writable virtio-blk device (drive_id="overlay") of
+	// this size at /dev/vdb. On the snapshot-load fast-boot path the
+	// device must exist in the template snapshot's virtio-blk state —
+	// templates built before Phase 3 PR-B (has_overlay=false) reject
+	// this field with an error pointing at POST /v1/templates for a
+	// rebuild. The host allocates a sparse file; the guest is
+	// responsible for mkfs and mount (or set SB_FIRECRACKER_OVERLAY_MKFS
+	// on the daemon to have the host mkfs.ext4 the file at create time).
+	// Ignored on the Docker path. Capped at 1024 GiB by request
+	// validation; the daemon's admission control may reject smaller.
+	OverlaySizeGB int `json:"overlay_size_gb,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -588,6 +600,13 @@ type Sandbox struct {
 	// template is still in use; the firecracker driver also reads it on
 	// recreate so failover stays on the same rootfs.
 	TemplateID string `json:"template_id,omitempty"`
+	// OverlaySizeGB is the size of the per-sandbox writable overlay
+	// drive (virtio-blk at /dev/vdb), echoed back from the create
+	// request so callers can confirm what was provisioned. Zero means
+	// no overlay was attached. Persisted because the runtime cleanup
+	// path needs to know whether overlay.ext4 was allocated in the
+	// per-sandbox runDir.
+	OverlaySizeGB int `json:"overlay_size_gb,omitempty"`
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.
@@ -906,6 +925,14 @@ type Template struct {
 	SnapshotVsockCID   uint32         `json:"-"`
 	SnapshotError      string         `json:"snapshot_error,omitempty"`
 	HasSnapshot        bool           `json:"has_snapshot"`
+	// HasOverlay is the API-facing "this template was built with a
+	// per-sandbox overlay drive placeholder baked into its snapshot
+	// state" flag. PR-A templates have it false; the snapshot-load path
+	// rejects an OverlaySizeGB request against a HasOverlay=false
+	// template because Firecracker cannot add a virtio-blk device
+	// post-load — only PATCH an existing one's backing path. Operators
+	// rebuild the template via POST /v1/templates to upgrade.
+	HasOverlay bool `json:"has_overlay"`
 }
 
 // CreateTemplateRequest is the body for POST /v1/templates. ID is

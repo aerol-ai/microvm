@@ -345,7 +345,13 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		// observably wrong but harmless (the next request still works
 		// against the rootfs).
 		snapshotSize := snap.MemorySizeBytes + snap.StateSizeBytes
-		if uerr := s.store.UpdateTemplateSnapshotReady(ctx, id, memOut, stateOut, snapshotSize, snap.Checksum, cid); uerr != nil {
+		// hasOverlay=true: every PR-B snapshot capture includes the
+		// overlay drive placeholder, so this template is safe to clone
+		// with an OverlaySizeGB request. PR-A templates that pre-dated
+		// the placeholder logic keep has_overlay=0 via the column
+		// default, and the runtime rejects an overlay request against
+		// them with a clear "rebuild template" error.
+		if uerr := s.store.UpdateTemplateSnapshotReady(ctx, id, memOut, stateOut, snapshotSize, snap.Checksum, cid, true); uerr != nil {
 			s.logger.Warn("template build: snapshot ready update failed", "template_id", id, "error", uerr)
 			// Don't try to roll back — the on-disk artifacts are valid,
 			// the row is just stale. Operators can re-trigger the build.

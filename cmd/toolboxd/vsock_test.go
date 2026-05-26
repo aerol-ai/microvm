@@ -157,7 +157,7 @@ func TestVsock_UnknownOpReturnsError(t *testing.T) {
 
 func TestVsock_MissingOp(t *testing.T) {
 	host, guest := newPipePair()
-	done := runHandlerInBackground(t, guest, newLoggingVsockHandler(nil))
+	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil))
 
 	_, _ = host.Write([]byte(`{}` + "\n"))
 	var resp VsockResponse
@@ -209,7 +209,7 @@ func TestVsock_HandlerErrorDoesNotCloseConn(t *testing.T) {
 // newline). The host should reconnect.
 func TestVsock_DecodeErrorClosesConn(t *testing.T) {
 	host, guest := newPipePair()
-	done := runHandlerInBackground(t, guest, newLoggingVsockHandler(nil))
+	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil))
 
 	_, _ = host.Write([]byte("not json\n"))
 	var resp VsockResponse
@@ -231,5 +231,164 @@ func TestVsock_DecodeErrorClosesConn(t *testing.T) {
 func closePipeWriter(p *pipeConn) {
 	if c, ok := p.w.(io.Closer); ok {
 		_ = c.Close()
+	}
+}
+
+// fakeQuiesceOps records ReseedRandom / SetWallclock calls so the
+// quiesceHandler tests can assert which kernel-state resync ops the
+// post_resume handler triggered without firing real syscalls.
+type fakeQuiesceOps struct {
+	mu            sync.Mutex
+	reseedCalls   int
+	wallclockArgs []int64
+	reseedErr     error
+	wallclockErr  error
+}
+
+func (f *fakeQuiesceOps) ReseedRandom() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reseedCalls++
+	return f.reseedErr
+}
+
+func (f *fakeQuiesceOps) SetWallclock(ns int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.wallclockArgs = append(f.wallclockArgs, ns)
+	return f.wallclockErr
+}
+
+// fakeSessionFlusher records FlushRecording calls; List returns
+// the pre-seeded IDs so the pre_snapshot test can assert the
+// handler iterates every active session.
+type fakeSessionFlusher struct {
+	mu        sync.Mutex
+	ids       []string
+	flushed   []string
+	flushErrs map[string]error
+}
+
+func (f *fakeSessionFlusher) ListIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.ids))
+	copy(out, f.ids)
+	return out
+}
+
+func (f *fakeSessionFlusher) FlushRecording(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flushed = append(f.flushed, id)
+	if f.flushErrs == nil {
+		return nil
+	}
+	return f.flushErrs[id]
+}
+
+// TestQuiesceHandler_PreSnapshot_FlushesEverySession asserts that the
+// pre_snapshot signal walks the session manager and calls
+// FlushRecording once per active session. A flush error is logged
+// (best-effort) and does NOT cause the op to fail — the snapshot
+// would otherwise abort just because one session's recording write
+// hit a disk-full or closed-file error.
+func TestQuiesceHandler_PreSnapshot_FlushesEverySession(t *testing.T) {
+	flusher := &fakeSessionFlusher{
+		ids:       []string{"s1", "s2", "s3"},
+		flushErrs: map[string]error{"s2": errors.New("disk full")},
+	}
+	h := newQuiesceHandler(nil, flusher)
+	h.quiesce = &fakeQuiesceOps{} // unused for pre_snapshot but avoids nil deref
+
+	if err := h.OnPreSnapshot(context.Background(), nil); err != nil {
+		t.Fatalf("OnPreSnapshot: %v", err)
+	}
+	flusher.mu.Lock()
+	got := append([]string(nil), flusher.flushed...)
+	flusher.mu.Unlock()
+	want := []string{"s1", "s2", "s3"}
+	if len(got) != len(want) {
+		t.Fatalf("flushed = %v, want %v", got, want)
+	}
+	for i, id := range want {
+		if got[i] != id {
+			t.Errorf("flushed[%d] = %q, want %q", i, got[i], id)
+		}
+	}
+}
+
+// TestQuiesceHandler_PostResume_ResyncsClockAndRNG asserts that a
+// well-formed post_resume payload with wallclock_unix_ns calls
+// SetWallclock then ReseedRandom. The RNG reseed is unconditional —
+// every clone resumes with the template's entropy pool, so reseed is
+// not gated on the wallclock field's presence.
+func TestQuiesceHandler_PostResume_ResyncsClockAndRNG(t *testing.T) {
+	q := &fakeQuiesceOps{}
+	h := newQuiesceHandler(nil, nil)
+	h.quiesce = q
+
+	raw := json.RawMessage(`{"wallclock_unix_ns":1700000000000000000}`)
+	if err := h.OnPostResume(context.Background(), raw); err != nil {
+		t.Fatalf("OnPostResume: %v", err)
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.reseedCalls != 1 {
+		t.Errorf("reseedCalls = %d, want 1", q.reseedCalls)
+	}
+	if len(q.wallclockArgs) != 1 || q.wallclockArgs[0] != 1700000000000000000 {
+		t.Errorf("wallclockArgs = %v, want [1700000000000000000]", q.wallclockArgs)
+	}
+}
+
+// TestQuiesceHandler_PostResume_RNGReseedAlwaysFires asserts that a
+// missing or malformed wallclock payload still triggers
+// ReseedRandom. The clock can be tolerably wrong for seconds (TLS
+// retries handle it); identical entropy across two clones is a
+// crypto bug from byte one.
+func TestQuiesceHandler_PostResume_RNGReseedAlwaysFires(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"empty", nil},
+		{"missing field", json.RawMessage(`{}`)},
+		{"malformed", json.RawMessage(`not-json`)},
+		{"zero wallclock", json.RawMessage(`{"wallclock_unix_ns":0}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &fakeQuiesceOps{}
+			h := newQuiesceHandler(nil, nil)
+			h.quiesce = q
+			if err := h.OnPostResume(context.Background(), tc.raw); err != nil {
+				t.Fatalf("OnPostResume: %v", err)
+			}
+			q.mu.Lock()
+			defer q.mu.Unlock()
+			if q.reseedCalls != 1 {
+				t.Errorf("reseedCalls = %d, want 1", q.reseedCalls)
+			}
+			if len(q.wallclockArgs) != 0 {
+				t.Errorf("wallclockArgs = %v, want empty (no positive ns)", q.wallclockArgs)
+			}
+		})
+	}
+}
+
+// TestQuiesceHandler_PostResume_QuiesceErrorIsNonFatal asserts a
+// failed RNG reseed or clock set logs and continues — the clone is
+// already serving, returning an error here would force a retry that
+// can't help.
+func TestQuiesceHandler_PostResume_QuiesceErrorIsNonFatal(t *testing.T) {
+	q := &fakeQuiesceOps{
+		reseedErr:    errors.New("entropy pool unavailable"),
+		wallclockErr: errors.New("CAP_SYS_TIME denied"),
+	}
+	h := newQuiesceHandler(nil, nil)
+	h.quiesce = q
+	if err := h.OnPostResume(context.Background(),
+		json.RawMessage(`{"wallclock_unix_ns":12345}`)); err != nil {
+		t.Errorf("OnPostResume returned %v; want nil despite quiesce errors", err)
 	}
 }

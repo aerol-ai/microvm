@@ -33,7 +33,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -162,6 +164,24 @@ type Config struct {
 	// load-cost of a known-good snapshot. Mirrors
 	// internal/config.Config.FirecrackerSnapshotVerifyOnLoad.
 	SnapshotVerifyOnLoad bool
+	// OverlayEnabled is the daemon-wide opt-out for the per-sandbox
+	// writable overlay drive. Mirrors
+	// internal/config.Config.FirecrackerOverlayEnabled. When false,
+	// Create rejects any request with OverlaySizeGB > 0.
+	OverlayEnabled bool
+	// OverlayMkfs makes the driver run mkfs.ext4 -F on each per-
+	// sandbox overlay.ext4 right after sparse allocation. Mirrors
+	// internal/config.Config.FirecrackerOverlayMkfs. Off by default —
+	// the guest is normally expected to mkfs /dev/vdb itself.
+	OverlayMkfs bool
+	// Mkfs4Bin is the host path to the mkfs.ext4 binary, reused from
+	// the OCI builder for the optional host-side overlay format step.
+	// Only consulted when OverlayMkfs is true.
+	Mkfs4Bin string
+	// PostResumeTimeout bounds the best-effort post_resume vsock send
+	// (carries host wall clock to the guest for clock+RNG resync).
+	// Mirrors internal/config.Config.FirecrackerSnapshotPostResumeTimeout.
+	PostResumeTimeout time.Duration
 }
 
 // FromDaemonConfig copies the Firecracker-relevant fields out of the full
@@ -180,6 +200,10 @@ func FromDaemonConfig(c config.Config) Config {
 		JailerUID:            c.JailerUID,
 		JailerGID:            c.JailerGID,
 		SnapshotVerifyOnLoad: c.FirecrackerSnapshotVerifyOnLoad,
+		OverlayEnabled:       c.FirecrackerOverlayEnabled,
+		OverlayMkfs:          c.FirecrackerOverlayMkfs,
+		Mkfs4Bin:             c.FirecrackerMkfs4Bin,
+		PostResumeTimeout:    c.FirecrackerSnapshotPostResumeTimeout,
 	}
 }
 
@@ -276,6 +300,14 @@ type TemplateResolution struct {
 	SnapshotChecksum   string
 	SnapshotVsockCID   uint32
 	HasSnapshot        bool
+	// HasOverlay reports whether the template was built with the
+	// per-sandbox overlay drive placeholder baked into its snapshot
+	// state (Phase 3 PR-B). False for PR-A templates. The driver
+	// rejects a snapshot-load request with OverlaySizeGB > 0 against
+	// a HasOverlay=false template with a clear "rebuild template"
+	// error rather than failing mid-PATCH — Firecracker cannot add a
+	// virtio-blk device post-load, only PATCH an existing one's path.
+	HasOverlay bool
 }
 
 // methodNotImplemented produces the canonical "not yet implemented" error
@@ -352,6 +384,19 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if err := validateSandboxID(allocID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: %w", err)
+	}
+
+	// Step 0: overlay-request sanity. Both the daemon-wide opt-out and
+	// the wire-level upper bound are checked before any allocation so a
+	// bad request fails fast and never leaks a slot. The upper bound
+	// mirrors models.CreateSandboxRequest documentation (0–1024). The
+	// runtime-vs-template-feature check (HasOverlay) lands later, once
+	// the template resolution result is in hand.
+	if req.OverlaySizeGB < 0 || req.OverlaySizeGB > 1024 {
+		return nil, fmt.Errorf("firecracker runtime: overlay_size_gb=%d out of range [0,1024]", req.OverlaySizeGB)
+	}
+	if req.OverlaySizeGB > 0 && !d.cfg.OverlayEnabled {
+		return nil, fmt.Errorf("firecracker runtime: overlay drive disabled on this daemon (SB_FIRECRACKER_OVERLAY_ENABLED=false)")
 	}
 
 	// Step 1: allocate the network slot.
@@ -434,12 +479,24 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("firecracker runtime: template stage: %w", err)
 		}
 		if src.HasSnapshot {
+			// PR-A templates (HasOverlay=false) baked no overlay drive
+			// into their snapshot state; Firecracker can only PATCH the
+			// path of a drive that already exists in the snapshot — it
+			// cannot add a new virtio-blk device post-load. Reject up
+			// front rather than failing mid-PATCH (which would leave
+			// the VMM loaded-but-unable-to-resume). Operator fix is to
+			// rebuild the template via POST /v1/templates.
+			if req.OverlaySizeGB > 0 && !src.HasOverlay {
+				return nil, fmt.Errorf("firecracker runtime: template %q has no overlay drive in its snapshot state; rebuild template via POST /v1/templates to use overlay_size_gb",
+					req.TemplateID)
+			}
 			snapshotLoadPath = true
 			snapshotInfo = src
 			d.logger.Info("firecracker create: snapshot-load path",
 				"sandbox_id", allocID, "template_id", req.TemplateID,
 				"template_cid", src.SnapshotVsockCID,
-				"unused_slot_cid", slot.VsockCID)
+				"unused_slot_cid", slot.VsockCID,
+				"overlay_size_gb", req.OverlaySizeGB)
 		} else {
 			d.logger.Info("firecracker create: staged template rootfs (cold-boot)",
 				"sandbox_id", allocID, "template_id", req.TemplateID, "src", src.RootfsPath)
@@ -499,6 +556,32 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			err, handle.StderrTail())
 	}
 
+	// Step 5b: per-sandbox overlay file. Allocated unconditionally when
+	// the request asks for one — both cold-boot (PutDrive overlay) and
+	// snapshot-load (PatchDrive overlay) consume the same file. Lives
+	// in the runDir so the deferred VMM cleanup also drops it; no
+	// extra cleanup branch needed (pr-review.md §4). Sparse so a 64
+	// GiB overlay request occupies sub-MiB on disk until the guest
+	// actually mutates it. When cfg.OverlayMkfs is true, the host
+	// formats the file as ext4 here so the guest can mount /dev/vdb
+	// directly; default off — see pr-review.md §2 boot-path latency.
+	var overlayPath string
+	if req.OverlaySizeGB > 0 {
+		overlayPath = filepath.Join(handle.RunDir(), overlayFileName)
+		if err := allocateSparse(overlayPath, int64(req.OverlaySizeGB)<<30); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: overlay alloc: %w", err)
+		}
+		if d.cfg.OverlayMkfs {
+			if d.cfg.Mkfs4Bin == "" {
+				return nil, fmt.Errorf("firecracker runtime: SB_FIRECRACKER_OVERLAY_MKFS=true but SB_FIRECRACKER_MKFS_BIN is unset")
+			}
+			cmd := exec.CommandContext(ctx, d.cfg.Mkfs4Bin, "-F", overlayPath)
+			if out, mErr := cmd.CombinedOutput(); mErr != nil {
+				return nil, fmt.Errorf("firecracker runtime: mkfs.ext4 overlay: %w (stderr: %s)", mErr, strings.TrimSpace(string(out)))
+			}
+		}
+	}
+
 	// Step 6: REST orchestration. Order matters per the firecracker
 	// docs: machine-config and boot-source before drives; drives and
 	// network-interfaces before InstanceStart. The snapshot-load path
@@ -506,11 +589,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// restored from the snapshot state file.
 	client := d.newClient(handle.APISocket())
 	if snapshotLoadPath {
-		if err := d.configureVMMForLoad(ctx, client, snapshotInfo); err != nil {
+		if err := d.configureVMMForLoad(ctx, client, snapshotInfo, overlayPath); err != nil {
 			return nil, err
 		}
 	} else {
-		if err := d.configureVMM(ctx, client, req, rootfsPath, slot); err != nil {
+		if err := d.configureVMM(ctx, client, req, rootfsPath, slot, overlayPath); err != nil {
 			return nil, err
 		}
 	}
@@ -550,6 +633,27 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: vsock handshake: %w", err)
 	}
 
+	// Step 8b: post-resume quiesce signal (snapshot-load path only).
+	// The clone resumed with the template's RNG entropy pool and
+	// wall clock — both observably wrong (two clones would draw the
+	// same getrandom bytes; logs and TLS handshakes show a backwards
+	// time jump). Tell the in-guest toolboxd to reseed the kernel
+	// RNG and set CLOCK_REALTIME from the host now. Best-effort:
+	// a failed ack here means the guest is using stale entropy/clock,
+	// not that the clone is broken, so we log-and-continue. Cold-boot
+	// has nothing to resync (kernel just initialized) so skip.
+	if snapshotLoadPath {
+		postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
+		err := d.sendVsockOp(postCtx, handshakeCID, "post_resume", map[string]any{
+			"wallclock_unix_ns": time.Now().UnixNano(),
+		})
+		cancel()
+		if err != nil {
+			d.logger.Warn("firecracker create: post_resume send failed (continuing)",
+				"sandbox_id", allocID, "error", err)
+		}
+	}
+
 	// All steps succeeded. Register the client + handle so Destroy can
 	// find them. Order matters: the map writes happen AFTER we flip
 	// `released = true`, so a panic between them still cleans up the
@@ -581,7 +685,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 // already-running firecracker VMM. Broken out from Create so the
 // happy-path flow stays readable and so future test variants (e.g.
 // snapshot-clone) can call it directly.
-func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.CreateSandboxRequest, rootfsPath string, slot *TapSlot) error {
+func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.CreateSandboxRequest, rootfsPath string, slot *TapSlot, overlayPath string) error {
 	vcpu := vcpuFromRequest(req.CPU)
 	if err := client.PutMachineConfig(ctx, firecracker.MachineConfig{
 		VcpuCount:  vcpu,
@@ -614,6 +718,20 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 		CacheType: "Writeback",
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutDrive root: %w", err)
+	}
+	// Optional per-sandbox overlay (Phase 3 PR-B). Attaches as
+	// /dev/vdb. On cold-boot we PutDrive the freshly-allocated sparse
+	// file directly — no PATCH needed because the VMM hasn't booted
+	// yet and no snapshot state pins a placeholder path.
+	if overlayPath != "" {
+		if err := client.PutDrive(ctx, overlayDriveID, firecracker.Drive{
+			DriveID:    overlayDriveID,
+			PathOnHost: overlayPath,
+			IsReadOnly: false,
+			CacheType:  "Writeback",
+		}); err != nil {
+			return fmt.Errorf("firecracker runtime: PutDrive overlay: %w", err)
+		}
 	}
 	if err := client.PutNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterface{
 		IfaceID:     primaryIfaceID,
@@ -654,7 +772,7 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 // (writes hit a dirty bitmap rather than the shared memory file).
 // ResumeVM=false keeps the clone paused so Create's caller controls
 // when the guest's vCPUs actually start ticking.
-func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap *TemplateResolution) error {
+func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap *TemplateResolution, overlayPath string) error {
 	if snap == nil {
 		return fmt.Errorf("firecracker runtime: configureVMMForLoad called with nil resolution")
 	}
@@ -673,6 +791,23 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 		ResumeVM:            false,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
+	}
+	// Per-sandbox overlay swap. Firecracker's snapshot state captured
+	// the overlay placeholder (1 MiB scratch from the template
+	// build); PATCH the path to the per-sandbox file before Resume so
+	// the guest's first write hits this clone's own backing store and
+	// not the shared placeholder. Drive geometry (read-only flag,
+	// cache type) is inherited from the snapshot state — only the
+	// path is mutable post-load. The caller has already rejected this
+	// request when snap.HasOverlay=false, so a missing placeholder
+	// here is a corrupted template, not a user error.
+	if overlayPath != "" {
+		if err := client.PatchDrive(ctx, overlayDriveID, firecracker.DrivePatch{
+			DriveID:    overlayDriveID,
+			PathOnHost: overlayPath,
+		}); err != nil {
+			return fmt.Errorf("firecracker runtime: PatchDrive overlay: %w", err)
+		}
 	}
 	return nil
 }

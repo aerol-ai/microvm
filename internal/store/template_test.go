@@ -268,7 +268,7 @@ func TestUpdateTemplateSnapshotReady(t *testing.T) {
 	if err := st.UpdateTemplateSnapshotReady(ctx, tpl.ID,
 		"/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.memory",
 		"/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.state",
-		1<<24, "sha256:deadbeef|sha256:cafef00d", 42,
+		1<<24, "sha256:deadbeef|sha256:cafef00d", 42, true,
 	); err != nil {
 		t.Fatalf("UpdateTemplateSnapshotReady: %v", err)
 	}
@@ -279,6 +279,9 @@ func TestUpdateTemplateSnapshotReady(t *testing.T) {
 	}
 	if !got.HasSnapshot {
 		t.Errorf("HasSnapshot = false, want true")
+	}
+	if !got.HasOverlay {
+		t.Errorf("HasOverlay = false, want true")
 	}
 	if got.SnapshotMemoryPath != "/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.memory" {
 		t.Errorf("SnapshotMemoryPath = %q", got.SnapshotMemoryPath)

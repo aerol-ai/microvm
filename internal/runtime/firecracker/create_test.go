@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -164,6 +165,13 @@ type fakeVsockDialer struct {
 	// calls (simulating the post-InstanceStart race) and succeed on
 	// the `retryUntil`th. Lets us assert the driver's retry loop.
 	retryUntil int
+	// writes records every line written through any returned conn, so
+	// post_resume payload-shape assertions can grep the captured JSON.
+	writes [][]byte
+	// errOnDialIdx >0 makes Dial fail on the Nth call (1-based) only —
+	// the snapshot-load post_resume test uses this to assert Create
+	// does not fail when the post_resume send fails.
+	errOnDialIdx int
 }
 
 func newFakeVsockDialer() *fakeVsockDialer {
@@ -172,17 +180,40 @@ func newFakeVsockDialer() *fakeVsockDialer {
 
 func (d *fakeVsockDialer) Dial(_ context.Context, cid, _ uint32) (io.ReadWriteCloser, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.dials++
 	d.lastCID = cid
 	if d.retryUntil > 0 && d.dials < d.retryUntil {
+		d.mu.Unlock()
 		return nil, errors.New("vsock: connection refused (fake)")
 	}
+	if d.errOnDialIdx > 0 && d.dials == d.errOnDialIdx {
+		d.mu.Unlock()
+		return nil, errors.New("vsock: dial fail (fake)")
+	}
 	if d.err != nil {
+		d.mu.Unlock()
 		return nil, d.err
 	}
 	rwc := newFakeVsockConn(d.guestRespOk, d.guestError)
+	rwc.parent = d
+	d.mu.Unlock()
 	return rwc, nil
+}
+
+func (d *fakeVsockDialer) recordWrite(p []byte) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	d.writes = append(d.writes, cp)
+}
+
+func (d *fakeVsockDialer) snapshotWrites() [][]byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([][]byte, len(d.writes))
+	copy(out, d.writes)
+	return out
 }
 
 // fakeVsockConn is a one-shot connection that, on read, returns either
@@ -192,6 +223,7 @@ type fakeVsockConn struct {
 	reply  []byte
 	pos    int
 	closed bool
+	parent *fakeVsockDialer
 }
 
 func newFakeVsockConn(ok bool, errMsg string) *fakeVsockConn {
@@ -216,6 +248,9 @@ func (c *fakeVsockConn) Read(p []byte) (int, error) {
 func (c *fakeVsockConn) Write(p []byte) (int, error) {
 	if c.closed {
 		return 0, io.ErrClosedPipe
+	}
+	if c.parent != nil {
+		c.parent.recordWrite(p)
 	}
 	return len(p), nil
 }
@@ -270,6 +305,12 @@ type fakeClient struct {
 	snapshotCreate *firecracker.SnapshotCreate
 	snapshotLoad   *firecracker.SnapshotLoad
 
+	// drivePatches records each PatchDrive call (snapshot-load + overlay
+	// path swap). Keyed by drive_id so a test can assert the post-load
+	// backing path is the per-sandbox overlay file and not the template
+	// placeholder.
+	drivePatches map[string]firecracker.DrivePatch
+
 	// restOrder captures every PUT / Action / Snapshot call in the order
 	// the driver issued them. Order is load-bearing for firecracker:
 	// machine-config + boot-source MUST land before drives + nics, and
@@ -281,6 +322,7 @@ type fakeClient struct {
 	machineErr        error
 	bootErr           error
 	driveErr          error
+	drivePatchErr     error
 	nicErr            error
 	vsockErr          error
 	actionErr         error
@@ -290,9 +332,10 @@ type fakeClient struct {
 
 func newFakeClient() *fakeClient {
 	return &fakeClient{
-		drives:   map[string]firecracker.Drive{},
-		nics:     map[string]firecracker.NetworkInterface{},
-		instance: &firecracker.InstanceInfo{State: "Running"},
+		drives:       map[string]firecracker.Drive{},
+		drivePatches: map[string]firecracker.DrivePatch{},
+		nics:         map[string]firecracker.NetworkInterface{},
+		instance:     &firecracker.InstanceInfo{State: "Running"},
 	}
 }
 
@@ -379,6 +422,14 @@ func (c *fakeClient) LoadSnapshot(_ context.Context, req firecracker.SnapshotLoa
 	return c.snapshotLoadErr
 }
 
+func (c *fakeClient) PatchDrive(_ context.Context, id string, patch firecracker.DrivePatch) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.drivePatches[id] = patch
+	c.restOrder = append(c.restOrder, "PatchDrive:"+id)
+	return c.drivePatchErr
+}
+
 // driverFixture is the standard test setup: a Driver wired with all
 // seam fakes ready for happy-path Create. Tests opt out of fakes by
 // overwriting their error field directly.
@@ -414,8 +465,10 @@ func newDriverFixture(t *testing.T) *driverFixture {
 	vmm := &fakeVMM{}
 
 	d := New(Config{
-		KernelImage: kernel,
-		RunDir:      runDir,
+		KernelImage:       kernel,
+		RunDir:            runDir,
+		OverlayEnabled:    true,
+		PostResumeTimeout: 2 * time.Second,
 	}, nil)
 	d.SetPool(pool)
 	d.SetRootfsBuilder(rootfs)
@@ -723,6 +776,7 @@ type fakeTemplateResolver struct {
 	lastID             string
 	rootfsPath         string
 	hasSnapshot        bool
+	hasOverlay         bool
 	snapshotMemoryPath string
 	snapshotStatePath  string
 	snapshotChecksum   string
@@ -741,6 +795,7 @@ func (r *fakeTemplateResolver) Resolve(_ context.Context, id string) (*TemplateR
 	return &TemplateResolution{
 		RootfsPath:         r.rootfsPath,
 		HasSnapshot:        r.hasSnapshot,
+		HasOverlay:         r.hasOverlay,
 		SnapshotMemoryPath: r.snapshotMemoryPath,
 		SnapshotStatePath:  r.snapshotStatePath,
 		SnapshotChecksum:   r.snapshotChecksum,
@@ -1059,6 +1114,357 @@ func TestCreate_SnapshotLoadPath_VerifyMismatchRefusesLoad(t *testing.T) {
 	}
 	if !f.vmm.shutdown {
 		t.Error("vmm should have been shut down on integrity error")
+	}
+}
+
+// TestCreate_ColdBoot_WithOverlay asserts that the cold-boot path
+// attaches the per-sandbox overlay drive (PutDrive:overlay after
+// PutDrive:rootfs) when OverlaySizeGB > 0, allocates the per-sandbox
+// overlay.ext4 file in the runDir at the requested size, and never
+// PATCHes the drive (PATCH is the snapshot-load tool, not the
+// cold-boot tool — cold-boot's PutDrive runs before InstanceStart so
+// the placeholder dance doesn't apply).
+func TestCreate_ColdBoot_WithOverlay(t *testing.T) {
+	f := newDriverFixture(t)
+
+	state, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image:         "alpine:3.20",
+		CPU:           1,
+		MemoryMB:      128,
+		DiskGB:        1,
+		OverlaySizeGB: 4,
+	}, "sb-overlay-cb", "tok", nil)
+	if err != nil {
+		t.Fatalf("Create cold-boot with overlay: %v", err)
+	}
+	if state.Status != models.SandboxStatusStarted {
+		t.Errorf("Status = %q, want started", state.Status)
+	}
+
+	// Overlay drive must be present alongside rootfs.
+	ov, ok := f.client.drives[overlayDriveID]
+	if !ok {
+		t.Fatalf("overlay drive not registered (drives=%v)", f.client.drives)
+	}
+	if ov.IsReadOnly {
+		t.Errorf("overlay drive IsReadOnly=true, want false")
+	}
+	// File must exist on disk at OverlaySizeGB * 1 GiB.
+	info, err := os.Stat(ov.PathOnHost)
+	if err != nil {
+		t.Fatalf("stat overlay file: %v", err)
+	}
+	if info.Size() != int64(4)<<30 {
+		t.Errorf("overlay file size = %d, want %d", info.Size(), int64(4)<<30)
+	}
+	// PATCH must not have run — cold-boot uses PutDrive only.
+	if len(f.client.drivePatches) != 0 {
+		t.Errorf("PatchDrive called on cold-boot path: %+v", f.client.drivePatches)
+	}
+	// REST order: rootfs PutDrive must come before overlay PutDrive
+	// (the snapshot-capture path bakes the same ordering into the
+	// snapshot state — keeping the orderings consistent avoids
+	// surprising the clone's PATCH).
+	rootIdx, overlayIdx := -1, -1
+	for i, op := range f.client.restOrder {
+		if op == "PutDrive:"+rootDriveID {
+			rootIdx = i
+		}
+		if op == "PutDrive:"+overlayDriveID {
+			overlayIdx = i
+		}
+	}
+	if rootIdx < 0 || overlayIdx < 0 || rootIdx >= overlayIdx {
+		t.Errorf("expected PutDrive:rootfs before PutDrive:overlay in %v", f.client.restOrder)
+	}
+}
+
+// TestCreate_ColdBoot_WithoutOverlay asserts that OverlaySizeGB=0 (the
+// wire default) leaves the cold-boot path untouched — no extra
+// PutDrive, no overlay file on disk. Pins the "PR-A behavior is
+// preserved for callers who don't opt in" invariant.
+func TestCreate_ColdBoot_WithoutOverlay(t *testing.T) {
+	f := newDriverFixture(t)
+
+	if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image:    "alpine:3.20",
+		CPU:      1,
+		MemoryMB: 128,
+		DiskGB:   1,
+	}, "sb-no-overlay", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, ok := f.client.drives[overlayDriveID]; ok {
+		t.Errorf("overlay drive registered without OverlaySizeGB request: %+v", f.client.drives)
+	}
+}
+
+// TestCreate_SnapshotLoadPath_WithOverlay asserts that the
+// snapshot-load path allocates a per-sandbox overlay file and
+// PATCHes the overlay drive to that path between LoadSnapshot and
+// Action(Resume). The PATCH order matters: Firecracker accepts
+// PathOnHost mutations on a loaded-but-paused VMM, but only before
+// Resume. A regression that PATCHed after Resume would either be
+// rejected by the API or be silently late (the guest's first write
+// would hit the template placeholder).
+func TestCreate_SnapshotLoadPath_WithOverlay(t *testing.T) {
+	f := newDriverFixture(t)
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := os.WriteFile(templateRootfs, []byte("TEMPLATE-ROOTFS"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+	snapMem := filepath.Join(tplDir, "snapshot.memory")
+	snapState := filepath.Join(tplDir, "snapshot.state")
+	for _, p := range []string{snapMem, snapState} {
+		if err := os.WriteFile(p, []byte("X"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	resolver := &fakeTemplateResolver{
+		rootfsPath:         templateRootfs,
+		hasSnapshot:        true,
+		hasOverlay:         true,
+		snapshotMemoryPath: snapMem,
+		snapshotStatePath:  snapState,
+		snapshotVsockCID:   200,
+	}
+	f.driver.SetTemplateResolver(resolver)
+
+	if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		Image:         "alpine:3.20",
+		CPU:           1,
+		MemoryMB:      128,
+		DiskGB:        1,
+		TemplateID:    "tpl-snap-ov",
+		OverlaySizeGB: 2,
+	}, "sb-snap-ov", "tok", nil); err != nil {
+		t.Fatalf("Create snapshot-load+overlay: %v", err)
+	}
+
+	// PatchDrive MUST have run for the overlay drive ID with a
+	// path-on-host pointing at the freshly-allocated per-sandbox file.
+	patch, ok := f.client.drivePatches[overlayDriveID]
+	if !ok {
+		t.Fatalf("PatchDrive overlay not called (patches=%+v)", f.client.drivePatches)
+	}
+	if filepath.Base(patch.PathOnHost) != overlayFileName {
+		t.Errorf("PatchDrive.PathOnHost = %q, want basename %q", patch.PathOnHost, overlayFileName)
+	}
+	if info, err := os.Stat(patch.PathOnHost); err != nil {
+		t.Errorf("overlay file at %q missing: %v", patch.PathOnHost, err)
+	} else if info.Size() != int64(2)<<30 {
+		t.Errorf("overlay file size = %d, want %d", info.Size(), int64(2)<<30)
+	}
+
+	// Order: LoadSnapshot → PatchDrive → Resume. Any rearrangement
+	// here is an outage (PATCH-after-Resume is rejected;
+	// Resume-before-PATCH silently corrupts).
+	var loadIdx, patchIdx, resumeIdx int = -1, -1, -1
+	for i, op := range f.client.restOrder {
+		switch op {
+		case "LoadSnapshot":
+			loadIdx = i
+		case "PatchDrive:" + overlayDriveID:
+			patchIdx = i
+		case "Action:" + firecracker.ActionResume:
+			resumeIdx = i
+		}
+	}
+	if loadIdx < 0 || patchIdx < 0 || resumeIdx < 0 {
+		t.Fatalf("missing one of LoadSnapshot/PatchDrive/Resume in %v", f.client.restOrder)
+	}
+	if !(loadIdx < patchIdx && patchIdx < resumeIdx) {
+		t.Errorf("REST order = %v; want LoadSnapshot(%d) < PatchDrive(%d) < Resume(%d)",
+			f.client.restOrder, loadIdx, patchIdx, resumeIdx)
+	}
+}
+
+// TestCreate_SnapshotLoadPath_RejectsOverlayOnLegacyTemplate asserts
+// that a snapshot-load request against a PR-A template (HasOverlay=
+// false) with OverlaySizeGB > 0 is rejected up-front with a clear
+// error pointing at template rebuild — and that the rejection comes
+// BEFORE LoadSnapshot runs, so the cleanup contract isn't tested with
+// a half-loaded VMM. Firecracker cannot add a virtio-blk drive after
+// LoadSnapshot, only PATCH an existing one; the rejection is the
+// only safe response.
+func TestCreate_SnapshotLoadPath_RejectsOverlayOnLegacyTemplate(t *testing.T) {
+	f := newDriverFixture(t)
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := os.WriteFile(templateRootfs, []byte("X"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+	resolver := &fakeTemplateResolver{
+		rootfsPath:         templateRootfs,
+		hasSnapshot:        true,
+		hasOverlay:         false, // PR-A template
+		snapshotMemoryPath: filepath.Join(tplDir, "snap.memory"),
+		snapshotStatePath:  filepath.Join(tplDir, "snap.state"),
+		snapshotVsockCID:   200,
+	}
+	f.driver.SetTemplateResolver(resolver)
+
+	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		TemplateID:    "tpl-legacy",
+		OverlaySizeGB: 1,
+		MemoryMB:      128,
+		CPU:           1,
+		DiskGB:        1,
+	}, "sb-legacy", "tok", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !contains(err.Error(), "no overlay drive") {
+		t.Errorf("err = %v, want message about 'no overlay drive'", err)
+	}
+	// LoadSnapshot must not have been called — the reject is pre-load.
+	if f.client.snapshotLoad != nil {
+		t.Error("LoadSnapshot was invoked despite rejection")
+	}
+	// Pool slot must have been released so a follow-up retry doesn't
+	// leak a TAP. The cleanup contract is the pr-review.md §4 line.
+	if f.pool.alloc != 1 || f.pool.release != 1 {
+		t.Errorf("pool alloc=%d release=%d, want 1/1", f.pool.alloc, f.pool.release)
+	}
+}
+
+// TestCreate_OverlayDisabledByConfig asserts SB_FIRECRACKER_OVERLAY_
+// ENABLED=false (cfg.OverlayEnabled=false) rejects any
+// OverlaySizeGB > 0 request before pool allocation. Pure-config gate;
+// flips to enable=false leave no on-disk state behind.
+func TestCreate_OverlayDisabledByConfig(t *testing.T) {
+	f := newDriverFixture(t)
+	// New() captured an Config with OverlayEnabled=true via the
+	// fixture; flip the live cfg pointer to off.
+	f.driver.cfg.OverlayEnabled = false
+
+	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		OverlaySizeGB: 1,
+		MemoryMB:      128,
+		CPU:           1,
+		DiskGB:        1,
+	}, "sb-disabled", "tok", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !contains(err.Error(), "overlay drive disabled") {
+		t.Errorf("err = %v, want 'overlay drive disabled'", err)
+	}
+	if f.pool.alloc != 0 {
+		t.Errorf("pool alloc=%d, want 0 (reject pre-allocation)", f.pool.alloc)
+	}
+}
+
+// TestCreate_SnapshotLoadPath_SendsPostResume asserts that after a
+// successful snapshot-load + handshake, the driver sends a
+// post_resume vsock op with a wall-clock payload. The second Dial is
+// the post_resume dial; the first is the handshake. We assert the
+// payload shape (op=post_resume, wallclock_unix_ns present and >0)
+// because both the entropy reseed and the clock resync inside the
+// guest depend on it.
+func TestCreate_SnapshotLoadPath_SendsPostResume(t *testing.T) {
+	f := newDriverFixture(t)
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := os.WriteFile(templateRootfs, []byte("X"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+	snapMem := filepath.Join(tplDir, "snap.memory")
+	snapState := filepath.Join(tplDir, "snap.state")
+	for _, p := range []string{snapMem, snapState} {
+		if err := os.WriteFile(p, []byte("X"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	resolver := &fakeTemplateResolver{
+		rootfsPath:         templateRootfs,
+		hasSnapshot:        true,
+		snapshotMemoryPath: snapMem,
+		snapshotStatePath:  snapState,
+		snapshotVsockCID:   200,
+	}
+	f.driver.SetTemplateResolver(resolver)
+
+	if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		TemplateID: "tpl-snap-pr",
+		CPU:        1,
+		MemoryMB:   128,
+		DiskGB:     1,
+	}, "sb-snap-pr", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Find the post_resume write. Vsock writes are recorded in dial
+	// order: handshake's ping is first; post_resume is the second.
+	var postLine []byte
+	for _, w := range f.vsock.snapshotWrites() {
+		if contains(string(w), "post_resume") {
+			postLine = w
+			break
+		}
+	}
+	if postLine == nil {
+		t.Fatalf("post_resume not sent; writes=%v", f.vsock.snapshotWrites())
+	}
+	var decoded struct {
+		Op   string `json:"op"`
+		Data struct {
+			WallclockUnixNs int64 `json:"wallclock_unix_ns"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(postLine, &decoded); err != nil {
+		t.Fatalf("decode post_resume: %v (line=%s)", err, postLine)
+	}
+	if decoded.Op != "post_resume" {
+		t.Errorf("Op = %q, want post_resume", decoded.Op)
+	}
+	if decoded.Data.WallclockUnixNs <= 0 {
+		t.Errorf("WallclockUnixNs = %d, want > 0", decoded.Data.WallclockUnixNs)
+	}
+}
+
+// TestCreate_SnapshotLoadPath_PostResumeFailureIsBestEffort asserts
+// that a failed post_resume vsock send does not fail Create. The
+// guest is already serving on the clone's TAP and vsock; the most
+// telling regression here would be "post_resume timeout → Create
+// returns 500 → caller retries → second VMM stuck because the first
+// one wasn't cleaned up".
+func TestCreate_SnapshotLoadPath_PostResumeFailureIsBestEffort(t *testing.T) {
+	f := newDriverFixture(t)
+	tplDir := t.TempDir()
+	templateRootfs := filepath.Join(tplDir, "rootfs.ext4")
+	if err := os.WriteFile(templateRootfs, []byte("X"), 0o644); err != nil {
+		t.Fatalf("write template rootfs: %v", err)
+	}
+	snapMem := filepath.Join(tplDir, "snap.memory")
+	snapState := filepath.Join(tplDir, "snap.state")
+	for _, p := range []string{snapMem, snapState} {
+		if err := os.WriteFile(p, []byte("X"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	resolver := &fakeTemplateResolver{
+		rootfsPath:         templateRootfs,
+		hasSnapshot:        true,
+		snapshotMemoryPath: snapMem,
+		snapshotStatePath:  snapState,
+		snapshotVsockCID:   200,
+	}
+	f.driver.SetTemplateResolver(resolver)
+	// Second Dial fails — that's the post_resume call (the first is
+	// the handshake). retryUntil + errOnDialIdx are mutually
+	// exclusive in our fake: we use errOnDialIdx only.
+	f.vsock.errOnDialIdx = 2
+
+	if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
+		TemplateID: "tpl-pr-fail",
+		CPU:        1,
+		MemoryMB:   128,
+		DiskGB:     1,
+	}, "sb-pr-fail", "tok", nil); err != nil {
+		t.Fatalf("Create should not fail on post_resume error: %v", err)
 	}
 }
 

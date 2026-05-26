@@ -127,7 +127,11 @@ func main() {
 	// listener constructor returns an error — we log it at WARN and keep
 	// HTTP running. Vsock is additive; its absence does not block sandbox
 	// operation, only the snapshot lifecycle hooks.
-	vsockHandler := newLoggingVsockHandler(logger)
+	//
+	// Pass srv.sessions (may be nil if the manager failed to init above)
+	// so the handler's pre_snapshot can fsync session recordings; nil
+	// is treated as "no sessions to flush" by the handler.
+	vsockHandler := newQuiesceHandler(logger, newSessionFlusher(srv.sessions))
 	if vs, err := newVsockServer(defaultVsockPort, vsockHandler, logger); err != nil {
 		logger.Warn("vsock listener disabled", "error", err)
 	} else {
@@ -144,6 +148,36 @@ func main() {
 		logger.Error("toolboxd failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// sessionFlusherAdapter narrows *sessions.Manager down to the
+// sessionFlusher interface the vsock quiesce handler expects. Nil
+// manager → nil adapter (and the handler treats nil as "no sessions
+// to flush"). Putting the adapter in main.go keeps the toolboxd
+// cross-platform vsock.go file free of any sessions-package import,
+// which matters because vsock.go is built on darwin too.
+type sessionFlusherAdapter struct {
+	mgr *sessions.Manager
+}
+
+func newSessionFlusher(mgr *sessions.Manager) sessionFlusher {
+	if mgr == nil {
+		return nil
+	}
+	return &sessionFlusherAdapter{mgr: mgr}
+}
+
+func (a *sessionFlusherAdapter) ListIDs() []string {
+	ms := a.mgr.List()
+	ids := make([]string, 0, len(ms))
+	for _, s := range ms {
+		ids = append(ids, s.ID)
+	}
+	return ids
+}
+
+func (a *sessionFlusherAdapter) FlushRecording(id string) error {
+	return a.mgr.FlushRecording(id)
 }
 
 func startUserCommand(logger *slog.Logger, args []string) {

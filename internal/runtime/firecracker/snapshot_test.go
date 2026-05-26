@@ -54,6 +54,7 @@ func TestSnapshotTemplate_HappyPath(t *testing.T) {
 		"PutMachineConfig",
 		"PutBootSource",
 		"PutDrive:" + rootDriveID,
+		"PutDrive:" + overlayDriveID,
 		"PutNetworkInterface:" + primaryIfaceID,
 		"PutVsock",
 		"Action:" + firecracker.ActionInstanceStart,
@@ -68,6 +69,18 @@ func TestSnapshotTemplate_HappyPath(t *testing.T) {
 		if got != want[i] {
 			t.Errorf("REST order[%d] = %q, want %q (full: %v)", i, got, want[i], f.client.restOrder)
 		}
+	}
+
+	// PR-B: rootfs MUST be captured read-only (the snapshot is the
+	// immutable base under per-sandbox overlays); overlay placeholder
+	// MUST exist (PATCHed away by each clone before Resume).
+	if root, ok := f.client.drives[rootDriveID]; !ok || !root.IsReadOnly {
+		t.Errorf("rootfs drive read-only = %v, want true (drive=%+v)", root.IsReadOnly, root)
+	}
+	if ov, ok := f.client.drives[overlayDriveID]; !ok || ov.PathOnHost == "" {
+		t.Errorf("overlay drive missing or empty path: %+v", ov)
+	} else if _, err := os.Stat(ov.PathOnHost); err != nil {
+		t.Errorf("overlay placeholder file %q not on disk: %v", ov.PathOnHost, err)
 	}
 
 	// Machine config came from the request, not the per-sandbox shape.

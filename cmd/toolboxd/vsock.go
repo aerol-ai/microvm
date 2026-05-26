@@ -163,31 +163,91 @@ func dispatchVsock(ctx context.Context, msg VsockMessage, handler VsockHandler) 
 	}
 }
 
-// loggingVsockHandler is the default no-op-with-logging handler used by
-// the toolbox when no caller has registered a specialized one. It
-// satisfies the interface so the vsock loop can run during early
-// development without each new op needing a custom callback.
-type loggingVsockHandler struct {
-	logger *slog.Logger
+// quiesceOps is the host-kernel-state resync seam used by the
+// post_resume handler. Linux gets a real implementation in
+// quiesce_linux.go (RNDADDENTROPY ioctl + ClockSettime syscall);
+// non-Linux build targets get the stub in quiesce_other.go that
+// returns "linux-only" errors. Defined as an interface so tests can
+// inject a recorder fake.
+type quiesceOps interface {
+	ReseedRandom() error
+	SetWallclock(unixNs int64) error
 }
 
-func newLoggingVsockHandler(logger *slog.Logger) *loggingVsockHandler {
+// sessionFlusher is the subset of behaviour the quiesce handler needs
+// from the sessions package. Returning just the session IDs (rather
+// than the full models.Session) keeps the interface narrow enough
+// that vsock_test.go's fake is a few lines, and avoids importing the
+// sessions package from vsock.go. main.go wires the real adapter.
+type sessionFlusher interface {
+	ListIDs() []string
+	FlushRecording(id string) error
+}
+
+// quiesceHandler is the production VsockHandler. PR-A's
+// loggingVsockHandler logged and acked; PR-B does real work:
+//   - OnPreSnapshot best-effort fsyncs every active session
+//     recording so a clone resumed from the snapshot observes a
+//     recording that ends cleanly at the freeze point. Template
+//     captures have no sessions so this is a no-op there.
+//   - OnPostResume reseeds the kernel RNG (every clone resumes with
+//     the template's entropy pool — a real crypto bug otherwise) and
+//     resyncs CLOCK_REALTIME from the host's wall clock carried in
+//     the message payload. Quiesce errors are logged at Warn and the
+//     ack is still Ok=true — the clone is already serving requests,
+//     telling the host to retry won't unbreak anything.
+type quiesceHandler struct {
+	logger   *slog.Logger
+	sessions sessionFlusher
+	quiesce  quiesceOps
+}
+
+func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher) *quiesceHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &loggingVsockHandler{logger: logger}
+	return &quiesceHandler{
+		logger:   logger,
+		sessions: sessions,
+		quiesce:  newQuiesceOps(),
+	}
 }
 
-func (h *loggingVsockHandler) OnPing(ctx context.Context) error {
+func (h *quiesceHandler) OnPing(ctx context.Context) error {
 	return nil
 }
 
-func (h *loggingVsockHandler) OnPreSnapshot(ctx context.Context, _ json.RawMessage) error {
-	h.logger.Info("vsock: pre_snapshot received; quiescing best-effort")
+func (h *quiesceHandler) OnPreSnapshot(ctx context.Context, _ json.RawMessage) error {
+	if h.sessions != nil {
+		for _, id := range h.sessions.ListIDs() {
+			if err := h.sessions.FlushRecording(id); err != nil {
+				h.logger.Debug("vsock pre_snapshot: session flush failed",
+					"session_id", id, "error", err)
+			}
+		}
+	}
+	h.logger.Info("vsock: pre_snapshot quiesce complete")
 	return nil
 }
 
-func (h *loggingVsockHandler) OnPostResume(ctx context.Context, _ json.RawMessage) error {
-	h.logger.Info("vsock: post_resume received; agent ready")
+func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) error {
+	var data struct {
+		WallclockUnixNs int64 `json:"wallclock_unix_ns"`
+	}
+	if len(raw) > 0 {
+		// Tolerate a missing/malformed payload — the RNG reseed is
+		// still worth doing even without a wallclock signal.
+		_ = json.Unmarshal(raw, &data)
+	}
+	if data.WallclockUnixNs > 0 {
+		if err := h.quiesce.SetWallclock(data.WallclockUnixNs); err != nil {
+			h.logger.Warn("vsock post_resume: clock resync failed", "error", err)
+		}
+	}
+	if err := h.quiesce.ReseedRandom(); err != nil {
+		h.logger.Warn("vsock post_resume: rng reseed failed", "error", err)
+	}
+	h.logger.Info("vsock: post_resume complete",
+		"wallclock_set", data.WallclockUnixNs > 0)
 	return nil
 }

@@ -1018,6 +1018,7 @@ func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcru
 	return &fcruntime.TemplateResolution{
 		RootfsPath:         t.RootfsPath,
 		HasSnapshot:        t.HasSnapshot,
+		HasOverlay:         t.HasOverlay,
 		SnapshotMemoryPath: t.SnapshotMemoryPath,
 		SnapshotStatePath:  t.SnapshotStatePath,
 		SnapshotChecksum:   t.SnapshotChecksum,

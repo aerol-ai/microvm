@@ -1889,6 +1889,7 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // serverless
 			0,              // wake_armed
 			"",             // template_id
+			0,              // overlay_size_gb
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

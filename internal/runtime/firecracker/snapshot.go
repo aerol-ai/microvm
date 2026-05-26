@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -212,14 +213,40 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: PutBootSource: %w", err)
 	}
+	// Step 6: rootfs as read-only. PR-A captured rootfs as writable
+	// because clones shared it directly; with PR-B the rootfs is the
+	// immutable base under the per-sandbox overlay (Step 6b below), so
+	// flipping IsReadOnly=true forces any clone that tries to mutate it
+	// to fault loudly instead of corrupting the shared image. The
+	// transient template VMM itself only boots far enough to handshake
+	// with toolboxd, so it doesn't need to write to rootfs either.
 	if err := client.PutDrive(ctx, rootDriveID, firecracker.Drive{
 		DriveID:      rootDriveID,
 		PathOnHost:   rootfsPath,
 		IsRootDevice: true,
-		IsReadOnly:   false,
+		IsReadOnly:   true,
 		CacheType:    "Writeback",
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: PutDrive root: %w", err)
+	}
+	// Step 6b: overlay placeholder. The drive must exist at snapshot
+	// time so /dev/vdb appears in the snapshot's virtio-blk state;
+	// clones PATCH the backing path before Resume (Firecracker cannot
+	// add a drive post-load, only PATCH an existing one's path). Size
+	// is intentionally tiny — only the device shape is captured into
+	// the snapshot state; the placeholder file is discarded with the
+	// staging runDir at Step 12.
+	placeholderPath := filepath.Join(handle.RunDir(), overlayFileName)
+	if err := allocateSparse(placeholderPath, overlayPlaceholderBytes); err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: overlay placeholder: %w", err)
+	}
+	if err := client.PutDrive(ctx, overlayDriveID, firecracker.Drive{
+		DriveID:    overlayDriveID,
+		PathOnHost: placeholderPath,
+		IsReadOnly: false,
+		CacheType:  "Writeback",
+	}); err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: PutDrive overlay: %w", err)
 	}
 	if err := client.PutNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterface{
 		IfaceID:     primaryIfaceID,
@@ -251,7 +278,7 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	// here. We log a failed send rather than aborting because a missing
 	// ack would leave us with no snapshot for an otherwise-healthy
 	// template build.
-	if err := d.sendVsockOp(ctx, req.GuestCID, `{"op":"pre_snapshot"}`); err != nil {
+	if err := d.sendVsockOp(ctx, req.GuestCID, "pre_snapshot", nil); err != nil {
 		d.logger.Warn("firecracker snapshot: pre_snapshot send failed (continuing)",
 			"template_id", req.TemplateID, "error", err)
 	}
@@ -332,13 +359,30 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 }
 
 // sendVsockOp opens a fresh AF_VSOCK connection to the in-guest toolbox
-// and writes one line of JSON. Used for the best-effort pre_snapshot /
-// post_resume signals — vsockHandshake already proved the listener is
-// up, so a failure here is "the agent didn't ack in time", not "agent
-// unreachable". We do read the response so the connection stays
-// well-formed (the toolbox writes ack-then-EOF), but we surface only
-// the error path; the ack body itself is ignored.
-func (d *Driver) sendVsockOp(ctx context.Context, guestCID uint32, line string) error {
+// and writes one line of JSON ({"op":"<op>","data":<data>}). Used for
+// the best-effort pre_snapshot / post_resume signals —
+// vsockHandshake already proved the listener is up, so a failure here
+// is "the agent didn't ack in time", not "agent unreachable". We do
+// read the response so the connection stays well-formed (the toolbox
+// writes ack-then-EOF), but we surface only the error path; the ack
+// body itself is ignored. Passing data=nil omits the data field via
+// json's "omitempty" on a *json.RawMessage built from the marshal.
+func (d *Driver) sendVsockOp(ctx context.Context, guestCID uint32, op string, data any) error {
+	payload := struct {
+		Op   string          `json:"op"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}{Op: op}
+	if data != nil {
+		raw, err := json.Marshal(data)
+		if err != nil {
+			return fmt.Errorf("marshal data: %w", err)
+		}
+		payload.Data = raw
+	}
+	line, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal op: %w", err)
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	conn, err := d.vsockDial.Dial(dialCtx, guestCID, defaultVsockPort)
@@ -346,12 +390,33 @@ func (d *Driver) sendVsockOp(ctx context.Context, guestCID uint32, line string) 
 		return fmt.Errorf("dial cid=%d: %w", guestCID, err)
 	}
 	defer conn.Close()
-	if _, err := conn.Write([]byte(line + "\n")); err != nil {
+	if _, err := conn.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 	// Discard the ack. A short read budget keeps a hung guest from
 	// pinning the snapshot pipeline.
 	_, _ = io.CopyN(io.Discard, conn, 256)
+	return nil
+}
+
+// allocateSparse creates (or truncates) path to be sizeBytes long
+// without writing any zeros. The kernel records the size; physical
+// blocks are allocated lazily on write — so a 4 GiB overlay file
+// occupies a few KiB on disk until the guest actually mutates it.
+// Used for both the snapshot-capture placeholder (1 MiB) and the
+// per-sandbox clone overlay (cfg-sized). No Linux dependency: the
+// portable os.File.Truncate works the same on darwin (where CI runs
+// the unit tests).
+func allocateSparse(path string, sizeBytes int64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := f.Truncate(sizeBytes); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("truncate %s to %d: %w", path, sizeBytes, err)
+	}
 	return nil
 }
 

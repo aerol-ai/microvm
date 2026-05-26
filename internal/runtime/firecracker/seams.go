@@ -152,6 +152,15 @@ type VMMClient interface {
 	InstanceInfo(ctx context.Context) (*firecracker.InstanceInfo, error)
 	CreateSnapshot(ctx context.Context, req firecracker.SnapshotCreate) error
 	LoadSnapshot(ctx context.Context, req firecracker.SnapshotLoad) error
+	// PatchDrive is the snapshot-load + overlay seam (Phase 3 PR-B).
+	// Firecracker accepts a PATCH of `path_on_host` between LoadSnapshot
+	// and Action(Resume); the driver uses it to swap the template's
+	// placeholder overlay (1 MiB scratch file from snapshot capture
+	// time) for the clone's own per-sandbox overlay.ext4 before the VM
+	// resumes. Drive geometry (read-only flag, cache type) is
+	// inherited from the snapshot state — only the backing path is
+	// mutable.
+	PatchDrive(ctx context.Context, driveID string, patch firecracker.DrivePatch) error
 }
 
 // defaultVsockPort is the in-guest port the toolbox listens on. Must
@@ -180,3 +189,25 @@ const rootDriveID = "rootfs"
 // per sandbox today; Phase 4+ may add a second for sandboxed-to-
 // internet egress via a different bridge.
 const primaryIfaceID = "eth0"
+
+// overlayDriveID is the drive_id of the per-sandbox writable overlay
+// drive (Phase 3 PR-B). On cold-boot the driver attaches it via
+// PutDrive when CreateSandboxRequest.OverlaySizeGB > 0; on snapshot-
+// load it is PATCHed in-place between LoadSnapshot and Resume so the
+// clone gets its own backing file. The guest sees this device as
+// /dev/vdb (rootfs is /dev/vda).
+const overlayDriveID = "overlay"
+
+// overlayFileName is the filename of the per-sandbox overlay.ext4
+// sparse file inside the runDir. Mirrors rootfsFileName for the same
+// debug-runbook reason.
+const overlayFileName = "overlay.ext4"
+
+// overlayPlaceholderBytes is the size of the placeholder overlay file
+// allocated at snapshot capture time. The capture only persists the
+// virtio-blk device shape into the snapshot state; the placeholder
+// path is discarded with the staging runDir when the snapshot phase
+// concludes. Kept at 1 MiB so the capture is fast and the placeholder
+// occupies no real disk (sparse) — clones PATCH to their own
+// per-sandbox file whose size is governed by OverlaySizeGB.
+const overlayPlaceholderBytes int64 = 1 << 20

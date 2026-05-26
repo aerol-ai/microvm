@@ -483,6 +483,34 @@ type Config struct {
 	// load path. SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD.
 	FirecrackerSnapshotVerifyOnLoad bool
 
+	// FirecrackerOverlayEnabled is the daemon-wide opt-out for the
+	// per-sandbox writable overlay drive (Phase 3 PR-B). Default true.
+	// When false, CreateSandbox rejects any request with
+	// OverlaySizeGB > 0 — a safety hatch for a host whose overlay
+	// machinery (sparse alloc, mkfs, virtio-blk PATCH) is misbehaving.
+	// Templates can still be built with the overlay placeholder in
+	// their snapshot state; only the per-clone path is bypassed.
+	// SB_FIRECRACKER_OVERLAY_ENABLED.
+	FirecrackerOverlayEnabled bool
+	// FirecrackerOverlayMkfs makes the host run `mkfs.ext4 -F` on each
+	// per-sandbox overlay.ext4 right after the sparse allocation and
+	// before PutDrive/PatchDrive. Default false — the guest is normally
+	// expected to mkfs /dev/vdb itself on first boot. Enabling adds
+	// ~50ms to every Create that requests an overlay (one mkfs.ext4
+	// subprocess invocation) and reuses the existing FirecrackerMkfs4Bin
+	// path. Off by default to keep the boot path lean per pr-review.md
+	// §2. SB_FIRECRACKER_OVERLAY_MKFS.
+	FirecrackerOverlayMkfs bool
+	// FirecrackerSnapshotPostResumeTimeout bounds the best-effort
+	// post_resume vsock send from the driver to the guest toolboxd
+	// (carries the host wall clock so the guest can resync
+	// CLOCK_REALTIME and reseed its RNG). Default 2s. A failure inside
+	// the timeout is logged and does not fail Create — the clone is
+	// already resumed and serving, the guest just inherits the
+	// template's clock/entropy for a little longer.
+	// SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT.
+	FirecrackerSnapshotPostResumeTimeout time.Duration
+
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
 	// picks a random candidate first; collisions fall back to a deterministic
@@ -988,6 +1016,10 @@ func Load() (Config, error) {
 		FirecrackerTemplateMemoryMB:     getEnvInt("SB_FIRECRACKER_TEMPLATE_MEMORY_MB", 512),
 		FirecrackerTemplateVCPU:         getEnvInt("SB_FIRECRACKER_TEMPLATE_VCPU", 1),
 		FirecrackerSnapshotVerifyOnLoad: getEnvBool("SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD", true),
+
+		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
+		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),
+		FirecrackerSnapshotPostResumeTimeout: getEnvDuration("SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT", 2*time.Second),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true

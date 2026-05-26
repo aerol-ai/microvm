@@ -110,6 +110,25 @@ func (m *Manager) List() []models.Session {
 	return out
 }
 
+// FlushRecording best-effort fsyncs the asciinema cast file for the
+// given session id. Called from the in-guest vsock handler's
+// OnPreSnapshot (Phase 3 PR-B) so a clone resumed from the snapshot
+// observes a session recording that ends cleanly at the freeze point
+// rather than missing the trailing few-hundred bytes. Returns nil for
+// sessions without an attached recording (the common case for
+// template captures), unknown IDs (caller iterates List() and a
+// session can finish between the two calls), and recorders that have
+// already been Close()d.
+func (m *Manager) FlushRecording(id string) error {
+	m.mu.Lock()
+	s := m.byID[id]
+	m.mu.Unlock()
+	if s == nil {
+		return nil
+	}
+	return s.recorder.Sync()
+}
+
 // Get fetches a session by ID. Returns ErrNotFound if missing.
 func (m *Manager) Get(id string) (*Session, error) {
 	m.mu.Lock()

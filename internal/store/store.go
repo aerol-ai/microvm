@@ -302,7 +302,8 @@ func Open(path string) (*Store, error) {
 			snapshot_checksum TEXT NOT NULL DEFAULT '',
 			snapshot_vsock_cid INTEGER NOT NULL DEFAULT 0,
 			snapshot_error TEXT NOT NULL DEFAULT '',
-			has_snapshot INTEGER NOT NULL DEFAULT 0
+			has_snapshot INTEGER NOT NULL DEFAULT 0,
+			has_overlay INTEGER NOT NULL DEFAULT 0
 		);`,
 		// Drives the GC sweep's "find rows older than X" query without a
 		// full scan once the catalogue grows beyond a handful of entries.
@@ -415,6 +416,15 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_vsock_cid INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_error TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE firecracker_templates ADD COLUMN has_snapshot INTEGER NOT NULL DEFAULT 0;`,
+		// Phase 3 PR-B — per-sandbox overlay drive plumbing. has_overlay on
+		// templates lets the runtime reject snapshot-load+overlay requests
+		// against PR-A templates (which lack the placeholder drive in their
+		// snapshot state) with a clear "rebuild template" error rather than
+		// failing mid-PATCH. overlay_size_gb on sandboxes is mirrored from
+		// the create request so the runtime cleanup path knows whether
+		// overlay.ext4 was allocated in the per-sandbox runDir.
+		`ALTER TABLE firecracker_templates ADD COLUMN has_overlay INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN overlay_size_gb INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -520,8 +530,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			registry_auth_sealed,
 			auto_import_pending,
 			serverless, wake_armed,
-			template_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			template_id,
+			overlay_size_gb
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -563,6 +574,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.Lifecycle.Serverless),
 		boolToInt(sandbox.WakeArmed),
 		strings.TrimSpace(sandbox.TemplateID),
+		sandbox.OverlaySizeGB,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -627,8 +639,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			registry_auth_sealed,
 			auto_import_pending,
 			serverless, wake_armed,
-			template_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			template_id,
+			overlay_size_gb
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -663,7 +676,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			auto_import_pending = excluded.auto_import_pending,
 			serverless = excluded.serverless,
 			wake_armed = excluded.wake_armed,
-			template_id = excluded.template_id
+			template_id = excluded.template_id,
+			overlay_size_gb = excluded.overlay_size_gb
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -705,6 +719,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.Lifecycle.Serverless),
 		boolToInt(sandbox.WakeArmed),
 		strings.TrimSpace(sandbox.TemplateID),
+		sandbox.OverlaySizeGB,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -728,7 +743,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			registry_auth_sealed,
 			auto_import_pending,
 			serverless, wake_armed,
-			template_id
+			template_id,
+			overlay_size_gb
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -769,7 +785,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			registry_auth_sealed,
 			auto_import_pending,
 			serverless, wake_armed,
-			template_id
+			template_id,
+			overlay_size_gb
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -1793,8 +1810,9 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 			id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
-			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		id,
 		image,
@@ -1813,6 +1831,7 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 		template.SnapshotVsockCID,
 		template.SnapshotError,
 		boolToInt(template.HasSnapshot),
+		boolToInt(template.HasOverlay),
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -1828,7 +1847,8 @@ func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, e
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
-			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay
 		FROM firecracker_templates
 		WHERE id = ?
 	`, strings.TrimSpace(id))
@@ -1847,7 +1867,8 @@ func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
-			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay
 		FROM firecracker_templates
 		ORDER BY created_at DESC, id ASC
 	`)
@@ -1915,18 +1936,22 @@ func (s *Store) UpdateTemplateStatus(ctx context.Context, id string, status mode
 
 // UpdateTemplateSnapshotReady is the terminal-success seam for the
 // snapshot phase. Writes the snapshot artifact metadata and flips
-// status=ready / has_snapshot=1 in one UPDATE so a concurrent reader
-// (CreateSandbox racing the build goroutine) never observes
-// "status=ready but the snapshot fields are still zero". snapshot_error
-// is unconditionally cleared so a retried build that finally succeeds
-// doesn't carry a stale message.
-func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, statePath string, sizeBytes int64, checksum string, vsockCID uint32) error {
+// status=ready / has_snapshot=1 / has_overlay=hasOverlay in one UPDATE
+// so a concurrent reader (CreateSandbox racing the build goroutine)
+// never observes "status=ready but the snapshot fields are still zero".
+// snapshot_error is unconditionally cleared so a retried build that
+// finally succeeds doesn't carry a stale message. hasOverlay is true
+// for every PR-B-built template (the snapshot capture path always
+// includes the overlay placeholder); kept as a parameter so a future
+// "snapshot without overlay" build profile (e.g. a tiny boot-only
+// template) does not require a schema change.
+func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, statePath string, sizeBytes int64, checksum string, vsockCID uint32, hasOverlay bool) error {
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE firecracker_templates
 		SET status = ?, snapshot_memory_path = ?, snapshot_state_path = ?,
 			snapshot_size_bytes = ?, snapshot_checksum = ?, snapshot_vsock_cid = ?,
-			snapshot_error = '', has_snapshot = 1,
+			snapshot_error = '', has_snapshot = 1, has_overlay = ?,
 			updated_at = ?, ready_at = COALESCE(?, ready_at)
 		WHERE id = ?
 	`,
@@ -1936,6 +1961,7 @@ func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, st
 		sizeBytes,
 		strings.TrimSpace(checksum),
 		vsockCID,
+		boolToInt(hasOverlay),
 		now,
 		now,
 		strings.TrimSpace(id),
@@ -2033,7 +2059,8 @@ func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time
 		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
-			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay
 		FROM firecracker_templates
 		WHERE status NOT IN (?, ?, ?) AND updated_at < ? AND id NOT IN (
 			SELECT template_id FROM sandboxes WHERE template_id <> ''
@@ -2651,6 +2678,7 @@ func scanSandbox(scanner interface {
 		&serverless,
 		&wakeArmed,
 		&sandbox.TemplateID,
+		&sandbox.OverlaySizeGB,
 	)
 	if err != nil {
 		return nil, err
@@ -2824,6 +2852,7 @@ func scanTemplate(scanner interface {
 	var template models.Template
 	var readyAt sql.NullTime
 	var hasSnapshot int
+	var hasOverlay int
 	err := scanner.Scan(
 		&template.ID,
 		&template.Image,
@@ -2842,6 +2871,7 @@ func scanTemplate(scanner interface {
 		&template.SnapshotVsockCID,
 		&template.SnapshotError,
 		&hasSnapshot,
+		&hasOverlay,
 	)
 	if err != nil {
 		return nil, err
@@ -2853,6 +2883,7 @@ func scanTemplate(scanner interface {
 		template.ReadyAt = &t
 	}
 	template.HasSnapshot = hasSnapshot != 0
+	template.HasOverlay = hasOverlay != 0
 	return &template, nil
 }
 
