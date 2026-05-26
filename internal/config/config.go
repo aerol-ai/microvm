@@ -416,6 +416,20 @@ type Config struct {
 	// SB_FIRECRACKER_TAP_BASE_CIDR / SB_FIRECRACKER_TAP_POOL_SIZE.
 	FirecrackerTapBaseCIDR string
 	FirecrackerTapPoolSize int
+	// FirecrackerSkopeoBin / FirecrackerUmociBin / FirecrackerMkfs4Bin are
+	// the absolute paths to the three subprocess binaries the OCI rootfs
+	// builder shells out to. Required when EnableFirecracker is true;
+	// pkg/oci.New stat-checks them at construction so a typo crashes the
+	// daemon at boot rather than on first Create.
+	// SB_FIRECRACKER_SKOPEO_BIN / SB_FIRECRACKER_UMOCI_BIN / SB_FIRECRACKER_MKFS_BIN.
+	FirecrackerSkopeoBin string
+	FirecrackerUmociBin  string
+	FirecrackerMkfs4Bin  string
+	// FirecrackerIPBinary is the path to the iproute2 `ip` binary. Empty
+	// means "use $PATH" (the default works on every systemd host); set
+	// this only when /usr/sbin is not in the daemon's PATH.
+	// SB_FIRECRACKER_IP_BINARY.
+	FirecrackerIPBinary string
 
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
@@ -908,6 +922,10 @@ func Load() (Config, error) {
 		JailerGID:               getEnvInt("SB_JAILER_GID", 1000),
 		FirecrackerTapBaseCIDR:  getEnv("SB_FIRECRACKER_TAP_BASE_CIDR", "172.16.0.0/20"),
 		FirecrackerTapPoolSize:  getEnvInt("SB_FIRECRACKER_TAP_POOL_SIZE", 256),
+		FirecrackerSkopeoBin:    getEnv("SB_FIRECRACKER_SKOPEO_BIN", "/usr/bin/skopeo"),
+		FirecrackerUmociBin:     getEnv("SB_FIRECRACKER_UMOCI_BIN", "/usr/bin/umoci"),
+		FirecrackerMkfs4Bin:     getEnv("SB_FIRECRACKER_MKFS_BIN", "/sbin/mkfs.ext4"),
+		FirecrackerIPBinary:     strings.TrimSpace(os.Getenv("SB_FIRECRACKER_IP_BINARY")),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -1037,6 +1055,20 @@ func Load() (Config, error) {
 		}
 		if cfg.FirecrackerTapPoolSize <= 0 {
 			return Config{}, fmt.Errorf("SB_FIRECRACKER_TAP_POOL_SIZE must be > 0 (got %d)", cfg.FirecrackerTapPoolSize)
+		}
+		// The OCI rootfs builder requires three subprocess binaries.
+		// Paths are validated by pkg/oci.New at construction time so
+		// the daemon crashes at boot rather than on first Create — but
+		// "empty path" is a config-shape error, not a runtime error;
+		// catch it here so the env-var name is in the failure message.
+		if cfg.FirecrackerSkopeoBin == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_SKOPEO_BIN is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerUmociBin == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_UMOCI_BIN is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerMkfs4Bin == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_MKFS_BIN is required when SB_ENABLE_FIRECRACKER=true")
 		}
 	}
 

@@ -77,11 +77,16 @@ func TestPing(t *testing.T) {
 	})
 }
 
-// TestSkeletonMethodsReturnNotImplemented walks every method we expect to
-// still be a skeleton stub. The point isn't to test the message — it's to
-// flag the day a method graduates: when the real implementation lands,
-// the corresponding case here must be removed (or the test loop will
-// fail), forcing the author to acknowledge the surface change.
+// TestSkeletonMethodsReturnNotImplemented walks the methods that remain
+// skeleton stubs after Phase 1. Phase 1 lands Create/Destroy/Stop/Inspect
+// /ListManaged for cold-boot sandboxes; the remaining methods stay
+// not-implemented (Start-from-stopped is Phase 2, CreateSnapshot is Phase
+// 3, Resize is post-Phase-1, the network-rule shims share their TAP-side
+// implementation with the firewall package that hasn't landed yet).
+//
+// When a method graduates, the corresponding case here must be removed
+// (or the test loop will fail), forcing the author to acknowledge the
+// surface change.
 func TestSkeletonMethodsReturnNotImplemented(t *testing.T) {
 	d := New(Config{}, nil)
 	ctx := context.Background()
@@ -91,25 +96,15 @@ func TestSkeletonMethodsReturnNotImplemented(t *testing.T) {
 		run  func() error
 	}
 	calls := []call{
-		{"Create", func() error {
-			_, err := d.Create(ctx, models.CreateSandboxRequest{}, "id", "tok", nil)
-			return err
-		}},
 		{"Start", func() error {
 			_, err := d.Start(ctx, "id")
 			return err
 		}},
-		{"Stop", func() error { return d.Stop(ctx, "id") }},
-		{"Destroy", func() error { return d.Destroy(ctx, &models.Sandbox{ID: "id"}) }},
 		{"CreateSnapshot", func() error {
 			_, err := d.CreateSnapshot(ctx, "id", "img")
 			return err
 		}},
 		{"Resize", func() error { return d.Resize(ctx, "id", models.ResizeSandboxRequest{}) }},
-		{"Inspect", func() error {
-			_, err := d.Inspect(ctx, "id")
-			return err
-		}},
 		{"RemoveImage", func() error { return d.RemoveImage(ctx, "img") }},
 		{"PushAllowedPorts", func() error { return d.PushAllowedPorts(ctx, "1.2.3.4", "tok", nil) }},
 		{"ClearNetworkRules", func() error { return d.ClearNetworkRules("1.2.3.4") }},
@@ -126,6 +121,31 @@ func TestSkeletonMethodsReturnNotImplemented(t *testing.T) {
 				t.Fatalf("%s: expected ErrRuntimeNotImplemented, got %v", c.name, err)
 			}
 		})
+	}
+}
+
+// TestStopUnknownSandboxIsNoop confirms Stop on an unregistered sandbox
+// is a no-op rather than an error. Reconcile may call Stop on rows it
+// has just learned of from a different node; returning an error would
+// look like a real failure in logs.
+func TestStopUnknownSandboxIsNoop(t *testing.T) {
+	d := New(Config{}, nil)
+	if err := d.Stop(context.Background(), "unknown-id"); err != nil {
+		t.Fatalf("Stop on unknown sandbox should be no-op; got %v", err)
+	}
+}
+
+// TestInspectUnknownSandboxReturnsNil mirrors the Docker driver's
+// contract: a sandbox that isn't in the driver's registry returns
+// (nil, nil) rather than an error.
+func TestInspectUnknownSandboxReturnsNil(t *testing.T) {
+	d := New(Config{}, nil)
+	state, err := d.Inspect(context.Background(), "unknown-id")
+	if err != nil {
+		t.Fatalf("Inspect on unknown sandbox should not error; got %v", err)
+	}
+	if state != nil {
+		t.Fatalf("Inspect on unknown sandbox should return nil state; got %+v", state)
 	}
 }
 

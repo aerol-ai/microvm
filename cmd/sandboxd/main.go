@@ -28,6 +28,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
 )
@@ -195,8 +196,26 @@ func main() {
 			logger.Error("firecracker tap pool seed failed", "error", err)
 			os.Exit(1)
 		}
+		// OCI rootfs builder: depends on skopeo, umoci, mkfs.ext4 being
+		// installed and on $PATH. The validator already required these
+		// binary paths when EnableFirecracker=true; pkg/oci.New stat-
+		// checks them again at construction so a typo'd path crashes
+		// the daemon at boot rather than on first Create.
+		ociBuilder, err := oci.New(oci.Config{
+			SkopeoBin: cfg.FirecrackerSkopeoBin,
+			UmociBin:  cfg.FirecrackerUmociBin,
+			Mkfs4Bin:  cfg.FirecrackerMkfs4Bin,
+			WorkDir:   filepath.Join(cfg.FirecrackerRunDir, "oci-work"),
+		})
+		if err != nil {
+			logger.Error("firecracker oci builder init failed", "error", err)
+			os.Exit(1)
+		}
 		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
 		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
+		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
+		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
+		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
 		svc.SetFirecrackerRuntime(fcDriver)
 		logger.Info("firecracker runtime enabled",
 			"tap_base_cidr", cfg.FirecrackerTapBaseCIDR,
@@ -862,6 +881,48 @@ func (a *firecrackerPoolAdapter) Get(ctx context.Context, sandboxID string) (*fc
 		return nil, err
 	}
 	return adaptTapSlot(s), nil
+}
+
+// firecrackerRootfsAdapter wraps *pkg/oci.Builder so it satisfies the
+// fcruntime.RootfsBuilder interface. Same import-cycle isolation
+// reason as firecrackerPoolAdapter: the runtime test binary stays
+// independent of pkg/oci's subprocess machinery.
+type firecrackerRootfsAdapter struct {
+	inner *oci.Builder
+}
+
+func (a *firecrackerRootfsAdapter) Build(ctx context.Context, req fcruntime.RootfsBuildRequest) (*fcruntime.RootfsResult, error) {
+	res, err := a.inner.Build(ctx, oci.BuildRequest{
+		ImageRef:   req.ImageRef,
+		OutPath:    req.OutPath,
+		MinSizeMiB: req.MinSizeMiB,
+		Tag:        req.Tag,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return fcruntime.NewRootfsResult(res.RootfsPath, res.StagingDir, res.SizeBytes, res.CleanupDir), nil
+}
+
+// firecrackerTapHostAdapter wraps *tap.Host so it satisfies
+// fcruntime.TapHost. Translates between the package-local Slot and
+// the runtime-package mirror. Same shape as firecrackerPoolAdapter.
+type firecrackerTapHostAdapter struct {
+	inner *tap.Host
+}
+
+func (a *firecrackerTapHostAdapter) Ensure(ctx context.Context, slot fcruntime.TapSlot) error {
+	return a.inner.Ensure(ctx, tap.Slot{
+		TapName:  slot.TapName,
+		CIDR:     slot.CIDR,
+		HostIP:   slot.HostIP,
+		GuestIP:  slot.GuestIP,
+		VsockCID: slot.VsockCID,
+	})
+}
+
+func (a *firecrackerTapHostAdapter) Remove(ctx context.Context, tapName string) error {
+	return a.inner.Remove(ctx, tapName)
 }
 
 func adaptTapSlot(s *tap.Slot) *fcruntime.TapSlot {

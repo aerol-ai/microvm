@@ -22,15 +22,22 @@ import (
 type fireRecordingRuntime struct {
 	calls int
 	err   error
+	// ok, when non-nil, is the SandboxRuntimeState the fake returns
+	// (with state.SandboxID overwritten by the per-call sandboxID so
+	// the service layer's row build sees the right id). Lets one fake
+	// type cover both the "driver errored" and "driver succeeded"
+	// paths.
+	ok *models.SandboxRuntimeState
 }
 
-func (r *fireRecordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, _, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (r *fireRecordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	r.calls++
-	// Confirm the dispatch is passing the request through unchanged.
-	// (The service layer normalises req.Runtime to chosenRuntime before
-	// dispatch; we don't re-assert that here because the docker tests
-	// already cover it.)
 	_ = req
+	if r.ok != nil {
+		out := *r.ok
+		out.SandboxID = sandboxID
+		return &out, nil
+	}
 	return nil, r.err
 }
 
@@ -153,3 +160,90 @@ func TestFirecrackerDispatch_RoutesToDriver(t *testing.T) {
 // gets called). Adding a dedicated test here would require constructing
 // a full mounts+docker+store harness only to assert a no-call counter;
 // the existing coverage is the cheaper signal.
+
+// TestFirecrackerDispatch_HappyPathBuildsResponse exercises the
+// createFirecrackerSandbox flow end-to-end against a real store /
+// caddy stub / no-op mounts manager, with the firecracker driver
+// mocked to return a populated SandboxRuntimeState. Asserts that the
+// returned CreateSandboxResponse carries the runtime + IP + status
+// the driver reported and that a row was persisted.
+func TestFirecrackerDispatch_HappyPathBuildsResponse(t *testing.T) {
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fctest/api.sock",
+			ContainerIP: "172.16.0.2",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	// The harness's admitter only declares docker as supported; for
+	// the firecracker test we don't care about admission shape, so we
+	// drop it. (A separate admitter test would assert the placement
+	// integration; that's not what this dispatch test covers.)
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(rt)
+
+	resp, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:    "alpine:3.20",
+		Runtime:  models.RuntimeFirecracker,
+		CPU:      1,
+		MemoryMB: 256,
+		DiskGB:   1,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected non-nil response")
+	}
+	if resp.Sandbox.Runtime != models.RuntimeFirecracker {
+		t.Errorf("Sandbox.Runtime = %q, want firecracker", resp.Sandbox.Runtime)
+	}
+	if resp.Sandbox.ContainerIP != "172.16.0.2" {
+		t.Errorf("Sandbox.ContainerIP = %q, want 172.16.0.2", resp.Sandbox.ContainerIP)
+	}
+	if resp.Sandbox.Status != models.SandboxStatusStarted {
+		t.Errorf("Sandbox.Status = %q, want started", resp.Sandbox.Status)
+	}
+	if resp.SSHPrivateKey == "" {
+		t.Error("expected SSHPrivateKey to be populated")
+	}
+	if rt.calls != 1 {
+		t.Errorf("driver.Create calls = %d, want 1", rt.calls)
+	}
+	// Row must be persisted with the firecracker runtime so subsequent
+	// inspect / list / destroy land on the right driver.
+	stored, err := st.Get(context.Background(), resp.Sandbox.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if stored.Runtime != models.RuntimeFirecracker {
+		t.Errorf("persisted runtime = %q, want firecracker", stored.Runtime)
+	}
+}
+
+// TestFirecrackerDispatch_RejectsMountsForNow confirms the explicit
+// Phase 1 rejection of mounts on the firecracker path. Once virtio-fs
+// support lands, this test becomes a positive coverage point.
+func TestFirecrackerDispatch_RejectsMountsForNow(t *testing.T) {
+	rt := &fireRecordingRuntime{}
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.SetFirecrackerRuntime(rt)
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:   "alpine:3.20",
+		Runtime: models.RuntimeFirecracker,
+		Mounts:  []models.MountSpec{{Source: "s3://bucket/key", Target: "/data"}},
+	})
+	if err == nil {
+		t.Fatal("expected mounts rejection")
+	}
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Errorf("error should wrap ErrRuntimeNotImplemented; got %v", err)
+	}
+	if rt.calls != 0 {
+		t.Errorf("driver should not be called when mounts are rejected; calls=%d", rt.calls)
+	}
+}

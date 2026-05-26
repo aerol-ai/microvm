@@ -671,54 +671,28 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
-	// "firecracker" is the second runtime being added alongside Docker per
-	// plans/snapshot-clone-fast-boot.md. ValidRuntime accepts the
-	// identifier so SDK callers and dashboards can ship support ahead of
-	// the host-side implementation; this branch is the dispatch point.
+	// "firecracker" is the second runtime, dispatched to the native
+	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
 	//
-	// Two operator-troubleshooting shapes:
+	// Two operator-troubleshooting shapes for the gate:
 	//   - SB_ENABLE_FIRECRACKER=false: the host has not opted in. Tell
 	//     them which env var to flip and which plan describes the path.
-	//   - SB_ENABLE_FIRECRACKER=true: the driver is installed but the
-	//     Create lifecycle is still skeleton (Phase 1 in progress).
-	//
-	// Both return ErrRuntimeNotImplemented so apihttp.WriteStoreAwareError
-	// surfaces the right HTTP status; the message text differs to point
-	// at the actual blocker. When the real Create lands, this branch is
-	// replaced with a call into the Firecracker driver.
+	//   - SB_ENABLE_FIRECRACKER=true but firecracker==nil: the driver
+	//     was not registered. This is a daemon-configuration bug
+	//     rather than an operator misconfiguration — main.go must
+	//     always register the driver when the env var is set. The
+	//     distinct message lets the operator tell the two apart.
 	if chosenRuntime == models.RuntimeFirecracker {
 		if !s.cfg.EnableFirecracker {
 			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_FIRECRACKER=true on this host (see plans/snapshot-clone-fast-boot.md): %w",
 				chosenRuntime, models.ErrRuntimeNotImplemented)
 		}
 		if s.firecracker == nil {
-			// EnableFirecracker is on but the driver was not registered.
-			// This is a daemon-configuration bug rather than an operator
-			// misconfiguration — main.go should always register the
-			// driver when the env var is set. Surface a distinct message
-			// so the operator can tell the two apart in logs.
 			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_FIRECRACKER=true but main.go did not call SetFirecrackerRuntime): %w",
 				chosenRuntime, models.ErrRuntimeNotImplemented)
 		}
-		// Dispatch to the registered Firecracker driver. Phase 1 of the
-		// driver still returns ErrRuntimeNotImplemented for the unfinished
-		// final steps (REST orchestration, sandbox row build, caddy
-		// attach). The error short-circuits before we'd need to translate
-		// SandboxRuntimeState → CreateSandboxResponse — when full Create
-		// lands, this branch grows the same post-Create scaffolding the
-		// docker path has (rows, mounts, caddy, snapshot push).
-		//
-		// Cleanup contract: the driver's Create releases any half-allocated
-		// state (TAP slot, vsock CID, runDir) before returning the error.
-		// The service layer adds no caddy/store side effects to roll back
-		// at this point, so failure-path consistency (pr-review.md §4) is
-		// trivially satisfied.
 		req.Runtime = chosenRuntime
-		// Pass nil binds — the driver's mount support is a future axis
-		// (the host's bind-mount story is Docker-shaped; Firecracker
-		// guests will use virtio-fs or per-snapshot rootfs hard-links).
-		_, err := s.firecracker.Create(ctx, req, "", "", nil)
-		return nil, err
+		return s.createFirecrackerSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
 
@@ -924,6 +898,191 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		"disk_gb", sandbox.DiskGB,
 		"network_block_all", sandbox.NetworkBlockAll,
 		"mount_count", len(req.Mounts),
+	)
+	stored, err := s.store.Get(ctx, sandbox.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &models.CreateSandboxResponse{
+		Sandbox:       *stored,
+		SSHPrivateKey: privateKeyPEM,
+	}, nil
+}
+
+// createFirecrackerSandbox is the post-Create scaffolding for the
+// native Firecracker runtime. Mirrors the docker path's flow in
+// createSandbox above — keep them in lockstep when the docker path
+// grows new steps. The differences are deliberate and short:
+//
+//   - No mount sealing: Phase 1 doesn't pass binds to the firecracker
+//     driver (the host's bind-mount story is Docker-shaped; the
+//     firecracker guest will use virtio-fs or per-snapshot rootfs
+//     hard-links in a later phase).
+//   - No GPU normalize: GPU passthrough on Firecracker requires PCI
+//     passthrough setup that's out of Phase 1 scope.
+//   - The "registry auth seal" step still runs because the firecracker
+//     driver may pull from private registries via skopeo, but the
+//     sealed bytes are persisted onto the sandbox row in case Phase 2's
+//     template builder needs to re-pull.
+//   - Caddy still gets UpsertSandboxRoute called with the guest IP —
+//     the caddy upstream doesn't care whether the IP is a docker veth
+//     peer or a firecracker TAP guest, so the public URL routing works
+//     uniformly across runtimes.
+//
+// Cleanup contract — pr-review.md §4: every post-driver failure path
+// unwinds the driver-side state via firecracker.Destroy, mirroring the
+// docker path's _ = s.docker.Destroy(...) calls. The driver's own
+// cleanup contract (TAP slot release, runDir teardown) sits inside
+// Destroy, so we don't have to know the driver's internals here.
+func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
+	if len(req.Mounts) > models.MaxMountsPerSandbox {
+		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
+	}
+	if len(req.Mounts) > 0 {
+		// Phase 1 explicitly rejects mounts on the firecracker path
+		// rather than silently dropping them. When virtio-fs support
+		// lands, this branch becomes a call into a new mount adapter.
+		return nil, fmt.Errorf("runtime %q does not yet support mounts (see plans/snapshot-clone-fast-boot.md): %w",
+			req.Runtime, models.ErrRuntimeNotImplemented)
+	}
+
+	var lifecycle models.Lifecycle
+	if req.Lifecycle != nil {
+		if err := s.validateLifecycle(*req.Lifecycle); err != nil {
+			return nil, fmt.Errorf("invalid lifecycle: %w", err)
+		}
+		lifecycle = *req.Lifecycle
+	}
+
+	// GPU on firecracker is a future axis; reject explicitly so users
+	// don't think a silent drop happened. Same shape as the mounts
+	// rejection above.
+	if req.GPUs != nil {
+		return nil, fmt.Errorf("runtime %q does not yet support GPUs (see plans/snapshot-clone-fast-boot.md): %w",
+			req.Runtime, models.ErrRuntimeNotImplemented)
+	}
+	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
+		return nil, errors.New("network byte limits must be >= 0")
+	}
+
+	toolboxToken, err := generateToolboxToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate toolbox token: %w", err)
+	}
+	authorizedKey, privateKeyPEM, err := generateSandboxSSHKeys()
+	if err != nil {
+		return nil, fmt.Errorf("generate ssh keypair: %w", err)
+	}
+
+	sandboxID := idOverride
+	if sandboxID == "" {
+		sandboxID, err = generateSandboxID()
+		if err != nil {
+			return nil, fmt.Errorf("generate sandbox id: %w", err)
+		}
+	}
+
+	// Admission check mirrors the docker path. The capacity model is
+	// runtime-agnostic — a firecracker VMM's vCPU/memory footprint
+	// is counted the same way as a docker container's.
+	if s.admitter != nil {
+		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
+			return nil, err
+		}
+	}
+	releaseAdmission := func() {
+		if s.admitter != nil {
+			s.admitter.Release(sandboxID)
+		}
+	}
+
+	// Dispatch into the firecracker driver. The driver's Create owns
+	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
+	// REST orchestration, and the vsock handshake. On error, the
+	// driver releases everything it acquired before returning.
+	state, err := s.firecracker.Create(ctx, req, sandboxID, toolboxToken, nil)
+	if err != nil {
+		releaseAdmission()
+		return nil, err
+	}
+
+	sealedRegistry, err := s.sealRegistry(req.Registry)
+	if err != nil {
+		_ = s.firecracker.Destroy(ctx, &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
+		releaseAdmission()
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	sandbox := &models.Sandbox{
+		ID:                   state.SandboxID,
+		Image:                req.Image,
+		Status:               state.Status,
+		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		ContainerID:          state.ContainerID,
+		ContainerIP:          state.ContainerIP,
+		CPU:                  req.CPU,
+		MemoryMB:             req.MemoryMB,
+		DiskGB:               req.DiskGB,
+		OSUser:               req.OSUser,
+		Env:                  req.Env,
+		NetworkBlockAll:      req.NetworkBlockAll,
+		ToolboxEnabled:       true,
+		ToolboxToken:         toolboxToken,
+		SSHPublicKey:         authorizedKey,
+		Name:                 strings.TrimSpace(req.Name),
+		Tags:                 req.Tags,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		LastActiveAt:         now,
+		ContainerCommand:     req.ContainerCommand,
+		Lifecycle:            lifecycle,
+		Failover:             req.Failover,
+		Runtime:              req.Runtime,
+		RegistryAuthSealed:   sealedRegistry,
+		NetworkBytesInLimit:  req.NetworkBytesInLimit,
+		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
+	}
+	if len(req.CustomDomains) > 0 {
+		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))
+		for _, h := range req.CustomDomains {
+			sandbox.CustomDomains = append(sandbox.CustomDomains, models.CustomDomain{
+				Hostname:  h,
+				Status:    models.CustomDomainPendingDNS,
+				CreatedAt: now,
+				UpdatedAt: now,
+			})
+		}
+	}
+
+	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+		_ = s.firecracker.Destroy(ctx, sandbox)
+		releaseAdmission()
+		return nil, err
+	}
+
+	if err := s.store.Create(ctx, sandbox); err != nil {
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.firecracker.Destroy(ctx, sandbox)
+		releaseAdmission()
+		return nil, err
+	}
+
+	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
+		_ = s.store.Delete(ctx, sandbox.ID)
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.firecracker.Destroy(ctx, sandbox)
+		releaseAdmission()
+		return nil, err
+	}
+
+	s.logger.Info("audit sandbox created",
+		"sandbox_id", sandbox.ID,
+		"image", sandbox.Image,
+		"cpu", sandbox.CPU,
+		"memory_mb", sandbox.MemoryMB,
+		"disk_gb", sandbox.DiskGB,
+		"runtime", sandbox.Runtime,
 	)
 	stored, err := s.store.Get(ctx, sandbox.ID)
 	if err != nil {
