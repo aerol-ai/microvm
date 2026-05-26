@@ -210,6 +210,71 @@
       ],
       "title": "Secret Recovery Health",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 42 },
+      "id": 16,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "sum(aerolvm_template_unhealthy)", "legendFormat": "unhealthy", "refId": "A" }
+      ],
+      "title": "Unhealthy Firecracker Templates",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 42 },
+      "id": 17,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "sum(aerolvm_template_push_pending)", "legendFormat": "pending", "refId": "A" },
+        { "expr": "sum(aerolvm_template_push_error)", "legendFormat": "errored", "refId": "B" }
+      ],
+      "title": "Template Push Backlog",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 42 },
+      "id": 18,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_template_push_succeeded_total[5m]))", "legendFormat": "push ok/s", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_template_push_failed_total[5m]))", "legendFormat": "push fail/s", "refId": "B" }
+      ],
+      "title": "Template Push Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 48 },
+      "id": 19,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_template_rebuild_started_total[5m]))", "legendFormat": "started/s", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_template_rebuild_succeeded_total[5m]))", "legendFormat": "succeeded/s", "refId": "B" },
+        { "expr": "sum(rate(aerolvm_template_rebuild_failed_total[5m]))", "legendFormat": "failed/s", "refId": "C" }
+      ],
+      "title": "Template Rebuilds",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 48 },
+      "id": 20,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_template_pull_succeeded_total[5m]))", "legendFormat": "pull ok/s", "refId": "A" },
+        { "expr": "sum(rate(aerolvm_template_pull_failed_total[5m]))", "legendFormat": "pull fail/s", "refId": "B" }
+      ],
+      "title": "Template Pull Activity",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

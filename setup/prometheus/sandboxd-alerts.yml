@@ -278,3 +278,95 @@ groups:
           summary: "sandboxd is throttling ACME issuance"
           description: "The daemon-wide ACME budget is refusing new orders. Check sandboxd logs for the offending sandbox_id and investigate the misconfigured tenant."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
+  - name: sandboxd.firecracker-templates
+    interval: 30s
+    rules:
+      # Rebuilds are kicked on first observation of a corrupt snapshot
+      # (MarkSnapshotCorrupt) and re-kicked at daemon start by
+      # RekickUnhealthyTemplatesAtStart, so a row should leave unhealthy
+      # within FirecrackerTemplateBuildTimeout. A sustained nonzero count
+      # means the rebuild path is stuck — VMM boot failing, CID allocator
+      # exhausted, or the goroutine wedged. Critical because every
+      # sandbox create against the affected template returns a confusing
+      # "template unhealthy" error until an operator intervenes.
+      - alert: SandboxdFirecrackerTemplateUnhealthy
+        expr: sum(aerolvm_template_unhealthy) > 0
+        for: 15m
+        labels:
+          severity: critical
+          component: firecracker-templates
+        annotations:
+          summary: "Firecracker templates have been unhealthy for 15+ minutes"
+          description: "At least one Firecracker rootfs template has stayed in status=unhealthy for 15 minutes. The async snapshot rebuild has either failed repeatedly or wedged. Sandbox creates against these templates will keep failing until the rebuild succeeds."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md"
+
+      # Rebuild failures are counted at terminal-state transitions in
+      # RebuildTemplateSnapshot. Any nonzero rate over 10m is worth
+      # investigating because the rebuild path is the only way out of
+      # unhealthy/ready_no_snapshot in steady state — repeated failures
+      # mean a structural problem (kernel mismatch, vsock CID conflict,
+      # rootfs corruption) rather than transient flakiness.
+      - alert: SandboxdFirecrackerTemplateRebuildErrors
+        expr: sum(rate(aerolvm_template_rebuild_failed_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: firecracker-templates
+        annotations:
+          summary: "Firecracker template rebuild errors are occurring"
+          description: "Snapshot rebuilds have been failing for 10 minutes. Templates that hit this path flip to ready_no_snapshot — cold boot still works but the fast-boot property is gone until the underlying cause is fixed."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md"
+
+      # The push reconciler ticks at SnapshotPushReconcileInterval
+      # (default seconds), so a row should leave pending within minutes
+      # of being written. A sustained pending count means the reconciler
+      # is wedged or the registry is unreachable from this node —
+      # cluster peers can't pull artifacts they don't have local copies
+      # of, so the consumer-side puller will block sandbox creates on
+      # remote template references.
+      - alert: SandboxdFirecrackerTemplatePushStalled
+        expr: sum(aerolvm_template_push_pending) > 0
+        for: 30m
+        labels:
+          severity: warning
+          component: firecracker-templates
+        annotations:
+          summary: "Firecracker template artifact push has stalled"
+          description: "At least one template has been waiting for AOCR push for 30 minutes. Cluster peers cannot replicate the artifacts until push completes — sandbox creates against this template on other nodes will block on a cold fetch."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md"
+
+      # Templates in push_state=error stay there until the reconciler
+      # retries successfully or an operator clears them. A sustained
+      # nonzero gauge means structural breakage (bad registry creds,
+      # network partition, registry rejecting the artifact size) rather
+      # than transient flakiness — the reconciler has already retried
+      # multiple times by the time the row settles into error.
+      - alert: SandboxdFirecrackerTemplatePushErrored
+        expr: sum(aerolvm_template_push_error) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: firecracker-templates
+        annotations:
+          summary: "Firecracker template artifact push is erroring"
+          description: "At least one template has been in push_state=error for 15 minutes. The reconciler has already retried and given up; check registry credentials, network reachability to the AOCR endpoint, and template artifact sizes."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md"
+
+      # Pull failures land on the consumer side of cluster replication —
+      # a node that needs a remote template's artifacts cannot retrieve
+      # them. Sandbox creates against affected templates block on the
+      # boot path while EnsureTemplateLocal keeps retrying. Even a low
+      # rate (>0/s for 5m) is operator-actionable because the failure
+      # is sticky: the underlying cause (auth, network, registry
+      # garbage-collected the artifact) won't fix itself.
+      - alert: SandboxdFirecrackerTemplatePullErrors
+        expr: sum(rate(aerolvm_template_pull_failed_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: firecracker-templates
+        annotations:
+          summary: "Firecracker template artifact pulls are failing"
+          description: "Peer-side template fetches have been failing for 5 minutes. Sandbox creates that resolve to a remote-built template will block on the pull retry on the affected nodes until the pull path recovers."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md"
