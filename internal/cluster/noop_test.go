@@ -60,6 +60,30 @@ func TestNoopAlwaysSelf(t *testing.T) {
 	}
 }
 
+// TestNoopIgnoresTemplateAwarePlacement is the Phase 6 PR-D single-node
+// regression. In EnableCluster=false mode the Noop satisfies the Client
+// interface without ever consulting LocalTemplateIDs — the request's
+// TemplateID is ignored, SelectPlacement always returns self, and the
+// resolver/puller continue to work locally. Without this, a single-node
+// upgrade that started populating capacity.Request.TemplateID could
+// surface as a "placement target unknown" error when no other gating
+// changed. Asserts the noop behaviour persists end-to-end.
+func TestNoopIgnoresTemplateAwarePlacement(t *testing.T) {
+	n := NewNoop("standalone", "http://localhost:21212", "")
+	req := capacity.Request{
+		CPU: 1, MemoryMB: 1024,
+		Runtime:    "firecracker",
+		TemplateID: "tpl-fc-1", // never seen on this node
+	}
+	target, err := n.SelectPlacement(req)
+	if err != nil {
+		t.Fatalf("SelectPlacement (with TemplateID): %v", err)
+	}
+	if !target.IsSelf {
+		t.Fatal("Noop SelectPlacement must report IsSelf even when TemplateID is set")
+	}
+}
+
 // TestNoopForwardHTTPSignals500 makes the bug loud: if anything ever calls
 // ForwardHTTP in single-node mode, surface it rather than silently 200.
 func TestNoopForwardHTTPSignals500(t *testing.T) {

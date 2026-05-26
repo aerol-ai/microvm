@@ -76,8 +76,63 @@ func (s *Service) MarkSnapshotCorrupt(ctx context.Context, templateID, reason st
 	}
 	s.logger.Warn("snapshot corruption detected; template marked unhealthy, rebuild kicked",
 		"template_id", templateID, "reason", reason)
+	addTemplateUnhealthyGauge(1)
 	s.kickSnapshotRebuild(templateID)
 	return nil
+}
+
+// RekickUnhealthyTemplatesAtStart sweeps every firecracker_templates
+// row in status='unhealthy' and re-kicks the snapshot rebuild for each.
+//
+// Closes the crash-mid-rebuild gap: MarkSnapshotCorrupt flips the row
+// then spawns an async kickSnapshotRebuild goroutine. If sandboxd dies
+// between the row flip and the rebuild completing, the row is stuck
+// unhealthy on restart and no caller re-kicks it — every subsequent
+// create against that template fails with a confusing "template
+// unhealthy" error until an operator intervenes.
+//
+// Designed to be called once at daemon start, after the snapshotter +
+// CID-allocator wiring has landed (without those, RebuildTemplateSnapshot
+// would refuse with a clear error and the rebuild would never happen).
+// Returns nil and only logs on store errors — a daemon that can't list
+// templates should still start, since the rest of the service may be
+// healthy and the scanner re-runs on the next process restart.
+//
+// Idempotency: safe under repeated daemon starts. The CAS in
+// MarkTemplateUnhealthy is not re-entered (the row is already
+// unhealthy), and RebuildTemplateSnapshot re-checks the row's state
+// before doing any work, so a row that another caller already recovered
+// between this list and the rebuild kick short-circuits cleanly.
+func (s *Service) RekickUnhealthyTemplatesAtStart(ctx context.Context) {
+	if s.templateSnapshotter == nil || s.templateCIDAllocator == nil {
+		// Without wiring the rebuild path can't run; logging here would
+		// fire on every non-Firecracker deployment that imports this
+		// package. The caller (main.go) gates the call on
+		// cfg.EnableFirecracker, so a no-op return here means
+		// "Firecracker enabled but template build wiring incomplete" —
+		// worth a single warning.
+		s.logger.Warn("rekick unhealthy templates skipped: snapshotter or cid allocator not wired")
+		return
+	}
+	templates, err := s.store.ListUnhealthyTemplates(ctx)
+	if err != nil {
+		s.logger.Warn("rekick unhealthy templates: list failed", "error", err)
+		return
+	}
+	// Seed the gauge so the operator's "unhealthy templates" panel is
+	// accurate from t=0 of the daemon process, not just after the first
+	// MarkSnapshotCorrupt or RebuildTemplateSnapshot transition. The
+	// rebuild kicks below each decrement on completion.
+	recordTemplateUnhealthyGauge(int64(len(templates)))
+	if len(templates) == 0 {
+		return
+	}
+	s.logger.Info("audit rekick unhealthy templates at start", "count", len(templates))
+	for _, tpl := range templates {
+		s.logger.Warn("rekick unhealthy template after daemon restart",
+			"template_id", tpl.ID, "snapshot_error", tpl.SnapshotError)
+		s.kickSnapshotRebuild(tpl.ID)
+	}
 }
 
 // kickSnapshotRebuild spawns the rebuild goroutine. Detached context
@@ -167,6 +222,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 		s.logger.Warn("snapshot rebuild: status update to snapshotting failed",
 			"template_id", templateID, "error", uerr)
 	}
+	templateRebuildStartedTotal.Add(1)
 
 	snap, snapErr := s.templateSnapshotter.SnapshotTemplate(ctx, TemplateSnapshotRequest{
 		TemplateID:    templateID,
@@ -199,6 +255,11 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 			"template_id", templateID,
 			"status", models.TemplateStatusReadyNoSnapshot,
 			"snapshot_error", snapErr.Error())
+		templateRebuildFailedTotal.Add(1)
+		// Row left ready_no_snapshot, no longer unhealthy — drop the gauge
+		// so the operator's "templates currently unhealthy" panel reflects
+		// the new steady state without waiting for the next scan.
+		addTemplateUnhealthyGauge(-1)
 		return fmt.Errorf("snapshotter: %w", snapErr)
 	}
 
@@ -231,5 +292,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 		"status", models.TemplateStatusReady,
 		"snapshot_size_bytes", snapshotSize,
 		"vsock_cid", cid)
+	templateRebuildSucceededTotal.Add(1)
+	addTemplateUnhealthyGauge(-1)
 	return nil
 }

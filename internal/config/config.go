@@ -450,6 +450,26 @@ type Config struct {
 	// long-lived templates should bump this. SB_FIRECRACKER_TEMPLATE_GC_TTL.
 	FirecrackerTemplateGCTTL time.Duration
 
+	// FirecrackerTemplateRotationInterval is the Phase 6 PR-E knob that
+	// controls how often the rotation reconciler sweeps for templates
+	// whose `ready_at` is older than FirecrackerTemplateMaxAge. Default
+	// 0 = rotation disabled (rotation is opt-in because it triggers
+	// rebuilds, and a misconfigured cluster could thrash the build queue
+	// before the operator notices). When > 0, the reconciler ticks on a
+	// dedicated goroutine and calls MarkTemplateUnhealthy(reason="rotation")
+	// against each stale row, which re-uses the snapshot-corruption
+	// rebuild path. SB_FIRECRACKER_TEMPLATE_ROTATION_INTERVAL.
+	FirecrackerTemplateRotationInterval time.Duration
+	// FirecrackerTemplateMaxAge is the age threshold that turns a healthy
+	// `ready` template into a rotation candidate. Default 0 = rotation
+	// disabled. Setting Interval without MaxAge is operator error — the
+	// reconciler would scan and find nothing to do, ticking forever; we
+	// log a warning at boot in that case but don't refuse to start. The
+	// typical production value is 30d to pick up kernel and
+	// toolbox-agent updates baked into newly-rebuilt templates.
+	// SB_FIRECRACKER_TEMPLATE_MAX_AGE.
+	FirecrackerTemplateMaxAge time.Duration
+
 	// FirecrackerSnapshotEnabled gates the Phase 3 snapshot phase of the
 	// template build pipeline. Default true. When false, templates stop
 	// after rootfs.ext4 lands on disk and every Create uses the cold-boot
@@ -1073,11 +1093,13 @@ func Load() (Config, error) {
 		FirecrackerTemplateGCInterval: getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_INTERVAL", 1*time.Hour),
 		FirecrackerTemplateGCTTL:      getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_TTL", 168*time.Hour),
 
-		FirecrackerSnapshotEnabled:      getEnvBool("SB_FIRECRACKER_SNAPSHOT_ENABLED", true),
-		FirecrackerTemplateBuildTimeout: getEnvDuration("SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT", 45*time.Minute),
-		FirecrackerTemplateMemoryMB:     getEnvInt("SB_FIRECRACKER_TEMPLATE_MEMORY_MB", 512),
-		FirecrackerTemplateVCPU:         getEnvInt("SB_FIRECRACKER_TEMPLATE_VCPU", 1),
-		FirecrackerSnapshotVerifyOnLoad: getEnvBool("SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD", true),
+		FirecrackerSnapshotEnabled:          getEnvBool("SB_FIRECRACKER_SNAPSHOT_ENABLED", true),
+		FirecrackerTemplateBuildTimeout:     getEnvDuration("SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT", 45*time.Minute),
+		FirecrackerTemplateRotationInterval: getEnvDuration("SB_FIRECRACKER_TEMPLATE_ROTATION_INTERVAL", 0),
+		FirecrackerTemplateMaxAge:           getEnvDuration("SB_FIRECRACKER_TEMPLATE_MAX_AGE", 0),
+		FirecrackerTemplateMemoryMB:         getEnvInt("SB_FIRECRACKER_TEMPLATE_MEMORY_MB", 512),
+		FirecrackerTemplateVCPU:             getEnvInt("SB_FIRECRACKER_TEMPLATE_VCPU", 1),
+		FirecrackerSnapshotVerifyOnLoad:     getEnvBool("SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD", true),
 
 		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
 		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),

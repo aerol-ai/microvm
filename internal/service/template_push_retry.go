@@ -80,6 +80,14 @@ func (r *TemplateArtifactPushReconciler) RunOnce(ctx context.Context) (TemplateA
 	if err != nil {
 		return TemplateArtifactPushStats{}, err
 	}
+	// Sample the push-state gauges off the rows we already have. The
+	// list is filtered to push_state IN ('pending','error'); partitioning
+	// it gives operators a per-state count without a second query.
+	gaugeRows := make([]*templatePushGaugeRow, 0, len(pending))
+	for _, tpl := range pending {
+		gaugeRows = append(gaugeRows, &templatePushGaugeRow{PushState: tpl.PushState})
+	}
+	recordTemplatePushGauges(gaugeRows)
 	stats := TemplateArtifactPushStats{Scanned: len(pending)}
 	if len(pending) == 0 {
 		return stats, nil
@@ -104,8 +112,10 @@ func (r *TemplateArtifactPushReconciler) RunOnce(ctx context.Context) (TemplateA
 			switch outcome {
 			case templatePushSucceeded:
 				stats.Succeeded++
+				templatePushSucceededTotal.Add(1)
 			case templatePushFailed:
 				stats.Failed++
+				templatePushFailedTotal.Add(1)
 			case templatePushSkipped:
 				stats.Skipped++
 			}

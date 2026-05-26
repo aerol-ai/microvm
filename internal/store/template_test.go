@@ -706,3 +706,206 @@ func TestUpdateTemplatePushDistribution_AtomicWithRefAndDigest(t *testing.T) {
 		t.Errorf("UpdateTemplatePushDistribution(missing) error = %v, want ErrNotFound", err)
 	}
 }
+
+// TestListUnhealthyTemplates_FiltersByStatus pins the daemon-start
+// scanner's source query: only rows in status='unhealthy' come back.
+// Other states (ready, ready_no_snapshot, snapshotting, failed) must
+// be filtered — re-kicking those would either no-op (RebuildTemplateSnapshot
+// refuses non-unhealthy) or actively race against an in-flight build
+// goroutine.
+func TestListUnhealthyTemplates_FiltersByStatus(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	mk := func(id string, status models.TemplateStatus) {
+		t.Helper()
+		tpl := &models.Template{
+			ID: id, Image: "docker://alpine:3.19",
+			Status: status, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate %s: %v", id, err)
+		}
+	}
+
+	mk("tpl-unhealthy-1", models.TemplateStatusUnhealthy)
+	mk("tpl-unhealthy-2", models.TemplateStatusUnhealthy)
+	mk("tpl-ready", models.TemplateStatusReady)
+	mk("tpl-ready-no-snap", models.TemplateStatusReadyNoSnapshot)
+	mk("tpl-snapshotting", models.TemplateStatusSnapshotting)
+	mk("tpl-building", models.TemplateStatusBuildingRootfs)
+	mk("tpl-failed", models.TemplateStatusFailed)
+
+	rows, err := st.ListUnhealthyTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListUnhealthyTemplates: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, r := range rows {
+		gotIDs[r.ID] = true
+	}
+	want := map[string]bool{
+		"tpl-unhealthy-1": true,
+		"tpl-unhealthy-2": true,
+	}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("ListUnhealthyTemplates returned %v, want exactly %v", gotIDs, want)
+	}
+	for id := range want {
+		if !gotIDs[id] {
+			t.Errorf("missing expected id %q", id)
+		}
+	}
+}
+
+// TestListUnhealthyTemplates_EmptyStore is the boring case the scanner
+// hits on every daemon start that hasn't experienced corruption.
+// Returning nil (not an error) keeps the scanner's caller path simple.
+func TestListUnhealthyTemplates_EmptyStore(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	rows, err := st.ListUnhealthyTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListUnhealthyTemplates on empty store: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("got %d rows on empty store, want 0", len(rows))
+	}
+}
+
+// TestListReadyTemplateIDs_FiltersByStatus pins the Phase 6 PR-D
+// capacity-heartbeat source query: only `ready` and
+// `ready_no_snapshot` rows come back. Unhealthy/building/failed rows
+// must NOT be advertised — a peer placing against an unhealthy
+// template would either fail at boot or race the in-progress rebuild.
+// Status filter is the gate; the projection is IDs-only so heartbeats
+// stay small once a cluster has hundreds of templates.
+func TestListReadyTemplateIDs_FiltersByStatus(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	mk := func(id string, status models.TemplateStatus) {
+		t.Helper()
+		tpl := &models.Template{
+			ID: id, Image: "docker://alpine:3.19",
+			Status: status, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate %s: %v", id, err)
+		}
+	}
+
+	mk("tpl-ready-1", models.TemplateStatusReady)
+	mk("tpl-ready-no-snap", models.TemplateStatusReadyNoSnapshot)
+	mk("tpl-ready-2", models.TemplateStatusReady)
+	mk("tpl-unhealthy", models.TemplateStatusUnhealthy)
+	mk("tpl-building", models.TemplateStatusBuildingRootfs)
+	mk("tpl-failed", models.TemplateStatusFailed)
+	mk("tpl-snapshotting", models.TemplateStatusSnapshotting)
+
+	ids, err := st.ListReadyTemplateIDs(ctx)
+	if err != nil {
+		t.Fatalf("ListReadyTemplateIDs: %v", err)
+	}
+	gotSet := map[string]bool{}
+	for _, id := range ids {
+		gotSet[id] = true
+	}
+	want := map[string]bool{
+		"tpl-ready-1":       true,
+		"tpl-ready-no-snap": true,
+		"tpl-ready-2":       true,
+	}
+	if len(gotSet) != len(want) {
+		t.Fatalf("ListReadyTemplateIDs returned %v, want exactly %v", gotSet, want)
+	}
+	for id := range want {
+		if !gotSet[id] {
+			t.Errorf("missing expected id %q", id)
+		}
+	}
+}
+
+// TestListReadyTemplateIDs_EmptyStore is the boring case a fresh node
+// hits before any templates are built. Returning a nil slice (not an
+// error) lets the Capacity() caller treat it as "no inventory" without
+// special-casing.
+func TestListReadyTemplateIDs_EmptyStore(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ids, err := st.ListReadyTemplateIDs(ctx)
+	if err != nil {
+		t.Fatalf("ListReadyTemplateIDs on empty store: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("got %d ids on empty store, want 0", len(ids))
+	}
+}
+
+// TestListTemplatesReadyBefore_FiltersByStatusAndAge pins the Phase 6
+// PR-E rotation query: a row must be both `ready` AND have
+// `ready_at < cutoff` to surface. Rows missing ready_at (which the
+// status='ready' update normally sets, but defensively) must NOT
+// surface — a non-NULL guard avoids treating an in-flight build as
+// rotation-ready.
+func TestListTemplatesReadyBefore_FiltersByStatusAndAge(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+	stale := now.Add(-45 * 24 * time.Hour)
+	freshTime := now.Add(-5 * time.Minute)
+
+	mk := func(id string, status models.TemplateStatus, ready *time.Time) {
+		t.Helper()
+		tpl := &models.Template{
+			ID: id, Image: "docker://alpine:3.19",
+			Status: status, CreatedAt: now, UpdatedAt: now,
+			ReadyAt: ready,
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate %s: %v", id, err)
+		}
+	}
+
+	mk("tpl-stale-ready", models.TemplateStatusReady, &stale)
+	mk("tpl-fresh-ready", models.TemplateStatusReady, &freshTime)
+	mk("tpl-stale-ready-no-snap", models.TemplateStatusReadyNoSnapshot, &stale)
+	mk("tpl-stale-unhealthy", models.TemplateStatusUnhealthy, &stale)
+	mk("tpl-ready-no-readyat", models.TemplateStatusReady, nil)
+
+	cutoff := now.Add(-30 * 24 * time.Hour)
+	rows, err := st.ListTemplatesReadyBefore(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("ListTemplatesReadyBefore: %v", err)
+	}
+	gotSet := map[string]bool{}
+	for _, r := range rows {
+		gotSet[r.ID] = true
+	}
+	want := map[string]bool{"tpl-stale-ready": true}
+	if len(gotSet) != len(want) {
+		t.Fatalf("got %v, want exactly %v", gotSet, want)
+	}
+	for id := range want {
+		if !gotSet[id] {
+			t.Errorf("missing expected id %q", id)
+		}
+	}
+}
+
+// TestListTemplatesReadyBefore_EmptyStore is the no-op case. A fresh
+// node has no templates; the reconciler ticks and gets back nil, which
+// is a fast no-op in RunOnce.
+func TestListTemplatesReadyBefore_EmptyStore(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	rows, err := st.ListTemplatesReadyBefore(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("ListTemplatesReadyBefore on empty store: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("got %d rows on empty store, want 0", len(rows))
+	}
+}

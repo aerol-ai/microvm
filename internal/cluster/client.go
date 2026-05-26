@@ -1179,6 +1179,20 @@ func (c *Cluster) IngressTargets() models.IngressTarget {
 	return aggregateIngressTargets(c.gossip.members())
 }
 
+// SetLocalTemplateIDsProvider registers the Phase 6 PR-D callback used
+// by the capacity lease cache to overlay Firecracker template inventory
+// onto local heartbeats. Idempotent; passing nil unregisters. Wired by
+// main.go after the service is attached. Single-node deployments and
+// nodes without Firecracker enabled never call this and degrade to
+// nil-provider behaviour (no LocalTemplateIDs on the snapshot, peers
+// see the legacy "unknown, allow" placement).
+func (c *Cluster) SetLocalTemplateIDsProvider(fn func() []string) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetLocalTemplateIDsProvider(fn)
+}
+
 func (c *Cluster) membersWithCapacity() []Member {
 	members := c.gossip.members()
 	if c.capacityLeases == nil {

@@ -2206,6 +2206,130 @@ func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Templat
 	return items, nil
 }
 
+// ListUnhealthyTemplates returns every template row sitting in
+// status='unhealthy'. The daemon-start scanner in
+// service.RekickUnhealthyTemplatesAtStart sweeps this list once at boot
+// and kicks RebuildTemplateSnapshot for each row, closing the
+// crash-mid-rebuild gap: if sandboxd died after MarkTemplateUnhealthy
+// flipped the row but before the in-process kicker finished, the row
+// would otherwise be stuck unhealthy forever — every create against
+// that template would fail with a confusing "template unhealthy"
+// error and only operator intervention would resolve it.
+//
+// Mirrors ListTemplatesPendingPush in shape (same SELECT projection,
+// different WHERE) so the scan path is uniform with the existing push
+// reconciler. No status precondition beyond status='unhealthy' itself
+// — the rebuild path inside RebuildTemplateSnapshot re-checks the row
+// under its own read, so a row that another caller already recovered
+// between this list and the rebuild kick is handled cleanly.
+func (s *Store) ListUnhealthyTemplates(ctx context.Context) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE status = ?
+		ORDER BY created_at ASC, id ASC
+	`, string(models.TemplateStatusUnhealthy))
+	if err != nil {
+		return nil, fmt.Errorf("list unhealthy templates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// ListTemplatesReadyBefore returns the `ready` templates whose
+// `ready_at` is older than the cutoff. Used by the Phase 6 PR-E
+// rotation reconciler to find rebuild candidates. Only `ready` (not
+// `ready_no_snapshot`) qualifies — rotating a ready_no_snapshot row
+// would just re-burn build budget without delivering the rotation's
+// goal (refreshing the snapshot's kernel + toolbox bytes).
+//
+// Returns rows sorted oldest-first so a reconcile sweep that hits its
+// per-tick fanout cap rotates the most-overdue templates first.
+func (s *Store) ListTemplatesReadyBefore(ctx context.Context, cutoff time.Time) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE status = ?
+		  AND ready_at IS NOT NULL
+		  AND ready_at < ?
+		ORDER BY ready_at ASC, id ASC
+	`, string(models.TemplateStatusReady), cutoff.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list rotation candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// ListReadyTemplateIDs returns the IDs of every template whose
+// artifacts are usable on this host: `status IN ('ready',
+// 'ready_no_snapshot')`. The Phase 6 PR-D capacity heartbeat hands this
+// list to peers so placement can prefer the node that already has the
+// template's artifacts cached.
+//
+// Returns IDs only (no payload columns) — the snapshot is gossiped
+// every few seconds and a full row projection would balloon heartbeats
+// once a cluster has hundreds of templates. The unknown-allow rule in
+// placement.go nodeFits means a momentary "empty list" mid-startup is
+// safe: peers fall back to "any host" placement until the heartbeat
+// catches up.
+func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id
+		FROM firecracker_templates
+		WHERE status IN (?, ?)
+		ORDER BY id ASC
+	`, string(models.TemplateStatusReady), string(models.TemplateStatusReadyNoSnapshot))
+	if err != nil {
+		return nil, fmt.Errorf("list ready template ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan template id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate template ids: %w", err)
+	}
+	return ids, nil
+}
+
 // SetTemplatePushState is a narrow single-column update used by the
 // push reconciler. errMsg is overwritten unconditionally (including
 // to empty on success transitions) so callers don't have to remember

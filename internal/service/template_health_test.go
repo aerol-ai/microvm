@@ -301,3 +301,119 @@ func TestRebuildTemplateSnapshot_RequiresWiring(t *testing.T) {
 		t.Error("RebuildTemplateSnapshot without wiring returned nil error")
 	}
 }
+
+// TestRekickUnhealthyTemplatesAtStart_RekicksEachUnhealthyRow simulates
+// the crash-mid-rebuild scenario the scanner exists to recover from:
+// two templates were marked unhealthy before a daemon restart and no
+// in-process rebuild ever fired. After RekickUnhealthyTemplatesAtStart
+// both rows should return to ready via the same RebuildTemplateSnapshot
+// path the in-process notifier uses.
+func TestRekickUnhealthyTemplatesAtStart_RekicksEachUnhealthyRow(t *testing.T) {
+	svc, st, templatesDir := newHealthHarness(t)
+	tplA := seedReadyTemplate(t, st, templatesDir, "tpl-rekick-a")
+	tplB := seedReadyTemplate(t, st, templatesDir, "tpl-rekick-b")
+	healthy := seedReadyTemplate(t, st, templatesDir, "tpl-healthy")
+	// Drive both targets into unhealthy directly (skip MarkSnapshotCorrupt
+	// so this isolates the scanner's rekick semantics from the notifier's
+	// CAS gate).
+	if _, err := st.MarkTemplateUnhealthy(context.Background(), tplA.ID, "prior crash"); err != nil {
+		t.Fatalf("seed unhealthy A: %v", err)
+	}
+	if _, err := st.MarkTemplateUnhealthy(context.Background(), tplB.ID, "prior crash"); err != nil {
+		t.Fatalf("seed unhealthy B: %v", err)
+	}
+
+	snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 4)}
+	svc.SetTemplateSnapshotter(snap)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 99})
+
+	svc.RekickUnhealthyTemplatesAtStart(context.Background())
+
+	// Two rebuilds should complete before the deadline. The scanner
+	// fires kicks synchronously but the rebuild runs in a detached
+	// goroutine — wait for both via the snapshotter's done channel.
+	deadline := time.After(3 * time.Second)
+	for i := range 2 {
+		select {
+		case <-snap.done:
+		case <-deadline:
+			t.Fatalf("only %d/2 rebuilds completed within deadline", i)
+		}
+	}
+
+	// Healthy row was never touched — no extra rebuild beyond the two
+	// unhealthy ones.
+	time.Sleep(50 * time.Millisecond)
+	snap.mu.Lock()
+	calls := snap.calls
+	snap.mu.Unlock()
+	if calls != 2 {
+		t.Errorf("snapshotter calls = %d, want 2 (one per unhealthy row)", calls)
+	}
+
+	// Both targets recovered; healthy row untouched.
+	for _, id := range []string{tplA.ID, tplB.ID} {
+		got, err := st.GetTemplate(context.Background(), id)
+		if err != nil {
+			t.Fatalf("GetTemplate %s: %v", id, err)
+		}
+		if got.Status != models.TemplateStatusReady {
+			t.Errorf("template %s post-rebuild status = %s, want ready", id, got.Status)
+		}
+	}
+	gotHealthy, err := st.GetTemplate(context.Background(), healthy.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate healthy: %v", err)
+	}
+	if gotHealthy.Status != models.TemplateStatusReady {
+		t.Errorf("healthy template status = %s, want ready (untouched)", gotHealthy.Status)
+	}
+}
+
+// TestRekickUnhealthyTemplatesAtStart_EmptyStoreIsNoop is the
+// boring-but-load-bearing case: most daemon starts have no unhealthy
+// templates and the scanner must not log noise or block startup.
+func TestRekickUnhealthyTemplatesAtStart_EmptyStoreIsNoop(t *testing.T) {
+	svc, _, _ := newHealthHarness(t)
+	snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 1)}
+	svc.SetTemplateSnapshotter(snap)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 1})
+
+	svc.RekickUnhealthyTemplatesAtStart(context.Background())
+
+	select {
+	case <-snap.done:
+		t.Fatal("snapshotter fired on empty store; scanner should be no-op")
+	case <-time.After(75 * time.Millisecond):
+	}
+	snap.mu.Lock()
+	defer snap.mu.Unlock()
+	if snap.calls != 0 {
+		t.Errorf("snapshotter calls = %d, want 0 on empty store", snap.calls)
+	}
+}
+
+// TestRekickUnhealthyTemplatesAtStart_NoOpWithoutWiring proves the
+// guard: if the daemon hasn't attached a snapshotter (e.g.
+// EnableFirecracker true but template subsystem partially wired) the
+// scanner short-circuits without touching the store. Important because
+// kickSnapshotRebuild would just log "rebuild requires wiring" forever
+// otherwise.
+func TestRekickUnhealthyTemplatesAtStart_NoOpWithoutWiring(t *testing.T) {
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-no-wire")
+	if _, err := st.MarkTemplateUnhealthy(context.Background(), tpl.ID, "test"); err != nil {
+		t.Fatalf("MarkTemplateUnhealthy: %v", err)
+	}
+	// snapshotter + allocator deliberately left nil.
+
+	svc.RekickUnhealthyTemplatesAtStart(context.Background())
+
+	got, err := st.GetTemplate(context.Background(), tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.Status != models.TemplateStatusUnhealthy {
+		t.Errorf("template status = %s, want unhealthy (scanner must not touch)", got.Status)
+	}
+}

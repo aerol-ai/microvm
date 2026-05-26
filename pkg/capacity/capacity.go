@@ -84,13 +84,17 @@ type Limits struct {
 // required vendor when GPUs > 0 and is matched against HostInfo.GPUVendor
 // at admission/placement time. Runtime is the OCI runtime identifier
 // ("docker", "gvisor", ...) — empty means "any runtime the host supports."
+// TemplateID, when set alongside Runtime="firecracker", lets placement
+// prefer (and gate on) peers that already have the template's artifacts
+// cached locally — empty means "any host," matching pre-Phase-6 behaviour.
 type Request struct {
-	CPU       float64
-	MemoryMB  int
-	DiskGB    int
-	GPUs      int
-	GPUVendor string
-	Runtime   string
+	CPU        float64
+	MemoryMB   int
+	DiskGB     int
+	GPUs       int
+	GPUVendor  string
+	Runtime    string
+	TemplateID string
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -151,6 +155,17 @@ type Snapshot struct {
 	// doesn't have, say, runsc installed. Empty = legacy node, treated as
 	// supporting any runtime so rolling upgrades don't strand pre-D peers.
 	SupportedRuntimes []string `json:"supported_runtimes,omitempty"`
+	// LocalTemplateIDs lists the Firecracker templates whose artifact
+	// files (rootfs.ext4 + snapshot.{memory,state}) are present on this
+	// host. Placement gates a Firecracker create against it so a clone
+	// against a template the target has never seen lands on a node that
+	// already has it — preserving the <100ms boot promise. Empty list
+	// from a peer is interpreted as "unknown, allow" (matches
+	// SupportedRuntimes' legacy-peer behaviour); the consumer-side
+	// puller from PR 6-B.2 is the safety net when placement does miss.
+	// Phase 6 PR-D field; pre-upgrade peers omit it and degrade to
+	// pre-feature behaviour.
+	LocalTemplateIDs []string `json:"local_template_ids,omitempty"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads

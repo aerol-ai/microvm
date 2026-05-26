@@ -382,6 +382,23 @@ func main() {
 		}); ok {
 			withRecreator.AttachRecreator(svc)
 		}
+		// Phase 6 PR-D: template-aware placement. The capacity lease
+		// cache asks the service for the local "ready" template
+		// inventory at every heartbeat tick; the result is overlaid
+		// onto the snapshot peers gossip. Single-node mode and
+		// non-Firecracker nodes naturally degrade — the callback
+		// returns nil and placement's unknown-allow rule does the
+		// rest. Gated on EnableFirecracker so nodes that never serve
+		// templates don't pay the (cached) SQLite read.
+		if cfg.EnableFirecracker {
+			if withTemplates, ok := clusterClient.(interface {
+				SetLocalTemplateIDsProvider(func() []string)
+			}); ok {
+				withTemplates.SetLocalTemplateIDsProvider(func() []string {
+					return svc.LocalReadyTemplateIDs(context.Background())
+				})
+			}
+		}
 		logger.Info("cluster mode enabled",
 			"node_id", clusterClient.SelfNodeID(),
 			"api_url", clusterClient.SelfAPIURL(),
@@ -496,6 +513,30 @@ func main() {
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
 		startTemplateArtifactPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
+		// Phase 6 PR 6-B.2: consumer-side puller. Symmetric with the
+		// pusher above — once attached, EnsureTemplateLocal in the
+		// resolver fetches missing artifacts from AOCR before a clone
+		// boots. Gated on EnableFirecracker (templates only exist on
+		// Firecracker nodes); does NOT require SnapshotPushEnabled
+		// because a node may be configured to consume cluster artifacts
+		// without producing any.
+		attachTemplateArtifactPuller(logger, cfg, svc, dockerClient)
+		// Phase 6 PR-E: opt-in template rotation. No-op unless both
+		// FirecrackerTemplateRotationInterval and FirecrackerTemplateMaxAge
+		// are set; default config leaves rotation off so operators have
+		// to consciously enable rebuild-storm prevention.
+		startTemplateRotationReconciler(ctx, logger, cfg, db, svc)
+		// Phase 6 PR-A scanner: close the crash-mid-rebuild gap.
+		// MarkSnapshotCorrupt flips a row to unhealthy and kicks an
+		// async rebuild; if sandboxd died between the flip and the
+		// rebuild completing, the row would be stuck unhealthy forever.
+		// Gated on EnableFirecracker so non-Firecracker deployments
+		// don't pay the (cheap) scan. Called after the snapshotter +
+		// CID allocator wiring above (line ~290) so the rekicked
+		// rebuilds find a working snapshot pipeline.
+		if cfg.EnableFirecracker {
+			svc.RekickUnhealthyTemplatesAtStart(ctx)
+		}
 		if cfg.AutoImportEnabled {
 			// Wire the post-pull trigger: when the docker client finishes a
 			// successful pull that BOTH used the mirror AND carried private
@@ -891,6 +932,100 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 	}()
 }
 
+// startTemplateRotationReconciler kicks off the Phase 6 PR-E rotation
+// ticker. Opt-in: gated on EnableFirecracker AND a non-zero rotation
+// interval AND a non-zero max-age. When either knob is zero we log and
+// return — a "rotation interval set but max-age zero" config would
+// scan every tick and find nothing, which is operator confusion we
+// don't want to silently absorb.
+//
+// Mirrors startTemplateArtifactPushReconciler in shape so a single
+// mental model covers both reconcilers: build → AttachX → goroutine
+// driving RunOnce off a ticker.
+func startTemplateRotationReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service) {
+	if !cfg.EnableFirecracker {
+		return
+	}
+	rotCfg := service.TemplateRotationConfig{
+		Interval: cfg.FirecrackerTemplateRotationInterval,
+		MaxAge:   cfg.FirecrackerTemplateMaxAge,
+	}
+	if cfg.FirecrackerTemplateRotationInterval > 0 && cfg.FirecrackerTemplateMaxAge == 0 {
+		logger.Warn("template rotation: interval set but max-age is zero; rotation will not run",
+			"interval", cfg.FirecrackerTemplateRotationInterval)
+		return
+	}
+	if !rotCfg.IsEnabled() {
+		return
+	}
+	adapter := &service.TemplateRotationStoreAdapter{Store: db}
+	r, err := service.NewTemplateRotationReconciler(rotCfg, adapter, svc, logger)
+	if err != nil {
+		logger.Warn("template rotation: reconciler build failed; feature stays off",
+			"error", err)
+		return
+	}
+	if r == nil {
+		return
+	}
+	logger.Info("template rotation reconciler started",
+		"interval", rotCfg.Interval, "max_age", rotCfg.MaxAge)
+	go func() {
+		t := time.NewTicker(rotCfg.Interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				stats, err := r.RunOnce(ctx)
+				if err != nil {
+					logger.Warn("template rotation sweep failed", "error", err)
+					continue
+				}
+				if stats.Scanned == 0 {
+					continue
+				}
+				logger.Info("template rotation sweep",
+					"scanned", stats.Scanned,
+					"marked", stats.Marked,
+					"skipped", stats.Skipped,
+				)
+			}
+		}
+	}()
+}
+
+// attachTemplateArtifactPuller wires the Phase 6 PR 6-B.2 consumer-side
+// puller. No ticker — the puller fires on-demand from the resolver's
+// EnsureTemplateLocal call. Returns early when Firecracker is off (no
+// templates to pull) or when the templates dir is unset (the puller
+// constructor would refuse anyway).
+//
+// Templates dir is the only producer-side config the puller actually
+// needs: there's no PAT or cluster_id, because the puller uses whatever
+// auth the daemon already has configured for the AOCR host (the same
+// flow the AOCR-imported image distribution mode uses). This keeps
+// pull-only nodes deployable without a sandboxd cluster PAT.
+func attachTemplateArtifactPuller(logger *slog.Logger, cfg config.Config, svc *service.Service, dockerClient *docker.Client) {
+	if !cfg.EnableFirecracker {
+		return
+	}
+	if strings.TrimSpace(cfg.FirecrackerTemplatesDir) == "" {
+		return
+	}
+	adapter := service.NewTemplateArtifactPullDockerAdapter(dockerClient)
+	puller, err := service.NewTemplateArtifactPuller(adapter, cfg.FirecrackerTemplatesDir, logger)
+	if err != nil {
+		logger.Warn("template pull: puller build failed; feature stays off",
+			"error", err)
+		return
+	}
+	svc.AttachTemplateArtifactPuller(puller)
+	logger.Info("template pull adapter attached",
+		"templates_dir", cfg.FirecrackerTemplatesDir)
+}
+
 // startTemplateArtifactPushReconciler builds the optional AOCR template
 // artifact pusher + reconciler (Phase 6 PR 6-B.1) and starts a ticker
 // goroutine if the feature is enabled. Gated on EnableFirecracker AND
@@ -1196,6 +1331,20 @@ func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcru
 	}
 	if t.RootfsPath == "" {
 		return nil, fmt.Errorf("template %q is %s but has no rootfs path", id, t.Status)
+	}
+	// Phase 6 PR 6-B.2: if the row was pushed from another node and our
+	// local files are missing, fetch+extract from AOCR under a per-
+	// template single-flight before handing the paths to the driver.
+	// EnsureTemplateLocal is a fast no-op when the puller is not
+	// attached (single-node mode), when registry_ref is blank (this
+	// node was the producer), or when the files are already on disk.
+	// Boot-path call-out: on the first miss for a template this blocks
+	// on docker pull of the template OCI image (rootfs.ext4 layer is
+	// the bulk — bounded by image size + link speed). The atomic.Bool
+	// latch makes every subsequent create against the same template a
+	// single load.
+	if err := a.svc.EnsureTemplateLocal(ctx, t); err != nil {
+		return nil, fmt.Errorf("template %q: ensure local: %w", id, err)
 	}
 	return &fcruntime.TemplateResolution{
 		RootfsPath:         t.RootfsPath,

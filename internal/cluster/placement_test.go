@@ -298,3 +298,84 @@ func TestAdmitReservationCommandsAccountsForBatchCapacity(t *testing.T) {
 		t.Fatalf("admitReservationCommands error = %v, want ErrCapacityExceeded", err)
 	}
 }
+
+// TestNodeFitsTemplatePresent: a peer that reports the requested
+// template in its inventory passes. The clone boots locally against
+// already-cached artifacts and inherits the <100ms fast-boot property.
+func TestNodeFitsTemplatePresent(t *testing.T) {
+	hot := Member{NodeID: "hot", APIURL: "http://h", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateIDs: []string{"tpl-a", "tpl-b", "tpl-c"},
+	}}
+	if !nodeFits(hot, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-b"}, capacity.Request{}) {
+		t.Fatal("node with the template should fit")
+	}
+}
+
+// TestNodeFitsTemplateAbsentRejected: a peer with a non-empty inventory
+// missing the requested template is rejected. This is the authoritative
+// "no" arm — the peer reported its inventory and the template isn't
+// in it, so placing here would force the consumer-side puller to fetch
+// from AOCR and lose the fast-boot property.
+func TestNodeFitsTemplateAbsentRejected(t *testing.T) {
+	cold := Member{NodeID: "cold", APIURL: "http://c", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateIDs: []string{"tpl-a"},
+	}}
+	if nodeFits(cold, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-z"}, capacity.Request{}) {
+		t.Fatal("node missing the template should be rejected when inventory is non-empty")
+	}
+}
+
+// TestNodeFitsTemplateUnknownAllowOnEmpty: a peer with an empty
+// inventory (legacy node mid-rolling-upgrade, or just-joined node that
+// hasn't reported yet) must remain a candidate. Gating here would
+// strand creates on fresh clusters; the consumer-side puller is the
+// safety net when the placement misses. Mirrors SupportedRuntimes'
+// unknown-allow rule.
+func TestNodeFitsTemplateUnknownAllowOnEmpty(t *testing.T) {
+	legacy := Member{NodeID: "l", APIURL: "http://l", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		// LocalTemplateIDs intentionally empty
+	}}
+	if !nodeFits(legacy, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-x"}, capacity.Request{}) {
+		t.Fatal("legacy (empty LocalTemplateIDs) peer must accept any template")
+	}
+}
+
+// TestNodeFitsNoTemplateRequestSkipsGate: a request without a template
+// (a non-Firecracker create) must not be filtered by LocalTemplateIDs
+// at all — empty TemplateID means "any host." Without this guard a
+// docker sandbox could be falsely rejected because the peer's
+// inventory doesn't list its (non-existent) template.
+func TestNodeFitsNoTemplateRequestSkipsGate(t *testing.T) {
+	docker := Member{NodeID: "d", APIURL: "http://d", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateIDs: []string{"tpl-a"},
+	}}
+	if !nodeFits(docker, capacity.Request{CPU: 1, MemoryMB: 100}, capacity.Request{}) {
+		t.Fatal("non-template request must skip the template gate")
+	}
+}
+
+// TestCapacityRequestFromSpecCarriesTemplateID pins the wiring
+// invariant: a Firecracker create flowing through capacityRequestFromSpec
+// (failover-recreate) must carry the TemplateID so the recreated
+// placement targets a node that has the template. Drift here would mean
+// a failed-over Firecracker sandbox loses its template-locality
+// guarantee on the recreate, paying the docker-pull cost on every
+// failover.
+func TestCapacityRequestFromSpecCarriesTemplateID(t *testing.T) {
+	spec := &models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		Runtime: "firecracker", TemplateID: "tpl-fc-1",
+	}
+	got := capacityRequestFromSpec(spec)
+	if got.TemplateID != "tpl-fc-1" {
+		t.Fatalf("capacityRequestFromSpec.TemplateID = %q, want %q", got.TemplateID, "tpl-fc-1")
+	}
+}

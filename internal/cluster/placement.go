@@ -34,7 +34,13 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	if disk <= 0 {
 		disk = models.DefaultDiskGB
 	}
-	out := capacity.Request{CPU: cpu, MemoryMB: mem, DiskGB: disk, Runtime: spec.Runtime}
+	out := capacity.Request{
+		CPU:        cpu,
+		MemoryMB:   mem,
+		DiskGB:     disk,
+		Runtime:    spec.Runtime,
+		TemplateID: spec.TemplateID,
+	}
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
 		if want <= 0 {
@@ -180,6 +186,31 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 			}
 		}
 		if !supported {
+			return false
+		}
+	}
+	// Phase 6 PR-D template-aware placement. A create that names a
+	// template prefers a node that already has the artifacts cached —
+	// the consumer-side puller (PR 6-B.2) can recover when placement
+	// misses, but a hit avoids paying the docker-pull-from-AOCR window
+	// on cold boot, preserving the <100ms boot property the runtime
+	// exists to deliver.
+	//
+	// Unknown-allow rule (mirrors SupportedRuntimes above): empty
+	// LocalTemplateIDs on the peer means a legacy or just-joined node
+	// that hasn't reported its inventory yet; we don't gate, because
+	// gating would strand creates on a fresh cluster. A non-empty list
+	// missing the requested template is an authoritative "no" — that
+	// peer reported its inventory and the template isn't in it.
+	if req.TemplateID != "" && len(cap.LocalTemplateIDs) > 0 {
+		hit := false
+		for _, t := range cap.LocalTemplateIDs {
+			if t == req.TemplateID {
+				hit = true
+				break
+			}
+		}
+		if !hit {
 			return false
 		}
 	}

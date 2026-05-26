@@ -119,6 +119,26 @@ type Service struct {
 	// always wait for the next reconciler tick.
 	templateArtifactPusher         *TemplateArtifactPusher
 	templateArtifactPushReconciler *TemplateArtifactPushReconciler
+	// templateArtifactPuller is the consumer-side pair to the pusher
+	// (Phase 6 PR 6-B.2). Non-nil iff cmd/sandboxd called
+	// AttachTemplateArtifactPuller — in single-node deployments and on
+	// nodes without AOCR configured it stays nil, and EnsureTemplateLocal
+	// degrades to a fast no-op. The per-template ready latch +
+	// single-flight mutex (templateLocalReady) live next to it; same
+	// shape as l4Ready/l4Mu but keyed by template ID so concurrent first
+	// creates against the same not-yet-local template collapse to one
+	// pull.
+	templateArtifactPuller *TemplateArtifactPuller
+	templateLocalReadyMu   sync.Mutex
+	templateLocalReady     map[string]*templateLocalReadyEntry
+	// localReadyTemplateIDsCache is the Phase 6 PR-D capacity-heartbeat
+	// payload cached for ~5s so the cluster-wide gossip cadence does not
+	// hammer SQLite (single-writer; MaxOpenConns=1). Same TTL window the
+	// capacity-lease loop uses, so a stale-by-one-tick reading is the
+	// worst case. Lazily populated on first Capacity() call.
+	localReadyTemplateIDsMu      sync.Mutex
+	localReadyTemplateIDsCache   []string
+	localReadyTemplateIDsExpires time.Time
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -634,12 +654,13 @@ func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, expo
 
 func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
 	return capacity.Request{
-		CPU:       req.CPU,
-		MemoryMB:  req.MemoryMB,
-		DiskGB:    req.DiskGB,
-		Runtime:   req.Runtime,
-		GPUs:      gpuCountForCapacity(req.GPUs),
-		GPUVendor: gpuVendorForCapacity(req.GPUs),
+		CPU:        req.CPU,
+		MemoryMB:   req.MemoryMB,
+		DiskGB:     req.DiskGB,
+		Runtime:    req.Runtime,
+		GPUs:       gpuCountForCapacity(req.GPUs),
+		GPUVendor:  gpuVendorForCapacity(req.GPUs),
+		TemplateID: req.TemplateID,
 	}
 }
 
@@ -648,12 +669,13 @@ func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 		return capacity.Request{}
 	}
 	return capacity.Request{
-		CPU:       sandbox.CPU,
-		MemoryMB:  sandbox.MemoryMB,
-		DiskGB:    sandbox.DiskGB,
-		Runtime:   sandbox.Runtime,
-		GPUs:      gpuCountForCapacity(sandbox.GPUs),
-		GPUVendor: gpuVendorForCapacity(sandbox.GPUs),
+		CPU:        sandbox.CPU,
+		MemoryMB:   sandbox.MemoryMB,
+		DiskGB:     sandbox.DiskGB,
+		Runtime:    sandbox.Runtime,
+		GPUs:       gpuCountForCapacity(sandbox.GPUs),
+		GPUVendor:  gpuVendorForCapacity(sandbox.GPUs),
+		TemplateID: sandbox.TemplateID,
 	}
 }
 
@@ -2672,11 +2694,67 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 
 // Capacity returns the admitter's current snapshot. Returns the zero value
 // when no admitter is configured (e.g. in tests).
+//
+// Phase 6 PR-D: overlays LocalTemplateIDs from a 5s-TTL cache so peers
+// fetching /v1/capacity see which Firecracker templates this node can
+// already serve without paying a remote AOCR pull. The cache shields
+// SQLite from the gossip cadence (single-writer; MaxOpenConns=1).
 func (s *Service) Capacity() capacity.Snapshot {
+	var snap capacity.Snapshot
 	if s.admitter == nil {
-		return capacity.Snapshot{CanAdmit: true}
+		snap = capacity.Snapshot{CanAdmit: true}
+	} else {
+		snap = s.admitter.Snapshot()
 	}
-	return s.admitter.Snapshot()
+	if ids := s.LocalReadyTemplateIDs(context.Background()); len(ids) > 0 {
+		snap.LocalTemplateIDs = ids
+	}
+	return snap
+}
+
+// LocalReadyTemplateIDs returns the IDs of Firecracker templates whose
+// artifacts are usable on this host. Cached for 5s — peers gossip
+// /v1/capacity at this cadence and a per-tick SQLite hit would starve
+// the create path's writes (single-writer DB). On error the cache is
+// left untouched and the previous value is returned, matching the
+// "stale is better than wrong" contract the rest of the heartbeat path
+// uses.
+func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	now := time.Now()
+	s.localReadyTemplateIDsMu.Lock()
+	if now.Before(s.localReadyTemplateIDsExpires) {
+		// Defensive copy: callers might mutate (placement wraps it in a
+		// snapshot that crosses goroutine boundaries) and we don't want
+		// to hand out the cache's backing array.
+		out := append([]string(nil), s.localReadyTemplateIDsCache...)
+		s.localReadyTemplateIDsMu.Unlock()
+		return out
+	}
+	s.localReadyTemplateIDsMu.Unlock()
+
+	ids, err := s.store.ListReadyTemplateIDs(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("local ready template ids: list failed",
+				"error", err)
+		}
+		// Return the stale cache rather than nil so a one-tick SQLite
+		// hiccup doesn't trick peers into thinking we lost all our
+		// templates.
+		s.localReadyTemplateIDsMu.Lock()
+		out := append([]string(nil), s.localReadyTemplateIDsCache...)
+		s.localReadyTemplateIDsMu.Unlock()
+		return out
+	}
+	s.localReadyTemplateIDsMu.Lock()
+	s.localReadyTemplateIDsCache = ids
+	s.localReadyTemplateIDsExpires = now.Add(5 * time.Second)
+	out := append([]string(nil), ids...)
+	s.localReadyTemplateIDsMu.Unlock()
+	return out
 }
 
 // ReplayReservations re-populates the admitter from persistent state. Without
