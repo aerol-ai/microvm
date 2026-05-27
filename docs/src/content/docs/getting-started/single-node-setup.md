@@ -63,6 +63,7 @@ Caddy issues exactly two certificates, `<domain>` and `*.<domain>`, then renews 
 |---|---|---|
 | Docker | Default | Lowest overhead. Best for trusted workloads. |
 | gVisor | `--with-gvisor` | Adds a user-space kernel boundary for untrusted code. |
+| Firecracker | `--with-firecracker` | MicroVM runtime for fast, secure isolation. |
 | Kata Containers | Not available yet | Create requests return `runtime not yet implemented`. |
 
 If you want gVisor on the host, add `--with-gvisor` to the install command above. gVisor is not compatible with `--privileged` containers, ignores `disk_gb`, requires cgroupv2 plus systemd, and does not support GPU passthrough.

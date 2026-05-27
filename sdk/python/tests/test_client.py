@@ -1144,3 +1144,123 @@ class DNSRecordsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemplateLifecycleTests(unittest.TestCase):
+    """Cover the Firecracker rootfs-template surface:
+    POST/GET/DELETE /v1/templates[/{id}] and the operator-triggered
+    POST /v1/templates/{id}/rebuild. Validates that the SDK maps
+    snake_case wire fields to the camelCase Template dict, sends the
+    right method/path, and surfaces 412 errors as MicroVMHTTPError.
+    """
+
+    def _client(self, *, response=None):
+        captured = {"calls": []}
+
+        class FakeMicroVM(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                captured["calls"].append((method, path, payload))
+                # Each individual test installs its own response, so we
+                # consume from a shared mailbox here.
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+        return FakeMicroVM(), captured
+
+    def test_create_template_sends_request_and_maps_response(self):
+        api_response = {
+            "id": "tpl-create",
+            "image": "docker://python:3.11",
+            "status": "pending",
+            "min_size_mib": 512,
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:00:00Z",
+            "has_snapshot": False,
+            "has_overlay": False,
+        }
+        client, captured = self._client(response=api_response)
+        tpl = client.create_template({"id": "tpl-create", "image": "docker://python:3.11", "minSizeMiB": 512})
+        self.assertEqual(captured["calls"][0][0], "POST")
+        self.assertEqual(captured["calls"][0][1], "/v1/templates")
+        self.assertEqual(captured["calls"][0][2], {"id": "tpl-create", "image": "docker://python:3.11", "min_size_mib": 512})
+        self.assertEqual(tpl["id"], "tpl-create")
+        self.assertEqual(tpl["status"], "pending")
+        self.assertEqual(tpl["minSizeMiB"], 512)
+        self.assertEqual(tpl["hasSnapshot"], False)
+
+    def test_create_template_requires_image(self):
+        client, _ = self._client(response={})
+        with self.assertRaises(client_module.MicroVMError):
+            client.create_template({"id": "tpl-x", "image": ""})
+
+    def test_list_templates_normalizes_null_to_empty(self):
+        client, _ = self._client(response=None)
+        rows = client.list_templates()
+        self.assertEqual(rows, [])
+
+    def test_list_templates_maps_each_row(self):
+        api_response = [
+            {
+                "id": "tpl-1",
+                "image": "docker://alpine:3.19",
+                "status": "ready",
+                "created_at": "2026-05-27T10:00:00Z",
+                "updated_at": "2026-05-27T10:05:00Z",
+                "ready_at": "2026-05-27T10:04:00Z",
+                "has_snapshot": True,
+                "has_overlay": False,
+                "push_state": "active",
+            },
+        ]
+        client, _ = self._client(response=api_response)
+        rows = client.list_templates()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "tpl-1")
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertEqual(rows[0]["hasSnapshot"], True)
+        self.assertEqual(rows[0]["readyAt"], "2026-05-27T10:04:00Z")
+        self.assertEqual(rows[0]["pushState"], "active")
+
+    def test_get_template_targets_per_id_path(self):
+        client, captured = self._client(response={
+            "id": "tpl-x",
+            "image": "docker://alpine:3.19",
+            "status": "ready",
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:00:00Z",
+            "has_snapshot": True,
+            "has_overlay": False,
+        })
+        tpl = client.get_template("tpl-x")
+        self.assertEqual(captured["calls"][0], ("GET", "/v1/templates/tpl-x", None))
+        self.assertEqual(tpl["id"], "tpl-x")
+
+    def test_delete_template_sends_delete(self):
+        client, captured = self._client(response=None)
+        client.delete_template("tpl-x")
+        self.assertEqual(captured["calls"][0], ("DELETE", "/v1/templates/tpl-x", None))
+
+    def test_rebuild_template_posts_and_maps_unhealthy_response(self):
+        api_response = {
+            "id": "tpl-rebuild",
+            "image": "docker://alpine:3.19",
+            "status": "unhealthy",
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:10:00Z",
+            "has_snapshot": True,
+            "has_overlay": False,
+        }
+        client, captured = self._client(response=api_response)
+        tpl = client.rebuild_template("tpl-rebuild")
+        self.assertEqual(captured["calls"][0], ("POST", "/v1/templates/tpl-rebuild/rebuild", None))
+        self.assertEqual(tpl["status"], "unhealthy")
+
+    def test_rebuild_template_surfaces_412_as_http_error(self):
+        client, _ = self._client(response=client_module.MicroVMHTTPError(412, "template not eligible for rebuild: current status=pending"))
+        with self.assertRaises(client_module.MicroVMHTTPError) as ctx:
+            client.rebuild_template("tpl-pending")
+        self.assertEqual(ctx.exception.status_code, 412)

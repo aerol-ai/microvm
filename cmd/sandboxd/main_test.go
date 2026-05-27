@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TestReadBypassMarkerMissingReadsFalse: first boot has no marker file
@@ -90,5 +92,22 @@ func TestReadBypassMarkerTrimsTrailingNewline(t *testing.T) {
 				t.Fatalf("readBypassMarker(%q) = %v, want %v", tc.content, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestAppendRuntimeIfMissing(t *testing.T) {
+	got := appendRuntimeIfMissing([]string{models.RuntimeDocker}, models.RuntimeFirecracker)
+	if len(got) != 2 || got[0] != models.RuntimeDocker || got[1] != models.RuntimeFirecracker {
+		t.Fatalf("appendRuntimeIfMissing appended = %v, want [docker firecracker]", got)
+	}
+
+	got = appendRuntimeIfMissing([]string{" docker ", models.RuntimeFirecracker}, models.RuntimeFirecracker)
+	if len(got) != 2 {
+		t.Fatalf("appendRuntimeIfMissing duplicated existing runtime: %v", got)
+	}
+
+	got = appendRuntimeIfMissing([]string{models.RuntimeDocker}, " ")
+	if len(got) != 1 || got[0] != models.RuntimeDocker {
+		t.Fatalf("appendRuntimeIfMissing blank changed runtimes: %v", got)
 	}
 }

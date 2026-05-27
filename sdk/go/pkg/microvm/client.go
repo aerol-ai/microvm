@@ -64,11 +64,25 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		return nil, errors.New(authRequiredErrorMessage)
 	}
 
-	inner := apiclient.NewClient(apiURL, apiclient.ClientOptions{
+	opts := apiclient.ClientOptions{
 		PATToken:   patToken,
 		HTTPClient: httpClient,
 		APIVersion: apiclient.APIVersion(apiVersion),
-	})
+	}
+	if config != nil && config.Retry != nil {
+		opts.Retry = &apiclient.RetryConfig{}
+		if config.Retry.MaxRetries != nil {
+			opts.Retry.MaxRetries = config.Retry.MaxRetries
+		}
+		if config.Retry.BaseDelayMs != nil {
+			opts.Retry.BaseDelayMs = config.Retry.BaseDelayMs
+		}
+		if config.Retry.MaxDelayMs != nil {
+			opts.Retry.MaxDelayMs = config.Retry.MaxDelayMs
+		}
+	}
+
+	inner := apiclient.NewClient(apiURL, opts)
 
 	return &Client{
 		apiURL:   strings.TrimRight(apiURL, "/"),
@@ -266,6 +280,41 @@ func (c *Client) RegisterSnapshotFromImage(ctx context.Context, name string, ima
 
 func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.inner.Destroy(ctx, id)
+}
+
+// CreateTemplate registers a Firecracker rootfs template. Returns immediately
+// with a status="pending" row; poll Client.GetTemplate until the row reaches
+// "ready" (fast-boot available) or "ready_no_snapshot" (cold boot only).
+//
+// Idempotent when opts.ID is set: a duplicate ID returns 409 so a retried
+// CI step does not register two rows for the same logical template.
+func (c *Client) CreateTemplate(ctx context.Context, opts sdktypes.CreateTemplateOptions) (sdktypes.Template, error) {
+	return c.inner.CreateTemplate(ctx, opts)
+}
+
+func (c *Client) ListTemplates(ctx context.Context) ([]sdktypes.Template, error) {
+	return c.inner.ListTemplates(ctx)
+}
+
+func (c *Client) GetTemplate(ctx context.Context, id string) (sdktypes.Template, error) {
+	return c.inner.GetTemplate(ctx, id)
+}
+
+func (c *Client) DeleteTemplate(ctx context.Context, id string) error {
+	return c.inner.DeleteTemplate(ctx, id)
+}
+
+// RebuildTemplate re-runs the snapshot phase against an existing template.
+// Idempotent under concurrent retry: the daemon's CAS collapses N parallel
+// calls for the same ready template into one rebuild kick. Returns the row
+// in its post-transition state (typically "unhealthy"); poll GetTemplate
+// to observe the transition back to "ready".
+//
+// Returns an HTTP error (status 412) when the template is in a state where
+// rebuild is not safe (build in flight) or not supported (ready_no_snapshot,
+// failed — those need delete+recreate today).
+func (c *Client) RebuildTemplate(ctx context.Context, id string) (sdktypes.Template, error) {
+	return c.inner.RebuildTemplate(ctx, id)
 }
 
 func (c *Client) Resize(ctx context.Context, id string, opts sdktypes.ResizeSandboxOptions) (*Sandbox, error) {

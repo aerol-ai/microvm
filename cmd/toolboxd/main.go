@@ -120,11 +120,64 @@ func main() {
 
 	go forwardShutdownSignals(logger, httpServer)
 
+	// Start the vsock listener alongside HTTP. On Linux guests with a
+	// virtio-vsock device this binds (CID 3, port 1024) and accepts
+	// control-plane signals from the host (pre-snapshot / post-resume).
+	// On any other OS, or on a Linux host without AF_VSOCK support, the
+	// listener constructor returns an error — we log it at WARN and keep
+	// HTTP running. Vsock is additive; its absence does not block sandbox
+	// operation, only the snapshot lifecycle hooks.
+	//
+	// Pass srv.sessions (may be nil if the manager failed to init above)
+	// so the handler's pre_snapshot can fsync session recordings; nil
+	// is treated as "no sessions to flush" by the handler.
+	vsockHandler := newQuiesceHandler(logger, newSessionFlusher(srv.sessions))
+	if vs, err := newVsockServer(defaultVsockPort, vsockHandler, logger); err != nil {
+		logger.Warn("vsock listener disabled", "error", err)
+	} else {
+		go func() {
+			if err := vs.Serve(context.Background()); err != nil {
+				logger.Warn("vsock serve exited", "error", err)
+			}
+		}()
+		defer vs.Close()
+	}
+
 	logger.Info("toolboxd listening", "addr", addr, "sandbox_id", srv.sandboxID, "version", version.Version)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("toolboxd failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// sessionFlusherAdapter narrows *sessions.Manager down to the
+// sessionFlusher interface the vsock quiesce handler expects. Nil
+// manager → nil adapter (and the handler treats nil as "no sessions
+// to flush"). Putting the adapter in main.go keeps the toolboxd
+// cross-platform vsock.go file free of any sessions-package import,
+// which matters because vsock.go is built on darwin too.
+type sessionFlusherAdapter struct {
+	mgr *sessions.Manager
+}
+
+func newSessionFlusher(mgr *sessions.Manager) sessionFlusher {
+	if mgr == nil {
+		return nil
+	}
+	return &sessionFlusherAdapter{mgr: mgr}
+}
+
+func (a *sessionFlusherAdapter) ListIDs() []string {
+	ms := a.mgr.List()
+	ids := make([]string, 0, len(ms))
+	for _, s := range ms {
+		ids = append(ids, s.ID)
+	}
+	return ids
+}
+
+func (a *sessionFlusherAdapter) FlushRecording(id string) error {
+	return a.mgr.FlushRecording(id)
 }
 
 func startUserCommand(logger *slog.Logger, args []string) {

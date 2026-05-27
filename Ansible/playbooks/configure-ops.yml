@@ -51,6 +51,10 @@
       SB_MIRROR_HOST: "{{ mirror.host }}"
       SB_MIRROR_PUSH_HOST: "{{ mirror.push_host }}"
       SB_MIRROR_UPSTREAMS: "{{ mirror.upstreams }}"
+      SB_DOMAIN: "{{ ingress.domain_name }}"
+      SB_ENABLE_CUSTOM_DOMAINS: "{{ ingress.enable_custom_domains | bool | string | lower }}"
+      SB_CUSTOM_DOMAIN_VERIFY_PREFIX: "{{ ingress.custom_domain_txt_prefix }}"
+      SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX: "{{ ingress.custom_domain_txt_value_prefix }}"
       # Secret path: keyed off whether the operator supplied a wrap key in
       # config/secrets.yml (aocr.upstream_wrap_key) OR via a control-node
       # file (sandboxd_upstream_wrap_key_src in local.yml). Empty path = no

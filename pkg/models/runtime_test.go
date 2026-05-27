@@ -19,9 +19,13 @@ func TestValidRuntime(t *testing.T) {
 		{name: "docker_accepted", input: "docker", want: "docker"},
 		{name: "gvisor_accepted", input: "gvisor", want: "gvisor"},
 		{name: "kata_accepted_as_identifier", input: "kata", want: "kata"},
+		// Firecracker is a recognized identifier so the API surface accepts
+		// it before the per-host implementation lands. CreateSandbox still
+		// rejects with ErrRuntimeNotImplemented when the operator hasn't
+		// flipped SB_ENABLE_FIRECRACKER on (see service.go).
+		{name: "firecracker_accepted_as_identifier", input: "firecracker", want: "firecracker"},
 		{name: "runc_legacy_rejected", input: "runc", wantErr: true},
 		{name: "runsc_legacy_rejected", input: "runsc", wantErr: true},
-		{name: "firecracker_rejected", input: "firecracker", wantErr: true},
 		{name: "case_sensitive", input: "Docker", wantErr: true},
 		{name: "whitespace_rejected", input: " gvisor ", wantErr: true},
 	}
@@ -58,7 +62,12 @@ func TestResolveOCIRuntime(t *testing.T) {
 		{name: "docker_means_no_override", input: "docker", want: ""},
 		{name: "gvisor_resolves_to_runsc", input: "gvisor", want: "runsc"},
 		{name: "kata_returns_not_implemented", input: "kata", wantErr: ErrRuntimeNotImplemented},
-		{name: "unknown_value_errors", input: "firecracker", want: ""},
+		// Firecracker is a hypervisor, not an OCI runtime Docker can drive.
+		// ResolveOCIRuntime returns ErrRuntimeNotImplemented so a stray
+		// call from the Docker path surfaces clearly instead of silently
+		// coercing the request to runc.
+		{name: "firecracker_returns_not_implemented", input: "firecracker", wantErr: ErrRuntimeNotImplemented},
+		{name: "unknown_value_errors", input: "containerd", want: ""},
 	}
 
 	for _, tc := range tests {
@@ -70,7 +79,7 @@ func TestResolveOCIRuntime(t *testing.T) {
 				}
 				return
 			}
-			if tc.input == "firecracker" {
+			if tc.input == "containerd" {
 				if err == nil {
 					t.Fatalf("expected error for unknown input")
 				}

@@ -158,6 +158,7 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 		excluded[id] = struct{}{}
 	}
 	req := capacityRequestFromSpec(spec)
+	drained := c.fsm.drainedNodesSnapshot()
 	// Score every alive candidate that isn't excluded; pick the one with the
 	// highest headroom. We don't use power-of-two here because the candidate
 	// set is already filtered (and likely small after excludes) — full scan
@@ -173,6 +174,12 @@ func (c *Cluster) selectRecreationTargetExcluding(spec *models.CreateSandboxRequ
 			continue
 		}
 		if _, skip := excluded[m.NodeID]; skip {
+			continue
+		}
+		if !CanOwnSandboxRole(m.Role) {
+			continue
+		}
+		if drained[m.NodeID] {
 			continue
 		}
 		if m.APIURL == "" && m.NodeID != c.nodeID {

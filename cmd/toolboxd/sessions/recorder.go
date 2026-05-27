@@ -115,6 +115,24 @@ func (r *recorder) Close() error {
 	return err
 }
 
+// Sync best-effort fsyncs the underlying cast file so a pre-snapshot
+// quiesce signal (Phase 3 PR-B) gets the partial recording onto disk
+// before Firecracker freezes the guest's memory. A nil recorder or a
+// recorder that has already been Close()d is a no-op — the snapshot
+// is a pause, not a destroy, and a session without an attached
+// recording is the common case (template captures have no sessions).
+func (r *recorder) Sync() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.f == nil {
+		return nil
+	}
+	return r.f.Sync()
+}
+
 // Path returns the on-disk path of the cast file.
 func (r *recorder) Path() string {
 	if r == nil {

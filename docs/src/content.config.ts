@@ -155,6 +155,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/firecracker-templates',
+        label: 'Firecracker Templates',
+        description: 'Register OCI images as Firecracker rootfs templates for sub-100ms cold starts; rebuild on demand.',
+      },
+      {
+        type: 'link',
         href: '/preview',
         label: 'Preview',
         description: 'Expose container ports publicly over HTTPS through Caddy routes.',

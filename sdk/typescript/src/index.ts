@@ -2,6 +2,7 @@ export { MicroVM } from "./MicroVM.js";
 export { Sandbox } from "./Sandbox.js";
 export { Image } from "./Image.js";
 export type { MicroVMConfig } from "./MicroVM.js";
+export type { RetryConfig } from "./internal/client.js";
 export type {
   BinaryLike,
   BuildImageOptions,
@@ -9,6 +10,7 @@ export type {
   BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
+  CreateTemplateOptions,
   CustomDomain,
   CustomDomainDNSRecords,
   CustomDomainStatus,
@@ -40,5 +42,8 @@ export type {
   SessionAttachHandle,
   SessionAttachOptions,
   SessionStatus,
+  Template,
+  TemplatePushState,
+  TemplateStatus,
   UpdateLifecycleOptions,
 } from "./types.js";

@@ -1,0 +1,315 @@
+---
+title: Firecracker Templates
+description: Register OCI images as Firecracker rootfs templates for sub-100ms snapshot-clone fast-boot, and trigger rebuilds when artifacts drift.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Firecracker templates let one OCI image power many sandboxes with sub-100ms cold starts. Register an image once; the daemon builds an `ext4` rootfs and captures a paused-VM snapshot. Subsequent `firecracker` sandbox creates against that template clone the snapshot instead of cold-booting the kernel.
+
+Templates are an opt-in alternative to the Docker runtime — your existing sandboxes are unaffected. Use the template lifecycle on this page when you want predictable, fast cold starts (CI runners, REPLs, agent workloads) and accept the up-front build cost.
+
+## When you want this
+
+- **Fast cold starts.** Once a template is `ready`, new sandboxes boot from a memory snapshot, not from kernel init.
+- **Predictable image content.** A template is built once and reused; you control when it gets rebuilt.
+- **Cluster replication.** Templates with a registry destination ship their artifacts to all peers automatically (see [Cluster Setup](/cluster-setup/)).
+
+If you only need one-off sandboxes from arbitrary images, stick with the default Docker runtime — templates are not required.
+
+## Register a template
+
+Pass an explicit `id` so retried CI steps are idempotent — the daemon rejects a duplicate id with `409 Conflict` rather than creating a second row. The build runs asynchronously; the call returns immediately with `status: "pending"`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const tpl = await microvm.createTemplate({
+      id: "py311",
+      image: "docker://python:3.11",
+      minSizeMiB: 1024,
+    });
+    console.log(tpl.id, tpl.status); // "py311" "pending"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    tpl = microvm.create_template({
+        "id": "py311",
+        "image": "docker://python:3.11",
+        "minSizeMiB": 1024,
+    })
+    print(tpl["id"], tpl["status"])  # "py311" "pending"
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    tpl, err := client.CreateTemplate(ctx, sdktypes.CreateTemplateOptions{
+        ID: "py311", Image: "docker://python:3.11", MinSizeMiB: 1024,
+    })
+    if err != nil { log.Fatal(err) }
+    fmt.Println(tpl.ID, tpl.Status) // "py311" "pending"
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let tpl = client.create_template(CreateTemplateOptions {
+        id: Some("py311".into()),
+        image: "docker://python:3.11".into(),
+        min_size_mib: Some(1024),
+    })?;
+    println!("{} {:?}", tpl.id, tpl.status); // "py311" Pending
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Template tpl = client.createTemplate(new CreateTemplateOptions()
+        .setId("py311")
+        .setImage("docker://python:3.11")
+        .setMinSizeMib(1024));
+    System.out.println(tpl.id + " " + tpl.status); // "py311" PENDING
+    ```
+  </TabItem>
+</Tabs>
+
+### Image references
+
+The `image` field is passed straight to the daemon's OCI builder, so any [`skopeo`-style](https://github.com/containers/skopeo) reference works — `docker://python:3.11`, `oci-archive:/path/to/image.tar`, `docker-daemon:my-tag:latest`, etc.
+
+## Poll for readiness
+
+The template moves through `pending → building_rootfs → snapshotting → ready` (or `ready_no_snapshot` if the snapshot phase failed but the rootfs is usable for cold boot). Poll `getTemplate` until it leaves the in-flight states. A simple polling loop is enough — the API has no webhook surface today.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    async function awaitReady(id: string) {
+      for (;;) {
+        const tpl = await microvm.getTemplate(id);
+        if (tpl.status === "ready" || tpl.status === "ready_no_snapshot") return tpl;
+        if (tpl.status === "failed") throw new Error(`build failed: ${tpl.lastError}`);
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import time
+
+    def await_ready(id: str):
+        while True:
+            tpl = microvm.get_template(id)
+            if tpl["status"] in ("ready", "ready_no_snapshot"):
+                return tpl
+            if tpl["status"] == "failed":
+                raise RuntimeError(f"build failed: {tpl.get('lastError')}")
+            time.sleep(2)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    func awaitReady(ctx context.Context, c *microvm.Client, id string) (sdktypes.Template, error) {
+        for {
+            tpl, err := c.GetTemplate(ctx, id)
+            if err != nil { return tpl, err }
+            switch tpl.Status {
+            case sdktypes.TemplateStatusReady, sdktypes.TemplateStatusReadyNoSnapshot:
+                return tpl, nil
+            case sdktypes.TemplateStatusFailed:
+                return tpl, fmt.Errorf("build failed: %s", tpl.LastError)
+            }
+            time.Sleep(2 * time.Second)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::{thread, time::Duration};
+    use aerolvm_sdk::TemplateStatus;
+
+    fn await_ready(client: &aerolvm_sdk::Client, id: &str) -> Result<aerolvm_sdk::Template, aerolvm_sdk::Error> {
+        loop {
+            let tpl = client.get_template(id)?;
+            match tpl.status {
+                TemplateStatus::Ready | TemplateStatus::ReadyNoSnapshot => return Ok(tpl),
+                TemplateStatus::Failed => {
+                    return Err(aerolvm_sdk::Error::Api(format!(
+                        "build failed: {}",
+                        tpl.last_error.unwrap_or_default()
+                    )));
+                }
+                _ => thread::sleep(Duration::from_secs(2)),
+            }
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Template awaitReady(MicroVMClient c, String id) throws InterruptedException {
+        while (true) {
+            Template tpl = c.getTemplate(id);
+            switch (tpl.status) {
+                case READY:
+                case READY_NO_SNAPSHOT:
+                    return tpl;
+                case FAILED:
+                    throw new RuntimeException("build failed: " + tpl.lastError);
+                default:
+                    Thread.sleep(2000);
+            }
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+`ready` means the daemon captured a snapshot — sandboxes against this template will fast-boot. `ready_no_snapshot` means the rootfs was built but the snapshot phase failed (check `snapshotError`); sandboxes still work, they just cold-boot the kernel.
+
+## List and inspect
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    for (const tpl of await microvm.listTemplates()) {
+      console.log(tpl.id, tpl.status, tpl.hasSnapshot ? "fast-boot" : "cold-boot");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    for tpl in microvm.list_templates():
+        kind = "fast-boot" if tpl["hasSnapshot"] else "cold-boot"
+        print(tpl["id"], tpl["status"], kind)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    rows, err := client.ListTemplates(ctx)
+    if err != nil { log.Fatal(err) }
+    for _, tpl := range rows {
+        kind := "cold-boot"
+        if tpl.HasSnapshot { kind = "fast-boot" }
+        fmt.Println(tpl.ID, tpl.Status, kind)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    for tpl in client.list_templates()? {
+        let kind = if tpl.has_snapshot { "fast-boot" } else { "cold-boot" };
+        println!("{} {:?} {}", tpl.id, tpl.status, kind);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    for (Template tpl : client.listTemplates()) {
+        String kind = tpl.hasSnapshot ? "fast-boot" : "cold-boot";
+        System.out.println(tpl.id + " " + tpl.status + " " + kind);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Rebuild a template
+
+`rebuildTemplate` re-runs the snapshot phase against an existing rootfs. Use it when:
+
+- The snapshot artifact got corrupted and you want to force the rebuild ahead of the next sandbox create.
+- Operator intervention — e.g. kernel or toolbox-agent upgrades — and you don't want to wait for the daemon's optional rotation reconciler.
+
+The call is **idempotent under concurrent retry**: N parallel callers against the same `ready` template collapse to one rebuild kick (the daemon's CAS gates the transition). The 202 response carries the template in its post-transition state (typically `unhealthy`); poll `getTemplate` to observe the transition back to `ready`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const tpl = await microvm.rebuildTemplate("py311");
+    console.log(tpl.status); // "unhealthy"
+    await awaitReady("py311");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    tpl = microvm.rebuild_template("py311")
+    print(tpl["status"])  # "unhealthy"
+    await_ready("py311")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    tpl, err := client.RebuildTemplate(ctx, "py311")
+    if err != nil { log.Fatal(err) }
+    fmt.Println(tpl.Status) // "unhealthy"
+    awaitReady(ctx, client, "py311")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let tpl = client.rebuild_template("py311")?;
+    println!("{:?}", tpl.status); // Unhealthy
+    await_ready(&client, "py311")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Template tpl = client.rebuildTemplate("py311");
+    System.out.println(tpl.status); // UNHEALTHY
+    awaitReady(client, "py311");
+    ```
+  </TabItem>
+</Tabs>
+
+### When rebuild is refused (HTTP 412)
+
+The endpoint refuses templates that are not in a re-runnable state:
+
+| Current status | Why rebuild is refused |
+|---|---|
+| `pending`, `building_rootfs`, `snapshotting` | Initial build is in flight; the goroutine owns the row's state |
+| `ready_no_snapshot` | No snapshot to re-derive from; needs a full from-scratch rebuild path (not yet supported — delete+recreate the row) |
+| `failed` | Terminal state from a failed initial build; delete and recreate |
+
+When the row is already `unhealthy`, the call returns the row as-is — a rebuild is in flight or will be re-kicked on the next daemon restart.
+
+## Delete a template
+
+Deleting a template removes the rootfs and snapshot artifacts. The daemon rejects the delete with `409 Conflict` if any active sandbox still references the template — destroy those first.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await microvm.deleteTemplate("py311");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    microvm.delete_template("py311")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := client.DeleteTemplate(ctx, "py311"); err != nil { log.Fatal(err) }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.delete_template("py311")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.deleteTemplate("py311");
+    ```
+  </TabItem>
+</Tabs>
+
+## Cluster mode
+
+When the daemon is running in cluster mode with an OCI registry destination configured for templates, the build node ships the rootfs and snapshot artifacts to the registry; peer nodes lazily pull the artifacts the first time a sandbox lands on them. Placement is template-aware: the scheduler prefers nodes that already have a copy of the template's artifacts. See [Cluster Setup](/cluster-setup/) for the deployment knobs.
+
+## Optional rotation
+
+Set `SB_FIRECRACKER_TEMPLATE_ROTATION_INTERVAL` and `SB_FIRECRACKER_TEMPLATE_MAX_AGE` to let the daemon re-kick the snapshot phase for templates older than `MAX_AGE` on each interval tick. Both knobs must be non-zero — interval-only setups log a warning and no-op. This is the operator-side equivalent of looping over `rebuildTemplate` for every `ready` row; if you want fine-grained control, drive it from your application code instead.

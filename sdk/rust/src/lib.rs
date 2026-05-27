@@ -25,12 +25,14 @@ pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
-    BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions, CreateSessionOptions,
-    CustomDomain, CustomDomainDnsRecords, CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest,
-    ExecResult, ExposeOptions, ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus,
-    IngressTarget, Lifecycle, MountSpec, MountSpecRedacted, MountType, NetworkUsage,
-    RegisterSnapshotOptions, RegistryAuth, ResizeOptions, Sandbox as SandboxData, SandboxSnapshot,
-    Session, SessionList, SessionStatus, SetNetworkLimitsOptions, UpdateLifecycleOptions,
+    BuildImageOptions, BuildImagePushOptions, BuildImageResult, ClientConfig, CreateOptions,
+    CreateSessionOptions, CreateTemplateOptions, CustomDomain, CustomDomainDnsRecords,
+    CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
+    ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
+    MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
+    ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
+    SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
+    UpdateLifecycleOptions,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -159,6 +161,7 @@ pub struct Client {
     pat_token: String,
     api_version: ApiVersion,
     inner: HttpClient,
+    retry_config: RetryConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -470,9 +473,19 @@ impl Client {
         pat_token: Option<&str>,
         api_version: ApiVersion,
     ) -> Result<Self, Error> {
-        let token = pat_token
+        Self::with_config(ClientConfig {
+            api_url: api_url.map(String::from),
+            pat_token: pat_token.map(String::from),
+            retry: None,
+        }, api_version)
+    }
+
+    pub fn with_config(
+        config: ClientConfig,
+        api_version: ApiVersion,
+    ) -> Result<Self, Error> {
+        let token = config.pat_token
             .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
             .or_else(|| {
                 std::env::var("SB_PAT_TOKEN")
                     .ok()
@@ -480,7 +493,7 @@ impl Client {
             });
 
         let pat_token = token.ok_or(Error::MissingToken)?;
-        let api_url = api_url
+        let api_url = config.api_url
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().trim_end_matches('/').to_string())
             .or_else(|| {
@@ -496,6 +509,7 @@ impl Client {
             pat_token,
             api_version,
             inner: HttpClient::new(),
+            retry_config: config.retry.unwrap_or_default(),
         })
     }
 
@@ -784,6 +798,67 @@ impl Client {
         self.do_json::<(), ()>(
             Method::DELETE,
             &format!("{}/sandboxes/{}", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    /// Register a Firecracker rootfs template. Returns immediately with a
+    /// `status = TemplateStatus::Pending` row; poll [`Client::get_template`]
+    /// until the row reaches `Ready` (fast-boot available) or
+    /// `ReadyNoSnapshot` (cold boot only).
+    ///
+    /// Idempotent when `opts.id` is supplied: a duplicate id returns 409 so a
+    /// retried CI step does not register two rows for the same logical
+    /// template.
+    pub fn create_template(&self, opts: CreateTemplateOptions) -> Result<Template, Error> {
+        if opts.image.trim().is_empty() {
+            return Err(Error::Api("image is required".to_string()));
+        }
+        self.do_json::<CreateTemplateOptions, Template>(
+            Method::POST,
+            &format!("{}/templates", self.version_prefix()),
+            Some(&opts),
+        )
+    }
+
+    pub fn list_templates(&self) -> Result<Vec<Template>, Error> {
+        self.do_json::<(), Vec<Template>>(
+            Method::GET,
+            &format!("{}/templates", self.version_prefix()),
+            None,
+        )
+    }
+
+    pub fn get_template(&self, id: &str) -> Result<Template, Error> {
+        self.do_json::<(), Template>(
+            Method::GET,
+            &format!("{}/templates/{}", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    pub fn delete_template(&self, id: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!("{}/templates/{}", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    /// Re-run the snapshot phase against an existing template. Idempotent
+    /// under concurrent retry: the daemon's CAS collapses N parallel calls
+    /// for the same ready template into one rebuild kick. Returns the row
+    /// in its post-transition state (typically `Unhealthy`); poll
+    /// [`Client::get_template`] to observe the transition back to `Ready`.
+    ///
+    /// Returns an [`Error::Api`] wrapping a 412 response when the template
+    /// is in a state where rebuild is unsafe (build in flight) or
+    /// unsupported (`ReadyNoSnapshot`, `Failed` — those need
+    /// delete+recreate today).
+    pub fn rebuild_template(&self, id: &str) -> Result<Template, Error> {
+        self.do_json::<(), Template>(
+            Method::POST,
+            &format!("{}/templates/{}/rebuild", self.version_prefix(), id),
             None,
         )
     }
@@ -1216,23 +1291,53 @@ impl Client {
         path: &str,
         payload: Option<&T>,
     ) -> Result<U, Error> {
-        let url = self.full_url(path);
-        let builder = self
-            .inner
-            .request(method, &url)
-            .bearer_auth(&self.pat_token);
-        let builder = if let Some(body) = payload {
-            builder.json(body)
-        } else {
-            builder
-        };
+        let max_retries = self.retry_config.max_retries.unwrap_or(3);
+        let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
+        let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
 
-        let response = builder.send()?;
-        let response = self.handle_response(response)?;
-        if response.status() == reqwest::StatusCode::NO_CONTENT {
-            return serde_json::from_str("null").map_err(Error::SerdeJson);
+        let mut attempt = 0;
+        loop {
+            let url = self.full_url(path);
+            let mut builder = self
+                .inner
+                .request(method.clone(), &url)
+                .bearer_auth(&self.pat_token);
+            if let Some(body) = payload {
+                builder = builder.json(body);
+            }
+
+            match builder.send() {
+                Ok(response) => {
+                    let status = response.status();
+                    if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
+                        && attempt < max_retries
+                    {
+                        // Fall through to retry logic
+                    } else {
+                        let response = self.handle_response(response)?;
+                        if response.status() == reqwest::StatusCode::NO_CONTENT {
+                            return serde_json::from_str("null").map_err(Error::SerdeJson);
+                        }
+                        return response.json().map_err(Error::Reqwest);
+                    }
+                }
+                Err(err) => {
+                    if attempt >= max_retries || !err.is_request() && !err.is_connect() && !err.is_timeout() {
+                        return Err(Error::Reqwest(err));
+                    }
+                }
+            }
+
+            let delay_ms = std::cmp::min(base_delay * (1 << attempt), max_delay);
+            // Add jitter
+            let jitter = 1.0 + (rand::random::<f64>() - 0.5) * 0.5;
+            let sleep_duration = std::time::Duration::from_millis((delay_ms as f64 * jitter) as u64);
+            std::thread::sleep(sleep_duration);
+            attempt += 1;
         }
-        response.json().map_err(Error::Reqwest)
     }
 
     fn do_multipart(&self, path: &str, form: Form) -> Result<(), Error> {
@@ -3084,6 +3189,114 @@ mod tests {
         );
         assert_eq!(dns.target.hostname.as_deref(), Some("ingress.example.com"));
         assert_eq!(dns.target.source, "hostname");
+    }
+
+    // Firecracker rootfs template lifecycle. We stub the server response
+    // shape and assert the SDK maps snake_case wire fields to the Template
+    // struct and hits the right method/path. Daemon-side concurrency /
+    // state-machine behaviour is covered by the internal/service tests on
+    // the server side.
+    #[test]
+    fn create_template_posts_request_and_maps_response() {
+        let body = serde_json::json!({
+            "id": "tpl-rust",
+            "image": "docker://alpine:3.19",
+            "status": "pending",
+            "min_size_mib": 256,
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:00:00Z",
+            "has_snapshot": false,
+            "has_overlay": false
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+
+        let tpl = client
+            .create_template(CreateTemplateOptions {
+                id: Some("tpl-rust".to_string()),
+                image: "docker://alpine:3.19".to_string(),
+                min_size_mib: Some(256),
+            })
+            .expect("create_template should succeed");
+        let request = request_rx.recv().expect("request captured");
+
+        assert!(
+            request.starts_with("POST /v1/templates HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(
+            request.contains("\"image\":\"docker://alpine:3.19\""),
+            "request body missing image: {}",
+            request
+        );
+        assert!(
+            request.contains("\"min_size_mib\":256"),
+            "request body missing min_size_mib: {}",
+            request
+        );
+        assert_eq!(tpl.id, "tpl-rust");
+        assert_eq!(tpl.status, TemplateStatus::Pending);
+        assert_eq!(tpl.min_size_mib, Some(256));
+        assert!(!tpl.has_snapshot);
+    }
+
+    #[test]
+    fn create_template_rejects_empty_image() {
+        let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token"))
+            .expect("client should build");
+        let err = client
+            .create_template(CreateTemplateOptions::default())
+            .expect_err("empty image must be rejected");
+        match err {
+            Error::Api(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rebuild_template_surfaces_412_as_error() {
+        let body = serde_json::json!({
+            "error": "template not eligible for rebuild: current status=pending"
+        })
+        .to_string();
+        let (url, _rx) = spawn_response_server("412 Precondition Failed", "application/json", body.into_bytes());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client
+            .rebuild_template("tpl-pending")
+            .expect_err("412 must surface as error");
+        match err {
+            Error::Api(msg) => assert!(msg.contains("not eligible"), "msg = {}", msg),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rebuild_template_returns_unhealthy_post_transition_state() {
+        let body = serde_json::json!({
+            "id": "tpl-rebuild",
+            "image": "docker://alpine:3.19",
+            "status": "unhealthy",
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:10:00Z",
+            "has_snapshot": true,
+            "has_overlay": false
+        })
+        .to_string();
+        let (url, request_rx) = spawn_response_server("202 Accepted", "application/json", body.into_bytes());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+
+        let tpl = client.rebuild_template("tpl-rebuild").expect("rebuild ok");
+        let request = request_rx.recv().expect("request captured");
+
+        assert!(
+            request.starts_with("POST /v1/templates/tpl-rebuild/rebuild HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(tpl.status, TemplateStatus::Unhealthy);
     }
 
     // Empty-records case: server returns `target` populated even when no

@@ -75,14 +75,30 @@ func TestV1CustomDomainDNS_ReturnsRecordsAfterAttach(t *testing.T) {
 	if got.Target.Hostname != "ingress.example.com" {
 		t.Fatalf("Target.Hostname=%q, want ingress.example.com", got.Target.Hostname)
 	}
-	if len(got.Records) != 2 {
-		t.Fatalf("len(Records)=%d, want 2; got %+v", len(got.Records), got.Records)
+	if len(got.Records) != 4 {
+		t.Fatalf("len(Records)=%d, want 4; got %+v", len(got.Records), got.Records)
 	}
-	// Order matches insertion; both should be CNAME against the hostname target.
+
+	cnames := 0
+	txts := 0
 	for _, r := range got.Records {
-		if r.Type != models.DNSRecordTypeCNAME || r.Value != "ingress.example.com" {
+		if r.Type == models.DNSRecordTypeCNAME {
+			cnames++
+			if r.Value != "ingress.example.com" {
+				t.Fatalf("unexpected CNAME record %+v", r)
+			}
+		} else if r.Type == "TXT" {
+			txts++
+			if r.Value != "aerol-verify=sb-1" {
+				t.Fatalf("unexpected TXT record %+v", r)
+			}
+		} else {
 			t.Fatalf("unexpected record %+v", r)
 		}
+	}
+
+	if cnames != 2 || txts != 2 {
+		t.Fatalf("expected 2 CNAME and 2 TXT records, got %d CNAME and %d TXT", cnames, txts)
 	}
 }
 

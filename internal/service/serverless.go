@@ -154,7 +154,12 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	arm := s.shouldArmWake(sandbox, mode)
 	s.recordExpectedStop(id, mode)
 
-	if err := s.docker.Stop(ctx, sandboxContainerRef(sandbox)); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		s.consumeExpectedStop(id)
+		return nil, err
+	}
+	if err := rt.Stop(ctx, s.runtimeRef(sandbox)); err != nil {
 		// Stop failed → drop the expectation so a later involuntary
 		// exit is correctly classified rather than masked.
 		s.consumeExpectedStop(id)
@@ -196,6 +201,10 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.WakeArmed = armedValue
+	if s.isFirecrackerSandbox(sandbox) {
+		sandbox.ContainerID = ""
+		sandbox.ContainerIP = ""
+	}
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err

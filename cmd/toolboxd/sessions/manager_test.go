@@ -240,3 +240,38 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// TestFlushRecording_UnknownIDIsNoop is the safety net for the
+// vsock pre_snapshot loop: the handler iterates List() then calls
+// FlushRecording on each ID, but a session can finish (and be
+// removed from byID) between the two calls. The flush must tolerate
+// the race silently rather than logging an error per missing
+// session.
+func TestFlushRecording_UnknownIDIsNoop(t *testing.T) {
+	mgr := newTestManager(t)
+	if err := mgr.FlushRecording("does-not-exist"); err != nil {
+		t.Errorf("FlushRecording unknown id: got %v, want nil", err)
+	}
+}
+
+// TestFlushRecording_FsyncsActiveRecording asserts the manager's
+// FlushRecording surfaces the recorder's Sync() — exercised by
+// creating a session that runs long enough to emit output and
+// verifying the call returns nil (the recorder is open and the
+// underlying file is syncable).
+func TestFlushRecording_FsyncsActiveRecording(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+	sess, err := mgr.Create(ctx, models.CreateSessionRequest{
+		Name:    "flush-target",
+		Command: "echo hi && sleep 1",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Signal("KILL") })
+	// FlushRecording should accept the live recorder and return nil.
+	if err := mgr.FlushRecording(sess.ID()); err != nil {
+		t.Errorf("FlushRecording: %v", err)
+	}
+}

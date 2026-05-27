@@ -1,4 +1,4 @@
-import { APIClient, type APIVersion } from "./internal/client.js";
+import { APIClient, type APIVersion, type RetryConfig } from "./internal/client.js";
 import { Sandbox } from "./Sandbox.js";
 import { Image } from "./Image.js";
 import type {
@@ -6,6 +6,7 @@ import type {
   BuildImageResult,
   CreateOptions,
   CreateSessionOptions,
+  CreateTemplateOptions,
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
@@ -20,6 +21,7 @@ import type {
   Session,
   SessionAttachHandle,
   SessionAttachOptions,
+  Template,
 } from "./types.js";
 
 const defaultAPIURL = "http://127.0.0.1:21212";
@@ -38,6 +40,13 @@ export interface MicroVMConfig {
    * other.
    */
   apiVersion?: APIVersion;
+  /**
+   * Retry policy for transient transport errors (socket closed, connection
+   * reset) and retryable HTTP status codes (429, 502, 503, 504). The SDK
+   * retries up to 3 times with exponential backoff by default. Pass
+   * `{ maxRetries: 0 }` to disable.
+   */
+  retry?: RetryConfig;
 }
 
 export class MicroVM {
@@ -61,6 +70,7 @@ export class MicroVM {
       patToken,
       fetch: config.fetch,
       apiVersion: config.apiVersion,
+      retry: config.retry,
     });
   }
 
@@ -179,6 +189,47 @@ export class MicroVM {
 
   attachSession(sandboxID: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
     return this.client.attachSession(sandboxID, sessionID, options);
+  }
+
+  /**
+   * Register a Firecracker rootfs template. Returns immediately with a
+   * `status: "pending"` row; poll {@link MicroVM.getTemplate} until the
+   * status reaches `"ready"` (fast-boot available) or `"ready_no_snapshot"`
+   * (cold boot only — see {@link Template.snapshotError}).
+   *
+   * Idempotent when {@link CreateTemplateOptions.id} is supplied: a
+   * duplicate ID returns 409 so a retried CI step does not create two
+   * rows for the same logical template.
+   */
+  async createTemplate(options: CreateTemplateOptions): Promise<Template> {
+    return this.client.createTemplate(options);
+  }
+
+  async listTemplates(): Promise<Template[]> {
+    return this.client.listTemplates();
+  }
+
+  async getTemplate(id: string): Promise<Template> {
+    return this.client.getTemplate(id);
+  }
+
+  async deleteTemplate(id: string): Promise<void> {
+    await this.client.deleteTemplate(id);
+  }
+
+  /**
+   * Re-run the snapshot phase against an existing template. Idempotent
+   * under concurrent retry: the daemon's CAS collapses N parallel calls
+   * for the same ready template into one rebuild kick. Returns the row in
+   * its post-transition state (typically `unhealthy`) — poll
+   * {@link MicroVM.getTemplate} to observe the transition back to `ready`.
+   *
+   * Returns 412 (raised as an error) when the template is in a state
+   * where rebuild is not safe (build in flight) or not supported
+   * (`ready_no_snapshot` / `failed` — those need delete+recreate today).
+   */
+  async rebuildTemplate(id: string): Promise<Template> {
+    return this.client.rebuildTemplate(id);
   }
 
   /**

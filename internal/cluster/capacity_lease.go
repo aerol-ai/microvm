@@ -29,6 +29,15 @@ type capacityLeaseCache struct {
 
 	mu     sync.RWMutex
 	leases map[string]capacityLease
+
+	// localTemplateInventory is the Phase 6 PR-D hook for template-aware
+	// placement. cmd/sandboxd registers a callback that reads from the
+	// service-layer's 5s cache; we overlay the result onto the local
+	// admitter snapshot so peers gossiping /v1/capacity AND the local
+	// SelectPlacement path see the same list. nil = single-node mode or
+	// Firecracker disabled, and the placement path naturally degrades
+	// to "no template gate" via the unknown-allow rule.
+	localTemplateInventory func() ([]string, bool)
 }
 
 func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval time.Duration, logger *slog.Logger) *capacityLeaseCache {
@@ -52,7 +61,31 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	if c == nil || c.admitter == nil || c.selfID == "" {
 		return
 	}
-	c.set(c.selfID, c.admitter.Snapshot(), now)
+	snap := c.admitter.Snapshot()
+	// Overlay PR-D template inventory before storing — placement reads
+	// straight off this lease, so without the overlay our own snapshot
+	// would advertise no templates and the unknown-allow rule would
+	// let creates land on peers that lack them.
+	if c.localTemplateInventory != nil {
+		if ids, known := c.localTemplateInventory(); known {
+			snap.LocalTemplateInventoryKnown = true
+			snap.LocalTemplateIDs = ids
+		}
+	}
+	c.set(c.selfID, snap, now)
+}
+
+// SetLocalTemplateIDsProvider installs the PR-D callback the capacity
+// lease cache invokes at every refreshLocal tick. Idempotent (call once
+// at boot); passing nil unregisters. The callback should return an
+// already-cached slice — refreshLocal runs on every gossip tick.
+func (c *capacityLeaseCache) SetLocalTemplateIDsProvider(fn func() ([]string, bool)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localTemplateInventory = fn
 }
 
 func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated time.Time) {

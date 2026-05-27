@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,7 +15,10 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
+	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -26,6 +30,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
 )
@@ -144,14 +149,45 @@ func main() {
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = cfg.HostSupportedRuntimes
-	admitter := capacity.New(host, capacity.Limits{
+	if len(host.SupportedRuntimes) == 0 {
+		host.SupportedRuntimes = []string{models.RuntimeDocker}
+	}
+	if cfg.EnableFirecracker {
+		host.SupportedRuntimes = appendRuntimeIfMissing(host.SupportedRuntimes, models.RuntimeFirecracker)
+	}
+	// Phase 5: the per-VMM RSS sampler is constructed up front when
+	// firecracker is enabled so admission can be wired against it from
+	// the start (capacity holds the RSSSource by reference, not value).
+	// The sampler's Run goroutine is started later inside the
+	// EnableFirecracker block, after the driver is constructed —
+	// keeping the goroutine lifecycle next to the rest of the
+	// firecracker boot block. On docker-only hosts the sampler is nil
+	// and capacity falls back to nominal accounting (the watermark
+	// check is gated on rss != nil).
+	//
+	// rssSource is a typed nil-safe wrapper: if we passed the
+	// *RSSSampler directly into the interface arg, a nil pointer would
+	// satisfy the interface (non-nil interface, nil value) and the
+	// admitter's `rss != nil` guard would lie — a watermark check
+	// would then dereference the nil pointer and panic. Materialising
+	// the interface as a true nil keeps that gate honest.
+	var (
+		rssSampler *fcruntime.RSSSampler
+		rssSource  capacity.RSSSource
+	)
+	if cfg.EnableFirecracker {
+		rssSampler = fcruntime.NewRSSSampler(logger)
+		rssSource = rssSampler
+	}
+	admitter := capacity.NewWithRSSSource(host, capacity.Limits{
 		CPUReservationRatio:       cfg.CPUReservationRatio,
 		MemoryReservationRatio:    cfg.MemoryReservationRatio,
 		DiskReservationRatio:      cfg.DiskReservationRatio,
 		MemoryFloorRatio:          cfg.MemoryFloorRatio,
 		CPUOverProvisionFactor:    cfg.CPUOverProvisionFactor,
 		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
-	}, capacity.NewProcMeminfoProbe())
+		RSSWatermarkRatio:         cfg.FirecrackerRSSWatermarkRatio,
+	}, capacity.NewProcMeminfoProbe(), rssSource)
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
@@ -167,6 +203,7 @@ func main() {
 		"memory_floor_ratio", cfg.MemoryFloorRatio,
 		"cpu_overprovision_factor", cfg.CPUOverProvisionFactor,
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
+		"rss_watermark_ratio", cfg.FirecrackerRSSWatermarkRatio,
 	)
 
 	// dockerClient is passed twice: as the runtime.Runtime driver (the
@@ -175,6 +212,148 @@ func main() {
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+
+	// Native Firecracker runtime is opt-in per host. When enabled, we
+	// seed the per-host network slot pool from
+	// SB_FIRECRACKER_TAP_BASE_CIDR / SB_FIRECRACKER_TAP_POOL_SIZE and
+	// register the driver with the service. Seed is idempotent; a warm
+	// restart preserves existing slot↔sandbox assignments. Errors here
+	// are fatal at boot — the config validator already required the
+	// fields, so any failure is operational (CIDR doesn't fit the pool,
+	// SQLite write failed) and worth crashing for rather than swallowing.
+	if cfg.EnableFirecracker {
+		pool := tap.New(db)
+		if err := pool.Seed(context.Background(), tap.SeedConfig{
+			BaseCIDR: cfg.FirecrackerTapBaseCIDR,
+			PoolSize: cfg.FirecrackerTapPoolSize,
+		}, time.Now()); err != nil {
+			logger.Error("firecracker tap pool seed failed", "error", err)
+			os.Exit(1)
+		}
+		// OCI rootfs builder: depends on skopeo, umoci, mkfs.ext4 being
+		// installed and on $PATH. The validator already required these
+		// binary paths when EnableFirecracker=true; pkg/oci.New stat-
+		// checks them again at construction so a typo'd path crashes
+		// the daemon at boot rather than on first Create.
+		ociBuilder, err := oci.New(oci.Config{
+			SkopeoBin: cfg.FirecrackerSkopeoBin,
+			UmociBin:  cfg.FirecrackerUmociBin,
+			Mkfs4Bin:  cfg.FirecrackerMkfs4Bin,
+			WorkDir:   filepath.Join(cfg.FirecrackerRunDir, "oci-work"),
+		})
+		if err != nil {
+			logger.Error("firecracker oci builder init failed", "error", err)
+			os.Exit(1)
+		}
+		// Phase 5: start the per-VMM RSS sampler now that we know
+		// firecracker is on. Run is a blocking ticker loop, so it goes in
+		// a goroutine; ctx cancellation (SIGINT/SIGTERM at top of main)
+		// stops it. Interval ≤ 0 makes Run return immediately, which is
+		// the safe behaviour if an operator zeroes the env var — the
+		// sampler then never flips Ready() and admission stays on
+		// nominal accounting.
+		go rssSampler.Run(ctx, cfg.FirecrackerRSSSamplerInterval)
+		logger.Info("firecracker rss sampler started",
+			"interval", cfg.FirecrackerRSSSamplerInterval,
+			"watermark_ratio", cfg.FirecrackerRSSWatermarkRatio)
+		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
+		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
+		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
+		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
+		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
+		// Phase 5: hand the sampler to the driver so Create / WarmSpawn
+		// / tryAcquireWarm / Destroy can Register/Unregister per-VMM
+		// pids. Without this call the sampler stays empty and the
+		// effective-memory admission axis would always read 0 RSS —
+		// the same "no data, allow" cold-start behaviour the watermark
+		// check already protects against.
+		fcDriver.SetRSSSampler(rssSampler)
+		// Phase 6 PR-A: warm-spawn corruption notifier. WarmSpawn runs
+		// outside any service-side call, so the runtime needs a back-
+		// channel to flip a corrupt template to unhealthy + kick rebuild.
+		// *Service satisfies firecracker.TemplateHealthNotifier
+		// structurally (one method, MarkSnapshotCorrupt). Wiring is
+		// unconditional when firecracker is enabled — the cold-load path
+		// has its own service-side intercept and doesn't depend on this.
+		fcDriver.SetTemplateHealthNotifier(svc)
+		// Template pipeline (plans/snapshot-clone-fast-boot.md Phase 2):
+		// templateBuilderAdapter reuses the same *oci.Builder the per-
+		// create path uses, so a template build and a non-template
+		// CreateSandbox share OCI binaries, workdir, and validation
+		// constraints. templateResolverAdapter lets the driver look up
+		// the template's rootfs path through the service layer without
+		// the runtime package importing internal/service.
+		svc.SetTemplateBuilder(&templateBuilderAdapter{inner: ociBuilder})
+		fcDriver.SetTemplateResolver(&templateResolverAdapter{svc: svc})
+		// Phase 3 snapshot pipeline: the snapshotter is the driver
+		// itself (it owns the transient VMM seams); the CID allocator
+		// wraps the same TAP pool used for per-sandbox slots, keyed by
+		// "template:<id>" so the pool's per-id PK gives idempotent
+		// reservation across daemon restarts. Wiring both unlocks the
+		// transition into status=snapshotting and the eventual ready
+		// terminal state; leaving either nil keeps templates at
+		// ready_no_snapshot (cold-boot only).
+		svc.SetTemplateSnapshotter(&firecrackerTemplateSnapshotterAdapter{driver: fcDriver})
+		svc.SetTemplateCIDAllocator(&firecrackerCIDAllocatorAdapter{pool: pool})
+		svc.SetFirecrackerRuntime(fcDriver)
+		logger.Info("firecracker runtime enabled",
+			"tap_base_cidr", cfg.FirecrackerTapBaseCIDR,
+			"tap_pool_size", cfg.FirecrackerTapPoolSize,
+			"use_jailer", cfg.UseJailer)
+
+		// Phase 4 warm-VMM pool wiring. Gated on FirecrackerVMMPoolEnabled
+		// so a daemon rebuilt from this branch with the flag unset behaves
+		// identically to today — every snapshot-load Create still pays the
+		// spawn + LoadSnapshot wall-clock. With the flag on, the refill
+		// goroutine keeps DepthDefault paused-and-loaded VMMs per
+		// warmable template, and Driver.Create's tryAcquireWarm consumes
+		// them ahead of the cold-spawn fallback.
+		//
+		// Three adapters bridge the import-cycle wall:
+		//
+		//   - PoolSpawner satisfies vmmpool.Spawner against the driver's
+		//     WarmSpawn (firecracker package depends on vmmpool, not vice
+		//     versa).
+		//
+		//   - vmmTemplateListerAdapter satisfies vmmpool.TemplateLister by
+		//     reading the service's template list and projecting only the
+		//     fields the refill loop needs.
+		//
+		//   - fcDriver.SetWarmPool wires the runtime's Acquire path
+		//     against the same Pool.
+		//
+		// The refill goroutine runs for the lifetime of the daemon; ctx
+		// cancellation from the SIGINT/SIGTERM handler at the top of main
+		// is what stops it. vmmPool.Close on graceful shutdown drains any
+		// still-warm handles so the host doesn't get orphan firecracker
+		// processes.
+		if cfg.FirecrackerVMMPoolEnabled {
+			vmmPool := vmmpool.New(db, logger)
+			vmmPool.SetDefaultDepth(cfg.FirecrackerVMMPoolDepthDefault)
+			fcDriver.SetWarmPool(vmmPool)
+			lister := &vmmTemplateListerAdapter{svc: svc}
+			spawner := fcruntime.NewPoolSpawner(fcDriver)
+			refillCfg := vmmpool.RefillConfig{
+				RefillInterval: cfg.FirecrackerVMMPoolRefillInterval,
+				GCInterval:     cfg.FirecrackerVMMPoolGCInterval,
+				GCTTL:          cfg.FirecrackerVMMPoolGCTTL,
+				SpawnTimeout:   30 * time.Second,
+			}
+			go vmmPool.Run(ctx, refillCfg, lister, spawner)
+			defer func() {
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer shutdownCancel()
+				if drained := vmmPool.Close(shutdownCtx, 5*time.Second); drained > 0 {
+					logger.Info("firecracker vmm pool drained on shutdown", "handles", drained)
+				}
+			}()
+			logger.Info("firecracker vmm pool enabled",
+				"depth_default", cfg.FirecrackerVMMPoolDepthDefault,
+				"refill_interval", cfg.FirecrackerVMMPoolRefillInterval,
+				"gc_interval", cfg.FirecrackerVMMPoolGCInterval,
+				"gc_ttl", cfg.FirecrackerVMMPoolGCTTL)
+		}
+	}
 
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
@@ -208,6 +387,26 @@ func main() {
 			AttachRecreator(cluster.SandboxRecreator)
 		}); ok {
 			withRecreator.AttachRecreator(svc)
+		}
+		// Phase 6 PR-D: template-aware placement. The capacity lease
+		// cache asks the service for the local "ready" template
+		// inventory at every heartbeat tick; the result is overlaid
+		// onto the snapshot peers gossip. Single-node mode and
+		// non-Firecracker nodes naturally degrade — the callback
+		// stays nil and placement's unknown-allow rule does the rest.
+		// When the callback reports known=true with an empty slice,
+		// peers treat that as an authoritative "no local templates"
+		// rather than legacy unknown. Gated on EnableFirecracker so
+		// nodes that never serve templates don't pay the (cached)
+		// SQLite read.
+		if cfg.EnableFirecracker {
+			if withTemplates, ok := clusterClient.(interface {
+				SetLocalTemplateIDsProvider(func() ([]string, bool))
+			}); ok {
+				withTemplates.SetLocalTemplateIDsProvider(func() ([]string, bool) {
+					return svc.LocalReadyTemplateInventory(context.Background())
+				})
+			}
 		}
 		logger.Info("cluster mode enabled",
 			"node_id", clusterClient.SelfNodeID(),
@@ -314,9 +513,39 @@ func main() {
 		svc.StartLifecycleSweep(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
+		// Firecracker template janitor (plans/snapshot-clone-fast-boot.md
+		// Phase 2). No-op when SB_ENABLE_FIRECRACKER=false or the GC
+		// enable knob is off; per-tick cancellation is wired off ctx like
+		// the other long-running sweeps above.
+		svc.StartTemplateGC(ctx)
 		svc.StartPendingImageGC(ctx)
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
+		startTemplateArtifactPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
+		// Phase 6 PR 6-B.2: consumer-side puller. Symmetric with the
+		// pusher above — once attached, EnsureTemplateLocal in the
+		// resolver fetches missing artifacts from AOCR before a clone
+		// boots. Gated on EnableFirecracker (templates only exist on
+		// Firecracker nodes); does NOT require SnapshotPushEnabled
+		// because a node may be configured to consume cluster artifacts
+		// without producing any.
+		attachTemplateArtifactPuller(logger, cfg, svc, dockerClient)
+		// Phase 6 PR-E: opt-in template rotation. No-op unless both
+		// FirecrackerTemplateRotationInterval and FirecrackerTemplateMaxAge
+		// are set; default config leaves rotation off so operators have
+		// to consciously enable rebuild-storm prevention.
+		startTemplateRotationReconciler(ctx, logger, cfg, db, svc)
+		// Phase 6 PR-A scanner: close the crash-mid-rebuild gap.
+		// MarkSnapshotCorrupt flips a row to unhealthy and kicks an
+		// async rebuild; if sandboxd died between the flip and the
+		// rebuild completing, the row would be stuck unhealthy forever.
+		// Gated on EnableFirecracker so non-Firecracker deployments
+		// don't pay the (cheap) scan. Called after the snapshotter +
+		// CID allocator wiring above (line ~290) so the rekicked
+		// rebuilds find a working snapshot pipeline.
+		if cfg.EnableFirecracker {
+			svc.RekickUnhealthyTemplatesAtStart(ctx)
+		}
 		if cfg.AutoImportEnabled {
 			// Wire the post-pull trigger: when the docker client finishes a
 			// successful pull that BOTH used the mirror AND carried private
@@ -712,6 +941,170 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 	}()
 }
 
+// startTemplateRotationReconciler kicks off the Phase 6 PR-E rotation
+// ticker. Opt-in: gated on EnableFirecracker AND a non-zero rotation
+// interval AND a non-zero max-age. When either knob is zero we log and
+// return — a "rotation interval set but max-age zero" config would
+// scan every tick and find nothing, which is operator confusion we
+// don't want to silently absorb.
+//
+// Mirrors startTemplateArtifactPushReconciler in shape so a single
+// mental model covers both reconcilers: build → AttachX → goroutine
+// driving RunOnce off a ticker.
+func startTemplateRotationReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service) {
+	if !cfg.EnableFirecracker {
+		return
+	}
+	rotCfg := service.TemplateRotationConfig{
+		Interval: cfg.FirecrackerTemplateRotationInterval,
+		MaxAge:   cfg.FirecrackerTemplateMaxAge,
+	}
+	if cfg.FirecrackerTemplateRotationInterval > 0 && cfg.FirecrackerTemplateMaxAge == 0 {
+		logger.Warn("template rotation: interval set but max-age is zero; rotation will not run",
+			"interval", cfg.FirecrackerTemplateRotationInterval)
+		return
+	}
+	if !rotCfg.IsEnabled() {
+		return
+	}
+	adapter := &service.TemplateRotationStoreAdapter{Store: db}
+	r, err := service.NewTemplateRotationReconciler(rotCfg, adapter, svc, logger)
+	if err != nil {
+		logger.Warn("template rotation: reconciler build failed; feature stays off",
+			"error", err)
+		return
+	}
+	if r == nil {
+		return
+	}
+	logger.Info("template rotation reconciler started",
+		"interval", rotCfg.Interval, "max_age", rotCfg.MaxAge)
+	go func() {
+		t := time.NewTicker(rotCfg.Interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				stats, err := r.RunOnce(ctx)
+				if err != nil {
+					logger.Warn("template rotation sweep failed", "error", err)
+					continue
+				}
+				if stats.Scanned == 0 {
+					continue
+				}
+				logger.Info("template rotation sweep",
+					"scanned", stats.Scanned,
+					"marked", stats.Marked,
+					"skipped", stats.Skipped,
+				)
+			}
+		}
+	}()
+}
+
+// attachTemplateArtifactPuller wires the Phase 6 PR 6-B.2 consumer-side
+// puller. No ticker — the puller fires on-demand from the resolver's
+// EnsureTemplateLocal call. Returns early when Firecracker is off (no
+// templates to pull) or when the templates dir is unset (the puller
+// constructor would refuse anyway).
+//
+// Templates dir is the only producer-side config the puller actually
+// needs: there's no PAT or cluster_id, because the puller uses whatever
+// auth the daemon already has configured for the AOCR host (the same
+// flow the AOCR-imported image distribution mode uses). This keeps
+// pull-only nodes deployable without a sandboxd cluster PAT.
+func attachTemplateArtifactPuller(logger *slog.Logger, cfg config.Config, svc *service.Service, dockerClient *docker.Client) {
+	if !cfg.EnableFirecracker {
+		return
+	}
+	if strings.TrimSpace(cfg.FirecrackerTemplatesDir) == "" {
+		return
+	}
+	adapter := service.NewTemplateArtifactPullDockerAdapter(dockerClient)
+	puller, err := service.NewTemplateArtifactPuller(adapter, cfg.FirecrackerTemplatesDir, logger)
+	if err != nil {
+		logger.Warn("template pull: puller build failed; feature stays off",
+			"error", err)
+		return
+	}
+	svc.AttachTemplateArtifactPuller(puller)
+	logger.Info("template pull adapter attached",
+		"templates_dir", cfg.FirecrackerTemplatesDir)
+}
+
+// startTemplateArtifactPushReconciler builds the optional AOCR template
+// artifact pusher + reconciler (Phase 6 PR 6-B.1) and starts a ticker
+// goroutine if the feature is enabled. Gated on EnableFirecracker AND
+// SnapshotPushEnabled — templates only exist on Firecracker nodes, and
+// the push pipeline reuses the snapshot-push auth/host/cluster config
+// (no new config surface). When either gate is off we log and return;
+// the template build path stays byte-identical to today.
+//
+// Reuses SnapshotPushReconcileInterval and SnapshotPushMaxInFlight as
+// the cadence and fanout knobs — operator-tunable template-specific
+// cadence is out of scope for this PR. A separate ticker keeps the
+// two reconcilers independent so a stuck template push can't starve
+// snapshot pushes.
+func startTemplateArtifactPushReconciler(ctx context.Context, logger *slog.Logger, cfg config.Config, db *store.Store, svc *service.Service, dockerClient *docker.Client) {
+	if !cfg.EnableFirecracker || !cfg.SnapshotPushEnabled {
+		return
+	}
+	host := strings.TrimSpace(cfg.MirrorPushHost)
+	if host == "" {
+		host = strings.TrimSpace(cfg.ImageDistributionAOCRHost)
+	}
+	pusher, err := service.NewTemplateArtifactPusher(service.SnapshotPushConfig{
+		Enabled:   true,
+		Host:      host,
+		ClusterID: cfg.AutoImportClusterID,
+		PATPath:   cfg.AutoImportClusterPATPath,
+	}, dockerClient, cfg.FirecrackerTemplatesDir, logger)
+	if err != nil {
+		logger.Warn("template push: pusher build failed; feature stays off",
+			"error", err)
+		return
+	}
+	r := service.NewTemplateArtifactPushReconciler(pusher, db, logger, cfg.SnapshotPushMaxInFlight)
+	if r == nil {
+		return
+	}
+	svc.AttachTemplateArtifactPusher(pusher, r)
+	logger.Info("template push reconciler started",
+		"host", host,
+		"cluster_id", cfg.AutoImportClusterID,
+		"interval", cfg.SnapshotPushReconcileInterval,
+		"max_in_flight", cfg.SnapshotPushMaxInFlight,
+	)
+	go func() {
+		t := time.NewTicker(cfg.SnapshotPushReconcileInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				stats, err := r.RunOnce(ctx)
+				if err != nil {
+					logger.Warn("template push reconcile sweep failed", "error", err)
+					continue
+				}
+				if stats.Scanned == 0 {
+					continue
+				}
+				logger.Info("template push reconcile sweep",
+					"scanned", stats.Scanned,
+					"succeeded", stats.Succeeded,
+					"failed", stats.Failed,
+					"skipped", stats.Skipped,
+				)
+			}
+		}
+	}()
+}
+
 // autoImportSpecResolver adapts the service+cluster surface to the
 // AutoImportSpecResolver interface. The replicated CreateSandboxRequest lives
 // in the cluster FSM (via cluster.SpecOf); we go through svc.Cluster() so the
@@ -789,6 +1182,19 @@ func readBypassMarker(path string) bool {
 	return string(bytesTrimSpace(data)) == "true"
 }
 
+func appendRuntimeIfMissing(runtimes []string, runtimeName string) []string {
+	runtimeName = strings.TrimSpace(runtimeName)
+	if runtimeName == "" {
+		return runtimes
+	}
+	for _, existing := range runtimes {
+		if strings.TrimSpace(existing) == runtimeName {
+			return runtimes
+		}
+	}
+	return append(runtimes, runtimeName)
+}
+
 // writeBypassMarker persists the current bypass flag for the next boot's
 // rollback check. Uses a tmp-then-rename so a daemon crash mid-write
 // cannot leave a truncated marker that would later be misread as
@@ -803,4 +1209,264 @@ func writeBypassMarker(path string, enabled bool) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// firecrackerPoolAdapter wraps a *tap.Pool so it satisfies the
+// fcruntime.TapPool interface. The interface and the concrete pool are
+// in different packages on purpose (the firecracker runtime test binary
+// stays light — it doesn't need a real SQLite store), and this thin
+// adapter is the single conversion point between the two Slot shapes.
+// Adding/renaming a Slot field requires touching both ends; the linter
+// will catch a mismatch at compile time.
+type firecrackerPoolAdapter struct {
+	inner *tap.Pool
+}
+
+func (a *firecrackerPoolAdapter) Allocate(ctx context.Context, sandboxID string, now time.Time) (*fcruntime.TapSlot, error) {
+	s, err := a.inner.Allocate(ctx, sandboxID, now)
+	if err != nil {
+		return nil, err
+	}
+	return adaptTapSlot(s), nil
+}
+
+func (a *firecrackerPoolAdapter) Release(ctx context.Context, sandboxID string) error {
+	return a.inner.Release(ctx, sandboxID)
+}
+
+func (a *firecrackerPoolAdapter) Get(ctx context.Context, sandboxID string) (*fcruntime.TapSlot, error) {
+	s, err := a.inner.Get(ctx, sandboxID)
+	if err != nil || s == nil {
+		return nil, err
+	}
+	return adaptTapSlot(s), nil
+}
+
+// firecrackerRootfsAdapter wraps *pkg/oci.Builder so it satisfies the
+// fcruntime.RootfsBuilder interface. Same import-cycle isolation
+// reason as firecrackerPoolAdapter: the runtime test binary stays
+// independent of pkg/oci's subprocess machinery.
+type firecrackerRootfsAdapter struct {
+	inner *oci.Builder
+}
+
+func (a *firecrackerRootfsAdapter) Build(ctx context.Context, req fcruntime.RootfsBuildRequest) (*fcruntime.RootfsResult, error) {
+	res, err := a.inner.Build(ctx, oci.BuildRequest{
+		ImageRef:   req.ImageRef,
+		OutPath:    req.OutPath,
+		MinSizeMiB: req.MinSizeMiB,
+		Tag:        req.Tag,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return fcruntime.NewRootfsResult(res.RootfsPath, res.StagingDir, res.SizeBytes, res.CleanupDir), nil
+}
+
+// firecrackerTapHostAdapter wraps *tap.Host so it satisfies
+// fcruntime.TapHost. Translates between the package-local Slot and
+// the runtime-package mirror. Same shape as firecrackerPoolAdapter.
+type firecrackerTapHostAdapter struct {
+	inner *tap.Host
+}
+
+func (a *firecrackerTapHostAdapter) Ensure(ctx context.Context, slot fcruntime.TapSlot) error {
+	return a.inner.Ensure(ctx, tap.Slot{
+		TapName:  slot.TapName,
+		CIDR:     slot.CIDR,
+		HostIP:   slot.HostIP,
+		GuestIP:  slot.GuestIP,
+		VsockCID: slot.VsockCID,
+	})
+}
+
+func (a *firecrackerTapHostAdapter) Remove(ctx context.Context, tapName string) error {
+	return a.inner.Remove(ctx, tapName)
+}
+
+func adaptTapSlot(s *tap.Slot) *fcruntime.TapSlot {
+	if s == nil {
+		return nil
+	}
+	return &fcruntime.TapSlot{
+		TapName:  s.TapName,
+		CIDR:     s.CIDR,
+		HostIP:   s.HostIP,
+		GuestIP:  s.GuestIP,
+		VsockCID: s.VsockCID,
+	}
+}
+
+// templateBuilderAdapter wraps *pkg/oci.Builder so it satisfies
+// service.TemplateBuilder. Same import-cycle isolation reason as the
+// rootfs adapter above — internal/service does not import pkg/oci, so
+// the translation lives at the wiring layer where both packages are
+// already in scope.
+type templateBuilderAdapter struct {
+	inner *oci.Builder
+}
+
+func (a *templateBuilderAdapter) Build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
+	res, err := a.inner.Build(ctx, oci.BuildRequest{
+		ImageRef:   req.ImageRef,
+		OutPath:    req.OutPath,
+		MinSizeMiB: req.MinSizeMiB,
+		Tag:        req.Tag,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &service.TemplateBuildResult{
+		RootfsPath: res.RootfsPath,
+		StagingDir: res.StagingDir,
+		SizeBytes:  res.SizeBytes,
+	}, nil
+}
+
+// templateResolverAdapter satisfies fcruntime.TemplateResolver by
+// looking up the template row through the service layer. The runtime
+// driver can't import internal/service directly (cycle: service depends
+// on the runtime package), so the daemon-level wiring layer brokers the
+// call. A template that hasn't reached READY is rejected here rather
+// than at the driver so the driver returns a structured error to the
+// API caller instead of staging a half-built rootfs.
+type templateResolverAdapter struct {
+	svc *service.Service
+}
+
+func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcruntime.TemplateResolution, error) {
+	t, err := a.svc.GetTemplate(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// ready and ready_no_snapshot expose a usable rootfs; only the
+	// former carries snapshot artifacts. unhealthy (Phase 6 PR-A) is
+	// "snapshot worked once and is now corrupt" — has_snapshot is cleared
+	// by MarkTemplateUnhealthy so the driver naturally falls back to
+	// cold-build at driver.go:577 until the async rebuild restores
+	// status=ready. Anything else (pending/building/failed) has no
+	// rootfs the driver can boot from.
+	if t.Status != models.TemplateStatusReady &&
+		t.Status != models.TemplateStatusReadyNoSnapshot &&
+		t.Status != models.TemplateStatusUnhealthy {
+		return nil, fmt.Errorf("template %q is %s, not ready", id, t.Status)
+	}
+	if t.RootfsPath == "" {
+		return nil, fmt.Errorf("template %q is %s but has no rootfs path", id, t.Status)
+	}
+	// Phase 6 PR 6-B.2: if the row was pushed from another node and our
+	// local files are missing, fetch+extract from AOCR under a per-
+	// template single-flight before handing the paths to the driver.
+	// EnsureTemplateLocal is a fast no-op when the puller is not
+	// attached (single-node mode), when registry_ref is blank (this
+	// node was the producer), or when the files are already on disk.
+	// Boot-path call-out: on the first miss for a template this blocks
+	// on docker pull of the template OCI image (rootfs.ext4 layer is
+	// the bulk — bounded by image size + link speed). The atomic.Bool
+	// latch makes every subsequent create against the same template a
+	// single load.
+	if err := a.svc.EnsureTemplateLocal(ctx, t); err != nil {
+		return nil, fmt.Errorf("template %q: ensure local: %w", id, err)
+	}
+	return &fcruntime.TemplateResolution{
+		RootfsPath:         t.RootfsPath,
+		HasSnapshot:        t.HasSnapshot,
+		HasOverlay:         t.HasOverlay,
+		SnapshotMemoryPath: t.SnapshotMemoryPath,
+		SnapshotStatePath:  t.SnapshotStatePath,
+		SnapshotChecksum:   t.SnapshotChecksum,
+		SnapshotVsockCID:   t.SnapshotVsockCID,
+	}, nil
+}
+
+// firecrackerTemplateSnapshotterAdapter satisfies
+// service.TemplateSnapshotter by forwarding to *fcruntime.Driver. The
+// snapshotter and the runtime driver share the same VMM/network seams,
+// so it's the natural home for the transient-VMM lifecycle that snapshot
+// capture needs; the adapter exists only so the service package never
+// imports the runtime package directly (which would be a cycle through
+// service.SetFirecrackerRuntime).
+type firecrackerTemplateSnapshotterAdapter struct {
+	driver *fcruntime.Driver
+}
+
+func (a *firecrackerTemplateSnapshotterAdapter) SnapshotTemplate(ctx context.Context, req service.TemplateSnapshotRequest) (*service.TemplateSnapshotResult, error) {
+	res, err := a.driver.SnapshotTemplate(ctx, fcruntime.TemplateSnapshotRequest{
+		TemplateID:    req.TemplateID,
+		RootfsPath:    req.RootfsPath,
+		OutMemoryPath: req.OutMemoryPath,
+		OutStatePath:  req.OutStatePath,
+		GuestCID:      req.GuestCID,
+		MemoryMB:      req.MemoryMB,
+		VCPU:          req.VCPU,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &service.TemplateSnapshotResult{
+		MemorySizeBytes: res.MemorySizeBytes,
+		StateSizeBytes:  res.StateSizeBytes,
+		Checksum:        res.Checksum,
+	}, nil
+}
+
+// firecrackerCIDAllocatorAdapter satisfies service.TemplateCIDAllocator
+// by reusing the per-sandbox TAP pool with a synthetic "template:<id>"
+// sandbox key. The pool's per-id PK gives idempotent reservation: a
+// second AllocateForTemplate on the same id returns the same CID rather
+// than burning a slot. PR-A's "one clone per template per host" limit
+// is what makes this safe — a future per-template CID pool lands in
+// Phase 4 alongside the warm pool.
+type firecrackerCIDAllocatorAdapter struct {
+	pool *tap.Pool
+}
+
+func (a *firecrackerCIDAllocatorAdapter) AllocateForTemplate(ctx context.Context, templateID string) (uint32, error) {
+	slot, err := a.pool.Allocate(ctx, "template:"+templateID, time.Now())
+	if err != nil {
+		return 0, err
+	}
+	return slot.VsockCID, nil
+}
+
+func (a *firecrackerCIDAllocatorAdapter) ReleaseForTemplate(ctx context.Context, templateID string) error {
+	return a.pool.Release(ctx, "template:"+templateID)
+}
+
+// vmmTemplateListerAdapter satisfies vmmpool.TemplateLister by walking
+// the service's template list and projecting only the snapshot
+// artifacts the refill goroutine needs. Filters to templates whose
+// snapshot is actually loadable (status=ready AND HasSnapshot AND
+// non-empty artifact paths) so the refill loop never wastes a Spawn
+// on a row the runtime would reject.
+//
+// The vmmpool package can't import internal/service (cycle: service
+// would then import vmmpool through the runtime adapter), so this
+// daemon-level adapter brokers the call.
+type vmmTemplateListerAdapter struct {
+	svc *service.Service
+}
+
+func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([]vmmpool.TemplateWarmInput, error) {
+	templates, err := a.svc.ListTemplates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]vmmpool.TemplateWarmInput, 0, len(templates))
+	for _, t := range templates {
+		if t.Status != models.TemplateStatusReady || !t.HasSnapshot {
+			continue
+		}
+		if t.SnapshotMemoryPath == "" || t.SnapshotStatePath == "" {
+			continue
+		}
+		out = append(out, vmmpool.TemplateWarmInput{
+			TemplateID:         t.ID,
+			SnapshotMemoryPath: t.SnapshotMemoryPath,
+			SnapshotStatePath:  t.SnapshotStatePath,
+			SnapshotChecksum:   t.SnapshotChecksum,
+			VsockCID:           t.SnapshotVsockCID,
+		})
+	}
+	return out, nil
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -176,6 +177,10 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := normalizeCreateRuntimeForPlacement(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	normalizedRaw, err := json.Marshal(req)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
@@ -275,6 +280,10 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := service.NormalizeCreateFailover(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := normalizeCreateRuntimeForPlacement(&req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1289,7 +1298,18 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	if disk <= 0 {
 		disk = models.DefaultDiskGB
 	}
-	out := capacity.Request{CPU: cpu, MemoryMB: mem, DiskGB: disk, Runtime: req.Runtime}
+	runtimeName := strings.TrimSpace(req.Runtime)
+	templateID := strings.TrimSpace(req.TemplateID)
+	if templateID != "" && runtimeName == "" {
+		runtimeName = models.RuntimeFirecracker
+	}
+	out := capacity.Request{
+		CPU:        cpu,
+		MemoryMB:   mem,
+		DiskGB:     diskGBForCapacity(disk, runtimeName, req.OverlaySizeGB),
+		Runtime:    runtimeName,
+		TemplateID: templateID,
+	}
 	// GPUs == nil means "no GPU"; a non-nil GPURequest with Count <= 0 is
 	// the documented "default 1" path (see GPURequest.Count comment in
 	// pkg/models/types.go) and we mirror that here so placement scoring
@@ -1305,4 +1325,31 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		out.GPUVendor = string(req.GPUs.Vendor)
 	}
 	return out
+}
+
+func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
+	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+		return base + overlaySizeGB
+	}
+	return base
+}
+
+func normalizeCreateRuntimeForPlacement(req *models.CreateSandboxRequest) error {
+	if req == nil {
+		return nil
+	}
+	chosenRuntime, err := models.ValidRuntime(strings.TrimSpace(req.Runtime))
+	if err != nil {
+		return err
+	}
+	req.TemplateID = strings.TrimSpace(req.TemplateID)
+	if req.TemplateID != "" {
+		if chosenRuntime != "" && chosenRuntime != models.RuntimeFirecracker {
+			return fmt.Errorf("template_id requires runtime %q (got %q)",
+				models.RuntimeFirecracker, chosenRuntime)
+		}
+		chosenRuntime = models.RuntimeFirecracker
+	}
+	req.Runtime = chosenRuntime
+	return nil
 }

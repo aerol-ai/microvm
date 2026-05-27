@@ -142,6 +142,12 @@ type Config struct {
 	// 25; the per-create-request cap (set in pkg/models) is stricter to
 	// avoid bursting issuance from one API call.
 	CustomDomainsMaxPerSandbox int
+	// CustomDomainVerifyPrefix sets the DNS TXT record name prefix for
+	// proving custom domain ownership. Defaults to "_aerol-verify".
+	CustomDomainVerifyPrefix string
+	// CustomDomainVerifyValuePrefix sets the required prefix value for
+	// the TXT record, followed by the sandbox ID. Defaults to "aerol-verify=".
+	CustomDomainVerifyValuePrefix string
 	// TLSOnDemandBurst is the Caddy on-demand TLS policy's per-interval
 	// burst (matches the JSON shape `rate_limit.burst`). Bounds simultaneous
 	// ACME orders Caddy will start before throttling. Default 5; the
@@ -344,6 +350,254 @@ type Config struct {
 	// back to ["docker"] in capacity.New so existing single-runtime hosts
 	// don't need new env to keep accepting placements.
 	HostSupportedRuntimes []string
+
+	// EnableFirecracker opts this host in to the native Firecracker runtime
+	// (see plans/snapshot-clone-fast-boot.md). False (the default) makes
+	// `sandboxd` behave exactly as it does today: the Docker driver is the
+	// only registered runtime and create requests with runtime="firecracker"
+	// are rejected at the service layer with ErrRuntimeNotImplemented.
+	//
+	// When true, the Firecracker driver is constructed alongside the Docker
+	// driver and dispatched per-sandbox by request.Runtime. Both gates
+	// (this flag AND request.Runtime=="firecracker") must be on for a
+	// sandbox to land on the new path. Existing Docker/gVisor sandboxes
+	// are untouched. SB_ENABLE_FIRECRACKER.
+	EnableFirecracker bool
+	// FirecrackerBinary is the absolute path to the `firecracker` VMM
+	// binary on this host. Required only when EnableFirecracker is true.
+	// Default /usr/local/bin/firecracker matches a typical install.
+	// SB_FIRECRACKER_BINARY.
+	FirecrackerBinary string
+	// JailerBinary is the absolute path to the `jailer` helper that
+	// chroots and cgroups the VMM process. Required only when
+	// EnableFirecracker is true. SB_JAILER_BINARY.
+	JailerBinary string
+	// FirecrackerKernelImage is the absolute path to the uncompressed
+	// guest kernel image (`vmlinux`) the Firecracker driver boots template
+	// VMs with. One kernel per host is sufficient for Phase 1; future
+	// phases may add per-template kernel selection. Required only when
+	// EnableFirecracker is true. SB_FIRECRACKER_KERNEL.
+	FirecrackerKernelImage string
+	// FirecrackerRunDir is the parent directory that holds per-sandbox
+	// runtime state (API sockets, jailer chroots, vsock UDS). Each
+	// sandbox lives under <FirecrackerRunDir>/<sandbox-id>/. tmpfs is
+	// recommended. Default /run/sandboxd/firecracker.
+	// SB_FIRECRACKER_RUN_DIR.
+	FirecrackerRunDir string
+	// FirecrackerTemplatesDir is the parent directory where template
+	// artifacts (kernel symlinks, rootfs.ext4, snapshot.memory,
+	// snapshot.state, manifest.json) are persisted. Survives daemon
+	// restarts. Default /var/lib/sandboxd/firecracker/templates.
+	// SB_FIRECRACKER_TEMPLATES_DIR.
+	FirecrackerTemplatesDir string
+	// UseJailer wraps each Firecracker process in `jailer` for chroot +
+	// cgroups + drop-priv. True is the only sane production setting; the
+	// flag exists because the jailer needs root, a real user account
+	// (JailerUID/GID), and a writable chroot tree — dev boxes and CI
+	// without those bits boot Firecracker directly. Default true to make
+	// "ship it" the path of least resistance; operators flip it off on
+	// laptops. SB_FIRECRACKER_USE_JAILER.
+	UseJailer bool
+	// JailerChrootBase is the parent directory under which jailer creates
+	// each sandbox's chroot (canonical layout: <base>/firecracker/<id>/root/).
+	// Should be on a filesystem that supports the file types the guest
+	// needs to see (no overlayfs underneath the rootfs.ext4 path). Default
+	// /srv/jailer matches the jailer docs. SB_JAILER_CHROOT_BASE.
+	JailerChrootBase string
+	// JailerUID / JailerGID are the UID/GID the firecracker process drops
+	// to inside the jail. The pair must exist on the host before the
+	// daemon starts (jailer setresuid()s into them; a nonexistent UID is
+	// accepted on Linux but is a security smell — assume the operator has
+	// created a `firecracker` system user). Defaults 1000/1000 are
+	// nominal; production setups override.
+	// SB_JAILER_UID / SB_JAILER_GID.
+	JailerUID int
+	JailerGID int
+	// FirecrackerTapBaseCIDR carves into /30 subnets, one per pool slot;
+	// FirecrackerTapPoolSize is the number of /30s to lay out. Together
+	// they cap concurrent Firecracker sandboxes on this host. Defaults
+	// (172.16.0.0/20, 256) accommodate a ~256-sandbox host with room to
+	// grow; production hosts override to match their networking plan.
+	// See internal/network/tap.SeedConfig for the layout math.
+	// SB_FIRECRACKER_TAP_BASE_CIDR / SB_FIRECRACKER_TAP_POOL_SIZE.
+	FirecrackerTapBaseCIDR string
+	FirecrackerTapPoolSize int
+	// FirecrackerSkopeoBin / FirecrackerUmociBin / FirecrackerMkfs4Bin are
+	// the absolute paths to the three subprocess binaries the OCI rootfs
+	// builder shells out to. Required when EnableFirecracker is true;
+	// pkg/oci.New stat-checks them at construction so a typo crashes the
+	// daemon at boot rather than on first Create.
+	// SB_FIRECRACKER_SKOPEO_BIN / SB_FIRECRACKER_UMOCI_BIN / SB_FIRECRACKER_MKFS_BIN.
+	FirecrackerSkopeoBin string
+	FirecrackerUmociBin  string
+	FirecrackerMkfs4Bin  string
+	// FirecrackerIPBinary is the path to the iproute2 `ip` binary. Empty
+	// means "use $PATH" (the default works on every systemd host); set
+	// this only when /usr/sbin is not in the daemon's PATH.
+	// SB_FIRECRACKER_IP_BINARY.
+	FirecrackerIPBinary string
+
+	// FirecrackerTemplateGCEnabled gates the background sweep that drops
+	// templates with no referencing sandbox and updated_at older than
+	// FirecrackerTemplateGCTTL. Default true — disabling it means stale
+	// templates accumulate on disk indefinitely, which is fine for dev
+	// hosts but a footgun in production. SB_FIRECRACKER_TEMPLATE_GC_ENABLED.
+	FirecrackerTemplateGCEnabled bool
+	// FirecrackerTemplateGCInterval is the sweep cadence. Default 1h —
+	// matches the order-of-magnitude of the TTL so the sweep runs ~7 times
+	// per default TTL window. SB_FIRECRACKER_TEMPLATE_GC_INTERVAL.
+	FirecrackerTemplateGCInterval time.Duration
+	// FirecrackerTemplateGCTTL is the unreferenced-template grace window
+	// before the sweep reclaims a template's row and on-disk artifacts.
+	// Default 168h (7 days) per plans/snapshot-clone-fast-boot.md Phase 2.
+	// Updated_at is the clock — building a sandbox from a template touches
+	// nothing on the template row, so a template that is being used but
+	// has no sandbox right now still ages out. Operators that want
+	// long-lived templates should bump this. SB_FIRECRACKER_TEMPLATE_GC_TTL.
+	FirecrackerTemplateGCTTL time.Duration
+
+	// FirecrackerTemplateRotationInterval is the Phase 6 PR-E knob that
+	// controls how often the rotation reconciler sweeps for templates
+	// whose `ready_at` is older than FirecrackerTemplateMaxAge. Default
+	// 0 = rotation disabled (rotation is opt-in because it triggers
+	// rebuilds, and a misconfigured cluster could thrash the build queue
+	// before the operator notices). When > 0, the reconciler ticks on a
+	// dedicated goroutine and calls MarkTemplateUnhealthy(reason="rotation")
+	// against each stale row, which re-uses the snapshot-corruption
+	// rebuild path. SB_FIRECRACKER_TEMPLATE_ROTATION_INTERVAL.
+	FirecrackerTemplateRotationInterval time.Duration
+	// FirecrackerTemplateMaxAge is the age threshold that turns a healthy
+	// `ready` template into a rotation candidate. Default 0 = rotation
+	// disabled. Setting Interval without MaxAge is operator error — the
+	// reconciler would scan and find nothing to do, ticking forever; we
+	// log a warning at boot in that case but don't refuse to start. The
+	// typical production value is 30d to pick up kernel and
+	// toolbox-agent updates baked into newly-rebuilt templates.
+	// SB_FIRECRACKER_TEMPLATE_MAX_AGE.
+	FirecrackerTemplateMaxAge time.Duration
+
+	// FirecrackerSnapshotEnabled gates the Phase 3 snapshot phase of the
+	// template build pipeline. Default true. When false, templates stop
+	// after rootfs.ext4 lands on disk and every Create uses the cold-boot
+	// path. Useful for hosts where the snapshotter is misbehaving and
+	// operators need to keep templates building.
+	// SB_FIRECRACKER_SNAPSHOT_ENABLED.
+	FirecrackerSnapshotEnabled bool
+	// FirecrackerTemplateBuildTimeout caps the total wall-clock budget for
+	// the async template build goroutine (rootfs build + optional snapshot
+	// phase combined). Default 45 min — comfortably above every
+	// real-world skopeo+umoci+mkfs+snapshot pipeline we've measured on
+	// the fattest CUDA bases. The cap exists to bound stuck builds (a
+	// wedged subprocess or a hung VMM), not to fail healthy ones.
+	// SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT.
+	FirecrackerTemplateBuildTimeout time.Duration
+	// FirecrackerTemplateMemoryMB / FirecrackerTemplateVCPU configure the
+	// transient VMM used to capture a template snapshot. Defaults
+	// 512 MiB / 1 vCPU keep snapshot.memory small — larger values
+	// inflate the on-disk artifact without changing what a clone can
+	// do (the clone's effective resources are pinned by the snapshot
+	// state, which equals these). Treat as a tuning knob only flipped
+	// when the template's init phase OOMs during the snapshot capture.
+	// SB_FIRECRACKER_TEMPLATE_MEMORY_MB / SB_FIRECRACKER_TEMPLATE_VCPU.
+	FirecrackerTemplateMemoryMB int
+	FirecrackerTemplateVCPU     int
+	// FirecrackerSnapshotVerifyOnLoad gates SHA256 verification of
+	// snapshot.memory + snapshot.state before each LoadSnapshot. Default
+	// true — paying ~one-pass-over-the-file at boot is preferable to
+	// resuming from a corrupted snapshot, which surfaces as silent guest
+	// memory damage hours later. Bypass only for benchmarking the raw
+	// load path. SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD.
+	FirecrackerSnapshotVerifyOnLoad bool
+
+	// FirecrackerOverlayEnabled is the daemon-wide opt-out for the
+	// per-sandbox writable overlay drive (Phase 3 PR-B). Default true.
+	// When false, CreateSandbox rejects any request with
+	// OverlaySizeGB > 0 — a safety hatch for a host whose overlay
+	// machinery (sparse alloc, mkfs, virtio-blk PATCH) is misbehaving.
+	// Templates can still be built with the overlay placeholder in
+	// their snapshot state; only the per-clone path is bypassed.
+	// SB_FIRECRACKER_OVERLAY_ENABLED.
+	FirecrackerOverlayEnabled bool
+	// FirecrackerOverlayMkfs makes the host run `mkfs.ext4 -F` on each
+	// per-sandbox overlay.ext4 right after the sparse allocation and
+	// before PutDrive/PatchDrive. Default false — the guest is normally
+	// expected to mkfs /dev/vdb itself on first boot. Enabling adds
+	// ~50ms to every Create that requests an overlay (one mkfs.ext4
+	// subprocess invocation) and reuses the existing FirecrackerMkfs4Bin
+	// path. Off by default to keep the boot path lean per pr-review.md
+	// §2. SB_FIRECRACKER_OVERLAY_MKFS.
+	FirecrackerOverlayMkfs bool
+	// FirecrackerSnapshotPostResumeTimeout bounds the best-effort
+	// post_resume vsock send from the driver to the guest toolboxd
+	// (carries the host wall clock so the guest can resync
+	// CLOCK_REALTIME and reseed its RNG). Default 2s. A failure inside
+	// the timeout is logged and does not fail Create — the clone is
+	// already resumed and serving, the guest just inherits the
+	// template's clock/entropy for a little longer.
+	// SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT.
+	FirecrackerSnapshotPostResumeTimeout time.Duration
+
+	// FirecrackerVMMPoolEnabled gates the Phase 4 warm-VMM pool. In
+	// PR 4-A (this commit) the field is plumbed through but nothing
+	// consumes it yet — the pool primitive lands as an inert
+	// substrate. PR 4-B's runtime adapter and refill goroutine flip
+	// the default on once the integration is wired. Off by default
+	// here so a daemon rebuilt from this branch behaves identically
+	// to today. SB_FIRECRACKER_VMM_POOL_ENABLED.
+	FirecrackerVMMPoolEnabled bool
+	// FirecrackerVMMPoolDepthDefault is the warm-slot floor PR 4-B's
+	// refill goroutine will use for any template without an explicit
+	// per-template override. 0 (the default) means "do not warm any
+	// template by default" — operators opt in per template once the
+	// per-template knob arrives in PR 4-C or via a future
+	// POST /v1/templates payload field. SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT.
+	FirecrackerVMMPoolDepthDefault int
+	// FirecrackerVMMPoolGCInterval is the cadence at which PR 4-B's
+	// GC sweep walks the 'released' rows whose released_at is older
+	// than FirecrackerVMMPoolGCTTL, tears the firecracker process
+	// down (if still alive), and drops the row. Default 5m — slow
+	// enough that an aggressive refresh doesn't churn SQLite, fast
+	// enough that a steady-state stream of releases doesn't pile
+	// stale rows up. SB_FIRECRACKER_VMM_POOL_GC_INTERVAL.
+	FirecrackerVMMPoolGCInterval time.Duration
+	// FirecrackerVMMPoolGCTTL is how long a slot stays in 'released'
+	// before the GC sweep drops the row. The window exists so PR 4-B's
+	// destroy path can observe a sandbox's release, finish tearing
+	// down the VMM process, and update its in-memory bookkeeping
+	// before the row disappears from under it. Default 1h.
+	// SB_FIRECRACKER_VMM_POOL_GC_TTL.
+	FirecrackerVMMPoolGCTTL time.Duration
+	// FirecrackerVMMPoolRefillInterval is the cadence at which the
+	// refill goroutine walks every warmable template and tops the
+	// per-template slot count up to its configured depth. Default 5s —
+	// short enough that a burst of Acquire-and-destroy churn refills
+	// before the next request arrives, long enough that an idle daemon
+	// isn't spawning serially. The first refill always fires at t=0
+	// regardless of this value so the pool warms up promptly after
+	// boot. SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL.
+	FirecrackerVMMPoolRefillInterval time.Duration
+
+	// FirecrackerRSSSamplerInterval is the cadence at which the Phase 5
+	// per-VMM RSS sampler walks /proc/<pid>/statm for every registered
+	// firecracker process and recomputes the aggregate admission reads.
+	// Default 1s — matches the plan ("statm is fine at ~1Hz") and is
+	// orders of magnitude cheaper than the firecracker spawn budget on
+	// any host that can run them at all. Only consulted when
+	// EnableFirecracker is true; the sampler is not constructed
+	// otherwise. SB_FIRECRACKER_RSS_SAMPLER_INTERVAL.
+	FirecrackerRSSSamplerInterval time.Duration
+	// FirecrackerRSSWatermarkRatio is the Phase 5 effective-memory
+	// safety floor as a fraction of host RAM. Admission refuses a new
+	// create when (HostMem - sum-of-VMM-RSS - request) would drop below
+	// this watermark. 0 disables the axis (the default) — operators opt
+	// in by setting the env var. Typical setting is 0.10 (keep 10% of
+	// RAM in reserve as RSS-spike headroom); higher means safer but less
+	// dense, lower means denser but more sensitive to bursts. The check
+	// is also gated on the sampler having produced at least one
+	// observation, so a cold-start daemon falls back to nominal
+	// accounting rather than admitting infinitely on the assumption that
+	// "0 RSS" means "host is empty". SB_FIRECRACKER_RSS_WATERMARK_RATIO.
+	FirecrackerRSSWatermarkRatio float64
 
 	// L4PortRangeStart / L4PortRangeEnd bound the parent-host port pool that
 	// raw-TCP sandbox exposures (caddy-l4) are allocated from. The allocator
@@ -709,6 +963,8 @@ func Load() (Config, error) {
 		EnableServerless:                 getEnvBool("SB_ENABLE_SERVERLESS", true),
 		EnableCustomDomains:              getEnvBool("SB_ENABLE_CUSTOM_DOMAINS", false),
 		CustomDomainsMaxPerSandbox:       getEnvInt("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", models.MaxCustomDomainsPerSandbox),
+		CustomDomainVerifyPrefix:         getEnv("SB_CUSTOM_DOMAIN_VERIFY_PREFIX", "_aerol-verify"),
+		CustomDomainVerifyValuePrefix:    getEnv("SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX", "aerol-verify="),
 		TLSOnDemandBurst:                 getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
 		TLSOnDemandInterval:              getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
 		ACMEDaemonBudgetFraction:         getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
@@ -823,6 +1079,50 @@ func Load() (Config, error) {
 		SnapshotPushEnabled:              getEnvBool("SB_SNAPSHOT_PUSH_ENABLED", false),
 		SnapshotPushReconcileInterval:    getEnvDuration("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL", 5*time.Minute),
 		SnapshotPushMaxInFlight:          getEnvInt("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT", 2),
+
+		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
+		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
+		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
+		FirecrackerKernelImage:  strings.TrimSpace(os.Getenv("SB_FIRECRACKER_KERNEL")),
+		FirecrackerRunDir:       getEnv("SB_FIRECRACKER_RUN_DIR", "/run/sandboxd/firecracker"),
+		FirecrackerTemplatesDir: getEnv("SB_FIRECRACKER_TEMPLATES_DIR", "/var/lib/sandboxd/firecracker/templates"),
+		UseJailer:               getEnvBool("SB_FIRECRACKER_USE_JAILER", true),
+		JailerChrootBase:        getEnv("SB_JAILER_CHROOT_BASE", "/srv/jailer"),
+		JailerUID:               getEnvInt("SB_JAILER_UID", 1000),
+		JailerGID:               getEnvInt("SB_JAILER_GID", 1000),
+		FirecrackerTapBaseCIDR:  getEnv("SB_FIRECRACKER_TAP_BASE_CIDR", "172.16.0.0/20"),
+		FirecrackerTapPoolSize:  getEnvInt("SB_FIRECRACKER_TAP_POOL_SIZE", 256),
+		FirecrackerSkopeoBin:    getEnv("SB_FIRECRACKER_SKOPEO_BIN", "/usr/bin/skopeo"),
+		FirecrackerUmociBin:     getEnv("SB_FIRECRACKER_UMOCI_BIN", "/usr/bin/umoci"),
+		FirecrackerMkfs4Bin:     getEnv("SB_FIRECRACKER_MKFS_BIN", "/sbin/mkfs.ext4"),
+		FirecrackerIPBinary:     strings.TrimSpace(os.Getenv("SB_FIRECRACKER_IP_BINARY")),
+
+		FirecrackerTemplateGCEnabled:  getEnvBool("SB_FIRECRACKER_TEMPLATE_GC_ENABLED", true),
+		FirecrackerTemplateGCInterval: getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_INTERVAL", 1*time.Hour),
+		FirecrackerTemplateGCTTL:      getEnvDuration("SB_FIRECRACKER_TEMPLATE_GC_TTL", 168*time.Hour),
+
+		FirecrackerSnapshotEnabled:          getEnvBool("SB_FIRECRACKER_SNAPSHOT_ENABLED", true),
+		FirecrackerTemplateBuildTimeout:     getEnvDuration("SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT", 45*time.Minute),
+		FirecrackerTemplateRotationInterval: getEnvDuration("SB_FIRECRACKER_TEMPLATE_ROTATION_INTERVAL", 0),
+		FirecrackerTemplateMaxAge:           getEnvDuration("SB_FIRECRACKER_TEMPLATE_MAX_AGE", 0),
+		FirecrackerTemplateMemoryMB:         getEnvInt("SB_FIRECRACKER_TEMPLATE_MEMORY_MB", 512),
+		FirecrackerTemplateVCPU:             getEnvInt("SB_FIRECRACKER_TEMPLATE_VCPU", 1),
+		FirecrackerSnapshotVerifyOnLoad:     getEnvBool("SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD", true),
+
+		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
+		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),
+		FirecrackerSnapshotPostResumeTimeout: getEnvDuration("SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT", 2*time.Second),
+
+		// Phase 4 PR-A — warm-VMM pool. Inert in this commit: nothing
+		// reads these knobs yet. They land here so PR 4-B's wiring is
+		// a pure addition without schema or config churn.
+		FirecrackerVMMPoolEnabled:        getEnvBool("SB_FIRECRACKER_VMM_POOL_ENABLED", false),
+		FirecrackerVMMPoolDepthDefault:   getEnvInt("SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT", 0),
+		FirecrackerVMMPoolGCInterval:     getEnvDuration("SB_FIRECRACKER_VMM_POOL_GC_INTERVAL", 5*time.Minute),
+		FirecrackerVMMPoolGCTTL:          getEnvDuration("SB_FIRECRACKER_VMM_POOL_GC_TTL", 1*time.Hour),
+		FirecrackerVMMPoolRefillInterval: getEnvDuration("SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL", 5*time.Second),
+		FirecrackerRSSSamplerInterval:    getEnvDuration("SB_FIRECRACKER_RSS_SAMPLER_INTERVAL", 1*time.Second),
+		FirecrackerRSSWatermarkRatio:     getEnvFloat("SB_FIRECRACKER_RSS_WATERMARK_RATIO", 0),
 	}
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
@@ -900,11 +1200,73 @@ func Load() (Config, error) {
 	// SB_CONTAINER_RUNTIME must be one of the runtimes we know how to drive.
 	// We reject "" here too: the caller substitutes the host default when a
 	// per-sandbox value is empty, but the host default itself must always be
-	// explicit. "kata" is a valid identifier but not implemented yet — we
-	// allow it as the host default so operators can pre-stage config, and
-	// reject individual create requests until the runtime is wired up.
+	// explicit. "kata" and "firecracker" are valid identifiers but the host
+	// default cannot resolve to a runtime the daemon won't actually drive:
+	// we reject those at the env layer so misconfiguration surfaces at boot
+	// rather than on every create call. Operators wanting Firecracker keep
+	// SB_CONTAINER_RUNTIME=docker as the host default and select Firecracker
+	// per-sandbox via the API (see plans/snapshot-clone-fast-boot.md).
 	if _, err := models.ValidRuntime(cfg.Runtime); err != nil || cfg.Runtime == "" {
-		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s)", cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata)
+		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s, %s)",
+			cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata, models.RuntimeFirecracker)
+	}
+	if cfg.Runtime == models.RuntimeFirecracker {
+		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select Firecracker per-sandbox via the API once SB_ENABLE_FIRECRACKER=true",
+			cfg.Runtime, models.RuntimeDocker)
+	}
+
+	// Firecracker host-side wiring is opt-in. The flag exists to gate the
+	// driver registration in cmd/sandboxd/main.go; when it's off the
+	// service rejects firecracker creates with ErrRuntimeNotImplemented.
+	// When it's on, the binaries and the kernel must actually exist so we
+	// fail at boot rather than on the first create — same model as
+	// EnableSSHGateway. The paths are not stat()-ed here on purpose: the
+	// runtime driver's Ping() does that and the daemon surfaces the result
+	// via /healthz, which is the right place for operators to look.
+	if cfg.EnableFirecracker {
+		if cfg.FirecrackerBinary == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_BINARY is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.JailerBinary == "" {
+			return Config{}, errors.New("SB_JAILER_BINARY is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerKernelImage == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_KERNEL is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerRunDir == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_RUN_DIR is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerTemplatesDir == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_TEMPLATES_DIR is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.UseJailer {
+			if cfg.JailerChrootBase == "" {
+				return Config{}, errors.New("SB_JAILER_CHROOT_BASE is required when SB_FIRECRACKER_USE_JAILER=true")
+			}
+			if cfg.JailerUID < 0 || cfg.JailerGID < 0 {
+				return Config{}, fmt.Errorf("SB_JAILER_UID/SB_JAILER_GID must be >= 0 (got %d/%d)", cfg.JailerUID, cfg.JailerGID)
+			}
+		}
+		if cfg.FirecrackerTapBaseCIDR == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_TAP_BASE_CIDR is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerTapPoolSize <= 0 {
+			return Config{}, fmt.Errorf("SB_FIRECRACKER_TAP_POOL_SIZE must be > 0 (got %d)", cfg.FirecrackerTapPoolSize)
+		}
+		// The OCI rootfs builder requires three subprocess binaries.
+		// Paths are validated by pkg/oci.New at construction time so
+		// the daemon crashes at boot rather than on first Create — but
+		// "empty path" is a config-shape error, not a runtime error;
+		// catch it here so the env-var name is in the failure message.
+		if cfg.FirecrackerSkopeoBin == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_SKOPEO_BIN is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerUmociBin == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_UMOCI_BIN is required when SB_ENABLE_FIRECRACKER=true")
+		}
+		if cfg.FirecrackerMkfs4Bin == "" {
+			return Config{}, errors.New("SB_FIRECRACKER_MKFS_BIN is required when SB_ENABLE_FIRECRACKER=true")
+		}
 	}
 
 	// L4 port pool sanity. Out-of-range or inverted bounds would silently

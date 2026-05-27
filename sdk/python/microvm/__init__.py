@@ -12,6 +12,8 @@ from .types import (
     Failover,
     FailoverPolicy,
     IngressTarget,
+    MicroVMConfig,
+    RetryConfig,
     SandboxSnapshot,
 )
 
@@ -29,5 +31,7 @@ __all__ = [
     "Failover",
     "FailoverPolicy",
     "IngressTarget",
+    "MicroVMConfig",
+    "RetryConfig",
     "SandboxSnapshot",
 ]

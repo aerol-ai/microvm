@@ -62,6 +62,37 @@ type Service struct {
 	// the type is runtime.Runtime so a non-Docker driver can be slotted in
 	// without touching service code.
 	docker runtime.Runtime
+	// firecracker is the second registered runtime (native Firecracker, per
+	// plans/snapshot-clone-fast-boot.md). Nil unless main.go has called
+	// SetFirecrackerRuntime — which only happens when cfg.EnableFirecracker
+	// is true. The CreateSandbox dispatch checks this field for
+	// runtime="firecracker" requests; nil here falls back to the
+	// "SB_ENABLE_FIRECRACKER required" operator-facing error.
+	//
+	// Kept as a separate field rather than a runtime-by-name map because
+	// (a) we have exactly two runtimes and a map adds indirection without
+	// type-system payoff, and (b) the docker field stays the unconditional
+	// Default-runtime fast path for the >>99% docker case.
+	firecracker runtime.Runtime
+	// templateBuilder is the Phase 2 OCI→ext4 builder used by the
+	// template lifecycle (internal/service/template.go). Nil unless main
+	// has called SetTemplateBuilder — which only happens when
+	// cfg.EnableFirecracker is true. CreateTemplate rejects with a
+	// not-configured error when this is nil so the handler can return
+	// 503 rather than panicking.
+	templateBuilder TemplateBuilder
+	// templateSnapshotter is the Phase 3 snapshot-capture seam. Nil
+	// disables the second build phase: rootfs builds still complete and
+	// templates end in status=ready_no_snapshot (cold-boot only). Wired
+	// from main.go to an adapter around *firecracker.Driver.
+	templateSnapshotter TemplateSnapshotter
+	// templateCIDAllocator reserves the per-template host-side AF_VSOCK
+	// CID that gets baked into the snapshot.state file at build time and
+	// re-used by every clone load. Wired to the same TapPool used for
+	// sandbox slot allocation via the "template:" + id synthetic sandbox
+	// id (the pool's per-id uniqueness gate gives us idempotent
+	// reservation). Nil here also disables the snapshot phase.
+	templateCIDAllocator TemplateCIDAllocator
 	// events is the concrete Docker client for the daemon /events stream and
 	// any other Docker-API-shaped surface that intentionally stays outside
 	// the runtime abstraction. Today both fields point at the same instance.
@@ -79,6 +110,36 @@ type Service struct {
 	// next reconciler tick.
 	snapshotPusher         *SnapshotPusher
 	snapshotPushReconciler *SnapshotPushReconciler
+	// templateArtifactPusher + templateArtifactPushReconciler are non-nil
+	// only when cfg.SnapshotPushEnabled is true AND a templates dir is
+	// configured. Mirror the snapshot push wiring: the build success path
+	// checks templateArtifactPusher for nil to decide whether to mark a
+	// new row as "pending" vs straight-to-"active", and kicks the
+	// reconciler once (best-effort, in a goroutine) so callers don't
+	// always wait for the next reconciler tick.
+	templateArtifactPusher         *TemplateArtifactPusher
+	templateArtifactPushReconciler *TemplateArtifactPushReconciler
+	// templateArtifactPuller is the consumer-side pair to the pusher
+	// (Phase 6 PR 6-B.2). Non-nil iff cmd/sandboxd called
+	// AttachTemplateArtifactPuller — in single-node deployments and on
+	// nodes without AOCR configured it stays nil, and EnsureTemplateLocal
+	// degrades to a fast no-op. The per-template ready latch +
+	// single-flight mutex (templateLocalReady) live next to it; same
+	// shape as l4Ready/l4Mu but keyed by template ID so concurrent first
+	// creates against the same not-yet-local template collapse to one
+	// pull.
+	templateArtifactPuller *TemplateArtifactPuller
+	templateLocalReadyMu   sync.Mutex
+	templateLocalReady     map[string]*templateLocalReadyEntry
+	// localReadyTemplateIDsCache is the Phase 6 PR-D capacity-heartbeat
+	// payload cached for ~5s so the cluster-wide gossip cadence does not
+	// hammer SQLite (single-writer; MaxOpenConns=1). Same TTL window the
+	// capacity-lease loop uses, so a stale-by-one-tick reading is the
+	// worst case. Lazily populated on first Capacity() call.
+	localReadyTemplateIDsMu      sync.Mutex
+	localReadyTemplateIDsCache   []string
+	localReadyTemplateIDsKnown   bool
+	localReadyTemplateIDsExpires time.Time
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -237,6 +298,7 @@ type Service struct {
 	ingressRouteMu        sync.Mutex
 	ingressRouteCache     map[string]ingressRouteIntent
 	ingressLastFullGCUnix atomic.Int64
+	dnsResolver           DNSResolver
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -256,7 +318,8 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		// cluster mode is enabled at boot. EffectivePublicHost() feeds the
 		// DNS-helper API (Noop.IngressTargets) — single-node deployments
 		// can answer "what should DNS point at" without any extra wiring.
-		cluster: cluster.NewNoop("standalone", "", cfg.EffectivePublicHost()),
+		cluster:     cluster.NewNoop("standalone", "", cfg.EffectivePublicHost()),
+		dnsResolver: &DefaultDNSResolver{},
 	}
 	s.ensureTouchCoalescer()
 	s.ensureCaddyCoalescer()
@@ -323,6 +386,57 @@ func (s *Service) AttachCluster(c cluster.Client) {
 	s.cluster = c
 }
 
+// SetFirecrackerRuntime registers the second runtime driver. Called by
+// main.go after construction, only when cfg.EnableFirecracker is true.
+// Passing nil clears the registration (used by tests). Once set, the
+// CreateSandbox dispatch routes runtime="firecracker" requests through
+// this driver instead of returning a "not enabled" error.
+//
+// Why a setter rather than a New() parameter: the existing service.New
+// signature is consumed by ~20 test files, and growing it to carry a
+// nil-able second runtime would force a fan-out edit across every one.
+// A setter keeps the constructor stable and confines the wire-up to
+// main.go where the daemon-config flag actually lives.
+func (s *Service) SetFirecrackerRuntime(r runtime.Runtime) {
+	s.firecracker = r
+}
+
+func (s *Service) isFirecrackerSandbox(sandbox *models.Sandbox) bool {
+	return sandbox != nil && sandbox.Runtime == models.RuntimeFirecracker
+}
+
+func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, error) {
+	if s.isFirecrackerSandbox(sandbox) {
+		if s.firecracker == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered: %w",
+				models.RuntimeFirecracker, models.ErrRuntimeNotImplemented)
+		}
+		return s.firecracker, nil
+	}
+	return s.docker, nil
+}
+
+func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
+	if s.isFirecrackerSandbox(sandbox) {
+		return sandbox.ID
+	}
+	return sandboxContainerRef(sandbox)
+}
+
+func mergeManagedRuntimes(maps ...map[string]*models.SandboxRuntimeState) map[string]*models.SandboxRuntimeState {
+	total := 0
+	for _, m := range maps {
+		total += len(m)
+	}
+	out := make(map[string]*models.SandboxRuntimeState, total)
+	for _, m := range maps {
+		for id, state := range m {
+			out[id] = state
+		}
+	}
+	return out
+}
+
 // AttachSnapshotPusher wires in the optional AOCR snapshot-push pipeline.
 // pusher must be non-nil to activate the feature; a nil pusher is a no-op
 // and leaves the service in legacy local-only snapshot mode. reconciler may
@@ -342,6 +456,27 @@ func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *Snaps
 // wrapper should no-op cleanly in that case.
 func (s *Service) SnapshotPushReconciler() *SnapshotPushReconciler {
 	return s.snapshotPushReconciler
+}
+
+// AttachTemplateArtifactPusher wires in the optional AOCR template push
+// pipeline (Phase 6 PR 6-B.1). pusher must be non-nil to activate the
+// feature; a nil pusher leaves new template rows in push_state='active'
+// forever (the reconciler only picks 'pending'/'error') — backward-
+// compatible with single-node deployments and with cfg.EnableCluster=false.
+// reconciler may be nil for tests that assert on initial persisted state.
+// Called once from main() after cfg.SnapshotPushEnabled validation.
+func (s *Service) AttachTemplateArtifactPusher(pusher *TemplateArtifactPusher, reconciler *TemplateArtifactPushReconciler) {
+	if pusher == nil {
+		return
+	}
+	s.templateArtifactPusher = pusher
+	s.templateArtifactPushReconciler = reconciler
+}
+
+// TemplateArtifactPushReconciler exposes the reconciler so main.go can
+// drive it from a ticker. Returns nil when template push is disabled.
+func (s *Service) TemplateArtifactPushReconciler() *TemplateArtifactPushReconciler {
+	return s.templateArtifactPushReconciler
 }
 
 // Cluster returns the attached cluster.Client. Always non-nil.
@@ -558,12 +693,13 @@ func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, expo
 
 func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
 	return capacity.Request{
-		CPU:       req.CPU,
-		MemoryMB:  req.MemoryMB,
-		DiskGB:    req.DiskGB,
-		Runtime:   req.Runtime,
-		GPUs:      gpuCountForCapacity(req.GPUs),
-		GPUVendor: gpuVendorForCapacity(req.GPUs),
+		CPU:        req.CPU,
+		MemoryMB:   req.MemoryMB,
+		DiskGB:     diskGBForCapacity(req.DiskGB, req.Runtime, req.OverlaySizeGB),
+		Runtime:    req.Runtime,
+		GPUs:       gpuCountForCapacity(req.GPUs),
+		GPUVendor:  gpuVendorForCapacity(req.GPUs),
+		TemplateID: req.TemplateID,
 	}
 }
 
@@ -572,13 +708,21 @@ func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 		return capacity.Request{}
 	}
 	return capacity.Request{
-		CPU:       sandbox.CPU,
-		MemoryMB:  sandbox.MemoryMB,
-		DiskGB:    sandbox.DiskGB,
-		Runtime:   sandbox.Runtime,
-		GPUs:      gpuCountForCapacity(sandbox.GPUs),
-		GPUVendor: gpuVendorForCapacity(sandbox.GPUs),
+		CPU:        sandbox.CPU,
+		MemoryMB:   sandbox.MemoryMB,
+		DiskGB:     diskGBForCapacity(sandbox.DiskGB, sandbox.Runtime, sandbox.OverlaySizeGB),
+		Runtime:    sandbox.Runtime,
+		GPUs:       gpuCountForCapacity(sandbox.GPUs),
+		GPUVendor:  gpuVendorForCapacity(sandbox.GPUs),
+		TemplateID: sandbox.TemplateID,
 	}
+}
+
+func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
+	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+		return base + overlaySizeGB
+	}
+	return base
 }
 
 func gpuCountForCapacity(req *models.GPURequest) int {
@@ -633,6 +777,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(req.TemplateID) != "" {
+		req.TemplateID = strings.TrimSpace(req.TemplateID)
+		if chosenRuntime != "" && chosenRuntime != models.RuntimeFirecracker {
+			return nil, fmt.Errorf("template_id requires runtime %q (got %q)",
+				models.RuntimeFirecracker, chosenRuntime)
+		}
+		chosenRuntime = models.RuntimeFirecracker
+	}
 	if chosenRuntime == "" {
 		chosenRuntime = s.cfg.Runtime
 	}
@@ -643,6 +795,29 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// generic Docker failure 30s later.
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
+	}
+	// "firecracker" is the second runtime, dispatched to the native
+	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
+	//
+	// Two operator-troubleshooting shapes for the gate:
+	//   - SB_ENABLE_FIRECRACKER=false: the host has not opted in. Tell
+	//     them which env var to flip and which plan describes the path.
+	//   - SB_ENABLE_FIRECRACKER=true but firecracker==nil: the driver
+	//     was not registered. This is a daemon-configuration bug
+	//     rather than an operator misconfiguration — main.go must
+	//     always register the driver when the env var is set. The
+	//     distinct message lets the operator tell the two apart.
+	if chosenRuntime == models.RuntimeFirecracker {
+		if !s.cfg.EnableFirecracker {
+			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_FIRECRACKER=true on this host (see plans/snapshot-clone-fast-boot.md): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		if s.firecracker == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_FIRECRACKER=true but main.go did not call SetFirecrackerRuntime): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		req.Runtime = chosenRuntime
+		return s.createFirecrackerSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
 
@@ -859,6 +1034,212 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}, nil
 }
 
+// createFirecrackerSandbox is the post-Create scaffolding for the
+// native Firecracker runtime. Mirrors the docker path's flow in
+// createSandbox above — keep them in lockstep when the docker path
+// grows new steps. The differences are deliberate and short:
+//
+//   - No mount sealing: Phase 1 doesn't pass binds to the firecracker
+//     driver (the host's bind-mount story is Docker-shaped; the
+//     firecracker guest will use virtio-fs or per-snapshot rootfs
+//     hard-links in a later phase).
+//   - No GPU normalize: GPU passthrough on Firecracker requires PCI
+//     passthrough setup that's out of Phase 1 scope.
+//   - The "registry auth seal" step still runs because the firecracker
+//     driver may pull from private registries via skopeo, but the
+//     sealed bytes are persisted onto the sandbox row in case Phase 2's
+//     template builder needs to re-pull.
+//   - Caddy still gets UpsertSandboxRoute called with the guest IP —
+//     the caddy upstream doesn't care whether the IP is a docker veth
+//     peer or a firecracker TAP guest, so the public URL routing works
+//     uniformly across runtimes.
+//
+// Cleanup contract — pr-review.md §4: every post-driver failure path
+// unwinds the driver-side state via firecracker.Destroy, mirroring the
+// docker path's _ = s.docker.Destroy(...) calls. The driver's own
+// cleanup contract (TAP slot release, runDir teardown) sits inside
+// Destroy, so we don't have to know the driver's internals here.
+func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
+	if len(req.Mounts) > models.MaxMountsPerSandbox {
+		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
+	}
+	if len(req.Mounts) > 0 {
+		// Phase 1 explicitly rejects mounts on the firecracker path
+		// rather than silently dropping them. When virtio-fs support
+		// lands, this branch becomes a call into a new mount adapter.
+		return nil, fmt.Errorf("runtime %q does not yet support mounts (see plans/snapshot-clone-fast-boot.md): %w",
+			req.Runtime, models.ErrRuntimeNotImplemented)
+	}
+
+	var lifecycle models.Lifecycle
+	if req.Lifecycle != nil {
+		if err := s.validateLifecycle(*req.Lifecycle); err != nil {
+			return nil, fmt.Errorf("invalid lifecycle: %w", err)
+		}
+		lifecycle = *req.Lifecycle
+	}
+
+	// GPU on firecracker is a future axis; reject explicitly so users
+	// don't think a silent drop happened. Same shape as the mounts
+	// rejection above.
+	if req.GPUs != nil {
+		return nil, fmt.Errorf("runtime %q does not yet support GPUs (see plans/snapshot-clone-fast-boot.md): %w",
+			req.Runtime, models.ErrRuntimeNotImplemented)
+	}
+	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
+		return nil, errors.New("network byte limits must be >= 0")
+	}
+	if req.NetworkBlockAll {
+		return nil, unsupportedFirecrackerOption("network_block_all")
+	}
+	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
+		return nil, unsupportedFirecrackerOption("network byte limits")
+	}
+
+	toolboxToken, err := generateToolboxToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate toolbox token: %w", err)
+	}
+	authorizedKey, privateKeyPEM, err := generateSandboxSSHKeys()
+	if err != nil {
+		return nil, fmt.Errorf("generate ssh keypair: %w", err)
+	}
+
+	sandboxID := idOverride
+	if sandboxID == "" {
+		sandboxID, err = generateSandboxID()
+		if err != nil {
+			return nil, fmt.Errorf("generate sandbox id: %w", err)
+		}
+	}
+
+	// Admission check mirrors the docker path. The capacity model is
+	// runtime-agnostic — a firecracker VMM's vCPU/memory footprint
+	// is counted the same way as a docker container's.
+	if s.admitter != nil {
+		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
+			return nil, err
+		}
+	}
+	releaseAdmission := func() {
+		if s.admitter != nil {
+			s.admitter.Release(sandboxID)
+		}
+	}
+
+	// Dispatch into the firecracker driver. The driver's Create owns
+	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
+	// REST orchestration, and the vsock handshake. On error, the
+	// driver releases everything it acquired before returning.
+	state, err := s.firecracker.Create(ctx, req, sandboxID, toolboxToken, nil)
+	if err != nil {
+		// Phase 6 PR-A: cold-load corruption intercept. The driver's
+		// configureVMMForLoad path verifies the snapshot checksum and
+		// returns ErrSnapshotCorrupt-wrapping errors on mismatch; surface
+		// that to the template-health code so the row transitions out of
+		// ready and the rebuild kicks. Best-effort (MarkSnapshotCorrupt is
+		// idempotent and swallows its own errors after logging); the
+		// caller still gets the original Create failure.
+		if errors.Is(err, models.ErrSnapshotCorrupt) && strings.TrimSpace(req.TemplateID) != "" {
+			_ = s.MarkSnapshotCorrupt(ctx, req.TemplateID, err.Error())
+		}
+		releaseAdmission()
+		return nil, err
+	}
+
+	sealedRegistry, err := s.sealRegistry(req.Registry)
+	if err != nil {
+		_ = s.firecracker.Destroy(ctx, &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
+		releaseAdmission()
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	sandbox := &models.Sandbox{
+		ID:                   state.SandboxID,
+		Image:                req.Image,
+		Status:               state.Status,
+		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		ContainerID:          state.ContainerID,
+		ContainerIP:          state.ContainerIP,
+		CPU:                  req.CPU,
+		MemoryMB:             req.MemoryMB,
+		DiskGB:               req.DiskGB,
+		OSUser:               req.OSUser,
+		Env:                  req.Env,
+		NetworkBlockAll:      req.NetworkBlockAll,
+		ToolboxEnabled:       true,
+		ToolboxToken:         toolboxToken,
+		SSHPublicKey:         authorizedKey,
+		Name:                 strings.TrimSpace(req.Name),
+		Tags:                 req.Tags,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		LastActiveAt:         now,
+		ContainerCommand:     req.ContainerCommand,
+		Lifecycle:            lifecycle,
+		Failover:             req.Failover,
+		Runtime:              req.Runtime,
+		RegistryAuthSealed:   sealedRegistry,
+		NetworkBytesInLimit:  req.NetworkBytesInLimit,
+		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
+		// TemplateID is persisted so the GC's IsTemplateReferenced probe
+		// finds this row and so failover re-creates the sandbox from the
+		// same template rather than re-resolving from the request.
+		TemplateID:    strings.TrimSpace(req.TemplateID),
+		OverlaySizeGB: req.OverlaySizeGB,
+	}
+	if len(req.CustomDomains) > 0 {
+		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))
+		for _, h := range req.CustomDomains {
+			sandbox.CustomDomains = append(sandbox.CustomDomains, models.CustomDomain{
+				Hostname:  h,
+				Status:    models.CustomDomainPendingDNS,
+				CreatedAt: now,
+				UpdatedAt: now,
+			})
+		}
+	}
+
+	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+		_ = s.firecracker.Destroy(ctx, sandbox)
+		releaseAdmission()
+		return nil, err
+	}
+
+	if err := s.store.Create(ctx, sandbox); err != nil {
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.firecracker.Destroy(ctx, sandbox)
+		releaseAdmission()
+		return nil, err
+	}
+
+	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
+		_ = s.store.Delete(ctx, sandbox.ID)
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+		_ = s.firecracker.Destroy(ctx, sandbox)
+		releaseAdmission()
+		return nil, err
+	}
+
+	s.logger.Info("audit sandbox created",
+		"sandbox_id", sandbox.ID,
+		"image", sandbox.Image,
+		"cpu", sandbox.CPU,
+		"memory_mb", sandbox.MemoryMB,
+		"disk_gb", sandbox.DiskGB,
+		"runtime", sandbox.Runtime,
+	)
+	stored, err := s.store.Get(ctx, sandbox.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &models.CreateSandboxResponse{
+		Sandbox:       *stored,
+		SSHPrivateKey: privateKeyPEM,
+	}, nil
+}
+
 // sealRegistry encrypts the user-supplied RegistryAuth so it can ride on the
 // sandbox row without exposing credentials at rest. Returns nil for the
 // no-credentials case (public registry, or a partially-zero RegistryAuth) so
@@ -1043,7 +1424,12 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 
-	state, err := s.docker.Start(ctx, sandboxContainerRef(sandbox))
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		releaseAdmission()
+		return nil, err
+	}
+	state, err := rt.Start(ctx, s.runtimeRef(sandbox))
 	if err != nil {
 		_ = s.mounts.UnmountAll(id)
 		releaseAdmission()
@@ -1064,8 +1450,8 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	// otherwise come back without network isolation. Fail closed: if we can't
 	// reinstall the rule, stop the container and surface the error.
 	if sandbox.NetworkBlockAll {
-		if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
-			_ = s.docker.Stop(ctx, sandboxContainerRef(sandbox))
+		if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
@@ -1118,7 +1504,11 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
 	_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-	if err := s.docker.Destroy(ctx, sandbox); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return err
+	}
+	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
 	if err := s.mounts.UnmountAll(id); err != nil {
@@ -1251,7 +1641,11 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 
-	imageID, err := s.docker.CreateSnapshot(ctx, sandboxContainerRef(sandbox), name)
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return nil, false, err
+	}
+	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), name)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1314,6 +1708,47 @@ func (s *Service) kickSnapshotPushReconciler(snapshot *models.SandboxSnapshot) {
 		if _, err := s.snapshotPushReconciler.RunOnce(ctx); err != nil && s.logger != nil {
 			s.logger.Warn("snapshot push: post-create reconciler tick failed",
 				"snapshot", snapshot.Name, "error", err)
+		}
+	}()
+}
+
+// markTemplateForPush is the kickTemplateBuild success-path seam for
+// Phase 6 PR 6-B.1. Best-effort: when the pusher isn't wired (cluster
+// off / push disabled) the call is a no-op so the build path stays
+// byte-identical to today. The store helper is state-guarded — a row
+// already in pending/pushing/error is left alone.
+func (s *Service) markTemplateForPush(ctx context.Context, templateID string) bool {
+	if s.templateArtifactPusher == nil {
+		return false
+	}
+	changed, err := s.store.MarkTemplatePushPending(ctx, templateID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("template push: mark pending failed",
+				"template", templateID, "error", err)
+		}
+		return false
+	}
+	return changed
+}
+
+// kickTemplateArtifactPushReconciler runs the reconciler once in a
+// background goroutine after the build path just flipped a template
+// row to push_state=pending. Pure latency optimization — without it,
+// the operator waits up to one reconciler tick before the AOCR push
+// starts. Detached context + 15-minute timeout mirror
+// kickSnapshotPushReconciler: a hung Docker import / push cannot pin
+// the goroutine forever.
+func (s *Service) kickTemplateArtifactPushReconciler(templateID string) {
+	if s.templateArtifactPushReconciler == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+		if _, err := s.templateArtifactPushReconciler.RunOnce(ctx); err != nil && s.logger != nil {
+			s.logger.Warn("template push: post-build reconciler tick failed",
+				"template", templateID, "error", err)
 		}
 	}()
 }
@@ -1392,7 +1827,14 @@ func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.Resiz
 		}
 	}
 
-	if err := s.docker.Resize(ctx, sandboxContainerRef(sandbox), req); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		if s.admitter != nil {
+			s.admitter.Reserve(id, capacityRequestFromSandbox(sandbox))
+		}
+		return nil, err
+	}
+	if err := rt.Resize(ctx, s.runtimeRef(sandbox), req); err != nil {
 		// Restore the prior reservation; the resize did not actually take
 		// effect on the container, so accounting must reflect the unchanged
 		// footprint.
@@ -1441,7 +1883,10 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.validateLifecycle(l); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
-	priorSandbox, _ := s.store.Get(ctx, id)
+	priorSandbox, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
 	}
@@ -2333,11 +2778,80 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 
 // Capacity returns the admitter's current snapshot. Returns the zero value
 // when no admitter is configured (e.g. in tests).
+//
+// Phase 6 PR-D: overlays LocalTemplateIDs from a 5s-TTL cache so peers
+// fetching /v1/capacity see which Firecracker templates this node can
+// already serve without paying a remote AOCR pull. The cache shields
+// SQLite from the gossip cadence (single-writer; MaxOpenConns=1).
 func (s *Service) Capacity() capacity.Snapshot {
+	var snap capacity.Snapshot
 	if s.admitter == nil {
-		return capacity.Snapshot{CanAdmit: true}
+		snap = capacity.Snapshot{CanAdmit: true}
+	} else {
+		snap = s.admitter.Snapshot()
 	}
-	return s.admitter.Snapshot()
+	if ids, known := s.LocalReadyTemplateInventory(context.Background()); known {
+		snap.LocalTemplateInventoryKnown = true
+		snap.LocalTemplateIDs = ids
+	}
+	return snap
+}
+
+// LocalReadyTemplateInventory returns the IDs of Firecracker templates
+// whose artifacts are usable on this host plus whether that inventory
+// is authoritative. Cached for 5s — peers gossip /v1/capacity at this
+// cadence and a per-tick SQLite hit would starve the create path's
+// writes (single-writer DB). On error the cache is left untouched and
+// the previous value is returned, matching the "stale is better than
+// wrong" contract the rest of the heartbeat path uses.
+func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bool) {
+	if s == nil || s.store == nil {
+		return nil, false
+	}
+	now := time.Now()
+	s.localReadyTemplateIDsMu.Lock()
+	if now.Before(s.localReadyTemplateIDsExpires) {
+		// Defensive copy: callers might mutate (placement wraps it in a
+		// snapshot that crosses goroutine boundaries) and we don't want
+		// to hand out the cache's backing array.
+		out := append([]string(nil), s.localReadyTemplateIDsCache...)
+		known := s.localReadyTemplateIDsKnown
+		s.localReadyTemplateIDsMu.Unlock()
+		return out, known
+	}
+	s.localReadyTemplateIDsMu.Unlock()
+
+	ids, err := s.store.ListReadyTemplateIDs(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("local ready template ids: list failed",
+				"error", err)
+		}
+		// Return the stale cache rather than nil so a one-tick SQLite
+		// hiccup doesn't trick peers into thinking we lost all our
+		// templates.
+		s.localReadyTemplateIDsMu.Lock()
+		out := append([]string(nil), s.localReadyTemplateIDsCache...)
+		known := s.localReadyTemplateIDsKnown
+		s.localReadyTemplateIDsMu.Unlock()
+		return out, known
+	}
+	s.localReadyTemplateIDsMu.Lock()
+	s.localReadyTemplateIDsCache = ids
+	s.localReadyTemplateIDsKnown = true
+	s.localReadyTemplateIDsExpires = now.Add(5 * time.Second)
+	out := append([]string(nil), ids...)
+	s.localReadyTemplateIDsMu.Unlock()
+	return out, true
+}
+
+// LocalReadyTemplateIDs returns only the template IDs from
+// LocalReadyTemplateInventory. Callers that need to distinguish
+// authoritative empty inventory from legacy/unknown should use the
+// richer method.
+func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
+	ids, _ := s.LocalReadyTemplateInventory(ctx)
+	return ids
 }
 
 // ReplayReservations re-populates the admitter from persistent state. Without
@@ -2398,10 +2912,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return err
 	}
 
-	managed, err := s.docker.ListManaged(ctx)
+	dockerManaged, err := s.docker.ListManaged(ctx)
 	if err != nil {
 		return err
 	}
+	firecrackerManaged := map[string]*models.SandboxRuntimeState{}
+	if s.firecracker != nil {
+		firecrackerManaged, err = s.firecracker.ListManaged(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	managed := mergeManagedRuntimes(dockerManaged, firecrackerManaged)
 
 	s.reconcileLocalClusterOwnership(ctx, known, managed)
 
@@ -2412,8 +2934,26 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
-		state, ok := managed[sandbox.ID]
+		runtimeManaged := dockerManaged
+		if s.isFirecrackerSandbox(sandbox) {
+			runtimeManaged = firecrackerManaged
+		}
+		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
+			if s.isFirecrackerSandbox(sandbox) && sandbox.Status == models.SandboxStatusStopped {
+				if s.admitter != nil {
+					s.admitter.Release(sandbox.ID)
+				}
+				_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+				if sandbox.WakeArmed {
+					s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
+				} else {
+					for _, port := range sandbox.ExposedPorts {
+						_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+					}
+				}
+				continue
+			}
 			// Container is gone (manual `docker rm`, OOM kill, host reboot,
 			// previous reconcile pass already destroyed it via events). Tear
 			// down all our state and delete the row outright. Cascades through
@@ -2422,14 +2962,25 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// host_port doesn't filter by sandbox status, so a destroyed-but-
 			// retained row would otherwise hold its host_port slot forever.
 			//
-			// docker.Destroy is intentionally skipped: the container is the
-			// reason we're in this branch. Caddy / mounts / admitter / image
-			// cleanup is best-effort and mirrors DestroySandbox's order;
-			// failures here are picked up by gcZombieCaddyEntries on a later
-			// pass and by the mounts.Sweep at the end of Reconcile.
+			// Docker Destroy is intentionally skipped: the container is the
+			// reason we're in this branch. Firecracker still gets Destroy so
+			// driver-owned bookkeeping (TAP/VMM slot/run dir) is reconciled
+			// before the store row disappears. Caddy / mounts / admitter /
+			// image cleanup is best-effort and mirrors DestroySandbox's
+			// order; failures here are picked up by gcZombieCaddyEntries on
+			// a later pass and by the mounts.Sweep at the end of Reconcile.
 			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+			}
+			if s.isFirecrackerSandbox(sandbox) {
+				rt, err := s.runtimeForSandbox(sandbox)
+				if err != nil {
+					return err
+				}
+				if err := rt.Destroy(ctx, sandbox); err != nil {
+					return err
+				}
 			}
 			if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
 				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
@@ -2495,7 +3046,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// Catches host-side state loss: iptables flush, daemon restart
 			// rebuilding chains, or a missed Create/Start install.
 			if sandbox.NetworkBlockAll {
-				if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+				rt, err := s.runtimeForSandbox(sandbox)
+				if err != nil {
+					return err
+				}
+				if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
 					s.logger.Warn("reconcile reapply network block failed",
 						"sandbox_id", sandbox.ID,
 						"ip", sandbox.ContainerIP,
@@ -2539,25 +3094,38 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 	}
 
-	// Orphan containers: managed by us but no DB row. Remove them so leaked
-	// state from a crashed create or a wiped DB doesn't accumulate.
-	for sandboxID, state := range managed {
-		if _, ok := knownIDs[sandboxID]; ok {
-			continue
-		}
-		s.logger.Warn("removing orphan container",
-			"sandbox_id", sandboxID,
-			"container_id", state.ContainerID,
-		)
-		stub := &models.Sandbox{ContainerID: state.ContainerID, ContainerIP: state.ContainerIP}
-		if err := s.docker.Destroy(ctx, stub); err != nil {
-			s.logger.Warn("orphan container removal failed",
+	// Orphan runtime instances: managed by us but no DB row. Remove them so
+	// leaked state from a crashed create or a wiped DB doesn't accumulate.
+	removeOrphans := func(rt runtime.Runtime, runtimeName string, items map[string]*models.SandboxRuntimeState) {
+		for sandboxID, state := range items {
+			if _, ok := knownIDs[sandboxID]; ok {
+				continue
+			}
+			s.logger.Warn("removing orphan runtime instance",
 				"sandbox_id", sandboxID,
-				"error", err,
+				"runtime", runtimeName,
+				"container_id", state.ContainerID,
 			)
+			stub := &models.Sandbox{
+				ID:          sandboxID,
+				ContainerID: state.ContainerID,
+				ContainerIP: state.ContainerIP,
+				Runtime:     runtimeName,
+			}
+			if err := rt.Destroy(ctx, stub); err != nil {
+				s.logger.Warn("orphan runtime removal failed",
+					"sandbox_id", sandboxID,
+					"runtime", runtimeName,
+					"error", err,
+				)
+			}
+			_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
+			_ = s.mounts.UnmountAll(sandboxID)
 		}
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
-		_ = s.mounts.UnmountAll(sandboxID)
+	}
+	removeOrphans(s.docker, models.RuntimeDocker, dockerManaged)
+	if s.firecracker != nil {
+		removeOrphans(s.firecracker, models.RuntimeFirecracker, firecrackerManaged)
 	}
 
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already
@@ -3445,6 +4013,11 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 	return req
 }
 
+func unsupportedFirecrackerOption(option string) error {
+	return fmt.Errorf("runtime %q does not yet support %s (see plans/snapshot-clone-fast-boot.md): %w",
+		models.RuntimeFirecracker, option, models.ErrRuntimeNotImplemented)
+}
+
 func NormalizeCreateFailover(req *models.CreateSandboxRequest) error {
 	if req == nil || req.Failover == nil {
 		return nil
@@ -3647,7 +4220,12 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	for _, p := range sandbox.ExposedPorts {
 		ports = append(ports, p.Port)
 	}
-	if err := s.docker.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		s.logger.Warn("failed to resolve runtime for allowed ports sync", "sandbox_id", sandbox.ID, "error", err)
+		return
+	}
+	if err := rt.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
 }

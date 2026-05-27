@@ -60,6 +60,26 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, "snapshot name already in use")
 		return
 	}
+	// Firecracker template sentinels (plans/snapshot-clone-fast-boot.md
+	// Phase 2). 409 on both: ErrTemplateIDConflict surfaces a PK collision
+	// when an operator POSTs the same explicit id twice (idempotency
+	// signal — the row already exists), and ErrTemplateInUse blocks a
+	// DELETE while a sandbox still references the template (forces the
+	// operator to destroy the sandbox first rather than yank rootfs out
+	// from under a live Firecracker guest).
+	if errors.Is(err, store.ErrTemplateIDConflict) || errors.Is(err, store.ErrTemplateInUse) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	// Phase 6 operator-triggered rebuild (POST /v1/templates/{id}/rebuild).
+	// 412 distinguishes "row is in a state where rebuild can't be honoured"
+	// (busy / no snapshot to re-derive / terminal failed) from "row
+	// missing" (404). The wrapped error string carries the offending
+	// status so operators don't have to do a second GET.
+	if errors.Is(err, models.ErrTemplateNotRebuildable) {
+		WriteError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
 	// Custom-domain sentinels (plans/custom-domains.md). 412 distinguishes
 	// "this deployment can't do custom domains at all" (feature flag off /
 	// IP mode) from "your input is malformed" (400). 409 covers both the
@@ -73,6 +93,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		errors.Is(err, models.ErrCustomDomainPerSandboxCap) ||
 		errors.Is(err, store.ErrCustomDomainConflict) {
 		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+		WriteError(w, http.StatusForbidden, err.Error())
 		return
 	}
 	// Capacity rejections are 503 with a Retry-After hint so well-behaved

@@ -34,7 +34,18 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	if disk <= 0 {
 		disk = models.DefaultDiskGB
 	}
-	out := capacity.Request{CPU: cpu, MemoryMB: mem, DiskGB: disk, Runtime: spec.Runtime}
+	runtimeName := strings.TrimSpace(spec.Runtime)
+	templateID := strings.TrimSpace(spec.TemplateID)
+	if templateID != "" && runtimeName == "" {
+		runtimeName = models.RuntimeFirecracker
+	}
+	out := capacity.Request{
+		CPU:        cpu,
+		MemoryMB:   mem,
+		DiskGB:     diskGBForCapacity(disk, runtimeName, spec.OverlaySizeGB),
+		Runtime:    runtimeName,
+		TemplateID: templateID,
+	}
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
 		if want <= 0 {
@@ -44,6 +55,13 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 		out.GPUVendor = string(spec.GPUs.Vendor)
 	}
 	return out
+}
+
+func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
+	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+		return base + overlaySizeGB
+	}
+	return base
 }
 
 // SelectPlacement chooses an owner node for a new sandbox using power-of-two-
@@ -180,6 +198,30 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 			}
 		}
 		if !supported {
+			return false
+		}
+	}
+	// Phase 6 PR-D template-aware placement. A create that names a
+	// template prefers a node that already has the artifacts cached —
+	// the consumer-side puller (PR 6-B.2) can recover when placement
+	// misses, but a hit avoids paying the docker-pull-from-AOCR window
+	// on cold boot, preserving the <100ms boot property the runtime
+	// exists to deliver.
+	//
+	// Unknown-allow rule (mirrors SupportedRuntimes above): a peer with
+	// LocalTemplateInventoryKnown=false is legacy or just-joined and we
+	// don't gate. Once LocalTemplateInventoryKnown=true, an empty list is
+	// an authoritative "no templates here" and a non-empty list missing
+	// the requested template is an authoritative "no" for that template.
+	if req.TemplateID != "" && cap.LocalTemplateInventoryKnown {
+		hit := false
+		for _, t := range cap.LocalTemplateIDs {
+			if t == req.TemplateID {
+				hit = true
+				break
+			}
+		}
+		if !hit {
 			return false
 		}
 	}

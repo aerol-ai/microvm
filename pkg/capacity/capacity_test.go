@@ -748,3 +748,161 @@ func TestSnapshotIsPointInTime(t *testing.T) {
 		t.Fatalf("live snapshot wrong: %+v", now)
 	}
 }
+
+// fakeRSS is the test double for the Phase 5 sampler. Mirrors the
+// shape of fakeProbe above — a value type with exported fields so each
+// test can dial it without a constructor.
+type fakeRSS struct {
+	total int
+	ready bool
+}
+
+func (f fakeRSS) TotalRSSMB() int { return f.total }
+func (f fakeRSS) Ready() bool     { return f.ready }
+
+// TestAdmitRSSWatermarkRejects exercises the Phase 5 effective-memory
+// floor: nominal accounting allows the request, but actual RSS leaves
+// less than the watermark free after admit. The reject reason must
+// name the watermark axis so /capacity dashboards can attribute the
+// 503 correctly.
+func TestAdmitRSSWatermarkRejects(t *testing.T) {
+	// 16 GB host, 10% watermark = 1638 MB must stay free of RSS+req.
+	// Existing RSS already sits at 14000 MB, so only 2384 MB of effective
+	// free remains. A 1024 MB request leaves 1360 MB — below the 1638 MB
+	// floor.
+	a := NewWithRSSSource(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		RSSWatermarkRatio:      0.10,
+	}, nil, fakeRSS{total: 14000, ready: true})
+
+	err := a.Admit("rss-reject", Request{CPU: 1, MemoryMB: 1024})
+	if err == nil {
+		t.Fatal("admit accepted but RSS watermark should have rejected")
+	}
+	if !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("err = %v, want wrapping ErrCapacityExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "rss watermark") {
+		t.Fatalf("err missing rss watermark reason: %v", err)
+	}
+}
+
+// TestAdmitRSSWatermarkAccepts is the positive twin of the reject
+// test — same host and ratio, but RSS is low enough that effective
+// free comfortably clears the watermark.
+func TestAdmitRSSWatermarkAccepts(t *testing.T) {
+	a := NewWithRSSSource(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		RSSWatermarkRatio:      0.10,
+	}, nil, fakeRSS{total: 2000, ready: true})
+
+	if err := a.Admit("rss-ok", Request{CPU: 1, MemoryMB: 1024}); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+}
+
+// TestAdmitRSSWatermarkSkippedWhenSamplerNotReady guards the cold-
+// start case: a brand-new daemon would have rss.TotalRSSMB()==0
+// before the first tick. Without the Ready() gate, that looks like
+// "host is empty" and admits unbounded — or, with a watermark set
+// against a host that legitimately is empty, would still admit. The
+// gate flips that to "fall back to nominal accounting until we have
+// real data".
+func TestAdmitRSSWatermarkSkippedWhenSamplerNotReady(t *testing.T) {
+	// Constructed so the RSS check would FAIL if it ran: 0 RSS means
+	// effective=full host, but with a watermark of 1.0 (the entire host
+	// must stay free of RSS+req) any non-zero request would breach.
+	a := NewWithRSSSource(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		RSSWatermarkRatio:      1.0,
+	}, nil, fakeRSS{total: 0, ready: false})
+
+	if err := a.Admit("cold-start", Request{CPU: 1, MemoryMB: 1024}); err != nil {
+		t.Fatalf("admit on !Ready sampler must skip the RSS check: %v", err)
+	}
+}
+
+// TestAdmitRSSWatermarkDisabledWhenRatioZero confirms that the
+// default (RSSWatermarkRatio=0, the opt-in switch) keeps admission
+// behaviour byte-identical to pre-Phase-5 even with a wired-in
+// sampler.
+func TestAdmitRSSWatermarkDisabledWhenRatioZero(t *testing.T) {
+	a := NewWithRSSSource(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		// RSSWatermarkRatio defaults to 0
+	}, nil, fakeRSS{total: 16000, ready: true}) // RSS would otherwise breach
+
+	if err := a.Admit("disabled", Request{CPU: 1, MemoryMB: 1024}); err != nil {
+		t.Fatalf("admit must succeed when watermark is disabled: %v", err)
+	}
+}
+
+// TestAdmitRSSWatermarkSkippedWhenNoSource is the docker-only-host
+// case: capacity.New leaves rss as nil, and the gate must skip the
+// check rather than panic on a nil interface deref.
+func TestAdmitRSSWatermarkSkippedWhenNoSource(t *testing.T) {
+	a := New(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		RSSWatermarkRatio:      0.50, // even an aggressive ratio must be a no-op
+	}, nil)
+
+	if err := a.Admit("no-source", Request{CPU: 1, MemoryMB: 1024}); err != nil {
+		t.Fatalf("admit must succeed when no RSS source is wired: %v", err)
+	}
+}
+
+// TestSnapshotRSSFields verifies that the cluster-heartbeat snapshot
+// surfaces the Phase 5 axis. Placement on a peer uses these to score
+// remote nodes; if Snapshot lied about effective-free, the local
+// admitter could accept a forward the remote will then 503.
+func TestSnapshotRSSFields(t *testing.T) {
+	a := NewWithRSSSource(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		RSSWatermarkRatio:      0.10,
+	}, nil, fakeRSS{total: 4096, ready: true})
+
+	snap := a.Snapshot()
+	if snap.ActualRSSMB != 4096 {
+		t.Fatalf("ActualRSSMB = %d, want 4096", snap.ActualRSSMB)
+	}
+	if snap.EffectiveMemoryFreeMB != 16384-4096 {
+		t.Fatalf("EffectiveMemoryFreeMB = %d, want %d", snap.EffectiveMemoryFreeMB, 16384-4096)
+	}
+	if snap.RSSWatermarkMB != 1638 /* 16384 * 0.10 */ {
+		t.Fatalf("RSSWatermarkMB = %d, want %d", snap.RSSWatermarkMB, 1638 /* 16384 * 0.10 */)
+	}
+	if snap.RSSWatermarkRatio != 0.10 {
+		t.Fatalf("RSSWatermarkRatio = %v, want 0.10", snap.RSSWatermarkRatio)
+	}
+}
+
+// TestSnapshotRSSFieldsZeroBeforeReady covers the pre-tick window.
+// Even with a wired sampler, the snapshot must report 0 for the
+// observation-derived fields so peers running new code don't take a
+// cold-start "0 RSS" reading as truth.
+func TestSnapshotRSSFieldsZeroBeforeReady(t *testing.T) {
+	a := NewWithRSSSource(HostInfo{CPUCores: 8, MemoryTotalMB: 16384}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+		RSSWatermarkRatio:      0.10,
+	}, nil, fakeRSS{total: 5000, ready: false}) // !Ready masks total
+
+	snap := a.Snapshot()
+	if snap.ActualRSSMB != 0 {
+		t.Fatalf("ActualRSSMB = %d, want 0 before Ready", snap.ActualRSSMB)
+	}
+	if snap.EffectiveMemoryFreeMB != 0 {
+		t.Fatalf("EffectiveMemoryFreeMB = %d, want 0 before Ready", snap.EffectiveMemoryFreeMB)
+	}
+	// Watermark MB is config-derived, not observation-derived — it can
+	// be reported even before the first sample.
+	if snap.RSSWatermarkMB != 1638 /* 16384 * 0.10 */ {
+		t.Fatalf("RSSWatermarkMB = %d, want %d", snap.RSSWatermarkMB, 1638 /* 16384 * 0.10 */)
+	}
+}

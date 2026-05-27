@@ -22,6 +22,14 @@ var (
 	hostPressureRejectReasons  = expvar.NewMap("aerolvm_host_pressure_reject_reasons")
 	hostPressureReasonKeysMu   sync.Mutex
 	hostPressureReasonKeys     = make(map[string]struct{})
+	// Phase 5 effective-memory axis. Three gauges so dashboards can
+	// plot "real RSS in use", "headroom we'd admit against", and "the
+	// floor we refuse below". Zero on hosts without a sampler (the
+	// default) — the watermark gauge stays at 0 so an alert "RSS within
+	// 10% of watermark" doesn't fire on docker-only hosts.
+	hostPressureActualRSS           = expvar.NewInt("aerolvm_host_pressure_actual_rss_mb")
+	hostPressureEffectiveMemoryFree = expvar.NewInt("aerolvm_host_pressure_effective_memory_free_mb")
+	hostPressureRSSWatermark        = expvar.NewInt("aerolvm_host_pressure_rss_watermark_mb")
 )
 
 func recordHostPressure(s Snapshot) {
@@ -35,6 +43,9 @@ func recordHostPressure(s Snapshot) {
 	hostPressureDiskBudget.Set(int64(s.DiskBudgetGB))
 	hostPressureReservedGPUs.Set(int64(s.ReservedGPUs))
 	hostPressureGPUCount.Set(int64(s.GPUCount))
+	hostPressureActualRSS.Set(int64(s.ActualRSSMB))
+	hostPressureEffectiveMemoryFree.Set(int64(s.EffectiveMemoryFreeMB))
+	hostPressureRSSWatermark.Set(int64(s.RSSWatermarkMB))
 	if s.CanAdmit {
 		hostPressureCanAdmit.Set(1)
 	} else {

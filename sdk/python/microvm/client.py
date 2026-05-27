@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import random
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +21,7 @@ from .types import (
     BuildImageResult,
     CreateOptions,
     CreateSessionOptions,
+    CreateTemplateOptions,
     CustomDomain,
     CustomDomainDNSRecords,
     DNSRecord,
@@ -32,16 +35,19 @@ from .types import (
     HealthStatus,
     IngressTarget,
     Lifecycle,
+    MicroVMConfig,
     MountSpec,
     MountSpecRedacted,
     NetworkUsage,
     RegisterSnapshotOptions,
     ResizeOptions,
+    RetryConfig,
     SandboxData,
     SandboxSnapshot,
     Session,
     SessionAttachOptions,
     SetNetworkLimitsOptions,
+    Template,
 )
 
 STREAM_PREFIX_STDOUT = 0x01
@@ -397,9 +403,21 @@ class MicroVM:
         pat_token: Optional[str] = None,
         *,
         api_version: str = _DEFAULT_API_VERSION,
+        config: Optional[MicroVMConfig] = None,
     ) -> None:
+        if config is not None:
+            api_url = api_url or config.get("apiUrl")
+            pat_token = pat_token or config.get("patToken")
+        
         self.api_url = _normalize_url(api_url or _read_env("SB_API_URL") or self.default_api_url)
         self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or ""
+
+        retry_cfg: RetryConfig = config.get("retry", {}) if config else {}
+        self._retry_config = {
+            "maxRetries": retry_cfg.get("maxRetries", 3),
+            "baseDelayMs": retry_cfg.get("baseDelayMs", 200),
+            "maxDelayMs": retry_cfg.get("maxDelayMs", 5000),
+        }
 
         if not self.pat_token:
             raise MicroVMError(self.auth_required_error_message)
@@ -542,6 +560,63 @@ class MicroVM:
 
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
+
+    def create_template(self, options: CreateTemplateOptions) -> Template:
+        """Register a Firecracker rootfs template.
+
+        Returns a row in ``status: "pending"`` and kicks the daemon's
+        async build. Poll :meth:`get_template` until ``status`` reaches
+        ``"ready"`` (fast-boot available) or ``"ready_no_snapshot"``
+        (cold boot only).
+
+        Idempotent when ``options["id"]`` is set: a duplicate ID
+        returns 409 so a retried CI step does not create two rows.
+        """
+        body: Dict[str, Any] = {}
+        tpl_id = str(_first_of(options, "id") or "").strip()
+        if tpl_id:
+            body["id"] = tpl_id
+        image = str(_first_of(options, "image") or "").strip()
+        if not image:
+            raise MicroVMError("image is required")
+        body["image"] = image
+        min_size = _first_of(options, "minSizeMiB", "min_size_mib")
+        if min_size is not None:
+            body["min_size_mib"] = int(min_size)
+        response = self._do_json("POST", self._versioned("/templates"), body)
+        return _from_api_template(response)
+
+    def list_templates(self) -> List[Template]:
+        response = self._do_json("GET", self._versioned("/templates"), None)
+        if response is None:
+            return []
+        if not isinstance(response, list):
+            raise MicroVMError("expected JSON array from /v1/templates")
+        return [_from_api_template(item) for item in response]
+
+    def get_template(self, template_id: str) -> Template:
+        response = self._do_json("GET", f"{self._version_prefix}/templates/{template_id}", None)
+        return _from_api_template(response)
+
+    def delete_template(self, template_id: str) -> None:
+        self._do_json("DELETE", f"{self._version_prefix}/templates/{template_id}", None)
+
+    def rebuild_template(self, template_id: str) -> Template:
+        """Re-run the snapshot phase against an existing template.
+
+        Idempotent under concurrent retry — the daemon's CAS collapses
+        N parallel calls for the same ``ready`` template to one rebuild
+        kick. Returns the row in its post-transition state (typically
+        ``unhealthy``); poll :meth:`get_template` for the transition
+        back to ``ready``.
+
+        Raises :class:`MicroVMHTTPError` with status 412 when the
+        template is in a state where rebuild is not safe (build in
+        flight) or not supported (``ready_no_snapshot``/``failed`` —
+        those need delete+recreate today).
+        """
+        response = self._do_json("POST", f"{self._version_prefix}/templates/{template_id}/rebuild", None)
+        return _from_api_template(response)
 
     def resize(self, sandbox_id: str, options: ResizeOptions) -> Sandbox:
         sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options))
@@ -749,21 +824,48 @@ class MicroVM:
         return f"{self.api_url}{path}"
 
     def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None) -> bytes:
-        request = urllib.request.Request(url, data=body, method=method)
-        request.add_header("Authorization", f"Bearer {self.pat_token}")
-        if content_type is not None:
-            request.add_header("Content-Type", content_type)
+        max_retries = self._retry_config["maxRetries"]
+        base_delay_ms = self._retry_config["baseDelayMs"]
+        max_delay_ms = self._retry_config["maxDelayMs"]
+        
+        last_exc: Optional[Exception] = None
+        
+        for attempt in range(max_retries + 1):
+            request = urllib.request.Request(url, data=body, method=method)
+            request.add_header("Authorization", f"Bearer {self.pat_token}")
+            if content_type is not None:
+                request.add_header("Content-Type", content_type)
 
-        try:
-            with urllib.request.urlopen(request) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            payload = exc.read()
             try:
-                data = json.loads(payload.decode("utf-8"))
-                raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
-            except (ValueError, TypeError):
-                raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
+                with urllib.request.urlopen(request) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                if exc.code in (429, 502, 503, 504) and attempt < max_retries:
+                    pass # Handled by the retry logic below
+                else:
+                    payload = exc.read()
+                    try:
+                        data = json.loads(payload.decode("utf-8"))
+                        raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
+                    except (ValueError, TypeError):
+                        raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
+            except urllib.error.URLError as exc:
+                last_exc = exc
+                if attempt >= max_retries:
+                    raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= max_retries:
+                    raise
+            
+            # Compute delay with exponential backoff and jitter
+            delay_ms = min(base_delay_ms * (2 ** attempt), max_delay_ms)
+            jitter = 1.0 + (random.random() - 0.5) * 0.5
+            time.sleep((delay_ms * jitter) / 1000.0)
+
+        assert last_exc is not None
+        raise last_exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
         body = None
@@ -1065,6 +1167,45 @@ def _from_api_exposed_port(port: Dict[str, Any]) -> Dict[str, Any]:
         "publicURL": str(_first_of(port, "public_url", "publicURL") or ""),
         "createdAt": str(_first_of(port, "created_at", "createdAt") or ""),
     }
+
+
+def _from_api_template(template: Any) -> Template:
+    if not isinstance(template, dict):
+        raise MicroVMError("expected JSON object for template")
+    result: Template = {
+        "id": str(_first_of(template, "id") or ""),
+        "image": str(_first_of(template, "image") or ""),
+        "status": str(_first_of(template, "status") or ""),  # type: ignore[typeddict-item]
+        "createdAt": str(_first_of(template, "created_at", "createdAt") or ""),
+        "updatedAt": str(_first_of(template, "updated_at", "updatedAt") or ""),
+        "hasSnapshot": bool(_first_of(template, "has_snapshot", "hasSnapshot") or False),
+        "hasOverlay": bool(_first_of(template, "has_overlay", "hasOverlay") or False),
+    }
+    rootfs_size = _first_of(template, "rootfs_size_bytes", "rootfsSizeBytes")
+    if rootfs_size is not None:
+        result["rootfsSizeBytes"] = int(rootfs_size)
+    min_size = _first_of(template, "min_size_mib", "minSizeMiB")
+    if min_size is not None:
+        result["minSizeMiB"] = int(min_size)
+    last_error = _first_of(template, "last_error", "lastError")
+    if last_error not in (None, ""):
+        result["lastError"] = str(last_error)
+    ready_at = _first_of(template, "ready_at", "readyAt")
+    if ready_at not in (None, ""):
+        result["readyAt"] = str(ready_at)
+    snap_size = _first_of(template, "snapshot_size_bytes", "snapshotSizeBytes")
+    if snap_size is not None:
+        result["snapshotSizeBytes"] = int(snap_size)
+    snap_err = _first_of(template, "snapshot_error", "snapshotError")
+    if snap_err not in (None, ""):
+        result["snapshotError"] = str(snap_err)
+    push_state = _first_of(template, "push_state", "pushState")
+    if push_state not in (None, ""):
+        result["pushState"] = str(push_state)  # type: ignore[typeddict-item]
+    push_err = _first_of(template, "push_error", "pushError")
+    if push_err not in (None, ""):
+        result["pushError"] = str(push_err)
+    return result
 
 
 def _from_api_sandbox_snapshot(snapshot: Dict[str, Any]) -> SandboxSnapshot:

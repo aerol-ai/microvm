@@ -57,6 +57,17 @@ const (
 	RuntimeDocker = "docker" // Docker's standard runc-backed runtime.
 	RuntimeGvisor = "gvisor" // gVisor (runsc). User-space kernel for untrusted workloads.
 	RuntimeKata   = "kata"   // Reserved: Kata Containers. Not yet implemented; rejected at create time.
+	// RuntimeFirecracker selects the native Firecracker microVM runtime
+	// (no Docker in the path). Plumbed through ValidRuntime so the API
+	// accepts the identifier ahead of the implementation; CreateSandbox
+	// rejects with ErrRuntimeNotImplemented until the per-host operator
+	// opts in via SB_ENABLE_FIRECRACKER=true AND the driver has actually
+	// landed. See plans/snapshot-clone-fast-boot.md.
+	//
+	// Distinct from RuntimeKata, which stays reserved for Kata Containers
+	// (a different shape — Kata-with-Firecracker abstracts the snapshot
+	// API away and is not what this constant refers to).
+	RuntimeFirecracker = "firecracker"
 )
 
 // ErrRuntimeNotImplemented is returned when a runtime is recognized as a valid
@@ -64,6 +75,35 @@ const (
 // "kata" hits this path. Surfaced through the API as a 4xx so operators get
 // an actionable error instead of a generic 500.
 var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
+
+// ErrSnapshotCorrupt is returned by the Firecracker runtime when a snapshot
+// fails its checksum verification at load time — the on-disk artifact does
+// not match the checksum that was stamped at capture. Phase 6 PR-A's
+// service-layer intercept tests for this with errors.Is to mark the
+// template UNHEALTHY and kick an async snapshot rebuild; the next Create
+// on the same template falls back to the cold-boot path until rebuild
+// completes. Lives here (rather than in internal/runtime/firecracker) so
+// the service layer can reference it without importing the runtime.
+var ErrSnapshotCorrupt = errors.New("snapshot integrity verification failed")
+
+// ErrTemplateNotRebuildable is returned by RequestTemplateRebuild when the
+// row is in a state where re-running the snapshot phase is unsafe or
+// unsupported:
+//
+//   - pending / building_rootfs / snapshotting: the initial build is in
+//     flight; the goroutine owns the row's state machine and a concurrent
+//     rebuild would race the goroutine's status writes.
+//   - ready_no_snapshot: the snapshot phase failed during initial build and
+//     the row has no usable snapshot artifact to re-derive from. A full
+//     from-scratch rebuild requires source-image access (deferred — see
+//     internal/service/template_health.go comments).
+//   - failed: terminal state from a failed initial build; operator must
+//     delete + recreate.
+//
+// apihttp.WriteStoreAwareError maps this to 412 Precondition Failed so the
+// operator's tooling can distinguish "row not in a rebuildable state" from
+// "row missing" (404) and "invalid request" (400).
+var ErrTemplateNotRebuildable = errors.New("template not eligible for rebuild")
 
 // GPUVendor identifies the GPU hardware vendor for sandbox GPU allocation.
 type GPUVendor string
@@ -120,10 +160,11 @@ func (g *GPURequest) Validate() error {
 // the runtime layer, we should already know the value is one we can act on.
 func ValidRuntime(value string) (string, error) {
 	switch value {
-	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata:
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker:
 		return value, nil
 	default:
-		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s)", value, RuntimeDocker, RuntimeGvisor, RuntimeKata)
+		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s)",
+			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker)
 	}
 }
 
@@ -144,6 +185,13 @@ func ResolveOCIRuntime(value string) (string, error) {
 	case RuntimeGvisor:
 		return "runsc", nil
 	case RuntimeKata:
+		return "", ErrRuntimeNotImplemented
+	case RuntimeFirecracker:
+		// Firecracker is a hypervisor, not an OCI runtime that Docker can
+		// shell out to. Reaching this branch means the service layer failed
+		// to dispatch the request away from the Docker driver — return
+		// ErrRuntimeNotImplemented so the failure is observable rather than
+		// silently coerced to a Docker default.
 		return "", ErrRuntimeNotImplemented
 	default:
 		return "", fmt.Errorf("unsupported runtime %q", value)
@@ -440,6 +488,27 @@ type CreateSandboxRequest struct {
 	// (Sandbox.CustomDomains) carries per-hostname status. Capped by
 	// MaxCustomDomainsPerCreateRequest.
 	CustomDomains []string `json:"custom_domains,omitempty"`
+	// TemplateID, when set alongside Runtime="firecracker", skips the
+	// per-create OCI→ext4 build and reuses a previously prepared
+	// rootfs.ext4 from a Firecracker template (POST /v1/templates). The
+	// template must be in status="ready" or Create rejects with a
+	// not-ready error. Ignored on the Docker path — templates are a
+	// Firecracker-only concept (see plans/snapshot-clone-fast-boot.md
+	// Phase 2). Pre-snapshot phase: the rootfs is the only artifact a
+	// template provides; Phase 3 layers snapshot.memory/state on top.
+	TemplateID string `json:"template_id,omitempty"`
+	// OverlaySizeGB, when > 0 and Runtime="firecracker", attaches a
+	// per-sandbox writable virtio-blk device (drive_id="overlay") of
+	// this size at /dev/vdb. On the snapshot-load fast-boot path the
+	// device must exist in the template snapshot's virtio-blk state —
+	// templates built before Phase 3 PR-B (has_overlay=false) reject
+	// this field with an error pointing at POST /v1/templates for a
+	// rebuild. The host allocates a sparse file; the guest is
+	// responsible for mkfs and mount (or set SB_FIRECRACKER_OVERLAY_MKFS
+	// on the daemon to have the host mkfs.ext4 the file at create time).
+	// Ignored on the Docker path. Capped at 1024 GiB by request
+	// validation; the daemon's admission control may reject smaller.
+	OverlaySizeGB int `json:"overlay_size_gb,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -553,6 +622,20 @@ type Sandbox struct {
 	// public hostnames. Status is server-managed (pending_dns → issuing →
 	// ready / failed). Nil when the sandbox has no custom domains.
 	CustomDomains []CustomDomain `json:"custom_domains,omitempty"`
+	// TemplateID records the Firecracker template this sandbox was created
+	// from, when one was supplied. Empty for Docker sandboxes and for
+	// Firecracker sandboxes built from an ad-hoc Image. The Phase 2 template
+	// GC reads this column via IsTemplateReferenced to decide whether a
+	// template is still in use; the firecracker driver also reads it on
+	// recreate so failover stays on the same rootfs.
+	TemplateID string `json:"template_id,omitempty"`
+	// OverlaySizeGB is the size of the per-sandbox writable overlay
+	// drive (virtio-blk at /dev/vdb), echoed back from the create
+	// request so callers can confirm what was provisioned. Zero means
+	// no overlay was attached. Persisted because the runtime cleanup
+	// path needs to know whether overlay.ext4 was allocated in the
+	// per-sandbox runDir.
+	OverlaySizeGB int `json:"overlay_size_gb,omitempty"`
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.
@@ -814,4 +897,129 @@ type IdempotentRequestRecord struct {
 	ReplayUntil time.Time
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+// TemplateStatus tracks a Firecracker template through its async build.
+// pending is the wire-visible state immediately after POST /v1/templates
+// (matches Phase 2 — clients that simply poll for ready keep working).
+// building_rootfs and snapshotting are intermediate states the Phase 3
+// two-phase build goroutine walks through. ready means rootfs+snapshot
+// are both on disk; ready_no_snapshot means rootfs is fine but the
+// snapshot phase failed (CID alloc, snapshotter error) — sandboxes can
+// still cold-boot from this template, just without fast-boot. failed
+// means even the rootfs phase did not complete; LastError carries the
+// reason for the operator to inspect. unhealthy is the Phase 6 PR-A
+// terminal state for "snapshot was ready and worked at least once, then
+// a load-time checksum mismatch proved the on-disk artifact is corrupt"
+// — distinct from ready_no_snapshot (which is build-time degradation)
+// so operators can alert on the runtime regression specifically. Cold-
+// boot still works against unhealthy because the rootfs is unaffected;
+// the service layer kicks an async rebuild that transitions back to
+// ready once the snapshot phase succeeds.
+type TemplateStatus string
+
+const (
+	TemplateStatusPending         TemplateStatus = "pending"
+	TemplateStatusBuildingRootfs  TemplateStatus = "building_rootfs"
+	TemplateStatusSnapshotting    TemplateStatus = "snapshotting"
+	TemplateStatusReady           TemplateStatus = "ready"
+	TemplateStatusReadyNoSnapshot TemplateStatus = "ready_no_snapshot"
+	TemplateStatusFailed          TemplateStatus = "failed"
+	TemplateStatusUnhealthy       TemplateStatus = "unhealthy"
+)
+
+// TemplatePushState tracks the lifecycle of the optional background push of a
+// Firecracker template's artifacts (rootfs.ext4 + snapshot.memory + snapshot.state
+// + manifest.json) to the AOCR registry under `cluster/<id>/templates/<tid>:latest`.
+// Mirrors SnapshotPushState* — operators see one push-state vocabulary across
+// snapshots and templates.
+//
+// "active" is the terminal value (push succeeded OR push is disabled / not
+// applicable on this node). New rows on a daemon with push disabled stay
+// "active" forever; the reconciler only picks "pending" and "error".
+const (
+	TemplatePushStateActive  = "active"
+	TemplatePushStatePending = "pending"
+	TemplatePushStatePushing = "pushing"
+	TemplatePushStateError   = "error"
+)
+
+// Template is the persisted record for a Firecracker rootfs template.
+// See plans/snapshot-clone-fast-boot.md Phase 2: an image is converted
+// once into a rootfs.ext4 and many sandboxes can boot from it without
+// re-running the skopeo+umoci+mkfs pipeline.
+//
+// RootfsPath is the absolute on-disk location of the prepared
+// rootfs.ext4 (`<FirecrackerTemplatesDir>/<id>/rootfs.ext4`). It is
+// json:"-" — the path is a server-internal detail that should not leak
+// to API callers; clients reference templates by ID.
+//
+// Snapshot* fields are populated by the Phase 3 second build phase.
+// HasSnapshot is the API-facing "this template fast-boots" flag — the
+// path/checksum/CID fields stay json:"-" because they are pure server
+// detail. SnapshotError carries the reason a template ended up
+// ready_no_snapshot (rootfs is usable, snapshot phase failed) so the
+// operator does not have to grep daemon logs.
+type Template struct {
+	ID                 string         `json:"id"`
+	Image              string         `json:"image"`
+	Status             TemplateStatus `json:"status"`
+	RootfsPath         string         `json:"-"`
+	RootfsSizeBytes    int64          `json:"rootfs_size_bytes,omitempty"`
+	MinSizeMiB         int            `json:"min_size_mib,omitempty"`
+	LastError          string         `json:"last_error,omitempty"`
+	CreatedAt          time.Time      `json:"created_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
+	ReadyAt            *time.Time     `json:"ready_at,omitempty"`
+	SnapshotMemoryPath string         `json:"-"`
+	SnapshotStatePath  string         `json:"-"`
+	SnapshotSizeBytes  int64          `json:"snapshot_size_bytes,omitempty"`
+	SnapshotChecksum   string         `json:"-"`
+	SnapshotVsockCID   uint32         `json:"-"`
+	SnapshotError      string         `json:"snapshot_error,omitempty"`
+	HasSnapshot        bool           `json:"has_snapshot"`
+	// HasOverlay is the API-facing "this template was built with a
+	// per-sandbox overlay drive placeholder baked into its snapshot
+	// state" flag. PR-A templates have it false; the snapshot-load path
+	// rejects an OverlaySizeGB request against a HasOverlay=false
+	// template because Firecracker cannot add a virtio-blk device
+	// post-load — only PATCH an existing one's backing path. Operators
+	// rebuild the template via POST /v1/templates to upgrade.
+	HasOverlay bool `json:"has_overlay"`
+	// PushState reflects the AOCR-push lifecycle for this template's
+	// artifacts (Phase 6 PR 6-B.1). See the TemplatePushState* constants.
+	// When push is disabled (or this is a warm-upgrade row) the value is
+	// "active" from the moment the row is inserted, matching pre-feature
+	// behaviour. Otherwise it transitions pending → pushing → active|error
+	// driven by TemplateArtifactPushReconciler.
+	PushState string `json:"push_state,omitempty"`
+	// PushError is populated only when PushState is "error" — the last
+	// error the reconciler saw, surfaced to operator-facing API responses.
+	PushError string `json:"push_error,omitempty"`
+	// RegistryRef is the canonical destination ref the push pipeline
+	// wrote (`<host>/cluster/<id>/templates/<tid>:latest`). Populated
+	// after a successful push; empty until then. Read by consumer-side
+	// code in PR 6-B.2 to know where peers can pull the template from.
+	RegistryRef string `json:"registry_ref,omitempty"`
+	// PushDigest is the manifest digest (`sha256:...`) the registry
+	// assigned to the pushed tag, as reported by the Docker push stream's
+	// `aux` payload. Empty when the daemon did not surface one — older
+	// daemons or registries that don't return a manifest digest leave
+	// this blank.
+	PushDigest string `json:"push_digest,omitempty"`
+}
+
+// CreateTemplateRequest is the body for POST /v1/templates. ID is
+// optional — empty means "service generates one"; supplying an explicit
+// ID lets a deploy pipeline assert idempotency across retries (the
+// store rejects a duplicate ID with ErrTemplateIDConflict → API 409).
+// Image is the skopeo-style ref ("docker://python:3.11",
+// "oci-archive:/path.tar", etc.) passed through verbatim to
+// pkg/oci.Builder. MinSizeMiB is an optional floor for the ext4 image —
+// useful when the unpacked rootfs is small but the operator expects
+// guests to write substantially more.
+type CreateTemplateRequest struct {
+	ID         string `json:"id,omitempty"`
+	Image      string `json:"image"`
+	MinSizeMiB int    `json:"min_size_mib,omitempty"`
 }

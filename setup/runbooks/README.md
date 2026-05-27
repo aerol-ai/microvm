@@ -11,6 +11,7 @@ Use them during incidents and during scheduled drills:
 | [backup-restore.md](backup-restore.md) | You need to restore a node or prove backups are usable. |
 | [lost-quorum-recovery.md](lost-quorum-recovery.md) | Raft has no leader because too many voter nodes are gone. |
 | [image-pull-storm.md](image-pull-storm.md) | Image pulls are queued, failing, rate-limited, or suppressed by backoff. |
+| [firecracker-template-health.md](firecracker-template-health.md) | Firecracker template push, pull, or rebuild metrics fire. |
 | [slo-breach.md](slo-breach.md) | Any sandboxd SLO alert fires and the first response is not obvious. |
 
 ## Incident Roles
@@ -56,6 +57,8 @@ Run these drills on a staging cluster at least monthly:
 - Lost quorum tabletop: walk the decision tree without creating `peers.json`.
 - Image pull storm drill: point one test workload at a deliberately missing
   image tag and verify backoff alerts.
+- Firecracker template health drill: mark a test template `unhealthy` via the
+  rebuild endpoint and confirm the rebuild path closes the gauge.
 - SLO breach drill: force a create backlog with a bounded load test and verify
   alert, dashboard, and mitigation steps.
 

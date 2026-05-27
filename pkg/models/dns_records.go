@@ -1,6 +1,7 @@
 package models
 
 import (
+	"fmt"
 	"net"
 	"strings"
 
@@ -35,7 +36,9 @@ const cloudflareNote = "Cloudflare/CDN: set the record to DNS only (gray cloud).
 // with A/AAAA records at the same name (RFC 1034 §3.6.2). DNS providers
 // reject the second row, so emitting both as "ready-to-paste" would just
 // trip the user up.
-func ComposeDNSRecords(hostnames []string, target IngressTarget) []DNSRecord {
+// `sandboxID` is provided to generate ownership verification records.
+// `txtNamePrefix` and `txtValuePrefix` allow customizing the verification TXT records.
+func ComposeDNSRecords(hostnames []string, target IngressTarget, sandboxID, txtNamePrefix, txtValuePrefix string) []DNSRecord {
 	if len(hostnames) == 0 {
 		return nil
 	}
@@ -59,19 +62,30 @@ func ComposeDNSRecords(hostnames []string, target IngressTarget) []DNSRecord {
 				Value:    target.Hostname,
 				Notes:    cloudflareNote,
 			})
-			continue
-		}
-		for _, ip := range target.IPs {
-			recType := DNSRecordTypeA
-			if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-				recType = DNSRecordTypeAAAA
+		} else {
+			for _, ip := range target.IPs {
+				recType := DNSRecordTypeA
+				if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+					recType = DNSRecordTypeAAAA
+				}
+				out = append(out, DNSRecord{
+					Hostname: host,
+					Type:     recType,
+					Name:     name,
+					Value:    ip,
+					Notes:    cloudflareNote,
+				})
 			}
+		}
+
+		// Add TXT verification record
+		if sandboxID != "" {
 			out = append(out, DNSRecord{
 				Hostname: host,
-				Type:     recType,
-				Name:     name,
-				Value:    ip,
-				Notes:    cloudflareNote,
+				Type:     "TXT",
+				Name:     fmt.Sprintf("%s.%s", txtNamePrefix, name),
+				Value:    fmt.Sprintf("%s%s", txtValuePrefix, sandboxID),
+				Notes:    "Required for domain ownership verification.",
 			})
 		}
 	}

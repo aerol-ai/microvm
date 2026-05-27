@@ -1607,11 +1607,238 @@ func TestStoreCases(t *testing.T) {
 				}
 			},
 		},
+		// Regression: the firecracker_tap_pool partial unique index on
+		// sandbox_id is the load-bearing primitive for the Firecracker
+		// boot path's idempotency (see pr-review.md §5 and
+		// plans/snapshot-clone-fast-boot.md). The shape mirrors the
+		// host_port index — any change to the schema or to
+		// AllocateFirecrackerTapSlot must re-run these cases AND the
+		// surrounding TryReserveHostPort regression next to it.
+		{
+			name: "firecracker_tap_pool_seed_is_idempotent",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				slot := FirecrackerTapSlot{
+					TapName: "fctap0", CIDR: "172.16.0.0/30",
+					HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 3,
+				}
+				if err := st.SeedFirecrackerTapSlot(ctx, slot, now); err != nil {
+					t.Fatalf("first seed: %v", err)
+				}
+				// Re-seeding the same tap_name must be a no-op (no error,
+				// no duplicate row).
+				if err := st.SeedFirecrackerTapSlot(ctx, slot, now); err != nil {
+					t.Fatalf("re-seed: %v", err)
+				}
+				stats, err := st.GetFirecrackerTapPoolStats(ctx)
+				if err != nil {
+					t.Fatalf("stats: %v", err)
+				}
+				if stats.Total != 1 {
+					t.Fatalf("Total = %d after duplicate seed, want 1", stats.Total)
+				}
+			},
+		},
+		{
+			name: "firecracker_tap_pool_rejects_reserved_vsock_cid",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
+					TapName: "fctap0", CIDR: "172.16.0.0/30",
+					HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 2,
+				}, time.Now().UTC())
+				if err == nil {
+					t.Fatal("expected error for reserved vsock_cid<3")
+				}
+			},
+		},
+		{
+			name: "firecracker_tap_pool_rejects_duplicate_vsock_cid",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				if err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
+					TapName: "fctap0", CIDR: "172.16.0.0/30",
+					HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 3,
+				}, now); err != nil {
+					t.Fatalf("seed slot 0: %v", err)
+				}
+				// Same vsock_cid on a different tap_name must trip the
+				// unique index. SQLite's single-writer model serializes
+				// the seed loop; this is just defense-in-depth.
+				err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
+					TapName: "fctap1", CIDR: "172.16.0.4/30",
+					HostIP: "172.16.0.5", GuestIP: "172.16.0.6", VsockCID: 3,
+				}, now)
+				if err == nil {
+					t.Fatal("expected unique-index violation for duplicate vsock_cid")
+				}
+			},
+		},
+		{
+			name: "firecracker_tap_pool_allocate_release_round_trip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				for i, cid := range []uint32{3, 4, 5} {
+					if err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
+						TapName:  "fctap" + iToStr(i),
+						CIDR:     "172.16." + iToStr(i) + ".0/30",
+						HostIP:   "172.16." + iToStr(i) + ".1",
+						GuestIP:  "172.16." + iToStr(i) + ".2",
+						VsockCID: cid,
+					}, now); err != nil {
+						t.Fatalf("seed slot %d: %v", i, err)
+					}
+				}
+				sb := sampleSandbox("sb-fc-alloc")
+				if err := st.Create(ctx, sb); err != nil {
+					t.Fatalf("create sandbox: %v", err)
+				}
+				slot, err := st.AllocateFirecrackerTapSlot(ctx, sb.ID, now)
+				if err != nil {
+					t.Fatalf("allocate: %v", err)
+				}
+				if slot.TapName == "" || slot.SandboxID != sb.ID {
+					t.Fatalf("allocated slot = %+v", slot)
+				}
+
+				// Idempotency: re-allocate for the same sandbox returns
+				// the same slot, not a second one.
+				again, err := st.AllocateFirecrackerTapSlot(ctx, sb.ID, now)
+				if err != nil {
+					t.Fatalf("re-allocate: %v", err)
+				}
+				if again.TapName != slot.TapName {
+					t.Fatalf("re-allocate returned a different slot: %s vs %s", again.TapName, slot.TapName)
+				}
+
+				// GetFirecrackerTapSlotBySandbox sees it.
+				got, err := st.GetFirecrackerTapSlotBySandbox(ctx, sb.ID)
+				if err != nil || got == nil {
+					t.Fatalf("get: %v / %+v", err, got)
+				}
+				if got.TapName != slot.TapName {
+					t.Fatalf("get returned %s, want %s", got.TapName, slot.TapName)
+				}
+
+				// Release returns the slot to the pool.
+				if err := st.ReleaseFirecrackerTapSlot(ctx, sb.ID); err != nil {
+					t.Fatalf("release: %v", err)
+				}
+				stats, err := st.GetFirecrackerTapPoolStats(ctx)
+				if err != nil {
+					t.Fatalf("stats: %v", err)
+				}
+				if stats.Allocated != 0 || stats.Free != 3 {
+					t.Fatalf("stats after release = %+v, want all free", stats)
+				}
+
+				// Re-allocate after release: any free slot is fine, and
+				// the partial unique index allows reuse of the freed one.
+				slot2, err := st.AllocateFirecrackerTapSlot(ctx, sb.ID, now)
+				if err != nil {
+					t.Fatalf("post-release allocate: %v", err)
+				}
+				if slot2.SandboxID != sb.ID {
+					t.Fatalf("post-release slot = %+v", slot2)
+				}
+			},
+		},
+		{
+			name: "firecracker_tap_pool_exhaustion_returns_sentinel",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				if err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
+					TapName: "fctap0", CIDR: "172.16.0.0/30",
+					HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 3,
+				}, now); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				sb1 := sampleSandbox("sb-fc-1")
+				sb2 := sampleSandbox("sb-fc-2")
+				for _, s := range []*models.Sandbox{sb1, sb2} {
+					if err := st.Create(ctx, s); err != nil {
+						t.Fatalf("create %s: %v", s.ID, err)
+					}
+				}
+				if _, err := st.AllocateFirecrackerTapSlot(ctx, sb1.ID, now); err != nil {
+					t.Fatalf("first allocate: %v", err)
+				}
+				// Pool is now exhausted — a second sandbox must get
+				// ErrNoFreeFirecrackerTapSlot, NOT silently steal the
+				// in-use slot. The admission controller upstream relies
+				// on this sentinel to return a clean 503-ish error.
+				_, err := st.AllocateFirecrackerTapSlot(ctx, sb2.ID, now)
+				if !errors.Is(err, ErrNoFreeFirecrackerTapSlot) {
+					t.Fatalf("expected ErrNoFreeFirecrackerTapSlot, got %v", err)
+				}
+			},
+		},
+		{
+			name: "firecracker_tap_pool_partial_unique_index_blocks_double_allocate",
+			run: func(t *testing.T) {
+				// Direct-SQL test of the partial unique index. The Go
+				// AllocateFirecrackerTapSlot path can't trigger this
+				// case (its idempotency check returns early), but a
+				// future code path that issues raw UPDATEs without that
+				// check would. Pinning the index here catches a
+				// migration that dropped it.
+				st := newTestStore(t)
+				now := time.Now().UTC()
+				if err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
+					TapName: "fctap0", CIDR: "172.16.0.0/30",
+					HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 3,
+				}, now); err != nil {
+					t.Fatalf("seed 0: %v", err)
+				}
+				if err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
+					TapName: "fctap1", CIDR: "172.16.0.4/30",
+					HostIP: "172.16.0.5", GuestIP: "172.16.0.6", VsockCID: 4,
+				}, now); err != nil {
+					t.Fatalf("seed 1: %v", err)
+				}
+				sb := sampleSandbox("sb-fc-dup")
+				if err := st.Create(ctx, sb); err != nil {
+					t.Fatalf("create sandbox: %v", err)
+				}
+				// First raw allocation
+				if _, err := st.db.ExecContext(ctx, `
+					UPDATE firecracker_tap_pool SET sandbox_id = ?, allocated_at = ?
+					WHERE tap_name = 'fctap0'`, sb.ID, now); err != nil {
+					t.Fatalf("first raw update: %v", err)
+				}
+				// Second raw allocation of a different row for the same
+				// sandbox_id — the partial unique index must reject.
+				_, err := st.db.ExecContext(ctx, `
+					UPDATE firecracker_tap_pool SET sandbox_id = ?, allocated_at = ?
+					WHERE tap_name = 'fctap1'`, sb.ID, now)
+				if err == nil {
+					t.Fatal("expected partial unique index to reject second slot for same sandbox_id")
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, tc.run)
 	}
+}
+
+// iToStr is a tiny int-to-string helper used by the firecracker_tap_pool
+// allocator tests to avoid pulling strconv into the file just for this.
+func iToStr(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	digits := []byte{}
+	for i > 0 {
+		digits = append([]byte{byte('0' + i%10)}, digits...)
+		i /= 10
+	}
+	return string(digits)
 }
 
 func TestStoreHelperCases(t *testing.T) {
@@ -1661,6 +1888,8 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // auto_import_pending
 			0,              // serverless
 			0,              // wake_armed
+			"",             // template_id
+			0,              // overlay_size_gb
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

@@ -29,6 +29,7 @@ import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
+import ai.aerol.microvm.model.CreateTemplateOptions;
 import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.DnsRecord;
@@ -51,6 +52,7 @@ import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
+import ai.aerol.microvm.model.Template;
 
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
@@ -69,6 +71,7 @@ public class MicroVMClient {
     private final String versionPrefix;
     private final HttpClient httpClient;
     private final WebSocketConnector webSocketConnector;
+    private final ai.aerol.microvm.model.RetryConfig retryConfig;
 
     public MicroVMClient() {
         this(new MicroVMConfig());
@@ -96,6 +99,7 @@ public class MicroVMClient {
         this.versionPrefix = prefix;
         this.httpClient = httpClient != null ? httpClient : effectiveConfig.httpClient != null ? effectiveConfig.httpClient : HttpClient.newHttpClient();
         this.webSocketConnector = webSocketConnector != null ? webSocketConnector : new JavaNetWebSocketConnector(this.httpClient);
+        this.retryConfig = effectiveConfig.retry != null ? effectiveConfig.retry : new ai.aerol.microvm.model.RetryConfig();
 
         if (this.patToken.isEmpty()) {
             throw new MicroVMException(AUTH_REQUIRED_ERROR_MESSAGE);
@@ -293,6 +297,60 @@ public class MicroVMClient {
 
     public void destroy(String sandboxId) {
         doNoContent("DELETE", sandboxPath(sandboxId), null);
+    }
+
+    /**
+     * Register a Firecracker rootfs template. Returns a row in
+     * {@code status="pending"} and kicks the daemon's async build. Poll
+     * {@link #getTemplate} until the row reaches
+     * {@link ai.aerol.microvm.model.TemplateStatus#READY} (fast-boot
+     * available) or
+     * {@link ai.aerol.microvm.model.TemplateStatus#READY_NO_SNAPSHOT}
+     * (cold boot only).
+     *
+     * <p>Idempotent when {@link CreateTemplateOptions#id} is supplied: a
+     * duplicate id returns 409 so a retried CI step does not register two
+     * rows for the same logical template.
+     */
+    public Template createTemplate(CreateTemplateOptions options) {
+        if (options == null || trimToNull(options.image) == null) {
+            throw new MicroVMException("image is required");
+        }
+        return doJson("POST", versioned("/templates"), options, Template.class);
+    }
+
+    public List<Template> listTemplates() {
+        Template[] response = doJson("GET", versioned("/templates"), null, Template[].class);
+        if (response == null) {
+            return Collections.emptyList();
+        }
+        return java.util.Arrays.asList(response);
+    }
+
+    public Template getTemplate(String templateId) {
+        return doJson("GET", versioned("/templates/" + templateId), null, Template.class);
+    }
+
+    public void deleteTemplate(String templateId) {
+        doNoContent("DELETE", versioned("/templates/" + templateId), null);
+    }
+
+    /**
+     * Re-run the snapshot phase against an existing template. Idempotent
+     * under concurrent retry: the daemon's CAS collapses N parallel calls
+     * for the same ready template into one rebuild kick. Returns the row
+     * in its post-transition state (typically
+     * {@link ai.aerol.microvm.model.TemplateStatus#UNHEALTHY}); poll
+     * {@link #getTemplate} to observe the transition back to
+     * {@link ai.aerol.microvm.model.TemplateStatus#READY}.
+     *
+     * <p>Throws {@link MicroVMException} wrapping HTTP 412 when the
+     * template is in a state where rebuild is unsafe (build in flight) or
+     * unsupported ({@code ready_no_snapshot} / {@code failed} — those need
+     * delete+recreate today).
+     */
+    public Template rebuildTemplate(String templateId) {
+        return doJson("POST", versioned("/templates/" + templateId + "/rebuild"), null, Template.class);
     }
 
     public Sandbox resize(String sandboxId, ResizeOptions options) {
@@ -770,20 +828,52 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
-        if (contentType != null) {
-            builder.header("Content-Type", contentType);
-        }
-        builder.header("Authorization", authorizationHeaderValue());
+        int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
+        int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
+        int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
+        
+        Exception lastException = null;
 
-        try {
-            return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
-        } catch (IOException | InterruptedException ex) {
-            if (ex instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
+            if (contentType != null) {
+                builder.header("Content-Type", contentType);
             }
-            throw new MicroVMException("request failed", ex);
+            builder.header("Authorization", authorizationHeaderValue());
+
+            try {
+                HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+                int status = response.statusCode();
+                if ((status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
+                    // Fall through to retry logic
+                } else {
+                    return response;
+                }
+            } catch (IOException | InterruptedException ex) {
+                if (ex instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                    throw new MicroVMException("request interrupted", ex);
+                }
+                lastException = ex;
+                if (attempt >= maxRetries) {
+                    break;
+                }
+            }
+
+            int delayMs = Math.min(baseDelay * (1 << attempt), maxDelay);
+            double jitter = 1.0 + (Math.random() - 0.5) * 0.5;
+            try {
+                Thread.sleep((long) (delayMs * jitter));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new MicroVMException("request interrupted during backoff", e);
+            }
         }
+
+        if (lastException != null) {
+            throw new MicroVMException("request failed after " + maxRetries + " retries", lastException);
+        }
+        throw new MicroVMException("request failed after " + maxRetries + " retries");
     }
 
     private void ensureSuccess(HttpResponse<byte[]> response) {

@@ -17,9 +17,11 @@ locals {
   # DNS records) and Ansible (day-2 rotation) read from the SoT. Lifted into
   # named locals so the rest of the .tf files don't sprinkle
   # local.cluster_ops.ingress.* / local.cluster_secrets.cluster.* everywhere.
-  domain_name = local.cluster_ops.ingress.domain_name
-  acme_email  = local.cluster_ops.ingress.acme_email
-  pat_token   = local.cluster_secrets.cluster.pat_token
+  domain_name                    = local.cluster_ops.ingress.domain_name
+  acme_email                     = local.cluster_ops.ingress.acme_email
+  custom_domain_txt_prefix       = local.cluster_ops.ingress.custom_domain_txt_prefix
+  custom_domain_txt_value_prefix = local.cluster_ops.ingress.custom_domain_txt_value_prefix
+  pat_token                      = local.cluster_secrets.cluster.pat_token
 
   # Normalise each node entry with its effective values (per-node overrides
   # win, then var.default_*). Doing this once here keeps nodes.tf / dns.tf
@@ -37,6 +39,7 @@ locals {
       ami_id            = coalesce(n.ami_id, var.ami_id, data.aws_ami.ubuntu.id)
       # bool defaults need explicit null handling — coalesce treats `false` as
       # a real value, but optional() without a default returns null.
+      with_firecracker = n.with_firecracker == null ? var.default_with_firecracker : n.with_firecracker
       with_gvisor      = n.with_gvisor == null ? var.default_with_gvisor : n.with_gvisor
       with_nvidia_gpu  = n.with_nvidia_gpu == null ? var.default_with_nvidia_gpu : n.with_nvidia_gpu
       with_amd_gpu     = n.with_amd_gpu == null ? var.default_with_amd_gpu : n.with_amd_gpu

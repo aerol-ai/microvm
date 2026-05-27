@@ -63,6 +63,19 @@ type Limits struct {
 	// the real backstop when this is set high. Same clamping as the CPU
 	// factor.
 	MemoryOverProvisionFactor float64
+	// RSSWatermarkRatio is the Phase 5 memory-overcommit safety floor,
+	// expressed as a fraction of host memory. Admission rejects a
+	// request when EffectiveMemoryFree (HostMem - sum-of-VMM-RSS) would
+	// drop below this watermark after admit. 0 disables the check (the
+	// default) — operators opt in by setting the env var, and the check
+	// is also gated on a non-nil RSSSource whose Ready() returns true,
+	// so a pre-tick daemon falls back to nominal accounting. The point
+	// of this axis is to safely raise MemoryOverProvisionFactor:
+	// nominal accounting caps you at "host RAM × ratio × factor" but
+	// can't see whether VMMs are actually touching the memory they
+	// reserved; the watermark says "regardless of nominal, keep this
+	// much real free RAM in reserve for the next RSS spike."
+	RSSWatermarkRatio float64
 }
 
 // Request is the per-sandbox resource ask, in normalized units. CPU is
@@ -71,13 +84,17 @@ type Limits struct {
 // required vendor when GPUs > 0 and is matched against HostInfo.GPUVendor
 // at admission/placement time. Runtime is the OCI runtime identifier
 // ("docker", "gvisor", ...) — empty means "any runtime the host supports."
+// TemplateID, when set alongside Runtime="firecracker", lets placement
+// prefer (and gate on) peers that already have the template's artifacts
+// cached locally — empty means "any host," matching pre-Phase-6 behaviour.
 type Request struct {
-	CPU       float64
-	MemoryMB  int
-	DiskGB    int
-	GPUs      int
-	GPUVendor string
-	Runtime   string
+	CPU        float64
+	MemoryMB   int
+	DiskGB     int
+	GPUs       int
+	GPUVendor  string
+	Runtime    string
+	TemplateID string
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -111,6 +128,17 @@ type Snapshot struct {
 	// MemoryFloorMB is the absolute floor derived from MemoryFloorRatio and
 	// host memory, exposed for operators reading /capacity.
 	MemoryFloorMB int `json:"memory_floor_mb"`
+	// Phase 5 effective-memory axis. ActualRSSMB is the live aggregate
+	// from the per-VMM sampler; EffectiveMemoryFreeMB is the headroom
+	// admission actually decides against (HostMem - ActualRSSMB);
+	// RSSWatermarkMB is the absolute floor derived from
+	// RSSWatermarkRatio. All four are 0 on hosts without a sampler so
+	// peers running older binaries report 0 and placement falls back to
+	// nominal accounting rather than treating "0" as "host is empty".
+	ActualRSSMB           int     `json:"actual_rss_mb,omitempty"`
+	EffectiveMemoryFreeMB int     `json:"effective_memory_free_mb,omitempty"`
+	RSSWatermarkMB        int     `json:"rss_watermark_mb,omitempty"`
+	RSSWatermarkRatio     float64 `json:"rss_watermark_ratio,omitempty"`
 	// CPUBudget and MemoryBudgetMB are the post-overcommit budgets actually
 	// used by Admit, exposed so operators can see the effective ceiling.
 	CPUBudget      float64 `json:"cpu_budget"`
@@ -127,12 +155,45 @@ type Snapshot struct {
 	// doesn't have, say, runsc installed. Empty = legacy node, treated as
 	// supporting any runtime so rolling upgrades don't strand pre-D peers.
 	SupportedRuntimes []string `json:"supported_runtimes,omitempty"`
+	// LocalTemplateInventoryKnown distinguishes an authoritative empty
+	// Firecracker template inventory from a legacy/unknown peer. When
+	// false, placement treats LocalTemplateIDs as "unknown, allow" for
+	// rolling upgrades and just-joined nodes. When true, an empty
+	// LocalTemplateIDs slice means this host definitely has no local
+	// templates cached.
+	LocalTemplateInventoryKnown bool `json:"local_template_inventory_known,omitempty"`
+	// LocalTemplateIDs lists the Firecracker templates whose artifact
+	// files (rootfs.ext4 + snapshot.{memory,state}) are present on this
+	// host. Placement gates a Firecracker create against it so a clone
+	// against a template the target has never seen lands on a node that
+	// already has it — preserving the <100ms boot promise. Consult
+	// LocalTemplateInventoryKnown before treating an empty list as
+	// authoritative: pre-upgrade peers omit both fields and degrade to
+	// pre-feature behaviour, while known=true plus an empty list means
+	// "definitely no local templates here."
+	LocalTemplateIDs []string `json:"local_template_ids,omitempty"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads
 // /proc/meminfo MemAvailable. Tests can substitute a fake.
 type MemProbe interface {
 	FreeMB() (int, error)
+}
+
+// RSSSource is the Phase 5 bridge for the per-VMM RSS sampler that
+// lives in internal/runtime/firecracker. The structural shape keeps
+// pkg/capacity from importing the runtime package (and forming a
+// cycle through main.go); the sampler satisfies the interface without
+// declaring it.
+//
+// TotalRSSMB returns the most recent aggregate in MB; Ready reports
+// whether the sampler has produced at least one observation. Admission
+// only consults TotalRSSMB when Ready returns true — pre-tick, the
+// "0 MB resident" reading is indistinguishable from "host is empty"
+// and falsely admits under any non-zero RSSWatermarkRatio.
+type RSSSource interface {
+	TotalRSSMB() int
+	Ready() bool
 }
 
 // HostInfo describes the static host capacity.
@@ -164,6 +225,7 @@ type Admitter struct {
 	host   HostInfo
 	limits Limits
 	probe  MemProbe
+	rss    RSSSource // Phase 5; nil disables the RSS-watermark axis
 
 	mu           sync.Mutex
 	reservations map[string]Request
@@ -175,7 +237,19 @@ type Admitter struct {
 
 // New builds an admitter. host should reflect the machine's total capacity;
 // callers that don't care about per-host detection can use DetectHost.
+//
+// New constructs without an RSSSource (the Phase 5 memory-overcommit
+// axis is disabled). Callers that want it should use NewWithRSSSource —
+// kept as a separate constructor rather than adding a fifth positional
+// arg here so existing call sites in tests and cluster bootstrapping
+// stay untouched.
 func New(host HostInfo, limits Limits, probe MemProbe) *Admitter {
+	return NewWithRSSSource(host, limits, probe, nil)
+}
+
+// NewWithRSSSource builds an admitter wired to a Phase 5 RSS source.
+// nil rss is equivalent to New — the watermark check is skipped.
+func NewWithRSSSource(host HostInfo, limits Limits, probe MemProbe, rss RSSSource) *Admitter {
 	// Default SupportedRuntimes to {"docker"} — every host that doesn't
 	// override is by definition a docker host (this binary requires it).
 	// Without this default, placement would treat unset SupportedRuntimes
@@ -188,6 +262,7 @@ func New(host HostInfo, limits Limits, probe MemProbe) *Admitter {
 		host:         host,
 		limits:       limits,
 		probe:        probe,
+		rss:          rss,
 		reservations: make(map[string]Request),
 	}
 }
@@ -305,6 +380,21 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 		}
 	}
 
+	// Phase 5: effective-memory watermark. Gated on a non-nil sampler
+	// AND Ready() — a cold-start sampler returns 0, which under a
+	// non-zero ratio would otherwise look like "host is empty" and
+	// falsely admit. Pre-tick we fall through to nominal accounting.
+	if watermark := a.rssWatermarkMB(); watermark > 0 && a.rss != nil && a.rss.Ready() {
+		actual := a.rss.TotalRSSMB()
+		effective := a.host.MemoryTotalMB - actual
+		if effective-req.MemoryMB < watermark {
+			reasons = append(reasons, fmt.Sprintf(
+				"effective memory below rss watermark (effective=%d MB - req=%d MB < floor=%d MB)",
+				effective, req.MemoryMB, watermark,
+			))
+		}
+	}
+
 	if len(reasons) > 0 {
 		return fmt.Errorf("%w: %v", ErrCapacityExceeded, reasons)
 	}
@@ -380,6 +470,16 @@ func (a *Admitter) Snapshot() Snapshot {
 		diskFree = v
 	}
 
+	// Phase 5: only surface RSS fields when a sampler is wired in and
+	// has produced at least one observation. Reporting 0 on a host
+	// without the axis would mislead placement on peers running the
+	// new binary into thinking the old peer has zero RSS in use.
+	var actualRSS, effectiveFree int
+	if a.rss != nil && a.rss.Ready() {
+		actualRSS = a.rss.TotalRSSMB()
+		effectiveFree = max(a.host.MemoryTotalMB-actualRSS, 0)
+	}
+
 	snap := Snapshot{
 		HostCPUCores:              a.host.CPUCores,
 		HostMemoryTotalMB:         a.host.MemoryTotalMB,
@@ -408,6 +508,10 @@ func (a *Admitter) Snapshot() Snapshot {
 		GPUCount:                  a.host.GPUCount,
 		GPUVendor:                 a.host.GPUVendor,
 		SupportedRuntimes:         a.host.SupportedRuntimes,
+		ActualRSSMB:               actualRSS,
+		EffectiveMemoryFreeMB:     effectiveFree,
+		RSSWatermarkMB:            a.rssWatermarkMB(),
+		RSSWatermarkRatio:         a.limits.RSSWatermarkRatio,
 	}
 	// Use the smallest meaningful request (1 CPU, 1 MB) as the probe ask.
 	// We don't use 0/0 because that bypasses every check and would always
@@ -464,6 +568,12 @@ func (a *Admitter) dryRun(req Request) (bool, []string) {
 			reasons = append(reasons, fmt.Sprintf("live memory floor breached (%d MB free, %d MB floor)", free, floor))
 		}
 	}
+	if watermark := a.rssWatermarkMB(); watermark > 0 && a.rss != nil && a.rss.Ready() {
+		effective := a.host.MemoryTotalMB - a.rss.TotalRSSMB()
+		if effective-req.MemoryMB < watermark {
+			reasons = append(reasons, fmt.Sprintf("effective memory below rss watermark (%d MB free, %d MB floor)", effective, watermark))
+		}
+	}
 	return len(reasons) == 0, reasons
 }
 
@@ -474,6 +584,17 @@ func (a *Admitter) memoryFloorMB() int {
 		return 0
 	}
 	return int(float64(a.host.MemoryTotalMB) * a.limits.MemoryFloorRatio)
+}
+
+// rssWatermarkMB is the absolute "keep this much real RAM in reserve"
+// floor derived from RSSWatermarkRatio and host memory. Returns 0 when
+// disabled or unknown — the gate check on the call sites already treats
+// 0 as "skip the check", so callers don't need a separate enable flag.
+func (a *Admitter) rssWatermarkMB() int {
+	if a.limits.RSSWatermarkRatio <= 0 || a.host.MemoryTotalMB <= 0 {
+		return 0
+	}
+	return int(float64(a.host.MemoryTotalMB) * a.limits.RSSWatermarkRatio)
 }
 
 // cpuOverProvisionFactor returns the effective CPU overcommit multiplier.

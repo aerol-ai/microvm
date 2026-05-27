@@ -33,9 +33,11 @@ type customDomainsV1Env struct {
 func newCustomDomainsV1Env(t *testing.T, cfgOverride func(*config.Config)) *customDomainsV1Env {
 	t.Helper()
 	cfg := config.Config{
-		EnableCustomDomains:        true,
-		Domain:                     "aerol.cloud",
-		CustomDomainsMaxPerSandbox: models.MaxCustomDomainsPerSandbox,
+		EnableCustomDomains:           true,
+		Domain:                        "aerol.cloud",
+		CustomDomainsMaxPerSandbox:    models.MaxCustomDomainsPerSandbox,
+		CustomDomainVerifyPrefix:      "_aerol-verify",
+		CustomDomainVerifyValuePrefix: "aerol-verify=",
 	}
 	if cfgOverride != nil {
 		cfgOverride(&cfg)
@@ -49,6 +51,12 @@ func newCustomDomainsV1Env(t *testing.T, cfgOverride func(*config.Config)) *cust
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	caddyClient := caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second})
 	svc := service.New(cfg, logger, st, &noopRuntime{}, nil, caddyClient, nil, nil, nil)
+	svc.SetDNSResolver(&mockDNSResolver{
+		records: map[string][]string{
+			"_aerol-verify.api.acme.com": {"aerol-verify=sb-1", "aerol-verify=sb-a", "aerol-verify=sb-b"},
+			"_aerol-verify.acme.com":     {"aerol-verify=sb-1"},
+		},
+	})
 
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{

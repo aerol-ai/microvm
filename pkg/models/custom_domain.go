@@ -80,6 +80,8 @@ var (
 	// ErrCustomDomainPerSandboxCap is returned by AddCustomDomain when the
 	// sandbox already holds MaxCustomDomainsPerSandbox rows. Surfaced as 409.
 	ErrCustomDomainPerSandboxCap = fmt.Errorf("at most %d custom domains per sandbox", MaxCustomDomainsPerSandbox)
+	// ErrCustomDomainVerificationFailed is returned when the DNS TXT record check fails.
+	ErrCustomDomainVerificationFailed = errors.New("custom domain TXT record verification failed")
 )
 
 // NormalizeCustomDomain lowercases, strips a trailing dot, and validates the

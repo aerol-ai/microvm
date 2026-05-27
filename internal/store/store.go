@@ -240,6 +240,136 @@ func Open(path string) (*Store, error) {
 			scheduled_at DATETIME NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_image_gc_scheduled_at ON pending_image_gc(scheduled_at);`,
+		// firecracker_tap_pool is the pre-populated network-slot pool for
+		// the native Firecracker runtime. Each row is one "slot" — a
+		// (TAP-device, host-IP, guest-IP, /30 CIDR, vsock-CID) tuple. The
+		// daemon seeds the table at boot from SB_FIRECRACKER_TAP_BASE_CIDR
+		// / SB_FIRECRACKER_TAP_POOL_SIZE; sandbox creates claim one slot,
+		// destroys release it. The seed is idempotent (INSERT OR IGNORE
+		// on tap_name PK) so warm restarts do not re-shuffle assignments.
+		//
+		// sandbox_id is NULL when the slot is free, set to the owning
+		// sandbox when claimed. The partial unique index below enforces
+		// exactly one allocated slot per sandbox — the load-bearing
+		// idempotency primitive for the Firecracker boot path (mirrors
+		// the host_port partial unique index in shape and purpose; see
+		// pr-review.md §5 + plans/snapshot-clone-fast-boot.md).
+		`CREATE TABLE IF NOT EXISTS firecracker_tap_pool (
+			tap_name TEXT PRIMARY KEY,
+			cidr TEXT NOT NULL,
+			host_ip TEXT NOT NULL,
+			guest_ip TEXT NOT NULL,
+			vsock_cid INTEGER NOT NULL,
+			sandbox_id TEXT,
+			created_at DATETIME NOT NULL,
+			allocated_at DATETIME
+		);`,
+		// Partial unique index — exactly one row per sandbox at a time.
+		// Two concurrent Allocate calls race to UPDATE a free slot, and
+		// the index rejects a second claim under the same sandbox_id.
+		// SQLite's single writer serializes the contest; the index
+		// guarantees correctness if a future change ever moves us off it.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_tap_pool_sandbox
+			ON firecracker_tap_pool(sandbox_id) WHERE sandbox_id IS NOT NULL;`,
+		// vsock CIDs are globally unique per host (the AF_VSOCK guest_cid
+		// space is host-flat). Unique-not-partial because every row carries
+		// a non-null CID — the pool is pre-allocated with monotonic CIDs
+		// starting at 3 (CIDs 0/1/2 are reserved by the virtio-vsock spec).
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_tap_pool_vsock_cid
+			ON firecracker_tap_pool(vsock_cid);`,
+		// firecracker_vmm_pool is the Phase 4 warm-VMM pool: one row per
+		// pre-spawned, snapshot-loaded, paused Firecracker process kept
+		// ready to be PATCH'd onto a per-sandbox TAP + overlay and Resumed.
+		// The row IS the slot's source of truth — status transitions live
+		// here, not in goroutine state, so a daemon restart can rediscover
+		// what's spawning vs. loaded vs. allocated without trawling /proc.
+		//
+		// Lifecycle (see plans/snapshot-clone-fast-boot.md §"Piece 4 — The
+		// VMM pool" and the PR-A foundation plan):
+		//
+		//   INSERT 'spawning' → 'loaded'    (refill goroutine, PR 4-B)
+		//                     → 'released'  (spawner failed)
+		//   'loaded'          → 'allocated' (sandbox create claims it)
+		//   'allocated'       → 'released'  (sandbox destroyed)
+		//   'released'        → row deleted (GC sweep after TTL)
+		//
+		// sandbox_id is NULL except in 'allocated'. The partial unique
+		// index below enforces exactly one allocated slot per sandbox —
+		// the load-bearing idempotency primitive for the snapshot-clone
+		// boot path, mirroring firecracker_tap_pool's idx_..._sandbox in
+		// shape and purpose (pr-review.md §5).
+		//
+		// template_id is the snapshot lineage, not a foreign key
+		// constraint — a soft reference so the template-GC sweep can
+		// proceed while loaded slots remain in flight; the pool GC drops
+		// stragglers separately.
+		`CREATE TABLE IF NOT EXISTS firecracker_vmm_pool (
+			id TEXT PRIMARY KEY,
+			template_id TEXT NOT NULL,
+			status TEXT NOT NULL,
+			sandbox_id TEXT,
+			api_socket TEXT NOT NULL DEFAULT '',
+			run_dir TEXT NOT NULL DEFAULT '',
+			vsock_cid INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			loaded_at DATETIME,
+			allocated_at DATETIME,
+			released_at DATETIME,
+			last_error TEXT NOT NULL DEFAULT ''
+		);`,
+		// Partial unique on sandbox_id — exactly one 'allocated' row per
+		// sandbox at a time. Two concurrent Allocate calls race to UPDATE
+		// a free 'loaded' row, and the index rejects a second claim under
+		// the same sandbox_id. SQLite's single writer serializes the
+		// contest; the index keeps correctness if a future change moves
+		// us off it. Mirrors idx_firecracker_tap_pool_sandbox exactly.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_firecracker_vmm_pool_sandbox
+			ON firecracker_vmm_pool(sandbox_id) WHERE sandbox_id IS NOT NULL;`,
+		// Compound index on (template_id, status) drives the two hot
+		// reads: "give me one loaded row for this template" (Allocate)
+		// and "how many non-released rows does this template have?"
+		// (refill goroutine in PR 4-B). Without this, both become full
+		// scans once the pool grows past a handful of slots.
+		`CREATE INDEX IF NOT EXISTS idx_firecracker_vmm_pool_template_status
+			ON firecracker_vmm_pool(template_id, status);`,
+		// Partial index on released_at keeps the GC sweep cheap even when
+		// the steady-state count of released rows is zero. Predicate is
+		// the GC selector verbatim so SQLite can use the index without a
+		// post-filter.
+		`CREATE INDEX IF NOT EXISTS idx_firecracker_vmm_pool_released_at
+			ON firecracker_vmm_pool(released_at) WHERE status = 'released';`,
+		// firecracker_templates is the Phase 2 catalogue: one row per
+		// pre-built rootfs.ext4 the operator has registered via
+		// POST /v1/templates. The build is async — the row lands in
+		// status='pending' first and the background goroutine transitions
+		// it to 'ready' (with rootfs_size_bytes populated and ready_at
+		// stamped) or 'failed' (with last_error). The GC sweep drops rows
+		// that are no longer referenced by any sandbox and have been idle
+		// past FirecrackerTemplateGCTTL — see ListGCEligibleTemplates.
+		`CREATE TABLE IF NOT EXISTS firecracker_templates (
+			id TEXT PRIMARY KEY,
+			image TEXT NOT NULL,
+			status TEXT NOT NULL,
+			rootfs_path TEXT NOT NULL DEFAULT '',
+			rootfs_size_bytes INTEGER NOT NULL DEFAULT 0,
+			min_size_mib INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			ready_at DATETIME,
+			snapshot_memory_path TEXT NOT NULL DEFAULT '',
+			snapshot_state_path TEXT NOT NULL DEFAULT '',
+			snapshot_size_bytes INTEGER NOT NULL DEFAULT 0,
+			snapshot_checksum TEXT NOT NULL DEFAULT '',
+			snapshot_vsock_cid INTEGER NOT NULL DEFAULT 0,
+			snapshot_error TEXT NOT NULL DEFAULT '',
+			has_snapshot INTEGER NOT NULL DEFAULT 0,
+			has_overlay INTEGER NOT NULL DEFAULT 0
+		);`,
+		// Drives the GC sweep's "find rows older than X" query without a
+		// full scan once the catalogue grows beyond a handful of entries.
+		`CREATE INDEX IF NOT EXISTS idx_firecracker_templates_updated_at
+			ON firecracker_templates(updated_at);`,
 	}
 
 	for _, stmt := range stmts {
@@ -329,6 +459,45 @@ func Open(path string) (*Store, error) {
 		// exactly as before.
 		`ALTER TABLE sandboxes ADD COLUMN serverless INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN wake_armed INTEGER NOT NULL DEFAULT 0;`,
+		// Phase 2 — Firecracker template lineage. Default '' so warm-upgrade
+		// rows (including every Docker sandbox) read as "no template
+		// reference" without further migration. The partial index below is
+		// what the template GC uses to answer "is anyone still using this
+		// template?" without scanning the whole sandboxes table.
+		`ALTER TABLE sandboxes ADD COLUMN template_id TEXT NOT NULL DEFAULT '';`,
+		// Phase 3 — snapshot-clone fast-boot columns. All default to the
+		// "no snapshot" zero values so a warm-upgraded Phase 2 row reads as
+		// HasSnapshot=false and the runtime falls back to cold-boot. The
+		// snapshot phase writes them via UpdateTemplateSnapshotReady once
+		// snapshot.memory + snapshot.state are on disk.
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_memory_path TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_state_path TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_size_bytes INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_checksum TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_vsock_cid INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE firecracker_templates ADD COLUMN snapshot_error TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN has_snapshot INTEGER NOT NULL DEFAULT 0;`,
+		// Phase 3 PR-B — per-sandbox overlay drive plumbing. has_overlay on
+		// templates lets the runtime reject snapshot-load+overlay requests
+		// against PR-A templates (which lack the placeholder drive in their
+		// snapshot state) with a clear "rebuild template" error rather than
+		// failing mid-PATCH. overlay_size_gb on sandboxes is mirrored from
+		// the create request so the runtime cleanup path knows whether
+		// overlay.ext4 was allocated in the per-sandbox runDir.
+		`ALTER TABLE firecracker_templates ADD COLUMN has_overlay INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE sandboxes ADD COLUMN overlay_size_gb INTEGER NOT NULL DEFAULT 0;`,
+		// Phase 6 PR 6-B.1 — background push of Firecracker template
+		// artifacts to AOCR. Mirrors the sandbox_snapshots push_state
+		// migration above (ALTER ... ADD push_state at line ~444). Default
+		// 'active' so warm-upgrade rows (built before this feature existed)
+		// are treated as terminal — the reconciler ignores them. New rows
+		// that need push start at 'pending' and transition through
+		// 'pushing' to 'active' or 'error'. registry_ref + push_digest are
+		// populated on success and read by PR 6-B.2's consumer-side pull.
+		`ALTER TABLE firecracker_templates ADD COLUMN push_state TEXT NOT NULL DEFAULT 'active';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN registry_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE firecracker_templates ADD COLUMN push_digest TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -352,6 +521,16 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_auto_import_pending ON sandboxes(id) WHERE auto_import_pending = 1;`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes auto_import_pending index: %w", err)
+	}
+
+	// Partial index on the new template_id column. The template GC and
+	// DELETE-template both call IsTemplateReferenced (a SELECT 1 ... WHERE
+	// template_id = ? LIMIT 1) which becomes an index probe instead of a
+	// table scan. Predicate keeps the index empty for Docker sandboxes and
+	// for Firecracker sandboxes built from ad-hoc images.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_template_id ON sandboxes(template_id) WHERE template_id <> '';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes template_id index: %w", err)
 	}
 
 	// SQLite materialized the DB file (and the WAL/SHM sidecars on the
@@ -423,8 +602,10 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			serverless, wake_armed,
+			template_id,
+			overlay_size_gb
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -465,6 +646,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.AutoImportPending),
 		boolToInt(sandbox.Lifecycle.Serverless),
 		boolToInt(sandbox.WakeArmed),
+		strings.TrimSpace(sandbox.TemplateID),
+		sandbox.OverlaySizeGB,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -528,8 +711,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			serverless, wake_armed,
+			template_id,
+			overlay_size_gb
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -563,7 +748,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			registry_auth_sealed = excluded.registry_auth_sealed,
 			auto_import_pending = excluded.auto_import_pending,
 			serverless = excluded.serverless,
-			wake_armed = excluded.wake_armed
+			wake_armed = excluded.wake_armed,
+			template_id = excluded.template_id,
+			overlay_size_gb = excluded.overlay_size_gb
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -604,6 +791,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.AutoImportPending),
 		boolToInt(sandbox.Lifecycle.Serverless),
 		boolToInt(sandbox.WakeArmed),
+		strings.TrimSpace(sandbox.TemplateID),
+		sandbox.OverlaySizeGB,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -626,7 +815,9 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
+			serverless, wake_armed,
+			template_id,
+			overlay_size_gb
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -666,7 +857,9 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			net_quota_exceeded, net_quota_exceeded_at,
 			registry_auth_sealed,
 			auto_import_pending,
-			serverless, wake_armed
+			serverless, wake_armed,
+			template_id,
+			overlay_size_gb
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -1660,6 +1853,647 @@ func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
 	return nil
 }
 
+// CreateTemplate inserts a freshly-allocated template row. Callers set
+// status=pending and an empty rootfs_path; the build goroutine flips both
+// via UpdateTemplateStatus once mkfs returns. A PK collision becomes
+// ErrTemplateIDConflict so an operator pipeline that retries POST with an
+// explicit ID gets a 409 instead of a 500.
+func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) error {
+	if template == nil {
+		return errors.New("create template: nil template")
+	}
+	id := strings.TrimSpace(template.ID)
+	if id == "" {
+		return errors.New("create template: id is required")
+	}
+	image := strings.TrimSpace(template.Image)
+	if image == "" {
+		return errors.New("create template: image is required")
+	}
+	status := string(template.Status)
+	if status == "" {
+		status = string(models.TemplateStatusPending)
+	}
+	var readyAt any
+	if template.ReadyAt != nil {
+		readyAt = template.ReadyAt.UTC()
+	}
+	// push_state defaults to "active" when the caller leaves it blank so
+	// CreateTemplate stays backward-compatible with code paths that don't
+	// know about the Phase 6 PR 6-B.1 push pipeline. The build success
+	// hook in template.go flips it to "pending" after the row is in
+	// status=ready, so the reconciler never sees a half-built row.
+	pushState := strings.TrimSpace(template.PushState)
+	if pushState == "" {
+		pushState = models.TemplatePushStateActive
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO firecracker_templates (
+			id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		id,
+		image,
+		status,
+		strings.TrimSpace(template.RootfsPath),
+		template.RootfsSizeBytes,
+		template.MinSizeMiB,
+		template.LastError,
+		template.CreatedAt.UTC(),
+		template.UpdatedAt.UTC(),
+		readyAt,
+		strings.TrimSpace(template.SnapshotMemoryPath),
+		strings.TrimSpace(template.SnapshotStatePath),
+		template.SnapshotSizeBytes,
+		strings.TrimSpace(template.SnapshotChecksum),
+		template.SnapshotVsockCID,
+		template.SnapshotError,
+		boolToInt(template.HasSnapshot),
+		boolToInt(template.HasOverlay),
+		pushState,
+		template.PushError,
+		strings.TrimSpace(template.RegistryRef),
+		strings.TrimSpace(template.PushDigest),
+	)
+	if err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			return ErrTemplateIDConflict
+		}
+		return fmt.Errorf("create template: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE id = ?
+	`, strings.TrimSpace(id))
+	template, err := scanTemplate(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get template: %w", err)
+	}
+	return template, nil
+}
+
+func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		ORDER BY created_at DESC, id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list templates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// UpdateTemplateStatus is the rootfs-phase seam the build goroutine uses
+// to transition between pending / building_rootfs / ready / ready_no_snapshot
+// / failed. rootfsPath, sizeBytes, and lastError are overwritten
+// unconditionally (including to empty on the success path) so a retried
+// build that succeeds doesn't have to remember to clear stale error text.
+// ready_at is stamped on the ready and ready_no_snapshot transitions
+// (both are terminal-and-usable states); the GC sweep treats "no ready_at"
+// as "never finished building" and leaves the row alone for the build
+// goroutine to finish or fail.
+//
+// The snapshot phase uses UpdateTemplateSnapshotReady / Failed instead so
+// the snapshot columns and the ready transition land in one row update —
+// readers never observe "status=ready but has_snapshot=0".
+func (s *Store) UpdateTemplateStatus(ctx context.Context, id string, status models.TemplateStatus, rootfsPath, lastError string, sizeBytes int64) error {
+	now := time.Now().UTC()
+	var readyAt any
+	if status == models.TemplateStatusReady || status == models.TemplateStatusReadyNoSnapshot {
+		readyAt = now
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, rootfs_path = ?, rootfs_size_bytes = ?, last_error = ?,
+			updated_at = ?, ready_at = COALESCE(?, ready_at)
+		WHERE id = ?
+	`,
+		string(status),
+		strings.TrimSpace(rootfsPath),
+		sizeBytes,
+		lastError,
+		now,
+		readyAt,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTemplateSnapshotReady is the terminal-success seam for the
+// snapshot phase. Writes the snapshot artifact metadata and flips
+// status=ready / has_snapshot=1 / has_overlay=hasOverlay in one UPDATE
+// so a concurrent reader (CreateSandbox racing the build goroutine)
+// never observes "status=ready but the snapshot fields are still zero".
+// snapshot_error is unconditionally cleared so a retried build that
+// finally succeeds doesn't carry a stale message. hasOverlay is true
+// for every PR-B-built template (the snapshot capture path always
+// includes the overlay placeholder); kept as a parameter so a future
+// "snapshot without overlay" build profile (e.g. a tiny boot-only
+// template) does not require a schema change.
+func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, statePath string, sizeBytes int64, checksum string, vsockCID uint32, hasOverlay bool) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, snapshot_memory_path = ?, snapshot_state_path = ?,
+			snapshot_size_bytes = ?, snapshot_checksum = ?, snapshot_vsock_cid = ?,
+			snapshot_error = '', has_snapshot = 1, has_overlay = ?,
+			updated_at = ?, ready_at = COALESCE(?, ready_at)
+		WHERE id = ?
+	`,
+		string(models.TemplateStatusReady),
+		strings.TrimSpace(memPath),
+		strings.TrimSpace(statePath),
+		sizeBytes,
+		strings.TrimSpace(checksum),
+		vsockCID,
+		boolToInt(hasOverlay),
+		now,
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template snapshot ready: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTemplateSnapshotFailed records the snapshot-phase error and flips
+// status to ready_no_snapshot. The rootfs columns are untouched — the
+// caller has already populated them via UpdateTemplateStatus during the
+// rootfs phase, and the cold-boot fallback still needs the rootfs path
+// intact. has_snapshot stays 0 (column default) so readers correctly skip
+// the snapshot-load path.
+func (s *Store) UpdateTemplateSnapshotFailed(ctx context.Context, id, snapshotError string) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, snapshot_error = ?, has_snapshot = 0,
+			updated_at = ?, ready_at = COALESCE(?, ready_at)
+		WHERE id = ?
+	`,
+		string(models.TemplateStatusReadyNoSnapshot),
+		snapshotError,
+		now,
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template snapshot failed: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkTemplateUnhealthy is the Phase 6 PR-A transition for "snapshot
+// was ready, now corrupt at load time". The WHERE status='ready' guard
+// is the idempotency primitive: many concurrent Creates can hit the
+// same corrupt snapshot in a burst, and only the first call's UPDATE
+// affects a row — subsequent calls return (false, nil). Callers gate
+// the async rebuild kick on changed=true so exactly one rebuild fires
+// per corruption event.
+//
+// has_snapshot is cleared in the same row update so the resolver and
+// the warm-pool lister both see HasSnapshot=false on the next read —
+// the cold-boot fallback fires until the rebuild succeeds. The
+// snapshot artifact paths are kept on the row for forensic inspection;
+// the rebuild overwrites them in place.
+//
+// snapshot_error captures the corruption reason for operator-facing
+// surfaces (the GET /v1/templates/{id} payload, future runbooks). The
+// status itself is the alertable signal; the message is the
+// human-readable detail.
+func (s *Store) MarkTemplateUnhealthy(ctx context.Context, id, reason string) (bool, error) {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET status = ?, snapshot_error = ?, has_snapshot = 0, updated_at = ?
+		WHERE id = ? AND status = ?
+	`,
+		string(models.TemplateStatusUnhealthy),
+		reason,
+		now,
+		strings.TrimSpace(id),
+		string(models.TemplateStatusReady),
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark template unhealthy: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark template unhealthy rows affected: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// MarkTemplatePushPending is the kickTemplateBuild success-path seam
+// for Phase 6 PR 6-B.1. Idempotent and state-guarded: the WHERE clause
+// only flips rows whose push_state is currently "active", so a row
+// that the reconciler is already working on (pending|pushing) is left
+// alone. push_error is cleared because a freshly-built artifact is a
+// fresh attempt — any prior failure no longer applies.
+//
+// Returns (true, nil) when the row moved, (false, nil) when the row
+// did not exist OR was already pending/pushing/error. Callers can
+// gate their reconciler-kick on changed=true so a no-op transition
+// doesn't fire an extra reconciler tick.
+func (s *Store) MarkTemplatePushPending(ctx context.Context, id string) (bool, error) {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET push_state = ?, push_error = '', updated_at = ?
+		WHERE id = ? AND push_state = ?
+	`,
+		models.TemplatePushStatePending,
+		now,
+		strings.TrimSpace(id),
+		models.TemplatePushStateActive,
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark template push pending: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark template push pending rows affected: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// ListTemplatesPendingPush returns the templates the reconciler should
+// retry: push_state IN ('pending', 'error'). 'pushing' is intentionally
+// excluded so a row currently being processed by another reconciler
+// tick is not re-claimed before its terminal state lands. Mirrors
+// ListSnapshotsPendingPush exactly.
+//
+// The status precondition (must be ready) keeps half-built templates
+// from sneaking into the push queue if someone manually flipped
+// push_state. The reconciler enforces the same guard defensively, but
+// filtering at the source means we never even materialize the row.
+func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE push_state IN ('pending', 'error') AND status = ?
+		ORDER BY created_at ASC, id ASC
+	`, string(models.TemplateStatusReady))
+	if err != nil {
+		return nil, fmt.Errorf("list templates pending push: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// ListUnhealthyTemplates returns every template row sitting in
+// status='unhealthy'. The daemon-start scanner in
+// service.RekickUnhealthyTemplatesAtStart sweeps this list once at boot
+// and kicks RebuildTemplateSnapshot for each row, closing the
+// crash-mid-rebuild gap: if sandboxd died after MarkTemplateUnhealthy
+// flipped the row but before the in-process kicker finished, the row
+// would otherwise be stuck unhealthy forever — every create against
+// that template would fail with a confusing "template unhealthy"
+// error and only operator intervention would resolve it.
+//
+// Mirrors ListTemplatesPendingPush in shape (same SELECT projection,
+// different WHERE) so the scan path is uniform with the existing push
+// reconciler. No status precondition beyond status='unhealthy' itself
+// — the rebuild path inside RebuildTemplateSnapshot re-checks the row
+// under its own read, so a row that another caller already recovered
+// between this list and the rebuild kick is handled cleanly.
+func (s *Store) ListUnhealthyTemplates(ctx context.Context) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE status = ?
+		ORDER BY created_at ASC, id ASC
+	`, string(models.TemplateStatusUnhealthy))
+	if err != nil {
+		return nil, fmt.Errorf("list unhealthy templates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// ListTemplatesReadyBefore returns the `ready` templates whose
+// `ready_at` is older than the cutoff. Used by the Phase 6 PR-E
+// rotation reconciler to find rebuild candidates. Only `ready` (not
+// `ready_no_snapshot`) qualifies — rotating a ready_no_snapshot row
+// would just re-burn build budget without delivering the rotation's
+// goal (refreshing the snapshot's kernel + toolbox bytes).
+//
+// Returns rows sorted oldest-first so a reconcile sweep that hits its
+// per-tick fanout cap rotates the most-overdue templates first.
+func (s *Store) ListTemplatesReadyBefore(ctx context.Context, cutoff time.Time) ([]*models.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE status = ?
+		  AND ready_at IS NOT NULL
+		  AND ready_at < ?
+		ORDER BY ready_at ASC, id ASC
+	`, string(models.TemplateStatusReady), cutoff.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list rotation candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
+// ListReadyTemplateIDs returns the IDs of every template whose
+// artifacts are usable on this host: `status IN ('ready',
+// 'ready_no_snapshot')`. The Phase 6 PR-D capacity heartbeat hands this
+// list to peers so placement can prefer the node that already has the
+// template's artifacts cached.
+//
+// Returns IDs only (no payload columns) — the snapshot is gossiped
+// every few seconds and a full row projection would balloon heartbeats
+// once a cluster has hundreds of templates. The unknown-allow rule in
+// placement.go nodeFits means a momentary "empty list" mid-startup is
+// safe: peers fall back to "any host" placement until the heartbeat
+// catches up.
+func (s *Store) ListReadyTemplateIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id
+		FROM firecracker_templates
+		WHERE status IN (?, ?)
+		ORDER BY id ASC
+	`, string(models.TemplateStatusReady), string(models.TemplateStatusReadyNoSnapshot))
+	if err != nil {
+		return nil, fmt.Errorf("list ready template ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan template id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate template ids: %w", err)
+	}
+	return ids, nil
+}
+
+// SetTemplatePushState is a narrow single-column update used by the
+// push reconciler. errMsg is overwritten unconditionally (including
+// to empty on success transitions) so callers don't have to remember
+// to clear it. Mirrors SetSnapshotPushState.
+func (s *Store) SetTemplatePushState(ctx context.Context, id, state, errMsg string) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET push_state = ?, push_error = ?, updated_at = ?
+		WHERE id = ?
+	`, strings.TrimSpace(state), errMsg, now, strings.TrimSpace(id))
+	if err != nil {
+		return fmt.Errorf("set template push state: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTemplatePushDistribution stamps the registry destination
+// metadata after a successful AOCR push. ref is the canonical repo:tag
+// the daemon pushed; digest is the manifest digest the registry
+// surfaced via the push stream's `aux` payload (may be empty). Called
+// from the reconciler success path together with SetTemplatePushState.
+//
+// Written in one statement so a crash between the two fields cannot
+// land a half-filled row — the consumer-side pull in PR 6-B.2 sees
+// either both fields populated or both empty.
+func (s *Store) UpdateTemplatePushDistribution(ctx context.Context, id, ref, digest string) error {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET registry_ref = ?, push_digest = ?, updated_at = ?
+		WHERE id = ?
+	`,
+		strings.TrimSpace(ref),
+		strings.TrimSpace(digest),
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("update template push distribution: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_templates WHERE id = ?`, strings.TrimSpace(id))
+	if err != nil {
+		return fmt.Errorf("delete template: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// IsTemplateReferenced reports whether any sandbox row still names this
+// template_id. Used by DeleteTemplate (so an operator gets a 409 instead
+// of yanking the rootfs out from under a live sandbox) and by the GC
+// sweep (so it skips rows that are still in use). Backed by the partial
+// index idx_sandboxes_template_id — constant cost regardless of the
+// destroyed-row history.
+func (s *Store) IsTemplateReferenced(ctx context.Context, id string) (bool, error) {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return false, nil
+	}
+	var present int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM sandboxes
+		WHERE template_id = ?
+		LIMIT 1
+	`, trimmed).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check template references: %w", err)
+	}
+	return true, nil
+}
+
+// IsTemplateReferencedByVMM reports whether any warm-VMM pool row still
+// names this template. This intentionally includes released rows: even a
+// released row is still persistent state that references the template, and
+// template GC should not leave dangling pool rows behind. Once the VMM-pool
+// GC deletes the row, template GC can remove the template on a later pass.
+func (s *Store) IsTemplateReferencedByVMM(ctx context.Context, id string) (bool, error) {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return false, nil
+	}
+	var present int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM firecracker_vmm_pool
+		WHERE template_id = ?
+		LIMIT 1
+	`, trimmed).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check template vmm references: %w", err)
+	}
+	return true, nil
+}
+
+// ListGCEligibleTemplates returns ready/failed templates not referenced by
+// any sandbox and last touched before olderThan. Pending rows are skipped
+// — they have an in-flight build goroutine that owns the row's terminal
+// transition. The anti-join against sandboxes uses the
+// idx_sandboxes_template_id partial index so the subquery is cheap.
+func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time) ([]*models.Template, error) {
+	// Phase 3: in-flight statuses now include building_rootfs and
+	// snapshotting on top of the original pending. All three mean
+	// "build goroutine still owns this row, do not GC" — same reason
+	// as pending. We explicitly enumerate so a stray status string
+	// (older build, manual SQL) doesn't get silently swept.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, rootfs_path, rootfs_size_bytes, min_size_mib,
+			last_error, created_at, updated_at, ready_at,
+			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
+			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
+			has_overlay, push_state, push_error, registry_ref, push_digest
+		FROM firecracker_templates
+		WHERE status NOT IN (?, ?, ?) AND updated_at < ? AND id NOT IN (
+			SELECT template_id FROM sandboxes WHERE template_id <> ''
+		) AND id NOT IN (
+			SELECT template_id FROM firecracker_vmm_pool WHERE template_id <> ''
+		)
+		ORDER BY updated_at ASC
+	`,
+		string(models.TemplateStatusPending),
+		string(models.TemplateStatusBuildingRootfs),
+		string(models.TemplateStatusSnapshotting),
+		olderThan.UTC(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list gc-eligible templates: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Template
+	for rows.Next() {
+		template, err := scanTemplate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan template: %w", err)
+		}
+		items = append(items, template)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate templates: %w", err)
+	}
+	return items, nil
+}
+
 // ListSnapshotsPendingPush returns snapshots the reconciler should retry —
 // 'pending' is the brand-new state set by the snapshot-create path, 'error'
 // is what a failed previous attempt left behind. 'pushing' is intentionally
@@ -2246,6 +3080,8 @@ func scanSandbox(scanner interface {
 		&autoImportPending,
 		&serverless,
 		&wakeArmed,
+		&sandbox.TemplateID,
+		&sandbox.OverlaySizeGB,
 	)
 	if err != nil {
 		return nil, err
@@ -2413,6 +3249,51 @@ func scanSnapshot(scanner interface {
 	return &snapshot, nil
 }
 
+func scanTemplate(scanner interface {
+	Scan(dest ...any) error
+}) (*models.Template, error) {
+	var template models.Template
+	var readyAt sql.NullTime
+	var hasSnapshot int
+	var hasOverlay int
+	err := scanner.Scan(
+		&template.ID,
+		&template.Image,
+		&template.Status,
+		&template.RootfsPath,
+		&template.RootfsSizeBytes,
+		&template.MinSizeMiB,
+		&template.LastError,
+		&template.CreatedAt,
+		&template.UpdatedAt,
+		&readyAt,
+		&template.SnapshotMemoryPath,
+		&template.SnapshotStatePath,
+		&template.SnapshotSizeBytes,
+		&template.SnapshotChecksum,
+		&template.SnapshotVsockCID,
+		&template.SnapshotError,
+		&hasSnapshot,
+		&hasOverlay,
+		&template.PushState,
+		&template.PushError,
+		&template.RegistryRef,
+		&template.PushDigest,
+	)
+	if err != nil {
+		return nil, err
+	}
+	template.CreatedAt = template.CreatedAt.UTC()
+	template.UpdatedAt = template.UpdatedAt.UTC()
+	if readyAt.Valid {
+		t := readyAt.Time.UTC()
+		template.ReadyAt = &t
+	}
+	template.HasSnapshot = hasSnapshot != 0
+	template.HasOverlay = hasOverlay != 0
+	return &template, nil
+}
+
 func marshalJSON(value any, fallback string) (string, error) {
 	if value == nil {
 		return fallback, nil
@@ -2479,6 +3360,18 @@ var ErrNotFound = errors.New("sandbox not found")
 var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")
+
+// ErrTemplateIDConflict is returned by CreateTemplate when a row with the
+// caller-supplied ID already exists. Operators that retry POST /v1/templates
+// with an explicit id get a 409 instead of a 500 — the standard idempotency
+// shape the v1 API uses everywhere else.
+var ErrTemplateIDConflict = errors.New("template id already in use")
+
+// ErrTemplateInUse is the service-layer sentinel for "cannot delete: an
+// active sandbox still names this template_id". DeleteTemplate returns it
+// after IsTemplateReferenced returns true; the API translates it to 409.
+// Held in the store package only because the SQL probe lives here.
+var ErrTemplateInUse = errors.New("template is referenced by an active sandbox")
 
 // ClusterSecretRecord is an opaque cluster-secret payload addressed by ref.
 // The store never decrypts SealedPayload; service owns the envelope format.
@@ -2611,4 +3504,731 @@ func (s *Store) DeleteMounts(ctx context.Context, sandboxID string) error {
 		return fmt.Errorf("delete sandbox mounts: %w", err)
 	}
 	return nil
+}
+
+// FirecrackerTapSlot is one pre-seeded row of the firecracker_tap_pool.
+// Mirrors the table shape. SandboxID is empty when the slot is free,
+// set to the owning sandbox when allocated; AllocatedAt is the zero
+// time when free.
+type FirecrackerTapSlot struct {
+	TapName     string
+	CIDR        string
+	HostIP      string
+	GuestIP     string
+	VsockCID    uint32
+	SandboxID   string
+	CreatedAt   time.Time
+	AllocatedAt time.Time
+}
+
+// SeedFirecrackerTapSlot inserts one slot row into the pool. Idempotent:
+// the tap_name PRIMARY KEY makes re-seeding with the same name a no-op,
+// so the daemon's boot path can call this for every configured slot
+// without coordinating across restarts. Two distinct slots with the
+// same vsock_cid would trip the unique index — callers must precompute
+// non-colliding CIDs (the wrapper in internal/network/tap does this).
+func (s *Store) SeedFirecrackerTapSlot(ctx context.Context, slot FirecrackerTapSlot, now time.Time) error {
+	if slot.TapName == "" || slot.CIDR == "" || slot.HostIP == "" || slot.GuestIP == "" {
+		return errors.New("seed firecracker tap slot: tap_name/cidr/host_ip/guest_ip are required")
+	}
+	if slot.VsockCID < 3 {
+		// CIDs 0/1/2 are reserved by the virtio-vsock spec (hypervisor,
+		// host, any). Catch this at the store layer because allocations
+		// flow through here and a buggy seed would only fail on the
+		// first sandbox create otherwise.
+		return fmt.Errorf("seed firecracker tap slot: vsock_cid must be >= 3 (got %d)", slot.VsockCID)
+	}
+	// ON CONFLICT(tap_name) DO NOTHING is narrower than INSERT OR IGNORE:
+	// it only swallows tap_name PK conflicts (the idempotent re-seed
+	// case). A duplicate vsock_cid on a different tap_name surfaces as
+	// a UNIQUE constraint error, which is the desired loud failure —
+	// the seed config is wrong and the operator should fix it before
+	// the first sandbox create discovers the clash.
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO firecracker_tap_pool
+			(tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(tap_name) DO NOTHING
+	`, slot.TapName, slot.CIDR, slot.HostIP, slot.GuestIP, slot.VsockCID, now.UTC())
+	if err != nil {
+		return fmt.Errorf("seed firecracker tap slot: %w", err)
+	}
+	return nil
+}
+
+// AllocateFirecrackerTapSlot claims a free slot for sandboxID and
+// returns it. Idempotent: if sandboxID already owns a slot, that slot
+// is returned without changes (the partial unique index guarantees at
+// most one). If no slot is free, returns ErrNoFreeFirecrackerTapSlot.
+//
+// The implementation is a two-step inside the SQLite single-writer
+// window:
+//
+//  1. SELECT a row WHERE sandbox_id IS NULL LIMIT 1.
+//  2. UPDATE that row SET sandbox_id = ?, allocated_at = ? WHERE
+//     tap_name = ? AND sandbox_id IS NULL.
+//
+// The WHERE clause on UPDATE re-checks sandbox_id IS NULL so a race
+// with a concurrent allocate of the same row updates RowsAffected=0
+// and we loop. SQLite's single-writer model makes this contest rare
+// in practice but the code stays correct under any future change.
+func (s *Store) AllocateFirecrackerTapSlot(ctx context.Context, sandboxID string, now time.Time) (*FirecrackerTapSlot, error) {
+	if sandboxID == "" {
+		return nil, errors.New("allocate firecracker tap slot: sandbox_id is required")
+	}
+	// Idempotency check first — if the sandbox already owns a slot,
+	// return it. Doing this before the allocate loop avoids a
+	// pessimistic UPDATE attempt that the partial unique index would
+	// reject (which would also work, but produces a noisier error).
+	if existing, err := s.GetFirecrackerTapSlotBySandbox(ctx, sandboxID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
+	}
+
+	// Bounded retry — under the SQLite single-writer model the contest
+	// resolves in one or two passes. The cap exists to prevent a buggy
+	// caller from spinning forever if every UPDATE fights for the same
+	// row; in practice the loop fires at most twice.
+	for attempt := 0; attempt < 8; attempt++ {
+		var candidate FirecrackerTapSlot
+		row := s.db.QueryRowContext(ctx, `
+			SELECT tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at
+			FROM firecracker_tap_pool
+			WHERE sandbox_id IS NULL
+			ORDER BY tap_name ASC
+			LIMIT 1
+		`)
+		if err := row.Scan(&candidate.TapName, &candidate.CIDR, &candidate.HostIP, &candidate.GuestIP, &candidate.VsockCID, &candidate.CreatedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrNoFreeFirecrackerTapSlot
+			}
+			return nil, fmt.Errorf("allocate firecracker tap slot (select): %w", err)
+		}
+
+		res, err := s.db.ExecContext(ctx, `
+			UPDATE firecracker_tap_pool
+			SET sandbox_id = ?, allocated_at = ?
+			WHERE tap_name = ? AND sandbox_id IS NULL
+		`, sandboxID, now.UTC(), candidate.TapName)
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker tap slot (update): %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker tap slot (affected): %w", err)
+		}
+		if n == 1 {
+			candidate.SandboxID = sandboxID
+			candidate.AllocatedAt = now.UTC()
+			return &candidate, nil
+		}
+		// Lost the race; loop and pick another free slot.
+	}
+	return nil, errors.New("allocate firecracker tap slot: pool contested after 8 attempts (likely allocator livelock)")
+}
+
+// ReleaseFirecrackerTapSlot returns a sandbox's slot to the pool by
+// clearing sandbox_id + allocated_at. Idempotent: releasing a sandbox
+// that owns no slot is a no-op.
+func (s *Store) ReleaseFirecrackerTapSlot(ctx context.Context, sandboxID string) error {
+	if sandboxID == "" {
+		return errors.New("release firecracker tap slot: sandbox_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_tap_pool
+		SET sandbox_id = NULL, allocated_at = NULL
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("release firecracker tap slot: %w", err)
+	}
+	return nil
+}
+
+// GetFirecrackerTapSlotBySandbox returns the slot currently owned by
+// sandboxID, or nil if it owns none. Used by both the idempotent
+// allocate path and the runtime driver's Inspect/Destroy paths.
+func (s *Store) GetFirecrackerTapSlotBySandbox(ctx context.Context, sandboxID string) (*FirecrackerTapSlot, error) {
+	if sandboxID == "" {
+		return nil, errors.New("get firecracker tap slot: sandbox_id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT tap_name, cidr, host_ip, guest_ip, vsock_cid, created_at, allocated_at
+		FROM firecracker_tap_pool
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	var slot FirecrackerTapSlot
+	var allocated sql.NullTime
+	if err := row.Scan(&slot.TapName, &slot.CIDR, &slot.HostIP, &slot.GuestIP, &slot.VsockCID, &slot.CreatedAt, &allocated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get firecracker tap slot: %w", err)
+	}
+	if allocated.Valid {
+		slot.AllocatedAt = allocated.Time
+	}
+	slot.SandboxID = sandboxID
+	return &slot, nil
+}
+
+// FirecrackerTapPoolStats reports the current pool occupancy. Used by
+// /healthz and the admission controller — a near-empty pool blocks new
+// Firecracker creates upstream of the failing Allocate call, which is
+// a better operator experience than discovering the exhaustion on the
+// next user request.
+type FirecrackerTapPoolStats struct {
+	Total     int
+	Allocated int
+	Free      int
+}
+
+func (s *Store) GetFirecrackerTapPoolStats(ctx context.Context) (FirecrackerTapPoolStats, error) {
+	var stats FirecrackerTapPoolStats
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COUNT(CASE WHEN sandbox_id IS NOT NULL THEN 1 END)
+		FROM firecracker_tap_pool
+	`)
+	if err := row.Scan(&stats.Total, &stats.Allocated); err != nil {
+		return stats, fmt.Errorf("firecracker tap pool stats: %w", err)
+	}
+	stats.Free = stats.Total - stats.Allocated
+	return stats, nil
+}
+
+// ErrNoFreeFirecrackerTapSlot is returned by AllocateFirecrackerTapSlot
+// when every slot is claimed. The Firecracker create path translates
+// this into a 503-ish admission error upstream — operators see "pool
+// exhausted" before the customer sees a confusing timeout.
+var ErrNoFreeFirecrackerTapSlot = errors.New("firecracker tap pool: no free slot")
+
+// Firecracker warm-VMM pool status constants. Kept as bare strings
+// rather than a typed enum because SQLite stores them as TEXT and the
+// store-layer queries WHERE status='...' literals — a typed wrapper
+// would just force every call site to string()-coerce. The state
+// machine is documented inline in the CREATE TABLE statement above.
+const (
+	FirecrackerVMMSlotStatusSpawning  = "spawning"
+	FirecrackerVMMSlotStatusLoaded    = "loaded"
+	FirecrackerVMMSlotStatusAllocated = "allocated"
+	FirecrackerVMMSlotStatusReleased  = "released"
+)
+
+// FirecrackerVMMSlot is one row of firecracker_vmm_pool. Mirrors the
+// table shape; nullable DATETIME columns map to zero-valued time.Time
+// when absent so the policy wrapper (internal/pool/vmm) doesn't have
+// to plumb sql.NullTime through its API.
+type FirecrackerVMMSlot struct {
+	ID          string
+	TemplateID  string
+	Status      string
+	SandboxID   string
+	APISocket   string
+	RunDir      string
+	VsockCID    uint32
+	CreatedAt   time.Time
+	LoadedAt    time.Time
+	AllocatedAt time.Time
+	ReleasedAt  time.Time
+	LastError   string
+}
+
+// FirecrackerVMMPoolStats is the per-template breakdown by status used
+// by /healthz and PR 4-B's refill goroutine to decide how many new
+// slots to spawn. Total is the count of all non-deleted rows for the
+// template; the sum of the per-status counters equals Total.
+type FirecrackerVMMPoolStats struct {
+	Total     int
+	Spawning  int
+	Loaded    int
+	Allocated int
+	Released  int
+}
+
+// ErrNoFreeFirecrackerVMMSlot is returned by AllocateFirecrackerVMMSlot
+// when no 'loaded' slot exists for the requested template. PR 4-B's
+// caller treats this as the cold-spawn fallback signal, not an error
+// state — the pool being momentarily empty is the expected behavior
+// under load between spawn-and-load passes.
+var ErrNoFreeFirecrackerVMMSlot = errors.New("firecracker vmm pool: no loaded slot")
+
+// InsertFirecrackerVMMSlot reserves a new row in status='spawning'.
+// PR 4-B's refill goroutine calls this BEFORE launching firecracker so
+// a crash mid-spawn leaves a 'spawning' row the GC sweep can clean up
+// rather than a silently-leaked process with no row to find it by.
+//
+// Validation is strict because a malformed insert is always a bug in
+// the caller — the refill goroutine should hand us a freshly-generated
+// id and an actual template id, not the zero value.
+func (s *Store) InsertFirecrackerVMMSlot(ctx context.Context, slot FirecrackerVMMSlot, now time.Time) error {
+	if strings.TrimSpace(slot.ID) == "" {
+		return errors.New("insert firecracker vmm slot: id is required")
+	}
+	if strings.TrimSpace(slot.TemplateID) == "" {
+		return errors.New("insert firecracker vmm slot: template_id is required")
+	}
+	// The pool's external API never inserts a row in any other state —
+	// the spawner is the only thing that knows when the snapshot is
+	// loaded, and it transitions the row via MarkFirecrackerVMMSlotLoaded.
+	// Reject anything else loudly so a future caller can't sneak a
+	// pre-loaded row past the spawner.
+	if slot.Status != "" && slot.Status != FirecrackerVMMSlotStatusSpawning {
+		return fmt.Errorf("insert firecracker vmm slot: status must be %q (got %q)",
+			FirecrackerVMMSlotStatusSpawning, slot.Status)
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO firecracker_vmm_pool
+			(id, template_id, status, created_at)
+		VALUES (?, ?, ?, ?)
+	`, slot.ID, slot.TemplateID, FirecrackerVMMSlotStatusSpawning, now.UTC())
+	if err != nil {
+		return fmt.Errorf("insert firecracker vmm slot: %w", err)
+	}
+	return nil
+}
+
+// MarkFirecrackerVMMSlotLoaded flips 'spawning' → 'loaded' and stamps
+// the per-slot artifact paths the allocator will hand to the sandbox
+// create path. The WHERE clause asserts the current state so a retried
+// call (or a racing GC) can't accidentally walk a slot backwards from
+// 'allocated' to 'loaded'. apiSocket and runDir live in the row so
+// PR 4-B's runtime adapter can adopt a pre-spawned firecracker process
+// across daemon restarts without re-deriving them.
+func (s *Store) MarkFirecrackerVMMSlotLoaded(ctx context.Context, slotID, apiSocket, runDir string, vsockCID uint32, now time.Time) error {
+	if strings.TrimSpace(slotID) == "" {
+		return errors.New("mark firecracker vmm slot loaded: slot id is required")
+	}
+	if strings.TrimSpace(apiSocket) == "" || strings.TrimSpace(runDir) == "" {
+		return errors.New("mark firecracker vmm slot loaded: api_socket and run_dir are required")
+	}
+	if vsockCID < 3 {
+		// Same guard as the TAP pool's seed: 0/1/2 are reserved and a
+		// snapshot keyed on one of those CIDs is corrupt by definition.
+		return fmt.Errorf("mark firecracker vmm slot loaded: vsock_cid must be >= 3 (got %d)", vsockCID)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, api_socket = ?, run_dir = ?, vsock_cid = ?, loaded_at = ?
+		WHERE id = ? AND status = ?
+	`, FirecrackerVMMSlotStatusLoaded, apiSocket, runDir, vsockCID, now.UTC(),
+		slotID, FirecrackerVMMSlotStatusSpawning)
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot loaded: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot loaded (affected): %w", err)
+	}
+	if n == 0 {
+		// Zero rows means either the slot id doesn't exist or it's no
+		// longer in 'spawning'. Both are caller-side bugs the spawner
+		// should surface rather than retry silently.
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkFirecrackerVMMSlotFailed records that the spawner could not
+// produce a paused-and-loaded VMM for this slot and moves the row
+// directly to 'released' so the GC sweep cleans it up after the TTL.
+// Skipping the 'loaded' intermediate is intentional: a failed slot was
+// never claimable, and a transient 'loaded' state on a row whose VMM
+// is actually missing would let the next Allocate hand out a dead
+// process. last_error is preserved on the row for operator triage.
+func (s *Store) MarkFirecrackerVMMSlotFailed(ctx context.Context, slotID, errMsg string, now time.Time) error {
+	if strings.TrimSpace(slotID) == "" {
+		return errors.New("mark firecracker vmm slot failed: slot id is required")
+	}
+	// last_error gets truncated to keep an unbounded spawner stderr
+	// from blowing up the row size. 1 KiB is enough to capture a
+	// firecracker boot panic line + the call site.
+	const errCap = 1024
+	if len(errMsg) > errCap {
+		errMsg = errMsg[:errCap]
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, last_error = ?, released_at = ?
+		WHERE id = ? AND status = ?
+	`, FirecrackerVMMSlotStatusReleased, errMsg, now.UTC(),
+		slotID, FirecrackerVMMSlotStatusSpawning)
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot failed: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark firecracker vmm slot failed (affected): %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// AllocateFirecrackerVMMSlot claims one 'loaded' slot for templateID +
+// sandboxID. Idempotent: if sandboxID already owns a slot, that slot
+// is returned without re-allocation (the partial unique index makes a
+// duplicate claim a hard error, but the pre-check yields a cleaner
+// happy path). If no 'loaded' slot for templateID exists, returns
+// ErrNoFreeFirecrackerVMMSlot — PR 4-B's caller falls back to cold
+// spawn rather than failing the create.
+//
+// The allocator shape is lifted from AllocateFirecrackerTapSlot:
+// SELECT one free row, UPDATE WHERE row is still free. The UPDATE's
+// WHERE re-checks status='loaded' AND sandbox_id IS NULL so a race
+// against a concurrent allocator updates RowsAffected=0 and we loop.
+// SQLite's single writer makes the contest rare, but the loop keeps
+// correctness if the locking model ever changes.
+func (s *Store) AllocateFirecrackerVMMSlot(ctx context.Context, templateID, sandboxID string, now time.Time) (*FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(templateID) == "" {
+		return nil, errors.New("allocate firecracker vmm slot: template_id is required")
+	}
+	if strings.TrimSpace(sandboxID) == "" {
+		return nil, errors.New("allocate firecracker vmm slot: sandbox_id is required")
+	}
+	if existing, err := s.GetFirecrackerVMMSlotBySandbox(ctx, sandboxID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		var candidate FirecrackerVMMSlot
+		var loadedAt sql.NullTime
+		row := s.db.QueryRowContext(ctx, `
+			SELECT id, template_id, status, api_socket, run_dir, vsock_cid, created_at, loaded_at
+			FROM firecracker_vmm_pool
+			WHERE template_id = ? AND status = ? AND sandbox_id IS NULL
+			ORDER BY loaded_at ASC
+			LIMIT 1
+		`, templateID, FirecrackerVMMSlotStatusLoaded)
+		if err := row.Scan(&candidate.ID, &candidate.TemplateID, &candidate.Status,
+			&candidate.APISocket, &candidate.RunDir, &candidate.VsockCID,
+			&candidate.CreatedAt, &loadedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrNoFreeFirecrackerVMMSlot
+			}
+			return nil, fmt.Errorf("allocate firecracker vmm slot (select): %w", err)
+		}
+		if loadedAt.Valid {
+			candidate.LoadedAt = loadedAt.Time
+		}
+
+		res, err := s.db.ExecContext(ctx, `
+			UPDATE firecracker_vmm_pool
+			SET status = ?, sandbox_id = ?, allocated_at = ?
+			WHERE id = ? AND status = ? AND sandbox_id IS NULL
+		`, FirecrackerVMMSlotStatusAllocated, sandboxID, now.UTC(),
+			candidate.ID, FirecrackerVMMSlotStatusLoaded)
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker vmm slot (update): %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("allocate firecracker vmm slot (affected): %w", err)
+		}
+		if n == 1 {
+			candidate.Status = FirecrackerVMMSlotStatusAllocated
+			candidate.SandboxID = sandboxID
+			candidate.AllocatedAt = now.UTC()
+			return &candidate, nil
+		}
+		// Lost the race; loop and pick another 'loaded' row.
+	}
+	return nil, errors.New("allocate firecracker vmm slot: pool contested after 8 attempts (likely allocator livelock)")
+}
+
+// ReleaseFirecrackerVMMSlot moves a sandbox's slot from 'allocated' to
+// 'released'. Idempotent in two senses: releasing a sandbox that never
+// owned a slot is a no-op (RowsAffected=0 returns nil), and releasing a
+// slot already in 'released' is a no-op for the same reason. The
+// WHERE-on-status keeps a malformed retry from resurrecting a slot
+// that the spawner failed and already marked released.
+func (s *Store) ReleaseFirecrackerVMMSlot(ctx context.Context, sandboxID string, now time.Time) error {
+	if strings.TrimSpace(sandboxID) == "" {
+		return errors.New("release firecracker vmm slot: sandbox_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, sandbox_id = NULL, released_at = ?
+		WHERE sandbox_id = ? AND status = ?
+	`, FirecrackerVMMSlotStatusReleased, now.UTC(), sandboxID, FirecrackerVMMSlotStatusAllocated)
+	if err != nil {
+		return fmt.Errorf("release firecracker vmm slot: %w", err)
+	}
+	return nil
+}
+
+// ReleaseOrphanedFirecrackerVMMSlots marks any warm-pool slot left in
+// 'spawning' or 'loaded' with no sandbox claim as 'released'. The
+// daemon calls this once at startup before refilling so rows stranded
+// by the previous process do not stay invisible to GC forever.
+func (s *Store) ReleaseOrphanedFirecrackerVMMSlots(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, released_at = ?
+		WHERE sandbox_id IS NULL AND status IN (?, ?)
+	`, FirecrackerVMMSlotStatusReleased, now.UTC(),
+		FirecrackerVMMSlotStatusSpawning, FirecrackerVMMSlotStatusLoaded)
+	if err != nil {
+		return 0, fmt.Errorf("release orphaned firecracker vmm slots: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("release orphaned firecracker vmm slots (affected): %w", err)
+	}
+	return int(n), nil
+}
+
+// GetFirecrackerVMMSlotBySandbox returns the slot currently claimed by
+// sandboxID, or nil if it owns none. Used by the idempotent Allocate
+// pre-check and by PR 4-B's destroy path to find the slot whose VMM
+// process needs to be torn down.
+func (s *Store) GetFirecrackerVMMSlotBySandbox(ctx context.Context, sandboxID string) (*FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return nil, errors.New("get firecracker vmm slot: sandbox_id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, template_id, status, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE sandbox_id = ?
+	`, sandboxID)
+	slot, err := scanFirecrackerVMMSlot(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get firecracker vmm slot: %w", err)
+	}
+	slot.SandboxID = sandboxID
+	return slot, nil
+}
+
+// GetFirecrackerVMMSlotByID returns the slot row whose id matches, or
+// nil if not found. Lets PR 4-B's refill goroutine re-read its own
+// freshly-inserted row to inspect the row's authoritative status
+// (the daemon may have raced a GC between InsertFirecrackerVMMSlot and
+// the spawner attempt). Unlike GetFirecrackerVMMSlotBySandbox, the
+// row's sandbox_id is unknown to the caller — we project the column
+// explicitly so an 'allocated' slot reads back with its claimant.
+func (s *Store) GetFirecrackerVMMSlotByID(ctx context.Context, slotID string) (*FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(slotID) == "" {
+		return nil, errors.New("get firecracker vmm slot by id: slot id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE id = ?
+	`, slotID)
+	var (
+		slot                              FirecrackerVMMSlot
+		sandboxID                         sql.NullString
+		loadedAt, allocatedAt, releasedAt sql.NullTime
+	)
+	if err := row.Scan(&slot.ID, &slot.TemplateID, &slot.Status, &sandboxID,
+		&slot.APISocket, &slot.RunDir, &slot.VsockCID,
+		&slot.CreatedAt, &loadedAt, &allocatedAt, &releasedAt, &slot.LastError); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get firecracker vmm slot by id: %w", err)
+	}
+	if sandboxID.Valid {
+		slot.SandboxID = sandboxID.String
+	}
+	if loadedAt.Valid {
+		slot.LoadedAt = loadedAt.Time
+	}
+	if allocatedAt.Valid {
+		slot.AllocatedAt = allocatedAt.Time
+	}
+	if releasedAt.Valid {
+		slot.ReleasedAt = releasedAt.Time
+	}
+	return &slot, nil
+}
+
+// ListFirecrackerVMMSlotsForRefill returns every non-released slot
+// owned by templateID. PR 4-B's refill goroutine calls this once per
+// tick to compute "desired_depth - len(non_released)" — the spawn
+// budget for the next pass. Released rows are excluded so a slow GC
+// doesn't inflate the count and starve refills.
+func (s *Store) ListFirecrackerVMMSlotsForRefill(ctx context.Context, templateID string) ([]FirecrackerVMMSlot, error) {
+	if strings.TrimSpace(templateID) == "" {
+		return nil, errors.New("list firecracker vmm slots: template_id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE template_id = ? AND status <> ?
+		ORDER BY created_at ASC
+	`, templateID, FirecrackerVMMSlotStatusReleased)
+	if err != nil {
+		return nil, fmt.Errorf("list firecracker vmm slots: %w", err)
+	}
+	defer rows.Close()
+	return collectFirecrackerVMMSlots(rows)
+}
+
+// ListReleasedFirecrackerVMMSlots is the GC sweep selector: every row
+// in status='released' whose released_at is older than olderThan. The
+// partial index on released_at WHERE status='released' covers this
+// query exactly so the sweep is cheap even when the steady-state
+// count is zero.
+func (s *Store) ListReleasedFirecrackerVMMSlots(ctx context.Context, olderThan time.Time) ([]FirecrackerVMMSlot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, template_id, status, sandbox_id, api_socket, run_dir, vsock_cid,
+			created_at, loaded_at, allocated_at, released_at, last_error
+		FROM firecracker_vmm_pool
+		WHERE status = ? AND released_at IS NOT NULL AND released_at <= ?
+		ORDER BY released_at ASC
+	`, FirecrackerVMMSlotStatusReleased, olderThan.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list released firecracker vmm slots: %w", err)
+	}
+	defer rows.Close()
+	return collectFirecrackerVMMSlots(rows)
+}
+
+// DeleteFirecrackerVMMSlot drops the row. PR 4-B's GC sweep calls this
+// after the VMM process for the slot is confirmed gone, so there is
+// no on-disk runDir or live socket the row was the last reference to.
+// Returns ErrNotFound when the row was already deleted — idempotent on
+// double-call.
+func (s *Store) DeleteFirecrackerVMMSlot(ctx context.Context, slotID string) error {
+	if strings.TrimSpace(slotID) == "" {
+		return errors.New("delete firecracker vmm slot: slot id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM firecracker_vmm_pool WHERE id = ?`, slotID)
+	if err != nil {
+		return fmt.Errorf("delete firecracker vmm slot: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete firecracker vmm slot (affected): %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetFirecrackerVMMPoolStats returns per-template occupancy by status.
+// Single GROUP BY scan covered by idx_firecracker_vmm_pool_template_status.
+// /healthz and PR 4-C's metrics exporter both call this; PR 4-B's
+// refill goroutine prefers ListFirecrackerVMMSlotsForRefill which
+// gives it the row ids it may want to act on.
+func (s *Store) GetFirecrackerVMMPoolStats(ctx context.Context, templateID string) (FirecrackerVMMPoolStats, error) {
+	var stats FirecrackerVMMPoolStats
+	if strings.TrimSpace(templateID) == "" {
+		return stats, errors.New("firecracker vmm pool stats: template_id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT status, COUNT(*)
+		FROM firecracker_vmm_pool
+		WHERE template_id = ?
+		GROUP BY status
+	`, templateID)
+	if err != nil {
+		return stats, fmt.Errorf("firecracker vmm pool stats: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return stats, fmt.Errorf("firecracker vmm pool stats (scan): %w", err)
+		}
+		switch status {
+		case FirecrackerVMMSlotStatusSpawning:
+			stats.Spawning = count
+		case FirecrackerVMMSlotStatusLoaded:
+			stats.Loaded = count
+		case FirecrackerVMMSlotStatusAllocated:
+			stats.Allocated = count
+		case FirecrackerVMMSlotStatusReleased:
+			stats.Released = count
+		}
+		stats.Total += count
+	}
+	if err := rows.Err(); err != nil {
+		return stats, fmt.Errorf("firecracker vmm pool stats (rows): %w", err)
+	}
+	return stats, nil
+}
+
+// scanFirecrackerVMMSlot decodes a single row from any SELECT that
+// returns the canonical 11-column projection. Centralized so the
+// nullable-DATETIME and nullable-sandbox-id handling is in one place;
+// every caller projects the same columns in the same order.
+func scanFirecrackerVMMSlot(row interface {
+	Scan(...any) error
+}) (*FirecrackerVMMSlot, error) {
+	var (
+		slot                              FirecrackerVMMSlot
+		sandboxID                         sql.NullString
+		loadedAt, allocatedAt, releasedAt sql.NullTime
+	)
+	if err := row.Scan(&slot.ID, &slot.TemplateID, &slot.Status,
+		&slot.APISocket, &slot.RunDir, &slot.VsockCID,
+		&slot.CreatedAt, &loadedAt, &allocatedAt, &releasedAt, &slot.LastError); err != nil {
+		return nil, err
+	}
+	if sandboxID.Valid {
+		slot.SandboxID = sandboxID.String
+	}
+	if loadedAt.Valid {
+		slot.LoadedAt = loadedAt.Time
+	}
+	if allocatedAt.Valid {
+		slot.AllocatedAt = allocatedAt.Time
+	}
+	if releasedAt.Valid {
+		slot.ReleasedAt = releasedAt.Time
+	}
+	return &slot, nil
+}
+
+// collectFirecrackerVMMSlots walks a *sql.Rows from the list queries.
+// These project the full 12-column shape — including sandbox_id —
+// because list callers can't recover the value from a WHERE clause
+// the way GetFirecrackerVMMSlotBySandbox does. Centralized so the
+// nullable-column handling stays in one place.
+func collectFirecrackerVMMSlots(rows *sql.Rows) ([]FirecrackerVMMSlot, error) {
+	var out []FirecrackerVMMSlot
+	for rows.Next() {
+		var (
+			slot                              FirecrackerVMMSlot
+			sandboxID                         sql.NullString
+			loadedAt, allocatedAt, releasedAt sql.NullTime
+		)
+		if err := rows.Scan(&slot.ID, &slot.TemplateID, &slot.Status, &sandboxID,
+			&slot.APISocket, &slot.RunDir, &slot.VsockCID,
+			&slot.CreatedAt, &loadedAt, &allocatedAt, &releasedAt, &slot.LastError); err != nil {
+			return nil, fmt.Errorf("scan firecracker vmm slot row: %w", err)
+		}
+		if sandboxID.Valid {
+			slot.SandboxID = sandboxID.String
+		}
+		if loadedAt.Valid {
+			slot.LoadedAt = loadedAt.Time
+		}
+		if allocatedAt.Valid {
+			slot.AllocatedAt = allocatedAt.Time
+		}
+		if releasedAt.Valid {
+			slot.ReleasedAt = releasedAt.Time
+		}
+		out = append(out, slot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iter firecracker vmm slot rows: %w", err)
+	}
+	return out, nil
 }

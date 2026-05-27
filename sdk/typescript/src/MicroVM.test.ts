@@ -878,3 +878,144 @@ test("MicroVM.dns.target GETs /v1/ingress/dns and maps response", async () => {
   assert.equal(target.hostname, "ingress.example.com");
   assert.equal(target.source, "hostname");
 });
+// Template lifecycle round-trips. We don't drive the daemon's async build
+// pipeline in these unit tests — we mock the wire shape and pin that the
+// SDK maps snake_case fields to the camelCase public surface, sends the
+// right method/path, and decodes the 202-with-template response on rebuild.
+
+test("MicroVM.createTemplate POSTs /v1/templates and maps the response", async () => {
+  let seenRequest: Request | undefined;
+  let seenBody = "";
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seenRequest = req;
+      seenBody = await req.text();
+      return new Response(JSON.stringify({
+        id: "tpl-create",
+        image: "docker://python:3.11",
+        status: "pending",
+        min_size_mib: 512,
+        created_at: "2026-05-27T10:00:00Z",
+        updated_at: "2026-05-27T10:00:00Z",
+        has_snapshot: false,
+        has_overlay: false,
+      }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const tpl = await sdk.createTemplate({
+    id: "tpl-create",
+    image: "docker://python:3.11",
+    minSizeMiB: 512,
+  });
+
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "POST");
+  assert.ok(seenRequest.url.endsWith("/v1/templates"));
+  assert.deepEqual(JSON.parse(seenBody), {
+    id: "tpl-create",
+    image: "docker://python:3.11",
+    min_size_mib: 512,
+  });
+  assert.equal(tpl.id, "tpl-create");
+  assert.equal(tpl.status, "pending");
+  assert.equal(tpl.minSizeMiB, 512);
+  assert.equal(tpl.hasSnapshot, false);
+});
+
+test("MicroVM.listTemplates handles empty and populated responses", async () => {
+  let response: unknown = null; // mimic the daemon returning JSON null for empty
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async () => new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+
+  assert.deepEqual(await sdk.listTemplates(), []);
+
+  response = [
+    {
+      id: "tpl-1",
+      image: "docker://alpine:3.19",
+      status: "ready",
+      created_at: "2026-05-27T10:00:00Z",
+      updated_at: "2026-05-27T10:05:00Z",
+      ready_at: "2026-05-27T10:04:00Z",
+      has_snapshot: true,
+      has_overlay: false,
+      push_state: "active",
+    },
+  ];
+  const rows = await sdk.listTemplates();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, "tpl-1");
+  assert.equal(rows[0].status, "ready");
+  assert.equal(rows[0].hasSnapshot, true);
+  assert.equal(rows[0].pushState, "active");
+});
+
+test("MicroVM.rebuildTemplate POSTs the rebuild path and surfaces 412 errors", async () => {
+  let seenRequest: Request | undefined;
+  let returnStatus = 202;
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      if (returnStatus === 412) {
+        return new Response(JSON.stringify({
+          error: "template not eligible for rebuild: current status=pending",
+        }), { status: 412, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        id: "tpl-rebuild",
+        image: "docker://alpine:3.19",
+        status: "unhealthy",
+        created_at: "2026-05-27T10:00:00Z",
+        updated_at: "2026-05-27T10:10:00Z",
+        has_snapshot: true,
+        has_overlay: false,
+      }), { status: 202, headers: { "content-type": "application/json" } });
+    },
+  });
+
+  // Happy path — 202 with the (now unhealthy) row.
+  const tpl = await sdk.rebuildTemplate("tpl-rebuild");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "POST");
+  assert.ok(seenRequest.url.endsWith("/v1/templates/tpl-rebuild/rebuild"));
+  assert.equal(tpl.status, "unhealthy");
+
+  // Not-rebuildable arm — the SDK must surface the 412 as a thrown error.
+  returnStatus = 412;
+  await assert.rejects(
+    () => sdk.rebuildTemplate("tpl-rebuild"),
+    /not eligible for rebuild/,
+  );
+});
+
+test("MicroVM.deleteTemplate sends DELETE on the per-id path", async () => {
+  let seenRequest: Request | undefined;
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return new Response(null, { status: 204 });
+    },
+  });
+
+  await sdk.deleteTemplate("tpl-x");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "DELETE");
+  assert.ok(seenRequest.url.endsWith("/v1/templates/tpl-x"));
+});

@@ -14,7 +14,7 @@ A side-by-side look at how AerolVM compares to the two most common alternatives 
 | **Open source** | ✅ | ✗ | ✅ |
 | **Primary use case** | AI agents + ephemeral CI | AI agent code execution | Developer workspaces |
 | **Sandbox startup** | <70ms | ~200s | <90ms |
-| **Runtime isolation** | Docker, gVisor (kernel-level) | Kata | Docker |
+| **Runtime isolation** | Docker, gVisor (kernel-level), Firecracker (microVM) | Kata | Docker |
 | **Security** | gVisor (very secure) | Kata(Extremely secure) | ✗ |
 | **Port Isolation** | ✅ | ✗ | ✗ |
 | **Persistent** | ✅ | ✗ | ✅ |

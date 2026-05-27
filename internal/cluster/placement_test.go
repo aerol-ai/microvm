@@ -3,8 +3,11 @@ package cluster
 import (
 	"errors"
 	"math"
+	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -179,6 +182,54 @@ func TestNodeFitsRejectsUnsupportedRuntime(t *testing.T) {
 	}
 }
 
+func TestSelectPlacementSkipsDockerOnlyWorkersForFirecrackerAt100Nodes(t *testing.T) {
+	index := newGossipMemberIndex()
+	var members []Member
+	for i := 0; i < 3; i++ {
+		members = append(members, Member{
+			NodeID: "server-" + string(rune('a'+i)),
+			APIURL: "http://server",
+			Alive:  true,
+			Role:   config.NodeRoleServer,
+		})
+	}
+	for i := 0; i < 10; i++ {
+		members = append(members, Member{
+			NodeID: "ingress-" + string(rune('a'+i)),
+			APIURL: "http://ingress",
+			Alive:  true,
+			Role:   config.NodeRoleIngress,
+		})
+	}
+	for i := 0; i < 30; i++ {
+		members = append(members, runtimeWorker("docker-worker-", i, []string{models.RuntimeDocker}))
+	}
+	for i := 0; i < 57; i++ {
+		members = append(members, runtimeWorker("fc-worker-", i, []string{models.RuntimeDocker, models.RuntimeFirecracker}))
+	}
+	index.replace(members)
+
+	c := &Cluster{
+		nodeID: "server-a",
+		apiURL: "http://server-a",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: index},
+	}
+
+	for i := 0; i < 200; i++ {
+		target, err := c.SelectPlacement(capacity.Request{
+			CPU: 1, MemoryMB: 100,
+			Runtime: models.RuntimeFirecracker,
+		})
+		if err != nil {
+			t.Fatalf("SelectPlacement iteration %d: %v", i, err)
+		}
+		if !strings.HasPrefix(target.NodeID, "fc-worker-") {
+			t.Fatalf("SelectPlacement chose %q, want only firecracker-capable workers", target.NodeID)
+		}
+	}
+}
+
 // TestNodeFitsLegacyEmptyRuntimesAllowsAny: a peer that pre-dates the
 // SupportedRuntimes field (empty list, but with a fresh non-zero capacity
 // heartbeat) must remain a candidate for any runtime — otherwise a rolling
@@ -296,5 +347,149 @@ func TestAdmitReservationCommandsAccountsForBatchCapacity(t *testing.T) {
 	})
 	if !errors.Is(err, ErrCapacityExceeded) {
 		t.Fatalf("admitReservationCommands error = %v, want ErrCapacityExceeded", err)
+	}
+}
+
+// TestNodeFitsTemplatePresent: a peer that reports the requested
+// template in its inventory passes. The clone boots locally against
+// already-cached artifacts and inherits the <100ms fast-boot property.
+func TestNodeFitsTemplatePresent(t *testing.T) {
+	hot := Member{NodeID: "hot", APIURL: "http://h", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateInventoryKnown: true,
+		LocalTemplateIDs:            []string{"tpl-a", "tpl-b", "tpl-c"},
+	}}
+	if !nodeFits(hot, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-b"}, capacity.Request{}) {
+		t.Fatal("node with the template should fit")
+	}
+}
+
+// TestNodeFitsTemplateAbsentRejected: a peer with a non-empty inventory
+// missing the requested template is rejected. This is the authoritative
+// "no" arm — the peer reported its inventory and the template isn't
+// in it, so placing here would force the consumer-side puller to fetch
+// from AOCR and lose the fast-boot property.
+func TestNodeFitsTemplateAbsentRejected(t *testing.T) {
+	cold := Member{NodeID: "cold", APIURL: "http://c", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateInventoryKnown: true,
+		LocalTemplateIDs:            []string{"tpl-a"},
+	}}
+	if nodeFits(cold, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-z"}, capacity.Request{}) {
+		t.Fatal("node missing the template should be rejected when inventory is non-empty")
+	}
+}
+
+// TestNodeFitsTemplateUnknownAllowOnEmpty: a peer with unknown template
+// inventory (legacy node mid-rolling-upgrade, or just-joined node that
+// hasn't reported yet) must remain a candidate. Gating here would
+// strand creates on fresh clusters; the consumer-side puller is the
+// safety net when the placement misses. Mirrors SupportedRuntimes'
+// unknown-allow rule.
+func TestNodeFitsTemplateUnknownAllowOnEmpty(t *testing.T) {
+	legacy := Member{NodeID: "l", APIURL: "http://l", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		// LocalTemplateInventoryKnown intentionally false
+	}}
+	if !nodeFits(legacy, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-x"}, capacity.Request{}) {
+		t.Fatal("legacy (empty LocalTemplateIDs) peer must accept any template")
+	}
+}
+
+func TestNodeFitsKnownEmptyTemplateInventoryRejected(t *testing.T) {
+	empty := Member{NodeID: "empty", APIURL: "http://e", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateInventoryKnown: true,
+	}}
+	if nodeFits(empty, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-x"}, capacity.Request{}) {
+		t.Fatal("authoritative empty template inventory should reject template-bound create")
+	}
+}
+
+// TestNodeFitsNoTemplateRequestSkipsGate: a request without a template
+// (a non-Firecracker create) must not be filtered by LocalTemplateIDs
+// at all — empty TemplateID means "any host." Without this guard a
+// docker sandbox could be falsely rejected because the peer's
+// inventory doesn't list its (non-existent) template.
+func TestNodeFitsNoTemplateRequestSkipsGate(t *testing.T) {
+	docker := Member{NodeID: "d", APIURL: "http://d", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateIDs: []string{"tpl-a"},
+	}}
+	if !nodeFits(docker, capacity.Request{CPU: 1, MemoryMB: 100}, capacity.Request{}) {
+		t.Fatal("non-template request must skip the template gate")
+	}
+}
+
+// TestCapacityRequestFromSpecCarriesTemplateID pins the wiring
+// invariant: a Firecracker create flowing through capacityRequestFromSpec
+// (failover-recreate) must carry the TemplateID so the recreated
+// placement targets a node that has the template. Drift here would mean
+// a failed-over Firecracker sandbox loses its template-locality
+// guarantee on the recreate, paying the docker-pull cost on every
+// failover.
+func TestCapacityRequestFromSpecCarriesTemplateID(t *testing.T) {
+	spec := &models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		Runtime: models.RuntimeFirecracker, TemplateID: "tpl-fc-1",
+	}
+	got := capacityRequestFromSpec(spec)
+	if got.TemplateID != "tpl-fc-1" {
+		t.Fatalf("capacityRequestFromSpec.TemplateID = %q, want %q", got.TemplateID, "tpl-fc-1")
+	}
+}
+
+func TestCapacityRequestFromSpecFirecrackerOverlayCountsAsDisk(t *testing.T) {
+	got := capacityRequestFromSpec(&models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		Runtime:       models.RuntimeFirecracker,
+		OverlaySizeGB: 20,
+	})
+	if got.DiskGB != 25 {
+		t.Fatalf("capacityRequestFromSpec DiskGB = %d, want 25", got.DiskGB)
+	}
+}
+
+func TestCapacityRequestFromSpecTemplateIDImpliesFirecracker(t *testing.T) {
+	spec := &models.CreateSandboxRequest{
+		CPU: 1, MemoryMB: 512, DiskGB: 5,
+		TemplateID: " tpl-fc-1 ",
+	}
+	got := capacityRequestFromSpec(spec)
+	if got.Runtime != models.RuntimeFirecracker || got.TemplateID != "tpl-fc-1" {
+		t.Fatalf("capacityRequestFromSpec = %+v, want runtime=firecracker template_id=tpl-fc-1", got)
+	}
+
+	dockerOnly := Member{NodeID: "docker-only", APIURL: "http://d", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		SupportedRuntimes: []string{models.RuntimeDocker},
+	}}
+	if nodeFits(dockerOnly, got, capacity.Request{}) {
+		t.Fatal("template-backed Firecracker request must not fit on a docker-only host")
+	}
+}
+
+func runtimeWorker(prefix string, i int, runtimes []string) Member {
+	return Member{
+		NodeID: prefix + strconv.Itoa(i),
+		APIURL: "http://" + prefix + strconv.Itoa(i),
+		Alive:  true,
+		Role:   config.NodeRoleWorker,
+		Capacity: capacity.Snapshot{
+			HostCPUCores:      16,
+			HostMemoryTotalMB: 65536,
+			CPUBudget:         16,
+			MemoryBudgetMB:    65536,
+			AvailableCPU:      16,
+			AvailableMemoryMB: 65536,
+			SupportedRuntimes: runtimes,
+			CanAdmit:          true,
+		},
 	}
 }

@@ -466,3 +466,139 @@ func TestListWithTagsOptionRendersWireFormat(t *testing.T) {
 		t.Fatalf("URL = %q, missing tag.user_id=alice", seenURL)
 	}
 }
+
+// TestTemplateLifecycle covers the public CreateTemplate / GetTemplate /
+// ListTemplates / DeleteTemplate / RebuildTemplate methods. The server
+// shape is stubbed via httptest so we can assert method+path+JSON shape
+// in one round trip per call. Daemon-side concurrency / state-machine
+// behaviour is covered by the internal/service tests on the server side.
+func TestTemplateLifecycle(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	type seenReq struct {
+		method string
+		path   string
+		body   map[string]any
+	}
+	var seen seenReq
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.method = r.Method
+		seen.path = r.URL.Path
+		seen.body = nil
+		if r.ContentLength > 0 {
+			_ = json.NewDecoder(r.Body).Decode(&seen.body)
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/templates":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "tpl-go", "image": "docker://alpine:3.19",
+				"status": "pending", "min_size_mib": 256,
+				"created_at": now, "updated_at": now,
+				"has_snapshot": false, "has_overlay": false,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/templates":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": "tpl-go", "image": "docker://alpine:3.19",
+				"status": "ready", "created_at": now, "updated_at": now,
+				"has_snapshot": true, "has_overlay": false, "push_state": "active",
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/templates/tpl-go":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "tpl-go", "image": "docker://alpine:3.19",
+				"status": "ready", "created_at": now, "updated_at": now,
+				"has_snapshot": true, "has_overlay": false,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/templates/tpl-go/rebuild":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "tpl-go", "image": "docker://alpine:3.19",
+				"status": "unhealthy", "created_at": now, "updated_at": now,
+				"has_snapshot": true, "has_overlay": false,
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/templates/tpl-go":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		PATToken: "pat", APIUrl: server.URL, HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+
+	tpl, err := client.CreateTemplate(ctx, sdktypes.CreateTemplateOptions{
+		ID: "tpl-go", Image: "docker://alpine:3.19", MinSizeMiB: 256,
+	})
+	if err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	if tpl.ID != "tpl-go" || tpl.Status != sdktypes.TemplateStatusPending {
+		t.Fatalf("CreateTemplate response = %+v", tpl)
+	}
+	if seen.body["image"] != "docker://alpine:3.19" || int(seen.body["min_size_mib"].(float64)) != 256 {
+		t.Fatalf("CreateTemplate body = %+v, missing fields", seen.body)
+	}
+
+	rows, err := client.ListTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListTemplates: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Status != sdktypes.TemplateStatusReady || !rows[0].HasSnapshot {
+		t.Fatalf("ListTemplates = %+v", rows)
+	}
+
+	got, err := client.GetTemplate(ctx, "tpl-go")
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.ID != "tpl-go" {
+		t.Fatalf("GetTemplate = %+v", got)
+	}
+
+	reb, err := client.RebuildTemplate(ctx, "tpl-go")
+	if err != nil {
+		t.Fatalf("RebuildTemplate: %v", err)
+	}
+	if reb.Status != sdktypes.TemplateStatusUnhealthy {
+		t.Fatalf("RebuildTemplate status = %s, want unhealthy", reb.Status)
+	}
+
+	if err := client.DeleteTemplate(ctx, "tpl-go"); err != nil {
+		t.Fatalf("DeleteTemplate: %v", err)
+	}
+	if seen.method != http.MethodDelete || seen.path != "/v1/templates/tpl-go" {
+		t.Fatalf("last call = %+v, want DELETE /v1/templates/tpl-go", seen)
+	}
+}
+
+// TestRebuildTemplate_412SurfacedAsError pins the operator-rebuild contract:
+// the daemon's 412 (template not in a rebuildable state) must surface as an
+// error from the SDK call, not as a silent zero-value response. Operator
+// tooling treating this as success would forever miss the underlying state.
+func TestRebuildTemplate_412SurfacedAsError(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		_, _ = w.Write([]byte(`{"error":"template not eligible for rebuild: current status=pending"}`))
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		PATToken: "pat", APIUrl: server.URL, HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+	_, err = client.RebuildTemplate(ctx, "tpl-pending")
+	if err == nil {
+		t.Fatal("RebuildTemplate returned nil error on 412 response")
+	}
+	if !strings.Contains(err.Error(), "not eligible for rebuild") {
+		t.Errorf("err = %v, want it to mention 'not eligible for rebuild'", err)
+	}
+}
