@@ -180,7 +180,7 @@ export interface CreateOptions {
    *
    * GPU access is not supported with `"gvisor"`.
    */
-  runtime?: "docker" | "gvisor" | "kata";
+  runtime?: "docker" | "gvisor" | "kata" | "firecracker";
   /**
    * Attach GPU resources to the sandbox. Omit for CPU-only workloads.
    * Not compatible with runtime="gvisor".
@@ -385,7 +385,7 @@ export interface Sandbox {
    * Container runtime this sandbox is running under. Empty string indicates
    * a pre-migration row that resolves to the host default at start time.
    */
-  runtime: "" | "docker" | "gvisor" | "kata";
+  runtime: "" | "docker" | "gvisor" | "kata" | "firecracker";
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
 }

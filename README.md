@@ -70,6 +70,7 @@ await sandbox.destroy()
 | Docker | Available | Default runtime with the lowest overhead. |
 | gVisor | Available | Install with `--with-gvisor` for stronger isolation. |
 | Kata Containers | Planned | Create requests return `runtime not yet implemented`. |
+| Firecracker | Available | MicroVM runtime for fast, secure isolation. |
 
 Install with gVisor support:
 
