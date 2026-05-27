@@ -1083,7 +1083,7 @@ func Load() (Config, error) {
 		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
-		FirecrackerKernelImage:  strings.TrimSpace(os.Getenv("SB_FIRECRACKER_KERNEL")),
+		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
 		FirecrackerRunDir:       getEnv("SB_FIRECRACKER_RUN_DIR", "/run/sandboxd/firecracker"),
 		FirecrackerTemplatesDir: getEnv("SB_FIRECRACKER_TEMPLATES_DIR", "/var/lib/sandboxd/firecracker/templates"),
 		UseJailer:               getEnvBool("SB_FIRECRACKER_USE_JAILER", true),

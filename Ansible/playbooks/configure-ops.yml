@@ -55,6 +55,16 @@
       SB_ENABLE_CUSTOM_DOMAINS: "{{ ingress.enable_custom_domains | bool | string | lower }}"
       SB_CUSTOM_DOMAIN_VERIFY_PREFIX: "{{ ingress.custom_domain_txt_prefix }}"
       SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX: "{{ ingress.custom_domain_txt_value_prefix }}"
+      SB_ENABLE_FIRECRACKER: "{{ firecracker.enabled | default(false) | bool | string | lower }}"
+      SB_FIRECRACKER_BINARY: "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') }}"
+      SB_JAILER_BINARY: "{{ firecracker.jailer_path | default('/usr/local/bin/jailer') }}"
+      SB_FIRECRACKER_KERNEL: "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}"
+      SB_FIRECRACKER_RUN_DIR: "{{ firecracker.run_dir | default('/run/sandboxd/firecracker') }}"
+      SB_FIRECRACKER_TEMPLATES_DIR: "{{ firecracker.templates_dir | default('/var/lib/sandboxd/firecracker/templates') }}"
+      SB_FIRECRACKER_USE_JAILER: "{{ firecracker.use_jailer | default(true) | bool | string | lower }}"
+      SB_JAILER_CHROOT_BASE: "{{ firecracker.jailer_chroot_base | default('/srv/jailer') }}"
+      SB_FIRECRACKER_TAP_BASE_CIDR: "{{ firecracker.tap_base_cidr | default('172.16.0.0/20') }}"
+      SB_FIRECRACKER_TAP_POOL_SIZE: "{{ firecracker.tap_pool_size | default(256) }}"
       # Secret path: keyed off whether the operator supplied a wrap key in
       # config/secrets.yml (aocr.upstream_wrap_key) OR via a control-node
       # file (sandboxd_upstream_wrap_key_src in local.yml). Empty path = no
