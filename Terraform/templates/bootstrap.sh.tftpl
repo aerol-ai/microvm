@@ -5,8 +5,26 @@
 # Variables expected:
 #   node_name, role, is_seed (bool),
 #   pat_token, domain, cloudflare_api_token,
-#   with_gvisor (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
+#   with_firecracker (bool), with_gvisor (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
 #   idle_timeout_min (number; 0 disables),
+#   firecracker_binary_url, firecracker_jailer_url, firecracker_kernel_url,
+#   firecracker_binary_path, firecracker_jailer_path, firecracker_kernel_path,
+#   firecracker_run_dir, firecracker_templates_dir,
+#   firecracker_use_jailer, firecracker_jailer_chroot_base,
+#   firecracker_jailer_uid, firecracker_jailer_gid,
+#   firecracker_tap_base_cidr, firecracker_tap_pool_size,
+#   firecracker_skopeo_bin, firecracker_umoci_bin, firecracker_mkfs_bin,
+#   firecracker_ip_binary, firecracker_template_gc_enabled,
+#   firecracker_template_gc_interval, firecracker_template_gc_ttl,
+#   firecracker_snapshot_enabled, firecracker_template_build_timeout,
+#   firecracker_template_rotation_interval, firecracker_template_max_age,
+#   firecracker_template_memory_mb, firecracker_template_vcpu,
+#   firecracker_snapshot_verify_on_load, firecracker_overlay_enabled,
+#   firecracker_overlay_mkfs, firecracker_snapshot_post_resume_timeout,
+#   firecracker_vmm_pool_enabled, firecracker_vmm_pool_depth_default,
+#   firecracker_vmm_pool_gc_interval, firecracker_vmm_pool_gc_ttl,
+#   firecracker_vmm_pool_refill_interval, firecracker_rss_sampler_interval,
+#   firecracker_rss_watermark_ratio,
 #   bundle_bucket, aws_region, seed_private_ip,
 #   install_script_url, cluster_init_script_url, cluster_join_script_url,
 #   seed_wait_max_seconds, extra_user_data
@@ -196,6 +214,57 @@ sudo /tmp/cluster-join.sh \
   --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 %{ endif ~}
 
+%{ if with_firecracker ~}
+###############################################################################
+# 2c. Firecracker host prerequisites
+#
+# install.sh does not yet know how to provision Firecracker hosts, so the
+# Terraform bootstrap handles the host-side prerequisites for nodes that opt
+# in. URLs are optional: when omitted we assume the AMI already carries the
+# artifact at the configured path.
+###############################################################################
+apt-get install -y skopeo umoci e2fsprogs iproute2
+
+install -d -m 0755 \
+  "$(dirname '${firecracker_binary_path}')" \
+  "$(dirname '${firecracker_jailer_path}')" \
+  "$(dirname '${firecracker_kernel_path}')" \
+  '${firecracker_run_dir}' \
+  '${firecracker_templates_dir}'
+
+%{ if firecracker_use_jailer ~}
+install -d -m 0755 '${firecracker_jailer_chroot_base}'
+%{ endif ~}
+
+if [ -n '${firecracker_binary_url}' ]; then
+  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_binary_url}' -o /tmp/firecracker.bin
+  install -m 0755 /tmp/firecracker.bin '${firecracker_binary_path}'
+fi
+
+if [ -n '${firecracker_jailer_url}' ]; then
+  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_jailer_url}' -o /tmp/jailer.bin
+  install -m 0755 /tmp/jailer.bin '${firecracker_jailer_path}'
+fi
+
+if [ -n '${firecracker_kernel_url}' ]; then
+  curl -fL --retry 5 --retry-delay 2 --retry-connrefused '${firecracker_kernel_url}' -o /tmp/vmlinux
+  install -m 0644 /tmp/vmlinux '${firecracker_kernel_path}'
+fi
+
+if [ ! -x '${firecracker_binary_path}' ]; then
+  echo "[bootstrap] firecracker binary missing or not executable at ${firecracker_binary_path}" >&2
+  exit 1
+fi
+if [ ! -f '${firecracker_kernel_path}' ]; then
+  echo "[bootstrap] firecracker kernel missing at ${firecracker_kernel_path}" >&2
+  exit 1
+fi
+if [ '${firecracker_use_jailer}' = 'true' ] && [ ! -x '${firecracker_jailer_path}' ]; then
+  echo "[bootstrap] jailer binary missing or not executable at ${firecracker_jailer_path}" >&2
+  exit 1
+fi
+%{ endif ~}
+
 ###############################################################################
 # 3. Operational hardening env
 #
@@ -220,6 +289,49 @@ SB_IMAGE_BUILD_GC_ENABLED=${image_build_gc_enabled}
 SB_IMAGE_BUILD_GC_INTERVAL=${image_build_gc_interval}
 SB_IMAGE_BUILD_GC_TTL=${image_build_gc_ttl}
 EOF
+
+%{ if with_firecracker ~}
+cat >> /tmp/aerolvm-ops.env <<'EOF'
+
+# Managed by Terraform bootstrap: Firecracker runtime host wiring.
+SB_ENABLE_FIRECRACKER=true
+SB_FIRECRACKER_BINARY=${firecracker_binary_path}
+SB_JAILER_BINARY=${firecracker_jailer_path}
+SB_FIRECRACKER_KERNEL=${firecracker_kernel_path}
+SB_FIRECRACKER_RUN_DIR=${firecracker_run_dir}
+SB_FIRECRACKER_TEMPLATES_DIR=${firecracker_templates_dir}
+SB_FIRECRACKER_USE_JAILER=${firecracker_use_jailer}
+SB_JAILER_CHROOT_BASE=${firecracker_jailer_chroot_base}
+SB_JAILER_UID=${firecracker_jailer_uid}
+SB_JAILER_GID=${firecracker_jailer_gid}
+SB_FIRECRACKER_TAP_BASE_CIDR=${firecracker_tap_base_cidr}
+SB_FIRECRACKER_TAP_POOL_SIZE=${firecracker_tap_pool_size}
+SB_FIRECRACKER_SKOPEO_BIN=${firecracker_skopeo_bin}
+SB_FIRECRACKER_UMOCI_BIN=${firecracker_umoci_bin}
+SB_FIRECRACKER_MKFS_BIN=${firecracker_mkfs_bin}
+SB_FIRECRACKER_IP_BINARY=${firecracker_ip_binary}
+SB_FIRECRACKER_TEMPLATE_GC_ENABLED=${firecracker_template_gc_enabled}
+SB_FIRECRACKER_TEMPLATE_GC_INTERVAL=${firecracker_template_gc_interval}
+SB_FIRECRACKER_TEMPLATE_GC_TTL=${firecracker_template_gc_ttl}
+SB_FIRECRACKER_SNAPSHOT_ENABLED=${firecracker_snapshot_enabled}
+SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT=${firecracker_template_build_timeout}
+SB_FIRECRACKER_TEMPLATE_ROTATION_INTERVAL=${firecracker_template_rotation_interval}
+SB_FIRECRACKER_TEMPLATE_MAX_AGE=${firecracker_template_max_age}
+SB_FIRECRACKER_TEMPLATE_MEMORY_MB=${firecracker_template_memory_mb}
+SB_FIRECRACKER_TEMPLATE_VCPU=${firecracker_template_vcpu}
+SB_FIRECRACKER_SNAPSHOT_VERIFY_ON_LOAD=${firecracker_snapshot_verify_on_load}
+SB_FIRECRACKER_OVERLAY_ENABLED=${firecracker_overlay_enabled}
+SB_FIRECRACKER_OVERLAY_MKFS=${firecracker_overlay_mkfs}
+SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT=${firecracker_snapshot_post_resume_timeout}
+SB_FIRECRACKER_VMM_POOL_ENABLED=${firecracker_vmm_pool_enabled}
+SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT=${firecracker_vmm_pool_depth_default}
+SB_FIRECRACKER_VMM_POOL_GC_INTERVAL=${firecracker_vmm_pool_gc_interval}
+SB_FIRECRACKER_VMM_POOL_GC_TTL=${firecracker_vmm_pool_gc_ttl}
+SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL=${firecracker_vmm_pool_refill_interval}
+SB_FIRECRACKER_RSS_SAMPLER_INTERVAL=${firecracker_rss_sampler_interval}
+SB_FIRECRACKER_RSS_WATERMARK_RATIO=${firecracker_rss_watermark_ratio}
+EOF
+%{ endif ~}
 
 %{ if aocr_enabled ~}
 ###############################################################################

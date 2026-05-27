@@ -175,6 +175,7 @@ variable "nodes" {
       volume_iops      (number,  default var.default_volume_iops)
       volume_throughput(number,  default var.default_volume_throughput)
       ami_id           (string,  default var.ami_id resolved to Ubuntu 22.04)
+      with_firecracker (bool,    default var.default_with_firecracker)
       with_gvisor      (bool,    default var.default_with_gvisor)
       with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
       with_amd_gpu     (bool,    default var.default_with_amd_gpu)
@@ -191,6 +192,7 @@ variable "nodes" {
     volume_iops       = optional(number)
     volume_throughput = optional(number)
     ami_id            = optional(string)
+    with_firecracker  = optional(bool)
     with_gvisor       = optional(bool)
     with_nvidia_gpu   = optional(bool)
     with_amd_gpu      = optional(bool)
@@ -246,11 +248,30 @@ variable "nodes" {
     ])
     error_message = "The seed node's role must contain \"server\" or equal \"mixed\" (cluster-init.sh refuses to bootstrap from a pure worker/ingress node)."
   }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      !(try(v.with_firecracker, false)) ||
+      contains(
+        split(",", replace(coalesce(v.role, "mixed"), " ", "")),
+        "worker",
+      ) ||
+      coalesce(v.role, "mixed") == "mixed"
+    ])
+    error_message = "nodes[*].with_firecracker may only be set on worker-capable nodes (role contains \"worker\" or equals \"mixed\")."
+  }
 }
 
 ###############################################################################
 # Install.sh feature defaults (per-node overrides live in var.nodes)
 ###############################################################################
+
+variable "default_with_firecracker" {
+  description = "Enable Firecracker runtime wiring on nodes that do not override it. Worker-capable nodes only. Bootstrap installs host deps, optionally downloads firecracker/jailer/kernel artifacts, and writes SB_ENABLE_FIRECRACKER + related SB_FIRECRACKER_* env."
+  type        = bool
+  default     = false
+}
 
 variable "default_with_gvisor" {
   description = "Install gVisor runsc and register it as an alternative OCI runtime. Per-node override via nodes[*].with_gvisor."
@@ -274,6 +295,77 @@ variable "default_idle_timeout_min" {
   description = "Idle auto-stop timeout in minutes for sandboxes (install.sh --idle-timeout-min). 0 disables."
   type        = number
   default     = 0
+}
+
+variable "firecracker" {
+  description = <<-EOT
+    Firecracker bootstrap settings for Terraform-managed hosts.
+
+    Nodes opt in with nodes[*].with_firecracker or default_with_firecracker.
+    When a node opts in, bootstrap installs distro dependencies
+    (skopeo, umoci, e2fsprogs, iproute2), optionally downloads the
+    firecracker/jailer/kernel artifacts from the URLs below, and writes the
+    matching SB_ENABLE_FIRECRACKER / SB_FIRECRACKER_* env vars into
+    /etc/sandboxd/cluster.env before restarting sandboxd.
+
+    The *_url fields are optional so pre-baked AMIs remain supported:
+    leave them empty if the AMI already ships the artifacts at the matching
+    *_path values. kernel_path must point at a real vmlinux image on the host
+    by the time sandboxd restarts or config validation will fail at boot.
+  EOT
+  type = object({
+    binary_url                   = optional(string, "")
+    jailer_url                   = optional(string, "")
+    kernel_url                   = optional(string, "")
+    binary_path                  = optional(string, "/usr/local/bin/firecracker")
+    jailer_path                  = optional(string, "/usr/local/bin/jailer")
+    kernel_path                  = optional(string, "/var/lib/sandboxd/firecracker/vmlinux")
+    run_dir                      = optional(string, "/run/sandboxd/firecracker")
+    templates_dir                = optional(string, "/var/lib/sandboxd/firecracker/templates")
+    use_jailer                   = optional(bool, true)
+    jailer_chroot_base           = optional(string, "/srv/jailer")
+    jailer_uid                   = optional(number, 1000)
+    jailer_gid                   = optional(number, 1000)
+    tap_base_cidr                = optional(string, "172.16.0.0/20")
+    tap_pool_size                = optional(number, 256)
+    skopeo_bin                   = optional(string, "/usr/bin/skopeo")
+    umoci_bin                    = optional(string, "/usr/bin/umoci")
+    mkfs_bin                     = optional(string, "/sbin/mkfs.ext4")
+    ip_binary                    = optional(string, "")
+    template_gc_enabled          = optional(bool, true)
+    template_gc_interval         = optional(string, "1h")
+    template_gc_ttl              = optional(string, "168h")
+    snapshot_enabled             = optional(bool, true)
+    template_build_timeout       = optional(string, "45m")
+    template_rotation_interval   = optional(string, "0s")
+    template_max_age             = optional(string, "0s")
+    template_memory_mb           = optional(number, 512)
+    template_vcpu                = optional(number, 1)
+    snapshot_verify_on_load      = optional(bool, true)
+    overlay_enabled              = optional(bool, true)
+    overlay_mkfs                 = optional(bool, false)
+    snapshot_post_resume_timeout = optional(string, "2s")
+    vmm_pool_enabled             = optional(bool, false)
+    vmm_pool_depth_default       = optional(number, 0)
+    vmm_pool_gc_interval         = optional(string, "5m")
+    vmm_pool_gc_ttl              = optional(string, "1h")
+    vmm_pool_refill_interval     = optional(string, "5s")
+    rss_sampler_interval         = optional(string, "1s")
+    rss_watermark_ratio          = optional(number, 0)
+  })
+  default = {}
+
+  validation {
+    condition = (
+      var.firecracker.tap_pool_size > 0
+      && var.firecracker.template_memory_mb > 0
+      && var.firecracker.template_vcpu > 0
+      && var.firecracker.vmm_pool_depth_default >= 0
+      && var.firecracker.rss_watermark_ratio >= 0
+      && var.firecracker.rss_watermark_ratio <= 1
+    )
+    error_message = "firecracker.tap_pool_size and template resource knobs must be positive, vmm_pool_depth_default must be >= 0, and rss_watermark_ratio must be between 0 and 1."
+  }
 }
 
 ###############################################################################

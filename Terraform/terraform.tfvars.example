@@ -44,10 +44,30 @@ default_volume_type       = "gp3"
 
 # install.sh feature flags. Per-node overrides take precedence; these apply
 # to any node that doesn't set the field explicitly.
+# default_with_firecracker = false   # enables Firecracker host wiring on worker-capable nodes
 # default_with_gvisor      = false   # adds --with-gvisor
 # default_with_nvidia_gpu  = false   # adds --with-nvidia-gpu (driver must be loaded)
 # default_with_amd_gpu     = false   # adds --with-amd-gpu (x86_64 only)
 # default_idle_timeout_min = 0       # sandbox auto-stop minutes; 0 disables
+
+# Firecracker host onboarding. URLs are optional: set them to let Terraform
+# bootstrap download the firecracker/jailer/kernel artifacts, or leave them
+# empty when the AMI already contains those files at the matching *_path.
+# firecracker = {
+#   binary_url               = "https://example.com/firecracker"
+#   jailer_url               = "https://example.com/jailer"
+#   kernel_url               = "https://example.com/vmlinux"
+#   kernel_path              = "/var/lib/sandboxd/firecracker/vmlinux"
+#   use_jailer               = true
+#   tap_base_cidr            = "172.16.0.0/20"
+#   tap_pool_size            = 256
+#   vmm_pool_enabled         = true
+#   vmm_pool_depth_default   = 1
+#   vmm_pool_refill_interval = "5s"
+#   vmm_pool_gc_interval     = "5m"
+#   vmm_pool_gc_ttl          = "1h"
+#   rss_watermark_ratio      = 0.10
+# }
 
 # --- Observability / operational hardening ----------------------------------
 #
@@ -89,12 +109,14 @@ nodes = {
 
   wrk1 = {
     role             = "worker"
+  #     with_firecracker = true
     instance_type    = "t3.large"
     volume_size_gb   = 200
     idle_timeout_min = 30 # auto-stop idle sandboxes on this host after 30 min
   }
   wrk2 = {
     role            = "worker"
+  #     with_firecracker = true
     instance_type   = "g5.xlarge" # NVIDIA A10G
     volume_size_gb  = 500
     with_nvidia_gpu = true # install nvidia-container-toolkit + configure docker

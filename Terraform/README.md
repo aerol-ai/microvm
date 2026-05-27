@@ -30,10 +30,16 @@ Spawns a complete AerolVM cluster on EC2 in one `terraform apply`:
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars
-# edit pat_token, cloudflare_*, domain_name, optionally tweak `nodes`
+# edit Terraform/terraform.tfvars, config/cluster.yml, and config/secrets.yml
 terraform init
 terraform apply
 ```
+
+The split is intentional:
+
+- `Terraform/terraform.tfvars`: cloud and per-node Terraform inputs such as `cloudflare_api_token`, instance sizing, `nodes[*].with_firecracker`, and the optional `firecracker.*_url` artifact downloads.
+- `config/cluster.yml`: shared non-secret cluster config such as `ingress.domain_name` and `ingress.acme_email`.
+- `config/secrets.yml`: shared cluster secrets such as `cluster.pat_token`.
 
 Outputs include every node's public IP, the seed's SSH command, and the
 verify-cluster `curl`. They also include Prometheus scrape targets for
@@ -83,6 +89,7 @@ Per-node fields:
 | `volume_iops`       | `var.default_volume_iops`        | gp3/io1/io2 only                                 |
 | `volume_throughput` | `var.default_volume_throughput`  | gp3 only                                         |
 | `ami_id`            | latest Ubuntu 22.04 LTS amd64    |                                                  |
+| `with_firecracker`  | `var.default_with_firecracker`   | worker-capable nodes only; writes `SB_ENABLE_FIRECRACKER` and optional host downloads |
 | `with_gvisor`       | `var.default_with_gvisor`        | adds `--with-gvisor` to install.sh               |
 | `with_nvidia_gpu`   | `var.default_with_nvidia_gpu`    | adds `--with-nvidia-gpu` (driver must be loaded) |
 | `with_amd_gpu`      | `var.default_with_amd_gpu`       | adds `--with-amd-gpu` (x86_64 only)              |
@@ -122,6 +129,52 @@ phases:
    node: OTEL metrics settings and image-pull storm controls. The bootstrap
    then restarts sandboxd once so those env vars are active immediately.
 
+## Onboarding Firecracker nodes
+
+Terraform now exposes Firecracker directly in the node schema instead of
+making operators smuggle everything through `extra_user_data`.
+
+1. Mark worker-capable nodes with `with_firecracker = true`.
+2. Fill the `firecracker` object in `terraform.tfvars`.
+3. Choose one of two bootstrap modes:
+
+- **Artifact-download mode**: set `firecracker.binary_url`, `firecracker.jailer_url`, and `firecracker.kernel_url`. Terraform bootstrap installs `skopeo`, `umoci`, `e2fsprogs`, and `iproute2`, downloads those artifacts, writes the matching `SB_ENABLE_FIRECRACKER` / `SB_FIRECRACKER_*` env vars into `/etc/sandboxd/cluster.env`, and restarts `sandboxd`.
+- **Pre-baked AMI mode**: leave the URLs empty and make sure the AMI already has the binaries and kernel at `firecracker.binary_path`, `firecracker.jailer_path`, and `firecracker.kernel_path`.
+
+Example:
+
+```hcl
+default_with_firecracker = false
+
+firecracker = {
+  binary_url               = "https://example.com/firecracker"
+  jailer_url               = "https://example.com/jailer"
+  kernel_url               = "https://example.com/vmlinux"
+  kernel_path              = "/var/lib/sandboxd/firecracker/vmlinux"
+  use_jailer               = true
+  tap_base_cidr            = "172.16.0.0/20"
+  tap_pool_size            = 256
+  vmm_pool_enabled         = true
+  vmm_pool_depth_default   = 1
+  vmm_pool_refill_interval = "5s"
+  vmm_pool_gc_interval     = "5m"
+  vmm_pool_gc_ttl          = "1h"
+  rss_watermark_ratio      = 0.10
+}
+
+nodes = {
+  srv1 = { role = "server", seed = true, instance_type = "t3.small" }
+  wrk1 = { role = "worker", with_firecracker = true, instance_type = "c6i.xlarge" }
+  wrk2 = { role = "worker", with_firecracker = true, instance_type = "c6i.xlarge" }
+}
+```
+
+Notes:
+
+- `with_firecracker` is validated at plan time and may only be set on worker-capable nodes (`worker`, `server,worker`, `worker,ingress`, or `mixed`).
+- The host default runtime stays Docker; Firecracker is selected per sandbox via `runtime: "firecracker"` or template-backed create calls.
+- The bootstrap writes the runtime env only on nodes with `with_firecracker = true`, so server-only and ingress-only nodes keep the old Docker-only shape.
+
 The S3 bucket is private, SSE-encrypted, and `force_destroy = true` by
 default so `terraform destroy` doesn't fail on leftover objects. Flip
 `bundle_bucket_force_destroy = false` if you want belt-and-braces.
@@ -139,15 +192,18 @@ Prometheus scraping is always available at `GET /v1/metrics` on each node's
 API port. The `prometheus_scrape_targets` output returns private-IP targets
 for a Prometheus running inside the VPC:
 
-```hcl
-otel_metrics_endpoint = "http://otel-collector.internal:4318/v1/metrics"
-otel_metrics_interval = "30s"
-otel_traces_endpoint = "http://otel-collector.internal:4318/v1/traces"
-otel_traces_sample_ratio = 0.05
-otel_service_name     = "sandboxd"
+```yaml
+# config/cluster.yml
+otel:
+  metrics_endpoint: "http://otel-collector.internal:4318/v1/metrics"
+  metrics_interval: "30s"
+  traces_endpoint: "http://otel-collector.internal:4318/v1/traces"
+  traces_sample_ratio: 0.05
+  service_name: "sandboxd"
 
-image_pull_max_concurrent  = 4
-image_pull_failure_backoff = "30s"
+image_pull:
+  max_concurrent: 4
+  failure_backoff: "30s"
 ```
 
 The repo-local observability artifacts to import are:
