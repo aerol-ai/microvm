@@ -1186,7 +1186,7 @@ func (c *Cluster) IngressTargets() models.IngressTarget {
 // nodes without Firecracker enabled never call this and degrade to
 // nil-provider behaviour (no LocalTemplateIDs on the snapshot, peers
 // see the legacy "unknown, allow" placement).
-func (c *Cluster) SetLocalTemplateIDsProvider(fn func() []string) {
+func (c *Cluster) SetLocalTemplateIDsProvider(fn func() ([]string, bool)) {
 	if c == nil || c.capacityLeases == nil {
 		return
 	}

@@ -72,7 +72,21 @@ func TestCapacity_OverlaysLocalTemplateIDs(t *testing.T) {
 	_ = seedReadyTemplate(t, st, templatesDir, "tpl-cap-1")
 	_ = seedReadyTemplate(t, st, templatesDir, "tpl-cap-2")
 	snap := svc.Capacity()
+	if !snap.LocalTemplateInventoryKnown {
+		t.Fatal("Capacity should mark template inventory authoritative")
+	}
 	if len(snap.LocalTemplateIDs) != 2 {
 		t.Fatalf("Capacity.LocalTemplateIDs = %v, want 2 ids", snap.LocalTemplateIDs)
+	}
+}
+
+func TestCapacity_EmptyTemplateInventoryIsStillAuthoritative(t *testing.T) {
+	svc, _, _ := newHealthHarness(t)
+	snap := svc.Capacity()
+	if !snap.LocalTemplateInventoryKnown {
+		t.Fatal("empty template inventory should still be marked authoritative")
+	}
+	if len(snap.LocalTemplateIDs) != 0 {
+		t.Fatalf("Capacity.LocalTemplateIDs = %v, want empty inventory", snap.LocalTemplateIDs)
 	}
 }

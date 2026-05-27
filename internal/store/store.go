@@ -3962,6 +3962,27 @@ func (s *Store) ReleaseFirecrackerVMMSlot(ctx context.Context, sandboxID string,
 	return nil
 }
 
+// ReleaseOrphanedFirecrackerVMMSlots marks any warm-pool slot left in
+// 'spawning' or 'loaded' with no sandbox claim as 'released'. The
+// daemon calls this once at startup before refilling so rows stranded
+// by the previous process do not stay invisible to GC forever.
+func (s *Store) ReleaseOrphanedFirecrackerVMMSlots(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_vmm_pool
+		SET status = ?, released_at = ?
+		WHERE sandbox_id IS NULL AND status IN (?, ?)
+	`, FirecrackerVMMSlotStatusReleased, now.UTC(),
+		FirecrackerVMMSlotStatusSpawning, FirecrackerVMMSlotStatusLoaded)
+	if err != nil {
+		return 0, fmt.Errorf("release orphaned firecracker vmm slots: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("release orphaned firecracker vmm slots (affected): %w", err)
+	}
+	return int(n), nil
+}
+
 // GetFirecrackerVMMSlotBySandbox returns the slot currently claimed by
 // sandboxID, or nil if it owns none. Used by the idempotent Allocate
 // pre-check and by PR 4-B's destroy path to find the slot whose VMM

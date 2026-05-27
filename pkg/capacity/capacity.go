@@ -155,16 +155,22 @@ type Snapshot struct {
 	// doesn't have, say, runsc installed. Empty = legacy node, treated as
 	// supporting any runtime so rolling upgrades don't strand pre-D peers.
 	SupportedRuntimes []string `json:"supported_runtimes,omitempty"`
+	// LocalTemplateInventoryKnown distinguishes an authoritative empty
+	// Firecracker template inventory from a legacy/unknown peer. When
+	// false, placement treats LocalTemplateIDs as "unknown, allow" for
+	// rolling upgrades and just-joined nodes. When true, an empty
+	// LocalTemplateIDs slice means this host definitely has no local
+	// templates cached.
+	LocalTemplateInventoryKnown bool `json:"local_template_inventory_known,omitempty"`
 	// LocalTemplateIDs lists the Firecracker templates whose artifact
 	// files (rootfs.ext4 + snapshot.{memory,state}) are present on this
 	// host. Placement gates a Firecracker create against it so a clone
 	// against a template the target has never seen lands on a node that
-	// already has it — preserving the <100ms boot promise. Empty list
-	// from a peer is interpreted as "unknown, allow" (matches
-	// SupportedRuntimes' legacy-peer behaviour); the consumer-side
-	// puller from PR 6-B.2 is the safety net when placement does miss.
-	// Phase 6 PR-D field; pre-upgrade peers omit it and degrade to
-	// pre-feature behaviour.
+	// already has it — preserving the <100ms boot promise. Consult
+	// LocalTemplateInventoryKnown before treating an empty list as
+	// authoritative: pre-upgrade peers omit both fields and degrade to
+	// pre-feature behaviour, while known=true plus an empty list means
+	// "definitely no local templates here."
 	LocalTemplateIDs []string `json:"local_template_ids,omitempty"`
 }
 

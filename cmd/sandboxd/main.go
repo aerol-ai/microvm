@@ -393,15 +393,18 @@ func main() {
 		// inventory at every heartbeat tick; the result is overlaid
 		// onto the snapshot peers gossip. Single-node mode and
 		// non-Firecracker nodes naturally degrade — the callback
-		// returns nil and placement's unknown-allow rule does the
-		// rest. Gated on EnableFirecracker so nodes that never serve
-		// templates don't pay the (cached) SQLite read.
+		// stays nil and placement's unknown-allow rule does the rest.
+		// When the callback reports known=true with an empty slice,
+		// peers treat that as an authoritative "no local templates"
+		// rather than legacy unknown. Gated on EnableFirecracker so
+		// nodes that never serve templates don't pay the (cached)
+		// SQLite read.
 		if cfg.EnableFirecracker {
 			if withTemplates, ok := clusterClient.(interface {
-				SetLocalTemplateIDsProvider(func() []string)
+				SetLocalTemplateIDsProvider(func() ([]string, bool))
 			}); ok {
-				withTemplates.SetLocalTemplateIDsProvider(func() []string {
-					return svc.LocalReadyTemplateIDs(context.Background())
+				withTemplates.SetLocalTemplateIDsProvider(func() ([]string, bool) {
+					return svc.LocalReadyTemplateInventory(context.Background())
 				})
 			}
 		}

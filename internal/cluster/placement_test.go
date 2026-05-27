@@ -357,7 +357,8 @@ func TestNodeFitsTemplatePresent(t *testing.T) {
 	hot := Member{NodeID: "hot", APIURL: "http://h", Alive: true, Capacity: capacity.Snapshot{
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,
 		CPUBudget: 8, MemoryBudgetMB: 8000,
-		LocalTemplateIDs: []string{"tpl-a", "tpl-b", "tpl-c"},
+		LocalTemplateInventoryKnown: true,
+		LocalTemplateIDs:            []string{"tpl-a", "tpl-b", "tpl-c"},
 	}}
 	if !nodeFits(hot, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-b"}, capacity.Request{}) {
 		t.Fatal("node with the template should fit")
@@ -373,14 +374,15 @@ func TestNodeFitsTemplateAbsentRejected(t *testing.T) {
 	cold := Member{NodeID: "cold", APIURL: "http://c", Alive: true, Capacity: capacity.Snapshot{
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,
 		CPUBudget: 8, MemoryBudgetMB: 8000,
-		LocalTemplateIDs: []string{"tpl-a"},
+		LocalTemplateInventoryKnown: true,
+		LocalTemplateIDs:            []string{"tpl-a"},
 	}}
 	if nodeFits(cold, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-z"}, capacity.Request{}) {
 		t.Fatal("node missing the template should be rejected when inventory is non-empty")
 	}
 }
 
-// TestNodeFitsTemplateUnknownAllowOnEmpty: a peer with an empty
+// TestNodeFitsTemplateUnknownAllowOnEmpty: a peer with unknown template
 // inventory (legacy node mid-rolling-upgrade, or just-joined node that
 // hasn't reported yet) must remain a candidate. Gating here would
 // strand creates on fresh clusters; the consumer-side puller is the
@@ -390,10 +392,21 @@ func TestNodeFitsTemplateUnknownAllowOnEmpty(t *testing.T) {
 	legacy := Member{NodeID: "l", APIURL: "http://l", Alive: true, Capacity: capacity.Snapshot{
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,
 		CPUBudget: 8, MemoryBudgetMB: 8000,
-		// LocalTemplateIDs intentionally empty
+		// LocalTemplateInventoryKnown intentionally false
 	}}
 	if !nodeFits(legacy, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-x"}, capacity.Request{}) {
 		t.Fatal("legacy (empty LocalTemplateIDs) peer must accept any template")
+	}
+}
+
+func TestNodeFitsKnownEmptyTemplateInventoryRejected(t *testing.T) {
+	empty := Member{NodeID: "empty", APIURL: "http://e", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalTemplateInventoryKnown: true,
+	}}
+	if nodeFits(empty, capacity.Request{CPU: 1, MemoryMB: 100, TemplateID: "tpl-x"}, capacity.Request{}) {
+		t.Fatal("authoritative empty template inventory should reject template-bound create")
 	}
 }
 

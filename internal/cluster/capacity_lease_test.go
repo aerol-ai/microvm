@@ -52,20 +52,24 @@ func TestCapacityLeaseCacheOverlaysLocalTemplateIDs(t *testing.T) {
 	// refreshLocal would have written.
 	cache := newCapacityLeaseCache("self", nil, 5*time.Second, nil)
 	called := 0
-	cache.SetLocalTemplateIDsProvider(func() []string {
+	cache.SetLocalTemplateIDsProvider(func() ([]string, bool) {
 		called++
-		return []string{"tpl-a", "tpl-b"}
+		return []string{"tpl-a", "tpl-b"}, true
 	})
 
 	// Simulate the refreshLocal overlay step on a hand-built snapshot.
 	snap := capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16000}
-	if cache.localTemplateIDs != nil {
-		if ids := cache.localTemplateIDs(); len(ids) > 0 {
+	if cache.localTemplateInventory != nil {
+		if ids, known := cache.localTemplateInventory(); known {
+			snap.LocalTemplateInventoryKnown = true
 			snap.LocalTemplateIDs = ids
 		}
 	}
 	if called != 1 {
 		t.Fatalf("provider called %d times, want 1", called)
+	}
+	if !snap.LocalTemplateInventoryKnown {
+		t.Fatal("overlay should mark template inventory authoritative")
 	}
 	if len(snap.LocalTemplateIDs) != 2 || snap.LocalTemplateIDs[0] != "tpl-a" {
 		t.Fatalf("LocalTemplateIDs = %v, want [tpl-a tpl-b]", snap.LocalTemplateIDs)
@@ -74,8 +78,29 @@ func TestCapacityLeaseCacheOverlaysLocalTemplateIDs(t *testing.T) {
 	// nil provider must not panic — single-node mode (or Firecracker
 	// disabled) leaves the field untouched.
 	cache.SetLocalTemplateIDsProvider(nil)
-	if cache.localTemplateIDs != nil {
+	if cache.localTemplateInventory != nil {
 		t.Fatal("nil provider should clear the callback")
+	}
+}
+
+func TestCapacityLeaseCacheOverlaysKnownEmptyTemplateInventory(t *testing.T) {
+	cache := newCapacityLeaseCache("self", nil, 5*time.Second, nil)
+	cache.SetLocalTemplateIDsProvider(func() ([]string, bool) {
+		return nil, true
+	})
+
+	snap := capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16000}
+	if cache.localTemplateInventory != nil {
+		if ids, known := cache.localTemplateInventory(); known {
+			snap.LocalTemplateInventoryKnown = true
+			snap.LocalTemplateIDs = ids
+		}
+	}
+	if !snap.LocalTemplateInventoryKnown {
+		t.Fatal("known empty template inventory lost its authoritative bit")
+	}
+	if len(snap.LocalTemplateIDs) != 0 {
+		t.Fatalf("LocalTemplateIDs = %v, want empty authoritative inventory", snap.LocalTemplateIDs)
 	}
 }
 

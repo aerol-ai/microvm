@@ -341,6 +341,97 @@ func TestPool_ReapReleased(t *testing.T) {
 	}
 }
 
+func TestPool_ReapReleasedKeepsRowWhenShutdownFails(t *testing.T) {
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Hour)
+
+	if err := p.RecordSpawning(ctx, "vmms-old", "tpl-a", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordLoaded(ctx, "vmms-old", "/api", "/dir", 3, old); err != nil {
+		t.Fatal(err)
+	}
+	parent := &fakeSpawner{}
+	p.registerHandle("vmms-old", &fakeHandle{
+		apiSocket:   "/api",
+		runDir:      "/dir",
+		parent:      parent,
+		shutdownErr: errors.New("shutdown failed"),
+	})
+	if _, err := p.Acquire(ctx, "tpl-a", "sb1", old); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := p.Release(ctx, "sb1", old); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	deleted, err := p.ReapReleased(ctx, now.Add(-1*time.Hour))
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("reaped %d rows, want 0 when shutdown fails", deleted)
+	}
+	if got := parent.shutdownCnt.Load(); got != 1 {
+		t.Fatalf("shutdown attempts = %d, want 1", got)
+	}
+	p.handlesMu.Lock()
+	_, ok := p.handles["vmms-old"]
+	p.handlesMu.Unlock()
+	if !ok {
+		t.Fatal("shutdown-failed handle was not restored for retry")
+	}
+	stats, err := p.Stats(ctx, "tpl-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Released != 1 {
+		t.Fatalf("released row was dropped after failed shutdown: %+v", stats)
+	}
+}
+
+func TestPool_ReleaseOrphanedRowsAtStart(t *testing.T) {
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	now := time.Now().UTC()
+
+	if err := p.RecordSpawning(ctx, "vmms-spawning", "tpl-a", now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordSpawning(ctx, "vmms-loaded", "tpl-a", now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordLoaded(ctx, "vmms-loaded", "/api", "/dir", 3, now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordSpawning(ctx, "vmms-live", "tpl-a", now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordLoaded(ctx, "vmms-live", "/api/live", "/dir/live", 4, now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Acquire(ctx, "tpl-a", "sb-live", now.Add(-2*time.Hour)); err != nil {
+		t.Fatalf("acquire live slot: %v", err)
+	}
+
+	released, err := p.releaseOrphanedRowsAtStart(ctx, now)
+	if err != nil {
+		t.Fatalf("release orphaned rows: %v", err)
+	}
+	if released != 2 {
+		t.Fatalf("released %d rows, want 2 orphaned warm rows", released)
+	}
+	stats, err := p.Stats(ctx, "tpl-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Allocated != 1 || stats.Released != 2 {
+		t.Fatalf("stats after startup repair = %+v, want allocated=1 released=2", stats)
+	}
+}
+
 func TestPool_DepthConfig(t *testing.T) {
 	p, _ := newTestPool(t)
 	// Default depth applies to any template without an override.

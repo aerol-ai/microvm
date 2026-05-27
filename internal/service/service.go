@@ -138,6 +138,7 @@ type Service struct {
 	// worst case. Lazily populated on first Capacity() call.
 	localReadyTemplateIDsMu      sync.Mutex
 	localReadyTemplateIDsCache   []string
+	localReadyTemplateIDsKnown   bool
 	localReadyTemplateIDsExpires time.Time
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
@@ -2778,22 +2779,23 @@ func (s *Service) Capacity() capacity.Snapshot {
 	} else {
 		snap = s.admitter.Snapshot()
 	}
-	if ids := s.LocalReadyTemplateIDs(context.Background()); len(ids) > 0 {
+	if ids, known := s.LocalReadyTemplateInventory(context.Background()); known {
+		snap.LocalTemplateInventoryKnown = true
 		snap.LocalTemplateIDs = ids
 	}
 	return snap
 }
 
-// LocalReadyTemplateIDs returns the IDs of Firecracker templates whose
-// artifacts are usable on this host. Cached for 5s — peers gossip
-// /v1/capacity at this cadence and a per-tick SQLite hit would starve
-// the create path's writes (single-writer DB). On error the cache is
-// left untouched and the previous value is returned, matching the
-// "stale is better than wrong" contract the rest of the heartbeat path
-// uses.
-func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
+// LocalReadyTemplateInventory returns the IDs of Firecracker templates
+// whose artifacts are usable on this host plus whether that inventory
+// is authoritative. Cached for 5s — peers gossip /v1/capacity at this
+// cadence and a per-tick SQLite hit would starve the create path's
+// writes (single-writer DB). On error the cache is left untouched and
+// the previous value is returned, matching the "stale is better than
+// wrong" contract the rest of the heartbeat path uses.
+func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bool) {
 	if s == nil || s.store == nil {
-		return nil
+		return nil, false
 	}
 	now := time.Now()
 	s.localReadyTemplateIDsMu.Lock()
@@ -2802,8 +2804,9 @@ func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
 		// snapshot that crosses goroutine boundaries) and we don't want
 		// to hand out the cache's backing array.
 		out := append([]string(nil), s.localReadyTemplateIDsCache...)
+		known := s.localReadyTemplateIDsKnown
 		s.localReadyTemplateIDsMu.Unlock()
-		return out
+		return out, known
 	}
 	s.localReadyTemplateIDsMu.Unlock()
 
@@ -2818,15 +2821,26 @@ func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
 		// templates.
 		s.localReadyTemplateIDsMu.Lock()
 		out := append([]string(nil), s.localReadyTemplateIDsCache...)
+		known := s.localReadyTemplateIDsKnown
 		s.localReadyTemplateIDsMu.Unlock()
-		return out
+		return out, known
 	}
 	s.localReadyTemplateIDsMu.Lock()
 	s.localReadyTemplateIDsCache = ids
+	s.localReadyTemplateIDsKnown = true
 	s.localReadyTemplateIDsExpires = now.Add(5 * time.Second)
 	out := append([]string(nil), ids...)
 	s.localReadyTemplateIDsMu.Unlock()
-	return out
+	return out, true
+}
+
+// LocalReadyTemplateIDs returns only the template IDs from
+// LocalReadyTemplateInventory. Callers that need to distinguish
+// authoritative empty inventory from legacy/unknown should use the
+// richer method.
+func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
+	ids, _ := s.LocalReadyTemplateInventory(ctx)
+	return ids
 }
 
 // ReplayReservations re-populates the admitter from persistent state. Without

@@ -208,13 +208,12 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 	// on cold boot, preserving the <100ms boot property the runtime
 	// exists to deliver.
 	//
-	// Unknown-allow rule (mirrors SupportedRuntimes above): empty
-	// LocalTemplateIDs on the peer means a legacy or just-joined node
-	// that hasn't reported its inventory yet; we don't gate, because
-	// gating would strand creates on a fresh cluster. A non-empty list
-	// missing the requested template is an authoritative "no" — that
-	// peer reported its inventory and the template isn't in it.
-	if req.TemplateID != "" && len(cap.LocalTemplateIDs) > 0 {
+	// Unknown-allow rule (mirrors SupportedRuntimes above): a peer with
+	// LocalTemplateInventoryKnown=false is legacy or just-joined and we
+	// don't gate. Once LocalTemplateInventoryKnown=true, an empty list is
+	// an authoritative "no templates here" and a non-empty list missing
+	// the requested template is an authoritative "no" for that template.
+	if req.TemplateID != "" && cap.LocalTemplateInventoryKnown {
 		hit := false
 		for _, t := range cap.LocalTemplateIDs {
 			if t == req.TemplateID {

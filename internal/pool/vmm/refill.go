@@ -129,6 +129,11 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, lister TemplateLister,
 	// happens at t=0, not t=RefillInterval" property matters for
 	// integration tests that want to observe a warmed pool without
 	// sleeping for a full interval.
+	if released, err := p.releaseOrphanedRowsAtStart(ctx, time.Now().UTC()); err != nil {
+		p.logger.Warn("vmm pool: startup orphan repair failed", "error", err)
+	} else if released > 0 {
+		p.logger.Info("vmm pool: released orphaned startup rows", "count", released)
+	}
 	p.runRefillOnce(ctx, lister, spawner, cfg.SpawnTimeout, &refillBusy)
 
 	for {

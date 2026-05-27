@@ -316,9 +316,8 @@ func (p *Pool) takeHandle(slotID string) (SpawnedHandle, bool) {
 //
 // Returns the number of handles drained. The SQLite rows are not
 // touched here — Release-then-Reap is the row lifecycle, and the
-// daemon's restart will re-derive the empty state from a no-handles
-// pool against any leftover 'loaded' rows (see AcquireWithHandle's
-// orphan-detect branch).
+// next daemon start will release any leftover warm rows before the
+// refill loop runs.
 func (p *Pool) Close(ctx context.Context, grace time.Duration) int {
 	p.handlesMu.Lock()
 	handles := p.handles
@@ -335,6 +334,19 @@ func (p *Pool) Close(ctx context.Context, grace time.Duration) int {
 		drained++
 	}
 	return drained
+}
+
+// releaseOrphanedRowsAtStart moves warm-pool rows stranded in
+// 'spawning'/'loaded' with no claimant into 'released' before the
+// daemon begins refilling again. Without this startup repair, a clean
+// or crashed restart can strand warm rows forever because no handle
+// survives to transition them later.
+func (p *Pool) releaseOrphanedRowsAtStart(ctx context.Context, now time.Time) (int, error) {
+	released, err := p.st.ReleaseOrphanedFirecrackerVMMSlots(ctx, now)
+	if err != nil {
+		return 0, fmt.Errorf("vmm pool release orphaned startup rows: %w", err)
+	}
+	return released, nil
 }
 
 // Get returns the slot currently claimed by sandboxID, or nil if it
@@ -441,11 +453,10 @@ func (p *Pool) ListNonReleased(ctx context.Context, templateID string) ([]Slot, 
 //
 // Per-row handle drain: when the in-memory map still has a handle for
 // a row being reaped, it means the slot was released without ever
-// being Acquire'd (e.g. depth was lowered, drained by Close, or a
-// load failure left the handle and row stuck). Best-effort Shutdown
-// before delete so the firecracker process doesn't outlive the row.
-// A failure here is logged and the row is still deleted — leaving
-// the row would block future reap passes from making progress.
+// being Acquire'd (e.g. a synthetic test, a future drain path, or a
+// partial cleanup that released the row before the process stopped).
+// Shutdown must succeed before delete so the row remains the durable
+// breadcrumb for a retry if teardown fails.
 func (p *Pool) ReapReleased(ctx context.Context, cutoff time.Time) (int, error) {
 	released, err := p.st.ListReleasedFirecrackerVMMSlots(ctx, cutoff)
 	if err != nil {
@@ -457,6 +468,8 @@ func (p *Pool) ReapReleased(ctx context.Context, cutoff time.Time) (int, error) 
 			if sErr := h.Shutdown(ctx, 3*time.Second); sErr != nil {
 				p.logger.Warn("vmm pool reap: shutdown failed",
 					"slot_id", sl.ID, "error", sErr)
+				p.registerHandle(sl.ID, h)
+				continue
 			}
 		}
 		if err := p.st.DeleteFirecrackerVMMSlot(ctx, sl.ID); err != nil {
