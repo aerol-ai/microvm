@@ -43,6 +43,8 @@ resource "aws_instance" "seed" {
     role                                     = local.seed_node.role
     is_seed                                  = true
     domain                                   = local.domain_name
+    custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
+    custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix
     pat_token                                = local.pat_token
     cloudflare_api_token                     = var.cloudflare_api_token
     acme_email                               = local.acme_email
@@ -183,6 +185,8 @@ resource "aws_instance" "joiner" {
     role                                     = each.value.role
     is_seed                                  = false
     domain                                   = local.domain_name
+    custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
+    custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix
     pat_token                                = local.pat_token
     cloudflare_api_token                     = var.cloudflare_api_token
     acme_email                               = local.acme_email

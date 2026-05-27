@@ -13,6 +13,7 @@ public class MicroVMConfig {
      * version.
      */
     public String apiVersion;
+    public ai.aerol.microvm.model.RetryConfig retry;
 
     public MicroVMConfig setPatToken(String patToken) {
         this.patToken = patToken;
@@ -31,6 +32,11 @@ public class MicroVMConfig {
 
     public MicroVMConfig setApiVersion(String apiVersion) {
         this.apiVersion = apiVersion;
+        return this;
+    }
+
+    public MicroVMConfig setRetry(ai.aerol.microvm.model.RetryConfig retry) {
+        this.retry = retry;
         return this;
     }
 }

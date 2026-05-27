@@ -71,6 +71,7 @@ public class MicroVMClient {
     private final String versionPrefix;
     private final HttpClient httpClient;
     private final WebSocketConnector webSocketConnector;
+    private final ai.aerol.microvm.model.RetryConfig retryConfig;
 
     public MicroVMClient() {
         this(new MicroVMConfig());
@@ -98,6 +99,7 @@ public class MicroVMClient {
         this.versionPrefix = prefix;
         this.httpClient = httpClient != null ? httpClient : effectiveConfig.httpClient != null ? effectiveConfig.httpClient : HttpClient.newHttpClient();
         this.webSocketConnector = webSocketConnector != null ? webSocketConnector : new JavaNetWebSocketConnector(this.httpClient);
+        this.retryConfig = effectiveConfig.retry != null ? effectiveConfig.retry : new ai.aerol.microvm.model.RetryConfig();
 
         if (this.patToken.isEmpty()) {
             throw new MicroVMException(AUTH_REQUIRED_ERROR_MESSAGE);
@@ -826,20 +828,52 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
-        if (contentType != null) {
-            builder.header("Content-Type", contentType);
-        }
-        builder.header("Authorization", authorizationHeaderValue());
+        int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
+        int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
+        int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
+        
+        Exception lastException = null;
 
-        try {
-            return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
-        } catch (IOException | InterruptedException ex) {
-            if (ex instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
+            if (contentType != null) {
+                builder.header("Content-Type", contentType);
             }
-            throw new MicroVMException("request failed", ex);
+            builder.header("Authorization", authorizationHeaderValue());
+
+            try {
+                HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+                int status = response.statusCode();
+                if ((status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
+                    // Fall through to retry logic
+                } else {
+                    return response;
+                }
+            } catch (IOException | InterruptedException ex) {
+                if (ex instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                    throw new MicroVMException("request interrupted", ex);
+                }
+                lastException = ex;
+                if (attempt >= maxRetries) {
+                    break;
+                }
+            }
+
+            int delayMs = Math.min(baseDelay * (1 << attempt), maxDelay);
+            double jitter = 1.0 + (Math.random() - 0.5) * 0.5;
+            try {
+                Thread.sleep((long) (delayMs * jitter));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new MicroVMException("request interrupted during backoff", e);
+            }
         }
+
+        if (lastException != null) {
+            throw new MicroVMException("request failed after " + maxRetries + " retries", lastException);
+        }
+        throw new MicroVMException("request failed after " + maxRetries + " retries");
     }
 
     private void ensureSuccess(HttpResponse<byte[]> response) {

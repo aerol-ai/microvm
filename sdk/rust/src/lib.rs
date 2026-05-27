@@ -25,13 +25,14 @@ pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
-    BuildImageOptions, BuildImagePushOptions, BuildImageResult, CreateOptions, CreateSessionOptions,
-    CreateTemplateOptions, CustomDomain, CustomDomainDnsRecords, CustomDomainStatus, DnsRecord,
-    ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, ExposeProtocol, ExposeResult,
-    ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle, MountSpec, MountSpecRedacted,
-    MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth, ResizeOptions,
-    Sandbox as SandboxData, SandboxSnapshot, Session, SessionList, SessionStatus,
-    SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus, UpdateLifecycleOptions,
+    BuildImageOptions, BuildImagePushOptions, BuildImageResult, ClientConfig, CreateOptions,
+    CreateSessionOptions, CreateTemplateOptions, CustomDomain, CustomDomainDnsRecords,
+    CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
+    ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
+    MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
+    ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
+    SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
+    UpdateLifecycleOptions,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -160,6 +161,7 @@ pub struct Client {
     pat_token: String,
     api_version: ApiVersion,
     inner: HttpClient,
+    retry_config: RetryConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -471,9 +473,19 @@ impl Client {
         pat_token: Option<&str>,
         api_version: ApiVersion,
     ) -> Result<Self, Error> {
-        let token = pat_token
+        Self::with_config(ClientConfig {
+            api_url: api_url.map(String::from),
+            pat_token: pat_token.map(String::from),
+            retry: None,
+        }, api_version)
+    }
+
+    pub fn with_config(
+        config: ClientConfig,
+        api_version: ApiVersion,
+    ) -> Result<Self, Error> {
+        let token = config.pat_token
             .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
             .or_else(|| {
                 std::env::var("SB_PAT_TOKEN")
                     .ok()
@@ -481,7 +493,7 @@ impl Client {
             });
 
         let pat_token = token.ok_or(Error::MissingToken)?;
-        let api_url = api_url
+        let api_url = config.api_url
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().trim_end_matches('/').to_string())
             .or_else(|| {
@@ -497,6 +509,7 @@ impl Client {
             pat_token,
             api_version,
             inner: HttpClient::new(),
+            retry_config: config.retry.unwrap_or_default(),
         })
     }
 
@@ -1278,23 +1291,53 @@ impl Client {
         path: &str,
         payload: Option<&T>,
     ) -> Result<U, Error> {
-        let url = self.full_url(path);
-        let builder = self
-            .inner
-            .request(method, &url)
-            .bearer_auth(&self.pat_token);
-        let builder = if let Some(body) = payload {
-            builder.json(body)
-        } else {
-            builder
-        };
+        let max_retries = self.retry_config.max_retries.unwrap_or(3);
+        let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
+        let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
 
-        let response = builder.send()?;
-        let response = self.handle_response(response)?;
-        if response.status() == reqwest::StatusCode::NO_CONTENT {
-            return serde_json::from_str("null").map_err(Error::SerdeJson);
+        let mut attempt = 0;
+        loop {
+            let url = self.full_url(path);
+            let mut builder = self
+                .inner
+                .request(method.clone(), &url)
+                .bearer_auth(&self.pat_token);
+            if let Some(body) = payload {
+                builder = builder.json(body);
+            }
+
+            match builder.send() {
+                Ok(response) => {
+                    let status = response.status();
+                    if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
+                        && attempt < max_retries
+                    {
+                        // Fall through to retry logic
+                    } else {
+                        let response = self.handle_response(response)?;
+                        if response.status() == reqwest::StatusCode::NO_CONTENT {
+                            return serde_json::from_str("null").map_err(Error::SerdeJson);
+                        }
+                        return response.json().map_err(Error::Reqwest);
+                    }
+                }
+                Err(err) => {
+                    if attempt >= max_retries || !err.is_request() && !err.is_connect() && !err.is_timeout() {
+                        return Err(Error::Reqwest(err));
+                    }
+                }
+            }
+
+            let delay_ms = std::cmp::min(base_delay * (1 << attempt), max_delay);
+            // Add jitter
+            let jitter = 1.0 + (rand::random::<f64>() - 0.5) * 0.5;
+            let sleep_duration = std::time::Duration::from_millis((delay_ms as f64 * jitter) as u64);
+            std::thread::sleep(sleep_duration);
+            attempt += 1;
         }
-        response.json().map_err(Error::Reqwest)
     }
 
     fn do_multipart(&self, path: &str, form: Form) -> Result<(), Error> {

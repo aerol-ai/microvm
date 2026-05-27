@@ -72,6 +72,28 @@ const PATH_PREFIXES: Record<APIVersion, string> = {
   v1: V1_PATH_PREFIX,
 };
 
+/**
+ * Retry configuration for transient transport and server errors.
+ * All fields are optional — the SDK ships sensible defaults.
+ */
+export interface RetryConfig {
+  /**
+   * Maximum number of retry attempts after the initial request fails.
+   * Set to `0` to disable retry entirely. Defaults to `3`.
+   */
+  maxRetries?: number;
+  /**
+   * Initial backoff delay in milliseconds. Subsequent retries double this
+   * value (exponential backoff). Defaults to `200`.
+   */
+  baseDelayMs?: number;
+  /**
+   * Hard ceiling on the computed delay in milliseconds. Prevents unbounded
+   * waits when `maxRetries` is high. Defaults to `5000`.
+   */
+  maxDelayMs?: number;
+}
+
 export interface APIClientConfig {
   baseURL: string;
   patToken?: string;
@@ -82,6 +104,12 @@ export interface APIClientConfig {
    * a future major SDK release.
    */
   apiVersion?: APIVersion;
+  /**
+   * Retry policy for transient transport errors (socket closed, connection
+   * reset) and retryable HTTP status codes (429, 502, 503, 504). Pass
+   * `{ maxRetries: 0 }` to disable retry entirely.
+   */
+  retry?: RetryConfig;
 }
 
 interface ApiExposedPort {
@@ -254,6 +282,54 @@ interface ApiNetworkUsage {
   last_sampled_at?: string | null;
 }
 
+/** HTTP status codes the retry loop considers transient. */
+const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
+
+/** Default retry settings when the caller doesn't supply a RetryConfig. */
+const DEFAULT_RETRY: Required<RetryConfig> = {
+  maxRetries: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 5_000,
+};
+
+/**
+ * Returns `true` when the thrown `error` looks like a transport-level failure
+ * that vanishes on retry (connection reset, socket closed by peer, DNS
+ * blip). `undici` and Node core use several `cause.code` values; we check
+ * the full cause chain.
+ */
+function isTransientTransportError(error: unknown): boolean {
+  const codes = new Set([
+    "UND_ERR_SOCKET",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "EPIPE",
+    "EAI_AGAIN",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+  ]);
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current != null; depth++) {
+    if (current instanceof Error) {
+      const code = (current as NodeJS.ErrnoException).code;
+      if (code && codes.has(code)) return true;
+      if (current.message && /socket hang up|other side closed/i.test(current.message)) return true;
+      current = (current as { cause?: unknown }).cause;
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
+/** Sleep with ±25% jitter so concurrent callers don't thundering-herd. */
+function jitteredDelay(baseMs: number): Promise<void> {
+  const jitter = 1 + (Math.random() - 0.5) * 0.5; // 0.75 – 1.25
+  return new Promise((resolve) => setTimeout(resolve, Math.round(baseMs * jitter)));
+}
+
 export class APIClient {
   readonly baseURL: string;
   readonly apiVersion: APIVersion;
@@ -261,6 +337,7 @@ export class APIClient {
   private readonly patToken: string;
   private readonly fetchFn: FetchLike;
   private readonly versionPrefix: string;
+  private readonly retryConfig: Required<RetryConfig>;
 
   constructor(config: APIClientConfig) {
     this.baseURL = config.baseURL.replace(/\/+$/, "");
@@ -268,6 +345,11 @@ export class APIClient {
     this.fetchFn = config.fetch ?? fetch;
     this.apiVersion = config.apiVersion ?? DEFAULT_API_VERSION;
     this.versionPrefix = PATH_PREFIXES[this.apiVersion];
+    this.retryConfig = {
+      maxRetries: config.retry?.maxRetries ?? DEFAULT_RETRY.maxRetries,
+      baseDelayMs: config.retry?.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs,
+      maxDelayMs: config.retry?.maxDelayMs ?? DEFAULT_RETRY.maxDelayMs,
+    };
   }
 
   /**
@@ -670,16 +752,55 @@ export class APIClient {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  private request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
+  /**
+   * Low-level HTTP request with automatic retry for transient failures.
+   *
+   * Transport-level errors (socket closed, connection reset, DNS blip) are
+   * always retried regardless of HTTP method — the request never reached the
+   * server so there is no idempotency concern.
+   *
+   * HTTP-level retryable codes (429, 502, 503, 504) are retried for ALL
+   * methods because every mutating endpoint in the daemon is already
+   * designed for idempotent retry (e.g. INSERT OR IGNORE + disambiguation).
+   */
+  private async request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers);
     if (this.patToken !== "") {
       headers.set("Authorization", `Bearer ${this.patToken}`);
     }
-    return this.fetchFn(`${this.baseURL}${path}`, {
-      ...init,
-      method,
-      headers,
-    });
+
+    const url = `${this.baseURL}${path}`;
+    const requestInit: RequestInit = { ...init, method, headers };
+    const { maxRetries, baseDelayMs, maxDelayMs } = this.retryConfig;
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await this.fetchFn(url, requestInit);
+
+        // Retry on transient HTTP status codes.
+        if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries) {
+          const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
+          await jitteredDelay(delay);
+          continue;
+        }
+
+        return response;
+      } catch (error: unknown) {
+        lastError = error;
+
+        // Only retry transport-level failures; anything else propagates.
+        if (!isTransientTransportError(error) || attempt >= maxRetries) {
+          throw error;
+        }
+
+        const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
+        await jitteredDelay(delay);
+      }
+    }
+
+    // Should be unreachable — the loop always throws or returns.
+    throw lastError;
   }
 }
 

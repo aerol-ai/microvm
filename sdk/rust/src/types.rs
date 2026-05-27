@@ -732,3 +732,27 @@ pub struct SetNetworkLimitsOptions {
     )]
     pub network_bytes_out_limit: Option<i64>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RetryConfig {
+    pub max_retries: Option<i32>,
+    pub base_delay_ms: Option<u64>,
+    pub max_delay_ms: Option<u64>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: Some(3),
+            base_delay_ms: Some(200),
+            max_delay_ms: Some(5000),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ClientConfig {
+    pub api_url: Option<String>,
+    pub pat_token: Option<String>,
+    pub retry: Option<RetryConfig>,
+}

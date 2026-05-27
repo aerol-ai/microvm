@@ -7,7 +7,7 @@ import (
 
 func TestComposeDNSRecords_SubdomainCNAME(t *testing.T) {
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
-	got := ComposeDNSRecords([]string{"api.acme.com"}, target)
+	got := ComposeDNSRecords([]string{"api.acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 {
 		t.Fatalf("want 1 record, got %d", len(got))
 	}
@@ -22,7 +22,7 @@ func TestComposeDNSRecords_SubdomainCNAME(t *testing.T) {
 
 func TestComposeDNSRecords_ApexCNAME(t *testing.T) {
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
-	got := ComposeDNSRecords([]string{"acme.com"}, target)
+	got := ComposeDNSRecords([]string{"acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 || got[0].Name != "@" || got[0].Type != DNSRecordTypeCNAME {
 		t.Fatalf("apex should produce one CNAME with Name=@, got %+v", got)
 	}
@@ -34,7 +34,7 @@ func TestComposeDNSRecords_DeepSubdomainUsesFullPrefix(t *testing.T) {
 	// "acme.com", the correct Name is "a.b.c" — using just "a" would
 	// create the wrong row.
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
-	got := ComposeDNSRecords([]string{"a.b.c.acme.com"}, target)
+	got := ComposeDNSRecords([]string{"a.b.c.acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 || got[0].Name != "a.b.c" {
 		t.Fatalf("expected Name=a.b.c for deep subdomain, got %+v", got)
 	}
@@ -45,7 +45,7 @@ func TestComposeDNSRecords_PublicSuffixApex(t *testing.T) {
 	// the leftmost label "example" is NOT a subdomain. A naive
 	// label-count heuristic would mis-render this as Name="example".
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
-	got := ComposeDNSRecords([]string{"example.co.uk"}, target)
+	got := ComposeDNSRecords([]string{"example.co.uk"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 || got[0].Name != "@" {
 		t.Fatalf("expected apex Name=@ for example.co.uk, got %+v", got)
 	}
@@ -53,7 +53,7 @@ func TestComposeDNSRecords_PublicSuffixApex(t *testing.T) {
 
 func TestComposeDNSRecords_PublicSuffixSubdomain(t *testing.T) {
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
-	got := ComposeDNSRecords([]string{"api.example.co.uk"}, target)
+	got := ComposeDNSRecords([]string{"api.example.co.uk"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 || got[0].Name != "api" {
 		t.Fatalf("expected Name=api for api.example.co.uk, got %+v", got)
 	}
@@ -61,7 +61,7 @@ func TestComposeDNSRecords_PublicSuffixSubdomain(t *testing.T) {
 
 func TestComposeDNSRecords_IPv4ProducesA(t *testing.T) {
 	target := IngressTarget{IPs: []string{"203.0.113.10"}, Source: IngressTargetSourceIPs}
-	got := ComposeDNSRecords([]string{"api.acme.com"}, target)
+	got := ComposeDNSRecords([]string{"api.acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 || got[0].Type != DNSRecordTypeA || got[0].Value != "203.0.113.10" {
 		t.Fatalf("expected single A record, got %+v", got)
 	}
@@ -69,7 +69,7 @@ func TestComposeDNSRecords_IPv4ProducesA(t *testing.T) {
 
 func TestComposeDNSRecords_IPv6ProducesAAAA(t *testing.T) {
 	target := IngressTarget{IPs: []string{"2001:db8::1"}, Source: IngressTargetSourceIPs}
-	got := ComposeDNSRecords([]string{"api.acme.com"}, target)
+	got := ComposeDNSRecords([]string{"api.acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 || got[0].Type != DNSRecordTypeAAAA {
 		t.Fatalf("expected AAAA for IPv6, got %+v", got)
 	}
@@ -77,7 +77,7 @@ func TestComposeDNSRecords_IPv6ProducesAAAA(t *testing.T) {
 
 func TestComposeDNSRecords_MixedIPv4AndIPv6(t *testing.T) {
 	target := IngressTarget{IPs: []string{"203.0.113.10", "2001:db8::1"}, Source: IngressTargetSourceIPs}
-	got := ComposeDNSRecords([]string{"acme.com"}, target)
+	got := ComposeDNSRecords([]string{"acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 2 {
 		t.Fatalf("want 2 records, got %d", len(got))
 	}
@@ -95,7 +95,7 @@ func TestComposeDNSRecords_MixedSourceSubdomainPrefersCNAME(t *testing.T) {
 		IPs:      []string{"203.0.113.10"},
 		Source:   IngressTargetSourceMixed,
 	}
-	got := ComposeDNSRecords([]string{"api.acme.com"}, target)
+	got := ComposeDNSRecords([]string{"api.acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 {
 		t.Fatalf("expected single record, got %d: %+v", len(got), got)
 	}
@@ -113,7 +113,7 @@ func TestComposeDNSRecords_MixedSourceApexPrefersIPs(t *testing.T) {
 		IPs:      []string{"203.0.113.10", "2001:db8::1"},
 		Source:   IngressTargetSourceMixed,
 	}
-	got := ComposeDNSRecords([]string{"acme.com"}, target)
+	got := ComposeDNSRecords([]string{"acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 2 {
 		t.Fatalf("expected A + AAAA at apex, got %d records: %+v", len(got), got)
 	}
@@ -129,7 +129,7 @@ func TestComposeDNSRecords_MixedSourceApexPrefersIPs(t *testing.T) {
 
 func TestComposeDNSRecords_MultipleHostnames(t *testing.T) {
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
-	got := ComposeDNSRecords([]string{"api.acme.com", "acme.com"}, target)
+	got := ComposeDNSRecords([]string{"api.acme.com", "acme.com"}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 2 {
 		t.Fatalf("want 2 records, got %d", len(got))
 	}
@@ -139,21 +139,42 @@ func TestComposeDNSRecords_MultipleHostnames(t *testing.T) {
 }
 
 func TestComposeDNSRecords_EmptyInputReturnsNil(t *testing.T) {
-	if got := ComposeDNSRecords(nil, IngressTarget{Hostname: "x.example.com"}); got != nil {
+	if got := ComposeDNSRecords(nil, IngressTarget{Hostname: "x.example.com"}, "", "_aerol-verify", "aerol-verify="); got != nil {
 		t.Fatalf("expected nil for empty hostnames, got %+v", got)
 	}
-	if got := ComposeDNSRecords([]string{"api.acme.com"}, IngressTarget{Source: IngressTargetSourceUnknown}); got != nil {
+	if got := ComposeDNSRecords([]string{"api.acme.com"}, IngressTarget{Source: IngressTargetSourceUnknown}, "", "_aerol-verify", "aerol-verify="); got != nil {
 		t.Fatalf("expected nil for empty target, got %+v", got)
 	}
 }
 
 func TestComposeDNSRecords_NormalizesHostname(t *testing.T) {
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
-	got := ComposeDNSRecords([]string{"  API.Acme.COM.  "}, target)
+	got := ComposeDNSRecords([]string{"  API.Acme.COM.  "}, target, "", "_aerol-verify", "aerol-verify=")
 	if len(got) != 1 {
 		t.Fatalf("want 1 record, got %d", len(got))
 	}
 	if got[0].Hostname != "api.acme.com" || got[0].Name != "api" {
 		t.Fatalf("expected normalized api.acme.com, got %+v", got[0])
+	}
+}
+
+func TestComposeDNSRecords_IncludesTXTRecord(t *testing.T) {
+	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
+	got := ComposeDNSRecords([]string{"api.acme.com"}, target, "sb-123", "_aerol-verify", "aerol-verify=")
+
+	txtFound := false
+	for _, r := range got {
+		if r.Type == "TXT" {
+			txtFound = true
+			if r.Name != "_aerol-verify.api" {
+				t.Errorf("TXT Name = %q, want _aerol-verify.api", r.Name)
+			}
+			if r.Value != "aerol-verify=sb-123" {
+				t.Errorf("TXT Value = %q, want aerol-verify=sb-123", r.Value)
+			}
+		}
+	}
+	if !txtFound {
+		t.Fatal("expected TXT record for ownership verification, none found")
 	}
 }

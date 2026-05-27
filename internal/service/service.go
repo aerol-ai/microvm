@@ -298,6 +298,7 @@ type Service struct {
 	ingressRouteMu        sync.Mutex
 	ingressRouteCache     map[string]ingressRouteIntent
 	ingressLastFullGCUnix atomic.Int64
+	dnsResolver           DNSResolver
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -317,7 +318,8 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 		// cluster mode is enabled at boot. EffectivePublicHost() feeds the
 		// DNS-helper API (Noop.IngressTargets) — single-node deployments
 		// can answer "what should DNS point at" without any extra wiring.
-		cluster: cluster.NewNoop("standalone", "", cfg.EffectivePublicHost()),
+		cluster:     cluster.NewNoop("standalone", "", cfg.EffectivePublicHost()),
+		dnsResolver: &DefaultDNSResolver{},
 	}
 	s.ensureTouchCoalescer()
 	s.ensureCaddyCoalescer()

@@ -1,4 +1,4 @@
-import { APIClient, type APIVersion } from "./internal/client.js";
+import { APIClient, type APIVersion, type RetryConfig } from "./internal/client.js";
 import { Sandbox } from "./Sandbox.js";
 import { Image } from "./Image.js";
 import type {
@@ -40,6 +40,13 @@ export interface MicroVMConfig {
    * other.
    */
   apiVersion?: APIVersion;
+  /**
+   * Retry policy for transient transport errors (socket closed, connection
+   * reset) and retryable HTTP status codes (429, 502, 503, 504). The SDK
+   * retries up to 3 times with exponential backoff by default. Pass
+   * `{ maxRetries: 0 }` to disable.
+   */
+  retry?: RetryConfig;
 }
 
 export class MicroVM {
@@ -63,6 +70,7 @@ export class MicroVM {
       patToken,
       fetch: config.fetch,
       apiVersion: config.apiVersion,
+      retry: config.retry,
     });
   }
 

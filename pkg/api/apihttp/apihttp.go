@@ -95,6 +95,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
+	if errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+		WriteError(w, http.StatusForbidden, err.Error())
+		return
+	}
 	// Capacity rejections are 503 with a Retry-After hint so well-behaved
 	// clients (and load balancers) back off instead of treating it as a
 	// permanent 4xx. The error string already carries human-readable

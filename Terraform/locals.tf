@@ -17,9 +17,11 @@ locals {
   # DNS records) and Ansible (day-2 rotation) read from the SoT. Lifted into
   # named locals so the rest of the .tf files don't sprinkle
   # local.cluster_ops.ingress.* / local.cluster_secrets.cluster.* everywhere.
-  domain_name = local.cluster_ops.ingress.domain_name
-  acme_email  = local.cluster_ops.ingress.acme_email
-  pat_token   = local.cluster_secrets.cluster.pat_token
+  domain_name                    = local.cluster_ops.ingress.domain_name
+  acme_email                     = local.cluster_ops.ingress.acme_email
+  custom_domain_txt_prefix       = local.cluster_ops.ingress.custom_domain_txt_prefix
+  custom_domain_txt_value_prefix = local.cluster_ops.ingress.custom_domain_txt_value_prefix
+  pat_token                      = local.cluster_secrets.cluster.pat_token
 
   # Normalise each node entry with its effective values (per-node overrides
   # win, then var.default_*). Doing this once here keeps nodes.tf / dns.tf

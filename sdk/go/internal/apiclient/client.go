@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	apiv1 "github.com/aerol-ai/microvm/sdk/go/internal/apiclient/v1"
@@ -49,6 +51,7 @@ type Client struct {
 	httpClient    *http.Client
 	apiVersion    APIVersion
 	versionPrefix string
+	retryConfig   RetryConfig
 }
 
 type ClientOptions struct {
@@ -58,7 +61,23 @@ type ClientOptions struct {
 	// the SDK's pinned default (v1 today). Pass APIVersionV1 explicitly to
 	// guarantee stability across SDK upgrades.
 	APIVersion APIVersion
+	// Retry configures the policy for transient transport errors and retryable
+	// HTTP status codes (429, 502, 503, 504).
+	Retry *RetryConfig
 }
+
+// RetryConfig specifies how the SDK should retry transient errors.
+type RetryConfig struct {
+	MaxRetries  *int
+	BaseDelayMs *int
+	MaxDelayMs  *int
+}
+
+const (
+	defaultMaxRetries  = 3
+	defaultBaseDelayMs = 200
+	defaultMaxDelayMs  = 5000
+)
 
 type Sandbox struct {
 	models.Sandbox
@@ -82,13 +101,30 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 		version = defaultAPIVersion
 		prefix = pathPrefixes[defaultAPIVersion]
 	}
-	return &Client{
+
+	client := &Client{
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		patToken:      config.PATToken,
 		httpClient:    httpClient,
 		apiVersion:    version,
 		versionPrefix: prefix,
 	}
+	if config.Retry != nil {
+		client.retryConfig = *config.Retry
+	}
+	if client.retryConfig.MaxRetries == nil {
+		v := defaultMaxRetries
+		client.retryConfig.MaxRetries = &v
+	}
+	if client.retryConfig.BaseDelayMs == nil {
+		v := defaultBaseDelayMs
+		client.retryConfig.BaseDelayMs = &v
+	}
+	if client.retryConfig.MaxDelayMs == nil {
+		v := defaultMaxDelayMs
+		client.retryConfig.MaxDelayMs = &v
+	}
+	return client
 }
 
 // versioned builds an API path with the active version's prefix prepended.
@@ -183,14 +219,16 @@ func (c *Client) BuildImageWithPush(ctx context.Context, dockerfile string, push
 	}
 
 	path := c.versioned("/images/build")
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(encoded))
-	if err != nil {
-		return BuildImageResult{}, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	c.addAuth(request)
 
-	response, err := c.httpClient.Do(request)
+	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(encoded))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		c.addAuth(request)
+		return request, nil
+	})
 	if err != nil {
 		return BuildImageResult{}, err
 	}
@@ -655,25 +693,30 @@ func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycl
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
-	var body io.Reader
+	var encoded []byte
+	var err error
 	if requestBody != nil {
-		encoded, err := json.Marshal(requestBody)
+		encoded, err = json.Marshal(requestBody)
 		if err != nil {
 			return err
 		}
-		body = bytes.NewReader(encoded)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
-	if err != nil {
-		return err
-	}
-	if requestBody != nil {
-		request.Header.Set("Content-Type", "application/json")
-	}
-	c.addAuth(request)
-
-	response, err := c.httpClient.Do(request)
+	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		var body io.Reader
+		if encoded != nil {
+			body = bytes.NewReader(encoded)
+		}
+		request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+		if err != nil {
+			return nil, err
+		}
+		if encoded != nil {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		c.addAuth(request)
+		return request, nil
+	})
 	if err != nil {
 		return err
 	}
@@ -686,6 +729,93 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return nil
 	}
 	return json.NewDecoder(response.Body).Decode(responseBody)
+}
+
+// isTransientTransportError loosely matches the Node.js SDK logic by checking
+// if the error indicates a socket/connection failure before the server processed
+// the request.
+func isTransientTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// context errors are only retryable if it's DeadlineExceeded. Canceled
+	// means the caller aborted, so we shouldn't retry.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// Typical Go network errors:
+	msg := err.Error()
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "timeout") {
+		return true
+	}
+	return false
+}
+
+// isRetryableStatusCode returns true for HTTP 429 and 502/503/504.
+func isRetryableStatusCode(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func (c *Client) doWithRetry(ctx context.Context, makeReq func() (*http.Request, error)) (*http.Response, error) {
+	maxRetries := *c.retryConfig.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	baseDelayMs := *c.retryConfig.BaseDelayMs
+	maxDelayMs := *c.retryConfig.MaxDelayMs
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		req, err := makeReq()
+		if err != nil {
+			return nil, err // Can't even build the request, don't retry.
+		}
+
+		response, err := c.httpClient.Do(req)
+
+		// If we got a response, check if the status code is transient.
+		if err == nil {
+			if isRetryableStatusCode(response.StatusCode) && attempt < maxRetries {
+				response.Body.Close()
+				goto retry
+			}
+			return response, nil
+		}
+
+		// We got an error. Check if it's a transport error.
+		lastErr = err
+		if !isTransientTransportError(err) || attempt >= maxRetries {
+			break
+		}
+
+	retry:
+		delayMs := baseDelayMs * (1 << attempt)
+		if delayMs > maxDelayMs {
+			delayMs = maxDelayMs
+		}
+		// Jitter ±25%
+		jitter := 1.0 + (rand.Float64()-0.5)*0.5
+		sleepDuration := time.Duration(float64(delayMs)*jitter) * time.Millisecond
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(sleepDuration):
+		}
+	}
+	return nil, lastErr
 }
 
 func (c *Client) addAuth(request *http.Request) {

@@ -142,6 +142,12 @@ type Config struct {
 	// 25; the per-create-request cap (set in pkg/models) is stricter to
 	// avoid bursting issuance from one API call.
 	CustomDomainsMaxPerSandbox int
+	// CustomDomainVerifyPrefix sets the DNS TXT record name prefix for
+	// proving custom domain ownership. Defaults to "_aerol-verify".
+	CustomDomainVerifyPrefix string
+	// CustomDomainVerifyValuePrefix sets the required prefix value for
+	// the TXT record, followed by the sandbox ID. Defaults to "aerol-verify=".
+	CustomDomainVerifyValuePrefix string
 	// TLSOnDemandBurst is the Caddy on-demand TLS policy's per-interval
 	// burst (matches the JSON shape `rate_limit.burst`). Bounds simultaneous
 	// ACME orders Caddy will start before throttling. Default 5; the
@@ -957,6 +963,8 @@ func Load() (Config, error) {
 		EnableServerless:                 getEnvBool("SB_ENABLE_SERVERLESS", true),
 		EnableCustomDomains:              getEnvBool("SB_ENABLE_CUSTOM_DOMAINS", false),
 		CustomDomainsMaxPerSandbox:       getEnvInt("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", models.MaxCustomDomainsPerSandbox),
+		CustomDomainVerifyPrefix:         getEnv("SB_CUSTOM_DOMAIN_VERIFY_PREFIX", "_aerol-verify"),
+		CustomDomainVerifyValuePrefix:    getEnv("SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX", "aerol-verify="),
 		TLSOnDemandBurst:                 getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
 		TLSOnDemandInterval:              getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
 		ACMEDaemonBudgetFraction:         getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),

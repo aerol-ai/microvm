@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import random
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,11 +35,13 @@ from .types import (
     HealthStatus,
     IngressTarget,
     Lifecycle,
+    MicroVMConfig,
     MountSpec,
     MountSpecRedacted,
     NetworkUsage,
     RegisterSnapshotOptions,
     ResizeOptions,
+    RetryConfig,
     SandboxData,
     SandboxSnapshot,
     Session,
@@ -399,9 +403,21 @@ class MicroVM:
         pat_token: Optional[str] = None,
         *,
         api_version: str = _DEFAULT_API_VERSION,
+        config: Optional[MicroVMConfig] = None,
     ) -> None:
+        if config is not None:
+            api_url = api_url or config.get("apiUrl")
+            pat_token = pat_token or config.get("patToken")
+        
         self.api_url = _normalize_url(api_url or _read_env("SB_API_URL") or self.default_api_url)
         self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or ""
+
+        retry_cfg: RetryConfig = config.get("retry", {}) if config else {}
+        self._retry_config = {
+            "maxRetries": retry_cfg.get("maxRetries", 3),
+            "baseDelayMs": retry_cfg.get("baseDelayMs", 200),
+            "maxDelayMs": retry_cfg.get("maxDelayMs", 5000),
+        }
 
         if not self.pat_token:
             raise MicroVMError(self.auth_required_error_message)
@@ -808,21 +824,48 @@ class MicroVM:
         return f"{self.api_url}{path}"
 
     def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None) -> bytes:
-        request = urllib.request.Request(url, data=body, method=method)
-        request.add_header("Authorization", f"Bearer {self.pat_token}")
-        if content_type is not None:
-            request.add_header("Content-Type", content_type)
+        max_retries = self._retry_config["maxRetries"]
+        base_delay_ms = self._retry_config["baseDelayMs"]
+        max_delay_ms = self._retry_config["maxDelayMs"]
+        
+        last_exc: Optional[Exception] = None
+        
+        for attempt in range(max_retries + 1):
+            request = urllib.request.Request(url, data=body, method=method)
+            request.add_header("Authorization", f"Bearer {self.pat_token}")
+            if content_type is not None:
+                request.add_header("Content-Type", content_type)
 
-        try:
-            with urllib.request.urlopen(request) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            payload = exc.read()
             try:
-                data = json.loads(payload.decode("utf-8"))
-                raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
-            except (ValueError, TypeError):
-                raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
+                with urllib.request.urlopen(request) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                if exc.code in (429, 502, 503, 504) and attempt < max_retries:
+                    pass # Handled by the retry logic below
+                else:
+                    payload = exc.read()
+                    try:
+                        data = json.loads(payload.decode("utf-8"))
+                        raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
+                    except (ValueError, TypeError):
+                        raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
+            except urllib.error.URLError as exc:
+                last_exc = exc
+                if attempt >= max_retries:
+                    raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= max_retries:
+                    raise
+            
+            # Compute delay with exponential backoff and jitter
+            delay_ms = min(base_delay_ms * (2 ** attempt), max_delay_ms)
+            jitter = 1.0 + (random.random() - 0.5) * 0.5
+            time.sleep((delay_ms * jitter) / 1000.0)
+
+        assert last_exc is not None
+        raise last_exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
         body = None

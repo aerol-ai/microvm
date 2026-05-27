@@ -216,6 +216,11 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 		}
 	}
 
+	// Verify DNS ownership (TXT record)
+	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, sandboxID, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix); err != nil {
+		return err
+	}
+
 	if err := s.store.AddCustomDomain(ctx, sandboxID, canonical); err != nil {
 		return err
 	}

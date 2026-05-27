@@ -64,11 +64,25 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		return nil, errors.New(authRequiredErrorMessage)
 	}
 
-	inner := apiclient.NewClient(apiURL, apiclient.ClientOptions{
+	opts := apiclient.ClientOptions{
 		PATToken:   patToken,
 		HTTPClient: httpClient,
 		APIVersion: apiclient.APIVersion(apiVersion),
-	})
+	}
+	if config != nil && config.Retry != nil {
+		opts.Retry = &apiclient.RetryConfig{}
+		if config.Retry.MaxRetries != nil {
+			opts.Retry.MaxRetries = config.Retry.MaxRetries
+		}
+		if config.Retry.BaseDelayMs != nil {
+			opts.Retry.BaseDelayMs = config.Retry.BaseDelayMs
+		}
+		if config.Retry.MaxDelayMs != nil {
+			opts.Retry.MaxDelayMs = config.Retry.MaxDelayMs
+		}
+	}
+
+	inner := apiclient.NewClient(apiURL, opts)
 
 	return &Client{
 		apiURL:   strings.TrimRight(apiURL, "/"),

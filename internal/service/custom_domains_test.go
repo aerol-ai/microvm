@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -21,6 +22,25 @@ import (
 // the real branches. Caddy is disabled so UpsertSandboxRoute is a no-op —
 // these tests assert on the service+store layer; the matcher shape is
 // covered separately in pkg/caddy/custom_domains_test.go.
+
+type mockDNSResolver struct {
+	records map[string][]string
+	err     error
+}
+
+func (m *mockDNSResolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if txts, ok := m.records[name]; ok {
+		return txts, nil
+	}
+	// For testing, if it's not found, maybe return a default or error
+	// return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	// We'll just return not found for exact matches
+	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
 func newCustomDomainsHarness(t *testing.T, cfgOverride func(*config.Config)) (*Service, *store.Store) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "state.db")
@@ -31,9 +51,11 @@ func newCustomDomainsHarness(t *testing.T, cfgOverride func(*config.Config)) (*S
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := config.Config{
-		EnableCustomDomains:        true,
-		Domain:                     "aerol.cloud",
-		CustomDomainsMaxPerSandbox: models.MaxCustomDomainsPerSandbox,
+		EnableCustomDomains:           true,
+		Domain:                        "aerol.cloud",
+		CustomDomainsMaxPerSandbox:    models.MaxCustomDomainsPerSandbox,
+		CustomDomainVerifyPrefix:      "_aerol-verify",
+		CustomDomainVerifyValuePrefix: "aerol-verify=",
 	}
 	if cfgOverride != nil {
 		cfgOverride(&cfg)
@@ -46,6 +68,15 @@ func newCustomDomainsHarness(t *testing.T, cfgOverride func(*config.Config)) (*S
 			EnableCaddy:       false,
 			HTTPClientTimeout: time.Second,
 		}),
+		dnsResolver: &mockDNSResolver{
+			records: map[string][]string{
+				// Match whatever tests need
+				"_aerol-verify.api.acme.com":   {"aerol-verify=sb-1", "aerol-verify=sb-a", "aerol-verify=sb-b"},
+				"_aerol-verify.h0.acme.com":    {"aerol-verify=sb-1"},
+				"_aerol-verify.h1.acme.com":    {"aerol-verify=sb-1"},
+				"_aerol-verify.extra.acme.com": {"aerol-verify=sb-1"},
+			},
+		},
 	}
 	return svc, st
 }
