@@ -33,6 +33,7 @@
 ingress:
   domain_name: "vm.aerol.cloud"
   acme_email:  "sumansaurabh@aerol.ai"
+  enable_custom_domains: true
 
 # --- OTEL exporter --------------------------------------------------------
 # Enable by setting metrics_endpoint and/or traces_endpoint. The *_enabled
