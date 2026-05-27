@@ -133,7 +133,7 @@ func stageWarmTemplate(t *testing.T, f *driverFixture, hasOverlay bool) {
 // TestCreate_WarmHit asserts that a Create against a snapshot-bearing
 // template with a warm pool slot ready skips cold-spawn entirely:
 // no spawn handle is allocated (the warm slot's API socket is used),
-// PutNetworkInterface PATCHes the per-sandbox TAP onto the loaded
+// PatchNetworkInterface PATCHes the per-sandbox TAP onto the loaded
 // snapshot, and Action(Resume) is the only Action call (no
 // InstanceStart, which would mean the driver mistakenly cold-booted).
 //
@@ -196,10 +196,8 @@ func TestCreate_WarmHit(t *testing.T) {
 
 	// PATCH NetworkInterface MUST have been called with the per-sandbox
 	// TAP name (mapped from the pool's preloaded slot.TapName via the
-	// fake tap pool's Allocate). The fakeClient stores PUTs and PATCHes
-	// in the same nics map; assert the entry is present and has the
-	// per-sandbox tap.
-	nic, ok := f.client.nics[primaryIfaceID]
+	// fake tap pool's Allocate).
+	nic, ok := f.client.networkPatches[primaryIfaceID]
 	if !ok {
 		t.Fatal("PATCH NetworkInterface was not called on warm-hit path")
 	}
@@ -268,7 +266,7 @@ func TestCreate_WarmRollbackOnPatchFailure(t *testing.T) {
 	f := newDriverFixture(t)
 	pool, handle := stageWarmFixture(t, f)
 	stageWarmTemplate(t, f, false)
-	f.client.nicErr = errors.New("synthetic PATCH NIC failure")
+	f.client.networkPatchErr = errors.New("synthetic PATCH NIC failure")
 
 	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 		Image:      "alpine:3.20",

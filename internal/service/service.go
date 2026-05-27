@@ -1074,9 +1074,6 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		if err := s.validateLifecycle(*req.Lifecycle); err != nil {
 			return nil, fmt.Errorf("invalid lifecycle: %w", err)
 		}
-		if firecrackerLifecycleRequiresStop(*req.Lifecycle) {
-			return nil, unsupportedFirecrackerOption("stop/serverless lifecycle")
-		}
 		lifecycle = *req.Lifecycle
 	}
 
@@ -1395,9 +1392,6 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
-	}
-	if s.isFirecrackerSandbox(sandbox) {
-		return nil, unsupportedFirecrackerOption("start from stopped")
 	}
 
 	// Re-Admit against the host budget before touching Docker. StopSandbox
@@ -1890,9 +1884,6 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	priorSandbox, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
-	}
-	if s.isFirecrackerSandbox(priorSandbox) && firecrackerLifecycleRequiresStop(l) {
-		return nil, unsupportedFirecrackerOption("stop/serverless lifecycle")
 	}
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
@@ -2947,6 +2938,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
+			if s.isFirecrackerSandbox(sandbox) && sandbox.Status == models.SandboxStatusStopped {
+				if s.admitter != nil {
+					s.admitter.Release(sandbox.ID)
+				}
+				_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+				if sandbox.WakeArmed {
+					s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
+				} else {
+					for _, port := range sandbox.ExposedPorts {
+						_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+					}
+				}
+				continue
+			}
 			// Container is gone (manual `docker rm`, OOM kill, host reboot,
 			// previous reconcile pass already destroyed it via events). Tear
 			// down all our state and delete the row outright. Cascades through
@@ -4009,10 +4014,6 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 func unsupportedFirecrackerOption(option string) error {
 	return fmt.Errorf("runtime %q does not yet support %s (see plans/snapshot-clone-fast-boot.md): %w",
 		models.RuntimeFirecracker, option, models.ErrRuntimeNotImplemented)
-}
-
-func firecrackerLifecycleRequiresStop(l models.Lifecycle) bool {
-	return l.Serverless || l.StopIfIdleFor > 0 || l.StopAtAge > 0
 }
 
 func NormalizeCreateFailover(req *models.CreateSandboxRequest) error {

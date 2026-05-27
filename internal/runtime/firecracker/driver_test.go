@@ -124,28 +124,13 @@ func TestSkeletonMethodsReturnNotImplemented(t *testing.T) {
 	}
 }
 
-// TestStopUnknownSandboxIsNoop confirms Stop on an unregistered sandbox
-// is a no-op rather than an error. Reconcile may call Stop on rows it
-// has just learned of from a different node; returning an error would
-// look like a real failure in logs.
-func TestStopUnknownSandboxIsNoop(t *testing.T) {
-	d := New(Config{}, nil)
-	if err := d.Stop(context.Background(), "unknown-id"); err != nil {
-		t.Fatalf("Stop on unknown sandbox should be no-op; got %v", err)
-	}
-}
-
-func TestStopRegisteredSandboxNotImplementedDoesNotShutdown(t *testing.T) {
-	d := New(Config{}, nil)
-	v := &fakeVMM{}
-	d.vmms["known-id"] = v
-
-	err := d.Stop(context.Background(), "known-id")
-	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("Stop registered sandbox error = %v, want ErrRuntimeNotImplemented", err)
-	}
-	if v.shutdown {
-		t.Fatal("Stop should not kill a Firecracker VMM until start/stop semantics are implemented")
+// TestStopUnknownSandboxWithoutSnapshotErrors prevents the unsafe state
+// transition where the service would persist status=stopped even though the
+// runtime has neither a running VMM nor a restorable snapshot.
+func TestStopUnknownSandboxWithoutSnapshotErrors(t *testing.T) {
+	d := New(Config{RunDir: t.TempDir()}, nil)
+	if err := d.Stop(context.Background(), "unknown-id"); err == nil {
+		t.Fatal("Stop on unknown sandbox without a snapshot returned nil")
 	}
 }
 

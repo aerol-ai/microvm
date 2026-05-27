@@ -379,34 +379,48 @@ func TestFirecrackerDispatch_RejectsUnsupportedNetworkControlsForNow(t *testing.
 	}
 }
 
-func TestFirecrackerDispatch_RejectsStopLifecycleForNow(t *testing.T) {
-	rt := &fireRecordingRuntime{}
+func TestFirecrackerDispatch_AllowsStopLifecycle(t *testing.T) {
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fclife/api.sock",
+			ContainerIP: "172.16.0.4",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
 	svc.SetFirecrackerRuntime(rt)
 
-	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+	resp, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
 		Image:   "alpine:3.20",
 		Runtime: models.RuntimeFirecracker,
 		Lifecycle: &models.Lifecycle{
 			StopIfIdleFor: time.Minute,
 		},
 	})
-	if err == nil {
-		t.Fatal("expected stop lifecycle rejection")
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
 	}
-	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("error should wrap ErrRuntimeNotImplemented; got %v", err)
+	if resp.Sandbox.Lifecycle.StopIfIdleFor != time.Minute {
+		t.Fatalf("lifecycle = %+v, want stop timer persisted", resp.Sandbox.Lifecycle)
 	}
-	if rt.calls != 0 {
-		t.Fatalf("driver should not be called when stop lifecycle is rejected; calls=%d", rt.calls)
+	if rt.calls != 1 {
+		t.Fatalf("driver calls = %d, want 1", rt.calls)
 	}
 }
 
-func TestFirecrackerLifecycle_StartStopRejectedAndDestroyRoutes(t *testing.T) {
+func TestFirecrackerLifecycle_StartStopAndDestroyRouteToFirecracker(t *testing.T) {
 	ctx := context.Background()
 	dockerRT := &recordingRuntime{}
-	fireRT := &recordingRuntime{}
+	fireRT := &recordingRuntime{
+		startState: &models.SandboxRuntimeState{
+			SandboxID:   "sb-fc-start",
+			ContainerID: "/var/run/sb/sb-fc-start/new.sock",
+			ContainerIP: "172.16.0.10",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
 	svc, st, _ := newServiceRuntimeHarness(t, dockerRT)
 	svc.cfg.EnableFirecracker = true
 	svc.admitter = nil
@@ -417,11 +431,15 @@ func TestFirecrackerLifecycle_StartStopRejectedAndDestroyRoutes(t *testing.T) {
 	if err := st.Create(ctx, starting); err != nil {
 		t.Fatalf("Create start sandbox: %v", err)
 	}
-	if _, err := svc.StartSandbox(ctx, starting.ID); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("StartSandbox error = %v, want ErrRuntimeNotImplemented", err)
+	started, err := svc.StartSandbox(ctx, starting.ID)
+	if err != nil {
+		t.Fatalf("StartSandbox: %v", err)
 	}
-	if len(fireRT.startRefs) != 0 {
-		t.Fatalf("firecracker start refs = %v, want none", fireRT.startRefs)
+	if started.Status != models.SandboxStatusStarted || started.ContainerIP != "172.16.0.10" {
+		t.Fatalf("started = %+v, want firecracker started state", started)
+	}
+	if len(fireRT.startRefs) != 1 || fireRT.startRefs[0] != starting.ID {
+		t.Fatalf("firecracker start refs = %v, want [%s]", fireRT.startRefs, starting.ID)
 	}
 	if len(dockerRT.startRefs) != 0 {
 		t.Fatalf("docker start refs = %v, want none", dockerRT.startRefs)
@@ -431,11 +449,15 @@ func TestFirecrackerLifecycle_StartStopRejectedAndDestroyRoutes(t *testing.T) {
 	if err := st.Create(ctx, stopping); err != nil {
 		t.Fatalf("Create stop sandbox: %v", err)
 	}
-	if _, err := svc.StopSandbox(ctx, stopping.ID); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("StopSandbox error = %v, want ErrRuntimeNotImplemented", err)
+	stopped, err := svc.StopSandbox(ctx, stopping.ID)
+	if err != nil {
+		t.Fatalf("StopSandbox: %v", err)
 	}
-	if len(fireRT.stopRefs) != 0 {
-		t.Fatalf("firecracker stop refs = %v, want none", fireRT.stopRefs)
+	if stopped.Status != models.SandboxStatusStopped || stopped.ContainerID != "" || stopped.ContainerIP != "" {
+		t.Fatalf("stopped = %+v, want stopped with runtime identity cleared", stopped)
+	}
+	if len(fireRT.stopRefs) != 1 || fireRT.stopRefs[0] != stopping.ID {
+		t.Fatalf("firecracker stop refs = %v, want [%s]", fireRT.stopRefs, stopping.ID)
 	}
 	if len(dockerRT.stopRefs) != 0 {
 		t.Fatalf("docker stop refs = %v, want none", dockerRT.stopRefs)
@@ -459,7 +481,7 @@ func TestFirecrackerLifecycle_StartStopRejectedAndDestroyRoutes(t *testing.T) {
 	}
 }
 
-func TestFirecrackerUpdateLifecycleRejectsStopTimersForNow(t *testing.T) {
+func TestFirecrackerUpdateLifecycleAllowsStopTimers(t *testing.T) {
 	ctx := context.Background()
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableFirecracker = true
@@ -469,9 +491,12 @@ func TestFirecrackerUpdateLifecycleRejectsStopTimersForNow(t *testing.T) {
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatalf("Create sandbox: %v", err)
 	}
-	_, err := svc.UpdateLifecycle(ctx, sb.ID, models.Lifecycle{StopAtAge: time.Hour})
-	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("UpdateLifecycle error = %v, want ErrRuntimeNotImplemented", err)
+	updated, err := svc.UpdateLifecycle(ctx, sb.ID, models.Lifecycle{StopAtAge: time.Hour})
+	if err != nil {
+		t.Fatalf("UpdateLifecycle: %v", err)
+	}
+	if updated.Lifecycle.StopAtAge != time.Hour {
+		t.Fatalf("lifecycle = %+v, want stop_at_age persisted", updated.Lifecycle)
 	}
 }
 
@@ -516,6 +541,34 @@ func TestFirecrackerReconcile_MissingRuntimeStateDestroysViaFirecracker(t *testi
 	}
 	if _, err := st.Get(ctx, sb.ID); err == nil {
 		t.Fatalf("reconciled missing sandbox row still exists")
+	}
+}
+
+func TestFirecrackerReconcile_StoppedMissingRuntimeStateIsKept(t *testing.T) {
+	ctx := context.Background()
+	dockerRT := &recordingRuntime{managed: map[string]*models.SandboxRuntimeState{}}
+	fireRT := &recordingRuntime{managed: map[string]*models.SandboxRuntimeState{}}
+	svc, st, _ := newServiceRuntimeHarness(t, dockerRT)
+	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(fireRT)
+
+	sb := firecrackerSandboxForTest("sb-fc-stopped-missing")
+	sb.Status = models.SandboxStatusStopped
+	sb.ContainerID = ""
+	sb.ContainerIP = ""
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(fireRT.destroyIDs) != 0 {
+		t.Fatalf("firecracker destroy IDs = %v, want none for stopped snapshot row", fireRT.destroyIDs)
+	}
+	if _, err := st.Get(ctx, sb.ID); err != nil {
+		t.Fatalf("stopped firecracker row was not preserved: %v", err)
 	}
 }
 

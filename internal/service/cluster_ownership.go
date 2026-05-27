@@ -46,7 +46,9 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 		}
 		if managed != nil {
 			if _, ok := managed[sb.ID]; !ok {
-				continue
+				if !isStoppedFirecrackerSnapshotRow(sb) {
+					continue
+				}
 			}
 		}
 		if !s.clusterOwnershipNeedsReplay(c, sb) {
@@ -76,6 +78,12 @@ func (s *Service) clusterOwnershipNeedsReplay(c cluster.Client, sb *models.Sandb
 		return true
 	}
 	if p.Spec == nil {
+		return true
+	}
+	if isStoppedFirecrackerSnapshotRow(sb) && p.Spec.ShouldRecreateOnFailover() {
+		return true
+	}
+	if p.Spec.TemplateID != sb.TemplateID || p.Spec.OverlaySizeGB != sb.OverlaySizeGB {
 		return true
 	}
 	if placementMissingLocalPorts(p, sb) {
@@ -175,9 +183,14 @@ func (s *Service) specFromSandbox(sb *models.Sandbox) *models.CreateSandboxReque
 		Runtime:          sb.Runtime,
 		GPUs:             sb.GPUs,
 		Failover:         sb.Failover,
+		TemplateID:       sb.TemplateID,
+		OverlaySizeGB:    sb.OverlaySizeGB,
 	}
 	lc := sb.Lifecycle
 	spec.Lifecycle = &lc
+	if isStoppedFirecrackerSnapshotRow(sb) {
+		spec.Failover = nil
+	}
 
 	auth, err := s.UnsealRegistry(sb.RegistryAuthSealed)
 	if err != nil {
@@ -189,6 +202,10 @@ func (s *Service) specFromSandbox(sb *models.Sandbox) *models.CreateSandboxReque
 		spec.Registry = auth
 	}
 	return spec
+}
+
+func isStoppedFirecrackerSnapshotRow(sb *models.Sandbox) bool {
+	return sb != nil && sb.Runtime == models.RuntimeFirecracker && sb.Status == models.SandboxStatusStopped
 }
 
 func clusterPortsFromSandbox(sb *models.Sandbox) map[int]cluster.ExposedPortRoute {

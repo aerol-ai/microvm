@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -62,6 +63,84 @@ func legacyPortProtocols(routes map[int]cluster.ExposedPortRoute) map[int]string
 		out[port] = route.Protocol
 	}
 	return out
+}
+
+func TestSpecFromSandboxPreservesFirecrackerTemplateFields(t *testing.T) {
+	svc := &Service{}
+	spec := svc.specFromSandbox(&models.Sandbox{
+		ID:            "sb-fc-spec",
+		Image:         "alpine:3.20",
+		Runtime:       models.RuntimeFirecracker,
+		TemplateID:    "tpl-fast",
+		OverlaySizeGB: 8,
+		CPU:           2,
+		MemoryMB:      1024,
+		DiskGB:        10,
+		Env:           map[string]string{"A": "B"},
+	})
+	if spec == nil {
+		t.Fatal("specFromSandbox returned nil")
+	}
+	if spec.Runtime != models.RuntimeFirecracker || spec.TemplateID != "tpl-fast" || spec.OverlaySizeGB != 8 {
+		t.Fatalf("spec firecracker fields = runtime:%q template:%q overlay:%d, want firecracker/tpl-fast/8",
+			spec.Runtime, spec.TemplateID, spec.OverlaySizeGB)
+	}
+}
+
+func TestOwnershipReplayStoppedFirecrackerClearsRecreateFailover(t *testing.T) {
+	ctx := context.Background()
+	svc := &Service{cfg: config.Config{EnableCluster: true}}
+	recorder := &recordingOwnershipCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""),
+		placements: map[string]cluster.Placement{
+			"sb-fc-stopped": {
+				SandboxID:       "sb-fc-stopped",
+				OwnerNodeID:     "self",
+				State:           cluster.PlacementStatePlaced,
+				OwnerState:      cluster.PlacementOwnerStateActive,
+				OwnerAPIURL:     "http://self",
+				Spec:            &models.CreateSandboxRequest{Runtime: models.RuntimeFirecracker, TemplateID: "tpl-fast", OverlaySizeGB: 4, Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}},
+				ExposedPorts:    nil,
+				CustomHostnames: nil,
+			},
+		},
+	}
+	svc.AttachCluster(recorder)
+
+	now := time.Now().UTC()
+	sb := &models.Sandbox{
+		ID:            "sb-fc-stopped",
+		Image:         "alpine:3.20",
+		Status:        models.SandboxStatusStopped,
+		Runtime:       models.RuntimeFirecracker,
+		TemplateID:    "tpl-fast",
+		OverlaySizeGB: 4,
+		Failover:      &models.Failover{Policy: models.FailoverPolicyRecreate},
+		CPU:           1,
+		MemoryMB:      256,
+		DiskGB:        1,
+		Env:           map[string]string{},
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		LastActiveAt:  now,
+	}
+	count, err := svc.assertClusterOwnership(ctx, []*models.Sandbox{sb}, map[string]*models.SandboxRuntimeState{})
+	if err != nil {
+		t.Fatalf("assertClusterOwnership: %v", err)
+	}
+	if count != 1 || len(recorder.asserted) != 1 || len(recorder.asserted[0]) != 1 {
+		t.Fatalf("asserted = %+v count=%d, want one stopped firecracker replay", recorder.asserted, count)
+	}
+	spec := recorder.asserted[0][0].Spec
+	if spec == nil {
+		t.Fatal("replayed spec is nil")
+	}
+	if spec.ShouldRecreateOnFailover() {
+		t.Fatalf("stopped firecracker replay kept recreate failover: %+v", spec.Failover)
+	}
+	if spec.TemplateID != "tpl-fast" || spec.OverlaySizeGB != 4 {
+		t.Fatalf("replayed firecracker fields = template:%q overlay:%d", spec.TemplateID, spec.OverlaySizeGB)
+	}
 }
 
 // TestReplayReservationsThenStaleOwnershipReleasesCapacity is the boot-time

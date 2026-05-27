@@ -169,6 +169,7 @@ type VMMClient interface {
 	// inherited from the snapshot state — only the backing path is
 	// mutable.
 	PatchDrive(ctx context.Context, driveID string, patch firecracker.DrivePatch) error
+	PatchNetworkInterface(ctx context.Context, ifaceID string, patch firecracker.NetworkInterfacePatch) error
 }
 
 // defaultVsockPort is the in-guest port the toolbox listens on. Must

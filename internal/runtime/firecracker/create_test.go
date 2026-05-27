@@ -311,7 +311,8 @@ type fakeClient struct {
 	// path swap). Keyed by drive_id so a test can assert the post-load
 	// backing path is the per-sandbox overlay file and not the template
 	// placeholder.
-	drivePatches map[string]firecracker.DrivePatch
+	drivePatches   map[string]firecracker.DrivePatch
+	networkPatches map[string]firecracker.NetworkInterfacePatch
 
 	// restOrder captures every PUT / Action / Snapshot call in the order
 	// the driver issued them. Order is load-bearing for firecracker:
@@ -325,6 +326,7 @@ type fakeClient struct {
 	bootErr           error
 	driveErr          error
 	drivePatchErr     error
+	networkPatchErr   error
 	nicErr            error
 	vsockErr          error
 	actionErr         error
@@ -334,10 +336,11 @@ type fakeClient struct {
 
 func newFakeClient() *fakeClient {
 	return &fakeClient{
-		drives:       map[string]firecracker.Drive{},
-		drivePatches: map[string]firecracker.DrivePatch{},
-		nics:         map[string]firecracker.NetworkInterface{},
-		instance:     &firecracker.InstanceInfo{State: "Running"},
+		drives:         map[string]firecracker.Drive{},
+		drivePatches:   map[string]firecracker.DrivePatch{},
+		networkPatches: map[string]firecracker.NetworkInterfacePatch{},
+		nics:           map[string]firecracker.NetworkInterface{},
+		instance:       &firecracker.InstanceInfo{State: "Running"},
 	}
 }
 
@@ -430,6 +433,14 @@ func (c *fakeClient) PatchDrive(_ context.Context, id string, patch firecracker.
 	c.drivePatches[id] = patch
 	c.restOrder = append(c.restOrder, "PatchDrive:"+id)
 	return c.drivePatchErr
+}
+
+func (c *fakeClient) PatchNetworkInterface(_ context.Context, id string, patch firecracker.NetworkInterfacePatch) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.networkPatches[id] = patch
+	c.restOrder = append(c.restOrder, "PatchNetworkInterface:"+id)
+	return c.networkPatchErr
 }
 
 // driverFixture is the standard test setup: a Driver wired with all
@@ -927,7 +938,7 @@ func TestCreate_TemplateResolveErrorReleasesSlot(t *testing.T) {
 // resolver returns HasSnapshot=true, so the driver MUST skip
 // configureVMM (no PutMachineConfig, no PutBootSource, no PutDrive,
 // no PutNetworkInterface, no PutVsock) and instead issue LoadSnapshot
-// + Action(Resume). The vsock handshake must dial the template's
+// + PATCH rebinding + Action(Resume). The vsock handshake must dial the template's
 // reserved CID (baked into the snapshot at build time), NOT the
 // per-sandbox slot CID — a regression there silently hangs the
 // handshake until deadline because the guest is listening on the
@@ -1024,6 +1035,12 @@ func TestCreate_SnapshotLoadPath(t *testing.T) {
 	}
 	if f.client.vsock != nil {
 		t.Errorf("PutVsock was called on snapshot-load path: %+v", f.client.vsock)
+	}
+	if patch, ok := f.client.drivePatches[rootDriveID]; !ok || filepath.Base(patch.PathOnHost) != rootfsFileName {
+		t.Errorf("PatchDrive rootfs = %+v, want staged rootfs path", f.client.drivePatches[rootDriveID])
+	}
+	if patch, ok := f.client.networkPatches[primaryIfaceID]; !ok || patch.HostDevName != "fctap-test" {
+		t.Errorf("PatchNetworkInterface = %+v, want fctap-test", f.client.networkPatches[primaryIfaceID])
 	}
 
 	// Resume only, never InstanceStart. The action list is the wire

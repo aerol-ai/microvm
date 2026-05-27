@@ -143,9 +143,6 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	if err != nil {
 		return nil, err
 	}
-	if s.isFirecrackerSandbox(sandbox) {
-		return nil, unsupportedFirecrackerOption("stop")
-	}
 
 	// Drop the warm-preflight cache up front. From this moment on the
 	// ingress proxy must take the slow path (store hit → cold-start
@@ -204,6 +201,10 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.WakeArmed = armedValue
+	if s.isFirecrackerSandbox(sandbox) {
+		sandbox.ContainerID = ""
+		sandbox.ContainerIP = ""
+	}
 	sandbox.UpdatedAt = time.Now().UTC()
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err

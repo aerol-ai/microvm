@@ -115,9 +115,10 @@ type Driver struct {
 	// needing a real socket.
 	newClient vmmClientFactory
 
-	mu      sync.Mutex
-	clients map[string]VMMClient // sandbox-id -> API client
-	vmms    map[string]VMMHandle // sandbox-id -> VMM handle (for Destroy)
+	mu       sync.Mutex
+	clients  map[string]VMMClient // sandbox-id -> API client
+	vmms     map[string]VMMHandle // sandbox-id -> VMM handle (for Destroy)
+	guestCID map[string]uint32    // sandbox-id -> CID baked into the running guest
 }
 
 // TapPool is the interface Driver depends on for network allocation.
@@ -242,10 +243,11 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		logger = slog.Default()
 	}
 	d := &Driver{
-		cfg:     cfg,
-		logger:  logger,
-		clients: make(map[string]VMMClient),
-		vmms:    make(map[string]VMMHandle),
+		cfg:      cfg,
+		logger:   logger,
+		clients:  make(map[string]VMMClient),
+		vmms:     make(map[string]VMMHandle),
+		guestCID: make(map[string]uint32),
 	}
 	// Default spawn function wires the real vmm. Tests overwrite via
 	// SetSpawner. The captured logger is used inside newVMM, so the
@@ -667,6 +669,12 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			}
 		}
 	}
+	if snapshotLoadPath && snapshotInfo != nil && snapshotInfo.HasOverlay && overlayPath == "" {
+		overlayPath = filepath.Join(handle.RunDir(), overlayFileName)
+		if err := allocateSparse(overlayPath, overlayPlaceholderBytes); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: overlay placeholder alloc: %w", err)
+		}
+	}
 
 	// Step 6: REST orchestration. Order matters per the firecracker
 	// docs: machine-config and boot-source before drives; drives and
@@ -675,7 +683,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// restored from the snapshot state file.
 	client := d.newClient(handle.APISocket())
 	if snapshotLoadPath {
-		if err := d.configureVMMForLoad(ctx, client, snapshotInfo, overlayPath); err != nil {
+		if err := d.configureVMMForLoad(ctx, client, snapshotInfo, rootfsPath, slot, overlayPath); err != nil {
 			return nil, err
 		}
 	} else {
@@ -749,6 +757,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.mu.Lock()
 	d.clients[allocID] = client
 	d.vmms[allocID] = handle
+	d.guestCID[allocID] = handshakeCID
 	d.mu.Unlock()
 
 	// Phase 5: tell the RSS sampler about the new VMM so the next
@@ -850,10 +859,10 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 
 // configureVMMForLoad is the snapshot-load sibling of configureVMM.
 // Per the firecracker docs, the ONLY pre-LoadSnapshot REST call allowed
-// is PutLogger (optional, debug-only); everything else — machine
-// config, boot source, drives, network interfaces, vsock — comes from
-// the snapshot state file. Restating any of those would be rejected
-// by the API.
+// is PutLogger (optional, debug-only); machine config, boot source, drives,
+// network interfaces, and vsock come from the snapshot state file. After load
+// and before Resume, we PATCH the mutable host paths/devices the snapshot
+// captured from the template build: rootfs, TAP, and optional overlay.
 //
 // Integrity verification happens here, on the host, before the load
 // request is issued. A mismatch surfaces immediately as an error
@@ -866,9 +875,15 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 // (writes hit a dirty bitmap rather than the shared memory file).
 // ResumeVM=false keeps the clone paused so Create's caller controls
 // when the guest's vCPUs actually start ticking.
-func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap *TemplateResolution, overlayPath string) error {
+func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap *TemplateResolution, rootfsPath string, slot *TapSlot, overlayPath string) error {
 	if snap == nil {
 		return fmt.Errorf("firecracker runtime: configureVMMForLoad called with nil resolution")
+	}
+	if rootfsPath == "" {
+		return fmt.Errorf("firecracker runtime: configureVMMForLoad called with empty rootfs path")
+	}
+	if slot == nil {
+		return fmt.Errorf("firecracker runtime: configureVMMForLoad called with nil tap slot")
 	}
 	if d.cfg.SnapshotVerifyOnLoad && snap.SnapshotChecksum != "" {
 		if err := verifySnapshotChecksum(snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum); err != nil {
@@ -885,6 +900,18 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 		ResumeVM:            false,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
+	}
+	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
+		DriveID:    rootDriveID,
+		PathOnHost: rootfsPath,
+	}); err != nil {
+		return fmt.Errorf("firecracker runtime: PatchDrive rootfs: %w", err)
+	}
+	if err := client.PatchNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterfacePatch{
+		IfaceID:     primaryIfaceID,
+		HostDevName: slot.TapName,
+	}); err != nil {
+		return fmt.Errorf("firecracker runtime: PatchNetworkInterface: %w", err)
 	}
 	// Per-sandbox overlay swap. Firecracker's snapshot state captured
 	// the overlay placeholder (1 MiB scratch from the template
@@ -1055,34 +1082,22 @@ func ociImageRefFor(ref string) string {
 	return "docker://" + ref
 }
 
-// Start boots a previously-stopped Firecracker VMM. The model diverges
-// slightly from Docker's: a stopped sandbox on the Firecracker path is a
-// destroyed VMM (Firecracker VMMs do not survive a stop), so Start
-// reconstructs from the persisted sandbox row + template. Phase 1
-// supports cold-boot create + destroy only; Start is wired in the same
-// shape Stop already is so the runtime.Runtime interface stays uniform,
-// but Start-from-stopped is not part of Phase 1.
-func (d *Driver) Start(_ context.Context, _ string) (*models.SandboxRuntimeState, error) {
-	return nil, methodNotImplemented("Start")
+// Start boots a previously-stopped Firecracker sandbox by restoring the
+// per-sandbox snapshot Stop wrote under the persistent artifact directory.
+// The VMM process itself does not survive Stop; the stable contract is
+// snapshot-on-stop, destroy host resources, then LoadSnapshot+PATCH+Resume
+// on Start.
+func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
+	return d.startFromSandboxSnapshot(ctx, sandboxID)
 }
 
-// Stop is intentionally not implemented yet. A real Firecracker stop/start
-// path must either snapshot+destroy and later restore, or pause while still
-// charging capacity. Killing the VMM here while reporting "stopped" would let
-// the service persist a row that reconcile later deletes as missing runtime
-// state. Unknown IDs remain a no-op to preserve the runtime.Runtime cleanup
-// contract used by reconcile.
-func (d *Driver) Stop(_ context.Context, sandboxID string) error {
-	d.mu.Lock()
-	_, ok := d.vmms[sandboxID]
-	d.mu.Unlock()
-	if !ok {
-		// Stop on an unknown sandbox is a no-op rather than an error:
-		// reconcile may call Stop on rows it has just learned of, and
-		// a "missing VMM" condition is the same end state.
-		return nil
-	}
-	return methodNotImplemented("Stop")
+// Stop captures a full per-sandbox snapshot, persists the root/overlay disk
+// files that snapshot expects, then tears down the VMM and host TAP. The TAP
+// pool allocation is intentionally kept so Start can restore the same guest IP
+// and vsock identity; Destroy releases that allocation and deletes the
+// snapshot.
+func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
+	return d.stopToSandboxSnapshot(ctx, sandboxID)
 }
 
 // Destroy tears down the VMM, releases the per-sandbox TAP/IP/vsock-CID
@@ -1111,6 +1126,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	handle, hasHandle := d.vmms[sandboxID]
 	delete(d.vmms, sandboxID)
 	delete(d.clients, sandboxID)
+	delete(d.guestCID, sandboxID)
 	d.mu.Unlock()
 
 	// Phase 5: tell the RSS sampler the VMM is gone so the next
@@ -1184,6 +1200,11 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 				"sandbox_id", sandboxID, "error", err)
 			rememberErr(err)
 		}
+	}
+	if err := os.RemoveAll(d.sandboxSnapshotDir(sandboxID)); err != nil {
+		d.logger.Warn("firecracker destroy: sandbox snapshot cleanup failed",
+			"sandbox_id", sandboxID, "error", err)
+		rememberErr(err)
 	}
 	return firstErr
 }

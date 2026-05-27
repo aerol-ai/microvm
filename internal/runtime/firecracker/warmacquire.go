@@ -161,25 +161,38 @@ func (d *Driver) tryAcquireWarm(
 			}
 		}
 	}
+	if snap.HasOverlay && warmOverlayPath == "" {
+		warmOverlayPath = filepath.Join(slot.RunDir, overlayFileName)
+		if err := allocateSparse(warmOverlayPath, overlayPlaceholderBytes); err != nil {
+			return nil, false, fmt.Errorf("firecracker runtime: overlay placeholder alloc (warm): %w", err)
+		}
+	}
 
 	// Construct a REST client against the warm slot's live API socket.
 	// The pool already loaded the snapshot; this client only issues
 	// PATCH + Action(Resume).
 	client := d.newClient(slot.APISocket)
 
+	warmRootfsPath := filepath.Join(slot.RunDir, rootfsFileName)
+	if err := linkOrCopyRootfs(snap.RootfsPath, warmRootfsPath); err != nil {
+		return nil, false, fmt.Errorf("firecracker runtime: warm stage rootfs: %w", err)
+	}
+	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
+		DriveID:    rootDriveID,
+		PathOnHost: warmRootfsPath,
+	}); err != nil {
+		return nil, false, fmt.Errorf("firecracker runtime: warm patch rootfs drive: %w", err)
+	}
+
 	// PATCH NetworkInterface: the snapshot's eth0 references the
 	// defunct template-build TAP. Swap it for this sandbox's TAP.
 	// Firecracker accepts the PATCH between LoadSnapshot and Resume
 	// (the device's mac/iface_id are inherited from the snapshot
 	// state; only host_dev_name is mutable post-load).
-	if err := client.PutNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterface{
+	if err := client.PatchNetworkInterface(ctx, primaryIfaceID, firecracker.NetworkInterfacePatch{
 		IfaceID:     primaryIfaceID,
 		HostDevName: tapSlot.TapName,
 	}); err != nil {
-		// PutNetworkInterface is the wire op the firecracker REST
-		// client uses for both Put (pre-Start) and Patch (post-Load).
-		// On the warm path it's a PATCH — the device already exists
-		// in the loaded snapshot state.
 		return nil, false, fmt.Errorf("firecracker runtime: warm patch network interface: %w", err)
 	}
 
@@ -236,6 +249,7 @@ func (d *Driver) tryAcquireWarm(
 	d.mu.Lock()
 	d.clients[sandboxID] = client
 	d.vmms[sandboxID] = wrapped
+	d.guestCID[sandboxID] = slot.VsockCID
 	d.mu.Unlock()
 
 	// Phase 5: re-key the RSS sampler entry from the warm slot's id
