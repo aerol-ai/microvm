@@ -135,6 +135,20 @@ func TestStopUnknownSandboxIsNoop(t *testing.T) {
 	}
 }
 
+func TestStopRegisteredSandboxNotImplementedDoesNotShutdown(t *testing.T) {
+	d := New(Config{}, nil)
+	v := &fakeVMM{}
+	d.vmms["known-id"] = v
+
+	err := d.Stop(context.Background(), "known-id")
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("Stop registered sandbox error = %v, want ErrRuntimeNotImplemented", err)
+	}
+	if v.shutdown {
+		t.Fatal("Stop should not kill a Firecracker VMM until start/stop semantics are implemented")
+	}
+}
+
 // TestInspectUnknownSandboxReturnsNil mirrors the Docker driver's
 // contract: a sandbox that isn't in the driver's registry returns
 // (nil, nil) rather than an error.

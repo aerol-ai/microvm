@@ -336,7 +336,74 @@ func TestFirecrackerDispatch_RejectsMountsForNow(t *testing.T) {
 	}
 }
 
-func TestFirecrackerLifecycle_RoutesStopAndDestroyToFirecrackerRuntime(t *testing.T) {
+func TestFirecrackerDispatch_RejectsUnsupportedNetworkControlsForNow(t *testing.T) {
+	cases := []struct {
+		name string
+		req  models.CreateSandboxRequest
+	}{
+		{
+			name: "network block all",
+			req: models.CreateSandboxRequest{
+				Image:           "alpine:3.20",
+				Runtime:         models.RuntimeFirecracker,
+				NetworkBlockAll: true,
+			},
+		},
+		{
+			name: "network byte limit",
+			req: models.CreateSandboxRequest{
+				Image:                "alpine:3.20",
+				Runtime:              models.RuntimeFirecracker,
+				NetworkBytesOutLimit: 1024,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &fireRecordingRuntime{}
+			svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+			svc.cfg.EnableFirecracker = true
+			svc.SetFirecrackerRuntime(rt)
+
+			_, err := svc.CreateSandbox(context.Background(), tc.req)
+			if err == nil {
+				t.Fatal("expected unsupported network control rejection")
+			}
+			if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+				t.Fatalf("error should wrap ErrRuntimeNotImplemented; got %v", err)
+			}
+			if rt.calls != 0 {
+				t.Fatalf("driver should not be called when network controls are rejected; calls=%d", rt.calls)
+			}
+		})
+	}
+}
+
+func TestFirecrackerDispatch_RejectsStopLifecycleForNow(t *testing.T) {
+	rt := &fireRecordingRuntime{}
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.SetFirecrackerRuntime(rt)
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:   "alpine:3.20",
+		Runtime: models.RuntimeFirecracker,
+		Lifecycle: &models.Lifecycle{
+			StopIfIdleFor: time.Minute,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected stop lifecycle rejection")
+	}
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("error should wrap ErrRuntimeNotImplemented; got %v", err)
+	}
+	if rt.calls != 0 {
+		t.Fatalf("driver should not be called when stop lifecycle is rejected; calls=%d", rt.calls)
+	}
+}
+
+func TestFirecrackerLifecycle_StartStopRejectedAndDestroyRoutes(t *testing.T) {
 	ctx := context.Background()
 	dockerRT := &recordingRuntime{}
 	fireRT := &recordingRuntime{}
@@ -350,11 +417,11 @@ func TestFirecrackerLifecycle_RoutesStopAndDestroyToFirecrackerRuntime(t *testin
 	if err := st.Create(ctx, starting); err != nil {
 		t.Fatalf("Create start sandbox: %v", err)
 	}
-	if _, err := svc.StartSandbox(ctx, starting.ID); err != nil {
-		t.Fatalf("StartSandbox: %v", err)
+	if _, err := svc.StartSandbox(ctx, starting.ID); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("StartSandbox error = %v, want ErrRuntimeNotImplemented", err)
 	}
-	if len(fireRT.startRefs) != 1 || fireRT.startRefs[0] != starting.ID {
-		t.Fatalf("firecracker start refs = %v, want [%s]", fireRT.startRefs, starting.ID)
+	if len(fireRT.startRefs) != 0 {
+		t.Fatalf("firecracker start refs = %v, want none", fireRT.startRefs)
 	}
 	if len(dockerRT.startRefs) != 0 {
 		t.Fatalf("docker start refs = %v, want none", dockerRT.startRefs)
@@ -364,11 +431,11 @@ func TestFirecrackerLifecycle_RoutesStopAndDestroyToFirecrackerRuntime(t *testin
 	if err := st.Create(ctx, stopping); err != nil {
 		t.Fatalf("Create stop sandbox: %v", err)
 	}
-	if _, err := svc.StopSandbox(ctx, stopping.ID); err != nil {
-		t.Fatalf("StopSandbox: %v", err)
+	if _, err := svc.StopSandbox(ctx, stopping.ID); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("StopSandbox error = %v, want ErrRuntimeNotImplemented", err)
 	}
-	if len(fireRT.stopRefs) != 1 || fireRT.stopRefs[0] != stopping.ID {
-		t.Fatalf("firecracker stop refs = %v, want [%s]", fireRT.stopRefs, stopping.ID)
+	if len(fireRT.stopRefs) != 0 {
+		t.Fatalf("firecracker stop refs = %v, want none", fireRT.stopRefs)
 	}
 	if len(dockerRT.stopRefs) != 0 {
 		t.Fatalf("docker stop refs = %v, want none", dockerRT.stopRefs)
@@ -389,6 +456,38 @@ func TestFirecrackerLifecycle_RoutesStopAndDestroyToFirecrackerRuntime(t *testin
 	}
 	if _, err := st.Get(ctx, destroying.ID); err == nil {
 		t.Fatalf("destroyed sandbox row still exists")
+	}
+}
+
+func TestFirecrackerUpdateLifecycleRejectsStopTimersForNow(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.SetFirecrackerRuntime(&recordingRuntime{})
+
+	sb := firecrackerSandboxForTest("sb-fc-lifecycle")
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+	_, err := svc.UpdateLifecycle(ctx, sb.ID, models.Lifecycle{StopAtAge: time.Hour})
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("UpdateLifecycle error = %v, want ErrRuntimeNotImplemented", err)
+	}
+}
+
+func TestFirecrackerSetNetworkLimitsRejectsPositiveLimitsForNow(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.SetFirecrackerRuntime(&recordingRuntime{})
+
+	sb := firecrackerSandboxForTest("sb-fc-netlimit")
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+	_, err := svc.SetNetworkLimits(ctx, sb.ID, 1, 0)
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("SetNetworkLimits error = %v, want ErrRuntimeNotImplemented", err)
 	}
 }
 

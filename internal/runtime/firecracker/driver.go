@@ -1066,19 +1066,15 @@ func (d *Driver) Start(_ context.Context, _ string) (*models.SandboxRuntimeState
 	return nil, methodNotImplemented("Start")
 }
 
-// Stop sends a graceful shutdown to the VMM. Phase 1 implementation:
-// signal SIGTERM to the firecracker process group with a short grace,
-// then SIGKILL. The in-guest toolbox receives no pre-shutdown notice
-// today (that's a Phase 3 vsock-op); the kernel sees SIGTERM as a
-// virtio-disconnect and the guest goes through its normal shutdown
-// path.
-//
-// Stop leaves the per-sandbox TAP, pool slot, and runDir in place —
-// Destroy is the only call that releases them. Mirrors the Docker
-// driver's Stop/Destroy split.
-func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
+// Stop is intentionally not implemented yet. A real Firecracker stop/start
+// path must either snapshot+destroy and later restore, or pause while still
+// charging capacity. Killing the VMM here while reporting "stopped" would let
+// the service persist a row that reconcile later deletes as missing runtime
+// state. Unknown IDs remain a no-op to preserve the runtime.Runtime cleanup
+// contract used by reconcile.
+func (d *Driver) Stop(_ context.Context, sandboxID string) error {
 	d.mu.Lock()
-	handle, ok := d.vmms[sandboxID]
+	_, ok := d.vmms[sandboxID]
 	d.mu.Unlock()
 	if !ok {
 		// Stop on an unknown sandbox is a no-op rather than an error:
@@ -1086,10 +1082,7 @@ func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
 		// a "missing VMM" condition is the same end state.
 		return nil
 	}
-	if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
-		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
-	}
-	return nil
+	return methodNotImplemented("Stop")
 }
 
 // Destroy tears down the VMM, releases the per-sandbox TAP/IP/vsock-CID

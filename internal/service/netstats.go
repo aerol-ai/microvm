@@ -98,6 +98,13 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 	if bytesInLimit < 0 || bytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
+	sandbox, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if s.isFirecrackerSandbox(sandbox) && (bytesInLimit > 0 || bytesOutLimit > 0) {
+		return nil, unsupportedFirecrackerOption("network byte limits")
+	}
 	// Stronger lazy-bootstrap case than GetNetworkUsage: setting a limit
 	// implies the operator wants enforcement to start. If the poller is
 	// down, "limit set, never enforced" is silent failure of a security
@@ -111,7 +118,7 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 	if err := s.store.SetNetworkLimits(ctx, id, bytesInLimit, bytesOutLimit); err != nil {
 		return nil, err
 	}
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err = s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}

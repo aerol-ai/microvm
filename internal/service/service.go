@@ -1074,6 +1074,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		if err := s.validateLifecycle(*req.Lifecycle); err != nil {
 			return nil, fmt.Errorf("invalid lifecycle: %w", err)
 		}
+		if firecrackerLifecycleRequiresStop(*req.Lifecycle) {
+			return nil, unsupportedFirecrackerOption("stop/serverless lifecycle")
+		}
 		lifecycle = *req.Lifecycle
 	}
 
@@ -1086,6 +1089,12 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	}
 	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
+	}
+	if req.NetworkBlockAll {
+		return nil, unsupportedFirecrackerOption("network_block_all")
+	}
+	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
+		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
 
 	toolboxToken, err := generateToolboxToken()
@@ -1386,6 +1395,9 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if s.isFirecrackerSandbox(sandbox) {
+		return nil, unsupportedFirecrackerOption("start from stopped")
 	}
 
 	// Re-Admit against the host budget before touching Docker. StopSandbox
@@ -1875,7 +1887,13 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.validateLifecycle(l); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
-	priorSandbox, _ := s.store.Get(ctx, id)
+	priorSandbox, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if s.isFirecrackerSandbox(priorSandbox) && firecrackerLifecycleRequiresStop(l) {
+		return nil, unsupportedFirecrackerOption("stop/serverless lifecycle")
+	}
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, err
 	}
@@ -3986,6 +4004,15 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 		req.Env = map[string]string{}
 	}
 	return req
+}
+
+func unsupportedFirecrackerOption(option string) error {
+	return fmt.Errorf("runtime %q does not yet support %s (see plans/snapshot-clone-fast-boot.md): %w",
+		models.RuntimeFirecracker, option, models.ErrRuntimeNotImplemented)
+}
+
+func firecrackerLifecycleRequiresStop(l models.Lifecycle) bool {
+	return l.Serverless || l.StopIfIdleFor > 0 || l.StopAtAge > 0
 }
 
 func NormalizeCreateFailover(req *models.CreateSandboxRequest) error {
