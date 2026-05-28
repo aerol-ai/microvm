@@ -22,6 +22,21 @@ The "target" below is whatever your default sandbox URLs already resolve to — 
 
 If your DNS provider does not support a flattened apex CNAME and you only have an ingress hostname (not IPs), the workaround is per-host DNS-01 issuance — tracked for v2 in `plans/custom-domains-dns01.md`.
 
+### Ownership verification (TXT record)
+
+In addition to the CNAME / A / AAAA above, you must publish a TXT record proving you control the zone. Without it, every `attach` call returns `403 Forbidden` with `custom domain TXT record verification failed`.
+
+The value is keyed to the **hostname**, not to a sandbox ID — one record per hostname, provisioned once, reusable across sandbox recreates and for any sandbox that wants to claim it. Cross-sandbox hijack of an already-attached hostname is still blocked by the cluster-wide uniqueness gate at attach time.
+
+| Custom hostname | TXT record name | TXT record value |
+|---|---|---|
+| Subdomain (`api.acme.com`) | `_aerol-verify.api` (zone `acme.com`) | `aerol-verify=api.acme.com` |
+| Apex (`acme.com`) | `_aerol-verify` (at zone root) | `aerol-verify=acme.com` |
+
+Most DNS provider UIs expect the Name relative to the managed zone (the left columns above); some expect the FQDN — in that case use `_aerol-verify.api.acme.com` or `_aerol-verify.acme.com` and the value is unchanged.
+
+Publish the TXT, wait for it to propagate (`dig TXT _aerol-verify.<your-host>`), then call `attach`. If you operate the cluster with non-default verification prefixes (`SB_CUSTOM_DOMAIN_VERIFY_PREFIX`, `SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX`), substitute those — `customDomains.dns()` always returns the correct row for the cluster you're talking to.
+
 ### Cloudflare specifics
 
 1. **Set the record to DNS-only (gray cloud), not Proxied (orange cloud).** With the proxy on, Cloudflare terminates TLS with its own certificate and the cluster never sees the SNI — Caddy's `ask` handler is never invoked, ACME never runs, and the domain stays `pending_dns` forever. The same applies to any CDN or reverse proxy that intercepts TLS in front of the ingress.
@@ -139,9 +154,10 @@ Two entry points:
   domain, when rendering "point your DNS here first" instructions. `source`
   is `"hostname"`, `"ips"`, `"mixed"`, or `"unknown"` — branch on it instead
   of guessing from which field is populated.
-- `customDomains.dns()` — per-sandbox. Returns one ready-to-paste DNS row per
-  attached domain plus the same `target` embedded, so callers don't need a
-  follow-up `dns.target()` round trip.
+- `customDomains.dns()` — per-sandbox. Returns the ready-to-paste DNS rows
+  for each attached domain — the routing record (CNAME / A / AAAA) **and**
+  the ownership-verification TXT — plus the same `target` embedded, so
+  callers don't need a follow-up `dns.target()` round trip.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -296,6 +312,7 @@ Each attached hostname carries a `status` that reflects where Caddy is in the pe
 | Status | When |
 |---|---|
 | `400 Bad Request` | Hostname is malformed or includes a port. |
+| `403 Forbidden` | Ownership verification TXT record is missing or has the wrong value at `_aerol-verify.<hostname>`. See [Ownership verification (TXT record)](#ownership-verification-txt-record). |
 | `409 Conflict` | The hostname is already attached to a different sandbox (hostnames are globally unique across the cluster), the sandbox already exposes a `tcp://` / `tls://` port (the IRON RULE — custom domains and L4 exposures can't coexist on one sandbox), or the per-sandbox cap is reached. |
 | `412 Precondition Failed` | Custom domains are disabled (`SB_ENABLE_CUSTOM_DOMAINS=false`) or the server runs in IP mode (`SB_DOMAIN` unset). |
 | `429 Too Many Requests` | The daemon-wide ACME issuance budget is exhausted (LE `new-orders` per-account limit nearing 80% of 300/3h). Honour `Retry-After` and try again. |
