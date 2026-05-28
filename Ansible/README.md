@@ -444,6 +444,104 @@ warrant it.
 4. `ansible-playbook playbooks/configure-ops.yml`.
 5. Verify with `grep` / `ls` on a node and `curl /v1/images` on AOCR.
 
+## Install Firecracker on existing nodes
+
+`configure-ops.yml` installs the Firecracker binary, jailer, and a guest
+kernel image whenever `firecracker.enabled: true` in `../config/cluster.yml`.
+No per-host or per-arch configuration is required — the play detects
+`uname -m`, picks the matching upstream asset, verifies its SHA256, and
+installs to the paths sandboxd already reads from
+(`SB_FIRECRACKER_BINARY`, `SB_JAILER_BINARY`, `SB_FIRECRACKER_KERNEL`).
+
+### Host requirements (read this first)
+
+Firecracker is a **KVM-only VMM**. The host must expose `/dev/kvm`:
+
+- **AWS EC2:** only bare-metal instance types pass KVM through to the OS.
+  Use `*.metal` SKUs (`c5n.metal`, `m5zn.metal`, `c7g.metal`, `i3.metal`,
+  `m5.metal`, `c5.metal`, etc.). Standard `t3`/`m5`/`c5`/`c6i`/`m6i`/`r5`
+  instances are themselves Nitro guests — `/dev/kvm` does not exist and
+  Firecracker cannot run there.
+- **GCP:** N2/N1 with `--enable-nested-virtualization` on the image.
+- **Azure:** Dv3/Ev3+ with nested virtualization.
+- **Bare metal / on-prem:** Intel VT-x or AMD-V enabled in BIOS, then
+  `sudo modprobe kvm_intel` (or `kvm_amd`).
+
+The play **hard-fails** with a remediation message if `/dev/kvm` is missing.
+If you need to install `configure-ops.yml`'s other artifacts (OTEL,
+backup, runbooks) on a host that can't run Firecracker, set
+`firecracker.enabled: false` in `../config/cluster.yml` and re-run. To
+install Firecracker on a *subset* of capable hosts only, target the play
+with `--limit` at a group whose nodes all expose `/dev/kvm`.
+
+```yaml
+# ../config/cluster.yml
+firecracker:
+  enabled: true
+  kernel_path: "/var/lib/sandboxd/firecracker/vmlinux"
+```
+
+```bash
+ansible-playbook playbooks/configure-ops.yml
+```
+
+What the play actually does, per host:
+
+1. Runs `uname -m` and maps `x86_64|amd64 → x86_64`, `aarch64|arm64 → aarch64`.
+   Anything else fails fast — Firecracker upstream only publishes those two.
+2. Stats `/dev/kvm`. Missing? Fails fast (the host is a non-nested VM or virt
+   is off in BIOS — cheaper to fail here than at first `CreateSandbox`).
+3. Probes `firecracker --version`. If the installed binary already matches
+   `firecracker_version`, skips the download. Idempotent re-runs are cheap.
+4. Downloads `firecracker-<ver>-<arch>.tgz` + its `.sha256.txt` sidecar
+   from `github.com/firecracker-microvm/firecracker/releases`, verifies with
+   `sha256sum -c`, extracts, installs binary + jailer.
+5. Downloads the guest kernel from `s3.amazonaws.com/spec.ccfc.min`
+   (the upstream-blessed CI bucket) to `firecracker.kernel_path`. The
+   defaults are pinned to a known-good combination (see below).
+6. Creates `firecracker.run_dir`, `templates_dir`, and `jailer_chroot_base`.
+
+### Pins and overrides
+
+Defaults in `inventory/group_vars/all/defaults.yml`:
+
+| Var | Default | What it controls |
+|---|---|---|
+| `firecracker_version` | `v1.15.1` | GitHub release tag; binary + jailer come from `firecracker-microvm/firecracker/releases/download/<ver>/` |
+| `firecracker_kernel_ci_version` | `v1.15` | CI bucket directory; usually `v<major>.<minor>` of the release |
+| `firecracker_kernel_version` | `5.10.245` | Guest kernel patch level; the bucket also ships 6.1 if you need a newer guest |
+| `firecracker_binary_url` | `""` | Set in `local.yml` to pull binary from a private mirror; bypasses upstream + checksum |
+| `firecracker_jailer_url` | `""` | Same for the jailer |
+| `firecracker_kernel_url` | `""` | Same for the kernel; useful if you ship a hand-built `vmlinux` |
+
+Bump the version pins together: when Firecracker releases `v1.16.0`, set
+`firecracker_version: "v1.16.0"` and `firecracker_kernel_ci_version: "v1.16"`,
+then list the bucket to pick the latest patch:
+
+```bash
+curl -s 'https://s3.amazonaws.com/spec.ccfc.min/?prefix=firecracker-ci/v1.16/x86_64/vmlinux-5.10&list-type=2' \
+  | grep -oE '<Key>[^<]+</Key>' | sort -V | tail -3
+```
+
+Both `x86_64` and `aarch64` ship the same kernel patch in lockstep, so one
+`firecracker_kernel_version` value covers a mixed fleet.
+
+### Limit to specific hosts
+
+`firecracker.enabled` is a cluster-wide switch. To install on a subset of
+hosts without flipping the cluster default, target the play with `--limit`:
+
+```bash
+ansible-playbook playbooks/configure-ops.yml --limit aerolvm_role_worker
+```
+
+### Why this differs from `scripts/install.sh`
+
+`scripts/install.sh` is day-0 bootstrap and only handles binaries that ship
+with sandboxd itself (sandboxd, toolboxd, runsc, the NVIDIA toolkit). The
+Firecracker runtime is opt-in and large enough to want its own day-2
+lifecycle, so it lives here instead.
+
 ## When to use this vs. Terraform
 
 | You want to...                                  | Use         |
@@ -456,6 +554,7 @@ warrant it.
 | Deploy backup/recovery helpers or backup cron   | Ansible     |
 | Deploy Grafana/Prometheus/Alertmanager artifacts | Ansible     |
 | Deploy operational runbooks                     | Ansible     |
+| Install / upgrade Firecracker binary + kernel   | Ansible     |
 | Restart a service, rotate a PAT, tail logs      | Ansible     |
 | Run one-off shell commands across many nodes    | Ansible     |
 

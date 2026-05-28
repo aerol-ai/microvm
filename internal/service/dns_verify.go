@@ -29,10 +29,14 @@ func (s *Service) SetDNSResolver(resolver DNSResolver) {
 }
 
 // verifyCustomDomainOwnership checks if the operator has proven ownership of
-// the custom domain by placing a specific TXT record.
-func verifyCustomDomainOwnership(ctx context.Context, resolver DNSResolver, hostname, sandboxID, txtNamePrefix, txtValuePrefix string) error {
+// the custom domain by placing a specific TXT record. The expected value is
+// derived from the hostname itself (not a sandbox ID), so the TXT can be
+// provisioned once per zone and reused across sandbox recreates. Cross-
+// sandbox hijack of an already-attached hostname is prevented by the
+// cluster-wide uniqueness gate on insert, not by this check.
+func verifyCustomDomainOwnership(ctx context.Context, resolver DNSResolver, hostname, txtNamePrefix, txtValuePrefix string) error {
 	verifyDomain := fmt.Sprintf("%s.%s", txtNamePrefix, hostname)
-	expectedValue := fmt.Sprintf("%s%s", txtValuePrefix, sandboxID)
+	expectedValue := fmt.Sprintf("%s%s", txtValuePrefix, hostname)
 
 	txts, err := resolver.LookupTXT(ctx, verifyDomain)
 	if err != nil {

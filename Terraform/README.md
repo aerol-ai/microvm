@@ -134,6 +134,20 @@ phases:
 Terraform now exposes Firecracker directly in the node schema instead of
 making operators smuggle everything through `extra_user_data`.
 
+> **Host requirements (read this first).** Firecracker is a KVM-only VMM
+> and needs `/dev/kvm` on the host. **On AWS that means a bare-metal
+> instance type only.** Use `*.metal` SKUs (`c5n.metal`, `m5zn.metal`,
+> `c7g.metal`, `i3.metal`, `m5.metal`, `c5.metal`, …). Standard
+> `t3`/`m5`/`c5`/`c6i`/`m6i`/`r5` instances are themselves Nitro guests,
+> have no `/dev/kvm`, and will fail user-data with a clear remediation
+> message at first boot. On GCP, use N1/N2 with
+> `--enable-nested-virtualization`. On Azure, Dv3/Ev3+ with nested
+> virtualization. Bare metal: enable VT-x / AMD-V in BIOS.
+>
+> To proceed without Firecracker on incapable hosts, leave
+> `default_with_firecracker = false` and set `with_firecracker = true`
+> **only** on node entries whose `instance_type` is a bare-metal SKU.
+
 1. Mark worker-capable nodes with `with_firecracker = true`.
 2. Fill the `firecracker` object in `terraform.tfvars`.
 3. Choose one of two bootstrap modes:
@@ -164,8 +178,11 @@ firecracker = {
 
 nodes = {
   srv1 = { role = "server", seed = true, instance_type = "t3.small" }
-  wrk1 = { role = "worker", with_firecracker = true, instance_type = "c6i.xlarge" }
-  wrk2 = { role = "worker", with_firecracker = true, instance_type = "c6i.xlarge" }
+  # Firecracker nodes MUST be bare-metal (*.metal) — standard Nitro types
+  # (c6i, m6i, c5, m5, t3, ...) do not expose /dev/kvm and bootstrap will
+  # hard-fail with a remediation message.
+  wrk1 = { role = "worker", with_firecracker = true, instance_type = "c5.metal" }
+  wrk2 = { role = "worker", with_firecracker = true, instance_type = "c5.metal" }
 }
 ```
 

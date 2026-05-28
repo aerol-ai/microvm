@@ -36,9 +36,14 @@ const cloudflareNote = "Cloudflare/CDN: set the record to DNS only (gray cloud).
 // with A/AAAA records at the same name (RFC 1034 §3.6.2). DNS providers
 // reject the second row, so emitting both as "ready-to-paste" would just
 // trip the user up.
-// `sandboxID` is provided to generate ownership verification records.
+//
+// The TXT verification record proves zone control, not sandbox binding:
+// value is `<txtValuePrefix><hostname>`, so the same record stays valid
+// across sandbox recreates and can be provisioned BEFORE a sandbox exists.
+// Cross-sandbox hijack is still blocked by the cluster-wide uniqueness gate
+// on hostname insert.
 // `txtNamePrefix` and `txtValuePrefix` allow customizing the verification TXT records.
-func ComposeDNSRecords(hostnames []string, target IngressTarget, sandboxID, txtNamePrefix, txtValuePrefix string) []DNSRecord {
+func ComposeDNSRecords(hostnames []string, target IngressTarget, txtNamePrefix, txtValuePrefix string) []DNSRecord {
 	if len(hostnames) == 0 {
 		return nil
 	}
@@ -78,16 +83,17 @@ func ComposeDNSRecords(hostnames []string, target IngressTarget, sandboxID, txtN
 			}
 		}
 
-		// Add TXT verification record
-		if sandboxID != "" {
-			out = append(out, DNSRecord{
-				Hostname: host,
-				Type:     "TXT",
-				Name:     fmt.Sprintf("%s.%s", txtNamePrefix, name),
-				Value:    fmt.Sprintf("%s%s", txtValuePrefix, sandboxID),
-				Notes:    "Required for domain ownership verification.",
-			})
-		}
+		// Add TXT verification record. Value is the hostname itself so the
+		// record proves zone control (one-time setup per hostname) instead
+		// of binding to a specific sandbox ID — that lets the TXT be added
+		// BEFORE any sandbox exists and survive sandbox recreates.
+		out = append(out, DNSRecord{
+			Hostname: host,
+			Type:     "TXT",
+			Name:     fmt.Sprintf("%s.%s", txtNamePrefix, name),
+			Value:    fmt.Sprintf("%s%s", txtValuePrefix, host),
+			Notes:    "Required for domain ownership verification.",
+		})
 	}
 	return out
 }

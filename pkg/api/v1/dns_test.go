@@ -82,17 +82,21 @@ func TestV1CustomDomainDNS_ReturnsRecordsAfterAttach(t *testing.T) {
 	cnames := 0
 	txts := 0
 	for _, r := range got.Records {
-		if r.Type == models.DNSRecordTypeCNAME {
+		switch r.Type {
+		case models.DNSRecordTypeCNAME:
 			cnames++
 			if r.Value != "ingress.example.com" {
 				t.Fatalf("unexpected CNAME record %+v", r)
 			}
-		} else if r.Type == "TXT" {
+		case "TXT":
 			txts++
-			if r.Value != "aerol-verify=sb-1" {
-				t.Fatalf("unexpected TXT record %+v", r)
+			// Value is keyed to the hostname, not the sandbox ID — same
+			// record works across sandbox recreates.
+			wantValue := "aerol-verify=" + r.Hostname
+			if r.Value != wantValue {
+				t.Fatalf("TXT Value=%q, want %q (record=%+v)", r.Value, wantValue, r)
 			}
-		} else {
+		default:
 			t.Fatalf("unexpected record %+v", r)
 		}
 	}

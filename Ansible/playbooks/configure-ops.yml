@@ -55,6 +55,16 @@
       SB_ENABLE_CUSTOM_DOMAINS: "{{ ingress.enable_custom_domains | bool | string | lower }}"
       SB_CUSTOM_DOMAIN_VERIFY_PREFIX: "{{ ingress.custom_domain_txt_prefix }}"
       SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX: "{{ ingress.custom_domain_txt_value_prefix }}"
+      SB_ENABLE_FIRECRACKER: "{{ firecracker.enabled | default(false) | bool | string | lower }}"
+      SB_FIRECRACKER_BINARY: "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') }}"
+      SB_JAILER_BINARY: "{{ firecracker.jailer_path | default('/usr/local/bin/jailer') }}"
+      SB_FIRECRACKER_KERNEL: "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}"
+      SB_FIRECRACKER_RUN_DIR: "{{ firecracker.run_dir | default('/run/sandboxd/firecracker') }}"
+      SB_FIRECRACKER_TEMPLATES_DIR: "{{ firecracker.templates_dir | default('/var/lib/sandboxd/firecracker/templates') }}"
+      SB_FIRECRACKER_USE_JAILER: "{{ firecracker.use_jailer | default(true) | bool | string | lower }}"
+      SB_JAILER_CHROOT_BASE: "{{ firecracker.jailer_chroot_base | default('/srv/jailer') }}"
+      SB_FIRECRACKER_TAP_BASE_CIDR: "{{ firecracker.tap_base_cidr | default('172.16.0.0/20') }}"
+      SB_FIRECRACKER_TAP_POOL_SIZE: "{{ firecracker.tap_pool_size | default(256) }}"
       # Secret path: keyed off whether the operator supplied a wrap key in
       # config/secrets.yml (aocr.upstream_wrap_key) OR via a control-node
       # file (sandboxd_upstream_wrap_key_src in local.yml). Empty path = no
@@ -187,6 +197,236 @@
         mode: "0700"
         owner: root
         group: root
+
+    # Firecracker host-side install. Runs only when firecracker.enabled is
+    # true in config/cluster.yml. Arch is detected from uname -m so operators
+    # don't have to hand-craft per-arch URLs (mirrors the runsc pattern in
+    # scripts/install.sh:install_runsc_binary). Unsupported arches fail
+    # immediately rather than producing a sandboxd that fails to start hours
+    # later when a Firecracker sandbox is first requested.
+    - name: Detect host architecture for Firecracker
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.command: uname -m
+      register: firecracker_uname_m
+      changed_when: false
+
+    - name: Map host arch → Firecracker release arch
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.set_fact:
+        # Firecracker upstream + spec.ccfc.min both publish only x86_64 and
+        # aarch64. Map common uname -m outputs to those two; anything else
+        # trips the assert below.
+        firecracker_arch: >-
+          {{
+            {
+              'x86_64': 'x86_64',
+              'amd64':  'x86_64',
+              'aarch64': 'aarch64',
+              'arm64':   'aarch64',
+            }.get(firecracker_uname_m.stdout | trim, '')
+          }}
+
+    - name: Refuse when host arch is not supported by Firecracker
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.assert:
+        that:
+          - firecracker_arch | length > 0
+        fail_msg: >-
+          Firecracker only ships x86_64 and aarch64 binaries; this host
+          reports uname -m={{ firecracker_uname_m.stdout | trim }}.
+          Either disable firecracker.enabled in config/cluster.yml or
+          exclude this host from the run.
+
+    - name: Check for /dev/kvm on host
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: firecracker_kvm
+
+    - name: Refuse when host has no /dev/kvm
+      # Firecracker is a KVM-only VMM. Without /dev/kvm there is nothing to
+      # install onto — sandboxd would fail at first CreateSandbox(runtime=
+      # firecracker). Catch it here with a paste-able remediation instead of
+      # the default "failed_when_result: true" stack trace.
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.assert:
+        that:
+          - firecracker_kvm.stat.exists
+        fail_msg: |
+          /dev/kvm is missing on {{ inventory_hostname }} ({{ firecracker_uname_m.stdout | trim }}).
+          Firecracker is KVM-only and CANNOT run on this host.
+
+          Most likely cause: this host does not expose hardware virtualization.
+            * AWS EC2: only bare-metal instance types pass KVM through. Use
+              *.metal (c5n.metal, m5zn.metal, c7g.metal, i3.metal, m5.metal,
+              c5.metal, etc.). Standard t3/m5/c5/c6i/m6i/r5 instances are
+              themselves Nitro guests and do not have /dev/kvm.
+            * GCP: enable nested virtualization on the image (only N2/N1
+              with --enable-nested-virtualization).
+            * Azure: only Dv3/Ev3 and later with nested virt support.
+            * Bare metal / on-prem: enable Intel VT-x / AMD-V in BIOS, then
+              `sudo modprobe kvm_intel` (or kvm_amd).
+
+          To proceed WITHOUT Firecracker on this host:
+            1. Edit ../config/cluster.yml and set:
+                 firecracker:
+                   enabled: false
+            2. Re-run: ansible-playbook playbooks/configure-ops.yml
+
+          To install Firecracker only on capable hosts, keep
+          firecracker.enabled: true in config/cluster.yml and target the
+          play with --limit at a group that excludes non-KVM hosts.
+
+    - name: Compute Firecracker upstream download URLs
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.set_fact:
+        # Tarball layout: release-<ver>-<arch>/firecracker-<ver>-<arch>
+        #                 release-<ver>-<arch>/jailer-<ver>-<arch>
+        # Sidecar checksum: <tarball>.sha256.txt (single-line "<hash>  <file>").
+        firecracker_release_base: >-
+          https://github.com/firecracker-microvm/firecracker/releases/download/{{ firecracker_version }}
+        firecracker_release_tarball: "firecracker-{{ firecracker_version }}-{{ firecracker_arch }}.tgz"
+        # Kernel: spec.ccfc.min is the upstream-blessed kernel bucket. Path
+        # layout is firecracker-ci/<ci_version>/<arch>/vmlinux-<kernel_version>.
+        firecracker_kernel_default_url: >-
+          https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/{{ firecracker_kernel_ci_version }}/{{ firecracker_arch }}/vmlinux-{{ firecracker_kernel_version }}
+
+    - name: Ensure Firecracker install directories exist
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      loop:
+        - "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') | dirname }}"
+        - "{{ firecracker.jailer_path | default('/usr/local/bin/jailer') | dirname }}"
+        - "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') | dirname }}"
+        - "{{ firecracker.run_dir | default('/run/sandboxd/firecracker') }}"
+        - "{{ firecracker.templates_dir | default('/var/lib/sandboxd/firecracker/templates') }}"
+        - "{{ firecracker.jailer_chroot_base | default('/srv/jailer') }}"
+
+    - name: Stat installed Firecracker binary
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.stat:
+        path: "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') }}"
+      register: firecracker_installed_bin
+
+    - name: Probe installed Firecracker version
+      when:
+        - firecracker.enabled | default(false) | bool
+        - firecracker_installed_bin.stat.exists
+      ansible.builtin.command: "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') }} --version"
+      register: firecracker_installed_version
+      changed_when: false
+      failed_when: false
+
+    # Skip the download/extract dance when the installed binary already
+    # reports the requested version. `firecracker --version` prints e.g.
+    # "Firecracker v1.10.1". Re-runs of configure-ops.yml stay fast.
+    - name: Install Firecracker + jailer from upstream release
+      when:
+        - firecracker.enabled | default(false) | bool
+        - firecracker_binary_url | length == 0
+        - (not firecracker_installed_bin.stat.exists) or (firecracker_version not in (firecracker_installed_version.stdout | default('')))
+      block:
+        - name: Create temp workspace for Firecracker release
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: firecracker
+          register: firecracker_tmp
+
+        - name: Download Firecracker release tarball
+          ansible.builtin.get_url:
+            url: "{{ firecracker_release_base }}/{{ firecracker_release_tarball }}"
+            dest: "{{ firecracker_tmp.path }}/{{ firecracker_release_tarball }}"
+            mode: "0644"
+
+        - name: Download Firecracker release SHA256 sidecar
+          ansible.builtin.get_url:
+            url: "{{ firecracker_release_base }}/{{ firecracker_release_tarball }}.sha256.txt"
+            dest: "{{ firecracker_tmp.path }}/{{ firecracker_release_tarball }}.sha256.txt"
+            mode: "0644"
+
+        - name: Verify Firecracker release tarball SHA256
+          # sha256sum -c reads "<hash>  <file>" and exits non-zero on mismatch.
+          # Run from the tmp dir so the relative <file> in the sidecar resolves.
+          ansible.builtin.command:
+            cmd: "sha256sum -c {{ firecracker_release_tarball }}.sha256.txt"
+            chdir: "{{ firecracker_tmp.path }}"
+          changed_when: false
+
+        - name: Extract Firecracker release tarball
+          ansible.builtin.unarchive:
+            src: "{{ firecracker_tmp.path }}/{{ firecracker_release_tarball }}"
+            dest: "{{ firecracker_tmp.path }}"
+            remote_src: true
+
+        - name: Install Firecracker binary
+          ansible.builtin.copy:
+            src: "{{ firecracker_tmp.path }}/release-{{ firecracker_version }}-{{ firecracker_arch }}/firecracker-{{ firecracker_version }}-{{ firecracker_arch }}"
+            dest: "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') }}"
+            mode: "0755"
+            owner: root
+            group: root
+            remote_src: true
+
+        - name: Install jailer binary
+          ansible.builtin.copy:
+            src: "{{ firecracker_tmp.path }}/release-{{ firecracker_version }}-{{ firecracker_arch }}/jailer-{{ firecracker_version }}-{{ firecracker_arch }}"
+            dest: "{{ firecracker.jailer_path | default('/usr/local/bin/jailer') }}"
+            mode: "0755"
+            owner: root
+            group: root
+            remote_src: true
+      always:
+        - name: Remove Firecracker release workspace
+          ansible.builtin.file:
+            path: "{{ firecracker_tmp.path }}"
+            state: absent
+          when: firecracker_tmp.path is defined
+
+    # Operator override path: a private mirror URL bypasses the upstream
+    # GitHub fetch entirely. Binary and jailer overrides are independent so
+    # operators can mix-and-match (e.g. host the binary internally, take
+    # jailer from upstream).
+    - name: Download Firecracker binary from operator-supplied URL
+      when:
+        - firecracker.enabled | default(false) | bool
+        - firecracker_binary_url | length > 0
+      ansible.builtin.get_url:
+        url: "{{ firecracker_binary_url }}"
+        dest: "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') }}"
+        mode: "0755"
+        owner: root
+        group: root
+        force: no
+
+    - name: Download jailer from operator-supplied URL
+      when:
+        - firecracker.enabled | default(false) | bool
+        - firecracker_jailer_url | length > 0
+      ansible.builtin.get_url:
+        url: "{{ firecracker_jailer_url }}"
+        dest: "{{ firecracker.jailer_path | default('/usr/local/bin/jailer') }}"
+        mode: "0755"
+        owner: root
+        group: root
+        force: no
+
+    - name: Download Firecracker guest kernel image
+      # Operator URL wins when set; otherwise pull the arch-matched vmlinux
+      # from the upstream spec.ccfc.min bucket. force: no preserves any
+      # locally-built kernel an operator dropped in by hand.
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.get_url:
+        url: "{{ firecracker_kernel_url if (firecracker_kernel_url | length > 0) else firecracker_kernel_default_url }}"
+        dest: "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}"
+        mode: "0644"
+        owner: root
+        group: root
+        force: no
 
     # Upstream wrap key (Phase 4 F17). Two delivery modes:
     #   * shared SoT      -> aocr.upstream_wrap_key in config/secrets.yml

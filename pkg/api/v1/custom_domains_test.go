@@ -52,9 +52,11 @@ func newCustomDomainsV1Env(t *testing.T, cfgOverride func(*config.Config)) *cust
 	caddyClient := caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second})
 	svc := service.New(cfg, logger, st, &noopRuntime{}, nil, caddyClient, nil, nil, nil)
 	svc.SetDNSResolver(&mockDNSResolver{
+		// TXT value is the hostname itself, not the sandbox ID, so a
+		// single record can serve every sandbox that claims the host.
 		records: map[string][]string{
-			"_aerol-verify.api.acme.com": {"aerol-verify=sb-1", "aerol-verify=sb-a", "aerol-verify=sb-b"},
-			"_aerol-verify.acme.com":     {"aerol-verify=sb-1"},
+			"_aerol-verify.api.acme.com": {"aerol-verify=api.acme.com"},
+			"_aerol-verify.acme.com":     {"aerol-verify=acme.com"},
 		},
 	})
 

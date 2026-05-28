@@ -223,6 +223,39 @@ sudo /tmp/cluster-join.sh \
 # in. URLs are optional: when omitted we assume the AMI already carries the
 # artifact at the configured path.
 ###############################################################################
+
+# KVM precondition. Firecracker is a KVM-only VMM — without /dev/kvm there
+# is nothing to install onto. Fail user-data with a paste-able remediation
+# instead of letting sandboxd hit it at first CreateSandbox(runtime=
+# firecracker). The check fires from user-data so the EC2 instance still
+# launches, but cloud-init reports failed and the node never joins the
+# cluster — exactly the signal an operator needs to fix the instance type.
+if [ ! -e /dev/kvm ]; then
+  cat >&2 <<EOF
+[bootstrap] /dev/kvm is missing on this host (uname -m: $(uname -m)).
+Firecracker is KVM-only and CANNOT run on this instance.
+
+Most likely cause on AWS: the instance type does not pass KVM through.
+  * Use a bare-metal type: *.metal (c5n.metal, m5zn.metal, c7g.metal,
+    i3.metal, m5.metal, c5.metal, etc.). Standard t3/m5/c5/c6i/m6i/r5
+    instances are themselves Nitro guests and do not expose /dev/kvm.
+  * GCP: enable nested virtualization on the image (N2/N1 only,
+    --enable-nested-virtualization). Azure: Dv3/Ev3+ with nested virt.
+  * Bare metal: enable Intel VT-x / AMD-V in BIOS, then
+    sudo modprobe kvm_intel (or kvm_amd).
+
+To proceed WITHOUT Firecracker, in your terraform.tfvars set:
+  default_with_firecracker = false
+and remove the per-node override (with_firecracker = true) from any
+node entry in the nodes list. Then: terraform apply.
+
+To enable Firecracker only on capable nodes, leave
+default_with_firecracker = false and set with_firecracker = true only on
+node entries whose instance_type is a bare-metal SKU.
+EOF
+  exit 1
+fi
+
 apt-get install -y skopeo umoci e2fsprogs iproute2
 
 install -d -m 0755 \

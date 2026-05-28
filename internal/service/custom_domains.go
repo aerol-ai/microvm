@@ -216,8 +216,11 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 		}
 	}
 
-	// Verify DNS ownership (TXT record)
-	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, sandboxID, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix); err != nil {
+	// Verify DNS ownership (TXT record). The TXT proves zone control and is
+	// keyed to the hostname, not the sandbox ID, so users can provision it
+	// once and attach the hostname to any sandbox (including a recreated
+	// one with a new ID).
+	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix); err != nil {
 		return err
 	}
 
