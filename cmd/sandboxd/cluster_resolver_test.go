@@ -78,7 +78,7 @@ func TestClusterAwareDomainResolver_NoopFallsBackToStore(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("store.Create: %v", err)
 	}
-	if err := st.AddCustomDomain(ctx, "sb-local", "api.local.example"); err != nil {
+	if err := st.AddCustomDomain(ctx, "sb-local", "api.local.example", 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
 

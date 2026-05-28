@@ -144,14 +144,34 @@ func (c *Client) TLSPublicEndpoint(id string, port int, l4Listen string) string 
 	return fmt.Sprintf("tls://%s-%d.%s:%s", id, port, c.domain, listenPort)
 }
 
+// CustomHostnameRoute describes one operator-attached public hostname plus
+// the in-container TCP port traffic should dial. TargetPort=0 means "use the
+// toolbox port" (the pre-target-port default), so existing callers that only
+// know hostnames can pass a zero-valued entry and preserve old behavior.
+type CustomHostnameRoute struct {
+	Hostname   string
+	TargetPort int
+}
+
 // UpsertSandboxRoute installs the HTTP ingress route for a sandbox owned by
-// this node. customHostnames is the operator-attached set of public hostnames
-// added under the custom-domains feature; when non-empty (and domain mode is
-// active) the host matcher includes both the default `{id}.{domain}` and each
-// custom hostname so a single route serves traffic for all of them. Order in
-// the list is irrelevant — Caddy treats `host` as a set match. nil/empty is
-// the legacy single-hostname behaviour.
-func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string, toolboxPort int, customHostnames []string) error {
+// this node, plus one route per attached custom hostname. The default
+// `sandbox-{id}` route matches ONLY `{id}.{domain}` (or the path-mode
+// equivalent in IP mode) and dials the toolbox port — the custom-hostname
+// routes are independent so each can dial a different in-container port
+// without affecting the toolbox-served default URL.
+//
+// customs is the operator-attached set of (hostname, target_port) pairs from
+// the custom-domains feature. Each entry is installed as a separate route
+// keyed by IngressCustomDomainHTTPRouteID(id, hostname), so the per-hostname
+// dial target can change independently. Passing nil/empty preserves the
+// legacy single-hostname behaviour. Custom-domain routes only take effect in
+// domain mode; in IP mode the field is ignored (custom domains are rejected
+// at the service layer in that deployment shape).
+//
+// NOTE: UpsertSandboxRoute does NOT garbage-collect stale per-hostname
+// routes — callers that detach a hostname must call
+// DeleteCustomDomainHTTPRoute (or the reconciler must converge it).
+func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string, toolboxPort int, customs []CustomHostnameRoute) error {
 	if !c.enabled {
 		return nil
 	}
@@ -169,16 +189,64 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 	}
 
 	if c.domain != "" {
-		hosts := []string{fmt.Sprintf("%s.%s", id, c.domain)}
-		hosts = append(hosts, normalizeCustomHostnames(customHostnames)...)
-		route["match"] = []map[string]any{{"host": hosts}}
+		route["match"] = []map[string]any{{"host": []string{fmt.Sprintf("%s.%s", id, c.domain)}}}
 	} else {
-		// IP mode never serves a public hostname; custom domains are
-		// rejected at the service layer in that deployment shape.
 		route["match"] = []map[string]any{{"path": []string{fmt.Sprintf("/%s", id), fmt.Sprintf("/%s/*", id)}}}
 	}
 
+	if err := c.upsertRoute(ctx, routeID, route); err != nil {
+		return err
+	}
+
+	// Custom-hostname routes are only relevant in domain mode — IP-mode
+	// deployments reject custom domains at the service layer.
+	if c.domain == "" {
+		return nil
+	}
+	for _, cd := range customs {
+		host := strings.TrimSpace(strings.ToLower(cd.Hostname))
+		if host == "" {
+			continue
+		}
+		port := cd.TargetPort
+		if port <= 0 {
+			port = toolboxPort
+		}
+		if err := c.upsertCustomDomainHTTPRoute(ctx, id, host, containerIP, port); err != nil {
+			return fmt.Errorf("install custom-domain route %q: %w", host, err)
+		}
+	}
+	return nil
+}
+
+// upsertCustomDomainHTTPRoute installs (or replaces) the per-hostname HTTP
+// route for a single (sandbox, custom hostname). The route ID is stable
+// across calls (IngressCustomDomainHTTPRouteID) so a re-add with the same
+// port is a no-op PUT, and a port change replaces the leaf in place.
+func (c *Client) upsertCustomDomainHTTPRoute(ctx context.Context, sandboxID, hostname, containerIP string, port int) error {
+	routeID := IngressCustomDomainHTTPRouteID(sandboxID, hostname)
+	route := map[string]any{
+		"@id":   routeID,
+		"match": []map[string]any{{"host": []string{hostname}}},
+		"handle": []map[string]any{{
+			"handler": "reverse_proxy",
+			"upstreams": []map[string]string{{
+				"dial": fmt.Sprintf("%s:%d", containerIP, port),
+			}},
+		}},
+		"terminal": true,
+	}
 	return c.upsertRoute(ctx, routeID, route)
+}
+
+// DeleteCustomDomainHTTPRoute removes the per-hostname HTTP route. 404 is a
+// no-op so the detach path is safe to retry and reconcile-driven GC can call
+// it without first checking existence.
+func (c *Client) DeleteCustomDomainHTTPRoute(ctx context.Context, sandboxID, hostname string) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	return c.deleteRoute(ctx, IngressCustomDomainHTTPRouteID(sandboxID, hostname))
 }
 
 // UpsertSandboxRouteToPeer installs the IP/path-mode ingress route for a
@@ -210,26 +278,6 @@ func (c *Client) UpsertSandboxRouteToPeer(ctx context.Context, id, peerHost stri
 		"terminal": true,
 	}
 	return c.upsertRoute(ctx, routeID, route)
-}
-
-// normalizeCustomHostnames drops empty / whitespace-only entries and
-// lower-cases the rest. The service layer is expected to have already
-// validated the inputs via models.ValidateCustomDomainList; this is purely
-// belt-and-braces against accidentally pushing a junk matcher value to
-// Caddy (which would silently match nothing, hiding the upstream).
-func normalizeCustomHostnames(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(in))
-	for _, h := range in {
-		h = strings.TrimSpace(strings.ToLower(h))
-		if h == "" {
-			continue
-		}
-		out = append(out, h)
-	}
-	return out
 }
 
 func (c *Client) DeleteSandboxRoute(ctx context.Context, id string) error {
@@ -658,6 +706,18 @@ func IngressCustomDomainSNIRouteID(sandboxID, hostname string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(strings.ToLower(hostname)))
 	return fmt.Sprintf("sandbox-%s-custom-%016x-ingress-sni", sandboxID, h.Sum64())
+}
+
+// IngressCustomDomainHTTPRouteID is the stable @id for the per-custom-
+// hostname HTTP route installed on the owner node. Mirrors the SNI variant's
+// naming so reconcile / GC code can derive both from the same (sandboxID,
+// hostname) pair. The hostname is fnv64-hashed so very long hostnames stay
+// within Caddy's @id size budget and the slug avoids characters that would
+// have to be escaped.
+func IngressCustomDomainHTTPRouteID(sandboxID, hostname string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strings.ToLower(hostname)))
+	return fmt.Sprintf("sandbox-%s-custom-%016x-http", sandboxID, h.Sum64())
 }
 
 // EnsureOnDemandTLS idempotently installs the on-demand TLS automation

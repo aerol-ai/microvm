@@ -263,6 +263,9 @@ class CustomDomain(TypedDict, total=False):
     lastError: str
     createdAt: str
     updatedAt: str
+    # Container port traffic to this hostname dials. 0 (or absent) means the
+    # sandbox's toolbox port (the default). Set once at attach time.
+    targetPort: int
 
 
 class IngressTarget(TypedDict, total=False):

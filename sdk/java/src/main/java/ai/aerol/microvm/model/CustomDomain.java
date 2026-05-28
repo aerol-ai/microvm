@@ -19,4 +19,11 @@ public class CustomDomain {
     public Instant createdAt;
     @JsonProperty("updated_at")
     public Instant updatedAt;
+    /**
+     * Container port traffic to this hostname dials. {@code 0} (the default)
+     * means the sandbox's toolbox port — set once at attach time. To change
+     * the port, detach the binding and re-add it.
+     */
+    @JsonProperty("target_port")
+    public int targetPort;
 }

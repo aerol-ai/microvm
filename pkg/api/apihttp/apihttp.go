@@ -91,8 +91,13 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	}
 	if errors.Is(err, models.ErrCustomDomainProtocolConflict) ||
 		errors.Is(err, models.ErrCustomDomainPerSandboxCap) ||
-		errors.Is(err, store.ErrCustomDomainConflict) {
+		errors.Is(err, store.ErrCustomDomainConflict) ||
+		errors.Is(err, store.ErrCustomDomainPortMismatch) {
 		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrCustomDomainInvalidTargetPort) {
+		WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if errors.Is(err, models.ErrCustomDomainVerificationFailed) {

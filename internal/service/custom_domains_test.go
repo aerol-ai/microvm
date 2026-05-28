@@ -178,7 +178,7 @@ func TestAddCustomDomain_DisabledRejects(t *testing.T) {
 		c.EnableCustomDomains = false
 	})
 	mustCreateSandboxRow(t, st, "sb-1")
-	err := svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com")
+	err := svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com", 0)
 	if !errors.Is(err, models.ErrCustomDomainNotSupported) {
 		t.Fatalf("got %v, want ErrCustomDomainNotSupported", err)
 	}
@@ -187,7 +187,7 @@ func TestAddCustomDomain_DisabledRejects(t *testing.T) {
 func TestAddCustomDomain_HappyPath(t *testing.T) {
 	svc, st := newCustomDomainsHarness(t, nil)
 	mustCreateSandboxRow(t, st, "sb-1")
-	if err := svc.AddCustomDomain(context.Background(), "sb-1", "API.Acme.com"); err != nil {
+	if err := svc.AddCustomDomain(context.Background(), "sb-1", "API.Acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
 	domains, err := svc.ListCustomDomains(context.Background(), "sb-1")
@@ -210,7 +210,7 @@ func TestAddCustomDomain_IronRuleRejectsTCPExposure(t *testing.T) {
 		Protocol:  models.ExposedPortProtocolTCP,
 		HostPort:  22001,
 	})
-	err := svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com")
+	err := svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com", 0)
 	if !errors.Is(err, models.ErrCustomDomainProtocolConflict) {
 		t.Fatalf("got %v, want ErrCustomDomainProtocolConflict", err)
 	}
@@ -220,10 +220,10 @@ func TestAddCustomDomain_IdempotentReadd(t *testing.T) {
 	svc, st := newCustomDomainsHarness(t, nil)
 	mustCreateSandboxRow(t, st, "sb-1")
 	ctx := context.Background()
-	if err := svc.AddCustomDomain(ctx, "sb-1", "api.acme.com"); err != nil {
+	if err := svc.AddCustomDomain(ctx, "sb-1", "api.acme.com", 0); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	if err := svc.AddCustomDomain(ctx, "sb-1", "API.Acme.com."); err != nil {
+	if err := svc.AddCustomDomain(ctx, "sb-1", "API.Acme.com.", 0); err != nil {
 		t.Fatalf("idempotent re-add: %v", err)
 	}
 	domains, _ := svc.ListCustomDomains(ctx, "sb-1")
@@ -237,10 +237,10 @@ func TestAddCustomDomain_CrossSandboxConflict(t *testing.T) {
 	mustCreateSandboxRow(t, st, "sb-a")
 	mustCreateSandboxRow(t, st, "sb-b")
 	ctx := context.Background()
-	if err := svc.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+	if err := svc.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	err := svc.AddCustomDomain(ctx, "sb-b", "api.acme.com")
+	err := svc.AddCustomDomain(ctx, "sb-b", "api.acme.com", 0)
 	if !errors.Is(err, store.ErrCustomDomainConflict) {
 		t.Fatalf("got %v, want ErrCustomDomainConflict", err)
 	}
@@ -255,11 +255,11 @@ func TestAddCustomDomain_PerSandboxCap(t *testing.T) {
 	ctx := context.Background()
 	for i := range perSandboxCap {
 		host := "h" + itoa(i) + ".acme.com"
-		if err := svc.AddCustomDomain(ctx, "sb-1", host); err != nil {
+		if err := svc.AddCustomDomain(ctx, "sb-1", host, 0); err != nil {
 			t.Fatalf("add %d (%s): %v", i, host, err)
 		}
 	}
-	err := svc.AddCustomDomain(ctx, "sb-1", "extra.acme.com")
+	err := svc.AddCustomDomain(ctx, "sb-1", "extra.acme.com", 0)
 	if !errors.Is(err, models.ErrCustomDomainPerSandboxCap) {
 		t.Fatalf("got %v, want ErrCustomDomainPerSandboxCap", err)
 	}
@@ -267,7 +267,7 @@ func TestAddCustomDomain_PerSandboxCap(t *testing.T) {
 
 func TestAddCustomDomain_MissingSandboxReturns404(t *testing.T) {
 	svc, _ := newCustomDomainsHarness(t, nil)
-	err := svc.AddCustomDomain(context.Background(), "nope", "api.acme.com")
+	err := svc.AddCustomDomain(context.Background(), "nope", "api.acme.com", 0)
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
 	}
@@ -277,7 +277,7 @@ func TestRemoveCustomDomain_HappyPath(t *testing.T) {
 	svc, st := newCustomDomainsHarness(t, nil)
 	mustCreateSandboxRow(t, st, "sb-1")
 	ctx := context.Background()
-	if err := svc.AddCustomDomain(ctx, "sb-1", "api.acme.com"); err != nil {
+	if err := svc.AddCustomDomain(ctx, "sb-1", "api.acme.com", 0); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := svc.RemoveCustomDomain(ctx, "sb-1", "API.Acme.com"); err != nil {
@@ -294,7 +294,7 @@ func TestRemoveCustomDomain_CrossSandboxReturns404(t *testing.T) {
 	mustCreateSandboxRow(t, st, "sb-a")
 	mustCreateSandboxRow(t, st, "sb-b")
 	ctx := context.Background()
-	if err := svc.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+	if err := svc.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	err := svc.RemoveCustomDomain(ctx, "sb-b", "api.acme.com")
@@ -312,13 +312,19 @@ func TestSandboxCustomHostnames(t *testing.T) {
 		t.Fatalf("empty CustomDomains: got %v, want nil", got)
 	}
 	sb.CustomDomains = []models.CustomDomain{
-		{Hostname: "api.acme.com"},
+		{Hostname: "api.acme.com", TargetPort: 3333},
 		{Hostname: ""}, // tolerated but skipped
 		{Hostname: "admin.acme.com"},
 	}
 	got := sandboxCustomHostnames(sb)
-	if len(got) != 2 || got[0] != "api.acme.com" || got[1] != "admin.acme.com" {
-		t.Fatalf("got %v", got)
+	if len(got) != 2 {
+		t.Fatalf("len(got)=%d, want 2; got=%+v", len(got), got)
+	}
+	if got[0].Hostname != "api.acme.com" || got[0].TargetPort != 3333 {
+		t.Fatalf("got[0]=%+v, want {api.acme.com, 3333}", got[0])
+	}
+	if got[1].Hostname != "admin.acme.com" || got[1].TargetPort != 0 {
+		t.Fatalf("got[1]=%+v, want {admin.acme.com, 0}", got[1])
 	}
 }
 
@@ -357,7 +363,7 @@ func TestAddCustomDomain_EvictsNegativeCacheOnSuccess(t *testing.T) {
 	svc.AttachCustomDomainCacheEvicter(evict)
 	t.Cleanup(func() { svc.AttachCustomDomainCacheEvicter(nil) })
 
-	if err := svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com"); err != nil {
+	if err := svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com", 0); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	evict.mu.Lock()

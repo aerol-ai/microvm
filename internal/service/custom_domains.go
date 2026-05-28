@@ -10,6 +10,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -55,15 +56,39 @@ func evictCustomDomainNegativeCache(hostname string) {
 	}
 }
 
-// sandboxCustomHostnames extracts the operator-attached public hostnames from
-// a sandbox snapshot in the shape expected by pkg/caddy's matcher helpers.
-// Returns nil when the field is empty so the route shape stays byte-identical
-// to pre-custom-domains for sandboxes that never attached one.
-func sandboxCustomHostnames(sandbox *models.Sandbox) []string {
+// sandboxCustomHostnamesList returns just the operator-attached hostnames
+// (without per-domain ports) for cluster-FSM replay and similar consumers
+// that only care about the ownership binding, not the routing dial target.
+func sandboxCustomHostnamesList(sandbox *models.Sandbox) []string {
 	if sandbox == nil || len(sandbox.CustomDomains) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(sandbox.CustomDomains))
+	for _, cd := range sandbox.CustomDomains {
+		if cd.Hostname != "" {
+			out = append(out, cd.Hostname)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// sandboxCustomHostnames extracts the operator-attached public hostnames
+// plus their per-domain target ports from a sandbox snapshot, in the shape
+// expected by pkg/caddy.UpsertSandboxRoute. Returns nil when the field is
+// empty so the route shape stays byte-identical to pre-custom-domains for
+// sandboxes that never attached one.
+//
+// TargetPort=0 propagates as-is — pkg/caddy resolves that to the toolbox
+// port at install time, preserving the pre-target-port default behavior for
+// rows persisted before the feature shipped.
+func sandboxCustomHostnames(sandbox *models.Sandbox) []caddy.CustomHostnameRoute {
+	if sandbox == nil || len(sandbox.CustomDomains) == 0 {
+		return nil
+	}
+	out := make([]caddy.CustomHostnameRoute, 0, len(sandbox.CustomDomains))
 	for _, cd := range sandbox.CustomDomains {
 		// Defense in depth: only the validated, normalized hostname goes
 		// into the Caddy matcher. Status (pending_dns / issuing / ready /
@@ -71,9 +96,10 @@ func sandboxCustomHostnames(sandbox *models.Sandbox) []string {
 		// the cert lifecycle independently. A domain whose DNS hasn't
 		// propagated yet simply won't get traffic; once it does, the
 		// route is already in place.
-		if cd.Hostname != "" {
-			out = append(out, cd.Hostname)
+		if cd.Hostname == "" {
+			continue
 		}
+		out = append(out, caddy.CustomHostnameRoute{Hostname: cd.Hostname, TargetPort: cd.TargetPort})
 	}
 	if len(out) == 0 {
 		return nil
@@ -125,6 +151,11 @@ var ErrCustomDomainProtocolConflict = models.ErrCustomDomainProtocolConflict
 // ErrCustomDomainPerSandboxCap — see pkg/models comment.
 var ErrCustomDomainPerSandboxCap = models.ErrCustomDomainPerSandboxCap
 
+// ErrCustomDomainPortMismatch surfaces the store-layer port-mismatch sentinel
+// under the service-layer sentinel that the API handler already maps to 409.
+// See store.ErrCustomDomainPortMismatch for the underlying rule.
+var ErrCustomDomainPortMismatch = store.ErrCustomDomainPortMismatch
+
 // recordClusterCustomDomain replicates the (sandbox, hostname) binding into
 // the placement FSM so cluster-wide uniqueness, ingress-node TLS-ask lookup,
 // and failover replay all see it. Mirrors recordClusterExposedPort.
@@ -169,16 +200,26 @@ func (s *Service) removeClusterCustomDomain(ctx context.Context, sandboxID, host
 // the hostname is punched so the next ACME ask hits the resolver instead of
 // being refused for the cached 60s.
 //
+// targetPort selects the in-container port the hostname routes to. Zero is
+// the sentinel meaning "use the toolbox port" (the pre-target-port default,
+// preserving existing behavior). Set once at attach time; changing the port
+// requires detach + re-add so in-flight traffic can't silently redirect.
+//
 // Returns:
 //   - ErrCustomDomainNotSupported (412) when the deployment doesn't support custom domains.
 //   - ErrCustomDomainInvalid (400) when the hostname fails validation.
+//   - ErrCustomDomainInvalidTargetPort (400) when targetPort is outside [0, 65535].
 //   - ErrCustomDomainProtocolConflict (409) when the sandbox already exposes tcp/tls ports.
 //   - ErrCustomDomainPerSandboxCap (409) when the sandbox already holds the cap.
+//   - ErrCustomDomainPortMismatch (409) when re-adding an existing hostname with a different port.
 //   - store.ErrCustomDomainConflict (409) when the hostname is owned by a different sandbox.
 //   - store.ErrNotFound (404) when the sandbox does not exist.
-func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname string, targetPort int) error {
 	if !s.cfg.EnableCustomDomains || strings.TrimSpace(s.cfg.Domain) == "" {
 		return ErrCustomDomainNotSupported
+	}
+	if err := models.ValidateCustomDomainTargetPort(targetPort); err != nil {
+		return err
 	}
 	canonical, err := models.NormalizeCustomDomain(hostname, s.cfg.Domain)
 	if err != nil {
@@ -224,7 +265,7 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 		return err
 	}
 
-	if err := s.store.AddCustomDomain(ctx, sandboxID, canonical); err != nil {
+	if err := s.store.AddCustomDomain(ctx, sandboxID, canonical, targetPort); err != nil {
 		return err
 	}
 
@@ -316,11 +357,17 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 		return fmt.Errorf("reload sandbox after custom-domain delete: %w", err)
 	}
 	if err := s.caddy.UpsertSandboxRoute(ctx, refreshed.ID, refreshed.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(refreshed)); err != nil {
-		// Caddy is the source of truth for routing; if we couldn't strip the
-		// host matcher entry, the row is gone from the store but Caddy still
-		// serves the hostname. The next ingress reconcile (or AddCustomDomain
+		// Caddy is the source of truth for routing; if we couldn't refresh the
+		// route set, the row is gone from the store but Caddy may still serve
+		// the hostname. The next ingress reconcile (or AddCustomDomain
 		// re-attaching the same hostname elsewhere) will converge it.
 		return fmt.Errorf("update caddy route after custom-domain delete %q: %w", canonical, err)
+	}
+	// UpsertSandboxRoute only writes; it does not GC the per-hostname route
+	// for the detached domain. Drop it explicitly so the dial target stops
+	// answering immediately rather than waiting on a reconcile sweep.
+	if err := s.caddy.DeleteCustomDomainHTTPRoute(ctx, refreshed.ID, canonical); err != nil {
+		return fmt.Errorf("delete caddy per-hostname route for %q: %w", canonical, err)
 	}
 	return nil
 }
@@ -372,6 +419,11 @@ func hasCustomDomains(sandbox *models.Sandbox) bool {
 // We deliberately do NOT re-PATCH caddy per hostname here — the initial
 // UpsertSandboxRoute already included sandboxCustomHostnames(sandbox) with
 // the full set, so the route matcher is in place before this runs.
+//
+// CreateSandbox does not (yet) accept per-domain target ports — the bulk
+// CustomDomains field on the request is still []string and every row is
+// persisted with target_port=0 (the toolbox-default sentinel). Callers that
+// need a per-domain port use AddCustomDomain post-create.
 func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID string, hostnames []string) error {
 	if len(hostnames) == 0 {
 		return nil
@@ -384,7 +436,7 @@ func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID st
 		}
 	}
 	for _, h := range hostnames {
-		if err := s.store.AddCustomDomain(ctx, sandboxID, h); err != nil {
+		if err := s.store.AddCustomDomain(ctx, sandboxID, h, 0); err != nil {
 			rollback()
 			if errors.Is(err, store.ErrCustomDomainConflict) {
 				return err

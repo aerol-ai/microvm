@@ -106,7 +106,7 @@ func placementCanBeClaimedBySelf(p cluster.Placement, self string) bool {
 // failed to ship them. Force a replay so the failover-recreate target has
 // the user's TLS matchers.
 func placementMissingLocalCustomHostnames(p cluster.Placement, sb *models.Sandbox) bool {
-	local := sandboxCustomHostnames(sb)
+	local := sandboxCustomHostnamesList(sb)
 	if len(local) == 0 {
 		return false
 	}
@@ -163,7 +163,7 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 		Spec:            spec,
 		Secrets:         secrets,
 		ExposedPorts:    clusterPortsFromSandbox(sb),
-		CustomHostnames: sandboxCustomHostnames(sb),
+		CustomHostnames: sandboxCustomHostnamesList(sb),
 	}
 }
 

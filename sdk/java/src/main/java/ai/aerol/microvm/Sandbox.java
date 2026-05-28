@@ -115,6 +115,10 @@ public class Sandbox extends SandboxData {
         return client.addCustomDomain(id, hostname);
     }
 
+    public List<CustomDomain> addCustomDomain(String hostname, int targetPort) {
+        return client.addCustomDomain(id, hostname, targetPort);
+    }
+
     public List<CustomDomain> listCustomDomains() {
         return client.listCustomDomains(id);
     }

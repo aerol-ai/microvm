@@ -119,11 +119,20 @@ func Open(path string) (*Store, error) {
 		// (pending_dns → issuing → ready / failed) surfaced through the API;
 		// last_error carries the surfaced reason on failed. FK CASCADE so
 		// destroying the sandbox releases every hostname in the same write.
+		// target_port is the in-container TCP port the ingress route dials
+		// for this hostname. 0 (the default) means "fall back to the
+		// daemon-wide toolbox port" — the legacy behavior from before
+		// per-domain target ports existed. Non-zero pins the route to a
+		// specific app port (e.g. 3333). Changing the value for an
+		// already-attached hostname is forbidden at the service layer
+		// (detach + re-add required) so live traffic cannot silently
+		// redirect.
 		`CREATE TABLE IF NOT EXISTS sandbox_custom_domains (
 			hostname TEXT PRIMARY KEY,
 			sandbox_id TEXT NOT NULL,
 			status TEXT NOT NULL DEFAULT 'pending_dns',
 			last_error TEXT NOT NULL DEFAULT '',
+			target_port INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
@@ -498,6 +507,10 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE firecracker_templates ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE firecracker_templates ADD COLUMN registry_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE firecracker_templates ADD COLUMN push_digest TEXT NOT NULL DEFAULT '';`,
+		// Per-custom-domain target port — 0 keeps the legacy toolbox-port
+		// behavior for rows attached before this column existed, so the
+		// upgrade is silent.
+		`ALTER TABLE sandbox_custom_domains ADD COLUMN target_port INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -2771,20 +2784,30 @@ var ErrCustomDomainConflict = errors.New("custom domain hostname already taken")
 // sandbox_custom_domains. ListAllCustomDomains returns these so the
 // reconcile loop and the cluster FSM hydration can walk the full set.
 type CustomDomainRow struct {
-	Hostname  string
-	SandboxID string
-	Status    models.CustomDomainStatus
-	LastError string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Hostname   string
+	SandboxID  string
+	Status     models.CustomDomainStatus
+	LastError  string
+	TargetPort int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
+
+// ErrCustomDomainPortMismatch surfaces an idempotent re-add of an
+// already-attached hostname that carries a different target_port than the
+// stored row. We never silently change the dial target — that would redirect
+// live traffic without the caller knowing. The service layer translates this
+// to HTTP 409 so the caller can detach + re-add deliberately.
+var ErrCustomDomainPortMismatch = errors.New("custom domain target_port mismatch on re-add")
 
 // AddCustomDomain inserts a hostname → sandbox mapping. Returns
 // ErrCustomDomainConflict when the hostname is already owned by a different
-// sandbox; returns nil when the same (hostname, sandbox) pair already exists
-// (idempotent — the caller may retry safely). New rows start in
-// CustomDomainPendingDNS; existing rows are left in whatever state they hold.
-func (s *Store) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
+// sandbox; returns ErrCustomDomainPortMismatch when the row exists for the
+// same sandbox but with a different targetPort; returns nil when the same
+// (hostname, sandbox, targetPort) tuple already exists (idempotent — the
+// caller may retry safely). targetPort=0 is the toolbox-default sentinel.
+// New rows start in CustomDomainPendingDNS.
+func (s *Store) AddCustomDomain(ctx context.Context, sandboxID, hostname string, targetPort int) error {
 	if sandboxID == "" {
 		return errors.New("sandbox id is required")
 	}
@@ -2798,9 +2821,9 @@ func (s *Store) AddCustomDomain(ctx context.Context, sandboxID, hostname string)
 	// reservation path — see TryReserveHostPort for the canonical rationale.
 	res, err := s.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO sandbox_custom_domains (
-			hostname, sandbox_id, status, last_error, created_at, updated_at
-		) VALUES (?, ?, ?, '', ?, ?)
-	`, hostname, sandboxID, string(models.CustomDomainPendingDNS), now, now)
+			hostname, sandbox_id, status, last_error, target_port, created_at, updated_at
+		) VALUES (?, ?, ?, '', ?, ?, ?)
+	`, hostname, sandboxID, string(models.CustomDomainPendingDNS), targetPort, now, now)
 	if err != nil {
 		return fmt.Errorf("insert sandbox_custom_domains: %w", err)
 	}
@@ -2811,9 +2834,10 @@ func (s *Store) AddCustomDomain(ctx context.Context, sandboxID, hostname string)
 	// IGNORE swallowed a PK conflict. The existing row may belong to the same
 	// sandbox (idempotent re-add) or a different one (true conflict).
 	var owner string
+	var existingPort int
 	if err := s.db.QueryRowContext(ctx, `
-		SELECT sandbox_id FROM sandbox_custom_domains WHERE hostname = ?
-	`, hostname).Scan(&owner); err != nil {
+		SELECT sandbox_id, target_port FROM sandbox_custom_domains WHERE hostname = ?
+	`, hostname).Scan(&owner, &existingPort); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Row vanished between INSERT IGNORE and SELECT (cascade delete).
 			// Treat as conflict so the caller does not assume success.
@@ -2821,10 +2845,13 @@ func (s *Store) AddCustomDomain(ctx context.Context, sandboxID, hostname string)
 		}
 		return fmt.Errorf("disambiguate custom domain insert: %w", err)
 	}
-	if owner == sandboxID {
-		return nil
+	if owner != sandboxID {
+		return ErrCustomDomainConflict
 	}
-	return ErrCustomDomainConflict
+	if existingPort != targetPort {
+		return ErrCustomDomainPortMismatch
+	}
+	return nil
 }
 
 // RemoveCustomDomain deletes the (sandbox, hostname) row. Cross-sandbox
@@ -2851,7 +2878,7 @@ func (s *Store) RemoveCustomDomain(ctx context.Context, sandboxID, hostname stri
 // Empty slice (nil) when the sandbox has no custom domains.
 func (s *Store) ListCustomDomains(ctx context.Context, sandboxID string) ([]models.CustomDomain, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT hostname, status, last_error, created_at, updated_at
+		SELECT hostname, status, last_error, target_port, created_at, updated_at
 		FROM sandbox_custom_domains
 		WHERE sandbox_id = ?
 		ORDER BY hostname ASC
@@ -2865,7 +2892,7 @@ func (s *Store) ListCustomDomains(ctx context.Context, sandboxID string) ([]mode
 	for rows.Next() {
 		var cd models.CustomDomain
 		var status string
-		if err := rows.Scan(&cd.Hostname, &status, &cd.LastError, &cd.CreatedAt, &cd.UpdatedAt); err != nil {
+		if err := rows.Scan(&cd.Hostname, &status, &cd.LastError, &cd.TargetPort, &cd.CreatedAt, &cd.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan custom domain: %w", err)
 		}
 		cd.Status = models.CustomDomainStatus(status)
@@ -2882,7 +2909,7 @@ func (s *Store) ListCustomDomains(ctx context.Context, sandboxID string) ([]mode
 // Ordered by hostname so reconcile diffs are stable across calls.
 func (s *Store) ListAllCustomDomains(ctx context.Context) ([]CustomDomainRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT hostname, sandbox_id, status, last_error, created_at, updated_at
+		SELECT hostname, sandbox_id, status, last_error, target_port, created_at, updated_at
 		FROM sandbox_custom_domains
 		ORDER BY hostname ASC
 	`)
@@ -2895,7 +2922,7 @@ func (s *Store) ListAllCustomDomains(ctx context.Context) ([]CustomDomainRow, er
 	for rows.Next() {
 		var r CustomDomainRow
 		var status string
-		if err := rows.Scan(&r.Hostname, &r.SandboxID, &status, &r.LastError, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.Hostname, &r.SandboxID, &status, &r.LastError, &r.TargetPort, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan custom domain row: %w", err)
 		}
 		r.Status = models.CustomDomainStatus(status)
@@ -2909,7 +2936,10 @@ func (s *Store) ListAllCustomDomains(ctx context.Context) ([]CustomDomainRow, er
 
 // ResolveCustomDomain is the hot path for the TLSAsk handler — single PK
 // lookup, no scan. Returns ErrNotFound for unknown hostnames so the handler
-// can fold it into a 403 without an error log on the success path.
+// can fold it into a 403 without an error log on the success path. We do not
+// surface target_port here because the routing dial target is already baked
+// into the per-domain Caddy route at install time (see
+// IngressCustomDomainHTTPRouteID); TLSAsk only needs the ownership signal.
 func (s *Store) ResolveCustomDomain(ctx context.Context, hostname string) (string, error) {
 	if hostname == "" {
 		return "", ErrNotFound
@@ -2966,7 +2996,7 @@ func (s *Store) loadCustomDomains(ctx context.Context, sandboxID string) ([]mode
 // ever crosses ~100k rows.
 func (s *Store) attachCustomDomainsBulk(ctx context.Context, byID map[string]*models.Sandbox) error {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sandbox_id, hostname, status, last_error, created_at, updated_at
+		SELECT sandbox_id, hostname, status, last_error, target_port, created_at, updated_at
 		FROM sandbox_custom_domains
 		ORDER BY sandbox_id, hostname ASC
 	`)
@@ -2979,7 +3009,7 @@ func (s *Store) attachCustomDomainsBulk(ctx context.Context, byID map[string]*mo
 		var sandboxID string
 		var cd models.CustomDomain
 		var status string
-		if err := rows.Scan(&sandboxID, &cd.Hostname, &status, &cd.LastError, &cd.CreatedAt, &cd.UpdatedAt); err != nil {
+		if err := rows.Scan(&sandboxID, &cd.Hostname, &status, &cd.LastError, &cd.TargetPort, &cd.CreatedAt, &cd.UpdatedAt); err != nil {
 			return fmt.Errorf("scan custom domain: %w", err)
 		}
 		cd.Status = models.CustomDomainStatus(status)

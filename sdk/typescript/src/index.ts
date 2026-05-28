@@ -4,6 +4,7 @@ export { Image } from "./Image.js";
 export type { MicroVMConfig } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {
+  AddCustomDomainOptions,
   BinaryLike,
   BuildImageOptions,
   BuildImagePushOptions,

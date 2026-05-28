@@ -865,6 +865,57 @@ test("internal client addCustomDomain POSTs hostname and parses list", async () 
   assert.equal(domains[0].lastError, undefined);
 });
 
+test("internal client addCustomDomain forwards target_port when port option set", async () => {
+  let sentBody: { hostname?: string; target_port?: number } | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      sentBody = (await req.json()) as { hostname?: string; target_port?: number };
+      return jsonResponse(
+        {
+          custom_domains: [
+            {
+              hostname: "api.acme.com",
+              status: "pending_dns",
+              target_port: 3333,
+              created_at: "2026-05-24T10:00:00Z",
+              updated_at: "2026-05-24T10:00:00Z",
+            },
+          ],
+        },
+        201,
+      );
+    },
+  });
+
+  const domains = await client.addCustomDomain("sb-cd", "api.acme.com", { port: 3333 });
+  assert.equal(sentBody?.hostname, "api.acme.com");
+  assert.equal(sentBody?.target_port, 3333);
+  assert.equal(domains[0].targetPort, 3333);
+});
+
+test("internal client addCustomDomain omits target_port when port option absent or zero", async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push((await req.json()) as Record<string, unknown>);
+      return jsonResponse({ custom_domains: [] }, 201);
+    },
+  });
+
+  await client.addCustomDomain("sb-cd", "api.acme.com");
+  await client.addCustomDomain("sb-cd", "api.acme.com", {});
+  await client.addCustomDomain("sb-cd", "api.acme.com", { port: 0 });
+  for (const body of seen) {
+    assert.equal("target_port" in body, false);
+  }
+});
+
 test("internal client addCustomDomain preserves hostname case sent by caller", async () => {
   let sentBody: { hostname?: string } | undefined;
   const client = new APIClient({

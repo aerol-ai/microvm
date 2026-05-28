@@ -9,6 +9,7 @@ import {
 } from "./api/v1/paths.js";
 import { Image } from "../Image.js";
 import type {
+  AddCustomDomainOptions,
   BinaryLike,
   BuildImageOptions,
   BuildImageResult,
@@ -132,6 +133,7 @@ interface ApiCustomDomain {
   last_error?: string;
   created_at: string;
   updated_at: string;
+  target_port?: number;
 }
 
 interface ApiCustomDomainList {
@@ -619,11 +621,19 @@ export class APIClient {
    * with an already-registered hostname is idempotent and returns the
    * existing list.
    */
-  async addCustomDomain(id: string, hostname: string): Promise<CustomDomain[]> {
+  async addCustomDomain(
+    id: string,
+    hostname: string,
+    options?: AddCustomDomainOptions,
+  ): Promise<CustomDomain[]> {
+    const body: { hostname: string; target_port?: number } = { hostname };
+    if (options?.port !== undefined && options.port !== 0) {
+      body.target_port = options.port;
+    }
     const response = await this.doJSON<ApiCustomDomainList>(
       "POST",
       v1SandboxCustomDomainsPath(this.versionPrefix, id),
-      { hostname },
+      body,
     );
     return response.custom_domains.map(fromApiCustomDomain);
   }
@@ -912,7 +922,7 @@ export class SandboxResource implements Sandbox {
    * so the closures always see the current `id` even after `refresh()`.
    */
   get customDomains(): {
-    add(hostname: string): Promise<CustomDomain[]>;
+    add(hostname: string, options?: AddCustomDomainOptions): Promise<CustomDomain[]>;
     remove(hostname: string): Promise<void>;
     list(): Promise<CustomDomain[]>;
     dns(): Promise<CustomDomainDNSRecords>;
@@ -920,7 +930,8 @@ export class SandboxResource implements Sandbox {
     const client = this.client;
     const id = this.id;
     return {
-      add: (hostname: string) => client.addCustomDomain(id, hostname),
+      add: (hostname: string, options?: AddCustomDomainOptions) =>
+        client.addCustomDomain(id, hostname, options),
       remove: (hostname: string) => client.removeCustomDomain(id, hostname),
       list: () => client.listCustomDomains(id),
       dns: () => client.customDomainDNS(id),
@@ -1165,6 +1176,7 @@ function fromApiCustomDomain(domain: ApiCustomDomain): CustomDomain {
     lastError: domain.last_error,
     createdAt: domain.created_at,
     updatedAt: domain.updated_at,
+    targetPort: domain.target_port,
   };
 }
 

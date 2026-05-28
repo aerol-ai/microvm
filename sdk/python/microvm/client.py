@@ -339,8 +339,13 @@ class Sandbox:
     def unexpose_port(self, port: int) -> None:
         self._client.unexpose_port(self.id, port)
 
-    def add_custom_domain(self, hostname: str) -> List[CustomDomain]:
-        return self._client.add_custom_domain(self.id, hostname)
+    def add_custom_domain(
+        self,
+        hostname: str,
+        *,
+        port: Optional[int] = None,
+    ) -> List[CustomDomain]:
+        return self._client.add_custom_domain(self.id, hostname, port=port)
 
     def list_custom_domains(self) -> List[CustomDomain]:
         return self._client.list_custom_domains(self.id)
@@ -749,18 +754,32 @@ class MicroVM:
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
 
-    def add_custom_domain(self, sandbox_id: str, hostname: str) -> List[CustomDomain]:
+    def add_custom_domain(
+        self,
+        sandbox_id: str,
+        hostname: str,
+        *,
+        port: Optional[int] = None,
+    ) -> List[CustomDomain]:
         """Attach a public hostname to a sandbox.
 
         Returns the post-attach list of :class:`CustomDomain` rows so callers
         can read the initial ``status`` (typically ``"pending_dns"``) without
         a follow-up GET. Server lowercases the hostname; case is preserved
         as-passed.
+
+        ``port`` pins the container port traffic to this hostname dials. Omit
+        (or pass ``0``) to route to the sandbox's toolbox port (the default).
+        Re-adding the same hostname with a different ``port`` returns 409 —
+        detach first.
         """
+        body: Dict[str, Any] = {"hostname": hostname}
+        if port is not None and port != 0:
+            body["target_port"] = port
         response = self._do_json(
             "POST",
             self._versioned(f"/sandboxes/{sandbox_id}/custom-domains"),
-            {"hostname": hostname},
+            body,
         )
         return _from_api_custom_domains_response(response)
 
@@ -1098,6 +1117,9 @@ def _from_api_custom_domain(domain: Dict[str, Any]) -> CustomDomain:
     last_error = _first_of(domain, "last_error", "lastError")
     if last_error not in (None, ""):
         result["lastError"] = str(last_error)
+    target_port = _first_of(domain, "target_port", "targetPort")
+    if isinstance(target_port, int) and target_port > 0:
+        result["targetPort"] = target_port
     return result
 
 

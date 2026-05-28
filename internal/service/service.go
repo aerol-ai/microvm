@@ -3471,6 +3471,16 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 				expectedTLSRoutes[fmt.Sprintf("sandbox-%s-port-%d-tls", sb.ID, p.Port)] = struct{}{}
 			}
 		}
+		// Custom-domain per-hostname HTTP routes share the same Caddy server
+		// as the default sandbox route, so they have to be enumerated as
+		// expected or the GC sweep will drop them on the next pass. The route
+		// ID matches what pkg/caddy installs in upsertCustomDomainHTTPRoute.
+		for _, cd := range sb.CustomDomains {
+			if cd.Hostname == "" {
+				continue
+			}
+			expectedHTTP[caddy.IngressCustomDomainHTTPRouteID(sb.ID, cd.Hostname)] = struct{}{}
+		}
 	}
 	s.addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes)
 

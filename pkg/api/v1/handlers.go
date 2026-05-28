@@ -207,10 +207,13 @@ func (h *handlers) unexposePort(w http.ResponseWriter, r *http.Request) {
 }
 
 // addCustomDomain attaches a new operator-provided public hostname to a
-// sandbox. Body shape: {"hostname":"api.acme.com"}. Status codes follow the
+// sandbox. Body shape: {"hostname":"api.acme.com","target_port":3333}.
+// target_port is optional; omitting it (or sending 0) routes the hostname to
+// the toolbox agent, preserving pre-v2 behavior. Status codes follow the
 // custom-domain sentinels in pkg/api/apihttp.WriteStoreAwareError:
-// 412 = feature disabled / IP mode; 409 = hostname owned by another sandbox
-// or IRON RULE violation (tcp/tls coexistence); 400 = malformed hostname;
+// 412 = feature disabled / IP mode; 409 = hostname owned by another sandbox,
+// IRON RULE violation (tcp/tls coexistence), or target_port mismatch on
+// idempotent re-add; 400 = malformed hostname / invalid target_port;
 // 404 = sandbox not found.
 func (h *handlers) addCustomDomain(w http.ResponseWriter, r *http.Request) {
 	var req models.AddCustomDomainRequest
@@ -219,7 +222,7 @@ func (h *handlers) addCustomDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if err := h.deps.Service.AddCustomDomain(r.Context(), id, req.Hostname); err != nil {
+	if err := h.deps.Service.AddCustomDomain(r.Context(), id, req.Hostname, req.TargetPort); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}

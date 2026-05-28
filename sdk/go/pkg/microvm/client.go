@@ -429,6 +429,23 @@ func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 	return s.client.inner.UnexposePort(ctx, s.ID, port)
 }
 
+// CustomDomainOption customizes an AddCustomDomain call. Build values with
+// WithTargetPort; the variadic shape leaves room for future expansion.
+type CustomDomainOption func(*customDomainOptions)
+
+type customDomainOptions struct {
+	targetPort int
+}
+
+// WithTargetPort routes the custom hostname to the given in-container TCP
+// port instead of the default toolbox agent. Set once at attach time;
+// changing the port for an already-attached hostname requires
+// RemoveCustomDomain + AddCustomDomain so in-flight traffic can't silently
+// redirect. Re-adding the same hostname with a different port returns 409.
+func WithTargetPort(port int) CustomDomainOption {
+	return func(o *customDomainOptions) { o.targetPort = port }
+}
+
 // AddCustomDomain attaches a public hostname (e.g. "api.acme.com") to this
 // sandbox. The server lowercases / trims and validates the hostname; the
 // returned slice is the full per-hostname row list, so callers can read the
@@ -436,11 +453,16 @@ func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 //
 // 412 Precondition Failed surfaces when the deployment is in IP mode or the
 // custom-domain feature is disabled. 409 Conflict surfaces when the hostname
-// is already attached to a different sandbox, or when the sandbox has any
+// is already attached to a different sandbox, the sandbox has any
 // tcp/tls-protocol exposed port (the IRON RULE: SNI cannot route per host on
-// a shared L4 listener).
-func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string) ([]sdktypes.CustomDomain, error) {
-	return s.client.inner.AddCustomDomain(ctx, s.ID, hostname)
+// a shared L4 listener), or the re-add target_port differs from the stored
+// value. 400 Bad Request surfaces when target_port is outside [0, 65535].
+func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string, opts ...CustomDomainOption) ([]sdktypes.CustomDomain, error) {
+	cfg := customDomainOptions{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return s.client.inner.AddCustomDomain(ctx, s.ID, hostname, cfg.targetPort)
 }
 
 // RemoveCustomDomain detaches a hostname previously attached via
