@@ -264,6 +264,23 @@ export interface CustomDomain {
   lastError?: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Target container port traffic to this hostname dials. `0` (or omitted)
+   * means the sandbox's toolbox port — the default that preserves the
+   * pre-target-port behavior. Set once at attach time; to change it, remove
+   * the binding and re-add it with the new port.
+   */
+  targetPort?: number;
+}
+
+/**
+ * Options for `sandbox.customDomains.add()`. `port` pins the container port
+ * traffic to this hostname dials; omit it to route to the sandbox's toolbox
+ * port (the default). Re-adding the same hostname with a different `port`
+ * returns 409 — detach first.
+ */
+export interface AddCustomDomainOptions {
+  port?: number;
 }
 
 /**

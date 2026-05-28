@@ -919,6 +919,33 @@ class CustomDomainsTests(unittest.TestCase):
         self.assertEqual(domains[0]["createdAt"], "2026-05-25T10:00:00Z")
         self.assertNotIn("lastError", domains[0])
 
+    def test_add_custom_domain_forwards_target_port_when_set(self):
+        client, captured = self._client(
+            post_body={
+                "custom_domains": [
+                    {
+                        "hostname": "api.acme.com",
+                        "status": "pending_dns",
+                        "target_port": 3333,
+                        "created_at": "2026-05-25T10:00:00Z",
+                        "updated_at": "2026-05-25T10:00:00Z",
+                    }
+                ]
+            },
+        )
+        domains = client.add_custom_domain("sb-1", "api.acme.com", port=3333)
+        self.assertEqual(
+            captured["calls"][0][2],
+            {"hostname": "api.acme.com", "target_port": 3333},
+        )
+        self.assertEqual(domains[0]["targetPort"], 3333)
+
+    def test_add_custom_domain_omits_target_port_when_unset_or_zero(self):
+        for port_arg in (None, 0):
+            client, captured = self._client(post_body={"custom_domains": []})
+            client.add_custom_domain("sb-1", "api.acme.com", port=port_arg)
+            self.assertEqual(captured["calls"][0][2], {"hostname": "api.acme.com"})
+
     def test_add_custom_domain_preserves_hostname_case(self):
         # Case is forwarded as-passed; the server normalizes. The SDK must not
         # lowercase locally or the wire payload diverges from caller intent.

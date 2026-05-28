@@ -57,10 +57,10 @@ func TestV1CustomDomainDNS_ReturnsRecordsAfterAttach(t *testing.T) {
 		c.PublicHost = "ingress.example.com"
 	})
 	seedSandboxRowV1(t, env.store, "sb-1")
-	if err := env.svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com"); err != nil {
+	if err := env.svc.AddCustomDomain(context.Background(), "sb-1", "api.acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
-	if err := env.svc.AddCustomDomain(context.Background(), "sb-1", "acme.com"); err != nil {
+	if err := env.svc.AddCustomDomain(context.Background(), "sb-1", "acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain apex: %v", err)
 	}
 

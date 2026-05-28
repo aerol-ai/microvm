@@ -560,11 +560,15 @@ type customDomainsEnvelope struct {
 }
 
 // AddCustomDomain attaches an operator-provided public hostname to a sandbox.
-// Returns the full per-hostname row list so callers don't need a follow-up
-// GET to read the canonical (lowercased, dot-trimmed) hostname or initial
-// status. The server normalizes hostname; passing it verbatim is correct.
-func (c *Client) AddCustomDomain(ctx context.Context, id, hostname string) ([]models.CustomDomain, error) {
-	body := models.AddCustomDomainRequest{Hostname: hostname}
+// targetPort is the in-container TCP port traffic for the hostname should
+// dial; pass 0 to route to the toolbox agent (the pre-target-port default,
+// preserving existing behavior). The port is set once at attach time —
+// changing it requires detach + re-add. Returns the full per-hostname row
+// list so callers don't need a follow-up GET to read the canonical hostname
+// or initial status. The server normalizes hostname; passing it verbatim is
+// correct.
+func (c *Client) AddCustomDomain(ctx context.Context, id, hostname string, targetPort int) ([]models.CustomDomain, error) {
+	body := models.AddCustomDomainRequest{Hostname: hostname, TargetPort: targetPort}
 	var response customDomainsEnvelope
 	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/custom-domains", body, &response); err != nil {
 		return nil, err
@@ -640,8 +644,8 @@ func (s *Sandbox) ExposePort(ctx context.Context, port int, protocol string) (Ex
 	return s.client.ExposePort(ctx, s.ID, port, protocol)
 }
 
-func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string) ([]models.CustomDomain, error) {
-	return s.client.AddCustomDomain(ctx, s.ID, hostname)
+func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string, targetPort int) ([]models.CustomDomain, error) {
+	return s.client.AddCustomDomain(ctx, s.ID, hostname, targetPort)
 }
 
 func (s *Sandbox) RemoveCustomDomain(ctx context.Context, hostname string) error {

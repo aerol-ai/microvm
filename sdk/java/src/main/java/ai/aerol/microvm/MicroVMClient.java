@@ -445,10 +445,20 @@ public class MicroVMClient {
      * operator's DNS resolves to the cluster.
      */
     public List<CustomDomain> addCustomDomain(String sandboxId, String hostname) {
+        return addCustomDomain(sandboxId, hostname, 0);
+    }
+
+    /**
+     * Attach with a per-domain target port. {@code targetPort == 0} routes to
+     * the sandbox's toolbox port (the same default the single-arg overload
+     * uses). Re-adding the same hostname with a different port returns 409 —
+     * detach first if you need to change it.
+     */
+    public List<CustomDomain> addCustomDomain(String sandboxId, String hostname, int targetPort) {
         CustomDomainListResponse response = doJson(
             "POST",
             sandboxPath(sandboxId) + "/custom-domains",
-            new AddCustomDomainRequest(hostname),
+            new AddCustomDomainRequest(hostname, targetPort),
             CustomDomainListResponse.class
         );
         if (response == null || response.customDomains == null) {
@@ -514,8 +524,13 @@ public class MicroVMClient {
     static class AddCustomDomainRequest {
         public final String hostname;
 
-        AddCustomDomainRequest(String hostname) {
+        @com.fasterxml.jackson.annotation.JsonProperty("target_port")
+        @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
+        public final int targetPort;
+
+        AddCustomDomainRequest(String hostname, int targetPort) {
             this.hostname = hostname;
+            this.targetPort = targetPort;
         }
     }
 

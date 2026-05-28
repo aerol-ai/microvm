@@ -25,8 +25,9 @@ pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
-    BuildImageOptions, BuildImagePushOptions, BuildImageResult, ClientConfig, CreateOptions,
-    CreateSessionOptions, CreateTemplateOptions, CustomDomain, CustomDomainDnsRecords,
+    AddCustomDomainOptions, BuildImageOptions, BuildImagePushOptions, BuildImageResult,
+    ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions, CustomDomain,
+    CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
     ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
@@ -394,9 +395,15 @@ impl Sandbox {
 
     /// Attach a custom hostname to this sandbox. Returns the post-add list
     /// of bindings (sorted by hostname). Idempotent: calling with an
-    /// already-registered hostname returns the existing list.
-    pub fn add_custom_domain(&self, hostname: &str) -> Result<Vec<CustomDomain>, Error> {
-        self.client.add_custom_domain(&self.data.id, hostname)
+    /// already-registered hostname returns the existing list — but re-adding
+    /// with a different `port` returns 409 (detach first).
+    pub fn add_custom_domain(
+        &self,
+        hostname: &str,
+        options: Option<AddCustomDomainOptions>,
+    ) -> Result<Vec<CustomDomain>, Error> {
+        self.client
+            .add_custom_domain(&self.data.id, hostname, options)
     }
 
     /// List all custom hostnames currently bound to this sandbox.
@@ -1213,13 +1220,24 @@ impl Client {
 
     /// Register a custom hostname against `id`. Returns the post-add list of
     /// bindings, sorted by hostname server-side. The hostname is forwarded
-    /// verbatim — the server lowercases and validates it.
+    /// verbatim — the server lowercases and validates it. `options.port`, if
+    /// set to a non-zero value, pins the container port traffic dials.
     pub fn add_custom_domain(
         &self,
         id: &str,
         hostname: &str,
+        options: Option<AddCustomDomainOptions>,
     ) -> Result<Vec<CustomDomain>, Error> {
-        let body = serde_json::json!({ "hostname": hostname });
+        let mut body = serde_json::json!({ "hostname": hostname });
+        if let Some(opts) = options {
+            if let Some(port) = opts.port {
+                if port != 0 {
+                    body.as_object_mut()
+                        .expect("body is object")
+                        .insert("target_port".to_string(), Value::from(port));
+                }
+            }
+        }
         let wire = self.do_json::<Value, CustomDomainListWire>(
             Method::POST,
             &format!("{}/sandboxes/{}/custom-domains", self.version_prefix(), id),
@@ -2947,7 +2965,7 @@ mod tests {
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
         let domains = client
-            .add_custom_domain("sb-1", "api.acme.com")
+            .add_custom_domain("sb-1", "api.acme.com", None)
             .expect("add_custom_domain should succeed");
         let request = request_rx.recv().expect("request should be captured");
 
@@ -2964,6 +2982,65 @@ mod tests {
         assert_eq!(domains[0].hostname, "api.acme.com");
         assert_eq!(domains[0].status, CustomDomainStatus::PendingDns);
         assert!(domains[0].last_error.is_none());
+        assert_eq!(domains[0].target_port, 0);
+    }
+
+    #[test]
+    fn add_custom_domain_forwards_target_port() {
+        let body = serde_json::json!({
+            "custom_domains": [
+                {
+                    "hostname": "api.acme.com",
+                    "status": "pending_dns",
+                    "target_port": 3333,
+                    "created_at": "2026-05-24T10:00:00Z",
+                    "updated_at": "2026-05-24T10:00:00Z"
+                }
+            ]
+        })
+        .to_string();
+        let (url, request_rx) =
+            spawn_response_server("201 Created", "application/json", body.into_bytes());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let domains = client
+            .add_custom_domain(
+                "sb-1",
+                "api.acme.com",
+                Some(AddCustomDomainOptions::with_port(3333)),
+            )
+            .expect("add_custom_domain should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"hostname": "api.acme.com", "target_port": 3333})
+        );
+        assert_eq!(domains[0].target_port, 3333);
+    }
+
+    #[test]
+    fn add_custom_domain_omits_target_port_when_zero() {
+        let (url, request_rx) = spawn_response_server(
+            "201 Created",
+            "application/json",
+            br#"{"custom_domains":[]}"#.to_vec(),
+        );
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client
+            .add_custom_domain(
+                "sb-1",
+                "api.acme.com",
+                Some(AddCustomDomainOptions::with_port(0)),
+            )
+            .expect("add_custom_domain should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"hostname": "api.acme.com"})
+        );
     }
 
     #[test]
@@ -3045,7 +3122,7 @@ mod tests {
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
         let err = client
-            .add_custom_domain("sb-1", "taken.acme.com")
+            .add_custom_domain("sb-1", "taken.acme.com", None)
             .expect_err("add_custom_domain should fail on 409");
 
         let message = err.to_string();
@@ -3074,7 +3151,7 @@ mod tests {
 
         let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
         let err = client
-            .add_custom_domain("sb-1", "api.acme.com")
+            .add_custom_domain("sb-1", "api.acme.com", None)
             .expect_err("add_custom_domain should fail on 412");
 
         let message = err.to_string();

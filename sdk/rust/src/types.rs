@@ -281,6 +281,30 @@ pub struct CustomDomain {
     pub created_at: String,
     #[serde(rename = "updated_at")]
     pub updated_at: String,
+    /// Container port traffic to this hostname dials. `0` (the default) means
+    /// the sandbox's toolbox port — preserves the pre-target-port behavior.
+    /// Set once at attach time via [`AddCustomDomainOptions::port`].
+    #[serde(rename = "target_port", default, skip_serializing_if = "is_zero_u16")]
+    pub target_port: u16,
+}
+
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+/// Options for [`Sandbox::add_custom_domain`]. `port` pins the container port
+/// traffic to this hostname dials; leave `None` (or set to `0`) to route to the
+/// sandbox's toolbox port (the default). Re-adding the same hostname with a
+/// different port returns 409 — detach first.
+#[derive(Debug, Clone, Default)]
+pub struct AddCustomDomainOptions {
+    pub port: Option<u16>,
+}
+
+impl AddCustomDomainOptions {
+    pub fn with_port(port: u16) -> Self {
+        Self { port: Some(port) }
+    }
 }
 
 /// Wire envelope returned by the custom-domains endpoints — kept private;

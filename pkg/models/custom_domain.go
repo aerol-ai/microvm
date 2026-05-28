@@ -32,16 +32,26 @@ const (
 
 // CustomDomain is the per-domain row returned in Sandbox.CustomDomains.
 type CustomDomain struct {
-	Hostname  string             `json:"hostname"`
-	Status    CustomDomainStatus `json:"status"`
-	LastError string             `json:"last_error,omitempty"`
-	CreatedAt time.Time          `json:"created_at"`
-	UpdatedAt time.Time          `json:"updated_at"`
+	Hostname string             `json:"hostname"`
+	Status   CustomDomainStatus `json:"status"`
+	// TargetPort is the in-container TCP port traffic for this hostname
+	// reverse-proxies to. Zero means "use the toolbox port" (the legacy
+	// behavior before per-domain target ports existed). Non-zero values
+	// dial straight to the user's app — e.g. an HTTP server on 3333.
+	// Set once at attach time; changing it requires detach + re-add so
+	// in-flight traffic can't silently redirect.
+	TargetPort int       `json:"target_port,omitempty"`
+	LastError  string    `json:"last_error,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // AddCustomDomainRequest is the body for POST /v1/sandboxes/{id}/custom-domains.
+// Omitting target_port (or sending 0) routes the hostname to the toolbox
+// agent, preserving pre-v2 behavior.
 type AddCustomDomainRequest struct {
-	Hostname string `json:"hostname"`
+	Hostname   string `json:"hostname"`
+	TargetPort int    `json:"target_port,omitempty"`
 }
 
 // Custom-domain caps. Exported so internal/config can read SB_ env overrides
@@ -82,7 +92,28 @@ var (
 	ErrCustomDomainPerSandboxCap = fmt.Errorf("at most %d custom domains per sandbox", MaxCustomDomainsPerSandbox)
 	// ErrCustomDomainVerificationFailed is returned when the DNS TXT record check fails.
 	ErrCustomDomainVerificationFailed = errors.New("custom domain TXT record verification failed")
+	// ErrCustomDomainInvalidTargetPort is returned when AddCustomDomainRequest
+	// carries a target_port outside [0, 65535]. Zero is the toolbox-default
+	// sentinel; anything else must be a real TCP port number. Surfaced as 400.
+	ErrCustomDomainInvalidTargetPort = errors.New("invalid custom domain target_port")
+	// ErrCustomDomainPortMismatch is returned when an idempotent re-add of
+	// an already-attached hostname carries a different target_port than the
+	// existing row. We do not silently change the dial target — that would
+	// redirect live traffic without the caller knowing. Surfaced as 409 so
+	// the caller can detach + re-add deliberately.
+	ErrCustomDomainPortMismatch = errors.New("custom domain target_port mismatch on re-add")
 )
+
+// ValidateCustomDomainTargetPort returns nil for 0 (the toolbox sentinel)
+// and any 1..65535. Anything else is ErrCustomDomainInvalidTargetPort. Kept
+// alongside the other custom-domain validators so the API + service layers
+// reference one canonical bound.
+func ValidateCustomDomainTargetPort(port int) error {
+	if port < 0 || port > 65535 {
+		return fmt.Errorf("%w: %d (must be 0 or 1..65535)", ErrCustomDomainInvalidTargetPort, port)
+	}
+	return nil
+}
 
 // NormalizeCustomDomain lowercases, strips a trailing dot, and validates the
 // shape of host. baseDomain is the operator's SB_DOMAIN — empty means the

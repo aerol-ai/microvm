@@ -102,7 +102,7 @@ func TestACME_FirstIssueAndS3Reuse(t *testing.T) {
 
 	h := startInProcessSandboxd(t, caddy1)
 	mustCreateE2ESandboxRow(t, h.store, e2eSandboxID)
-	if err := h.svc.AddCustomDomain(context.Background(), e2eSandboxID, e2eHostname); err != nil {
+	if err := h.svc.AddCustomDomain(context.Background(), e2eSandboxID, e2eHostname, 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
 	patchPebbleACME(t, caddy1, pebbleRoots)

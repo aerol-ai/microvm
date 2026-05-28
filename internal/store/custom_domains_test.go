@@ -17,7 +17,7 @@ func TestAddCustomDomain(t *testing.T) {
 		if err := st.Create(ctx, sampleSandbox("sb-a")); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
-		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 			t.Fatalf("AddCustomDomain: %v", err)
 		}
 		got, err := st.ListCustomDomains(ctx, "sb-a")
@@ -40,14 +40,14 @@ func TestAddCustomDomain(t *testing.T) {
 		if err := st.Create(ctx, sampleSandbox("sb-a")); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
-		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 			t.Fatalf("first add: %v", err)
 		}
 		// Mutate status so we can prove the second add does not reset it.
 		if err := st.SetCustomDomainStatus(ctx, "api.acme.com", models.CustomDomainReady, ""); err != nil {
 			t.Fatalf("SetCustomDomainStatus: %v", err)
 		}
-		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 			t.Fatalf("idempotent re-add: %v", err)
 		}
 		got, _ := st.ListCustomDomains(ctx, "sb-a")
@@ -64,10 +64,10 @@ func TestAddCustomDomain(t *testing.T) {
 		if err := st.Create(ctx, sampleSandbox("sb-b")); err != nil {
 			t.Fatalf("Create sb-b: %v", err)
 		}
-		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 			t.Fatalf("first add: %v", err)
 		}
-		err := st.AddCustomDomain(ctx, "sb-b", "api.acme.com")
+		err := st.AddCustomDomain(ctx, "sb-b", "api.acme.com", 0)
 		if !errors.Is(err, ErrCustomDomainConflict) {
 			t.Fatalf("got %v, want ErrCustomDomainConflict", err)
 		}
@@ -83,10 +83,10 @@ func TestAddCustomDomain(t *testing.T) {
 
 	t.Run("rejects empty inputs", func(t *testing.T) {
 		st := newTestStore(t)
-		if err := st.AddCustomDomain(ctx, "", "api.acme.com"); err == nil {
+		if err := st.AddCustomDomain(ctx, "", "api.acme.com", 0); err == nil {
 			t.Fatalf("empty sandbox id accepted")
 		}
-		if err := st.AddCustomDomain(ctx, "sb-a", ""); err == nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", "", 0); err == nil {
 			t.Fatalf("empty hostname accepted")
 		}
 	})
@@ -100,7 +100,7 @@ func TestRemoveCustomDomain(t *testing.T) {
 		if err := st.Create(ctx, sampleSandbox("sb-a")); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
-		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 			t.Fatalf("AddCustomDomain: %v", err)
 		}
 		if err := st.RemoveCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
@@ -119,7 +119,7 @@ func TestRemoveCustomDomain(t *testing.T) {
 		if err := st.Create(ctx, sampleSandbox("sb-b")); err != nil {
 			t.Fatalf("Create sb-b: %v", err)
 		}
-		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 			t.Fatalf("AddCustomDomain: %v", err)
 		}
 		err := st.RemoveCustomDomain(ctx, "sb-b", "api.acme.com")
@@ -150,7 +150,7 @@ func TestResolveCustomDomain(t *testing.T) {
 	if err := st.Create(ctx, sampleSandbox("sb-a")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
 
@@ -177,7 +177,7 @@ func TestCustomDomainsCascadeOnSandboxDelete(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	for _, h := range []string{"api.acme.com", "acme.com"} {
-		if err := st.AddCustomDomain(ctx, "sb-a", h); err != nil {
+		if err := st.AddCustomDomain(ctx, "sb-a", h, 0); err != nil {
 			t.Fatalf("AddCustomDomain %s: %v", h, err)
 		}
 	}
@@ -200,7 +200,7 @@ func TestSetCustomDomainStatus(t *testing.T) {
 	if err := st.Create(ctx, sampleSandbox("sb-a")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
 
@@ -251,7 +251,7 @@ func TestListAllCustomDomainsGroupsBySandbox(t *testing.T) {
 	}
 	for sb, hosts := range domains {
 		for _, h := range hosts {
-			if err := st.AddCustomDomain(ctx, sb, h); err != nil {
+			if err := st.AddCustomDomain(ctx, sb, h, 0); err != nil {
 				t.Fatalf("AddCustomDomain %s %s: %v", sb, h, err)
 			}
 		}
@@ -281,13 +281,13 @@ func TestAttachCustomDomainsBulkInList(t *testing.T) {
 			t.Fatalf("Create %s: %v", id, err)
 		}
 	}
-	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain a: %v", err)
 	}
-	if err := st.AddCustomDomain(ctx, "sb-a", "acme.com"); err != nil {
+	if err := st.AddCustomDomain(ctx, "sb-a", "acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain a2: %v", err)
 	}
-	if err := st.AddCustomDomain(ctx, "sb-b", "foo.example.com"); err != nil {
+	if err := st.AddCustomDomain(ctx, "sb-b", "foo.example.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain b: %v", err)
 	}
 
@@ -315,7 +315,7 @@ func TestGetIncludesCustomDomains(t *testing.T) {
 	if err := st.Create(ctx, sampleSandbox("sb-a")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com"); err != nil {
+	if err := st.AddCustomDomain(ctx, "sb-a", "api.acme.com", 0); err != nil {
 		t.Fatalf("AddCustomDomain: %v", err)
 	}
 	got, err := st.Get(ctx, "sb-a")

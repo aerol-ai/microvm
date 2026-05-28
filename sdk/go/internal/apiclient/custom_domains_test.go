@@ -41,7 +41,7 @@ func TestAddCustomDomainSendsHostnameAndDecodesEnvelope(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
-	domains, err := client.AddCustomDomain(ctx, "sb-123", "api.acme.com")
+	domains, err := client.AddCustomDomain(ctx, "sb-123", "api.acme.com", 0)
 	if err != nil {
 		t.Fatalf("AddCustomDomain() error = %v", err)
 	}

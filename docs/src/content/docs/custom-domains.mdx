@@ -129,7 +129,7 @@ The add call returns the post-attach list with the new row's `status` so callers
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let domains = sandbox.add_custom_domain("staging.acme.com")?;
+    let domains = sandbox.add_custom_domain("staging.acme.com", None)?;
     ```
   </TabItem>
   <TabItem label="Java">
@@ -138,6 +138,45 @@ The add call returns the post-attach list with the new row's `status` so callers
     ```
   </TabItem>
 </Tabs>
+
+### Target port
+
+By default traffic to a custom domain dials the sandbox's toolbox port — the same root URL `https://{id}.{cluster-domain}` serves. Pass a `port` to route the hostname at a specific application port inside the container instead (e.g. an app listening on `3333`). This is the same routing the default `sb-{id}-{port}.{cluster-domain}` URLs use, but bound to your custom hostname.
+
+`port` is fixed at attach time. To change it, detach and re-add — re-adding the same hostname with a different `port` returns `409 Conflict` rather than silently redirecting live traffic.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.customDomains.add("api.acme.com", { port: 3333 });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.add_custom_domain("api.acme.com", port=3333)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := sandbox.AddCustomDomain(ctx, "api.acme.com", microvm.WithTargetPort(3333))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.add_custom_domain(
+        "api.acme.com",
+        Some(AddCustomDomainOptions::with_port(3333)),
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.addCustomDomain("api.acme.com", 3333);
+    ```
+  </TabItem>
+</Tabs>
+
+Create-time `customDomains` always uses the toolbox-port default; to bind a custom port, attach after create.
 
 ## Discover DNS records from the SDK
 
@@ -311,9 +350,9 @@ Each attached hostname carries a `status` that reflects where Caddy is in the pe
 
 | Status | When |
 |---|---|
-| `400 Bad Request` | Hostname is malformed or includes a port. |
+| `400 Bad Request` | Hostname is malformed or includes a port, or `target_port` is outside `1..65535`. |
 | `403 Forbidden` | Ownership verification TXT record is missing or has the wrong value at `_aerol-verify.<hostname>`. See [Ownership verification (TXT record)](#ownership-verification-txt-record). |
-| `409 Conflict` | The hostname is already attached to a different sandbox (hostnames are globally unique across the cluster), the sandbox already exposes a `tcp://` / `tls://` port (the IRON RULE — custom domains and L4 exposures can't coexist on one sandbox), or the per-sandbox cap is reached. |
+| `409 Conflict` | The hostname is already attached to a different sandbox (hostnames are globally unique across the cluster), the sandbox already exposes a `tcp://` / `tls://` port (the IRON RULE — custom domains and L4 exposures can't coexist on one sandbox), the per-sandbox cap is reached, or the hostname is already attached to this sandbox with a different `target_port` (detach + re-add to change it). |
 | `412 Precondition Failed` | Custom domains are disabled (`SB_ENABLE_CUSTOM_DOMAINS=false`) or the server runs in IP mode (`SB_DOMAIN` unset). |
 | `429 Too Many Requests` | The daemon-wide ACME issuance budget is exhausted (LE `new-orders` per-account limit nearing 80% of 300/3h). Honour `Retry-After` and try again. |
 
