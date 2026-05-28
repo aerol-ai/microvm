@@ -68,3 +68,22 @@ sandboxd_auto_import_cluster_pat_path: "{{ sandboxd_secrets_dir }}/cluster-pat"
 # empty = feature off.
 sandboxd_upstream_wrap_key_src: ""
 sandboxd_auto_import_cluster_pat_src: ""
+
+# Firecracker host-side artifact install. When firecracker.enabled is true
+# in config/cluster.yml, configure-ops.yml auto-detects host arch (uname -m)
+# and installs:
+#   - firecracker + jailer from the upstream GitHub release pinned to
+#     firecracker_version, SHA256-verified against the release's published
+#     .sha256.txt sidecar (same trust model install.sh uses for runsc).
+#   - a guest kernel image from the AWS spec.ccfc.min bucket pinned to
+#     firecracker_kernel_ci_version / firecracker_kernel_version. Both
+#     x86_64 and aarch64 paths exist there; unsupported arches fail fast.
+# Only x86_64 / aarch64 hosts are supported (Firecracker upstream constraint).
+# Override any of the *_url vars in local.yml to pull from a private mirror
+# instead — the override skips the upstream URL construction entirely.
+firecracker_version: "v1.15.1"
+firecracker_kernel_ci_version: "v1.15"
+firecracker_kernel_version: "5.10.245"
+firecracker_binary_url: ""
+firecracker_jailer_url: ""
+firecracker_kernel_url: ""
