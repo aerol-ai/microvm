@@ -411,9 +411,16 @@ class HealthStatus(TypedDict):
     version: str
 
 
+class RetryConfig(TypedDict, total=False):
+    maxRetries: int
+    baseDelayMs: int
+    maxDelayMs: int
+
+
 class MicroVMConfig(TypedDict, total=False):
     apiUrl: str
     patToken: str
+    retry: RetryConfig
 
 
 # Firecracker rootfs templates. The lifecycle mirrors the daemon's
