@@ -69,12 +69,13 @@ func newCustomDomainsHarness(t *testing.T, cfgOverride func(*config.Config)) (*S
 			HTTPClientTimeout: time.Second,
 		}),
 		dnsResolver: &mockDNSResolver{
+			// TXT value is the hostname itself (proves zone control,
+			// reusable across sandbox recreates) — not the sandbox ID.
 			records: map[string][]string{
-				// Match whatever tests need
-				"_aerol-verify.api.acme.com":   {"aerol-verify=sb-1", "aerol-verify=sb-a", "aerol-verify=sb-b"},
-				"_aerol-verify.h0.acme.com":    {"aerol-verify=sb-1"},
-				"_aerol-verify.h1.acme.com":    {"aerol-verify=sb-1"},
-				"_aerol-verify.extra.acme.com": {"aerol-verify=sb-1"},
+				"_aerol-verify.api.acme.com":   {"aerol-verify=api.acme.com"},
+				"_aerol-verify.h0.acme.com":    {"aerol-verify=h0.acme.com"},
+				"_aerol-verify.h1.acme.com":    {"aerol-verify=h1.acme.com"},
+				"_aerol-verify.extra.acme.com": {"aerol-verify=extra.acme.com"},
 			},
 		},
 	}
