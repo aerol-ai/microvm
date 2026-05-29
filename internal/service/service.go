@@ -183,6 +183,22 @@ type Service struct {
 	netstatsPoller   *netstats.Poller
 	netstatsLastTick atomic.Int64 // unix nanos; last successful tick for /usage staleness reporting
 
+	// usageReporter ships neutral usage samples toward the managed control
+	// plane. nil on the open-source build (set only by the managed daemon via
+	// SetUsageReporter), so emitUsage is a no-op there and adds zero work. It is
+	// read on background loops (reconcile / event monitor / netstats / live
+	// sampler), never on the request hot path.
+	//
+	// usageCursor tracks, per sandbox, the end of the last reserved-usage window
+	// emitted. The reconcile sweep and the lifecycle event edges both advance it,
+	// so the two sources tile each sandbox's timeline without gaps or overlaps —
+	// a sandbox that starts and dies between heartbeats still gets its tail
+	// emitted from the stop edge. In-memory only; lost on restart (the server
+	// reconciles via window bounds + idempotent EventIDs).
+	usageReporter controlplane.Reporter
+	usageMu       sync.Mutex
+	usageCursor   map[string]time.Time
+
 	// netstatsActivity is the per-sandbox "last observed network activity"
 	// timestamp (unix nanos), populated by the netstats poller sink from
 	// non-zero byte deltas and established TCP sockets. The idle sweep uses it
@@ -3173,6 +3189,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 	}
 	s.mounts.Sweep(keep)
+
+	// Reuse this sweep's already-loaded snapshot to emit one window of reserved
+	// usage (uptime + cpu/mem/disk/gpu). No-op on the open-source build (no
+	// reporter wired). Last so a reporting hiccup can't affect reconcile.
+	s.emitReservedUsage(ctx, known)
 
 	return nil
 }

@@ -259,6 +259,11 @@ func (k netstatsServiceSink) HandleSamples(ctx context.Context, samples []netsta
 			continue
 		}
 
+		// Mirror the per-tick byte deltas as egress/ingress usage samples
+		// (owner_ref comes off the row we just re-read). No-op without a
+		// reporter; the poller goroutine is already off the request path.
+		k.svc.emitNetworkUsage(ctx, sandbox, sample.BytesIn, sample.BytesOut, sample.SampledAt)
+
 		overIn := sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
 		overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
 		if overIn || overOut || sandbox.NetworkQuotaExceeded {

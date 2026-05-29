@@ -260,6 +260,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	// Wire the control-plane usage reporter into the service's background loops
+	// (reconcile / event monitor / netstats / live sampler). Under
+	// controlplane.Noop() this is the no-op reporter, so the open-source build
+	// emits nothing and pays no cost.
+	svc.SetUsageReporter(cp.Reporter)
 
 	// Native Firecracker runtime is opt-in per host. When enabled, we
 	// seed the per-host network slot pool from
