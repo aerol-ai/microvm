@@ -199,6 +199,14 @@ type Service struct {
 	usageMu       sync.Mutex
 	usageCursor   map[string]time.Time
 
+	// liveCursor holds, per sandbox, the previous live-sampler observation (its
+	// cumulative CPU counter and the time it was read), so the next tick can
+	// difference the CPU counter into vcpu-seconds for the window. Separate from
+	// usageMu so the opt-in live sampler never contends with the reserved-usage
+	// cursor on the reconcile/event paths. nil/empty unless the live sampler runs.
+	liveMu     sync.Mutex
+	liveCursor map[string]liveSamplePoint
+
 	// fleetAdmitter is the managed create-gate: consulted in createSandbox for
 	// owner-scoped (user-token) creates before any capacity is reserved. nil on
 	// the open-source build (set only by the managed daemon via

@@ -576,6 +576,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		svc.StartLifecycleSweep(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
+		// Opt-in live CPU/memory sampler. No-op unless a usage reporter is wired
+		// (managed build) and SB_FLEET_LIVE_SAMPLE_INTERVAL > 0; the reserved
+		// axes are emitted from the reconcile/event/netstats loops regardless.
+		svc.StartLiveUsageSampler(ctx)
 		// Firecracker template janitor (plans/snapshot-clone-fast-boot.md
 		// Phase 2). No-op when SB_ENABLE_FIRECRACKER=false or the GC
 		// enable knob is off; per-tick cancellation is wired off ctx like

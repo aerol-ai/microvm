@@ -948,6 +948,13 @@ type Config struct {
 	// often the managed contract (which carries every other tunable) is
 	// re-fetched. Default 5m. SB_FLEET_CONTRACT_REFRESH.
 	FleetControlPlaneContractRefresh time.Duration
+	// FleetLiveSampleInterval is the cadence of the opt-in live CPU/memory
+	// sampler. 0 (the default) disables it: only the reserved axes are emitted,
+	// which is the right posture for most fleets. When > 0 it is clamped up to a
+	// 1s floor (≤1 Hz) so an aggressive value can't hammer the Docker stats
+	// endpoint. Only has any effect on a managed build with a usage reporter
+	// wired; the open-source build emits nothing regardless. SB_FLEET_LIVE_SAMPLE_INTERVAL.
+	FleetLiveSampleInterval time.Duration
 }
 
 // MirrorUpstreamMapping is a single host=shortname pair parsed from
@@ -1109,6 +1116,7 @@ func Load() (Config, error) {
 		FleetControlPlaneEndpoint:        strings.TrimSpace(os.Getenv("SB_FLEET_ENDPOINT")),
 		FleetControlPlaneToken:           strings.TrimSpace(os.Getenv("SB_FLEET_TOKEN")),
 		FleetControlPlaneContractRefresh: getEnvDuration("SB_FLEET_CONTRACT_REFRESH", 5*time.Minute),
+		FleetLiveSampleInterval:          getEnvDuration("SB_FLEET_LIVE_SAMPLE_INTERVAL", 0),
 
 		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
