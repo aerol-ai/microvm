@@ -265,6 +265,16 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// controlplane.Noop() this is the no-op reporter, so the open-source build
 	// emits nothing and pays no cost.
 	svc.SetUsageReporter(cp.Reporter)
+	// Wire the managed create-gate. Under Noop() this is the allow-all admitter,
+	// so the open-source build never gates a create.
+	svc.SetFleetAdmitter(cp.Admitter)
+	// Start the standing-driven enforcement loop. EnforcementFor binds the loop
+	// to the service as its FleetController; under Noop() the factory yields a
+	// no-op whose Start does nothing. Runs on the daemon's cancellable ctx so it
+	// stops on shutdown. Started here (right after the service exists) rather than
+	// alongside the other reconcilers because the FleetController it drives is the
+	// service itself.
+	cp.EnforcementFor(svc).Start(ctx)
 
 	// Native Firecracker runtime is opt-in per host. When enabled, we
 	// seed the per-host network slot pool from

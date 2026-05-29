@@ -199,6 +199,13 @@ type Service struct {
 	usageMu       sync.Mutex
 	usageCursor   map[string]time.Time
 
+	// fleetAdmitter is the managed create-gate: consulted in createSandbox for
+	// owner-scoped (user-token) creates before any capacity is reserved. nil on
+	// the open-source build (set only by the managed daemon via
+	// SetFleetAdmitter), so the gate is skipped entirely there. Its Admit must be
+	// a fast in-memory check — it sits on the create request path.
+	fleetAdmitter controlplane.Admitter
+
 	// netstatsActivity is the per-sandbox "last observed network activity"
 	// timestamp (unix nanos), populated by the netstats poller sink from
 	// non-zero byte deltas and established TCP sockets. The idle sweep uses it
@@ -793,6 +800,19 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := s.store.UpsertAccountMapping(ctx, ownerRef, access.Identity.ExternalID); err != nil {
 			s.logger.Warn("fleet: account mapping upsert failed; attribution still on the sandbox row",
 				"owner_ref", ownerRef, "error", err)
+		}
+		// Fleet create-gate. Owner-scoped creates consult the managed admitter
+		// before any capacity is reserved or Docker/Firecracker is touched, so a
+		// refused create costs nothing. Placed ahead of the runtime branch below
+		// so both the Docker and Firecracker paths are gated by the one check.
+		// Operator/PAT and internal creates (ownerRef == "") skip the gate — the
+		// open-source admitter admits everything anyway. The error is returned
+		// verbatim so apihttp maps ErrAdmissionDenied→403 and
+		// ErrAdmissionUnavailable→503.
+		if s.fleetAdmitter != nil {
+			if err := s.fleetAdmitter.Admit(ctx, ownerRef); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Custom-domain validation runs early so an invalid or unsupported

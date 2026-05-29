@@ -22,6 +22,19 @@ import (
 // maps it to 401.
 var ErrTokenRejected = errors.New("controlplane: token rejected")
 
+// ErrAdmissionDenied is returned by Admitter.Admit when the caller's account is
+// not permitted to create a sandbox right now (e.g. its access has been
+// suspended or terminated by the control plane). It is a definite "no": the API
+// edge maps it to 403. Distinct from ErrAdmissionUnavailable, which is a
+// retryable "ask again later".
+var ErrAdmissionDenied = errors.New("controlplane: admission denied")
+
+// ErrAdmissionUnavailable is returned by Admitter.Admit when the control plane
+// cannot vouch for the caller right now (standing data is not yet known and the
+// contract's grace window has elapsed). It is retryable; the API edge maps it
+// to 503 with a Retry-After hint.
+var ErrAdmissionUnavailable = errors.New("controlplane: admission temporarily unavailable")
+
 // Identity is the account a caller token resolves to. OwnerRef is the stable
 // account key stamped onto sandboxes and usage samples; ExternalID is
 // informational only.
