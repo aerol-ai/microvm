@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -42,13 +43,27 @@ func extractBearerToken(r *http.Request) string {
 	return ""
 }
 
-// requireAuth wraps next with PAT bearer-token authentication. All API
-// versions share this middleware via the Deps.Auth callback in their
-// RegisterRoutes — there is no per-version auth.
+// requireAuth wraps next with bearer-token authentication. All API versions
+// share this middleware via the Deps.Auth callback in their RegisterRoutes —
+// there is no per-version auth.
+//
+// Two paths:
+//   - The PAT authenticates as operator: full, unscoped (fleet-wide) access,
+//     exactly as before this seam existed.
+//   - Any other bearer token is handed to the control-plane validator. On
+//     success the resolved Identity is attached as a non-operator Access, so the
+//     service layer scopes the request to that owner. Under controlplane.Noop()
+//     the validator rejects every non-PAT token, so this collapses back to
+//     PAT-only behavior.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if extractBearerToken(r) == s.patToken {
-			next.ServeHTTP(w, r)
+		token := extractBearerToken(r)
+		if token == s.patToken {
+			next.ServeHTTP(w, s.withOperatorAccess(r))
+			return
+		}
+		if r2, ok := s.authenticateUserToken(r, token); ok {
+			next.ServeHTTP(w, r2)
 			return
 		}
 		apihttp.WriteError(w, http.StatusUnauthorized, "unauthorized")
@@ -57,13 +72,46 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 
 func (s *Server) requireE2BAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := extractBearerToken(r)
 		apiKey := strings.TrimSpace(r.Header.Get("X-API-KEY"))
-		if apiKey == s.patToken || extractBearerToken(r) == s.patToken {
-			next.ServeHTTP(w, r)
+		if apiKey == s.patToken || token == s.patToken {
+			next.ServeHTTP(w, s.withOperatorAccess(r))
+			return
+		}
+		// The E2B facade also accepts the API key via X-API-KEY; try whichever
+		// non-PAT credential was supplied as a user token.
+		candidate := token
+		if candidate == "" {
+			candidate = apiKey
+		}
+		if r2, ok := s.authenticateUserToken(r, candidate); ok {
+			next.ServeHTTP(w, r2)
 			return
 		}
 		apie2b.WriteError(w, http.StatusUnauthorized, "Unauthorized, please check your credentials.")
 	})
+}
+
+// withOperatorAccess stamps the PAT/operator marker onto the request context so
+// the service layer bypasses owner scoping.
+func (s *Server) withOperatorAccess(r *http.Request) *http.Request {
+	return r.WithContext(controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: true}))
+}
+
+// authenticateUserToken validates a non-PAT token via the control plane. On
+// success it returns the request carrying a non-operator Access (owner-scoped);
+// on rejection (including every token under the no-op validator) it returns
+// ok=false and the caller writes 401. An empty token is never validated.
+func (s *Server) authenticateUserToken(r *http.Request, token string) (*http.Request, bool) {
+	if token == "" {
+		return nil, false
+	}
+	identity, err := s.validator.Validate(r.Context(), token)
+	if err != nil {
+		return nil, false
+	}
+	access := controlplane.Access{Identity: identity}
+	return r.WithContext(controlplane.ContextWithAccess(r.Context(), access)), true
 }
 
 func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {

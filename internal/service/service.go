@@ -26,6 +26,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -762,6 +763,22 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if req.Image == "" {
 		return nil, errors.New("image is required")
 	}
+
+	// Owner attribution: a validated user token stamps its account onto the
+	// new sandbox; operator/PAT and internal creates are owner-less (""). The
+	// value is resolved once here and applied to whichever runtime path builds
+	// the row below. The account mapping is refreshed here (one write per
+	// create, not per request) so the auth hot path stays write-free; it is
+	// best-effort because attribution on the sandbox row is the source of
+	// truth, and a noop store/owner-less create has nothing to record.
+	ownerRef := ownerRefForCreate(ctx)
+	if ownerRef != "" {
+		access, _ := controlplane.AccessFromContext(ctx)
+		if err := s.store.UpsertAccountMapping(ctx, ownerRef, access.Identity.ExternalID); err != nil {
+			s.logger.Warn("fleet: account mapping upsert failed; attribution still on the sandbox row",
+				"owner_ref", ownerRef, "error", err)
+		}
+	}
 	// Custom-domain validation runs early so an invalid or unsupported
 	// payload fails before admission/mounts/docker.Create burn resources.
 	// On success req.CustomDomains is rewritten with the canonical slice.
@@ -977,6 +994,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 
+	sandbox.OwnerRef = ownerRef
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.docker.Destroy(ctx, sandbox)
@@ -1207,6 +1225,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		return nil, err
 	}
 
+	// Same owner attribution as the docker path; createSandbox already
+	// refreshed the account mapping before dispatching here.
+	sandbox.OwnerRef = ownerRefForCreate(ctx)
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.firecracker.Destroy(ctx, sandbox)
@@ -1319,7 +1340,7 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) ([]models.Mo
 // ListMounts returns the redacted mount config for a sandbox. Credentials are
 // never included in the response — they are write-only via CreateSandbox.
 func (s *Service) ListMounts(ctx context.Context, sandboxID string) ([]models.MountSpecRedacted, error) {
-	if _, err := s.store.Get(ctx, sandboxID); err != nil {
+	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
 		return nil, err
 	}
 	specs, err := s.loadMounts(ctx, sandboxID)
@@ -1352,7 +1373,7 @@ func generateSandboxSSHKeys() (authorizedKey, privateKeyPEM string, err error) {
 }
 
 func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	return s.store.Get(ctx, id)
+	return s.scopedGet(ctx, id)
 }
 
 // ListSandboxes returns sandboxes whose Tags match every entry in tagFilter.
@@ -1367,6 +1388,10 @@ func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string
 	if err != nil {
 		return nil, err
 	}
+	// Owner scoping first: a user token sees only its own sandboxes; operator
+	// and internal callers see all. Applied before the tag filter so a tenant
+	// can't tag-probe across owners.
+	sandboxes = filterByOwnerScope(ctx, sandboxes)
 	if len(tagFilter) == 0 {
 		return sandboxes, nil
 	}
@@ -1391,7 +1416,7 @@ func sandboxMatchesTags(sb *models.Sandbox, want map[string]string) bool {
 }
 
 func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1496,7 +1521,7 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 }
 
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1636,7 +1661,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 
-	sandbox, err := s.store.Get(ctx, sandboxID)
+	sandbox, err := s.scopedGet(ctx, sandboxID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1800,7 +1825,7 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1883,7 +1908,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.validateLifecycle(l); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
-	priorSandbox, err := s.store.Get(ctx, id)
+	priorSandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1934,7 +1959,7 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 }
 
 func (s *Service) exposePort(ctx context.Context, id string, port int, protocol string, preferredHostPort int) (models.ExposePortResponse, error) {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return models.ExposePortResponse{}, err
 	}
@@ -2272,7 +2297,7 @@ func (s *Service) removeClusterExposedPort(ctx context.Context, sandboxID string
 }
 
 func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -2539,7 +2564,7 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	if err := s.TouchSandbox(ctx, id); err != nil {
 		return ToolboxEndpoint{}, err
 	}
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return ToolboxEndpoint{}, err
 	}
@@ -2633,7 +2658,7 @@ func (s *Service) IsSandboxStarted(ctx context.Context, id string) (bool, error)
 	if s.warmCacheHit(id) {
 		return true, nil
 	}
-	sb, err := s.store.Get(ctx, id)
+	sb, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return false, err
 	}

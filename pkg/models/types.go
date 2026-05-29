@@ -636,6 +636,18 @@ type Sandbox struct {
 	// path needs to know whether overlay.ext4 was allocated in the
 	// per-sandbox runDir.
 	OverlaySizeGB int `json:"overlay_size_gb,omitempty"`
+	// OwnerRef is the account key this sandbox is attributed to, resolved by
+	// the optional fleet control plane from a user token at create time.
+	// Empty means operator/PAT-created (the only possibility on the
+	// open-source build). Owner scoping uses it to fence user tokens to their
+	// own sandboxes; the PAT bypasses scoping. Never exposed over the wire —
+	// it is internal attribution, not caller-facing.
+	OwnerRef string `json:"-"`
+	// FleetSuspended marks a sandbox that was stopped by a fleet standing
+	// directive (suspend), as opposed to a user/operator stop. Recovery
+	// restarts exactly the sandboxes carrying this marker, then clears it.
+	// Internal-only bookkeeping.
+	FleetSuspended bool `json:"-"`
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.

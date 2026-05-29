@@ -31,7 +31,7 @@ func (s *Service) CustomDomainDNS(ctx context.Context, sandboxID string) (models
 	if !s.cfg.EnableCustomDomains || s.cfg.Domain == "" {
 		return models.CustomDomainDNSRecords{}, ErrCustomDomainNotSupported
 	}
-	if _, err := s.store.Get(ctx, sandboxID); err != nil {
+	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
 		return models.CustomDomainDNSRecords{}, err
 	}
 	domains, err := s.store.ListCustomDomains(ctx, sandboxID)

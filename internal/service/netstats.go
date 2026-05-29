@@ -65,7 +65,7 @@ func (s *Service) GetNetworkUsage(ctx context.Context, id string) (*models.Netwo
 		s.logger.Warn("netstats lazy bootstrap failed; counters may be stale",
 			"sandbox_id", id, "error", err)
 	}
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 	if bytesInLimit < 0 || bytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}

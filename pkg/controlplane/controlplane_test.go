@@ -15,18 +15,24 @@ func TestNoopProviderRejectsTokens(t *testing.T) {
 	if err := p.Reporter.Report(ctx, []Sample{{OwnerRef: "x"}}); err != nil {
 		t.Errorf("noop Report = %v, want nil", err)
 	}
+	if err := p.Admitter.Admit(ctx, "x"); err != nil {
+		t.Errorf("noop Admit = %v, want nil (admit all)", err)
+	}
 	// Must not panic or block.
-	p.Enforcement.Start(ctx)
+	p.EnforcementFor(stubController{}).Start(ctx)
 }
 
 func TestProviderWithDefaultsFillsNils(t *testing.T) {
 	p := Provider{}.WithDefaults()
-	if p.Validator == nil || p.Reporter == nil || p.Enforcement == nil {
+	if p.Validator == nil || p.Reporter == nil || p.Admitter == nil || p.EnforcementFor == nil {
 		t.Fatalf("WithDefaults left a nil capability: %+v", p)
 	}
 	ctx := context.Background()
 	if _, err := p.Validator.Validate(ctx, "tok"); err != ErrTokenRejected {
 		t.Errorf("filled validator should be no-op reject, got %v", err)
+	}
+	if p.EnforcementFor(stubController{}) == nil {
+		t.Errorf("filled EnforcementFor returned nil enforcement")
 	}
 }
 
