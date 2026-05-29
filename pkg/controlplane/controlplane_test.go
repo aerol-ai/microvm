@@ -1,0 +1,44 @@
+package controlplane
+
+import (
+	"context"
+	"testing"
+)
+
+func TestNoopProviderRejectsTokens(t *testing.T) {
+	p := Noop()
+	ctx := context.Background()
+
+	if _, err := p.Validator.Validate(ctx, "anything"); err != ErrTokenRejected {
+		t.Errorf("noop Validate = %v, want ErrTokenRejected", err)
+	}
+	if err := p.Reporter.Report(ctx, []Sample{{OwnerRef: "x"}}); err != nil {
+		t.Errorf("noop Report = %v, want nil", err)
+	}
+	// Must not panic or block.
+	p.Enforcement.Start(ctx)
+}
+
+func TestProviderWithDefaultsFillsNils(t *testing.T) {
+	p := Provider{}.WithDefaults()
+	if p.Validator == nil || p.Reporter == nil || p.Enforcement == nil {
+		t.Fatalf("WithDefaults left a nil capability: %+v", p)
+	}
+	ctx := context.Background()
+	if _, err := p.Validator.Validate(ctx, "tok"); err != ErrTokenRejected {
+		t.Errorf("filled validator should be no-op reject, got %v", err)
+	}
+}
+
+// stubController proves the FleetController interface is satisfiable by a host
+// type; the managed build supplies the real one.
+type stubController struct{}
+
+func (stubController) StopByOwner(context.Context, string) error         { return nil }
+func (stubController) RestoreByOwner(context.Context, string) error      { return nil }
+func (stubController) DeleteByOwner(context.Context, string) error       { return nil }
+func (stubController) FireWebhook(context.Context, string, string) error { return nil }
+
+func TestFleetControllerIsImplementable(t *testing.T) {
+	var _ FleetController = stubController{}
+}
