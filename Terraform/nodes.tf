@@ -135,6 +135,11 @@ resource "aws_instance" "seed" {
     aocr_request_timeout     = local.aocr.request_timeout
     aocr_reconcile_interval  = local.aocr.reconcile_interval
     aocr_max_in_flight       = local.aocr.max_in_flight
+
+    fleet_enabled          = local.fleet.enabled
+    fleet_endpoint         = local.fleet.endpoint
+    fleet_token            = local.fleet.token
+    fleet_contract_refresh = local.fleet.contract_refresh
   })
 
   tags = merge(
@@ -277,6 +282,11 @@ resource "aws_instance" "joiner" {
     aocr_request_timeout     = local.aocr.request_timeout
     aocr_reconcile_interval  = local.aocr.reconcile_interval
     aocr_max_in_flight       = local.aocr.max_in_flight
+
+    fleet_enabled          = local.fleet.enabled
+    fleet_endpoint         = local.fleet.endpoint
+    fleet_token            = local.fleet.token
+    fleet_contract_refresh = local.fleet.contract_refresh
   })
 
   depends_on = [aws_instance.seed]

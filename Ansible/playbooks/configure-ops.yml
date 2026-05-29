@@ -79,6 +79,17 @@
       SB_AUTO_IMPORT_REQUEST_TIMEOUT: "{{ auto_import.request_timeout }}"
       SB_AUTO_IMPORT_RECONCILE_INTERVAL: "{{ auto_import.reconcile_interval }}"
       SB_AUTO_IMPORT_MAX_IN_FLIGHT: "{{ auto_import.max_in_flight }}"
+      # Fleet control plane (optional). enabled/endpoint/contract_refresh come
+      # from cluster.yml's fleet_control_plane block; the token is a secret
+      # from secrets.yml's separate `fleet` key. Only these land in env — every
+      # other tunable is fetched from the managed contract API at runtime. The
+      # token rides cluster.env (root 0600) rather than a dedicated file like
+      # the cluster PAT; switching to an SB_FLEET_TOKEN_PATH file is a possible
+      # hardening follow-up.
+      SB_FLEET_ENABLED: "{{ fleet_control_plane.enabled | bool | string | lower }}"
+      SB_FLEET_ENDPOINT: "{{ fleet_control_plane.endpoint }}"
+      SB_FLEET_TOKEN: "{{ fleet.token }}"
+      SB_FLEET_CONTRACT_REFRESH: "{{ fleet_control_plane.contract_refresh }}"
 
   pre_tasks:
     - name: Check base sandboxd env file
