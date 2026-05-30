@@ -15,8 +15,14 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// admissionRetryAfterSeconds is the Retry-After hint sent with a 503 when the
+// fleet admitter cannot vouch for a caller yet (standing not known). Short, so
+// a client retries promptly once the control plane's first standing poll lands.
+const admissionRetryAfterSeconds = 15
 
 // WriteJSON serializes value as JSON and writes it with the given status.
 func WriteJSON(w http.ResponseWriter, status int, value any) {
@@ -39,6 +45,19 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		WriteError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	// Fleet admission verdicts (managed builds only; the open-source admitter
+	// admits everything so these never fire there). Denied is a definite 403;
+	// unavailable is a retryable 503 so clients back off rather than treating a
+	// transient control-plane gap as a hard failure.
+	if errors.Is(err, controlplane.ErrAdmissionDenied) {
+		WriteError(w, http.StatusForbidden, "account access is not currently permitted")
+		return
+	}
+	if errors.Is(err, controlplane.ErrAdmissionUnavailable) {
+		w.Header().Set("Retry-After", strconv.Itoa(admissionRetryAfterSeconds))
+		WriteError(w, http.StatusServiceUnavailable, "fleet access validation temporarily unavailable; retry shortly")
 		return
 	}
 	// Wake-aware proxy sentinels (plans/serverless-sandbox-http-wake.md).

@@ -102,11 +102,29 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 
 	switch event.Action {
 	case "die", "stop", "oom":
-		return s.markSandboxStopped(ctx, sandbox, event)
+		if err := s.markSandboxStopped(ctx, sandbox, event); err != nil {
+			return err
+		}
+		// Close the running window at the stop edge so a sandbox that ran and
+		// exited between reconcile sweeps still has its tail metered. Uses the
+		// pre-stop row (CPU/mem/disk/owner intact); no-op without a reporter.
+		s.emitLifecycleStopUsage(ctx, sandbox, time.Now(), false)
+		return nil
 	case "destroy":
-		return s.handleDestroyEvent(ctx, sandbox)
+		if err := s.handleDestroyEvent(ctx, sandbox); err != nil {
+			return err
+		}
+		// Terminal: meter the final tail and forget the sandbox's cursor.
+		s.emitLifecycleStopUsage(ctx, sandbox, time.Now(), true)
+		return nil
 	case "start":
-		return s.handleStartEvent(ctx, sandbox)
+		if err := s.handleStartEvent(ctx, sandbox); err != nil {
+			return err
+		}
+		// Begin accrual from the actual start so the next sweep meters from here
+		// rather than one reconcile interval back.
+		s.noteLifecycleStart(sandbox.ID, time.Now())
+		return nil
 	default:
 		return nil
 	}

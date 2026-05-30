@@ -379,6 +379,19 @@ func Open(path string) (*Store, error) {
 		// full scan once the catalogue grows beyond a handful of entries.
 		`CREATE INDEX IF NOT EXISTS idx_firecracker_templates_updated_at
 			ON firecracker_templates(updated_at);`,
+		// account_mappings records the identities resolved by the optional
+		// fleet control plane (managed builds only). owner_ref is the stable
+		// account key stamped onto sandboxes; external_id is informational.
+		// Empty on the open-source build — nothing writes here unless a
+		// validator is wired. first_seen/last_seen bound an account's activity
+		// window for the managed side without the open-source code needing to
+		// know what they mean.
+		`CREATE TABLE IF NOT EXISTS account_mappings (
+			owner_ref TEXT PRIMARY KEY,
+			external_id TEXT NOT NULL DEFAULT '',
+			first_seen DATETIME NOT NULL,
+			last_seen DATETIME NOT NULL
+		);`,
 	}
 
 	for _, stmt := range stmts {
@@ -511,6 +524,15 @@ func Open(path string) (*Store, error) {
 		// behavior for rows attached before this column existed, so the
 		// upgrade is silent.
 		`ALTER TABLE sandbox_custom_domains ADD COLUMN target_port INTEGER NOT NULL DEFAULT 0;`,
+		// Fleet control plane (managed builds). owner_ref is the account key a
+		// sandbox is attributed to; empty means operator/PAT-created (the only
+		// possibility on the open-source build, where no validator resolves
+		// user tokens). fleet_suspended marks a sandbox stopped by a standing
+		// directive so recovery can restart exactly those — distinguishing a
+		// fleet-suspend from an operator/user stop. Both default to the
+		// open-source baseline so warm upgrades are silent.
+		`ALTER TABLE sandboxes ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN fleet_suspended INTEGER NOT NULL DEFAULT 0;`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -617,8 +639,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			auto_import_pending,
 			serverless, wake_armed,
 			template_id,
-			overlay_size_gb
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			overlay_size_gb,
+			owner_ref, fleet_suspended
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -661,6 +684,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.WakeArmed),
 		strings.TrimSpace(sandbox.TemplateID),
 		sandbox.OverlaySizeGB,
+		strings.TrimSpace(sandbox.OwnerRef),
+		boolToInt(sandbox.FleetSuspended),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -726,8 +751,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			auto_import_pending,
 			serverless, wake_armed,
 			template_id,
-			overlay_size_gb
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			overlay_size_gb,
+			owner_ref, fleet_suspended
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -763,7 +789,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			serverless = excluded.serverless,
 			wake_armed = excluded.wake_armed,
 			template_id = excluded.template_id,
-			overlay_size_gb = excluded.overlay_size_gb
+			overlay_size_gb = excluded.overlay_size_gb,
+			owner_ref = excluded.owner_ref,
+			fleet_suspended = excluded.fleet_suspended
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -806,6 +834,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.WakeArmed),
 		strings.TrimSpace(sandbox.TemplateID),
 		sandbox.OverlaySizeGB,
+		strings.TrimSpace(sandbox.OwnerRef),
+		boolToInt(sandbox.FleetSuspended),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -830,7 +860,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			auto_import_pending,
 			serverless, wake_armed,
 			template_id,
-			overlay_size_gb
+			overlay_size_gb,
+			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -872,7 +903,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			auto_import_pending,
 			serverless, wake_armed,
 			template_id,
-			overlay_size_gb
+			overlay_size_gb,
+			owner_ref, fleet_suspended
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -910,6 +942,101 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	}
 
 	return sandboxes, nil
+}
+
+// ListByOwner returns the sandboxes attributed to ownerRef, newest first. It is
+// the owner-scoped counterpart of List: the API edge uses it to fence a user
+// token to its own sandboxes, and the fleet enforcement loop uses it to fan a
+// standing directive (stop/restore/delete) across one account. An empty
+// ownerRef matches operator/PAT-created rows; callers that want the whole fleet
+// use List instead. Ports and custom domains are intentionally not attached
+// here — the current callers (scoping filter, enforcement) only need identity
+// and lifecycle fields, so we skip the bulk joins.
+func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.Sandbox, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
+			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			failover_policy,
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed,
+			auto_import_pending,
+			serverless, wake_armed,
+			template_id,
+			overlay_size_gb,
+			owner_ref, fleet_suspended
+		FROM sandboxes
+		WHERE owner_ref = ?
+		ORDER BY created_at DESC
+	`, strings.TrimSpace(ownerRef))
+	if err != nil {
+		return nil, fmt.Errorf("list sandboxes by owner: %w", err)
+	}
+	defer rows.Close()
+
+	var sandboxes []*models.Sandbox
+	for rows.Next() {
+		sandbox, err := scanSandbox(rows)
+		if err != nil {
+			return nil, err
+		}
+		sandboxes = append(sandboxes, sandbox)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sandboxes by owner: %w", err)
+	}
+	return sandboxes, nil
+}
+
+// SetFleetSuspended flips the fleet-suspend marker on a sandbox. The
+// enforcement loop sets it true when a standing=suspend directive stops a
+// running sandbox, and clears it on recovery so only fleet-suspended sandboxes
+// are auto-restarted (a user/operator stop is left alone). Idempotent: writing
+// the same value twice is a harmless no-op UPDATE. Returns ErrNotFound if the
+// row is gone (already deleted), which callers treat as success — there is
+// nothing left to converge.
+func (s *Store) SetFleetSuspended(ctx context.Context, id string, suspended bool) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE sandboxes SET fleet_suspended = ?, updated_at = ? WHERE id = ?`,
+		boolToInt(suspended), time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("set fleet_suspended: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set fleet_suspended rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpsertAccountMapping records (or refreshes) an identity resolved by the fleet
+// control plane. first_seen is preserved across calls; last_seen advances to
+// now. Idempotent by owner_ref PK. Open-source builds never call this (no
+// validator resolves user tokens); managed builds call it at create time, not
+// per request, to keep the auth hot path write-free.
+func (s *Store) UpsertAccountMapping(ctx context.Context, ownerRef, externalID string) error {
+	ownerRef = strings.TrimSpace(ownerRef)
+	if ownerRef == "" {
+		return fmt.Errorf("upsert account mapping: empty owner_ref")
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO account_mappings (owner_ref, external_id, first_seen, last_seen)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(owner_ref) DO UPDATE SET
+			external_id = excluded.external_id,
+			last_seen = excluded.last_seen
+	`, ownerRef, strings.TrimSpace(externalID), now, now)
+	if err != nil {
+		return fmt.Errorf("upsert account mapping: %w", err)
+	}
+	return nil
 }
 
 // attachPortsBulk reads every exposed_ports row for any sandbox in byID with
@@ -3069,6 +3196,7 @@ func scanSandbox(scanner interface {
 	var autoImportPending int
 	var serverless int
 	var wakeArmed int
+	var fleetSuspended int
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -3112,10 +3240,13 @@ func scanSandbox(scanner interface {
 		&wakeArmed,
 		&sandbox.TemplateID,
 		&sandbox.OverlaySizeGB,
+		&sandbox.OwnerRef,
+		&fleetSuspended,
 	)
 	if err != nil {
 		return nil, err
 	}
+	sandbox.FleetSuspended = fleetSuspended == 1
 	sandbox.NetworkQuotaExceeded = netQuotaExceeded == 1
 	if netQuotaExceededAt.Valid {
 		t := netQuotaExceededAt.Time.UTC()

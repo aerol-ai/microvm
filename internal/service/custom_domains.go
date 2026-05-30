@@ -225,7 +225,7 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	if err != nil {
 		return err
 	}
-	sandbox, err := s.store.Get(ctx, sandboxID)
+	sandbox, err := s.scopedGet(ctx, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -323,7 +323,7 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	if err != nil {
 		return err
 	}
-	sandbox, err := s.store.Get(ctx, sandboxID)
+	sandbox, err := s.scopedGet(ctx, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -381,7 +381,7 @@ func (s *Service) ListCustomDomains(ctx context.Context, sandboxID string) ([]mo
 	if !s.cfg.EnableCustomDomains || strings.TrimSpace(s.cfg.Domain) == "" {
 		return nil, ErrCustomDomainNotSupported
 	}
-	if _, err := s.store.Get(ctx, sandboxID); err != nil {
+	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
 		return nil, err
 	}
 	return s.store.ListCustomDomains(ctx, sandboxID)

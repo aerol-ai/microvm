@@ -34,6 +34,11 @@ func (s *Service) ResolveSandboxIDByName(ctx context.Context, name string) (stri
 // the native key/value bag — facades use it for label-style metadata
 // (Daytona labels, E2B metadata).
 func (s *Service) UpdateTags(ctx context.Context, sandboxID string, tags map[string]string) error {
+	// Owner-scope the tag write: a user token may only retag its own sandbox;
+	// a cross-owner id reads as 404. Operator/internal callers pass through.
+	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
+		return err
+	}
 	return s.store.UpdateTags(ctx, sandboxID, tags)
 }
 

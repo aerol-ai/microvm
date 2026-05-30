@@ -923,6 +923,38 @@ type Config struct {
 	// AOCR registry. Default 2 — pushes are I/O-heavy per snapshot.
 	// SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT.
 	SnapshotPushMaxInFlight int
+
+	// FleetControlPlaneEnabled gates the optional managed control-plane
+	// integration (caller-token validation + fleet usage telemetry +
+	// standing-driven quota enforcement). False (the default) keeps sandboxd
+	// in pure open-source behavior: the only accepted credential is the
+	// operator PAT, no usage is reported, and no enforcement loop runs.
+	// Everything else about the integration is pulled at runtime from the
+	// managed contract API — only the three fields below live in local config.
+	// SB_FLEET_ENABLED.
+	FleetControlPlaneEnabled bool
+	// FleetControlPlaneEndpoint is the managed control-plane base URL (no
+	// trailing slash). Required when FleetControlPlaneEnabled is true. The
+	// contract, validate, and standing paths are appended to it by the client.
+	// SB_FLEET_ENDPOINT.
+	FleetControlPlaneEndpoint string
+	// FleetControlPlaneToken is the fleet credential (avm_<32hex>) the client
+	// presents to the control plane. Treat as secret; never logged. Rendered
+	// from config/secrets.yml like the cluster PAT, or supplied directly via
+	// the env var. Required when FleetControlPlaneEnabled is true.
+	// SB_FLEET_TOKEN.
+	FleetControlPlaneToken string
+	// FleetControlPlaneContractRefresh is the only locally-pinned cadence: how
+	// often the managed contract (which carries every other tunable) is
+	// re-fetched. Default 5m. SB_FLEET_CONTRACT_REFRESH.
+	FleetControlPlaneContractRefresh time.Duration
+	// FleetLiveSampleInterval is the cadence of the opt-in live CPU/memory
+	// sampler. 0 (the default) disables it: only the reserved axes are emitted,
+	// which is the right posture for most fleets. When > 0 it is clamped up to a
+	// 1s floor (≤1 Hz) so an aggressive value can't hammer the Docker stats
+	// endpoint. Only has any effect on a managed build with a usage reporter
+	// wired; the open-source build emits nothing regardless. SB_FLEET_LIVE_SAMPLE_INTERVAL.
+	FleetLiveSampleInterval time.Duration
 }
 
 // MirrorUpstreamMapping is a single host=shortname pair parsed from
@@ -1080,6 +1112,12 @@ func Load() (Config, error) {
 		SnapshotPushReconcileInterval:    getEnvDuration("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL", 5*time.Minute),
 		SnapshotPushMaxInFlight:          getEnvInt("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT", 2),
 
+		FleetControlPlaneEnabled:         getEnvBool("SB_FLEET_ENABLED", false),
+		FleetControlPlaneEndpoint:        strings.TrimSpace(os.Getenv("SB_FLEET_ENDPOINT")),
+		FleetControlPlaneToken:           strings.TrimSpace(os.Getenv("SB_FLEET_TOKEN")),
+		FleetControlPlaneContractRefresh: getEnvDuration("SB_FLEET_CONTRACT_REFRESH", 5*time.Minute),
+		FleetLiveSampleInterval:          getEnvDuration("SB_FLEET_LIVE_SAMPLE_INTERVAL", 0),
+
 		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
@@ -1186,6 +1224,24 @@ func Load() (Config, error) {
 		}
 		if cfg.SnapshotPushMaxInFlight <= 0 {
 			return Config{}, errors.New("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT must be > 0 when snapshot push is enabled")
+		}
+	}
+
+	if cfg.FleetControlPlaneEnabled {
+		// The control plane is contract-driven: only the reachability +
+		// credential basics are validated locally, mirroring how auto-import
+		// requires its hooks URL + cluster identity before it will boot.
+		if cfg.FleetControlPlaneEndpoint == "" {
+			return Config{}, errors.New("SB_FLEET_ENDPOINT is required when SB_FLEET_ENABLED=true")
+		}
+		if u, err := url.Parse(cfg.FleetControlPlaneEndpoint); err != nil || u.Scheme == "" || u.Host == "" {
+			return Config{}, fmt.Errorf("SB_FLEET_ENDPOINT must be an absolute URL, got %q", cfg.FleetControlPlaneEndpoint)
+		}
+		if cfg.FleetControlPlaneToken == "" {
+			return Config{}, errors.New("SB_FLEET_TOKEN is required when SB_FLEET_ENABLED=true")
+		}
+		if cfg.FleetControlPlaneContractRefresh <= 0 {
+			return Config{}, errors.New("SB_FLEET_CONTRACT_REFRESH must be > 0 when SB_FLEET_ENABLED=true")
 		}
 	}
 

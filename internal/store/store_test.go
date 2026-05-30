@@ -1890,6 +1890,8 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // wake_armed
 			"",             // template_id
 			0,              // overlay_size_gb
+			"",             // owner_ref
+			0,              // fleet_suspended
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

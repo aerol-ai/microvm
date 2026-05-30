@@ -65,7 +65,7 @@ func (s *Service) GetNetworkUsage(ctx context.Context, id string) (*models.Netwo
 		s.logger.Warn("netstats lazy bootstrap failed; counters may be stale",
 			"sandbox_id", id, "error", err)
 	}
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (s *Service) SetNetworkLimits(ctx context.Context, id string, bytesInLimit,
 	if bytesInLimit < 0 || bytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +258,11 @@ func (k netstatsServiceSink) HandleSamples(ctx context.Context, samples []netsta
 				"sandbox_id", sample.SandboxID, "error", err)
 			continue
 		}
+
+		// Mirror the per-tick byte deltas as egress/ingress usage samples
+		// (owner_ref comes off the row we just re-read). No-op without a
+		// reporter; the poller goroutine is already off the request path.
+		k.svc.emitNetworkUsage(ctx, sandbox, sample.BytesIn, sample.BytesOut, sample.SampledAt)
 
 		overIn := sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
 		overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit

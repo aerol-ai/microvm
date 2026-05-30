@@ -421,6 +421,21 @@ SB_AUTO_IMPORT_MAX_IN_FLIGHT=${aocr_max_in_flight}
 EOF
 %{ endif ~}
 
+%{ if fleet_enabled ~}
+cat >> /tmp/aerolvm-ops.env <<'EOF'
+
+# Managed by Terraform bootstrap: fleet control plane (optional).
+# The token is a Bearer secret; cluster.env is root-owned 0600. Every other
+# tunable is fetched from the managed contract API at runtime, so only these
+# four land here. (A file-based token delivery like cluster-pat — read via an
+# SB_FLEET_TOKEN_PATH — is a possible hardening follow-up.)
+SB_FLEET_ENABLED=${fleet_enabled}
+SB_FLEET_ENDPOINT=${fleet_endpoint}
+SB_FLEET_TOKEN=${fleet_token}
+SB_FLEET_CONTRACT_REFRESH=${fleet_contract_refresh}
+EOF
+%{ endif ~}
+
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
 sudo systemctl restart sandboxd
 

@@ -143,6 +143,21 @@ locals {
     reconcile_interval  = local.aocr_enabled ? local.cluster_ops.auto_import.reconcile_interval : "5m"
     max_in_flight       = local.aocr_enabled ? local.cluster_ops.auto_import.max_in_flight : 4
   }
+
+  # Fleet control plane (optional managed integration) — resolved view for
+  # bootstrap.sh.tftpl. Non-secret config (enable toggle, endpoint, contract
+  # refresh) comes from config/cluster.yml; the fleet token is a secret that
+  # lives under a SEPARATE top-level key in config/secrets.yml (fleet.token)
+  # so loading it never clobbers the cluster.yml fleet_control_plane block.
+  # Everything else the integration needs is fetched from the managed contract
+  # API at runtime, so nothing else is templated here.
+  fleet_enabled = local.cluster_ops.fleet_control_plane.enabled
+  fleet = {
+    enabled          = local.fleet_enabled
+    endpoint         = local.fleet_enabled ? local.cluster_ops.fleet_control_plane.endpoint : ""
+    token            = local.fleet_enabled ? local.cluster_secrets.fleet.token : ""
+    contract_refresh = local.fleet_enabled ? local.cluster_ops.fleet_control_plane.contract_refresh : "5m"
+  }
 }
 
 # Plan-time validation of values that come from local.cluster_ops. Terraform
@@ -213,6 +228,30 @@ resource "terraform_data" "validate_cluster_ops" {
     precondition {
       condition     = local.pat_token != ""
       error_message = "cluster.pat_token in config/secrets.yml must be set (shared SB_PAT_TOKEN used by every node for operator/SDK API auth)."
+    }
+
+    precondition {
+      condition = (
+        !local.cluster_ops.fleet_control_plane.enabled
+        || (
+          local.cluster_ops.fleet_control_plane.endpoint != ""
+          && local.cluster_secrets.fleet.token != ""
+        )
+      )
+      error_message = "When fleet_control_plane.enabled = true in config/cluster.yml, fleet_control_plane.endpoint and fleet.token in config/secrets.yml are both required (sandboxd refuses to boot otherwise)."
+    }
+
+    precondition {
+      condition = (
+        !local.cluster_ops.fleet_control_plane.enabled
+        || can(regex("^https?://", local.cluster_ops.fleet_control_plane.endpoint))
+      )
+      error_message = "fleet_control_plane.endpoint must be an absolute http(s) URL."
+    }
+
+    precondition {
+      condition     = can(regex("^[0-9]+(ns|us|ms|s|m|h)$", local.cluster_ops.fleet_control_plane.contract_refresh))
+      error_message = "fleet_control_plane.contract_refresh must be a Go duration such as 30s, 5m, 1h."
     }
   }
 }

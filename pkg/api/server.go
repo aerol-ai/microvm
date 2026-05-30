@@ -21,26 +21,36 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
 type Server struct {
-	logger   *slog.Logger
-	service  *service.Service
-	builder  *docker.Client
-	build    daytona.BuildConfig
-	patToken string
-	mux      *http.ServeMux
+	logger    *slog.Logger
+	service   *service.Service
+	builder   *docker.Client
+	build     daytona.BuildConfig
+	patToken  string
+	validator controlplane.Validator
+	mux       *http.ServeMux
 }
 
-func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, cfg config.Config, patToken string) *Server {
+// NewServer constructs the API server. validator is the second-token (non-PAT)
+// validation path; pass controlplane.Noop().Validator (or any rejecting
+// validator) for the open-source PAT-only behavior. A nil validator is treated
+// as reject-all so callers can't accidentally open the door by omission.
+func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
+	if validator == nil {
+		validator = controlplane.Noop().Validator
+	}
 	s := &Server{
-		logger:   logger,
-		service:  service,
-		builder:  dockerClient,
-		build:    daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
-		patToken: patToken,
-		mux:      http.NewServeMux(),
+		logger:    logger,
+		service:   service,
+		builder:   dockerClient,
+		build:     daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
+		patToken:  patToken,
+		validator: validator,
+		mux:       http.NewServeMux(),
 	}
 	s.routes()
 	return s

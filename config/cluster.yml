@@ -101,3 +101,19 @@ auto_import:
   request_timeout: "15s"
   reconcile_interval: "5m"
   max_in_flight: 4
+
+# --- Fleet control plane --------------------------------------------------
+# Optional managed integration: caller-token validation, fleet usage
+# telemetry, and standing-driven quota enforcement. Off by default — the
+# open-source daemon then accepts only the operator PAT and reports nothing.
+#
+# Deliberately minimal: only the endpoint and a refresh cadence live here.
+# Every operational tunable (account-key field, cache/poll cadences,
+# thresholds and their grace windows, webhook target, delivery sink, the
+# create-gating policy) is pulled at runtime from the managed contract API, so
+# policy changes never require editing this file or redeploying. The fleet
+# token is a secret delivered via config/secrets.yml (see header), not here.
+fleet_control_plane:
+  enabled: false
+  endpoint: ""
+  contract_refresh: "5m"

@@ -26,6 +26,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netstats"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -181,6 +182,37 @@ type Service struct {
 	netstatsReady    atomic.Bool
 	netstatsPoller   *netstats.Poller
 	netstatsLastTick atomic.Int64 // unix nanos; last successful tick for /usage staleness reporting
+
+	// usageReporter ships neutral usage samples toward the managed control
+	// plane. nil on the open-source build (set only by the managed daemon via
+	// SetUsageReporter), so emitUsage is a no-op there and adds zero work. It is
+	// read on background loops (reconcile / event monitor / netstats / live
+	// sampler), never on the request hot path.
+	//
+	// usageCursor tracks, per sandbox, the end of the last reserved-usage window
+	// emitted. The reconcile sweep and the lifecycle event edges both advance it,
+	// so the two sources tile each sandbox's timeline without gaps or overlaps —
+	// a sandbox that starts and dies between heartbeats still gets its tail
+	// emitted from the stop edge. In-memory only; lost on restart (the server
+	// reconciles via window bounds + idempotent EventIDs).
+	usageReporter controlplane.Reporter
+	usageMu       sync.Mutex
+	usageCursor   map[string]time.Time
+
+	// liveCursor holds, per sandbox, the previous live-sampler observation (its
+	// cumulative CPU counter and the time it was read), so the next tick can
+	// difference the CPU counter into vcpu-seconds for the window. Separate from
+	// usageMu so the opt-in live sampler never contends with the reserved-usage
+	// cursor on the reconcile/event paths. nil/empty unless the live sampler runs.
+	liveMu     sync.Mutex
+	liveCursor map[string]liveSamplePoint
+
+	// fleetAdmitter is the managed create-gate: consulted in createSandbox for
+	// owner-scoped (user-token) creates before any capacity is reserved. nil on
+	// the open-source build (set only by the managed daemon via
+	// SetFleetAdmitter), so the gate is skipped entirely there. Its Admit must be
+	// a fast in-memory check — it sits on the create request path.
+	fleetAdmitter controlplane.Admitter
 
 	// netstatsActivity is the per-sandbox "last observed network activity"
 	// timestamp (unix nanos), populated by the netstats poller sink from
@@ -762,6 +794,35 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if req.Image == "" {
 		return nil, errors.New("image is required")
 	}
+
+	// Owner attribution: a validated user token stamps its account onto the
+	// new sandbox; operator/PAT and internal creates are owner-less (""). The
+	// value is resolved once here and applied to whichever runtime path builds
+	// the row below. The account mapping is refreshed here (one write per
+	// create, not per request) so the auth hot path stays write-free; it is
+	// best-effort because attribution on the sandbox row is the source of
+	// truth, and a noop store/owner-less create has nothing to record.
+	ownerRef := ownerRefForCreate(ctx)
+	if ownerRef != "" {
+		access, _ := controlplane.AccessFromContext(ctx)
+		if err := s.store.UpsertAccountMapping(ctx, ownerRef, access.Identity.ExternalID); err != nil {
+			s.logger.Warn("fleet: account mapping upsert failed; attribution still on the sandbox row",
+				"owner_ref", ownerRef, "error", err)
+		}
+		// Fleet create-gate. Owner-scoped creates consult the managed admitter
+		// before any capacity is reserved or Docker/Firecracker is touched, so a
+		// refused create costs nothing. Placed ahead of the runtime branch below
+		// so both the Docker and Firecracker paths are gated by the one check.
+		// Operator/PAT and internal creates (ownerRef == "") skip the gate — the
+		// open-source admitter admits everything anyway. The error is returned
+		// verbatim so apihttp maps ErrAdmissionDenied→403 and
+		// ErrAdmissionUnavailable→503.
+		if s.fleetAdmitter != nil {
+			if err := s.fleetAdmitter.Admit(ctx, ownerRef); err != nil {
+				return nil, err
+			}
+		}
+	}
 	// Custom-domain validation runs early so an invalid or unsupported
 	// payload fails before admission/mounts/docker.Create burn resources.
 	// On success req.CustomDomains is rewritten with the canonical slice.
@@ -977,6 +1038,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 
+	sandbox.OwnerRef = ownerRef
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.docker.Destroy(ctx, sandbox)
@@ -1207,6 +1269,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		return nil, err
 	}
 
+	// Same owner attribution as the docker path; createSandbox already
+	// refreshed the account mapping before dispatching here.
+	sandbox.OwnerRef = ownerRefForCreate(ctx)
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.firecracker.Destroy(ctx, sandbox)
@@ -1319,7 +1384,7 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) ([]models.Mo
 // ListMounts returns the redacted mount config for a sandbox. Credentials are
 // never included in the response — they are write-only via CreateSandbox.
 func (s *Service) ListMounts(ctx context.Context, sandboxID string) ([]models.MountSpecRedacted, error) {
-	if _, err := s.store.Get(ctx, sandboxID); err != nil {
+	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
 		return nil, err
 	}
 	specs, err := s.loadMounts(ctx, sandboxID)
@@ -1352,7 +1417,7 @@ func generateSandboxSSHKeys() (authorizedKey, privateKeyPEM string, err error) {
 }
 
 func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	return s.store.Get(ctx, id)
+	return s.scopedGet(ctx, id)
 }
 
 // ListSandboxes returns sandboxes whose Tags match every entry in tagFilter.
@@ -1367,6 +1432,10 @@ func (s *Service) ListSandboxes(ctx context.Context, tagFilter map[string]string
 	if err != nil {
 		return nil, err
 	}
+	// Owner scoping first: a user token sees only its own sandboxes; operator
+	// and internal callers see all. Applied before the tag filter so a tenant
+	// can't tag-probe across owners.
+	sandboxes = filterByOwnerScope(ctx, sandboxes)
 	if len(tagFilter) == 0 {
 		return sandboxes, nil
 	}
@@ -1391,7 +1460,7 @@ func sandboxMatchesTags(sb *models.Sandbox, want map[string]string) bool {
 }
 
 func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1496,7 +1565,7 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 }
 
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1636,7 +1705,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 
-	sandbox, err := s.store.Get(ctx, sandboxID)
+	sandbox, err := s.scopedGet(ctx, sandboxID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1800,7 +1869,7 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1883,7 +1952,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.validateLifecycle(l); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
-	priorSandbox, err := s.store.Get(ctx, id)
+	priorSandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1934,7 +2003,7 @@ func (s *Service) ExposePort(ctx context.Context, id string, port int, protocol 
 }
 
 func (s *Service) exposePort(ctx context.Context, id string, port int, protocol string, preferredHostPort int) (models.ExposePortResponse, error) {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return models.ExposePortResponse{}, err
 	}
@@ -2272,7 +2341,7 @@ func (s *Service) removeClusterExposedPort(ctx context.Context, sandboxID string
 }
 
 func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -2539,7 +2608,7 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	if err := s.TouchSandbox(ctx, id); err != nil {
 		return ToolboxEndpoint{}, err
 	}
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return ToolboxEndpoint{}, err
 	}
@@ -2633,7 +2702,7 @@ func (s *Service) IsSandboxStarted(ctx context.Context, id string) (bool, error)
 	if s.warmCacheHit(id) {
 		return true, nil
 	}
-	sb, err := s.store.Get(ctx, id)
+	sb, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return false, err
 	}
@@ -3148,6 +3217,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 	}
 	s.mounts.Sweep(keep)
+
+	// Reuse this sweep's already-loaded snapshot to emit one window of reserved
+	// usage (uptime + cpu/mem/disk/gpu). No-op on the open-source build (no
+	// reporter wired). Last so a reporting hiccup can't affect reconcile.
+	s.emitReservedUsage(ctx, known)
 
 	return nil
 }

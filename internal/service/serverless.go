@@ -139,7 +139,10 @@ func (s *Service) consumeExpectedStop(id string) stopMode {
 // recordExpectedStop must be called before docker.Stop so the events
 // handler does not race the stop and classify it as involuntary.
 func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopMode) (*models.Sandbox, error) {
-	sandbox, err := s.store.Get(ctx, id)
+	// scopedGet fences a user token to its own sandbox (cross-owner → 404).
+	// Internal idle-stop/lifecycle callers run with no Access in ctx, so this
+	// stays unscoped for them.
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -482,7 +485,7 @@ func (s *Service) forgetWakeFlight(id string) {
 // StartSandbox; waves to different sandboxes proceed concurrently.
 func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*models.Sandbox, error) {
 	finish := beginWakeMetric()
-	sandbox, err := s.store.Get(ctx, id)
+	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		finish(false, err)
 		return nil, err
