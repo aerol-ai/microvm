@@ -3,7 +3,7 @@
 # Role and Seed tags Terraform sets in nodes.tf.
 #
 # Override the defaults from the CLI without editing this file:
-#   AEROLVM_CLUSTER=prod AEROLVM_REGION=us-east-1 ansible-inventory --graph
+#   AEROLVM_CLUSTER=aerolvm AEROLVM_REGION=us-east-1 ansible-inventory --graph
 
 plugin: amazon.aws.aws_ec2
 
