@@ -59,7 +59,7 @@ environment variables:
 
 ```bash
 export AEROLVM_CLUSTER=prod
-export AEROLVM_REGION=us-west-2
+export AEROLVM_REGION=us-east-1
 ansible-inventory --graph
 ```
 
