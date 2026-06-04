@@ -18,7 +18,7 @@ AerolVM supports multiple container runtimes, giving you a choice between securi
 |---|---|---|
 | Docker | ✅ | Fast startup, broad image compatibility, standard workloads |
 | GVisor | ✅ | Kernel-level isolation without a full VM - ideal for untrusted code |
-| Kata Containers | 🗓 | [Planned] Full VM isolation with hardware virtualization |
+| Firecracker | ✅ | Kernel-level isolation Full VM isolation with hardware virtualization |
 | WebAssembly | 🗓 | [Planned] Ultra-lightweight, portable workloads |
 
 Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the roadmap.
