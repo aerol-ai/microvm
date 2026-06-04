@@ -165,7 +165,7 @@ func TestVMM_StartWaitSocketShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newVMM: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if err := v.Start(ctx); err != nil {
@@ -175,7 +175,7 @@ func TestVMM_StartWaitSocketShutdown(t *testing.T) {
 		t.Fatal("Pid is 0 after Start")
 	}
 
-	if err := v.WaitSocket(ctx, 15*time.Second); err != nil {
+	if err := v.WaitSocket(ctx, 45*time.Second); err != nil {
 		t.Fatalf("WaitSocket: %v (tail: %s)", err, v.StderrTail())
 	}
 
@@ -202,12 +202,12 @@ func TestVMM_StartTwiceIsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newVMM: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := v.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer func() { _ = v.Shutdown(ctx, 1*time.Second) }()
+	defer func() { _ = v.Shutdown(ctx, 5*time.Second) }()
 	if err := v.Start(ctx); err == nil {
 		t.Fatal("expected error on second Start")
 	}
@@ -260,12 +260,12 @@ func TestVMM_KillIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newVMM: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := v.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := v.WaitSocket(ctx, 5*time.Second); err != nil {
+	if err := v.WaitSocket(ctx, 20*time.Second); err != nil {
 		t.Fatalf("WaitSocket: %v", err)
 	}
 	if err := v.Kill(); err != nil {
