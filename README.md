@@ -54,6 +54,7 @@ AerolVM beats the two most common alternatives on the axes that matter most for 
 | **Sandbox startup** | < 90ms | ~200ms | < 90ms |
 | **Runtime isolation** | ✅ Docker, gVisor (user-space kernel), Firecracker (microVM) | Firecracker (microVM) | Docker only |
 | **Sandbox lifetime** | Unlimited | 1 day | Unlimited |
+| **Serveless Sandbox(based on Lambda Arch)** | ✅ | ✗ | ✗ |
 | **TCP + TLS port routing** | ✅ | ✗ | ✗ |
 | **Per-sandbox egress control** | ✅ | ✗ | ✗ |
 | **External storage** | ✅ S3 / NFS / SSHFS / rclone | ✗ | ✗ |
