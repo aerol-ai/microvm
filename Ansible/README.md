@@ -37,10 +37,8 @@ pipx inject ansible-core boto3 botocore
 # Load your SSH key into the agent (per session, no config edit needed).
 ssh-add ~/.ssh/your-aws-key.pem
 
-# Point at your cluster (defaults: cluster=aerolvm, region=us-east-1).
-export AEROLVM_CLUSTER=aerolvm
-export AEROLVM_REGION=us-east-1
-export AWS_PROFILE=default            # if you use named profiles
+# Cluster=aerolvm / region=us-east-1 are the built-in defaults — nothing to set.
+export AWS_PROFILE=default            # only if you use named profiles
 ```
 
 Smoke test:
@@ -54,13 +52,12 @@ ansible-playbook playbooks/ping.yml
 
 `inventory/aws_ec2.yml` is a dynamic inventory plugin — it queries EC2 every
 time you run a playbook. It filters by the `Cluster` tag (default `aerolvm`,
-matches `var.cluster_name` in Terraform) in `us-east-1`. Override either via
-environment variables:
+matches `var.cluster_name` in Terraform) in `us-east-1`. Those defaults match a
+standard deploy, so **you normally set nothing**. Only if your fleet uses a
+different cluster name or region, override inline for that one command:
 
 ```bash
-export AEROLVM_CLUSTER=prod
-export AEROLVM_REGION=us-east-1
-ansible-inventory --graph
+AEROLVM_CLUSTER=prod AEROLVM_REGION=us-west-2 ansible-inventory --graph
 ```
 
 You'll get groups for free, derived from the tags Terraform sets:
@@ -144,8 +141,8 @@ cluster name are per-machine and don't belong in it. Use:
 - `ssh-add ~/.ssh/<your-key>.pem` for the key (persist on macOS with
   `ssh-add --apple-use-keychain`). Once loaded, `ansible-playbook` picks it
   up via the agent — no `--private-key` flag, no config edit.
-- `AEROLVM_CLUSTER`, `AEROLVM_REGION`, `AWS_PROFILE` env vars for cluster
-  selection (the dynamic inventory reads these directly).
+- `AWS_PROFILE` env var if you use named profiles. (`AEROLVM_CLUSTER` /
+  `AEROLVM_REGION` default to `aerolvm` / `us-east-1` — set them only to override.)
 - `Ansible/ansible.local.cfg` (gitignored) + `ANSIBLE_CONFIG=$PWD/Ansible/ansible.local.cfg`
   if you genuinely need to override `ansible.cfg` settings locally.
 
