@@ -1,6 +1,7 @@
 # AerolVM
 
 [![Tests](https://github.com/aerol-ai/microvm/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aerol-ai/microvm/actions/workflows/test.yml)
+[![Coverage](https://codecov.io/gh/aerol-ai/microvm/branch/main/graph/badge.svg)](https://codecov.io/gh/aerol-ai/microvm)
 [![Release](https://github.com/aerol-ai/microvm/actions/workflows/release.yml/badge.svg?event=release)](https://github.com/aerol-ai/microvm/actions/workflows/release.yml)
 [![Publish SDKs](https://github.com/aerol-ai/microvm/actions/workflows/publish-sdks.yml/badge.svg)](https://github.com/aerol-ai/microvm/actions/workflows/publish-sdks.yml)
 
