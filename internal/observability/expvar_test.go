@@ -3,6 +3,7 @@ package observability
 import (
 	"expvar"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 )
@@ -46,4 +47,96 @@ func hasIntSample(samples []ExpvarSample, name, labelName, labelValue string, wa
 		}
 	}
 	return false
+}
+
+// rawVar is a minimal expvar.Var whose String() returns its value verbatim.
+// expvar.String quotes its output (JSON), so we use this to exercise the
+// default branch in sampleFromExpvar that parses bare numeric strings.
+type rawVar string
+
+func (r rawVar) String() string { return string(r) }
+
+func TestSampleFromExpvar(t *testing.T) {
+	t.Run("expvar_int", func(t *testing.T) {
+		v := new(expvar.Int)
+		v.Set(42)
+		s, ok := sampleFromExpvar("m", nil, v)
+		if !ok || s.Int64 == nil || *s.Int64 != 42 {
+			t.Fatalf("expected Int64=42, got ok=%v sample=%+v", ok, s)
+		}
+		if s.Float != nil {
+			t.Fatal("expected Float nil for Int var")
+		}
+	})
+
+	t.Run("expvar_float_valid", func(t *testing.T) {
+		v := new(expvar.Float)
+		v.Set(3.14)
+		s, ok := sampleFromExpvar("m", nil, v)
+		if !ok || s.Float == nil {
+			t.Fatalf("expected Float sample, got ok=%v sample=%+v", ok, s)
+		}
+		if math.Abs(*s.Float-3.14) > 1e-9 {
+			t.Fatalf("Float = %v, want 3.14", *s.Float)
+		}
+	})
+
+	t.Run("expvar_float_nan_filtered", func(t *testing.T) {
+		v := new(expvar.Float)
+		v.Set(math.NaN())
+		_, ok := sampleFromExpvar("m", nil, v)
+		if ok {
+			t.Fatal("NaN float should be filtered (ok=false)")
+		}
+	})
+
+	t.Run("expvar_float_inf_filtered", func(t *testing.T) {
+		v := new(expvar.Float)
+		v.Set(math.Inf(1))
+		_, ok := sampleFromExpvar("m", nil, v)
+		if ok {
+			t.Fatal("+Inf float should be filtered (ok=false)")
+		}
+	})
+
+	t.Run("string_backed_int", func(t *testing.T) {
+		// A custom expvar.Var whose String() returns a bare integer (no JSON quotes).
+		// This exercises the default branch that falls through to ParseInt.
+		s, ok := sampleFromExpvar("m", nil, rawVar("99"))
+		if !ok || s.Int64 == nil || *s.Int64 != 99 {
+			t.Fatalf("expected Int64=99, got ok=%v sample=%+v", ok, s)
+		}
+	})
+
+	t.Run("string_backed_float", func(t *testing.T) {
+		s, ok := sampleFromExpvar("m", nil, rawVar("2.718"))
+		if !ok || s.Float == nil {
+			t.Fatalf("expected Float sample, got ok=%v sample=%+v", ok, s)
+		}
+		if math.Abs(*s.Float-2.718) > 1e-9 {
+			t.Fatalf("Float = %v, want 2.718", *s.Float)
+		}
+	})
+
+	t.Run("string_unparseable_filtered", func(t *testing.T) {
+		_, ok := sampleFromExpvar("m", nil, rawVar("not-a-number"))
+		if ok {
+			t.Fatal("unparseable string should be filtered (ok=false)")
+		}
+	})
+
+	t.Run("labels_copied", func(t *testing.T) {
+		v := new(expvar.Int)
+		v.Set(1)
+		labels := []ExpvarLabel{{Name: "k", Value: "v"}}
+		s, ok := sampleFromExpvar("m", labels, v)
+		if !ok || len(s.Labels) != 1 || s.Labels[0].Name != "k" {
+			t.Fatalf("labels not propagated: ok=%v sample=%+v", ok, s)
+		}
+		// mutating original labels must not affect the stored copy
+		labels[0].Value = "changed"
+		if s.Labels[0].Value != "v" {
+			t.Fatal("labels were not deep-copied")
+		}
+	})
 }

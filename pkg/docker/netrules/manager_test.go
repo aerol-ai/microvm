@@ -1,6 +1,9 @@
 package netrules
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 func TestManagerDisabledAndNilGuards(t *testing.T) {
 	var nilMgr *Manager
@@ -52,5 +55,18 @@ func TestNew_DisabledReturnsDisabledManager(t *testing.T) {
 	}
 	if m == nil || m.Enabled() {
 		t.Fatalf("New(false) = %+v, want non-nil disabled manager", m)
+	}
+}
+
+func TestNew_EnabledOnNonLinux(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("this test covers the non-Linux branch only")
+	}
+	m, err := New(true)
+	if err != nil {
+		t.Fatalf("New(true) on non-Linux err = %v", err)
+	}
+	if m == nil || m.Enabled() {
+		t.Fatalf("New(true) on non-Linux = %+v, want non-nil disabled manager", m)
 	}
 }
