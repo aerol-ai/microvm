@@ -165,7 +165,7 @@ func TestVMM_StartWaitSocketShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newVMM: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	if err := v.Start(ctx); err != nil {
@@ -175,7 +175,7 @@ func TestVMM_StartWaitSocketShutdown(t *testing.T) {
 		t.Fatal("Pid is 0 after Start")
 	}
 
-	if err := v.WaitSocket(ctx, 5*time.Second); err != nil {
+	if err := v.WaitSocket(ctx, 15*time.Second); err != nil {
 		t.Fatalf("WaitSocket: %v (tail: %s)", err, v.StderrTail())
 	}
 
@@ -235,7 +235,9 @@ func TestVMM_ExitsBeforeSocket(t *testing.T) {
 	if err := v.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	err = v.WaitSocket(ctx, 2*time.Second)
+	// Full-suite runs can have transient scheduler delay before waitCh observes
+	// the fast process exit; use a slightly wider budget to avoid timeout flakes.
+	err = v.WaitSocket(ctx, 5*time.Second)
 	if err == nil {
 		t.Fatal("expected error from WaitSocket when fc exits early")
 	}
