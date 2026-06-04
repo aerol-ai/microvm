@@ -92,15 +92,15 @@ For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-
 ┌─────────────────────────────────────────────────────┐
 │                    sandboxd                         │
 │                                                     │
-│  ┌──────────┐   ┌──────────┐   ┌─────────────────┐ │
-│  │  HTTP    │   │ Service  │   │    SQLite store  │ │
-│  │  API v1  │──▶│  layer   │──▶│  (WAL, 1-writer) │ │
-│  └──────────┘   └────┬─────┘   └─────────────────┘ │
+│  ┌──────────┐   ┌──────────┐   ┌─────────────────┐  │
+│  │  HTTP    │   │ Service  │   │    SQLite store │  │
+│  │  API v1  │──▶│  layer   │──▶│  (WAL, 1-writer)│  │
+│  └──────────┘   └────┬─────┘   └─────────────────┘  │
 │                      │                              │
 │          ┌───────────┼───────────┐                  │
 │          ▼           ▼           ▼                  │
 │       Docker      Caddy      SSH gateway            │
-│    gVisor/FC    admin API    (Ed25519)               │
+│    gVisor/FC    admin API    (Ed25519)              │
 └─────────────────────────────────────────────────────┘
 ```
 
