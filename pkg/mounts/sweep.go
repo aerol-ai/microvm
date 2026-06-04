@@ -16,9 +16,13 @@ import (
 // because mount tools (mountpoint-s3, sshfs, rclone) don't all show up under
 // a single name and we want to match by argv path.
 func killFUSEProcessesFor(logger *slog.Logger, dir string) {
-	entries, err := os.ReadDir("/proc")
+	killFUSEProcessesInRoot(logger, dir, "/proc")
+}
+
+func killFUSEProcessesInRoot(logger *slog.Logger, dir, procRoot string) {
+	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		// /proc not available (non-Linux test, container without /proc, etc.).
+		// procRoot not available (non-Linux test, container without /proc, etc.).
 		return
 	}
 	dirSlash := dir
@@ -35,7 +39,7 @@ func killFUSEProcessesFor(logger *slog.Logger, dir string) {
 		if err != nil {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join("/proc", name, "cmdline"))
+		raw, err := os.ReadFile(filepath.Join(procRoot, name, "cmdline"))
 		if err != nil {
 			continue
 		}
