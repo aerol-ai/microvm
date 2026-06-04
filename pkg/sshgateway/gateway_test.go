@@ -1,10 +1,12 @@
 package sshgateway
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -16,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -130,11 +134,11 @@ func TestDemuxDockerStream(t *testing.T) {
 		copy(out[8:], payload)
 		return out
 	}
-	input := bytes.NewReader(append(frame(1, "hi"), frame(2, "err")...))
+	input := bytes.NewReader(append(append(frame(1, "hi"), make([]byte, 8)...), frame(2, "err")...))
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	demuxDockerStream(fakeChannel{stdout: stdout, stderr: stderr}, input)
+	demuxDockerStream(&fakeChannel{stdout: stdout, stderr: stderr}, input)
 
 	if stdout.String() != "hi" {
 		t.Errorf("stdout = %q, want hi", stdout.String())
@@ -168,6 +172,46 @@ func TestParseSSHUser(t *testing.T) {
 				t.Fatalf("got (%q,%q,%q), want (%q,%q,%q)", id, mode, sess, tc.wantID, tc.wantMode, tc.wantSession)
 			}
 		})
+	}
+}
+
+func TestKeysEqual(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "id")
+	signer, err := LoadOrGenerateHostKey(keyPath)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateHostKey: %v", err)
+	}
+	otherSigner, err := LoadOrGenerateHostKey(filepath.Join(t.TempDir(), "other"))
+	if err != nil {
+		t.Fatalf("LoadOrGenerateHostKey(other): %v", err)
+	}
+
+	if keysEqual(nil, signer.PublicKey()) {
+		t.Fatal("keysEqual(nil, key) = true, want false")
+	}
+	if keysEqual(signer.PublicKey(), nil) {
+		t.Fatal("keysEqual(key, nil) = true, want false")
+	}
+	if !keysEqual(signer.PublicKey(), signer.PublicKey()) {
+		t.Fatal("keysEqual(key, key) = false, want true")
+	}
+	if keysEqual(signer.PublicKey(), otherSigner.PublicKey()) {
+		t.Fatal("keysEqual(key, other) = true, want false")
+	}
+}
+
+func TestLoadOrGenerateHostKeyExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "host_key")
+	first, err := LoadOrGenerateHostKey(path)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateHostKey(first): %v", err)
+	}
+	second, err := LoadOrGenerateHostKey(path)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateHostKey(second): %v", err)
+	}
+	if !keysEqual(first.PublicKey(), second.PublicKey()) {
+		t.Fatal("reloaded host key does not match the original key")
 	}
 }
 
@@ -207,6 +251,19 @@ func TestNewAndStart(t *testing.T) {
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("Start did not return after context cancellation")
+		}
+	})
+
+	t.Run("start-listen-error", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		defer listener.Close()
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		g := &Gateway{logger: logger, listenOn: listener.Addr().String()}
+		if err := g.Start(context.Background()); err == nil {
+			t.Fatalf("expected Start to fail when the address is already in use")
 		}
 	})
 }
@@ -281,6 +338,22 @@ func TestPublicKeyCallback(t *testing.T) {
 		defer func() { lookup.err = nil }()
 		if _, err := cb(fakeConnMetadata{user: "sb-1"}, signer.PublicKey()); err == nil {
 			t.Fatalf("expected permission denied when sandbox lookup fails")
+		}
+	})
+
+	t.Run("deny-invalid-stored-key", func(t *testing.T) {
+		lookup.sandbox.SSHPublicKey = "not-a-key"
+		defer func() { lookup.sandbox.SSHPublicKey = authorized }()
+		if _, err := cb(fakeConnMetadata{user: "sb-1"}, signer.PublicKey()); err == nil {
+			t.Fatalf("expected permission denied for invalid stored key")
+		}
+	})
+
+	t.Run("deny-empty-container-id", func(t *testing.T) {
+		lookup.sandbox.ContainerID = ""
+		defer func() { lookup.sandbox.ContainerID = "ctr-1" }()
+		if _, err := cb(fakeConnMetadata{user: "sb-1"}, signer.PublicKey()); err == nil {
+			t.Fatalf("expected permission denied for empty container id")
 		}
 	})
 }
@@ -384,20 +457,301 @@ func TestFindOrCreateSession(t *testing.T) {
 	})
 }
 
+func TestHandleSessionSandboxUnavailableWritesErrorAndExit(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stderr := &bytes.Buffer{}
+	g := &Gateway{logger: logger, svc: &fakeLookup{err: os.ErrNotExist}}
+	requests := make(chan *ssh.Request)
+	close(requests)
+	g.handleSession(context.Background(), "sb-1", "exec", "", &fakeChannel{stdout: io.Discard, stderr: stderr}, requests)
+	if !bytes.Contains(stderr.Bytes(), []byte("sandbox unavailable")) {
+		t.Fatalf("stderr = %q, want sandbox unavailable", stderr.String())
+	}
+}
+
+func TestRunExecFailurePaths(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("create-failure", func(t *testing.T) {
+		stderr := &bytes.Buffer{}
+		channel := &fakeChannel{stdout: io.Discard, stderr: stderr}
+		g := &Gateway{logger: logger, svc: &fakeLookup{}, dockerCli: &fakeDockerExec{createErr: errors.New("boom")}}
+		g.runExec(context.Background(), channel, "sb-1", "ctr-1", []string{"sh"}, &sessionState{})
+		if !bytes.Contains(stderr.Bytes(), []byte("failed to start session")) {
+			t.Fatalf("stderr = %q, want failed to start session", stderr.String())
+		}
+		if got := channel.exitStatus(); got != 1 {
+			t.Fatalf("exit status = %d, want 1", got)
+		}
+	})
+
+	t.Run("start-failure", func(t *testing.T) {
+		stderr := &bytes.Buffer{}
+		channel := &fakeChannel{stdout: io.Discard, stderr: stderr}
+		g := &Gateway{logger: logger, svc: &fakeLookup{}, dockerCli: &fakeDockerExec{createID: "exec-1", startErr: errors.New("boom")}}
+		g.runExec(context.Background(), channel, "sb-1", "ctr-1", []string{"sh"}, &sessionState{})
+		if !bytes.Contains(stderr.Bytes(), []byte("failed to attach session")) {
+			t.Fatalf("stderr = %q, want failed to attach session", stderr.String())
+		}
+		if got := channel.exitStatus(); got != 1 {
+			t.Fatalf("exit status = %d, want 1", got)
+		}
+	})
+}
+
+func TestAttachToSessionDialFailure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/sessions" {
+			_, _ = w.Write([]byte(`{"sessions":[{"id":"sess-1","name":"prod","status":"running"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	host, portStr, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi: %v", err)
+	}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	channel := &fakeChannel{stdout: stdout, stderr: stderr}
+	g := &Gateway{logger: logger, toolboxPort: port}
+	code := g.attachToSession(context.Background(), channel, &models.Sandbox{ContainerIP: host}, "prod", &sessionState{})
+	if code != 1 {
+		t.Fatalf("attachToSession exit code = %d, want 1", code)
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("attach dial failed")) {
+		t.Fatalf("stderr = %q, want attach dial failed", stderr.String())
+	}
+}
+
+func TestHandleConnExecMode(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dockerCli := &fakeDockerExec{
+		createID:     "exec-1",
+		startSession: newTestExecSession(t, "hello from exec"),
+		inspectCode:  7,
+	}
+	lookup := &fakeLookup{sandbox: &models.Sandbox{
+		ID:          "sb-1",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-1",
+	}}
+	g := &Gateway{logger: logger, svc: lookup, dockerCli: dockerCli}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	channel := &fakeChannel{stdout: stdout, stderr: stderr}
+	requests := make(chan *ssh.Request, 4)
+	done := make(chan struct{})
+	go func() {
+		g.handleSession(context.Background(), "sb-1", "exec", "", channel, requests)
+		close(done)
+	}()
+
+	requests <- &ssh.Request{Type: "pty-req", Payload: bytes.Join([][]byte{
+		encodeString("xterm-256color"),
+		encodeUint32(120),
+		encodeUint32(40),
+		encodeUint32(0),
+		encodeUint32(0),
+		encodeString(""),
+	}, nil)}
+	requests <- &ssh.Request{Type: "env", Payload: append(encodeString("LANG"), encodeString("en_US.UTF-8")...)}
+	requests <- &ssh.Request{Type: "window-change", Payload: bytes.Join([][]byte{
+		encodeUint32(120),
+		encodeUint32(40),
+		encodeUint32(0),
+		encodeUint32(0),
+	}, nil)}
+	requests <- &ssh.Request{Type: "exec", Payload: encodeString("printf hello")}
+	close(requests)
+	waitForDone(t, done)
+	if stdout.String() != "hello from exec" {
+		t.Fatalf("stdout = %q, want hello from exec", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if got := channel.exitStatus(); got != 7 {
+		t.Fatalf("exit status = %d, want 7", got)
+	}
+	if dockerCli.createContainerID != "ctr-1" || !dockerCli.createTTY {
+		t.Fatalf("ExecCreate args = %+v", dockerCli)
+	}
+	if dockerCli.resizeExecID != "exec-1" || dockerCli.resizeHeight != 40 || dockerCli.resizeWidth != 120 {
+		t.Fatalf("ExecResize args = %+v", dockerCli)
+	}
+	if dockerCli.inspectExecID != "exec-1" {
+		t.Fatalf("ExecInspect execID = %q, want exec-1", dockerCli.inspectExecID)
+	}
+	if len(dockerCli.createEnv) != 2 {
+		t.Fatalf("ExecCreate env = %#v, want TERM plus LANG", dockerCli.createEnv)
+	}
+}
+
+func TestHandleConnSessionModeAttach(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	getAuthCh := make(chan string, 1)
+	postAuthCh := make(chan string, 1)
+	postBodyCh := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/sessions":
+			getAuthCh <- r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/sessions":
+			postAuthCh <- r.Header.Get("Authorization")
+			body, _ := io.ReadAll(r.Body)
+			postBodyCh <- body
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"sess-1","name":"default","status":"running"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/sessions/sess-1/attach":
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{streamFramePrefixStdout}, []byte("attached")...))
+				_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{streamFramePrefixStderr}, []byte("warn")...))
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"exit","code":13}`))
+			}()
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	host, portStr, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi: %v", err)
+	}
+
+	lookup := &fakeLookup{sandbox: &models.Sandbox{
+		ID:           "sb-1",
+		Status:       models.SandboxStatusStarted,
+		ContainerID:  "ctr-1",
+		ContainerIP:  host,
+		ToolboxToken: "tok",
+	}}
+	g := &Gateway{logger: logger, svc: lookup, toolboxPort: port}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	channel := &fakeChannel{stdout: stdout, stderr: stderr}
+	requests := make(chan *ssh.Request, 2)
+	done := make(chan struct{})
+	go func() {
+		g.handleSession(context.Background(), "sb-1", "session", "prod", channel, requests)
+		close(done)
+	}()
+
+	requests <- &ssh.Request{Type: "pty-req", Payload: bytes.Join([][]byte{
+		encodeString("xterm-256color"),
+		encodeUint32(120),
+		encodeUint32(40),
+		encodeUint32(0),
+		encodeUint32(0),
+		encodeString(""),
+	}, nil)}
+	requests <- &ssh.Request{Type: "shell"}
+	close(requests)
+	waitForDone(t, done)
+
+	if got := <-getAuthCh; got != "Bearer tok" {
+		t.Fatalf("GET auth = %q, want Bearer tok", got)
+	}
+	if got := <-postAuthCh; got != "Bearer tok" {
+		t.Fatalf("POST auth = %q, want Bearer tok", got)
+	}
+	var createReq models.CreateSessionRequest
+	if err := json.Unmarshal(<-postBodyCh, &createReq); err != nil {
+		t.Fatalf("unmarshal create request: %v", err)
+	}
+	if createReq.Name != "prod" || !createReq.PTY || createReq.Cols != 120 || createReq.Rows != 40 {
+		t.Fatalf("create request = %+v", createReq)
+	}
+	if stdout.String() != "attached" {
+		t.Fatalf("stdout = %q, want attached", stdout.String())
+	}
+	if stderr.String() != "warn" {
+		t.Fatalf("stderr = %q, want warn", stderr.String())
+	}
+	if got := channel.exitStatus(); got != 13 {
+		t.Fatalf("exit status = %d, want 13", got)
+	}
+}
+
+func waitForDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for handleSession")
+	}
+}
+
+func newTestExecSession(t *testing.T, output string) *docker.ExecSession {
+	t.Helper()
+	local, remote := net.Pipe()
+	go func() {
+		_, _ = io.Copy(io.Discard, remote)
+	}()
+	t.Cleanup(func() {
+		_ = local.Close()
+		_ = remote.Close()
+	})
+	return &docker.ExecSession{
+		ID:     "exec-1",
+		Conn:   local,
+		Reader: bufio.NewReader(bytes.NewReader([]byte(output))),
+	}
+}
+
 // fakeChannel is the smallest ssh.Channel surface we need for demuxDockerStream.
 type fakeChannel struct {
-	stdout io.Writer
-	stderr io.Writer
+	stdout   io.Writer
+	stderr   io.Writer
+	requests []recordedRequest
 }
 
 func (f fakeChannel) Read(p []byte) (int, error)  { return 0, io.EOF }
 func (f fakeChannel) Write(p []byte) (int, error) { return f.stdout.Write(p) }
 func (f fakeChannel) Close() error                { return nil }
 func (f fakeChannel) CloseWrite() error           { return nil }
-func (f fakeChannel) SendRequest(string, bool, []byte) (bool, error) {
-	return false, nil
+func (f fakeChannel) Stderr() io.ReadWriter       { return stderrAdapter{w: f.stderr} }
+
+type recordedRequest struct {
+	name      string
+	wantReply bool
+	payload   []byte
 }
-func (f fakeChannel) Stderr() io.ReadWriter { return stderrAdapter{w: f.stderr} }
+
+func (f *fakeChannel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
+	f.requests = append(f.requests, recordedRequest{name: name, wantReply: wantReply, payload: append([]byte(nil), payload...)})
+	return true, nil
+}
+
+func (f *fakeChannel) exitStatus() uint32 {
+	for _, req := range f.requests {
+		if req.name != "exit-status" || len(req.payload) != 4 {
+			continue
+		}
+		return binary.BigEndian.Uint32(req.payload)
+	}
+	return 0
+}
 
 type stderrAdapter struct{ w io.Writer }
 
@@ -429,4 +783,71 @@ func (f fakeConnMetadata) RemoteAddr() net.Addr {
 }
 func (f fakeConnMetadata) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 22}
+}
+
+type fakeDockerExec struct {
+	createContainerID string
+	createCmd         []string
+	createEnv         []string
+	createWorkdir     string
+	createTTY         bool
+	createErr         error
+	createID          string
+
+	startExecID  string
+	startTTY     bool
+	startErr     error
+	startSession *docker.ExecSession
+
+	resizeExecID string
+	resizeHeight int
+	resizeWidth  int
+	resizeErr    error
+
+	inspectExecID  string
+	inspectCode    int
+	inspectRunning bool
+	inspectErr     error
+}
+
+func (f *fakeDockerExec) ExecCreate(ctx context.Context, containerID string, cmd []string, env []string, workdir string, tty bool) (string, error) {
+	f.createContainerID = containerID
+	f.createCmd = append([]string(nil), cmd...)
+	f.createEnv = append([]string(nil), env...)
+	f.createWorkdir = workdir
+	f.createTTY = tty
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	if f.createID != "" {
+		return f.createID, nil
+	}
+	return "exec-1", nil
+}
+
+func (f *fakeDockerExec) ExecStart(ctx context.Context, execID string, tty bool) (*docker.ExecSession, error) {
+	f.startExecID = execID
+	f.startTTY = tty
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
+	if f.startSession == nil {
+		return nil, io.EOF
+	}
+	return f.startSession, nil
+}
+
+func (f *fakeDockerExec) ExecResize(ctx context.Context, execID string, height, width int) error {
+	f.resizeExecID = execID
+	f.resizeHeight = height
+	f.resizeWidth = width
+	return f.resizeErr
+}
+
+func (f *fakeDockerExec) ExecInspect(ctx context.Context, execID string) (int, bool, error) {
+	f.inspectExecID = execID
+	if f.inspectErr != nil {
+		return 0, false, f.inspectErr
+	}
+	return f.inspectCode, f.inspectRunning, nil
 }
