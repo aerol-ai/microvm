@@ -251,6 +251,88 @@ func TestDaytonaGitRoutes(t *testing.T) {
 	})
 }
 
+func TestDaytonaFileAndGitRouteErrors(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+	h := srv.routes()
+
+	t.Run("files_info_missing_path", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/files/info", nil)
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("files_info_not_found", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/files/info?path=/definitely/missing/file", nil)
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("files_search_errors", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/files/search?path=/tmp", nil)
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("missing pattern status = %d, want 400", rr.Code)
+		}
+
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "/files/search?path=/tmp&pattern=[", nil)
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("invalid pattern status = %d, want 400", rr.Code)
+		}
+	})
+
+	t.Run("files_move_errors", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/files/move?destination=/tmp/x", nil)
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("missing source status = %d, want 400", rr.Code)
+		}
+	})
+
+	repo := initGitRepo(t)
+	t.Run("git_body_and_validation_errors", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/git/add", strings.NewReader(`{"path":"`+repo+`"}`))
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("git add missing files status = %d, want 400", rr.Code)
+		}
+
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/git/commit", strings.NewReader(`{"path":"`+repo+`"}`))
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("git commit missing fields status = %d, want 400", rr.Code)
+		}
+
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "/git/status", nil)
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("git status missing path status = %d, want 400", rr.Code)
+		}
+	})
+
+	t.Run("git_error_mapping_from_command_failure", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		badCheckout := `{"path":"` + repo + `","branch":"definitely-not-a-branch"}`
+		req := httptest.NewRequest(http.MethodPost, "/git/checkout", strings.NewReader(badCheckout))
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("git checkout invalid branch status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
 func initGitRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -80,6 +82,58 @@ func TestEnvdFilesystemRoutes(t *testing.T) {
 		}
 		if _, err := os.Stat(movedDir); !os.IsNotExist(err) {
 			t.Fatalf("expected removed dir, stat err=%v", err)
+		}
+	})
+
+	t.Run("octet_stream_write_plain_and_gzip", func(t *testing.T) {
+		plainPath := filepath.Join(root, "plain.txt")
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, envdPrefix+"/files?path="+plainPath, strings.NewReader("plain-body"))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		req.Header.Set("Content-Type", "application/octet-stream")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("plain octet status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		if got, err := os.ReadFile(plainPath); err != nil || string(got) != "plain-body" {
+			t.Fatalf("plain write mismatch got=%q err=%v", string(got), err)
+		}
+
+		gzPath := filepath.Join(root, "gzip.txt")
+		var compressed bytes.Buffer
+		zw := gzip.NewWriter(&compressed)
+		_, _ = zw.Write([]byte("gzip-body"))
+		_ = zw.Close()
+
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/files?path="+gzPath, bytes.NewReader(compressed.Bytes()))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Content-Encoding", "gzip")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("gzip octet status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		if got, err := os.ReadFile(gzPath); err != nil || string(got) != "gzip-body" {
+			t.Fatalf("gzip write mismatch got=%q err=%v", string(got), err)
+		}
+	})
+
+	t.Run("filesystem_error_mapping", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/Stat", strings.NewReader(`{"path":"/definitely/missing/file"}`))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("stat missing status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+		}
+
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/Remove", strings.NewReader(`{"path":"/definitely/missing/file"}`))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("remove missing status = %d, want 404; body=%s", rr.Code, rr.Body.String())
 		}
 	})
 }
@@ -201,6 +255,38 @@ func TestEnvdProcessRoutes(t *testing.T) {
 		h.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("send signal status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendSignal", strings.NewReader(`{"process":{"tag":"`+runningTag+`"},"signal":"BOGUS"}`))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("unsupported signal status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("process_not_found_and_bad_connect_envelope", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/Connect", bytes.NewReader(encodeConnectEnvelopeForTest([]byte(`{"process":{"tag":"missing"}}`))))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		req.Header.Set("Content-Type", "application/connect+json")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("connect missing status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+		}
+
+		header := make([]byte, connectEnvelopeHeaderLen)
+		header[0] = connectFlagCompressed
+		binary.BigEndian.PutUint32(header[1:], 2)
+		payload := append(header, []byte("{}")...)
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/Connect", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer toolbox-token")
+		req.Header.Set("Content-Type", "application/connect+json")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("compressed envelope status = %d, want 400; body=%s", rr.Code, rr.Body.String())
 		}
 	})
 }
