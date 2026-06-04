@@ -530,6 +530,323 @@ func TestAttachToSessionDialFailure(t *testing.T) {
 	}
 }
 
+func TestAttachToSessionCloseWithoutExit(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/sessions":
+			_, _ = w.Write([]byte(`{"sessions":[{"id":"sess-1","name":"default","status":"running"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/sessions/sess-1/attach":
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	host, portStr, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi: %v", err)
+	}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	channel := &fakeChannel{stdout: stdout, stderr: stderr}
+	g := &Gateway{logger: logger, toolboxPort: port}
+	code := g.attachToSession(context.Background(), channel, &models.Sandbox{ContainerIP: host}, "", &sessionState{})
+	if code != 1 {
+		t.Fatalf("attachToSession exit code = %d, want 1", code)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("unexpected channel output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestHandleConnExecModeOverTCP(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	signerPath := filepath.Join(t.TempDir(), "host_key")
+	signer, err := LoadOrGenerateHostKey(signerPath)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateHostKey: %v", err)
+	}
+	authorized := string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+	dockerCli := &fakeDockerExec{
+		createID:     "exec-1",
+		startSession: newTestExecSession(t, "hello over tcp"),
+		inspectCode:  7,
+	}
+	lookup := &fakeLookup{sandbox: &models.Sandbox{
+		ID:           "sb-1",
+		Status:       models.SandboxStatusStarted,
+		ContainerID:  "ctr-1",
+		SSHPublicKey: authorized,
+	}}
+	g := &Gateway{logger: logger, svc: lookup, dockerCli: dockerCli, signer: signer}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		g.handleConn(context.Background(), conn)
+	}()
+
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	clientConfig := &ssh.ClientConfig{
+		User:            "sb-1",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+	clientConnSSH, chans, reqs, err := ssh.NewClientConn(clientConn, listener.Addr().String(), clientConfig)
+	if err != nil {
+		t.Fatalf("NewClientConn: %v", err)
+	}
+	client := ssh.NewClient(clientConnSSH, chans, reqs)
+	channel, requests, err := client.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("OpenChannel: %v", err)
+	}
+	exitCh := captureExitStatus(requests)
+
+	if ok, err := channel.SendRequest("pty-req", true, bytes.Join([][]byte{
+		encodeString("xterm-256color"),
+		encodeUint32(120),
+		encodeUint32(40),
+		encodeUint32(0),
+		encodeUint32(0),
+		encodeString(""),
+	}, nil)); err != nil || !ok {
+		t.Fatalf("pty-req failed: ok=%v err=%v", ok, err)
+	}
+	if ok, err := channel.SendRequest("exec", true, encodeString("printf hello")); err != nil || !ok {
+		t.Fatalf("exec failed: ok=%v err=%v", ok, err)
+	}
+	_ = channel.CloseWrite()
+	stdout, err := io.ReadAll(channel)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if string(stdout) != "hello over tcp" {
+		t.Fatalf("stdout = %q, want hello over tcp", string(stdout))
+	}
+	if got := waitForExitStatus(t, exitCh); got != 7 {
+		t.Fatalf("exit status = %d, want 7", got)
+	}
+	_ = channel.Close()
+	_ = client.Close()
+	_ = clientConn.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for handleConn")
+	}
+	if dockerCli.createContainerID != "ctr-1" || !dockerCli.createTTY {
+		t.Fatalf("ExecCreate args = %+v", dockerCli)
+	}
+	if dockerCli.inspectExecID != "exec-1" {
+		t.Fatalf("ExecInspect execID = %q, want exec-1", dockerCli.inspectExecID)
+	}
+}
+
+func TestHandleConnRejectsNonSessionChannel(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	signerPath := filepath.Join(t.TempDir(), "host_key")
+	signer, err := LoadOrGenerateHostKey(signerPath)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateHostKey: %v", err)
+	}
+	lookup := &fakeLookup{sandbox: &models.Sandbox{
+		ID:           "sb-1",
+		Status:       models.SandboxStatusStarted,
+		ContainerID:  "ctr-1",
+		SSHPublicKey: string(ssh.MarshalAuthorizedKey(signer.PublicKey())),
+	}}
+	g := &Gateway{logger: logger, svc: lookup, signer: signer}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		g.handleConn(context.Background(), conn)
+	}()
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	clientConfig := &ssh.ClientConfig{
+		User:            "sb-1",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+	clientConnSSH, chans, reqs, err := ssh.NewClientConn(clientConn, listener.Addr().String(), clientConfig)
+	if err != nil {
+		t.Fatalf("NewClientConn: %v", err)
+	}
+	client := ssh.NewClient(clientConnSSH, chans, reqs)
+	if _, _, err := client.OpenChannel("weird", nil); err == nil {
+		t.Fatal("expected non-session channel to be rejected")
+	}
+	_ = client.Close()
+	_ = clientConn.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for handleConn")
+	}
+}
+
+func TestHandleConnHandshakeFailure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := &Gateway{logger: logger}
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleConn(context.Background(), serverConn)
+	}()
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for handshake failure")
+	}
+}
+
+func TestHandleSessionRequestBranches(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := &Gateway{logger: logger, svc: &fakeLookup{sandbox: &models.Sandbox{
+		ID:          "sb-1",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-1",
+	}}}
+	channel := &fakeChannel{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	requests := make(chan *ssh.Request, 6)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleSession(context.Background(), "sb-1", "session", "prod", channel, requests)
+	}()
+	requests <- &ssh.Request{Type: "pty-req", Payload: []byte{0, 0, 0, 1, 'x'}}
+	requests <- &ssh.Request{Type: "env", Payload: []byte{0, 0, 0, 1}}
+	requests <- &ssh.Request{Type: "window-change", Payload: []byte{0, 0}}
+	requests <- &ssh.Request{Type: "subsystem"}
+	requests <- &ssh.Request{Type: "bogus"}
+	close(requests)
+	waitForDone(t, done)
+}
+
+func TestHandleSessionShellFallbackExec(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dockerCli := &fakeDockerExec{createID: "exec-1", startSession: newTestExecSession(t, "fallback shell"), inspectCode: 0}
+	g := &Gateway{logger: logger, svc: &fakeLookup{sandbox: &models.Sandbox{
+		ID:          "sb-1",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-1",
+	}}, dockerCli: dockerCli}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	channel := &fakeChannel{stdout: stdout, stderr: stderr}
+	requests := make(chan *ssh.Request, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleSession(context.Background(), "sb-1", "session", "prod", channel, requests)
+	}()
+	requests <- &ssh.Request{Type: "pty-req", Payload: bytes.Join([][]byte{
+		encodeString("xterm-256color"),
+		encodeUint32(80),
+		encodeUint32(24),
+		encodeUint32(0),
+		encodeUint32(0),
+		encodeString(""),
+	}, nil)}
+	requests <- &ssh.Request{Type: "shell"}
+	close(requests)
+	waitForDone(t, done)
+	if stdout.String() != "fallback shell" {
+		t.Fatalf("stdout = %q, want fallback shell", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if dockerCli.startExecID != "exec-1" || !dockerCli.startTTY {
+		t.Fatalf("ExecStart args = %+v", dockerCli)
+	}
+}
+
+func TestHandleSessionExecWithoutPTY(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	frame := func(stream byte, payload string) []byte {
+		out := make([]byte, 8+len(payload))
+		out[0] = stream
+		binary.BigEndian.PutUint32(out[4:8], uint32(len(payload)))
+		copy(out[8:], payload)
+		return out
+	}
+	muxStream := append(frame(1, "std-out"), frame(2, "std-err")...)
+	local, remote := net.Pipe()
+	t.Cleanup(func() {
+		_ = local.Close()
+		_ = remote.Close()
+	})
+	go func() {
+		_, _ = io.Copy(io.Discard, remote)
+	}()
+	dockerCli := &fakeDockerExec{createID: "exec-1", startSession: &docker.ExecSession{ID: "exec-1", Conn: local, Reader: bufio.NewReader(bytes.NewReader(muxStream))}, inspectCode: 0}
+	g := &Gateway{logger: logger, svc: &fakeLookup{sandbox: &models.Sandbox{
+		ID:          "sb-1",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-1",
+	}}, dockerCli: dockerCli}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	channel := &fakeChannel{stdout: stdout, stderr: stderr}
+	requests := make(chan *ssh.Request, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleSession(context.Background(), "sb-1", "exec", "", channel, requests)
+	}()
+	requests <- &ssh.Request{Type: "exec", Payload: encodeString("printf hello")}
+	close(requests)
+	waitForDone(t, done)
+	if stdout.String() != "std-out" {
+		t.Fatalf("stdout = %q, want std-out", stdout.String())
+	}
+	if stderr.String() != "std-err" {
+		t.Fatalf("stderr = %q, want std-err", stderr.String())
+	}
+	if dockerCli.startTTY {
+		t.Fatal("expected non-PTY exec start")
+	}
+}
+
 func TestHandleConnExecMode(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	dockerCli := &fakeDockerExec{
@@ -699,6 +1016,35 @@ func waitForDone(t *testing.T, done <-chan struct{}) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for handleSession")
+	}
+}
+
+func captureExitStatus(reqs <-chan *ssh.Request) <-chan uint32 {
+	exitCh := make(chan uint32, 1)
+	go func() {
+		defer close(exitCh)
+		for req := range reqs {
+			if req.Type != "exit-status" || len(req.Payload) != 4 {
+				continue
+			}
+			exitCh <- binary.BigEndian.Uint32(req.Payload)
+			return
+		}
+	}()
+	return exitCh
+}
+
+func waitForExitStatus(t *testing.T, exitCh <-chan uint32) uint32 {
+	t.Helper()
+	select {
+	case code, ok := <-exitCh:
+		if !ok {
+			t.Fatal("exit status channel closed without a value")
+		}
+		return code
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for exit status")
+		return 0
 	}
 }
 
