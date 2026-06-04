@@ -79,6 +79,13 @@ jobs:
           name: go-coverage
           path: coverage.out
 
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          flags: go-main
+          fail_ci_if_error: false
+
   go-sdk-tests:
     needs: changes
     if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_sdk == 'true'

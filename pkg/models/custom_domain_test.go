@@ -150,3 +150,21 @@ func TestValidateCustomDomainList(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateCustomDomainTargetPort(t *testing.T) {
+	if err := ValidateCustomDomainTargetPort(0); err != nil {
+		t.Errorf("port 0: %v", err)
+	}
+	if err := ValidateCustomDomainTargetPort(80); err != nil {
+		t.Errorf("port 80: %v", err)
+	}
+	if err := ValidateCustomDomainTargetPort(65535); err != nil {
+		t.Errorf("port 65535: %v", err)
+	}
+	if err := ValidateCustomDomainTargetPort(-1); err == nil {
+		t.Error("port -1: want error")
+	}
+	if err := ValidateCustomDomainTargetPort(65536); err == nil {
+		t.Error("port 65536: want error")
+	}
+}

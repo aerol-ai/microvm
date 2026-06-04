@@ -254,6 +254,88 @@ func TestHandleDaytonaSessionCommandInputRejectsInactive(t *testing.T) {
 	}
 }
 
+func TestHandleDaytonaSessionListAndCommandGet(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewBufferString(`{"sessionId":"list-session"}`))
+	createRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(createRec, createReq) {
+		t.Fatal("expected create route to be handled")
+	}
+	if createRec.Code != http.StatusCreated && createRec.Code != http.StatusOK {
+		t.Fatalf("create status = %d", createRec.Code)
+	}
+
+	execReq := httptest.NewRequest(http.MethodPost, "/process/session/list-session/exec", bytes.NewBufferString(`{"command":"printf listed"}`))
+	execRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(execRec, execReq) {
+		t.Fatal("expected exec route to be handled")
+	}
+	if execRec.Code != http.StatusOK {
+		t.Fatalf("exec status = %d body=%s", execRec.Code, execRec.Body.String())
+	}
+	var execResp daytonaSessionExecuteResponse
+	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("decode exec response: %v", err)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/process/session", nil)
+	listRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(listRec, listReq) {
+		t.Fatal("expected list route to be handled")
+	}
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	var listed []daytonaSessionResponse
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if len(listed) == 0 {
+		t.Fatalf("expected at least one session in list response")
+	}
+
+	cmdGetReq := httptest.NewRequest(http.MethodGet, "/process/session/list-session/command/"+execResp.CmdID, nil)
+	cmdGetRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(cmdGetRec, cmdGetReq) {
+		t.Fatal("expected command get route to be handled")
+	}
+	if cmdGetRec.Code != http.StatusOK {
+		t.Fatalf("command get status = %d body=%s", cmdGetRec.Code, cmdGetRec.Body.String())
+	}
+
+	notFoundReq := httptest.NewRequest(http.MethodGet, "/process/session/list-session/command/missing-cmd", nil)
+	notFoundRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(notFoundRec, notFoundReq) {
+		t.Fatal("expected command get route to be handled")
+	}
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Fatalf("missing command get status = %d, want 404", notFoundRec.Code)
+	}
+}
+
+func TestHandleDaytonaSessionCreateValidationErrors(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+
+	badJSONReq := httptest.NewRequest(http.MethodPost, "/process/session", strings.NewReader("{bad"))
+	badJSONRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(badJSONRec, badJSONReq) {
+		t.Fatal("expected create route to be handled")
+	}
+	if badJSONRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid JSON status = %d, want 400", badJSONRec.Code)
+	}
+
+	emptyReq := httptest.NewRequest(http.MethodPost, "/process/session", strings.NewReader(`{"sessionId":""}`))
+	emptyRec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(emptyRec, emptyReq) {
+		t.Fatal("expected create route to be handled")
+	}
+	if emptyRec.Code != http.StatusBadRequest {
+		t.Fatalf("empty sessionId status = %d, want 400", emptyRec.Code)
+	}
+}
+
 func waitForActiveCommand(t *testing.T, srv *server, sessionID, commandID string, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

@@ -95,3 +95,36 @@ func TestRedactStripsCredentials(t *testing.T) {
 		t.Errorf("Options lost: %v", r.Options)
 	}
 }
+
+func TestRedactMounts(t *testing.T) {
+	mounts := []MountSpec{
+		{
+			Source:  "s3://my-bucket",
+			Target:  "/mnt/data",
+			Type:    "s3",
+			Options: map[string]string{"region": "us-east-1"},
+			Credentials: map[string]string{
+				"access_key_id":     "AKIA",
+				"secret_access_key": "secret",
+			},
+		},
+		{
+			Source: "nfs://host/share",
+			Target: "/mnt/nfs",
+			Type:   "nfs",
+		},
+	}
+	redacted := RedactMounts(mounts)
+	if len(redacted) != 2 {
+		t.Fatalf("len = %d, want 2", len(redacted))
+	}
+	if redacted[0].HasCredentials != true {
+		t.Error("first mount should have credentials flagged")
+	}
+	if redacted[1].HasCredentials != false {
+		t.Error("second mount should not have credentials flagged")
+	}
+	if redacted[0].Source != "s3://my-bucket" {
+		t.Errorf("Source = %q, want s3://my-bucket", redacted[0].Source)
+	}
+}
