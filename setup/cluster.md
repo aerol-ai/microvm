@@ -217,7 +217,7 @@ If a workload can tolerate writable-layer loss but should keep its sandbox ID,
 create it with `failover.policy="recreate"`. Local-only images are rejected
 for this policy because another worker cannot pull them.
 
-See [Durability and Failover](https://docs.aerol.ai/durability) for the
+See [Durability and Failover](https://microvm.aerol.ai/durability) for the
 production runbook.
 
 ---

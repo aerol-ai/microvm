@@ -174,7 +174,7 @@ const sb = new Sandbox({
 });
 ```
 
-See [SDK Setup](https://docs.aerol.ai/sdk-setup) for the other four SDK
+See [SDK Setup](https://microvm.aerol.ai/sdk-setup) for the other four SDK
 languages.
 
 ---

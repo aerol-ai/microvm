@@ -72,7 +72,7 @@ const sb = new Sandbox({
 });
 ```
 
-See [SDK Setup](https://docs.aerol.ai/sdk-setup) for examples in all five
+See [SDK Setup](https://microvm.aerol.ai/sdk-setup) for examples in all five
 SDK languages.
 
 ---
