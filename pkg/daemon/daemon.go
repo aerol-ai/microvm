@@ -155,6 +155,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("create docker client: %w", err)
 	}
 	configureMirror(logger, cfg, dockerClient)
+	configureAOCRPullAuth(logger, cfg, dockerClient)
 
 	caddyClient := caddy.New(cfg)
 
@@ -862,6 +863,53 @@ func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
 		"upstreams", len(mcfg.Upstreams),
 		"wrap_key_loaded", ring != nil,
 	)
+}
+
+// configureAOCRPullAuth installs the cluster-PAT credential the docker client
+// uses to pull cluster-owned artifacts (snapshots + Firecracker templates) from
+// AOCR's `cluster/<id>/*` namespace. It reuses the same host/cluster/PAT config
+// as the producer-side snapshot and template pushers, so one credential covers
+// push and pull symmetrically.
+//
+// Deliberately independent of SnapshotPushEnabled: a consume-only node (one that
+// never produces artifacts but must pull snapshots/templates on failover or
+// cross-node placement) still needs the pull credential. ConfigureAOCRPullAuth
+// is a no-op when cluster_id or the PAT path is unset, so a node with no AOCR
+// wiring keeps pulling anonymously exactly as before.
+//
+// This call itself runs once at boot and adds nothing to the create path. The
+// only per-create cost it introduces lands later, in resolveAOCRPullAuth: a
+// single node-local PAT file read, and only on a cache-miss pull of an AOCR
+// `cluster/...` ref (warm pulls, non-AOCR refs, and caller-supplied creds all
+// skip it). The fresh read is deliberate — it makes PAT rotation a file write.
+func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, c *docker.Client) {
+	clusterID := strings.TrimSpace(cfg.AutoImportClusterID)
+	patPath := strings.TrimSpace(cfg.AutoImportClusterPATPath)
+	if clusterID == "" || patPath == "" {
+		return
+	}
+	// Cluster artifact refs target the AOCR push vhost (MirrorPushHost), with
+	// ImageDistributionAOCRHost as the fallback both pushers also use. Pass both
+	// so a ref under either host is recognized; ConfigureAOCRPullAuth dedups and
+	// drops empties.
+	hosts := []string{cfg.MirrorPushHost, cfg.ImageDistributionAOCRHost}
+	c.ConfigureAOCRPullAuth(hosts, clusterID, patPath)
+	logger.Info("aocr pull auth configured",
+		"cluster_id", clusterID,
+		"hosts", strings.Join(nonEmptyHosts(hosts), ","),
+	)
+}
+
+// nonEmptyHosts is a tiny log helper: it filters blank host entries so the
+// boot log line shows only the hosts actually in play.
+func nonEmptyHosts(hosts []string) []string {
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		if strings.TrimSpace(h) != "" {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // startAutoImportReconciler builds the F21 auto-import importer + reconciler
