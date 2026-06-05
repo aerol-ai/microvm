@@ -1,6 +1,9 @@
 package microvm
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestImageBuilderCases(t *testing.T) {
 	tests := []struct {
@@ -74,6 +77,61 @@ func TestImageBuilderCases(t *testing.T) {
 					if err := image.Err(); err == nil {
 						t.Fatal("Err() = nil, want error")
 					}
+				}
+			},
+		},
+		{
+			name: "nil_and_error_receivers_are_safe",
+			run: func(t *testing.T) {
+				var nilImage *Image
+				if got := nilImage.Dockerfile(); got != "" {
+					t.Fatalf("Dockerfile() = %q, want empty", got)
+				}
+				if err := nilImage.Err(); err == nil || !strings.Contains(err.Error(), "image is nil") {
+					t.Fatalf("Err() = %v, want image is nil", err)
+				}
+				if got := nilImage.RunCommands("echo hi"); got != nil {
+					t.Fatalf("RunCommands() = %+v, want nil", got)
+				}
+				if got := nilImage.Env(map[string]string{"A": "b"}); got != nil {
+					t.Fatalf("Env() = %+v, want nil", got)
+				}
+				if got := nilImage.Workdir("/tmp"); got != nil {
+					t.Fatalf("Workdir() = %+v, want nil", got)
+				}
+
+				image := BaseImage("alpine").RunCommands(123)
+				if err := image.Err(); err == nil || !strings.Contains(err.Error(), "RunCommands accepts string or []string") {
+					t.Fatalf("Err() = %v, want RunCommands type error", err)
+				}
+				before := image.Dockerfile()
+				image.RunCommands("echo after-error").Env(map[string]string{"A": "b"}).Entrypoint("sh").Cmd("echo").User("root").Expose(80)
+				if got := image.Dockerfile(); got != before {
+					t.Fatalf("Dockerfile mutated after error: %q != %q", got, before)
+				}
+			},
+		},
+		{
+			name: "docker_quote_and_optional_skips",
+			run: func(t *testing.T) {
+				image := BaseImage("alpine").
+					RunCommands("", []string{"echo hi", "", "echo bye"}).
+					Env(map[string]string{"PLAIN": "alpha-1", "QUOTED": `needs "quotes"`}).
+					Entrypoint().
+					Cmd().
+					Expose(443)
+				if err := image.Err(); err != nil {
+					t.Fatalf("Err() = %v", err)
+				}
+				got := image.Dockerfile()
+				if !strings.Contains(got, "RUN echo hi && echo bye\n") {
+					t.Fatalf("Dockerfile() missing joined RUN: %q", got)
+				}
+				if !strings.Contains(got, `PLAIN=alpha-1`) || !strings.Contains(got, `QUOTED="needs \"quotes\""`) {
+					t.Fatalf("Dockerfile() missing expected ENV quoting: %q", got)
+				}
+				if !strings.Contains(got, "ENTRYPOINT null\n") || !strings.Contains(got, "CMD null\n") {
+					t.Fatalf("Dockerfile() missing empty JSON directives: %q", got)
 				}
 			},
 		},

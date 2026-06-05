@@ -6,8 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
@@ -384,6 +387,232 @@ func TestRegisterSnapshotForwardsToWire(t *testing.T) {
 	}
 	if seen["name"] != "py-base" || seen["image"] != "python:3.12-slim" {
 		t.Fatalf("payload missing fields: %+v", seen)
+	}
+}
+
+func TestExecStreamWrappersAndHandleMethods(t *testing.T) {
+	var upgrader websocket.Upgrader
+	var mu sync.Mutex
+	var binaries []string
+	var controls []map[string]any
+	var stdout string
+	var stderr string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/sandboxes/sb-stream/toolbox/process/exec/stream" {
+			t.Fatalf("path: %q", r.URL.Path)
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+
+		var start map[string]any
+		if err := conn.ReadJSON(&start); err != nil {
+			t.Fatalf("read start payload: %v", err)
+		}
+		if start["command"] != "bash" {
+			t.Fatalf("start payload = %+v, want command bash", start)
+		}
+
+		for i := 0; i < 4; i++ {
+			mt, payload, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("ReadMessage(%d): %v", i, err)
+			}
+			mu.Lock()
+			if mt == websocket.BinaryMessage {
+				binaries = append(binaries, string(payload))
+			} else {
+				var item map[string]any
+				if err := json.Unmarshal(payload, &item); err != nil {
+					mu.Unlock()
+					t.Fatalf("unmarshal control: %v", err)
+				}
+				controls = append(controls, item)
+			}
+			mu.Unlock()
+		}
+
+		if err := conn.WriteMessage(websocket.BinaryMessage, append([]byte{1}, []byte("out")...)); err != nil {
+			t.Fatalf("write stdout frame: %v", err)
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, append([]byte{2}, []byte("err")...)); err != nil {
+			t.Fatalf("write stderr frame: %v", err)
+		}
+		if err := conn.WriteJSON(map[string]any{"type": "exit", "code": 0}); err != nil {
+			t.Fatalf("write exit: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+	sb := &Sandbox{Sandbox: sdktypes.Sandbox{ID: "sb-stream"}, client: client}
+
+	handle, err := sb.ExecStream(context.Background(), sdktypes.ExecStreamOptions{
+		Command: "bash",
+		OnStdout: func(chunk []byte) {
+			stdout += string(chunk)
+		},
+		OnStderr: func(chunk []byte) {
+			stderr += string(chunk)
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecStream: %v", err)
+	}
+	if err := handle.Write([]byte("pwd\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := handle.WriteString("ls\n"); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+	if err := handle.Resize(120, 40); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	if err := handle.Signal("INT"); err != nil {
+		t.Fatalf("Signal: %v", err)
+	}
+
+	info, err := handle.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if info.Code != 0 || info.Signal != "" {
+		t.Fatalf("wait result = %+v, want zero exit", info)
+	}
+	if stdout != "out" || stderr != "err" {
+		t.Fatalf("stdout/stderr = (%q,%q), want (out,err)", stdout, stderr)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(binaries) != 2 || binaries[0] != "pwd\n" || binaries[1] != "ls\n" {
+		t.Fatalf("binary messages = %+v", binaries)
+	}
+	if len(controls) != 2 {
+		t.Fatalf("control messages len = %d, want 2", len(controls))
+	}
+	if controls[0]["type"] != "resize" || int(controls[0]["cols"].(float64)) != 120 || int(controls[0]["rows"].(float64)) != 40 {
+		t.Fatalf("resize control mismatch: %+v", controls[0])
+	}
+	if controls[1]["type"] != "signal" || controls[1]["signal"] != "INT" {
+		t.Fatalf("signal control mismatch: %+v", controls[1])
+	}
+}
+
+func TestExecStreamHandleClose(t *testing.T) {
+	var upgrader websocket.Upgrader
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+
+		var start map[string]any
+		if err := conn.ReadJSON(&start); err != nil {
+			t.Fatalf("read start payload: %v", err)
+		}
+		mt, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage: %v", err)
+		}
+		if mt != websocket.TextMessage {
+			t.Fatalf("message type = %d, want text", mt)
+		}
+		var control map[string]any
+		if err := json.Unmarshal(payload, &control); err != nil {
+			t.Fatalf("unmarshal control: %v", err)
+		}
+		if control["type"] != "close" {
+			t.Fatalf("control = %+v, want close", control)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+	handle, err := client.ExecStream(context.Background(), "sb-stream", sdktypes.ExecStreamOptions{Command: "bash"})
+	if err != nil {
+		t.Fatalf("ExecStream: %v", err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, waitErr := handle.Wait(); waitErr == nil || !strings.Contains(waitErr.Error(), "stream closed before exit") {
+		t.Fatalf("Wait err = %v, want stream closed before exit", waitErr)
+	}
+}
+
+func TestWrapperErrorPaths(t *testing.T) {
+	ctx := context.Background()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		PATToken: "pat",
+		APIUrl:   "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+
+	if _, err := client.BuildImage(ctx, nil); err == nil || !strings.Contains(err.Error(), "image is nil") {
+		t.Fatalf("BuildImage(nil) err = %v", err)
+	}
+	if _, err := client.BuildImageWithOptions(ctx, nil, sdktypes.BuildImageOptions{}); err == nil || !strings.Contains(err.Error(), "image is nil") {
+		t.Fatalf("BuildImageWithOptions(nil) err = %v", err)
+	}
+	if _, err := client.CreateWithImage(ctx, nil, sdktypes.CreateSandboxOptions{}); err == nil || !strings.Contains(err.Error(), "image is nil") {
+		t.Fatalf("CreateWithImage(nil) err = %v", err)
+	}
+	if _, err := client.RegisterSnapshotFromImage(ctx, "snap", nil, sdktypes.RegisterSnapshotOptions{}); err == nil || !strings.Contains(err.Error(), "image is nil") {
+		t.Fatalf("RegisterSnapshotFromImage(nil) err = %v", err)
+	}
+	if wrapSandbox(client, nil) != nil {
+		t.Fatal("wrapSandbox(nil) != nil")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client, err = NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+	sb := &Sandbox{Sandbox: sdktypes.Sandbox{ID: "sb-err"}, client: client}
+
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "create", run: func() error { _, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "alpine"}); return err }},
+		{name: "get", run: func() error { _, err := client.Get(ctx, "sb-err"); return err }},
+		{name: "start", run: func() error { _, err := client.Start(ctx, "sb-err"); return err }},
+		{name: "stop", run: func() error { _, err := client.Stop(ctx, "sb-err"); return err }},
+		{name: "resize", run: func() error {
+			_, err := client.Resize(ctx, "sb-err", sdktypes.ResizeSandboxOptions{CPU: 2})
+			return err
+		}},
+		{name: "update_lifecycle", run: func() error { _, err := client.UpdateLifecycle(ctx, "sb-err", sdktypes.Lifecycle{}); return err }},
+		{name: "refresh", run: func() error { return sb.Refresh(ctx) }},
+		{name: "sandbox_start", run: func() error { return sb.Start(ctx) }},
+		{name: "sandbox_stop", run: func() error { return sb.Stop(ctx) }},
+		{name: "sandbox_resize", run: func() error { return sb.Resize(ctx, sdktypes.ResizeSandboxOptions{CPU: 2}) }},
+		{name: "sandbox_update_lifecycle", run: func() error { return sb.UpdateLifecycle(ctx, sdktypes.Lifecycle{}) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); err == nil {
+				t.Fatalf("%s err = nil, want error", tc.name)
+			}
+		})
 	}
 }
 
