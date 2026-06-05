@@ -1,7 +1,11 @@
+import mdx from '@astrojs/mdx'
 import starlight from '@astrojs/starlight'
 import { defineConfig } from 'astro/config'
 
 export default defineConfig({
+  markdown: {
+    gfm: false,
+  },
   site: process.env.PUBLIC_SITE_URL || 'http://localhost:4321',
   base: process.env.PUBLIC_BASE_PATH || '/',
   outDir: './dist',
@@ -9,6 +13,10 @@ export default defineConfig({
     '/': '/getting-started',
   },
   integrations: [
+    // Register before Starlight so remark-gfm is explicit for MDX. Starlight's
+    // auto-added mdx({ optimize: true }) omits gfm: true; without it, pipe
+    // tables in .mdx compile to <p>| ...</p> while .md pages still render tables.
+    mdx({ gfm: true, optimize: true }),
     starlight({
       title: 'AerolVM',
       favicon: '/favicon.svg',
