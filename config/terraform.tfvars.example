@@ -1,17 +1,27 @@
 ###############################################################################
-# Copy to terraform.tfvars, fill in the four required values, then:
-#   terraform init && terraform apply
+# Copy to config/terraform.tfvars, then from the repo root:
+#   scripts/terraform.sh init
+#   scripts/terraform.sh apply
+#
+# scripts/terraform.sh runs `terraform -chdir=Terraform` and auto-loads this
+# file via -var-file=../config/terraform.tfvars. Don't run `terraform` directly
+# from Terraform/ — this file is no longer on Terraform's auto-load path.
 ###############################################################################
 
 # --- Required ---------------------------------------------------------------
 #
-# Cluster-wide values that both Terraform and Ansible read have moved out of
-# this file and into the shared SoT at ../config/:
-#   - pat_token              -> config/secrets.yml as cluster.pat_token
-#   - domain_name, acme_email -> config/cluster.yml under the ingress: section
-# Only the Terraform-provider credential (DNS API access) remains here.
-
-cloudflare_api_token = "REPLACE-with-cloudflare-api-token" # Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01. Add Zone:Read if you want auto-zone-lookup below.
+# All cluster-wide secrets live in the shared SoT at ../config/secrets.yml:
+#   - cluster.pat_token       (shared SB_PAT_TOKEN)
+#   - cloudflare.api_token    (Cloudflare DNS + Let's Encrypt DNS-01)
+#   - aocr.*                  (mirror auth + auto-import bearer)
+#   - fleet.token             (managed fleet control plane bearer)
+#
+# Non-secret cluster ops config (ingress.*, mirror.*, auto_import.*,
+# fleet_control_plane.*, otel.*, image_pull.*, image_build_gc.*) lives in the
+# shared SoT at ../config/cluster.yml.
+#
+# What remains in THIS file are Terraform-only inputs: AWS placement,
+# instance sizing, the node list, and a few tweakable Cloudflare DNS flags.
 
 # cloudflare_zone_id is optional. Leave it unset to auto-resolve the zone from
 # domain_name by stripping the first label ("cluster.example.com" -> "example.com").

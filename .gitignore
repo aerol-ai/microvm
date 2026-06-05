@@ -13,7 +13,9 @@ config/secrets.yml
 node_modules/
 sdk/typescript/node_modules
 docs/.astro/
-Terraform/terraform.tfvars
+# Shared Terraform tfvars (read by Terraform via scripts/terraform.sh).
+# The committed sibling is config/terraform.tfvars.example.
+config/terraform.tfvars
 # Python SDK artifacts
 sdk/python/__pycache__/
 sdk/python/.venv/
@@ -47,8 +49,8 @@ terraform.tfstate
 terraform.tfstate.backup
 terraform.rc
 .terraformrc
-# Auto-loaded var files often hold secrets. terraform.tfvars is already
-# ignored above; this catches *.auto.tfvars / *.auto.tfvars.json too.
+# Auto-loaded var files often hold secrets. config/terraform.tfvars is
+# already ignored above; this catches *.auto.tfvars / *.auto.tfvars.json too.
 *.auto.tfvars
 *.auto.tfvars.json
 .terraform.tfstate.lock.info

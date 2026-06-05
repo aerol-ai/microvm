@@ -375,18 +375,23 @@ variable "firecracker" {
 # Observability, image-pull controls, image-GC, mirror/auto-import config —
 # everything except secrets — lives in ../config/cluster.yml. That file is
 # the single source of truth both Terraform and Ansible read from, so
-# day-0 (terraform apply) and day-2 (configure-ops.yml) cannot drift.
-# See locals.tf:cluster_ops and resource.terraform_data.validate_cluster_ops.
+# day-0 (scripts/terraform.sh apply) and day-2 (configure-ops.yml) cannot
+# drift. See locals.tf:cluster_ops and
+# resource.terraform_data.validate_cluster_ops.
+#
+# Cluster SECRETS (pat_token, cloudflare api_token, aocr secrets, fleet
+# token) live in ../config/secrets.yml, also shared with Ansible. See
+# locals.tf:cluster_secrets.
 
 ###############################################################################
 # Cloudflare DNS
 ###############################################################################
 
-variable "cloudflare_api_token" {
-  description = "Cloudflare API token with Zone:DNS:Edit on the target zone."
-  type        = string
-  sensitive   = true
-}
+# cloudflare_api_token has moved to ../config/secrets.yml (cloudflare.api_token).
+# It's a real secret — the rest of secrets.yml holds cluster.pat_token,
+# aocr.*, and fleet.token, so the Cloudflare token belongs there too rather
+# than in the non-secret config/terraform.tfvars. providers.tf reads it via
+# local.cloudflare_api_token; locals.tf validates it is non-empty.
 
 variable "cloudflare_zone_id" {
   description = "Cloudflare zone ID for the apex domain (the 'region key' shown on the zone overview page). Leave empty to auto-resolve from domain_name (requires Zone:Read on the API token)."
