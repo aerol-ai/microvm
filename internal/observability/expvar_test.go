@@ -139,4 +139,34 @@ func TestSampleFromExpvar(t *testing.T) {
 			t.Fatal("labels were not deep-copied")
 		}
 	})
+
+	t.Run("string_backed_float_with_spaces", func(t *testing.T) {
+		s, ok := sampleFromExpvar("m", nil, rawVar(" 12.5 "))
+		if !ok || s.Float == nil || math.Abs(*s.Float-12.5) > 1e-9 {
+			t.Fatalf("expected Float=12.5, got ok=%v sample=%+v", ok, s)
+		}
+	})
+}
+
+func TestCollectExpvarSamplesNestedMap(t *testing.T) {
+	root := new(expvar.Map).Init()
+	child := new(expvar.Map).Init()
+	leaf := new(expvar.Int)
+	leaf.Set(7)
+	child.Set("worker-a", leaf)
+	root.Set("cluster-1", child)
+
+	var samples []ExpvarSample
+	collectExpvarSamples("aerolvm_nested", root, nil, &samples)
+	if len(samples) != 1 {
+		t.Fatalf("samples len = %d, want 1", len(samples))
+	}
+	if samples[0].Int64 == nil || *samples[0].Int64 != 7 {
+		t.Fatalf("sample value = %+v, want int64 7", samples[0])
+	}
+	if len(samples[0].Labels) != 2 ||
+		samples[0].Labels[0] != (ExpvarLabel{Name: "key", Value: "cluster-1"}) ||
+		samples[0].Labels[1] != (ExpvarLabel{Name: "key2", Value: "worker-a"}) {
+		t.Fatalf("nested labels = %+v", samples[0].Labels)
+	}
 }

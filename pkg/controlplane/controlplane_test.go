@@ -48,3 +48,18 @@ func (stubController) FireWebhook(context.Context, string, string) error { retur
 func TestFleetControllerIsImplementable(t *testing.T) {
 	var _ FleetController = stubController{}
 }
+
+func TestContextWithAccess(t *testing.T) {
+	ctx := context.Background()
+	access := Access{Identity: Identity{OwnerRef: "test-acc"}, Operator: false}
+
+	ctx2 := ContextWithAccess(ctx, access)
+	access2, ok := AccessFromContext(ctx2)
+
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	if access2.Identity.OwnerRef != "test-acc" {
+		t.Fatal("wrong owner ref")
+	}
+}

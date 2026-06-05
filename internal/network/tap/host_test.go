@@ -149,6 +149,37 @@ func TestEnsure_ValidatesSlot(t *testing.T) {
 	}
 }
 
+func TestHostHelpers(t *testing.T) {
+	t.Run("new_host_and_ip_binary", func(t *testing.T) {
+		h := NewHost("")
+		if h == nil {
+			t.Fatal("NewHost returned nil")
+		}
+		if got := h.ipBinary(); got != "ip" {
+			t.Fatalf("ipBinary() = %q, want ip", got)
+		}
+		h = NewHost("/usr/sbin/ip")
+		if got := h.ipBinary(); got != "/usr/sbin/ip" {
+			t.Fatalf("ipBinary() = %q, want /usr/sbin/ip", got)
+		}
+	})
+
+	t.Run("exec_uses_run_seam", func(t *testing.T) {
+		r := &recordingRun{plan: []runReply{{out: []byte("ok")}}}
+		h := newHostWithRun(r)
+		out, err := h.exec(context.Background(), "link", "show", "fctap-x")
+		if err != nil {
+			t.Fatalf("exec() error = %v", err)
+		}
+		if string(out) != "ok" {
+			t.Fatalf("exec() output = %q, want ok", string(out))
+		}
+		if len(r.calls) != 1 || r.calls[0].name != "/test/ip" {
+			t.Fatalf("calls = %+v, want one /test/ip invocation", r.calls)
+		}
+	})
+}
+
 // TestRemove_HappyPath confirms `ip link delete` is issued with the
 // right argv.
 func TestRemove_HappyPath(t *testing.T) {
@@ -162,6 +193,56 @@ func TestRemove_HappyPath(t *testing.T) {
 	}
 	if !equalStrings(r.calls[0].args, []string{"link", "delete", "fctap-5"}) {
 		t.Errorf("argv mismatch: %v", r.calls[0].args)
+	}
+}
+
+func TestEnsureAndRemoveAdditionalFailures(t *testing.T) {
+	t.Run("link_set_failure_bubbles", func(t *testing.T) {
+		r := &recordingRun{
+			plan: []runReply{
+				{},
+				{},
+				{out: []byte("permission denied"), err: errors.New("exit 1")},
+			},
+		}
+		h := newHostWithRun(r)
+		slot := Slot{TapName: "fctap-8", CIDR: "172.16.0.12/30", HostIP: "172.16.0.13"}
+		err := h.Ensure(context.Background(), slot)
+		if err == nil || !contains(err.Error(), "permission denied") {
+			t.Fatalf("Ensure() err = %v, want permission denied", err)
+		}
+		if len(r.calls) != 3 {
+			t.Fatalf("calls = %d, want 3", len(r.calls))
+		}
+	})
+
+	t.Run("remove_rejects_empty_name", func(t *testing.T) {
+		h := newHostWithRun(&recordingRun{})
+		if err := h.Remove(context.Background(), ""); err == nil {
+			t.Fatal("Remove(empty) err = nil, want error")
+		}
+	})
+}
+
+func TestExistsAndMissingMatchers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   func([]byte) bool
+		in   string
+		want bool
+	}{
+		{name: "exists_busy", fn: looksLikeExists, in: "Device or resource busy", want: true},
+		{name: "exists_already", fn: looksLikeExists, in: "already exists", want: true},
+		{name: "exists_false", fn: looksLikeExists, in: "permission denied", want: false},
+		{name: "missing_no_such_device", fn: looksLikeMissing, in: "No such device", want: true},
+		{name: "missing_does_not_exist", fn: looksLikeMissing, in: "does not exist", want: true},
+		{name: "missing_false", fn: looksLikeMissing, in: "resource busy", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.fn([]byte(tc.in)); got != tc.want {
+				t.Fatalf("matcher(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -113,9 +113,14 @@ func TestMarkSnapshotCorrupt_IdempotentUnderConcurrency(t *testing.T) {
 	svc, st, templatesDir := newHealthHarness(t)
 	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-conc")
 
-	// Stub the snapshotter so RebuildTemplateSnapshot completes
-	// synchronously and we can count rebuild invocations through it.
-	snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 16)}
+	// Keep the first rebuild in flight until all concurrent observers
+	// have raced. Without this gate, a fast rebuild can return the row
+	// to ready before late goroutines execute, and those stale observers
+	// would legitimately trigger a fresh corruption cycle.
+	snap := &fakeTemplateSnapshotter{
+		done:  make(chan struct{}, 16),
+		block: make(chan struct{}),
+	}
 	svc.SetTemplateSnapshotter(snap)
 	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
 
@@ -130,29 +135,22 @@ func TestMarkSnapshotCorrupt_IdempotentUnderConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for at most one rebuild to complete. A deterministic deadline
-	// rather than a fixed sleep so the test doesn't slow the suite.
-	deadline := time.After(3 * time.Second)
-waitRebuild:
-	for {
-		select {
-		case <-snap.done:
-			break waitRebuild
-		case <-deadline:
-			t.Fatal("rebuild never fired; MarkSnapshotCorrupt's first observer must kick a rebuild")
-		}
-	}
-
-	// Drain any *additional* rebuilds with a short grace window. There
-	// should be none — the UPDATE WHERE status='ready' guard means only
-	// the first observer transitions the row, and the kick is gated on
-	// that transition succeeding.
-	time.Sleep(50 * time.Millisecond)
+	// The first rebuild should now be blocked inside the snapshotter.
+	// While it is in flight, no other observer may kick a second one.
+	time.Sleep(75 * time.Millisecond)
 	snap.mu.Lock()
 	calls := snap.calls
 	snap.mu.Unlock()
 	if calls != 1 {
 		t.Errorf("snapshotter calls = %d, want exactly 1 (one rebuild per corruption event)", calls)
+	}
+
+	// Release the blocked rebuild and wait for it to complete.
+	close(snap.block)
+	select {
+	case <-snap.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rebuild never fired; MarkSnapshotCorrupt's first observer must kick a rebuild")
 	}
 
 	// After the rebuild succeeds the row is back in ready.
