@@ -127,7 +127,7 @@ Sizing guidelines:
 
 ## Step 5 - Enable gVisor (optional)
 
-gVisor is a runtime that adds an extra layer of isolation to Docker containers. It runs a user-space kernel between each sandbox and the host — so if a sandbox tries to exploit a host kernel vulnerability, gVisor intercepts the call instead of the real kernel.
+gVisor is a runtime that adds an extra layer of isolation to Docker containers. It runs a user-space kernel between each sandbox and the host - so if a sandbox tries to exploit a host kernel vulnerability, gVisor intercepts the call instead of the real kernel.
 
 gVisor works on any standard EC2 instance type. There are no special hardware requirements.
 
@@ -149,7 +149,7 @@ After deployment, create sandboxes with `runtime: "runsc"` to use gVisor isolati
 Firecracker is a virtual machine runtime for sandboxes. Instead of Docker containers, each sandbox runs inside its own microVM that boots in under 100ms. This provides the strongest isolation - each sandbox has its own kernel, so a vulnerability in one cannot affect the host or other sandboxes.
 
 :::caution[Firecracker requires bare-metal AWS instances]
-Firecracker needs direct access to the hardware virtualization unit (`/dev/kvm`). Standard EC2 instance types (`t3`, `c6i`, `m5`, `r5`, etc.) are themselves virtual machines and don't expose `/dev/kvm`. You must use **bare-metal instance types** — the `*.metal` SKUs. Common options:
+Firecracker needs direct access to the hardware virtualization unit (`/dev/kvm`). Standard EC2 instance types (`t3`, `c6i`, `m5`, `r5`, etc.) are themselves virtual machines and don't expose `/dev/kvm`. You must use **bare-metal instance types** - the `*.metal` SKUs. Common options:
 
 - Compute: `c5.metal`, `c5n.metal`, `c6i.metal`, `c7g.metal`
 - General purpose: `m5.metal`, `m5zn.metal`, `m6i.metal`
@@ -186,7 +186,7 @@ After deployment, you register container images as Firecracker templates and the
 
 ## Step 7 - Enable GPU support (optional)
 
-AerolVM can pass through physical GPUs to sandboxes. NVIDIA and AMD GPUs are both supported. GPU-enabled worker nodes run alongside regular workers — the cluster placement engine automatically routes GPU sandbox requests to nodes that have the right hardware.
+AerolVM can pass through physical GPUs to sandboxes. NVIDIA and AMD GPUs are both supported. GPU-enabled worker nodes run alongside regular workers - the cluster placement engine automatically routes GPU sandbox requests to nodes that have the right hardware.
 
 ### NVIDIA GPUs
 
@@ -210,7 +210,7 @@ nodes = {
 }
 ```
 
-The optional `tags` field is useful if you have multiple GPU types in the cluster — SDK clients can target a specific GPU model by tag.
+The optional `tags` field is useful if you have multiple GPU types in the cluster - SDK clients can target a specific GPU model by tag.
 
 ### AMD GPUs
 
@@ -222,7 +222,7 @@ wrk3 = { role = "worker", with_amd_gpu = true, instance_type = "g4ad.xlarge",
 ```
 
 :::note
-GPU passthrough is not compatible with gVisor. A sandbox can use either a GPU or gVisor isolation — not both at the same time. You can mix GPU nodes and gVisor nodes in the same cluster; they simply accept different sandbox requests.
+GPU passthrough is not compatible with gVisor. A sandbox can use either a GPU or gVisor isolation - not both at the same time. You can mix GPU nodes and gVisor nodes in the same cluster; they simply accept different sandbox requests.
 :::
 
 After deployment, see [GPU Sandboxes](/gpu-sandboxes) for the full sandbox creation flow.

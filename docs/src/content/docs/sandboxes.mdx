@@ -1,74 +1,22 @@
 ---
-title: Create Sandbox
+title: Docker Sandbox
+description: Create, manage, and resize standard Docker sandboxes.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 A sandbox is an isolated compute environment. Each sandbox has its own filesystem, network namespace, and configurable vCPU, memory, and disk. Sandboxes spin up in under 90ms and run any OCI-compatible image.
 
-## Runtimes
+## Sandbox types
 
-| Runtime | Status | Description |
+| Type | Runtime value | Description |
 |---|---|---|
-| `docker` | ✅ | Standard runc-backed Docker. Default for most workloads. |
-| `gvisor` | ✅ | gVisor (runsc) - user-space kernel. Intercepts syscalls for untrusted code. |
-| `kata` | 🗓 | Planned - full VM isolation with hardware virtualization. |
-| `wasm` | 🗓 | Planned - ultra-lightweight portable workloads. |
+| Docker | `docker` (default) | Standard runc-backed containers. Works on any node. |
+| gVisor | `gvisor` | User-space kernel — intercepts syscalls. Better isolation, same hardware requirements. See [gVisor Sandbox](/gvisor-sandbox). |
+| Firecracker | `firecracker` | Full microVM — each sandbox boots its own kernel in under 100ms. Requires bare-metal nodes. See [Firecracker Sandbox](/firecracker-sandbox). |
+| GPU | `docker` + `gpus` field | Standard Docker with direct GPU passthrough. See [GPU Sandbox](/gpu-sandboxes). |
 
-The default runtime is `docker`. Pass `runtime: 'gvisor'` in the create request to run in the gVisor user-space kernel. gVisor is ideal when running LLM-generated or otherwise untrusted code - the container process never talks directly to the Linux kernel.
-
-### Create a GVisor Sandbox
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      runtime: 'gvisor',
-    })
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'runtime': 'gvisor',
-    })
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image:   "ubuntu:22.04",
-        Runtime: sdktypes.RuntimeGvisor,
-    })
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = client.create(CreateOptions {
-        image:   "ubuntu:22.04".to_string(),
-        runtime: Some("gvisor".to_string()),
-        ..Default::default()
-    })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setRuntime("gvisor")
-    );
-    ```
-  </TabItem>
-</Tabs>
-
-### Create a GPU Sandbox
-
-See [GPU Sandboxes](/gpu-sandboxes) for full examples covering NVIDIA, AMD, and Apple Silicon.
-
-## Lifecycle States
+## Lifecycle states
 
 ```
 created ──► running ──► stopped ──► running
@@ -80,7 +28,7 @@ created ──► running ──► stopped ──► running
 | State | Description |
 |---|---|
 | `running` | Sandbox is up and accepting requests. |
-| `stopped` | Sandbox is paused; state is persisted. |
+| `stopped` | Sandbox is paused; filesystem state is persisted. |
 | `destroyed` | Sandbox and all its data are permanently removed. |
 
 ## Create
@@ -101,8 +49,8 @@ created ──► running ──► stopped ──► running
       memoryMB: 1024,
       diskGB: 10,
       lifecycle: {
-        stopIfIdleFor: 60 * 60 * 1_000_000_000,   // 1 hour in nanoseconds
-        destroyAtAge: 24 * 60 * 60 * 1_000_000_000, // 24 hours in nanoseconds
+        stopIfIdleFor: 60 * 60 * 1_000_000_000,    // 1 hour in nanoseconds
+        destroyAtAge:  24 * 60 * 60 * 1_000_000_000, // 24 hours in nanoseconds
       },
     })
 
@@ -232,16 +180,15 @@ created ──► running ──► stopped ──► running
   </TabItem>
 </Tabs>
 
-## Connect to Existing Sandbox
+## Connect to existing sandbox
 
-If you already have a sandbox running (from a previous session or another process), retrieve it by ID to get a fully usable sandbox object.
+Retrieve a running sandbox by ID to get a fully usable sandbox object.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.get('sbx_abc123')
 
-    // sandbox is now ready - run commands, manage files, etc.
     console.log(sandbox.id)
     console.log(sandbox.publicURL)
     ```
@@ -250,7 +197,6 @@ If you already have a sandbox running (from a previous session or another proces
     ```python
     sandbox = client.get('sbx_abc123')
 
-    # sandbox is now ready - run commands, manage files, etc.
     print(sandbox.id)
     print(sandbox.public_url)
     ```
@@ -262,7 +208,6 @@ If you already have a sandbox running (from a previous session or another proces
         log.Fatal(err)
     }
 
-    // sandbox is now ready - run commands, manage files, etc.
     fmt.Println(sandbox.ID, sandbox.PublicURL)
     ```
   </TabItem>
@@ -270,7 +215,6 @@ If you already have a sandbox running (from a previous session or another proces
     ```rust
     let sandbox = client.get("sbx_abc123")?;
 
-    // sandbox is now ready - run commands, manage files, etc.
     println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
     ```
   </TabItem>
@@ -278,15 +222,14 @@ If you already have a sandbox running (from a previous session or another proces
     ```java
     Sandbox sandbox = client.get("sbx_abc123");
 
-    // sandbox is now ready - run commands, manage files, etc.
     System.out.println(sandbox.id + " " + sandbox.publicUrl);
     ```
   </TabItem>
 </Tabs>
 
-## Start and Stop
+## Start and stop
 
-Stopping persists all container-level state. Starting resumes from the persisted image layer - running processes are not retained across a stop/start cycle.
+Stopping persists all container-level filesystem state. Starting resumes from the persisted layer — running processes are not retained across a stop/start cycle.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -385,7 +328,7 @@ Change CPU or memory allocation on a running sandbox without restarting it.
   </TabItem>
 </Tabs>
 
-## List and Get
+## List and get
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -420,7 +363,7 @@ Change CPU or memory allocation on a running sandbox without restarting it.
   </TabItem>
 </Tabs>
 
-## Idle Lifecycle
+## Idle lifecycle
 
 Sandboxes can self-terminate based on age or inactivity. Lifecycle parameters can be updated at any time without restarting the sandbox.
 

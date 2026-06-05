@@ -1,0 +1,227 @@
+---
+title: Firecracker Sandbox
+description: Create sandboxes backed by Firecracker microVMs for full kernel isolation and sub-100ms boot times.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Firecracker sandboxes run inside lightweight virtual machines instead of containers. Each sandbox boots its own Linux kernel in under 100ms and is completely isolated from the host and from other sandboxes at the hardware level. There is no shared kernel — a vulnerability in one sandbox cannot affect another.
+
+Use Firecracker when:
+- You are running untrusted or LLM-generated code that should not have any path to the host kernel
+- Your workload requires VM-level security boundaries (compliance, multi-tenant execution)
+- You want faster cold starts than full VMs while keeping stronger isolation than containers
+
+## Before you start
+
+Firecracker sandboxes require worker nodes that have Firecracker installed. On a cluster, set `with_firecracker = true` on worker nodes in `terraform.tfvars` and use bare-metal EC2 instance types. See [Cluster Setup](/cluster-setup#step-6---enable-firecracker-optional) for the provisioning steps.
+
+You also need at least one Firecracker template registered for the image you want to run. A template is a pre-built rootfs snapshot that Firecracker boots from. See [Firecracker Templates](/firecracker-templates) to register one before creating sandboxes.
+
+## Create a Firecracker sandbox
+
+Pass `runtime: "firecracker"` in the create request. The image you specify must have a registered Firecracker template on the target node.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      runtime: 'firecracker',
+      cpu: 1,
+      memoryMB: 512,
+    })
+
+    console.log(sandbox.id)
+    console.log(sandbox.publicURL)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url='https://sandbox.example.com',
+        pat_token='your-token',
+    )
+
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'runtime': 'firecracker',
+        'cpu': 1.0,
+        'memoryMB': 512,
+    })
+
+    print(sandbox.id)
+    print(sandbox.publicURL)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+        "os"
+
+        microvm   "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes  "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   os.Getenv("SB_API_URL"),
+        PATToken: os.Getenv("SB_PAT_TOKEN"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        Runtime:  sdktypes.RuntimeFirecracker,
+        CPU:      1,
+        MemoryMB: 512,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions};
+
+    let client = Client::new(
+        Some("https://sandbox.example.com"),
+        Some("your-token"),
+    )?;
+
+    let sandbox = client.create(CreateOptions {
+        image:    "ubuntu:22.04".to_string(),
+        runtime:  Some("firecracker".to_string()),
+        cpu:      Some(1),
+        memory_mb: Some(512),
+        ..Default::default()
+    })?;
+
+    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl("https://sandbox.example.com")
+            .setPatToken(System.getenv("SB_PAT_TOKEN"))
+    );
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setRuntime("firecracker")
+            .setCpu(1.0)
+            .setMemoryMb(512)
+    );
+
+    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    ```
+  </TabItem>
+</Tabs>
+
+## With lifecycle
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      runtime: 'firecracker',
+      cpu: 2,
+      memoryMB: 1024,
+      lifecycle: {
+        stopIfIdleFor: 30 * 60 * 1_000_000_000,  // 30 minutes
+        destroyAtAge:  4 * 60 * 60 * 1_000_000_000, // 4 hours
+      },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'runtime': 'firecracker',
+        'cpu': 2.0,
+        'memoryMB': 1024,
+        'lifecycle': {
+            'stopIfIdleFor': 1_800_000_000_000,   # 30 minutes
+            'destroyAtAge':  14_400_000_000_000,  # 4 hours
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        Runtime:  sdktypes.RuntimeFirecracker,
+        CPU:      2,
+        MemoryMB: 1024,
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: 30 * time.Minute,
+            DestroyAtAge:  4 * time.Hour,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image:    "ubuntu:22.04".to_string(),
+        runtime:  Some("firecracker".to_string()),
+        cpu:      Some(2),
+        memory_mb: Some(1024),
+        lifecycle: Some(aerolvm_sdk::Lifecycle {
+            stop_if_idle_for: 1_800_000_000_000,
+            destroy_at_age:   14_400_000_000_000,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setRuntime("firecracker")
+            .setCpu(2.0)
+            .setMemoryMb(1024)
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(1_800_000_000_000L)
+                .setDestroyAtAge(14_400_000_000_000L))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Notes
+
+- **Templates required.** The image must have a registered Firecracker template on the node. The first time you use a new image, Firecracker builds the template — this takes 10–60 seconds. Subsequent creates from the same image use the cached template and boot in under 100ms.
+- **Memory is reserved.** Unlike Docker, Firecracker allocates the full `memoryMB` value upfront for the VM. Size the request to what the workload actually needs.
+- **Not compatible with GPU passthrough.** Firecracker VMs do not support direct GPU access.
+- **Lifecycle operations** (stop, start, destroy, resize) work the same as Docker sandboxes. See [Docker Sandbox](/sandboxes) for those examples.

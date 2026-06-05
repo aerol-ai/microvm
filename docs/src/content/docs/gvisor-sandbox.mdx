@@ -1,0 +1,225 @@
+---
+title: gVisor Sandbox
+description: Create sandboxes backed by the gVisor user-space kernel for stronger syscall isolation.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+gVisor sandboxes run inside the standard Docker runtime but with an extra layer between the container and the host kernel. gVisor implements a user-space kernel (`runsc`) that intercepts every system call the container makes — so instead of talking directly to the Linux kernel, the process talks to gVisor, which then decides what to pass through.
+
+Use gVisor when:
+- You are running LLM-generated or otherwise untrusted code that should not have direct access to the host kernel
+- You need stronger isolation than standard Docker containers without the overhead of full VMs
+- Your workload is compatible with gVisor's Linux ABI coverage (most common workloads are)
+
+gVisor works on **any standard server** — there are no bare-metal or special hardware requirements.
+
+## Limitations
+
+- Not compatible with GPU passthrough. A sandbox can use gVisor or a GPU, but not both.
+- Privileged containers (`--privileged`) are not supported under gVisor.
+- `disk_gb` limits are not enforced by gVisor — disk usage falls back to host limits.
+- Requires cgroupv2 + systemd on the host (satisfied by default on Ubuntu 22.04+).
+
+## Create a gVisor sandbox
+
+Pass `runtime: "gvisor"` in the create request.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      runtime: 'gvisor',
+      cpu: 1,
+      memoryMB: 512,
+    })
+
+    console.log(sandbox.id)
+    console.log(sandbox.publicURL)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url='https://sandbox.example.com',
+        pat_token='your-token',
+    )
+
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'runtime': 'gvisor',
+        'cpu': 1.0,
+        'memoryMB': 512,
+    })
+
+    print(sandbox.id)
+    print(sandbox.publicURL)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+        "os"
+
+        microvm   "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes  "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   os.Getenv("SB_API_URL"),
+        PATToken: os.Getenv("SB_PAT_TOKEN"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        Runtime:  sdktypes.RuntimeGvisor,
+        CPU:      1,
+        MemoryMB: 512,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions};
+
+    let client = Client::new(
+        Some("https://sandbox.example.com"),
+        Some("your-token"),
+    )?;
+
+    let sandbox = client.create(CreateOptions {
+        image:   "ubuntu:22.04".to_string(),
+        runtime: Some("gvisor".to_string()),
+        cpu:     Some(1),
+        memory_mb: Some(512),
+        ..Default::default()
+    })?;
+
+    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl("https://sandbox.example.com")
+            .setPatToken(System.getenv("SB_PAT_TOKEN"))
+    );
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setRuntime("gvisor")
+            .setCpu(1.0)
+            .setMemoryMb(512)
+    );
+
+    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    ```
+  </TabItem>
+</Tabs>
+
+## With lifecycle
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      runtime: 'gvisor',
+      cpu: 2,
+      memoryMB: 1024,
+      lifecycle: {
+        stopIfIdleFor: 30 * 60 * 1_000_000_000,     // 30 minutes
+        destroyAtAge:  4 * 60 * 60 * 1_000_000_000, // 4 hours
+      },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'runtime': 'gvisor',
+        'cpu': 2.0,
+        'memoryMB': 1024,
+        'lifecycle': {
+            'stopIfIdleFor': 1_800_000_000_000,   # 30 minutes
+            'destroyAtAge':  14_400_000_000_000,  # 4 hours
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        Runtime:  sdktypes.RuntimeGvisor,
+        CPU:      2,
+        MemoryMB: 1024,
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: 30 * time.Minute,
+            DestroyAtAge:  4 * time.Hour,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image:   "ubuntu:22.04".to_string(),
+        runtime: Some("gvisor".to_string()),
+        cpu:     Some(2),
+        memory_mb: Some(1024),
+        lifecycle: Some(aerolvm_sdk::Lifecycle {
+            stop_if_idle_for: 1_800_000_000_000,
+            destroy_at_age:   14_400_000_000_000,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setRuntime("gvisor")
+            .setCpu(2.0)
+            .setMemoryMb(1024)
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(1_800_000_000_000L)
+                .setDestroyAtAge(14_400_000_000_000L))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+**Lifecycle operations** (stop, start, destroy, resize) work the same as Docker sandboxes. See [Docker Sandbox](/sandboxes) for those examples.

@@ -125,16 +125,35 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     homePageHref: '/',
     entries: [
       {
-        type: 'link',
-        href: '/sandboxes',
+        type: 'group',
         label: 'Create Sandbox',
-        description: 'Create, start, stop, destroy, and resize sandboxes.',
-      },
-      {
-        type: 'link',
-        href: '/gpu-sandboxes',
-        label: 'GPU Sandboxes',
-        description: 'Attach NVIDIA, AMD, or Apple Silicon GPUs to a sandbox.',
+        homePageHref: '/sandboxes',
+        entries: [
+          {
+            type: 'link',
+            href: '/sandboxes',
+            label: 'Docker',
+            description: 'Create, manage, and resize standard Docker sandboxes.',
+          },
+          {
+            type: 'link',
+            href: '/gpu-sandboxes',
+            label: 'GPU',
+            description: 'Attach NVIDIA, AMD, or Apple Silicon GPUs to a sandbox.',
+          },
+          {
+            type: 'link',
+            href: '/firecracker-sandbox',
+            label: 'Firecracker',
+            description: 'Full microVM isolation with sub-100ms boot times.',
+          },
+          {
+            type: 'link',
+            href: '/gvisor-sandbox',
+            label: 'gVisor',
+            description: 'User-space kernel isolation for untrusted code.',
+          },
+        ],
       },
       {
         type: 'link',
@@ -305,12 +324,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         href: '/dashboard',
         label: 'Dashboard',
         description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics - sign in with your PAT.',
-      },
-      {
-        type: 'link',
-        href: '/operational-runbooks',
-        label: 'Operational Runbooks',
-        description: 'Incident procedures for restore, lost quorum, image-pull storms, and SLO breaches.',
       },
     ],
   },
