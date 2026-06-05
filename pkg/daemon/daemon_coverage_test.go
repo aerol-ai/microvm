@@ -3,8 +3,10 @@ package daemon
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -46,6 +49,63 @@ func writeWrapKeyFile(t *testing.T) string {
 		t.Fatalf("write wrap key: %v", err)
 	}
 	return path
+}
+
+// TestRun_ConfigLoadFailureReturnsError: a missing SB_PAT_TOKEN makes
+// config.Load fail, and Run must surface that as a wrapped error rather than
+// exiting the process. This is the boot-failure path that os.Exit previously
+// made impossible to assert.
+func TestRun_ConfigLoadFailureReturnsError(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "") // config.Load rejects an empty PAT first.
+	err := Run(context.Background(), testLogger(), nil)
+	if err == nil {
+		t.Fatalf("Run with empty SB_PAT_TOKEN = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), "load config") {
+		t.Fatalf("Run error = %v, want it to wrap \"load config\"", err)
+	}
+}
+
+// TestRun_StoreOpenFailureReturnsError: with a loadable config but an
+// unopenable DB path (parent is a regular file, so store.Open's MkdirAll
+// fails), Run must return the wrapped error. This exercises the store.Open
+// boot-failure branch that previously called os.Exit(1).
+func TestRun_StoreOpenFailureReturnsError(t *testing.T) {
+	// A regular file standing where store.Open expects the DB's parent dir.
+	parentAsFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(parentAsFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed parent file: %v", err)
+	}
+	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_PUBLIC_HOST", "localhost") // required when SB_DOMAIN is empty
+	t.Setenv("SB_DB_PATH", filepath.Join(parentAsFile, "state.db"))
+
+	err := Run(context.Background(), testLogger(), nil)
+	if err == nil {
+		t.Fatalf("Run with unopenable DB path = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), "open store") {
+		t.Fatalf("Run error = %v, want it to wrap \"open store\"", err)
+	}
+}
+
+// TestRun_ProviderFactoryErrorReturnsError: a makeProvider that fails must
+// abort boot with a wrapped error before any infrastructure is opened.
+func TestRun_ProviderFactoryErrorReturnsError(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_PUBLIC_HOST", "localhost")
+	t.Setenv("SB_DB_PATH", filepath.Join(t.TempDir(), "state.db"))
+
+	boom := func(context.Context, FleetConfig) (controlplane.Provider, error) {
+		return controlplane.Provider{}, errors.New("provider boom")
+	}
+	err := Run(context.Background(), testLogger(), boom)
+	if err == nil {
+		t.Fatalf("Run with failing provider factory = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), "control plane provider") {
+		t.Fatalf("Run error = %v, want it to wrap \"control plane provider\"", err)
+	}
 }
 
 // TestConfigureMirror walks every branch: the disabled early-return, the
