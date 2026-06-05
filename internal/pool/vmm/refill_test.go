@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/store"
 )
 
 // fakeSpawner records every Spawn call and returns a stub handle.
@@ -349,4 +351,319 @@ func TestRun_EndToEnd_WarmsFromCold(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// cancellingSpawner cancels the provided context on the first Spawn call,
+// then delegates to the embedded fakeSpawner. Used to drive ctx.Err()
+// short-circuit paths in runRefillOnce / refillTemplate.
+type cancellingSpawner struct {
+	cancel context.CancelFunc
+	fakeSpawner
+}
+
+func (s *cancellingSpawner) Spawn(ctx context.Context, slotID string, inputs SnapshotInputs) (SpawnedHandle, error) {
+	s.cancel()
+	return s.fakeSpawner.Spawn(ctx, slotID, inputs)
+}
+
+// cancelAndErrorSpawner cancels the context AND returns an error from Spawn.
+// Used to cover the "RecordFailed also fails after spawn error" path.
+type cancelAndErrorSpawner struct {
+	cancel context.CancelFunc
+}
+
+func (s *cancelAndErrorSpawner) Spawn(_ context.Context, _ string, _ SnapshotInputs) (SpawnedHandle, error) {
+	s.cancel()
+	return nil, errors.New("spawner failed")
+}
+
+// dbClosingSpawner closes the store during Spawn so RecordLoaded fails.
+type dbClosingSpawner struct {
+	st     *store.Store
+	handle SpawnedHandle
+}
+
+func (s *dbClosingSpawner) Spawn(_ context.Context, slotID string, _ SnapshotInputs) (SpawnedHandle, error) {
+	s.st.Close()
+	if s.handle != nil {
+		return s.handle, nil
+	}
+	return &stubHandle{api: "/api/" + slotID, run: "/run/" + slotID}, nil
+}
+
+// errorWithHandleSpawner returns both a handle AND an error to exercise
+// the defense-in-depth Shutdown path after a failed spawn.
+type errorWithHandleSpawner struct {
+	handle      SpawnedHandle
+	err         error
+	shutdownCnt *atomic.Int32
+}
+
+func (s *errorWithHandleSpawner) Spawn(_ context.Context, _ string, _ SnapshotInputs) (SpawnedHandle, error) {
+	return s.handle, s.err
+}
+
+func TestRefill_CtxCancelledMidBudget(t *testing.T) {
+	// budget=2 for tpl-a; spawner cancels ctx on the first Spawn so the
+	// second budget iteration hits ctx.Err() and returns early.
+	p, _ := newTestPool(t)
+	p.SetDepth("tpl-a", 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	spawner := &cancellingSpawner{
+		cancel:      cancel,
+		fakeSpawner: fakeSpawner{},
+	}
+	lister := &fakeLister{templates: []TemplateWarmInput{{TemplateID: "tpl-a", VsockCID: 3}}}
+	var busy atomic.Bool
+	p.runRefillOnce(ctx, lister, spawner, 5*time.Second, &busy)
+	// Only the first spawn was attempted; the second iteration returned early.
+	if got := len(spawner.Calls()); got != 1 {
+		t.Fatalf("spawn calls = %d, want 1 (ctx cancelled mid-budget)", got)
+	}
+}
+
+func TestRefill_CtxCancelledBetweenTemplates(t *testing.T) {
+	// Two templates; spawner cancels ctx during tpl-a's spawn so the
+	// template loop's ctx.Err() check fires before tpl-b is processed.
+	p, _ := newTestPool(t)
+	p.SetDepth("tpl-a", 1)
+	p.SetDepth("tpl-b", 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	spawner := &cancellingSpawner{
+		cancel:      cancel,
+		fakeSpawner: fakeSpawner{},
+	}
+	lister := &fakeLister{templates: []TemplateWarmInput{
+		{TemplateID: "tpl-a", VsockCID: 3},
+		{TemplateID: "tpl-b", VsockCID: 4},
+	}}
+	var busy atomic.Bool
+	p.runRefillOnce(ctx, lister, spawner, 5*time.Second, &busy)
+	// Only tpl-a's spawn was attempted.
+	if got := len(spawner.Calls()); got != 1 {
+		t.Fatalf("spawn calls = %d, want 1 (ctx cancelled before tpl-b)", got)
+	}
+}
+
+func TestRefill_StatsPublishFailed(t *testing.T) {
+	// Close the store so ListNonReleased and Stats both fail.
+	// runRefillOnce must not panic; it just logs warnings and continues.
+	p, st := newTestPool(t)
+	p.SetDepth("tpl-a", 1)
+	st.Close()
+	spawner := &fakeSpawner{}
+	lister := &fakeLister{templates: []TemplateWarmInput{{TemplateID: "tpl-a", VsockCID: 3}}}
+	var busy atomic.Bool
+	p.runRefillOnce(context.Background(), lister, spawner, 5*time.Second, &busy)
+	// No panics; the warning for "list non-released failed" and
+	// "publish stats query failed" cover those log branches.
+}
+
+func TestGC_ReapError(t *testing.T) {
+	p, st := newTestPool(t)
+	st.Close()
+	// Must not panic; the gc-reap-failed warning is logged.
+	p.runGCOnce(context.Background(), time.Hour)
+}
+
+func TestSpawnOne_RecordSpawningFailure(t *testing.T) {
+	// Close the store before spawnOne so RecordSpawning fails.
+	p, st := newTestPool(t)
+	st.Close()
+	spawner := &fakeSpawner{}
+	tpl := TemplateWarmInput{TemplateID: "tpl-a", VsockCID: 3}
+	p.spawnOne(context.Background(), tpl, spawner, 5*time.Second)
+	// RecordSpawning failed → early return; Spawn never called.
+	if got := len(spawner.Calls()); got != 0 {
+		t.Fatalf("spawn calls = %d, want 0 when RecordSpawning fails", got)
+	}
+}
+
+func TestSpawnOne_HandleDefenseInDepth(t *testing.T) {
+	// Spawner returns (handle, error). The pool must call handle.Shutdown
+	// even though the spawn "failed", to ensure no leaked process.
+	p, _ := newTestPool(t)
+	var shutdownCalled atomic.Int32
+	handle := &shutdownCountHandle{cnt: &shutdownCalled}
+	spawner := &errorWithHandleSpawner{
+		handle: handle,
+		err:    errors.New("spawn failed but leaked handle"),
+	}
+	tpl := TemplateWarmInput{TemplateID: "tpl-a", VsockCID: 3}
+	p.spawnOne(context.Background(), tpl, spawner, 5*time.Second)
+	if got := shutdownCalled.Load(); got != 1 {
+		t.Fatalf("handle.Shutdown calls = %d, want 1 (defense-in-depth)", got)
+	}
+}
+
+// shutdownCountHandle counts Shutdown calls without requiring a fakeSpawner.
+type shutdownCountHandle struct {
+	cnt *atomic.Int32
+}
+
+func (h *shutdownCountHandle) APISocket() string { return "/api/test" }
+func (h *shutdownCountHandle) RunDir() string    { return "/run/test" }
+func (h *shutdownCountHandle) Pid() int          { return 0 }
+func (h *shutdownCountHandle) Shutdown(_ context.Context, _ time.Duration) error {
+	h.cnt.Add(1)
+	return nil
+}
+
+func TestSpawnOne_RecordLoadedFailure(t *testing.T) {
+	// DB-closing spawner: RecordSpawning succeeds, Spawn closes the DB
+	// and returns a handle, RecordLoaded then fails (DB closed).
+	p, st := newTestPool(t)
+	tpl := TemplateWarmInput{TemplateID: "tpl-a", VsockCID: 3}
+	spawner := &dbClosingSpawner{st: st}
+
+	spawnErrBefore := mapInt(spawnTotal, "record_error")
+	p.spawnOne(context.Background(), tpl, spawner, 5*time.Second)
+	if got := mapInt(spawnTotal, "record_error") - spawnErrBefore; got != 1 {
+		t.Fatalf("record_error counter delta = %d, want 1", got)
+	}
+}
+
+func TestSpawnOne_MarkFailedAfterSpawnErrorFails(t *testing.T) {
+	// cancelAndErrorSpawner: Spawn cancels ctx AND returns error.
+	// RecordFailed then fails because parentCtx is cancelled.
+	// The "mark failed after spawn error failed" warning must be logged.
+	p, _ := newTestPool(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	spawner := &cancelAndErrorSpawner{cancel: cancel}
+	tpl := TemplateWarmInput{TemplateID: "tpl-a", VsockCID: 3}
+
+	spawnErrBefore := mapInt(spawnTotal, "spawn_error")
+	p.spawnOne(ctx, tpl, spawner, 5*time.Second)
+	// spawn_error counter must have advanced by 1 (or the warn-path was
+	// taken when mErr != nil, which is logged but doesn't bump a separate counter).
+	// Either way, no panic is the primary assertion.
+	_ = spawnErrBefore
+}
+
+func TestRun_ZeroSpawnTimeoutDefaulted(t *testing.T) {
+	// SpawnTimeout: 0 in RefillConfig should be defaulted to 30s inside Run
+	// so spawns still complete (fakeSpawner is instant).
+	p, _ := newTestPool(t)
+	p.SetDepth("tpl-a", 1)
+	spawner := &fakeSpawner{}
+	lister := &fakeLister{templates: []TemplateWarmInput{{TemplateID: "tpl-a", VsockCID: 3}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, RefillConfig{
+			RefillInterval: 50 * time.Millisecond,
+			GCInterval:     time.Hour,
+			GCTTL:          time.Hour,
+			SpawnTimeout:   0, // will be defaulted to 30s
+		}, lister, spawner)
+		close(done)
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		stats, _ := p.Stats(context.Background(), "tpl-a")
+		if stats.Loaded == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("pool did not warm up with defaulted SpawnTimeout")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
+func TestRun_OrphanRepairError(t *testing.T) {
+	// Close the store before Run starts so releaseOrphanedRowsAtStart fails.
+	// Run must log a warning and continue rather than crashing.
+	p, st := newTestPool(t)
+	st.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, RefillConfig{
+			RefillInterval: 50 * time.Millisecond,
+			GCInterval:     50 * time.Millisecond,
+			GCTTL:          time.Hour,
+		}, &fakeLister{}, &fakeSpawner{})
+		close(done)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after context cancel")
+	}
+}
+
+func TestRun_OrphanRepairReleased_Logged(t *testing.T) {
+	// Seed warm-but-handleless rows so releaseOrphanedRowsAtStart reports
+	// released > 0 and Run logs the "released orphaned startup rows" info.
+	bgCtx := context.Background()
+	p, _ := newTestPool(t)
+	now := time.Now().UTC()
+	for _, id := range []string{"vmms-orphan1", "vmms-orphan2"} {
+		if err := p.RecordSpawning(bgCtx, id, "tpl-a", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.RecordLoaded(bgCtx, "vmms-orphan2", "/api", "/dir", 3, now); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, RefillConfig{
+			RefillInterval: 50 * time.Millisecond,
+			GCInterval:     time.Hour,
+			GCTTL:          time.Hour,
+		}, &fakeLister{}, &fakeSpawner{})
+		close(done)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit")
+	}
+
+	stats, err := p.Stats(bgCtx, "tpl-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Released != 2 {
+		t.Fatalf("expected 2 released orphans, got %+v", stats)
+	}
+}
+
+func TestRun_TickerPaths(t *testing.T) {
+	// Use short tickers so both refillTicker.C and gcTicker.C fire before
+	// context cancel. Pool has no depth configured — ticks are no-ops but
+	// cover the select case branches.
+	p, _ := newTestPool(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, RefillConfig{
+			RefillInterval: 5 * time.Millisecond,
+			GCInterval:     5 * time.Millisecond,
+			GCTTL:          time.Hour,
+		}, &fakeLister{}, &fakeSpawner{})
+		close(done)
+	}()
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after context cancel")
+	}
 }

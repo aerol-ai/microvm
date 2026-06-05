@@ -487,3 +487,183 @@ func TestPool_GetBySandbox(t *testing.T) {
 		t.Fatalf("got = %+v", got)
 	}
 }
+
+func TestPool_SlotFromStore_Nil(t *testing.T) {
+	if got := slotFromStore(nil); got != nil {
+		t.Fatalf("slotFromStore(nil) = %+v, want nil", got)
+	}
+}
+
+func TestPool_SetDefaultDepth_Negative(t *testing.T) {
+	p, _ := newTestPool(t)
+	p.SetDefaultDepth(-5)
+	if got := p.DepthFor("any"); got != 0 {
+		t.Fatalf("SetDefaultDepth(-5) → DepthFor = %d, want 0", got)
+	}
+}
+
+func TestPool_Acquire_WrapsStoreError(t *testing.T) {
+	ctx := context.Background()
+	p, st := newTestPool(t)
+	st.Close()
+	_, err := p.Acquire(ctx, "tpl-a", "sb1", time.Now().UTC())
+	if err == nil || errors.Is(err, ErrNoLoadedSlot) {
+		t.Fatalf("expected wrapped store error, got %v", err)
+	}
+}
+
+func TestPool_AcquireWithHandle_NonSentinelError(t *testing.T) {
+	ctx := context.Background()
+	p, st := newTestPool(t)
+	st.Close()
+	_, _, err := p.AcquireWithHandle(ctx, "tpl-a", "sb1", time.Now().UTC())
+	if err == nil || errors.Is(err, ErrNoLoadedSlot) {
+		t.Fatalf("expected wrapped store error, got %v", err)
+	}
+}
+
+func TestPool_Close_ShutdownFailure(t *testing.T) {
+	p, _ := newTestPool(t)
+	fs := &fakeSpawner{}
+	shutErr := errors.New("process busy")
+	p.registerHandle("vmms-h1", &fakeHandle{apiSocket: "/api", runDir: "/dir", parent: fs, shutdownErr: shutErr})
+	p.registerHandle("vmms-h2", &fakeHandle{apiSocket: "/api2", runDir: "/dir2", parent: fs, shutdownErr: shutErr})
+	// Both shutdown calls fail — drained should be 0.
+	if drained := p.Close(context.Background(), 0); drained != 0 {
+		t.Fatalf("Close drained = %d, want 0 when all shutdowns fail", drained)
+	}
+}
+
+func TestPool_ReleaseOrphanedRowsAtStart_Error(t *testing.T) {
+	p, st := newTestPool(t)
+	st.Close()
+	_, err := p.releaseOrphanedRowsAtStart(context.Background(), time.Now().UTC())
+	if err == nil {
+		t.Fatal("expected error from closed store")
+	}
+}
+
+func TestPool_Get_StoreError(t *testing.T) {
+	p, st := newTestPool(t)
+	st.Close()
+	_, err := p.Get(context.Background(), "sb1")
+	if err == nil {
+		t.Fatal("expected error from closed store")
+	}
+}
+
+func TestPool_Release_StoreError(t *testing.T) {
+	p, st := newTestPool(t)
+	st.Close()
+	err := p.Release(context.Background(), "sb1", time.Now().UTC())
+	if err == nil {
+		t.Fatal("expected error from closed store")
+	}
+}
+
+func TestPool_Stats_StoreError(t *testing.T) {
+	p, st := newTestPool(t)
+	st.Close()
+	_, err := p.Stats(context.Background(), "tpl-a")
+	if err == nil {
+		t.Fatal("expected error from closed store")
+	}
+}
+
+func TestPool_ListNonReleased_StoreError(t *testing.T) {
+	p, st := newTestPool(t)
+	st.Close()
+	_, err := p.ListNonReleased(context.Background(), "tpl-a")
+	if err == nil {
+		t.Fatal("expected error from closed store")
+	}
+}
+
+func TestPool_ReapReleased_ListError(t *testing.T) {
+	p, st := newTestPool(t)
+	st.Close()
+	_, err := p.ReapReleased(context.Background(), time.Now().UTC())
+	if err == nil {
+		t.Fatal("expected error from closed store")
+	}
+}
+
+func TestPool_ReapReleased_ErrNotFound(t *testing.T) {
+	// Two concurrent ReapReleased calls: the first deletes the row,
+	// the second sees ErrNotFound and silently continues (not an error).
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Hour)
+
+	if err := p.RecordSpawning(ctx, "vmms-race", "tpl-a", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordFailed(ctx, "vmms-race", "boom", old); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := now.Add(-time.Hour)
+	var wg sync.WaitGroup
+	var total int
+	var mu sync.Mutex
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n, err := p.ReapReleased(ctx, cutoff)
+			if err != nil {
+				// ErrNotFound is swallowed inside ReapReleased, so no
+				// error should leak to the caller.
+				t.Errorf("unexpected error from ReapReleased: %v", err)
+				return
+			}
+			mu.Lock()
+			total += n
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	// Exactly 1 row was deleted across both goroutines.
+	if total != 1 {
+		t.Fatalf("total deletions across two concurrent reaps = %d, want 1", total)
+	}
+}
+
+// dbClosingHandle is a SpawnedHandle whose Shutdown closes the store
+// so that the next store call (e.g. DeleteFirecrackerVMMSlot) fails.
+type dbClosingHandle struct {
+	st        *store.Store
+	apiSocket string
+	runDir    string
+}
+
+func (h *dbClosingHandle) APISocket() string { return h.apiSocket }
+func (h *dbClosingHandle) RunDir() string    { return h.runDir }
+func (h *dbClosingHandle) Pid() int          { return 0 }
+func (h *dbClosingHandle) Shutdown(_ context.Context, _ time.Duration) error {
+	h.st.Close()
+	return nil
+}
+
+func TestPool_ReapReleased_DeleteError(t *testing.T) {
+	ctx := context.Background()
+	p, st := newTestPool(t)
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Hour)
+
+	if err := p.RecordSpawning(ctx, "vmms-del", "tpl-a", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordFailed(ctx, "vmms-del", "boom", old); err != nil {
+		t.Fatal(err)
+	}
+	// Register a handle whose Shutdown closes the DB so the subsequent
+	// DeleteFirecrackerVMMSlot fails with a non-ErrNotFound error.
+	p.registerHandle("vmms-del", &dbClosingHandle{st: st, apiSocket: "/api", runDir: "/dir"})
+
+	_, err := p.ReapReleased(ctx, now.Add(-time.Hour))
+	if err == nil {
+		t.Fatal("expected error when delete fails after successful list")
+	}
+}

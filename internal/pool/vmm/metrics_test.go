@@ -2,6 +2,7 @@ package vmm
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"strconv"
 	"sync/atomic"
@@ -268,3 +269,47 @@ var errFakeSpawn = &stringError{msg: "fake spawn failure"}
 type stringError struct{ msg string }
 
 func (e *stringError) Error() string { return e.msg }
+
+func TestMetrics_ClassifyAcquireError(t *testing.T) {
+	// nil → empty string (no outcome)
+	if got := metricsClassifyAcquireError(nil); got != "" {
+		t.Fatalf("nil error → %q, want empty", got)
+	}
+	// error containing "no loaded slot" → miss (defensive path)
+	if got := metricsClassifyAcquireError(errors.New("vmm pool: no loaded slot for template")); got != acquireOutcomeMiss {
+		t.Fatalf("'no loaded slot' error → %q, want miss", got)
+	}
+	// any other error → error outcome
+	if got := metricsClassifyAcquireError(errors.New("sqlite: database is closed")); got != acquireOutcomeError {
+		t.Fatalf("generic error → %q, want error", got)
+	}
+}
+
+func TestMetrics_RecordRefillShortfall_NoOp(t *testing.T) {
+	before := mapInt(refillShortfall, "tpl_noop")
+	// Zero shortfall → no increment.
+	recordRefillShortfall("tpl-noop", 0)
+	if got := mapInt(refillShortfall, "tpl_noop") - before; got != 0 {
+		t.Fatalf("zero shortfall bumped counter by %d", got)
+	}
+	// Negative shortfall → no increment.
+	recordRefillShortfall("tpl-noop", -1)
+	if got := mapInt(refillShortfall, "tpl_noop") - before; got != 0 {
+		t.Fatalf("negative shortfall bumped counter by %d", got)
+	}
+	// Empty templateID → no increment.
+	before2 := intValue(refillShortfall)
+	recordRefillShortfall("", 5)
+	if intValue(refillShortfall) != before2 {
+		t.Fatal("empty templateID should be a no-op")
+	}
+}
+
+func TestMetrics_PublishSlotStats_EmptyTemplateID(t *testing.T) {
+	before := intValue(slotGauges)
+	// Empty templateID → early return; slotGauges must not change.
+	publishSlotStats("", Stats{Loaded: 3})
+	if intValue(slotGauges) != before {
+		t.Fatal("publishSlotStats with empty templateID should be a no-op")
+	}
+}
