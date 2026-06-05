@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -82,8 +83,17 @@ func TestLinkOrCopyRootfs(t *testing.T) {
 func TestNonLinuxStubsAndWarmDestroyHandle(t *testing.T) {
 	t.Run("rss_sampler_stub", func(t *testing.T) {
 		pages, err := readRSSPagesForPID(123)
-		if err != nil || pages != 0 {
-			t.Fatalf("readRSSPagesForPID() = (%d,%v), want (0,nil)", pages, err)
+		if pages != 0 {
+			t.Fatalf("readRSSPagesForPID() pages = %d, want 0", pages)
+		}
+		if runtime.GOOS == "linux" {
+			if err == nil {
+				t.Fatal("readRSSPagesForPID() error = nil, want error for missing /proc pid on linux")
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("readRSSPagesForPID() error = %v, want nil on non-linux stub", err)
 		}
 	})
 
