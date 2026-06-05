@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -55,6 +57,27 @@ func TestDaemonReconcilerGuards_NoPanic(t *testing.T) {
 	attachTemplateArtifactPuller(logger, config.Config{EnableFirecracker: true, FirecrackerTemplatesDir: ""}, nil, nil)
 	startTemplateArtifactPushReconciler(ctx, logger, config.Config{EnableFirecracker: false, SnapshotPushEnabled: true}, nil, nil, nil)
 	startTemplateArtifactPushReconciler(ctx, logger, config.Config{EnableFirecracker: true, SnapshotPushEnabled: false}, nil, nil, nil)
+}
+
+func TestConfigureAOCRPullAuthGuard_NoPanic(t *testing.T) {
+	logger := testLogger()
+
+	// Empty config: must short-circuit before touching the client.
+	configureAOCRPullAuth(logger, config.Config{}, &docker.Client{})
+
+	// Fully configured: writes node-local pull auth onto the client. The
+	// behavior of the resolver itself is covered in pkg/docker; here we only
+	// assert the daemon wiring path runs cleanly.
+	patPath := filepath.Join(t.TempDir(), "cluster-pat")
+	if err := os.WriteFile(patPath, []byte("tok"), 0o600); err != nil {
+		t.Fatalf("write pat: %v", err)
+	}
+	configureAOCRPullAuth(logger, config.Config{
+		AutoImportClusterID:       "prod-aerolvm-us-east-1",
+		AutoImportClusterPATPath:  patPath,
+		MirrorPushHost:            "aocr.aerol.ai",
+		ImageDistributionAOCRHost: "aocr.aerol.ai",
+	}, &docker.Client{})
 }
 
 func TestAdaptTapSlot(t *testing.T) {

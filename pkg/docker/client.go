@@ -72,6 +72,11 @@ type Client struct {
 	mirrorCfg    MirrorConfig
 	wrapKeyRing  *secrets.UpstreamWrapKeyRing
 	pullObserver PullObserver
+	// aocrPullAuth is the node-local cluster PAT used to pull cluster-owned
+	// artifacts (snapshots + Firecracker templates) from AOCR. nil disables it
+	// (anonymous pulls). Set via ConfigureAOCRPullAuth after construction. See
+	// aocr_pull_auth.go.
+	aocrPullAuth *aocrClusterPullAuth
 }
 
 type imagePull struct {
@@ -829,6 +834,18 @@ func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *mode
 	finishMetric := beginImagePullMetric()
 	var resultErr error
 	defer func() { finishMetric(resultErr) }()
+
+	// Back-fill the cluster PAT for AOCR `cluster/...` refs when the caller
+	// supplied no credentials. This is the single chokepoint for both consumer
+	// paths that pull cluster-owned artifacts anonymously today: the create-path
+	// snapshot pull (Create) and the Firecracker template puller (PullImage).
+	// Resolving here — before the dedup key is computed — keeps the key,
+	// backoff, and pull all keyed off the credential that will actually be used.
+	// No-op (returns nil) for non-AOCR hosts, non-cluster repos, or when AOCR
+	// pull auth was never configured.
+	if auth == nil {
+		auth = c.resolveAOCRPullAuth(imageRef)
+	}
 
 	key := imagePullKey(imageRef, auth)
 	c.pullMu.Lock()
