@@ -75,7 +75,12 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = st.CreateSnapshot(ctx, &models.SandboxSnapshot{SourceSandboxID: "sb-list", Name: "snap-update"})
 
 	_, _, _ = st.ClaimIdempotentRequest(ctx, "req-2", "fp2", time.Now(), time.Minute)
-	_, _, _ = st.ClaimIdempotentRequest(ctx, "req-2", "fp2", time.Now(), time.Minute) // Duplicate
+	_, _, _ = st.ClaimIdempotentRequest(ctx, "", "fp2", time.Now(), time.Minute)
+	_, _, _ = st.ClaimIdempotentRequest(ctx, "req-2", "", time.Now(), time.Minute)
+
+	// Claim on expired lock
+	_, _, _ = st.ClaimIdempotentRequest(ctx, "req-expired", "fp-expired", time.Now().Add(-2*time.Minute), time.Minute)
+	_, _, _ = st.ClaimIdempotentRequest(ctx, "req-expired", "fp-expired", time.Now(), time.Minute)
 
 	_ = st.InsertFirecrackerVMMSlot(ctx, FirecrackerVMMSlot{ID: "slot-update", TemplateID: "tpl-update"}, time.Now())
 	_ = st.MarkFirecrackerVMMSlotLoaded(ctx, "slot-update", "sb-list", "tap", 1, time.Now())
@@ -116,6 +121,21 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_, _ = st.ListAllExposedPorts(ctx)
 	_, _ = st.ListCustomDomains(ctx, "sb-list")
 
+	_ = st.Upsert(ctx, sampleSandbox("sb-upsert"))
+
+	// Internal Helpers
+	_ = isSandboxNameConflict(errors.New("unique constraint failed"), "name")
+	_ = isSandboxNameConflict(ErrSandboxNameConflict, "name")
+	_, _ = marshalGPUs(nil)
+	_, _ = marshalGPUs(&models.GPURequest{})
+	nowTime := time.Now()
+	_ = nullableTime(&time.Time{})
+	_ = nullableTime(&nowTime)
+	_ = boolToInt(true)
+	_ = boolToInt(false)
+	_, _ = marshalJSON(nil, "")
+	_ = sandboxFailoverPolicy(&models.Sandbox{})
+
 	_ = st.DeleteMounts(ctx, "sb-list")
 	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb-list")
 	_ = st.DeleteSnapshotAlias(ctx, "alias-list")
@@ -133,7 +153,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	st := newTestStore(t)
 	st.Close() // Close the DB immediately to trigger all error paths
 
-	_ = st.Upsert(ctx, &models.Sandbox{})
+	_ = st.Upsert(ctx, sampleSandbox("sb-upsert"))
 	_ = st.UpsertCompatState(ctx, "a", "b", "c")
 	_, _, _ = st.ClaimIdempotentRequest(ctx, "req", "fp", time.Now(), time.Minute)
 	_ = st.CreateTemplate(ctx, &models.Template{Image: "img"})
