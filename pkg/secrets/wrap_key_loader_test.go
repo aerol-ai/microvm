@@ -140,3 +140,12 @@ func TestCurrentOnNilRingIsSafe(t *testing.T) {
 		t.Fatalf("empty ring should not have a current key")
 	}
 }
+
+func TestLoadUpstreamWrapKeyRing_ReadFileError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "isdir")
+	os.Mkdir(path, 0400)
+	if _, err := LoadUpstreamWrapKeyRing(path); err == nil {
+		t.Fatal("expected error reading directory as key file")
+	}
+}

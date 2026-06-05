@@ -170,3 +170,15 @@ func TestIdentityTokenPrefixIsStable(t *testing.T) {
 		t.Fatalf("prefix drifted from contract: %q", IdentityTokenPrefix)
 	}
 }
+
+func TestWrapUpstreamCreds_InvalidKeySize(t *testing.T) {
+	ring := &UpstreamWrapKeyRing{
+		Keys: []UpstreamWrapKey{
+			{ID: "invalid", Bytes: []byte("short")},
+		},
+	}
+	_, err := WrapUpstreamCreds(ring, sampleCreds())
+	if err == nil {
+		t.Fatal("expected error with invalid key size")
+	}
+}

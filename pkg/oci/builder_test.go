@@ -256,3 +256,54 @@ func TestCappedBuffer_OciDuplicate(t *testing.T) {
 		t.Errorf("drop counter broke: %q", got)
 	}
 }
+
+func TestCleanupDir_Empty(t *testing.T) {
+	r := Result{}
+	if err := r.CleanupDir(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuild_UmociFailure(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	cfg.UmociBin = writeFake(t, t.TempDir(), "umoci", "exit 1")
+	b, _ := New(cfg)
+	if _, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: "out"}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestBuild_MkfsFailure(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	cfg.Mkfs4Bin = writeFake(t, t.TempDir(), "mkfs", "exit 1")
+	b, _ := New(cfg)
+	if _, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: "out"}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestBuild_StatFailure(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	// Make mkfs NOT create the out path, but exit 0
+	cfg.Mkfs4Bin = writeFake(t, t.TempDir(), "mkfs", "exit 0")
+	b, _ := New(cfg)
+	if _, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: filepath.Join(t.TempDir(), "missing")}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestRunStage_EmptyBinary(t *testing.T) {
+	if err := runStage(context.Background(), "label", "", nil); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestCappedBuffer_Overflow(t *testing.T) {
+	b := newCappedBuffer(4)
+	b.Write([]byte("ABC"))
+	b.Write([]byte("DEF"))
+	got := b.String()
+	if !strings.HasPrefix(got, "ABCD\n[... ") {
+		t.Errorf("head-keep broke: %q", got)
+	}
+}
