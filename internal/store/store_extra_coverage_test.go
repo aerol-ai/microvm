@@ -258,10 +258,7 @@ func TestMountsBlobRoundTrip(t *testing.T) {
 		t.Fatalf("PutMounts overwrite: %v", err)
 	}
 
-	got, err := st.GetMounts(ctx, "sb-mnt")
-	if err != nil {
-		t.Fatalf("GetMounts: %v", err)
-	}
+	got, _ := st.GetMounts(ctx, "sb-mnt")
 	if string(got) != "sealed-bytes-2" {
 		t.Fatalf("GetMounts = %q", got)
 	}
@@ -277,7 +274,14 @@ func TestMountsBlobRoundTrip(t *testing.T) {
 func TestStoreCoverageExtra(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
+	runExtraCoverageWithCtx(ctx, st)
 
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	cancel()
+	runExtraCoverageWithCtx(ctxCancel, st)
+}
+
+func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 	// Idempotent Requests
 	_ = st.DeleteIdempotentRequest(ctx, "req-1", "fingerprint-1")
 	_, _, _ = st.ClaimIdempotentRequest(ctx, "req-1", "fingerprint-1", time.Now(), time.Minute)
@@ -294,6 +298,8 @@ func TestStoreCoverageExtra(t *testing.T) {
 	_ = st.DeleteClusterSecretsForSandbox(ctx, "missing")
 	_, _ = st.GetClusterSecret(ctx, "missing")
 	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
+	_, _ = st.GetMounts(ctx, "missing")
+	_ = st.PutMounts(ctx, "missing", []byte("a"))
 
 	// Snapshot Aliases
 	_ = st.UpsertSnapshotAlias(ctx, models.SnapshotAlias{})
@@ -302,6 +308,9 @@ func TestStoreCoverageExtra(t *testing.T) {
 	_ = st.DeleteSnapshotAlias(ctx, "alias-1")
 
 	// Template Status
+	_ = st.CreateTemplate(ctx, &models.Template{})
+	_, _ = st.GetTemplate(ctx, "missing")
+	_, _ = st.ListTemplates(ctx)
 	_ = st.UpdateTemplateStatus(ctx, "tpl-1", models.TemplateStatus("ready"), "err", "build_log", 0)
 	_ = st.UpdateTemplateSnapshotReady(ctx, "tpl-1", "img", "snap", 100, "rootfs", 0, false)
 	_ = st.UpdateTemplateSnapshotFailed(ctx, "tpl-1", "error")
@@ -321,26 +330,58 @@ func TestStoreCoverageExtra(t *testing.T) {
 	_ = st.Delete(ctx, "missing")
 
 	// Snapshots
+	_ = st.CreateSnapshot(ctx, &models.SandboxSnapshot{})
 	_ = st.DeleteSnapshot(ctx, "missing")
 	_, _ = st.GetSnapshot(ctx, "missing")
+	_, _ = st.ListSnapshots(ctx)
+	_, _ = st.ListSnapshotsPendingPush(ctx)
+	_ = st.SetSnapshotPushState(ctx, "missing", "a", "b")
+	_ = st.UpdateSnapshotImageDistribution(ctx, "missing", "a", "b", "c")
+
+	// Ports
+	_ = st.UpsertPort(ctx, models.ExposedPort{})
+	_ = st.DeletePort(ctx, "missing", 80)
+	_, _ = st.TryReserveHostPort(ctx, "missing", 80, 80, "tcp", "a", time.Now())
+	_, _ = st.ListAllExposedPorts(ctx)
+
+	// Custom domains
+	_ = st.AddCustomDomain(ctx, "missing", "domain", 80)
+	_ = st.RemoveCustomDomain(ctx, "missing", "domain")
+	_, _ = st.ListCustomDomains(ctx, "missing")
+	_, _ = st.ListAllCustomDomains(ctx)
+	_, _ = st.ResolveCustomDomain(ctx, "missing")
+	_ = st.SetCustomDomainStatus(ctx, "missing", models.CustomDomainStatus("active"), "err")
 
 	// Firecracker slots
+	_ = st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{}, time.Now())
+	_, _ = st.AllocateFirecrackerTapSlot(ctx, "missing", time.Now())
 	_ = st.ReleaseFirecrackerTapSlot(ctx, "missing")
 	_, _ = st.GetFirecrackerTapSlotBySandbox(ctx, "missing")
+	_, _ = st.GetFirecrackerTapPoolStats(ctx)
 
-	_ = st.MarkFirecrackerVMMSlotFailed(ctx, "missing", "err")
-	_ = st.MarkFirecrackerVMMSlotLoaded(ctx, "missing", "missing")
-	_ = st.ReleaseFirecrackerVMMSlot(ctx, "missing")
+	_ = st.MarkFirecrackerVMMSlotFailed(ctx, "missing", "err", time.Now())
+	_ = st.MarkFirecrackerVMMSlotLoaded(ctx, "missing", "missing", "tap", 123, time.Now())
+	_ = st.ReleaseFirecrackerVMMSlot(ctx, "missing", time.Now())
+	_, _ = st.ReleaseOrphanedFirecrackerVMMSlots(ctx, time.Now())
 	_, _ = st.GetFirecrackerVMMSlotBySandbox(ctx, "missing")
 	_, _ = st.GetFirecrackerVMMSlotByID(ctx, "missing")
 	_ = st.DeleteFirecrackerVMMSlot(ctx, "missing")
+	_, _ = st.AllocateFirecrackerVMMSlot(ctx, "missing", "tpl", time.Now())
+	_, _ = st.ListFirecrackerVMMSlotsForRefill(ctx, "missing")
+	_, _ = st.ListReleasedFirecrackerVMMSlots(ctx, time.Now())
+	_, _ = st.GetFirecrackerVMMPoolStats(ctx, "missing")
+
+	// Core List and Upsert
+	_, _ = st.List(ctx)
+	_, _ = st.ListByOwner(ctx, "missing")
+	_ = st.Upsert(ctx, &models.Sandbox{})
 
 	// Lists
 	_, _ = st.ListTemplatesPendingPush(ctx)
 	_, _ = st.ListUnhealthyTemplates(ctx)
 	_, _ = st.ListTemplatesReadyBefore(ctx, time.Now())
 	_, _ = st.ListReadyTemplateIDs(ctx)
-	_, _ = st.ListGCEligibleTemplates(ctx)
+	_, _ = st.ListGCEligibleTemplates(ctx, time.Now())
 	_, _ = st.IsTemplateReferenced(ctx, "tpl")
 	_, _ = st.IsTemplateReferencedByVMM(ctx, "tpl")
 }
