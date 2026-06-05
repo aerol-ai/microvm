@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func TestConfigureVMMForLoad_Errors_Extra(t *testing.T) {
@@ -129,7 +131,7 @@ func TestDriver_NotImplemented_Extra(t *testing.T) {
 	if err := d.ClearNetworkBlockEgress("id"); err == nil || !strings.Contains(err.Error(), "not yet implemented") {
 		t.Errorf("expected not implemented error, got %v", err)
 	}
-	if err := d.Resize(ctx, "id", nil); err == nil || !strings.Contains(err.Error(), "not yet implemented") {
+	if err := d.Resize(ctx, "id", models.ResizeSandboxRequest{}); err == nil || !strings.Contains(err.Error(), "not yet implemented") {
 		t.Errorf("expected not implemented error, got %v", err)
 	}
 }
