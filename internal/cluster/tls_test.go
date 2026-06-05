@@ -2,7 +2,6 @@ package cluster
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"os"
 	"path/filepath"
 	"testing"
