@@ -158,6 +158,9 @@ func TestUpsertHelpers_AgainstFakeCaddy(t *testing.T) {
 	if err := client.UpsertTCPRoute(ctx, "abc", "10.0.0.1", 1234, 1234); err != nil {
 		t.Fatalf("UpsertTCPRoute: %v", err)
 	}
+	if err := client.UpsertTCPProxyRoute(ctx, "abc", 1235, 1235, "10.0.0.1", 1235); err != nil {
+		t.Fatalf("UpsertTCPProxyRoute: %v", err)
+	}
 	if err := client.DeleteTCPRoute(ctx, 1234); err != nil {
 		t.Fatalf("DeleteTCPRoute: %v", err)
 	}
@@ -203,11 +206,17 @@ func TestUpsertHelpers_ErrorPaths(t *testing.T) {
 	if err := client.UpsertTCPRoute(ctx, "abc", "10.0.0.1", 1234, 1234); err == nil {
 		t.Error("UpsertTCPRoute: expected error on 500")
 	}
+	if err := client.UpsertTCPProxyRoute(ctx, "abc", 1235, 1235, "10.0.0.1", 1235); err == nil {
+		t.Error("UpsertTCPProxyRoute: expected error on 500")
+	}
 	if err := client.DeleteTCPRoute(ctx, 1234); err == nil {
 		t.Error("DeleteTCPRoute: expected error on 500")
 	}
 	if err := client.EnsureLayer4(ctx, ":443", "127.0.0.1:8443"); err == nil {
 		t.Error("EnsureLayer4: expected error on 500")
+	}
+	if err := client.EnsureLayer4(ctx, ":443", ""); err == nil {
+		t.Error("EnsureLayer4: expected error when fallback missing")
 	}
 	// Test EnsureOnDemandTLS error
 	if err := client.EnsureOnDemandTLS(ctx, "http://ask", 10, 0); err == nil {

@@ -275,3 +275,73 @@ func TestSweepIgnoresMissingRoot(t *testing.T) {
 	}
 	m.Sweep(map[string]struct{}{}) // must not panic
 }
+
+func TestNew_Errors(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, err := New(logger, Config{RootDir: "relative", CredDir: "/tmp"})
+	if err == nil {
+		t.Fatal("expected error for relative RootDir")
+	}
+	_, err = New(logger, Config{RootDir: "/tmp", CredDir: "relative"})
+	if err == nil {
+		t.Fatal("expected error for relative CredDir")
+	}
+	// Try creating a file instead of a dir to trigger MkdirAll error
+	f, _ := os.CreateTemp("", "mounts-root-*")
+	defer os.Remove(f.Name())
+	f.Close()
+	_, err = New(logger, Config{RootDir: f.Name(), CredDir: "/tmp"})
+	if err == nil {
+		t.Fatal("expected error when RootDir is a file")
+	}
+	f2, _ := os.CreateTemp("", "mounts-cred-*")
+	defer os.Remove(f2.Name())
+	f2.Close()
+	_, err = New(logger, Config{RootDir: "/tmp", CredDir: f2.Name()})
+	if err == nil {
+		t.Fatal("expected error when CredDir is a file")
+	}
+}
+
+type startErrAdapter struct{}
+
+func (startErrAdapter) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, credDir string) (adapters.Plan, error) {
+	return adapters.Plan{
+		Argv:          []string{"/does-not-exist-xyz"},
+		IsKernelMount: false,
+	}, nil
+}
+
+type sleepAdapter struct{}
+
+func (sleepAdapter) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, credDir string) (adapters.Plan, error) {
+	return adapters.Plan{
+		Argv:          []string{"sleep", "0.1"},
+		IsKernelMount: false,
+	}, nil
+}
+
+func TestMountOne_Coverage(t *testing.T) {
+	m := newTestManager(t, map[models.MountType]adapters.Adapter{
+		models.MountTypeS3:  startErrAdapter{},
+		models.MountTypeNFS: sleepAdapter{},
+	})
+
+	specs := []models.MountSpec{
+		{Type: models.MountTypeS3, Source: "s3", Target: "/s3"},
+	}
+	_, err := m.MountAll(context.Background(), "sb-fail-start", specs)
+	if err == nil {
+		t.Fatal("expected MountAll to fail because command doesn't exist")
+	}
+
+	specs2 := []models.MountSpec{
+		{Type: models.MountTypeNFS, Source: "nfs", Target: "/nfs"},
+	}
+	_, err = m.MountAll(context.Background(), "sb-sleep", specs2)
+	if err == nil {
+		t.Fatal("expected MountAll to fail with timeout")
+	}
+
+	m.UnmountAll("sb-sleep")
+}

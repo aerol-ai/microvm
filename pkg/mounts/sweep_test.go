@@ -146,3 +146,13 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 		_ = cmd.Wait()
 	})
 }
+
+func TestUnmountTree_Coverage(t *testing.T) {
+	d := t.TempDir()
+	child := filepath.Join(d, "child")
+	os.MkdirAll(child, 0755)
+
+	// Just call unmountTree, it shouldn't crash. Since devOf(child) == devOf(d),
+	// it won't actually call umount unless we fake it.
+	unmountTree(slog.Default(), d)
+}
