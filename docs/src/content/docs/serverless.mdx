@@ -6,6 +6,16 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 A serverless sandbox auto-stops when it goes idle and is transparently restarted on the next inbound HTTP, TCP, or TLS-SNI connection to one of its exposed ports. Long-lived sandboxes that only serve occasional traffic - preview deployments, per-user code environments, model endpoints - stop consuming CPU and memory between requests without losing their disk state or public URL.
 
+### Key Capabilities
+
+Because of scale-to-zero, serverless sandboxes enable you to build:
+- **Massive density hosting**: Run thousands of isolated workspaces or container instances on a single physical node by reclaiming CPU and memory from idle environments.
+- **Vercel-style deployment platforms**: Spin up instant-on web applications or frontend preview deployments that automatically sleep and wake up dynamically upon client requests.
+- **Neon-style serverless databases**: Provision dedicated database instances (e.g. Postgres, Redis) per tenant that scale to zero when inactive and resume instantly when queries arrive.
+- **On-demand interactive environments**: Deploy coding interview platforms, tutorials, web playgrounds, or secure burner browsers that only consume active resources.
+
+Check the [usecase](/use-cases/customer-facing-product-experiences/spawn-postgres) sections to learn more.
+
 ## What it does
 
 Set `serverless: true` on the sandbox's lifecycle alongside `stopIfIdleFor`. When the idle timer fires, the sandbox stops, but its exposed-port routes stay alive in a wake-aware shape and `wake_armed` is set in the store. The next inbound HTTP request or L4 connection through its public endpoint drives a cold start, then traffic is proxied to the started container.

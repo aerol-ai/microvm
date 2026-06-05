@@ -199,6 +199,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
           },
           {
             type: 'link',
+            href: '/port-allowlist',
+            label: 'Port Allowlist',
+            description: 'Require explicit exposure before public traffic reaches a sandbox port.',
+          },
+          {
+            type: 'link',
             href: '/custom-domains',
             label: 'Custom Domains',
             description: 'Attach arbitrary public hostnames to a sandbox with automatic per-host HTTPS via ACME.',
@@ -236,11 +242,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       //   label: 'Reconcile',
       //   description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
       // },
+
       {
         type: 'link',
-        href: '/durability',
-        label: 'Durability & Failover',
-        description: 'What survives host crashes and cluster-mode owner failover, and how to make workspace state durable.',
+        href: '/sandbox-tags',
+        label: 'Filter Sandbox Tags',
+        description: 'Filter list responses by tag with AND semantics for multi-tenant control planes.',
       },
     ],
   },
@@ -268,44 +275,17 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'Sessions',
         description: 'Persistent PTY sessions that survive reconnects with output replay.',
       },
-    ],
-  },
-  {
-    type: 'group',
-    label: 'Access',
-    category: NavigationCategory.ACCESS,
-    homePageHref: '/',
-    entries: [
       {
         type: 'link',
         href: '/ssh-access',
         label: 'SSH Access',
         description: 'Connect over SSH using per-sandbox Ed25519 keys via the gateway.',
       },
-      {
-        type: 'link',
-        href: '/preview',
-        label: 'Preview',
-        description: 'Expose container ports publicly over HTTPS through Caddy routes.',
-      },
-      {
-        type: 'link',
-        href: '/tcp-ports',
-        label: 'TCP & TLS Ports',
-        description: 'Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo) via caddy-l4.',
-      },
-      {
-        type: 'link',
-        href: '/port-allowlist',
-        label: 'Port Allowlist',
-        description: 'Require explicit exposure before public traffic reaches a sandbox port.',
-      },
-
     ],
   },
   {
     type: 'group',
-    label: 'Features',
+    label: 'Important Features',
     category: NavigationCategory.FEATURES,
     homePageHref: '/',
     entries: [
@@ -314,6 +294,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         href: '/serverless',
         label: 'Serverless',
         description: 'Auto-stop sandboxes on idle and wake them on the next inbound HTTP request.',
+      },
+      {
+        type: 'link',
+        href: '/durability',
+        label: 'Durability & Failover',
+        description: 'What survives host crashes and cluster-mode owner failover, and how to make workspace state durable.',
       },
       {
         type: 'link',
@@ -327,18 +313,11 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'External Storage',
         description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
       },
-
       {
         type: 'link',
-        href: '/port-allowlist',
-        label: 'Port Allowlist',
-        description: 'Require explicit exposure before public traffic reaches a sandbox port.',
-      },
-      {
-        type: 'link',
-        href: '/sandbox-tags',
-        label: 'Sandbox Tags',
-        description: 'Filter list responses by tag with AND semantics for multi-tenant control planes.',
+        href: '/tcp-ports',
+        label: 'TCP & TLS Ports',
+        description: 'Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo) via caddy-l4.',
       },
     ],
   },
