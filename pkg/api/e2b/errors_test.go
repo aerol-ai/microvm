@@ -2,6 +2,7 @@ package e2b
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
 func TestRequestErrorHelpersAndWriteStoreAwareError(t *testing.T) {
@@ -35,12 +37,16 @@ func TestRequestErrorHelpersAndWriteStoreAwareError(t *testing.T) {
 		retryAfter string
 	}{
 		{name: "known_bad_request", err: badRequest("x"), wantStatus: http.StatusBadRequest},
+		{name: "known_not_implemented", err: notImplemented("y"), wantStatus: http.StatusNotImplemented},
 		{name: "store_not_found", err: store.ErrNotFound, wantStatus: http.StatusNotFound},
 		{name: "manual_stop_conflict", err: service.ErrSandboxManuallyStopped, wantStatus: http.StatusConflict},
 		{name: "wake_circuit_open", err: service.ErrWakeCircuitOpen, wantStatus: http.StatusServiceUnavailable, retryAfter: "60"},
 		{name: "snapshot_name_conflict", err: store.ErrSnapshotNameConflict, wantStatus: http.StatusConflict},
+		{name: "capacity_exceeded", err: capacity.ErrCapacityExceeded, wantStatus: http.StatusServiceUnavailable, retryAfter: "30"},
+		{name: "cluster_capacity_exceeded_long", err: cluster.ErrCapacityExceeded, wantStatus: http.StatusServiceUnavailable, retryAfter: "30"}, // we also pass a logger test down below for coverage
 		{name: "create_backpressure", err: cluster.ErrCreateBackpressure, wantStatus: http.StatusTooManyRequests, retryAfter: "5"},
 		{name: "invalid_topology", err: cluster.ErrInvalidTopology, wantStatus: http.StatusServiceUnavailable, retryAfter: "300"},
+		{name: "no_placement_target", err: cluster.ErrNoPlacementTarget, wantStatus: http.StatusServiceUnavailable},
 		{name: "fallback_long_error_trimmed", err: errors.New(strings.Repeat("a", 260)), wantStatus: http.StatusBadRequest},
 	}
 	for _, tc := range cases {
@@ -54,5 +60,20 @@ func TestRequestErrorHelpersAndWriteStoreAwareError(t *testing.T) {
 				t.Fatalf("retry-after = %q, want %q", rr.Header().Get("Retry-After"), tc.retryAfter)
 			}
 		})
+	}
+}
+
+func TestWriteStoreAwareError_WithLogger(t *testing.T) {
+	rr := httptest.NewRecorder()
+	logger := slog.Default() // Just a non-nil logger
+	writeStoreAwareError(logger, rr, capacity.ErrCapacityExceeded)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+
+	rr2 := httptest.NewRecorder()
+	writeStoreAwareError(logger, rr2, errors.New("fallback error with logger"))
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rr2.Code, http.StatusBadRequest)
 	}
 }

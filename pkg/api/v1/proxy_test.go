@@ -49,6 +49,17 @@ func createProxySandbox(t *testing.T, db *store.Store, id, containerIP, token st
 	}
 }
 
+func TestProxyToToolbox_SandboxNotFound(t *testing.T) {
+	h, _ := newProxyTestHandler(t, config.Config{ToolboxPort: 21212})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/missing/toolbox", nil)
+	req.SetPathValue("id", "missing")
+	h.toolboxProxy(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestToolboxProxy_ForwardsPathAndToken(t *testing.T) {
 	var gotPath string
 	var gotAuth string

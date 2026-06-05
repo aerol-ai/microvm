@@ -30,6 +30,13 @@ func newHandlerWithStore(t *testing.T) *handlers {
 	return &handlers{deps: Deps{Service: svc, Logger: logger}}
 }
 
+func newHandlerNilCluster(t *testing.T) *handlers {
+	t.Helper()
+	h := newHandlerNoStore(t)
+	h.deps.Service.ClearClusterForTest()
+	return h
+}
+
 // newHandlerNoStore is fine for handlers that don't touch the store.
 func newHandlerNoStore(t *testing.T) *handlers {
 	t.Helper()

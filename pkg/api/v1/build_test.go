@@ -3,16 +3,19 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
 type fakeImageBuilder struct {
 	exists     map[string]bool
+	existsErr  error
 	builds     []docker.BuildImageRequest
 	buildErr   error
 	pushes     []docker.PushImageRequest
@@ -40,6 +43,9 @@ func (f *fakeImageBuilder) RemoveImage(_ context.Context, ref string) error {
 }
 
 func (f *fakeImageBuilder) ImageExists(_ context.Context, ref string) (bool, error) {
+	if f.existsErr != nil {
+		return false, f.existsErr
+	}
 	return f.exists[ref], nil
 }
 
@@ -272,6 +278,103 @@ func TestBuildImagePushFailureSurfaces(t *testing.T) {
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildImageInvalidJSON(t *testing.T) {
+	h := &handlers{deps: Deps{}}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader("{bad"))
+	h.buildImage(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestBuildImageContextHashesEnabledReturns501(t *testing.T) {
+	mux := newTestMux(&fakeImageBuilder{}, BuildConfig{ContextEnabled: true})
+	body, _ := json.Marshal(buildImageRequest{
+		DockerfileContent: "FROM alpine\nCOPY . /app",
+		ContextHashes:     []string{"deadbeef"},
+	})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildImageCacheRefreshFailureStillOK(t *testing.T) {
+	dockerfile := "FROM alpine\nRUN echo hi"
+	wantTag := docker.BuildTagFor(dockerfile, nil)
+	builder := &fakeImageBuilder{
+		exists:     map[string]bool{wantTag: true},
+		refreshErr: errors.New("refresh failed"),
+	}
+	mux := newTestMux(builder, BuildConfig{})
+
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: dockerfile})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildImageBuildFailure(t *testing.T) {
+	builder := &fakeImageBuilder{buildErr: errors.New("build failed")}
+	mux := newTestMux(builder, BuildConfig{})
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine\nRUN false"})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildImageBuildTimeout(t *testing.T) {
+	builder := &fakeImageBuilder{buildErr: context.DeadlineExceeded}
+	mux := newTestMux(builder, BuildConfig{Timeout: time.Second})
+	body, _ := json.Marshal(buildImageRequest{DockerfileContent: "FROM alpine\nRUN sleep 999"})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if rr.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildImagePushTimeout(t *testing.T) {
+	builder := &fakeImageBuilder{pushErr: context.DeadlineExceeded}
+	mux := newTestMux(builder, BuildConfig{Timeout: time.Second})
+	body, _ := json.Marshal(buildImageRequest{
+		DockerfileContent: "FROM alpine",
+		Push: &buildImagePushSpec{
+			Registry: "ghcr.io/x/y", Username: "u", Password: "p",
+		},
+	})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(string(body))))
+	if rr.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildImageExistsCheckError(t *testing.T) {
+	builder := &fakeImageBuilder{existsErr: errors.New("daemon down")}
+	mux := newTestMux(builder, BuildConfig{})
+	body := `{"dockerfile_content":"FROM alpine\nRUN echo hi"}`
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/images/build", strings.NewReader(body)))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildContextWithTimeoutZeroUsesCancelOnly(t *testing.T) {
+	ctx, cancel := buildContextWithTimeout(context.Background(), 0)
+	defer cancel()
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("zero timeout should not set deadline")
 	}
 }
 

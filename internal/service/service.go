@@ -418,6 +418,15 @@ func (s *Service) AttachCluster(c cluster.Client) {
 	s.cluster = c
 }
 
+// ClearClusterForTest drops the attached cluster client so API handlers can
+// exercise their "cluster disabled" branches. Production always has at least
+// cluster.Noop from New().
+func (s *Service) ClearClusterForTest() {
+	s.clusterMu.Lock()
+	defer s.clusterMu.Unlock()
+	s.cluster = nil
+}
+
 // SetFirecrackerRuntime registers the second runtime driver. Called by
 // main.go after construction, only when cfg.EnableFirecracker is true.
 // Passing nil clears the registration (used by tests). Once set, the

@@ -89,6 +89,63 @@ func newTemplateV1TestEnv(t *testing.T) *templateV1Env {
 // TestV1CreateTemplate_Returns202 is the canonical happy path: POST
 // returns 202 + a PENDING row, and the background goroutine fires the
 // builder. This is the API-shape contract Phase 2 promises clients.
+func TestV1CreateTemplate_InvalidJSON(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/templates", strings.NewReader("{bad"))
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestV1DeleteTemplate_Success(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	tpl := &models.Template{
+		ID: "tpl-del", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusReady, RootfsPath: filepath.Join(t.TempDir(), "rootfs.ext4"),
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := env.store.CreateTemplate(context.Background(), tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/v1/templates/tpl-del", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestV1ListTemplates_StoreError(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	_ = env.store.Close()
+	req := httptest.NewRequest(http.MethodGet, "/v1/templates", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestV1GetTemplate_Success(t *testing.T) {
+	env := newTemplateV1TestEnv(t)
+	tpl := &models.Template{
+		ID: "tpl-get", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusReady, RootfsPath: filepath.Join(t.TempDir(), "rootfs.ext4"),
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := env.store.CreateTemplate(context.Background(), tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/templates/tpl-get", nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestV1CreateTemplate_Returns202(t *testing.T) {
 	env := newTemplateV1TestEnv(t)
 
