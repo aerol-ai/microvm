@@ -147,37 +147,32 @@ func TestReplayClusterOwnership_StoreError(t *testing.T) {
 
 // TestStartClusterOwnershipReplayRetry_StopsOnCtxCancel: the retry goroutine
 // must return when its context is cancelled rather than ticking forever.
+// t.Context() is cancelled at test cleanup, which is what unblocks the
+// goroutine's <-ctx.Done() case.
 func TestStartClusterOwnershipReplayRetry_StopsOnCtxCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
-	startClusterOwnershipReplayRetry(ctx, svc, testLogger())
-	cancel()
-	// Give the goroutine a moment to observe the cancellation. There's no
-	// observable signal, so this is a best-effort no-leak check; the test
-	// passing means the call didn't block or panic.
-	time.Sleep(20 * time.Millisecond)
+	startClusterOwnershipReplayRetry(t.Context(), svc, testLogger())
+	// No observable signal; the test passing means the call didn't block
+	// or panic, and cleanup-time ctx cancellation stops the goroutine.
 }
 
 // TestStartAutoImportReconciler_PATUnreadable: enabled but the PAT file is
 // missing — the feature logs and stays off without scheduling a goroutine.
 func TestStartAutoImportReconciler_PATUnreadable(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
-	startAutoImportReconciler(ctx, testLogger(), config.Config{
+	startAutoImportReconciler(t.Context(), testLogger(), config.Config{
 		AutoImportEnabled:        true,
 		AutoImportClusterPATPath: filepath.Join(t.TempDir(), "missing-pat"),
 	}, st, svc)
 }
 
 // TestStartAutoImportReconciler_Enabled: a readable PAT plus a valid config
-// builds the importer + reconciler and starts the ticker goroutine, which we
-// stop via ctx cancellation.
+// builds the importer + reconciler and starts the ticker goroutine. The
+// interval is shrunk so one empty sweep fires (Scanned == 0 → continue)
+// before t.Context() cancellation stops the loop at cleanup.
 func TestStartAutoImportReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 
@@ -186,45 +181,43 @@ func TestStartAutoImportReconciler_Enabled(t *testing.T) {
 		t.Fatalf("write pat: %v", err)
 	}
 
-	startAutoImportReconciler(ctx, testLogger(), config.Config{
+	startAutoImportReconciler(t.Context(), testLogger(), config.Config{
 		AutoImportEnabled:           true,
 		AutoImportClusterPATPath:    patPath,
 		AutoImportHooksBaseURL:      "https://hooks.example",
 		AutoImportClusterID:         "cluster-1",
-		AutoImportReconcileInterval: time.Hour,
+		AutoImportReconcileInterval: 5 * time.Millisecond,
 		AutoImportMaxInFlight:       2,
 	}, st, svc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestStartSnapshotPushReconciler_Enabled: a valid push config builds the
-// pusher + reconciler and schedules the sweep goroutine.
+// pusher + reconciler and drives one empty sweep through the goroutine.
 func TestStartSnapshotPushReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startSnapshotPushReconciler(ctx, testLogger(), config.Config{
+	startSnapshotPushReconciler(t.Context(), testLogger(), config.Config{
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "push.example",
 		AutoImportClusterID:           "cluster-1",
 		AutoImportClusterPATPath:      filepath.Join(t.TempDir(), "pat"),
-		SnapshotPushReconcileInterval: time.Hour,
+		SnapshotPushReconcileInterval: 5 * time.Millisecond,
 		SnapshotPushMaxInFlight:       1,
 	}, st, svc, dc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestStartSnapshotPushReconciler_HostFallback: with MirrorPushHost unset the
 // reconciler falls back to ImageDistributionAOCRHost.
 func TestStartSnapshotPushReconciler_HostFallback(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startSnapshotPushReconciler(ctx, testLogger(), config.Config{
+	startSnapshotPushReconciler(t.Context(), testLogger(), config.Config{
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "",
 		ImageDistributionAOCRHost:     "aocr.example",
@@ -239,16 +232,15 @@ func TestStartSnapshotPushReconciler_HostFallback(t *testing.T) {
 // rotation interval and a max-age builds the reconciler and starts its
 // ticker.
 func TestStartTemplateRotationReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 
-	startTemplateRotationReconciler(ctx, testLogger(), config.Config{
+	startTemplateRotationReconciler(t.Context(), testLogger(), config.Config{
 		EnableFirecracker:                   true,
-		FirecrackerTemplateRotationInterval: time.Hour,
+		FirecrackerTemplateRotationInterval: 5 * time.Millisecond,
 		FirecrackerTemplateMaxAge:           24 * time.Hour,
 	}, st, svc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestAttachTemplateArtifactPuller_Enabled: firecracker on with a templates
@@ -267,34 +259,31 @@ func TestAttachTemplateArtifactPuller_Enabled(t *testing.T) {
 // TestStartTemplateArtifactPushReconciler_Enabled: firecracker + snapshot
 // push on builds the template-artifact pusher and schedules its sweep.
 func TestStartTemplateArtifactPushReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startTemplateArtifactPushReconciler(ctx, testLogger(), config.Config{
+	startTemplateArtifactPushReconciler(t.Context(), testLogger(), config.Config{
 		EnableFirecracker:             true,
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "push.example",
 		AutoImportClusterID:           "cluster-1",
 		AutoImportClusterPATPath:      filepath.Join(t.TempDir(), "pat"),
 		FirecrackerTemplatesDir:       t.TempDir(),
-		SnapshotPushReconcileInterval: time.Hour,
+		SnapshotPushReconcileInterval: 5 * time.Millisecond,
 		SnapshotPushMaxInFlight:       1,
 	}, st, svc, dc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestStartTemplateArtifactPushReconciler_HostFallback: MirrorPushHost unset
 // falls back to ImageDistributionAOCRHost on the template push side too.
 func TestStartTemplateArtifactPushReconciler_HostFallback(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startTemplateArtifactPushReconciler(ctx, testLogger(), config.Config{
+	startTemplateArtifactPushReconciler(t.Context(), testLogger(), config.Config{
 		EnableFirecracker:             true,
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "",

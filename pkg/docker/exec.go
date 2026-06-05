@@ -2,6 +2,7 @@ package docker
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -94,7 +95,12 @@ func (c *Client) ExecStart(ctx context.Context, execID string, tty bool) (*ExecS
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, "http://docker/exec/"+url.PathEscape(execID)+"/start", nil)
+	// The payload rides as the request body so req.Write emits headers and
+	// body in one well-formed write. Setting req.ContentLength on a nil-Body
+	// request and writing the body separately is rejected by net/http's
+	// transfer writer ("ContentLength=N with nil Body") before a single byte
+	// reaches the socket, which would break every exec start.
+	req, err := http.NewRequest(http.MethodPost, "http://docker/exec/"+url.PathEscape(execID)+"/start", bytes.NewReader(payload))
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -102,15 +108,10 @@ func (c *Client) ExecStart(ctx context.Context, execID string, tty bool) (*ExecS
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "tcp")
-	req.ContentLength = int64(len(payload))
 
 	if err := req.Write(conn); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("write exec start request: %w", err)
-	}
-	if _, err := conn.Write(payload); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("write exec start body: %w", err)
 	}
 
 	reader := bufio.NewReader(conn)
