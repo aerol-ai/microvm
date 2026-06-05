@@ -168,6 +168,77 @@ func TestRouteCases(t *testing.T) {
 			},
 		},
 		{
+			name: "all_deletes_return_nil_when_disabled",
+			run: func(t *testing.T) {
+				client := &Client{enabled: false}
+				ctx := context.Background()
+				if client.DeleteSandboxRoute(ctx, "abc") != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeletePortRoute(ctx, "abc", 80) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteCustomDomainHTTPRoute(ctx, "abc", "host") != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteWakeHTTPPortRoute(ctx, "abc", 80) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteInFluxSandboxRoute(ctx, "abc") != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteInFluxPortRoute(ctx, "abc", 80) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteTCPRoute(ctx, 80) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteTLSSNIRoute(ctx, "abc", 80) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteRouteByID(ctx, "id") != nil {
+					t.Fatal("expected nil")
+				}
+				if client.DeleteTCPServer(ctx, "id") != nil {
+					t.Fatal("expected nil")
+				}
+				if client.UpsertPortRouteToPeer(ctx, "abc", 3000, "10.0.0.9") != nil {
+					t.Fatal("expected nil")
+				}
+				if client.UpsertSandboxRoute(ctx, "abc", "10.0.0.2", 2280, nil) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.UpsertPortRoute(ctx, "abc", "10.0.0.2", 3000) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.UpsertTCPRoute(ctx, "abc", "10.0.0.2", 3000, 3000) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.UpsertTCPProxyRoute(ctx, "abc", 3000, 3000, "10.0.0.2", 3000) != nil {
+					t.Fatal("expected nil")
+				}
+				if client.UpsertWakeTLSSNIRoute(ctx, "abc", "host", "sock", 3000) != nil {
+					t.Fatal("expected nil")
+				}
+			},
+		},
+		{
+			name: "upsert_port_route_to_peer",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, publicHost: "203.0.113.10", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertPortRouteToPeer(context.Background(), "abc", 3000, "10.0.0.9"); err != nil {
+					t.Fatalf("UpsertPortRouteToPeer() error = %v", err)
+				}
+				route, ok := fake.routes["sandbox-abc-port-3000"]
+				if !ok {
+					t.Fatalf("route missing; routes=%+v", fake.routes)
+				}
+				assertRoutePathMatch(t, route, []string{"/abc/proxy/3000", "/abc/proxy/3000/*"})
+				assertRouteDial(t, route, "10.0.0.9:80")
+			},
+		},
+		{
 			name: "upsert_sandbox_route_inserts_when_missing",
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
@@ -750,6 +821,116 @@ func TestPublicEndpointHelpers(t *testing.T) {
 			t.Fatalf("TLSPublicEndpoint() in IP mode = %q, want empty", got)
 		}
 	})
+}
+
+func TestClientErrors(t *testing.T) {
+	ctx := context.Background()
+
+	// Bad URL causes NewRequest to fail
+	client := &Client{enabled: true, baseURL: "http://\x00invalid", httpClient: http.DefaultClient}
+	if client.DeleteSandboxRoute(ctx, "abc") == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 80, nil) == nil {
+		t.Fatal("expected err")
+	}
+	if client.EnsureLayer4(ctx, ":443", "10.0.0.1:80") == nil {
+		t.Fatal("expected err")
+	}
+	if client.DeleteTCPServer(ctx, "srv") == nil {
+		t.Fatal("expected err")
+	}
+
+	// Server returns 500
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client = &Client{enabled: true, baseURL: server.URL, httpClient: server.Client()}
+	if client.DeleteSandboxRoute(ctx, "abc") == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 80, nil) == nil {
+		t.Fatal("expected err")
+	}
+	if client.EnsureLayer4(ctx, ":443", "10.0.0.1:80") == nil {
+		t.Fatal("expected err")
+	}
+	if client.DeleteTCPServer(ctx, "srv") == nil {
+		t.Fatal("expected err")
+	}
+	if _, err := client.Snapshot(ctx); err == nil {
+		t.Fatal("expected err")
+	}
+	if err := client.EnsureOnDemandTLS(ctx, "http://localhost:8080", 1, time.Second); err == nil {
+		t.Fatal("expected err")
+	}
+
+	// hostPort <= 0 tests
+	if client.UpsertTCPRoute(ctx, "abc", "1.1.1.1", 80, 0) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertWakeTCPRoute(ctx, "abc", 80, 0, "1.1.1.1") == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertWakeTCPRoute(ctx, "abc", 80, 80, "") == nil {
+		t.Fatal("expected err")
+	}
+
+	// proxy route input validations
+	if client.UpsertTCPProxyRoute(ctx, "abc", 80, 0, "ip", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "ip", 0) == nil {
+		t.Fatal("expected err")
+	}
+
+	// sni validations
+	if client.UpsertTLSSNIRoute(ctx, "abc", "", "ip", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertWakeTLSSNIRoute(ctx, "abc", "", "ip", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertWakeTLSSNIRoute(ctx, "abc", "sni", "", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertSNIPassthroughRoute(ctx, "id", "", "ip", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertSNIPassthroughRoute(ctx, "id", "sni", "", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client.UpsertSNIPassthroughRoute(ctx, "id", "sni", "ip", 0) == nil {
+		t.Fatal("expected err")
+	}
+
+	// Server returns invalid JSON
+	serverBadJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("{bad json"))
+	}))
+	defer serverBadJSON.Close()
+	clientBadJSON := &Client{enabled: true, baseURL: serverBadJSON.URL, httpClient: serverBadJSON.Client()}
+	if _, err := clientBadJSON.Snapshot(ctx); err == nil {
+		t.Fatal("expected err on bad json")
+	}
+
+	// Disabled snapshot
+	disabledClient := &Client{enabled: false}
+	if _, err := disabledClient.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWrapTransport_Nil(t *testing.T) {
+	wt := wrapTransport(nil)
+	if wt.(*instrumentingTransport).inner != http.DefaultTransport {
+		t.Fatal("expected DefaultTransport")
+	}
 }
 
 func countMethod(records []requestRecord, method string) int {
