@@ -260,3 +260,14 @@ func pagesForMB(mb int) int64 {
 	bytes := int64(mb) * (1 << 20)
 	return bytes / hostPageSizeBytes
 }
+
+func TestDiscard_Write(t *testing.T) {
+	d := discard{}
+	n, err := d.Write([]byte("hello"))
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if n != 5 {
+		t.Errorf("expected 5, got %d", n)
+	}
+}
