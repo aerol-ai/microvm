@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1197,6 +1198,19 @@ func (f *fakeDockerExec) ExecInspect(ctx context.Context, execID string) (int, b
 		return 0, false, f.inspectErr
 	}
 	return f.inspectCode, f.inspectRunning, nil
+}
+
+func TestHandleSessionSandboxNotRunningWritesErrorAndExit(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stderr := &bytes.Buffer{}
+	g := &Gateway{logger: logger, svc: &fakeLookup{sandbox: &models.Sandbox{Status: "stopped"}}}
+	requests := make(chan *ssh.Request)
+	close(requests)
+
+	g.handleSession(context.Background(), "sb-1", "exec", "", &fakeChannel{stdout: io.Discard, stderr: stderr}, requests)
+	if !strings.Contains(stderr.String(), "sandbox not running") {
+		t.Errorf("expected not running error, got %q", stderr.String())
+	}
 }
 
 func TestStartListenError(t *testing.T) {
