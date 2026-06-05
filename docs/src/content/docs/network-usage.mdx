@@ -4,17 +4,7 @@ title: Network Usage
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Every sandbox has a per-direction byte counter and an optional cap. You can set the cap at create time, read live counters, and raise or lift the cap while the sandbox is running. When a cap is hit, the platform installs an iptables drop on the sandbox's container IP - the container keeps running, but its network goes dark until the cap is raised.
-
-This is the model AerolVM uses for billing-style network quotas and for shutting down a sandbox that has started behaving badly without killing it outright.
-
-## How it works
-
-- Counters are sampled from `/proc/<pid>/net/dev` at a fixed interval and persisted to the sandbox row. They are cumulative across container restarts.
-- `bytes_in` is ingress (rx, traffic delivered to the container). `bytes_out` is egress (tx, traffic sent from the container).
-- A cap of `0` means unlimited. This is the default and matches the historical behaviour.
-- When `bytes_in >= bytes_in_limit` (and the limit is non-zero), the platform installs an ingress drop. The same applies to egress. `quota_exceeded` flips to `true` and `quota_exceeded_at` is set.
-- Raising the cap above current usage clears the drop on the next reconcile pass, or immediately when you call `setNetworkLimits` with a higher limit.
+Every sandbox has a per-direction byte counter and an optional cap. You can set the cap at create time, read live counters, and raise or lift the cap while the sandbox is running.
 
 ## Create a sandbox with limits
 

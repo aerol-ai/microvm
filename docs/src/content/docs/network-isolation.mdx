@@ -12,14 +12,6 @@ When network isolation is enabled:
 
 ---
 
-## How it works
-
-1. Declare the egress block at sandbox creation by passing `networkBlockAll: true` (or its language-specific equivalent) in the create options.
-2. The platform installs a firewall rule on the host that drops every packet originating from the sandbox's IP address.
-3. The egress block persists across sandbox starts, stops, and host reboots. The rule is automatically cleaned up when the sandbox is destroyed.
-
----
-
 ## Enable Network Isolation
 
 To isolate a sandbox, set `networkBlockAll` (or `network_block_all`) to `true` when creating the sandbox.

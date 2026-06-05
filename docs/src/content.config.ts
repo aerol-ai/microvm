@@ -206,6 +206,25 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         ]
       },
       {
+        type: 'group',
+        homePageHref: '/network-usage',
+        label: 'Network Usage',
+        entries: [
+          {
+            type: 'link',
+            href: '/network-usage',
+            label: 'Network Usage & Quotas',
+            description: 'Per-sandbox ingress / egress byte counters with optional caps that drop traffic when exceeded.',
+          },
+          {
+            type: 'link',
+            href: '/network-isolation',
+            label: 'Network Isolation',
+            description: 'Block egress with host-level firewall rules on a per-sandbox basis.',
+          }
+        ]
+      },
+      {
         type: 'link',
         href: '/serverless',
         label: 'Serverless',
@@ -308,18 +327,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'External Storage',
         description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
       },
-      {
-        type: 'link',
-        href: '/network-isolation',
-        label: 'Network Isolation',
-        description: 'Block egress with host-level firewall rules on a per-sandbox basis.',
-      },
-      {
-        type: 'link',
-        href: '/network-usage',
-        label: 'Network Usage & Quotas',
-        description: 'Per-sandbox ingress / egress byte counters with optional caps that drop traffic when exceeded.',
-      },
+
       {
         type: 'link',
         href: '/port-allowlist',
