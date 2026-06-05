@@ -58,11 +58,12 @@ func (p *fakeWarmPool) Release(_ context.Context, sandboxID string, _ time.Time)
 // place the per-sandbox overlay file. Shutdown is invoked on the
 // rollback paths.
 type fakeSpawnedHandle struct {
-	mu        sync.Mutex
-	apiSocket string
-	runDir    string
-	pid       int
-	shutdowns int
+	mu          sync.Mutex
+	apiSocket   string
+	runDir      string
+	pid         int
+	shutdowns   int
+	shutdownErr error
 }
 
 func (h *fakeSpawnedHandle) APISocket() string { return h.apiSocket }
@@ -72,7 +73,7 @@ func (h *fakeSpawnedHandle) Shutdown(_ context.Context, _ time.Duration) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.shutdowns++
-	return nil
+	return h.shutdownErr
 }
 
 // stageWarmFixture preloads a warm-pool fixture into the driverFixture

@@ -26,6 +26,7 @@ type fakePool struct {
 	get       int
 	nextErr   error // injected on next Allocate
 	relErr    error // injected on next Release
+	getErr    error // injected on next Get
 	lastAlloc string
 }
 
@@ -71,6 +72,11 @@ func (p *fakePool) Get(_ context.Context, sandboxID string) (*TapSlot, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.get++
+	if p.getErr != nil {
+		err := p.getErr
+		p.getErr = nil
+		return nil, err
+	}
 	if s, ok := p.slots[sandboxID]; ok {
 		return s, nil
 	}
@@ -267,6 +273,7 @@ type fakeVMM struct {
 	startErr    error
 	waitErr     error
 	shutdownErr error
+	cleanupErr  error
 
 	started  bool
 	waited   bool
@@ -288,8 +295,11 @@ func (v *fakeVMM) Shutdown(_ context.Context, _ time.Duration) error {
 	v.shutdown = true
 	return v.shutdownErr
 }
-func (v *fakeVMM) Kill() error    { v.shutdown = true; return nil }
-func (v *fakeVMM) Cleanup() error { v.cleaned = true; return nil }
+func (v *fakeVMM) Kill() error { v.shutdown = true; return nil }
+func (v *fakeVMM) Cleanup() error {
+	v.cleaned = true
+	return v.cleanupErr
+}
 
 // fakeClient records every REST call. Returns whatever per-call error
 // is injected; default is success on every method.

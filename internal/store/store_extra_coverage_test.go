@@ -273,3 +273,74 @@ func TestMountsBlobRoundTrip(t *testing.T) {
 		t.Fatalf("GetMounts after delete = %v, want ErrNotFound", err)
 	}
 }
+
+func TestStoreCoverageExtra(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Idempotent Requests
+	_ = st.DeleteIdempotentRequest(ctx, "req-1", "fingerprint-1")
+	_, _, _ = st.ClaimIdempotentRequest(ctx, "req-1", "fingerprint-1", time.Now(), time.Minute)
+	_, _ = st.GetIdempotentRequest(ctx, "req-1", "fingerprint-1")
+	_ = st.CompleteIdempotentRequest(ctx, "req-1", "fingerprint-1", "resp-1", time.Now(), time.Minute)
+
+	// Missing sandbox updates
+	_ = st.UpdateStatus(ctx, "missing", models.SandboxStatus("running"), "err")
+	_ = st.UpdateRuntime(ctx, "missing", "container-1", "ip", "url")
+	_ = st.Touch(ctx, "missing", time.Now())
+
+	// Mounts and Secrets missing paths
+	_ = st.DeleteMounts(ctx, "missing")
+	_ = st.DeleteClusterSecretsForSandbox(ctx, "missing")
+	_, _ = st.GetClusterSecret(ctx, "missing")
+	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
+
+	// Snapshot Aliases
+	_ = st.UpsertSnapshotAlias(ctx, models.SnapshotAlias{})
+	_, _ = st.GetSnapshotAlias(ctx, "alias-1")
+	_, _ = st.ListSnapshotAliases(ctx, "missing")
+	_ = st.DeleteSnapshotAlias(ctx, "alias-1")
+
+	// Template Status
+	_ = st.UpdateTemplateStatus(ctx, "tpl-1", models.TemplateStatus("ready"), "err", "build_log", 0)
+	_ = st.UpdateTemplateSnapshotReady(ctx, "tpl-1", "img", "snap", 100, "rootfs", 0, false)
+	_ = st.UpdateTemplateSnapshotFailed(ctx, "tpl-1", "error")
+	_, _ = st.MarkTemplateUnhealthy(ctx, "tpl-1", "error")
+	_, _ = st.MarkTemplatePushPending(ctx, "tpl-1")
+	_ = st.SetTemplatePushState(ctx, "tpl-1", "ready", "")
+	_ = st.UpdateTemplatePushDistribution(ctx, "tpl-1", "reg", "repo")
+	_ = st.DeleteTemplate(ctx, "tpl-1")
+
+	// Compat State
+	_ = st.UpsertCompatState(ctx, "missing", "k1", "v1")
+	_, _ = st.GetCompatState(ctx, "missing", "k1")
+	_, _ = st.ListCompatState(ctx, "missing")
+
+	// Misc Sandbox
+	_, _ = st.ResolveSandboxIDByName(ctx, "missing")
+	_ = st.Delete(ctx, "missing")
+
+	// Snapshots
+	_ = st.DeleteSnapshot(ctx, "missing")
+	_, _ = st.GetSnapshot(ctx, "missing")
+
+	// Firecracker slots
+	_ = st.ReleaseFirecrackerTapSlot(ctx, "missing")
+	_, _ = st.GetFirecrackerTapSlotBySandbox(ctx, "missing")
+
+	_ = st.MarkFirecrackerVMMSlotFailed(ctx, "missing", "err")
+	_ = st.MarkFirecrackerVMMSlotLoaded(ctx, "missing", "missing")
+	_ = st.ReleaseFirecrackerVMMSlot(ctx, "missing")
+	_, _ = st.GetFirecrackerVMMSlotBySandbox(ctx, "missing")
+	_, _ = st.GetFirecrackerVMMSlotByID(ctx, "missing")
+	_ = st.DeleteFirecrackerVMMSlot(ctx, "missing")
+
+	// Lists
+	_, _ = st.ListTemplatesPendingPush(ctx)
+	_, _ = st.ListUnhealthyTemplates(ctx)
+	_, _ = st.ListTemplatesReadyBefore(ctx, time.Now())
+	_, _ = st.ListReadyTemplateIDs(ctx)
+	_, _ = st.ListGCEligibleTemplates(ctx)
+	_, _ = st.IsTemplateReferenced(ctx, "tpl")
+	_, _ = st.IsTemplateReferencedByVMM(ctx, "tpl")
+}
