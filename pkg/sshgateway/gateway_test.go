@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1196,4 +1197,120 @@ func (f *fakeDockerExec) ExecInspect(ctx context.Context, execID string) (int, b
 		return 0, false, f.inspectErr
 	}
 	return f.inspectCode, f.inspectRunning, nil
+}
+
+func TestStartListenError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		ListenAddr:  "invalid-address:9999999", // Invalid port/address
+		HostKeyPath: filepath.Join(t.TempDir(), "host_key"),
+	}
+	gw, err := New(logger, cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	err = gw.Start(context.Background())
+	if err == nil {
+		t.Error("expected error from Start due to invalid listen address")
+	}
+}
+
+func TestNewErrors(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{
+		ListenAddr:  "127.0.0.1:0",
+		HostKeyPath: filepath.Join(t.TempDir(), "host_key"),
+	}
+
+	// Nil logger
+	if _, err := New(nil, cfg, nil, nil); err == nil {
+		t.Error("expected error for nil logger")
+	}
+
+	// Empty listen addr
+	cfg2 := cfg
+	cfg2.ListenAddr = ""
+	if _, err := New(logger, cfg2, nil, nil); err == nil {
+		t.Error("expected error for empty listen addr")
+	}
+}
+
+func TestFindOrCreateSessionErrors(t *testing.T) {
+	gw := &Gateway{
+		toolboxPort: 12345,
+	}
+	sb := &models.Sandbox{
+		ContainerIP: "1.2.3.4",
+	}
+	state := &sessionState{}
+
+	// Fast timeout via context to trigger http.NewRequest / httpClient.Do error
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	_, err := gw.findOrCreateSession(ctx, sb, "test-name", state)
+	if err == nil {
+		t.Error("expected error from findOrCreateSession with tiny timeout/bad IP")
+	}
+}
+
+func TestFindOrCreateSessionHttp(t *testing.T) {
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if r.Method == "GET" {
+			w.Write([]byte(`{"sessions":[{"id":"sess-123","name":"test-name","status":"running"}]}`))
+		} else {
+			w.Write([]byte(`{"id":"sess-123"}`))
+		}
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	port, _ := strconv.Atoi(u.Port())
+
+	gw := &Gateway{
+		toolboxPort: port,
+	}
+	sb := &models.Sandbox{
+		ContainerIP: u.Hostname(),
+	}
+	state := &sessionState{}
+
+	id, err := gw.findOrCreateSession(context.Background(), sb, "test-name", state)
+	if err != nil {
+		t.Fatalf("findOrCreateSession error: %v", err)
+	}
+	if id != "sess-123" {
+		t.Errorf("expected sess-123, got %s", id)
+	}
+}
+
+func TestFindOrCreateSessionHttpCreate(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"sessions":[]}`))
+		} else if r.Method == "POST" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"sess-created"}`))
+		}
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	port, _ := strconv.Atoi(u.Port())
+
+	gw := &Gateway{toolboxPort: port}
+	sb := &models.Sandbox{ContainerIP: u.Hostname()}
+	state := &sessionState{}
+
+	id, err := gw.findOrCreateSession(context.Background(), sb, "test-name", state)
+	if err != nil {
+		t.Fatalf("findOrCreateSession error: %v", err)
+	}
+	if id != "sess-created" {
+		t.Errorf("expected sess-created, got %s", id)
+	}
 }

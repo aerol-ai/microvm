@@ -120,3 +120,57 @@ func (c *testClock) advance(d time.Duration) {
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
 }
+
+func TestGlobalTrackerFunctions(t *testing.T) {
+	// Test DefaultIssuanceTracker
+	tr := DefaultIssuanceTracker()
+	if tr == nil {
+		t.Fatal("DefaultIssuanceTracker returned nil")
+	}
+
+	// Test RecordIssuanceStart
+	RecordIssuanceStart("test-global.example.com")
+
+	// Test RecordIssuanceCompleted
+	RecordIssuanceCompleted("test-global.example.com")
+
+	// Ensure no crash on empty inputs
+	RecordIssuanceStart("")
+	RecordIssuanceCompleted("")
+}
+
+func TestEvictStaleLocked(t *testing.T) {
+	clk := &testClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	gauge := new(expvar.Map).Init()
+	tr := newIssuanceTrackerWithGauge(gauge)
+	tr.now = clk.Now
+
+	// Empty evict
+	tr.mu.Lock()
+	tr.evictStaleLocked()
+	tr.mu.Unlock()
+
+	// Insert and expire
+	tr.Started("expire.acme.com")
+	tr.Started("keep.acme.com")
+
+	// Hack: manipulate startedAt directly to simulate old entry
+	tr.mu.Lock()
+	tr.startedAt["expire.acme.com"] = clk.Now().Add(-11 * time.Minute)
+	tr.mu.Unlock()
+
+	// This Started will trigger evictStaleLocked
+	tr.Started("new.acme.com")
+
+	tr.mu.Lock()
+	_, ok1 := tr.startedAt["expire.acme.com"]
+	_, ok2 := tr.startedAt["keep.acme.com"]
+	tr.mu.Unlock()
+
+	if ok1 {
+		t.Errorf("evictStaleLocked failed to remove stale entry")
+	}
+	if !ok2 {
+		t.Errorf("evictStaleLocked removed fresh entry")
+	}
+}

@@ -38,6 +38,35 @@ func TestLoadOrGenerateHostKeyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadOrGenerateHostKeyErrors(t *testing.T) {
+	// Empty path
+	if _, err := LoadOrGenerateHostKey(""); err == nil {
+		t.Error("expected error for empty path")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host_key")
+
+	// Read error (directory as a file)
+	if _, err := LoadOrGenerateHostKey(dir); err == nil {
+		t.Error("expected error reading a directory as a file")
+	}
+
+	// Parse error (invalid private key format)
+	os.WriteFile(path, []byte("not a valid key"), 0o600)
+	if _, err := LoadOrGenerateHostKey(path); err == nil {
+		t.Error("expected error parsing invalid key")
+	}
+
+	// Unwritable directory
+	readonlyDir := filepath.Join(dir, "readonly")
+	os.MkdirAll(readonlyDir, 0o500)
+	unwritablePath := filepath.Join(readonlyDir, "new_dir", "host_key")
+	if _, err := LoadOrGenerateHostKey(unwritablePath); err == nil {
+		t.Error("expected error creating directory in unwritable parent")
+	}
+}
+
 func TestParseAuthorizedKey(t *testing.T) {
 	cases := []struct {
 		name    string

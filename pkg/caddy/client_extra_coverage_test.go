@@ -2,6 +2,8 @@ package caddy
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -126,5 +128,109 @@ func TestDeleteHelpers_AgainstFakeCaddy(t *testing.T) {
 	// DeleteTCPServer on a missing server tolerates 404.
 	if err := client.DeleteTCPServer(ctx, "tcp-port-99999"); err != nil {
 		t.Fatalf("DeleteTCPServer(missing): %v", err)
+	}
+}
+
+func TestUpsertHelpers_AgainstFakeCaddy(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeCaddy(t)
+	client := &Client{enabled: true, serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+
+	// InFlux route upserts
+	if err := client.UpsertInFluxSandboxRoute(ctx, "abc"); err != nil {
+		t.Fatalf("UpsertInFluxSandboxRoute: %v", err)
+	}
+	if err := client.UpsertInFluxPortRoute(ctx, "abc", 8080); err != nil {
+		t.Fatalf("UpsertInFluxPortRoute: %v", err)
+	}
+
+	// PortRoute with retry
+	if err := client.UpsertPortRouteWithRetry(ctx, "abc", "10.0.0.1", 8080, 0); err != nil {
+		t.Fatalf("UpsertPortRouteWithRetry: %v", err)
+	}
+
+	// Layer4 checks
+	if err := client.EnsureLayer4(ctx, ":443", "127.0.0.1:8443"); err != nil {
+		t.Fatalf("EnsureLayer4: %v", err)
+	}
+
+	// TCP route upsert and delete
+	if err := client.UpsertTCPRoute(ctx, "abc", "10.0.0.1", 1234, 1234); err != nil {
+		t.Fatalf("UpsertTCPRoute: %v", err)
+	}
+	if err := client.DeleteTCPRoute(ctx, 1234); err != nil {
+		t.Fatalf("DeleteTCPRoute: %v", err)
+	}
+
+	// SNI routes
+	if err := client.UpsertSNIPassthroughRoute(ctx, "abc", "sni.host", "peer.host", 443); err != nil {
+		t.Fatalf("UpsertSNIPassthroughRoute: %v", err)
+	}
+	if err := client.UpsertTLSSNIRoute(ctx, "abc", "sni.host", "10.0.0.1", 443); err != nil {
+		t.Fatalf("UpsertTLSSNIRoute: %v", err)
+	}
+	if err := client.UpsertWakeTLSSNIRoute(ctx, "abc", "sni.host", "/tmp/sock", 443); err != nil {
+		t.Fatalf("UpsertWakeTLSSNIRoute: %v", err)
+	}
+
+	// Wake routes
+	if err := client.UpsertWakeTCPRoute(ctx, "abc", 1234, 1234, "127.0.0.1:9090"); err != nil {
+		t.Fatalf("UpsertWakeTCPRoute: %v", err)
+	}
+}
+
+func TestUpsertHelpers_ErrorPaths(t *testing.T) {
+
+	ctx := context.Background()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	client := &Client{enabled: true, baseURL: ts.URL, httpClient: ts.Client()}
+
+	if err := client.UpsertSNIPassthroughRoute(ctx, "abc", "sni.host", "peer.host", 443); err == nil {
+		t.Error("UpsertSNIPassthroughRoute: expected error on 500")
+	}
+	if err := client.UpsertTLSSNIRoute(ctx, "abc", "sni.host", "10.0.0.1", 443); err == nil {
+		t.Error("UpsertTLSSNIRoute: expected error on 500")
+	}
+	if err := client.UpsertWakeTLSSNIRoute(ctx, "abc", "sni.host", "/tmp/sock", 443); err == nil {
+		t.Error("UpsertWakeTLSSNIRoute: expected error on 500")
+	}
+	if err := client.UpsertWakeTCPRoute(ctx, "abc", 1234, 1234, "127.0.0.1:9090"); err == nil {
+		t.Error("UpsertWakeTCPRoute: expected error on 500")
+	}
+	if err := client.UpsertTCPRoute(ctx, "abc", "10.0.0.1", 1234, 1234); err == nil {
+		t.Error("UpsertTCPRoute: expected error on 500")
+	}
+	if err := client.DeleteTCPRoute(ctx, 1234); err == nil {
+		t.Error("DeleteTCPRoute: expected error on 500")
+	}
+	if err := client.EnsureLayer4(ctx, ":443", "127.0.0.1:8443"); err == nil {
+		t.Error("EnsureLayer4: expected error on 500")
+	}
+	// Test EnsureOnDemandTLS error
+	if err := client.EnsureOnDemandTLS(ctx, "http://ask", 10, 0); err == nil {
+		t.Error("EnsureOnDemandTLS: expected error on 500")
+	}
+}
+
+func TestPingAndSnapshot(t *testing.T) {
+	ctx := context.Background()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if strings.Contains(r.URL.Path, "config") {
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer ts.Close()
+	client := &Client{enabled: true, baseURL: ts.URL, httpClient: ts.Client()}
+
+	if err := client.Ping(ctx); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+
+	if _, err := client.Snapshot(ctx); err != nil {
+		t.Fatalf("Snapshot: %v", err)
 	}
 }

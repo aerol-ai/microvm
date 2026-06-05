@@ -56,6 +56,7 @@ func TestStartOTELEnabledPaths(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	expvarName := "aerolvm_otel_test_metric"
 	expvar.NewInt(expvarName).Set(3)
+	expvar.NewFloat("aerolvm_otel_test_float").Set(1.5)
 
 	metricsShutdown, err := StartOTELMetrics(context.Background(), logger, OTELMetricsConfig{
 		Enabled:     true,
@@ -117,4 +118,29 @@ func TestStartOTELExporterErrors(t *testing.T) {
 	if tracesShutdown == nil {
 		t.Fatal("expected StartOTELTraces shutdown on permissive endpoint parse")
 	}
+}
+
+func TestStartOTELDefaultConfigPaths(t *testing.T) {
+	metricsShutdown, err := StartOTELMetrics(context.Background(), nil, OTELMetricsConfig{
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("StartOTELMetrics default config error = %v", err)
+	}
+	if metricsShutdown == nil {
+		t.Fatal("expected metrics shutdown for default config")
+	}
+	_ = metricsShutdown(context.Background())
+
+	tracesShutdown, err := StartOTELTraces(context.Background(), nil, OTELTracesConfig{
+		Enabled:     true,
+		SampleRatio: 2,
+	})
+	if err != nil {
+		t.Fatalf("StartOTELTraces default config error = %v", err)
+	}
+	if tracesShutdown == nil {
+		t.Fatal("expected traces shutdown for default config")
+	}
+	_ = tracesShutdown(context.Background())
 }
