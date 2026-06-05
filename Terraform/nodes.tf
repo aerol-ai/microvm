@@ -46,7 +46,7 @@ resource "aws_instance" "seed" {
     custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
     custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix
     pat_token                                = local.pat_token
-    cloudflare_api_token                     = var.cloudflare_api_token
+    cloudflare_api_token                     = local.cloudflare_api_token
     acme_email                               = local.acme_email
     with_firecracker                         = local.seed_node.with_firecracker
     with_gvisor                              = local.seed_node.with_gvisor
@@ -193,7 +193,7 @@ resource "aws_instance" "joiner" {
     custom_domain_txt_prefix                 = local.custom_domain_txt_prefix
     custom_domain_txt_value_prefix           = local.custom_domain_txt_value_prefix
     pat_token                                = local.pat_token
-    cloudflare_api_token                     = var.cloudflare_api_token
+    cloudflare_api_token                     = local.cloudflare_api_token
     acme_email                               = local.acme_email
     with_firecracker                         = each.value.with_firecracker
     with_gvisor                              = each.value.with_gvisor

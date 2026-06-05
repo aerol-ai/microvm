@@ -15,5 +15,8 @@ provider "aws" {
 }
 
 provider "cloudflare" {
-  api_token = var.cloudflare_api_token
+  # Pulled from config/secrets.yml (cloudflare.api_token) via locals.tf —
+  # not from config/terraform.tfvars. Keeps every cluster secret in one
+  # gitignored file alongside cluster.pat_token, aocr.*, and fleet.token.
+  api_token = local.cloudflare_api_token
 }

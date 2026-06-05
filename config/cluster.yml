@@ -4,21 +4,23 @@
 # render its values into /etc/sandboxd/cluster.env on every node. Edit here,
 # then apply with EITHER tool — they produce the same env file contents:
 #
-#   - terraform apply                               # day-0 / re-provision
+#   - scripts/terraform.sh apply                    # day-0 / re-provision
 #   - ansible-playbook playbooks/configure-ops.yml  # day-2 / live rollout
 #
-# DO NOT put values in terraform.tfvars or Ansible local.yml that this file
-# already controls — the two tools would disagree on which to write and the
-# last one to run would silently clobber the other.
+# DO NOT put values in config/terraform.tfvars or Ansible local.yml that
+# this file already controls — the two tools would disagree on which to
+# write and the last one to run would silently clobber the other.
 #
 # Secrets split:
-#   - AOCR secrets (upstream wrap key, cluster PAT) live in ./secrets.yml,
-#     a parallel shared SoT also read by both Terraform and Ansible.
-#     Gitignored — bootstrap with `cp config/secrets.example.yml config/secrets.yml`.
-#   - Cloud creds (pat_token, cloudflare_api_token, ACME email, AWS profile)
-#     stay in Terraform/terraform.tfvars (Terraform-only — Ansible never
-#     re-provisions cloud infrastructure).
-# Those keys are intentionally NOT in this file.
+#   - All cluster secrets (cluster.pat_token, cloudflare.api_token, aocr.*,
+#     fleet.token) live in ./secrets.yml, a parallel shared SoT also read
+#     by both Terraform and Ansible. Gitignored — bootstrap with
+#     `cp config/secrets.example.yml config/secrets.yml`.
+#   - Terraform-only inputs that Ansible never sees (AWS placement,
+#     instance sizing, the node list, firecracker artifact URLs, the
+#     caddy shared-cert-storage block) live in ./terraform.tfvars
+#     (also gitignored; example in ./terraform.tfvars.example).
+# None of those keys belong in this file.
 
 # --- Cluster identity / public ingress ------------------------------------
 # domain_name is the hostname advertised as the cluster ingress. Both an A

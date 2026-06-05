@@ -23,6 +23,13 @@ locals {
   custom_domain_txt_value_prefix = local.cluster_ops.ingress.custom_domain_txt_value_prefix
   pat_token                      = local.cluster_secrets.cluster.pat_token
 
+  # Cloudflare provider credential. Lives in config/secrets.yml under
+  # cloudflare.api_token (NOT in config/terraform.tfvars) so the rule
+  # "non-secret config in cluster.yml / terraform.tfvars, secrets in
+  # secrets.yml" holds uniformly. providers.tf reads this local; if the value
+  # is empty the precondition below fails at plan time.
+  cloudflare_api_token = local.cluster_secrets.cloudflare.api_token
+
   # Normalise each node entry with its effective values (per-node overrides
   # win, then var.default_*). Doing this once here keeps nodes.tf / dns.tf
   # readable.
@@ -228,6 +235,11 @@ resource "terraform_data" "validate_cluster_ops" {
     precondition {
       condition     = local.pat_token != ""
       error_message = "cluster.pat_token in config/secrets.yml must be set (shared SB_PAT_TOKEN used by every node for operator/SDK API auth)."
+    }
+
+    precondition {
+      condition     = local.cloudflare_api_token != ""
+      error_message = "cloudflare.api_token in config/secrets.yml must be set (Cloudflare token with Zone:DNS:Edit on the target zone; reused for Let's Encrypt DNS-01)."
     }
 
     precondition {

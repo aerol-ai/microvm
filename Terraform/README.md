@@ -1,6 +1,6 @@
 # AerolVM cluster on AWS - Terraform
 
-Spawns a complete AerolVM cluster on EC2 in one `terraform apply`:
+Spawns a complete AerolVM cluster on EC2 in one `scripts/terraform.sh apply`:
 
 - a VPC + public subnet + IGW + security group with the cluster-internal
   ports (`7000/TCP`, `7001/TCP+UDP`, `7002/TCP`) and public ingress
@@ -28,18 +28,38 @@ Spawns a complete AerolVM cluster on EC2 in one `terraform apply`:
 
 ## Quick start
 
+All cluster configuration lives under `config/` at the repo root. From the
+repo root:
+
 ```bash
-cp terraform.tfvars.example terraform.tfvars
-# edit Terraform/terraform.tfvars, config/cluster.yml, and config/secrets.yml
-terraform init
-terraform apply
+cp config/terraform.tfvars.example config/terraform.tfvars
+cp config/secrets.example.yml      config/secrets.yml
+# then edit:
+#   config/terraform.tfvars  -> AWS placement, instance sizing, node list
+#   config/cluster.yml       -> ingress.domain_name, ingress.acme_email, mirror/auto_import/...
+#   config/secrets.yml       -> cluster.pat_token, cloudflare.api_token, aocr.*, fleet.token
+scripts/terraform.sh init
+scripts/terraform.sh apply
 ```
 
-The split is intentional:
+> **Always invoke via `scripts/terraform.sh`**, not bare `terraform`. The
+> wrapper runs `terraform -chdir=Terraform` with
+> `-var-file=../config/terraform.tfvars`. Running `terraform` directly from
+> `Terraform/` will silently skip the tfvars file (which no longer sits on
+> Terraform's auto-load path) and produce an incomplete plan.
 
-- `Terraform/terraform.tfvars`: cloud and per-node Terraform inputs such as `cloudflare_api_token`, instance sizing, `nodes[*].with_firecracker`, and the optional `firecracker.*_url` artifact downloads.
-- `config/cluster.yml`: shared non-secret cluster config such as `ingress.domain_name` and `ingress.acme_email`.
-- `config/secrets.yml`: shared cluster secrets such as `cluster.pat_token`.
+### Where each value lives
+
+Three files, one rule: **non-secret day-0+day-2 SoT → `cluster.yml`,
+secrets → `secrets.yml`, Terraform-only inputs → `terraform.tfvars`**.
+
+| File | Contents | Tracked? |
+|---|---|---|
+| `config/terraform.tfvars` | Terraform-only inputs: `aws_region`, `aws_profile`, `ssh_key_name`, `default_*`, `nodes = {...}`, `firecracker = {...}`, `caddy_shared_cert_storage`, `cloudflare_zone_id`, `extra_tags`. | gitignored |
+| `config/terraform.tfvars.example` | Drop-in starter for the above. | committed |
+| `config/cluster.yml` | Shared non-secret cluster ops env both Terraform (day-0) and Ansible (day-2) read: `ingress.domain_name`, `ingress.acme_email`, `mirror.*`, `auto_import.*`, `fleet_control_plane.*`, `otel.*`, `image_pull.*`, `image_build_gc.*`. | committed |
+| `config/secrets.yml` | Shared cluster secrets both Terraform and Ansible read: `cluster.pat_token`, `cloudflare.api_token`, `aocr.upstream_wrap_key`, `aocr.cluster_pat`, `fleet.token`. | gitignored |
+| `config/secrets.example.yml` | Empty template for the above. | committed |
 
 Outputs include every node's public IP, the seed's SSH command, and the
 verify-cluster `curl`. They also include Prometheus scrape targets for
@@ -110,7 +130,7 @@ Each instance's `user_data` (rendered from
 phases:
 
 1. **`install.sh`** with `--pat-token <shared> --domain <domain_name>
-   --dns-provider cloudflare --dns-api-token <cloudflare_api_token>` so the
+   --dns-provider cloudflare --dns-api-token <cloudflare.api_token>` so the
    per-node Caddy gets a real wildcard cert via Let's Encrypt DNS-01. Optional
    `--with-gvisor` / `--with-nvidia-gpu` / `--with-amd-gpu` /
    `--idle-timeout-min` are appended from per-node flags. If `domain_name` is
@@ -149,7 +169,7 @@ making operators smuggle everything through `extra_user_data`.
 > **only** on node entries whose `instance_type` is a bare-metal SKU.
 
 1. Mark worker-capable nodes with `with_firecracker = true`.
-2. Fill the `firecracker` object in `terraform.tfvars`.
+2. Fill the `firecracker` object in `config/terraform.tfvars`.
 3. Choose one of two bootstrap modes:
 
 - **Artifact-download mode**: set `firecracker.binary_url`, `firecracker.jailer_url`, and `firecracker.kernel_url`. Terraform bootstrap installs `skopeo`, `umoci`, `e2fsprogs`, and `iproute2`, downloads those artifacts, writes the matching `SB_ENABLE_FIRECRACKER` / `SB_FIRECRACKER_*` env vars into `/etc/sandboxd/cluster.env`, and restarts `sandboxd`.
@@ -262,7 +282,10 @@ proxies HTTP(S); leave it `false` for raw TCP ingress.
 | `dns.tf`                    | Cloudflare A + wildcard records           |
 | `outputs.tf`                | Node summary, ingress IPs, SSH help       |
 | `templates/bootstrap.sh.tftpl` | Single user_data template (seed/joiner) |
-| `terraform.tfvars.example`  | Drop-in starter config                    |
+| `../config/terraform.tfvars.example` | Drop-in starter for `config/terraform.tfvars` (gitignored sibling) |
+| `../config/cluster.yml`     | Shared non-secret cluster ops env (Terraform + Ansible) |
+| `../config/secrets.example.yml` | Template for `config/secrets.yml` (gitignored sibling) |
+| `../scripts/terraform.sh`   | Wrapper — always invoke Terraform via this, not bare `terraform` |
 
 ## Connect this cluster to AOCR (mirror + auto-import)
 
@@ -332,7 +355,14 @@ group your imported tags under `cluster/<your-id>/_imported/...`. Pick once
 per cluster and never change it (changing it later orphans previously
 imported tags under the old namespace).
 
-### Step 2 - Add the `aocr` block to `terraform.tfvars`
+### Step 2 - Add the `aocr` block to `config/cluster.yml` + `config/secrets.yml`
+
+> **AOCR no longer lives in `terraform.tfvars`.** Non-secret AOCR config
+> (`mirror.host`, `auto_import.*`) sits in `config/cluster.yml` so both
+> Terraform and Ansible read it; AOCR secrets (`upstream_wrap_key`,
+> `cluster_pat`) sit in `config/secrets.yml`. The example block below shows
+> the shape — for the live keys see `config/cluster.yml` and
+> `config/secrets.example.yml`.
 
 ```hcl
 aocr = {
@@ -349,14 +379,14 @@ aocr = {
 }
 ```
 
-The whole variable is `sensitive = true`, so `terraform plan/apply` won't
-print the wrap key or PAT.
+`config/secrets.yml` is loaded through `sensitive(yamldecode(...))` in
+`locals.tf`, so `terraform plan/apply` won't print the wrap key or PAT.
 
 ### Step 3 - Apply
 
 ```bash
-terraform plan       # expect existing nodes to recycle; user_data changed
-terraform apply
+scripts/terraform.sh plan    # expect existing nodes to recycle; user_data changed
+scripts/terraform.sh apply
 ```
 
 `nodes.tf` sets `user_data_replace_on_change = true`, so existing EC2
@@ -415,16 +445,18 @@ warrant it. The full default set lives in `variables.tf`.
 ### TL;DR
 
 1. AOCR was deployed once; its secrets sit in `aocr.sh/secrets/`.
-2. Add the `aocr = { … }` block to `terraform.tfvars` with values copied
-   from those files plus a `cluster_id` you pick.
-3. `terraform apply` - nodes recycle, secrets land at `/etc/sandboxd/secrets/`,
-   sandboxd restarts wired to the mirror.
+2. Fill the `mirror.*` + `auto_import.*` blocks in `config/cluster.yml`, and
+   the `aocr.upstream_wrap_key` + `aocr.cluster_pat` keys in
+   `config/secrets.yml`, with values copied from those files plus an
+   `auto_import.cluster_id` you pick.
+3. `scripts/terraform.sh apply` - nodes recycle, secrets land at
+   `/etc/sandboxd/secrets/`, sandboxd restarts wired to the mirror.
 4. Verify with `grep` / `ls` on a node and `curl /v1/images` on AOCR.
 
 ## Tear-down
 
 ```bash
-terraform destroy
+scripts/terraform.sh destroy
 ```
 
 This deletes the VPC, instances, security group, IAM profiles, S3 bundle
