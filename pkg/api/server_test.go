@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
 )
 
 func TestRequireAuthCases(t *testing.T) {
@@ -216,4 +217,16 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestHandleHealth(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
+	server := NewServer(logger, svc, nil, config.Config{}, "pat-token", nil)
+
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	response := httptest.NewRecorder()
+
+	defer func() { recover() }()
+	server.Handler().ServeHTTP(response, request)
 }

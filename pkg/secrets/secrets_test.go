@@ -111,3 +111,61 @@ func TestCipherRejectsBadKeyLengths(t *testing.T) {
 		t.Fatal("expected error for non-base64 key")
 	}
 }
+
+func TestCipherNilRejects(t *testing.T) {
+	var c *Cipher
+	if _, err := c.EncryptWithAAD([]byte("a"), nil); err == nil {
+		t.Fatal("EncryptWithAAD: expected error on nil cipher")
+	}
+	if _, err := c.DecryptWithAAD([]byte("a"), nil); err == nil {
+		t.Fatal("DecryptWithAAD: expected error on nil cipher")
+	}
+}
+
+func TestCipherDecryptWithAADShort(t *testing.T) {
+	keyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+	c, _ := NewCipher(keyB64, "")
+	if _, err := c.DecryptWithAAD([]byte("short"), nil); err == nil {
+		t.Fatal("DecryptWithAAD: expected error on short cipher")
+	}
+}
+
+func TestLoadOrGenerateKeyEdgeCases(t *testing.T) {
+	if _, err := loadOrGenerateKey("", ""); err == nil {
+		t.Fatal("expected error with empty key and empty fallback path")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "key")
+	os.WriteFile(path, []byte("invalid-base64-xyz!"), 0600)
+	if _, err := loadOrGenerateKey("", path); err == nil {
+		t.Fatal("expected error for invalid base64 in fallback file")
+	}
+
+	os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString([]byte("short-key"))), 0600)
+	if _, err := loadOrGenerateKey("", path); err == nil {
+		t.Fatal("expected error for short key in fallback file")
+	}
+
+	// Using a directory as a file path should trigger a read error.
+	isdir := filepath.Join(dir, "isdir")
+	os.Mkdir(isdir, 0700)
+	if _, err := loadOrGenerateKey("", isdir); err == nil {
+		t.Fatal("expected error when fallback path is a directory")
+	}
+}
+
+func TestCipherAAD(t *testing.T) {
+	keyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+	c, _ := NewCipher(keyB64, "")
+	sealed, err := c.EncryptWithAAD([]byte("secret"), []byte("aad"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DecryptWithAAD(sealed, []byte("wrong-aad")); err == nil {
+		t.Fatal("expected error with wrong aad")
+	}
+	if _, err := c.DecryptWithAAD(sealed, []byte("aad")); err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+}
