@@ -142,7 +142,7 @@ nodes = {
 }
 ```
 
-After deployment, create sandboxes with `runtime: "runsc"` to use gVisor isolation. Nodes without `with_gvisor = true` continue to use the default Docker runtime.
+After deployment, create sandboxes with `runtime: "gvisor"` to use gVisor isolation. Nodes without `with_gvisor = true` continue to use the default Docker runtime.
 
 ## Step 6 - Enable Firecracker (optional)
 
