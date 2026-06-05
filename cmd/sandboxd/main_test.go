@@ -47,3 +47,45 @@ func TestRunReturnsDaemonError(t *testing.T) {
 		t.Fatalf("run() error = %v, want boom", err)
 	}
 }
+
+func TestMainSuccess(t *testing.T) {
+	origDaemon := runDaemon
+	t.Cleanup(func() { runDaemon = origDaemon })
+	runDaemon = func(context.Context, *slog.Logger, daemon.ProviderFactory) error {
+		return nil
+	}
+
+	origExit := osExit
+	t.Cleanup(func() { osExit = origExit })
+	exited := false
+	osExit = func(code int) {
+		exited = true
+	}
+
+	main()
+
+	if exited {
+		t.Fatalf("expected main not to call osExit on success")
+	}
+}
+
+func TestMainError(t *testing.T) {
+	origDaemon := runDaemon
+	t.Cleanup(func() { runDaemon = origDaemon })
+	runDaemon = func(context.Context, *slog.Logger, daemon.ProviderFactory) error {
+		return errors.New("boom")
+	}
+
+	origExit := osExit
+	t.Cleanup(func() { osExit = origExit })
+	exitCode := -1
+	osExit = func(code int) {
+		exitCode = code
+	}
+
+	main()
+
+	if exitCode != 1 {
+		t.Fatalf("expected main to call osExit(1) on error, got %d", exitCode)
+	}
+}

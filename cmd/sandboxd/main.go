@@ -10,7 +10,10 @@ import (
 	"github.com/aerol-ai/microvm/pkg/daemon"
 )
 
-var runDaemon = daemon.Run
+var (
+	runDaemon = daemon.Run
+	osExit    = os.Exit
+)
 
 func run(ctx context.Context, logger *slog.Logger) error {
 	return runDaemon(ctx, logger, nil)
@@ -29,6 +32,6 @@ func main() {
 
 	if err := run(ctx, logger); err != nil {
 		logger.Error("sandboxd exited with error", "error", err)
-		os.Exit(1)
+		osExit(1)
 	}
 }
