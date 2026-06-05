@@ -1,7 +1,7 @@
 # Local Setup
 
 Run AerolVM directly on your Mac or Linux laptop for SDK development, demos, or
-quick experiments. No domain, no TLS, no Caddy — the daemon listens on
+quick experiments. No domain, no TLS, no Caddy - the daemon listens on
 `http://localhost:21212` and your SDK connects there directly.
 
 This setup is **not for production**. For a single production server see
@@ -19,7 +19,7 @@ deployment see [`cluster.md`](./cluster.md).
 | `sudo` access | The installer registers a launchd / systemd daemon. |
 | `curl` and `bash` | Available out of the box on both OSes. |
 
-No port-forwarding, DNS, or firewall changes are needed — the API binds to
+No port-forwarding, DNS, or firewall changes are needed - the API binds to
 `127.0.0.1` only.
 
 ---
@@ -36,7 +36,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
 ```
 
 If you omit `--pat-token`, the installer generates a random token and prints
-it once at the end. Save it — you can also re-read it from
+it once at the end. Save it - you can also re-read it from
 `/etc/sandboxd/sandboxd.env` later.
 
 What the installer does:
@@ -99,7 +99,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/uninstal
 ```
 
 Removes the daemon registration, binaries, and `/etc/sandboxd/`. **Does not**
-remove Docker, sandbox state DB, or running sandbox containers — clean those
+remove Docker, sandbox state DB, or running sandbox containers - clean those
 up manually if you want a fresh slate:
 
 ```bash

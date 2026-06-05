@@ -6,13 +6,13 @@ Reference: [Daytona README](https://github.com/daytonaio/daytona/blob/main/READM
 
 ## 10 Things the Current README Lacks
 
-1. **No logo / hero section.** The file opens with a plain `# AerolVM` heading. GitHub renders a logo prominently when you use centered HTML `<picture>` — the first scroll matters for first impressions.
+1. **No logo / hero section.** The file opens with a plain `# AerolVM` heading. GitHub renders a logo prominently when you use centered HTML `<picture>` - the first scroll matters for first impressions.
 
 2. **No tagline.** There is no one-line pitch that tells a visitor what the product is and who it is for. Daytona leads with "Run AI Code. Secure and Elastic Infrastructure." The current README leads with a paragraph.
 
 3. **No navigation links.** No links to docs, bug reports, feature requests, or community. Daytona puts these at the very top so visitors land on the right next action.
 
-4. **No features / capabilities table.** The current README has a flat list of bullet points under "What AerolVM Does" — five items, none linked. Daytona has a rich table with 5 categories and 30+ linked rows. AerolVM has sessions, SSH, TCP ports, snapshots, external storage, GPU support, egress control, and more that are invisible in the current README.
+4. **No features / capabilities table.** The current README has a flat list of bullet points under "What AerolVM Does" - five items, none linked. Daytona has a rich table with 5 categories and 30+ linked rows. AerolVM has sessions, SSH, TCP ports, snapshots, external storage, GPU support, egress control, and more that are invisible in the current README.
 
 5. **No architecture section.** Nothing explains how the system is composed: single Go binary, Caddy for TLS + L7 + L4 routing, SQLite store, cluster mode with Raft FSM + SWIM gossip. Visitors cannot evaluate operational fit from the current README.
 
@@ -34,7 +34,7 @@ Reference: [Daytona README](https://github.com/daytonaio/daytona/blob/main/READM
 
 2. **Two-line H3 tagline.** "Run AI Code. / Secure and Elastic Infrastructure for Running Your AI-Generated Code." One line for attention, one line for clarity.
 
-3. **Nav links block in centered HTML.** Documentation · Report Bug · Request Feature · Join our Slack · Connect on X — all visible before any prose.
+3. **Nav links block in centered HTML.** Documentation · Report Bug · Request Feature · Join our Slack · Connect on X - all visible before any prose.
 
 4. **Opening paragraph names the product category, key primitives, and target audience** in three sentences. No fluff, no marketing jargon.
 
@@ -42,9 +42,9 @@ Reference: [Daytona README](https://github.com/daytonaio/daytona/blob/main/READM
 
 6. **Architecture section explains planes without diving into internals.** Interface / Control / Compute planes, then a directory table that maps each `apps/` folder to one sentence. Easy for evaluators to understand operational shape.
 
-7. **Client libraries section has install commands + package lists per language.** `pip install daytona`, `npm install @daytona/sdk`, `go get …` — all language-native. No guessing.
+7. **Client libraries section has install commands + package lists per language.** `pip install daytona`, `npm install @daytona/sdk`, `go get …` - all language-native. No guessing.
 
-8. **Quick Start shows working code for every SDK.** Python, TypeScript, Ruby, Go, Java, curl, CLI — all in one section. Any visitor can copy-paste and have a running sandbox.
+8. **Quick Start shows working code for every SDK.** Python, TypeScript, Ruby, Go, Java, curl, CLI - all in one section. Any visitor can copy-paste and have a running sandbox.
 
 9. **Deployments section explains the full hosting spectrum.** Managed SaaS → open-source stack → customer-managed compute. Visitors understand their options without digging through docs.
 
@@ -70,15 +70,15 @@ Reference: [Daytona README](https://github.com/daytonaio/daytona/blob/main/READM
 
 8. **Add an SDKs section** with one `install` command per language (npm, pip, go get, cargo add, Maven/Gradle snippet) and a one-sentence description.
 
-9. **Show a multi-language Quick Start** with TypeScript, Python, and Go examples — the three most common agent languages. Link to the full docs for Rust and Java.
+9. **Show a multi-language Quick Start** with TypeScript, Python, and Go examples - the three most common agent languages. Link to the full docs for Rust and Java.
 
-10. **Call out `/daytona` and `/e2b` facade compatibility** as a dedicated callout block: "Already on the Daytona SDK? Point `SB_API_URL` at your AerolVM host — no code changes required."
+10. **Call out `/daytona` and `/e2b` facade compatibility** as a dedicated callout block: "Already on the Daytona SDK? Point `SB_API_URL` at your AerolVM host - no code changes required."
 
 11. **Add an Installation section** with the two primary paths: local (`--local`) and production (with `--domain` + Cloudflare DNS-01). Keep the snippets from the current README but label them clearly.
 
 12. **Add a Use Cases section** with 4 one-line callouts (AI code execution, ephemeral CI, interactive dev environments, data processing pipelines) each linking to the docs use-cases section.
 
-13. **Link to `docs.aerol.ai`** for every docs reference. Use the production URL, not relative paths to `.md` files in the repo — those are internal links for GitHub web browsing, not for users.
+13. **Link to `docs.aerol.ai`** for every docs reference. Use the production URL, not relative paths to `.md` files in the repo - those are internal links for GitHub web browsing, not for users.
 
 14. **Add a Runtime Options table** keeping the current Docker / gVisor / Firecracker / Kata rows. It is a genuine differentiator worth surfacing early.
 
@@ -90,7 +90,7 @@ Reference: [Daytona README](https://github.com/daytonaio/daytona/blob/main/READM
 
 18. **Add a "Start Here" navigation table** (already exists in the current README but is buried) in a more prominent position, covering: Quick Start, Server Setup, SDK Setup, Comparison, Cluster Setup.
 
-19. **Add GitHub badges** for CI status, license, and release — they are already defined in the current README but can be expanded with a `license` badge and a `latest release` badge.
+19. **Add GitHub badges** for CI status, license, and release - they are already defined in the current README but can be expanded with a `license` badge and a `latest release` badge.
 
 20. **Use an HTML `<br>` and `&nbsp;` spacer** between the logo/header block and the prose sections, matching the Daytona visual rhythm that makes the README feel polished on GitHub.
 

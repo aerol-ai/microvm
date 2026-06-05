@@ -3,7 +3,7 @@
 Run AerolVM across multiple hosts behind one logical API. Clients call any
 node, raft coordinates placement, and traffic is transparently forwarded to
 whichever node owns each sandbox. **Sandboxes themselves are not highly
-available** — if the owner node dies, the sandbox is gone (see
+available** - if the owner node dies, the sandbox is gone (see
 [Failover semantics](#failover-semantics)). What survives a node failure is
 the cluster: the control plane stays available, other sandboxes keep running,
 and new placements continue to land on healthy nodes.
@@ -97,7 +97,7 @@ Key invariants:
   the selected owner ID, and a node rejects the request if it is not that owner.
 - Only the **leader** can apply raft entries. Followers forward writes.
 - Every node ends up with the same **redacted spec** + **sealed secrets**
-  in its in-memory FSM. SealedSecrets are bytes — only the owner with the
+  in its in-memory FSM. SealedSecrets are bytes - only the owner with the
   shared key can read them as plaintext.
 - The owner's local SQLite is the source of truth for runtime state
   (container ID, port allocations, sessions). Raft only carries placement
@@ -125,7 +125,7 @@ client ──► any node
         response streams back through the proxy
 ```
 
-Hot-path traffic does NOT go through raft — it would be far too slow.
+Hot-path traffic does NOT go through raft - it would be far too slow.
 Membership info from gossip is enough to find the owner.
 
 ### 3. A node dies
@@ -150,7 +150,7 @@ leader runs the dead-owner reconciler:
 default sandboxes return 410 Gone; opted-in sandboxes are recreated
         │
         ▼
-clients (or operators) issue a fresh create — placement picks
+clients (or operators) issue a fresh create - placement picks
 a new owner from the live, healthy nodes
 ```
 
@@ -180,7 +180,7 @@ seed's leader adds it to raft
 raft replays the FSM log: this node now has the full placement map
         │
         ▼
-no sandboxes are migrated automatically — the new node has 0 owned
+no sandboxes are migrated automatically - the new node has 0 owned
 sandboxes and can accept new placements based on its capacity
 ```
 
@@ -264,9 +264,9 @@ prereqs, `sudo`), plus:
 - `openssl` available (cluster-init generates the gossip key, the TLS CA,
   and the credential encryption key with it).
 - Cluster-internal ports open between nodes only:
-  - `7000/TCP` — raft replication
-  - `7001/TCP+UDP` — gossip
-  - `7002/TCP` — internal mTLS RPC (only when TLS is enabled)
+  - `7000/TCP` - raft replication
+  - `7001/TCP+UDP` - gossip
+  - `7002/TCP` - internal mTLS RPC (only when TLS is enabled)
 - Public ports open as in single-node: `443/TCP`, `2220/TCP`, optionally
   `22000-23000/TCP`.
 
@@ -277,7 +277,7 @@ prereqs, `sudo`), plus:
 This is the recommended starting topology. Three small VPS hosts behind one
 domain.
 
-### Step 1 — Run install.sh on EVERY node
+### Step 1 - Run install.sh on EVERY node
 
 This is the same single-node install. The cluster scripts assume `sandboxd`
 is already installed and managed by systemd. Use the **same PAT token** on
@@ -300,13 +300,13 @@ Verify on each:
 curl https://sandbox.example.com/health
 ```
 
-> The `--domain` value can be the same across nodes — they're behind the
+> The `--domain` value can be the same across nodes - they're behind the
 > same DNS records. Or different: each node may resolve a different
 > sub-domain depending on your load-balancer setup. Most operators use a
 > single shared domain plus a load balancer in front. See [DNS for
 > clusters](#dns-for-clusters) below.
 
-### Step 2 — Open cluster-internal ports
+### Step 2 - Open cluster-internal ports
 
 On each node's firewall (cloud security group or `ufw`):
 
@@ -319,7 +319,7 @@ ALLOW 7002/TCP       from <other-cluster-node-IPs>   # internal mTLS (TLS mode o
 **Never open these to the public internet.** Gossip carries auth tokens;
 raft carries the full FSM.
 
-### Step 3 — Bootstrap the seed (node A)
+### Step 3 - Bootstrap the seed (node A)
 
 Pick one node to bootstrap. From now on it's "the seed". On `node-a`:
 
@@ -345,7 +345,7 @@ Replace `10.0.0.5` with `node-a`'s private IP. The script:
    the other nodes.
 
 **Save the printed gossip key and copy the printed bundle path.** The script
-prints a ready-to-run join command — paste it for steps 4 and 5.
+prints a ready-to-run join command - paste it for steps 4 and 5.
 
 Verify the seed came up clean:
 
@@ -357,7 +357,7 @@ Look for `cluster: leader elected` and absence of any
 `SB_CREDENTIAL_ENCRYPTION_KEY is required` or `SB_GOSSIP_SECRET_KEY is
 required` errors.
 
-### Step 4 — Securely transfer the TLS bundle
+### Step 4 - Securely transfer the TLS bundle
 
 The bundle contains the CA private key and the credential encryption key.
 Anyone who gets it can mint a node cert AND decrypt every sealed credential
@@ -378,7 +378,7 @@ Wipe local copies after distribution:
 shred -u /tmp/aerolvm-tls-bundle.tar.gz
 ```
 
-### Step 5 — Join the rest (node B, node C)
+### Step 5 - Join the rest (node B, node C)
 
 On each joining node:
 
@@ -403,7 +403,7 @@ The script:
    `SB_GOSSIP_SECRET_KEY`, `SB_CREDENTIAL_ENCRYPTION_KEY`, and the TLS dir.
 6. Restarts `sandboxd`.
 
-`--peers` accepts a comma-separated list — one reachable peer is enough; the
+`--peers` accepts a comma-separated list - one reachable peer is enough; the
 new node discovers the rest through gossip.
 
 After both joins land, check the seed's log:
@@ -424,7 +424,7 @@ The seed leader auto-promotes new joiners to raft voters until
 `SB_CLUSTER_MAX_AUTO_VOTERS` is reached. Additional joiners are added as raft
 non-voters so they receive the placement log without increasing quorum.
 
-### Step 6 — Verify the cluster
+### Step 6 - Verify the cluster
 
 From any node:
 
@@ -442,7 +442,7 @@ curl -H "Authorization: Bearer $SB_PAT_TOKEN" \
 
 Expect a non-empty leader ID matching one of the three nodes.
 
-Create a sandbox via the SDK against any node — the cluster picks the owner
+Create a sandbox via the SDK against any node - the cluster picks the owner
 based on capacity, and subsequent calls are transparently forwarded.
 
 ---
@@ -451,9 +451,9 @@ based on capacity, and subsequent calls are transparently forwarded.
 
 A cluster has **two distinct kinds of public traffic**, and they route
 differently. This is the most common source of confusion when standing up a
-cluster — read this section before configuring DNS.
+cluster - read this section before configuring DNS.
 
-### Path 1 — API traffic (`sandbox.example.com/v1/...`)
+### Path 1 - API traffic (`sandbox.example.com/v1/...`)
 
 Lands on any node. For sandbox-scoped requests, the application looks up the
 placement record and reverse-proxies the HTTP request to the owner
@@ -463,7 +463,7 @@ create to that owner.
 
 **Channel selection.** When both this node and the owner have TLS material
 (`SB_CLUSTER_TLS_DIR` set on both), the proxy rides the cluster-internal
-mTLS channel on `:7002` — the receiving node's mTLS listener serves the
+mTLS channel on `:7002` - the receiving node's mTLS listener serves the
 same `/v1/...` mux as its public port, so handlers run identically but the
 hop is cert-pinned end-to-end. The PAT bearer header is still forwarded
 (belt-and-braces), but possession of the PAT alone is no longer sufficient
@@ -476,7 +476,7 @@ node's advertised API URL must still be reachable by its peers as the
 mixed-rollout fallback. The `:7002` mTLS port must be reachable between
 cluster members for the cert-pinned path to be used at all.
 
-### Path 2 — Sandbox URLs (`<id>.sandbox.example.com`, `<id>-<port>.sandbox.example.com`)
+### Path 2 - Sandbox URLs (`<id>.sandbox.example.com`, `<id>-<port>.sandbox.example.com`)
 
 Each sandbox container lives on exactly **one** owner node, but every node runs
 an ingress reconciler. Non-owner nodes install Caddy/caddy-l4 routes from the
@@ -510,7 +510,7 @@ https://<sandbox-id>.sandbox.example.com   # sandbox URL
 No matter how many nodes you have, the SDK uses one `baseURL`. The DNS
 records below decide which physical node the connection actually reaches.
 
-### Topology A — SNI-aware L4 LB (recommended; works for both paths) — **2 DNS records**
+### Topology A - SNI-aware L4 LB (recommended; works for both paths) - **2 DNS records**
 
 ```
 A   sandbox.example.com    →  <LB-public-IP>
@@ -521,14 +521,14 @@ The LB does **TLS pass-through** (TCP-mode listener on `:443`, no cert at the
 LB), preserving SNI. Each backend node terminates TLS with its own copy of
 the wildcard cert.
 
-For the **API path**, this works trivially — any backend forwards the call.
+For the **API path**, this works trivially - any backend forwards the call.
 
 For the **sandbox URL path**, this also works: if the LB lands on a non-owner,
 that node's ingress route forwards the connection to the owner. Route
 convergence is controlled by the sandboxd cluster-ingress reconcile loop, so a
 fresh expose or failover can briefly return 404/502 until the next reconcile.
 
-### Topology B — Per-sandbox DNS (not recommended unless you need direct owner routing)
+### Topology B - Per-sandbox DNS (not recommended unless you need direct owner routing)
 
 On each sandbox create, write a per-sandbox A record pointing at the owner:
 
@@ -542,7 +542,7 @@ any-node ingress layer, but it adds Cloudflare TTL lag during failover
 record per sandbox. Prefer Topology A unless your environment forbids
 node-to-node ingress forwarding.
 
-### Topology C — DNS round-robin (NOT RECOMMENDED) — **6 records**
+### Topology C - DNS round-robin (NOT RECOMMENDED) - **6 records**
 
 ```
 A   sandbox.example.com    →  <node-a-IP>
@@ -605,7 +605,7 @@ use case, see "After the cluster is up" at the end.
       `sandbox.example.com`. The wildcard `*.sandbox.example.com` will be
       yours too.
 
-### Step 1 — Create the VPC and subnets
+### Step 1 - Create the VPC and subnets
 
 ```bash
 # Region: pick one with ≥3 AZs. Example: us-east-1.
@@ -644,7 +644,7 @@ done
 echo "VPC=$VPC_ID  subnets=$SUBNET_A,$SUBNET_B,$SUBNET_C"
 ```
 
-### Step 2 — Security groups
+### Step 2 - Security groups
 
 Three groups: public-edge, cluster-internal, management.
 
@@ -659,7 +659,7 @@ aws ec2 authorize-security-group-ingress --group-id $SG_PUBLIC \
 aws ec2 authorize-security-group-ingress --group-id $SG_PUBLIC \
   --ip-permissions IpProtocol=tcp,FromPort=2220,ToPort=2220,IpRanges='[{CidrIp=0.0.0.0/0}]'
 
-# Cluster-internal (raft, gossip, mTLS) — only from the SG itself.
+# Cluster-internal (raft, gossip, mTLS) - only from the SG itself.
 SG_CLUSTER=$(aws ec2 create-security-group --vpc-id $VPC_ID \
   --group-name aerolvm-cluster --description "Cluster-internal" \
   --query 'GroupId' --output text)
@@ -679,7 +679,7 @@ aws ec2 authorize-security-group-ingress --group-id $SG_MGMT \
 echo "SGs: public=$SG_PUBLIC cluster=$SG_CLUSTER mgmt=$SG_MGMT"
 ```
 
-### Step 3 — Launch 3 EC2 instances
+### Step 3 - Launch 3 EC2 instances
 
 ```bash
 # Ubuntu 22.04 LTS AMI for your region (this is us-east-1 as of 2026; use SSM
@@ -727,7 +727,7 @@ for name in "${!NODES[@]}"; do
 done
 ```
 
-### Step 4 — Network Load Balancer with TLS pass-through
+### Step 4 - Network Load Balancer with TLS pass-through
 
 ```bash
 # Create the NLB across all 3 subnets.
@@ -770,9 +770,9 @@ echo "NLB DNS: $NLB_DNS"
 
 The key choice here is **TCP listener, not TLS**. TLS pass-through preserves
 the encrypted handshake to the backend, where each node's Caddy terminates
-TLS using its own copy of the wildcard cert (issued via DNS-01 — see Step 6).
+TLS using its own copy of the wildcard cert (issued via DNS-01 - see Step 6).
 
-### Step 5 — Cloudflare DNS
+### Step 5 - Cloudflare DNS
 
 In the Cloudflare dashboard, add **two CNAME records** under your zone:
 
@@ -810,7 +810,7 @@ dig +short test.sandbox.example.com
 
 Both should return the NLB's IP(s) (Amazon-assigned, may be multiple).
 
-### Step 6 — Run `install.sh` on each EC2 instance
+### Step 6 - Run `install.sh` on each EC2 instance
 
 SSH to each instance (the EIPs you allocated earlier are the SSH targets):
 
@@ -840,7 +840,7 @@ curl http://127.0.0.1:21212/health    # local
 curl https://sandbox.example.com/health   # via NLB → some backend
 ```
 
-### Step 7 — Bootstrap the cluster on `node-a`
+### Step 7 - Bootstrap the cluster on `node-a`
 
 ```bash
 # On node-a:
@@ -858,7 +858,7 @@ sudo /usr/local/bin/cluster-init.sh \
 Save the printed gossip key and bundle path. The bundle is at
 `./aerolvm-tls-bundle.tar.gz` by default (the script prints the exact path).
 
-### Step 8 — Distribute the TLS bundle to `node-b` and `node-c`
+### Step 8 - Distribute the TLS bundle to `node-b` and `node-c`
 
 From your laptop:
 
@@ -869,7 +869,7 @@ scp /tmp/aerolvm-tls-bundle.tar.gz ubuntu@<node-c-EIP>:/tmp/
 shred -u /tmp/aerolvm-tls-bundle.tar.gz
 ```
 
-### Step 9 — Join `node-b` and `node-c`
+### Step 9 - Join `node-b` and `node-c`
 
 On each joiner:
 
@@ -889,7 +889,7 @@ sudo /usr/local/bin/cluster-join.sh \
     --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 ```
 
-### Step 10 — Verify
+### Step 10 - Verify
 
 ```bash
 PAT=shared-pat-token-pick-something-strong
@@ -916,7 +916,7 @@ The cluster picks the owner via power-of-two-choices over the gossip
 capacity table; subsequent SDK calls reach the right node automatically
 through API forwarding.
 
-### After the cluster is up — what works, what doesn't
+### After the cluster is up - what works, what doesn't
 
 | Path | Status with this setup |
 |---|---|
@@ -935,7 +935,7 @@ window where a non-owner backend can return 404/502 before it refreshes.
 
 While the cluster's placement view and the node's installed routes are
 catching up, the daemon returns documented HTTP codes rather than letting the
-caller fall into a generic timeout. Treat these as the wire contract — SDKs
+caller fall into a generic timeout. Treat these as the wire contract - SDKs
 and load-balancer health checks key off them:
 
 | Surface | Situation | Response |
@@ -944,7 +944,7 @@ and load-balancer health checks key off them:
 | API control plane | Owner died and grace expired; placement orphaned | **410 Gone**. Stop retrying; issue a fresh `Create`. |
 | API control plane | Request forwarded to wrong node (stale placement view at sender) | **421 Misdirected Request**. Caller should re-resolve owner. |
 | Data plane HTTP/TLS (Caddy) | Route in flux on this node (placement seen, route not yet installed) | **503** with `Retry-After: 2` and body `Sandbox placement in flux. Retry in a moment.` |
-| Data plane raw TCP | Route in flux on this node | Connection refused. (No in-flux mirror — raw TCP has no hostname to match on, so the port simply isn't bound until the reconciler installs it.) |
+| Data plane raw TCP | Route in flux on this node | Connection refused. (No in-flux mirror - raw TCP has no hostname to match on, so the port simply isn't bound until the reconciler installs it.) |
 | Internal raft apply (`/v1/cluster/_apply`) | This node is not the leader | **503**, treat as retry signal. |
 
 Convergence is event-driven, not periodic: every committed FSM mutation wakes
@@ -971,10 +971,10 @@ query `GET /v1/cluster/placements/<sandbox-id>` from the node in question:
 }
 ```
 
-- `converged: true` — owner is this node (synchronous install) OR the
+- `converged: true` - owner is this node (synchronous install) OR the
   reconciler has applied routes for an FSM version ≥ `placement_version`.
   Client traffic via this node will hit the route.
-- `converged: false` — the reconciler is still catching up; raw TCP dials may
+- `converged: false` - the reconciler is still catching up; raw TCP dials may
   see connection refused and HTTP/TLS sees the 503-with-Retry-After in-flux
   response above. Recheck after the next 5s reconcile tick. If
   `node_installed_version` does not catch up after multiple ticks, scrape
@@ -996,7 +996,7 @@ new owner (taken by an unrelated TCP exposure, or in use locally), the replay
 - The FSM record (with the original `host_port`) stays intact.
 - The local re-bind fails with `ErrPreferredHostPortUnavailable`; the
   per-sandbox convergence status above reports `converged: false`.
-- The allocator does **not** fall through to the random/linear pool walk —
+- The allocator does **not** fall through to the random/linear pool walk -
   silently switching `host:40123` → `host:55555` would break every client
   that memorized the original endpoint, which is the whole point of the
   cluster-stable TCP route map.
@@ -1012,8 +1012,8 @@ restart the placement on a different node via an explicit re-create.
 
 Both `cluster-init.sh` and `cluster-join.sh` write the same two files:
 
-- `/etc/sandboxd/cluster.env` (mode 0600) — cluster env vars.
-- `/etc/systemd/system/sandboxd.service.d/cluster.conf` — drop-in adding
+- `/etc/sandboxd/cluster.env` (mode 0600) - cluster env vars.
+- `/etc/systemd/system/sandboxd.service.d/cluster.conf` - drop-in adding
   `EnvironmentFile=/etc/sandboxd/cluster.env`.
 
 The base `/etc/sandboxd/sandboxd.env` from `install.sh` is never modified.
@@ -1137,7 +1137,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 
 The daemon **refuses to boot** in cluster mode if either gossip or
 credential keys are missing (and the matching `INSECURE_*` flag isn't set).
-This is deliberate — silent divergence breaks failover.
+This is deliberate - silent divergence breaks failover.
 
 ---
 
@@ -1169,11 +1169,11 @@ gets replicated to every node within milliseconds. Take periodic backups.
 
 Per-node, back up:
 
-1. `/var/lib/sandboxd/state.db` — local SQLite (sandboxes this node owns).
-2. `/var/lib/sandboxd/raft/` — local raft log + snapshots.
-3. `/etc/sandboxd/cluster.env`, `/etc/sandboxd/sandboxd.env` — config.
-4. `/etc/sandboxd/tls/` — node cert and CA.
-5. `/var/lib/sandboxd/credential_encryption.key` — required to decrypt
+1. `/var/lib/sandboxd/state.db` - local SQLite (sandboxes this node owns).
+2. `/var/lib/sandboxd/raft/` - local raft log + snapshots.
+3. `/etc/sandboxd/cluster.env`, `/etc/sandboxd/sandboxd.env` - config.
+4. `/etc/sandboxd/tls/` - node cert and CA.
+5. `/var/lib/sandboxd/credential_encryption.key` - required to decrypt
    sealed credentials in the FSM.
 
 For a full cluster recovery from total destruction, you also need the
@@ -1213,12 +1213,12 @@ curl -s -H "Authorization: Bearer $SB_PAT_TOKEN" http://127.0.0.1:21212/v1/clust
 A persistent empty `Leader` field with repeated election timeouts is the
 signature.
 
-### Option A — wait for the lost nodes to come back
+### Option A - wait for the lost nodes to come back
 
 If their raft state on disk is intact, restarting them rejoins the existing
-configuration. **Try this first** — non-destructive.
+configuration. **Try this first** - non-destructive.
 
-### Option B — manual quorum recovery (last resort, destructive)
+### Option B - manual quorum recovery (last resort, destructive)
 
 If the lost voters are gone for good (disk loss, hardware destroyed):
 
@@ -1251,7 +1251,7 @@ If the lost voters are gone for good (disk loss, hardware destroyed):
    permanently-lost nodes are reassigned (or orphaned if no capacity) by
    the dead-owner reconciler.
 
-This is **destructive to durability guarantees** — any committed entry the
+This is **destructive to durability guarantees** - any committed entry the
 surviving node never replicated is lost. Document this procedure in your
 runbook before you need it.
 
@@ -1266,11 +1266,11 @@ A healthy cluster reports:
 - No repeated `cluster: AssertOwnership skipped, no leader yet` warnings.
 - `cluster: auto-promoted member to raft voter` or `cluster: added member as
   raft non-voter because voter cap is reached` log lines when joiners come
-  online — silence here means the raft membership loop isn't seeing the
+  online - silence here means the raft membership loop isn't seeing the
   joiner.
 
 Set up monitoring on `GET /v1/cluster/leader` returning empty for more than
-30 seconds — that's the earliest signal of a brewing quorum problem.
+30 seconds - that's the earliest signal of a brewing quorum problem.
 
 For metric scraping, use the PAT-gated Prometheus endpoint on every node:
 
@@ -1325,7 +1325,7 @@ Full incident runbooks are available under `setup/runbooks/`:
 | Joiner stuck, gossip never lands | Wrong `--gossip-key`, or `:7001` blocked | Compare gossip key char-for-char; check security group |
 | Joiner gossiped but no voter promotion | Raft `:7000` blocked | Open `:7000` between nodes |
 | Daemon refuses to start: `SB_GOSSIP_SECRET_KEY is required` | Cluster env file missing or empty | Re-run `cluster-init.sh` / `cluster-join.sh` |
-| Daemon refuses to start: `SB_CREDENTIAL_ENCRYPTION_KEY is required` | Same — credential key not in `cluster.env` and no key file on disk | Re-run cluster scripts (they now distribute the key); or copy `/var/lib/sandboxd/credential_encryption.key` from another node |
+| Daemon refuses to start: `SB_CREDENTIAL_ENCRYPTION_KEY is required` | Same - credential key not in `cluster.env` and no key file on disk | Re-run cluster scripts (they now distribute the key); or copy `/var/lib/sandboxd/credential_encryption.key` from another node |
 | Failed-over sandbox can't pull image | Different credential keys across nodes | Verify `sha256sum /var/lib/sandboxd/credential_encryption.key` matches everywhere |
 | `502` from any node for a sandbox URL | Owner node down and grace not yet elapsed | Wait up to `SB_DEAD_OWNER_GRACE`; then dead-owner reconciler reassigns |
 | Quorum lost (no leader for >30s) | Too many simultaneous failures | See [Lost-quorum recovery](#lost-quorum-recovery) |

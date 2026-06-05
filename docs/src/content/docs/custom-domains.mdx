@@ -8,39 +8,39 @@ Attach an arbitrary public hostname (`api.acme.com`, `acme.com`) to a sandbox so
 
 ## Prerequisites
 
-1. **DNS must point at the cluster's ingress** when the first HTTPS request arrives. AerolVM does not host DNS, and issuance uses ACME HTTP-01 — Let's Encrypt's validator must be able to reach the hostname over port 80/443 at the cluster. If DNS isn't pointing yet, the domain stays in `pending_dns` until you fix it.
-2. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope — they reject with `409 Conflict` if a custom domain is configured.
+1. **DNS must point at the cluster's ingress** when the first HTTPS request arrives. AerolVM does not host DNS, and issuance uses ACME HTTP-01 - Let's Encrypt's validator must be able to reach the hostname over port 80/443 at the cluster. If DNS isn't pointing yet, the domain stays in `pending_dns` until you fix it.
+2. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope - they reject with `409 Conflict` if a custom domain is configured.
 
 ### DNS records to add
 
-The "target" below is whatever your default sandbox URLs already resolve to — `SB_INGRESS_ADVERTISE_HOST` in cluster mode (see [Cluster Ingress](/cluster-ingress/)) or `SB_PUBLIC_HOST` for single-node. The record type you create depends on the shape of the custom hostname and how your ingress is published.
+The "target" below is whatever your default sandbox URLs already resolve to - `SB_INGRESS_ADVERTISE_HOST` in cluster mode (see [Cluster Ingress](/cluster-ingress/)) or `SB_PUBLIC_HOST` for single-node. The record type you create depends on the shape of the custom hostname and how your ingress is published.
 
 | Custom hostname | Ingress target is a hostname (e.g. `ingress.example.com`) | Ingress target is raw IPs |
 |---|---|---|
 | Subdomain (`api.acme.com`) | `CNAME api → ingress.example.com` | `A` (and `AAAA` if IPv6) on `api`, one record per ingress IP |
 | Apex (`acme.com`) | `CNAME @ → ingress.example.com` *(requires apex-CNAME support: Cloudflare CNAME flattening, Route 53 alias, DNSimple `ALIAS`, dnsmadeeasy `ANAME`, etc.)* | `A` (and `AAAA` if IPv6) on `@`, one record per ingress IP |
 
-If your DNS provider does not support a flattened apex CNAME and you only have an ingress hostname (not IPs), the workaround is per-host DNS-01 issuance — tracked for v2 in `plans/custom-domains-dns01.md`.
+If your DNS provider does not support a flattened apex CNAME and you only have an ingress hostname (not IPs), the workaround is per-host DNS-01 issuance - tracked for v2 in `plans/custom-domains-dns01.md`.
 
 ### Ownership verification (TXT record)
 
 In addition to the CNAME / A / AAAA above, you must publish a TXT record proving you control the zone. Without it, every `attach` call returns `403 Forbidden` with `custom domain TXT record verification failed`.
 
-The value is keyed to the **hostname**, not to a sandbox ID — one record per hostname, provisioned once, reusable across sandbox recreates and for any sandbox that wants to claim it. Cross-sandbox hijack of an already-attached hostname is still blocked by the cluster-wide uniqueness gate at attach time.
+The value is keyed to the **hostname**, not to a sandbox ID - one record per hostname, provisioned once, reusable across sandbox recreates and for any sandbox that wants to claim it. Cross-sandbox hijack of an already-attached hostname is still blocked by the cluster-wide uniqueness gate at attach time.
 
 | Custom hostname | TXT record name | TXT record value |
 |---|---|---|
 | Subdomain (`api.acme.com`) | `_aerol-verify.api` (zone `acme.com`) | `aerol-verify=api.acme.com` |
 | Apex (`acme.com`) | `_aerol-verify` (at zone root) | `aerol-verify=acme.com` |
 
-Most DNS provider UIs expect the Name relative to the managed zone (the left columns above); some expect the FQDN — in that case use `_aerol-verify.api.acme.com` or `_aerol-verify.acme.com` and the value is unchanged.
+Most DNS provider UIs expect the Name relative to the managed zone (the left columns above); some expect the FQDN - in that case use `_aerol-verify.api.acme.com` or `_aerol-verify.acme.com` and the value is unchanged.
 
-Publish the TXT, wait for it to propagate (`dig TXT _aerol-verify.<your-host>`), then call `attach`. If you operate the cluster with non-default verification prefixes (`SB_CUSTOM_DOMAIN_VERIFY_PREFIX`, `SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX`), substitute those — `customDomains.dns()` always returns the correct row for the cluster you're talking to.
+Publish the TXT, wait for it to propagate (`dig TXT _aerol-verify.<your-host>`), then call `attach`. If you operate the cluster with non-default verification prefixes (`SB_CUSTOM_DOMAIN_VERIFY_PREFIX`, `SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX`), substitute those - `customDomains.dns()` always returns the correct row for the cluster you're talking to.
 
 ### Cloudflare specifics
 
-1. **Set the record to DNS-only (gray cloud), not Proxied (orange cloud).** With the proxy on, Cloudflare terminates TLS with its own certificate and the cluster never sees the SNI — Caddy's `ask` handler is never invoked, ACME never runs, and the domain stays `pending_dns` forever. The same applies to any CDN or reverse proxy that intercepts TLS in front of the ingress.
-2. **Apex works as a plain `CNAME` in Cloudflare** thanks to built-in CNAME flattening — there is no separate `ALIAS` / `ANAME` record type to pick. Create the row with `Type = CNAME`, `Name = @`, `Target = <ingress hostname>`, and Cloudflare resolves it to A/AAAA at query time.
+1. **Set the record to DNS-only (gray cloud), not Proxied (orange cloud).** With the proxy on, Cloudflare terminates TLS with its own certificate and the cluster never sees the SNI - Caddy's `ask` handler is never invoked, ACME never runs, and the domain stays `pending_dns` forever. The same applies to any CDN or reverse proxy that intercepts TLS in front of the ingress.
+2. **Apex works as a plain `CNAME` in Cloudflare** thanks to built-in CNAME flattening - there is no separate `ALIAS` / `ANAME` record type to pick. Create the row with `Type = CNAME`, `Name = @`, `Target = <ingress hostname>`, and Cloudflare resolves it to A/AAAA at query time.
 
 ## Attach at create time
 
@@ -141,9 +141,9 @@ The add call returns the post-attach list with the new row's `status` so callers
 
 ### Target port
 
-By default traffic to a custom domain dials the sandbox's toolbox port — the same root URL `https://{id}.{cluster-domain}` serves. Pass a `port` to route the hostname at a specific application port inside the container instead (e.g. an app listening on `3333`). This is the same routing the default `sb-{id}-{port}.{cluster-domain}` URLs use, but bound to your custom hostname.
+By default traffic to a custom domain dials the sandbox's toolbox port - the same root URL `https://{id}.{cluster-domain}` serves. Pass a `port` to route the hostname at a specific application port inside the container instead (e.g. an app listening on `3333`). This is the same routing the default `sb-{id}-{port}.{cluster-domain}` URLs use, but bound to your custom hostname.
 
-`port` is fixed at attach time. To change it, detach and re-add — re-adding the same hostname with a different `port` returns `409 Conflict` rather than silently redirecting live traffic.
+`port` is fixed at attach time. To change it, detach and re-add - re-adding the same hostname with a different `port` returns `409 Conflict` rather than silently redirecting live traffic.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -188,14 +188,14 @@ CNAME-vs-A logic.
 
 Two entry points:
 
-- `dns.target()` — cluster-wide. Returns the ingress target (hostname or
+- `dns.target()` - cluster-wide. Returns the ingress target (hostname or
   IP set) that custom-domain DNS must point at. Useful **before** attaching a
   domain, when rendering "point your DNS here first" instructions. `source`
-  is `"hostname"`, `"ips"`, `"mixed"`, or `"unknown"` — branch on it instead
+  is `"hostname"`, `"ips"`, `"mixed"`, or `"unknown"` - branch on it instead
   of guessing from which field is populated.
-- `customDomains.dns()` — per-sandbox. Returns the ready-to-paste DNS rows
-  for each attached domain — the routing record (CNAME / A / AAAA) **and**
-  the ownership-verification TXT — plus the same `target` embedded, so
+- `customDomains.dns()` - per-sandbox. Returns the ready-to-paste DNS rows
+  for each attached domain - the routing record (CNAME / A / AAAA) **and**
+  the ownership-verification TXT - plus the same `target` embedded, so
   callers don't need a follow-up `dns.target()` round trip.
 
 <Tabs syncKey="lang">
@@ -270,7 +270,7 @@ Two entry points:
 </Tabs>
 
 When the cluster has no ingress address gossiped yet (boot, mis-configured
-deployment), `source` is `"unknown"` and `records` is empty — treat the
+deployment), `source` is `"unknown"` and `records` is empty - treat the
 target as unusable rather than guessing.
 
 ## Detach
@@ -337,14 +337,14 @@ Detach removes the Caddy route and deletes the row. The issued certificate stays
 
 ## Status lifecycle
 
-Each attached hostname carries a `status` that reflects where Caddy is in the per-host ACME flow. Poll `list` (or re-read the sandbox) to observe transitions — there is no push notification.
+Each attached hostname carries a `status` that reflects where Caddy is in the per-host ACME flow. Poll `list` (or re-read the sandbox) to observe transitions - there is no push notification.
 
 | Status | Meaning |
 |---|---|
 | `pending_dns` | Row exists, no TLS handshake seen for this host yet. Either DNS isn't pointed yet, or no client has connected. |
 | `issuing` | Caddy has started the ACME flow (first HTTPS hit arrived). HTTP-01 challenge in progress. |
 | `ready` | Certificate is in Caddy storage and serving traffic. |
-| `failed` | ACME gave up. `lastError` carries the reason — usually DNS still wrong, or LE rate-limited. Detach + reattach after fixing DNS to retry. |
+| `failed` | ACME gave up. `lastError` carries the reason - usually DNS still wrong, or LE rate-limited. Detach + reattach after fixing DNS to retry. |
 
 ## Errors
 
@@ -352,10 +352,10 @@ Each attached hostname carries a `status` that reflects where Caddy is in the pe
 |---|---|
 | `400 Bad Request` | Hostname is malformed or includes a port, or `target_port` is outside `1..65535`. |
 | `403 Forbidden` | Ownership verification TXT record is missing or has the wrong value at `_aerol-verify.<hostname>`. See [Ownership verification (TXT record)](#ownership-verification-txt-record). |
-| `409 Conflict` | The hostname is already attached to a different sandbox (hostnames are globally unique across the cluster), the sandbox already exposes a `tcp://` / `tls://` port (the IRON RULE — custom domains and L4 exposures can't coexist on one sandbox), the per-sandbox cap is reached, or the hostname is already attached to this sandbox with a different `target_port` (detach + re-add to change it). |
+| `409 Conflict` | The hostname is already attached to a different sandbox (hostnames are globally unique across the cluster), the sandbox already exposes a `tcp://` / `tls://` port (the IRON RULE - custom domains and L4 exposures can't coexist on one sandbox), the per-sandbox cap is reached, or the hostname is already attached to this sandbox with a different `target_port` (detach + re-add to change it). |
 | `412 Precondition Failed` | Custom domains are disabled (`SB_ENABLE_CUSTOM_DOMAINS=false`) or the server runs in IP mode (`SB_DOMAIN` unset). |
 | `429 Too Many Requests` | The daemon-wide ACME issuance budget is exhausted (LE `new-orders` per-account limit nearing 80% of 300/3h). Honour `Retry-After` and try again. |
 
 ## Cluster mode
 
-In multi-node clusters the hostname-to-sandbox mapping is replicated through Raft, so any ingress node accepts traffic for a custom domain regardless of which node owns the sandbox. Non-owner ingress nodes pass TLS through to the owner over SNI. The shared `certmagic-s3` cert store means only one node performs the ACME flow per hostname — see [multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md) for the storage / lock layout.
+In multi-node clusters the hostname-to-sandbox mapping is replicated through Raft, so any ingress node accepts traffic for a custom domain regardless of which node owns the sandbox. Non-owner ingress nodes pass TLS through to the owner over SNI. The shared `certmagic-s3` cert store means only one node performs the ACME flow per hostname - see [multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md) for the storage / lock layout.

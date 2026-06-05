@@ -7,7 +7,7 @@ production deployment for a single-tenant or low-volume installation.
 When to pick this over [`cluster.md`](./cluster.md):
 
 - Your workload fits on one host's CPU + memory.
-- You don't need failover — a host outage means a sandbox outage until you
+- You don't need failover - a host outage means a sandbox outage until you
   bring the host back.
 - You want minimal moving parts (no raft, no gossip, no inter-node mTLS).
 
@@ -53,14 +53,14 @@ truth for sandbox state.
 | Domain you control | e.g. `sandbox.example.com`. Subdomains under this become sandbox URLs. |
 | DNS provider with API access | Cloudflare is currently the only supported provider for DNS-01. |
 | `sudo` / root | The installer writes to `/etc/`, `/var/lib/`, and `systemd`. |
-| Open ports | `443/TCP` (HTTPS), `2220/TCP` (SSH gateway), `22000-23000/TCP` (raw-TCP exposes — only if you'll use them). |
+| Open ports | `443/TCP` (HTTPS), `2220/TCP` (SSH gateway), `22000-23000/TCP` (raw-TCP exposes - only if you'll use them). |
 
 `21212/TCP` (the API port) and `2019/TCP` (Caddy admin) bind to the host but
-should **not** be exposed publicly — Caddy fronts the API on `:443`.
+should **not** be exposed publicly - Caddy fronts the API on `:443`.
 
 ---
 
-## Step 1 — DNS records
+## Step 1 - DNS records
 
 Create both records before running the installer. Wildcard issuance fails
 without them.
@@ -85,7 +85,7 @@ Both should return your server IP.
 
 ---
 
-## Step 2 — Cloudflare API token
+## Step 2 - Cloudflare API token
 
 Caddy uses DNS-01 challenges (not HTTP-01) so the wildcard cert renews
 without ever touching `:443`. Create a **scoped** token at
@@ -96,7 +96,7 @@ without ever touching `:443`. Create a **scoped** token at
 | Zone → Zone → Read | The zone for `example.com` |
 | Zone → DNS → Edit | The zone for `example.com` |
 
-Save the token — the installer needs it.
+Save the token - the installer needs it.
 
 > **Why DNS-01 only?** HTTP-01 with Caddy's `ask` endpoint would accept any
 > subdomain probe and could burn the Let's Encrypt 50-cert/week quota for the
@@ -105,7 +105,7 @@ Save the token — the installer needs it.
 
 ---
 
-## Step 3 — Open the firewall
+## Step 3 - Open the firewall
 
 On your VPS provider's security group / `ufw` / cloud firewall:
 
@@ -115,11 +115,11 @@ ALLOW 2220/TCP       from anywhere      # SSH gateway (set SB_ENABLE_SSH_GATEWAY
 ALLOW 22000-23000/TCP from anywhere     # Raw-TCP sandbox exposures (only if you'll use them)
 ```
 
-`80/TCP` is **not** needed — DNS-01 doesn't go through HTTP.
+`80/TCP` is **not** needed - DNS-01 doesn't go through HTTP.
 
 ---
 
-## Step 4 — Install
+## Step 4 - Install
 
 One command:
 
@@ -163,7 +163,7 @@ DNS-01 challenge can take 30-90s), check `journalctl -u caddy -f`.
 
 ---
 
-## Step 5 — Connect from an SDK
+## Step 5 - Connect from an SDK
 
 ```ts
 import { Sandbox } from "@aerol-ai/sdk";
@@ -205,7 +205,7 @@ The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon if
 | `/etc/sandboxd/sandboxd.env` | Env vars (PAT, ports, paths). Mode 0600. |
 | `/etc/caddy/Caddyfile` | Caddy site config (HTTPS sites, TLS provider). |
 | `/etc/default/caddy` | Cloudflare API token. Mode 0600. |
-| `/var/lib/sandboxd/state.db` | SQLite — sandboxes, ports, sessions. **Source of truth.** |
+| `/var/lib/sandboxd/state.db` | SQLite - sandboxes, ports, sessions. **Source of truth.** |
 | `/var/lib/sandboxd/credential_encryption.key` | AES key for sealed registry/mount creds at rest. **Back this up.** |
 | `/var/lib/sandboxd/ssh_host_ed25519_key` | SSH-gateway host key. |
 | `/var/lib/sandboxd/mounts/` | FUSE mount roots for external-storage sandboxes. |
@@ -218,13 +218,13 @@ The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon if
 
 To restore service on a new host with the same data, back up:
 
-1. `/var/lib/sandboxd/state.db` — the state database.
-2. `/var/lib/sandboxd/credential_encryption.key` — without it, sealed
+1. `/var/lib/sandboxd/state.db` - the state database.
+2. `/var/lib/sandboxd/credential_encryption.key` - without it, sealed
    registry passwords and mount credentials in the DB cannot be decrypted.
-3. `/etc/sandboxd/sandboxd.env` — env config.
-4. `/var/lib/sandboxd/ssh_host_ed25519_key` — preserves the SSH host
+3. `/etc/sandboxd/sandboxd.env` - env config.
+4. `/var/lib/sandboxd/ssh_host_ed25519_key` - preserves the SSH host
    fingerprint so clients don't get a host-key-changed warning.
-5. `/var/lib/caddy/` (optional) — saves a fresh DNS-01 challenge on restore.
+5. `/var/lib/caddy/` (optional) - saves a fresh DNS-01 challenge on restore.
 
 A simple nightly tarball is sufficient for most installations:
 
@@ -235,7 +235,7 @@ sudo tar -C / -czf /backup/aerolvm-$(date +%F).tar.gz \
   var/lib/caddy
 ```
 
-Containers themselves are NOT in the backup — they get recreated from the
+Containers themselves are NOT in the backup - they get recreated from the
 state DB on first start. That recreation needs the credential key, hence
 its inclusion above.
 

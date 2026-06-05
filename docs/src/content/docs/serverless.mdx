@@ -4,7 +4,7 @@ title: Serverless Sandboxes
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A serverless sandbox auto-stops when it goes idle and is transparently restarted on the next inbound HTTP, TCP, or TLS-SNI connection to one of its exposed ports. Long-lived sandboxes that only serve occasional traffic — preview deployments, per-user code environments, model endpoints — stop consuming CPU and memory between requests without losing their disk state or public URL.
+A serverless sandbox auto-stops when it goes idle and is transparently restarted on the next inbound HTTP, TCP, or TLS-SNI connection to one of its exposed ports. Long-lived sandboxes that only serve occasional traffic - preview deployments, per-user code environments, model endpoints - stop consuming CPU and memory between requests without losing their disk state or public URL.
 
 ## What it does
 
@@ -12,14 +12,14 @@ Set `serverless: true` on the sandbox's lifecycle alongside `stopIfIdleFor`. Whe
 
 | Aspect | Behavior |
 |---|---|
-| Idle trigger | `stopIfIdleFor` (required) — sandboxes stopped by lifecycle / age / involuntary exit re-arm for wake. |
+| Idle trigger | `stopIfIdleFor` (required) - sandboxes stopped by lifecycle / age / involuntary exit re-arm for wake. |
 | Manual stop | Calling stop explicitly clears `wake_armed`. The sandbox stays down until you start it again. |
 | Cold-start latency | Hundreds of milliseconds to a few seconds, dominated by container start. |
 | Cold-start timeout | 15s. After that, the ingress handler returns `503 Retry-After: 2`. |
 | Request body cap | 8 MiB. Larger requests during cold start are rejected with `413`. |
 | Protocols woken | HTTP, TCP, and TLS-SNI exposures. HTTP requests are buffered during cold start up to the body cap; TCP/TLS connections wait for wake and then stream bytes. |
 
-The sandbox keeps its ID, public URL, environment, mounts, and disk across stop / wake cycles. Memory and in-process state do not survive — a serverless sandbox is more like a fast scale-to-zero container than a snapshot resume.
+The sandbox keeps its ID, public URL, environment, mounts, and disk across stop / wake cycles. Memory and in-process state do not survive - a serverless sandbox is more like a fast scale-to-zero container than a snapshot resume.
 
 ## Enable per-sandbox
 
@@ -142,4 +142,4 @@ The lifecycle update endpoint accepts the same field. Toggle `serverless` on or 
 
 ## Manual stop blocks wake
 
-Stopping the sandbox through the API is treated as an operator decision — `wake_armed` is cleared and exposed endpoints fail until the sandbox is explicitly started again. Only lifecycle-driven stops (idle timer, age, involuntary container exit) re-arm wake. Use this to take a serverless sandbox out of rotation without destroying it.
+Stopping the sandbox through the API is treated as an operator decision - `wake_armed` is cleared and exposed endpoints fail until the sandbox is explicitly started again. Only lifecycle-driven stops (idle timer, age, involuntary container exit) re-arm wake. Use this to take a serverless sandbox out of rotation without destroying it.

@@ -3,12 +3,12 @@
 Use this when Firecracker template push, pull, or rebuild metrics fire. The
 template pipeline has three stages and they fail in distinct ways:
 
-1. **Build** — `ImportTemplate` produces `rootfs.ext4`, boots a one-shot VMM,
+1. **Build** - `ImportTemplate` produces `rootfs.ext4`, boots a one-shot VMM,
    and snapshots memory + device state. Failures here flip the row to
    `failed` (terminal) or `ready_no_snapshot` (rootfs ok, snapshot didn't).
-2. **Push** — `TemplateArtifactPusher` ships the artifact bundle to AOCR for
+2. **Push** - `TemplateArtifactPusher` ships the artifact bundle to AOCR for
    peer nodes to fetch. Failures move `push_state` from `pending` → `error`.
-3. **Pull** — peer nodes call `EnsureTemplateLocal` on first create against
+3. **Pull** - peer nodes call `EnsureTemplateLocal` on first create against
    a template they don't have on disk; the puller fetches and extracts.
 
 Snapshot corruption observed on the boot path flips the row to `unhealthy`
@@ -71,7 +71,7 @@ Pick the smallest action that stops amplification:
      http://127.0.0.1:21212/v1/cluster/nodes/<node-id>/drain
    ```
 
-3. If push is the only failing stage, do not touch creates — push only
+3. If push is the only failing stage, do not touch creates - push only
    affects new nodes joining or recovering. Buy time, then mitigate.
 
 ## Mitigation by Cause
@@ -144,7 +144,7 @@ observer. If the count is stuck:
      after a memory bump, not after a code change.
    - network / timeout → transient; reconciler retries on its own.
 
-3. Rows in `push_state=error` are picked up by the next reconciler tick — no
+3. Rows in `push_state=error` are picked up by the next reconciler tick - no
    manual kick needed unless the underlying cause is fixed and you want
    immediate retry.
 

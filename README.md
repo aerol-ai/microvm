@@ -29,7 +29,7 @@
 
 &nbsp;
 
-AerolVM is open-source, self-hosted sandbox infrastructure for running isolated code environments on your own Linux host. Each sandbox is a fully isolated compute unit with its own filesystem, network namespace, and allocated vCPU, RAM, and disk — spinning up in **under 60ms** and supporting Docker, gVisor, and Firecracker runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
+AerolVM is open-source, self-hosted sandbox infrastructure for running isolated code environments on your own Linux host. Each sandbox is a fully isolated compute unit with its own filesystem, network namespace, and allocated vCPU, RAM, and disk - spinning up in **under 60ms** and supporting Docker, gVisor, and Firecracker runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
 
 ## Features
 
@@ -71,23 +71,23 @@ AerolVM beats the two most common alternatives on the axes that matter most for 
 
 e2b is the fastest managed path if you want zero infrastructure, but it means your code runs on someone else's hardware with no self-hosting option, per-sandbox-hour billing that compounds fast at scale, a hard 1-day sandbox lifetime cap, and no kernel-level isolation for untrusted LLM-generated code. AerolVM covers the same AI execution use case on infrastructure you own, with gVisor isolation and predictable fixed-cost pricing.
 
-> **Already on the e2b SDK?** AerolVM's `/e2b` API facade means your existing code keeps working — just point `E2B_API_URL` at your AerolVM host.
+> **Already on the e2b SDK?** AerolVM's `/e2b` API facade means your existing code keeps working - just point `E2B_API_URL` at your AerolVM host.
 
 ### vs Daytona
 
 Daytona targets long-lived developer workspaces, not high-frequency ephemeral agent workloads. It requires multi-component infrastructure that is genuinely difficult to self-host and has no kernel-level isolation, no per-sandbox egress control, and no port allowlist. AerolVM is a single binary you install in 60 seconds.
 
-> **Already on the Daytona SDK?** AerolVM's `/daytona` API facade lets you swap the backend without touching your SDK code — just update `DAYTONA_API_URL`.
+> **Already on the Daytona SDK?** AerolVM's `/daytona` API facade lets you swap the backend without touching your SDK code - just update `DAYTONA_API_URL`.
 
 ## Architecture
 
 AerolVM is a single Go binary (`sandboxd`) wired to three components:
 
-- **Caddy** — handles wildcard TLS via DNS-01, L7 HTTP routing (`<sandbox-id>.<domain>`), and L4 TCP SNI routing (`<sandbox-id>-<port>.<domain>`). The daemon talks to the Caddy admin API; no config files are reloaded at runtime.
-- **Docker / gVisor / Firecracker** — the container runtimes. gVisor runs as an OCI-compatible runtime (`runsc`) so the same Docker API creates a kernel-isolated container with one extra flag.
-- **SQLite (WAL mode, single-writer)** — stores sandbox state, the TCP host-port pool, exposed-port intents, and sealed secrets. Single-writer means no contention; WAL mode means reads never block writes.
+- **Caddy** - handles wildcard TLS via DNS-01, L7 HTTP routing (`<sandbox-id>.<domain>`), and L4 TCP SNI routing (`<sandbox-id>-<port>.<domain>`). The daemon talks to the Caddy admin API; no config files are reloaded at runtime.
+- **Docker / gVisor / Firecracker** - the container runtimes. gVisor runs as an OCI-compatible runtime (`runsc`) so the same Docker API creates a kernel-isolated container with one extra flag.
+- **SQLite (WAL mode, single-writer)** - stores sandbox state, the TCP host-port pool, exposed-port intents, and sealed secrets. Single-writer means no contention; WAL mode means reads never block writes.
 
-For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-replicated placement state) and **SWIM gossip** (membership + capacity heartbeats). Nodes take `server`, `worker`, or `ingress` roles. The Raft voter count stays fixed at 3 or 5 regardless of how many workers you add — the same topology Kubernetes uses for control-plane vs. data-plane scaling. See [Cluster Setup](https://microvm.aerol.ai/cluster-setup).
+For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-replicated placement state) and **SWIM gossip** (membership + capacity heartbeats). Nodes take `server`, `worker`, or `ingress` roles. The Raft voter count stays fixed at 3 or 5 regardless of how many workers you add - the same topology Kubernetes uses for control-plane vs. data-plane scaling. See [Cluster Setup](https://microvm.aerol.ai/cluster-setup).
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -111,7 +111,7 @@ For multi-host deployments, `sandboxd` nodes form a cluster using **Raft** (FSM-
 | :--- | :--- | :--- |
 | Docker (`runc`) | ✅ Available | Default. Lowest overhead, broadest image compatibility. |
 | gVisor (`runsc`) | ✅ Available | User-space kernel isolation for untrusted LLM-generated code. Install with `--with-gvisor`. |
-| Firecracker | ✅ Available | MicroVM isolation — dedicated kernel per sandbox for maximum security. |
+| Firecracker | ✅ Available | MicroVM isolation - dedicated kernel per sandbox for maximum security. |
 
 ## SDKs
 
@@ -246,7 +246,7 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | [AI Code Execution](https://microvm.aerol.ai/use-cases/coding-agents) | Run LLM-generated code safely in kernel-isolated environments. Handle untrusted Python, JS, and shell from agent workflows without risking the host. |
 | [Ephemeral CI / Build Agents](https://microvm.aerol.ai/use-cases) | Spin up a fresh environment per job, run tests, collect artifacts, destroy. No persistent state, no environment drift. |
 | [Customer-Facing Products](https://microvm.aerol.ai/use-cases/customer-facing-product-experiences) | Ship interactive code runners, coding interview sandboxes, and per-user compute environments backed by AerolVM's isolation and port exposure. |
-| [Data Processing Pipelines](https://microvm.aerol.ai/use-cases) | Attach S3 or NFS storage, run transforms in parallel across sandboxes, extract results — with per-sandbox network quotas to prevent runaway egress. |
+| [Data Processing Pipelines](https://microvm.aerol.ai/use-cases) | Attach S3 or NFS storage, run transforms in parallel across sandboxes, extract results - with per-sandbox network quotas to prevent runaway egress. |
 
 ## Documentation
 
@@ -259,11 +259,11 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | [Sessions](https://microvm.aerol.ai/sessions) | Persistent PTY sessions that survive reconnects with output replay. |
 | [Snapshots](https://microvm.aerol.ai/snapshots) | Stop a sandbox, snapshot its state, restart it later exactly where it left off. |
 | [Cluster Setup](https://microvm.aerol.ai/cluster-setup) | Multi-node deployment with Raft placement and SWIM gossip. |
-| [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona — full feature and cost analysis. |
+| [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona - full feature and cost analysis. |
 
 ## Contributing
 
-AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome — open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
+AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
 
 ```bash
 make fmt      # format Go code

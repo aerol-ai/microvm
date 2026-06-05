@@ -6,20 +6,20 @@ operating it, or hacking on it.
 
 The reading order is:
 
-1. **One-paragraph summary** — what AerolVM is.
-2. **Glossary** — every term and dependency, with what it does and why it's
+1. **One-paragraph summary** - what AerolVM is.
+2. **Glossary** - every term and dependency, with what it does and why it's
    here. Skim this first; refer back from later sections.
-3. **Process model** — what runs on a host.
-4. **Component diagrams** — how parts talk inside a single host, and across a
+3. **Process model** - what runs on a host.
+4. **Component diagrams** - how parts talk inside a single host, and across a
    cluster.
-5. **Lifecycles** — what happens during the most important flows.
-6. **Why these choices** — the trade-offs behind the architecture.
+5. **Lifecycles** - what happens during the most important flows.
+6. **Why these choices** - the trade-offs behind the architecture.
 
 ---
 
 ## 1. What AerolVM is
 
-AerolVM is a daemon (`sandboxd`) that creates and manages **sandboxes** —
+AerolVM is a daemon (`sandboxd`) that creates and manages **sandboxes** -
 isolated Linux environments that run user code, expose HTTP/TCP services, and
 mount external storage. It can run on one host (single-node) or across many
 hosts that fail over to each other (cluster). Clients talk to it through
@@ -59,7 +59,7 @@ The same word is used the same way everywhere in the codebase and these docs.
 
 | Term | What it is | Where |
 |---|---|---|
-| **State DB** | SQLite database — the source of truth for sandbox specs, ports, sessions, sealed creds, mounts. | `/var/lib/sandboxd/state.db` |
+| **State DB** | SQLite database - the source of truth for sandbox specs, ports, sessions, sealed creds, mounts. | `/var/lib/sandboxd/state.db` |
 | **Sealed secret** | An AES-256-GCM ciphertext blob written into the state DB (and replicated through Raft) instead of a plaintext credential. Decrypted just-in-time during pulls and mounts. | Inline in DB columns |
 | **Credential encryption key** | The 32-byte AES key that seals/unseals the above. **Cluster-wide:** all nodes must share it or failover-recovered sandboxes will fail to decrypt their pull/mount creds. | `/var/lib/sandboxd/credential_encryption.key` (mode 0600) and/or `SB_CREDENTIAL_ENCRYPTION_KEY` env var |
 | **Mount root** | Per-sandbox FUSE mount directory on the host that gets bind-mounted into the container. | `/var/lib/sandboxd/mounts/<sandbox-id>/...` |
@@ -73,23 +73,23 @@ The same word is used the same way everywhere in the codebase and these docs.
 | **Owner** | The node currently authoritative for a sandbox. Reads and writes the container, holds the runtime credentials, replies to API calls. | |
 | **Spec** | Immutable desired state of a sandbox (image, env, mounts, runtime, etc.). Lives in the Raft FSM so any node can recreate the sandbox. | |
 | **Raft** | A consensus protocol that replicates an ordered log of operations to every voter node. AerolVM uses [HashiCorp Raft](https://github.com/hashicorp/raft). | Strongly consistent placement and spec across nodes; survives the loss of a minority. |
-| **FSM** | The Raft Finite State Machine — an in-memory data structure that applies log entries deterministically on every node. Holds placements, specs, sealed secrets. | Same FSM on every node = anyone can read it locally without coordination. |
+| **FSM** | The Raft Finite State Machine - an in-memory data structure that applies log entries deterministically on every node. Holds placements, specs, sealed secrets. | Same FSM on every node = anyone can read it locally without coordination. |
 | **Voter / Non-voter** | Two roles a node can have in Raft. Voters participate in elections and quorum; non-voters get the log but can't vote. New nodes start non-voter and are auto-promoted once gossip-authenticated. | Auto-promotion gated by gossip auth prevents a hostile node from casting a vote before it has proven cluster membership. |
-| **Quorum** | Majority of voters (e.g. 2 of 3, 3 of 5). Required to commit log entries. | If quorum is lost the cluster goes read-only — see lost-quorum recovery. |
+| **Quorum** | Majority of voters (e.g. 2 of 3, 3 of 5). Required to commit log entries. | If quorum is lost the cluster goes read-only - see lost-quorum recovery. |
 | **Gossip** | A SWIM-protocol membership and capacity broadcast layer using [HashiCorp memberlist](https://github.com/hashicorp/memberlist). Every node tells every other node "I'm alive" and "here's my free CPU/mem". | Lightweight liveness signal; raft is too heavy for per-second pings. |
 | **Gossip secret key** | A 32-byte symmetric key shared by all nodes; signs and authenticates gossip packets. `SB_GOSSIP_SECRET_KEY`. | Without it any host that can reach the gossip port could join the membership view. |
 | **Cluster TLS** | mTLS on the cluster-internal RPC port (`:7002`). All nodes share a CA-signed cert. | Ensures only authorized nodes can talk Raft / inter-node RPCs. |
 | **TLS bundle** | The `aerolvm-tls-bundle.tar.gz` produced by `cluster-init.sh`. Contains `ca.crt`, `ca.key`, and `credential_encryption.key`. Joiners extract it on install. | Single artifact, single scp, complete trust setup. |
 | **Owner watcher** | A goroutine on each node that watches placement changes; when this node becomes a new owner of a sandbox it doesn't yet have, it pulls the spec from the FSM and recreates the container. | Drives failover. |
 | **Dead-owner reconciler** | A periodic loop that, when an owner has been gossip-down longer than `SB_DEAD_OWNER_GRACE`, proposes a `placement.move` Raft entry to a healthy node. | Turns "node missing for N minutes" into "sandbox is now owned by someone else." |
-| **Admission** | The `/v1/admission` endpoint and underlying scheduler that picks an owner for a new sandbox based on per-node capacity (CPU/mem) advertised in gossip. | Decentralized scheduling — no central scheduler service. |
+| **Admission** | The `/v1/admission` endpoint and underlying scheduler that picks an owner for a new sandbox based on per-node capacity (CPU/mem) advertised in gossip. | Decentralized scheduling - no central scheduler service. |
 
 ### External dependencies
 
 | Term | What it is | Why we depend on it |
 |---|---|---|
 | **Docker Engine** | Container runtime. AerolVM speaks the Docker HTTP API on the local socket. | Mature image format, stable API, runs anywhere. We don't reinvent OCI. |
-| **gVisor (`runsc`)** | A user-space kernel that intercepts syscalls; stronger isolation than `runc`, lower than a VM. Optional — opt in per-sandbox via `runtime: "gvisor"`. | Defense-in-depth for untrusted code without VM-level overhead. |
+| **gVisor (`runsc`)** | A user-space kernel that intercepts syscalls; stronger isolation than `runc`, lower than a VM. Optional - opt in per-sandbox via `runtime: "gvisor"`. | Defense-in-depth for untrusted code without VM-level overhead. |
 | **`fuse3`, `sshfs`, `nfs-common`, `rclone`, `mountpoint-s3`** | Filesystem clients used by external-storage mounts. | Pluggable per-mount backend; sandbox just sees a directory. |
 | **Cloudflare DNS API** | The currently supported DNS provider for ACME DNS-01 challenges. | DNS-01 lets us renew wildcard certs without exposing port 80 or relying on probe-based HTTP-01. |
 | **Let's Encrypt** | The CA Caddy uses for issuance. | Free, automated, ubiquitous. |
@@ -188,8 +188,8 @@ Key points:
 - **All client traffic enters through Caddy on `:443`.** Caddy uses SNI to
   decide whether the request goes to the API (`api.<domain>`) or to a sandbox
   (`<sandbox-id>.<domain>` and `<sandbox-id>-<port>.<domain>`).
-- **The service layer is the only thing that mutates state.** Everything —
-  the Docker call, the SQLite write, the Caddy reconfigure — flows through
+- **The service layer is the only thing that mutates state.** Everything -
+  the Docker call, the SQLite write, the Caddy reconfigure - flows through
   one place so that failures can be unwound consistently.
 - **Sealed creds** are decrypted only at the moment they're needed (image
   pull, mount establishment) and never logged.
@@ -232,9 +232,9 @@ flowchart TB
 
 Two independent layers:
 
-- **Raft (mTLS, port 7002)** — strongly consistent, ordered. Used for
+- **Raft (mTLS, port 7002)** - strongly consistent, ordered. Used for
   *decisions*: who owns what, what specs exist, what's sealed.
-- **Gossip (UDP/TCP via memberlist)** — eventually consistent, fast. Used for
+- **Gossip (UDP/TCP via memberlist)** - eventually consistent, fast. Used for
   *signals*: who's alive, what their free capacity is.
 
 ### 4.3 What's where in the codebase
@@ -244,7 +244,7 @@ Two independent layers:
 | `cmd/sandboxd` | Process entry point. Loads config, builds dependencies, starts the daemon. |
 | `cmd/toolboxd` | The in-sandbox agent. |
 | `internal/config` | Env-var parsing and validation (including the cluster-mode credential-key safety check). |
-| `internal/service` | The service layer — orchestration of store, runtime, caddy, secrets. |
+| `internal/service` | The service layer - orchestration of store, runtime, caddy, secrets. |
 | `internal/store` | SQLite access and migrations. |
 | `internal/runtime` | Container lifecycle (Docker calls, runtime selection, port allocation). |
 | `internal/cluster` | Raft, gossip, owner watcher, dead-owner reconciler, admission. |
@@ -295,11 +295,11 @@ sequenceDiagram
     API-->>SDK: 201 Created
 ```
 
-API responses are **idempotent on the request id** — retrying a partial
+API responses are **idempotent on the request id** - retrying a partial
 create returns the same sandbox. This is enforced everywhere in the service
 layer (see `pr-review.md`).
 
-### 5.2 Creating a sandbox (cluster) — admission and placement
+### 5.2 Creating a sandbox (cluster) - admission and placement
 
 ```mermaid
 sequenceDiagram
@@ -323,7 +323,7 @@ sequenceDiagram
     N-->>SDK: 201 Created
 ```
 
-If the receiving node is *not* the chosen owner, it still answers the SDK —
+If the receiving node is *not* the chosen owner, it still answers the SDK -
 it forwards the start-completion check to the owner via internal RPC.
 
 ### 5.3 Failover when a node dies
@@ -351,7 +351,7 @@ sequenceDiagram
 ```
 
 This is why the **credential encryption key must be the same on every node**
-— `unseal` on N3 only works if N3 holds the key N1 used to `seal`.
+- `unseal` on N3 only works if N3 holds the key N1 used to `seal`.
 
 ### 5.4 A new node joining
 
@@ -391,8 +391,8 @@ A few decisions in the architecture are non-obvious. The reasoning:
   needs zero ops, and benefits from being in the same backup as everything
   else on disk.
 - **Raft *and* gossip, not Raft alone.** Raft is the wrong tool for "is this
-  node alive in the last 2 seconds" — every heartbeat would be a log entry.
-  Gossip is the wrong tool for "who owns sandbox X" — it has no consistency
+  node alive in the last 2 seconds" - every heartbeat would be a log entry.
+  Gossip is the wrong tool for "who owns sandbox X" - it has no consistency
   guarantee. Each layer does what it's good at.
 - **Gossip-auth-gated voter promotion.** A node can technically reach the
   Raft port and request to join even before it has proven membership. By
@@ -403,7 +403,7 @@ A few decisions in the architecture are non-obvious. The reasoning:
   node's filesystem. Sealing keeps the plaintext only in `sandboxd` memory
   and only at use.
 - **Cluster-wide credential key is mandatory.** Without it, a sealed cred
-  written by node A is unreadable on node B — and you only discover this
+  written by node A is unreadable on node B - and you only discover this
   during failover, when it's already too late. The daemon refuses to start
   in cluster mode without a shared key (or an explicit
   `SB_CLUSTER_INSECURE_CREDENTIALS=true` opt-out).
@@ -415,15 +415,15 @@ A few decisions in the architecture are non-obvious. The reasoning:
   expose raw TCP sandbox ports through the same TLS-fronted endpoint as
   HTTP, which keeps the firewall surface minimal.
 - **Docker, not a custom OCI runtime.** Image format compatibility is the
-  point — anything you can `docker run` works as a sandbox base image.
+  point - anything you can `docker run` works as a sandbox base image.
   gVisor is opt-in via the standard Docker runtime mechanism.
 
 ---
 
 ## See also
 
-- [`local.md`](./local.md) — laptop install (`--local`).
-- [`single-node.md`](./single-node.md) — production single-host.
-- [`cluster.md`](./cluster.md) — multi-node deployment, failover, recovery.
-- [`../pr-review.md`](../pr-review.md) — invariants every code change must
+- [`local.md`](./local.md) - laptop install (`--local`).
+- [`single-node.md`](./single-node.md) - production single-host.
+- [`cluster.md`](./cluster.md) - multi-node deployment, failover, recovery.
+- [`../pr-review.md`](../pr-review.md) - invariants every code change must
   preserve.

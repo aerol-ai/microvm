@@ -2,7 +2,7 @@
 
 How to keep an AerolVM cluster in a consistent state across the two tools
 that operate it: **Terraform** (declared infra + topology) and **Ansible**
-(ephemeral ops — binary pushes, service restarts, log tails).
+(ephemeral ops - binary pushes, service restarts, log tails).
 
 The unifying principle: **for any field that describes the cluster, exactly
 one tool is allowed to write it.** Two writers always drift. Pick one,
@@ -31,11 +31,11 @@ dynamic inventory asks AWS).
 
 ## Guidelines
 
-- [**role-changes.md**](./role-changes.md) — Changing a node's role
+- [**role-changes.md**](./role-changes.md) - Changing a node's role
   consistently. Why role lives in Terraform only, the `user_data_replace_on_change`
   setting that makes it work, and why there is no `change-role.yml`
   playbook.
-- [**toolboxd-updates.md**](./toolboxd-updates.md) — Rolling a new
+- [**toolboxd-updates.md**](./toolboxd-updates.md) - Rolling a new
   `toolboxd` binary across the fleet. Local-build vs release-asset paths,
   the atomic file swap, and why existing sandboxes have to be recreated to
   pick up the new code.
@@ -61,6 +61,6 @@ The rule "one writer per field" eliminates this class of bug at the cost of
 some operations being slower (e.g. role changes recreate the instance
 instead of editing it in place). For a small self-hosted cluster, that
 trade is correct. For a fleet where role changes are frequent, the right
-answer isn't "let two systems write" — it's to remove the field from
+answer isn't "let two systems write" - it's to remove the field from
 Terraform entirely and own it in cluster state. See the long-term-version
 section in `role-changes.md`.

@@ -1,4 +1,4 @@
-# Docker Hub mirror via AOCR — day-0 setup
+# Docker Hub mirror via AOCR - day-0 setup
 
 This document explains why Docker Hub pulls bypass the AOCR mirror by
 default, what Terraform now does about it automatically, and how to
@@ -10,8 +10,8 @@ Sandboxd ships a client-side rewriter (`pkg/docker/mirror_rewrite.go`)
 that turns refs like `ghcr.io/aerol-ai/sandbox:v1` into
 `<mirror_host>/aocr/ghcr/aerol-ai/sandbox:v1` before handing them to
 the Docker daemon. That works for any registry whose name appears in
-`SB_MIRROR_UPSTREAMS` — `ghcr.io`, `gcr.io`, `quay.io`,
-`registry.k8s.io` — because rewriting the URL is enough to redirect
+`SB_MIRROR_UPSTREAMS` - `ghcr.io`, `gcr.io`, `quay.io`,
+`registry.k8s.io` - because rewriting the URL is enough to redirect
 the pull.
 
 Docker Hub is intentionally **not** in that list. The reason is a
@@ -45,8 +45,8 @@ Two things to know:
    `/v2/<org>/<repo>/...`) and proxies them.
 2. **`live-restore: true`** lets the daemon restart in the future
    (cert rotation, package upgrades) without killing running
-   sandboxes. The first apply doesn't need the flag yet — no
-   containers exist at provision time — but turning it on now means
+   sandboxes. The first apply doesn't need the flag yet - no
+   containers exist at provision time - but turning it on now means
    you don't have to remember later.
 
 If a pre-baked AMI already contains `/etc/docker/daemon.json` with
@@ -109,7 +109,7 @@ docker info 2>/dev/null | grep -i 'Live Restore'
 
 # 3. Pull through the mirror.
 docker pull alpine:3.20
-# Check the mirror access log — you should see a /v2/library/alpine/...
+# Check the mirror access log - you should see a /v2/library/alpine/...
 # request from this host's IP. Hub itself should NOT see a hit.
 ```
 
@@ -119,13 +119,13 @@ This is a one-time, deterministic day-0 setting that piggybacks on
 existing user_data. Ansible would add an extra moving part for what
 amounts to "write one JSON file before dockerd starts." If you later
 need fleet-wide rotation (changing `mirror_host`), the right move is
-to roll the launch template and replace nodes — same operational
+to roll the launch template and replace nodes - same operational
 profile as any other AMI/user-data change.
 
 ## Sources
 
 - Docker daemon mirror behavior:
-  <https://docs.docker.com/engine/registry/recipes/mirror/> —
+  <https://docs.docker.com/engine/registry/recipes/mirror/> -
   "registry-mirrors" only applies to Docker Hub.
 - `live-restore`: <https://docs.docker.com/config/containers/live-restore/>
 - Sandboxd rewriter (non-Hub registries):

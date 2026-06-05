@@ -2,7 +2,7 @@
 
 Opt-in feature for clusters with **10+ ingress-bearing nodes**. Lets one node
 issue and renew the wildcard cert via Let's Encrypt while every other node
-reads the same cert from S3 — sidestepping the rate limits that bite when
+reads the same cert from S3 - sidestepping the rate limits that bite when
 many independent Caddys race for the same `*.<domain>` cert.
 
 When to pick this:
@@ -16,7 +16,7 @@ When to pick this:
 
 When **not** to pick this:
 
-- Single-node deployment ([`single-node.md`](./single-node.md)) — no
+- Single-node deployment ([`single-node.md`](./single-node.md)) - no
   contention exists.
 - Small clusters (≤5 ingress nodes). The independent-issuance model in
   [`cluster.md`](./cluster.md) is simpler and fits inside the rate limits.
@@ -57,7 +57,7 @@ protocol. End users see no difference.
 ```
 
 Locking and leader election are handled by `certmagic-s3` using S3
-conditional writes — there is no orchestration code on the AerolVM side.
+conditional writes - there is no orchestration code on the AerolVM side.
 
 The bucket holds two cert objects (`<domain>` and `*.<domain>`) plus
 account-key metadata. Cert files are tiny (~5 KB each); S3 storage and
@@ -88,7 +88,7 @@ terraform output -raw caddy_certs_encryption_key  # SAVE THIS
 ```
 
 The encryption key lives in Terraform state. Copy it into your secrets
-manager (1Password, AWS Secrets Manager, Vault) — losing it makes existing
+manager (1Password, AWS Secrets Manager, Vault) - losing it makes existing
 stored certs unrecoverable.
 
 ### BYO mode (you bring an existing bucket)
@@ -119,7 +119,7 @@ openssl rand -base64 32
 ```
 
 If the bucket is **in the same AWS account** and your EC2 instance role
-can already reach it, leave `access_key` / `secret_key` empty —
+can already reach it, leave `access_key` / `secret_key` empty -
 Terraform attaches an IAM policy granting the cluster's instance roles
 R/W on the prefix.
 
@@ -155,7 +155,7 @@ operations on the prefix you chose (default `caddy/`):
 | `s3:ListBucket` | `<bucket-arn>` |
 
 For an existing-bucket-in-same-account setup with TF doing the IAM, you
-don't need to write a bucket policy — Terraform attaches the policy to the
+don't need to write a bucket policy - Terraform attaches the policy to the
 cluster's instance roles.
 
 For R2 / MinIO, scope the credentials similarly via the provider's own
@@ -212,7 +212,7 @@ aws s3 ls s3://<bucket>/<prefix>/ --recursive
 You should see exactly one set of cert files, not one per node.
 
 Then try the API endpoint from outside the cluster against each ingress
-node's public IP — every node should serve the same valid cert:
+node's public IP - every node should serve the same valid cert:
 
 ```bash
 curl --resolve sandbox.example.com:443:<node-ip> https://sandbox.example.com/health
@@ -229,7 +229,7 @@ it's lost:
 
 1. Empty the bucket (or change the `prefix`).
 2. Generate a new key, distribute, redeploy.
-3. The first node up will re-issue against Let's Encrypt — this counts
+3. The first node up will re-issue against Let's Encrypt - this counts
    against the weekly cert-issuance ceiling, so don't do it casually.
 
 **Mitigation:** copy `terraform output -raw caddy_certs_encryption_key`
@@ -244,7 +244,7 @@ restart Caddy in sequence. Plan around the Let's Encrypt rate limit.
 
 ### Renewal storms
 
-With shared storage there is no renewal storm — only the lock holder
+With shared storage there is no renewal storm - only the lock holder
 performs ACME. Other nodes pick up the rotated cert from S3 on their next
 read (certmagic re-reads on cache expiry).
 
@@ -252,14 +252,14 @@ read (certmagic re-reads on cache expiry).
 
 Flipping `enabled = false → true` forces a `user_data_replace_on_change`
 recycle of every node. Plan this as a rolling change (or schedule it
-during a maintenance window) — Terraform will report the recreate in
+during a maintenance window) - Terraform will report the recreate in
 the plan.
 
 ### Cost
 
-- S3 storage: ~10 KB per cert × 1 cert set per cluster — sub-cent.
+- S3 storage: ~10 KB per cert × 1 cert set per cluster - sub-cent.
 - S3 requests: a few PUT/GET operations per renewal cycle, plus one
-  GET per Caddy startup per node — also sub-cent at any realistic
+  GET per Caddy startup per node - also sub-cent at any realistic
   cluster size.
 
 The economic cost of this feature is the operator's time to manage the

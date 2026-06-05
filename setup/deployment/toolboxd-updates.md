@@ -1,7 +1,7 @@
 # Updating toolboxd across the cluster
 
 `toolboxd` is the in-container agent that handles file I/O, exec, and session
-proxying for every sandbox. It is **not** a host daemon — sandboxd
+proxying for every sandbox. It is **not** a host daemon - sandboxd
 bind-mounts the host binary read-only into each container at create time
 (see `pkg/docker/client.go`), so updating it has different semantics from
 updating sandboxd:
@@ -16,7 +16,7 @@ This guide is the routine "I pushed new toolboxd code, now what" runbook.
 ## The rule
 
 **Ansible is the sole writer of `/usr/local/bin/toolboxd`. Terraform never
-touches it.** Use `Ansible/playbooks/update-toolboxd.yml` — the playbook
+touches it.** Use `Ansible/playbooks/update-toolboxd.yml` - the playbook
 already handles atomic file swap, per-host serialization, and version
 reporting.
 
@@ -30,7 +30,7 @@ Don't `scp` a binary onto a node by hand. The playbook's atomic `mv`
 guarantees a sandbox starting mid-rollout sees either the old or the new
 inode, never a half-written file.
 
-## Path A — push a locally built binary (most common while developing)
+## Path A - push a locally built binary (most common while developing)
 
 Use this whenever you've merged or cherry-picked changes that aren't in a
 released artifact yet.
@@ -54,10 +54,10 @@ works regardless of where ansible-playbook switches cwd to internally.
 For ARM64 nodes (e.g. Graviton), build with `GOARCH=arm64` and roll out the
 same way.
 
-## Path B — fetch a GitHub release asset
+## Path B - fetch a GitHub release asset
 
 Only valid if you've tagged a release and `release.yml` has finished
-building. Release assets follow `toolboxd_<goos>_<goarch>` — matching the
+building. Release assets follow `toolboxd_<goos>_<goarch>` - matching the
 sandboxd asset naming convention.
 
 ```bash
@@ -96,7 +96,7 @@ Per node, in order:
 2. Stages the new binary at `/tmp/toolboxd.new` (upload or `get_url`),
    mode `0755`, root-owned.
 3. Atomically `mv -f /tmp/toolboxd.new /usr/local/bin/toolboxd`. `mv`
-   within a filesystem is a directory-entry swap — sandboxes that already
+   within a filesystem is a directory-entry swap - sandboxes that already
    bind-mounted the old inode keep it; new sandboxes see the new file.
 4. Runs `timeout 5s /usr/local/bin/toolboxd --version` and prints the
    reported version. The `timeout` wrapper is intentional: toolboxd builds
@@ -109,7 +109,7 @@ Per node, in order:
 ## Existing sandboxes do not pick up the change
 
 The Linux kernel keeps the original inode alive as long as something holds
-it open — and every running sandbox holds toolboxd open as PID 1 of its
+it open - and every running sandbox holds toolboxd open as PID 1 of its
 container. Rolling the host binary updates the directory entry, not the
 inode in use.
 
@@ -122,12 +122,12 @@ const next = await daytona.create({ image, language, ... })
 ```
 
 For a sweep of many sandboxes, drive the recreate from your own
-orchestration — there is no host-level toolboxd restart that flushes them,
+orchestration - there is no host-level toolboxd restart that flushes them,
 and there shouldn't be (it would kill every running session at once).
 
 If a user reports "I updated toolboxd but my fix doesn't show up", this is
 almost always the explanation. Confirm by checking
-`/proc/<sandbox-pid>/exe` on the host — it will be a symlink ending
+`/proc/<sandbox-pid>/exe` on the host - it will be a symlink ending
 `(deleted)` once the host binary has been replaced and the sandbox is still
 running the old inode.
 
@@ -153,5 +153,5 @@ that need the fix will pick it up on their next recreate cycle.
 ## When to use Terraform instead
 
 Never, for toolboxd. The binary version is ephemeral cluster ops, exactly
-like sandboxd's version. Terraform owns provisioning, role, and DNS — see
+like sandboxd's version. Terraform owns provisioning, role, and DNS - see
 [`role-changes.md`](./role-changes.md) for the broader rule.

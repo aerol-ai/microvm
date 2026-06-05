@@ -1,4 +1,4 @@
-# AerolVM cluster — Ansible
+# AerolVM cluster - Ansible
 
 Day-N operations against the cluster that `../Terraform` provisions. Terraform
 owns infra (VPC, EC2, SG, DNS); Ansible owns "push a new binary, restart a
@@ -9,7 +9,7 @@ service, tail logs across all nodes."
 - Ansible ≥ 2.15 (`pipx install ansible-core` or `brew install ansible`)
 - `boto3` + `botocore` reachable from **Ansible's Python** (see install note below)
 - AWS credentials in the default chain (env, profile, instance role) with
-  `ec2:DescribeInstances` — that's all the inventory plugin needs
+  `ec2:DescribeInstances` - that's all the inventory plugin needs
 - The same SSH private key Terraform installed on the nodes (default:
   `~/.ssh/id_rsa`; change in `ansible.cfg` if you use a different one)
 
@@ -25,7 +25,7 @@ ansible-galaxy collection install -r requirements.yml
 # depends on how Ansible itself was installed:
 #
 #   - pipx (recommended):    pipx inject ansible-core boto3 botocore
-#   - brew install ansible:  brew installs them as part of the formula — skip
+#   - brew install ansible:  brew installs them as part of the formula - skip
 #   - system pip / venv:     pip install boto3 botocore  (into the SAME env
 #                            that owns the `ansible` binary)
 #
@@ -37,7 +37,7 @@ pipx inject ansible-core boto3 botocore
 # Load your SSH key into the agent (per session, no config edit needed).
 ssh-add ~/.ssh/your-aws-key.pem
 
-# Cluster=aerolvm / region=us-east-1 are the built-in defaults — nothing to set.
+# Cluster=aerolvm / region=us-east-1 are the built-in defaults - nothing to set.
 export AWS_PROFILE=default            # only if you use named profiles
 ```
 
@@ -50,7 +50,7 @@ ansible-playbook playbooks/ping.yml
 
 ## Inventory
 
-`inventory/aws_ec2.yml` is a dynamic inventory plugin — it queries EC2 every
+`inventory/aws_ec2.yml` is a dynamic inventory plugin - it queries EC2 every
 time you run a playbook. It filters by the `Cluster` tag (default `aerolvm`,
 matches `var.cluster_name` in Terraform) in `us-east-1`. Those defaults match a
 standard deploy, so **you normally set nothing**. Only if your fleet uses a
@@ -112,13 +112,13 @@ ansible-playbook playbooks/prepare-role-change.yml --limit aerolvm-worker-17
 # Configure OTEL/image-pull hardening and deploy backup/recovery,
 # node lifecycle, Grafana, Prometheus, Alertmanager, and runbook artifacts.
 # OTEL endpoints, image-pull/GC tuning, mirror host, and auto-import config
-# live in ../config/cluster.yml (shared with Terraform) — edit there.
+# live in ../config/cluster.yml (shared with Terraform) - edit there.
 ansible-playbook playbooks/configure-ops.yml \
   -e sandboxd_backup_enabled=true
 ```
 
-`update-sandboxd.yml` runs `serial: 1` — one host at a time, with
-`any_errors_fatal: true` — so a failed health check on node 1 stops the
+`update-sandboxd.yml` runs `serial: 1` - one host at a time, with
+`any_errors_fatal: true` - so a failed health check on node 1 stops the
 rollout before it touches the Raft quorum. Limit to a single non-seed test
 node first (use a hostname from `ansible-inventory --graph`, e.g. one that
 shows up under `@aerolvm_false`):
@@ -130,19 +130,19 @@ ansible-playbook playbooks/update-sandboxd.yml \
 ```
 
 Release asset names come from `.github/workflows/release.yml` and follow
-`sandboxd_<goos>_<goarch>` — `linux_amd64`, `linux_arm64`, `linux_armv7`,
+`sandboxd_<goos>_<goarch>` - `linux_amd64`, `linux_arm64`, `linux_armv7`,
 `linux_armv6`, `linux_386`, `freebsd_amd64`, `darwin_arm64`, etc.
 
 ## Per-machine config
 
-`ansible.cfg` is committed — your SSH key path, AWS profile, region, and
+`ansible.cfg` is committed - your SSH key path, AWS profile, region, and
 cluster name are per-machine and don't belong in it. Use:
 
 - `ssh-add ~/.ssh/<your-key>.pem` for the key (persist on macOS with
   `ssh-add --apple-use-keychain`). Once loaded, `ansible-playbook` picks it
-  up via the agent — no `--private-key` flag, no config edit.
+  up via the agent - no `--private-key` flag, no config edit.
 - `AWS_PROFILE` env var if you use named profiles. (`AEROLVM_CLUSTER` /
-  `AEROLVM_REGION` default to `aerolvm` / `us-east-1` — set them only to override.)
+  `AEROLVM_REGION` default to `aerolvm` / `us-east-1` - set them only to override.)
 - `Ansible/ansible.local.cfg` (gitignored) + `ANSIBLE_CONFIG=$PWD/Ansible/ansible.local.cfg`
   if you genuinely need to override `ansible.cfg` settings locally.
 
@@ -174,11 +174,11 @@ playbooks/
 
 If you operate an [AOCR](https://github.com/aerolai/aocr) deployment alongside
 this cluster, you can route every public-registry pull through AOCR's
-authenticated mirror — and optionally auto-import each first pull into a
+authenticated mirror - and optionally auto-import each first pull into a
 cluster-owned namespace so future failovers are decoupled from the original
 upstream credential. The defaults in `inventory/group_vars/all/defaults.yml`
 and the secret-copy + env-template tasks in `playbooks/configure-ops.yml`
-are already in place. Enabling it requires zero code edits — only values in
+are already in place. Enabling it requires zero code edits - only values in
 a gitignored `local.yml` (no secret files needed if you use the inline-value
 mode).
 
@@ -193,7 +193,7 @@ architecture, read
 For the full end-to-end deploy + stitch story, read
 [`aocr.sh/aocr_aerol_stitch.md`](https://github.com/aerolai/aocr/blob/main/aocr_aerol_stitch.md).
 
-### Step 1 — Pull values from your AOCR side
+### Step 1 - Pull values from your AOCR side
 
 The AOCR Ansible playbook auto-generates every secret on first deploy. After
 you've run it once, the values you need are in `aocr.sh/secrets/` and
@@ -202,17 +202,17 @@ you've run it once, the values you need are in `aocr.sh/secrets/` and
 ```bash
 cd /path/to/aocr.sh
 
-# 1. Mirror host — derived from your aocr_global_domain
+# 1. Mirror host - derived from your aocr_global_domain
 #    Default is "mirror." + aocr_global_domain (e.g. mirror.aocr.aerol.ai).
 grep aocr_global_domain ansible/inventory/group_vars/all/vars.yml
 
-# 2. Upstream wrap key (base64, 32 bytes) — required for private upstream pulls
+# 2. Upstream wrap key (base64, 32 bytes) - required for private upstream pulls
 cat secrets/upstream_wrap_key
 
-# 3. Internal API token (64-char bearer) — only for auto-import
+# 3. Internal API token (64-char bearer) - only for auto-import
 cat secrets/internal_api_token
 
-# 4. Hooks URL — the AOCR root, no trailing slash (e.g. https://aocr.aerol.ai)
+# 4. Hooks URL - the AOCR root, no trailing slash (e.g. https://aocr.aerol.ai)
 ```
 
 > **Where does the value actually live?** Each AOCR secret is *either* a
@@ -237,22 +237,22 @@ cat secrets/internal_api_token
 > See `aocr.sh/aocr_aerol_stitch.md` § *Resolving AOCR secret values* for
 > the full table.
 
-You also pick a **cluster ID** yourself — any string matching
+You also pick a **cluster ID** yourself - any string matching
 `^[A-Za-z0-9_-]{1,64}$`, e.g. `prod-aerolvm-us-east-1`. AOCR has no
 pre-registered list of clusters; this is a label you choose so AOCR can
 group your imported tags under `cluster/<your-id>/_imported/...`. Pick once
 per cluster and never change it (changing it later orphans previously
 imported tags under the old namespace).
 
-### Step 2 — Choose how to hand the secrets to the play
+### Step 2 - Choose how to hand the secrets to the play
 
-Two ways to do this — pick whichever fits your setup. **Inline values** are
+Two ways to do this - pick whichever fits your setup. **Inline values** are
 simplest for a single operator on a laptop; **control-node files** are how
 fleets do it when Vault/SOPS/Secrets Manager renders secrets out-of-band.
 
 **Important: never commit secrets to git.** Edit `inventory/group_vars/all.yml`
 and you've edited a tracked file. The clean pattern is a gitignored override
-file — convert `all.yml` into a directory: `all/defaults.yml` (committed,
+file - convert `all.yml` into a directory: `all/defaults.yml` (committed,
 ships everything OFF) plus `all/local.yml` (gitignored, per-operator).
 Ansible auto-loads every `*.yml` in `group_vars/all/` **alphabetically, and
 later files win**, so the file names matter: `defaults.yml` < `local.yml`,
@@ -260,16 +260,16 @@ so `local.yml` overrides `defaults.yml`. If you name the defaults file
 something that sorts after `local.yml` (e.g. `main.yml`, `vars.yml`) the
 override won't apply.
 
-#### Option A — Inline values (recommended for laptop / single operator)
+#### Option A - Inline values (recommended for laptop / single operator)
 
 Set `sandboxd_*_value` directly in your gitignored override file. The play
 uses `copy: content:` to write the bytes onto each managed host at `0600`,
 and the secret-installing tasks are `no_log: true` so the values don't
 land in stdout.
 
-No staging on the control node — skip to Step 3.
+No staging on the control node - skip to Step 3.
 
-#### Option B — Control-node files (fleet / Vault-rendered)
+#### Option B - Control-node files (fleet / Vault-rendered)
 
 Set `sandboxd_*_src` to a path on the control node (the box that runs
 `ansible-playbook`). The play uses `copy: src:` to push that file out:
@@ -295,15 +295,15 @@ at whatever path that pipeline writes to.
 
 > If a `*_src` path is set AND the matching `aocr.*` key in
 > `config/secrets.yml` is non-empty, the `config/secrets.yml` value wins.
-> Leaving both empty skips the copy entirely — sandboxd boots without the
+> Leaving both empty skips the copy entirely - sandboxd boots without the
 > secret and the corresponding feature is disabled.
 
-### Step 3 — Fill in the vars
+### Step 3 - Fill in the vars
 
 Non-secret AOCR config (mirror host, auto-import toggle / hooks_url /
 cluster_id, retention/timeouts) lives in the shared `../config/cluster.yml`.
 AOCR secret values live in the parallel shared `../config/secrets.yml`
-(gitignored — bootstrap with `cp ../config/secrets.example.yml ../config/secrets.yml`).
+(gitignored - bootstrap with `cp ../config/secrets.example.yml ../config/secrets.yml`).
 Edit those two files once; both Terraform (day-0) and Ansible (day-2) read them.
 
 ```yaml
@@ -320,13 +320,13 @@ auto_import:
 ```
 
 ```yaml
-# ../config/secrets.yml  (gitignored — copy from secrets.example.yml)
+# ../config/secrets.yml  (gitignored - copy from secrets.example.yml)
 aocr:
   upstream_wrap_key: "<paste upstream_wrap_key>"
   cluster_pat:       "<paste internal_api_token>"
 ```
 
-**Optional — control-node file paths (Vault/SOPS workflow):** if your fleet
+**Optional - control-node file paths (Vault/SOPS workflow):** if your fleet
 renders the secrets to files instead, leave the matching keys in
 `config/secrets.yml` empty and point at the rendered files from
 `group_vars/all/local.yml`:
@@ -336,7 +336,7 @@ sandboxd_upstream_wrap_key_src:          "/home/you/aerol-secrets/upstream_wrap_
 sandboxd_auto_import_cluster_pat_src:    "/home/you/aerol-secrets/cluster_pat"
 ```
 
-### Step 4 — Run configure-ops
+### Step 4 - Run configure-ops
 
 ```bash
 ansible-playbook playbooks/configure-ops.yml
@@ -350,10 +350,10 @@ For each host the play:
 4. Re-renders `/etc/sandboxd/cluster.env` with the `SB_MIRROR_*` / `SB_AUTO_IMPORT_*` lines.
 5. Restarts `sandboxd` (gated by `sandboxd_restart_after_ops_config`, default true).
 
-The cluster PAT is **file-sourced** — never an env var, never visible in
+The cluster PAT is **file-sourced** - never an env var, never visible in
 `systemctl show sandboxd` or process listings.
 
-### Step 5 — Verify
+### Step 5 - Verify
 
 SSH into any node:
 
@@ -381,38 +381,38 @@ curl -sf -H "Authorization: Bearer $(cat aocr.sh/secrets/auth_pat_token)" \
 Non-secret keys live in `../config/cluster.yml` (shared SoT, committable).
 Secret values live in `../config/secrets.yml` (shared SoT, gitignored). The
 two `*_src` vars in `group_vars/all/local.yml` are an Ansible-only fallback
-for Vault/SOPS rendering — not needed if `config/secrets.yml` holds the
+for Vault/SOPS rendering - not needed if `config/secrets.yml` holds the
 values directly.
 
-**`../config/cluster.yml` — `mirror.*` / `auto_import.*`:**
+**`../config/cluster.yml` - `mirror.*` / `auto_import.*`:**
 
 | Key | Purpose | Where the value comes from |
 |---|---|---|
-| `mirror.host` | Vhost sandboxd rewrites `ghcr.io` / `gcr.io` / `quay.io` / `registry.k8s.io` pulls onto. Empty disables rewrite entirely. Docker Hub is intentionally not rewritten. | AOCR side — derived from `aocr_global_domain` |
+| `mirror.host` | Vhost sandboxd rewrites `ghcr.io` / `gcr.io` / `quay.io` / `registry.k8s.io` pulls onto. Empty disables rewrite entirely. Docker Hub is intentionally not rewritten. | AOCR side - derived from `aocr_global_domain` |
 | `mirror.push_host` | Optional. Push vhost (e.g. `aocr.aerol.ai`) so already-pushed refs aren't double-rewritten. Leave empty unless sandboxes also push. | AOCR side |
 | `mirror.upstreams` | Default `docker.io=docker,ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s`. Override only if your AOCR exposes different upstream shortnames. | AOCR operator |
 | `auto_import.enabled` | Master switch for F21. When true, every successful private pull triggers a re-mount under `cluster/<id>/_imported/...`. | You |
-| `auto_import.hooks_url` | AOCR hooks service root, e.g. `https://aocr.aerol.ai`. Sandboxd appends `/v1/internal/imports`. | AOCR side — same as `aocr_global_domain` |
+| `auto_import.hooks_url` | AOCR hooks service root, e.g. `https://aocr.aerol.ai`. Sandboxd appends `/v1/internal/imports`. | AOCR side - same as `aocr_global_domain` |
 | `auto_import.cluster_id` | **A label you choose**, not internal AOCR config. AOCR validates only the format (`^[A-Za-z0-9_-]{1,64}$`) and uses it as a namespace prefix for imported tags. Pick a meaningful per-cluster name like `prod-us-east-1`, `staging`, `dev-suman`. | You |
 | `auto_import.retention_suffix` | Suffix appended to imported tags. Drives the reaper's idle-eviction window (see [`aocr.sh/RETENTION.md`](https://github.com/aerolai/aocr/blob/main/RETENTION.md)). | Operator policy |
 
 `request_timeout`, `reconcile_interval`, and `max_in_flight` in the same
-file have sensible defaults — only tune if recovery storms or remote latency
+file have sensible defaults - only tune if recovery storms or remote latency
 warrant it.
 
-**`../config/secrets.yml` — `aocr.*` (gitignored):**
+**`../config/secrets.yml` - `aocr.*` (gitignored):**
 
 | Key | Purpose | Where the value comes from |
 |---|---|---|
-| `aocr.upstream_wrap_key` | Base64 32-byte AES-GCM key. Written to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: content:` (no_log). Sandboxd wraps per-pull upstream creds with this; only AOCR's mirror can unwrap. Without it, private upstream pulls 401 at the mirror. | AOCR side — `aocr_auth_upstream_wrap_key` from `secrets.yml`, or `cat secrets/upstream_wrap_key` |
-| `aocr.cluster_pat` | Bearer token sandboxd presents on `POST /v1/internal/imports`. Written to `/etc/sandboxd/secrets/cluster-pat` via `copy: content:` (no_log). Despite the name, this is AOCR's `internal_api_token`, not the UUID-keyed cluster PAT used by `auth/src/clusterPat.ts` (different concept; see `aocr_aerol_stitch.md`). | AOCR side — `aocr_internal_api_token` or `cat secrets/internal_api_token` |
+| `aocr.upstream_wrap_key` | Base64 32-byte AES-GCM key. Written to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: content:` (no_log). Sandboxd wraps per-pull upstream creds with this; only AOCR's mirror can unwrap. Without it, private upstream pulls 401 at the mirror. | AOCR side - `aocr_auth_upstream_wrap_key` from `secrets.yml`, or `cat secrets/upstream_wrap_key` |
+| `aocr.cluster_pat` | Bearer token sandboxd presents on `POST /v1/internal/imports`. Written to `/etc/sandboxd/secrets/cluster-pat` via `copy: content:` (no_log). Despite the name, this is AOCR's `internal_api_token`, not the UUID-keyed cluster PAT used by `auth/src/clusterPat.ts` (different concept; see `aocr_aerol_stitch.md`). | AOCR side - `aocr_internal_api_token` or `cat secrets/internal_api_token` |
 
-**Ansible local override (gitignored) — Vault/SOPS fallback only:**
+**Ansible local override (gitignored) - Vault/SOPS fallback only:**
 
 | Var | Purpose | Where the value comes from |
 |---|---|---|
-| `sandboxd_upstream_wrap_key_src` | Path on the **control node** to a file holding the wrap key. The play copies it to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: src:`. Use when Vault/SOPS/Secrets Manager renders the file. If `aocr.upstream_wrap_key` in `config/secrets.yml` is also set, secrets.yml wins. | AOCR side — `secrets/upstream_wrap_key` (auto-generated on first AOCR deploy) |
-| `sandboxd_auto_import_cluster_pat_src` | Path on the **control node** to a file holding the cluster PAT. Same precedence rules as the wrap key. | AOCR side — `secrets/internal_api_token` |
+| `sandboxd_upstream_wrap_key_src` | Path on the **control node** to a file holding the wrap key. The play copies it to `/etc/sandboxd/secrets/upstream-wrap.key` via `copy: src:`. Use when Vault/SOPS/Secrets Manager renders the file. If `aocr.upstream_wrap_key` in `config/secrets.yml` is also set, secrets.yml wins. | AOCR side - `secrets/upstream_wrap_key` (auto-generated on first AOCR deploy) |
+| `sandboxd_auto_import_cluster_pat_src` | Path on the **control node** to a file holding the cluster PAT. Same precedence rules as the wrap key. | AOCR side - `secrets/internal_api_token` |
 
 ### Rotating secrets
 
@@ -433,7 +433,7 @@ warrant it.
 1. AOCR was deployed once; its secrets sit in `aocr.sh/secrets/` (or
    inline in `aocr.sh/ansible/inventory/group_vars/all/secrets.yml`).
 2. Set `mirror.host` and `auto_import.*` in `../config/cluster.yml` (shared
-   with Terraform — committable, no secrets).
+   with Terraform - committable, no secrets).
 3. Set `aocr.upstream_wrap_key` and `aocr.cluster_pat` in
    `../config/secrets.yml` (copy from `secrets.example.yml`, gitignored,
    shared with Terraform). For Vault/SOPS rendering, leave those empty and
@@ -445,7 +445,7 @@ warrant it.
 
 `configure-ops.yml` installs the Firecracker binary, jailer, and a guest
 kernel image whenever `firecracker.enabled: true` in `../config/cluster.yml`.
-No per-host or per-arch configuration is required — the play detects
+No per-host or per-arch configuration is required - the play detects
 `uname -m`, picks the matching upstream asset, verifies its SHA256, and
 installs to the paths sandboxd already reads from
 (`SB_FIRECRACKER_BINARY`, `SB_JAILER_BINARY`, `SB_FIRECRACKER_KERNEL`).
@@ -457,7 +457,7 @@ Firecracker is a **KVM-only VMM**. The host must expose `/dev/kvm`:
 - **AWS EC2:** only bare-metal instance types pass KVM through to the OS.
   Use `*.metal` SKUs (`c5n.metal`, `m5zn.metal`, `c7g.metal`, `i3.metal`,
   `m5.metal`, `c5.metal`, etc.). Standard `t3`/`m5`/`c5`/`c6i`/`m6i`/`r5`
-  instances are themselves Nitro guests — `/dev/kvm` does not exist and
+  instances are themselves Nitro guests - `/dev/kvm` does not exist and
   Firecracker cannot run there.
 - **GCP:** N2/N1 with `--enable-nested-virtualization` on the image.
 - **Azure:** Dv3/Ev3+ with nested virtualization.
@@ -485,9 +485,9 @@ ansible-playbook playbooks/configure-ops.yml
 What the play actually does, per host:
 
 1. Runs `uname -m` and maps `x86_64|amd64 → x86_64`, `aarch64|arm64 → aarch64`.
-   Anything else fails fast — Firecracker upstream only publishes those two.
+   Anything else fails fast - Firecracker upstream only publishes those two.
 2. Stats `/dev/kvm`. Missing? Fails fast (the host is a non-nested VM or virt
-   is off in BIOS — cheaper to fail here than at first `CreateSandbox`).
+   is off in BIOS - cheaper to fail here than at first `CreateSandbox`).
 3. Probes `firecracker --version`. If the installed binary already matches
    `firecracker_version`, skips the download. Idempotent re-runs are cheap.
 4. Downloads `firecracker-<ver>-<arch>.tgz` + its `.sha256.txt` sidecar
@@ -555,5 +555,5 @@ lifecycle, so it lives here instead.
 | Restart a service, rotate a PAT, tail logs      | Ansible     |
 | Run one-off shell commands across many nodes    | Ansible     |
 
-Terraform's `user_data` only runs at instance launch — it can't update an
+Terraform's `user_data` only runs at instance launch - it can't update an
 already-running node. That's what this folder exists for.

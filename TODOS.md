@@ -6,7 +6,7 @@ to start.
 
 ---
 
-## Custom domains — cert blob GC after removal
+## Custom domains - cert blob GC after removal
 
 **What:** Background sweep prunes Caddy cert blobs in shared storage whose hostname
 is no longer present in the FSM hostname → sandbox map.
@@ -14,7 +14,7 @@ is no longer present in the FSM hostname → sandbox map.
 **Why:** When a user removes a custom domain via `DELETE /v1/sandboxes/{id}/custom-domains/{hostname}`,
 the route matcher is updated and the FSM entry is deleted, but Caddy keeps the
 issued cert in storage (S3 when `--caddy-storage-s3` is enabled) until natural
-expiry. Bloat-only — correctness is intact. Becomes noticeable at high churn
+expiry. Bloat-only - correctness is intact. Becomes noticeable at high churn
 (thousands of one-off custom domains per month).
 
 **Pros:** Tidy storage; lower S3 cost at scale; clearer "what certs exist" answer.
@@ -28,5 +28,5 @@ The certmagic-s3 plugin exposes a list/delete API.
 ---
 
 *(Daemon-wide ACME budget counter was originally captured here; promoted to
-custom-domains v1 scope per outside-voice review decision OV5A — see
+custom-domains v1 scope per outside-voice review decision OV5A - see
 `plans/custom-domains.md` and the GSTACK REVIEW REPORT therein.)*

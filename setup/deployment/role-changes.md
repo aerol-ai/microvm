@@ -2,7 +2,7 @@
 
 When a node's role needs to change (e.g. `mixed` → `ingress`, or
 `worker,ingress` → `worker`), the question that always comes up is: *who is
-allowed to write the role — Terraform, Ansible, or both?* This document
+allowed to write the role - Terraform, Ansible, or both?* This document
 states the rule, explains why, and gives you the implementation.
 
 ## The rule
@@ -11,16 +11,16 @@ states the rule, explains why, and gives you the implementation.
 recreating the instance, never by editing it in place.**
 
 Ansible never touches `SB_NODE_ROLE` or `/etc/sandboxd/sandboxd.env`. There
-is no `change-role.yml` playbook — and there shouldn't be.
+is no `change-role.yml` playbook - and there shouldn't be.
 
 ## Why
 
 Three pieces of state describe a node's role:
 
-1. **EC2 `Role` tag** — owned by Terraform's `nodes.tf`.
-2. **`SB_NODE_ROLE` in `/etc/sandboxd/sandboxd.env`** — written by
+1. **EC2 `Role` tag** - owned by Terraform's `nodes.tf`.
+2. **`SB_NODE_ROLE` in `/etc/sandboxd/sandboxd.env`** - written by
    `cluster-init.sh` / `cluster-join.sh` during the user_data bootstrap.
-3. **Cloudflare A records** — created by Terraform's `dns.tf` for any node
+3. **Cloudflare A records** - created by Terraform's `dns.tf` for any node
    whose role contains `ingress`.
 
 If two systems can write any of those, they will drift. The dangerous one is
@@ -31,9 +31,9 @@ without Terraform knowing, the new capability is invisible from outside.
 
 The cheapest way to guarantee consistency is to ensure only one system ever
 writes the field. We pick Terraform because it already owns the other two
-related pieces (the EC2 tag and DNS), and because the alternative —
+related pieces (the EC2 tag and DNS), and because the alternative -
 "cluster owns role, Terraform launches every node as mixed, role assigned
-via API" — is a multi-day feature, not a config change.
+via API" - is a multi-day feature, not a config change.
 
 ## How (the one-time Terraform setup)
 
@@ -61,7 +61,7 @@ impossible.
 Changing a role becomes a normal Terraform change:
 
 ```bash
-# edit Terraform/terraform.tfvars — flip wrk1's role from "worker" to "worker,ingress"
+# edit Terraform/terraform.tfvars - flip wrk1's role from "worker" to "worker,ingress"
 terraform -chdir=Terraform plan -target='aws_instance.joiner["wrk1"]'
 terraform -chdir=Terraform apply -target='aws_instance.joiner["wrk1"]'
 ```
@@ -72,7 +72,7 @@ destroy + recreate plan before doing anything.
 What happens during the apply:
 
 1. The instance is destroyed (Raft handles the voter loss if it was a server;
-   workloads on the node are lost — see "Caveats" below).
+   workloads on the node are lost - see "Caveats" below).
 2. A new instance comes up with the new role baked into user_data.
 3. The cluster-join.sh script joins it in its new role.
 4. DNS records reconcile: if the node gained ingress, an A record is added;
@@ -118,7 +118,7 @@ still owns everything that isn't declared state:
 The split: **declared state in Terraform, ephemeral operations in Ansible.**
 Role belongs to declared state because it's part of the cluster's identity.
 Binary versions belong to ephemeral operations because Terraform doesn't need
-to know what version is running — it's not part of the topology.
+to know what version is running - it's not part of the topology.
 
 ## The long-term version (only when you outgrow the above)
 
@@ -131,7 +131,7 @@ answer is to move role out of Terraform entirely:
 - Role state lives in the Raft-backed store, reconciled into
   `/etc/sandboxd/sandboxd.env` by a per-node reconciler that restarts
   sandboxd when role changes.
-- DNS becomes a function of cluster state, not of `var.nodes` — either via a
+- DNS becomes a function of cluster state, not of `var.nodes` - either via a
   cluster-managed DNS controller, or by Terraform reading cluster state at
   plan-time.
 
@@ -145,5 +145,5 @@ rework), not a config change. Don't build it until the pain is concrete.
 - Add `user_data_replace_on_change = true` to your EC2 instances.
 - Change roles by editing `var.nodes` and running `terraform apply -target=...`.
 - Never write a `change-role.yml` Ansible playbook.
-- If recreate cost becomes painful, move role to cluster state — don't add a
+- If recreate cost becomes painful, move role to cluster state - don't add a
   second writer.

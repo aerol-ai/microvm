@@ -18,7 +18,7 @@ AerolVM node. From the AOCR operator, get these three values:
 | You need                  | Where it lives on the AOCR side                                | What it's for                                                                 |
 |---------------------------|----------------------------------------------------------------|-------------------------------------------------------------------------------|
 | **Mirror host**           | The vhost AOCR exposes for cached pulls (e.g. `mirror.aocr.example.com`) | Sandboxd rewrites `ghcr.io`/`gcr.io`/`quay.io`/`registry.k8s.io` pulls onto this host. |
-| **Upstream wrap key**     | `aocr.sh/secrets/upstream_wrap_key` (base64, 32 bytes)         | Wraps per-pull upstream credentials so the mirror — and only the mirror — can unwrap them. Required for **private** upstream pulls. |
+| **Upstream wrap key**     | `aocr.sh/secrets/upstream_wrap_key` (base64, 32 bytes)         | Wraps per-pull upstream credentials so the mirror - and only the mirror - can unwrap them. Required for **private** upstream pulls. |
 | **Internal API token**    | `aocr.sh/secrets/internal_api_token` (64-char string)          | Bearer token sandboxd presents on `POST /v1/internal/imports`. **Only needed for auto-import (F21).** |
 
 Plus one identifier you choose yourself:
@@ -36,7 +36,7 @@ The wrap key and the internal API token are real secrets. Treat them like
 |--------------------------|------------------------------------|
 | Terraform                | [Terraform setup](#terraform-setup) |
 | Ansible only             | [Ansible setup](#ansible-setup)     |
-| Both (Terraform → Ansible later) | [Terraform setup](#terraform-setup) — Ansible's `configure-ops.yml` will read the same `/etc/sandboxd/cluster.env` and overwrite cleanly if you run it later. |
+| Both (Terraform → Ansible later) | [Terraform setup](#terraform-setup) - Ansible's `configure-ops.yml` will read the same `/etc/sandboxd/cluster.env` and overwrite cleanly if you run it later. |
 
 ---
 
@@ -48,7 +48,7 @@ both Terraform and Ansible read:
 - `config/cluster.yml` (committed) holds the non-secret knobs: mirror host,
   upstreams, auto-import toggle / hooks_url / cluster_id, retention suffix,
   timeouts, max-in-flight.
-- `config/secrets.yml` (gitignored — `cp config/secrets.example.yml config/secrets.yml`
+- `config/secrets.yml` (gitignored - `cp config/secrets.example.yml config/secrets.yml`
   on first checkout) holds the two AOCR secrets: `aocr.upstream_wrap_key`
   and `aocr.cluster_pat`.
 
@@ -59,7 +59,7 @@ Nothing AOCR-specific lives in `terraform.tfvars` anymore.
 **Off (default).** Leave `mirror.host` empty and `auto_import.enabled = false`
 in `config/cluster.yml`. The bootstrap template skips the AOCR section.
 
-**Mirror-only — cached + wrapped private pulls.**
+**Mirror-only - cached + wrapped private pulls.**
 
 ```yaml
 # config/cluster.yml
@@ -124,7 +124,7 @@ bootstrap script content changed. The new bootstrap:
 4. Appends `SB_MIRROR_*` / `SB_AUTO_IMPORT_*` to `/etc/sandboxd/cluster.env`.
 5. `systemctl restart sandboxd`.
 
-The cluster PAT is **file-sourced**, never an env var — it never appears
+The cluster PAT is **file-sourced**, never an env var - it never appears
 in `systemctl show sandboxd` or process listings.
 
 ---
@@ -133,7 +133,7 @@ in `systemctl show sandboxd` or process listings.
 
 Ansible reads the **same** `config/cluster.yml` and `config/secrets.yml`
 files Terraform uses, so the YAML blocks under [Terraform setup](#terraform-setup)
-above are also the Ansible config — there is no separate inline-value var
+above are also the Ansible config - there is no separate inline-value var
 to set in `local.yml` anymore.
 
 For fleet / Vault-rendered workflows, leave `aocr.upstream_wrap_key` /
@@ -141,7 +141,7 @@ For fleet / Vault-rendered workflows, leave `aocr.upstream_wrap_key` /
 paths from `Ansible/inventory/group_vars/all/local.yml`:
 
 ```yaml
-# inventory/group_vars/all/local.yml — gitignored
+# inventory/group_vars/all/local.yml - gitignored
 sandboxd_upstream_wrap_key_src:          "/home/you/aerol-secrets/upstream_wrap_key"
 sandboxd_auto_import_cluster_pat_src:    "/home/you/aerol-secrets/cluster_pat"
 ```
