@@ -875,8 +875,13 @@ func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
 // never produces artifacts but must pull snapshots/templates on failover or
 // cross-node placement) still needs the pull credential. ConfigureAOCRPullAuth
 // is a no-op when cluster_id or the PAT path is unset, so a node with no AOCR
-// wiring keeps pulling anonymously exactly as before. This adds no per-create
-// latency — it sets node-local config once at boot.
+// wiring keeps pulling anonymously exactly as before.
+//
+// This call itself runs once at boot and adds nothing to the create path. The
+// only per-create cost it introduces lands later, in resolveAOCRPullAuth: a
+// single node-local PAT file read, and only on a cache-miss pull of an AOCR
+// `cluster/...` ref (warm pulls, non-AOCR refs, and caller-supplied creds all
+// skip it). The fresh read is deliberate — it makes PAT rotation a file write.
 func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, c *docker.Client) {
 	clusterID := strings.TrimSpace(cfg.AutoImportClusterID)
 	patPath := strings.TrimSpace(cfg.AutoImportClusterPATPath)

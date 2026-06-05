@@ -54,7 +54,7 @@ func (c *Client) ConfigureAOCRPullAuth(hosts []string, clusterID, patPath string
 	normalized := make([]string, 0, len(hosts))
 	seen := make(map[string]struct{}, len(hosts))
 	for _, h := range hosts {
-		h = strings.ToLower(strings.TrimRight(strings.TrimSpace(h), "/"))
+		h = normalizeAOCRHost(h)
 		if h == "" {
 			continue
 		}
@@ -98,7 +98,7 @@ func (c *Client) resolveAOCRPullAuth(imageRef string) *models.RegistryAuth {
 	if host == "" {
 		return nil
 	}
-	if !slices.Contains(c.aocrPullAuth.hosts, strings.ToLower(host)) {
+	if !slices.Contains(c.aocrPullAuth.hosts, normalizeAOCRHost(host)) {
 		return nil
 	}
 	// Only the cluster-owned namespace is in scope for this credential; a
@@ -121,6 +121,28 @@ func (c *Client) resolveAOCRPullAuth(imageRef string) *models.RegistryAuth {
 		Username: c.aocrPullAuth.clusterID,
 		Password: pat,
 	}
+}
+
+// normalizeAOCRHost canonicalizes a registry host for comparison: trims space
+// and trailing slashes, lowercases, and drops an explicit default registry port
+// (`:443`/`:80`) so a configured `aocr.aerol.ai` still matches a ref written as
+// `aocr.aerol.ai:443/cluster/...`. A non-default port (e.g. `:5000`) is
+// significant and kept. IPv6 literals are bracketed (`[::1]:443`), so only the
+// final `:port` is treated as a port — `strings.LastIndex` after the last `]`.
+func normalizeAOCRHost(h string) string {
+	h = strings.ToLower(strings.TrimRight(strings.TrimSpace(h), "/"))
+	if h == "" {
+		return ""
+	}
+	// Find a port colon that isn't part of an IPv6 literal.
+	portColon := strings.LastIndexByte(h, ':')
+	if portColon > strings.LastIndexByte(h, ']') {
+		switch h[portColon+1:] {
+		case "443", "80":
+			h = h[:portColon]
+		}
+	}
+	return h
 }
 
 // readAOCRPATFile reads the bearer token from disk, trimming trailing

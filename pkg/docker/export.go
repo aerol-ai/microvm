@@ -50,9 +50,11 @@ func (c *Client) ExportImageTar(ctx context.Context, ref string) (io.ReadCloser,
 // PullImage is the exported single-call pull wrapper the template puller
 // uses. Goes through pullImageDedup so concurrent first-callers for the
 // same ref collapse to one daemon request — the same dedup that protects
-// the create-sandbox pull path. Auth is optional; nil means anonymous,
-// which is fine for AOCR refs that the daemon already has credentials
-// configured for at the daemon level.
+// the create-sandbox pull path. Auth is optional: nil means anonymous,
+// except that pullImageDedup back-fills the cluster PAT for AOCR
+// `cluster/...` refs when ConfigureAOCRPullAuth has been called (see
+// aocr_pull_auth.go), so the template puller can pass nil and still
+// authenticate against a private AOCR.
 func (c *Client) PullImage(ctx context.Context, ref string, auth *models.RegistryAuth) error {
 	if strings.TrimSpace(ref) == "" {
 		return errors.New("pull image: ref is required")

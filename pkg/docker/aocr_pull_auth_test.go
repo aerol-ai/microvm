@@ -1,8 +1,15 @@
 package docker
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +73,8 @@ func TestResolveAOCRPullAuth_ScopingRules(t *testing.T) {
 		{"cluster prefix collision", "aocr.aerol.ai/clusterfoo/bar:latest", false},
 		{"configured host cluster path", "aocr.aerol.ai/cluster/c1/templates/py311:latest", true},
 		{"transport prefix stripped", "docker://aocr.aerol.ai/cluster/c1/snapshots/s:latest", true},
+		{"default https port stripped", "aocr.aerol.ai:443/cluster/c1/templates/py311:latest", true},
+		{"non-default port is significant", "aocr.aerol.ai:5000/cluster/c1/templates/py311:latest", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,6 +110,76 @@ func TestResolveAOCRPullAuth_NilWhenPATMissing(t *testing.T) {
 	c.ConfigureAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", filepath.Join(t.TempDir(), "does-not-exist"))
 	if got := c.resolveAOCRPullAuth("aocr.aerol.ai/cluster/c1/templates/py311:latest"); got != nil {
 		t.Fatalf("expected nil auth when PAT file missing, got %+v", got)
+	}
+}
+
+// newAOCRCaptureClient builds a Client whose pull transport records the
+// X-Registry-Auth header and the fromImage query of the /images/create call,
+// with pulls initialized so pullImageDedup is safe to drive directly.
+func newAOCRCaptureClient(gotAuthB64, gotFrom *string) *Client {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		*gotAuthB64 = r.Header.Get("X-Registry-Auth")
+		*gotFrom = r.URL.Query().Get("fromImage")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"status":"done"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	return &Client{
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		streamClient: &http.Client{Transport: transport},
+		httpClient:   &http.Client{Transport: transport},
+		pulls:        make(map[string]*imagePull),
+	}
+}
+
+// TestPullImageDedup_SetsClusterPATForClusterRef is the end-to-end assertion
+// that the back-fill actually reaches the daemon request: a nil-auth pull of an
+// AOCR cluster ref (the template-puller's exact call shape) must carry the
+// cluster PAT in X-Registry-Auth, and the ref must not be mirror-rewritten.
+func TestPullImageDedup_SetsClusterPATForClusterRef(t *testing.T) {
+	patPath := writePAT(t, "tok-xyz")
+	var gotAuthB64, gotFrom string
+	c := newAOCRCaptureClient(&gotAuthB64, &gotFrom)
+	c.ConfigureAOCRPullAuth([]string{"aocr.aerol.ai"}, "prod-aerolvm-us-east-1", patPath)
+
+	ref := "aocr.aerol.ai/cluster/prod-aerolvm-us-east-1/templates/py311:latest"
+	if err := c.PullImage(context.Background(), ref, nil); err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	if gotFrom != ref {
+		t.Fatalf("fromImage = %q, want %q (no mirror rewrite expected)", gotFrom, ref)
+	}
+	if gotAuthB64 == "" {
+		t.Fatal("X-Registry-Auth missing; cluster PAT was not applied to the pull")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(gotAuthB64)
+	if err != nil {
+		t.Fatalf("decode X-Registry-Auth: %v", err)
+	}
+	var a map[string]string
+	if err := json.Unmarshal(decoded, &a); err != nil {
+		t.Fatalf("unmarshal auth: %v", err)
+	}
+	if a["username"] != "prod-aerolvm-us-east-1" || a["password"] != "tok-xyz" || a["serveraddress"] != "aocr.aerol.ai" {
+		t.Fatalf("auth payload mismatch: %+v", a)
+	}
+}
+
+// TestPullImageDedup_NoAuthForNonClusterRef confirms the back-fill stays scoped:
+// a non-cluster repo on the same AOCR host must not borrow the cluster PAT.
+func TestPullImageDedup_NoAuthForNonClusterRef(t *testing.T) {
+	patPath := writePAT(t, "tok-xyz")
+	var gotAuthB64, gotFrom string
+	c := newAOCRCaptureClient(&gotAuthB64, &gotFrom)
+	c.ConfigureAOCRPullAuth([]string{"aocr.aerol.ai"}, "c1", patPath)
+
+	if err := c.PullImage(context.Background(), "aocr.aerol.ai/acme/my-image:latest", nil); err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	if gotAuthB64 != "" {
+		t.Fatalf("unexpected X-Registry-Auth for non-cluster ref: %q", gotAuthB64)
 	}
 }
 
