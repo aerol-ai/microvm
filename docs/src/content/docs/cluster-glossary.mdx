@@ -1,0 +1,155 @@
+---
+title: Cluster Glossary
+description: Environment variables, node roles, and configuration reference for AerolVM clusters.
+---
+
+Reference for operators who want to understand what's happening under the hood, read logs, or configure cluster settings beyond the Terraform defaults.
+
+## Node roles
+
+Each node in a cluster has a role that determines what it does.
+
+| Role | Votes in consensus | Runs sandboxes | Handles traffic |
+|---|---|---|---|
+| `mixed` | Yes | Yes | Yes |
+| `server` | Yes | No | No |
+| `worker` | No | Yes | No |
+| `ingress` | No | No | Yes |
+| `server,worker` | Yes | Yes | No |
+| `server,ingress` | Yes | No | Yes |
+| `worker,ingress` | No | Yes | Yes |
+
+**Consensus (Raft)** keeps all nodes in agreement on which sandbox lives on which server. Nodes that vote ("server" or "mixed") must have a majority online to make decisions. Non-voters ("worker", "ingress") can run sandboxes and forward traffic without affecting this threshold.
+
+**Gossip (SWIM)** is the lightweight protocol all nodes use to discover each other, report capacity, and propagate membership changes. Every node participates regardless of role.
+
+## Quorum reference
+
+| Voting nodes | Can lose | Notes |
+|---|---|---|
+| 1 | 0 | Testing only |
+| 2 | 0 | Avoid — same fault tolerance as 1 voter, higher quorum cost |
+| 3 | 1 | Minimum for production |
+| 5 | 2 | Recommended when spanning availability zones |
+| 7 | 3 | Diminishing returns; replication overhead increases |
+
+Always use an **odd number** of voting nodes. Even numbers raise the quorum threshold without improving fault tolerance.
+
+`SB_CLUSTER_MAX_AUTO_VOTERS` caps how many nodes automatically become voters. Nodes beyond the cap join as **non-voters** — they receive the placement log and can run sandboxes, but don't count toward quorum. The default cap is `5`.
+
+## Cluster environment variables
+
+These variables are written to `/etc/sandboxd/cluster.env` on each node when you run `scripts/terraform.sh apply`. Terraform manages them automatically, but knowing what they mean helps when reading logs or troubleshooting.
+
+### Node identity
+
+| Variable | Required | Description |
+|---|---|---|
+| `SB_ENABLE_CLUSTER` | Yes | Set to `true` to enable cluster mode. Default `false`. |
+| `SB_NODE_ID` | Yes | Stable name for this node (e.g. `node1`). Must not change across restarts — a changed ID leaves a ghost entry in the cluster configuration. |
+| `SB_CLUSTER_BOOTSTRAP` | Yes | `true` only on the seed node; `false` on all others. |
+| `SB_CLUSTER_MAX_AUTO_VOTERS` | No | Maximum nodes auto-promoted to Raft voters. Default `5`. Nodes beyond this cap join as non-voters. |
+
+### Networking
+
+| Variable | Required | Description |
+|---|---|---|
+| `SB_API_ADVERTISE_URL` | Yes | URL other nodes use to forward API requests to this node — e.g. `http://10.0.0.5:21212`. |
+| `SB_DATA_PLANE_ADVERTISE_HOST` | Yes | Host other nodes use to route sandbox traffic. Defaults to the host in `SB_API_ADVERTISE_URL`; set explicitly when the API address and sandbox traffic address differ. |
+| `SB_BOOTSTRAP_PEERS` | Joiners only | Comma-separated gossip addresses to connect to when joining the cluster. Empty on the seed. |
+
+### Raft (consensus protocol)
+
+Raft is the consensus protocol that makes all nodes agree on sandbox placement. Its state lives on disk and survives restarts.
+
+| Variable | Required | Description |
+|---|---|---|
+| `SB_RAFT_BIND_ADDR` | Yes | Address Raft listens on. Default `0.0.0.0:7000`. |
+| `SB_RAFT_ADVERTISE_ADDR` | Yes | Address peers connect to for Raft. Cannot be `0.0.0.0`. |
+| `SB_RAFT_DATA_DIR` | Yes | Directory where Raft stores its log and snapshots. Default `/var/lib/sandboxd/raft`. |
+
+### Gossip (membership protocol)
+
+Gossip is how nodes discover each other and share capacity information.
+
+| Variable | Required | Description |
+|---|---|---|
+| `SB_GOSSIP_BIND_ADDR` | Yes | Address gossip listens on. Default `0.0.0.0:7001`. |
+| `SB_GOSSIP_ADVERTISE_ADDR` | Yes | Address peers connect to for gossip. Cannot be `0.0.0.0`. |
+| `SB_GOSSIP_SECRET_KEY` | Yes | Base64-encoded AES key (16, 24, or 32 bytes) shared across all nodes. Authenticates gossip messages so rogue nodes cannot join. |
+| `SB_CLUSTER_INSECURE_GOSSIP` | No | Skip the gossip key requirement. Only safe on a fully isolated network where untrusted machines cannot connect. Default `false`. |
+
+### Security
+
+| Variable | Required | Description |
+|---|---|---|
+| `SB_CLUSTER_TLS_DIR` | Recommended | Directory holding the cluster CA and this node's cert and key (`ca.crt`, `node.crt`, `node.key`). When set, internal cluster traffic uses mutual TLS so possession of a PAT alone isn't enough to forge forwarded writes. |
+| `SB_CLUSTER_INTERNAL_LISTEN` | No | Bind address for the cluster-internal mTLS listener. Default `0.0.0.0:7002`. |
+| `SB_CLUSTER_INTERNAL_ADVERTISE` | No | HTTPS URL peers use for the internal mTLS channel — e.g. `https://10.0.0.5:7002`. Auto-derived from the node's primary IP when empty. |
+| `SB_CREDENTIAL_ENCRYPTION_KEY` | Yes | Base64-encoded 32-byte key used to encrypt sandbox credentials (registry passwords, mount secrets) before replicating them across nodes. Every node must share the same value — if they differ, sandboxes that fail over to a new host will lose access to private registries and credentialed mounts. |
+| `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | No | File path to load the credential key from. Default `/var/lib/sandboxd/credential_encryption.key`. |
+| `SB_CLUSTER_INSECURE_CREDENTIALS` | No | Skip the credential key requirement. **Recovered sandboxes lose access to private registries and credentialed mounts after failover** without this key. Only for test setups. Default `false`. |
+
+## GPU support
+
+GPU passthrough lets sandboxes use physical NVIDIA or AMD GPUs attached to the worker node. The cluster placement engine routes GPU sandbox requests only to nodes that have the matching GPU capability installed.
+
+GPU support is installed as a host capability when you set `with_nvidia_gpu = true` or `with_amd_gpu = true` on a worker node in `terraform.tfvars`. Terraform passes the corresponding flag (`--with-nvidia-gpu` or `--with-amd-gpu`) to the node's install script, which installs the required driver toolkit and configures Docker.
+
+There is no additional environment variable to set. GPU capability is advertised through the gossip protocol alongside CPU and memory capacity.
+
+**NVIDIA** — installs NVIDIA Container Toolkit. Requires an EC2 instance with a physical NVIDIA GPU (`g4dn`, `g5`, `p3`, etc.).
+
+**AMD** — installs ROCm. Supported on `x86_64` instances only (`g4ad`, etc.).
+
+GPU passthrough is not compatible with gVisor — a sandbox can request one or the other, but not both.
+
+## gVisor
+
+gVisor intercepts system calls with a user-space kernel, providing stronger isolation than a standard container without requiring bare-metal hardware. It works on any EC2 instance type.
+
+gVisor is installed as a host capability when you set `with_gvisor = true` on a worker node in `terraform.tfvars`. Terraform passes the `--with-gvisor` flag to the node's install script, which installs the `runsc` runtime and configures Docker to expose it.
+
+Once installed, the node advertises that it supports the `gvisor` runtime, and the cluster's placement engine routes `runtime: "gvisor"` sandbox requests to those nodes only. There is no additional environment variable to set.
+
+## Firecracker environment variables
+
+These variables are written automatically when a node has `with_firecracker = true` in `terraform.tfvars`. They configure the Firecracker runtime on the host.
+
+### Core settings
+
+| Variable | Description |
+|---|---|
+| `SB_ENABLE_FIRECRACKER` | Set to `true` to enable the Firecracker runtime on this node. |
+| `SB_FIRECRACKER_BINARY` | Path to the `firecracker` binary. |
+| `SB_JAILER_BINARY` | Path to the `jailer` binary. The jailer wraps each microVM for extra isolation. |
+| `SB_FIRECRACKER_KERNEL` | Path to the Linux kernel image (`vmlinux`). Required — Firecracker cannot start without a kernel. |
+| `SB_FIRECRACKER_USE_JAILER` | `true` to run each microVM inside the jailer. Default `true`. |
+| `SB_FIRECRACKER_RUN_DIR` | Directory where Firecracker stores per-VM socket files and state. |
+| `SB_FIRECRACKER_TEMPLATES_DIR` | Directory where Firecracker rootfs templates are cached on disk. |
+| `SB_FIRECRACKER_TAP_BASE_CIDR` | IP range for the virtual network interfaces that connect microVMs to the host. Default `172.16.0.0/20`. |
+| `SB_FIRECRACKER_TAP_POOL_SIZE` | Number of tap interfaces to pre-allocate. Default `256`. |
+
+### VMM pool (pre-warming)
+
+The VMM pool keeps microVMs booted and ready so that sandbox creation is nearly instant. The pool refills automatically in the background.
+
+| Variable | Description |
+|---|---|
+| `SB_FIRECRACKER_VMM_POOL_ENABLED` | Enable the pre-warm pool. Default `true`. |
+| `SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT` | Number of pre-warmed microVMs to keep per template. Default `1`. Increase for bursty workloads. |
+| `SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL` | How often the pool checks itself and starts replacement VMs. Default `5s`. |
+| `SB_FIRECRACKER_VMM_POOL_GC_INTERVAL` | How often stale pooled VMs are cleaned up. Default `5m`. |
+| `SB_FIRECRACKER_VMM_POOL_GC_TTL` | Age at which a pooled VM is considered stale and replaced. Default `1h`. |
+
+### Template and snapshot settings
+
+| Variable | Description |
+|---|---|
+| `SB_FIRECRACKER_SNAPSHOT_ENABLED` | Enable snapshot-based warm starts. A snapshot captures a booted VM's memory state so subsequent boots restore from the snapshot instead of booting from scratch. |
+| `SB_FIRECRACKER_TEMPLATE_MEMORY_MB` | Memory (MB) allocated to the VM when building a template. Default `256`. |
+| `SB_FIRECRACKER_TEMPLATE_VCPU` | vCPUs allocated to the VM when building a template. Default `1`. |
+| `SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT` | Maximum time to wait for a template build to complete. |
+| `SB_FIRECRACKER_TEMPLATE_GC_ENABLED` | Automatically delete old templates from disk. |
+| `SB_FIRECRACKER_TEMPLATE_GC_TTL` | Age at which an unused template is eligible for deletion. Default `24h`. |
+| `SB_FIRECRACKER_RSS_WATERMARK_RATIO` | Fraction of host memory at which the node stops accepting new Firecracker sandboxes. Default `0.10` (10% headroom). |

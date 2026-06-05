@@ -64,26 +64,33 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
             description: 'Install AerolVM on one Linux host with domain, TLS, SSH, and optional GPU support.',
           },
           {
-            type: 'link',
-            href: '/cluster-setup',
-            label: 'Cluster Setup',
-            description: 'Bootstrap a multi-node AerolVM cluster with raft-coordinated placement.',
-          },
-          {
-            type: 'link',
-            href: '/cluster-ingress',
-            label: 'Cluster Ingress',
-            description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
-          },
-          {
-            type: 'link',
-            href: '/cluster-setup-step-by-step',
-            label: 'Cluster Setup Step by Step',
-            description: 'Guided checklist for bootstrapping a 3-node or custom AerolVM cluster.',
+            type: 'group',
+            label: 'Cluster',
+            homePageHref: '/cluster-setup',
+            entries: [
+              {
+                type: 'link',
+                href: '/cluster-setup',
+                label: 'Setup',
+                description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
+              },
+              {
+                type: 'link',
+                href: '/cluster-ingress',
+                label: 'Ingress',
+                description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
+              },
+              {
+                type: 'link',
+                href: '/cluster-glossary',
+                label: 'Glossary',
+                description: 'Environment variables, node roles, and quorum reference for AerolVM clusters.',
+              },
+            ],
           },
         ],
       },
-      
+
       {
         type: 'group',
         label: 'SDK Setup',
@@ -406,7 +413,7 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
 
         ],
       },
-      
+
       {
         type: 'group',
         label: 'Data Processing & ML',

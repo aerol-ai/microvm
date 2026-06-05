@@ -285,7 +285,7 @@ proxies HTTP(S); leave it `false` for raw TCP ingress.
 | `../config/terraform.tfvars.example` | Drop-in starter for `config/terraform.tfvars` (gitignored sibling) |
 | `../config/cluster.yml`     | Shared non-secret cluster ops env (Terraform + Ansible) |
 | `../config/secrets.example.yml` | Template for `config/secrets.yml` (gitignored sibling) |
-| `../scripts/terraform.sh`   | Wrapper — always invoke Terraform via this, not bare `terraform` |
+| `../scripts/terraform.sh`   | Wrapper - always invoke Terraform via this, not bare `terraform` |
 
 ## Connect this cluster to AOCR (mirror + auto-import)
 
@@ -361,7 +361,7 @@ imported tags under the old namespace).
 > (`mirror.host`, `auto_import.*`) sits in `config/cluster.yml` so both
 > Terraform and Ansible read it; AOCR secrets (`upstream_wrap_key`,
 > `cluster_pat`) sit in `config/secrets.yml`. The example block below shows
-> the shape — for the live keys see `config/cluster.yml` and
+> the shape - for the live keys see `config/cluster.yml` and
 > `config/secrets.example.yml`.
 
 ```hcl
