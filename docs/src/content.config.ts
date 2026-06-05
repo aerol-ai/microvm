@@ -156,10 +156,54 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         ],
       },
       {
+        type: 'group',
+        homePageHref: '/snapshots',
+        label: 'Snapshots',
+        entries: [
+          {
+            type: 'link',
+            href: '/snapshots',
+            label: 'Snapshots',
+            description: 'Capture a running sandbox or register an image as a named, reusable template.',
+          },
+          {
+            type: 'link',
+            href: '/firecracker-templates',
+            label: 'Firecracker Templates',
+            description: 'Register OCI images as Firecracker rootfs templates for sub-100ms cold starts; rebuild on demand.',
+          },
+        ]
+      },
+      {
         type: 'link',
         href: '/environment',
-        label: 'Environment',
+        label: 'Lifecycle + Environment',
         description: 'Docker image, env vars, resource limits, and idle lifecycle.',
+      },
+      {
+        type: 'link',
+        href: '/external-storage',
+        label: 'Attach Volumes',
+        description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
+      },
+      {
+        type: 'group',
+        homePageHref: '/preview',
+        label: 'Preview Publicly',
+        entries: [
+          {
+            type: 'link',
+            href: '/preview',
+            label: 'Preview',
+            description: 'Expose container ports publicly over HTTPS through Caddy routes.',
+          },
+          {
+            type: 'link',
+            href: '/custom-domains',
+            label: 'Custom Domains',
+            description: 'Attach arbitrary public hostnames to a sandbox with automatic per-host HTTPS via ACME.',
+          },
+        ]
       },
       {
         type: 'link',
@@ -167,36 +211,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'Serverless',
         description: 'Auto-stop sandboxes on idle and wake them on the next inbound HTTP request.',
       },
-      {
-        type: 'link',
-        href: '/external-storage',
-        label: 'Volumes',
-        description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
-      },
-      {
-        type: 'link',
-        href: '/snapshots',
-        label: 'Snapshots',
-        description: 'Capture a running sandbox or register an image as a named, reusable template.',
-      },
-      {
-        type: 'link',
-        href: '/firecracker-templates',
-        label: 'Firecracker Templates',
-        description: 'Register OCI images as Firecracker rootfs templates for sub-100ms cold starts; rebuild on demand.',
-      },
-      {
-        type: 'link',
-        href: '/preview',
-        label: 'Preview',
-        description: 'Expose container ports publicly over HTTPS through Caddy routes.',
-      },
-      {
-        type: 'link',
-        href: '/reconcile',
-        label: 'Reconcile',
-        description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
-      },
+      // {
+      //   type: 'link',
+      //   href: '/reconcile',
+      //   label: 'Reconcile',
+      //   description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
+      // },
       {
         type: 'link',
         href: '/durability',
@@ -261,12 +281,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         label: 'Port Allowlist',
         description: 'Require explicit exposure before public traffic reaches a sandbox port.',
       },
-      {
-        type: 'link',
-        href: '/custom-domains',
-        label: 'Custom Domains',
-        description: 'Attach arbitrary public hostnames to a sandbox with automatic per-host HTTPS via ACME.',
-      },
+
     ],
   },
   {
@@ -275,6 +290,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     category: NavigationCategory.FEATURES,
     homePageHref: '/',
     entries: [
+      {
+        type: 'link',
+        href: '/serverless',
+        label: 'Serverless',
+        description: 'Auto-stop sandboxes on idle and wake them on the next inbound HTTP request.',
+      },
       {
         type: 'link',
         href: '/exec-streaming',

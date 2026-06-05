@@ -4,23 +4,7 @@ title: Preview
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Every sandbox gets a public URL that routes to the sandbox's API endpoint. You can also expose additional ports on separate public URLs so browsers and external tools can reach services running inside the sandbox.
-
-## Sandbox URL
-
-When `SB_DOMAIN` is configured, sandboxes are reachable at:
-
-```
-https://<sandbox-id>.<domain>
-```
-
-Without `SB_DOMAIN`, the server falls back to a path-based URL:
-
-```
-http://<SB_PUBLIC_HOST>/<sandbox-id>/
-```
-
-The sandbox URL is returned as `publicUrl` in the create and get responses.
+Every sandbox+port can get a public URL that routes to the sandbox's API endpoint.
 
 ## Expose a Port
 

@@ -1,30 +1,51 @@
 ---
-title: Environment
+title: Lifecycle + Environment
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-The sandbox environment is fully specified at creation time. All fields are optional except `image`.
+## Idle Lifecycle
 
-## Image
+Sandboxes can self-terminate based on age or inactivity. Both fields are optional and can be set independently.
 
-Any OCI-compatible image reachable by the Docker daemon on the host. Public images are pulled automatically. Private registries require the host Docker daemon to be pre-authenticated.
+| Field | Behavior |
+|---|---|
+| `stopIfIdleFor` | Stop the sandbox after this duration of inactivity (nanoseconds). |
+| `destroyAtAge` | Destroy the sandbox once it is this old (nanoseconds from creation). |
+
+Go uses `time.Duration` for these fields. TypeScript, Python, and Rust use integer nanoseconds.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.create({ image: 'ubuntu:22.04' })
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      lifecycle: {
+        stopIfIdleFor: 60 * 60 * 1_000_000_000,   // 1 hour
+        destroyAtAge:  24 * 60 * 60 * 1_000_000_000, // 24 hours
+      },
+    })
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({'image': 'ubuntu:22.04'})
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'lifecycle': {
+            'stopIfIdleFor': 3_600_000_000_000,
+            'destroyAtAge':  86_400_000_000_000,
+        },
+    })
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
         Image: "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: time.Hour,
+            DestroyAtAge:  24 * time.Hour,
+        },
     })
     ```
   </TabItem>
@@ -32,18 +53,31 @@ Any OCI-compatible image reachable by the Docker daemon on the host. Public imag
     ```rust
     let sandbox = client.create(CreateOptions {
         image: "ubuntu:22.04".to_string(),
+        lifecycle: Some(Lifecycle {
+            stop_if_idle_for: 3_600_000_000_000,
+            destroy_at_age:   86_400_000_000_000,
+            ..Default::default()
+        }),
         ..Default::default()
     })?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(3_600_000_000_000L)
+                .setDestroyAtAge(86_400_000_000_000L))
+    );
     ```
   </TabItem>
 </Tabs>
 
-## Environment Variables
+## Environment
+
+The sandbox environment is fully specified at creation time. All fields are optional except `image`.
 
 Pass key-value pairs into the container at creation. Variables are stored encrypted at rest and are not returned by list or get endpoints.
 
@@ -174,76 +208,7 @@ Resources can be changed on a live sandbox without a restart using [resize](/san
   </TabItem>
 </Tabs>
 
-## Idle Lifecycle
 
-Sandboxes can self-terminate based on age or inactivity. Both fields are optional and can be set independently.
-
-| Field | Behavior |
-|---|---|
-| `stopIfIdleFor` | Stop the sandbox after this duration of inactivity (nanoseconds). |
-| `destroyAtAge` | Destroy the sandbox once it is this old (nanoseconds from creation). |
-
-Go uses `time.Duration` for these fields. TypeScript, Python, and Rust use integer nanoseconds.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      lifecycle: {
-        stopIfIdleFor: 60 * 60 * 1_000_000_000,   // 1 hour
-        destroyAtAge:  24 * 60 * 60 * 1_000_000_000, // 24 hours
-      },
-    })
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'lifecycle': {
-            'stopIfIdleFor': 3_600_000_000_000,
-            'destroyAtAge':  86_400_000_000_000,
-        },
-    })
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ubuntu:22.04",
-        Lifecycle: &sdktypes.Lifecycle{
-            StopIfIdleFor: time.Hour,
-            DestroyAtAge:  24 * time.Hour,
-        },
-    })
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        lifecycle: Some(Lifecycle {
-            stop_if_idle_for: 3_600_000_000_000,
-            destroy_at_age:   86_400_000_000_000,
-            ..Default::default()
-        }),
-        ..Default::default()
-    })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setLifecycle(new Lifecycle()
-                .setStopIfIdleFor(3_600_000_000_000L)
-                .setDestroyAtAge(86_400_000_000_000L))
-    );
-    ```
-  </TabItem>
-</Tabs>
 
 ## Entrypoint
 

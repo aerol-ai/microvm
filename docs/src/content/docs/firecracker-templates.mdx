@@ -5,6 +5,12 @@ description: Register OCI images as Firecracker rootfs templates for sub-100ms s
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
+**Firecracker Templates are a Firecracker-only feature.** Without a template, every Firecracker sandbox runs the full OCI-to-rootfs pipeline on each create — expect 10–60 seconds per boot. A template pre-builds the `ext4` rootfs once and captures a paused VM memory state; subsequent sandbox creates clone that snapshot instead of cold-booting the kernel, bringing boot time under 100ms.
+
+:::note[Using Docker sandboxes?]
+If you are not using `runtime: "firecracker"`, templates do not apply to you. For saving and reusing Docker container state, see [Snapshots](/snapshots) instead — snapshots let you commit a running sandbox into a named image and launch copies from it.
+:::
+
 Firecracker templates let one OCI image power many sandboxes with sub-100ms cold starts. Register an image once; the daemon builds an `ext4` rootfs and captures a paused-VM snapshot. Subsequent `firecracker` sandbox creates against that template clone the snapshot instead of cold-booting the kernel.
 
 Templates are an opt-in alternative to the Docker runtime - your existing sandboxes are unaffected. Use the template lifecycle on this page when you want predictable, fast cold starts (CI runners, REPLs, agent workloads) and accept the up-front build cost.
