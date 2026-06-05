@@ -1,0 +1,197 @@
+---
+title: Network Isolation
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+By default, sandboxes have full access to the internet. If you need to run untrusted user code or LLM agents that should not exfiltrate data, you can opt the sandbox into **Network Isolation** to completely block all outbound network traffic (egress).
+
+When network isolation is enabled:
+- **Outbound network calls** (e.g., HTTP requests, database connections, DNS lookups) are blocked immediately by the host firewall.
+- **Ingress requests** on exposed ports (like public URLs or TCP exposures) are still permitted.
+
+---
+
+## How it works
+
+1. Declare the egress block at sandbox creation by passing `networkBlockAll: true` (or its language-specific equivalent) in the create options.
+2. The platform installs a firewall rule on the host that drops every packet originating from the sandbox's IP address.
+3. The egress block persists across sandbox starts, stops, and host reboots. The rule is automatically cleaned up when the sandbox is destroyed.
+
+---
+
+## Enable Network Isolation
+
+To isolate a sandbox, set `networkBlockAll` (or `network_block_all`) to `true` when creating the sandbox.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      networkBlockAll: true,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'networkBlockAll': True,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "ubuntu:22.04",
+        NetworkBlockAll: true,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        network_block_all: Some(true),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setNetworkBlockAll(true)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Verify Network Isolation
+
+Once isolated, executing a command inside the sandbox that requires outbound network access (like `curl` or package installers) will fail.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({
+      command: 'curl -I https://google.com',
+    })
+    console.log(`Exit code: ${result.exitCode}`) // Non-zero exit code due to blocked egress
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec({
+        'command': 'curl -I https://google.com'
+    })
+    print(f"Exit code: {result['exitCode']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command: "curl -I https://google.com",
+    })
+    if err != nil {
+        return err
+    }
+    fmt.Printf("Exit code: %d\n", result.ExitCode)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let result = sandbox.exec(ExecRequest {
+        command: "curl -I https://google.com".to_string(),
+        ..Default::default()
+    })?;
+    println!("Exit code: {}", result.exit_code);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.ExecRequest;
+    import ai.aerol.microvm.model.ExecResult;
+
+    ExecResult result = sandbox.exec(
+        new ExecRequest().setCommand("curl -I https://google.com")
+    );
+    System.out.println("Exit code: " + result.exitCode);
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Ingress with Network Isolation
+
+Network isolation only blocks outbound requests. It does not affect ingress traffic to ports exposed via the SDK's port exposure APIs:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Expose port 80 to the public internet
+    const exposure = await sandbox.exposePort(80)
+    console.log(`Access the isolated sandbox at: ${exposure.url}`)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(80)
+    print(f"Access the isolated sandbox at: {exposure['url']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 80)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("Access the isolated sandbox at: %s\n", exposure.PublicURL)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExposeOptions;
+
+    let exposure = sandbox.expose_port(80, ExposeOptions::http())?;
+    if let aerolvm_sdk::ExposeResult::Http { url } = exposure {
+        println!("Access the isolated sandbox at: {}", url);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.ExposeResult;
+
+    ExposeResult exposure = sandbox.exposePort(80);
+    System.out.println("Access the isolated sandbox at: " + exposure.publicURL);
+    ```
+  </TabItem>
+</Tabs>
+
+Services running inside the sandbox remain reachable via their exposed public URLs, even though the sandbox itself cannot initiate connection requests to the internet.
+
+---
+
+## Fine-Grained Quotas vs. Blanket Blocking
+
+If you do not want to block all network traffic permanently, you can use the SDK's **Network Usage & Quotas** features to set limits on total bytes sent or received. 
+
+Using the limits API, you can:
+- Define maximum ingress/egress bytes at create time.
+- Retrieve live byte counters via `getNetworkUsage()`.
+- Dynamically update limits at runtime using `setNetworkLimits()`.
+
+For details on setting up quotas, see the [Network Usage & Quotas](/network-usage) guide.
+
+---
+
+## Limitations
+
+- **IPv4 Only**: Network isolation and byte limits are applied to IPv4 routes. If the sandbox has IPv6 routing enabled, those connections are not blocked.
+- **No Domain Allowlist/DNS-Only Mode**: Currently, setting `networkBlockAll: true` is a blanket egress block. There is no support for allowing only specific domains or allowing only DNS resolution.

@@ -314,7 +314,19 @@ Deleting a template removes the rootfs and snapshot artifacts. The daemon reject
 
 ## Cluster mode
 
-When the daemon is running in cluster mode with an OCI registry destination configured for templates, the build node ships the rootfs and snapshot artifacts to the registry; peer nodes lazily pull the artifacts the first time a sandbox lands on them. Placement is template-aware: the scheduler prefers nodes that already have a copy of the template's artifacts. See [Cluster Setup](/cluster-setup/) for the deployment knobs.
+When the daemon runs in cluster mode with AOCR (Aerol OCI Registry) configured, the build node ships the template's `rootfs.ext4` + paused-VM snapshot to AOCR as a single OCI artifact under `cluster/<id>/templates/<tid>:latest`, and peer nodes lazily pull + extract it the first time a sandbox lands on them. Placement is template-aware: the scheduler prefers nodes that already hold a copy of the template's artifacts. See [Cluster Setup](/cluster-setup/) for the deployment knobs.
+
+This reuses the same push pipeline as Docker [Snapshots](/snapshots#snapshot-distribution-in-cluster-mode) — one switch turns on both, and both push to the same AOCR host with the same cluster credential:
+
+| Env var | Purpose |
+|---|---|
+| `SB_SNAPSHOT_PUSH_ENABLED` | Gates the background push for **both** snapshots and templates. When `false` (default), templates stay local to the build node. |
+| `SB_ENABLE_FIRECRACKER` | Templates only exist on Firecracker nodes, so template push additionally requires this. |
+| `SB_MIRROR_PUSH_HOST` | AOCR push host (falls back to `SB_IMAGE_DISTRIBUTION_AOCR_HOST`). |
+| `SB_AUTO_IMPORT_CLUSTER_ID` | Cluster label that namespaces the artifact (`cluster/<id>/templates/...`) and scopes the credential. |
+| `SB_AUTO_IMPORT_CLUSTER_PAT_PATH` | File holding the cluster PAT presented as the registry credential for push **and** pull. Re-read per call, so rotation is just a file write. |
+
+The pull side is authenticated with the same cluster PAT and does **not** require `SB_SNAPSHOT_PUSH_ENABLED` — a consume-only node fetches template artifacts from AOCR as long as the cluster ID and PAT file are set. Each template row carries a `pushState` you can read back to watch the lifecycle, mirroring snapshots. Unlike snapshots, a template has no "register an existing image" shortcut: it always carries the locally-built rootfs + snapshot, so its only distribution states are `pushState` + `registryRef`.
 
 ## Optional rotation
 
