@@ -60,9 +60,13 @@ type ProviderFactory func(ctx context.Context, fc FleetConfig) (controlplane.Pro
 
 // Run loads configuration and executes the full daemon boot sequence, blocking
 // until ctx is cancelled (SIGINT/SIGTERM in the standard wrapper), then performs
-// graceful shutdown. Fatal boot failures call os.Exit(1) exactly as the
-// historical main() did; the returned error covers the pre-boot phases (config
-// load, provider construction) and is nil at graceful shutdown.
+// graceful shutdown. Every fatal boot failure is returned as a wrapped error
+// rather than calling os.Exit; the thin main() wrapper turns a non-nil return
+// into the exit(1) the historical main() did, so observable behavior is
+// unchanged (process dies on boot failure) while the boot-failure paths stay
+// testable. Returning also lets the deferred cleanup (store/mount/otel
+// shutdown) run on failure, which os.Exit skipped. The returned error covers
+// every boot phase; it is nil at graceful shutdown.
 //
 // makeProvider supplies the control-plane capabilities. nil (the open-source
 // default) means controlplane.Noop(): every non-PAT token rejected, every usage
@@ -137,21 +141,18 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {
-		logger.Error("failed to open store", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("open store: %w", err)
 	}
 	defer db.Close()
 
 	rules, err := netrules.New(cfg.EnableNetworkRules)
 	if err != nil {
-		logger.Error("failed to create netrules manager", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("create netrules manager: %w", err)
 	}
 
 	dockerClient, err := docker.New(logger, cfg, rules)
 	if err != nil {
-		logger.Error("failed to create docker client", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("create docker client: %w", err)
 	}
 	configureMirror(logger, cfg, dockerClient)
 
@@ -159,8 +160,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 
 	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
 	if err != nil {
-		logger.Error("failed to initialize credential cipher", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("initialize credential cipher: %w", err)
 	}
 
 	mountManager, err := mounts.New(logger, mounts.Config{
@@ -169,8 +169,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		WaitTimeout: cfg.MountWaitTimeout,
 	})
 	if err != nil {
-		logger.Error("failed to initialize mount manager", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("initialize mount manager: %w", err)
 	}
 	defer mountManager.Close()
 
@@ -290,8 +289,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			BaseCIDR: cfg.FirecrackerTapBaseCIDR,
 			PoolSize: cfg.FirecrackerTapPoolSize,
 		}, time.Now()); err != nil {
-			logger.Error("firecracker tap pool seed failed", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("firecracker tap pool seed: %w", err)
 		}
 		// OCI rootfs builder: depends on skopeo, umoci, mkfs.ext4 being
 		// installed and on $PATH. The validator already required these
@@ -305,8 +303,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			WorkDir:   filepath.Join(cfg.FirecrackerRunDir, "oci-work"),
 		})
 		if err != nil {
-			logger.Error("firecracker oci builder init failed", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("firecracker oci builder init: %w", err)
 		}
 		// Phase 5: start the per-VMM RSS sampler now that we know
 		// firecracker is on. Run is a blocking ticker loop, so it goes in
@@ -432,8 +429,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			clusterClient, err = cluster.NewAgent(cfg, logger, admitter)
 		}
 		if err != nil {
-			logger.Error("failed to start cluster mode", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("start cluster mode: %w", err)
 		}
 		defer func() {
 			if err := clusterClient.Close(); err != nil {
@@ -641,8 +637,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			ToolboxPort: cfg.ToolboxPort,
 		}, svc, dockerClient)
 		if err != nil {
-			logger.Error("failed to create ssh gateway", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("create ssh gateway: %w", err)
 		}
 		go func() {
 			if err := gw.Start(ctx); err != nil {

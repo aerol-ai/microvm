@@ -3,8 +3,10 @@ package daemon
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -46,6 +49,63 @@ func writeWrapKeyFile(t *testing.T) string {
 		t.Fatalf("write wrap key: %v", err)
 	}
 	return path
+}
+
+// TestRun_ConfigLoadFailureReturnsError: a missing SB_PAT_TOKEN makes
+// config.Load fail, and Run must surface that as a wrapped error rather than
+// exiting the process. This is the boot-failure path that os.Exit previously
+// made impossible to assert.
+func TestRun_ConfigLoadFailureReturnsError(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "") // config.Load rejects an empty PAT first.
+	err := Run(context.Background(), testLogger(), nil)
+	if err == nil {
+		t.Fatalf("Run with empty SB_PAT_TOKEN = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), "load config") {
+		t.Fatalf("Run error = %v, want it to wrap \"load config\"", err)
+	}
+}
+
+// TestRun_StoreOpenFailureReturnsError: with a loadable config but an
+// unopenable DB path (parent is a regular file, so store.Open's MkdirAll
+// fails), Run must return the wrapped error. This exercises the store.Open
+// boot-failure branch that previously called os.Exit(1).
+func TestRun_StoreOpenFailureReturnsError(t *testing.T) {
+	// A regular file standing where store.Open expects the DB's parent dir.
+	parentAsFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(parentAsFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed parent file: %v", err)
+	}
+	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_PUBLIC_HOST", "localhost") // required when SB_DOMAIN is empty
+	t.Setenv("SB_DB_PATH", filepath.Join(parentAsFile, "state.db"))
+
+	err := Run(context.Background(), testLogger(), nil)
+	if err == nil {
+		t.Fatalf("Run with unopenable DB path = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), "open store") {
+		t.Fatalf("Run error = %v, want it to wrap \"open store\"", err)
+	}
+}
+
+// TestRun_ProviderFactoryErrorReturnsError: a makeProvider that fails must
+// abort boot with a wrapped error before any infrastructure is opened.
+func TestRun_ProviderFactoryErrorReturnsError(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_PUBLIC_HOST", "localhost")
+	t.Setenv("SB_DB_PATH", filepath.Join(t.TempDir(), "state.db"))
+
+	boom := func(context.Context, FleetConfig) (controlplane.Provider, error) {
+		return controlplane.Provider{}, errors.New("provider boom")
+	}
+	err := Run(context.Background(), testLogger(), boom)
+	if err == nil {
+		t.Fatalf("Run with failing provider factory = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), "control plane provider") {
+		t.Fatalf("Run error = %v, want it to wrap \"control plane provider\"", err)
+	}
 }
 
 // TestConfigureMirror walks every branch: the disabled early-return, the
@@ -147,37 +207,32 @@ func TestReplayClusterOwnership_StoreError(t *testing.T) {
 
 // TestStartClusterOwnershipReplayRetry_StopsOnCtxCancel: the retry goroutine
 // must return when its context is cancelled rather than ticking forever.
+// t.Context() is cancelled at test cleanup, which is what unblocks the
+// goroutine's <-ctx.Done() case.
 func TestStartClusterOwnershipReplayRetry_StopsOnCtxCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
-	startClusterOwnershipReplayRetry(ctx, svc, testLogger())
-	cancel()
-	// Give the goroutine a moment to observe the cancellation. There's no
-	// observable signal, so this is a best-effort no-leak check; the test
-	// passing means the call didn't block or panic.
-	time.Sleep(20 * time.Millisecond)
+	startClusterOwnershipReplayRetry(t.Context(), svc, testLogger())
+	// No observable signal; the test passing means the call didn't block
+	// or panic, and cleanup-time ctx cancellation stops the goroutine.
 }
 
 // TestStartAutoImportReconciler_PATUnreadable: enabled but the PAT file is
 // missing — the feature logs and stays off without scheduling a goroutine.
 func TestStartAutoImportReconciler_PATUnreadable(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
-	startAutoImportReconciler(ctx, testLogger(), config.Config{
+	startAutoImportReconciler(t.Context(), testLogger(), config.Config{
 		AutoImportEnabled:        true,
 		AutoImportClusterPATPath: filepath.Join(t.TempDir(), "missing-pat"),
 	}, st, svc)
 }
 
 // TestStartAutoImportReconciler_Enabled: a readable PAT plus a valid config
-// builds the importer + reconciler and starts the ticker goroutine, which we
-// stop via ctx cancellation.
+// builds the importer + reconciler and starts the ticker goroutine. The
+// interval is shrunk so one empty sweep fires (Scanned == 0 → continue)
+// before t.Context() cancellation stops the loop at cleanup.
 func TestStartAutoImportReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 
@@ -186,45 +241,43 @@ func TestStartAutoImportReconciler_Enabled(t *testing.T) {
 		t.Fatalf("write pat: %v", err)
 	}
 
-	startAutoImportReconciler(ctx, testLogger(), config.Config{
+	startAutoImportReconciler(t.Context(), testLogger(), config.Config{
 		AutoImportEnabled:           true,
 		AutoImportClusterPATPath:    patPath,
 		AutoImportHooksBaseURL:      "https://hooks.example",
 		AutoImportClusterID:         "cluster-1",
-		AutoImportReconcileInterval: time.Hour,
+		AutoImportReconcileInterval: 5 * time.Millisecond,
 		AutoImportMaxInFlight:       2,
 	}, st, svc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestStartSnapshotPushReconciler_Enabled: a valid push config builds the
-// pusher + reconciler and schedules the sweep goroutine.
+// pusher + reconciler and drives one empty sweep through the goroutine.
 func TestStartSnapshotPushReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startSnapshotPushReconciler(ctx, testLogger(), config.Config{
+	startSnapshotPushReconciler(t.Context(), testLogger(), config.Config{
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "push.example",
 		AutoImportClusterID:           "cluster-1",
 		AutoImportClusterPATPath:      filepath.Join(t.TempDir(), "pat"),
-		SnapshotPushReconcileInterval: time.Hour,
+		SnapshotPushReconcileInterval: 5 * time.Millisecond,
 		SnapshotPushMaxInFlight:       1,
 	}, st, svc, dc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestStartSnapshotPushReconciler_HostFallback: with MirrorPushHost unset the
 // reconciler falls back to ImageDistributionAOCRHost.
 func TestStartSnapshotPushReconciler_HostFallback(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startSnapshotPushReconciler(ctx, testLogger(), config.Config{
+	startSnapshotPushReconciler(t.Context(), testLogger(), config.Config{
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "",
 		ImageDistributionAOCRHost:     "aocr.example",
@@ -239,16 +292,15 @@ func TestStartSnapshotPushReconciler_HostFallback(t *testing.T) {
 // rotation interval and a max-age builds the reconciler and starts its
 // ticker.
 func TestStartTemplateRotationReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 
-	startTemplateRotationReconciler(ctx, testLogger(), config.Config{
+	startTemplateRotationReconciler(t.Context(), testLogger(), config.Config{
 		EnableFirecracker:                   true,
-		FirecrackerTemplateRotationInterval: time.Hour,
+		FirecrackerTemplateRotationInterval: 5 * time.Millisecond,
 		FirecrackerTemplateMaxAge:           24 * time.Hour,
 	}, st, svc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestAttachTemplateArtifactPuller_Enabled: firecracker on with a templates
@@ -267,34 +319,31 @@ func TestAttachTemplateArtifactPuller_Enabled(t *testing.T) {
 // TestStartTemplateArtifactPushReconciler_Enabled: firecracker + snapshot
 // push on builds the template-artifact pusher and schedules its sweep.
 func TestStartTemplateArtifactPushReconciler_Enabled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startTemplateArtifactPushReconciler(ctx, testLogger(), config.Config{
+	startTemplateArtifactPushReconciler(t.Context(), testLogger(), config.Config{
 		EnableFirecracker:             true,
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "push.example",
 		AutoImportClusterID:           "cluster-1",
 		AutoImportClusterPATPath:      filepath.Join(t.TempDir(), "pat"),
 		FirecrackerTemplatesDir:       t.TempDir(),
-		SnapshotPushReconcileInterval: time.Hour,
+		SnapshotPushReconcileInterval: 5 * time.Millisecond,
 		SnapshotPushMaxInFlight:       1,
 	}, st, svc, dc)
+	time.Sleep(40 * time.Millisecond)
 }
 
 // TestStartTemplateArtifactPushReconciler_HostFallback: MirrorPushHost unset
 // falls back to ImageDistributionAOCRHost on the template push side too.
 func TestStartTemplateArtifactPushReconciler_HostFallback(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	st := openTestStore(t)
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
-	startTemplateArtifactPushReconciler(ctx, testLogger(), config.Config{
+	startTemplateArtifactPushReconciler(t.Context(), testLogger(), config.Config{
 		EnableFirecracker:             true,
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "",
