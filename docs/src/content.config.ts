@@ -23,7 +23,7 @@ export enum NavigationCategory {
   ACCESS,
   SDKS,
   FEATURES,
-  ARCHITECTURE,
+  ENGINEERING,
   OPERATIONS,
   USE_CASES,
 }
@@ -324,10 +324,34 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
   },
   {
     type: 'group',
-    label: 'Architecture',
-    category: NavigationCategory.ARCHITECTURE,
+    label: 'Engineering',
+    category: NavigationCategory.ENGINEERING,
     homePageHref: '/',
     entries: [
+      {
+        type: 'link',
+        href: '/engineering-idempotency',
+        label: 'Idempotency on a Single Writer',
+        description: 'Partial unique indexes + request_idempotency replay + a one-writer SQLite core. Making concurrent-duplicate races structurally unrepresentable.',
+      },
+      {
+        type: 'link',
+        href: '/engineering-placement-failover',
+        label: 'Placement & Failover',
+        description: 'Raft FSM with two-stage reservations, SWIM gossip + pulled capacity, power-of-two placement, owner-sharded forwarding, dead-owner orphan/reclaim, and the Noop single-node degradation.',
+      },
+      {
+        type: 'link',
+        href: '/engineering-trust-boundary',
+        label: 'Host-Mediated Trust Boundary',
+        description: 'AES-256-GCM sealed credentials whose key never leaves the package, mount tools that execute on the host, cross-tenant isolation via the kernel mount namespace, and host-enforced network chokepoints.',
+      },
+      {
+        type: 'link',
+        href: '/engineering-snapshot-correctness',
+        label: 'Snapshot Clone Correctness',
+        description: 'Five hazards when many sandboxes resume from one snapshot: vsock-safe control channel, post-resume RNG/clock reseed, template-CID handshake, mmap-time integrity verification, CoW-aware capacity accounting.',
+      },
       {
         type: 'link',
         href: '/firecracker-architecture',
