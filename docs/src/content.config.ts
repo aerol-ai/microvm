@@ -324,6 +324,20 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
   },
   {
     type: 'group',
+    label: 'Operations',
+    category: NavigationCategory.OPERATIONS,
+    homePageHref: '/',
+    entries: [
+      {
+        type: 'link',
+        href: '/dashboard',
+        label: 'Dashboard',
+        description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics - sign in with your PAT.',
+      },
+    ],
+  },
+  {
+    type: 'group',
     label: 'Engineering',
     category: NavigationCategory.ENGINEERING,
     homePageHref: '/',
@@ -354,6 +368,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
       {
         type: 'link',
+        href: '/engineering-frozen-kernel-problem',
+        label: 'The Frozen-Kernel Problem',
+        description: 'Two clones of one snapshot are the same machine — same RNG pool, same wall clock, same network identity. The paused-resume + vsock + post-resume reseed architecture that makes them unique before any guest code runs.',
+      },
+      {
+        type: 'link',
         href: '/firecracker-architecture',
         label: 'Firecracker Architecture',
         description: 'Components, the jailer-isolated microVM anatomy, and the Create boot path step by step.',
@@ -366,20 +386,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       },
     ],
   },
-  {
-    type: 'group',
-    label: 'Operations',
-    category: NavigationCategory.OPERATIONS,
-    homePageHref: '/',
-    entries: [
-      {
-        type: 'link',
-        href: '/dashboard',
-        label: 'Dashboard',
-        description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics - sign in with your PAT.',
-      },
-    ],
-  },
+  
 ]
 
 const getUseCasesSidebarConfig = (): NavigationGroup[] => [
