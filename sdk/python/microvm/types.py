@@ -295,6 +295,11 @@ class DNSRecord(TypedDict, total=False):
     Mirrors ``pkg/models.DNSRecord`` on the server. ``notes`` is optional and
     only set when the server has additional human-readable guidance to attach
     (TTL recommendations, CNAME vs A choice rationale, etc.).
+
+    ``type`` is one of ``CNAME``, ``A``, ``AAAA``, ``ANAME``, or ``ALIAS``. The
+    last two appear only for an apex domain on a hostname ingress, as
+    mutually-exclusive flattening alternatives to ``CNAME`` — add the one your
+    DNS provider supports (see ``notes``).
     """
 
     hostname: str

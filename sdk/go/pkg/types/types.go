@@ -132,11 +132,15 @@ const (
 // the target. Notes carries provider-specific gotchas the daemon pre-renders.
 type DNSRecord = models.DNSRecord
 
-// DNS record types emitted in CustomDomainDNSRecords.
+// DNS record types emitted in CustomDomainDNSRecords. ANAME and ALIAS are
+// apex-flattening alternatives to CNAME, emitted only for an apex domain on a
+// hostname ingress; add the one your provider supports (see DNSRecord.Notes).
 const (
 	DNSRecordTypeCNAME = models.DNSRecordTypeCNAME
 	DNSRecordTypeA     = models.DNSRecordTypeA
 	DNSRecordTypeAAAA  = models.DNSRecordTypeAAAA
+	DNSRecordTypeANAME = models.DNSRecordTypeANAME
+	DNSRecordTypeALIAS = models.DNSRecordTypeALIAS
 )
 
 // CustomDomainDNSRecords is the response body for the per-sandbox

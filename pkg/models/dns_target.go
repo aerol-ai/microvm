@@ -51,12 +51,20 @@ type DNSRecord struct {
 	Notes    string `json:"notes,omitempty"`
 }
 
-// DNS record types we emit. Limited to the three that on-demand ACME +
-// HTTP-01 actually require — TXT / SRV / etc. are not in scope.
+// DNS record types we emit. CNAME / A / AAAA are the routing records
+// on-demand ACME + HTTP-01 require; TXT (composed inline) proves ownership.
+// ANAME / ALIAS are apex-flattening alternatives to CNAME: a bare CNAME is
+// illegal at a zone root (RFC 1034 §3.6.2), so providers expose flattening
+// under different record types (Cloudflare: CNAME, dnsmadeeasy/EasyDNS:
+// ANAME, Route 53/DNSimple: ALIAS). For an apex on a hostname ingress we emit
+// all three as mutually-exclusive candidates — the caller adds the one their
+// provider supports.
 const (
 	DNSRecordTypeCNAME = "CNAME"
 	DNSRecordTypeA     = "A"
 	DNSRecordTypeAAAA  = "AAAA"
+	DNSRecordTypeANAME = "ANAME"
+	DNSRecordTypeALIAS = "ALIAS"
 )
 
 // CustomDomainDNSRecords is the response body for

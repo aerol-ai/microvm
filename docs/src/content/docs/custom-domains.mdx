@@ -14,7 +14,7 @@ Before a custom domain can go `ready`, three things must be true:
 
 1. **DNS points at the cluster ingress.** Issuance uses ACME HTTP-01, so Let's
    Encrypt must reach the hostname on port 80/443 at your ingress. Until DNS
-   resolves, the domain stays `pending_dns`. See the [record shapes](#dns-records) below.
+   resolves, the domain stays `pending_dns`. See [DNS records](#dns-records).
 2. **An ownership TXT record is published.** Without it, `attach` returns `403`.
    See [ownership verification](#ownership-verification).
 3. **The sandbox exposes HTTP/HTTPS only on a given PORT).** Custom domains bind to the sandbox
@@ -76,10 +76,130 @@ to built-in flattening.
   </TabItem>
 </Tabs>
 
-The SDK can also hand back ready-to-paste DNS rows for the cluster you're
-connected to - `dns.target()` (cluster-wide ingress target, for "point your DNS
-here first") and `sandbox.customDomains.dns()` (per-domain routing + TXT rows).
-Use them instead of re-deriving the tables above.
+## DNS records
+
+`sandbox.customDomains.dns()` returns, for each attached hostname, the routing
+record (`CNAME` / `A` / `AAAA`) and the ownership `TXT` record. Each record has
+`hostname`, `type`, `name`, `value`, and an optional `notes`. An **apex** domain
+on a hostname ingress instead returns three mutually-exclusive routing rows —
+`CNAME`, `ANAME`, and `ALIAS` — since a bare `CNAME` is invalid at a zone root
+and providers expose flattening under different types.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const dns = await sandbox.customDomains.dns();
+
+    // dns.target  → { hostname: "ingress.example.com", source: "hostname" }
+    // dns.records → [
+    //   { hostname: "api.acme.com", type: "CNAME", name: "api",
+    //     value: "ingress.example.com",
+    //     notes: "Cloudflare/CDN: set the record to DNS only (gray cloud). …" },
+    //   { hostname: "api.acme.com", type: "TXT", name: "_aerol-verify.api",
+    //     value: "aerol-verify=api.acme.com",
+    //     notes: "Required for domain ownership verification." },
+    // ]
+
+    for (const r of dns.records) {
+      console.log(`${r.type}\t${r.name}\t→ ${r.value}`);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    dns = sandbox.custom_domain_dns()
+
+    # dns["target"]  -> {"hostname": "ingress.example.com", "source": "hostname"}
+    # dns["records"] -> [
+    #   {"hostname": "api.acme.com", "type": "CNAME", "name": "api",
+    #    "value": "ingress.example.com",
+    #    "notes": "Cloudflare/CDN: set the record to DNS only (gray cloud). …"},
+    #   {"hostname": "api.acme.com", "type": "TXT", "name": "_aerol-verify.api",
+    #    "value": "aerol-verify=api.acme.com",
+    #    "notes": "Required for domain ownership verification."},
+    # ]
+
+    for r in dns["records"]:
+        print(r["type"], r["name"], "->", r["value"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    dns, err := sandbox.CustomDomainDNS(ctx)
+    if err != nil { log.Fatal(err) }
+
+    // dns.Target  = {Hostname: "ingress.example.com", Source: "hostname"}
+    // dns.Records = [
+    //   {Hostname: "api.acme.com", Type: "CNAME", Name: "api",
+    //    Value: "ingress.example.com", Notes: "Cloudflare/CDN: … (gray cloud). …"},
+    //   {Hostname: "api.acme.com", Type: "TXT", Name: "_aerol-verify.api",
+    //    Value: "aerol-verify=api.acme.com", Notes: "Required for domain ownership verification."},
+    // ]
+
+    for _, r := range dns.Records {
+        fmt.Printf("%s\t%s\t→ %s\n", r.Type, r.Name, r.Value)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let dns = sandbox.custom_domain_dns()?;
+
+    // dns.target  = IngressTarget { hostname: Some("ingress.example.com"), source: "hostname", .. }
+    // dns.records = [
+    //   DnsRecord { hostname: "api.acme.com", record_type: "CNAME", name: "api",
+    //     value: "ingress.example.com", notes: Some("Cloudflare/CDN: … (gray cloud). …") },
+    //   DnsRecord { hostname: "api.acme.com", record_type: "TXT", name: "_aerol-verify.api",
+    //     value: "aerol-verify=api.acme.com", notes: Some("Required for domain ownership verification.") },
+    // ]
+
+    // NB: the JSON `type` field is exposed as `record_type` in Rust.
+    for r in &dns.records {
+        println!("{}\t{}\t→ {}", r.record_type, r.name, r.value);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CustomDomainDnsRecords dns = sandbox.customDomainDns();
+
+    // dns.target  = IngressTarget{hostname="ingress.example.com", source="hostname"}
+    // dns.records = [
+    //   DnsRecord{hostname="api.acme.com", type="CNAME", name="api",
+    //     value="ingress.example.com", notes="Cloudflare/CDN: … (gray cloud). …"},
+    //   DnsRecord{hostname="api.acme.com", type="TXT", name="_aerol-verify.api",
+    //     value="aerol-verify=api.acme.com", notes="Required for domain ownership verification."},
+    // ]
+
+    for (DnsRecord r : dns.records) {
+        System.out.println(r.type + "\t" + r.name + "\t→ " + r.value);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+For the example above (a subdomain against a hostname ingress), the routing row
+to add at your DNS provider is:
+
+| Type | Name | Value |
+|---|---|---|
+| `CNAME` | `api` | `ingress.example.com` |
+
+The type depends on `target`. A hostname against a raw-IP ingress returns one
+`A` / `AAAA` per IP instead of a `CNAME`. The same response also carries the
+ownership `TXT` record from [Ownership verification](#ownership-verification). In
+Cloudflare, set the `CNAME` to **DNS only (gray cloud)** — a proxied record
+terminates TLS at the CDN and blocks ACME issuance.
+
+For an **apex** domain (e.g. `acme.com`) on a hostname ingress, the response
+returns three rows at `@` with the same value. Add **only the one** your
+provider supports:
+
+| Type | Name | Value | Provider |
+|---|---|---|---|
+| `CNAME` | `@` | `ingress.example.com` | Cloudflare (CNAME flattening) |
+| `ANAME` | `@` | `ingress.example.com` | dnsmadeeasy, EasyDNS |
+| `ALIAS` | `@` | `ingress.example.com` | Route 53, DNSimple |
 
 ## Status lifecycle
 

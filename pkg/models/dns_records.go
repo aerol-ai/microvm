@@ -16,6 +16,12 @@ import (
 // so we phrase the note generically and call Cloudflare out explicitly.
 const cloudflareNote = "Cloudflare/CDN: set the record to DNS only (gray cloud). A proxied record terminates TLS at the CDN and blocks on-demand ACME issuance."
 
+// apexFlatteningNote is attached to every apex routing candidate. A bare CNAME
+// is illegal at a zone root (RFC 1034 §3.6.2); providers expose flattening
+// under different record types, so we emit CNAME/ANAME/ALIAS together and tell
+// the caller to add exactly one — the type their provider accepts.
+const apexFlatteningNote = "Apex domain: add only ONE of these, whichever your DNS provider supports — CNAME (Cloudflare flattening), ANAME (dnsmadeeasy/EasyDNS), or ALIAS (Route 53/DNSimple)."
+
 // ComposeDNSRecords expands every hostname against an IngressTarget into
 // the set of DNS records the user must create at their provider. Shape
 // rules:
@@ -26,8 +32,11 @@ const cloudflareNote = "Cloudflare/CDN: set the record to DNS only (gray cloud).
 //     per IP. Apex prefers IPs over CNAME because CNAME-at-apex requires
 //     provider-specific flattening (Cloudflare, Route 53 alias, DNSimple
 //     ALIAS, etc.) and many providers reject it.
-//   - Apex hostnames with only target.Hostname (no IPs) → one CNAME with a
-//     note that the provider must support apex CNAME flattening.
+//   - Apex hostnames with only target.Hostname (no IPs) → three mutually-
+//     exclusive flattening candidates (CNAME, ANAME, ALIAS), all at "@" with
+//     the same value. A bare CNAME is illegal at a zone root, and providers
+//     name their flattening record differently, so we emit all three and the
+//     note tells the caller to add the one their provider supports.
 //   - Subdomains with only target.IPs → one A/AAAA per IP.
 //   - target empty / Source=unknown → returns nil. Callers render an
 //     operator-must-configure-ingress error rather than fake records.
@@ -59,7 +68,36 @@ func ComposeDNSRecords(hostnames []string, target IngressTarget, txtNamePrefix, 
 		name := dnsRecordName(host)
 		isApex := name == "@"
 		useCNAME := target.Hostname != "" && (!isApex || len(target.IPs) == 0)
-		if useCNAME {
+		if useCNAME && isApex {
+			// Apex on a hostname ingress: a bare CNAME is illegal at the zone
+			// root, so emit the three flattening candidates and let the caller
+			// pick the one their provider supports. Fixed order keeps the
+			// output deterministic. The CNAME row also carries the Cloudflare
+			// gray-cloud warning since Cloudflare users add exactly that row.
+			out = append(out,
+				DNSRecord{
+					Hostname: host,
+					Type:     DNSRecordTypeCNAME,
+					Name:     name,
+					Value:    target.Hostname,
+					Notes:    cloudflareNote + " " + apexFlatteningNote,
+				},
+				DNSRecord{
+					Hostname: host,
+					Type:     DNSRecordTypeANAME,
+					Name:     name,
+					Value:    target.Hostname,
+					Notes:    apexFlatteningNote,
+				},
+				DNSRecord{
+					Hostname: host,
+					Type:     DNSRecordTypeALIAS,
+					Name:     name,
+					Value:    target.Hostname,
+					Notes:    apexFlatteningNote,
+				},
+			)
+		} else if useCNAME {
 			out = append(out, DNSRecord{
 				Hostname: host,
 				Type:     DNSRecordTypeCNAME,
