@@ -116,8 +116,9 @@ A few invariants worth naming up front:
   would otherwise resume with identical RNG state (two clones drawing the same
   `getrandom` bytes is a real correctness issue, not cosmetic: TLS session
   tickets, JWT nonces, session-id generation all depend on it). The `post_resume`
-  signal below is wired to reseed the kernel RNG before any in-guest service
-  runs, though the payload field that drives it is still a TODO.
+  signal below tells the in-guest agent to reseed the kernel RNG from
+  virtio-rng and set `CLOCK_REALTIME` from the host before any service runs;
+  cold boots skip this because the kernel just initialized.
 - **MMDS.** Firecracker's MicroVM Metadata Service exists. AerolVM does not use
   it. Per-sandbox config is delivered over vsock by `post_resume`; MMDS would
   add an HTTP-over-link-local dependency that does not survive `LoadSnapshot`
@@ -193,9 +194,10 @@ Details that bite if you skip them:
 - **Snapshot clones resume with stale entropy and clock.** Two clones of the
   same snapshot would otherwise draw identical `getrandom` bytes and a time
   that jumped backwards. After resume the driver sends a best-effort
-  `post_resume` signal so the in-guest agent can set the clock from the host.
-  RNG reseed is wired on the agent side but not yet driven from the post-resume
-  payload (`pkg/firecracker/snapshot.go:277`); cold boots skip this entirely
+  `post_resume` signal so the in-guest agent sets the clock from the host
+  (`wallclock_unix_ns`) and unconditionally reseeds the kernel RNG from
+  virtio-rng via `RNDADDENTROPY` (`cmd/toolboxd/vsock.go:247`,
+  `cmd/toolboxd/quiesce_linux.go:41`). Cold boots skip this entirely
   because their kernel just initialized.
 - **The vsock CID differs by path.** On the snapshot/warm path the guest listens
   on the template's CID (baked into the snapshot at build time), not the
@@ -347,14 +349,14 @@ benchmark; the cost it avoids is real, but the headline number depends on host
 class, kernel size, and warm-pool depth.
 [Snapshot restore and the warm-VMM pool](/firecracker-hydration) covers how the
 rootfs, kernel snapshot, and live VMM are pre-warmed, restored, and shared
-across a host - and what AerolVM still doesn't do today (UFFD, huge pages, RNG
-reseed driven from `post_resume`).
+across a host, and what AerolVM still doesn't do today (UFFD, huge pages,
+diff-snapshot API).
 
 ## Further reading
 
 The primary sources behind the design on these two pages:
 
-- [Firecracker: Lightweight Virtualization for Serverless Applications](https://www.usenix.org/conference/nsdi20/presentation/agache) (USENIX NSDI 2020) - the foundational paper on microVMs for serverless and agent workloads.
+- [Firecracker: Lightweight Virtualization for Serverless Applications](https://www.usenix.org/conference/nsdi20/presentation/agache) (USENIX NSDI 2020): the foundational paper on the VMM design AerolVM builds on.
 - [Firecracker snapshotting](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md) - the upstream spec for `LoadSnapshot`, diff snapshots, the dirty bitmap, and the `File` vs `Uffd` memory backends behind the [copy-on-write model](/firecracker-hydration#memory-copy-on-write-clones).
 - [Firecracker jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md) - chroot + cgroups + privilege drop; the source for the microVM anatomy above.
 - [Firecracker network setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md) - TAP-device guest networking, the basis for the TAP slot pool.

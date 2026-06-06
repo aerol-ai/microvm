@@ -145,13 +145,15 @@ sequenceDiagram
 ```
 
 Both end identically. A `vsock` handshake confirms the agent is alive, and a
-best-effort `post_resume` message resyncs the guest wall clock. The payload is
-only `{ "wallclock_unix_ns": ... }` today
+best-effort `post_resume` message resyncs the guest. The payload is only
+`{ "wallclock_unix_ns": ... }` today
 (`internal/runtime/firecracker/warmacquire.go:230-232`,
-`sandbox_snapshot.go:422-424`); RNG re-seeding is a TODO at
-`internal/runtime/firecracker/snapshot.go:277` and is **not shipping**. See
-[Limitations](#limitations-and-gaps) for what that means for clones that share
-an entropy pool, and for `CLOCK_MONOTONIC`.
+`sandbox_snapshot.go:422-424`), but the in-guest handler does two things on
+every invocation: it sets `CLOCK_REALTIME` from the payload and unconditionally
+reseeds the kernel RNG from virtio-rng via `RNDADDENTROPY`
+(`cmd/toolboxd/vsock.go:233-249`, `cmd/toolboxd/quiesce_linux.go:41`). See
+[Limitations](#limitations-and-gaps) for the entropy window before that ack
+lands, and for `CLOCK_MONOTONIC`.
 
 ## The warm slot lifecycle
 
@@ -268,9 +270,9 @@ infrastructure is on; a user-facing diff-snapshot API is not shipping yet
 
 A clone's *reserved* `memoryMB` overstates its real footprint once pages are
 shared. AerolVM's per-VM RSS sampler walks `/proc/<pid>/statm`
-(`internal/runtime/firecracker/rss_sampler.go`) and the
-[capacity admitter](https://github.com/) consumes that signal so admission
-decisions reflect actual physical pages, not reserved size.
+(`internal/runtime/firecracker/rss_sampler.go`) and the capacity admitter
+(`pkg/capacity/capacity.go`) consumes that signal so admission decisions
+reflect actual physical pages, not reserved size.
 
 ## Operational knobs
 
@@ -397,13 +399,16 @@ A short list of things this page deliberately does not over-claim.
 - **Per-template warm-pool depth.** Only the global default
   (`SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT`) is wired today. The per-template
   override referenced in `config.go:548-553` is a planned follow-up.
-- **RNG re-seed on resume is not shipping.** The `post_resume` payload carries
-  only `wallclock_unix_ns`. Every clone of a template resumes with the same
-  entropy-pool state captured in the snapshot. Any in-guest CSPRNG that pins
-  state at process start (TLS handshake nonces, session keys, IDs derived
-  without re-reading `/dev/urandom`) **will** repeat values across clones of
-  the same template until reseed lands. The TODO is at
-  `internal/runtime/firecracker/snapshot.go:277`.
+- **There is an entropy window before `post_resume` lands.** Reseed itself
+  ships (`cmd/toolboxd/vsock.go:247` calls `ReseedRandom` on every
+  `post_resume`), but the window between `Action(Resume)` and the agent's ack
+  is hundreds of milliseconds on a slow host. Anything that runs in that window
+  (init scripts, systemd units, the agent's own startup) draws from the
+  template's captured entropy pool. Any in-guest CSPRNG that pins state at
+  process start (TLS handshake nonces, session keys, IDs derived without
+  re-reading `/dev/urandom`) before the ack **will** repeat values across
+  clones of the same template. Templates AerolVM ships defer key generation
+  until after the agent signals quiesce-complete.
 - **`CLOCK_MONOTONIC` is not reset.** `post_resume` only nudges
   `CLOCK_REALTIME`. Workloads that pin monotonic deadlines across the snapshot
   boundary will see a long forward jump in elapsed time. This is a known
