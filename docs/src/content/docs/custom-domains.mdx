@@ -4,146 +4,49 @@ title: Custom Domains
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Attach an arbitrary public hostname (`api.acme.com`, `acme.com`) to a sandbox so traffic to that host reaches the sandbox's root service over HTTPS. 
+Attach a public hostname (`api.acme.com`, `acme.com`) to a sandbox so traffic to
+that host reaches the sandbox over HTTPS. TLS is issued automatically via ACME
+HTTP-01.
 
 ## Prerequisites
 
-1. **DNS must point at the cluster's ingress** when the first HTTPS request arrives. AerolVM does not host DNS, and issuance uses ACME HTTP-01 - Let's Encrypt's validator must be able to reach the hostname over port 80/443 at the cluster. If DNS isn't pointing yet, the domain stays in `pending_dns` until you fix it.
-2. **HTTP / HTTPS only.** Custom domains attach to the sandbox root (the toolbox-proxied URL). Raw `tcp://` and `tls://` port exposures are out of scope - they reject with `409 Conflict` if a custom domain is configured.
+Before a custom domain can go `ready`, three things must be true:
 
-### DNS records to add
+1. **DNS points at the cluster ingress.** Issuance uses ACME HTTP-01, so Let's
+   Encrypt must reach the hostname on port 80/443 at your ingress. Until DNS
+   resolves, the domain stays `pending_dns`. See the [record shapes](#dns-records) below.
+2. **An ownership TXT record is published.** Without it, `attach` returns `403`.
+   See [ownership verification](#ownership-verification).
+3. **The sandbox exposes HTTP/HTTPS only on a given PORT).** Custom domains bind to the sandbox
+   root (or a target port). A sandbox with a raw `tcp://` / `tls://` exposure
+   rejects custom domains with `409` - the two can't coexist.
 
-The "target" below is whatever your default sandbox URLs already resolve to - `SB_INGRESS_ADVERTISE_HOST` in cluster mode (see [Cluster Ingress](/cluster-ingress/)) or `SB_PUBLIC_HOST` for single-node. The record type you create depends on the shape of the custom hostname and how your ingress is published.
 
-| Custom hostname | Ingress target is a hostname (e.g. `ingress.example.com`) | Ingress target is raw IPs |
+### Ownership verification
+
+Publish a TXT record proving you control the zone. It is keyed to the
+**hostname** (not the sandbox), so provision it once and reuse it across
+recreates.
+
+| Custom hostname | TXT name | TXT value |
 |---|---|---|
-| Subdomain (`api.acme.com`) | `CNAME api → ingress.example.com` | `A` (and `AAAA` if IPv6) on `api`, one record per ingress IP |
-| Apex (`acme.com`) | `CNAME @ → ingress.example.com` *(requires apex-CNAME support: Cloudflare CNAME flattening, Route 53 alias, DNSimple `ALIAS`, dnsmadeeasy `ANAME`, etc.)* | `A` (and `AAAA` if IPv6) on `@`, one record per ingress IP |
+| Subdomain (`api.acme.com`) | `_aerol-verify.api` | `aerol-verify=api.acme.com` |
+| Apex (`acme.com`) | `_aerol-verify` | `aerol-verify=acme.com` |
 
-If your DNS provider does not support a flattened apex CNAME and you only have an ingress hostname (not IPs), the workaround is per-host DNS-01 issuance - tracked for v2 in `plans/custom-domains-dns01.md`.
+Some provider UIs want the FQDN (`_aerol-verify.api.acme.com`) instead of the
+zone-relative name; the value is unchanged. 
 
-### Ownership verification (TXT record)
+Verify with `dig TXT _aerol-verify.<host>` before attaching. 
 
-In addition to the CNAME / A / AAAA above, you must publish a TXT record proving you control the zone. Without it, every `attach` call returns `403 Forbidden` with `custom domain TXT record verification failed`.
 
-The value is keyed to the **hostname**, not to a sandbox ID - one record per hostname, provisioned once, reusable across sandbox recreates and for any sandbox that wants to claim it. Cross-sandbox hijack of an already-attached hostname is still blocked by the cluster-wide uniqueness gate at attach time.
-
-| Custom hostname | TXT record name | TXT record value |
-|---|---|---|
-| Subdomain (`api.acme.com`) | `_aerol-verify.api` (zone `acme.com`) | `aerol-verify=api.acme.com` |
-| Apex (`acme.com`) | `_aerol-verify` (at zone root) | `aerol-verify=acme.com` |
-
-Most DNS provider UIs expect the Name relative to the managed zone (the left columns above); some expect the FQDN - in that case use `_aerol-verify.api.acme.com` or `_aerol-verify.acme.com` and the value is unchanged.
-
-Publish the TXT, wait for it to propagate (`dig TXT _aerol-verify.<your-host>`), then call `attach`. If you operate the cluster with non-default verification prefixes (`SB_CUSTOM_DOMAIN_VERIFY_PREFIX`, `SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX`), substitute those - `customDomains.dns()` always returns the correct row for the cluster you're talking to.
-
-### Cloudflare specifics
-
-1. **Set the record to DNS-only (gray cloud), not Proxied (orange cloud).** With the proxy on, Cloudflare terminates TLS with its own certificate and the cluster never sees the SNI - Caddy's `ask` handler is never invoked, ACME never runs, and the domain stays `pending_dns` forever. The same applies to any CDN or reverse proxy that intercepts TLS in front of the ingress.
-2. **Apex works as a plain `CNAME` in Cloudflare** thanks to built-in CNAME flattening - there is no separate `ALIAS` / `ANAME` record type to pick. Create the row with `Type = CNAME`, `Name = @`, `Target = <ingress hostname>`, and Cloudflare resolves it to A/AAAA at query time.
-
-## Attach at create time
-
-Pass `customDomains` on the create call. Up to 5 hostnames per request; the server validates each one and rejects the entire create with `400` if any is malformed or already taken.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sb = await microvm.sandboxes.create({
-      image: "node:20",
-      customDomains: ["api.acme.com", "acme.com"],
-    });
-    for (const d of sb.customDomains ?? []) {
-      console.log(d.hostname, d.status); // "api.acme.com" "pending_dns"
-    }
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sb = microvm.create(CreateOptions(
-        image="node:20",
-        customDomains=["api.acme.com", "acme.com"],
-    ))
-    for d in sb.get("customDomains", []):
-        print(d["hostname"], d["status"])
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sb, err := client.CreateSandbox(ctx, &microvm.CreateOptions{
-        Image:         "node:20",
-        CustomDomains: []string{"api.acme.com", "acme.com"},
-    })
-    if err != nil { log.Fatal(err) }
-    for _, d := range sb.CustomDomains {
-        fmt.Println(d.Hostname, d.Status)
-    }
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sb = client.create_sandbox(CreateOptions {
-        image: Some("node:20".into()),
-        custom_domains: Some(vec!["api.acme.com".into(), "acme.com".into()]),
-        ..Default::default()
-    })?;
-    for d in sb.custom_domains.unwrap_or_default() {
-        println!("{} {:?}", d.hostname, d.status);
-    }
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sb = client.create(new CreateOptions()
-        .setImage("node:20")
-        .setCustomDomains(List.of("api.acme.com", "acme.com")));
-    for (CustomDomain d : sb.customDomains) {
-        System.out.println(d.hostname + " " + d.status);
-    }
-    ```
-  </TabItem>
-</Tabs>
+:::caution[Cloudflare and other TLS-terminating proxies]
+Set the record to **DNS-only (gray cloud)**, not Proxied. A proxy that
+terminates TLS hides the SNI from the cluster, so ACME never runs and the domain
+stays `pending_dns` forever. Apex works as a plain `CNAME` in Cloudflare thanks
+to built-in flattening.
+:::
 
 ## Attach to a running sandbox
-
-The add call returns the post-attach list with the new row's `status` so callers don't need a follow-up `list`.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const domains = await sandbox.customDomains.add("staging.acme.com");
-    console.log(domains.map(d => d.hostname));
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    domains = sandbox.add_custom_domain("staging.acme.com")
-    print([d["hostname"] for d in domains])
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    domains, err := sandbox.AddCustomDomain(ctx, "staging.acme.com")
-    if err != nil { log.Fatal(err) }
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let domains = sandbox.add_custom_domain("staging.acme.com", None)?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    List<CustomDomain> domains = sandbox.addCustomDomain("staging.acme.com");
-    ```
-  </TabItem>
-</Tabs>
-
-### Target port
-
-By default traffic to a custom domain dials the sandbox's toolbox port - the same root URL `https://{id}.{cluster-domain}` serves. Pass a `port` to route the hostname at a specific application port inside the container instead (e.g. an app listening on `3333`). This is the same routing the default `sb-{id}-{port}.{cluster-domain}` URLs use, but bound to your custom hostname.
-
-`port` is fixed at attach time. To change it, detach and re-add - re-adding the same hostname with a different `port` returns `409 Conflict` rather than silently redirecting live traffic.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -163,10 +66,7 @@ By default traffic to a custom domain dials the sandbox's toolbox port - the sam
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.add_custom_domain(
-        "api.acme.com",
-        Some(AddCustomDomainOptions::with_port(3333)),
-    )?;
+    sandbox.add_custom_domain("api.acme.com", Some(AddCustomDomainOptions::with_port(3333)))?;
     ```
   </TabItem>
   <TabItem label="Java">
@@ -176,186 +76,73 @@ By default traffic to a custom domain dials the sandbox's toolbox port - the sam
   </TabItem>
 </Tabs>
 
-Create-time `customDomains` always uses the toolbox-port default; to bind a custom port, attach after create.
+The SDK can also hand back ready-to-paste DNS rows for the cluster you're
+connected to - `dns.target()` (cluster-wide ingress target, for "point your DNS
+here first") and `sandbox.customDomains.dns()` (per-domain routing + TXT rows).
+Use them instead of re-deriving the tables above.
 
-## Discover DNS records from the SDK
+## Status lifecycle
 
-The static table in [DNS records to add](#dns-records-to-add) describes the
-shape of the records. The SDK can also return them already filled in for the
-cluster you're connected to, so a product built on top of AerolVM can advertise
-"add this exact row" without re-implementing the apex-vs-subdomain /
-CNAME-vs-A logic.
+Each hostname carries a `status`. Poll `list` (or re-read the sandbox) to observe
+transitions - there is no push notification.
 
-Two entry points:
-
-- `dns.target()` - cluster-wide. Returns the ingress target (hostname or
-  IP set) that custom-domain DNS must point at. Useful **before** attaching a
-  domain, when rendering "point your DNS here first" instructions. `source`
-  is `"hostname"`, `"ips"`, `"mixed"`, or `"unknown"` - branch on it instead
-  of guessing from which field is populated.
-- `customDomains.dns()` - per-sandbox. Returns the ready-to-paste DNS rows
-  for each attached domain - the routing record (CNAME / A / AAAA) **and**
-  the ownership-verification TXT - plus the same `target` embedded, so
-  callers don't need a follow-up `dns.target()` round trip.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const target = await microvm.dns.target();
-    // { hostname: "ingress.example.com", source: "hostname" }
-
-    const dns = await sandbox.customDomains.dns();
-    for (const r of dns.records) {
-      console.log(`${r.type} ${r.name} → ${r.value}`); // "CNAME api → ingress.example.com"
-      if (r.notes) console.log("  note:", r.notes);
-    }
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    target = microvm.dns_target()
-    # {"hostname": "ingress.example.com", "source": "hostname"}
-
-    dns = sandbox.custom_domain_dns()
-    for r in dns["records"]:
-        print(f"{r['type']} {r['name']} → {r['value']}")
-        if r.get("notes"):
-            print("  note:", r["notes"])
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    target, err := client.DNSTarget(ctx)
-    if err != nil { log.Fatal(err) }
-    // target.Hostname == "ingress.example.com", target.Source == "hostname"
-
-    dns, err := sandbox.CustomDomainDNS(ctx)
-    if err != nil { log.Fatal(err) }
-    for _, r := range dns.Records {
-        fmt.Printf("%s %s → %s\n", r.Type, r.Name, r.Value)
-        if r.Notes != "" {
-            fmt.Println("  note:", r.Notes)
-        }
-    }
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let target = client.dns_target()?;
-    // target.hostname == Some("ingress.example.com"), target.source == "hostname"
-
-    let dns = sandbox.custom_domain_dns()?;
-    for r in dns.records {
-        println!("{} {} → {}", r.record_type, r.name, r.value);
-        if let Some(note) = r.notes {
-            println!("  note: {}", note);
-        }
-    }
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    IngressTarget target = client.dnsTarget();
-    // target.hostname == "ingress.example.com", target.source == "hostname"
-
-    CustomDomainDnsRecords dns = sandbox.customDomainDns();
-    for (DnsRecord r : dns.records) {
-        System.out.println(r.type + " " + r.name + " → " + r.value);
-        if (r.notes != null) {
-            System.out.println("  note: " + r.notes);
-        }
-    }
-    ```
-  </TabItem>
-</Tabs>
-
-When the cluster has no ingress address gossiped yet (boot, mis-configured
-deployment), `source` is `"unknown"` and `records` is empty - treat the
-target as unusable rather than guessing.
-
-## Detach
-
-Detach removes the Caddy route and deletes the row. The issued certificate stays in Caddy's storage and ages out on renewal. Returns `404` if the hostname is not attached to this sandbox.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    await sandbox.customDomains.remove("acme.com");
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox.remove_custom_domain("acme.com")
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    err := sandbox.RemoveCustomDomain(ctx, "acme.com")
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    sandbox.remove_custom_domain("acme.com")?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    sandbox.removeCustomDomain("acme.com");
-    ```
-  </TabItem>
-</Tabs>
-
-## List
+| Status | Meaning |
+|---|---|
+| `pending_dns` | Row exists, no TLS handshake seen yet. DNS not pointed, or no client has connected. |
+| `issuing` | First HTTPS hit arrived; ACME HTTP-01 challenge in progress. |
+| `ready` | Certificate issued and serving traffic. |
+| `failed` | ACME gave up. `lastError` has the reason (usually wrong DNS or LE rate-limit). Detach + reattach to retry. |
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const domains = await sandbox.customDomains.list();
+    await sandbox.customDomains.remove("acme.com");
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     domains = sandbox.list_custom_domains()
+    sandbox.remove_custom_domain("acme.com")
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    domains, err := sandbox.ListCustomDomains(ctx)
+    domains, _ := sandbox.ListCustomDomains(ctx)
+    err := sandbox.RemoveCustomDomain(ctx, "acme.com")
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let domains = sandbox.list_custom_domains()?;
+    sandbox.remove_custom_domain("acme.com")?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     List<CustomDomain> domains = sandbox.listCustomDomains();
+    sandbox.removeCustomDomain("acme.com");
     ```
   </TabItem>
 </Tabs>
 
-## Status lifecycle
-
-Each attached hostname carries a `status` that reflects where Caddy is in the per-host ACME flow. Poll `list` (or re-read the sandbox) to observe transitions - there is no push notification.
-
-| Status | Meaning |
-|---|---|
-| `pending_dns` | Row exists, no TLS handshake seen for this host yet. Either DNS isn't pointed yet, or no client has connected. |
-| `issuing` | Caddy has started the ACME flow (first HTTPS hit arrived). HTTP-01 challenge in progress. |
-| `ready` | Certificate is in Caddy storage and serving traffic. |
-| `failed` | ACME gave up. `lastError` carries the reason - usually DNS still wrong, or LE rate-limited. Detach + reattach after fixing DNS to retry. |
+Detach removes the Caddy route and deletes the row (the cert ages out of storage
+on renewal). Removing a hostname not attached to this sandbox returns `404`.
 
 ## Errors
 
 | Status | When |
 |---|---|
-| `400 Bad Request` | Hostname is malformed or includes a port, or `target_port` is outside `1..65535`. |
-| `403 Forbidden` | Ownership verification TXT record is missing or has the wrong value at `_aerol-verify.<hostname>`. See [Ownership verification (TXT record)](#ownership-verification-txt-record). |
-| `409 Conflict` | The hostname is already attached to a different sandbox (hostnames are globally unique across the cluster), the sandbox already exposes a `tcp://` / `tls://` port (the IRON RULE - custom domains and L4 exposures can't coexist on one sandbox), the per-sandbox cap is reached, or the hostname is already attached to this sandbox with a different `target_port` (detach + re-add to change it). |
-| `412 Precondition Failed` | Custom domains are disabled (`SB_ENABLE_CUSTOM_DOMAINS=false`) or the server runs in IP mode (`SB_DOMAIN` unset). |
-| `429 Too Many Requests` | The daemon-wide ACME issuance budget is exhausted (LE `new-orders` per-account limit nearing 80% of 300/3h). Honour `Retry-After` and try again. |
+| `400 Bad Request` | Hostname malformed or includes a port, or `target_port` outside `1..65535`. |
+| `403 Forbidden` | Ownership TXT missing or wrong at `_aerol-verify.<hostname>`. See [ownership verification](#ownership-verification). |
+| `409 Conflict` | Hostname already attached elsewhere (globally unique), the sandbox has a `tcp://`/`tls://` exposure, the per-sandbox cap is reached, or it's re-added with a different `target_port`. |
+| `412 Precondition Failed` | Custom domains disabled (`SB_ENABLE_CUSTOM_DOMAINS=false`) or server in IP mode (`SB_DOMAIN` unset). |
+| `429 Too Many Requests` | Daemon-wide ACME issuance budget exhausted. Honour `Retry-After`. |
 
 ## Cluster mode
 
-In multi-node clusters the hostname-to-sandbox mapping is replicated through Raft, so any ingress node accepts traffic for a custom domain regardless of which node owns the sandbox. Non-owner ingress nodes pass TLS through to the owner over SNI. The shared `certmagic-s3` cert store means only one node performs the ACME flow per hostname - see [multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md) for the storage / lock layout.
+The hostname-to-sandbox mapping replicates through Raft, so any ingress node
+accepts traffic for a custom domain regardless of which node owns the sandbox;
+non-owner nodes pass TLS through to the owner over SNI. A shared `certmagic-s3`
+cert store means only one node runs ACME per hostname - see
+[multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md).
