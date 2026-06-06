@@ -424,13 +424,21 @@ func TestRuntimeProxyRewritesToEnvdToolboxSurface(t *testing.T) {
 }
 
 type fakeE2BRuntime struct {
-	mu            sync.Mutex
-	states        map[string]*models.SandboxRuntimeState
-	removedImages []string
-	imageSeq      int
-	ipSeq         int
-	createHits    int
-	containerIP   string
+	mu                sync.Mutex
+	states            map[string]*models.SandboxRuntimeState
+	removedImages     []string
+	imageSeq          int
+	ipSeq             int
+	createHits        int
+	containerIP       string
+	errCreate         error
+	errStart          error
+	errStop           error
+	errDestroy        error
+	errRemoveImage    error
+	errCreateSnapshot error
+	onCreateChan      chan struct{}
+	blockCreate       chan struct{}
 }
 
 func newFakeE2BRuntime() *fakeE2BRuntime {
@@ -441,8 +449,20 @@ func newFakeE2BRuntime() *fakeE2BRuntime {
 }
 
 func (f *fakeE2BRuntime) Create(_ context.Context, _ models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	if f.onCreateChan != nil {
+		select {
+		case f.onCreateChan <- struct{}{}:
+		default:
+		}
+	}
+	if f.blockCreate != nil {
+		<-f.blockCreate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errCreate != nil {
+		return nil, f.errCreate
+	}
 	f.ipSeq++
 	f.createHits++
 	containerIP := f.containerIP
@@ -462,6 +482,9 @@ func (f *fakeE2BRuntime) Create(_ context.Context, _ models.CreateSandboxRequest
 func (f *fakeE2BRuntime) Start(_ context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errStart != nil {
+		return nil, f.errStart
+	}
 	state, ok := f.lookup(containerRef)
 	if !ok {
 		return nil, fmt.Errorf("sandbox %q not found", containerRef)
@@ -473,6 +496,9 @@ func (f *fakeE2BRuntime) Start(_ context.Context, containerRef string) (*models.
 func (f *fakeE2BRuntime) Stop(_ context.Context, containerRef string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errStop != nil {
+		return f.errStop
+	}
 	state, ok := f.lookup(containerRef)
 	if !ok {
 		return fmt.Errorf("sandbox %q not found", containerRef)
@@ -487,6 +513,9 @@ func (f *fakeE2BRuntime) Destroy(_ context.Context, sandbox *models.Sandbox) err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errDestroy != nil {
+		return f.errDestroy
+	}
 	delete(f.states, sandbox.ID)
 	return nil
 }
@@ -494,6 +523,9 @@ func (f *fakeE2BRuntime) Destroy(_ context.Context, sandbox *models.Sandbox) err
 func (f *fakeE2BRuntime) CreateSnapshot(_ context.Context, _ string, imageRef string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errCreateSnapshot != nil {
+		return "", f.errCreateSnapshot
+	}
 	f.imageSeq++
 	return fmt.Sprintf("sha256:%s-%03d", sanitizeSnapshotID(imageRef), f.imageSeq), nil
 }
@@ -527,6 +559,9 @@ func (f *fakeE2BRuntime) Ping(context.Context) error { return nil }
 func (f *fakeE2BRuntime) RemoveImage(_ context.Context, imageRef string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errRemoveImage != nil {
+		return f.errRemoveImage
+	}
 	f.removedImages = append(f.removedImages, imageRef)
 	return nil
 }

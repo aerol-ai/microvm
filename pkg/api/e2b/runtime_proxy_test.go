@@ -91,7 +91,7 @@ func TestRuntimeProxy(t *testing.T) {
 		st.UpdateStatus(context.Background(), id, models.SandboxStatusStarted, "")
 		st.UpdateRuntime(context.Background(), id, "cid", "127.0.0.1", "")
 
-		req := httptest.NewRequest(http.MethodGet, "/e2b/runtimeno-slash-path", nil)
+		req := httptest.NewRequest(http.MethodGet, "/e2b/runtime/no-slash-path", nil)
 		req.Header.Set("E2b-Sandbox-Id", id)
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
@@ -110,4 +110,104 @@ func TestRuntimeProxy(t *testing.T) {
 			t.Errorf("expected 500, got %d", rr.Code)
 		}
 	})
+
+	t.Run("empty container ip error", func(t *testing.T) {
+		st.UpdateStatus(context.Background(), id, models.SandboxStatusStarted, "")
+		st.UpdateRuntime(context.Background(), id, "cid", "", "") // empty container IP
+
+		req := httptest.NewRequest(http.MethodGet, "/e2b/runtime", nil)
+		req.Header.Set("E2b-Sandbox-Id", id)
+		req.Header.Set("X-Access-Token", testToken)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("expected 400, got %d", rr.Code)
+		}
+	})
+
+	t.Run("store errors", func(t *testing.T) {
+		// Create a separate test env so we don't mess up the database of other tests
+		_, st2, handler2 := newE2BHandlerTestEnv(t)
+		id2 := createE2BSandbox(t, handler2)
+
+		// Close the database to trigger db errors during runtime_proxy handler
+		_ = st2.Close()
+
+		// 1. Database error in GetSandbox
+		req := httptest.NewRequest(http.MethodGet, "/e2b/runtime", nil)
+		req.Header.Set("E2b-Sandbox-Id", id2)
+		rr := httptest.NewRecorder()
+		handler2.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest && rr.Code != http.StatusInternalServerError {
+			t.Errorf("expected error code on closed DB, got %d", rr.Code)
+		}
+	})
+
+	t.Run("invalid compat json error", func(t *testing.T) {
+		_, st2, handler2 := newE2BHandlerTestEnv(t)
+		id2 := createE2BSandbox(t, handler2)
+
+		// Corrupt the compat state so loadSandboxMeta fails
+		st2.UpsertCompatState(context.Background(), id2, "e2b", "{bad")
+
+		req := httptest.NewRequest(http.MethodGet, "/e2b/runtime", nil)
+		req.Header.Set("E2b-Sandbox-Id", id2)
+		rr := httptest.NewRecorder()
+		handler2.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", rr.Code)
+		}
+	})
+
+	t.Run("empty publicPath and no toolboxToken", func(t *testing.T) {
+		svc2, st2, handler2 := newE2BHandlerTestEnv(t)
+		id2 := createE2BSandbox(t, handler2)
+
+		sb2, err := svc2.GetSandbox(context.Background(), id2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb2.ToolboxToken = ""
+		if err := st2.Upsert(context.Background(), sb2); err != nil {
+			t.Fatal(err)
+		}
+
+		st2.UpdateStatus(context.Background(), id2, models.SandboxStatusStarted, "")
+		st2.UpdateRuntime(context.Background(), id2, "cid", "127.0.0.1", "")
+
+		// Requesting exactly PathPrefix + "/runtime" to cover empty publicPath
+		req := httptest.NewRequest(http.MethodGet, "/e2b/runtime", nil)
+		req.Header.Set("E2b-Sandbox-Id", id2)
+		req.Header.Set("X-Access-Token", "") // secure false state below
+		stateBlob := compatBlob{Secure: false, OnTimeout: "kill"}
+		b, _ := json.Marshal(stateBlob)
+		st2.UpsertCompatState(context.Background(), id2, "e2b", string(b))
+
+		rr := httptest.NewRecorder()
+		handler2.ServeHTTP(rr, req)
+		// Should forward and fail to dial (Bad Gateway 502), which is fine.
+		// What we care about is executing Director with empty publicPath and empty toolboxToken.
+		if rr.Code != http.StatusBadGateway && rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected 502/503, got %d", rr.Code)
+		}
+	})
+}
+
+func TestRequestDomainHelper(t *testing.T) {
+	// r is nil
+	if got := requestDomain(nil); got != nil {
+		t.Errorf("expected nil for nil request, got %v", got)
+	}
+	// r.Host is empty
+	req1 := httptest.NewRequest("GET", "/foo", nil)
+	req1.Host = ""
+	if got := requestDomain(req1); got != nil {
+		t.Errorf("expected nil for empty host, got %v", got)
+	}
+	// r.Host becomes empty after split/trim
+	req2 := httptest.NewRequest("GET", "/foo", nil)
+	req2.Host = " :80 "
+	if got := requestDomain(req2); got != nil {
+		t.Errorf("expected nil for invalid/empty split host, got %v", got)
+	}
 }
