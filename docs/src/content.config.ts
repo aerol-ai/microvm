@@ -23,6 +23,7 @@ export enum NavigationCategory {
   ACCESS,
   SDKS,
   FEATURES,
+  ARCHITECTURE,
   OPERATIONS,
   USE_CASES,
 }
@@ -318,6 +319,26 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         href: '/tcp-ports',
         label: 'TCP & TLS Ports',
         description: 'Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo) via caddy-l4.',
+      },
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Architecture',
+    category: NavigationCategory.ARCHITECTURE,
+    homePageHref: '/',
+    entries: [
+      {
+        type: 'link',
+        href: '/firecracker-architecture',
+        label: 'Firecracker Architecture',
+        description: 'Components, the jailer-isolated microVM anatomy, and the Create boot path step by step.',
+      },
+      {
+        type: 'link',
+        href: '/firecracker-hydration',
+        label: 'Hydration & Operational Fold',
+        description: 'Warm-VMM pool, snapshot restore with lazy load, the warm-slot state machine, and node-level resource sharing.',
       },
     ],
   },

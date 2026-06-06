@@ -1,5 +1,6 @@
 import starlight from '@astrojs/starlight'
 import { defineConfig } from 'astro/config'
+import mermaid from 'astro-mermaid'
 
 export default defineConfig({
   // Starlight's setup replaces `markdown.remarkPlugins` but does not set `gfm`.
@@ -16,6 +17,13 @@ export default defineConfig({
     '/': '/getting-started',
   },
   integrations: [
+    // Must precede starlight() so it rewrites ```mermaid fenced blocks into
+    // rendered diagrams before Starlight's Shiki highlighter treats them as
+    // plain code. autoTheme follows the site's light/dark toggle.
+    mermaid({
+      theme: 'default',
+      autoTheme: true,
+    }),
     starlight({
       title: 'AerolVM',
       favicon: '/favicon.svg',
