@@ -12,8 +12,8 @@ A sandbox is an isolated compute environment. Each sandbox has its own filesyste
 | Type | Runtime value | Description |
 |---|---|---|
 | Docker | `docker` (default) | Standard runc-backed containers. Works on any node. |
-| gVisor | `gvisor` | User-space kernel — intercepts syscalls. Better isolation, same hardware requirements. See [gVisor Sandbox](/gvisor-sandbox). |
-| Firecracker | `firecracker` | Full microVM — each sandbox boots its own kernel in under 100ms. Requires bare-metal nodes. See [Firecracker Sandbox](/firecracker-sandbox). |
+| gVisor | `gvisor` | User-space kernel - intercepts syscalls. Better isolation, same hardware requirements. See [gVisor Sandbox](/gvisor-sandbox). |
+| Firecracker | `firecracker` | Full microVM - each sandbox boots its own kernel in under 100ms. Requires bare-metal nodes. See [Firecracker Sandbox](/firecracker-sandbox). |
 | GPU | `docker` + `gpus` field | Standard Docker with direct GPU passthrough. See [GPU Sandbox](/gpu-sandboxes). |
 
 ## Lifecycle states
@@ -229,7 +229,7 @@ Retrieve a running sandbox by ID to get a fully usable sandbox object.
 
 ## Start and stop
 
-Stopping persists all container-level filesystem state. Starting resumes from the persisted layer — running processes are not retained across a stop/start cycle.
+Stopping persists all container-level filesystem state. Starting resumes from the persisted layer - running processes are not retained across a stop/start cycle.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

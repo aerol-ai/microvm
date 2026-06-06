@@ -5,10 +5,10 @@ description: Register OCI images as Firecracker rootfs templates for sub-100ms s
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-**Firecracker Templates are a Firecracker-only feature.** Without a template, every Firecracker sandbox runs the full OCI-to-rootfs pipeline on each create — expect 10–60 seconds per boot. A template pre-builds the `ext4` rootfs once and captures a paused VM memory state; subsequent sandbox creates clone that snapshot instead of cold-booting the kernel, bringing boot time under 100ms.
+**Firecracker Templates are a Firecracker-only feature.** Without a template, every Firecracker sandbox runs the full OCI-to-rootfs pipeline on each create - expect 10–60 seconds per boot. A template pre-builds the `ext4` rootfs once and captures a paused VM memory state; subsequent sandbox creates clone that snapshot instead of cold-booting the kernel, bringing boot time under 100ms.
 
 :::note[Using Docker sandboxes?]
-If you are not using `runtime: "firecracker"`, templates do not apply to you. For saving and reusing Docker container state, see [Snapshots](/snapshots) instead — snapshots let you commit a running sandbox into a named image and launch copies from it.
+If you are not using `runtime: "firecracker"`, templates do not apply to you. For saving and reusing Docker container state, see [Snapshots](/snapshots) instead - snapshots let you commit a running sandbox into a named image and launch copies from it.
 :::
 
 Firecracker templates let one OCI image power many sandboxes with sub-100ms cold starts. Register an image once; the daemon builds an `ext4` rootfs and captures a paused-VM snapshot. Subsequent `firecracker` sandbox creates against that template clone the snapshot instead of cold-booting the kernel.
@@ -316,7 +316,7 @@ Deleting a template removes the rootfs and snapshot artifacts. The daemon reject
 
 When the daemon runs in cluster mode with AOCR (Aerol OCI Registry) configured, the build node ships the template's `rootfs.ext4` + paused-VM snapshot to AOCR as a single OCI artifact under `cluster/<id>/templates/<tid>:latest`, and peer nodes lazily pull + extract it the first time a sandbox lands on them. Placement is template-aware: the scheduler prefers nodes that already hold a copy of the template's artifacts. See [Cluster Setup](/cluster-setup/) for the deployment knobs.
 
-This reuses the same push pipeline as Docker [Snapshots](/snapshots#snapshot-distribution-in-cluster-mode) — one switch turns on both, and both push to the same AOCR host with the same cluster credential:
+This reuses the same push pipeline as Docker [Snapshots](/snapshots#snapshot-distribution-in-cluster-mode) - one switch turns on both, and both push to the same AOCR host with the same cluster credential:
 
 | Env var | Purpose |
 |---|---|
@@ -326,7 +326,7 @@ This reuses the same push pipeline as Docker [Snapshots](/snapshots#snapshot-dis
 | `SB_AUTO_IMPORT_CLUSTER_ID` | Cluster label that namespaces the artifact (`cluster/<id>/templates/...`) and scopes the credential. |
 | `SB_AUTO_IMPORT_CLUSTER_PAT_PATH` | File holding the cluster PAT presented as the registry credential for push **and** pull. Re-read per call, so rotation is just a file write. |
 
-The pull side is authenticated with the same cluster PAT and does **not** require `SB_SNAPSHOT_PUSH_ENABLED` — a consume-only node fetches template artifacts from AOCR as long as the cluster ID and PAT file are set. Each template row carries a `pushState` you can read back to watch the lifecycle, mirroring snapshots. Unlike snapshots, a template has no "register an existing image" shortcut: it always carries the locally-built rootfs + snapshot, so its only distribution states are `pushState` + `registryRef`.
+The pull side is authenticated with the same cluster PAT and does **not** require `SB_SNAPSHOT_PUSH_ENABLED` - a consume-only node fetches template artifacts from AOCR as long as the cluster ID and PAT file are set. Each template row carries a `pushState` you can read back to watch the lifecycle, mirroring snapshots. Unlike snapshots, a template has no "register an existing image" shortcut: it always carries the locally-built rootfs + snapshot, so its only distribution states are `pushState` + `registryRef`.
 
 ## Optional rotation
 

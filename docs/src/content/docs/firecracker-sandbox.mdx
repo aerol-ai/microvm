@@ -5,7 +5,7 @@ description: Create sandboxes backed by Firecracker microVMs for full kernel iso
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Firecracker sandboxes run inside lightweight virtual machines instead of containers. Each sandbox boots its own Linux kernel in under 100ms and is completely isolated from the host and from other sandboxes at the hardware level. There is no shared kernel — a vulnerability in one sandbox cannot affect another.
+Firecracker sandboxes run inside lightweight virtual machines instead of containers. Each sandbox boots its own Linux kernel in under 100ms and is completely isolated from the host and from other sandboxes at the hardware level. There is no shared kernel - a vulnerability in one sandbox cannot affect another.
 
 Use Firecracker when:
 - You are running untrusted or LLM-generated code that should not have any path to the host kernel
@@ -23,7 +23,7 @@ Firecracker sandboxes require worker nodes that have Firecracker installed. On a
 | **Ad-hoc** | Pass any OCI image (`ubuntu:22.04`). The daemon converts it to a Firecracker rootfs on demand. | 10–60 seconds per create |
 | **Template-backed** | Pre-build a rootfs once using the Templates API, then pass `template_id` in the create request. | Under 100ms |
 
-The examples below use the ad-hoc path — it works without any setup beyond having Firecracker enabled on the node. For the fast template-backed path, see [Firecracker Templates](/firecracker-templates).
+The examples below use the ad-hoc path - it works without any setup beyond having Firecracker enabled on the node. For the fast template-backed path, see [Firecracker Templates](/firecracker-templates).
 
 ## Create a Firecracker sandbox
 
@@ -228,7 +228,7 @@ Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the i
 
 ## Notes
 
-- **Ad-hoc builds every time.** Without a pre-built template, each create runs the full OCI-to-rootfs pipeline — expect 10–60 seconds per create. For sub-100ms boots, pre-build a template with [Firecracker Templates](/firecracker-templates) and pass `template_id` in the create request (Go SDK exposes this as `TemplateID`; other SDKs use the direct API).
+- **Ad-hoc builds every time.** Without a pre-built template, each create runs the full OCI-to-rootfs pipeline - expect 10–60 seconds per create. For sub-100ms boots, pre-build a template with [Firecracker Templates](/firecracker-templates) and pass `template_id` in the create request (Go SDK exposes this as `TemplateID`; other SDKs use the direct API).
 - **Memory is reserved.** Unlike Docker, Firecracker allocates the full `memoryMB` value upfront for the VM. Size the request to what the workload actually needs.
 - **Not compatible with GPU passthrough.** Firecracker VMs do not support direct GPU access.
 - **Lifecycle operations** (stop, start, destroy, resize) work the same as Docker sandboxes. See [Docker Sandbox](/sandboxes) for those examples.
