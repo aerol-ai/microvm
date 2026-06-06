@@ -5,6 +5,7 @@ package e2b
 // to close the DB and break GetSandbox first.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -216,7 +217,7 @@ func TestConnectSandboxUpdateLifecyclePersistsMetadata(t *testing.T) {
 	}
 
 	// Verify that the metadata (TimeoutSeconds) was persisted.
-	state, err := st.GetCompatState(nil, created.SandboxID, "e2b")
+	state, err := st.GetCompatState(context.Background(), created.SandboxID, "e2b")
 	if err == nil && state != nil {
 		t.Logf("compat state persisted after connect: %s", state.StateJSON)
 	}

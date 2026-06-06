@@ -75,11 +75,16 @@ func TestV1CustomDomainDNS_ReturnsRecordsAfterAttach(t *testing.T) {
 	if got.Target.Hostname != "ingress.example.com" {
 		t.Fatalf("Target.Hostname=%q, want ingress.example.com", got.Target.Hostname)
 	}
-	if len(got.Records) != 4 {
-		t.Fatalf("len(Records)=%d, want 4; got %+v", len(got.Records), got.Records)
+	// Two domains attached: api.acme.com (subdomain) → CNAME + TXT, and
+	// acme.com (apex) → the three apex flattening candidates CNAME/ANAME/ALIAS
+	// (caller picks one) + TXT. Total 6 records.
+	if len(got.Records) != 6 {
+		t.Fatalf("len(Records)=%d, want 6; got %+v", len(got.Records), got.Records)
 	}
 
 	cnames := 0
+	anames := 0
+	aliases := 0
 	txts := 0
 	for _, r := range got.Records {
 		switch r.Type {
@@ -87,6 +92,16 @@ func TestV1CustomDomainDNS_ReturnsRecordsAfterAttach(t *testing.T) {
 			cnames++
 			if r.Value != "ingress.example.com" {
 				t.Fatalf("unexpected CNAME record %+v", r)
+			}
+		case models.DNSRecordTypeANAME:
+			anames++
+			if r.Value != "ingress.example.com" {
+				t.Fatalf("unexpected ANAME record %+v", r)
+			}
+		case models.DNSRecordTypeALIAS:
+			aliases++
+			if r.Value != "ingress.example.com" {
+				t.Fatalf("unexpected ALIAS record %+v", r)
 			}
 		case "TXT":
 			txts++
@@ -101,8 +116,11 @@ func TestV1CustomDomainDNS_ReturnsRecordsAfterAttach(t *testing.T) {
 		}
 	}
 
-	if cnames != 2 || txts != 2 {
-		t.Fatalf("expected 2 CNAME and 2 TXT records, got %d CNAME and %d TXT", cnames, txts)
+	// Subdomain CNAME + apex CNAME = 2; apex-only ANAME and ALIAS = 1 each;
+	// one TXT per domain = 2.
+	if cnames != 2 || anames != 1 || aliases != 1 || txts != 2 {
+		t.Fatalf("expected 2 CNAME, 1 ANAME, 1 ALIAS, 2 TXT; got %d/%d/%d/%d",
+			cnames, anames, aliases, txts)
 	}
 }
 
