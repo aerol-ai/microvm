@@ -146,7 +146,13 @@ A few details worth calling out, because they are easy to get wrong:
   from the host. Cold boots skip this - their kernel just initialized.
 - **The vsock CID differs by path.** On the snapshot/warm path the guest listens
   on the *template's* CID (baked into the snapshot at build time), not the
-  per-sandbox slot CID, so the host dials that CID for the handshake.
+  per-sandbox slot CID, so the host dials that CID for the handshake. (vsock is
+  used precisely because it is snapshot-safe - a TCP control channel over the TAP
+  would tear on resume.)
+- **Snapshot/warm clones share guest memory copy-on-write.** `LoadSnapshot`
+  `mmap`s the template's memory image as a read-only base; per-clone writes hit a
+  private dirty bitmap. The full memory model is in
+  [Hydration & the Operational Fold](/firecracker-hydration#memory-copy-on-write-clones).
 
 ## Two creation paths, two boot budgets
 

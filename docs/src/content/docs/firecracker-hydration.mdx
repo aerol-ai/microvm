@@ -183,12 +183,59 @@ host:
 | Guest kernel (`vmlinux`) | Yes, read-only | One image on disk; every jailer chroot references it. |
 | Template `rootfs.ext4` | Yes, as a backing file | Hard-linked into each sandbox's jailer chroot (copy fallback across filesystems). Writes go to the overlay, not the shared rootfs. |
 | Writable layer | No | Each sandbox gets its own sparse `overlay.ext4`; real blocks are allocated only on write. |
-| Guest memory | **No** | Firecracker reserves the full `memoryMB` per VM. AerolVM does **not** do copy-on-write page sharing between running clones - size requests to what the workload needs. |
+| Guest memory - snapshot/warm clones | **Unmodified pages: yes**, copy-on-write | The template's `snapshot.memory` is `mmap`'d read-only as a shared base; per-clone writes divert to a private dirty bitmap. See [below](#memory-copy-on-write-clones). |
+| Guest memory - cold boot | No | A cold-booted VM has no shared base; it reserves its `memoryMB` fresh. |
 | Snapshot artifacts | Yes, as source | One `snapshot.memory` / `snapshot.state` per template feeds every restore and every warm-pool spawn. |
 
 The honest summary: AerolVM shares the *read-only* inputs (kernel, rootfs,
-snapshot) aggressively and isolates everything writable (overlay, RAM) completely.
-It does not deduplicate live guest memory across running VMs.
+snapshot) **and** the unmodified guest pages of same-template clones, and keeps
+private only what each clone actually writes - its overlay blocks and its
+dirtied memory pages. A cold-booted, template-less sandbox is the one case with
+no sharing: it reserves its memory fresh.
+
+## Memory: copy-on-write clones
+
+The single largest source of density is that clones of the same template
+**share their unmodified guest memory**. Every snapshot load is issued with diff
+snapshots enabled and a file-backed memory backend, so Firecracker `mmap`s the
+template's `snapshot.memory` as a read-only **CoW base**. The guest runs against
+that shared mapping; the instant it writes a page, the write diverts to a
+private **dirty bitmap** for that VM and never disturbs the shared file.
+
+```mermaid
+graph TB
+    BASE["snapshot.memory<br/>one file, mmap'd read-only<br/>(host page cache)"]
+    BASE --> C1["clone A<br/>shared pages + dirty bitmap A"]
+    BASE --> C2["clone B<br/>shared pages + dirty bitmap B"]
+    BASE --> C3["clone C<br/>shared pages + dirty bitmap C"]
+```
+
+Because the base is one file in the host page cache, the host keeps **one
+physical copy** of every page the clones have not modified - kernel text, the
+booted userspace, the agent, everything identical at snapshot time. A clone's
+real memory cost is only the pages it dirties. The supporting pieces:
+
+- **Dirty-page tracking** is on for every VM (`track_dirty_pages`). That is what
+  lets writes divert to the bitmap instead of the shared file - and what makes a
+  running VM snapshottable later.
+- **Huge pages** are enabled on template VMs so clones share huge pages with the
+  page cache rather than faulting 4 KiB at a time.
+- **Demand paging.** `mmap` means a page is faulted in only when the guest
+  touches it, so memory the workload never uses is never paged in. A
+  `userfaultfd` memory backend - lazy, fault-handler-driven page-in - is the
+  next axis along this path.
+- **Integrity before mmap.** The snapshot checksum is verified on the host
+  *before* the load, so a corrupt memory file fails fast instead of faulting
+  into a bad page mid-run.
+
+One consequence for capacity: a clone's *reserved* `memoryMB` badly overstates
+its real footprint once pages are shared. AerolVM samples actual per-VM
+resident-set-size for exactly this reason - reserved size is the wrong number to
+admit against on a host packed with same-template clones.
+
+The same dirty-bitmap machinery that makes writes private is also the foundation
+for incremental and high-frequency snapshots: a diff snapshot is just the dirty
+set since the base.
 
 ## Operational knobs
 
