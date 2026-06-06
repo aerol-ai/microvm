@@ -326,6 +326,19 @@ function isTransientTransportError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * Trim trailing slashes from a URL without a backtracking regex. The natural
+ * `value.replace(/\/+$/, "")` is an anchored `+` quantifier — a polynomial
+ * ReDoS shape that CodeQL flags — so we strip by index instead, which is O(n).
+ */
+export function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47 /* "/" */) {
+    end--;
+  }
+  return value.slice(0, end);
+}
+
 /** Sleep with ±25% jitter so concurrent callers don't thundering-herd. */
 function jitteredDelay(baseMs: number): Promise<void> {
   const jitter = 1 + (Math.random() - 0.5) * 0.5; // 0.75 – 1.25
@@ -342,7 +355,7 @@ export class APIClient {
   private readonly retryConfig: Required<RetryConfig>;
 
   constructor(config: APIClientConfig) {
-    this.baseURL = config.baseURL.replace(/\/+$/, "");
+    this.baseURL = stripTrailingSlashes(config.baseURL);
     this.patToken = config.patToken ?? "";
     this.fetchFn = config.fetch ?? fetch;
     this.apiVersion = config.apiVersion ?? DEFAULT_API_VERSION;

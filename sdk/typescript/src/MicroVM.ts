@@ -1,4 +1,4 @@
-import { APIClient, type APIVersion, type RetryConfig } from "./internal/client.js";
+import { APIClient, stripTrailingSlashes, type APIVersion, type RetryConfig } from "./internal/client.js";
 import { Sandbox } from "./Sandbox.js";
 import { Image } from "./Image.js";
 import type {
@@ -252,7 +252,7 @@ export class MicroVM {
 }
 
 function normalizeURL(value: string): string {
-  return value.replace(/\/+$/, "");
+  return stripTrailingSlashes(value);
 }
 
 function readEnv(name: string): string | undefined {
