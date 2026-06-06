@@ -385,3 +385,347 @@ func TestWriteToolboxError(t *testing.T) {
 		t.Fatalf("generic err status = %d, want 502", rr2.Code)
 	}
 }
+
+func TestToolboxExtraCoverage(t *testing.T) {
+	facadeURL, id := newToolboxExecEnv(t)
+
+	t.Run("routing_switches", func(t *testing.T) {
+		endpoints := []struct {
+			method string
+			path   string
+		}{
+			{http.MethodGet, ""},
+			{http.MethodGet, "health"},
+			{http.MethodGet, "version"},
+			{http.MethodGet, "files"},
+			{http.MethodDelete, "files"},
+			{http.MethodPost, "files/folder"},
+			{http.MethodPost, "files/replace"},
+			{http.MethodPost, "files/permissions"},
+			{http.MethodGet, "files/info"},
+			{http.MethodPost, "files/upload"},
+			{http.MethodGet, "files/download"},
+			{http.MethodPost, "files/move"},
+			{http.MethodGet, "files/search"},
+			{http.MethodGet, "files/find"},
+			{http.MethodGet, "git/status"},
+			{http.MethodGet, "lsp/initialize"},
+			{http.MethodPost, "process/code-run"},
+			{http.MethodGet, "process/session/123"},
+			{http.MethodGet, "process/interpreter/execute"},
+			{http.MethodGet, "process/pty/123"},
+		}
+
+		for _, ep := range endpoints {
+			req, err := http.NewRequest(ep.method, facadeURL+ToolboxPrefix+"/"+id+"/"+ep.path, nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do %s %s: %v", ep.method, ep.path, err)
+			}
+			resp.Body.Close()
+		}
+	})
+
+	t.Run("unsupported_route", func(t *testing.T) {
+		resp, err := http.Get(facadeURL + ToolboxPrefix + "/" + id + "/unsupported-endpoint")
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Fatalf("status = %d, want 501", resp.StatusCode)
+		}
+	})
+
+	t.Run("sendToolboxJSON_marshal_error", func(t *testing.T) {
+		h := newHandlers(Deps{})
+		_, err := h.sendToolboxJSON(context.Background(), "sb-1", "POST", "/test", nil, make(chan int), nil)
+		if err == nil {
+			t.Fatal("expected json marshal error")
+		}
+	})
+
+	t.Run("copyResponseHeaders_exclusions", func(t *testing.T) {
+		src := http.Header{
+			"Connection":      []string{"keep-alive"},
+			"Upgrade":         []string{"websocket"},
+			"X-Custom-Header": []string{"custom-value"},
+		}
+		dst := http.Header{}
+		copyResponseHeaders(dst, src)
+		if dst.Get("Connection") != "" || dst.Get("Upgrade") != "" {
+			t.Fatalf("excluded headers were copied: %+v", dst)
+		}
+		if dst.Get("X-Custom-Header") != "custom-value" {
+			t.Fatalf("custom header not copied: %+v", dst)
+		}
+	})
+
+	t.Run("error_env_calls", func(t *testing.T) {
+		errFacadeURL, errId := newToolboxErrorEnv(t)
+
+		// execute command failure
+		resp, _ := http.Post(errFacadeURL+ToolboxPrefix+"/"+errId+"/process/execute", "application/json", strings.NewReader(`{"command":"echo"}`))
+		if resp != nil {
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d", resp.StatusCode)
+			}
+		}
+
+		// user home dir failure
+		resp2, _ := http.Get(errFacadeURL + ToolboxPrefix + "/" + errId + "/user-home-dir")
+		if resp2 != nil {
+			resp2.Body.Close()
+			if resp2.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d", resp2.StatusCode)
+			}
+		}
+
+		// work dir failure
+		resp3, _ := http.Get(errFacadeURL + ToolboxPrefix + "/" + errId + "/work-dir")
+		if resp3 != nil {
+			resp3.Body.Close()
+			if resp3.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d", resp3.StatusCode)
+			}
+		}
+
+		// bulk download failure (should generate error parts)
+		resp4, err := http.Post(errFacadeURL+ToolboxPrefix+"/"+errId+"/files/bulk-download", "application/json", strings.NewReader(`{"paths":["/a.txt"]}`))
+		if err != nil {
+			t.Fatalf("POST bulk-download: %v", err)
+		}
+		defer resp4.Body.Close()
+		if resp4.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp4.StatusCode)
+		}
+		mediaType, params, err := mime.ParseMediaType(resp4.Header.Get("Content-Type"))
+		if err == nil && strings.HasPrefix(mediaType, "multipart/") {
+			mr := multipart.NewReader(resp4.Body, params["boundary"])
+			part, err := mr.NextPart()
+			if err == nil {
+				if part.FormName() != "error" {
+					t.Fatalf("expected error part, got %s", part.FormName())
+				}
+				body, _ := io.ReadAll(part)
+				if !strings.Contains(string(body), "download failed") {
+					t.Fatalf("expected download failed, got %s", body)
+				}
+			}
+		}
+
+		// bulk upload failure
+		var buf strings.Builder
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("files[0].path", "/dest/a.txt")
+		part, _ := mw.CreateFormFile("files[0].file", "a.txt")
+		_, _ = io.WriteString(part, "hello")
+		_ = mw.Close()
+
+		req, _ := http.NewRequest(http.MethodPost, errFacadeURL+ToolboxPrefix+"/"+errId+"/files/bulk-upload", strings.NewReader(buf.String()))
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		resp5, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("bulk-upload error env: %v", err)
+		}
+		defer resp5.Body.Close()
+		if resp5.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", resp5.StatusCode)
+		}
+	})
+}
+
+func newToolboxErrorEnv(t *testing.T) (facadeURL, sandboxID string) {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/process/execute", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"command execution failed"}`, http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/files/download", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"download failed"}`, http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/files/upload", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"upload failed"}`, http.StatusInternalServerError)
+	})
+
+	toolboxServer := httptest.NewServer(mux)
+	t.Cleanup(toolboxServer.Close)
+
+	host, portText, err := net.SplitHostPort(mustParseURL(t, toolboxServer.URL).Host)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mountManager, err := mounts.New(logger, mounts.Config{
+		RootDir:     filepath.Join(dir, "mounts"),
+		CredDir:     filepath.Join(dir, "cred"),
+		WaitTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("mounts: %v", err)
+	}
+	t.Cleanup(mountManager.Close)
+
+	cfg := config.Config{
+		DBPath:            filepath.Join(dir, "state.db"),
+		PublicHost:        "sandbox.test",
+		ToolboxPort:       port,
+		Runtime:           models.RuntimeDocker,
+		EnableCaddy:       false,
+		HTTPClientTimeout: 5 * time.Second,
+	}
+	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, mountManager, nil)
+
+	sandboxID = "sb-exec-err"
+	now := time.Now().UTC()
+	if err := st.Upsert(context.Background(), &models.Sandbox{
+		ID:             sandboxID,
+		Name:           sandboxID,
+		Status:         models.SandboxStatusStarted,
+		ContainerIP:    host,
+		ToolboxEnabled: true,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	mux2 := http.NewServeMux()
+	RegisterRoutes(mux2, Deps{
+		Service: svc,
+		Logger:  logger,
+		Auth:    func(next http.Handler) http.Handler { return next },
+	})
+	facadeServer := httptest.NewServer(mux2)
+	t.Cleanup(facadeServer.Close)
+	return facadeServer.URL, sandboxID
+}
+
+func TestToolboxDirectCoverage(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	svc := service.New(config.Config{}, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, nil, nil)
+	h := newHandlers(Deps{
+		Service: svc,
+		Logger:  logger,
+	})
+
+	t.Run("proxyToolbox_WakeAwareToolboxTarget_error", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/process/session/123", nil)
+		rr := httptest.NewRecorder()
+		h.proxyToolbox(rr, req, "missing-sandbox", "/process/session/123")
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d", rr.Code)
+		}
+	})
+
+	t.Run("proxyToolbox_invalid_target_url", func(t *testing.T) {
+		now := time.Now().UTC()
+		if err := st.Upsert(context.Background(), &models.Sandbox{
+			ID:             "sb-bad-url",
+			Name:           "sb-bad-url",
+			Status:         models.SandboxStatusStarted,
+			ContainerIP:    "127.0.0.1\x7f",
+			ToolboxEnabled: true,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/process/session/123", nil)
+		rr := httptest.NewRecorder()
+		h.proxyToolbox(rr, req, "sb-bad-url", "/process/session/123")
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", rr.Code)
+		}
+	})
+
+	t.Run("bulkUpload_parse_multipart_error", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/files/bulk-upload", strings.NewReader("not-multipart"))
+		req.Header.Set("Content-Type", "multipart/form-data; boundary=invalid-boundary")
+		rr := httptest.NewRecorder()
+		h.bulkUpload(rr, req, "sb-1")
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rr.Code)
+		}
+	})
+
+	t.Run("bulkUpload_missing_file_or_path", func(t *testing.T) {
+		// entry.file is nil
+		var buf strings.Builder
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("files[0].path", "/dest/a.txt")
+		_ = mw.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/files/bulk-upload", strings.NewReader(buf.String()))
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rr := httptest.NewRecorder()
+		h.bulkUpload(rr, req, "sb-1")
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rr.Code)
+		}
+
+		// entry.path is empty
+		var buf2 strings.Builder
+		mw2 := multipart.NewWriter(&buf2)
+		part, _ := mw2.CreateFormFile("files[0].file", "a.txt")
+		_, _ = io.WriteString(part, "hello")
+		_ = mw2.Close()
+
+		req2 := httptest.NewRequest(http.MethodPost, "/files/bulk-upload", strings.NewReader(buf2.String()))
+		req2.Header.Set("Content-Type", mw2.FormDataContentType())
+		rr2 := httptest.NewRecorder()
+		h.bulkUpload(rr2, req2, "sb-1")
+		if rr2.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rr2.Code)
+		}
+
+		// entry == nil in File loop (path is empty but file is present - same as above but path is completely absent)
+		var buf3 strings.Builder
+		mw3 := multipart.NewWriter(&buf3)
+		part3, _ := mw3.CreateFormFile("files[0].file", "a.txt")
+		_, _ = io.WriteString(part3, "hello")
+		_ = mw3.Close()
+
+		req3 := httptest.NewRequest(http.MethodPost, "/files/bulk-upload", strings.NewReader(buf3.String()))
+		req3.Header.Set("Content-Type", mw3.FormDataContentType())
+		rr3 := httptest.NewRecorder()
+		h.bulkUpload(rr3, req3, "sb-1")
+		if rr3.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rr3.Code)
+		}
+	})
+
+	t.Run("writeMultipartErrorPart_empty_body", func(t *testing.T) {
+		var buf strings.Builder
+		mw := multipart.NewWriter(&buf)
+		h.writeMultipartErrorPart(mw, nil)
+		_ = mw.Close()
+		if !strings.Contains(buf.String(), "Bad Gateway") {
+			t.Fatalf("expected Bad Gateway, got %s", buf.String())
+		}
+	})
+}

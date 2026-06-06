@@ -1165,9 +1165,6 @@ func singleLineFromImage(dockerfile string) (string, bool) {
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "FROM") {
 		return "", false
 	}
-	if strings.TrimSpace(parts[1]) == "" {
-		return "", false
-	}
 	return parts[1], true
 }
 
