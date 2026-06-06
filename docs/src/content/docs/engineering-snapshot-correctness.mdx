@@ -126,19 +126,19 @@ quiesce-complete.
 
 ```mermaid
 sequenceDiagram
-    participant H as Host (driver.go)
+    participant H as Host driver.go
     participant FC as Firecracker VMM
     participant G as Guest toolboxd
-    H->>FC: LoadSnapshot (ResumeVM=false, EnableDiffSnapshots)
-    H->>FC: PatchDrive / PatchNetworkInterface (per-sandbox TAP + overlay)
-    H->>FC: Action(Resume)
-    Note over FC,G: clone now running with TEMPLATE entropy + frozen clock
-    H->>G: vsock dial (handshakeCID, 1024)  ·  {"op":"ping"}
-    G-->>H: {"ok":true}
-    H->>G: {"op":"post_resume", wallclock_unix_ns}
+    H->>FC: LoadSnapshot -- ResumeVM=false -- EnableDiffSnapshots
+    H->>FC: PatchDrive / PatchNetworkInterface -- per-sandbox TAP plus overlay
+    H->>FC: Action Resume
+    Note over FC,G: clone now running with TEMPLATE entropy plus frozen clock
+    H->>G: vsock dial handshakeCID 1024 -- op=ping
+    G-->>H: ok=true
+    H->>G: op=post_resume -- wallclock_unix_ns
     G->>G: reseed kernel RNG
     G->>G: set CLOCK_REALTIME from host
-    G-->>H: ack (best-effort; discarded)
+    G-->>H: ack -- best-effort -- discarded
 ```
 
 ### Why best-effort and not fatal

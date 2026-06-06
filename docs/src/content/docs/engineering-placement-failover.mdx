@@ -195,18 +195,18 @@ sequenceDiagram
     participant R as Router node
     participant L as Raft leader
     participant O as Chosen owner
-    C->>R: create(spec)
-    R->>R: SelectPlacement(spec)<br/>(local on server; RPC on Agent)
-    R->>L: opReserve(sandbox_id, spec, owner=O)<br/>(leader-forwarded if R is a follower)
-    L-->>R: applied (name unique, capacity held)
-    R->>O: forward create (R==O when self wins)
+    C->>R: create spec
+    R->>R: SelectPlacement spec<br/>local on server -- RPC on Agent
+    R->>L: opReserve sandbox_id spec owner=O<br/>leader-forwarded if R is a follower
+    L-->>R: applied -- name unique -- capacity held
+    R->>O: forward create -- R equals O when self wins
     alt docker create ok
-        O->>L: opPlace(sandbox_id, owner=O)
+        O->>L: opPlace sandbox_id owner=O
         L-->>O: placed
         O-->>R: ok
         R-->>C: sandbox
     else docker create failed
-        R->>L: opCancelReserve(sandbox_id)
+        R->>L: opCancelReserve sandbox_id
         R-->>C: error
     end
 ```

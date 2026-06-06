@@ -121,16 +121,16 @@ exactly the bug this prevents:
 
 ```mermaid
 sequenceDiagram
-    participant H as Handler (retry)
-    participant DB as SQLite (1 writer)
-    H->>DB: INSERT OR IGNORE exposed_ports(host_port=X)
-    Note over DB: idx_exposed_ports_host_port (partial) checks WHERE host_port > 0
+    participant H as Handler retry
+    participant DB as SQLite one writer
+    H->>DB: INSERT OR IGNORE exposed_ports host_port=X
+    Note over DB: idx_exposed_ports_host_port partial<br/>checks WHERE host_port gt 0
     alt no row yet
-        DB-->>H: 1 row affected → Reserved
-    else (sandbox_id, port) already present
-        DB-->>H: 0 rows; SELECT returns Existing → return existing URL
+        DB-->>H: 1 row affected -- Reserved
+    else sandbox_id and port already present
+        DB-->>H: 0 rows -- SELECT returns Existing -- return existing URL
     else other sandbox owns host_port=X
-        DB-->>H: 0 rows; SELECT returns nil → walk to next candidate
+        DB-->>H: 0 rows -- SELECT returns nil -- walk to next candidate
     end
 ```
 
