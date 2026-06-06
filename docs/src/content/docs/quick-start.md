@@ -6,7 +6,7 @@ title: Quick Start
 
 The idea is to provide a seamless, secure sandbox experience that can start in under 50ms to 1s.
 
-Sandboxes are the core component of the [Aerol.ai](https://aerol.ai) platform, spinning up in under 90ms from code to execution and running any code in Python, TypeScript, and JavaScript. Built on OCI/Docker compatibility, massive parallelization, and unlimited persistence, sandboxes deliver consistent, predictable environments for agent workflows.
+Sandboxes are the core component of the [Aerol.ai](https://aerol.ai) platform, spinning up in under 70ms from code to execution and running any code in Python, TypeScript, and JavaScript. Built on OCI/Docker compatibility, massive parallelization, and unlimited persistence, sandboxes deliver consistent, predictable environments for agent workflows.
 
 Agents and developers interact with sandboxes programmatically using the AerolVM SDKs, API, and CLI. Operations span sandbox lifecycle management, filesystem operations, process and code execution, and runtime configuration. Our stateful environment snapshots enable persistent agent operations across sessions, making AerolVM the ideal foundation for AI agent architectures.
 

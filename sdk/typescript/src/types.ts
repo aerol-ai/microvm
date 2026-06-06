@@ -307,8 +307,13 @@ export interface IngressTarget {
   source: IngressTargetSource;
 }
 
-/** DNS record types the daemon emits for custom-domain wiring. */
-export type DNSRecordType = "CNAME" | "A" | "AAAA";
+/**
+ * DNS record types the daemon emits for custom-domain wiring. `ANAME` and
+ * `ALIAS` only appear for an apex domain on a hostname ingress, where they are
+ * mutually-exclusive flattening alternatives to `CNAME` (add the one your
+ * provider supports — see each record's `notes`).
+ */
+export type DNSRecordType = "CNAME" | "A" | "AAAA" | "ANAME" | "ALIAS";
 
 /**
  * One ready-to-paste DNS record a user adds at their DNS provider to make a

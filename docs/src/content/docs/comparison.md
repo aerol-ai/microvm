@@ -16,7 +16,7 @@ A side-by-side look at how AerolVM compares to the two most common alternatives 
 | **Sandbox startup** | <70ms | ~200s | <90ms |
 | **Runtime isolation** | Docker, gVisor (kernel-level), Firecracker (microVM) | Kata | Docker |
 | **Serveless Sandbox(based on Lambda Arch)** | ✅ | ✗ | ✗ |
-| **Security** | gVisor (very secure) | Kata(Extremely secure) | ✗ |
+| **Security** | gVisor + FireCracker (Extremely secure) | FireCracker(Extremely secure) | ✗ |
 | **Port Isolation** | ✅ | ✗ | ✗ |
 | **Persistent** | ✅ | ✗ | ✅ |
 | **Sandbox Lifecycle** | Infinite | 1 day | Infinite |
@@ -69,7 +69,6 @@ The 16 GB disk allocation sits on top of this, but compute is the main cost driv
 **e2b** is a managed cloud service optimized for AI agent sandboxes. It is the fastest way to get started if you do not want to run any infrastructure yourself, but the trade-offs add up quickly:
 
 - **No self-hosting.** Your code, your customers' code, and your data all run on e2b's infrastructure. Regulated workloads, air-gapped deployments, and bring-your-own-cloud requirements are off the table.
-- **No kernel-level isolation.** e2b runs Docker containers. AerolVM ships with gVisor as a first-class runtime, so untrusted code from LLMs or end-users is isolated at the kernel boundary.
 - **Per-sandbox-hour pricing.** Costs scale linearly with usage. A team running 1,000+ sandboxes can pay $500+ per month on e2b vs. ~$20/month on a single host with AerolVM.
 - **Hard sandbox lifetime cap.** Sandboxes expire after 1 day. AerolVM sandboxes live indefinitely and support persistent stop/start.
 - **No GPU, no external storage, no SSH, no TCP ports, no per-sandbox egress control, no per-sandbox network quotas, no multi-tenant tagging.**

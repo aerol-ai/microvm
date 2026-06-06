@@ -28,14 +28,14 @@ Each node in a cluster has a role that determines what it does.
 | Voting nodes | Can lose | Notes |
 |---|---|---|
 | 1 | 0 | Testing only |
-| 2 | 0 | Avoid — same fault tolerance as 1 voter, higher quorum cost |
+| 2 | 0 | Avoid - same fault tolerance as 1 voter, higher quorum cost |
 | 3 | 1 | Minimum for production |
 | 5 | 2 | Recommended when spanning availability zones |
 | 7 | 3 | Diminishing returns; replication overhead increases |
 
 Always use an **odd number** of voting nodes. Even numbers raise the quorum threshold without improving fault tolerance.
 
-`SB_CLUSTER_MAX_AUTO_VOTERS` caps how many nodes automatically become voters. Nodes beyond the cap join as **non-voters** — they receive the placement log and can run sandboxes, but don't count toward quorum. The default cap is `5`.
+`SB_CLUSTER_MAX_AUTO_VOTERS` caps how many nodes automatically become voters. Nodes beyond the cap join as **non-voters** - they receive the placement log and can run sandboxes, but don't count toward quorum. The default cap is `5`.
 
 ## Cluster environment variables
 
@@ -46,7 +46,7 @@ These variables are written to `/etc/sandboxd/cluster.env` on each node when you
 | Variable | Required | Description |
 |---|---|---|
 | `SB_ENABLE_CLUSTER` | Yes | Set to `true` to enable cluster mode. Default `false`. |
-| `SB_NODE_ID` | Yes | Stable name for this node (e.g. `node1`). Must not change across restarts — a changed ID leaves a ghost entry in the cluster configuration. |
+| `SB_NODE_ID` | Yes | Stable name for this node (e.g. `node1`). Must not change across restarts - a changed ID leaves a ghost entry in the cluster configuration. |
 | `SB_CLUSTER_BOOTSTRAP` | Yes | `true` only on the seed node; `false` on all others. |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | No | Maximum nodes auto-promoted to Raft voters. Default `5`. Nodes beyond this cap join as non-voters. |
 
@@ -54,7 +54,7 @@ These variables are written to `/etc/sandboxd/cluster.env` on each node when you
 
 | Variable | Required | Description |
 |---|---|---|
-| `SB_API_ADVERTISE_URL` | Yes | URL other nodes use to forward API requests to this node — e.g. `http://10.0.0.5:21212`. |
+| `SB_API_ADVERTISE_URL` | Yes | URL other nodes use to forward API requests to this node - e.g. `http://10.0.0.5:21212`. |
 | `SB_DATA_PLANE_ADVERTISE_HOST` | Yes | Host other nodes use to route sandbox traffic. Defaults to the host in `SB_API_ADVERTISE_URL`; set explicitly when the API address and sandbox traffic address differ. |
 | `SB_BOOTSTRAP_PEERS` | Joiners only | Comma-separated gossip addresses to connect to when joining the cluster. Empty on the seed. |
 
@@ -85,8 +85,8 @@ Gossip is how nodes discover each other and share capacity information.
 |---|---|---|
 | `SB_CLUSTER_TLS_DIR` | Recommended | Directory holding the cluster CA and this node's cert and key (`ca.crt`, `node.crt`, `node.key`). When set, internal cluster traffic uses mutual TLS so possession of a PAT alone isn't enough to forge forwarded writes. |
 | `SB_CLUSTER_INTERNAL_LISTEN` | No | Bind address for the cluster-internal mTLS listener. Default `0.0.0.0:7002`. |
-| `SB_CLUSTER_INTERNAL_ADVERTISE` | No | HTTPS URL peers use for the internal mTLS channel — e.g. `https://10.0.0.5:7002`. Auto-derived from the node's primary IP when empty. |
-| `SB_CREDENTIAL_ENCRYPTION_KEY` | Yes | Base64-encoded 32-byte key used to encrypt sandbox credentials (registry passwords, mount secrets) before replicating them across nodes. Every node must share the same value — if they differ, sandboxes that fail over to a new host will lose access to private registries and credentialed mounts. |
+| `SB_CLUSTER_INTERNAL_ADVERTISE` | No | HTTPS URL peers use for the internal mTLS channel - e.g. `https://10.0.0.5:7002`. Auto-derived from the node's primary IP when empty. |
+| `SB_CREDENTIAL_ENCRYPTION_KEY` | Yes | Base64-encoded 32-byte key used to encrypt sandbox credentials (registry passwords, mount secrets) before replicating them across nodes. Every node must share the same value - if they differ, sandboxes that fail over to a new host will lose access to private registries and credentialed mounts. |
 | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | No | File path to load the credential key from. Default `/var/lib/sandboxd/credential_encryption.key`. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | No | Skip the credential key requirement. **Recovered sandboxes lose access to private registries and credentialed mounts after failover** without this key. Only for test setups. Default `false`. |
 
@@ -98,11 +98,11 @@ GPU support is installed as a host capability when you set `with_nvidia_gpu = tr
 
 There is no additional environment variable to set. GPU capability is advertised through the gossip protocol alongside CPU and memory capacity.
 
-**NVIDIA** — installs NVIDIA Container Toolkit. Requires an EC2 instance with a physical NVIDIA GPU (`g4dn`, `g5`, `p3`, etc.).
+**NVIDIA** - installs NVIDIA Container Toolkit. Requires an EC2 instance with a physical NVIDIA GPU (`g4dn`, `g5`, `p3`, etc.).
 
-**AMD** — installs ROCm. Supported on `x86_64` instances only (`g4ad`, etc.).
+**AMD** - installs ROCm. Supported on `x86_64` instances only (`g4ad`, etc.).
 
-GPU passthrough is not compatible with gVisor — a sandbox can request one or the other, but not both.
+GPU passthrough is not compatible with gVisor - a sandbox can request one or the other, but not both.
 
 ## gVisor
 
@@ -123,7 +123,7 @@ These variables are written automatically when a node has `with_firecracker = tr
 | `SB_ENABLE_FIRECRACKER` | Set to `true` to enable the Firecracker runtime on this node. |
 | `SB_FIRECRACKER_BINARY` | Path to the `firecracker` binary. |
 | `SB_JAILER_BINARY` | Path to the `jailer` binary. The jailer wraps each microVM for extra isolation. |
-| `SB_FIRECRACKER_KERNEL` | Path to the Linux kernel image (`vmlinux`). Required — Firecracker cannot start without a kernel. |
+| `SB_FIRECRACKER_KERNEL` | Path to the Linux kernel image (`vmlinux`). Required - Firecracker cannot start without a kernel. |
 | `SB_FIRECRACKER_USE_JAILER` | `true` to run each microVM inside the jailer. Default `true`. |
 | `SB_FIRECRACKER_RUN_DIR` | Directory where Firecracker stores per-VM socket files and state. |
 | `SB_FIRECRACKER_TEMPLATES_DIR` | Directory where Firecracker rootfs templates are cached on disk. |

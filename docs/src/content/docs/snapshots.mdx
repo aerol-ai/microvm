@@ -4,10 +4,10 @@ title: Snapshots
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-**Snapshots are a Docker sandbox feature.** They let you save a Docker container's state as a named image and spin up new sandboxes from it. The sandbox you get back runs on the standard Docker runtime — same as `create({ image: 'ubuntu:22.04' })`, just with your pre-built image instead.
+**Snapshots are a Docker sandbox feature.** They let you save a Docker container's state as a named image and spin up new sandboxes from it. The sandbox you get back runs on the standard Docker runtime - same as `create({ image: 'ubuntu:22.04' })`, just with your pre-built image instead.
 
 :::note[Using Firecracker?]
-If you are creating sandboxes with `runtime: "firecracker"`, snapshots are not what you want. Firecracker uses [Firecracker Templates](/firecracker-templates) instead — a separate concept that pre-builds a microVM rootfs and captures a paused VM memory state to enable sub-100ms boots. The two features are for different runtimes and are not interchangeable.
+If you are creating sandboxes with `runtime: "firecracker"`, snapshots are not what you want. Firecracker uses [Firecracker Templates](/firecracker-templates) instead - a separate concept that pre-builds a microVM rootfs and captures a paused VM memory state to enable sub-100ms boots. The two features are for different runtimes and are not interchangeable.
 :::
 
 A snapshot is a named, reusable image you can launch sandboxes from. AerolVM gives you three ways to make one and a single way to use it.

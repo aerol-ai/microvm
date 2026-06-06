@@ -339,7 +339,10 @@ pub struct IngressTarget {
 /// One DNS row a user must add at their provider to make a custom domain
 /// reach the cluster. Mirrors `pkg/models.DNSRecord`. `notes` carries
 /// provider-specific gotchas the server pre-renders (e.g. Cloudflare
-/// "DNS only, gray cloud" warning) when relevant.
+/// "DNS only, gray cloud" warning) when relevant. `record_type` is one of
+/// `CNAME`, `A`, `AAAA`, `ANAME`, or `ALIAS` — the last two appear only for
+/// an apex domain on a hostname ingress, as mutually-exclusive flattening
+/// alternatives to `CNAME` (add the one your provider supports, per `notes`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DnsRecord {
     pub hostname: String,

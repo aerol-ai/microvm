@@ -35,10 +35,47 @@ func TestComposeDNSRecords_SubdomainCNAME(t *testing.T) {
 }
 
 func TestComposeDNSRecords_ApexCNAME(t *testing.T) {
+	// Apex on a hostname ingress emits three flattening candidates
+	// (CNAME/ANAME/ALIAS) at "@", all pointing at the same ingress host.
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
 	got := nonTXT(ComposeDNSRecords([]string{"acme.com"}, target, "_aerol-verify", "aerol-verify="))
-	if len(got) != 1 || got[0].Name != "@" || got[0].Type != DNSRecordTypeCNAME {
-		t.Fatalf("apex should produce one CNAME with Name=@, got %+v", got)
+	wantTypes := []string{DNSRecordTypeCNAME, DNSRecordTypeANAME, DNSRecordTypeALIAS}
+	if len(got) != len(wantTypes) {
+		t.Fatalf("apex should produce %d flattening rows, got %d: %+v", len(wantTypes), len(got), got)
+	}
+	for i, r := range got {
+		if r.Type != wantTypes[i] || r.Name != "@" || r.Value != "ingress.example.com" {
+			t.Fatalf("row %d = %+v, want Type=%s Name=@ Value=ingress.example.com", i, r, wantTypes[i])
+		}
+	}
+}
+
+func TestComposeDNSRecords_ApexHostnameEmitsFlatteningAlternatives(t *testing.T) {
+	// Each apex candidate must carry the pick-one guidance; the CNAME row
+	// additionally keeps the Cloudflare gray-cloud warning.
+	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
+	got := nonTXT(ComposeDNSRecords([]string{"acme.com"}, target, "_aerol-verify", "aerol-verify="))
+
+	byType := make(map[string]DNSRecord, len(got))
+	for _, r := range got {
+		byType[r.Type] = r
+	}
+	for _, typ := range []string{DNSRecordTypeCNAME, DNSRecordTypeANAME, DNSRecordTypeALIAS} {
+		r, ok := byType[typ]
+		if !ok {
+			t.Fatalf("missing %s apex row, got %+v", typ, got)
+		}
+		if !strings.Contains(r.Notes, "add only ONE") {
+			t.Errorf("%s row missing pick-one note: %q", typ, r.Notes)
+		}
+	}
+	// Only the CNAME row carries the gray-cloud proxy warning (Cloudflare
+	// users add that row); ANAME/ALIAS rows must not.
+	if !strings.Contains(byType[DNSRecordTypeCNAME].Notes, "gray cloud") {
+		t.Errorf("apex CNAME row should keep the gray-cloud warning: %q", byType[DNSRecordTypeCNAME].Notes)
+	}
+	if strings.Contains(byType[DNSRecordTypeANAME].Notes, "gray cloud") {
+		t.Errorf("ANAME row should not carry the gray-cloud warning: %q", byType[DNSRecordTypeANAME].Notes)
 	}
 }
 
@@ -60,8 +97,13 @@ func TestComposeDNSRecords_PublicSuffixApex(t *testing.T) {
 	// label-count heuristic would mis-render this as Name="example".
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
 	got := nonTXT(ComposeDNSRecords([]string{"example.co.uk"}, target, "_aerol-verify", "aerol-verify="))
-	if len(got) != 1 || got[0].Name != "@" {
-		t.Fatalf("expected apex Name=@ for example.co.uk, got %+v", got)
+	if len(got) == 0 {
+		t.Fatal("expected apex flattening rows for example.co.uk, got none")
+	}
+	for _, r := range got {
+		if r.Name != "@" {
+			t.Fatalf("expected apex Name=@ for example.co.uk, got %+v", r)
+		}
 	}
 }
 
@@ -142,13 +184,19 @@ func TestComposeDNSRecords_MixedSourceApexPrefersIPs(t *testing.T) {
 }
 
 func TestComposeDNSRecords_MultipleHostnames(t *testing.T) {
+	// Subdomain → 1 CNAME (Name=api); apex → 3 flattening rows (Name=@).
 	target := IngressTarget{Hostname: "ingress.example.com", Source: IngressTargetSourceHostname}
 	got := nonTXT(ComposeDNSRecords([]string{"api.acme.com", "acme.com"}, target, "_aerol-verify", "aerol-verify="))
-	if len(got) != 2 {
-		t.Fatalf("want 2 records, got %d", len(got))
+	if len(got) != 4 {
+		t.Fatalf("want 4 records (1 subdomain + 3 apex), got %d: %+v", len(got), got)
 	}
-	if got[0].Name != "api" || got[1].Name != "@" {
-		t.Fatalf("expected [api, @], got [%s, %s]", got[0].Name, got[1].Name)
+	if got[0].Name != "api" || got[0].Type != DNSRecordTypeCNAME {
+		t.Fatalf("expected first row CNAME api, got %+v", got[0])
+	}
+	for _, r := range got[1:] {
+		if r.Name != "@" {
+			t.Fatalf("expected apex rows at @, got %+v", r)
+		}
 	}
 }
 
