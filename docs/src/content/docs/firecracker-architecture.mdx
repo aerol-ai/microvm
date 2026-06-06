@@ -290,3 +290,13 @@ path - the rootfs is already built, the kernel is already booted into a
 snapshot, and on a warm hit the snapshot is already loaded into a live process.
 [Hydration & the Operational Fold](/firecracker-hydration) explains how those
 pieces are pre-warmed, restored, and shared across a host.
+
+## Further reading
+
+The primary sources behind the design on these two pages:
+
+- [Firecracker: Lightweight Virtualization for Serverless Applications](https://www.usenix.org/conference/nsdi20/presentation/agache) (USENIX NSDI 2020) - the foundational paper on microVMs for serverless and agent workloads.
+- [Firecracker snapshotting](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md) - the upstream spec for `LoadSnapshot`, diff snapshots, the dirty bitmap, and the `File` vs `Uffd` memory backends behind the [copy-on-write model](/firecracker-hydration#memory-copy-on-write-clones).
+- [Firecracker jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md) - chroot + cgroups + privilege drop; the source for the microVM anatomy above.
+- [Firecracker network setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md) - TAP-device guest networking, the basis for the TAP slot pool.
+- [Firecracker REST API](https://github.com/firecracker-microvm/firecracker/blob/main/src/firecracker/swagger/firecracker.yaml) - the wire contract for every `Put`/`Patch`/`Action` call in the boot sequence.
