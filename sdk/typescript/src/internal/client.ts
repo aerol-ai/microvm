@@ -17,6 +17,7 @@ import type {
   CreateSessionOptions,
   CreateTemplateOptions,
   CustomDomain,
+  CloneGeneration,
   CustomDomainDNSRecords,
   CustomDomainStatus,
   ExecExitInfo,
@@ -249,6 +250,11 @@ interface ApiHealthStatus {
   caddy: string;
   ssh_gateway?: string;
   version: string;
+}
+
+interface ApiCloneGeneration {
+  generation: string;
+  resumed_at: number;
 }
 
 interface ApiMountSpec {
@@ -700,6 +706,14 @@ export class APIClient {
     return response.mounts.map(fromApiMountSpecRedacted);
   }
 
+  async cloneGeneration(id: string): Promise<CloneGeneration> {
+    const response = await this.doJSON<ApiCloneGeneration>(
+      "GET",
+      `${this.versionPrefix}/sandboxes/${id}/toolbox/clone-generation`,
+    );
+    return fromApiCloneGeneration(response);
+  }
+
   async getNetworkUsage(id: string): Promise<NetworkUsage> {
     const response = await this.doJSON<ApiNetworkUsage>("GET", `${this.versionPrefix}/sandboxes/${id}/network/usage`);
     return fromApiNetworkUsage(response);
@@ -868,6 +882,16 @@ export class SandboxResource implements Sandbox {
 
   async exec(command: string | ExecRequest): Promise<ExecResult> {
     return this.client.exec(this.id, typeof command === "string" ? { command } : command);
+  }
+
+  /**
+   * Read this sandbox's clone-generation token. The token changes whenever the
+   * sandbox is resumed from a snapshot. Use it to detect that a sandbox is a
+   * clone (e.g. to re-run setup). It does NOT reseed in-guest PRNGs — see the
+   * "Randomness in cloned sandboxes" docs page for the in-guest pattern.
+   */
+  async cloneGeneration(): Promise<CloneGeneration> {
+    return this.client.cloneGeneration(this.id);
   }
 
   execStream(options: ExecStreamOptions): ExecStreamHandle {
@@ -1235,6 +1259,13 @@ function fromApiHealthStatus(status: ApiHealthStatus): HealthStatus {
     caddy: status.caddy,
     sshGateway: status.ssh_gateway ?? "",
     version: status.version,
+  };
+}
+
+function fromApiCloneGeneration(gen: ApiCloneGeneration): CloneGeneration {
+  return {
+    generation: gen.generation,
+    resumedAt: gen.resumed_at ?? 0,
   };
 }
 

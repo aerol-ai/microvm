@@ -3,6 +3,7 @@ from .image import Image
 from .types import (
     BuildImagePushOptions,
     BuildImageResult,
+    CloneGeneration,
     CustomDomain,
     CustomDomainDNSRecords,
     CustomDomainStatus,
@@ -20,6 +21,7 @@ from .types import (
 __all__ = [
     "BuildImagePushOptions",
     "BuildImageResult",
+    "CloneGeneration",
     "CustomDomain",
     "CustomDomainDNSRecords",
     "CustomDomainStatus",

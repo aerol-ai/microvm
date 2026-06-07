@@ -22,6 +22,26 @@ test("internal client uses config object and auth header", async () => {
   assert.ok(sandbox instanceof SandboxResource);
 });
 
+test("internal client cloneGeneration reads token via toolbox proxy", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({ generation: "2d0d8c69", resumed_at: 1700000000000000000 });
+    },
+  });
+
+  const gen = await client.cloneGeneration("sb-clone");
+
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  assert.equal(seenRequest.url, "https://api.example.com/v1/sandboxes/sb-clone/toolbox/clone-generation");
+  assert.equal(gen.generation, "2d0d8c69");
+  assert.equal(gen.resumedAt, 1700000000000000000);
+});
+
 test("internal client create maps request and response", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

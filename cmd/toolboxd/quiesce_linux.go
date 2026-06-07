@@ -14,10 +14,11 @@ package main
 //   - ReseedRandom: every snapshot clone resumes with the template's
 //     /dev/urandom entropy pool. Two clones of the same template
 //     would draw identical bytes from getrandom(0), a real crypto
-//     bug. RNDADDENTROPY forces the kernel to bump its entropy
-//     estimate AND mix the supplied bytes into the input pool, so
-//     the next getrandom reseeds the CSPRNG. Fresh entropy comes
-//     from the host-attached virtio-rng device via /dev/random.
+//     bug. RNDADDENTROPY credits the kernel input pool with fresh
+//     bytes; RNDRESEEDCRNG then forces the CRNG to consume them
+//     immediately so the next getrandom returns a clone-distinct
+//     stream. Fresh entropy comes from the host-attached virtio-rng
+//     device via /dev/random.
 
 import (
 	"crypto/rand"
@@ -29,15 +30,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// ioctlPtr is the syscall seam ReseedRandom uses for both the
+// RNDADDENTROPY and RNDRESEEDCRNG ioctls. A package var so the linux
+// unit test (quiesce_linux_test.go) can assert both fire — in order —
+// without a real kernel or CAP_SYS_ADMIN. Production wires the real
+// SYS_IOCTL.
+var ioctlPtr = func(fd, request, arg uintptr) syscall.Errno {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, request, arg)
+	return errno
+}
+
 // linuxQuiesceOps is the concrete quiesceOps used inside the sandbox.
 // Holds no state — all ops are syscalls against the running kernel.
 type linuxQuiesceOps struct{}
 
 // ReseedRandom mixes 32 fresh bytes of entropy into the kernel input
-// pool and credits them as 256 bits. Forces the next getrandom call to
-// reseed the CSPRNG so two clones drawing entropy after resume see
-// distinct streams. Errors are returned but the caller logs and
-// continues — a sandbox without fresh entropy is degraded, not broken.
+// pool and then forces the CRNG to reseed from it, so two clones drawing
+// entropy after resume see distinct streams. Errors are returned but the
+// caller logs and continues — a sandbox without fresh entropy is
+// degraded, not broken.
 func (linuxQuiesceOps) ReseedRandom() error {
 	const entropyBytes = 32
 	var buf [entropyBytes]byte
@@ -59,13 +70,28 @@ func (linuxQuiesceOps) ReseedRandom() error {
 		return fmt.Errorf("open /dev/random: %w", err)
 	}
 	defer f.Close()
-	if _, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
+
+	// Step 1: credit the input pool. This is the load-bearing op — if it
+	// fails the clone has no fresh entropy, so surface the error.
+	if errno := ioctlPtr(
 		f.Fd(),
 		uintptr(unix.RNDADDENTROPY),
 		uintptr(unsafe.Pointer(&payload[0])),
 	); errno != 0 {
 		return fmt.Errorf("ioctl RNDADDENTROPY: %w", errno)
+	}
+
+	// Step 2: force an immediate CRNG reseed. RNDADDENTROPY only credits
+	// the pool; on kernels < 5.18 the CRNG may not reseed from it until
+	// its own interval elapses, leaving a window where two clones'
+	// getrandom() still return the pre-snapshot stream. RNDRESEEDCRNG
+	// (Linux >= 5.10) closes that window. The request arg is ignored.
+	// Older kernels lack the ioctl and answer ENOTTY/EINVAL — tolerate
+	// that: the entropy is already credited and the CRNG will reseed on
+	// schedule, so it's a soft degrade, not a failure.
+	if errno := ioctlPtr(f.Fd(), uintptr(unix.RNDRESEEDCRNG), 0); errno != 0 &&
+		errno != syscall.ENOTTY && errno != syscall.EINVAL {
+		return fmt.Errorf("ioctl RNDRESEEDCRNG: %w", errno)
 	}
 	return nil
 }

@@ -172,6 +172,32 @@ class MicroVMClientTest {
     }
 
     @Test
+    void cloneGenerationReadsTokenViaToolboxProxy() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenMethod.set(exchange.getRequestMethod());
+            seenPath.set(exchange.getRequestURI().getPath());
+            writeJson(exchange, 200, mapOf(
+                "generation", "2d0d8c69",
+                "resumed_at", 1700000000000000000L
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            ai.aerol.microvm.model.CloneGeneration gen = client.cloneGeneration("sb-clone");
+
+            assertEquals("GET", seenMethod.get());
+            assertEquals("/v1/sandboxes/sb-clone/toolbox/clone-generation", seenPath.get());
+            assertEquals("2d0d8c69", gen.generation);
+            assertEquals(1700000000000000000L, gen.resumedAt);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void buildImageWithPushRejectsMissingCredentialsClientSide() throws Exception {
         // No HTTP server: validation must throw before any wire call. If a
         // request leaks out, the HttpClient will fail with a connect error

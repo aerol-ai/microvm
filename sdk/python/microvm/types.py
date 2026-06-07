@@ -36,6 +36,22 @@ class BuildImageResult:
     pushed: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class CloneGeneration:
+    """Clone-generation marker for a sandbox.
+
+    ``generation`` changes every time the sandbox is resumed from a snapshot
+    (i.e. it is a clone). A long-lived process running *inside* the sandbox can
+    poll this and reseed its own userspace PRNGs when the token changes — two
+    clones otherwise share the snapshot's frozen seed state. Read-only: the SDK
+    cannot reseed an in-guest process from the client side. See the "Randomness
+    in cloned sandboxes" docs page.
+    """
+
+    generation: str
+    resumedAt: int = 0
+
+
 class RegisterSnapshotOptions(TypedDict, total=False):
     name: str
     image: str

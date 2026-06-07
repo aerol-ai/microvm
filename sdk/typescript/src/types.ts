@@ -512,6 +512,22 @@ export interface HealthStatus {
   version: string;
 }
 
+/**
+ * Clone-generation marker for a sandbox. The `generation` token changes every
+ * time the sandbox is resumed from a snapshot (i.e. it is a clone). A
+ * long-lived process running *inside* the sandbox can poll this and reseed its
+ * own userspace PRNGs when the token changes — two clones otherwise share the
+ * snapshot's frozen seed state. This is a read-only signal; the SDK cannot
+ * reseed an in-guest process from the client side. See the "Randomness in
+ * cloned sandboxes" docs page.
+ */
+export interface CloneGeneration {
+  /** Opaque token that changes on every resume-from-snapshot. */
+  generation: string;
+  /** Host wall-clock of the last resume, in unix nanoseconds. 0 = never resumed. */
+  resumedAt: number;
+}
+
 export type BinaryLike = Uint8Array | ArrayBuffer | Blob | string;
 
 /**

@@ -200,9 +200,10 @@ type quiesceHandler struct {
 	logger   *slog.Logger
 	sessions sessionFlusher
 	quiesce  quiesceOps
+	cloneGen *cloneGeneration
 }
 
-func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher) *quiesceHandler {
+func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher, cloneGen *cloneGeneration) *quiesceHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -210,6 +211,7 @@ func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher) *quiesceHan
 		logger:   logger,
 		sessions: sessions,
 		quiesce:  newQuiesceOps(),
+		cloneGen: cloneGen,
 	}
 }
 
@@ -246,6 +248,12 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 	}
 	if err := h.quiesce.ReseedRandom(); err != nil {
 		h.logger.Warn("vsock post_resume: rng reseed failed", "error", err)
+	}
+	// Bump the clone-generation token AFTER the kernel reseed so an in-guest
+	// process that observes the new token can immediately reseed its own
+	// userspace PRNGs from a kernel that already has fresh entropy.
+	if h.cloneGen != nil {
+		h.cloneGen.bump(data.WallclockUnixNs)
 	}
 	h.logger.Info("vsock: post_resume complete",
 		"wallclock_set", data.WallclockUnixNs > 0)

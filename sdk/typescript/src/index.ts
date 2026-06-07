@@ -9,6 +9,7 @@ export type {
   BuildImageOptions,
   BuildImagePushOptions,
   BuildImageResult,
+  CloneGeneration,
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,

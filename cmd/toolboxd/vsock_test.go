@@ -157,7 +157,7 @@ func TestVsock_UnknownOpReturnsError(t *testing.T) {
 
 func TestVsock_MissingOp(t *testing.T) {
 	host, guest := newPipePair()
-	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil))
+	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil, nil))
 
 	_, _ = host.Write([]byte(`{}` + "\n"))
 	var resp VsockResponse
@@ -209,7 +209,7 @@ func TestVsock_HandlerErrorDoesNotCloseConn(t *testing.T) {
 // newline). The host should reconnect.
 func TestVsock_DecodeErrorClosesConn(t *testing.T) {
 	host, guest := newPipePair()
-	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil))
+	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil, nil))
 
 	_, _ = host.Write([]byte("not json\n"))
 	var resp VsockResponse
@@ -298,7 +298,7 @@ func TestQuiesceHandler_PreSnapshot_FlushesEverySession(t *testing.T) {
 		ids:       []string{"s1", "s2", "s3"},
 		flushErrs: map[string]error{"s2": errors.New("disk full")},
 	}
-	h := newQuiesceHandler(nil, flusher)
+	h := newQuiesceHandler(nil, flusher, nil)
 	h.quiesce = &fakeQuiesceOps{} // unused for pre_snapshot but avoids nil deref
 
 	if err := h.OnPreSnapshot(context.Background(), nil); err != nil {
@@ -325,7 +325,7 @@ func TestQuiesceHandler_PreSnapshot_FlushesEverySession(t *testing.T) {
 // not gated on the wallclock field's presence.
 func TestQuiesceHandler_PostResume_ResyncsClockAndRNG(t *testing.T) {
 	q := &fakeQuiesceOps{}
-	h := newQuiesceHandler(nil, nil)
+	h := newQuiesceHandler(nil, nil, nil)
 	h.quiesce = q
 
 	raw := json.RawMessage(`{"wallclock_unix_ns":1700000000000000000}`)
@@ -359,7 +359,7 @@ func TestQuiesceHandler_PostResume_RNGReseedAlwaysFires(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := &fakeQuiesceOps{}
-			h := newQuiesceHandler(nil, nil)
+			h := newQuiesceHandler(nil, nil, nil)
 			h.quiesce = q
 			if err := h.OnPostResume(context.Background(), tc.raw); err != nil {
 				t.Fatalf("OnPostResume: %v", err)
@@ -385,7 +385,7 @@ func TestQuiesceHandler_PostResume_QuiesceErrorIsNonFatal(t *testing.T) {
 		reseedErr:    errors.New("entropy pool unavailable"),
 		wallclockErr: errors.New("CAP_SYS_TIME denied"),
 	}
-	h := newQuiesceHandler(nil, nil)
+	h := newQuiesceHandler(nil, nil, nil)
 	h.quiesce = q
 	if err := h.OnPostResume(context.Background(),
 		json.RawMessage(`{"wallclock_unix_ns":12345}`)); err != nil {

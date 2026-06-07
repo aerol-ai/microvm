@@ -209,6 +209,18 @@ func (c *Client) GetNetworkUsage(ctx context.Context, id string) (sdktypes.Netwo
 	return c.inner.GetNetworkUsage(ctx, id)
 }
 
+// CloneGeneration reads a sandbox's clone-generation token. The token changes
+// whenever the sandbox is resumed from a snapshot, so a change signals "this
+// is a clone." Read-only — the SDK cannot reseed a process inside the guest;
+// see the "Randomness in cloned sandboxes" docs for the in-guest pattern.
+func (c *Client) CloneGeneration(ctx context.Context, id string) (sdktypes.CloneGeneration, error) {
+	res, err := c.inner.CloneGeneration(ctx, id)
+	if err != nil {
+		return sdktypes.CloneGeneration{}, err
+	}
+	return sdktypes.CloneGeneration{Generation: res.Generation, ResumedAt: res.ResumedAt}, nil
+}
+
 // SetNetworkLimits raises or lifts the per-direction byte caps. Leave a field
 // nil to keep the current value; pass a pointer to zero to set "unlimited".
 // Raising a cap above current usage clears the per-IP iptables block on the
@@ -377,6 +389,12 @@ func (s *Sandbox) Exec(ctx context.Context, request sdktypes.ExecRequest) (sdkty
 
 func (s *Sandbox) ExecCommand(ctx context.Context, command string) (sdktypes.ExecResult, error) {
 	return s.client.inner.Exec(ctx, s.ID, sdktypes.ExecRequest{Command: command})
+}
+
+// CloneGeneration reads this sandbox's clone-generation token (changes on
+// resume-from-snapshot). Read-only; does not reseed in-guest PRNGs.
+func (s *Sandbox) CloneGeneration(ctx context.Context) (sdktypes.CloneGeneration, error) {
+	return s.client.CloneGeneration(ctx, s.ID)
 }
 
 func (s *Sandbox) ExecStream(ctx context.Context, options sdktypes.ExecStreamOptions) (*ExecStreamHandle, error) {

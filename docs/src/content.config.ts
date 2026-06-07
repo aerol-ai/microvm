@@ -173,6 +173,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
             label: 'Firecracker Templates',
             description: 'Register OCI images as Firecracker rootfs templates for sub-100ms cold starts; rebuild on demand.',
           },
+          {
+            type: 'link',
+            href: '/randomness-in-cloned-sandboxes',
+            label: 'Randomness in Clones',
+            description: 'Why snapshot clones can share random-number state, what AerolVM reseeds automatically, and how to reseed your own long-lived processes.',
+          },
         ]
       },
       {
