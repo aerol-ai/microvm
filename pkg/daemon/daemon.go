@@ -1038,6 +1038,19 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 		return
 	}
 	svc.AttachSnapshotPusher(pusher, r)
+	wasmPusher, err := service.NewWasmCheckpointPusher(service.SnapshotPushConfig{
+		Enabled:   true,
+		Host:      host,
+		ClusterID: cfg.AutoImportClusterID,
+		PATPath:   cfg.AutoImportClusterPATPath,
+	}, logger)
+	if err != nil {
+		logger.Warn("wasm checkpoint push: pusher build failed; feature stays off",
+			"error", err)
+	} else {
+		svc.AttachWasmCheckpointPusher(wasmPusher)
+		logger.Info("wasm checkpoint push enabled", "host", host, "cluster_id", cfg.AutoImportClusterID)
+	}
 	logger.Info("snapshot push reconciler started",
 		"host", host,
 		"cluster_id", cfg.AutoImportClusterID,

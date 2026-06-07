@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -267,8 +268,8 @@ func (e *wazeroEngine) CaptureSnapshot(_ context.Context) (SnapshotCapture, erro
 		return SnapshotCapture{}, fmt.Errorf("no active instance")
 	}
 	mem := e.module.Memory()
-	if mem == nil {
-		return SnapshotCapture{}, fmt.Errorf("module has no memory export")
+	if mem == nil || reflect.ValueOf(mem).IsNil() {
+		return SnapshotCapture{}, fmt.Errorf("module has no linear memory")
 	}
 	data, ok := mem.Read(0, mem.Size())
 	if !ok {

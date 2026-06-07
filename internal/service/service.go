@@ -115,6 +115,8 @@ type Service struct {
 	// next reconciler tick.
 	snapshotPusher         *SnapshotPusher
 	snapshotPushReconciler *SnapshotPushReconciler
+	// wasmCheckpointPusher uploads durable WASM checkpoints to AOCR (§4.8).
+	wasmCheckpointPusher *WasmCheckpointPusher
 	// templateArtifactPusher + templateArtifactPushReconciler are non-nil
 	// only when cfg.SnapshotPushEnabled is true AND a templates dir is
 	// configured. Mirror the snapshot push wiring: the build success path
@@ -519,6 +521,15 @@ func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *Snaps
 	}
 	s.snapshotPusher = pusher
 	s.snapshotPushReconciler = reconciler
+}
+
+// AttachWasmCheckpointPusher wires AOCR push for durable WASM checkpoints.
+// Called from main when SnapshotPushEnabled is true.
+func (s *Service) AttachWasmCheckpointPusher(pusher *WasmCheckpointPusher) {
+	if pusher == nil {
+		return
+	}
+	s.wasmCheckpointPusher = pusher
 }
 
 // SnapshotPushReconciler exposes the reconciler so main.go can drive it

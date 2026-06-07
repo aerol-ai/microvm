@@ -1943,6 +1943,7 @@ func TestStoreHelperCases(t *testing.T) {
 			"passivatable", // durability
 			"", "",         // module_ref, module_digest
 			"", "", // checkpoint_path, clone_generation
+			"", "", // wasm_registry_ref, wasm_registry_digest
 			"", // owner_ref
 			0,  // fleet_suspended
 		}}

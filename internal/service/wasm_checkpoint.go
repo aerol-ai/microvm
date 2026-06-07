@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -100,7 +101,29 @@ func (s *Service) checkpointWasmSandbox(ctx context.Context, host wasmruntime.Ch
 		"checkpoint", path,
 		slog.String("clone_generation", gen),
 	)
+	if sandbox.Durability == models.DurabilityDurable && s.wasmCheckpointPusher != nil {
+		go s.pushWasmCheckpointBestEffort(sandbox.ID, path)
+	}
 	return nil
+}
+
+func (s *Service) pushWasmCheckpointBestEffort(sandboxID, memSnapDir string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	result, err := s.wasmCheckpointPusher.PushOnce(ctx, sandboxID, memSnapDir)
+	if err != nil {
+		s.logger.Warn("wasm checkpoint AOCR push failed",
+			"sandbox_id", sandboxID,
+			"error", err,
+		)
+		return
+	}
+	if err := s.store.UpdateWasmRegistryPush(ctx, sandboxID, result.RegistryRef, result.Digest); err != nil {
+		s.logger.Warn("wasm checkpoint AOCR push metadata persist failed",
+			"sandbox_id", sandboxID,
+			"error", err,
+		)
+	}
 }
 
 func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.Sandbox) (*models.Sandbox, error) {

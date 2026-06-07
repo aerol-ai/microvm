@@ -558,6 +558,8 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN module_digest TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN checkpoint_path TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN clone_generation TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_digest TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -668,8 +670,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			durability,
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -717,6 +720,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.ModuleDigest),
 		strings.TrimSpace(sandbox.CheckpointPath),
 		strings.TrimSpace(sandbox.CloneGeneration),
+		strings.TrimSpace(sandbox.WasmRegistryRef),
+		strings.TrimSpace(sandbox.WasmRegistryDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -795,8 +800,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			durability,
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -838,6 +844,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			module_digest = excluded.module_digest,
 			checkpoint_path = excluded.checkpoint_path,
 			clone_generation = excluded.clone_generation,
+			wasm_registry_ref = excluded.wasm_registry_ref,
+			wasm_registry_digest = excluded.wasm_registry_digest,
 			owner_ref = excluded.owner_ref,
 			fleet_suspended = excluded.fleet_suspended
 	`,
@@ -887,6 +895,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.ModuleDigest),
 		strings.TrimSpace(sandbox.CheckpointPath),
 		strings.TrimSpace(sandbox.CloneGeneration),
+		strings.TrimSpace(sandbox.WasmRegistryRef),
+		strings.TrimSpace(sandbox.WasmRegistryDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -917,6 +927,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			durability,
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE id = ?
@@ -963,6 +974,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			durability,
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		ORDER BY created_at DESC
@@ -1029,6 +1041,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			durability,
 			module_ref, module_digest,
 			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE owner_ref = ?
@@ -3307,6 +3320,8 @@ func scanSandbox(scanner interface {
 		&sandbox.ModuleDigest,
 		&sandbox.CheckpointPath,
 		&sandbox.CloneGeneration,
+		&sandbox.WasmRegistryRef,
+		&sandbox.WasmRegistryDigest,
 		&sandbox.OwnerRef,
 		&fleetSuspended,
 	)
@@ -4530,6 +4545,20 @@ func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, status, che
 	`, status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID)
 	if err != nil {
 		return fmt.Errorf("update wasm checkpoint: %w", err)
+	}
+	return nil
+}
+
+// UpdateWasmRegistryPush records the AOCR ref/digest after a durable checkpoint push.
+func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, registryRef, digest string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET wasm_registry_ref = ?, wasm_registry_digest = ?, updated_at = ?
+		WHERE id = ?
+	`, strings.TrimSpace(registryRef), strings.TrimSpace(digest), now, sandboxID)
+	if err != nil {
+		return fmt.Errorf("update wasm registry push: %w", err)
 	}
 	return nil
 }

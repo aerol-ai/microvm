@@ -731,6 +731,10 @@ type Sandbox struct {
 	CheckpointPath string `json:"-"`
 	// CloneGeneration is the §4.8 fencing token for checkpoint/clone writes.
 	CloneGeneration string `json:"-"`
+	// WasmRegistryRef is the AOCR ref for the last pushed durable checkpoint.
+	WasmRegistryRef string `json:"-"`
+	// WasmRegistryDigest is the manifest digest from the last AOCR push.
+	WasmRegistryDigest string `json:"-"`
 }
 
 // ModuleRefForCreate returns the WASM module reference from a create request.
