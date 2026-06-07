@@ -2,6 +2,7 @@ package toolhost
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -71,6 +72,10 @@ func (h *Host) handleStateKV(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.stateKV.Set(r.Context(), h.sandboxID, key, body); err != nil {
+			if errors.Is(err, statekv.ErrRateLimited) {
+				writeError(w, http.StatusTooManyRequests, err.Error())
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -85,6 +90,10 @@ func (h *Host) handleStateKV(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.stateKV.Delete(r.Context(), h.sandboxID, key); err != nil {
+			if errors.Is(err, statekv.ErrRateLimited) {
+				writeError(w, http.StatusTooManyRequests, err.Error())
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

@@ -27,7 +27,12 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)
 	if st != nil {
-		driver.SetStateKV(statekv.NewSQLiteStore(st))
+		// Wrap the durable host-KV store in a per-sandbox write limiter so a
+		// chatty guest cannot starve the single-writer boot path (§4.6).
+		// NewRateLimitedStore returns the inner store unchanged when the rate is
+		// 0, keeping the feature off when the operator disables it.
+		kv := statekv.NewRateLimitedStore(statekv.NewSQLiteStore(st), cfg.WasmStateKVWritesPerSec, cfg.WasmStateKVBurst)
+		driver.SetStateKV(kv)
 	}
 	svc.SetWasmRuntime(driver)
 	svc.SetWasmModuleResolver(resolver)

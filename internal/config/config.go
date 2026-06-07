@@ -407,6 +407,15 @@ type Config struct {
 	// WasmCheckpointKeepLastN retains the newest N AOCR push records per sandbox.
 	// 0 disables pruning. Default 3. SB_WASM_CHECKPOINT_KEEP_LAST_N.
 	WasmCheckpointKeepLastN int
+	// WasmStateKVWritesPerSec caps per-sandbox durable host-KV writes (Set/Delete).
+	// Host-KV writes land synchronously on the single-writer SQLite store, so a
+	// chatty durable guest can otherwise contend with the CreateSandbox boot path
+	// (plans/wasm-runtime.md §4.6). 0 disables limiting. SB_WASM_STATEKV_WRITES_PER_SEC.
+	WasmStateKVWritesPerSec float64
+	// WasmStateKVBurst is the host-KV write token-bucket capacity (allowed burst
+	// above the steady rate). Ignored when WasmStateKVWritesPerSec is 0.
+	// SB_WASM_STATEKV_BURST.
+	WasmStateKVBurst int
 	// WasmModuleGCEnabled gates the wasm_modules catalogue janitor.
 	// SB_WASM_MODULE_GC_ENABLED.
 	WasmModuleGCEnabled bool
@@ -1182,6 +1191,13 @@ func Load() (Config, error) {
 		WasmCheckpointInterval:  getEnvDuration("SB_WASM_CHECKPOINT_INTERVAL", 0),
 		WasmDurablePushInterval: getEnvDuration("SB_WASM_DURABLE_PUSH_INTERVAL", 0),
 		WasmCheckpointKeepLastN: getEnvInt("SB_WASM_CHECKPOINT_KEEP_LAST_N", 3),
+		// Default is deliberately generous: the guard exists to stop a single
+		// runaway guest (thousands of writes/sec hammering the single writer),
+		// not to throttle normal durable workloads. Operators tune down for
+		// stricter boot-path protection or set 0 to disable. WASM durable is new
+		// in this release, so there are no existing guests this default can break.
+		WasmStateKVWritesPerSec: getEnvFloat("SB_WASM_STATEKV_WRITES_PER_SEC", 50),
+		WasmStateKVBurst:        getEnvInt("SB_WASM_STATEKV_BURST", 100),
 		WasmModuleGCEnabled:     getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
 		WasmModuleGCInterval:    getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
 		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),

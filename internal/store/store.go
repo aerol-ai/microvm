@@ -408,6 +408,16 @@ func Open(path string) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS idx_wasm_state_kv_sandbox
 			ON wasm_state_kv(sandbox_id);`,
 		// wasm_checkpoint_pushes tracks AOCR push history for keep-last-N (§4.8).
+		//
+		// Deliberate deviation from plan §4.8's "reuse sandbox_snapshots" note:
+		// sandbox_snapshots models user-invoked, named snapshots (one row per
+		// snapshot name, surfaced over the snapshot API). This table instead
+		// records the *rolling, automatic* boundary-checkpoint pushes a durable
+		// WASM sandbox emits on drain/periodic cadence — unnamed, content-addressed
+		// by digest, and pruned to keep-last-N. Folding both into sandbox_snapshots
+		// would mean a type discriminator column plus snapshot-API rows the user
+		// never asked for. Kept separate on purpose; revisit if the two histories
+		// ever need to share retention/GC machinery.
 		`CREATE TABLE IF NOT EXISTS wasm_checkpoint_pushes (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			sandbox_id TEXT NOT NULL,
@@ -573,7 +583,20 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN fleet_suspended INTEGER NOT NULL DEFAULT 0;`,
 		// Durability class (plans/wasm-runtime.md D7). Pre-migration rows default
 		// to passivatable — container/VM runtimes survive restarts natively.
+		// durability is a shared concept (every runtime declares one) so it lives
+		// on the sandboxes row.
 		`ALTER TABLE sandboxes ADD COLUMN durability TEXT NOT NULL DEFAULT 'passivatable';`,
+		// The columns below are WASM-only: they are empty for docker/firecracker
+		// rows. They live on the shared sandboxes row (rather than a 1:1
+		// wasm_sandbox_state side-table) for phase 1 because reconcile, the
+		// failover/clone-generation fencing path, and rehydrate all read them on
+		// the hot list/scan path, and a per-row LEFT JOIN there is not worth it at
+		// this column count. Empty TEXT columns are ~free in SQLite. If the
+		// WASM-specific column set keeps growing, migrate these into a side-table
+		// keyed by sandbox_id (same shape as wasm_state_kv). Note module_ref
+		// overlaps the image column (the start path falls back to image when
+		// module_ref is empty) and clone_generation mirrors the toolboxd clonegen
+		// token.
 		`ALTER TABLE sandboxes ADD COLUMN module_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN module_digest TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN checkpoint_path TEXT NOT NULL DEFAULT '';`,
