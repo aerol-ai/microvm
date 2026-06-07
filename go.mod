@@ -18,6 +18,8 @@ require (
 	golang.org/x/sync v0.20.0
 )
 
+require github.com/tetratelabs/wazero v1.9.0 // indirect
+
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.6 // indirect

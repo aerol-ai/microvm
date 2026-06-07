@@ -193,6 +193,26 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "module_ref_roundtrip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-wasm-mod")
+				sandbox.Runtime = models.RuntimeWasm
+				sandbox.ModuleRef = "hello.wasm"
+				sandbox.ModuleDigest = "abc123"
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.ModuleRef != "hello.wasm" || got.ModuleDigest != "abc123" {
+					t.Fatalf("module fields = %+v", got)
+				}
+			},
+		},
+		{
 			name: "create_duplicate_returns_error",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
@@ -1921,8 +1941,9 @@ func TestStoreHelperCases(t *testing.T) {
 			"",             // template_id
 			0,              // overlay_size_gb
 			"passivatable", // durability
-			"",             // owner_ref
-			0,              // fleet_suspended
+			"", "",         // module_ref, module_digest
+			"", // owner_ref
+			0,  // fleet_suspended
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {

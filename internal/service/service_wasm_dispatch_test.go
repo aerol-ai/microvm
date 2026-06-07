@@ -94,6 +94,26 @@ func TestWasmDispatch_RoutesToDriver(t *testing.T) {
 	}
 }
 
+func TestWasmDispatch_ModuleRefWithoutImage(t *testing.T) {
+	rt := &wasmRecordingRuntime{err: errors.New("driver stub")}
+	svc := &Service{cfg: config.Config{Runtime: models.RuntimeDocker, EnableWasm: true}}
+	svc.SetWasmRuntime(rt)
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		ModuleRef: "hello.wasm",
+		Runtime:   models.RuntimeWasm,
+	})
+	if err == nil || !strings.Contains(err.Error(), "driver stub") {
+		t.Fatalf("expected driver error, got %v", err)
+	}
+	if rt.lastCreateReq.ModuleRef != "hello.wasm" {
+		t.Fatalf("module_ref = %q", rt.lastCreateReq.ModuleRef)
+	}
+	if rt.lastCreateReq.Image != "hello.wasm" {
+		t.Fatalf("image normalized to %q", rt.lastCreateReq.Image)
+	}
+}
+
 func TestWasmDispatch_RejectsMounts(t *testing.T) {
 	svc := &Service{cfg: config.Config{EnableWasm: true}}
 	svc.SetWasmRuntime(&wasmRecordingRuntime{})

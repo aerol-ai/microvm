@@ -40,6 +40,14 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		return nil, fmt.Errorf("runtime %q does not support template_id (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)
 	}
+	moduleRef := models.ModuleRefForCreate(req)
+	if moduleRef == "" {
+		return nil, errors.New("module_ref or image is required for wasm runtime")
+	}
+	req.ModuleRef = moduleRef
+	if strings.TrimSpace(req.Image) == "" {
+		req.Image = moduleRef
+	}
 
 	var lifecycle models.Lifecycle
 	if req.Lifecycle != nil {
@@ -111,6 +119,8 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
 		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
 		Durability:           req.Durability,
+		ModuleRef:            moduleRef,
+		ModuleDigest:         state.ModuleDigest,
 	}
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 

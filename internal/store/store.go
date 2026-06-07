@@ -536,6 +536,8 @@ func Open(path string) (*Store, error) {
 		// Durability class (plans/wasm-runtime.md D7). Pre-migration rows default
 		// to passivatable — container/VM runtimes survive restarts natively.
 		`ALTER TABLE sandboxes ADD COLUMN durability TEXT NOT NULL DEFAULT 'passivatable';`,
+		`ALTER TABLE sandboxes ADD COLUMN module_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN module_digest TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -644,8 +646,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			template_id,
 			overlay_size_gb,
 			durability,
+			module_ref, module_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -689,6 +692,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.TemplateID),
 		sandbox.OverlaySizeGB,
 		sandboxDurability(sandbox),
+		strings.TrimSpace(sandbox.ModuleRef),
+		strings.TrimSpace(sandbox.ModuleDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -765,8 +770,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			template_id,
 			overlay_size_gb,
 			durability,
+			module_ref, module_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -804,6 +810,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			template_id = excluded.template_id,
 			overlay_size_gb = excluded.overlay_size_gb,
 			durability = excluded.durability,
+			module_ref = excluded.module_ref,
+			module_digest = excluded.module_digest,
 			owner_ref = excluded.owner_ref,
 			fleet_suspended = excluded.fleet_suspended
 	`,
@@ -849,6 +857,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		strings.TrimSpace(sandbox.TemplateID),
 		sandbox.OverlaySizeGB,
 		sandboxDurability(sandbox),
+		strings.TrimSpace(sandbox.ModuleRef),
+		strings.TrimSpace(sandbox.ModuleDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -877,6 +887,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			template_id,
 			overlay_size_gb,
 			durability,
+			module_ref, module_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE id = ?
@@ -921,6 +932,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			template_id,
 			overlay_size_gb,
 			durability,
+			module_ref, module_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		ORDER BY created_at DESC
@@ -985,6 +997,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			template_id,
 			overlay_size_gb,
 			durability,
+			module_ref, module_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE owner_ref = ?
@@ -3259,6 +3272,8 @@ func scanSandbox(scanner interface {
 		&sandbox.TemplateID,
 		&sandbox.OverlaySizeGB,
 		&sandbox.Durability,
+		&sandbox.ModuleRef,
+		&sandbox.ModuleDigest,
 		&sandbox.OwnerRef,
 		&fleetSuspended,
 	)

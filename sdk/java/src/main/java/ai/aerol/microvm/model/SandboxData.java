@@ -39,6 +39,10 @@ public class SandboxData {
     public Failover failover;
     public String runtime = "";
     public String durability;
+    @JsonProperty("module_ref")
+    public String moduleRef;
+    @JsonProperty("module_digest")
+    public String moduleDigest;
     /** GPU configuration this sandbox was created with. Null means no GPU. */
     public GpuOptions gpus;
 

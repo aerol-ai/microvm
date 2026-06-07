@@ -160,6 +160,8 @@ class CreateOptions(TypedDict, total=False):
     runtime: Literal["docker", "gvisor", "kata", "firecracker", "wasm"]
     # Survival class across daemon restarts. Omit for the runtime default.
     durability: Literal["ephemeral", "passivatable", "durable"]
+    # WASM module reference. When runtime is wasm, may be used instead of image.
+    module_ref: str
     # Attach GPU resources to the sandbox. Omit for CPU-only workloads.
     # Not compatible with runtime="gvisor".
     gpus: GPUOptions
@@ -404,6 +406,8 @@ class SandboxData(TypedDict, total=False):
     # a pre-migration row that resolves to the host default at start time.
     runtime: Literal["", "docker", "gvisor", "kata", "firecracker", "wasm"]
     durability: Literal["ephemeral", "passivatable", "durable"]
+    module_ref: str
+    module_digest: str
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
 

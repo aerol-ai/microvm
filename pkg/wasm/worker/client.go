@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 // Client talks to one worker over a Unix domain socket.
@@ -38,6 +40,20 @@ func (c *Client) roundTrip(env Envelope) (Envelope, error) {
 	return reply, nil
 }
 
+func (c *Client) expectOK(reply Envelope) error {
+	if reply.Type == MsgError {
+		var p errorPayload
+		if err := decodePayload(reply.Payload, &p); err != nil {
+			return err
+		}
+		return fmt.Errorf("%s", p.Message)
+	}
+	if reply.Type != MsgOK {
+		return fmt.Errorf("unexpected reply type %q", reply.Type)
+	}
+	return nil
+}
+
 // Ping verifies the worker responds to HealthPing.
 func (c *Client) Ping(sandboxID string) error {
 	reply, err := c.roundTrip(Envelope{Type: MsgHealthPing, SandboxID: sandboxID})
@@ -48,6 +64,54 @@ func (c *Client) Ping(sandboxID string) error {
 		return fmt.Errorf("unexpected reply type %q", reply.Type)
 	}
 	return nil
+}
+
+// LoadModule compiles the module at path inside the worker process.
+func (c *Client) LoadModule(sandboxID, path string) error {
+	body, err := encodePayload(loadModulePayload{Path: path})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgLoadModule, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
+// Instantiate creates a WASI instance with the given capabilities.
+func (c *Client) Instantiate(sandboxID string, caps wasmengine.Capabilities) error {
+	body, err := encodePayload(instantiatePayload{Caps: caps})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgInstantiate, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
+// Invoke calls an exported function (defaults to _start).
+func (c *Client) Invoke(sandboxID, export string) error {
+	body, err := encodePayload(invokePayload{Export: export})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgInvoke, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
+// StopInstance tears down the active instance inside the worker.
+func (c *Client) StopInstance(sandboxID string) error {
+	reply, err := c.roundTrip(Envelope{Type: MsgStopInstance, SandboxID: sandboxID})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
 }
 
 // TriggerPanic sends the test-only panic message. The worker process is expected to exit.

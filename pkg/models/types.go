@@ -49,6 +49,9 @@ type SandboxRuntimeState struct {
 	ContainerID string
 	ContainerIP string
 	Status      SandboxStatus
+	// WASM-only: resolved module metadata returned by the wasm driver on create.
+	ModuleRef    string
+	ModuleDigest string
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and
@@ -567,6 +570,9 @@ type CreateSandboxRequest struct {
 	// docker/firecracker/gvisor; ephemeral for wasm. "durable" is WASM-only
 	// and not yet implemented on any runtime.
 	Durability string `json:"durability,omitempty"`
+	// ModuleRef selects the WASM module for runtime=wasm. When set, Image may
+	// be omitted; when empty, Image is treated as the module reference.
+	ModuleRef string `json:"module_ref,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -709,6 +715,18 @@ type Sandbox struct {
 	// Durability is the survival class this sandbox was created with. Empty
 	// on pre-migration rows resolves to passivatable at read time.
 	Durability string `json:"durability,omitempty"`
+	// ModuleRef is the WASM module reference when runtime=wasm.
+	ModuleRef string `json:"module_ref,omitempty"`
+	// ModuleDigest is the sha256 hex digest of the resolved .wasm bytes.
+	ModuleDigest string `json:"module_digest,omitempty"`
+}
+
+// ModuleRefForCreate returns the WASM module reference from a create request.
+func ModuleRefForCreate(req CreateSandboxRequest) string {
+	if ref := strings.TrimSpace(req.ModuleRef); ref != "" {
+		return ref
+	}
+	return strings.TrimSpace(req.Image)
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.

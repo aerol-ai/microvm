@@ -829,7 +829,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
-	if req.Image == "" {
+	if req.Image == "" && strings.TrimSpace(req.ModuleRef) == "" {
 		return nil, errors.New("image is required")
 	}
 

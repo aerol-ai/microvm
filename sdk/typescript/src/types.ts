@@ -196,6 +196,8 @@ export interface CreateOptions {
    * `durable` is wasm-only and not yet implemented.
    */
   durability?: Durability;
+  /** WASM module reference. When runtime is wasm, may be used instead of image. */
+  moduleRef?: string;
   /**
    * Attach GPU resources to the sandbox. Omit for CPU-only workloads.
    * Not compatible with runtime="gvisor".
@@ -425,6 +427,10 @@ export interface Sandbox {
   runtime: "" | "docker" | "gvisor" | "kata" | "firecracker" | "wasm";
   /** Survival class this sandbox was created with. */
   durability?: Durability;
+  /** Resolved WASM module reference when runtime is wasm. */
+  moduleRef?: string;
+  /** sha256 hex digest of the resolved WASM module bytes. */
+  moduleDigest?: string;
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
 }
