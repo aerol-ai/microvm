@@ -8,7 +8,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
-func TestFSConfigOmitsPreopensWhenListenEnabled(t *testing.T) {
+func TestFSConfigMountsPreopensWithListenEnabled(t *testing.T) {
 	e := &wazeroEngine{}
 	caps := Capabilities{
 		WASIListenPort: 0,
@@ -17,8 +17,14 @@ func TestFSConfigOmitsPreopensWhenListenEnabled(t *testing.T) {
 			HostPath:  t.TempDir(),
 		}},
 	}
-	if got := e.fsConfigForCaps(caps); got != nil {
-		t.Fatalf("fsConfigForCaps with listen enabled = %#v, want nil preopens", got)
+	// Preopens are mounted even while listening so an HTTP guest can also read
+	// /work; the listener moves off fd 3 and the guest learns its fd from
+	// ListenFDEnv (see ListenerFD). This inverts the earlier omit-on-listen rule.
+	if got := e.fsConfigForCaps(caps); got == nil {
+		t.Fatal("fsConfigForCaps with listen enabled should still mount preopens")
+	}
+	if got := ListenerFD(caps); got != 4 {
+		t.Fatalf("ListenerFD with one preopen = %d, want 4", got)
 	}
 	caps.WASIListenPort = WASIListenPortDisabled
 	if got := e.fsConfigForCaps(caps); got == nil {

@@ -1,6 +1,6 @@
 # WASM-based Sandboxes — Design & Implementation Plan
 
-Status: **Mostly implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover + multi-node owner-watcher WASM soak, UC-43 worker NetMediator + engine NetworkHook (`aerol/vm/net` egress + wasip1 listener context) + IPC byte accounting + gateway merge, UC-44 RemoveImage/module GC + warm-pool eviction, AOCR tag prune, wasm OTEL spans, toolhost sessions/exec-stream/code-run + Daytona `/process/session*` parity, UC-42b wasmtime CGo engine behind `-tags wasmtime` + `SB_WASM_ENGINE`, interpreter routes matching toolboxd 501, **UC-31/32/33 HTTP networking** (driver lifecycle + host mediator preview URLs + WASM custom-domain dial routes — see [`wasm-networking-finish.md`](./wasm-networking-finish.md)), and **wazero listen/preopen fd fix** (omit dirs when listen enabled; `/work`+listen concurrently still deferred)) · **wazero pinned at v1.12.0** (latest stable 1.x; bump on routine dep updates) · **Still open (engine):** native WASI P2/component model (wazero 1.x), wasmtime wasip1 `ResolvedListenPort`, TinyGo `/work`+listen spike · Owner: TBD · Created: 2026-06-07
+Status: **Mostly implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover + multi-node owner-watcher WASM soak, UC-43 worker NetMediator + engine NetworkHook (`aerol/vm/net` egress + wasip1 listener context) + IPC byte accounting + gateway merge, UC-44 RemoveImage/module GC + warm-pool eviction, AOCR tag prune, wasm OTEL spans, toolhost sessions/exec-stream/code-run + Daytona `/process/session*` parity, UC-42b wasmtime CGo engine behind `-tags wasmtime` + `SB_WASM_ENGINE`, interpreter routes matching toolboxd 501, **UC-31/32/33 HTTP networking** (driver lifecycle + host mediator preview URLs + WASM custom-domain dial routes — see [`wasm-networking-finish.md`](./wasm-networking-finish.md)), and **wazero listen/preopen fd fix** (`/work`+listen now run concurrently via the `AEROL_WASM_LISTEN_FD` contract), **wasmtime ingress rejected loudly** (`SupportsListen()==false`)) · **wazero pinned at v1.12.0** (latest stable 1.x; bump on routine dep updates) · **Still open (engine):** native WASI P2/component model (wazero 1.x — upstream defers), real wasmtime wasip1 listen impl · Owner: TBD · Created: 2026-06-07
 
 This plan adds a **fourth runtime** to AerolVM — WebAssembly (WASM/WASI) — as a
 peer to `docker`, `gvisor`, and `firecracker`. The design principle is the one
@@ -166,16 +166,23 @@ Component Model support (upstream explicitly defers that to other runtimes).
   and waits for TCP accept. `guestHTTPProxy` dials via `ProxyHTTP(...,
   guestPort=0)` using the resolved port. Driver e2e:
   `TestDriverWasip1HTTPExposeEndToEnd` (create → expose → proxy).
-- **Wazero fd ordering (shipped):** wazero assigns directory preopens before TCP
-  listeners (`InitFSContext`). `engine_wazero.fsConfigForCaps` omits dir preopens
-  when `ListenEnabled()` so the wasip1 listener stays at `FdPreopen` (fd 3).
-  Sandbox workdir mounts at `/work` (UC-15); preopens remain in caps for the
-  next cold instantiate after listen is disabled.
+- **Wazero fd ordering + `/work`+listen concurrently (shipped):** wazero assigns
+  directory preopens before TCP listeners (`InitFSContext`), so with `/work`
+  mounted the wasip1 listener lands at `FdPreopen + len(preopens)`, not fd 3.
+  `engine_wazero.fsConfigForCaps` now mounts dir preopens *even while listening*,
+  and `moduleConfig` injects `AEROL_WASM_LISTEN_FD` (= `ListenerFD(caps)`) so
+  AerolVM-aware guests accept on the right fd; guests with no dir preopens still
+  get fd 3 (bare-wasip1 convention). The host's `ResolvedListenPort` already
+  scans fds dynamically. Test guest: `pkg/wasm/testdata/aerolhttp` (reads the env,
+  serves `/work` files). E2e: `TestDriverWasip1HTTPServeWhileWorkPreopen`.
+- **wasmtime ingress rejected loudly (shipped):** the wasmtime engine does not yet
+  wire a wasip1 listener (`SupportsListen()==false`); enabling a listener on it now
+  returns a clear `SB_WASM_ENGINE=wazero` error at the worker instead of silently
+  failing to resolve a port. Test: `TestSetListenPortRejectedWhenEngineLacksListen`.
 - **Still open:** `expose_port` API guest-port `0` as a routing key (service
   rejects `port <= 0` today — exposed port numbers are Caddy routing keys only;
-  guest bind is always ephemeral via wasip1); wasmtime wasip1 listen path; native
-  P2/components on wazero; HTTP+FS guests that need `/work` preopen *while*
-  listening (re-enable dir mounts + dynamic listener fd discovery).
+  guest bind is always ephemeral via wasip1); a real wasmtime wasip1 listen
+  implementation; native P2/components on wazero (upstream defers — use wasmtime).
 
 **What is NOT possible / changes vs. firecracker** (honest limits, per the ask):
 

@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -30,13 +29,12 @@ func ensureWasip1HTTPWasm(t *testing.T) string {
 	if runtime.GOOS == "windows" {
 		t.Skip("wasip1-http.wasm compile skipped on windows")
 	}
-	list, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/tetratelabs/wazero").Output()
+	src, err := filepath.Abs(filepath.Join("..", "testdata", "aerolhttp"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := filepath.Join(strings.TrimSpace(string(list)), "imports", "wasi_snapshot_preview1", "testdata", "go")
 	if st, err := os.Stat(src); err != nil || !st.IsDir() {
-		t.Skip("wazero wasip1 test source missing")
+		t.Skip("aerolhttp wasip1 guest source missing")
 	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		t.Fatal(err)

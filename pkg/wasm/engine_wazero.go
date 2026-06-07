@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -176,7 +177,23 @@ func (e *wazeroEngine) moduleConfig(caps Capabilities) wazero.ModuleConfig {
 	for k, v := range caps.Env {
 		cfg = cfg.WithEnv(k, v)
 	}
+	// Tell HTTP guests which fd the wasip1 listener landed on. wazero appends the
+	// listener after dir preopens, so it is not always fd 3 once /work is mounted.
+	if caps.ListenEnabled() {
+		cfg = cfg.WithEnv(ListenFDEnv, strconv.Itoa(ListenerFD(caps)))
+	}
 	return cfg
+}
+
+// ListenFDEnv carries the wasip1 listener fd to AerolVM-aware guests. Guests that
+// hardcode fd 3 (the bare-wasip1 convention) keep working when no dir preopens are
+// configured; guests that also need /work read this env var to find the listener.
+const ListenFDEnv = "AEROL_WASM_LISTEN_FD"
+
+// ListenerFD returns the fd wazero assigns the single wasip1 TCP listener:
+// stdio (0–2), then len(preopens) dir fds, then the listener (InitFSContext order).
+func ListenerFD(caps Capabilities) int {
+	return int(fdPreopen) + len(caps.Preopens)
 }
 
 func (e *wazeroEngine) Run(ctx context.Context, caps Capabilities, export string) (RunResult, error) {
@@ -242,14 +259,12 @@ func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities,
 	return nil
 }
 
-// fsConfigForCaps builds wazero FS mounts. When wasip1 listen is enabled, directory
-// preopens are omitted: wazero assigns dir fds before TCP listeners (InitFSContext),
-// which breaks guests that expect the listener at FdPreopen (fd 3). Caps still
-// retain Preopens for the next cold instantiate after listen is disabled.
+// fsConfigForCaps builds wazero FS mounts. Directory preopens are mounted even
+// when a wasip1 listener is enabled, so an HTTP guest can also read /work. wazero
+// assigns dir fds before TCP listeners (InitFSContext), so the listener lands at
+// fd (3 + len(preopens)) rather than fd 3 — guests learn the right fd from the
+// AEROL_WASM_LISTEN_FD env var injected by moduleConfig (see listenerFD).
 func (e *wazeroEngine) fsConfigForCaps(caps Capabilities) wazero.FSConfig {
-	if caps.ListenEnabled() {
-		return nil
-	}
 	preopens := caps.Preopens
 	if len(preopens) == 0 {
 		return nil

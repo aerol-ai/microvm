@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 )
@@ -20,13 +19,12 @@ import (
 const wasip1HTTPWasmName = "wasip1-http.wasm"
 
 func wasip1HTTPSourceDir() (string, error) {
-	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/tetratelabs/wazero").Output()
+	base, err := filepath.Abs(filepath.Join("testdata", "aerolhttp"))
 	if err != nil {
-		return "", fmt.Errorf("locate wazero module: %w", err)
+		return "", fmt.Errorf("resolve aerolhttp guest source: %w", err)
 	}
-	base := filepath.Join(strings.TrimSpace(string(out)), "imports", "wasi_snapshot_preview1", "testdata", "go")
 	if st, err := os.Stat(base); err != nil || !st.IsDir() {
-		return "", fmt.Errorf("wazero wasip1 test source missing at %s", base)
+		return "", fmt.Errorf("aerolhttp wasip1 guest source missing at %s", base)
 	}
 	return base, nil
 }
