@@ -13,7 +13,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/mattn/go-sqlite3 v1.14.44
+	github.com/mattn/go-sqlite3 v1.14.45
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
 )
