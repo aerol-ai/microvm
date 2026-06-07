@@ -64,7 +64,10 @@ func (s *inProcessSupervisor) Ensure(ctx context.Context, sandboxID, socketPath 
 					return
 				}
 			}
-			go func(c net.Conn) { _ = srv.Serve(c) }(conn)
+			go func(c net.Conn) {
+				defer func() { _ = recover() }()
+				_ = srv.Serve(c)
+			}(conn)
 		}
 	}()
 
