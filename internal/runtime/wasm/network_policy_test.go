@@ -39,6 +39,7 @@ func (c *stubWorkerNetstatsClient) SetCapability(string, wasmengine.Capabilities
 func (c *stubWorkerNetstatsClient) NetstatsTick(string) (int64, int64, error) {
 	return c.in, c.out, nil
 }
+func (c *stubWorkerNetstatsClient) SetNetworkBlocks(string, bool, bool) error { return nil }
 
 func TestDrainNetworkByteCountersMergesGatewayAndWorker(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)

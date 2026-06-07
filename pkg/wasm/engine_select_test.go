@@ -15,9 +15,9 @@ func TestNewEngineForWazeroDefault(t *testing.T) {
 	t.Cleanup(func() { _ = eng.Close(context.Background()) })
 }
 
-func TestNewEngineForWasmtimeUnavailableWithoutTag(t *testing.T) {
-	_, err := wasmengine.NewEngineFor(context.Background(), wasmengine.EngineNameWasmtime())
+func TestNewEngineForUnknown(t *testing.T) {
+	_, err := wasmengine.NewEngineFor(context.Background(), "unknown-engine")
 	if err == nil {
-		t.Fatal("expected wasmtime engine to be unavailable without build tag")
+		t.Fatal("expected error for unknown engine")
 	}
 }

@@ -374,6 +374,9 @@ type Config struct {
 	// WasmModulesDir is the content-addressed module + checkpoint cache root.
 	// Required when EnableWasm is true. SB_WASM_MODULES_DIR.
 	WasmModulesDir string
+	// WasmEngine selects the guest engine backend (wazero or wasmtime). Default wazero.
+	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
+	WasmEngine string
 	// WasmMaxInstances caps live WASM sandboxes on this host. 0 = unlimited.
 	// SB_WASM_MAX_INSTANCES.
 	WasmMaxInstances int
@@ -1171,6 +1174,7 @@ func Load() (Config, error) {
 		EnableWasm:              getEnvBool("SB_ENABLE_WASM", false),
 		WasmRunDir:              getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
 		WasmModulesDir:          getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
+		WasmEngine:              strings.ToLower(strings.TrimSpace(getEnv("SB_WASM_ENGINE", "wazero"))),
 		WasmMaxInstances:        getEnvInt("SB_WASM_MAX_INSTANCES", 0),
 		WasmDefaultMemoryMB:     getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
 		WasmDefaultTimeout:      getEnvDuration("SB_WASM_DEFAULT_TIMEOUT", 5*time.Minute),
@@ -1411,6 +1415,11 @@ func Load() (Config, error) {
 		}
 		if cfg.WasmPoolEnabled && cfg.WasmPoolDepthDefault <= 0 {
 			return Config{}, errors.New("SB_WASM_POOL_DEPTH_DEFAULT must be > 0 when SB_WASM_POOL_ENABLED=true")
+		}
+		switch cfg.WasmEngine {
+		case "", "wazero", "wasmtime":
+		default:
+			return Config{}, fmt.Errorf("SB_WASM_ENGINE=%q: want wazero or wasmtime", cfg.WasmEngine)
 		}
 	}
 

@@ -112,10 +112,6 @@ func (d *Driver) Ping(context.Context) error {
 	return nil
 }
 
-func (d *Driver) RemoveImage(context.Context, string) error {
-	return d.notImplemented("RemoveImage")
-}
-
 // Ensure Driver still satisfies runtime.Runtime at compile time.
 var _ interface {
 	Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error)

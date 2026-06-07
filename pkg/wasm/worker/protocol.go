@@ -7,21 +7,22 @@ package worker
 type MessageType string
 
 const (
-	MsgHealthPing    MessageType = "health_ping"
-	MsgPong          MessageType = "pong"
-	MsgTriggerPanic  MessageType = "trigger_panic" // test-only: verifies crash isolation (D10)
-	MsgLoadModule    MessageType = "load_module"
-	MsgInstantiate   MessageType = "instantiate"
-	MsgInvoke        MessageType = "invoke"
-	MsgExec          MessageType = "exec"
-	MsgStopInstance  MessageType = "stop_instance"
-	MsgOK            MessageType = "ok"
-	MsgError         MessageType = "error"
-	MsgInvokeResult  MessageType = "invoke_result"
-	MsgCheckpoint    MessageType = "checkpoint"
-	MsgRestore       MessageType = "restore"
-	MsgSetCapability MessageType = "set_capability"
-	MsgNetstatsTick  MessageType = "netstats_tick"
+	MsgHealthPing       MessageType = "health_ping"
+	MsgPong             MessageType = "pong"
+	MsgTriggerPanic     MessageType = "trigger_panic" // test-only: verifies crash isolation (D10)
+	MsgLoadModule       MessageType = "load_module"
+	MsgInstantiate      MessageType = "instantiate"
+	MsgInvoke           MessageType = "invoke"
+	MsgExec             MessageType = "exec"
+	MsgStopInstance     MessageType = "stop_instance"
+	MsgOK               MessageType = "ok"
+	MsgError            MessageType = "error"
+	MsgInvokeResult     MessageType = "invoke_result"
+	MsgCheckpoint       MessageType = "checkpoint"
+	MsgRestore          MessageType = "restore"
+	MsgSetCapability    MessageType = "set_capability"
+	MsgNetstatsTick     MessageType = "netstats_tick"
+	MsgSetNetworkBlocks MessageType = "set_network_blocks"
 )
 
 // Envelope is the on-wire message body (after the length prefix).

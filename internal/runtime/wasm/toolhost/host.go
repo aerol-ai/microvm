@@ -18,6 +18,7 @@ type Host struct {
 	exec      Executor
 	stateKV   StateKV
 	sessions  *sessions.Manager
+	daytona   *daytonaCompat
 }
 
 // Config wires a toolbox host for one sandbox.
@@ -32,7 +33,7 @@ type Config struct {
 
 // New constructs a toolbox host.
 func New(cfg Config) *Host {
-	return &Host{
+	h := &Host{
 		sandboxID: cfg.SandboxID,
 		workDir:   cfg.WorkDir,
 		authToken: cfg.AuthToken,
@@ -40,6 +41,10 @@ func New(cfg Config) *Host {
 		stateKV:   cfg.StateKV,
 		sessions:  cfg.Sessions,
 	}
+	if h.sessions != nil {
+		h.daytona = newDaytonaCompat()
+	}
+	return h
 }
 
 // Handler returns an http.Handler implementing the core toolbox surface.
@@ -79,7 +84,9 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !h.requireAuth(w, r) {
 			return
 		}
-		writeError(w, http.StatusNotImplemented, "daytona process sessions are not implemented for wasm runtime")
+		if !h.handleDaytonaProcessRoute(w, r) {
+			writeError(w, http.StatusNotFound, "not found")
+		}
 	case r.Method == http.MethodPost && r.URL.Path == "/files/upload":
 		if !h.requireAuth(w, r) {
 			return

@@ -18,7 +18,8 @@ type Server struct {
 	mu       sync.Mutex
 	eng      wasmengine.Engine
 	lastCaps wasmengine.Capabilities
-	// workerNet accumulates guest-side socket bytes until the driver polls via MsgNetstatsTick.
+	net      *NetMediator
+	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick drains them.
 	workerNet map[string]*workerNetUsage
 }
 
@@ -35,6 +36,17 @@ func (s *Server) netUsageFor(sandboxID string) *workerNetUsage {
 		s.workerNet[sandboxID] = &workerNetUsage{}
 	}
 	return s.workerNet[sandboxID]
+}
+
+func (s *Server) mediator() *NetMediator {
+	if s.net == nil {
+		s.net = newNetMediator()
+	}
+	return s.net
+}
+
+func workerEngineName() string {
+	return strings.TrimSpace(os.Getenv("AEROL_WASM_ENGINE"))
 }
 
 // Serve accepts framed control messages on conn until EOF or an unrecoverable error.
@@ -82,7 +94,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				_ = s.eng.Close(ctx)
 				s.eng = nil
 			}
-			s.eng, err = wasmengine.NewEngine(ctx)
+			s.eng, err = wasmengine.NewEngineFor(ctx, workerEngineName())
 			if err != nil {
 				s.mu.Unlock()
 				if replyErr(env.SandboxID, err) != nil {
@@ -152,7 +164,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			}
 			result, err := s.eng.Run(ctx, p.Caps, p.Export)
 			s.mu.Unlock()
-			// Guest→host WASI output bytes until socket-level metering lands (UC-43).
+			// Guest→host WASI output bytes; socket bytes come from NetMediator (UC-43).
 			if out := int64(len(result.Stdout) + len(result.Stderr)); out > 0 {
 				s.netUsageFor(env.SandboxID).bytesOut.Add(out)
 			}
@@ -337,12 +349,25 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
+		case MsgSetNetworkBlocks:
+			var p setNetworkBlocksPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mediator().SetBlocks(env.SandboxID, p.BlockIngress, p.BlockEgress)
+			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
 		case MsgNetstatsTick:
 			sandboxID := strings.TrimSpace(env.SandboxID)
 			u := s.netUsageFor(sandboxID)
+			sockIn, sockOut := s.mediator().DrainUsage(sandboxID)
 			body, encErr := encodePayload(netstatsResultPayload{
-				BytesIn:  u.bytesIn.Swap(0),
-				BytesOut: u.bytesOut.Swap(0),
+				BytesIn:  u.bytesIn.Swap(0) + sockIn,
+				BytesOut: u.bytesOut.Swap(0) + sockOut,
 			})
 			if encErr != nil {
 				return encErr

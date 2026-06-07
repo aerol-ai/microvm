@@ -208,6 +208,22 @@ func (c *Client) NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err er
 	return p.BytesIn, p.BytesOut, nil
 }
 
+// SetNetworkBlocks applies quota blocks at the worker-side socket mediator (UC-43).
+func (c *Client) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error {
+	body, err := encodePayload(setNetworkBlocksPayload{
+		BlockIngress: blockIngress,
+		BlockEgress:  blockEgress,
+	})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgSetNetworkBlocks, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
 // TriggerPanic sends the test-only panic message. The worker process is expected to exit.
 func (c *Client) TriggerPanic(sandboxID string) error {
 	_, err := c.roundTrip(Envelope{Type: MsgTriggerPanic, SandboxID: sandboxID})

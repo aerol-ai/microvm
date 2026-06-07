@@ -1,6 +1,6 @@
 # WASM-based Sandboxes — Design & Implementation Plan
 
-Status: **Partially implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover tests, UC-43 worker netstats IPC + gateway merge, AOCR tag prune on keep-last-N, wasm OTEL spans, toolhost sessions/exec-stream/code-run, and UC-42b engine-selection seam; **still open:** optional wasmtime CGo fuel backend, code-interpreter + Daytona process-session facades, socket-level WASI egress metering, live multi-node cluster e2e) · Owner: TBD · Created: 2026-06-07
+Status: **Mostly implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover + owner-watcher WASM spec tests, UC-43 worker NetMediator + IPC byte accounting + gateway merge, UC-44 RemoveImage/module GC + warm-pool eviction, AOCR tag prune, wasm OTEL spans, toolhost sessions/exec-stream/code-run + Daytona `/process/session*` parity, UC-42b wasmtime CGo engine behind `-tags wasmtime` + `SB_WASM_ENGINE`, and interpreter routes matching toolboxd 501; **still open:** guest WASI-sockets hook into NetMediator for full UC-43 egress from guest TCP, live multi-node cluster soak beyond single-node Raft tests) · Owner: TBD · Created: 2026-06-07
 
 This plan adds a **fourth runtime** to AerolVM — WebAssembly (WASM/WASI) — as a
 peer to `docker`, `gvisor`, and `firecracker`. The design principle is the one

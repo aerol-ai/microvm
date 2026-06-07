@@ -48,8 +48,19 @@ func (d *Driver) DrainNetworkByteCounters() map[string]struct{ BytesIn, BytesOut
 
 // SetNetworkBlocks implements NetworkPolicySink for WASM quota enforcement.
 func (d *Driver) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) {
-	if d == nil || d.net == nil {
+	if d == nil {
 		return
 	}
-	d.net.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
+	if d.net != nil {
+		d.net.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
+	}
+	d.mu.Lock()
+	inst := d.byID[sandboxID]
+	d.mu.Unlock()
+	if inst == nil || inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+		return
+	}
+	if err := d.newWorkerClient(inst.socketPath).SetNetworkBlocks(sandboxID, blockIngress, blockEgress); err != nil && d.logger != nil {
+		d.logger.Debug("wasm worker set network blocks failed", "sandbox_id", sandboxID, "error", err)
+	}
 }

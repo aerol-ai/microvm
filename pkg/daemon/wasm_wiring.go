@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -30,6 +32,10 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	svc.SetWasmRuntime(driver)
 	svc.SetWasmModuleResolver(resolver)
 
+	if eng := strings.TrimSpace(cfg.WasmEngine); eng != "" && eng != "wazero" {
+		_ = os.Setenv("AEROL_WASM_ENGINE", eng)
+	}
+
 	var pool *wasmpool.Pool
 	if cfg.WasmPoolEnabled {
 		pool = wasmpool.New(cfg.WasmRunDir, logger)
@@ -49,6 +55,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	logger.Info("wasm runtime enabled",
 		"run_dir", cfg.WasmRunDir,
 		"modules_dir", cfg.WasmModulesDir,
+		"engine", cfg.WasmEngine,
 		"pool_enabled", cfg.WasmPoolEnabled,
 	)
 	return pool

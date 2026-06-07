@@ -31,6 +31,7 @@ type WorkerClient interface {
 	Restore(sandboxID, dir string, caps wasmengine.Capabilities) error
 	SetCapability(sandboxID string, caps wasmengine.Capabilities) error
 	NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err error)
+	SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error
 }
 
 // WorkerClientFactory builds a client for a worker socket path.
@@ -82,4 +83,8 @@ func (a workerClientAdapter) SetCapability(sandboxID string, caps wasmengine.Cap
 
 func (a workerClientAdapter) NetstatsTick(sandboxID string) (int64, int64, error) {
 	return a.client.NetstatsTick(sandboxID)
+}
+
+func (a workerClientAdapter) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error {
+	return a.client.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
 }

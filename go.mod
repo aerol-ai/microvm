@@ -22,7 +22,10 @@ require (
 	oras.land/oras-go/v2 v2.5.0
 )
 
-require github.com/opencontainers/go-digest v1.0.0 // indirect
+require (
+	github.com/bytecodealliance/wasmtime-go/v37 v37.0.0 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
+)
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect

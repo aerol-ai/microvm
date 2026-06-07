@@ -173,6 +173,29 @@ func (p *Pool) MarkSpawning(digest string) {
 	p.mu.Unlock()
 }
 
+// DropModule evicts warm slots and refill targets for digest after module GC.
+func (p *Pool) DropModule(digest string) {
+	if digest == "" {
+		return
+	}
+	p.mu.Lock()
+	slots := append([]*Slot(nil), p.ready[digest]...)
+	delete(p.ready, digest)
+	delete(p.targets, digest)
+	delete(p.spawning, digest)
+	spawner := p.spawner
+	p.mu.Unlock()
+	for _, slot := range slots {
+		if slot == nil {
+			continue
+		}
+		if spawner != nil {
+			_ = spawner.Shutdown(slot.WorkerKey)
+		}
+		_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+	}
+}
+
 // UnmarkSpawning decrements the in-flight spawn counter after a failed warm.
 func (p *Pool) UnmarkSpawning(digest string) {
 	p.mu.Lock()

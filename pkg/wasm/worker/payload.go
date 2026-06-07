@@ -62,6 +62,11 @@ type netstatsResultPayload struct {
 	BytesOut int64 `json:"bytes_out"`
 }
 
+type setNetworkBlocksPayload struct {
+	BlockIngress bool `json:"block_ingress"`
+	BlockEgress  bool `json:"block_egress"`
+}
+
 func encodePayload(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

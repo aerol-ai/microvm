@@ -62,6 +62,7 @@ func (c *recordingWorkerClient) Checkpoint(string, string, wasmengine.SnapshotCo
 func (c *recordingWorkerClient) Restore(string, string, wasmengine.Capabilities) error { return nil }
 func (c *recordingWorkerClient) SetCapability(string, wasmengine.Capabilities) error   { return nil }
 func (c *recordingWorkerClient) NetstatsTick(string) (int64, int64, error)             { return 0, 0, nil }
+func (c *recordingWorkerClient) SetNetworkBlocks(string, bool, bool) error             { return nil }
 
 func TestDestroyNilSandboxIsNoop(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
@@ -107,9 +108,6 @@ func TestNotImplementedMethods(t *testing.T) {
 	}
 	if err := d.Resize(ctx, "missing", models.ResizeSandboxRequest{CPU: 2.0}); err == nil {
 		t.Fatal("Resize on missing sandbox expected error")
-	}
-	if err := d.RemoveImage(ctx, "img"); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("RemoveImage: %v", err)
 	}
 }
 

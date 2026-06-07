@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -21,8 +24,19 @@ var _ wasmruntime.CheckpointHost = (*fakeWasmRecreateRuntime)(nil)
 
 type fakeWasmRecreateRuntime struct {
 	wasmModuleAPINoopRuntime
+	noopWasmPortGateway
 	rehydrated []string
 }
+
+type noopWasmPortGateway struct{}
+
+func (noopWasmPortGateway) EnsureHTTPListener(_ context.Context, _ string, _ int) (string, error) {
+	return "127.0.0.1:0", nil
+}
+
+func (noopWasmPortGateway) ReleaseHTTPListener(string, int) {}
+
+func (noopWasmPortGateway) SyncAllowedPorts(string, []int) {}
 
 func (f *fakeWasmRecreateRuntime) CheckpointSandbox(context.Context, *models.Sandbox) (string, string, error) {
 	return "", "", nil
@@ -211,6 +225,71 @@ func TestRecreateSandboxWasmDurableFailoverE2E(t *testing.T) {
 		t.Fatalf("pull count = %d, want 1", puller.pulled)
 	}
 	if len(rt.rehydrated) != 1 {
+		t.Fatalf("rehydrated = %v", rt.rehydrated)
+	}
+}
+
+func TestRecreateSandboxWasmDurableFailoverReplaysPorts(t *testing.T) {
+	ctx := context.Background()
+	modulesDir := t.TempDir()
+	checkpointPath := filepath.Join(modulesDir, "sb-wasm-ports", "mem.snap")
+	seedWasmSnapshot(t, checkpointPath, "gen-ports-1")
+
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:              "sb-wasm-ports",
+		Runtime:         models.RuntimeWasm,
+		Durability:      models.DurabilityDurable,
+		ModuleRef:       "file:///tmp/demo.wasm",
+		Status:          models.SandboxStatusPassivated,
+		CheckpointPath:  checkpointPath,
+		CloneGeneration: "gen-ports-1",
+		ContainerID:     "wasm:sb-wasm-ports",
+		ContainerIP:     "127.0.0.1",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	rt := &fakeWasmRecreateRuntime{}
+	svc := New(config.Config{
+		EnableWasm:     true,
+		WasmModulesDir: modulesDir,
+		EnableCluster:  true,
+		EnableCaddy:    true,
+		Domain:         "wasm.test",
+	}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.SetWasmRuntime(rt)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		CaddyAdminURL:     server.URL,
+		EnableCaddy:       true,
+		Domain:            "wasm.test",
+		HTTPClientTimeout: time.Second,
+	})
+
+	ports := map[int]cluster.ExposedPortRoute{
+		8080: {Protocol: models.ExposedPortProtocolHTTP},
+	}
+	spec := models.CreateSandboxRequest{
+		Runtime:    models.RuntimeWasm,
+		Durability: models.DurabilityDurable,
+		ModuleRef:  "file:///tmp/demo.wasm",
+	}
+	if err := svc.RecreateSandbox(ctx, "sb-wasm-ports", spec, cluster.PlacementSecrets{}, ports); err != nil {
+		t.Fatalf("RecreateSandbox: %v", err)
+	}
+	if len(rt.rehydrated) != 1 || rt.rehydrated[0] != "sb-wasm-ports" {
 		t.Fatalf("rehydrated = %v", rt.rehydrated)
 	}
 }
