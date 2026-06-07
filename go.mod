@@ -15,9 +15,9 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/klauspost/compress v1.17.11
-	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/opencontainers/image-spec v1.1.0
 	github.com/tetratelabs/wazero v1.12.0
+	github.com/mattn/go-sqlite3 v1.14.45
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
 	oras.land/oras-go/v2 v2.5.0
