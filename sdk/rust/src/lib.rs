@@ -27,6 +27,7 @@ use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, BuildImageOptions, BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
+    CreateWasmModuleOptions,
     CustomDomain,
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
@@ -34,7 +35,7 @@ pub use types::{
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
     SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
-    UpdateLifecycleOptions,
+    UpdateLifecycleOptions, WasmModule, WasmModuleStatus,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -855,6 +856,43 @@ impl Client {
         self.do_json::<(), ()>(
             Method::DELETE,
             &format!("{}/templates/{}", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    /// Register a WASM module in the host catalogue. Resolution is synchronous —
+    /// the returned row is typically already `WasmModuleStatus::Ready`.
+    pub fn create_wasm_module(&self, opts: CreateWasmModuleOptions) -> Result<WasmModule, Error> {
+        if opts.module_ref.trim().is_empty() {
+            return Err(Error::Api("module_ref is required".to_string()));
+        }
+        self.do_json::<CreateWasmModuleOptions, WasmModule>(
+            Method::POST,
+            &format!("{}/wasm-modules", self.version_prefix()),
+            Some(&opts),
+        )
+    }
+
+    pub fn list_wasm_modules(&self) -> Result<Vec<WasmModule>, Error> {
+        self.do_json::<(), Vec<WasmModule>>(
+            Method::GET,
+            &format!("{}/wasm-modules", self.version_prefix()),
+            None,
+        )
+    }
+
+    pub fn get_wasm_module(&self, id: &str) -> Result<WasmModule, Error> {
+        self.do_json::<(), WasmModule>(
+            Method::GET,
+            &format!("{}/wasm-modules/{}", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    pub fn delete_wasm_module(&self, id: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!("{}/wasm-modules/{}", self.version_prefix(), id),
             None,
         )
     }
@@ -1899,6 +1937,8 @@ mod tests {
             runtime: None,
             gpus: None,
             custom_domains: None,
+            durability: None,
+            module_ref: None,
         }
     }
 
@@ -3377,6 +3417,77 @@ mod tests {
             Error::Api(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+
+    #[test]
+    fn create_wasm_module_posts_request_and_maps_response() {
+        let body = serde_json::json!({
+            "id": "mod-rust",
+            "module_ref": "file:///agent.wasm",
+            "status": "ready",
+            "module_size_bytes": 4096,
+            "has_warm": true,
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:00:00Z",
+            "ready_at": "2026-05-27T10:00:00Z"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+
+        let module = client
+            .create_wasm_module(CreateWasmModuleOptions {
+                id: None,
+                module_ref: "file:///agent.wasm".to_string(),
+                entrypoint: Some("_start".to_string()),
+            })
+            .expect("create_wasm_module should succeed");
+        let request = request_rx.recv().expect("request captured");
+
+        assert!(
+            request.starts_with("POST /v1/wasm-modules HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(
+            request.contains("\"module_ref\":\"file:///agent.wasm\""),
+            "request body missing module_ref: {}",
+            request
+        );
+        assert_eq!(module.id, "mod-rust");
+        assert_eq!(module.status, WasmModuleStatus::Ready);
+        assert_eq!(module.module_ref, "file:///agent.wasm");
+        assert!(module.has_warm);
+    }
+
+    #[test]
+    fn create_wasm_module_rejects_empty_module_ref() {
+        let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token"))
+            .expect("client should build");
+        let err = client
+            .create_wasm_module(CreateWasmModuleOptions {
+                id: None,
+                module_ref: String::new(),
+                entrypoint: None,
+            })
+            .expect_err("empty module_ref must be rejected");
+        match err {
+            Error::Api(msg) => assert!(msg.contains("module_ref is required"), "msg = {}", msg),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_wasm_module_sends_delete() {
+        let (url, request_rx) = spawn_response_server("204 No Content", "application/json", Vec::new());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client.delete_wasm_module("mod-x").expect("delete ok");
+        let request = request_rx.recv().expect("request captured");
+        assert!(
+            request.starts_with("DELETE /v1/wasm-modules/mod-x HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
     }
 
     #[test]

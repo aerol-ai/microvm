@@ -8,7 +8,6 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"net/http/httputil"
 	"net/textproto"
 	"net/url"
 	"path/filepath"
@@ -293,12 +292,6 @@ func (h *handlers) uploadSingleFile(ctx context.Context, sandboxID, targetPath s
 	headers := http.Header{}
 	headers.Set("Content-Type", multipartWriter.FormDataContentType())
 
-	req, err := h.newToolboxRequest(ctx, sandboxID, http.MethodPost, "/files/upload", url.Values{"path": []string{targetPath}}, reader, headers)
-	if err != nil {
-		_ = reader.CloseWithError(err)
-		return err
-	}
-
 	errCh := make(chan error, 1)
 	go func() {
 		part, err := multipartWriter.CreateFormFile("file", fileHeader.Filename)
@@ -313,7 +306,7 @@ func (h *handlers) uploadSingleFile(ctx context.Context, sandboxID, targetPath s
 		errCh <- err
 	}()
 
-	resp, err := h.httpClient.Do(req)
+	resp, err := h.deps.Service.RoundTripToolbox(ctx, sandboxID, http.MethodPost, "/files/upload", url.Values{"path": []string{targetPath}}, reader, headers)
 	if err != nil {
 		_ = reader.CloseWithError(err)
 		<-errCh
@@ -358,36 +351,9 @@ func (h *handlers) runToolboxCommand(ctx context.Context, sandboxID string, req 
 // negotiates Upgrade: websocket handshakes — unlike forwardToolbox, which
 // reads the body fully through httpClient.Do and breaks WS streams.
 func (h *handlers) proxyToolbox(w http.ResponseWriter, r *http.Request, sandboxID, path string) {
-	endpoint, err := h.deps.Service.WakeAwareToolboxTarget(r.Context(), sandboxID)
-	if err != nil {
+	if err := h.deps.Service.ServeToolboxReverseProxy(r.Context(), sandboxID, w, r, path); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
-		return
 	}
-	target, err := url.Parse(endpoint.URL)
-	if err != nil {
-		apihttp.WriteError(w, http.StatusInternalServerError, "invalid toolbox target")
-		return
-	}
-
-	toolboxToken := endpoint.Token
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(target)
-			pr.Out.URL.Path = path
-			pr.Out.URL.RawPath = ""
-			pr.Out.Host = target.Host
-			if toolboxToken != "" {
-				pr.Out.Header.Set("Authorization", "Bearer "+toolboxToken)
-			}
-		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			if h.deps.Logger != nil {
-				h.deps.Logger.Warn("daytona toolbox proxy failed", "error", err, "path", path)
-			}
-			apihttp.WriteError(w, http.StatusBadGateway, "toolbox unavailable")
-		},
-	}
-	proxy.ServeHTTP(w, r)
 }
 
 func (h *handlers) forwardToolbox(w http.ResponseWriter, r *http.Request, sandboxID, path string) {
@@ -431,36 +397,7 @@ func (h *handlers) sendToolboxJSON(ctx context.Context, sandboxID, method, path 
 }
 
 func (h *handlers) sendToolboxRequest(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
-	req, err := h.newToolboxRequest(ctx, sandboxID, method, path, query, body, headers)
-	if err != nil {
-		return nil, err
-	}
-	return h.httpClient.Do(req)
-}
-
-func (h *handlers) newToolboxRequest(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Request, error) {
-	endpoint, err := h.deps.Service.WakeAwareToolboxTarget(ctx, sandboxID)
-	if err != nil {
-		return nil, err
-	}
-	target, err := url.Parse(endpoint.URL)
-	if err != nil {
-		return nil, err
-	}
-	resolved := target.ResolveReference(&url.URL{Path: path, RawQuery: query.Encode()})
-	req, err := http.NewRequestWithContext(ctx, method, resolved.String(), body)
-	if err != nil {
-		return nil, err
-	}
-	for key, values := range headers {
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
-	if endpoint.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+endpoint.Token)
-	}
-	return req, nil
+	return h.deps.Service.RoundTripToolbox(ctx, sandboxID, method, path, query, body, headers)
 }
 
 func (h *handlers) writeToolboxError(w http.ResponseWriter, err error) {

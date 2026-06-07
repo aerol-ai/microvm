@@ -157,7 +157,11 @@ class CreateOptions(TypedDict, total=False):
     # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
     # when running untrusted workloads. "kata" is reserved and rejected by the
     # API today. Not compatible with gpus.
-    runtime: Literal["docker", "gvisor", "kata", "firecracker"]
+    runtime: Literal["docker", "gvisor", "kata", "firecracker", "wasm"]
+    # Survival class across daemon restarts. Omit for the runtime default.
+    durability: Literal["ephemeral", "passivatable", "durable"]
+    # WASM module reference. When runtime is wasm, may be used instead of image.
+    module_ref: str
     # Attach GPU resources to the sandbox. Omit for CPU-only workloads.
     # Not compatible with runtime="gvisor".
     gpus: GPUOptions
@@ -400,7 +404,10 @@ class SandboxData(TypedDict, total=False):
     failover: Failover
     # Container runtime this sandbox is running under. Empty string indicates
     # a pre-migration row that resolves to the host default at start time.
-    runtime: Literal["", "docker", "gvisor", "kata", "firecracker"]
+    runtime: Literal["", "docker", "gvisor", "kata", "firecracker", "wasm"]
+    durability: Literal["ephemeral", "passivatable", "durable"]
+    module_ref: str
+    module_digest: str
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
 
@@ -487,3 +494,26 @@ class Template(TypedDict, total=False):
     hasOverlay: bool
     pushState: TemplatePushState
     pushError: str
+
+
+WasmModuleStatus = Literal["ready", "failed"]
+
+
+class CreateWasmModuleOptions(TypedDict, total=False):
+    id: str
+    moduleRef: str  # required
+    entrypoint: str
+
+
+class WasmModule(TypedDict, total=False):
+    id: str
+    moduleRef: str
+    status: WasmModuleStatus
+    moduleSizeBytes: int
+    digest: str
+    entrypoint: str
+    hasWarm: bool
+    lastError: str
+    createdAt: str
+    updatedAt: str
+    readyAt: str

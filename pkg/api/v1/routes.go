@@ -121,6 +121,12 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// a rebuild only makes sense on the node that owns the rootfs.
 	mux.Handle("POST "+PathPrefix+"/templates/{id}/rebuild", d.Auth(http.HandlerFunc(h.rebuildTemplate)))
 
+	// WASM module catalogue (plans/wasm-runtime.md). Per-host like templates.
+	mux.Handle("POST "+PathPrefix+"/wasm-modules", d.Auth(http.HandlerFunc(h.createWasmModule)))
+	mux.Handle("GET "+PathPrefix+"/wasm-modules", d.Auth(http.HandlerFunc(h.listWasmModules)))
+	mux.Handle("GET "+PathPrefix+"/wasm-modules/{id}", d.Auth(http.HandlerFunc(h.getWasmModule)))
+	mux.Handle("DELETE "+PathPrefix+"/wasm-modules/{id}", d.Auth(http.HandlerFunc(h.deleteWasmModule)))
+
 	// Explicit session routes are syntactic sugar for the toolbox proxy:
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
 	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.Auth(wrap(http.HandlerFunc(h.sessionsProxy))))
@@ -143,6 +149,9 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// consistent with /admin/reconcile (also a leader-side write side effect).
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", d.Auth(http.HandlerFunc(h.clusterDrainNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", d.Auth(http.HandlerFunc(h.clusterUncordonNode)))
+	mux.Handle("POST "+cluster.PublicWasmMigratePath, d.Auth(http.HandlerFunc(h.clusterWasmMigrate)))
+	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
+	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
 	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", d.Auth(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", d.Auth(http.HandlerFunc(h.clusterDeleteOrphan)))
 	// Internal endpoint: receives leader-forwarded raft commands from peer

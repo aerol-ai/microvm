@@ -90,6 +90,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
+	if errors.Is(err, store.ErrWasmModuleIDConflict) || errors.Is(err, store.ErrWasmModuleInUse) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	// Phase 6 operator-triggered rebuild (POST /v1/templates/{id}/rebuild).
 	// 412 distinguishes "row is in a state where rebuild can't be honoured"
 	// (busy / no snapshot to re-derive / terminal failed) from "row
@@ -115,7 +119,8 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
-	if errors.Is(err, models.ErrCustomDomainInvalidTargetPort) {
+	if errors.Is(err, models.ErrCustomDomainInvalidTargetPort) ||
+		errors.Is(err, service.ErrWasmCustomDomainPortNotExposed) {
 		WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}

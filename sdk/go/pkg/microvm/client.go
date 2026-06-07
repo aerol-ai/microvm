@@ -316,6 +316,24 @@ func (c *Client) DeleteTemplate(ctx context.Context, id string) error {
 	return c.inner.DeleteTemplate(ctx, id)
 }
 
+// CreateWasmModule registers a WASM module in the host catalogue. Resolution
+// is synchronous — the returned row is typically already ready.
+func (c *Client) CreateWasmModule(ctx context.Context, opts sdktypes.CreateWasmModuleOptions) (sdktypes.WasmModule, error) {
+	return c.inner.CreateWasmModule(ctx, opts)
+}
+
+func (c *Client) ListWasmModules(ctx context.Context) ([]sdktypes.WasmModule, error) {
+	return c.inner.ListWasmModules(ctx)
+}
+
+func (c *Client) GetWasmModule(ctx context.Context, id string) (sdktypes.WasmModule, error) {
+	return c.inner.GetWasmModule(ctx, id)
+}
+
+func (c *Client) DeleteWasmModule(ctx context.Context, id string) error {
+	return c.inner.DeleteWasmModule(ctx, id)
+}
+
 // RebuildTemplate re-runs the snapshot phase against an existing template.
 // Idempotent under concurrent retry: the daemon's CAS collapses N parallel
 // calls for the same ready template into one rebuild kick. Returns the row

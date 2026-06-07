@@ -23,6 +23,7 @@ import (
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/clonegen"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -40,7 +41,7 @@ type server struct {
 	sessions *sessions.Manager
 	daytona  *daytonaCompat
 	envd     *envdCompat
-	cloneGen *cloneGeneration
+	cloneGen *clonegen.Generation
 }
 
 func (s *server) setAllowedPorts(ports []int) {
@@ -88,7 +89,7 @@ func main() {
 		allowedPorts: map[int]struct{}{},
 		daytona:      newDaytonaCompat(),
 		envd:         newEnvdCompat(),
-		cloneGen:     newCloneGeneration(envString("SB_CLONE_GEN_PATH", defaultCloneGenPath), logger),
+		cloneGen:     clonegen.New(envString("SB_CLONE_GEN_PATH", clonegen.DefaultPath), logger),
 	}
 	// Evict the token from the process env table so child processes spawned
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
@@ -267,7 +268,7 @@ func (s *server) routes() http.Handler {
 			// change-detector for snapshot clones, and external access is
 			// gated by the auth'd v1 toolbox proxy. In-guest readers can use
 			// this or the well-known file written by cloneGeneration.
-			token, resumedAt := s.cloneGen.current()
+			token, resumedAt := s.cloneGen.Current()
 			writeJSON(w, http.StatusOK, map[string]any{"generation": token, "resumed_at": resumedAt})
 		case strings.HasPrefix(r.URL.Path, "/proxy/"):
 			s.handleProxy(w, r)

@@ -22,6 +22,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/runtime"
+	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/caddy"
@@ -75,6 +76,12 @@ type Service struct {
 	// type-system payoff, and (b) the docker field stays the unconditional
 	// Default-runtime fast path for the >>99% docker case.
 	firecracker runtime.Runtime
+	// wasm is the third registered runtime (plans/wasm-runtime.md). Nil
+	// unless pkg/daemon has called SetWasmRuntime when cfg.EnableWasm is
+	// true.
+	wasm runtime.Runtime
+	// wasmModuleResolver resolves module_ref for POST /v1/wasm-modules.
+	wasmModuleResolver WasmModuleResolver
 	// templateBuilder is the Phase 2 OCI→ext4 builder used by the
 	// template lifecycle (internal/service/template.go). Nil unless main
 	// has called SetTemplateBuilder — which only happens when
@@ -111,6 +118,8 @@ type Service struct {
 	// next reconciler tick.
 	snapshotPusher         *SnapshotPusher
 	snapshotPushReconciler *SnapshotPushReconciler
+	// wasmCheckpointPusher uploads durable WASM checkpoints to AOCR (§4.8).
+	wasmCheckpointPusher WasmCheckpointStore
 	// templateArtifactPusher + templateArtifactPushReconciler are non-nil
 	// only when cfg.SnapshotPushEnabled is true AND a templates dir is
 	// configured. Mirror the snapshot push wiring: the build success path
@@ -137,10 +146,14 @@ type Service struct {
 	// hammer SQLite (single-writer; MaxOpenConns=1). Same TTL window the
 	// capacity-lease loop uses, so a stale-by-one-tick reading is the
 	// worst case. Lazily populated on first Capacity() call.
-	localReadyTemplateIDsMu      sync.Mutex
-	localReadyTemplateIDsCache   []string
-	localReadyTemplateIDsKnown   bool
-	localReadyTemplateIDsExpires time.Time
+	localReadyTemplateIDsMu        sync.Mutex
+	localReadyTemplateIDsCache     []string
+	localReadyTemplateIDsKnown     bool
+	localReadyTemplateIDsExpires   time.Time
+	localReadyWasmModuleIDsMu      sync.Mutex
+	localReadyWasmModuleIDsCache   []string
+	localReadyWasmModuleIDsKnown   bool
+	localReadyWasmModuleIDsExpires time.Time
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -442,6 +455,12 @@ func (s *Service) SetFirecrackerRuntime(r runtime.Runtime) {
 	s.firecracker = r
 }
 
+// SetWasmRuntime registers the WASM driver. Called from pkg/daemon when
+// cfg.EnableWasm is true.
+func (s *Service) SetWasmRuntime(r runtime.Runtime) {
+	s.wasm = r
+}
+
 func (s *Service) isFirecrackerSandbox(sandbox *models.Sandbox) bool {
 	return sandbox != nil && sandbox.Runtime == models.RuntimeFirecracker
 }
@@ -454,14 +473,33 @@ func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, e
 		}
 		return s.firecracker, nil
 	}
+	if s.isWasmSandbox(sandbox) {
+		if s.wasm == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered: %w",
+				models.RuntimeWasm, models.ErrRuntimeNotImplemented)
+		}
+		return s.wasm, nil
+	}
 	return s.docker, nil
 }
 
 func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
-	if s.isFirecrackerSandbox(sandbox) {
+	if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) {
 		return sandbox.ID
 	}
 	return sandboxContainerRef(sandbox)
+}
+
+func (s *Service) containerRuntimeForSandbox(sandbox *models.Sandbox) (runtime.ContainerRuntime, error) {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return nil, err
+	}
+	cr, ok := runtime.AsContainerRuntime(rt)
+	if !ok {
+		return nil, fmt.Errorf("runtime %q does not support container network rules", sandbox.Runtime)
+	}
+	return cr, nil
 }
 
 func mergeManagedRuntimes(maps ...map[string]*models.SandboxRuntimeState) map[string]*models.SandboxRuntimeState {
@@ -490,6 +528,15 @@ func (s *Service) AttachSnapshotPusher(pusher *SnapshotPusher, reconciler *Snaps
 	}
 	s.snapshotPusher = pusher
 	s.snapshotPushReconciler = reconciler
+}
+
+// AttachWasmCheckpointPusher wires AOCR push for durable WASM checkpoints.
+// Called from main when SnapshotPushEnabled is true.
+func (s *Service) AttachWasmCheckpointPusher(pusher WasmCheckpointStore) {
+	if pusher == nil {
+		return
+	}
+	s.wasmCheckpointPusher = pusher
 }
 
 // SnapshotPushReconciler exposes the reconciler so main.go can drive it
@@ -690,7 +737,29 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // Only placements whose create spec opted into failover.policy=recreate reach
 // this path; default sandboxes remain non-HA and are orphaned on owner death.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
+	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
+		nodeID := ""
+		if c := s.Cluster(); c != nil {
+			nodeID = c.SelfNodeID()
+		}
+		merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
+		if err != nil {
+			return fmt.Errorf("recreate %s: %w", id, err)
+		}
+		if err := s.recreateWasmDurableSandbox(ctx, id, merged, exposedPorts); err != nil {
+			return err
+		}
+		s.logger.Info("cluster: recreated durable wasm sandbox after failover",
+			"sandbox_id", id, "replayed_ports", len(exposedPorts))
+		return nil
+	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		if s.isWasmSandbox(existing) && existing.Durability == models.DurabilityDurable &&
+			(existing.Status == models.SandboxStatusPassivated || existing.Status == models.SandboxStatusAwaitingRuntime) {
+			if _, err := s.rehydrateWasmIfNeeded(ctx, existing, nil); err != nil {
+				return fmt.Errorf("recreate %s: rehydrate wasm: %w", id, err)
+			}
+		}
 		// D1 reconstruction: on owner change, a Serverless && stopped row
 		// without wake_armed is the new owner's first chance to install
 		// wake routes and arm the bit. Done before port replay so the
@@ -732,8 +801,10 @@ func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, expo
 	return firstErr
 }
 
+const wasmWorkerOverheadMB = 8
+
 func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
-	return capacity.Request{
+	out := capacity.Request{
 		CPU:        req.CPU,
 		MemoryMB:   req.MemoryMB,
 		DiskGB:     diskGBForCapacity(req.DiskGB, req.Runtime, req.OverlaySizeGB),
@@ -741,14 +812,19 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		GPUs:       gpuCountForCapacity(req.GPUs),
 		GPUVendor:  gpuVendorForCapacity(req.GPUs),
 		TemplateID: req.TemplateID,
+		ModuleRef:  models.ModuleRefForCreate(req),
 	}
+	if req.Runtime == models.RuntimeWasm {
+		out.MemoryMB += wasmWorkerOverheadMB
+	}
+	return out
 }
 
 func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 	if sandbox == nil {
 		return capacity.Request{}
 	}
-	return capacity.Request{
+	out := capacity.Request{
 		CPU:        sandbox.CPU,
 		MemoryMB:   sandbox.MemoryMB,
 		DiskGB:     diskGBForCapacity(sandbox.DiskGB, sandbox.Runtime, sandbox.OverlaySizeGB),
@@ -756,7 +832,12 @@ func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 		GPUs:       gpuCountForCapacity(sandbox.GPUs),
 		GPUVendor:  gpuVendorForCapacity(sandbox.GPUs),
 		TemplateID: sandbox.TemplateID,
+		ModuleRef:  sandbox.ModuleRef,
 	}
+	if sandbox.Runtime == models.RuntimeWasm {
+		out.MemoryMB += wasmWorkerOverheadMB
+	}
+	return out
 }
 
 func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
@@ -793,6 +874,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, cluster.ErrNoPlacementTarget
 	}
 
+	memoryWasOmitted := req.MemoryMB <= 0
 	req = normalizeCreateRequest(req)
 	if err := s.NormalizeCreateImageDistribution(ctx, &req); err != nil {
 		return nil, err
@@ -800,7 +882,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
-	if req.Image == "" {
+	if req.Image == "" && strings.TrimSpace(req.ModuleRef) == "" {
 		return nil, errors.New("image is required")
 	}
 
@@ -866,6 +948,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	durability, err := models.NormalizeCreateDurability(req.Durability, chosenRuntime)
+	if err != nil {
+		return nil, err
+	}
+	req.Durability = durability
 	// "firecracker" is the second runtime, dispatched to the native
 	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
 	//
@@ -888,6 +975,21 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 		req.Runtime = chosenRuntime
 		return s.createFirecrackerSandbox(ctx, req, idOverride)
+	}
+	if chosenRuntime == models.RuntimeWasm {
+		if !s.cfg.EnableWasm {
+			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_WASM=true on this host (see plans/wasm-runtime.md): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		if s.wasm == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_WASM=true but daemon did not call SetWasmRuntime): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		if memoryWasOmitted {
+			req.MemoryMB = 0
+		}
+		req.Runtime = chosenRuntime
+		return s.createWasmSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
 
@@ -1024,6 +1126,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		RegistryAuthSealed:   sealedRegistry,
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
 		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
+		Durability:           req.Durability,
 	}
 	// Populate the in-memory CustomDomains slice so the initial route
 	// matcher sees the full hostname union. Status is pending_dns until
@@ -1259,6 +1362,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		// same template rather than re-resolving from the request.
 		TemplateID:    strings.TrimSpace(req.TemplateID),
 		OverlaySizeGB: req.OverlaySizeGB,
+		Durability:    req.Durability,
 	}
 	if len(req.CustomDomains) > 0 {
 		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))
@@ -1473,6 +1577,24 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	if err != nil {
 		return nil, err
 	}
+	wasmPassivated := s.isWasmSandbox(sandbox) && sandbox.Status == models.SandboxStatusPassivated
+	var wasmRehydrateBinds []mounts.ContainerBind
+	if wasmPassivated {
+		specs, loadErr := s.loadMounts(ctx, id)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if len(specs) > 0 {
+			if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+				return nil, fmt.Errorf("reestablish mounts: %w", err)
+			}
+			wasmRehydrateBinds = s.mounts.HostBindsFor(id)
+		}
+		sandbox, err = s.rehydrateWasmIfNeeded(ctx, sandbox, wasmRehydrateBinds)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Re-Admit against the host budget before touching Docker. StopSandbox
 	// (and the die/stop/oom event handler) releases the reservation, so a
@@ -1507,28 +1629,49 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		releaseAdmission()
 		return nil, err
 	}
-	state, err := rt.Start(ctx, s.runtimeRef(sandbox))
-	if err != nil {
-		_ = s.mounts.UnmountAll(id)
-		releaseAdmission()
-		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
-		s.invalidateWarm(id)
-		return nil, err
+	var state *models.SandboxRuntimeState
+	if s.isWasmSandbox(sandbox) {
+		if host, ok := s.wasm.(wasmruntime.StartHost); ok {
+			hostBinds := s.mounts.HostBindsFor(id)
+			state, err = host.StartSandbox(ctx, sandbox, hostBinds)
+			if err != nil {
+				_ = s.mounts.UnmountAll(id)
+				releaseAdmission()
+				_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+				s.invalidateWarm(id)
+				return nil, err
+			}
+		}
 	}
-
+	if state == nil {
+		state, err = rt.Start(ctx, s.runtimeRef(sandbox))
+		if err != nil {
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+			s.invalidateWarm(id)
+			return nil, err
+		}
+	}
 	sandbox.ContainerID = state.ContainerID
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
 	sandbox.WakeArmed = false
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
-
 	// Reapply the per-IP egress DROP rule. The stop event clears it (the IP
 	// can be reassigned to another container), so a Stop+Start cycle would
 	// otherwise come back without network isolation. Fail closed: if we can't
 	// reinstall the rule, stop the container and surface the error.
 	if sandbox.NetworkBlockAll {
-		if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+		cr, ok := runtime.AsContainerRuntime(rt)
+		if !ok {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			return nil, fmt.Errorf("apply network block on start: runtime %q does not support network_block_all", sandbox.Runtime)
+		}
+		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
 			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
@@ -1581,7 +1724,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
-	_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+	if s.caddy != nil {
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+	}
 	rt, err := s.runtimeForSandbox(sandbox)
 	if err != nil {
 		return err
@@ -1589,10 +1734,15 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
-	if err := s.mounts.UnmountAll(id); err != nil {
-		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", err)
+	if s.mounts != nil {
+		if err := s.mounts.UnmountAll(id); err != nil {
+			s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", err)
+		}
 	}
 	if err := s.store.Delete(ctx, id); err != nil {
+		return err
+	}
+	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
 		return err
 	}
 	s.forgetWakeFlight(id)
@@ -1604,8 +1754,12 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
-	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
-	s.schedulePendingImageGC(ctx, sandbox.Image)
+	if s.logger != nil {
+		s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
+	}
+	if !s.isWasmSandbox(sandbox) {
+		s.schedulePendingImageGC(ctx, sandbox.Image)
+	}
 	return nil
 }
 
@@ -2031,6 +2185,9 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	// install a half-broken route.
 	if (canonicalProto == models.ExposedPortProtocolTCP || canonicalProto == models.ExposedPortProtocolTLS) && hasCustomDomains(sandbox) {
 		return models.ExposePortResponse{}, ErrCustomDomainProtocolConflict
+	}
+	if s.isWasmSandbox(sandbox) && canonicalProto != models.ExposedPortProtocolHTTP {
+		return models.ExposePortResponse{}, unsupportedWasmOption("expose_port protocol " + canonicalProto)
 	}
 
 	now := time.Now().UTC()
@@ -2468,6 +2625,9 @@ func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sand
 // so the coalescer's drain can invoke it with a stable sandbox
 // snapshot. Not called directly outside the coalescer path.
 func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	if s.isWasmSandbox(sandbox) {
+		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
+	}
 	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
 	case RouteShapeDirect:
 		// Non-serverless callers (and serverless-bypass-off callers)
@@ -2590,6 +2750,7 @@ func (s *Service) serverlessWakeEnabled(sandbox *models.Sandbox) bool {
 // Both calls are idempotent and treat 404 as success, so calling this
 // without knowing which shape is currently live is safe and cheap.
 func (s *Service) removeHTTPPortRoute(ctx context.Context, id string, port int) error {
+	s.releaseWasmHTTPListener(id, port)
 	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
 		return err
 	}
@@ -2673,12 +2834,19 @@ func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) 
 		}
 		sandbox = fresh
 	}
-	if sandbox.ContainerIP == "" {
-		return PortEndpoint{}, errors.New("sandbox container IP is not available")
-	}
 	exposure := findExposure(sandbox, port)
 	if exposure == nil || (exposure.Protocol != "" && exposure.Protocol != models.ExposedPortProtocolHTTP) {
 		return PortEndpoint{}, fmt.Errorf("sandbox %s does not expose HTTP port %d", id, port)
+	}
+	if s.isWasmSandbox(sandbox) {
+		url, err := s.wasmHTTPUpstreamURL(ctx, id, port)
+		if err != nil {
+			return PortEndpoint{}, err
+		}
+		return PortEndpoint{URL: url}, nil
+	}
+	if sandbox.ContainerIP == "" {
+		return PortEndpoint{}, errors.New("sandbox container IP is not available")
 	}
 	return PortEndpoint{URL: fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, port)}, nil
 }
@@ -2835,11 +3003,28 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		}
 	}
 
+	wasmStatus := "disabled"
+	if s.cfg.EnableWasm {
+		switch rt := s.wasm.(type) {
+		case nil:
+			wasmStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeWasm)
+		default:
+			if err := rt.Ping(ctx); err != nil {
+				wasmStatus = err.Error()
+			} else {
+				wasmStatus = "ok"
+			}
+		}
+	}
+
 	status := "ok"
 	if dockerStatus != "ok" || caddyStatus != "ok" {
 		status = "degraded"
 	}
 	if s.cfg.EnableFirecracker && firecrackerStatus != "ok" {
+		status = "degraded"
+	}
+	if s.cfg.EnableWasm && wasmStatus != "ok" {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.
@@ -2867,6 +3052,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		Docker:          dockerStatus,
 		Caddy:           caddyStatus,
 		Firecracker:     firecrackerStatus,
+		Wasm:            wasmStatus,
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
@@ -2891,6 +3077,10 @@ func (s *Service) Capacity() capacity.Snapshot {
 	if ids, known := s.LocalReadyTemplateInventory(context.Background()); known {
 		snap.LocalTemplateInventoryKnown = true
 		snap.LocalTemplateIDs = ids
+	}
+	if refs, known := s.LocalReadyWasmModuleInventory(context.Background()); known {
+		snap.LocalWasmModuleInventoryKnown = true
+		snap.LocalWasmModuleIDs = refs
 	}
 	return snap
 }
@@ -2950,6 +3140,42 @@ func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bo
 func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
 	ids, _ := s.LocalReadyTemplateInventory(ctx)
 	return ids
+}
+
+// LocalReadyWasmModuleInventory returns module_ref values present in the local
+// wasm_modules catalogue plus whether that inventory is authoritative.
+func (s *Service) LocalReadyWasmModuleInventory(ctx context.Context) ([]string, bool) {
+	if s == nil || s.store == nil || !s.cfg.EnableWasm {
+		return nil, false
+	}
+	now := time.Now()
+	s.localReadyWasmModuleIDsMu.Lock()
+	if now.Before(s.localReadyWasmModuleIDsExpires) {
+		out := append([]string(nil), s.localReadyWasmModuleIDsCache...)
+		known := s.localReadyWasmModuleIDsKnown
+		s.localReadyWasmModuleIDsMu.Unlock()
+		return out, known
+	}
+	s.localReadyWasmModuleIDsMu.Unlock()
+
+	refs, err := s.store.ListReadyWasmModuleRefs(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("local ready wasm module refs: list failed", "error", err)
+		}
+		s.localReadyWasmModuleIDsMu.Lock()
+		out := append([]string(nil), s.localReadyWasmModuleIDsCache...)
+		known := s.localReadyWasmModuleIDsKnown
+		s.localReadyWasmModuleIDsMu.Unlock()
+		return out, known
+	}
+	s.localReadyWasmModuleIDsMu.Lock()
+	s.localReadyWasmModuleIDsCache = refs
+	s.localReadyWasmModuleIDsKnown = true
+	s.localReadyWasmModuleIDsExpires = now.Add(5 * time.Second)
+	out := append([]string(nil), refs...)
+	s.localReadyWasmModuleIDsMu.Unlock()
+	return out, true
 }
 
 // ReplayReservations re-populates the admitter from persistent state. Without
@@ -3021,7 +3247,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			return err
 		}
 	}
-	managed := mergeManagedRuntimes(dockerManaged, firecrackerManaged)
+	wasmManaged := map[string]*models.SandboxRuntimeState{}
+	if s.wasm != nil {
+		wasmManaged, err = s.wasm.ListManaged(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	managed := mergeManagedRuntimes(dockerManaged, firecrackerManaged, wasmManaged)
 
 	s.reconcileLocalClusterOwnership(ctx, known, managed)
 
@@ -3036,8 +3269,33 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if s.isFirecrackerSandbox(sandbox) {
 			runtimeManaged = firecrackerManaged
 		}
+		if s.isWasmSandbox(sandbox) {
+			runtimeManaged = wasmManaged
+		}
 		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
+			if s.isWasmSandbox(sandbox) {
+				if s.reconcileWasmOfflineRow(ctx, sandbox) {
+					continue
+				}
+				switch sandbox.Status {
+				case models.SandboxStatusPassivated, models.SandboxStatusAwaitingRuntime:
+					continue
+				case models.SandboxStatusStopped:
+					if s.admitter != nil {
+						s.admitter.Release(sandbox.ID)
+					}
+					_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+					if sandbox.WakeArmed {
+						s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
+					} else {
+						for _, port := range sandbox.ExposedPorts {
+							_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+						}
+					}
+					continue
+				}
+			}
 			if s.isFirecrackerSandbox(sandbox) && sandbox.Status == models.SandboxStatusStopped {
 				if s.admitter != nil {
 					s.admitter.Release(sandbox.ID)
@@ -3067,11 +3325,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// image cleanup is best-effort and mirrors DestroySandbox's
 			// order; failures here are picked up by gcZombieCaddyEntries on
 			// a later pass and by the mounts.Sweep at the end of Reconcile.
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			if s.caddy != nil {
+				_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			}
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 			}
-			if s.isFirecrackerSandbox(sandbox) {
+			if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) {
 				rt, err := s.runtimeForSandbox(sandbox)
 				if err != nil {
 					return err
@@ -3080,8 +3340,10 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					return err
 				}
 			}
-			if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
-				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
+			if s.mounts != nil {
+				if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
+					s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
+				}
 			}
 			// store.Delete must happen BEFORE schedulePendingImageGC. The
 			// pending-image janitor uses HasActiveImageRef to decide whether
@@ -3099,11 +3361,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.admitter.Release(sandbox.ID)
 			}
 			s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "reconcile-destroyed")
-			s.schedulePendingImageGC(ctx, sandbox.Image)
-			s.logger.Info("audit reconcile destroyed",
-				"sandbox_id", sandbox.ID,
-				"image", sandbox.Image,
-			)
+			if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+				return err
+			}
+			if !s.isWasmSandbox(sandbox) {
+				s.schedulePendingImageGC(ctx, sandbox.Image)
+			}
+			if s.logger != nil {
+				s.logger.Info("audit reconcile destroyed",
+					"sandbox_id", sandbox.ID,
+					"image", sandbox.Image,
+				)
+			}
 			continue
 		}
 
@@ -3144,11 +3413,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// Catches host-side state loss: iptables flush, daemon restart
 			// rebuilding chains, or a missed Create/Start install.
 			if sandbox.NetworkBlockAll {
-				rt, err := s.runtimeForSandbox(sandbox)
+				cr, err := s.containerRuntimeForSandbox(sandbox)
 				if err != nil {
-					return err
-				}
-				if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+					s.logger.Warn("reconcile reapply network block skipped",
+						"sandbox_id", sandbox.ID,
+						"error", err,
+					)
+				} else if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
 					s.logger.Warn("reconcile reapply network block failed",
 						"sandbox_id", sandbox.ID,
 						"ip", sandbox.ContainerIP,
@@ -3217,13 +3488,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					"error", err,
 				)
 			}
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
-			_ = s.mounts.UnmountAll(sandboxID)
+			if s.caddy != nil {
+				_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
+			}
+			if s.mounts != nil {
+				_ = s.mounts.UnmountAll(sandboxID)
+			}
 		}
 	}
 	removeOrphans(s.docker, models.RuntimeDocker, dockerManaged)
 	if s.firecracker != nil {
 		removeOrphans(s.firecracker, models.RuntimeFirecracker, firecrackerManaged)
+	}
+	if s.wasm != nil {
+		removeOrphans(s.wasm, models.RuntimeWasm, wasmManaged)
 	}
 
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already
@@ -4329,16 +4607,19 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	if sandbox == nil || sandbox.Status != models.SandboxStatusStarted || sandbox.ContainerIP == "" {
 		return
 	}
+	if s.isWasmSandbox(sandbox) {
+		s.syncWasmAllowedPorts(ctx, sandbox)
+		return
+	}
 	ports := make([]int, 0, len(sandbox.ExposedPorts))
 	for _, p := range sandbox.ExposedPorts {
 		ports = append(ports, p.Port)
 	}
-	rt, err := s.runtimeForSandbox(sandbox)
+	cr, err := s.containerRuntimeForSandbox(sandbox)
 	if err != nil {
-		s.logger.Warn("failed to resolve runtime for allowed ports sync", "sandbox_id", sandbox.ID, "error", err)
 		return
 	}
-	if err := rt.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
+	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
 }

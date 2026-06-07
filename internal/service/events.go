@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -179,12 +180,16 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	// helper applies the D5 wake-arming exception for HTTP ports and
 	// demotes arm to false if every wake-route install attempt failed.
 	arm = s.tearDownPortRoutesForStop(ctx, sandbox, arm)
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
-		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
+	if s.caddy != nil {
+		if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+			s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
+		}
 	}
 	if previousIP != "" {
-		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
-			s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
+			if err := cr.ClearNetworkRules(previousIP); err != nil {
+				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
 		}
 	}
 
@@ -242,12 +247,16 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 			s.logger.Warn("delete port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 		}
 	}
-	if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
-		s.logger.Warn("unmount on destroy event failed", "sandbox_id", sandbox.ID, "error", err)
+	if s.mounts != nil {
+		if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
+			s.logger.Warn("unmount on destroy event failed", "sandbox_id", sandbox.ID, "error", err)
+		}
 	}
 	if previousIP != "" {
-		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
-			s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
+			if err := cr.ClearNetworkRules(previousIP); err != nil {
+				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
 		}
 	}
 
@@ -259,17 +268,24 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
+	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+		return err
+	}
 
 	if s.admitter != nil {
 		s.admitter.Release(sandbox.ID)
 	}
 	s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "docker-destroy-event")
-	s.schedulePendingImageGC(ctx, sandbox.Image)
+	if !s.isWasmSandbox(sandbox) {
+		s.schedulePendingImageGC(ctx, sandbox.Image)
+	}
 
-	s.logger.Info("audit sandbox destroyed via docker event",
-		"sandbox_id", sandbox.ID,
-		"image", sandbox.Image,
-	)
+	if s.logger != nil {
+		s.logger.Info("audit sandbox destroyed via docker event",
+			"sandbox_id", sandbox.ID,
+			"image", sandbox.Image,
+		)
+	}
 	return nil
 }
 

@@ -181,10 +181,10 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 
 	p.gcBaselines(targets)
 
-	if len(samples) > 0 {
-		sampleCount = len(samples)
-		p.sink.HandleSamples(ctx, samples)
-	}
+	// Always invoke the sink so alternate runtimes (WASM HTTP mediator) can
+	// drain byte counters even when no Docker targets produced deltas.
+	sampleCount = len(samples)
+	p.sink.HandleSamples(ctx, samples)
 }
 
 // diffAndUpdate computes the delta against the stored baseline and rotates

@@ -1003,6 +1003,95 @@ test("MicroVM.rebuildTemplate POSTs the rebuild path and surfaces 412 errors", a
   );
 });
 
+test("MicroVM.createWasmModule POSTs /v1/wasm-modules and maps the response", async () => {
+  let seenRequest: Request | undefined;
+  let seenBody = "";
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seenRequest = req;
+      seenBody = await req.text();
+      return new Response(JSON.stringify({
+        id: "abc123",
+        module_ref: "file:///opt/mod.wasm",
+        status: "ready",
+        module_size_bytes: 4096,
+        digest: "abc123",
+        entrypoint: "_start",
+        has_warm: true,
+        created_at: "2026-05-27T10:00:00Z",
+        updated_at: "2026-05-27T10:00:00Z",
+        ready_at: "2026-05-27T10:00:00Z",
+      }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const mod = await sdk.createWasmModule({
+    moduleRef: "file:///opt/mod.wasm",
+    entrypoint: "_start",
+  });
+
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "POST");
+  assert.ok(seenRequest.url.endsWith("/v1/wasm-modules"));
+  assert.deepEqual(JSON.parse(seenBody), {
+    module_ref: "file:///opt/mod.wasm",
+    entrypoint: "_start",
+  });
+  assert.equal(mod.id, "abc123");
+  assert.equal(mod.status, "ready");
+  assert.equal(mod.moduleRef, "file:///opt/mod.wasm");
+  assert.equal(mod.hasWarm, true);
+});
+
+test("MicroVM.listWasmModules handles empty and populated responses", async () => {
+  let response: unknown = null;
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async () => new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+
+  assert.deepEqual(await sdk.listWasmModules(), []);
+
+  response = [{
+    id: "mod-1",
+    module_ref: "https://example.com/agent.wasm",
+    status: "ready",
+    has_warm: false,
+    created_at: "2026-05-27T10:00:00Z",
+    updated_at: "2026-05-27T10:00:00Z",
+  }];
+  const rows = await sdk.listWasmModules();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].moduleRef, "https://example.com/agent.wasm");
+});
+
+test("MicroVM.deleteWasmModule sends DELETE on the per-id path", async () => {
+  let seenRequest: Request | undefined;
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return new Response(null, { status: 204 });
+    },
+  });
+
+  await sdk.deleteWasmModule("mod-x");
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "DELETE");
+  assert.ok(seenRequest.url.endsWith("/v1/wasm-modules/mod-x"));
+});
+
 test("MicroVM.deleteTemplate sends DELETE on the per-id path", async () => {
   let seenRequest: Request | undefined;
   const sdk = new MicroVM({

@@ -38,6 +38,11 @@ public class SandboxData {
     public Lifecycle lifecycle = new Lifecycle();
     public Failover failover;
     public String runtime = "";
+    public String durability;
+    @JsonProperty("module_ref")
+    public String moduleRef;
+    @JsonProperty("module_digest")
+    public String moduleDigest;
     /** GPU configuration this sandbox was created with. Null means no GPU. */
     public GpuOptions gpus;
 
@@ -75,6 +80,7 @@ public class SandboxData {
         lifecycle = other.lifecycle == null ? new Lifecycle() : other.lifecycle.copy();
         failover = other.failover == null ? null : other.failover.copy();
         runtime = other.runtime == null ? "" : other.runtime;
+        durability = other.durability;
         gpus = other.gpus == null ? null : other.gpus.copy();
     }
 }

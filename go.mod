@@ -3,6 +3,7 @@ module github.com/aerol-ai/microvm
 go 1.26.3
 
 require (
+	github.com/bytecodealliance/wasmtime-go/v37 v37.0.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/creack/pty v1.1.24
 	github.com/daytonaio/daytona/libs/api-client-go v0.177.0
@@ -13,10 +14,16 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
+	github.com/klauspost/compress v1.17.11
+	github.com/opencontainers/image-spec v1.1.0
+	github.com/tetratelabs/wazero v1.12.0
 	github.com/mattn/go-sqlite3 v1.14.45
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
+	oras.land/oras-go/v2 v2.5.0
 )
+
+require github.com/opencontainers/go-digest v1.0.0 // indirect
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect

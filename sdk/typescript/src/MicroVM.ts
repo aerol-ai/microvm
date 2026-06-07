@@ -8,6 +8,7 @@ import type {
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
+  CreateWasmModuleOptions,
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
@@ -23,6 +24,7 @@ import type {
   SessionAttachHandle,
   SessionAttachOptions,
   Template,
+  WasmModule,
 } from "./types.js";
 
 const defaultAPIURL = "http://127.0.0.1:21212";
@@ -226,6 +228,27 @@ export class MicroVM {
 
   async deleteTemplate(id: string): Promise<void> {
     await this.client.deleteTemplate(id);
+  }
+
+  /**
+   * Register a WASM module in the host catalogue. Resolution is synchronous —
+   * the returned row is typically already `ready`. Use the row's `id` or
+   * `moduleRef` on subsequent `create` calls with `runtime: "wasm"`.
+   */
+  async createWasmModule(options: CreateWasmModuleOptions): Promise<WasmModule> {
+    return this.client.createWasmModule(options);
+  }
+
+  async listWasmModules(): Promise<WasmModule[]> {
+    return this.client.listWasmModules();
+  }
+
+  async getWasmModule(id: string): Promise<WasmModule> {
+    return this.client.getWasmModule(id);
+  }
+
+  async deleteWasmModule(id: string): Promise<void> {
+    await this.client.deleteWasmModule(id);
   }
 
   /**

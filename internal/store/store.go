@@ -379,6 +379,56 @@ func Open(path string) (*Store, error) {
 		// full scan once the catalogue grows beyond a handful of entries.
 		`CREATE INDEX IF NOT EXISTS idx_firecracker_templates_updated_at
 			ON firecracker_templates(updated_at);`,
+		// wasm_modules mirrors firecracker_templates for WASM module catalogue
+		// (plans/wasm-runtime.md Phase 6). One row per registered module ref.
+		`CREATE TABLE IF NOT EXISTS wasm_modules (
+			id TEXT PRIMARY KEY,
+			module_ref TEXT NOT NULL,
+			status TEXT NOT NULL,
+			module_path TEXT NOT NULL DEFAULT '',
+			module_size_bytes INTEGER NOT NULL DEFAULT 0,
+			digest TEXT NOT NULL DEFAULT '',
+			entrypoint TEXT NOT NULL DEFAULT '_start',
+			has_warm INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			ready_at DATETIME
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at
+			ON wasm_modules(updated_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_status_ref
+			ON wasm_modules(status, module_ref);`,
+		// wasm_state_kv backs the durable host-KV capability (§4.6).
+		`CREATE TABLE IF NOT EXISTS wasm_state_kv (
+			sandbox_id TEXT NOT NULL,
+			key TEXT NOT NULL,
+			value BLOB NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, key)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_state_kv_sandbox
+			ON wasm_state_kv(sandbox_id);`,
+		// wasm_checkpoint_pushes tracks AOCR push history for keep-last-N (§4.8).
+		//
+		// Deliberate deviation from plan §4.8's "reuse sandbox_snapshots" note:
+		// sandbox_snapshots models user-invoked, named snapshots (one row per
+		// snapshot name, surfaced over the snapshot API). This table instead
+		// records the *rolling, automatic* boundary-checkpoint pushes a durable
+		// WASM sandbox emits on drain/periodic cadence — unnamed, content-addressed
+		// by digest, and pruned to keep-last-N. Folding both into sandbox_snapshots
+		// would mean a type discriminator column plus snapshot-API rows the user
+		// never asked for. Kept separate on purpose; revisit if the two histories
+		// ever need to share retention/GC machinery.
+		`CREATE TABLE IF NOT EXISTS wasm_checkpoint_pushes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			sandbox_id TEXT NOT NULL,
+			registry_ref TEXT NOT NULL,
+			digest TEXT NOT NULL,
+			pushed_at DATETIME NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_checkpoint_pushes_sandbox
+			ON wasm_checkpoint_pushes(sandbox_id, pushed_at DESC);`,
 		// account_mappings records the identities resolved by the optional
 		// fleet control plane (managed builds only). owner_ref is the stable
 		// account key stamped onto sandboxes; external_id is informational.
@@ -533,6 +583,28 @@ func Open(path string) (*Store, error) {
 		// open-source baseline so warm upgrades are silent.
 		`ALTER TABLE sandboxes ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN fleet_suspended INTEGER NOT NULL DEFAULT 0;`,
+		// Durability class (plans/wasm-runtime.md D7). Pre-migration rows default
+		// to passivatable — container/VM runtimes survive restarts natively.
+		// durability is a shared concept (every runtime declares one) so it lives
+		// on the sandboxes row.
+		`ALTER TABLE sandboxes ADD COLUMN durability TEXT NOT NULL DEFAULT 'passivatable';`,
+		// The columns below are WASM-only: they are empty for docker/firecracker
+		// rows. They live on the shared sandboxes row (rather than a 1:1
+		// wasm_sandbox_state side-table) for phase 1 because reconcile, the
+		// failover/clone-generation fencing path, and rehydrate all read them on
+		// the hot list/scan path, and a per-row LEFT JOIN there is not worth it at
+		// this column count. Empty TEXT columns are ~free in SQLite. If the
+		// WASM-specific column set keeps growing, migrate these into a side-table
+		// keyed by sandbox_id (same shape as wasm_state_kv). Note module_ref
+		// overlaps the image column (the start path falls back to image when
+		// module_ref is empty) and clone_generation mirrors the toolboxd clonegen
+		// token.
+		`ALTER TABLE sandboxes ADD COLUMN module_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN module_digest TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN checkpoint_path TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN clone_generation TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_ref TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_digest TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -566,6 +638,18 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_template_id ON sandboxes(template_id) WHERE template_id <> '';`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes template_id index: %w", err)
+	}
+
+	// WASM module GC checks whether any sandbox still references a catalogue
+	// row by module_ref or module_digest. These columns are compatibility
+	// migrations, so create the indexes after the ALTER loop above.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_module_ref ON sandboxes(module_ref) WHERE module_ref <> '';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes module_ref index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_module_digest ON sandboxes(module_digest) WHERE module_digest <> '';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
 	}
 
 	// SQLite materialized the DB file (and the WAL/SHM sidecars on the
@@ -640,8 +724,12 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			serverless, wake_armed,
 			template_id,
 			overlay_size_gb,
+			durability,
+			module_ref, module_digest,
+			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -684,6 +772,13 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.WakeArmed),
 		strings.TrimSpace(sandbox.TemplateID),
 		sandbox.OverlaySizeGB,
+		sandboxDurability(sandbox),
+		strings.TrimSpace(sandbox.ModuleRef),
+		strings.TrimSpace(sandbox.ModuleDigest),
+		strings.TrimSpace(sandbox.CheckpointPath),
+		strings.TrimSpace(sandbox.CloneGeneration),
+		strings.TrimSpace(sandbox.WasmRegistryRef),
+		strings.TrimSpace(sandbox.WasmRegistryDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -703,6 +798,13 @@ func nullableBlob(b []byte) []byte {
 		return []byte{}
 	}
 	return b
+}
+
+func sandboxDurability(sandbox *models.Sandbox) string {
+	if sandbox == nil || strings.TrimSpace(sandbox.Durability) == "" {
+		return models.DurabilityPassivatable
+	}
+	return strings.TrimSpace(sandbox.Durability)
 }
 
 func sandboxFailoverPolicy(sandbox *models.Sandbox) string {
@@ -752,8 +854,12 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			serverless, wake_armed,
 			template_id,
 			overlay_size_gb,
+			durability,
+			module_ref, module_digest,
+			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -790,6 +896,13 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			wake_armed = excluded.wake_armed,
 			template_id = excluded.template_id,
 			overlay_size_gb = excluded.overlay_size_gb,
+			durability = excluded.durability,
+			module_ref = excluded.module_ref,
+			module_digest = excluded.module_digest,
+			checkpoint_path = excluded.checkpoint_path,
+			clone_generation = excluded.clone_generation,
+			wasm_registry_ref = excluded.wasm_registry_ref,
+			wasm_registry_digest = excluded.wasm_registry_digest,
 			owner_ref = excluded.owner_ref,
 			fleet_suspended = excluded.fleet_suspended
 	`,
@@ -834,6 +947,13 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.WakeArmed),
 		strings.TrimSpace(sandbox.TemplateID),
 		sandbox.OverlaySizeGB,
+		sandboxDurability(sandbox),
+		strings.TrimSpace(sandbox.ModuleRef),
+		strings.TrimSpace(sandbox.ModuleDigest),
+		strings.TrimSpace(sandbox.CheckpointPath),
+		strings.TrimSpace(sandbox.CloneGeneration),
+		strings.TrimSpace(sandbox.WasmRegistryRef),
+		strings.TrimSpace(sandbox.WasmRegistryDigest),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -861,6 +981,10 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			serverless, wake_armed,
 			template_id,
 			overlay_size_gb,
+			durability,
+			module_ref, module_digest,
+			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE id = ?
@@ -904,6 +1028,10 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			serverless, wake_armed,
 			template_id,
 			overlay_size_gb,
+			durability,
+			module_ref, module_digest,
+			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		ORDER BY created_at DESC
@@ -967,6 +1095,10 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			serverless, wake_armed,
 			template_id,
 			overlay_size_gb,
+			durability,
+			module_ref, module_digest,
+			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE owner_ref = ?
@@ -3240,6 +3372,13 @@ func scanSandbox(scanner interface {
 		&wakeArmed,
 		&sandbox.TemplateID,
 		&sandbox.OverlaySizeGB,
+		&sandbox.Durability,
+		&sandbox.ModuleRef,
+		&sandbox.ModuleDigest,
+		&sandbox.CheckpointPath,
+		&sandbox.CloneGeneration,
+		&sandbox.WasmRegistryRef,
+		&sandbox.WasmRegistryDigest,
 		&sandbox.OwnerRef,
 		&fleetSuspended,
 	)
@@ -4392,4 +4531,418 @@ func collectFirecrackerVMMSlots(rows *sql.Rows) ([]FirecrackerVMMSlot, error) {
 		return nil, fmt.Errorf("iter firecracker vmm slot rows: %w", err)
 	}
 	return out, nil
+}
+
+// WasmModuleRecord is one row in wasm_modules.
+type WasmModuleRecord struct {
+	ID              string
+	ModuleRef       string
+	Status          string
+	ModulePath      string
+	ModuleSizeBytes int64
+	Digest          string
+	Entrypoint      string
+	HasWarm         bool
+	LastError       string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	ReadyAt         *time.Time
+}
+
+// UpsertWasmModule inserts or updates a wasm_modules catalogue row.
+func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) error {
+	now := time.Now().UTC()
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = now
+	}
+	rec.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_modules (
+			id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			module_ref = excluded.module_ref,
+			status = excluded.status,
+			module_path = excluded.module_path,
+			module_size_bytes = excluded.module_size_bytes,
+			digest = excluded.digest,
+			entrypoint = excluded.entrypoint,
+			has_warm = excluded.has_warm,
+			last_error = excluded.last_error,
+			updated_at = excluded.updated_at,
+			ready_at = excluded.ready_at
+	`,
+		rec.ID,
+		strings.TrimSpace(rec.ModuleRef),
+		rec.Status,
+		rec.ModulePath,
+		rec.ModuleSizeBytes,
+		rec.Digest,
+		rec.Entrypoint,
+		boolToInt(rec.HasWarm),
+		rec.LastError,
+		rec.CreatedAt.UTC(),
+		rec.UpdatedAt.UTC(),
+		nullableTime(rec.ReadyAt),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert wasm module: %w", err)
+	}
+	return nil
+}
+
+// UpdateWasmCheckpoint persists passivation metadata on a sandbox row.
+func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, status, checkpointPath, cloneGen, lastError string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status = ?, checkpoint_path = ?, clone_generation = ?, last_error = ?, updated_at = ?
+		WHERE id = ?
+	`, status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID)
+	if err != nil {
+		return fmt.Errorf("update wasm checkpoint: %w", err)
+	}
+	return nil
+}
+
+// PutWasmStateKV upserts one durable host-KV row (§4.6).
+func (s *Store) PutWasmStateKV(ctx context.Context, sandboxID, key string, value []byte) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	key = strings.TrimSpace(key)
+	if sandboxID == "" || key == "" {
+		return fmt.Errorf("wasm state kv: sandbox id and key required")
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_state_kv (sandbox_id, key, value, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, key) DO UPDATE SET
+			value = excluded.value,
+			updated_at = excluded.updated_at
+	`, sandboxID, key, value, now)
+	if err != nil {
+		return fmt.Errorf("put wasm state kv: %w", err)
+	}
+	return nil
+}
+
+// GetWasmStateKV returns one durable host-KV value.
+func (s *Store) GetWasmStateKV(ctx context.Context, sandboxID, key string) ([]byte, bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	key = strings.TrimSpace(key)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT value FROM wasm_state_kv WHERE sandbox_id = ? AND key = ?`,
+		sandboxID, key)
+	var value []byte
+	err := row.Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("get wasm state kv: %w", err)
+	}
+	return value, true, nil
+}
+
+// DeleteWasmStateKV removes one durable host-KV row.
+func (s *Store) DeleteWasmStateKV(ctx context.Context, sandboxID, key string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	key = strings.TrimSpace(key)
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM wasm_state_kv WHERE sandbox_id = ? AND key = ?`,
+		sandboxID, key)
+	if err != nil {
+		return fmt.Errorf("delete wasm state kv: %w", err)
+	}
+	return nil
+}
+
+// DeleteAllWasmStateKV removes every durable host-KV row for sandboxID.
+func (s *Store) DeleteAllWasmStateKV(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM wasm_state_kv WHERE sandbox_id = ?`,
+		sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete all wasm state kv: %w", err)
+	}
+	return nil
+}
+
+// ListWasmStateKVKeys lists keys for a sandbox.
+func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT key FROM wasm_state_kv WHERE sandbox_id = ? ORDER BY key`,
+		sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("list wasm state kv keys: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		out = append(out, key)
+	}
+	return out, rows.Err()
+}
+
+// WasmCheckpointPushRecord is one AOCR push history row.
+type WasmCheckpointPushRecord struct {
+	ID          int64
+	SandboxID   string
+	RegistryRef string
+	Digest      string
+	PushedAt    time.Time
+}
+
+// InsertWasmCheckpointPush records a successful AOCR push for keep-last-N retention.
+func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, registryRef, digest string) (int64, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_checkpoint_pushes (sandbox_id, registry_ref, digest, pushed_at)
+		VALUES (?, ?, ?, ?)`,
+		strings.TrimSpace(sandboxID), strings.TrimSpace(registryRef), strings.TrimSpace(digest), now)
+	if err != nil {
+		return 0, fmt.Errorf("insert wasm checkpoint push: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// ListWasmCheckpointPushes returns push history newest-first.
+func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) ([]WasmCheckpointPushRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, sandbox_id, registry_ref, digest, pushed_at
+		FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ?
+		ORDER BY pushed_at DESC, id DESC`, strings.TrimSpace(sandboxID))
+	if err != nil {
+		return nil, fmt.Errorf("list wasm checkpoint pushes: %w", err)
+	}
+	defer rows.Close()
+	var out []WasmCheckpointPushRecord
+	for rows.Next() {
+		var rec WasmCheckpointPushRecord
+		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// DeleteWasmCheckpointPush removes one push history row by id.
+func (s *Store) DeleteWasmCheckpointPush(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM wasm_checkpoint_pushes WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete wasm checkpoint push: %w", err)
+	}
+	return nil
+}
+
+// DeleteAllWasmCheckpointPushes removes all retained AOCR push-history rows for sandboxID.
+func (s *Store) DeleteAllWasmCheckpointPushes(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM wasm_checkpoint_pushes WHERE sandbox_id = ?`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete all wasm checkpoint pushes: %w", err)
+	}
+	return nil
+}
+
+// UpdateWasmRegistryPush records the AOCR ref/digest after a durable checkpoint push.
+func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, registryRef, digest string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET wasm_registry_ref = ?, wasm_registry_digest = ?, updated_at = ?
+		WHERE id = ?
+	`, strings.TrimSpace(registryRef), strings.TrimSpace(digest), now, sandboxID)
+	if err != nil {
+		return fmt.Errorf("update wasm registry push: %w", err)
+	}
+	return nil
+}
+
+// ListReadyWasmModuleRefs returns module_ref values for ready catalogue rows.
+func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT module_ref FROM wasm_modules
+		WHERE status = 'ready' AND module_ref != ''
+		ORDER BY module_ref`)
+	if err != nil {
+		return nil, fmt.Errorf("list ready wasm module refs: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
+// ListWasmModulesOlderThan returns catalogue rows not updated since cutoff.
+func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) ([]WasmModuleRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		FROM wasm_modules
+		WHERE updated_at < ?
+		ORDER BY updated_at ASC`, cutoff.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list wasm modules older than: %w", err)
+	}
+	defer rows.Close()
+	var out []WasmModuleRecord
+	for rows.Next() {
+		rec, err := scanWasmModule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// IsWasmModuleReferenced reports whether any sandbox still names moduleRef or digest id.
+func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef string) (bool, error) {
+	moduleID = strings.TrimSpace(moduleID)
+	moduleRef = strings.TrimSpace(moduleRef)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM sandboxes
+		WHERE module_ref = ? OR module_ref = ? OR module_digest = ?
+		LIMIT 1`, moduleRef, moduleID, moduleID)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ErrWasmModuleIDConflict is returned when POST /v1/wasm-modules reuses an id
+// bound to a different module_ref.
+var ErrWasmModuleIDConflict = errors.New("wasm module id already in use")
+
+// ErrWasmModuleInUse blocks DELETE while a sandbox still references the module.
+var ErrWasmModuleInUse = errors.New("wasm module is referenced by an active sandbox")
+
+func scanWasmModule(row interface {
+	Scan(dest ...any) error
+}) (WasmModuleRecord, error) {
+	var rec WasmModuleRecord
+	var hasWarm int
+	var readyAt sql.NullTime
+	if err := row.Scan(
+		&rec.ID, &rec.ModuleRef, &rec.Status, &rec.ModulePath, &rec.ModuleSizeBytes,
+		&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError,
+		&rec.CreatedAt, &rec.UpdatedAt, &readyAt,
+	); err != nil {
+		return WasmModuleRecord{}, err
+	}
+	rec.HasWarm = hasWarm != 0
+	if readyAt.Valid {
+		t := readyAt.Time
+		rec.ReadyAt = &t
+	}
+	return rec, nil
+}
+
+// GetWasmModule returns one wasm_modules row by catalogue id.
+func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return WasmModuleRecord{}, errors.New("get wasm module: id required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		FROM wasm_modules WHERE id = ?`, id)
+	rec, err := scanWasmModule(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WasmModuleRecord{}, ErrNotFound
+		}
+		return WasmModuleRecord{}, fmt.Errorf("get wasm module: %w", err)
+	}
+	return rec, nil
+}
+
+// ListWasmModules returns all catalogue rows newest-first.
+func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		FROM wasm_modules
+		ORDER BY created_at DESC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list wasm modules: %w", err)
+	}
+	defer rows.Close()
+	var out []WasmModuleRecord
+	for rows.Next() {
+		rec, err := scanWasmModule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// DeleteWasmModule removes a wasm_modules catalogue row.
+func (s *Store) DeleteWasmModule(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("delete wasm module: id required")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM wasm_modules WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete wasm module: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CompareCloneGeneration rejects stale snapshot writes when wantGen is older
+// than the row's current clone_generation (§4.8 fencing).
+func (s *Store) CompareCloneGeneration(ctx context.Context, sandboxID, snapshotGen string) error {
+	row := s.db.QueryRowContext(ctx, `SELECT clone_generation FROM sandboxes WHERE id = ?`, sandboxID)
+	var current string
+	if err := row.Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	current = strings.TrimSpace(current)
+	snapshotGen = strings.TrimSpace(snapshotGen)
+	if current == "" || snapshotGen == "" || current == snapshotGen {
+		return nil
+	}
+	return fmt.Errorf("clone generation mismatch (row=%s snapshot=%s): %w", current, snapshotGen, models.ErrSnapshotFenced)
 }

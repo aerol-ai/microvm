@@ -528,6 +528,11 @@ type Client interface {
 	// about to stop.
 	SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error
 
+	// ReassignPlacement moves sandboxID to target without touching the
+	// replicated spec or port intents. Used by WASM live migration once the
+	// receiving node has imported a §4.8.1 checkpoint.
+	ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error
+
 	// RemoveMember explicitly removes nodeID from the raft configuration after
 	// marking it drained and orphaning any placements it owned. Unknown raft
 	// members return ErrUnknownMember. Live members require force=true so an

@@ -138,6 +138,21 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 	if sandbox == nil {
 		return
 	}
+	if s.isWasmSandbox(sandbox) {
+		s.syncWasmNetworkPolicy(sandbox, overIn, overOut)
+		if overIn || overOut {
+			if err := s.store.MarkNetworkQuotaExceeded(ctx, sandbox.ID, time.Now().UTC()); err != nil && !errors.Is(err, store.ErrNotFound) {
+				s.logger.Warn("mark network quota exceeded failed",
+					"sandbox_id", sandbox.ID, "error", err)
+			}
+		} else if sandbox.NetworkQuotaExceeded {
+			if err := s.store.ClearNetworkQuotaExceeded(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+				s.logger.Warn("clear network quota exceeded failed",
+					"sandbox_id", sandbox.ID, "error", err)
+			}
+		}
+		return
+	}
 
 	// iptables reconciliation needs an IP to install rules against. A
 	// sandbox in a state with no ContainerIP (stopped, between create and
@@ -148,30 +163,36 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 	// `quota_exceeded` flag stuck true even after the operator raises the
 	// limit and the over-quota condition no longer holds.
 	if sandbox.ContainerIP != "" {
-		// Egress: only clear when NetworkBlockAll is also off. NetworkBlockAll
-		// owns the same DOCKER-USER row, so ApplyNetworkBlockAll is the right
-		// shared installer for the quota path too.
-		if overOut {
-			if err := s.docker.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
-				s.logger.Warn("apply quota egress block failed",
-					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
-			}
-		} else if !sandbox.NetworkBlockAll {
-			if err := s.docker.ClearNetworkBlockEgress(sandbox.ContainerIP); err != nil {
-				s.logger.Warn("clear quota egress block failed",
-					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
-			}
-		}
-
-		if overIn {
-			if err := s.docker.ApplyNetworkBlockIngress(sandbox.ContainerIP); err != nil {
-				s.logger.Warn("apply quota ingress block failed",
-					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
-			}
+		cr, err := s.containerRuntimeForSandbox(sandbox)
+		if err != nil {
+			s.logger.Warn("apply network quota skipped: runtime has no container network rules",
+				"sandbox_id", sandbox.ID, "error", err)
 		} else {
-			if err := s.docker.ClearNetworkBlockIngress(sandbox.ContainerIP); err != nil {
-				s.logger.Warn("clear quota ingress block failed",
-					"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			// Egress: only clear when NetworkBlockAll is also off. NetworkBlockAll
+			// owns the same DOCKER-USER row, so ApplyNetworkBlockAll is the right
+			// shared installer for the quota path too.
+			if overOut {
+				if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+					s.logger.Warn("apply quota egress block failed",
+						"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+				}
+			} else if !sandbox.NetworkBlockAll {
+				if err := cr.ClearNetworkBlockEgress(sandbox.ContainerIP); err != nil {
+					s.logger.Warn("clear quota egress block failed",
+						"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+				}
+			}
+
+			if overIn {
+				if err := cr.ApplyNetworkBlockIngress(sandbox.ContainerIP); err != nil {
+					s.logger.Warn("apply quota ingress block failed",
+						"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+				}
+			} else {
+				if err := cr.ClearNetworkBlockIngress(sandbox.ContainerIP); err != nil {
+					s.logger.Warn("clear quota ingress block failed",
+						"sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+				}
 			}
 		}
 	}
@@ -222,6 +243,11 @@ func (l netstatsServiceLister) NetstatsTargets(ctx context.Context) []netstats.T
 type netstatsServiceSink struct{ svc *Service }
 
 func (k netstatsServiceSink) HandleSamples(ctx context.Context, samples []netstats.Sample) {
+	k.svc.drainWasmNetworkCounters(ctx)
+	k.handleNetworkSamples(ctx, samples)
+}
+
+func (k netstatsServiceSink) handleNetworkSamples(ctx context.Context, samples []netstats.Sample) {
 	if len(samples) == 0 {
 		return
 	}

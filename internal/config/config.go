@@ -363,6 +363,70 @@ type Config struct {
 	// sandbox to land on the new path. Existing Docker/gVisor sandboxes
 	// are untouched. SB_ENABLE_FIRECRACKER.
 	EnableFirecracker bool
+	// EnableWasm opts this host in to the WASM/WASI runtime
+	// (plans/wasm-runtime.md). False (the default) keeps WASM creates at
+	// ErrRuntimeNotImplemented unless the operator flips SB_ENABLE_WASM.
+	// SB_ENABLE_WASM.
+	EnableWasm bool
+	// WasmRunDir holds per-sandbox runtime state (worker sockets, scratch).
+	// Default /run/sandboxd/wasm. SB_WASM_RUN_DIR.
+	WasmRunDir string
+	// WasmModulesDir is the content-addressed module + checkpoint cache root.
+	// Required when EnableWasm is true. SB_WASM_MODULES_DIR.
+	WasmModulesDir string
+	// WasmEngine selects the guest engine backend (wazero or wasmtime). Default wazero.
+	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
+	WasmEngine string
+	// WasmMaxInstances caps live WASM sandboxes on this host. 0 = unlimited.
+	// SB_WASM_MAX_INSTANCES.
+	WasmMaxInstances int
+	// WasmDefaultMemoryMB is the guest linear-memory cap when a create omits memory_mb.
+	// SB_WASM_DEFAULT_MEMORY_MB.
+	WasmDefaultMemoryMB int
+	// WasmDefaultTimeout is the default wall-clock budget for guest invocations.
+	// SB_WASM_DEFAULT_TIMEOUT.
+	WasmDefaultTimeout time.Duration
+	// WasmPoolEnabled gates the in-memory warm-worker pool (Phase 5).
+	// SB_WASM_POOL_ENABLED.
+	WasmPoolEnabled bool
+	// WasmPoolDepthDefault is the target number of warm workers per module digest.
+	// SB_WASM_POOL_DEPTH_DEFAULT.
+	WasmPoolDepthDefault int
+	// WasmPoolRefillInterval is how often the refill loop tops up the pool.
+	// SB_WASM_POOL_REFILL_INTERVAL.
+	WasmPoolRefillInterval time.Duration
+	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
+	// SB_WASM_DRAIN_TIMEOUT.
+	WasmDrainTimeout time.Duration
+	// WasmCheckpointMaxParallel caps concurrent drain/periodic checkpoint IPC.
+	// SB_WASM_CHECKPOINT_MAX_PARALLEL.
+	WasmCheckpointMaxParallel int
+	// WasmCheckpointInterval triggers periodic boundary checkpoints for live
+	// passivatable/durable WASM sandboxes. 0 = off. SB_WASM_CHECKPOINT_INTERVAL.
+	WasmCheckpointInterval time.Duration
+	// WasmDurablePushInterval re-pushes durable checkpoints missing AOCR metadata.
+	// 0 = off (push still happens at passivation). SB_WASM_DURABLE_PUSH_INTERVAL.
+	WasmDurablePushInterval time.Duration
+	// WasmCheckpointKeepLastN retains the newest N AOCR push records per sandbox.
+	// 0 disables pruning. Default 3. SB_WASM_CHECKPOINT_KEEP_LAST_N.
+	WasmCheckpointKeepLastN int
+	// WasmStateKVWritesPerSec caps per-sandbox durable host-KV writes (Set/Delete).
+	// Host-KV writes land synchronously on the single-writer SQLite store, so a
+	// chatty durable guest can otherwise contend with the CreateSandbox boot path
+	// (plans/wasm-runtime.md §4.6). 0 disables limiting. SB_WASM_STATEKV_WRITES_PER_SEC.
+	WasmStateKVWritesPerSec float64
+	// WasmStateKVBurst is the host-KV write token-bucket capacity (allowed burst
+	// above the steady rate). Ignored when WasmStateKVWritesPerSec is 0.
+	// SB_WASM_STATEKV_BURST.
+	WasmStateKVBurst int
+	// WasmModuleGCEnabled gates the wasm_modules catalogue janitor.
+	// SB_WASM_MODULE_GC_ENABLED.
+	WasmModuleGCEnabled bool
+	// WasmModuleGCInterval is the wasm_modules sweep cadence. SB_WASM_MODULE_GC_INTERVAL.
+	WasmModuleGCInterval time.Duration
+	// WasmModuleGCTTL drops unreferenced catalogue rows older than this.
+	// SB_WASM_MODULE_GC_TTL.
+	WasmModuleGCTTL time.Duration
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1118,7 +1182,32 @@ func Load() (Config, error) {
 		FleetControlPlaneContractRefresh: getEnvDuration("SB_FLEET_CONTRACT_REFRESH", 5*time.Minute),
 		FleetLiveSampleInterval:          getEnvDuration("SB_FLEET_LIVE_SAMPLE_INTERVAL", 0),
 
-		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
+		EnableFirecracker:         getEnvBool("SB_ENABLE_FIRECRACKER", false),
+		EnableWasm:                getEnvBool("SB_ENABLE_WASM", false),
+		WasmRunDir:                getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
+		WasmModulesDir:            getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
+		WasmEngine:                strings.ToLower(strings.TrimSpace(getEnv("SB_WASM_ENGINE", "wazero"))),
+		WasmMaxInstances:          getEnvInt("SB_WASM_MAX_INSTANCES", 0),
+		WasmDefaultMemoryMB:       getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
+		WasmDefaultTimeout:        getEnvDuration("SB_WASM_DEFAULT_TIMEOUT", 5*time.Minute),
+		WasmDrainTimeout:          getEnvDuration("SB_WASM_DRAIN_TIMEOUT", 30*time.Second),
+		WasmCheckpointMaxParallel: getEnvInt("SB_WASM_CHECKPOINT_MAX_PARALLEL", 64),
+		WasmCheckpointInterval:    getEnvDuration("SB_WASM_CHECKPOINT_INTERVAL", 0),
+		WasmDurablePushInterval:   getEnvDuration("SB_WASM_DURABLE_PUSH_INTERVAL", 0),
+		WasmCheckpointKeepLastN:   getEnvInt("SB_WASM_CHECKPOINT_KEEP_LAST_N", 3),
+		// Default is deliberately generous: the guard exists to stop a single
+		// runaway guest (thousands of writes/sec hammering the single writer),
+		// not to throttle normal durable workloads. Operators tune down for
+		// stricter boot-path protection or set 0 to disable. WASM durable is new
+		// in this release, so there are no existing guests this default can break.
+		WasmStateKVWritesPerSec: getEnvFloat("SB_WASM_STATEKV_WRITES_PER_SEC", 50),
+		WasmStateKVBurst:        getEnvInt("SB_WASM_STATEKV_BURST", 100),
+		WasmModuleGCEnabled:     getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
+		WasmModuleGCInterval:    getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
+		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),
+		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
+		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
+		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
@@ -1270,6 +1359,10 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select Firecracker per-sandbox via the API once SB_ENABLE_FIRECRACKER=true",
 			cfg.Runtime, models.RuntimeDocker)
 	}
+	if cfg.Runtime == models.RuntimeWasm {
+		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select WASM per-sandbox via the API once SB_ENABLE_WASM=true",
+			cfg.Runtime, models.RuntimeDocker)
+	}
 
 	// Firecracker host-side wiring is opt-in. The flag exists to gate the
 	// driver registration in cmd/sandboxd/main.go; when it's off the
@@ -1322,6 +1415,34 @@ func Load() (Config, error) {
 		}
 		if cfg.FirecrackerMkfs4Bin == "" {
 			return Config{}, errors.New("SB_FIRECRACKER_MKFS_BIN is required when SB_ENABLE_FIRECRACKER=true")
+		}
+	}
+	if cfg.EnableWasm {
+		if cfg.WasmRunDir == "" {
+			return Config{}, errors.New("SB_WASM_RUN_DIR is required when SB_ENABLE_WASM=true")
+		}
+		if cfg.WasmModulesDir == "" {
+			return Config{}, errors.New("SB_WASM_MODULES_DIR is required when SB_ENABLE_WASM=true")
+		}
+		if cfg.WasmMaxInstances < 0 {
+			return Config{}, errors.New("SB_WASM_MAX_INSTANCES must be >= 0")
+		}
+		if cfg.WasmDefaultMemoryMB < 0 {
+			return Config{}, errors.New("SB_WASM_DEFAULT_MEMORY_MB must be >= 0")
+		}
+		if cfg.WasmCheckpointMaxParallel < 0 {
+			return Config{}, errors.New("SB_WASM_CHECKPOINT_MAX_PARALLEL must be >= 0")
+		}
+		if cfg.WasmPoolDepthDefault < 0 {
+			return Config{}, errors.New("SB_WASM_POOL_DEPTH_DEFAULT must be >= 0")
+		}
+		if cfg.WasmPoolEnabled && cfg.WasmPoolDepthDefault <= 0 {
+			return Config{}, errors.New("SB_WASM_POOL_DEPTH_DEFAULT must be > 0 when SB_WASM_POOL_ENABLED=true")
+		}
+		switch cfg.WasmEngine {
+		case "", "wazero", "wasmtime":
+		default:
+			return Config{}, fmt.Errorf("SB_WASM_ENGINE=%q: want wazero or wasmtime", cfg.WasmEngine)
 		}
 	}
 

@@ -3,128 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
-	"strings"
-	"sync"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/clonegen"
 )
 
-// TestCloneGeneration_InitWritesStableToken asserts the constructor seeds a
-// token and persists it, and that current() matches the file — the baseline
-// an in-guest reader records before any clone.
-func TestCloneGeneration_InitWritesStableToken(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sub", "clone-generation")
-	c := newCloneGeneration(path, nil)
-
-	token, resumedAt := c.current()
-	if token == "" {
-		t.Fatal("initial token is empty")
-	}
-	if resumedAt != 0 {
-		t.Errorf("initial resumedAt = %d, want 0 (never resumed)", resumedAt)
-	}
-
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read clone-generation file: %v", err)
-	}
-	if strings.TrimSpace(string(got)) != token {
-		t.Errorf("file token = %q, want %q", strings.TrimSpace(string(got)), token)
-	}
-}
-
-// TestCloneGeneration_BumpChangesTokenAndPersists asserts bump rotates the
-// token, records the resume time, and rewrites the file — the signal an
-// in-guest process keys off to reseed.
-func TestCloneGeneration_BumpChangesTokenAndPersists(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "clone-generation")
-	c := newCloneGeneration(path, nil)
-	before, _ := c.current()
-
-	c.bump(1700000000000000000)
-
-	after, resumedAt := c.current()
-	if after == before {
-		t.Errorf("token unchanged after bump: %q", after)
-	}
-	if resumedAt != 1700000000000000000 {
-		t.Errorf("resumedAt = %d, want 1700000000000000000", resumedAt)
-	}
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read clone-generation file: %v", err)
-	}
-	if strings.TrimSpace(string(got)) != after {
-		t.Errorf("file token = %q, want %q", strings.TrimSpace(string(got)), after)
-	}
-}
-
-// TestCloneGeneration_BumpPublishesAtomically asserts the on-disk token is
-// replaced via rename semantics: readers should only ever see the full old or
-// full new token, never an empty/truncated intermediate write.
-func TestCloneGeneration_BumpPublishesAtomically(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "clone-generation")
-	c := newCloneGeneration(path, nil)
-	before, _ := c.current()
-
-	c.bump(1700000000000000000)
-
-	after, _ := c.current()
-	if after == before {
-		t.Fatalf("token unchanged after bump: %q", after)
-	}
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read clone-generation file: %v", err)
-	}
-	fileToken := strings.TrimSpace(string(got))
-	if fileToken != before && fileToken != after {
-		t.Fatalf("file token = %q, want old %q or new %q", fileToken, before, after)
-	}
-}
-
-// TestCloneGeneration_MissingDirIsNonFatal asserts an unwritable path never
-// panics or blocks — the HTTP endpoint stays the source of truth even when
-// /run is read-only. The token is still served from memory.
-func TestCloneGeneration_MissingDirIsNonFatal(t *testing.T) {
-	// A path under a file (not a dir) makes MkdirAll fail.
-	file := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	c := newCloneGeneration(filepath.Join(file, "clone-generation"), nil)
-	if token, _ := c.current(); token == "" {
-		t.Error("token should still be served from memory when file write fails")
-	}
-	c.bump(1) // must not panic
-}
-
-// TestCloneGeneration_ConcurrentReadWrite is a race-detector smoke test:
-// concurrent bumps and reads must not data-race.
-func TestCloneGeneration_ConcurrentReadWrite(t *testing.T) {
-	c := newCloneGeneration(filepath.Join(t.TempDir(), "clone-generation"), nil)
-	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(2)
-		go func(n int) { defer wg.Done(); c.bump(int64(n)) }(i)
-		go func() { defer wg.Done(); _, _ = c.current() }()
-	}
-	wg.Wait()
-}
-
-// TestCloneGenerationRoute_ReturnsToken asserts GET /clone-generation is
-// unauthenticated (like /health) and returns the current token + resume time.
 func TestCloneGenerationRoute_ReturnsToken(t *testing.T) {
-	cg := newCloneGeneration(filepath.Join(t.TempDir(), "clone-generation"), nil)
-	cg.bump(1700000000000000000)
+	cg := clonegen.New(filepath.Join(t.TempDir(), "clone-generation"), nil)
+	cg.Bump(1700000000000000000)
 	s := &server{
-		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		sandboxID:    "sb-test",
 		authToken:    "token-123",
 		allowedPorts: map[int]struct{}{},
@@ -144,7 +34,7 @@ func TestCloneGenerationRoute_ReturnsToken(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	wantToken, wantResumedAt := cg.current()
+	wantToken, wantResumedAt := cg.Current()
 	if body.Generation != wantToken {
 		t.Errorf("generation = %q, want %q", body.Generation, wantToken)
 	}
@@ -153,12 +43,9 @@ func TestCloneGenerationRoute_ReturnsToken(t *testing.T) {
 	}
 }
 
-// TestQuiesceHandler_PostResume_BumpsCloneGeneration asserts the post_resume
-// handler rotates the clone-generation token — the wiring that lets an
-// in-guest process detect the clone and reseed its userspace PRNGs.
 func TestQuiesceHandler_PostResume_BumpsCloneGeneration(t *testing.T) {
-	cg := newCloneGeneration(filepath.Join(t.TempDir(), "clone-generation"), nil)
-	before, _ := cg.current()
+	cg := clonegen.New(filepath.Join(t.TempDir(), "clone-generation"), nil)
+	before, _ := cg.Current()
 
 	h := newQuiesceHandler(nil, nil, cg)
 	h.quiesce = &fakeQuiesceOps{}
@@ -168,45 +55,11 @@ func TestQuiesceHandler_PostResume_BumpsCloneGeneration(t *testing.T) {
 		t.Fatalf("OnPostResume: %v", err)
 	}
 
-	after, resumedAt := cg.current()
+	after, resumedAt := cg.Current()
 	if after == before {
 		t.Error("clone generation token was not bumped on post_resume")
 	}
 	if resumedAt != 1700000000000000000 {
 		t.Errorf("resumedAt = %d, want 1700000000000000000", resumedAt)
-	}
-}
-
-// TestCloneGeneration_NilReceiverIsSafe pins the cheap hardening that the
-// /clone-generation route relies on: a nil *cloneGeneration (a partial
-// server in a test, or future code that skips newCloneGeneration) must
-// report the baseline "never cloned" state instead of panicking. bump on a
-// nil receiver is likewise a no-op.
-func TestCloneGeneration_NilReceiverIsSafe(t *testing.T) {
-	var cg *cloneGeneration // nil
-
-	token, resumedAt := cg.current()
-	if token != "" || resumedAt != 0 {
-		t.Errorf("nil current() = (%q, %d), want (\"\", 0)", token, resumedAt)
-	}
-	// Must not panic.
-	cg.bump(123)
-}
-
-func TestRandomTokenFallbackUsesResumeTimestamp(t *testing.T) {
-	oldRandRead := randRead
-	randRead = func([]byte) (int, error) { return 0, errors.New("entropy unavailable") }
-	defer func() { randRead = oldRandRead }()
-
-	a := randomToken(111)
-	b := randomToken(222)
-	if a == b {
-		t.Fatalf("fallback token collision: %q", a)
-	}
-	if !strings.Contains(a, "fallback-111-") {
-		t.Fatalf("fallback token %q does not include resume timestamp", a)
-	}
-	if !strings.Contains(b, "fallback-222-") {
-		t.Fatalf("fallback token %q does not include resume timestamp", b)
 	}
 }

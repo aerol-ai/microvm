@@ -27,6 +27,11 @@ public class CreateOptions {
     public Lifecycle lifecycle;
     public Failover failover;
     public String runtime;
+    /** Survival class across daemon restarts. Null uses the runtime default. */
+    public String durability;
+    /** WASM module reference. When runtime is wasm, may be used instead of image. */
+    @JsonProperty("module_ref")
+    public String moduleRef;
     /** Attach GPU resources to the sandbox. Null means no GPU (CPU-only). */
     public GpuOptions gpus;
     /**
@@ -111,6 +116,11 @@ public class CreateOptions {
 
     public CreateOptions setRuntime(String runtime) {
         this.runtime = runtime;
+        return this;
+    }
+
+    public CreateOptions setDurability(String durability) {
+        this.durability = durability;
         return this;
     }
 

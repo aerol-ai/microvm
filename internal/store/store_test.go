@@ -163,6 +163,56 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "durability_roundtrip_and_default",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-dur")
+				sandbox.Durability = models.DurabilityEphemeral
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Durability != models.DurabilityEphemeral {
+					t.Fatalf("durability = %q, want %q", got.Durability, models.DurabilityEphemeral)
+				}
+
+				defaulted := sampleSandbox("sb-dur-default")
+				if err := st.Create(ctx, defaulted); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				gotDefault, err := st.Get(ctx, defaulted.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if gotDefault.Durability != models.DurabilityPassivatable {
+					t.Fatalf("default durability = %q, want %q", gotDefault.Durability, models.DurabilityPassivatable)
+				}
+			},
+		},
+		{
+			name: "module_ref_roundtrip",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-wasm-mod")
+				sandbox.Runtime = models.RuntimeWasm
+				sandbox.ModuleRef = "hello.wasm"
+				sandbox.ModuleDigest = "abc123"
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.ModuleRef != "hello.wasm" || got.ModuleDigest != "abc123" {
+					t.Fatalf("module fields = %+v", got)
+				}
+			},
+		},
+		{
 			name: "create_duplicate_returns_error",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
@@ -1890,8 +1940,12 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // wake_armed
 			"",             // template_id
 			0,              // overlay_size_gb
-			"",             // owner_ref
-			0,              // fleet_suspended
+			"passivatable", // durability
+			"", "",         // module_ref, module_digest
+			"", "", // checkpoint_path, clone_generation
+			"", "", // wasm_registry_ref, wasm_registry_digest
+			"", // owner_ref
+			0,  // fleet_suspended
 		}}
 		_, err := scanSandbox(row)
 		if err == nil {
@@ -1982,5 +2036,93 @@ func sampleSandbox(id string) *models.Sandbox {
 		UpdatedAt:        now,
 		LastActiveAt:     now,
 		Runtime:          models.RuntimeGvisor,
+	}
+}
+
+func TestWasmCheckpointColumnsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sb := sampleSandbox("sb-wasm-ckpt")
+	sb.Runtime = models.RuntimeWasm
+	sb.Durability = models.DurabilityPassivatable
+	sb.ModuleRef = "file:///tmp/demo.wasm"
+	sb.ModuleDigest = "deadbeef"
+	sb.CheckpointPath = "/var/lib/sandboxd/wasm/modules/sb-wasm-ckpt/mem.snap"
+	sb.CloneGeneration = "gen-abc"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.CheckpointPath != sb.CheckpointPath || got.CloneGeneration != sb.CloneGeneration {
+		t.Fatalf("checkpoint fields = %+v, want path=%q gen=%q", got, sb.CheckpointPath, sb.CloneGeneration)
+	}
+	if err := st.UpdateWasmCheckpoint(ctx, sb.ID, string(models.SandboxStatusPassivated), "/new/path", "gen-2", ""); err != nil {
+		t.Fatalf("UpdateWasmCheckpoint: %v", err)
+	}
+	got, err = st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get after update: %v", err)
+	}
+	if got.Status != models.SandboxStatusPassivated || got.CheckpointPath != "/new/path" || got.CloneGeneration != "gen-2" {
+		t.Fatalf("after update = status %q path %q gen %q", got.Status, got.CheckpointPath, got.CloneGeneration)
+	}
+	if err := st.CompareCloneGeneration(ctx, sb.ID, "gen-2"); err != nil {
+		t.Fatalf("CompareCloneGeneration match: %v", err)
+	}
+	if err := st.CompareCloneGeneration(ctx, sb.ID, "stale-gen"); !errors.Is(err, models.ErrSnapshotFenced) {
+		t.Fatalf("CompareCloneGeneration stale = %v, want ErrSnapshotFenced", err)
+	}
+	if err := st.UpsertWasmModule(ctx, WasmModuleRecord{
+		ID:              "mod-1",
+		ModuleRef:       "file:///tmp/demo.wasm",
+		Status:          "ready",
+		Digest:          "deadbeef",
+		Entrypoint:      "_start",
+		ModuleSizeBytes: 128,
+		CreatedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertWasmModule: %v", err)
+	}
+}
+
+func TestWasmStateKVCRUD(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	const sandboxID = "sb-wasm-kv"
+
+	if err := st.PutWasmStateKV(ctx, sandboxID, "counter", []byte("1")); err != nil {
+		t.Fatalf("PutWasmStateKV: %v", err)
+	}
+	got, ok, err := st.GetWasmStateKV(ctx, sandboxID, "counter")
+	if err != nil || !ok || string(got) != "1" {
+		t.Fatalf("GetWasmStateKV = %q ok=%v err=%v", got, ok, err)
+	}
+	if err := st.PutWasmStateKV(ctx, sandboxID, "counter", []byte("2")); err != nil {
+		t.Fatalf("PutWasmStateKV update: %v", err)
+	}
+	got, ok, err = st.GetWasmStateKV(ctx, sandboxID, "counter")
+	if err != nil || !ok || string(got) != "2" {
+		t.Fatalf("GetWasmStateKV after update = %q ok=%v err=%v", got, ok, err)
+	}
+	if err := st.PutWasmStateKV(ctx, sandboxID, "other", []byte("x")); err != nil {
+		t.Fatalf("PutWasmStateKV other: %v", err)
+	}
+	keys, err := st.ListWasmStateKVKeys(ctx, sandboxID)
+	if err != nil {
+		t.Fatalf("ListWasmStateKVKeys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("keys = %v, want 2 entries", keys)
+	}
+	if err := st.DeleteWasmStateKV(ctx, sandboxID, "counter"); err != nil {
+		t.Fatalf("DeleteWasmStateKV: %v", err)
+	}
+	_, ok, err = st.GetWasmStateKV(ctx, sandboxID, "counter")
+	if err != nil || ok {
+		t.Fatalf("GetWasmStateKV after delete = ok=%v err=%v", ok, err)
 	}
 }

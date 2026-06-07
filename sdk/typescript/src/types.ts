@@ -1,4 +1,13 @@
-export type SandboxStatus = "creating" | "started" | "stopped" | "destroyed" | "error";
+export type SandboxStatus =
+  | "creating"
+  | "started"
+  | "stopped"
+  | "destroyed"
+  | "error"
+  | "passivated"
+  | "awaiting_runtime";
+
+export type Durability = "ephemeral" | "passivatable" | "durable";
 
 export interface RegistryAuth {
   server: string;
@@ -180,7 +189,15 @@ export interface CreateOptions {
    *
    * GPU access is not supported with `"gvisor"`.
    */
-  runtime?: "docker" | "gvisor" | "kata" | "firecracker";
+  runtime?: "docker" | "gvisor" | "kata" | "firecracker" | "wasm";
+  /**
+   * Survival class across daemon restarts. Omit for the runtime default:
+   * `passivatable` for docker/gvisor/firecracker, `ephemeral` for wasm.
+   * `durable` is wasm-only and not yet implemented.
+   */
+  durability?: Durability;
+  /** WASM module reference. When runtime is wasm, may be used instead of image. */
+  moduleRef?: string;
   /**
    * Attach GPU resources to the sandbox. Omit for CPU-only workloads.
    * Not compatible with runtime="gvisor".
@@ -407,7 +424,13 @@ export interface Sandbox {
    * Container runtime this sandbox is running under. Empty string indicates
    * a pre-migration row that resolves to the host default at start time.
    */
-  runtime: "" | "docker" | "gvisor" | "kata" | "firecracker";
+  runtime: "" | "docker" | "gvisor" | "kata" | "firecracker" | "wasm";
+  /** Survival class this sandbox was created with. */
+  durability?: Durability;
+  /** Resolved WASM module reference when runtime is wasm. */
+  moduleRef?: string;
+  /** sha256 hex digest of the resolved WASM module bytes. */
+  moduleDigest?: string;
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
 }
@@ -599,4 +622,34 @@ export interface CreateTemplateOptions {
   image: string;
   /** Optional floor for the ext4 image size, in MiB. */
   minSizeMiB?: number;
+}
+
+/** Catalogue lifecycle for POST /v1/wasm-modules rows. */
+export type WasmModuleStatus = "ready" | "failed";
+
+/**
+ * A WASM module catalogue entry. Resolved synchronously on the host and
+ * referenced by `moduleRef` when creating `runtime: "wasm"` sandboxes.
+ */
+export interface WasmModule {
+  id: string;
+  moduleRef: string;
+  status: WasmModuleStatus;
+  moduleSizeBytes?: number;
+  digest?: string;
+  entrypoint?: string;
+  hasWarm: boolean;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  readyAt?: string;
+}
+
+export interface CreateWasmModuleOptions {
+  /** Optional explicit ID. Empty means the daemon uses the module digest. */
+  id?: string;
+  /** Module reference resolved on this host (file path, URL, etc.). */
+  moduleRef: string;
+  /** WASI entry export; defaults to `_start` on the daemon. */
+  entrypoint?: string;
 }

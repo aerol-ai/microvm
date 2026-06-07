@@ -666,6 +666,36 @@ func (c *Cluster) SetNodeDrainState(ctx context.Context, nodeID string, drained 
 	return c.applyCommand(ctx, cmd)
 }
 
+// ReassignPlacement moves sandboxID to target via opReassign.
+func (c *Cluster) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
+	if sandboxID == "" {
+		return fmt.Errorf("cluster: ReassignPlacement requires sandbox id")
+	}
+	if target.NodeID == "" {
+		return fmt.Errorf("cluster: ReassignPlacement requires target node id")
+	}
+	cmd := command{
+		Op:                 opReassign,
+		SandboxID:          sandboxID,
+		OwnerNodeID:        target.NodeID,
+		OwnerAPIURL:        target.APIURL,
+		OwnerDataPlaneHost: target.DataPlaneHost,
+	}
+	return c.applyCommand(ctx, cmd)
+}
+
+func (c *Cluster) wasmMigratePAT() string { return c.patToken }
+
+func (c *Cluster) wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error) {
+	if c.internalClient != nil && internalURL != "" {
+		return c.internalClient, internalURL, nil
+	}
+	if apiURL == "" {
+		return nil, "", fmt.Errorf("cluster: peer API URL unknown")
+	}
+	return c.httpClient, apiURL, nil
+}
+
 // RemoveMember explicitly retires nodeID from the raft configuration. It is an
 // operator lifecycle command, not gossip failure detection: the caller should
 // drain the node first, then stop/terminate it, then remove it from raft.
@@ -1191,6 +1221,14 @@ func (c *Cluster) SetLocalTemplateIDsProvider(fn func() ([]string, bool)) {
 		return
 	}
 	c.capacityLeases.SetLocalTemplateIDsProvider(fn)
+}
+
+// SetLocalWasmModuleIDsProvider registers the WASM module inventory callback.
+func (c *Cluster) SetLocalWasmModuleIDsProvider(fn func() ([]string, bool)) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetLocalWasmModuleIDsProvider(fn)
 }
 
 func (c *Cluster) membersWithCapacity() []Member {

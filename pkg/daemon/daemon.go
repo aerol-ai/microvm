@@ -416,6 +416,17 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 
+	if cfg.EnableWasm {
+		wasmPool := wireWasmRuntime(ctx, cfg, logger, svc, db)
+		if wasmPool != nil {
+			defer func() {
+				if drained := wasmPool.Close(); drained > 0 {
+					logger.Info("wasm warm pool drained on shutdown", "slots", drained)
+				}
+			}()
+		}
+	}
+
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
 	// control-plane RPC, but no Raft transport and no placement FSM copy.
@@ -465,6 +476,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}); ok {
 				withTemplates.SetLocalTemplateIDsProvider(func() ([]string, bool) {
 					return svc.LocalReadyTemplateInventory(context.Background())
+				})
+			}
+		}
+		if cfg.EnableWasm {
+			if withModules, ok := clusterClient.(interface {
+				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
+			}); ok {
+				withModules.SetLocalWasmModuleIDsProvider(func() ([]string, bool) {
+					return svc.LocalReadyWasmModuleInventory(context.Background())
 				})
 			}
 		}
@@ -582,6 +602,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// enable knob is off; per-tick cancellation is wired off ctx like
 		// the other long-running sweeps above.
 		svc.StartTemplateGC(ctx)
+		if cfg.EnableWasm {
+			svc.StartWasmModuleGC(ctx)
+			svc.StartWasmPeriodicCheckpoint(ctx)
+			svc.StartWasmDurablePushSweep(ctx)
+		}
 		svc.StartPendingImageGC(ctx)
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
@@ -770,6 +795,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
+	if cfg.EnableWasm {
+		if err := svc.DrainWasmSandboxes(shutdownCtx); err != nil {
+			logger.Warn("wasm drain checkpoint failed", "error", err)
+		}
+	}
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown failed", "error", err)
 	}
@@ -1022,6 +1052,19 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 		return
 	}
 	svc.AttachSnapshotPusher(pusher, r)
+	wasmPusher, err := service.NewWasmCheckpointPusher(service.SnapshotPushConfig{
+		Enabled:   true,
+		Host:      host,
+		ClusterID: cfg.AutoImportClusterID,
+		PATPath:   cfg.AutoImportClusterPATPath,
+	}, logger)
+	if err != nil {
+		logger.Warn("wasm checkpoint push: pusher build failed; feature stays off",
+			"error", err)
+	} else {
+		svc.AttachWasmCheckpointPusher(wasmPusher)
+		logger.Info("wasm checkpoint push enabled", "host", host, "cluster_id", cfg.AutoImportClusterID)
+	}
 	logger.Info("snapshot push reconciler started",
 		"host", host,
 		"cluster_id", cfg.AutoImportClusterID,

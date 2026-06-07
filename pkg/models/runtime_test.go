@@ -24,6 +24,7 @@ func TestValidRuntime(t *testing.T) {
 		// rejects with ErrRuntimeNotImplemented when the operator hasn't
 		// flipped SB_ENABLE_FIRECRACKER on (see service.go).
 		{name: "firecracker_accepted_as_identifier", input: "firecracker", want: "firecracker"},
+		{name: "wasm_accepted_as_identifier", input: "wasm", want: "wasm"},
 		{name: "runc_legacy_rejected", input: "runc", wantErr: true},
 		{name: "runsc_legacy_rejected", input: "runsc", wantErr: true},
 		{name: "case_sensitive", input: "Docker", wantErr: true},
@@ -67,6 +68,7 @@ func TestResolveOCIRuntime(t *testing.T) {
 		// call from the Docker path surfaces clearly instead of silently
 		// coercing the request to runc.
 		{name: "firecracker_returns_not_implemented", input: "firecracker", wantErr: ErrRuntimeNotImplemented},
+		{name: "wasm_returns_not_implemented", input: "wasm", wantErr: ErrRuntimeNotImplemented},
 		{name: "unknown_value_errors", input: "containerd", want: ""},
 	}
 

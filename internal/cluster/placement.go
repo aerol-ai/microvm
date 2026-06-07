@@ -45,6 +45,10 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 		DiskGB:     diskGBForCapacity(disk, runtimeName, spec.OverlaySizeGB),
 		Runtime:    runtimeName,
 		TemplateID: templateID,
+		ModuleRef:  models.ModuleRefForCreate(*spec),
+	}
+	if runtimeName == models.RuntimeWasm {
+		out.MemoryMB += 8
 	}
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
@@ -217,6 +221,18 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 		hit := false
 		for _, t := range cap.LocalTemplateIDs {
 			if t == req.TemplateID {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			return false
+		}
+	}
+	if req.Runtime == models.RuntimeWasm && req.ModuleRef != "" && cap.LocalWasmModuleInventoryKnown {
+		hit := false
+		for _, ref := range cap.LocalWasmModuleIDs {
+			if ref == req.ModuleRef {
 				hit = true
 				break
 			}

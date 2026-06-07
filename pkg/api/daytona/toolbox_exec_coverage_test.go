@@ -658,8 +658,8 @@ func TestToolboxDirectCoverage(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/process/session/123", nil)
 		rr := httptest.NewRecorder()
 		h.proxyToolbox(rr, req, "sb-bad-url", "/process/session/123")
-		if rr.Code != http.StatusInternalServerError {
-			t.Fatalf("expected 500, got %d", rr.Code)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rr.Code)
 		}
 	})
 

@@ -1,0 +1,48 @@
+---
+title: WASM Architecture
+description: How AerolVM runs WASM sandboxes — workers, checkpoints, and AOCR durability.
+---
+
+WASM sandboxes use a **host-mediated** model: the API server stays in `sandboxd`, while each sandbox runs inside a dedicated worker subprocess speaking IPC over a Unix socket.
+
+## Components
+
+```text
+sandboxd (service layer)
+  └─ internal/runtime/wasm.Driver
+       ├─ pkg/wasmmod resolver (module cache)
+       ├─ pkg/wasm/worker supervisor
+       └─ toolbox reverse proxy (files / exec)
+```
+
+## Checkpoint format
+
+Passivation writes a `mem.snap` directory:
+
+- `config.json` — engine metadata, clone generation, module digest
+- `memory.zstd`, `globals.cbor`, `wasi-state.cbor` — guest state
+
+Durable sandboxes push the directory to AOCR at:
+
+`cluster/<cluster-id>/wasm-checkpoints/<sandbox-id>:latest`
+
+## Lifecycle
+
+1. **Create** — resolve module, start or acquire warm worker, instantiate, invoke entrypoint.
+2. **Passivate** — checkpoint live guest, stop worker, release admission.
+3. **Rehydrate** — restore from local `mem.snap` (pull from AOCR first when durable and missing).
+4. **Failover** — cluster owner calls `RecreateSandbox`; durable WASM pulls checkpoint then rehydrates.
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `SB_ENABLE_WASM` | Master gate |
+| `SB_WASM_MODULES_DIR` | Module + checkpoint cache root |
+| `SB_WASM_CHECKPOINT_INTERVAL` | Optional periodic boundary checkpoint |
+| `SB_WASM_DURABLE_PUSH_INTERVAL` | Retry AOCR push for durable rows |
+| `SB_SNAPSHOT_PUSH_ENABLED` | Enables AOCR push/pull credentials |
+
+## Operations
+
+See the [WASM runtime health runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/wasm-runtime-health.md) for failure modes and log signatures.

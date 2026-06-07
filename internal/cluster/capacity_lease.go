@@ -37,7 +37,8 @@ type capacityLeaseCache struct {
 	// SelectPlacement path see the same list. nil = single-node mode or
 	// Firecracker disabled, and the placement path naturally degrades
 	// to "no template gate" via the unknown-allow rule.
-	localTemplateInventory func() ([]string, bool)
+	localTemplateInventory   func() ([]string, bool)
+	localWasmModuleInventory func() ([]string, bool)
 }
 
 func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval time.Duration, logger *slog.Logger) *capacityLeaseCache {
@@ -72,6 +73,12 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 			snap.LocalTemplateIDs = ids
 		}
 	}
+	if c.localWasmModuleInventory != nil {
+		if refs, known := c.localWasmModuleInventory(); known {
+			snap.LocalWasmModuleInventoryKnown = true
+			snap.LocalWasmModuleIDs = refs
+		}
+	}
 	c.set(c.selfID, snap, now)
 }
 
@@ -86,6 +93,16 @@ func (c *capacityLeaseCache) SetLocalTemplateIDsProvider(fn func() ([]string, bo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.localTemplateInventory = fn
+}
+
+// SetLocalWasmModuleIDsProvider installs the WASM module inventory callback.
+func (c *capacityLeaseCache) SetLocalWasmModuleIDsProvider(fn func() ([]string, bool)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localWasmModuleInventory = fn
 }
 
 func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated time.Time) {

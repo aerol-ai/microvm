@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 const runtimeProxyPrefix = PathPrefix + "/runtime"
@@ -41,6 +42,30 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	publicPath := strings.TrimPrefix(r.URL.Path, runtimeProxyPrefix)
+	if publicPath == "" {
+		publicPath = "/"
+	}
+	if !strings.HasPrefix(publicPath, "/") {
+		publicPath = "/" + publicPath
+	}
+	toolboxPath := "/envd" + publicPath
+
+	userAuthorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(userAuthorization, "Basic ") {
+		r.Header.Set("X-E2B-User-Authorization", userAuthorization)
+	} else {
+		r.Header.Del("X-E2B-User-Authorization")
+	}
+	r.Header.Set("X-E2B-Sandbox-Id", sandboxID)
+
+	if sandbox.Runtime == models.RuntimeWasm {
+		if err := h.deps.Service.ServeToolboxReverseProxy(r.Context(), sandboxID, w, r, toolboxPath); err != nil {
+			writeStoreAwareError(h.deps.Logger, w, err)
+		}
+		return
+	}
+
 	endpoint, err := h.deps.Service.WakeAwareToolboxTarget(r.Context(), sandboxID)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
@@ -52,16 +77,6 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	publicPath := strings.TrimPrefix(r.URL.Path, runtimeProxyPrefix)
-	if publicPath == "" {
-		publicPath = "/"
-	}
-	if !strings.HasPrefix(publicPath, "/") {
-		publicPath = "/" + publicPath
-	}
-	toolboxPath := "/envd" + publicPath
-
-	userAuthorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
 	toolboxToken := endpoint.Token

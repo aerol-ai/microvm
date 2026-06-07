@@ -101,6 +101,38 @@ func TestOwnerWatcherRecreatesOwnedSandbox(t *testing.T) {
 	}
 }
 
+// TestOwnerWatcherRecreatesWasmDurableSandbox verifies durable WASM placements
+// with failover opt-in drive the owner watcher to call RecreateSandbox with the
+// WASM runtime spec (UC-39 cluster path).
+func TestOwnerWatcherRecreatesWasmDurableSandbox(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
+
+	rec := newRecordingRecreator()
+	c.AttachRecreator(rec)
+
+	spec := failoverWasmRecreateSpec()
+	cmd := command{Op: opPlace, SandboxID: "sb-wasm-failover", OwnerNodeID: "leader", Spec: spec}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+
+	c.recreateOwnedSandboxes(context.Background())
+	got, ok := rec.get("sb-wasm-failover")
+	if !ok {
+		t.Fatal("recreator was not invoked for sb-wasm-failover")
+	}
+	if got.spec.Runtime != models.RuntimeWasm || got.spec.Durability != models.DurabilityDurable {
+		t.Fatalf("recreator received wrong wasm spec: %+v", got.spec)
+	}
+}
+
 func TestOwnerWatcherSkipsSandboxWithoutFailoverOptIn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft socket")
@@ -256,6 +288,17 @@ func failoverRecreateSpec() *models.CreateSandboxRequest {
 		CPU:      1,
 		MemoryMB: 512,
 		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+}
+
+func failoverWasmRecreateSpec() *models.CreateSandboxRequest {
+	return &models.CreateSandboxRequest{
+		Runtime:    models.RuntimeWasm,
+		Durability: models.DurabilityDurable,
+		ModuleRef:  "file:///tmp/demo.wasm",
+		CPU:        1,
+		MemoryMB:   256,
+		Failover:   &models.Failover{Policy: models.FailoverPolicyRecreate},
 	}
 }
 

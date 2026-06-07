@@ -19,9 +19,9 @@ AerolVM supports multiple container runtimes, giving you a choice between securi
 | Docker | ✅ | Fast startup, broad image compatibility, standard workloads |
 | GVisor | ✅ | Kernel-level isolation without a full VM - ideal for untrusted code |
 | Firecracker | ✅ | Kernel-level isolation Full VM isolation with hardware virtualization |
-| WebAssembly | 🗓 | [Planned] Ultra-lightweight, portable workloads |
+| WebAssembly | ✅ | Ultra-lightweight WASI workloads with optional durable checkpoints |
 
-Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the roadmap.
+Docker is the default runtime today. GVisor, Firecracker, and WebAssembly are also available when enabled in server config.
 
 ## Use Cases
 
@@ -37,3 +37,4 @@ Today, sandboxes run on Docker. GVisor, Kata, and WebAssembly support are on the
 - [Environment](/environment) - image selection, env vars, and resource limits
 - [Streaming Exec](/exec-streaming) - stream stdout/stderr live and use interactive PTY sessions
 - [Sessions](/sessions) - persistent terminal sessions that survive reconnects
+- [WebAssembly Sandboxes](/wasm-sandbox) - create and run WASI modules with durable checkpoints

@@ -1,0 +1,147 @@
+---
+title: WASM Sandbox
+description: Run WebAssembly/WASI workloads with optional checkpoint durability and AOCR failover.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+WASM sandboxes run guest modules inside isolated worker processes on the host. They boot quickly, share the same toolbox and routing model as Docker sandboxes, and support optional checkpoint durability for daemon restarts and cluster failover.
+
+## Before you start
+
+Enable WASM on worker nodes with `SB_ENABLE_WASM=true` and set `SB_WASM_MODULES_DIR`. For durable checkpoints replicated to AOCR, enable snapshot push (`SB_SNAPSHOT_PUSH_ENABLED`) with a cluster PAT.
+
+## Create a WASM sandbox
+
+Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `durability` to `passivatable` or `durable` when you need restart survival.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    const sandbox = await client.create({
+      module_ref: 'file:///var/lib/sandboxd/wasm/modules/app.wasm',
+      runtime: 'wasm',
+      cpu: 0.5,
+      memoryMB: 256,
+      durability: 'passivatable',
+    })
+
+    console.log(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url='https://sandbox.example.com',
+        pat_token='your-token',
+    )
+
+    sandbox = client.create({
+        'module_ref': 'file:///var/lib/sandboxd/wasm/modules/app.wasm',
+        'runtime': 'wasm',
+        'cpu': 0.5,
+        'memoryMB': 256,
+        'durability': 'passivatable',
+    })
+
+    print(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+
+        "github.com/aerol-ai/microvm/pkg/microvm"
+        "github.com/aerol-ai/microvm/pkg/types"
+    )
+
+    client, err := microvm.New(microvm.Config{
+        APIURL:   "https://sandbox.example.com",
+        PATToken: "your-token",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sb, err := client.Create(context.Background(), types.CreateSandboxRequest{
+        ModuleRef:  "file:///var/lib/sandboxd/wasm/modules/app.wasm",
+        Runtime:    types.RuntimeWasm,
+        CPU:        0.5,
+        MemoryMB:   256,
+        Durability: types.DurabilityPassivatable,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sb.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateSandboxRequest};
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new("https://sandbox.example.com", "your-token")?;
+        let sandbox = client
+            .create(CreateSandboxRequest {
+                module_ref: Some("file:///var/lib/sandboxd/wasm/modules/app.wasm".into()),
+                runtime: Some("wasm".into()),
+                cpu: Some(0.5),
+                memory_mb: Some(256),
+                durability: Some("passivatable".into()),
+                ..Default::default()
+            })
+            .await?;
+        println!("{}", sandbox.id);
+        Ok(())
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVM;
+    import ai.aerol.microvm.model.CreateSandboxRequest;
+
+    public class WasmExample {
+        public static void main(String[] args) throws Exception {
+            MicroVM client = new MicroVM("https://sandbox.example.com", "your-token");
+            CreateSandboxRequest req = new CreateSandboxRequest();
+            req.setModuleRef("file:///var/lib/sandboxd/wasm/modules/app.wasm");
+            req.setRuntime("wasm");
+            req.setCpu(0.5);
+            req.setMemoryMB(256);
+            req.setDurability("passivatable");
+            var sandbox = client.create(req);
+            System.out.println(sandbox.getId());
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Durability
+
+| Class | Behavior |
+|---|---|
+| `ephemeral` | Default. Lost on daemon restart. |
+| `passivatable` | Checkpointed to local `mem.snap` on drain; rehydrates on start. |
+| `durable` | Local checkpoint plus AOCR push for cross-node failover. |
+
+## See also
+
+- [WASM networking](/wasm-networking) — `expose_port`, custom domains, and host-mediated HTTP ingress
+- [WASM modules](/wasm-modules) — catalogue and warm pool
+- [WASM architecture](/wasm-architecture) — worker model and checkpoints

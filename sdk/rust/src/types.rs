@@ -206,6 +206,12 @@ pub struct CreateOptions {
     /// list via [`Sandbox::add_custom_domain`] / [`Sandbox::remove_custom_domain`].
     #[serde(rename = "custom_domains", skip_serializing_if = "Option::is_none")]
     pub custom_domains: Option<Vec<String>>,
+    /// Survival class across daemon restarts. Omit for the runtime default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durability: Option<String>,
+    /// WASM module reference. When runtime is wasm, may be used instead of image.
+    #[serde(rename = "module_ref", skip_serializing_if = "Option::is_none")]
+    pub module_ref: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -510,6 +516,13 @@ pub struct Sandbox {
     /// was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpus: Option<GPUOptions>,
+    /// Survival class this sandbox was created with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durability: Option<String>,
+    #[serde(rename = "module_ref", skip_serializing_if = "Option::is_none")]
+    pub module_ref: Option<String>,
+    #[serde(rename = "module_digest", skip_serializing_if = "Option::is_none")]
+    pub module_digest: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -758,6 +771,50 @@ pub struct CreateTemplateOptions {
     pub image: String,
     #[serde(rename = "min_size_mib", skip_serializing_if = "Option::is_none")]
     pub min_size_mib: Option<u32>,
+}
+
+/// Catalogue lifecycle for POST /v1/wasm-modules rows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmModuleStatus {
+    Ready,
+    Failed,
+}
+
+/// A WASM module catalogue entry on the host.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WasmModule {
+    pub id: String,
+    #[serde(rename = "module_ref")]
+    pub module_ref: String,
+    pub status: WasmModuleStatus,
+    #[serde(rename = "module_size_bytes", skip_serializing_if = "Option::is_none")]
+    pub module_size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    #[serde(rename = "has_warm")]
+    pub has_warm: bool,
+    #[serde(rename = "last_error", skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(rename = "created_at")]
+    pub created_at: String,
+    #[serde(rename = "updated_at")]
+    pub updated_at: String,
+    #[serde(rename = "ready_at", skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
+}
+
+/// Request body for [`Client::create_wasm_module`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CreateWasmModuleOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "module_ref")]
+    pub module_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
 }
 
 /// Patch body for [`Client::set_network_limits`]. Each field is `Option`-wrapped

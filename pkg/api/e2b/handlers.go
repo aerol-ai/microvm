@@ -20,6 +20,7 @@ import (
 	svcmetrics "github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
+	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -609,25 +610,10 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		onTimeout = "pause"
 	}
 
-	resolvedImage, templateAlias, err := h.resolveTemplate(ctx, templateID)
-	if err != nil {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, err
-	}
-
-	// Serverless opt-in (plans/serverless-sandbox-http-wake.md): callers
-	// flip the AerolVM-native serverless mode via metadata. When set,
-	// the lifecycle is rewritten so that `timeout` becomes the idle
-	// window (StopIfIdleFor) instead of a wall-clock age limit — that
-	// is the only lifecycle shape the wake helper accepts as a valid
-	// serverless config. autoResume / autoPause are left untouched.
 	serverless := serverlessFromMetadata(metadata)
 	lifecycle := lifecyclePtr(timeoutSeconds, onTimeout)
 	if serverless {
 		lifecycle.Serverless = true
-		// The native store rejects Serverless=true without
-		// StopIfIdleFor — move whatever duration the timeout
-		// translation produced into that field so the request
-		// passes validation.
 		if lifecycle.StopAtAge > 0 {
 			lifecycle.StopIfIdleFor = lifecycle.StopAtAge
 			lifecycle.StopAtAge = 0
@@ -635,6 +621,34 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 			lifecycle.StopIfIdleFor = lifecycle.DestroyAtAge
 			lifecycle.DestroyAtAge = 0
 		}
+	}
+
+	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, h.deps.Service, templateID, metadata); err != nil {
+		return models.CreateSandboxRequest{}, sandboxMeta{}, err
+	} else if ok {
+		wasmReq.Env = envVars
+		wasmReq.NetworkBlockAll = networkBlockAll
+		wasmReq.Lifecycle = lifecycle
+		wasmReq.Tags = cloneStringMap(metadata)
+		meta := sandboxMeta{
+			TemplateID:          templateID,
+			Metadata:            metadata,
+			TimeoutSeconds:      timeoutSeconds,
+			OnTimeout:           onTimeout,
+			AutoResume:          autoResume,
+			Secure:              secure,
+			AllowInternetAccess: allowInternetAccess,
+			NetworkAllowOut:     networkAllowOut,
+			NetworkDenyOut:      networkDenyOut,
+			AllowPublicTraffic:  allowPublicTraffic,
+			MaskRequestHost:     maskRequestHost,
+		}
+		return wasmReq, meta, nil
+	}
+
+	resolvedImage, templateAlias, err := h.resolveTemplate(ctx, templateID)
+	if err != nil {
+		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	}
 
 	serviceReq := models.CreateSandboxRequest{

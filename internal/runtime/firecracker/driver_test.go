@@ -19,6 +19,7 @@ import (
 // compile — which is the right place to catch the drift.
 func TestDriverImplementsRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*Driver)(nil)
+	var _ runtime.ContainerRuntime = (*Driver)(nil)
 }
 
 func TestRuntimeHealthVMGenIDCapability(t *testing.T) {

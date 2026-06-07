@@ -41,6 +41,20 @@ const (
 	TemplateStatusUnhealthy       = models.TemplateStatusUnhealthy
 )
 
+// WasmModule is one row in the wasm_modules catalogue.
+type WasmModule = models.WasmModule
+
+// CreateWasmModuleOptions is the request body for Client.CreateWasmModule.
+type CreateWasmModuleOptions = models.CreateWasmModuleRequest
+
+// WasmModuleStatus is the catalogue lifecycle for WASM modules.
+type WasmModuleStatus = models.WasmModuleStatus
+
+const (
+	WasmModuleStatusReady  = models.WasmModuleStatusReady
+	WasmModuleStatusFailed = models.WasmModuleStatusFailed
+)
+
 // ExposeProtocol selects the wire surface an exposure publishes through.
 type ExposeProtocol string
 
@@ -91,6 +105,13 @@ const (
 	RuntimeGvisor      = models.RuntimeGvisor
 	RuntimeKata        = models.RuntimeKata
 	RuntimeFirecracker = models.RuntimeFirecracker
+	RuntimeWasm        = models.RuntimeWasm
+)
+
+const (
+	DurabilityEphemeral    = models.DurabilityEphemeral
+	DurabilityPassivatable = models.DurabilityPassivatable
+	DurabilityDurable      = models.DurabilityDurable
 )
 
 type NetworkUsage = models.NetworkUsage

@@ -26,6 +26,15 @@ const (
 	SandboxStatusStopped   SandboxStatus = "stopped"
 	SandboxStatusDestroyed SandboxStatus = "destroyed"
 	SandboxStatusError     SandboxStatus = "error"
+	// SandboxStatusPassivated marks a WASM sandbox checkpointed to disk,
+	// awaiting rehydrate after daemon restart (plans/wasm-runtime.md §4.3).
+	SandboxStatusPassivated SandboxStatus = "passivated"
+	// SandboxStatusAwaitingRuntime marks a passivated/durable WASM row found
+	// when EnableWasm=false — reconcile holds the row until WASM is re-enabled.
+	SandboxStatusAwaitingRuntime SandboxStatus = "awaiting_runtime"
+	// SandboxStatusPassivateFailed marks a WASM sandbox whose drain checkpoint
+	// timed out or failed; durability is preserved for operator inspection.
+	SandboxStatusPassivateFailed SandboxStatus = "passivate_failed"
 )
 
 type RegistryAuth struct {
@@ -43,6 +52,9 @@ type SandboxRuntimeState struct {
 	ContainerID string
 	ContainerIP string
 	Status      SandboxStatus
+	// WASM-only: resolved module metadata returned by the wasm driver on create.
+	ModuleRef    string
+	ModuleDigest string
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and
@@ -68,6 +80,17 @@ const (
 	// (a different shape — Kata-with-Firecracker abstracts the snapshot
 	// API away and is not what this constant refers to).
 	RuntimeFirecracker = "firecracker"
+	// RuntimeWasm selects the WASM/WASI runtime (plans/wasm-runtime.md).
+	// ValidRuntime accepts the identifier ahead of the implementation; create
+	// rejects with ErrRuntimeNotImplemented until SB_ENABLE_WASM lands.
+	RuntimeWasm = "wasm"
+)
+
+// Durability class for sandbox restart/survival semantics (plans/wasm-runtime.md §4.2).
+const (
+	DurabilityEphemeral    = "ephemeral"
+	DurabilityPassivatable = "passivatable"
+	DurabilityDurable      = "durable"
 )
 
 // ErrRuntimeNotImplemented is returned when a runtime is recognized as a valid
@@ -76,15 +99,16 @@ const (
 // an actionable error instead of a generic 500.
 var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this build")
 
-// ErrSnapshotCorrupt is returned by the Firecracker runtime when a snapshot
-// fails its checksum verification at load time — the on-disk artifact does
-// not match the checksum that was stamped at capture. Phase 6 PR-A's
-// service-layer intercept tests for this with errors.Is to mark the
-// template UNHEALTHY and kick an async snapshot rebuild; the next Create
-// on the same template falls back to the cold-boot path until rebuild
-// completes. Lives here (rather than in internal/runtime/firecracker) so
-// the service layer can reference it without importing the runtime.
+// ErrSnapshotCorrupt is returned when a runtime snapshot fails checksum
+// verification at load time — the on-disk artifact does not match the
+// checksum stamped at capture. Firecracker templates and WASM boundary
+// checkpoints both surface this; the service layer intercepts with
+// errors.Is to mark the backing artifact unhealthy and kick rebuild.
 var ErrSnapshotCorrupt = errors.New("snapshot integrity verification failed")
+
+// ErrSnapshotFenced is returned when a snapshot's clone_generation is older
+// than the store row's current token (§4.8 zombie-write guard).
+var ErrSnapshotFenced = errors.New("snapshot clone generation fenced")
 
 // ErrTemplateNotRebuildable is returned by RequestTemplateRebuild when the
 // row is in a state where re-running the snapshot phase is unsafe or
@@ -160,12 +184,53 @@ func (g *GPURequest) Validate() error {
 // the runtime layer, we should already know the value is one we can act on.
 func ValidRuntime(value string) (string, error) {
 	switch value {
-	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker:
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm:
 		return value, nil
 	default:
-		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s)",
-			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker)
+		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s, %s)",
+			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm)
 	}
+}
+
+// ValidDurability normalizes and validates a durability class. Empty input
+// passes through so the caller can apply a runtime-specific default.
+func ValidDurability(value string) (string, error) {
+	switch value {
+	case "", DurabilityEphemeral, DurabilityPassivatable, DurabilityDurable:
+		return value, nil
+	default:
+		return "", fmt.Errorf("unsupported durability %q (allowed: %s, %s, %s)",
+			value, DurabilityEphemeral, DurabilityPassivatable, DurabilityDurable)
+	}
+}
+
+// DefaultDurabilityForRuntime returns the API default when the caller omits
+// durability on create. WASM defaults to ephemeral; container/VM runtimes
+// default to passivatable (they survive restarts natively).
+func DefaultDurabilityForRuntime(runtime string) string {
+	if runtime == RuntimeWasm {
+		return DurabilityEphemeral
+	}
+	return DurabilityPassivatable
+}
+
+// NormalizeCreateDurability validates req.Durability, applies the runtime
+// default when empty, and rejects classes the chosen runtime cannot honor yet.
+func NormalizeCreateDurability(value, runtime string) (string, error) {
+	normalized, err := ValidDurability(value)
+	if err != nil {
+		return "", err
+	}
+	if normalized == "" {
+		normalized = DefaultDurabilityForRuntime(runtime)
+	}
+	if normalized == DurabilityDurable {
+		if runtime != RuntimeWasm {
+			return "", fmt.Errorf("durability %q is not supported for runtime %q", normalized, runtime)
+		}
+		return "", fmt.Errorf("durability %q: %w", normalized, ErrRuntimeNotImplemented)
+	}
+	return normalized, nil
 }
 
 // ResolveOCIRuntime maps a user-facing runtime identifier to the OCI runtime
@@ -186,12 +251,10 @@ func ResolveOCIRuntime(value string) (string, error) {
 		return "runsc", nil
 	case RuntimeKata:
 		return "", ErrRuntimeNotImplemented
-	case RuntimeFirecracker:
-		// Firecracker is a hypervisor, not an OCI runtime that Docker can
-		// shell out to. Reaching this branch means the service layer failed
-		// to dispatch the request away from the Docker driver — return
-		// ErrRuntimeNotImplemented so the failure is observable rather than
-		// silently coerced to a Docker default.
+	case RuntimeFirecracker, RuntimeWasm:
+		// Firecracker and WASM are not OCI runtimes Docker can shell out to.
+		// Reaching this branch means the service layer failed to dispatch the
+		// request away from the Docker driver.
 		return "", ErrRuntimeNotImplemented
 	default:
 		return "", fmt.Errorf("unsupported runtime %q", value)
@@ -509,6 +572,14 @@ type CreateSandboxRequest struct {
 	// Ignored on the Docker path. Capped at 1024 GiB by request
 	// validation; the daemon's admission control may reject smaller.
 	OverlaySizeGB int `json:"overlay_size_gb,omitempty"`
+	// Durability selects the sandbox survival class across restarts (§4.2 in
+	// plans/wasm-runtime.md). Empty defaults per runtime: passivatable for
+	// docker/firecracker/gvisor; ephemeral for wasm. "durable" is WASM-only
+	// and not yet implemented on any runtime.
+	Durability string `json:"durability,omitempty"`
+	// ModuleRef selects the WASM module for runtime=wasm. When set, Image may
+	// be omitted; when empty, Image is treated as the module reference.
+	ModuleRef string `json:"module_ref,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -648,6 +719,30 @@ type Sandbox struct {
 	// restarts exactly the sandboxes carrying this marker, then clears it.
 	// Internal-only bookkeeping.
 	FleetSuspended bool `json:"-"`
+	// Durability is the survival class this sandbox was created with. Empty
+	// on pre-migration rows resolves to passivatable at read time.
+	Durability string `json:"durability,omitempty"`
+	// ModuleRef is the WASM module reference when runtime=wasm.
+	ModuleRef string `json:"module_ref,omitempty"`
+	// ModuleDigest is the sha256 hex digest of the resolved .wasm bytes.
+	ModuleDigest string `json:"module_digest,omitempty"`
+	// CheckpointPath points at a local §4.8.1 mem.snap directory when status
+	// is passivated. Internal-only; not exposed over the wire.
+	CheckpointPath string `json:"-"`
+	// CloneGeneration is the §4.8 fencing token for checkpoint/clone writes.
+	CloneGeneration string `json:"-"`
+	// WasmRegistryRef is the AOCR ref for the last pushed durable checkpoint.
+	WasmRegistryRef string `json:"-"`
+	// WasmRegistryDigest is the manifest digest from the last AOCR push.
+	WasmRegistryDigest string `json:"-"`
+}
+
+// ModuleRefForCreate returns the WASM module reference from a create request.
+func ModuleRefForCreate(req CreateSandboxRequest) string {
+	if ref := strings.TrimSpace(req.ModuleRef); ref != "" {
+		return ref
+	}
+	return strings.TrimSpace(req.Image)
 }
 
 // NetworkUsage is the response shape for GET /v1/sandboxes/{id}/network/usage.
@@ -830,6 +925,7 @@ type HealthStatus struct {
 	Docker          string `json:"docker"`
 	Caddy           string `json:"caddy"`
 	Firecracker     string `json:"firecracker,omitempty"`
+	Wasm            string `json:"wasm,omitempty"`
 	SSHGateway      string `json:"ssh_gateway"`
 	ClusterTopology string `json:"cluster_topology,omitempty"`
 	ClusterNodes    int    `json:"cluster_nodes,omitempty"`
@@ -1035,4 +1131,37 @@ type CreateTemplateRequest struct {
 	ID         string `json:"id,omitempty"`
 	Image      string `json:"image"`
 	MinSizeMiB int    `json:"min_size_mib,omitempty"`
+}
+
+// WasmModuleStatus is the catalogue lifecycle for POST /v1/wasm-modules rows.
+type WasmModuleStatus string
+
+const (
+	WasmModuleStatusReady  WasmModuleStatus = "ready"
+	WasmModuleStatusFailed WasmModuleStatus = "failed"
+)
+
+// WasmModule is one row in the wasm_modules catalogue (plans/wasm-runtime.md).
+type WasmModule struct {
+	ID              string           `json:"id"`
+	ModuleRef       string           `json:"module_ref"`
+	Status          WasmModuleStatus `json:"status"`
+	ModulePath      string           `json:"-"`
+	ModuleSizeBytes int64            `json:"module_size_bytes,omitempty"`
+	Digest          string           `json:"digest,omitempty"`
+	Entrypoint      string           `json:"entrypoint,omitempty"`
+	HasWarm         bool             `json:"has_warm"`
+	LastError       string           `json:"last_error,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+	UpdatedAt       time.Time        `json:"updated_at"`
+	ReadyAt         *time.Time       `json:"ready_at,omitempty"`
+}
+
+// CreateWasmModuleRequest is the body for POST /v1/wasm-modules. ID is
+// optional — empty means the service uses the module digest as the
+// catalogue id. ModuleRef is resolved synchronously on this host.
+type CreateWasmModuleRequest struct {
+	ID         string `json:"id,omitempty"`
+	ModuleRef  string `json:"module_ref"`
+	Entrypoint string `json:"entrypoint,omitempty"`
 }
