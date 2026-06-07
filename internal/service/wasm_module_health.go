@@ -51,13 +51,23 @@ func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
 		if referenced {
 			continue
 		}
-		if rec.ModulePath != "" {
+		if s.wasm != nil {
+			ref := rec.ModuleRef
+			if ref == "" {
+				ref = rec.ID
+			}
+			if err := s.wasm.RemoveImage(ctx, ref); err != nil {
+				s.logger.Warn("wasm module gc artifact delete failed", "module_id", rec.ID, "ref", ref, "error", err)
+				continue
+			}
+		} else if rec.ModulePath != "" {
 			_ = os.RemoveAll(rec.ModulePath)
 		}
 		if err := s.store.DeleteWasmModule(ctx, rec.ID); err != nil {
 			s.logger.Warn("wasm module gc delete failed", "module_id", rec.ID, "error", err)
 			continue
 		}
+		s.invalidateWasmModuleInventoryCache()
 		s.logger.Info("wasm module gc removed unreferenced catalogue row", "module_id", rec.ID)
 	}
 }

@@ -31,6 +31,11 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 		if d.cfg.ModulesDir != "" {
 			paths = append(paths, filepath.Join(d.cfg.ModulesDir, ref))
 		}
+		if d.warmPool != nil {
+			if dropper, ok := d.warmPool.(warmPoolDropper); ok {
+				dropper.DropModule(ref)
+			}
+		}
 	} else {
 		resolved, err := d.resolver.Resolve(ctx, ref)
 		if err != nil {

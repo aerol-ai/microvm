@@ -7,6 +7,7 @@ import (
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/pkg/models"
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 const wasmLoopbackIP = "127.0.0.1"
@@ -24,6 +25,7 @@ type sandboxInstance struct {
 	entryExport  string
 	baseEnv      map[string]string
 	baseArgs     []string
+	preopens     []wasmengine.Preopen
 	cpu          float64
 	memoryMB     int
 	diskGB       int

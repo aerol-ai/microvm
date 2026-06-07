@@ -68,6 +68,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		entryExport:  entryExportFromRequest(req),
 		baseEnv:      copyStringMap(req.Env),
 		baseArgs:     wasmArgs(req),
+		preopens:     preopensFromBinds(workDir, hostMounts),
 		cpu:          req.CPU,
 		memoryMB:     memoryMB,
 		diskGB:       req.DiskGB,
@@ -110,7 +111,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            req.Env,
 		Args:           wasmArgs(req),
-		Preopens:       preopensFromBinds(workDir, hostMounts),
+		Preopens:       append([]wasmengine.Preopen(nil), inst.preopens...),
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, memoryMB, d.cfg.DefaultWallTimeout)
 

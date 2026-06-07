@@ -22,6 +22,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/runtime"
+	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/caddy"
@@ -1624,22 +1625,36 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		releaseAdmission()
 		return nil, err
 	}
-	state, err := rt.Start(ctx, s.runtimeRef(sandbox))
-	if err != nil {
-		_ = s.mounts.UnmountAll(id)
-		releaseAdmission()
-		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
-		s.invalidateWarm(id)
-		return nil, err
+	var state *models.SandboxRuntimeState
+	if s.isWasmSandbox(sandbox) {
+		if host, ok := s.wasm.(wasmruntime.StartHost); ok {
+			hostBinds := s.mounts.HostBindsFor(id)
+			state, err = host.StartSandbox(ctx, sandbox, hostBinds)
+			if err != nil {
+				_ = s.mounts.UnmountAll(id)
+				releaseAdmission()
+				_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+				s.invalidateWarm(id)
+				return nil, err
+			}
+		}
 	}
-
+	if state == nil {
+		state, err = rt.Start(ctx, s.runtimeRef(sandbox))
+		if err != nil {
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+			s.invalidateWarm(id)
+			return nil, err
+		}
+	}
 	sandbox.ContainerID = state.ContainerID
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
 	sandbox.WakeArmed = false
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
-
 	// Reapply the per-IP egress DROP rule. The stop event clears it (the IP
 	// can be reassigned to another container), so a Stop+Start cycle would
 	// otherwise come back without network isolation. Fail closed: if we can't
@@ -1705,7 +1720,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	for _, port := range sandbox.ExposedPorts {
 		_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 	}
-	_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+	if s.caddy != nil {
+		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+	}
 	rt, err := s.runtimeForSandbox(sandbox)
 	if err != nil {
 		return err
@@ -1713,10 +1730,15 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
-	if err := s.mounts.UnmountAll(id); err != nil {
-		s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", err)
+	if s.mounts != nil {
+		if err := s.mounts.UnmountAll(id); err != nil {
+			s.logger.Warn("unmount on destroy failed", "sandbox_id", id, "error", err)
+		}
 	}
 	if err := s.store.Delete(ctx, id); err != nil {
+		return err
+	}
+	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
 		return err
 	}
 	s.forgetWakeFlight(id)
@@ -1728,8 +1750,12 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if s.admitter != nil {
 		s.admitter.Release(id)
 	}
-	s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
-	s.schedulePendingImageGC(ctx, sandbox.Image)
+	if s.logger != nil {
+		s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
+	}
+	if !s.isWasmSandbox(sandbox) {
+		s.schedulePendingImageGC(ctx, sandbox.Image)
+	}
 	return nil
 }
 
@@ -3295,7 +3321,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// image cleanup is best-effort and mirrors DestroySandbox's
 			// order; failures here are picked up by gcZombieCaddyEntries on
 			// a later pass and by the mounts.Sweep at the end of Reconcile.
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			if s.caddy != nil {
+				_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			}
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 			}
@@ -3308,8 +3336,10 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					return err
 				}
 			}
-			if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
-				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
+			if s.mounts != nil {
+				if err := s.mounts.UnmountAll(sandbox.ID); err != nil {
+					s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", err)
+				}
 			}
 			// store.Delete must happen BEFORE schedulePendingImageGC. The
 			// pending-image janitor uses HasActiveImageRef to decide whether
@@ -3327,11 +3357,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.admitter.Release(sandbox.ID)
 			}
 			s.deleteSelfOwnedClusterPlacement(ctx, sandbox.ID, "reconcile-destroyed")
-			s.schedulePendingImageGC(ctx, sandbox.Image)
-			s.logger.Info("audit reconcile destroyed",
-				"sandbox_id", sandbox.ID,
-				"image", sandbox.Image,
-			)
+			if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
+				return err
+			}
+			if !s.isWasmSandbox(sandbox) {
+				s.schedulePendingImageGC(ctx, sandbox.Image)
+			}
+			if s.logger != nil {
+				s.logger.Info("audit reconcile destroyed",
+					"sandbox_id", sandbox.ID,
+					"image", sandbox.Image,
+				)
+			}
 			continue
 		}
 
@@ -3447,8 +3484,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					"error", err,
 				)
 			}
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
-			_ = s.mounts.UnmountAll(sandboxID)
+			if s.caddy != nil {
+				_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
+			}
+			if s.mounts != nil {
+				_ = s.mounts.UnmountAll(sandboxID)
+			}
 		}
 	}
 	removeOrphans(s.docker, models.RuntimeDocker, dockerManaged)

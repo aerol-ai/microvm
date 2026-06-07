@@ -4621,6 +4621,21 @@ func (s *Store) DeleteWasmStateKV(ctx context.Context, sandboxID, key string) er
 	return nil
 }
 
+// DeleteAllWasmStateKV removes every durable host-KV row for sandboxID.
+func (s *Store) DeleteAllWasmStateKV(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM wasm_state_kv WHERE sandbox_id = ?`,
+		sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete all wasm state kv: %w", err)
+	}
+	return nil
+}
+
 // ListWasmStateKVKeys lists keys for a sandbox.
 func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]string, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
@@ -4695,6 +4710,19 @@ func (s *Store) DeleteWasmCheckpointPush(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM wasm_checkpoint_pushes WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete wasm checkpoint push: %w", err)
+	}
+	return nil
+}
+
+// DeleteAllWasmCheckpointPushes removes all retained AOCR push-history rows for sandboxID.
+func (s *Store) DeleteAllWasmCheckpointPushes(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM wasm_checkpoint_pushes WHERE sandbox_id = ?`, sandboxID)
+	if err != nil {
+		return fmt.Errorf("delete all wasm checkpoint pushes: %w", err)
 	}
 	return nil
 }

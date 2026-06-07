@@ -149,6 +149,11 @@ func (s *Service) DeleteWasmModule(ctx context.Context, id string) error {
 	if referenced {
 		return store.ErrWasmModuleInUse
 	}
+	if s.wasm != nil {
+		if err := s.wasm.RemoveImage(ctx, rec.ModuleRef); err != nil {
+			return err
+		}
+	}
 	if err := s.store.DeleteWasmModule(ctx, id); err != nil {
 		return err
 	}

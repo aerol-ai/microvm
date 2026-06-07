@@ -10,6 +10,7 @@ import (
 
 	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
@@ -39,8 +40,9 @@ func (f *fakeSupervisor) Stop(string) error {
 }
 
 type recordingWorkerClient struct {
-	loadPath string
-	stopped  bool
+	loadPath        string
+	stopped         bool
+	instantiateCaps []wasmengine.Capabilities
 }
 
 func (c *recordingWorkerClient) Ping(string) error { return nil }
@@ -48,8 +50,11 @@ func (c *recordingWorkerClient) LoadModule(_, path string) error {
 	c.loadPath = path
 	return nil
 }
-func (c *recordingWorkerClient) Instantiate(string, wasmengine.Capabilities) error { return nil }
-func (c *recordingWorkerClient) Invoke(string, string) error                       { return nil }
+func (c *recordingWorkerClient) Instantiate(_ string, caps wasmengine.Capabilities) error {
+	c.instantiateCaps = append(c.instantiateCaps, caps)
+	return nil
+}
+func (c *recordingWorkerClient) Invoke(string, string) error { return nil }
 func (c *recordingWorkerClient) Exec(string, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, nil
 }
@@ -219,6 +224,82 @@ func TestCreateColdPathWithFakeWorker(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runDir, "sb-1")); !os.IsNotExist(err) {
 		t.Fatalf("expected sandbox dir removed, stat err=%v", err)
+	}
+}
+
+func TestStartPreservesEnvArgsAndMountPreopens(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	runDir := filepath.Join(dir, "run")
+	hostDir := filepath.Join(dir, "host")
+	if err := os.MkdirAll(hostDir, 0o700); err != nil {
+		t.Fatalf("mkdir host dir: %v", err)
+	}
+
+	sup := &fakeSupervisor{}
+	client := &recordingWorkerClient{}
+	d := New(Config{RunDir: runDir, ModulesDir: dir}, nil)
+	d.SetModuleResolver(fakeResolver{path: modPath, digest: "deadbeef"})
+	d.SetWorkerSupervisor(sup)
+	d.SetWorkerClientFactory(func(string) WorkerClient { return client })
+
+	_, err := d.Create(context.Background(), models.CreateSandboxRequest{
+		Image:            "demo.wasm",
+		Env:              map[string]string{"FOO": "bar"},
+		ContainerCommand: []string{"entry", "--flag"},
+	}, "sb-start", "tok", []mounts.ContainerBind{{
+		HostPath:      hostDir,
+		ContainerPath: "/data",
+	}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := d.Stop(context.Background(), "sb-start"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	client.instantiateCaps = nil
+	if _, err := d.Start(context.Background(), "sb-start"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if len(client.instantiateCaps) != 1 {
+		t.Fatalf("instantiate calls = %d, want 1", len(client.instantiateCaps))
+	}
+	caps := client.instantiateCaps[0]
+	if got := caps.Env["FOO"]; got != "bar" {
+		t.Fatalf("env FOO = %q, want bar", got)
+	}
+	if len(caps.Args) != 2 || caps.Args[0] != "entry" || caps.Args[1] != "--flag" {
+		t.Fatalf("args = %#v, want [entry --flag]", caps.Args)
+	}
+	var foundData bool
+	for _, pre := range caps.Preopens {
+		if pre.GuestPath == "/data" && pre.HostPath == hostDir {
+			foundData = true
+			break
+		}
+	}
+	if !foundData {
+		t.Fatalf("preopens = %#v, want /data -> %s", caps.Preopens, hostDir)
+	}
+}
+
+func TestDestroyRemovesCheckpointDir(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	modulesDir := filepath.Join(dir, "modules")
+	d := New(Config{RunDir: runDir, ModulesDir: modulesDir}, nil)
+	checkpointDir := filepath.Join(modulesDir, "sb-gc", "mem.snap")
+	if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+		t.Fatalf("mkdir checkpoint dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(checkpointDir, "config.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write checkpoint file: %v", err)
+	}
+	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-gc"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if _, err := os.Stat(checkpointDir); !os.IsNotExist(err) {
+		t.Fatalf("expected checkpoint dir removed, stat err=%v", err)
 	}
 }
 

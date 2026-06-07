@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
@@ -35,8 +37,9 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		return nil, fmt.Errorf("load module: %w", err)
 	}
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
-		Preopens:       []wasmengine.Preopen{{GuestPath: "/work", HostPath: inst.workDir}},
-		Args:           []string{"wasm"},
+		Env:            copyStringMap(inst.baseEnv),
+		Preopens:       append([]wasmengine.Preopen(nil), inst.preopens...),
+		Args:           append([]string(nil), inst.baseArgs...),
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, inst.memoryMB, d.cfg.DefaultWallTimeout)
 	if err := client.Instantiate(sandboxID, caps); err != nil {
@@ -47,6 +50,62 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	d.byID[sandboxID] = inst
 	d.mu.Unlock()
 	return d.runtimeState(inst), nil
+}
+
+// StartSandbox reconstructs a stopped sandbox from its persisted row and mounts.
+func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	if sandbox == nil {
+		return nil, fmt.Errorf("start sandbox: nil sandbox")
+	}
+	if inst, err := d.instance(sandbox.ID); err == nil {
+		return d.Start(ctx, inst.sandboxID)
+	}
+
+	ref := strings.TrimSpace(sandbox.ModuleRef)
+	if ref == "" {
+		ref = strings.TrimSpace(sandbox.Image)
+	}
+	if ref == "" {
+		return nil, fmt.Errorf("start sandbox %s: module_ref is required", sandbox.ID)
+	}
+	if d.resolver == nil {
+		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
+	}
+	resolved, err := d.resolver.Resolve(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
+	}
+
+	workDir := d.sandboxDir(sandbox.ID)
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
+	}
+	inst := &sandboxInstance{
+		sandboxID:    sandbox.ID,
+		moduleRef:    ref,
+		modulePath:   resolved.Path,
+		moduleDigest: resolved.Digest,
+		socketPath:   filepath.Join(workDir, "worker.sock"),
+		workDir:      workDir,
+		workerKey:    sandbox.ID,
+		status:       models.SandboxStatusStopped,
+		entryExport:  "_start",
+		baseEnv:      copyStringMap(sandbox.Env),
+		baseArgs:     wasmArgsFromSandbox(sandbox),
+		preopens:     preopensFromBinds(workDir, hostMounts),
+		cpu:          sandbox.CPU,
+		memoryMB:     sandbox.MemoryMB,
+		diskGB:       sandbox.DiskGB,
+		durability:   sandbox.Durability,
+	}
+	if inst.memoryMB <= 0 {
+		inst.memoryMB = d.cfg.DefaultMemoryMB
+	}
+	d.mu.Lock()
+	d.byID[sandbox.ID] = inst
+	d.mu.Unlock()
+
+	return d.Start(ctx, sandbox.ID)
 }
 
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
@@ -94,6 +153,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		workDir = inst.workDir
 	}
 	_ = os.RemoveAll(workDir)
+	_ = os.RemoveAll(d.checkpointDir(sandboxID))
 	return nil
 }
 

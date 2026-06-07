@@ -19,8 +19,15 @@ type MigrationHost interface {
 	MigrateSandbox(ctx context.Context, sandbox *models.Sandbox, destDir string) (checkpointPath, cloneGen string, err error)
 }
 
+// StartHost reconstructs a stopped sandbox using persisted sandbox metadata.
+type StartHost interface {
+	StartSandbox(ctx context.Context, sandbox *models.Sandbox, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error)
+}
+
 var _ CheckpointHost = (*Driver)(nil)
 
 var _ MigrationHost = (*Driver)(nil)
+
+var _ StartHost = (*Driver)(nil)
 
 var _ GuestListenPortSyncer = (*Driver)(nil)

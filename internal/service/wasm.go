@@ -225,6 +225,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	}
 
 	s.registerWasmModuleCatalogue(ctx, sandbox, "", 0)
+	s.invalidateWasmModuleInventoryCache()
 
 	s.logger.Info("audit sandbox created",
 		"sandbox_id", sandbox.ID,
