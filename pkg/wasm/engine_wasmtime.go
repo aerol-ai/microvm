@@ -310,6 +310,11 @@ func (e *wasmtimeEngine) ResolvedListenPort() (int, bool) {
 	return 0, false
 }
 
+// SupportsListen is false: the wasmtime backend does not yet wire a wasip1 TCP
+// listener, so HTTP ingress / expose_port is rejected up front (see
+// plans/wasm-runtime.md "Still open"). Use the default wazero engine for ingress.
+func (e *wasmtimeEngine) SupportsListen() bool { return false }
+
 func (e *wasmtimeEngine) Close(_ context.Context) error {
 	e.dropInstance()
 	if e.module != nil {

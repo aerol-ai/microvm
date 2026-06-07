@@ -450,6 +450,13 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			if p.Port != wasmengine.WASIListenPortDisabled && !s.eng.SupportsListen() {
+				s.mu.Unlock()
+				if replyErr(env.SandboxID, fmt.Errorf("HTTP ingress (expose_port) is not supported on the %q WASM engine; use SB_WASM_ENGINE=wazero", workerEngineName())) != nil {
+					return err
+				}
+				continue
+			}
 			s.bindNetworkHook(env.SandboxID)
 			next := s.lastCaps
 			next.WASIListenPort = p.Port

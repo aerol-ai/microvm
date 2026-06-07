@@ -342,6 +342,8 @@ func (e *wazeroEngine) ResolvedListenPort() (int, bool) {
 	return ResolvedListenPort(e.module)
 }
 
+func (e *wazeroEngine) SupportsListen() bool { return true }
+
 func (e *wazeroEngine) Close(ctx context.Context) error {
 	if e.module != nil {
 		_ = e.module.Close(ctx)

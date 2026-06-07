@@ -24,6 +24,11 @@ type Engine interface {
 	Close(ctx context.Context) error
 	// ResolvedListenPort returns the host port for an ephemeral wasip1 listener (0 in caps).
 	ResolvedListenPort() (int, bool)
+	// SupportsListen reports whether the engine can host a wasip1 TCP listener
+	// (the HTTP ingress / expose_port path). wazero can; the wasmtime backend
+	// cannot yet (see plans/wasm-runtime.md "Still open"). Callers must reject
+	// listen requests up front rather than silently failing to resolve a port.
+	SupportsListen() bool
 }
 
 // NewEngine constructs the default wazero-backed engine.

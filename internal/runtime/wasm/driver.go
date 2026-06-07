@@ -72,11 +72,6 @@ func (d *Driver) SetStateKV(kv statekv.Store) {
 	d.stateKV = kv
 }
 
-func (d *Driver) notImplemented(method string) error {
-	return fmt.Errorf("wasm runtime: %s not implemented (see plans/wasm-runtime.md): %w",
-		method, models.ErrRuntimeNotImplemented)
-}
-
 func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, _ string) (string, error) {
 	sb := &models.Sandbox{ID: sandboxID}
 	path, _, err := d.CheckpointSandbox(ctx, sb)
