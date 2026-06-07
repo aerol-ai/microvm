@@ -59,11 +59,11 @@ func newCloneGeneration(path string, logger *slog.Logger) *cloneGeneration {
 		path = defaultCloneGenPath
 	}
 	c := &cloneGeneration{
-		token:  randomToken(),
+		token:  randomToken(0),
 		path:   path,
 		logger: logger,
 	}
-	c.writeFile()
+	c.writeFile(c.token)
 	return c
 }
 
@@ -77,10 +77,11 @@ func (c *cloneGeneration) bump(resumedAtUnixNs int64) {
 		return
 	}
 	c.mu.Lock()
-	c.token = randomToken()
+	nextToken := randomToken(resumedAtUnixNs)
+	c.token = nextToken
 	c.resumedAt = resumedAtUnixNs
+	c.writeFileLocked(nextToken)
 	c.mu.Unlock()
-	c.writeFile()
 }
 
 // current returns the token and the last resume time for HTTP responses.
@@ -100,38 +101,69 @@ func (c *cloneGeneration) current() (token string, resumedAt int64) {
 // writeFile persists the current token to the well-known path. Best-effort:
 // failures are logged at Debug and swallowed so a read-only/missing /run
 // never breaks the sandbox — the HTTP endpoint remains the source of truth.
-func (c *cloneGeneration) writeFile() {
-	token, _ := c.current()
+func (c *cloneGeneration) writeFile(token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writeFileLocked(token)
+}
+
+// writeFileLocked persists token to the well-known path using a temp-file +
+// rename publish. Callers must hold c.mu if they need HTTP readers to see
+// the same generation only after the file is committed.
+func (c *cloneGeneration) writeFileLocked(token string) {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
 		c.logger.Debug("clone-generation: mkdir failed", "path", c.path, "error", err)
 		return
 	}
+	tmp, err := os.CreateTemp(filepath.Dir(c.path), ".clone-generation-*")
+	if err != nil {
+		c.logger.Debug("clone-generation: temp file create failed", "path", c.path, "error", err)
+		return
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
 	// Trailing newline so `cat` / shell `$(<file)` reads are clean.
-	if err := os.WriteFile(c.path, []byte(token+"\n"), 0o644); err != nil {
-		c.logger.Debug("clone-generation: write failed", "path", c.path, "error", err)
+	if _, err := tmp.Write([]byte(token + "\n")); err != nil {
+		c.logger.Debug("clone-generation: temp write failed", "path", c.path, "error", err)
+		return
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		c.logger.Debug("clone-generation: temp chmod failed", "path", c.path, "error", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		c.logger.Debug("clone-generation: temp close failed", "path", c.path, "error", err)
+		return
+	}
+	if err := os.Rename(tmpName, c.path); err != nil {
+		c.logger.Debug("clone-generation: rename failed", "path", c.path, "error", err)
 	}
 }
 
 // fallbackCounter guarantees randomToken's fallback path varies between
 // calls even if crypto/rand is somehow unavailable. See randomToken.
 var fallbackCounter atomic.Uint64
+var randRead = rand.Read
 
 // randomToken returns 16 bytes of crypto entropy as hex. crypto/rand reads
 // the OS CSPRNG, which the resume path reseeds before bump() is ever called,
 // so successive clones get distinct tokens.
-func randomToken() string {
+func randomToken(resumeUnixNs int64) string {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	if _, err := randRead(b[:]); err != nil {
 		// crypto/rand.Read effectively never fails on a booted Linux guest.
 		// If it somehow does we must STILL return a value that *changes*
 		// between calls: the token's entire job is to differ on each resume,
 		// and a constant fallback would make a second bump a silent no-op,
-		// hiding a clone from in-guest pollers. Mix a process-lifetime
-		// monotonic counter with the wall-clock nanosecond so successive
-		// fallbacks are distinct. (The kernel reseed is the real entropy
-		// guarantee; this token is only a change signal, so non-crypto
-		// uniqueness here is fine.)
-		return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), fallbackCounter.Add(1))
+		// hiding a clone from in-guest pollers. Mix the host-provided resume
+		// timestamp (not snapshotted), a process-lifetime counter, and the
+		// local wall clock so the degraded path does not rely solely on frozen
+		// process state. The kernel reseed is the real entropy guarantee; this
+		// token is only a change signal, so non-crypto uniqueness here is fine.
+		return fmt.Sprintf("fallback-%d-%d-%d", resumeUnixNs, time.Now().UnixNano(), fallbackCounter.Add(1))
 	}
 	return hex.EncodeToString(b[:])
 }

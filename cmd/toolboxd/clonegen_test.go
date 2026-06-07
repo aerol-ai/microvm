@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -61,6 +62,30 @@ func TestCloneGeneration_BumpChangesTokenAndPersists(t *testing.T) {
 	}
 	if strings.TrimSpace(string(got)) != after {
 		t.Errorf("file token = %q, want %q", strings.TrimSpace(string(got)), after)
+	}
+}
+
+// TestCloneGeneration_BumpPublishesAtomically asserts the on-disk token is
+// replaced via rename semantics: readers should only ever see the full old or
+// full new token, never an empty/truncated intermediate write.
+func TestCloneGeneration_BumpPublishesAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clone-generation")
+	c := newCloneGeneration(path, nil)
+	before, _ := c.current()
+
+	c.bump(1700000000000000000)
+
+	after, _ := c.current()
+	if after == before {
+		t.Fatalf("token unchanged after bump: %q", after)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read clone-generation file: %v", err)
+	}
+	fileToken := strings.TrimSpace(string(got))
+	if fileToken != before && fileToken != after {
+		t.Fatalf("file token = %q, want old %q or new %q", fileToken, before, after)
 	}
 }
 
@@ -166,4 +191,22 @@ func TestCloneGeneration_NilReceiverIsSafe(t *testing.T) {
 	}
 	// Must not panic.
 	cg.bump(123)
+}
+
+func TestRandomTokenFallbackUsesResumeTimestamp(t *testing.T) {
+	oldRandRead := randRead
+	randRead = func([]byte) (int, error) { return 0, errors.New("entropy unavailable") }
+	defer func() { randRead = oldRandRead }()
+
+	a := randomToken(111)
+	b := randomToken(222)
+	if a == b {
+		t.Fatalf("fallback token collision: %q", a)
+	}
+	if !strings.Contains(a, "fallback-111-") {
+		t.Fatalf("fallback token %q does not include resume timestamp", a)
+	}
+	if !strings.Contains(b, "fallback-222-") {
+		t.Fatalf("fallback token %q does not include resume timestamp", b)
+	}
 }
