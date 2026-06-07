@@ -298,6 +298,10 @@ func (e *wasmtimeEngine) RestoreSnapshot(ctx context.Context, snap SnapshotResto
 	return nil
 }
 
+func (e *wasmtimeEngine) SetNetworkHook(_ *NetworkHook) {}
+
+func (e *wasmtimeEngine) ClearNetworkHook() {}
+
 func (e *wasmtimeEngine) Close(_ context.Context) error {
 	e.dropInstance()
 	if e.module != nil {

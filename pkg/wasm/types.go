@@ -7,6 +7,10 @@ type Capabilities struct {
 	Args          []string          `json:"args,omitempty"`
 	MemoryMB      int               `json:"memory_mb,omitempty"`
 	WallTimeoutNs int64             `json:"wall_timeout_ns,omitempty"`
+	// WASIListenPort enables wasip1 pre-open TCP listeners when >= 0 (0 = ephemeral).
+	// When unset, use -1 to disable.
+	WASIListenPort int    `json:"wasi_listen_port,omitempty"`
+	WASIListenHost string `json:"wasi_listen_host,omitempty"`
 }
 
 // Preopen maps a host directory into the guest filesystem.

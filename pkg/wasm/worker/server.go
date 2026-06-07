@@ -45,6 +45,39 @@ func (s *Server) mediator() *NetMediator {
 	return s.net
 }
 
+type mediatorDialer struct {
+	m         *NetMediator
+	sandboxID string
+}
+
+func (d mediatorDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return d.m.DialContext(ctx, d.sandboxID, network, address)
+}
+
+func (s *Server) bindNetworkHook(sandboxID string) {
+	if s.eng == nil {
+		return
+	}
+	ne, ok := s.eng.(wasmengine.NetworkAwareEngine)
+	if !ok {
+		return
+	}
+	m := s.mediator()
+	ne.SetNetworkHook(&wasmengine.NetworkHook{
+		SandboxID: sandboxID,
+		Dial:      mediatorDialer{m: m, sandboxID: sandboxID},
+	})
+}
+
+func (s *Server) clearNetworkHook() {
+	if s.eng == nil {
+		return
+	}
+	if ne, ok := s.eng.(wasmengine.NetworkAwareEngine); ok {
+		ne.ClearNetworkHook()
+	}
+}
+
 func workerEngineName() string {
 	return strings.TrimSpace(os.Getenv("AEROL_WASM_ENGINE"))
 }
@@ -129,6 +162,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.bindNetworkHook(env.SandboxID)
 			err = s.eng.Instantiate(ctx, p.Caps)
 			if err == nil {
 				s.lastCaps = p.Caps
@@ -162,6 +196,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.bindNetworkHook(env.SandboxID)
 			result, err := s.eng.Run(ctx, p.Caps, p.Export)
 			s.mu.Unlock()
 			// Guest→host WASI output bytes; socket bytes come from NetMediator (UC-43).
@@ -205,6 +240,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.bindNetworkHook(env.SandboxID)
 			invokeCtx, cancel := wasmengine.WithInvocationDeadline(ctx, s.lastCaps)
 			start := time.Now()
 			err = s.eng.InvokeExport(invokeCtx, p.Export)
@@ -224,6 +260,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			s.mu.Lock()
 			if s.eng != nil {
 				err = s.eng.StopInstance(ctx)
+				s.clearNetworkHook()
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -298,6 +335,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.bindNetworkHook(env.SandboxID)
 			err = s.eng.RestoreSnapshot(ctx, snap, p.Caps)
 			if err == nil {
 				s.lastCaps = p.Caps
@@ -328,6 +366,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.bindNetworkHook(env.SandboxID)
 			next := s.lastCaps
 			if p.Caps.MemoryMB > 0 {
 				next.MemoryMB = p.Caps.MemoryMB

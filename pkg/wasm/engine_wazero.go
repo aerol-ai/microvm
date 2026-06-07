@@ -22,6 +22,8 @@ type wazeroEngine struct {
 	module      api.Module
 	moduleBytes []byte
 	memoryPages uint32
+	netHook     *NetworkHook
+	netHost     *wazeroNetHost
 }
 
 func newWazeroEngine(ctx context.Context) (*wazeroEngine, error) {
@@ -54,6 +56,10 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
 		_ = r.Close(ctx)
 		return fmt.Errorf("wasi instantiate: %w", err)
+	}
+	if err := e.ensureNetworkHost(ctx); err != nil {
+		_ = r.Close(ctx)
+		return err
 	}
 	e.runtime = r
 	e.memoryPages = pages
@@ -123,7 +129,11 @@ func (e *wazeroEngine) Instantiate(ctx context.Context, caps Capabilities) error
 	if len(caps.Preopens) > 0 {
 		cfg = cfg.WithFSConfig(fsCfg)
 	}
-	mod, err := e.runtime.InstantiateModule(ctx, e.compiled, cfg)
+	instCtx := e.withNetworkContext(ctx, caps)
+	if err := e.ensureNetworkHost(instCtx); err != nil {
+		return err
+	}
+	mod, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}
@@ -219,7 +229,11 @@ func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities,
 	if len(caps.Preopens) > 0 {
 		cfg = cfg.WithFSConfig(fsCfg)
 	}
-	mod, err := e.runtime.InstantiateModule(ctx, e.compiled, cfg)
+	instCtx := e.withNetworkContext(ctx, caps)
+	if err := e.ensureNetworkHost(instCtx); err != nil {
+		return err
+	}
+	mod, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}

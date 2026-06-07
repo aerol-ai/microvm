@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 // NetMediator is the host-mediated TCP egress surface for UC-43. Guest WASI
@@ -65,7 +67,7 @@ func (m *NetMediator) ingressBlocked(sandboxID string) bool {
 // DialContext dials address when egress is allowed and counts bytes in/out.
 func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, address string) (net.Conn, error) {
 	if m.egressBlocked(sandboxID) {
-		return nil, errors.New("network egress blocked by quota")
+		return nil, wasmengine.ErrNetworkEgressBlocked
 	}
 	d := net.Dialer{Timeout: 30 * time.Second}
 	conn, err := d.DialContext(ctx, network, address)
@@ -104,7 +106,7 @@ func (c *meteredConn) Write(p []byte) (int, error) {
 func (m *NetMediator) Copy(sandboxID string, dst io.Writer, src io.Reader, outbound bool) (int64, error) {
 	u := m.usageFor(sandboxID)
 	if outbound && m.egressBlocked(sandboxID) {
-		return 0, errors.New("network egress blocked by quota")
+		return 0, wasmengine.ErrNetworkEgressBlocked
 	}
 	if !outbound && m.ingressBlocked(sandboxID) {
 		return 0, errors.New("network ingress blocked by quota")
