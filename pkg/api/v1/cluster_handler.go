@@ -887,6 +887,13 @@ func (h *handlers) setNodeDrainState(w http.ResponseWriter, r *http.Request, dra
 		apihttp.WriteError(w, http.StatusBadRequest, "node id required")
 		return
 	}
+	if drained && id == c.SelfNodeID() {
+		evacCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		if err := h.deps.Service.EvacuateLocalWasmSandboxesForDrain(evacCtx); err != nil {
+			h.deps.Logger.Warn("wasm evacuate on drain failed", "node_id", id, "error", err)
+		}
+		cancel()
+	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := c.SetNodeDrainState(commitCtx, id, drained); err != nil {
@@ -1145,6 +1152,92 @@ func (h *handlers) clusterInternalDrainState(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.DrainStateResponse{Drained: c.IsNodeDrained(strings.TrimSpace(r.PathValue("id")))})
+}
+
+// clusterWasmMigrate orchestrates §4.8.1 checkpoint export from the current
+// owner and import on target_node_id.
+func (h *handlers) clusterWasmMigrate(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	if h.deps.Service.Cluster() == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	var req service.WasmMigrateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := h.deps.Service.MigrateWasmSandboxToNode(r.Context(), req.SandboxID, req.TargetNodeID)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+func (h *handlers) clusterInternalWasmMigrateExport(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	owner, err := c.OwnerOf(id)
+	if err != nil {
+		if errors.Is(err, cluster.ErrUnknownSandbox) {
+			apihttp.WriteError(w, http.StatusNotFound, "no placement record")
+			return
+		}
+		if errors.Is(err, cluster.ErrOrphaned) {
+			apihttp.WriteError(w, http.StatusConflict, "placement is orphaned")
+			return
+		}
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if !owner.IsSelf {
+		apihttp.WriteError(w, http.StatusConflict, "sandbox is not owned by this node")
+		return
+	}
+	var buf bytes.Buffer
+	cloneGen, err := h.deps.Service.ExportWasmMigration(r.Context(), id, &buf)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.Header().Set(cluster.WasmMigrateCloneGenHeader, cloneGen)
+	w.Header().Set("Content-Type", cluster.WasmMigrateTarMediaType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (h *handlers) clusterInternalWasmMigrateImport(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "sandbox id required")
+		return
+	}
+	cloneGen := strings.TrimSpace(r.Header.Get(cluster.WasmMigrateCloneGenHeader))
+	if err := h.deps.Service.ImportWasmMigration(r.Context(), id, cloneGen, r.Body); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // placementOwner is the snake_case JSON view of cluster.OwnerInfo. We don't

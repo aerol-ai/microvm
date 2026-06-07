@@ -2,6 +2,7 @@ package toolhost_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -22,6 +23,37 @@ type stubExec struct {
 func (s *stubExec) Exec(_ *http.Request, req models.ExecRequest) (models.ExecResult, error) {
 	s.last = req
 	return models.ExecResult{Stdout: "ok", ExitCode: 0}, nil
+}
+
+type memStateKV struct {
+	data map[string][]byte
+}
+
+func newMemStateKV() *memStateKV {
+	return &memStateKV{data: map[string][]byte{}}
+}
+
+func (m *memStateKV) Get(_ context.Context, _, key string) ([]byte, bool, error) {
+	v, ok := m.data[key]
+	return v, ok, nil
+}
+
+func (m *memStateKV) Set(_ context.Context, _, key string, value []byte) error {
+	m.data[key] = append([]byte(nil), value...)
+	return nil
+}
+
+func (m *memStateKV) Delete(_ context.Context, _, key string) error {
+	delete(m.data, key)
+	return nil
+}
+
+func (m *memStateKV) ListKeys(_ context.Context, _ string) ([]string, error) {
+	out := make([]string, 0, len(m.data))
+	for k := range m.data {
+		out = append(out, k)
+	}
+	return out, nil
 }
 
 func TestHostFilesAndExec(t *testing.T) {
@@ -101,6 +133,62 @@ func TestHostFilesAndExec(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+func TestHostStateKV(t *testing.T) {
+	kv := newMemStateKV()
+	host := toolhost.New(toolhost.Config{
+		SandboxID: "sb-kv",
+		WorkDir:   t.TempDir(),
+		StateKV:   kv,
+	})
+	h := host.Handler()
+
+	t.Run("put get delete list", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, "/state/kv/counter", bytes.NewReader([]byte("42")))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("put status = %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		req = httptest.NewRequest(http.MethodGet, "/state/kv/counter", nil)
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.String() != "42" {
+			t.Fatalf("get status = %d body=%q", rec.Code, rec.Body.String())
+		}
+
+		req = httptest.NewRequest(http.MethodGet, "/state/kv/", nil)
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list status = %d", rec.Code)
+		}
+		var listed struct {
+			Keys []string `json:"keys"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+			t.Fatalf("list json: %v", err)
+		}
+		if len(listed.Keys) != 1 || listed.Keys[0] != "counter" {
+			t.Fatalf("keys = %v", listed.Keys)
+		}
+
+		req = httptest.NewRequest(http.MethodDelete, "/state/kv/counter", nil)
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("delete status = %d", rec.Code)
+		}
+
+		req = httptest.NewRequest(http.MethodGet, "/state/kv/counter", nil)
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("get after delete status = %d", rec.Code)
 		}
 	})
 }

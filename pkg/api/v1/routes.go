@@ -149,6 +149,9 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// consistent with /admin/reconcile (also a leader-side write side effect).
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", d.Auth(http.HandlerFunc(h.clusterDrainNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", d.Auth(http.HandlerFunc(h.clusterUncordonNode)))
+	mux.Handle("POST "+cluster.PublicWasmMigratePath, d.Auth(http.HandlerFunc(h.clusterWasmMigrate)))
+	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
+	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", d.Auth(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
 	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", d.Auth(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", d.Auth(http.HandlerFunc(h.clusterDeleteOrphan)))
 	// Internal endpoint: receives leader-forwarded raft commands from peer

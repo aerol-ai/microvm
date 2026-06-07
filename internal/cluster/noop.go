@@ -79,6 +79,9 @@ func (n *Noop) CancelReservation(ctx context.Context, sandboxID string) error { 
 func (n *Noop) SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error {
 	return nil
 }
+func (n *Noop) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
+	return nil
+}
 func (n *Noop) RemoveMember(ctx context.Context, nodeID string, force bool) error {
 	return ErrUnknownMember
 }

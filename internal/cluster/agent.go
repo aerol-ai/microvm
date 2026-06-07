@@ -423,6 +423,34 @@ func (a *Agent) SetNodeDrainState(ctx context.Context, nodeID string, drained bo
 	return a.applyCommand(ctx, command{Op: opSetNodeDrainState, NodeID: nodeID, Drained: drained})
 }
 
+func (a *Agent) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
+	if sandboxID == "" {
+		return fmt.Errorf("cluster: ReassignPlacement requires sandbox id")
+	}
+	if target.NodeID == "" {
+		return fmt.Errorf("cluster: ReassignPlacement requires target node id")
+	}
+	return a.applyCommand(ctx, command{
+		Op:                 opReassign,
+		SandboxID:          sandboxID,
+		OwnerNodeID:        target.NodeID,
+		OwnerAPIURL:        target.APIURL,
+		OwnerDataPlaneHost: target.DataPlaneHost,
+	})
+}
+
+func (a *Agent) wasmMigratePAT() string { return a.patToken }
+
+func (a *Agent) wasmMigrateHTTPClient(internalURL, apiURL string) (*http.Client, string, error) {
+	if a.internalClient != nil && internalURL != "" {
+		return a.internalClient, internalURL, nil
+	}
+	if apiURL == "" {
+		return nil, "", fmt.Errorf("cluster agent: peer API URL unknown")
+	}
+	return a.httpClient, apiURL, nil
+}
+
 func (a *Agent) RemoveMember(ctx context.Context, nodeID string, force bool) error {
 	if nodeID == "" {
 		return fmt.Errorf("cluster: RemoveMember requires non-empty nodeID")

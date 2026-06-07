@@ -2088,3 +2088,41 @@ func TestWasmCheckpointColumnsRoundTrip(t *testing.T) {
 		t.Fatalf("UpsertWasmModule: %v", err)
 	}
 }
+
+func TestWasmStateKVCRUD(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	const sandboxID = "sb-wasm-kv"
+
+	if err := st.PutWasmStateKV(ctx, sandboxID, "counter", []byte("1")); err != nil {
+		t.Fatalf("PutWasmStateKV: %v", err)
+	}
+	got, ok, err := st.GetWasmStateKV(ctx, sandboxID, "counter")
+	if err != nil || !ok || string(got) != "1" {
+		t.Fatalf("GetWasmStateKV = %q ok=%v err=%v", got, ok, err)
+	}
+	if err := st.PutWasmStateKV(ctx, sandboxID, "counter", []byte("2")); err != nil {
+		t.Fatalf("PutWasmStateKV update: %v", err)
+	}
+	got, ok, err = st.GetWasmStateKV(ctx, sandboxID, "counter")
+	if err != nil || !ok || string(got) != "2" {
+		t.Fatalf("GetWasmStateKV after update = %q ok=%v err=%v", got, ok, err)
+	}
+	if err := st.PutWasmStateKV(ctx, sandboxID, "other", []byte("x")); err != nil {
+		t.Fatalf("PutWasmStateKV other: %v", err)
+	}
+	keys, err := st.ListWasmStateKVKeys(ctx, sandboxID)
+	if err != nil {
+		t.Fatalf("ListWasmStateKVKeys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("keys = %v, want 2 entries", keys)
+	}
+	if err := st.DeleteWasmStateKV(ctx, sandboxID, "counter"); err != nil {
+		t.Fatalf("DeleteWasmStateKV: %v", err)
+	}
+	_, ok, err = st.GetWasmStateKV(ctx, sandboxID, "counter")
+	if err != nil || ok {
+		t.Fatalf("GetWasmStateKV after delete = ok=%v err=%v", ok, err)
+	}
+}
