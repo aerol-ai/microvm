@@ -1,6 +1,6 @@
 # WASM-based Sandboxes — Design & Implementation Plan
 
-Status: **Partially implemented** (Phases 1–6 landed; Phase 7 cluster live-migration + drain evacuate wired via `POST /v1/cluster/wasm-migrate` and internal export/import routes; OTEL/fuel/netstats IPC/registry tag prune/interpreter modules still open) · Owner: TBD · Created: 2026-06-07
+Status: **Partially implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-43 worker netstats IPC, AOCR tag prune on keep-last-N, and wasm OTEL spans; wasmtime fuel, interpreter modules, and cluster failover e2e still open) · Owner: TBD · Created: 2026-06-07
 
 This plan adds a **fourth runtime** to AerolVM — WebAssembly (WASM/WASI) — as a
 peer to `docker`, `gvisor`, and `firecracker`. The design principle is the one

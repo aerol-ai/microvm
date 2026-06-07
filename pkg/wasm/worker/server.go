@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -16,6 +18,23 @@ type Server struct {
 	mu       sync.Mutex
 	eng      wasmengine.Engine
 	lastCaps wasmengine.Capabilities
+	// workerNet accumulates guest-side socket bytes until the driver polls via MsgNetstatsTick.
+	workerNet map[string]*workerNetUsage
+}
+
+type workerNetUsage struct {
+	bytesIn  atomic.Int64
+	bytesOut atomic.Int64
+}
+
+func (s *Server) netUsageFor(sandboxID string) *workerNetUsage {
+	if s.workerNet == nil {
+		s.workerNet = make(map[string]*workerNetUsage)
+	}
+	if s.workerNet[sandboxID] == nil {
+		s.workerNet[sandboxID] = &workerNetUsage{}
+	}
+	return s.workerNet[sandboxID]
 }
 
 // Serve accepts framed control messages on conn until EOF or an unrecoverable error.
@@ -312,6 +331,19 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgNetstatsTick:
+			sandboxID := strings.TrimSpace(env.SandboxID)
+			u := s.netUsageFor(sandboxID)
+			body, encErr := encodePayload(netstatsResultPayload{
+				BytesIn:  u.bytesIn.Swap(0),
+				BytesOut: u.bytesOut.Swap(0),
+			})
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: sandboxID, Payload: body}); err != nil {
 				return err
 			}
 		default:

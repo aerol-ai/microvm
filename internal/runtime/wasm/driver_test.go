@@ -61,6 +61,7 @@ func (c *recordingWorkerClient) Checkpoint(string, string, wasmengine.SnapshotCo
 }
 func (c *recordingWorkerClient) Restore(string, string, wasmengine.Capabilities) error { return nil }
 func (c *recordingWorkerClient) SetCapability(string, wasmengine.Capabilities) error   { return nil }
+func (c *recordingWorkerClient) NetstatsTick(string) (int64, int64, error)             { return 0, 0, nil }
 
 func TestDestroyNilSandboxIsNoop(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)

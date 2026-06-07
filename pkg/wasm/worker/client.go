@@ -185,6 +185,29 @@ func (c *Client) StopInstance(sandboxID string) error {
 	return c.expectOK(reply)
 }
 
+// NetstatsTick drains worker-side byte counters since the last poll (UC-43).
+func (c *Client) NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err error) {
+	reply, err := c.roundTrip(Envelope{Type: MsgNetstatsTick, SandboxID: sandboxID})
+	if err != nil {
+		return 0, 0, err
+	}
+	if reply.Type == MsgError {
+		var p errorPayload
+		if err := decodePayload(reply.Payload, &p); err != nil {
+			return 0, 0, err
+		}
+		return 0, 0, fmt.Errorf("%s", p.Message)
+	}
+	if reply.Type != MsgOK {
+		return 0, 0, fmt.Errorf("unexpected reply type %q", reply.Type)
+	}
+	var p netstatsResultPayload
+	if err := decodePayload(reply.Payload, &p); err != nil {
+		return 0, 0, err
+	}
+	return p.BytesIn, p.BytesOut, nil
+}
+
 // TriggerPanic sends the test-only panic message. The worker process is expected to exit.
 func (c *Client) TriggerPanic(sandboxID string) error {
 	_, err := c.roundTrip(Envelope{Type: MsgTriggerPanic, SandboxID: sandboxID})

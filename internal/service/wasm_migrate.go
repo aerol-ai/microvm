@@ -11,10 +11,12 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/observability"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // WasmMigrateRequest is the operator body for POST /v1/cluster/wasm-migrate.
@@ -53,6 +55,11 @@ func (s *Service) MigrateWasmSandbox(ctx context.Context, sandboxID, destDir str
 
 // ExportWasmMigration streams a §4.8.1 mem.snap tarball for sandboxID.
 func (s *Service) ExportWasmMigration(ctx context.Context, sandboxID string, w io.Writer) (cloneGen string, err error) {
+	ctx, span := observability.StartSpan(ctx, "wasm.migrate.export",
+		attribute.String("sandbox.id", sandboxID),
+	)
+	defer func() { observability.EndSpan(span, err) }()
+
 	if s.wasm == nil || !s.cfg.EnableWasm {
 		return "", fmt.Errorf("wasm runtime not configured")
 	}
@@ -81,7 +88,12 @@ func (s *Service) ExportWasmMigration(ctx context.Context, sandboxID string, w i
 
 // ImportWasmMigration accepts a streamed mem.snap tarball on the receiving node,
 // promotes the sandbox row to passivated, and reassigns cluster ownership to self.
-func (s *Service) ImportWasmMigration(ctx context.Context, sandboxID, expectedCloneGen string, r io.Reader) error {
+func (s *Service) ImportWasmMigration(ctx context.Context, sandboxID, expectedCloneGen string, r io.Reader) (err error) {
+	ctx, span := observability.StartSpan(ctx, "wasm.migrate.import",
+		attribute.String("sandbox.id", sandboxID),
+	)
+	defer func() { observability.EndSpan(span, err) }()
+
 	if !s.cfg.EnableWasm {
 		return fmt.Errorf("wasm runtime disabled")
 	}
@@ -175,7 +187,13 @@ func (s *Service) clusterSpecForImport(sandboxID string, snap wasmengine.Snapsho
 
 // MigrateWasmSandboxToNode orchestrates export on the current owner and import
 // on targetNodeID (plans/wasm-runtime.md §4.4).
-func (s *Service) MigrateWasmSandboxToNode(ctx context.Context, sandboxID, targetNodeID string) (*WasmMigrateResponse, error) {
+func (s *Service) MigrateWasmSandboxToNode(ctx context.Context, sandboxID, targetNodeID string) (resp *WasmMigrateResponse, err error) {
+	ctx, span := observability.StartSpan(ctx, "wasm.migrate",
+		attribute.String("sandbox.id", sandboxID),
+		attribute.String("target.node_id", targetNodeID),
+	)
+	defer func() { observability.EndSpan(span, err) }()
+
 	c := s.Cluster()
 	if c == nil {
 		return nil, fmt.Errorf("cluster not enabled")

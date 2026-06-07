@@ -57,6 +57,11 @@ type setCapabilityPayload struct {
 	Caps wasmengine.Capabilities `json:"caps"`
 }
 
+type netstatsResultPayload struct {
+	BytesIn  int64 `json:"bytes_in"`
+	BytesOut int64 `json:"bytes_out"`
+}
+
 func encodePayload(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

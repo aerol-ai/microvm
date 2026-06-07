@@ -7,9 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 func (s *Service) isWasmSandbox(sandbox *models.Sandbox) bool {
@@ -20,7 +22,7 @@ func (s *Service) isWasmSandbox(sandbox *models.Sandbox) bool {
 // Phase 1 mirrors the firecracker scaffolding: validate unsupported options,
 // reserve admission, dispatch to the driver, persist the row. Create on the
 // driver still returns ErrRuntimeNotImplemented until Phase 2 lands the cold path.
-func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
+func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	if req.GPUs != nil {
 		return nil, fmt.Errorf("runtime %q does not yet support GPUs (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)
@@ -86,6 +88,12 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			s.admitter.Release(sandboxID)
 		}
 	}
+
+	ctx, span := observability.StartSpan(ctx, "wasm.create",
+		attribute.String("sandbox.id", sandboxID),
+		attribute.String("module.ref", moduleRef),
+	)
+	defer func() { observability.EndSpan(span, err) }()
 
 	var sealedMounts []byte
 	var binds []mounts.ContainerBind

@@ -108,3 +108,19 @@ func (p *WasmCheckpointPusher) orasPullConfig() wasmmod.ORASPullConfig {
 		PATPath:   p.cfg.PATPath,
 	}
 }
+
+// DeleteRef removes a tagged WASM checkpoint manifest from AOCR.
+func (p *WasmCheckpointPusher) DeleteRef(ctx context.Context, registryRef string) error {
+	if p == nil {
+		return errors.New("wasm checkpoint push disabled (pusher is nil)")
+	}
+	return wasmmod.DeleteSnapshotRef(ctx, p.orasPushConfig(), registryRef)
+}
+
+func (p *WasmCheckpointPusher) orasPushConfig() wasmmod.ORASPushConfig {
+	return wasmmod.ORASPushConfig{
+		Host:      p.cfg.Host,
+		ClusterID: p.cfg.ClusterID,
+		PATPath:   p.cfg.PATPath,
+	}
+}

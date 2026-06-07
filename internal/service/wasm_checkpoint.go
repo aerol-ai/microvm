@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/observability"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // DrainWasmSandboxes checkpoints passivatable/durable live WASM sandboxes during
@@ -76,7 +79,13 @@ func wasmShouldCheckpoint(durability string) bool {
 	}
 }
 
-func (s *Service) checkpointWasmSandbox(ctx context.Context, host wasmruntime.CheckpointHost, sandbox *models.Sandbox) error {
+func (s *Service) checkpointWasmSandbox(ctx context.Context, host wasmruntime.CheckpointHost, sandbox *models.Sandbox) (err error) {
+	ctx, span := observability.StartSpan(ctx, "wasm.checkpoint",
+		attribute.String("sandbox.id", sandbox.ID),
+		attribute.String("durability", sandbox.Durability),
+	)
+	defer func() { observability.EndSpan(span, err) }()
+
 	path, gen, err := host.CheckpointSandbox(ctx, sandbox)
 	if err != nil {
 		s.logger.Error("wasm drain checkpoint failed",
@@ -164,10 +173,19 @@ func (s *Service) pruneWasmCheckpointPushes(ctx context.Context, sandboxID strin
 		return
 	}
 	for i := keep; i < len(recs); i++ {
-		if err := s.store.DeleteWasmCheckpointPush(ctx, recs[i].ID); err != nil {
+		rec := recs[i]
+		if s.wasmCheckpointPusher != nil && strings.TrimSpace(rec.RegistryRef) != "" {
+			if err := s.wasmCheckpointPusher.DeleteRef(ctx, rec.RegistryRef); err != nil {
+				s.logger.Warn("wasm checkpoint AOCR tag delete failed",
+					"sandbox_id", sandboxID,
+					"registry_ref", rec.RegistryRef,
+					"error", err,
+				)
+			}
+		}
+		if err := s.store.DeleteWasmCheckpointPush(ctx, rec.ID); err != nil {
 			s.logger.Warn("wasm checkpoint push history prune failed",
-				"sandbox_id", sandboxID,
-				"push_id", recs[i].ID,
+				"push_id", rec.ID,
 				"error", err,
 			)
 		}
