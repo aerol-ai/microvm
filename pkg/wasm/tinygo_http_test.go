@@ -31,7 +31,12 @@ func wasip1HTTPSourceDir() (string, error) {
 
 func ensureWasip1HTTPWasm(t *testing.T) string {
 	t.Helper()
-	out := filepath.Join("testdata", wasip1HTTPWasmName)
+	// Absolute output: the build runs with cmd.Dir = the guest source dir, so a
+	// relative -o would land next to the source instead of in pkg/wasm/testdata.
+	out, err := filepath.Abs(filepath.Join("testdata", wasip1HTTPWasmName))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if st, err := os.Stat(out); err == nil && st.Size() > 0 {
 		return out
 	}
