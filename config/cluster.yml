@@ -79,7 +79,8 @@ image_build_gc:
 # --- Firecracker runtime bootstrap ---------------------------------------
 # Host-level Firecracker enablement is opt-in. The bootstrap path must
 # install the runtime binaries and provide a kernel image at the configured
-# path before sandboxd starts with SB_ENABLE_FIRECRACKER=true.
+# path, plus <kernel_path>.config with CONFIG_VMGENID=y, before sandboxd
+# starts with SB_ENABLE_FIRECRACKER=true.
 firecracker:
   enabled: false
   kernel_path: "/var/lib/sandboxd/firecracker/vmlinux"

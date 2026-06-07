@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/runtime"
@@ -18,6 +19,65 @@ import (
 // compile — which is the right place to catch the drift.
 func TestDriverImplementsRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*Driver)(nil)
+}
+
+func TestRuntimeHealthVMGenIDCapability(t *testing.T) {
+	dir := t.TempDir()
+	fcBin := filepath.Join(dir, "firecracker")
+	jailerBin := filepath.Join(dir, "jailer")
+	kernel := filepath.Join(dir, "vmlinux")
+	kernelConfig := kernel + ".config"
+	for _, tc := range []struct {
+		name       string
+		versionOut string
+		kernelCfg  string
+		want       string
+		wantSubstr string
+	}{
+		{
+			name:       "ok",
+			versionOut: "Firecracker v1.8.0\n",
+			kernelCfg:  "CONFIG_VMGENID=y\n",
+			want:       "ok",
+		},
+		{
+			name:       "old firecracker",
+			versionOut: "Firecracker v1.7.0\n",
+			kernelCfg:  "CONFIG_VMGENID=y\n",
+			wantSubstr: "requires Firecracker >= 1.8.0",
+		},
+		{
+			name:       "kernel config missing flag",
+			versionOut: "Firecracker v1.8.0\n",
+			kernelCfg:  "# CONFIG_VMGENID is not set\n",
+			wantSubstr: "does not enable CONFIG_VMGENID=y",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := "#!/bin/sh\nprintf '%s' '" + strings.ReplaceAll(tc.versionOut, "'", "'\"'\"'") + "'\n"
+			if err := os.WriteFile(fcBin, []byte(script), 0o755); err != nil {
+				t.Fatalf("write firecracker: %v", err)
+			}
+			if err := os.WriteFile(jailerBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+				t.Fatalf("write jailer: %v", err)
+			}
+			if err := os.WriteFile(kernel, []byte{}, 0o644); err != nil {
+				t.Fatalf("write kernel: %v", err)
+			}
+			if err := os.WriteFile(kernelConfig, []byte(tc.kernelCfg), 0o644); err != nil {
+				t.Fatalf("write kernel config: %v", err)
+			}
+
+			d := New(Config{FirecrackerBinary: fcBin, JailerBinary: jailerBin, KernelImage: kernel}, nil)
+			got := d.RuntimeHealth(context.Background())
+			if tc.want != "" && got != tc.want {
+				t.Fatalf("RuntimeHealth() = %q, want %q", got, tc.want)
+			}
+			if tc.wantSubstr != "" && !strings.Contains(got, tc.wantSubstr) {
+				t.Fatalf("RuntimeHealth() = %q, want substring %q", got, tc.wantSubstr)
+			}
+		})
+	}
 }
 
 // TestPing confirms the binary-existence checks behave as expected:

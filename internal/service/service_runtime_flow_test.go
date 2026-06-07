@@ -47,6 +47,7 @@ type recordingRuntime struct {
 	destroyIDs []string
 
 	pingErr error
+	health  string
 
 	pushes []allowedPortsPush
 
@@ -139,6 +140,13 @@ func (r *recordingRuntime) ListManaged(_ context.Context) (map[string]*models.Sa
 }
 
 func (r *recordingRuntime) Ping(context.Context) error { return r.pingErr }
+
+func (r *recordingRuntime) RuntimeHealth(context.Context) string {
+	if r.health == "" {
+		return "ok"
+	}
+	return r.health
+}
 
 func (r *recordingRuntime) RemoveImage(_ context.Context, imageRef string) error {
 	r.removeImages = append(r.removeImages, imageRef)
@@ -288,7 +296,7 @@ func TestServiceLifecycleStopStartDestroyAndHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Health() error = %v", err)
 	}
-	if health.Status != "ok" || health.Sandboxes != 1 || health.Docker != "ok" || health.Caddy != "ok" {
+	if health.Status != "ok" || health.Sandboxes != 1 || health.Docker != "ok" || health.Caddy != "ok" || health.Firecracker != "disabled" {
 		t.Fatalf("initial health = %+v, want ok with one live sandbox", health)
 	}
 
@@ -356,6 +364,25 @@ func TestServiceLifecycleStopStartDestroyAndHealth(t *testing.T) {
 	}
 	if _, err := st.Get(ctx, resp.ID); !errors.Is(err, storepkg.ErrNotFound) {
 		t.Fatalf("sandbox still present after destroy: %v", err)
+	}
+}
+
+func TestHealthReportsFirecrackerCapabilityDegraded(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{health: "firecracker runtime: vmgenid capability check could not find a kernel config"}
+	svc, _, _ := newServiceRuntimeHarness(t, rt)
+	svc.cfg.EnableFirecracker = true
+	svc.SetFirecrackerRuntime(rt)
+
+	health, err := svc.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() error = %v", err)
+	}
+	if health.Status != "degraded" {
+		t.Fatalf("health status = %q, want degraded", health.Status)
+	}
+	if health.Firecracker != rt.health {
+		t.Fatalf("firecracker status = %q, want %q", health.Firecracker, rt.health)
 	}
 }
 

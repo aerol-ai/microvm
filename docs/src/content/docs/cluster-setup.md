@@ -176,11 +176,12 @@ firecracker = {
   binary_url  = "https://example.com/firecracker"
   jailer_url  = "https://example.com/jailer"
   kernel_url  = "https://example.com/vmlinux"
+  kernel_config_url = "https://example.com/vmlinux.config"
   kernel_path = "/var/lib/sandboxd/firecracker/vmlinux"
 }
 ```
 
-Set the `*_url` fields to download locations for the binaries. Leave them empty if your server image already has the files installed at those paths - Terraform will skip the download step.
+Set the `*_url` fields to download locations for the binaries and kernel artifacts. If `kernel_config_url` is empty, Terraform tries `kernel_url + ".config"`. Leave them empty only if your server image already has the files installed at those paths, including `/var/lib/sandboxd/firecracker/vmlinux.config`.
 
 After deployment, you register container images as Firecracker templates and then create sandboxes using the `firecracker` runtime. See [Firecracker Templates](/firecracker-templates) for the step-by-step workflow.
 

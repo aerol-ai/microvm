@@ -35,6 +35,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -119,6 +121,13 @@ type Driver struct {
 	clients  map[string]VMMClient // sandbox-id -> API client
 	vmms     map[string]VMMHandle // sandbox-id -> VMM handle (for Destroy)
 	guestCID map[string]uint32    // sandbox-id -> CID baked into the running guest
+	healthMu sync.Mutex
+	// runtimeHealth caches the vmgenid-capability probe result. The Firecracker
+	// binary path and kernel artifact are static for a daemon lifetime, so
+	// recomputing on every /health call just burns a subprocess and disk reads
+	// without adding signal.
+	runtimeHealth string
+	healthReady   bool
 }
 
 // TapPool is the interface Driver depends on for network allocation.
@@ -1333,6 +1342,119 @@ func (d *Driver) Ping(_ context.Context) error {
 		}
 	}
 	return nil
+}
+
+var firecrackerVersionRE = regexp.MustCompile(`(?i)\bv?(\d+)\.(\d+)\.(\d+)\b`)
+
+// RuntimeHealth reports whether this node can prove the vmgenid prerequisites
+// needed to close the pre-userspace snapshot-clone entropy window. "ok" means
+// the daemon validated its local Firecracker binary and found a neighboring
+// kernel config artifact with CONFIG_VMGENID=y; any other string is an
+// operator-facing degradation reason suitable for /health.
+func (d *Driver) RuntimeHealth(ctx context.Context) string {
+	d.healthMu.Lock()
+	defer d.healthMu.Unlock()
+	if d.healthReady {
+		return d.runtimeHealth
+	}
+	status := "ok"
+	if err := d.Ping(ctx); err != nil {
+		status = err.Error()
+	} else if err := d.validateVMGenIDCapability(ctx); err != nil {
+		status = err.Error()
+	}
+	d.runtimeHealth = status
+	d.healthReady = true
+	return status
+}
+
+func (d *Driver) validateVMGenIDCapability(ctx context.Context) error {
+	if err := d.requireFirecrackerVersion(ctx, 1, 8, 0); err != nil {
+		return err
+	}
+	if err := d.requireKernelVMGenID(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *Driver) requireFirecrackerVersion(ctx context.Context, wantMajor, wantMinor, wantPatch int) error {
+	out, err := exec.CommandContext(ctx, d.cfg.FirecrackerBinary, "--version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: vmgenid capability check failed to exec %q --version: %w",
+			d.cfg.FirecrackerBinary, err)
+	}
+	m := firecrackerVersionRE.FindStringSubmatch(string(out))
+	if len(m) != 4 {
+		return fmt.Errorf("firecracker runtime: vmgenid capability check could not parse firecracker version from %q",
+			strings.TrimSpace(string(out)))
+	}
+	gotMajor, _ := strconv.Atoi(m[1])
+	gotMinor, _ := strconv.Atoi(m[2])
+	gotPatch, _ := strconv.Atoi(m[3])
+	if versionLess(gotMajor, gotMinor, gotPatch, wantMajor, wantMinor, wantPatch) {
+		return fmt.Errorf("firecracker runtime: vmgenid requires Firecracker >= %d.%d.%d, found %d.%d.%d",
+			wantMajor, wantMinor, wantPatch, gotMajor, gotMinor, gotPatch)
+	}
+	return nil
+}
+
+func versionLess(gotMajor, gotMinor, gotPatch, wantMajor, wantMinor, wantPatch int) bool {
+	if gotMajor != wantMajor {
+		return gotMajor < wantMajor
+	}
+	if gotMinor != wantMinor {
+		return gotMinor < wantMinor
+	}
+	return gotPatch < wantPatch
+}
+
+func (d *Driver) requireKernelVMGenID() error {
+	if d.cfg.KernelImage == "" {
+		return errors.New("firecracker runtime: vmgenid capability check cannot verify guest kernel because SB_FIRECRACKER_KERNEL is not set")
+	}
+	paths := kernelConfigCandidates(d.cfg.KernelImage)
+	sawConfig := false
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("firecracker runtime: vmgenid capability check could not read kernel config %q: %w", path, err)
+		}
+		sawConfig = true
+		if kernelConfigEnablesVMGenID(data) {
+			return nil
+		}
+		return fmt.Errorf("firecracker runtime: guest kernel config %q does not enable CONFIG_VMGENID=y", path)
+	}
+	if sawConfig {
+		return errors.New("firecracker runtime: vmgenid capability check could not verify guest kernel CONFIG_VMGENID")
+	}
+	return fmt.Errorf("firecracker runtime: vmgenid capability check could not find a kernel config near %q; looked for %s",
+		d.cfg.KernelImage, strings.Join(paths, ", "))
+}
+
+func kernelConfigCandidates(kernelPath string) []string {
+	dir := filepath.Dir(kernelPath)
+	base := filepath.Base(kernelPath)
+	return []string{
+		kernelPath + ".config",
+		filepath.Join(dir, base+".config"),
+		filepath.Join(dir, "config"),
+		filepath.Join(dir, "config-"+base),
+	}
+}
+
+func kernelConfigEnablesVMGenID(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "CONFIG_VMGENID=y" {
+			return true
+		}
+	}
+	return false
 }
 
 // RemoveImage is a Docker concept; on the Firecracker path images are
