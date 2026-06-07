@@ -101,6 +101,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		cleanup()
 		return nil, err
 	}
+	d.noteWorkerSpawnCount(inst)
 	if warmSlot == nil {
 		if err := client.LoadModule(sandboxID, resolved.Path); err != nil {
 			cleanup()

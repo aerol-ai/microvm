@@ -39,6 +39,10 @@ type okPayload struct {
 	OK bool `json:"ok"`
 }
 
+type instanceStatusPayload struct {
+	Loaded bool `json:"loaded"`
+}
+
 type checkpointPayload struct {
 	OutDir string                    `json:"out_dir"`
 	Meta   wasmengine.SnapshotConfig `json:"meta"`

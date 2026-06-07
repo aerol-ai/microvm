@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -25,7 +27,16 @@ func (s *Service) ensureWasmCheckpointLocal(ctx context.Context, sandbox *models
 		checkpointPath = wasmCheckpointDir(s.cfg.WasmModulesDir, sandbox.ID)
 	}
 	if wasmengine.DirExists(checkpointPath) {
-		return checkpointPath, nil
+		if _, err := wasmengine.ReadSnapshotDir(checkpointPath, wasmengine.EngineNameWazero()); err == nil {
+			return checkpointPath, nil
+		} else if sandbox.Durability != models.DurabilityDurable {
+			return checkpointPath, err
+		} else if !errors.Is(err, models.ErrSnapshotCorrupt) && !errors.Is(err, models.ErrSnapshotFenced) {
+			return checkpointPath, err
+		}
+		if err := os.RemoveAll(checkpointPath); err != nil {
+			return checkpointPath, fmt.Errorf("remove corrupt wasm checkpoint %s: %w", checkpointPath, err)
+		}
 	}
 	if sandbox.Durability != models.DurabilityDurable {
 		return checkpointPath, fmt.Errorf("wasm checkpoint missing locally for %s", sandbox.ID)
@@ -45,6 +56,9 @@ func (s *Service) ensureWasmCheckpointLocal(ctx context.Context, sandbox *models
 	}
 	if !wasmengine.DirExists(checkpointPath) {
 		return checkpointPath, fmt.Errorf("wasm checkpoint pull succeeded but artifact missing at %s", checkpointPath)
+	}
+	if _, err := wasmengine.ReadSnapshotDir(checkpointPath, wasmengine.EngineNameWazero()); err != nil {
+		return checkpointPath, fmt.Errorf("pulled wasm checkpoint invalid at %s: %w", checkpointPath, err)
 	}
 	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID,
 		string(models.SandboxStatusPassivated), checkpointPath, sandbox.CloneGeneration, ""); err != nil {

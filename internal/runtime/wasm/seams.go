@@ -20,15 +20,20 @@ type WorkerSupervisor interface {
 	Stop(sandboxID string) error
 }
 
+type WorkerSupervisorSpawnCounter interface {
+	SpawnCount(sandboxID string) int
+}
+
 // WorkerClient is the IPC surface the driver uses inside a worker subprocess.
 type WorkerClient interface {
 	Ping(sandboxID string) error
+	InstanceLoaded(ctx context.Context, sandboxID string) (bool, error)
 	LoadModule(sandboxID, path string) error
 	Instantiate(sandboxID string, caps wasmengine.Capabilities) error
 	Invoke(sandboxID, export string) error
 	Exec(sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error)
 	StopInstance(sandboxID string) error
-	Checkpoint(sandboxID, outDir string, meta wasmengine.SnapshotConfig) error
+	Checkpoint(ctx context.Context, sandboxID, outDir string, meta wasmengine.SnapshotConfig) error
 	Restore(sandboxID, dir string, caps wasmengine.Capabilities) error
 	SetCapability(sandboxID string, caps wasmengine.Capabilities) error
 	NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err error)
@@ -53,6 +58,10 @@ func (a workerClientAdapter) Ping(sandboxID string) error {
 	return a.client.Ping(sandboxID)
 }
 
+func (a workerClientAdapter) InstanceLoaded(ctx context.Context, sandboxID string) (bool, error) {
+	return a.client.InstanceLoaded(ctx, sandboxID)
+}
+
 func (a workerClientAdapter) LoadModule(sandboxID, path string) error {
 	return a.client.LoadModule(sandboxID, path)
 }
@@ -73,8 +82,8 @@ func (a workerClientAdapter) StopInstance(sandboxID string) error {
 	return a.client.StopInstance(sandboxID)
 }
 
-func (a workerClientAdapter) Checkpoint(sandboxID, outDir string, meta wasmengine.SnapshotConfig) error {
-	return a.client.Checkpoint(sandboxID, outDir, meta)
+func (a workerClientAdapter) Checkpoint(ctx context.Context, sandboxID, outDir string, meta wasmengine.SnapshotConfig) error {
+	return a.client.Checkpoint(ctx, sandboxID, outDir, meta)
 }
 
 func (a workerClientAdapter) Restore(sandboxID, dir string, caps wasmengine.Capabilities) error {

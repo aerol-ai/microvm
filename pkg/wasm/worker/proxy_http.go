@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
@@ -84,15 +83,80 @@ func (s *Server) proxyGuestHTTPFromPayload(ctx context.Context, sandboxID string
 		return proxyHTTPResultPayload{}, err
 	}
 	req.Header = p.Header
-	rec := httptest.NewRecorder()
+	rec := newLimitedProxyResponseRecorder(maxProxyHTTPBody)
 	if err := s.proxyGuestHTTP(ctx, sandboxID, p.GuestPort, rec, req); err != nil {
 		return proxyHTTPResultPayload{}, err
 	}
+	if rec.Overflowed() {
+		return proxyHTTPResultPayload{}, fmt.Errorf("proxy http response body exceeds %d bytes", maxProxyHTTPBody)
+	}
 	return proxyHTTPResultPayload{
-		StatusCode: rec.Code,
+		StatusCode: rec.StatusCode(),
 		Header:     rec.Header(),
-		Body:       rec.Body.Bytes(),
+		Body:       rec.Body(),
 	}, nil
+}
+
+type limitedProxyResponseRecorder struct {
+	header   http.Header
+	status   int
+	body     bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func newLimitedProxyResponseRecorder(limit int) *limitedProxyResponseRecorder {
+	return &limitedProxyResponseRecorder{
+		header: make(http.Header),
+		limit:  limit,
+	}
+}
+
+func (r *limitedProxyResponseRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *limitedProxyResponseRecorder) WriteHeader(statusCode int) {
+	if r.status == 0 {
+		r.status = statusCode
+	}
+}
+
+func (r *limitedProxyResponseRecorder) Write(p []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	remaining := r.limit + 1 - r.body.Len()
+	if remaining <= 0 {
+		r.overflow = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		_, _ = r.body.Write(p[:remaining])
+		r.overflow = true
+		return len(p), nil
+	}
+	_, _ = r.body.Write(p)
+	return len(p), nil
+}
+
+func (r *limitedProxyResponseRecorder) StatusCode() int {
+	if r.status == 0 {
+		return http.StatusOK
+	}
+	return r.status
+}
+
+func (r *limitedProxyResponseRecorder) Body() []byte {
+	body := r.body.Bytes()
+	if len(body) > r.limit {
+		return body[:r.limit]
+	}
+	return body
+}
+
+func (r *limitedProxyResponseRecorder) Overflowed() bool {
+	return r.overflow || r.body.Len() > r.limit
 }
 
 type countReadCloser struct {
@@ -134,9 +198,12 @@ func buildProxyHTTPPayload(guestPort int, r *http.Request) (proxyHTTPPayload, er
 	var body []byte
 	if r.Body != nil {
 		var err error
-		body, err = io.ReadAll(io.LimitReader(r.Body, maxProxyHTTPBody))
+		body, err = io.ReadAll(io.LimitReader(r.Body, int64(maxProxyHTTPBody)+1))
 		if err != nil {
 			return proxyHTTPPayload{}, err
+		}
+		if len(body) > maxProxyHTTPBody {
+			return proxyHTTPPayload{}, fmt.Errorf("proxy http request body exceeds %d bytes", maxProxyHTTPBody)
 		}
 	}
 	return proxyHTTPPayload{

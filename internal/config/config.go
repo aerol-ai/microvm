@@ -398,6 +398,9 @@ type Config struct {
 	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
 	// SB_WASM_DRAIN_TIMEOUT.
 	WasmDrainTimeout time.Duration
+	// WasmCheckpointMaxParallel caps concurrent drain/periodic checkpoint IPC.
+	// SB_WASM_CHECKPOINT_MAX_PARALLEL.
+	WasmCheckpointMaxParallel int
 	// WasmCheckpointInterval triggers periodic boundary checkpoints for live
 	// passivatable/durable WASM sandboxes. 0 = off. SB_WASM_CHECKPOINT_INTERVAL.
 	WasmCheckpointInterval time.Duration
@@ -1179,18 +1182,19 @@ func Load() (Config, error) {
 		FleetControlPlaneContractRefresh: getEnvDuration("SB_FLEET_CONTRACT_REFRESH", 5*time.Minute),
 		FleetLiveSampleInterval:          getEnvDuration("SB_FLEET_LIVE_SAMPLE_INTERVAL", 0),
 
-		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
-		EnableWasm:              getEnvBool("SB_ENABLE_WASM", false),
-		WasmRunDir:              getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
-		WasmModulesDir:          getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
-		WasmEngine:              strings.ToLower(strings.TrimSpace(getEnv("SB_WASM_ENGINE", "wazero"))),
-		WasmMaxInstances:        getEnvInt("SB_WASM_MAX_INSTANCES", 0),
-		WasmDefaultMemoryMB:     getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
-		WasmDefaultTimeout:      getEnvDuration("SB_WASM_DEFAULT_TIMEOUT", 5*time.Minute),
-		WasmDrainTimeout:        getEnvDuration("SB_WASM_DRAIN_TIMEOUT", 30*time.Second),
-		WasmCheckpointInterval:  getEnvDuration("SB_WASM_CHECKPOINT_INTERVAL", 0),
-		WasmDurablePushInterval: getEnvDuration("SB_WASM_DURABLE_PUSH_INTERVAL", 0),
-		WasmCheckpointKeepLastN: getEnvInt("SB_WASM_CHECKPOINT_KEEP_LAST_N", 3),
+		EnableFirecracker:         getEnvBool("SB_ENABLE_FIRECRACKER", false),
+		EnableWasm:                getEnvBool("SB_ENABLE_WASM", false),
+		WasmRunDir:                getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
+		WasmModulesDir:            getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
+		WasmEngine:                strings.ToLower(strings.TrimSpace(getEnv("SB_WASM_ENGINE", "wazero"))),
+		WasmMaxInstances:          getEnvInt("SB_WASM_MAX_INSTANCES", 0),
+		WasmDefaultMemoryMB:       getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
+		WasmDefaultTimeout:        getEnvDuration("SB_WASM_DEFAULT_TIMEOUT", 5*time.Minute),
+		WasmDrainTimeout:          getEnvDuration("SB_WASM_DRAIN_TIMEOUT", 30*time.Second),
+		WasmCheckpointMaxParallel: getEnvInt("SB_WASM_CHECKPOINT_MAX_PARALLEL", 64),
+		WasmCheckpointInterval:    getEnvDuration("SB_WASM_CHECKPOINT_INTERVAL", 0),
+		WasmDurablePushInterval:   getEnvDuration("SB_WASM_DURABLE_PUSH_INTERVAL", 0),
+		WasmCheckpointKeepLastN:   getEnvInt("SB_WASM_CHECKPOINT_KEEP_LAST_N", 3),
 		// Default is deliberately generous: the guard exists to stop a single
 		// runaway guest (thousands of writes/sec hammering the single writer),
 		// not to throttle normal durable workloads. Operators tune down for
@@ -1425,6 +1429,9 @@ func Load() (Config, error) {
 		}
 		if cfg.WasmDefaultMemoryMB < 0 {
 			return Config{}, errors.New("SB_WASM_DEFAULT_MEMORY_MB must be >= 0")
+		}
+		if cfg.WasmCheckpointMaxParallel < 0 {
+			return Config{}, errors.New("SB_WASM_CHECKPOINT_MAX_PARALLEL must be >= 0")
 		}
 		if cfg.WasmPoolDepthDefault < 0 {
 			return Config{}, errors.New("SB_WASM_POOL_DEPTH_DEFAULT must be >= 0")

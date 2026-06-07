@@ -18,6 +18,16 @@ func (d *Driver) checkpointDir(sandboxID string) string {
 
 // CheckpointSandbox writes mem.snap for a live sandbox and tears down its worker.
 func (d *Driver) CheckpointSandbox(ctx context.Context, sandbox *models.Sandbox) (string, string, error) {
+	return d.checkpointSandbox(ctx, sandbox, true)
+}
+
+// CheckpointLiveSandbox writes mem.snap for a live sandbox without passivating
+// or evicting the worker. Used by periodic boundary checkpoint sweeps.
+func (d *Driver) CheckpointLiveSandbox(ctx context.Context, sandbox *models.Sandbox) (string, string, error) {
+	return d.checkpointSandbox(ctx, sandbox, false)
+}
+
+func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox, stopAfter bool) (string, string, error) {
 	if sandbox == nil {
 		return "", "", fmt.Errorf("checkpoint: nil sandbox")
 	}
@@ -43,14 +53,21 @@ func (d *Driver) CheckpointSandbox(ctx context.Context, sandbox *models.Sandbox)
 	}
 
 	client := d.newWorkerClient(inst.socketPath)
-	_ = ctx
-	if err := client.Checkpoint(sandbox.ID, outDir, meta); err != nil {
+	if err := client.Checkpoint(ctx, sandbox.ID, outDir, meta); err != nil {
 		workerKey := inst.workerKey
 		if workerKey == "" {
 			workerKey = sandbox.ID
 		}
-		_ = d.supervisor.Stop(workerKey)
+		if stopAfter {
+			_ = d.supervisor.Stop(workerKey)
+			d.mu.Lock()
+			delete(d.byID, sandbox.ID)
+			d.mu.Unlock()
+		}
 		return "", "", fmt.Errorf("checkpoint sandbox %s: %w", sandbox.ID, err)
+	}
+	if !stopAfter {
+		return outDir, token, nil
 	}
 	_ = client.StopInstance(sandbox.ID)
 	workerKey := inst.workerKey

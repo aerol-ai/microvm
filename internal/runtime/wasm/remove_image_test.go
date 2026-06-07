@@ -43,3 +43,19 @@ func TestRemoveImageByDigest(t *testing.T) {
 		t.Fatal("digest path still exists")
 	}
 }
+
+func TestRemoveImageDoesNotDeleteExternalAbsoluteModule(t *testing.T) {
+	cacheDir := t.TempDir()
+	externalDir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, externalDir, "external.wasm")
+
+	d := New(Config{ModulesDir: cacheDir, RunDir: t.TempDir()}, nil)
+	d.SetModuleResolver(wasmmod.NewResolver(cacheDir))
+
+	if err := d.RemoveImage(context.Background(), modPath); err != nil {
+		t.Fatalf("RemoveImage external: %v", err)
+	}
+	if _, err := os.Stat(modPath); err != nil {
+		t.Fatalf("external module should not be deleted, stat err=%v", err)
+	}
+}

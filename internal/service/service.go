@@ -874,6 +874,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, cluster.ErrNoPlacementTarget
 	}
 
+	memoryWasOmitted := req.MemoryMB <= 0
 	req = normalizeCreateRequest(req)
 	if err := s.NormalizeCreateImageDistribution(ctx, &req); err != nil {
 		return nil, err
@@ -983,6 +984,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if s.wasm == nil {
 			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_WASM=true but daemon did not call SetWasmRuntime): %w",
 				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		if memoryWasOmitted {
+			req.MemoryMB = 0
 		}
 		req.Runtime = chosenRuntime
 		return s.createWasmSandbox(ctx, req, idOverride)

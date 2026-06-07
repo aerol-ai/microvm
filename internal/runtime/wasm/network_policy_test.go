@@ -16,6 +16,9 @@ type stubWorkerNetstatsClient struct {
 }
 
 func (c *stubWorkerNetstatsClient) Ping(string) error { return nil }
+func (c *stubWorkerNetstatsClient) InstanceLoaded(context.Context, string) (bool, error) {
+	return true, nil
+}
 func (c *stubWorkerNetstatsClient) LoadModule(string, string) error {
 	return nil
 }
@@ -27,7 +30,7 @@ func (c *stubWorkerNetstatsClient) Exec(string, wasmengine.Capabilities, string)
 	return wasmengine.RunResult{}, nil
 }
 func (c *stubWorkerNetstatsClient) StopInstance(string) error { return nil }
-func (c *stubWorkerNetstatsClient) Checkpoint(string, string, wasmengine.SnapshotConfig) error {
+func (c *stubWorkerNetstatsClient) Checkpoint(context.Context, string, string, wasmengine.SnapshotConfig) error {
 	return nil
 }
 func (c *stubWorkerNetstatsClient) Restore(string, string, wasmengine.Capabilities) error {

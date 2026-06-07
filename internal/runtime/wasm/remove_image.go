@@ -50,10 +50,16 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 				dropper.DropModule(resolved.Digest)
 			}
 		}
+		if !pathUnderDir(d.cfg.ModulesDir, resolved.Path) {
+			paths = paths[:len(paths)-1]
+		}
 	}
 
 	for _, path := range paths {
 		if path == "" {
+			continue
+		}
+		if !pathUnderDir(d.cfg.ModulesDir, path) {
 			continue
 		}
 		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -73,6 +79,27 @@ func looksLikeDigest(ref string) bool {
 		}
 	}
 	return true
+}
+
+func pathUnderDir(root, path string) bool {
+	root = strings.TrimSpace(root)
+	path = strings.TrimSpace(path)
+	if root == "" || path == "" {
+		return false
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
 }
 
 type warmPoolDropper interface {

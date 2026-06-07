@@ -35,7 +35,7 @@ func (s *Service) StartWasmPeriodicCheckpoint(ctx context.Context) {
 }
 
 func (s *Service) runWasmPeriodicCheckpoint(ctx context.Context) error {
-	host, ok := s.wasm.(wasmruntime.CheckpointHost)
+	host, ok := s.wasm.(wasmruntime.LiveCheckpointHost)
 	if !ok {
 		return nil
 	}
@@ -47,6 +47,7 @@ func (s *Service) runWasmPeriodicCheckpoint(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	eligible := make([]*models.Sandbox, 0, len(known))
 	for _, sb := range known {
 		if sb == nil || !s.isWasmSandbox(sb) {
 			continue
@@ -60,9 +61,11 @@ func (s *Service) runWasmPeriodicCheckpoint(ctx context.Context) error {
 		if _, live := managed[sb.ID]; !live {
 			continue
 		}
-		_ = s.checkpointWasmSandbox(ctx, host, sb)
+		eligible = append(eligible, sb)
 	}
-	return nil
+	return s.runWasmCheckpointPool(ctx, eligible, func(sandbox *models.Sandbox) error {
+		return s.checkpointLiveWasmSandbox(ctx, host, sandbox)
+	})
 }
 
 // StartWasmDurablePushSweep retries AOCR push for durable checkpoints missing registry metadata.

@@ -157,14 +157,14 @@ func TestSetListenPortDisabled(t *testing.T) {
 	}
 }
 
-func TestBuildProxyHTTPPayloadLimitsBody(t *testing.T) {
+func TestBuildProxyHTTPPayloadRejectsOversizedBody(t *testing.T) {
 	body := make([]byte, maxProxyHTTPBody+1)
 	req, err := http.NewRequest(http.MethodPost, "http://x/", io.NopCloser(io.LimitReader(&repeatReader{b: body}, int64(len(body)))))
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	if _, err := buildProxyHTTPPayload(8080, req); err != nil {
-		t.Fatalf("buildProxyHTTPPayload: %v", err)
+	if _, err := buildProxyHTTPPayload(8080, req); err == nil {
+		t.Fatal("buildProxyHTTPPayload expected oversized body error")
 	}
 }
 

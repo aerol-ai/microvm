@@ -9,6 +9,7 @@ type MessageType string
 const (
 	MsgHealthPing       MessageType = "health_ping"
 	MsgPong             MessageType = "pong"
+	MsgInstanceStatus   MessageType = "instance_status"
 	MsgTriggerPanic     MessageType = "trigger_panic" // test-only: verifies crash isolation (D10)
 	MsgLoadModule       MessageType = "load_module"
 	MsgInstantiate      MessageType = "instantiate"

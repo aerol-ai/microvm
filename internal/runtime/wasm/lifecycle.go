@@ -33,6 +33,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if err := d.waitWorker(ctx, client, sandboxID); err != nil {
 		return nil, err
 	}
+	d.noteWorkerSpawnCount(inst)
 	if err := client.LoadModule(sandboxID, inst.modulePath); err != nil {
 		return nil, fmt.Errorf("load module: %w", err)
 	}

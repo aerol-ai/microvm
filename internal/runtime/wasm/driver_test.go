@@ -46,6 +46,9 @@ type recordingWorkerClient struct {
 }
 
 func (c *recordingWorkerClient) Ping(string) error { return nil }
+func (c *recordingWorkerClient) InstanceLoaded(context.Context, string) (bool, error) {
+	return true, nil
+}
 func (c *recordingWorkerClient) LoadModule(_, path string) error {
 	c.loadPath = path
 	return nil
@@ -62,7 +65,7 @@ func (c *recordingWorkerClient) StopInstance(string) error {
 	c.stopped = true
 	return nil
 }
-func (c *recordingWorkerClient) Checkpoint(string, string, wasmengine.SnapshotConfig) error {
+func (c *recordingWorkerClient) Checkpoint(context.Context, string, string, wasmengine.SnapshotConfig) error {
 	return nil
 }
 func (c *recordingWorkerClient) Restore(string, string, wasmengine.Capabilities) error { return nil }
@@ -101,6 +104,100 @@ func TestInspectUnknownSandboxReturnsNil(t *testing.T) {
 	}
 	if state != nil {
 		t.Fatalf("expected nil state, got %+v", state)
+	}
+}
+
+type unloadedWorkerClient struct {
+	recordingWorkerClient
+}
+
+func (c *unloadedWorkerClient) InstanceLoaded(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func TestInspectMarksRespawnedEmptyWorkerStopped(t *testing.T) {
+	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	d.SetWorkerClientFactory(func(string) WorkerClient { return &unloadedWorkerClient{} })
+	d.mu.Lock()
+	d.byID["sb-empty-worker"] = &sandboxInstance{
+		sandboxID:  "sb-empty-worker",
+		socketPath: "/tmp/fake.sock",
+		status:     models.SandboxStatusStarted,
+	}
+	d.mu.Unlock()
+
+	state, err := d.Inspect(context.Background(), "sb-empty-worker")
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if state == nil || state.Status != models.SandboxStatusStopped {
+		t.Fatalf("state = %+v, want stopped", state)
+	}
+	managed, err := d.ListManaged(context.Background())
+	if err != nil {
+		t.Fatalf("ListManaged: %v", err)
+	}
+	if managed["sb-empty-worker"].Status != models.SandboxStatusStopped {
+		t.Fatalf("managed status = %q, want stopped", managed["sb-empty-worker"].Status)
+	}
+}
+
+type spawnCountingSupervisor struct {
+	fakeSupervisor
+	count int
+}
+
+func (s *spawnCountingSupervisor) SpawnCount(string) int {
+	return s.count
+}
+
+type statusCountingWorkerClient struct {
+	recordingWorkerClient
+	statusCalls int
+}
+
+func (c *statusCountingWorkerClient) InstanceLoaded(context.Context, string) (bool, error) {
+	c.statusCalls++
+	return false, nil
+}
+
+func TestListManagedUsesSupervisorSpawnCountWithoutWorkerIPC(t *testing.T) {
+	sup := &spawnCountingSupervisor{count: 1}
+	client := &statusCountingWorkerClient{}
+	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	d.SetWorkerSupervisor(sup)
+	d.SetWorkerClientFactory(func(string) WorkerClient { return client })
+	d.mu.Lock()
+	d.byID["sb-spawn-count"] = &sandboxInstance{
+		sandboxID:        "sb-spawn-count",
+		socketPath:       "/tmp/fake.sock",
+		workerKey:        "sb-spawn-count",
+		workerSpawnCount: 1,
+		status:           models.SandboxStatusStarted,
+	}
+	d.mu.Unlock()
+
+	managed, err := d.ListManaged(context.Background())
+	if err != nil {
+		t.Fatalf("ListManaged: %v", err)
+	}
+	if managed["sb-spawn-count"].Status != models.SandboxStatusStarted {
+		t.Fatalf("status before respawn = %q, want started", managed["sb-spawn-count"].Status)
+	}
+	if client.statusCalls != 0 {
+		t.Fatalf("InstanceLoaded calls = %d, want 0 when supervisor has spawn count", client.statusCalls)
+	}
+
+	sup.count = 2
+	managed, err = d.ListManaged(context.Background())
+	if err != nil {
+		t.Fatalf("ListManaged after respawn: %v", err)
+	}
+	if managed["sb-spawn-count"].Status != models.SandboxStatusStopped {
+		t.Fatalf("status after respawn = %q, want stopped", managed["sb-spawn-count"].Status)
+	}
+	if client.statusCalls != 0 {
+		t.Fatalf("InstanceLoaded calls after respawn = %d, want 0", client.statusCalls)
 	}
 }
 

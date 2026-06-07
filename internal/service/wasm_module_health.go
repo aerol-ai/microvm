@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -60,7 +62,7 @@ func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
 				s.logger.Warn("wasm module gc artifact delete failed", "module_id", rec.ID, "ref", ref, "error", err)
 				continue
 			}
-		} else if rec.ModulePath != "" {
+		} else if wasmPathUnderDir(s.cfg.WasmModulesDir, rec.ModulePath) {
 			_ = os.RemoveAll(rec.ModulePath)
 		}
 		if err := s.store.DeleteWasmModule(ctx, rec.ID); err != nil {
@@ -70,4 +72,25 @@ func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
 		s.invalidateWasmModuleInventoryCache()
 		s.logger.Info("wasm module gc removed unreferenced catalogue row", "module_id", rec.ID)
 	}
+}
+
+func wasmPathUnderDir(root, path string) bool {
+	root = strings.TrimSpace(root)
+	path = strings.TrimSpace(path)
+	if root == "" || path == "" {
+		return false
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
 }

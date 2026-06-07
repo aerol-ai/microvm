@@ -195,6 +195,59 @@ func TestRecreateWasmDurableSandbox_AOCRPullThenRehydrates(t *testing.T) {
 	}
 }
 
+func TestRehydrateWasmDurableSandbox_CorruptLocalCheckpointPullsAOCR(t *testing.T) {
+	ctx := context.Background()
+	modulesDir := t.TempDir()
+	remoteSnap := filepath.Join(t.TempDir(), "remote-mem.snap")
+	seedWasmSnapshot(t, remoteSnap, "gen-pull-good")
+	localPath := wasmCheckpointDir(modulesDir, "sb-corrupt")
+	if err := os.MkdirAll(localPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localPath, "config.json"), []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	sb := &models.Sandbox{
+		ID:              "sb-corrupt",
+		Runtime:         models.RuntimeWasm,
+		Durability:      models.DurabilityDurable,
+		Status:          models.SandboxStatusPassivated,
+		CheckpointPath:  localPath,
+		CloneGeneration: "gen-local-bad",
+		WasmRegistryRef: "test://sb-corrupt:latest",
+		ModuleRef:       "file:///tmp/demo.wasm",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("store.Create: %v", err)
+	}
+
+	puller := &fakeWasmCheckpointStore{pullSrc: remoteSnap}
+	rt := &fakeWasmRecreateRuntime{}
+	svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+	svc.SetWasmRuntime(rt)
+	svc.AttachWasmCheckpointPusher(puller)
+
+	if _, err := svc.rehydrateWasmIfNeeded(ctx, sb, nil); err != nil {
+		t.Fatalf("rehydrateWasmIfNeeded: %v", err)
+	}
+	if puller.pulled != 1 {
+		t.Fatalf("pull count = %d, want 1", puller.pulled)
+	}
+	if _, err := wasmengine.ReadSnapshotDir(localPath, wasmengine.EngineNameWazero()); err != nil {
+		t.Fatalf("local checkpoint should be replaced with valid pull: %v", err)
+	}
+}
+
 func TestRecreateSandboxWasmDurableFailoverE2E(t *testing.T) {
 	ctx := context.Background()
 	modulesDir := t.TempDir()

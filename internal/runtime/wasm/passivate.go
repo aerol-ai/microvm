@@ -77,6 +77,10 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	if err := d.waitWorker(ctx, client, sandbox.ID); err != nil {
 		return nil, err
 	}
+	spawnCount := 0
+	if count, ok := d.supervisorSpawnCount(workerKey); ok {
+		spawnCount = count
+	}
 	if err := client.LoadModule(sandbox.ID, modulePath); err != nil {
 		return nil, fmt.Errorf("load module: %w", err)
 	}
@@ -100,22 +104,23 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	}
 
 	inst := &sandboxInstance{
-		sandboxID:    sandbox.ID,
-		moduleRef:    moduleRef,
-		modulePath:   modulePath,
-		moduleDigest: moduleDigest,
-		socketPath:   socketPath,
-		workDir:      workDir,
-		workerKey:    workerKey,
-		status:       models.SandboxStatusStarted,
-		entryExport:  snap.Config.Entrypoint,
-		baseEnv:      copyStringMap(sandbox.Env),
-		baseArgs:     wasmArgsFromSandbox(sandbox),
-		preopens:     preopensFromBinds(workDir, hostMounts),
-		cpu:          sandbox.CPU,
-		memoryMB:     memoryMB,
-		diskGB:       sandbox.DiskGB,
-		durability:   sandbox.Durability,
+		sandboxID:        sandbox.ID,
+		moduleRef:        moduleRef,
+		modulePath:       modulePath,
+		moduleDigest:     moduleDigest,
+		socketPath:       socketPath,
+		workDir:          workDir,
+		workerKey:        workerKey,
+		workerSpawnCount: spawnCount,
+		status:           models.SandboxStatusStarted,
+		entryExport:      snap.Config.Entrypoint,
+		baseEnv:          copyStringMap(sandbox.Env),
+		baseArgs:         wasmArgsFromSandbox(sandbox),
+		preopens:         preopensFromBinds(workDir, hostMounts),
+		cpu:              sandbox.CPU,
+		memoryMB:         memoryMB,
+		diskGB:           sandbox.DiskGB,
+		durability:       sandbox.Durability,
 	}
 	if inst.entryExport == "" {
 		inst.entryExport = "_start"

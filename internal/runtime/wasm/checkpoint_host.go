@@ -14,6 +14,13 @@ type CheckpointHost interface {
 	RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error)
 }
 
+// LiveCheckpointHost writes a boundary checkpoint without passivating the
+// sandbox. Periodic checkpoint sweeps use this so live sandboxes stay admitted
+// and routable.
+type LiveCheckpointHost interface {
+	CheckpointLiveSandbox(ctx context.Context, sandbox *models.Sandbox) (checkpointPath, cloneGen string, err error)
+}
+
 // MigrationHost streams a boundary checkpoint to a sibling node (§4.4).
 type MigrationHost interface {
 	MigrateSandbox(ctx context.Context, sandbox *models.Sandbox, destDir string) (checkpointPath, cloneGen string, err error)
@@ -25,6 +32,8 @@ type StartHost interface {
 }
 
 var _ CheckpointHost = (*Driver)(nil)
+
+var _ LiveCheckpointHost = (*Driver)(nil)
 
 var _ MigrationHost = (*Driver)(nil)
 

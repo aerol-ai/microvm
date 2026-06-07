@@ -20,17 +20,21 @@ type sandboxInstance struct {
 	socketPath   string
 	workDir      string
 	workerKey    string
-	fromWarmPool bool
-	status       models.SandboxStatus
-	entryExport  string
-	baseEnv      map[string]string
-	baseArgs     []string
-	preopens     []wasmengine.Preopen
-	cpu          float64
-	memoryMB     int
-	diskGB       int
-	durability   string
-	sessions     *sessions.Manager
+	// workerSpawnCount is sampled from the supervisor when this instance is
+	// loaded. If the slot respawns later, the new worker is empty and the
+	// driver must not keep reporting the sandbox as live.
+	workerSpawnCount int
+	fromWarmPool     bool
+	status           models.SandboxStatus
+	entryExport      string
+	baseEnv          map[string]string
+	baseArgs         []string
+	preopens         []wasmengine.Preopen
+	cpu              float64
+	memoryMB         int
+	diskGB           int
+	durability       string
+	sessions         *sessions.Manager
 
 	// Guest HTTP: resolved host port after ephemeral wasip1 bind (0 in caps).
 	resolvedListenPort int

@@ -140,6 +140,17 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := writeFrame(conn, Envelope{Type: MsgPong, SandboxID: env.SandboxID}); err != nil {
 				return err
 			}
+		case MsgInstanceStatus:
+			s.mu.Lock()
+			loaded := s.eng != nil
+			s.mu.Unlock()
+			body, encErr := encodePayload(instanceStatusPayload{Loaded: loaded})
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: env.SandboxID, Payload: body}); err != nil {
+				return err
+			}
 		case MsgTriggerPanic:
 			panic("wasm worker test panic")
 		case MsgLoadModule:

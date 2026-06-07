@@ -17,6 +17,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
+const defaultWasmCheckpointMaxParallel = 64
+
 // DrainWasmSandboxes checkpoints passivatable/durable live WASM sandboxes during
 // graceful shutdown (plans/wasm-runtime.md §4.3).
 func (s *Service) DrainWasmSandboxes(ctx context.Context) error {
@@ -37,8 +39,7 @@ func (s *Service) DrainWasmSandboxes(ctx context.Context) error {
 		return fmt.Errorf("drain wasm: list managed: %w", err)
 	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(known))
+	eligible := make([]*models.Sandbox, 0, len(known))
 	for _, sb := range known {
 		if sb == nil || !s.isWasmSandbox(sb) {
 			continue
@@ -52,22 +53,11 @@ func (s *Service) DrainWasmSandboxes(ctx context.Context) error {
 		if _, live := managed[sb.ID]; !live {
 			continue
 		}
-		wg.Add(1)
-		go func(sandbox *models.Sandbox) {
-			defer wg.Done()
-			if err := s.checkpointWasmSandbox(ctx, host, sandbox); err != nil {
-				errCh <- err
-			}
-		}(sb)
+		eligible = append(eligible, sb)
 	}
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.runWasmCheckpointPool(ctx, eligible, func(sandbox *models.Sandbox) error {
+		return s.checkpointWasmSandbox(ctx, host, sandbox)
+	})
 }
 
 func wasmShouldCheckpoint(durability string) bool {
@@ -116,6 +106,86 @@ func (s *Service) checkpointWasmSandbox(ctx context.Context, host wasmruntime.Ch
 		go s.pushWasmCheckpointBestEffort(sandbox.ID, path)
 	}
 	return nil
+}
+
+func (s *Service) checkpointLiveWasmSandbox(ctx context.Context, host wasmruntime.LiveCheckpointHost, sandbox *models.Sandbox) (err error) {
+	ctx, span := observability.StartSpan(ctx, "wasm.checkpoint.live",
+		attribute.String("sandbox.id", sandbox.ID),
+		attribute.String("durability", sandbox.Durability),
+	)
+	defer func() { observability.EndSpan(span, err) }()
+
+	path, gen, err := host.CheckpointLiveSandbox(ctx, sandbox)
+	if err != nil {
+		s.logger.Warn("wasm live checkpoint failed",
+			"sandbox_id", sandbox.ID,
+			"durability", sandbox.Durability,
+			"error", err,
+		)
+		return nil
+	}
+	if err := s.store.UpdateWasmCheckpoint(ctx, sandbox.ID,
+		string(models.SandboxStatusStarted), path, gen, ""); err != nil {
+		return err
+	}
+	s.logger.Info("wasm live checkpoint written",
+		"sandbox_id", sandbox.ID,
+		"checkpoint", path,
+		slog.String("clone_generation", gen),
+	)
+	if sandbox.Durability == models.DurabilityDurable && s.wasmCheckpointPusher != nil {
+		go s.pushWasmCheckpointBestEffort(sandbox.ID, path)
+	}
+	return nil
+}
+
+func (s *Service) runWasmCheckpointPool(ctx context.Context, sandboxes []*models.Sandbox, fn func(*models.Sandbox) error) error {
+	if len(sandboxes) == 0 {
+		return nil
+	}
+	parallelism := s.wasmCheckpointParallelism()
+	if parallelism > len(sandboxes) {
+		parallelism = len(sandboxes)
+	}
+	jobs := make(chan *models.Sandbox)
+	errCh := make(chan error, len(sandboxes))
+	var wg sync.WaitGroup
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sandbox := range jobs {
+				if err := fn(sandbox); err != nil {
+					errCh <- err
+				}
+			}
+		}()
+	}
+	for _, sandbox := range sandboxes {
+		select {
+		case jobs <- sandbox:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) wasmCheckpointParallelism() int {
+	if s == nil || s.cfg.WasmCheckpointMaxParallel <= 0 {
+		return defaultWasmCheckpointMaxParallel
+	}
+	return s.cfg.WasmCheckpointMaxParallel
 }
 
 func (s *Service) pushWasmCheckpointBestEffort(sandboxID, memSnapDir string) {

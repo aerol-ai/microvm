@@ -397,6 +397,8 @@ func Open(path string) (*Store, error) {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at
 			ON wasm_modules(updated_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_status_ref
+			ON wasm_modules(status, module_ref);`,
 		// wasm_state_kv backs the durable host-KV capability (§4.6).
 		`CREATE TABLE IF NOT EXISTS wasm_state_kv (
 			sandbox_id TEXT NOT NULL,
@@ -636,6 +638,18 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_template_id ON sandboxes(template_id) WHERE template_id <> '';`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create sandboxes template_id index: %w", err)
+	}
+
+	// WASM module GC checks whether any sandbox still references a catalogue
+	// row by module_ref or module_digest. These columns are compatibility
+	// migrations, so create the indexes after the ALTER loop above.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_module_ref ON sandboxes(module_ref) WHERE module_ref <> '';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes module_ref index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandboxes_module_digest ON sandboxes(module_digest) WHERE module_digest <> '';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create sandboxes module_digest index: %w", err)
 	}
 
 	// SQLite materialized the DB file (and the WAL/SHM sidecars on the

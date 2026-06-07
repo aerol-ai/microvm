@@ -94,6 +94,27 @@ func TestWasmDispatch_RoutesToDriver(t *testing.T) {
 	}
 }
 
+func TestWasmDispatch_OmittedMemoryUsesWasmDefault(t *testing.T) {
+	rt := &wasmRecordingRuntime{err: errors.New("driver stub")}
+	svc := &Service{cfg: config.Config{
+		Runtime:             models.RuntimeDocker,
+		EnableWasm:          true,
+		WasmDefaultMemoryMB: 256,
+	}}
+	svc.SetWasmRuntime(rt)
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:   "demo.wasm",
+		Runtime: models.RuntimeWasm,
+	})
+	if err == nil || !strings.Contains(err.Error(), "driver stub") {
+		t.Fatalf("expected driver error, got %v", err)
+	}
+	if rt.lastCreateReq.MemoryMB != 256 {
+		t.Fatalf("memory_mb = %d, want wasm default 256", rt.lastCreateReq.MemoryMB)
+	}
+}
+
 func TestWasmDispatch_ModuleRefWithoutImage(t *testing.T) {
 	rt := &wasmRecordingRuntime{err: errors.New("driver stub")}
 	svc := &Service{cfg: config.Config{Runtime: models.RuntimeDocker, EnableWasm: true}}

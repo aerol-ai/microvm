@@ -42,6 +42,12 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if strings.TrimSpace(req.Image) == "" {
 		req.Image = moduleRef
 	}
+	if req.MemoryMB <= 0 {
+		req.MemoryMB = s.cfg.WasmDefaultMemoryMB
+		if req.MemoryMB <= 0 {
+			req.MemoryMB = models.DefaultMemoryMB
+		}
+	}
 
 	var lifecycle models.Lifecycle
 	if req.Lifecycle != nil {

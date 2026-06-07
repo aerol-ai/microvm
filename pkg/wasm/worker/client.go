@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
@@ -40,6 +41,57 @@ func (c *Client) roundTrip(env Envelope) (Envelope, error) {
 	return reply, nil
 }
 
+func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		conn, err := c.dial(c.socketPath)
+		select {
+		case ch <- dialResult{conn: conn, err: err}:
+		case <-done:
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}()
+	var res dialResult
+	select {
+	case res = <-ch:
+	case <-ctx.Done():
+		return Envelope{}, ctx.Err()
+	}
+	if res.err != nil {
+		return Envelope{}, res.err
+	}
+	conn := res.conn
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	if err := writeFrame(conn, env); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Envelope{}, ctxErr
+		}
+		return Envelope{}, err
+	}
+	reply, err := readFrame(conn)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Envelope{}, ctxErr
+		}
+		return Envelope{}, err
+	}
+	return reply, nil
+}
+
 func (c *Client) expectOK(reply Envelope) error {
 	if reply.Type == MsgError {
 		var p errorPayload
@@ -64,6 +116,29 @@ func (c *Client) Ping(sandboxID string) error {
 		return fmt.Errorf("unexpected reply type %q", reply.Type)
 	}
 	return nil
+}
+
+// InstanceLoaded reports whether the worker currently has an engine/module loaded.
+func (c *Client) InstanceLoaded(ctx context.Context, sandboxID string) (bool, error) {
+	reply, err := c.roundTripContext(ctx, Envelope{Type: MsgInstanceStatus, SandboxID: sandboxID})
+	if err != nil {
+		return false, err
+	}
+	if reply.Type == MsgError {
+		var p errorPayload
+		if err := decodePayload(reply.Payload, &p); err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("%s", p.Message)
+	}
+	if reply.Type != MsgOK {
+		return false, fmt.Errorf("unexpected reply type %q", reply.Type)
+	}
+	var p instanceStatusPayload
+	if err := decodePayload(reply.Payload, &p); err != nil {
+		return false, err
+	}
+	return p.Loaded, nil
 }
 
 // LoadModule compiles the module at path inside the worker process.
@@ -138,12 +213,12 @@ func (c *Client) Invoke(sandboxID, export string) error {
 }
 
 // Checkpoint writes a mem.snap artifact to outDir.
-func (c *Client) Checkpoint(sandboxID, outDir string, meta wasmengine.SnapshotConfig) error {
+func (c *Client) Checkpoint(ctx context.Context, sandboxID, outDir string, meta wasmengine.SnapshotConfig) error {
 	body, err := encodePayload(checkpointPayload{OutDir: outDir, Meta: meta})
 	if err != nil {
 		return err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgCheckpoint, SandboxID: sandboxID, Payload: body})
+	reply, err := c.roundTripContext(ctx, Envelope{Type: MsgCheckpoint, SandboxID: sandboxID, Payload: body})
 	if err != nil {
 		return err
 	}
