@@ -1,6 +1,6 @@
 # WASM-based Sandboxes — Design & Implementation Plan
 
-Status: **Mostly implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover + multi-node owner-watcher WASM soak, UC-43 worker NetMediator + engine NetworkHook (`aerol/vm/net` egress + wasip1 listener context) + IPC byte accounting + gateway merge, UC-44 RemoveImage/module GC + warm-pool eviction, AOCR tag prune, wasm OTEL spans, toolhost sessions/exec-stream/code-run + Daytona `/process/session*` parity, UC-42b wasmtime CGo engine behind `-tags wasmtime` + `SB_WASM_ENGINE`, and interpreter routes matching toolboxd 501) · Owner: TBD · Created: 2026-06-07
+Status: **Mostly implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover + multi-node owner-watcher WASM soak, UC-43 worker NetMediator + engine NetworkHook (`aerol/vm/net` egress + wasip1 listener context) + IPC byte accounting + gateway merge, UC-44 RemoveImage/module GC + warm-pool eviction, AOCR tag prune, wasm OTEL spans, toolhost sessions/exec-stream/code-run + Daytona `/process/session*` parity, UC-42b wasmtime CGo engine behind `-tags wasmtime` + `SB_WASM_ENGINE`, and interpreter routes matching toolboxd 501) · **wazero pinned at v1.12.0** (latest stable 1.x; bump on routine dep updates) · **UC-31/43 networking (pkg/wasm): wasip1 listener + `aerol/vm/net` egress + P2-shaped compat host modules + inbound byte metering landed; driver lifecycle wiring for expose→serve still open** · Owner: TBD · Created: 2026-06-07
 
 This plan adds a **fourth runtime** to AerolVM — WebAssembly (WASM/WASI) — as a
 peer to `docker`, `gvisor`, and `firecracker`. The design principle is the one
@@ -144,6 +144,26 @@ plugins) this is the right tradeoff — startup latency and density dominate.
 The engine seam (`pkg/wasm.Engine`) keeps `wasmtime-go` (CGo, Cranelift JIT) a
 drop-in for compute-heavy operators who accept the CGo build.
 
+**Version policy (2026-06-07):** Pin `github.com/tetratelabs/wazero` at the
+latest stable **1.x** release (currently **v1.12.0** in `go.mod`). Bump on
+routine dependency updates — not because wazero will gain native Preview 2 /
+Component Model support (upstream explicitly defers that to other runtimes).
+
+**Networking on wazero (shipped in `pkg/wasm/`):**
+
+- **Egress:** custom `aerol/vm/net` host module (TCP connect/read/write) with
+  `NetworkHook` policy + byte metering; wasmtime path implements the same hook.
+- **Ingress (HTTP preview URL):** wasip1 `sock_*` listener on a pre-open fd
+  (`WASIListenPort`); worker `ProxyHTTP` bridges to the guest. Guest must run an
+  HTTP server on that fd (e.g. wazero's Go `wasi http` test guest).
+- **P2-shaped compat:** Aerol host modules `wasi:sockets` / `wasi:http` map to
+  `aerol/vm/net` for guests compiled against Preview 2 import names — **not**
+  spec-faithful WASI P2 or the Component Model.
+- **Still open:** `internal/runtime/wasm` create/lifecycle does not yet enable
+  listen before `_start`, re-run `_start` after `SetListenPort`, or wire
+  ephemeral port-0 through `expose_port` → full UC-31 end-to-end without manual
+  worker steps.
+
 **What is NOT possible / changes vs. firecracker** (honest limits, per the ask):
 
 1. **Arbitrary unmodified Linux binaries don't run.** A WASM sandbox runs a
@@ -158,10 +178,15 @@ drop-in for compute-heavy operators who accept the CGo build.
    workload. We move the toolbox file/exec/session semantics to the **host**
    (see §3) — the host runtime driver owns the WASI virtual FS and the module
    lifecycle, so it can serve `/v1/.../files`, `/exec`, `/sessions` directly.
-3. **Full POSIX networking is limited.** Inbound HTTP works via
-   `wasi-http`/host listener; outbound sockets via `wasi-sockets` (Preview 2)
-   are gated behind capabilities. Raw netfilter byte-quotas become host-counted
-   byte meters on the mediated socket, not iptables rules.
+3. **Full POSIX networking is limited.** Inbound HTTP works via **wasip1**
+   `sock_*` on a pre-open listener fd (`WASIListenPort` + worker `ProxyHTTP`);
+   outbound TCP via **`aerol/vm/net`** (not kernel sockets inside the guest).
+   Guests that import **`wasi:http` / `wasi:sockets`** (Preview 2 names) are
+   served by **Aerol compat host modules** (`wazero_wasi_compat.go`) — not
+   native wazero P2. wazero 1.x will not ship Component Model support; use
+   wasmtime (`-tags wasmtime`) if true P2/components are required later. Raw
+   netfilter byte-quotas become host-counted byte meters on the mediated socket,
+   not iptables rules.
 4. **GPU passthrough: not supported** initially (same as Firecracker Phase 1).
    WASI-NN is a future axis for ML inference.
 
@@ -697,7 +722,8 @@ them here so the implementer doesn't reinvent them under pressure.
 11. **Polyglot** — Rust, Go (TinyGo), C/C++, Zig, plus WASM-packaged Python/JS/Ruby interpreters.
 12. **Per-call billing granularity** — meter and bill at the function-invocation level, not the VM-uptime level.
 13. **Worker-isolated multi-tenancy** — one wazero module per worker subprocess (§2.1). Crash blast radius is one sandbox, matching Firecracker's failure-domain model, without per-tenant VMs.
-14. **Component composition** — WASI Preview 2 components can be linked (one sandbox composed of several capability-scoped components).
+14. **Component composition** — WASI Preview 2 components can be linked on the
+    **wasmtime** engine path only; wazero remains wasip1 + Aerol compat shims.
 15. **Boundary snapshot = small, portable image** — a host-boundary snapshot (memory + globals + WASI state) is single-digit MB and arch-independent, enabling fast checkpoint/rehydrate and cross-node live migration (§4.3–4.4). Not a faithful mid-execution VM snapshot.
 
 ---
@@ -798,6 +824,13 @@ pkg/wasm/                         Low-level engine wrapper (analog of pkg/firecr
   instance.go                       Instance handle: stdin/stdout/stderr pipes, fuel, epoch deadline
   capabilities.go                   WASI capability config: preopens, env, clocks, sockets, args
   fuel.go                           CPU-fuel / epoch-interruption metering helpers
+  net_meter.go                      Inbound/outbound byte counters (NetworkHook.Meter)
+  network_hook.go                   NetworkHook interface (policy + metering)
+  wazero_network.go                 wazero `aerol/vm/net` host module + tcp_read/write
+  wazero_wasi_compat.go             P2-shaped `wasi:sockets` / `wasi:http` → aerol/vm/net
+  wazero_wasip1_meter.go              Function listeners on sock_recv/send/accept
+  wazero_listen.go                  ResolvedListenPort via wasip1 listener context
+  wasmtime_network.go               wasmtime NetworkHook (SetNetworkHook/ClearNetworkHook)
   snapshot.go                       Boundary snapshot: capture {memory,globals,WASI state}, checksum, restore, clone (§4.1)
   snapshot_codec.go                 Pack/unpack a §4.8.1 versioned OCI artifact for AOCR (renamed from snapshot_oci.go per D8)
                                     File-header doc comment enumerates the contract for both snapshot.go and snapshot_codec.go
@@ -807,7 +840,8 @@ pkg/wasm/                         Low-level engine wrapper (analog of pkg/firecr
     supervisor.go                     Spawn/respawn workers; one wazero per worker; crash isolation
     client.go                         Driver-side: per-worker UDS client; CBOR framing
     server.go                         Worker-side: UDS server; runs as `sandboxd --wasm-worker`
-    protocol.go                       Message types: Invoke, InvokeResult, Checkpoint, Restore, SetCapability, NetstatsTick, HealthPing
+    protocol.go                       Message types: Invoke, InvokeResult, Checkpoint, Restore, SetCapability, SetListenPort, NetstatsTick, HealthPing
+    proxy_http.go                     Worker-side HTTP reverse proxy to guest wasip1 listener
     *_test.go                         Includes the D10 release-gate test (panic in host func → daemon survives)
   engine_wasmtime.go                (optional, build tag `wasmtime`) CGo Cranelift engine for UC-42b fuel
   *_test.go
@@ -1158,12 +1192,12 @@ Each phase is independently mergeable because the `Runtime` surface stays stable
 | 21,22,23,24,26 | `internal/runtime/wasm/toolhost/`, `pkg/wasmmod` (interpreter modules), `internal/pool/wasm` |
 | 25,29 | `pkg/wasm/snapshot.go` determinism + reuse of `cmd/toolboxd/clonegen.go` reseed model |
 | 27,28 | `pkg/wasm/snapshot.go` (boundary capture, §4.1), `internal/service/wasm_snapshot.go` |
-| 31,32,33 | `pkg/caddy` (reuse) + `internal/runtime/wasm/network.go` host listener |
+| 31,32,33 | `pkg/caddy` (reuse) + `internal/runtime/wasm/network.go` + `pkg/wasm/{wazero_network,wazero_listen,worker/proxy_http}.go` — **engine/worker path landed; driver create→expose→serve lifecycle still open for UC-31** |
 | 35 | `pkg/secrets` (reuse) + env injection in `internal/runtime/wasm/create.go` |
 | 36 | `pkg/mounts` (reuse) surfaced as WASI preopens in `pkg/wasm/capabilities.go` |
 | 37,38 | `internal/cluster` (reuse) + WASM footprint in placement |
 | 39 | `internal/cluster` failover + `durable` re-hydrate from host KV (§4.6); `passivatable`/`ephemeral` recreate per §4.5 |
-| 41,42,43 | `internal/observability` (reuse) + `internal/runtime/wasm` + `pkg/wasm/fuel.go` |
+| 41,42,43 | `internal/observability` (reuse) + `internal/runtime/wasm` + `pkg/wasm/{fuel,net_meter,wazero_wasip1_meter}.go` |
 | 44,45 | `internal/service/wasm_module.go` GC + `pkg/wasmmod/validate.go` |
 | 46 | graceful drain in `internal/runtime/wasm/driver.go` + `checkpoint.go` (ctx cancel + drain to boundary) |
 | 47,48 | 5 SDKs + Daytona/E2B facade translation carrying `runtime:"wasm"` |
@@ -1187,9 +1221,13 @@ All 56 use cases trace to a concrete component; the 40-minimum bar is exceeded.
 2. **Module catalogue scope**: lazy-resolve-on-create only, or also expose
    `POST /v1/wasm-modules` pre-build like `/v1/templates`? Plan keeps catalogue
    internal first, exposes later if needed.
-3. **WASI Preview 1 vs Preview 2 (Components)**: P1 ships first (broadest tool
-   support); P2 components are a Phase 6+ axis (composition, `wasi-http`,
-   `wasi-sockets`). Confirm acceptable.
+3. **WASI Preview 1 vs Preview 2 (Components) — decided (2026-06-07):**
+   Ship **wasip1 first** plus Aerol **P2-shaped compat host modules**
+   (`wazero_wasi_compat.go`) and **`aerol/vm/net`** for egress. Do **not**
+   block on wazero native P2 — upstream will not implement it. Track wazero
+   **latest 1.x** (v1.12.0) for wasip1 fixes only. True Component Model /
+   spec-faithful `wasi-http` is a **wasmtime** (`-tags wasmtime`) or
+   lower-to-core-wasm axis if needed later.
 4. **Do we persist a warm-instance pool table?** Plan says no (in-process,
    cheap to rebuild) — flag if durable slot identity is wanted for metrics
    continuity across daemon restarts.
