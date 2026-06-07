@@ -79,6 +79,8 @@ type Service struct {
 	// unless pkg/daemon has called SetWasmRuntime when cfg.EnableWasm is
 	// true.
 	wasm runtime.Runtime
+	// wasmModuleResolver resolves module_ref for POST /v1/wasm-modules.
+	wasmModuleResolver WasmModuleResolver
 	// templateBuilder is the Phase 2 OCI→ext4 builder used by the
 	// template lifecycle (internal/service/template.go). Nil unless main
 	// has called SetTemplateBuilder — which only happens when

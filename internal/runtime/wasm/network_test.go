@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +52,33 @@ func TestHTTPListenerAllowlist(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("after sync status = %d", resp.StatusCode)
+	}
+}
+
+func TestNetworkByteCounters(t *testing.T) {
+	g := newNetworkGateway()
+	ctx := context.Background()
+	dial, err := g.EnsureHTTPListener(ctx, "sb-bytes", 5000)
+	if err != nil {
+		t.Fatalf("EnsureHTTPListener: %v", err)
+	}
+	g.SyncAllowedPorts("sb-bytes", []int{5000})
+
+	body := "hello-ingress"
+	resp, err := http.Post("http://"+dial+"/", "text/plain", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	deltas := g.DrainNetworkByteCounters()
+	d := deltas["sb-bytes"]
+	if d.BytesIn < int64(len(body)) {
+		t.Fatalf("bytes in = %d, want >= %d", d.BytesIn, len(body))
+	}
+	if d.BytesOut == 0 {
+		t.Fatalf("expected non-zero egress bytes for error response")
 	}
 }
 

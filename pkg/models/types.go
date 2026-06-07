@@ -1132,3 +1132,36 @@ type CreateTemplateRequest struct {
 	Image      string `json:"image"`
 	MinSizeMiB int    `json:"min_size_mib,omitempty"`
 }
+
+// WasmModuleStatus is the catalogue lifecycle for POST /v1/wasm-modules rows.
+type WasmModuleStatus string
+
+const (
+	WasmModuleStatusReady  WasmModuleStatus = "ready"
+	WasmModuleStatusFailed WasmModuleStatus = "failed"
+)
+
+// WasmModule is one row in the wasm_modules catalogue (plans/wasm-runtime.md).
+type WasmModule struct {
+	ID              string           `json:"id"`
+	ModuleRef       string           `json:"module_ref"`
+	Status          WasmModuleStatus `json:"status"`
+	ModulePath      string           `json:"-"`
+	ModuleSizeBytes int64            `json:"module_size_bytes,omitempty"`
+	Digest          string           `json:"digest,omitempty"`
+	Entrypoint      string           `json:"entrypoint,omitempty"`
+	HasWarm         bool             `json:"has_warm"`
+	LastError       string           `json:"last_error,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+	UpdatedAt       time.Time        `json:"updated_at"`
+	ReadyAt         *time.Time       `json:"ready_at,omitempty"`
+}
+
+// CreateWasmModuleRequest is the body for POST /v1/wasm-modules. ID is
+// optional — empty means the service uses the module digest as the
+// catalogue id. ModuleRef is resolved synchronously on this host.
+type CreateWasmModuleRequest struct {
+	ID         string `json:"id,omitempty"`
+	ModuleRef  string `json:"module_ref"`
+	Entrypoint string `json:"entrypoint,omitempty"`
+}

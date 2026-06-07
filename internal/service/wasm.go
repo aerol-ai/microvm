@@ -28,12 +28,6 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
-	if req.NetworkBlockAll {
-		return nil, unsupportedWasmOption("network_block_all")
-	}
-	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
-		return nil, unsupportedWasmOption("network byte limits")
-	}
 	if strings.TrimSpace(req.TemplateID) != "" {
 		return nil, fmt.Errorf("runtime %q does not support template_id (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)

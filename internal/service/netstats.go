@@ -138,6 +138,21 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 	if sandbox == nil {
 		return
 	}
+	if s.isWasmSandbox(sandbox) {
+		s.syncWasmNetworkPolicy(sandbox, overIn, overOut)
+		if overIn || overOut {
+			if err := s.store.MarkNetworkQuotaExceeded(ctx, sandbox.ID, time.Now().UTC()); err != nil && !errors.Is(err, store.ErrNotFound) {
+				s.logger.Warn("mark network quota exceeded failed",
+					"sandbox_id", sandbox.ID, "error", err)
+			}
+		} else if sandbox.NetworkQuotaExceeded {
+			if err := s.store.ClearNetworkQuotaExceeded(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+				s.logger.Warn("clear network quota exceeded failed",
+					"sandbox_id", sandbox.ID, "error", err)
+			}
+		}
+		return
+	}
 
 	// iptables reconciliation needs an IP to install rules against. A
 	// sandbox in a state with no ContainerIP (stopped, between create and
@@ -228,6 +243,11 @@ func (l netstatsServiceLister) NetstatsTargets(ctx context.Context) []netstats.T
 type netstatsServiceSink struct{ svc *Service }
 
 func (k netstatsServiceSink) HandleSamples(ctx context.Context, samples []netstats.Sample) {
+	k.svc.drainWasmNetworkCounters(ctx)
+	k.handleNetworkSamples(ctx, samples)
+}
+
+func (k netstatsServiceSink) handleNetworkSamples(ctx context.Context, samples []netstats.Sample) {
 	if len(samples) == 0 {
 		return
 	}

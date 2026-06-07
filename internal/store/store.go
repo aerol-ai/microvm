@@ -4598,20 +4598,9 @@ func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) 
 	defer rows.Close()
 	var out []WasmModuleRecord
 	for rows.Next() {
-		var rec WasmModuleRecord
-		var hasWarm int
-		var readyAt sql.NullTime
-		if err := rows.Scan(
-			&rec.ID, &rec.ModuleRef, &rec.Status, &rec.ModulePath, &rec.ModuleSizeBytes,
-			&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError,
-			&rec.CreatedAt, &rec.UpdatedAt, &readyAt,
-		); err != nil {
+		rec, err := scanWasmModule(rows)
+		if err != nil {
 			return nil, err
-		}
-		rec.HasWarm = hasWarm != 0
-		if readyAt.Valid {
-			t := readyAt.Time
-			rec.ReadyAt = &t
 		}
 		out = append(out, rec)
 	}
@@ -4635,6 +4624,76 @@ func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef 
 		return false, err
 	}
 	return true, nil
+}
+
+// ErrWasmModuleIDConflict is returned when POST /v1/wasm-modules reuses an id
+// bound to a different module_ref.
+var ErrWasmModuleIDConflict = errors.New("wasm module id already in use")
+
+// ErrWasmModuleInUse blocks DELETE while a sandbox still references the module.
+var ErrWasmModuleInUse = errors.New("wasm module is referenced by an active sandbox")
+
+func scanWasmModule(row interface {
+	Scan(dest ...any) error
+}) (WasmModuleRecord, error) {
+	var rec WasmModuleRecord
+	var hasWarm int
+	var readyAt sql.NullTime
+	if err := row.Scan(
+		&rec.ID, &rec.ModuleRef, &rec.Status, &rec.ModulePath, &rec.ModuleSizeBytes,
+		&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError,
+		&rec.CreatedAt, &rec.UpdatedAt, &readyAt,
+	); err != nil {
+		return WasmModuleRecord{}, err
+	}
+	rec.HasWarm = hasWarm != 0
+	if readyAt.Valid {
+		t := readyAt.Time
+		rec.ReadyAt = &t
+	}
+	return rec, nil
+}
+
+// GetWasmModule returns one wasm_modules row by catalogue id.
+func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return WasmModuleRecord{}, errors.New("get wasm module: id required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		FROM wasm_modules WHERE id = ?`, id)
+	rec, err := scanWasmModule(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WasmModuleRecord{}, ErrNotFound
+		}
+		return WasmModuleRecord{}, fmt.Errorf("get wasm module: %w", err)
+	}
+	return rec, nil
+}
+
+// ListWasmModules returns all catalogue rows newest-first.
+func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		FROM wasm_modules
+		ORDER BY created_at DESC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list wasm modules: %w", err)
+	}
+	defer rows.Close()
+	var out []WasmModuleRecord
+	for rows.Next() {
+		rec, err := scanWasmModule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }
 
 // DeleteWasmModule removes a wasm_modules catalogue row.

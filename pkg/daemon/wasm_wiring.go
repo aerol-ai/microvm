@@ -23,6 +23,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)
 	svc.SetWasmRuntime(driver)
+	svc.SetWasmModuleResolver(resolver)
 
 	var pool *wasmpool.Pool
 	if cfg.WasmPoolEnabled {

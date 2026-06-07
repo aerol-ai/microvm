@@ -197,8 +197,8 @@ func TestPollerSkipsStoppedContainers(t *testing.T) {
 	p := NewPoller(slog.Default(), reader, lookup, lister, sink, time.Second)
 
 	p.tick(context.Background(), time.Unix(1000, 0))
-	if len(sink.batches) != 0 {
-		t.Fatalf("expected no samples for stopped container, got %#v", sink.batches)
+	if len(sink.batches) != 1 || len(sink.batches[0]) != 0 {
+		t.Fatalf("expected one empty sink batch for stopped container, got %#v", sink.batches)
 	}
 }
 

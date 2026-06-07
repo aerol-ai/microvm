@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 )
 
 // PortGateway is the host-mediated HTTP ingress surface for WASM sandboxes.
@@ -18,10 +19,25 @@ type PortGateway interface {
 	SyncAllowedPorts(sandboxID string, ports []int)
 }
 
+// NetworkByteCounter drains ingress/egress byte deltas observed at the HTTP mediator.
+type NetworkByteCounter interface {
+	DrainNetworkByteCounters() map[string]struct{ BytesIn, BytesOut int64 }
+}
+
+// NetworkPolicySink applies ingress/egress quota blocks at the mediator.
+type NetworkPolicySink interface {
+	SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool)
+}
+
 // AsPortGateway returns the HTTP ingress surface when rt implements it.
 func AsPortGateway(rt any) (PortGateway, bool) {
 	pg, ok := rt.(PortGateway)
 	return pg, ok
+}
+
+type sandboxNetUsage struct {
+	bytesIn  atomic.Int64
+	bytesOut atomic.Int64
 }
 
 type httpListener struct {
@@ -36,13 +52,24 @@ type networkGateway struct {
 	listeners map[string]map[int]*httpListener
 	// sandboxID -> allowed guest ports (from expose_port / syncAllowedPorts)
 	allowed map[string]map[int]struct{}
+	usage   map[string]*sandboxNetUsage
+	blocked map[string]struct{ ingress, egress bool }
 }
 
 func newNetworkGateway() *networkGateway {
 	return &networkGateway{
 		listeners: make(map[string]map[int]*httpListener),
 		allowed:   make(map[string]map[int]struct{}),
+		usage:     make(map[string]*sandboxNetUsage),
+		blocked:   make(map[string]struct{ ingress, egress bool }),
 	}
+}
+
+func (g *networkGateway) usageFor(sandboxID string) *sandboxNetUsage {
+	if g.usage[sandboxID] == nil {
+		g.usage[sandboxID] = &sandboxNetUsage{}
+	}
+	return g.usage[sandboxID]
 }
 
 func (g *networkGateway) EnsureHTTPListener(_ context.Context, sandboxID string, guestPort int) (string, error) {
@@ -97,6 +124,8 @@ func (g *networkGateway) ReleaseSandbox(sandboxID string) {
 		g.closeListenerLocked(sandboxID, port)
 	}
 	delete(g.allowed, sandboxID)
+	delete(g.usage, sandboxID)
+	delete(g.blocked, sandboxID)
 }
 
 func (g *networkGateway) SyncAllowedPorts(sandboxID string, ports []int) {
@@ -114,21 +143,70 @@ func (g *networkGateway) SyncAllowedPorts(sandboxID string, ports []int) {
 	g.allowed[sandboxID] = set
 }
 
+func (g *networkGateway) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if sandboxID == "" {
+		return
+	}
+	g.blocked[sandboxID] = struct{ ingress, egress bool }{ingress: blockIngress, egress: blockEgress}
+}
+
+func (g *networkGateway) DrainNetworkByteCounters() map[string]struct{ BytesIn, BytesOut int64 } {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.usage) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{ BytesIn, BytesOut int64 }, len(g.usage))
+	for id, u := range g.usage {
+		out[id] = struct{ BytesIn, BytesOut int64 }{
+			BytesIn:  u.bytesIn.Swap(0),
+			BytesOut: u.bytesOut.Swap(0),
+		}
+	}
+	return out
+}
+
 func (g *networkGateway) serveHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) {
-	if !g.portAllowed(sandboxID, guestPort) {
+	g.mu.Lock()
+	block := g.blocked[sandboxID]
+	if block.ingress {
+		g.mu.Unlock()
+		http.Error(w, "network ingress blocked", http.StatusForbidden)
+		return
+	}
+	if !g.portAllowedLocked(sandboxID, guestPort) {
+		g.mu.Unlock()
 		http.Error(w, "port not allowed", http.StatusForbidden)
 		return
 	}
-	_, _ = io.Copy(io.Discard, r.Body)
-	_ = r.Body.Close()
+	usage := g.usageForLocked(sandboxID)
+	g.mu.Unlock()
+
+	if r.Body != nil {
+		body := &byteCountReader{r: r.Body, counter: &usage.bytesIn}
+		_, _ = io.Copy(io.Discard, body)
+		_ = body.Close()
+	}
+	if block.egress {
+		http.Error(w, "network egress blocked", http.StatusForbidden)
+		return
+	}
 	// Guest wasi-http bridging is a later phase; the listener exists so Caddy
 	// and ingress can route end-to-end while the worker HTTP surface lands.
-	http.Error(w, "wasm guest http not connected", http.StatusServiceUnavailable)
+	cw := &byteCountWriter{ResponseWriter: w, counter: &usage.bytesOut}
+	http.Error(cw, "wasm guest http not connected", http.StatusServiceUnavailable)
 }
 
-func (g *networkGateway) portAllowed(sandboxID string, guestPort int) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+func (g *networkGateway) usageForLocked(sandboxID string) *sandboxNetUsage {
+	if g.usage[sandboxID] == nil {
+		g.usage[sandboxID] = &sandboxNetUsage{}
+	}
+	return g.usage[sandboxID]
+}
+
+func (g *networkGateway) portAllowedLocked(sandboxID string, guestPort int) bool {
 	ports := g.allowed[sandboxID]
 	if len(ports) == 0 {
 		return false
@@ -151,4 +229,34 @@ func (g *networkGateway) closeListenerLocked(sandboxID string, guestPort int) {
 	if len(ports) == 0 {
 		delete(g.listeners, sandboxID)
 	}
+}
+
+type byteCountReader struct {
+	r       io.ReadCloser
+	counter *atomic.Int64
+}
+
+func (b *byteCountReader) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if n > 0 {
+		b.counter.Add(int64(n))
+	}
+	return n, err
+}
+
+func (b *byteCountReader) Close() error {
+	return b.r.Close()
+}
+
+type byteCountWriter struct {
+	http.ResponseWriter
+	counter *atomic.Int64
+}
+
+func (w *byteCountWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if n > 0 {
+		w.counter.Add(int64(n))
+	}
+	return n, err
 }
