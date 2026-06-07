@@ -50,6 +50,13 @@ func TestWorkerColdPathLoadInstantiateInvoke(t *testing.T) {
 	if err := client.Invoke(sandboxID, "_start"); err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
+	run, err := client.Exec(sandboxID, wasmengine.Capabilities{Args: []string{"exec-test"}}, "_start")
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if run.ExitCode != 0 {
+		t.Fatalf("exit code = %d stderr=%q", run.ExitCode, run.Stderr)
+	}
 	if err := client.StopInstance(sandboxID); err != nil {
 		t.Fatalf("StopInstance: %v", err)
 	}

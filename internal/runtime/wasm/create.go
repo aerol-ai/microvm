@@ -47,6 +47,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		workDir:      workDir,
 		status:       models.SandboxStatusCreating,
 		entryExport:  entryExportFromRequest(req),
+		baseEnv:      copyStringMap(req.Env),
+		baseArgs:     wasmArgs(req),
 	}
 
 	d.mu.Lock()
@@ -99,6 +101,17 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.mu.Unlock()
 
 	return d.runtimeState(inst), nil
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func wasmArgs(req models.CreateSandboxRequest) []string {

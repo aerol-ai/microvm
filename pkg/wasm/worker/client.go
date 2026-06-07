@@ -92,6 +92,37 @@ func (c *Client) Instantiate(sandboxID string, caps wasmengine.Capabilities) err
 	return c.expectOK(reply)
 }
 
+// Exec re-instantiates with caps, invokes export, and returns captured IO.
+func (c *Client) Exec(sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error) {
+	body, err := encodePayload(execPayload{Caps: caps, Export: export})
+	if err != nil {
+		return wasmengine.RunResult{}, err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgExec, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return wasmengine.RunResult{}, err
+	}
+	if reply.Type == MsgError {
+		var p errorPayload
+		if err := decodePayload(reply.Payload, &p); err != nil {
+			return wasmengine.RunResult{}, err
+		}
+		return wasmengine.RunResult{}, fmt.Errorf("%s", p.Message)
+	}
+	if reply.Type != MsgInvokeResult {
+		return wasmengine.RunResult{}, fmt.Errorf("unexpected reply type %q", reply.Type)
+	}
+	var p execResultPayload
+	if err := decodePayload(reply.Payload, &p); err != nil {
+		return wasmengine.RunResult{}, err
+	}
+	return wasmengine.RunResult{
+		ExitCode: p.ExitCode,
+		Stdout:   p.Stdout,
+		Stderr:   p.Stderr,
+	}, nil
+}
+
 // Invoke calls an exported function (defaults to _start).
 func (c *Client) Invoke(sandboxID, export string) error {
 	body, err := encodePayload(invokePayload{Export: export})

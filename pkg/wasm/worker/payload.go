@@ -19,6 +19,17 @@ type invokePayload struct {
 	Export string `json:"export"`
 }
 
+type execPayload struct {
+	Caps   wasmengine.Capabilities `json:"caps"`
+	Export string                  `json:"export"`
+}
+
+type execResultPayload struct {
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout,omitempty"`
+	Stderr   string `json:"stderr,omitempty"`
+}
+
 type errorPayload struct {
 	Message string `json:"message"`
 }

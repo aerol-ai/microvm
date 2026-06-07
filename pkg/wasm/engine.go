@@ -12,6 +12,8 @@ type Engine interface {
 	Instantiate(ctx context.Context, caps Capabilities) error
 	// InvokeExport calls an exported function by name.
 	InvokeExport(ctx context.Context, name string) error
+	// Run re-instantiates with caps, invokes export, and captures stdout/stderr.
+	Run(ctx context.Context, caps Capabilities, export string) (RunResult, error)
 	// StopInstance tears down the active instance but keeps the compiled module.
 	StopInstance(ctx context.Context) error
 	// Close releases compiled module and any active instance.

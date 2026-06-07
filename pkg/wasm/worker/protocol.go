@@ -13,6 +13,7 @@ const (
 	MsgLoadModule    MessageType = "load_module"
 	MsgInstantiate   MessageType = "instantiate"
 	MsgInvoke        MessageType = "invoke"
+	MsgExec          MessageType = "exec"
 	MsgStopInstance  MessageType = "stop_instance"
 	MsgOK            MessageType = "ok"
 	MsgError         MessageType = "error"

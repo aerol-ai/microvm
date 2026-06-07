@@ -48,6 +48,9 @@ func (c *recordingWorkerClient) LoadModule(_, path string) error {
 }
 func (c *recordingWorkerClient) Instantiate(string, wasmengine.Capabilities) error { return nil }
 func (c *recordingWorkerClient) Invoke(string, string) error                       { return nil }
+func (c *recordingWorkerClient) Exec(string, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
+	return wasmengine.RunResult{}, nil
+}
 func (c *recordingWorkerClient) StopInstance(string) error {
 	c.stopped = true
 	return nil

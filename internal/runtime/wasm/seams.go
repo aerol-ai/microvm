@@ -25,6 +25,7 @@ type WorkerClient interface {
 	LoadModule(sandboxID, path string) error
 	Instantiate(sandboxID string, caps wasmengine.Capabilities) error
 	Invoke(sandboxID, export string) error
+	Exec(sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error)
 	StopInstance(sandboxID string) error
 }
 
@@ -53,6 +54,10 @@ func (a workerClientAdapter) Instantiate(sandboxID string, caps wasmengine.Capab
 
 func (a workerClientAdapter) Invoke(sandboxID, export string) error {
 	return a.client.Invoke(sandboxID, export)
+}
+
+func (a workerClientAdapter) Exec(sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error) {
+	return a.client.Exec(sandboxID, caps, export)
 }
 
 func (a workerClientAdapter) StopInstance(sandboxID string) error {

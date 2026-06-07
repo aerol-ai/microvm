@@ -18,6 +18,8 @@ type sandboxInstance struct {
 	workDir      string
 	status       models.SandboxStatus
 	entryExport  string
+	baseEnv      map[string]string
+	baseArgs     []string
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {

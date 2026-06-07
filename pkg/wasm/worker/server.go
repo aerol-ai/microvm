@@ -107,6 +107,44 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
+		case MsgExec:
+			var p execPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			if p.Export == "" {
+				p.Export = "_start"
+			}
+			s.mu.Lock()
+			if s.eng == nil {
+				s.mu.Unlock()
+				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
+					return err
+				}
+				continue
+			}
+			result, err := s.eng.Run(ctx, p.Caps, p.Export)
+			s.mu.Unlock()
+			if err != nil && result.ExitCode == 0 && result.Stderr == "" {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			body, encErr := encodePayload(execResultPayload{
+				ExitCode: result.ExitCode,
+				Stdout:   result.Stdout,
+				Stderr:   result.Stderr,
+			})
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgInvokeResult, SandboxID: env.SandboxID, Payload: body}); err != nil {
+				return err
+			}
 		case MsgInvoke:
 			var p invokePayload
 			if err := decodePayload(env.Payload, &p); err != nil {
