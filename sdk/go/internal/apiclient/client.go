@@ -461,6 +461,18 @@ func (c *Client) Mounts(ctx context.Context, id string) ([]models.MountSpecRedac
 	return response.Mounts, nil
 }
 
+// CloneGeneration is the toolbox clone-generation marker (wire shape).
+type CloneGeneration struct {
+	Generation string `json:"generation"`
+	ResumedAt  int64  `json:"resumed_at"`
+}
+
+func (c *Client) CloneGeneration(ctx context.Context, id string) (CloneGeneration, error) {
+	var response CloneGeneration
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/toolbox/clone-generation", nil, &response)
+	return response, err
+}
+
 func (c *Client) GetNetworkUsage(ctx context.Context, id string) (models.NetworkUsage, error) {
 	var response models.NetworkUsage
 	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/network/usage", nil, &response); err != nil {

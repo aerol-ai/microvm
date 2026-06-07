@@ -159,6 +159,49 @@ indefinitely.
 > reseed failure does not destroy the sandbox. The warning log is load-bearing;
 > an operator watching for entropy-divergence regressions greps that signal.
 
+### Closing the entropy window: vmgenid
+
+`post_resume` is **reactive**: it runs after `Action(Resume)`, so the guest is
+already executing with template entropy for the few hundred milliseconds until
+the reseed lands. The robust complement is **synchronous, in-kernel, and needs
+no host round-trip**: Firecracker's **VM Generation ID** (vmgenid).
+
+vmgenid is a 128-bit value Firecracker regenerates on every snapshot restore and
+exposes to the guest through an ACPI device. A guest kernel built with
+`CONFIG_VMGENID` watches that device and, the instant it observes the value
+change on resume, reseeds the kernel CSPRNG from inside the resume path —
+*before* userspace is scheduled again. Code that runs in the window
+`post_resume` cannot reach (early init, systemd units, toolboxd's own startup)
+therefore still draws post-clone entropy. The two mechanisms compose as
+defense-in-depth: vmgenid covers the kernel CSPRNG with zero window, and
+`post_resume` still does the work vmgenid does *not* — it resyncs
+`CLOCK_REALTIME` (vmgenid is entropy-only) and credits additional host entropy
+via `RNDADDENTROPY` + `RNDRESEEDCRNG`.
+
+This only fires when the deployment supplies the pieces, and AerolVM controls
+only one of them in code:
+
+- **Kernel command line (in code).** vmgenid is surfaced over ACPI, so ACPI must
+  stay enabled. `baseBootArgs`
+  (`internal/runtime/firecracker/driver.go`) deliberately omits `acpi=off`;
+  `pci=off` is unrelated and safe. A regression test
+  (`bootargs_test.go`) fails the build if a future edit reintroduces
+  `acpi=off` and silently disables the pre-userspace reseed.
+- **Guest kernel (operator artifact).** The kernel image
+  (`SB_FIRECRACKER_KERNEL`) must be built with `CONFIG_VMGENID=y`. The repo does
+  not build the kernel; verify this at template-build / deploy time.
+- **Firecracker binary (operator artifact).** vmgenid support landed in
+  Firecracker v1.8; `SB_FIRECRACKER_BINARY` must be at least that. On a binary
+  that predates it, the guest never sees a generation-ID change and silently
+  falls back to `post_resume`-only behavior — correct on the happy path, but
+  with the window restored.
+
+vmgenid reseeds the **kernel** CSPRNG. A userspace PRNG already seeded inside a
+long-lived process baked into the template (a preloaded `python` that did
+`import numpy`) is in that process's own heap and is not reached by either
+mechanism; closing that gap needs the clone-generation signal documented in
+[Randomness in Cloned Sandboxes](/randomness-in-cloned-sandboxes).
+
 ## Hazard 3: dial the guest's CID, not the slot's
 
 The vsock handshake hinges on dialing the right CID, and the snapshot path makes
@@ -312,7 +355,11 @@ workload.
 - **Entropy window.** Between `Action(Resume)` and the `post_resume` ack, the
   guest is running with template entropy. Code that runs in that window
   (early init, systemd units, the toolboxd's own startup) draws stale
-  entropy. Quantified in Hazard 2.
+  entropy. Quantified in Hazard 2. **Closed when the deployment supports
+  vmgenid** (Firecracker ≥ v1.8 + a guest kernel with `CONFIG_VMGENID`), which
+  reseeds the kernel CSPRNG in-kernel before userspace runs — see "Closing the
+  entropy window" in Hazard 2. Without that kernel/binary support the window
+  stands.
 - **In-flight guest TCP.** `pre_snapshot` does not quiesce guest-side outbound
   sockets; connections that were open at capture resume broken.
 - **KASLR is not re-randomized across restore.** Every clone has the same

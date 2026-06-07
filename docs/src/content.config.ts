@@ -173,6 +173,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
             label: 'Firecracker Templates',
             description: 'Register OCI images as Firecracker rootfs templates for sub-100ms cold starts; rebuild on demand.',
           },
+          {
+            type: 'link',
+            href: '/randomness-in-cloned-sandboxes',
+            label: 'Randomness in Clones',
+            description: 'Why snapshot clones can share random-number state, what AerolVM reseeds automatically, and how to reseed your own long-lived processes.',
+          },
         ]
       },
       {
@@ -342,6 +348,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     category: NavigationCategory.ENGINEERING,
     homePageHref: '/',
     entries: [
+      {
+        type: 'link',
+        href: '/engineering-distributed-sandbox-runtime',
+        label: 'The Sandbox Runtime Nobody Built',
+        description: 'Every self-hostable sandbox is single-node. Every multi-node sandbox is managed. AerolVM is one Go binary that runs as both, with raw TCP ingress and HA stateful sandboxes that survive host death.',
+      },
       {
         type: 'link',
         href: '/engineering-idempotency',

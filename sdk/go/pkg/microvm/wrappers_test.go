@@ -50,6 +50,8 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/toolbox/files/download":
 			_, _ = w.Write([]byte("file-data"))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/toolbox/clone-generation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"generation": "2d0d8c69", "resumed_at": 1700000000000000000})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandboxes/sb1/ports/8080":
 			_ = json.NewEncoder(w).Encode(models.ExposePortResponse{Protocol: "http", PublicURL: "https://example.test"})
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1/sandboxes/sb1/ports/8080":
@@ -83,6 +85,11 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if _, err := client.Mounts(ctx, "sb1"); err != nil {
 		t.Fatalf("Mounts() error = %v", err)
+	}
+	if gen, err := client.CloneGeneration(ctx, "sb1"); err != nil {
+		t.Fatalf("CloneGeneration() error = %v", err)
+	} else if gen.Generation != "2d0d8c69" || gen.ResumedAt != 1700000000000000000 {
+		t.Fatalf("CloneGeneration() = %+v, want {2d0d8c69 1700000000000000000}", gen)
 	}
 	if _, err := client.GetNetworkUsage(ctx, "sb1"); err != nil {
 		t.Fatalf("GetNetworkUsage() error = %v", err)

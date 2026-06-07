@@ -27,6 +27,7 @@ import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.model.BuildImageOptions;
 import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
+import ai.aerol.microvm.model.CloneGeneration;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CreateTemplateOptions;
@@ -371,6 +372,16 @@ public class MicroVMClient {
 
     public NetworkUsage getNetworkUsage(String sandboxId) {
         return doJson("GET", sandboxPath(sandboxId) + "/network/usage", null, NetworkUsage.class);
+    }
+
+    /**
+     * Reads a sandbox's clone-generation token. The token changes whenever the
+     * sandbox is resumed from a snapshot, so a change signals "this is a clone."
+     * Read-only — the SDK cannot reseed a process inside the guest; see the
+     * "Randomness in cloned sandboxes" docs for the in-guest reseed pattern.
+     */
+    public CloneGeneration cloneGeneration(String sandboxId) {
+        return doJson("GET", sandboxPath(sandboxId) + "/toolbox/clone-generation", null, CloneGeneration.class);
     }
 
     public NetworkUsage setNetworkLimits(String sandboxId, SetNetworkLimitsOptions options) {

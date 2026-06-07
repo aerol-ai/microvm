@@ -157,7 +157,7 @@ func TestVsock_UnknownOpReturnsError(t *testing.T) {
 
 func TestVsock_MissingOp(t *testing.T) {
 	host, guest := newPipePair()
-	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil))
+	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil, nil))
 
 	_, _ = host.Write([]byte(`{}` + "\n"))
 	var resp VsockResponse
@@ -209,7 +209,7 @@ func TestVsock_HandlerErrorDoesNotCloseConn(t *testing.T) {
 // newline). The host should reconnect.
 func TestVsock_DecodeErrorClosesConn(t *testing.T) {
 	host, guest := newPipePair()
-	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil))
+	done := runHandlerInBackground(t, guest, newQuiesceHandler(nil, nil, nil))
 
 	_, _ = host.Write([]byte("not json\n"))
 	var resp VsockResponse
@@ -298,7 +298,7 @@ func TestQuiesceHandler_PreSnapshot_FlushesEverySession(t *testing.T) {
 		ids:       []string{"s1", "s2", "s3"},
 		flushErrs: map[string]error{"s2": errors.New("disk full")},
 	}
-	h := newQuiesceHandler(nil, flusher)
+	h := newQuiesceHandler(nil, flusher, nil)
 	h.quiesce = &fakeQuiesceOps{} // unused for pre_snapshot but avoids nil deref
 
 	if err := h.OnPreSnapshot(context.Background(), nil); err != nil {
@@ -325,7 +325,7 @@ func TestQuiesceHandler_PreSnapshot_FlushesEverySession(t *testing.T) {
 // not gated on the wallclock field's presence.
 func TestQuiesceHandler_PostResume_ResyncsClockAndRNG(t *testing.T) {
 	q := &fakeQuiesceOps{}
-	h := newQuiesceHandler(nil, nil)
+	h := newQuiesceHandler(nil, nil, nil)
 	h.quiesce = q
 
 	raw := json.RawMessage(`{"wallclock_unix_ns":1700000000000000000}`)
@@ -359,7 +359,7 @@ func TestQuiesceHandler_PostResume_RNGReseedAlwaysFires(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := &fakeQuiesceOps{}
-			h := newQuiesceHandler(nil, nil)
+			h := newQuiesceHandler(nil, nil, nil)
 			h.quiesce = q
 			if err := h.OnPostResume(context.Background(), tc.raw); err != nil {
 				t.Fatalf("OnPostResume: %v", err)
@@ -385,10 +385,42 @@ func TestQuiesceHandler_PostResume_QuiesceErrorIsNonFatal(t *testing.T) {
 		reseedErr:    errors.New("entropy pool unavailable"),
 		wallclockErr: errors.New("CAP_SYS_TIME denied"),
 	}
-	h := newQuiesceHandler(nil, nil)
+	h := newQuiesceHandler(nil, nil, nil)
 	h.quiesce = q
 	if err := h.OnPostResume(context.Background(),
 		json.RawMessage(`{"wallclock_unix_ns":12345}`)); err != nil {
 		t.Errorf("OnPostResume returned %v; want nil despite quiesce errors", err)
+	}
+}
+
+// TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure pins the
+// deliberate coupling between the kernel reseed and the clone-generation
+// bump: the token MUST still change when ReseedRandom fails. The token is a
+// clone/migration detector first (SDK cloneGeneration() + in-guest pollers),
+// so a resume that failed to reseed must not also silently fail to register
+// as a clone. On that rare failure an in-guest poller reseeding userspace
+// from the (possibly stale) kernel is no worse than leaving its frozen seed
+// in place; the reseed failure is logged loudly and vmgenid is the backstop.
+// If you intend to gate the bump on reseed success, this test should fail
+// and force that decision to be explicit.
+func TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure(t *testing.T) {
+	cg := newCloneGeneration(t.TempDir()+"/clone-generation", nil)
+	initialToken, _ := cg.current()
+
+	q := &fakeQuiesceOps{reseedErr: errors.New("entropy pool unavailable")}
+	h := newQuiesceHandler(nil, nil, cg)
+	h.quiesce = q
+
+	if err := h.OnPostResume(context.Background(),
+		json.RawMessage(`{"wallclock_unix_ns":777}`)); err != nil {
+		t.Fatalf("OnPostResume returned %v; want nil", err)
+	}
+
+	gotToken, gotResumedAt := cg.current()
+	if gotToken == initialToken {
+		t.Errorf("clone-generation token unchanged after reseed failure (%q); bump must fire regardless of reseed result", gotToken)
+	}
+	if gotResumedAt != 777 {
+		t.Errorf("resumedAt = %d, want 777 (bump records resume time even on reseed failure)", gotResumedAt)
 	}
 }

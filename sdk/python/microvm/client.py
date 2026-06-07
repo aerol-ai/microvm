@@ -19,6 +19,7 @@ from .image import Image
 from .types import (
     BuildImagePushOptions,
     BuildImageResult,
+    CloneGeneration,
     CreateOptions,
     CreateSessionOptions,
     CreateTemplateOptions,
@@ -296,6 +297,14 @@ class Sandbox:
 
     def exec_command(self, command: str) -> ExecResult:
         return self._client.exec(self.id, {"command": command})
+
+    def clone_generation(self) -> CloneGeneration:
+        """Read this sandbox's clone-generation token (changes on resume-from-snapshot).
+
+        Read-only: does not reseed in-guest PRNGs. See the "Randomness in
+        cloned sandboxes" docs page for the in-guest reseed pattern.
+        """
+        return self._client.clone_generation(self.id)
 
     def exec_stream(self, options: ExecStreamOptions) -> ExecStreamHandle:
         return self._client.exec_stream(self.id, options)
@@ -643,6 +652,13 @@ class MicroVM:
         if not isinstance(mounts, list):
             return []
         return [_from_api_mount_spec_redacted(item) for item in mounts]
+
+    def clone_generation(self, sandbox_id: str) -> CloneGeneration:
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/clone-generation", None)
+        return CloneGeneration(
+            generation=str(_first_of(payload, "generation") or ""),
+            resumedAt=int(_first_of(payload, "resumed_at", "resumedAt") or 0),
+        )
 
     def get_network_usage(self, sandbox_id: str) -> NetworkUsage:
         payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)

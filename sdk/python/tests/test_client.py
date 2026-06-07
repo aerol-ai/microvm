@@ -1291,3 +1291,21 @@ class TemplateLifecycleTests(unittest.TestCase):
         with self.assertRaises(client_module.MicroVMHTTPError) as ctx:
             client.rebuild_template("tpl-pending")
         self.assertEqual(ctx.exception.status_code, 412)
+
+
+class CloneGenerationTest(unittest.TestCase):
+    def test_clone_generation_reads_token_via_toolbox_proxy(self):
+        class CloneGenMicroVM(RecordingMicroVM):
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                self.calls.append((method, path, payload))
+                return {"generation": "2d0d8c69", "resumed_at": 1700000000000000000}
+
+        client = CloneGenMicroVM()
+        gen = client.clone_generation("sb-clone")
+
+        self.assertEqual(
+            client.calls[0],
+            ("GET", "/v1/sandboxes/sb-clone/toolbox/clone-generation", None),
+        )
+        self.assertEqual(gen.generation, "2d0d8c69")
+        self.assertEqual(gen.resumedAt, 1700000000000000000)

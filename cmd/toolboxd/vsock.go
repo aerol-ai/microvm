@@ -200,9 +200,10 @@ type quiesceHandler struct {
 	logger   *slog.Logger
 	sessions sessionFlusher
 	quiesce  quiesceOps
+	cloneGen *cloneGeneration
 }
 
-func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher) *quiesceHandler {
+func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher, cloneGen *cloneGeneration) *quiesceHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -210,6 +211,7 @@ func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher) *quiesceHan
 		logger:   logger,
 		sessions: sessions,
 		quiesce:  newQuiesceOps(),
+		cloneGen: cloneGen,
 	}
 }
 
@@ -246,6 +248,20 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 	}
 	if err := h.quiesce.ReseedRandom(); err != nil {
 		h.logger.Warn("vsock post_resume: rng reseed failed", "error", err)
+	}
+	// Bump the clone-generation token on every resume, regardless of the
+	// reseed result above. The token is first a clone/migration *detector*
+	// (the SDK cloneGeneration() reader and in-guest pollers), so it must
+	// change even if the reseed failed — otherwise a clone goes undetected.
+	// Ordered after ReseedRandom so that on the happy path an in-guest poller
+	// reseeds its userspace PRNG from a kernel that already holds fresh
+	// entropy. On the rare reseed failure the kernel may still hold the
+	// snapshot's stale entropy, but reseeding userspace from it is no worse
+	// than leaving the frozen seed in place — both duplicate across clones —
+	// and that failure is logged loudly just above; vmgenid is the real
+	// backstop. See TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure.
+	if h.cloneGen != nil {
+		h.cloneGen.bump(data.WallclockUnixNs)
 	}
 	h.logger.Info("vsock: post_resume complete",
 		"wallclock_set", data.WallclockUnixNs > 0)

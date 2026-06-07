@@ -179,6 +179,20 @@ type BuildImageResult struct {
 	Pushed string
 }
 
+// CloneGeneration is a sandbox's clone-generation marker. Generation changes
+// every time the sandbox is resumed from a snapshot (i.e. it is a clone). A
+// long-lived process running inside the sandbox can poll this and reseed its
+// own userspace PRNGs when the token changes — two clones otherwise share the
+// snapshot's frozen seed state. Read-only: the SDK cannot reseed an in-guest
+// process from the client side. See the "Randomness in cloned sandboxes" docs.
+type CloneGeneration struct {
+	// Generation is an opaque token that changes on every resume-from-snapshot.
+	Generation string `json:"generation"`
+	// ResumedAt is the host wall-clock of the last resume, in unix nanoseconds.
+	// 0 means the sandbox has never been resumed.
+	ResumedAt int64 `json:"resumedAt"`
+}
+
 // RegisterSnapshotOptions is the input shape for Client.RegisterSnapshot.
 // Exactly one of Image (a pre-built registry reference) or
 // DockerfileContent (build inputs the daemon will compile) must be set.

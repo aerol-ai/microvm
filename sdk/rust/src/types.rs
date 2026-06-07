@@ -48,6 +48,23 @@ pub struct BuildImageResult {
     pub pushed: Option<String>,
 }
 
+/// Clone-generation marker for a sandbox.
+///
+/// `generation` changes every time the sandbox is resumed from a snapshot
+/// (i.e. it is a clone). A long-lived process running *inside* the sandbox can
+/// poll this and reseed its own userspace PRNGs when the token changes — two
+/// clones otherwise share the snapshot's frozen seed state. Read-only: the SDK
+/// cannot reseed an in-guest process from the client side. See the "Randomness
+/// in cloned sandboxes" docs page.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CloneGeneration {
+    /// Opaque token that changes on every resume-from-snapshot.
+    pub generation: String,
+    /// Host wall-clock of the last resume, in unix nanoseconds. 0 = never resumed.
+    #[serde(default)]
+    pub resumed_at: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RegisterSnapshotOptions {
     /// Human-readable identifier other callers use in create-time snapshot references.

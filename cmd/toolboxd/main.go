@@ -40,6 +40,7 @@ type server struct {
 	sessions *sessions.Manager
 	daytona  *daytonaCompat
 	envd     *envdCompat
+	cloneGen *cloneGeneration
 }
 
 func (s *server) setAllowedPorts(ports []int) {
@@ -87,6 +88,7 @@ func main() {
 		allowedPorts: map[int]struct{}{},
 		daytona:      newDaytonaCompat(),
 		envd:         newEnvdCompat(),
+		cloneGen:     newCloneGeneration(envString("SB_CLONE_GEN_PATH", defaultCloneGenPath), logger),
 	}
 	// Evict the token from the process env table so child processes spawned
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
@@ -131,7 +133,7 @@ func main() {
 	// Pass srv.sessions (may be nil if the manager failed to init above)
 	// so the handler's pre_snapshot can fsync session recordings; nil
 	// is treated as "no sessions to flush" by the handler.
-	vsockHandler := newQuiesceHandler(logger, newSessionFlusher(srv.sessions))
+	vsockHandler := newQuiesceHandler(logger, newSessionFlusher(srv.sessions), srv.cloneGen)
 	if vs, err := newVsockServer(defaultVsockPort, vsockHandler, logger); err != nil {
 		logger.Warn("vsock listener disabled", "error", err)
 	} else {
@@ -260,6 +262,13 @@ func (s *server) routes() http.Handler {
 			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
 		case r.Method == http.MethodGet && r.URL.Path == "/version":
 			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
+		case r.Method == http.MethodGet && r.URL.Path == "/clone-generation":
+			// Unauthenticated like /health: the token is a non-sensitive
+			// change-detector for snapshot clones, and external access is
+			// gated by the auth'd v1 toolbox proxy. In-guest readers can use
+			// this or the well-known file written by cloneGeneration.
+			token, resumedAt := s.cloneGen.current()
+			writeJSON(w, http.StatusOK, map[string]any{"generation": token, "resumed_at": resumedAt})
 		case strings.HasPrefix(r.URL.Path, "/proxy/"):
 			s.handleProxy(w, r)
 		case strings.HasPrefix(r.URL.Path, "/envd/"):
@@ -432,6 +441,8 @@ func isKnownToolboxPath(path string) bool {
 	case path == "/health":
 		return true
 	case path == "/version":
+		return true
+	case path == "/clone-generation":
 		return true
 	case strings.HasPrefix(path, "/process/"):
 		return true

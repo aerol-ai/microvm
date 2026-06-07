@@ -2,6 +2,7 @@ package ai.aerol.microvm;
 
 import java.util.List;
 
+import ai.aerol.microvm.model.CloneGeneration;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
@@ -42,6 +43,14 @@ public class Sandbox extends SandboxData {
 
     public ExecResult exec(String command) {
         return client.exec(id, new ExecRequest().setCommand(command));
+    }
+
+    /**
+     * Reads this sandbox's clone-generation token (changes on
+     * resume-from-snapshot). Read-only; does not reseed in-guest PRNGs.
+     */
+    public CloneGeneration cloneGeneration() {
+        return client.cloneGeneration(id);
     }
 
     public ExecStreamHandle execStream(ExecStreamOptions options) {

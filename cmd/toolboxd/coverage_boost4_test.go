@@ -21,7 +21,7 @@ import (
 )
 
 func TestQuiesceHandlerOnPing(t *testing.T) {
-	h := newQuiesceHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	h := newQuiesceHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 	if err := h.OnPing(t.Context()); err != nil {
 		t.Fatalf("OnPing: %v", err)
 	}

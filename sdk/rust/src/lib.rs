@@ -26,7 +26,8 @@ pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, BuildImageOptions, BuildImagePushOptions, BuildImageResult,
-    ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions, CustomDomain,
+    CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
+    CustomDomain,
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
     ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
@@ -323,6 +324,12 @@ impl Sandbox {
 
     pub fn exec(&self, request: ExecRequest) -> Result<ExecResult, Error> {
         self.client.exec(&self.data.id, request)
+    }
+
+    /// Read this sandbox's clone-generation token (changes on
+    /// resume-from-snapshot). Read-only; does not reseed in-guest PRNGs.
+    pub fn clone_generation(&self) -> Result<CloneGeneration, Error> {
+        self.client.clone_generation(&self.data.id)
     }
 
     pub fn exec_stream(&self, options: ExecStreamOptions) -> Result<ExecStreamHandle, Error> {
@@ -913,6 +920,22 @@ impl Client {
             None,
         )?;
         Ok(raw.mounts)
+    }
+
+    /// Read a sandbox's clone-generation token. The token changes whenever the
+    /// sandbox is resumed from a snapshot, so a change signals "this is a
+    /// clone." Read-only — the SDK cannot reseed a process inside the guest;
+    /// see the "Randomness in cloned sandboxes" docs for the in-guest pattern.
+    pub fn clone_generation(&self, id: &str) -> Result<CloneGeneration, Error> {
+        self.do_json::<(), CloneGeneration>(
+            Method::GET,
+            &format!(
+                "{}/sandboxes/{}/toolbox/clone-generation",
+                self.version_prefix(),
+                id
+            ),
+            None,
+        )
     }
 
     pub fn get_network_usage(&self, id: &str) -> Result<NetworkUsage, Error> {
@@ -2547,6 +2570,30 @@ mod tests {
                 has_credentials: true,
             }]
         );
+    }
+
+    #[test]
+    fn clone_generation_reads_token_via_toolbox_proxy() {
+        let body = serde_json::json!({
+            "generation": "2d0d8c69",
+            "resumed_at": 1700000000000000000i64
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let gen = client
+            .clone_generation("sb-1")
+            .expect("clone_generation should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("GET /v1/sandboxes/sb-1/toolbox/clone-generation HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(gen.generation, "2d0d8c69");
+        assert_eq!(gen.resumed_at, 1700000000000000000);
     }
 
     #[test]

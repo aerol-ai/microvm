@@ -1,0 +1,506 @@
+---
+title: The Sandbox Runtime Nobody Built
+description: Every self-hostable sandbox is single-node. Every multi-node sandbox is a managed service. AerolVM is one Go binary that runs as both — distributed control plane, raw TCP/TLS ingress, and stateful sandboxes that survive host death. This is the architecture, the competitive landscape, and why this gap existed in the first place.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+I spent six months looking for an open-source, self-hostable sandbox runtime
+that could span more than one machine. It does not exist. Not E2B, not
+Daytona, not Microsandbox, not moru, not Era, not Cognitora, not Beam, not
+Northflank's self-host story. Every project in the agent-sandbox category is
+exactly one of two things: **a managed cloud you cannot self-host**, or **a
+single-node runtime you can self-host but cannot scale past one machine**.
+
+The category has a hole shaped like Kubernetes. I built the thing that fills
+it. This page is the architecture, the four differentiators that fall out of
+it, and an honest comparison with every adjacent project I could find.
+
+## The gap, stated precisely
+
+Sandbox runtimes for AI agents and untrusted code have converged on a shape.
+You boot a microVM or container, expose a public URL, run code via an SDK,
+tear it down. The thirty-plus projects in this category disagree on the
+isolation primitive (Firecracker, gVisor, Kata, libkrun, V8 isolates, raw
+runc) and on the SDK surface (Python-first, TypeScript-first, code-execution
+vs. dev-environment). They agree on one thing: **the orchestration story is
+either "ours, managed" or "yours, single-box."**
+
+That is not a small gap. It is the gap that defines whether you can run
+sandboxes on hardware you own at a scale that matters. Three concrete things
+fall out of the missing distributed control plane:
+
+1. **You cannot survive a host going down.** A managed service does this for
+   you, opaquely. A single-node runtime cannot, by definition. A self-hosted
+   multi-node runtime is the only shape that lets *you* own the failure
+   domain while *also* not losing sandboxes when a machine dies.
+2. **You cannot publish raw TCP/TLS from a sandbox to the internet.** The
+   reason is mundane: nobody built an open-source ingress layer for
+   sandbox-shaped workloads. Managed services have it (Fly Machines does);
+   self-hosted runtimes don't. So if you want to give a sandbox a real
+   Postgres port, you're stuck wiring it yourself or moving to a managed VM
+   platform that isn't pitched as a sandbox.
+3. **You cannot run stateful workloads with any kind of availability
+   guarantee.** Postgres, Redis, MinIO, a Jupyter kernel holding hours of
+   work — all of these become "if the host dies, the work is gone." For
+   ephemeral agent execution this is fine. For everything else, it's a
+   ceiling.
+
+I will defend each of those claims with code below, and with a comparison
+table against every project I evaluated. First, the architecture, because
+the claims are only meaningful if the architecture supports them.
+
+## The architecture, in one paragraph
+
+AerolVM is one Go binary, `sandboxd`. It runs in two modes from the same
+build: **standalone**, where it is the entire sandbox runtime on one host,
+and **cluster**, where N copies of it form a distributed control plane using
+[hashicorp/raft](https://github.com/hashicorp/raft) for placement consensus,
+[hashicorp/memberlist](https://github.com/hashicorp/memberlist) (SWIM) for
+membership, and HTTP reverse-proxy forwarding for mutating calls that need
+to land on the sandbox's current owner. There is no separate scheduler. No
+etcd. No Kubernetes. No control-plane / data-plane split — every node is
+both. The cluster package is a no-op when `EnableCluster=false`, so the
+standalone path costs nothing.
+
+Ingress is [Caddy](https://caddyserver.com/), embedded as a library, with
+[caddy-l4](https://github.com/mholt/caddy-l4) handling raw TCP/TLS routes
+in addition to standard HTTPS. The same daemon that runs sandboxes runs the
+ingress; routes are added and removed as sandboxes come and go, with
+zero-downtime config patches via the Caddy admin API.
+
+Storage is SQLite per node, single-writer (`MaxOpenConns=1`, WAL). Cluster
+state lives in the Raft FSM in memory and is replicated through Raft.
+
+That is the whole shape. The differentiators below all derive from it.
+
+## Differentiator 1: one binary holds the whole distributed control plane
+
+> **Video placeholder:** *Three-node cluster from zero in under two minutes.
+> Single binary on each box, `sandboxd cluster init` on the first, join on
+> the others, sandbox lands and is reachable.*
+
+Other "distributed" things in this space require:
+
+- A separate scheduler binary (Nomad-style).
+- An external KV store (etcd, Consul).
+- An orchestrator (Kubernetes) with a sandbox runtime layered on top
+  (KubeVirt + custom controllers, or one of the failed "sandbox operator"
+  projects).
+- A control-plane / data-plane split that means at minimum two binaries to
+  deploy.
+
+AerolVM has none of those. The same binary running your sandboxes is also
+the Raft member, the SWIM member, the ingress controller, the API server,
+and the SDK transport target. `internal/cluster/` is ~5000 lines of Go;
+when the cluster is disabled it returns the `Noop` implementation and the
+rest of the daemon never branches on cluster mode.
+
+The shape this enables for operators:
+
+```bash
+# Standalone, day zero
+systemctl start sandboxd
+
+# Cluster, same binary, three nodes
+sandboxd cluster init      # node A
+sandboxd cluster join A    # node B
+sandboxd cluster join A    # node C
+```
+
+That's it. No external dependencies. No companion services. No Helm charts.
+
+**Why nobody else did this.** Two reasons, and both are honest:
+
+- The agent-sandbox category is young (most projects launched 2024–2026).
+  Building a distributed control plane is a year of work that doesn't
+  visibly differentiate from "we have a fast cold start" in early demos.
+- The companies in the space are venture-funded, and shipping a multi-node
+  open-source story is a *direct subtraction* from their managed-service
+  revenue. The incentives point the other way.
+
+I'm not venture-funded and I had the year. So here we are.
+
+## Differentiator 2: raw TCP/TLS exposure, not just HTTP
+
+> **Video placeholder:** *Spin up a Postgres sandbox. Connect from `psql` on
+> a laptop over raw TCP via the cluster's public endpoint. Run a query.*
+
+Every sandbox vendor in the agent-sandbox category exposes HTTP. None of
+the open-source self-hostable ones publish raw TCP/TLS. The reason is that
+HTTP ingress is solved (nginx, Caddy, Envoy, Traefik) and TCP ingress for
+arbitrary multi-tenant workloads is not — it requires either SNI-based
+multiplexing on shared ports or per-sandbox host-port allocation, and both
+have ugly edge cases.
+
+AerolVM uses [caddy-l4](https://github.com/mholt/caddy-l4) for L4
+multiplexing on shared ports, plus the host-port pool described in
+[Idempotency on a Single Writer](/engineering-idempotency) for the cases
+where SNI doesn't apply (raw TCP without TLS, or protocols where the
+server expects to own the port). The same daemon that runs the sandbox
+patches the Caddy config to add and remove L4 routes as sandboxes come
+and go.
+
+The practical effect: a sandbox can publish a real Postgres port, a real
+Redis port, a real MongoDB port, a real MySQL port, a real Mosquitto MQTT
+port, a real anything-with-TCP, to the public internet, with optional TLS
+termination, behind a public hostname your DNS already points at the
+cluster. **No other open-source sandbox runtime does this.** Managed VM
+platforms that aren't pitched as sandboxes (Fly Machines, in particular)
+do. The gap in the sandbox category is real.
+
+See [TCP & TLS Ports](/tcp-ports) for the operator-facing docs and
+[Deploy your own Supabase](/use-cases/customer-facing-product-experiences/spawn-postgres)
+for the worked Postgres example.
+
+## Differentiator 3: stateful sandboxes that survive host death
+
+> **Video placeholder:** *Three-node cluster. Postgres sandbox running on
+> node B with data in S3-backed mount. `kill -9` sandboxd on B (or
+> `poweroff`). Watch placement re-elect, the sandbox respawn on node C
+> with the same mount reattached, `psql` reconnect, data intact.*
+
+This is the strongest claim in the document and I will defend it the
+hardest, because the database people in the HN thread will press on it.
+
+The mechanism, in order:
+
+1. **External persistent storage.** A sandbox can declare a mount backed
+   by S3, NFS, SSHFS, or any [rclone](https://rclone.org) remote (see
+   [Attach Volumes](/external-storage)). The mount tooling executes on
+   the host — see [Host-Mediated Trust Boundary](/engineering-trust-boundary) —
+   so credentials never enter the sandbox and the mount's lifetime is
+   not tied to the container's lifetime.
+2. **Cluster-wide placement state in Raft.** The sandbox's identity
+   (name, hostname binding, declared mounts, declared exposed ports) is
+   in the Raft FSM. When the owner node dies, that state is not lost; the
+   surviving leader has it.
+3. **Owner-death detection via SWIM.** `memberlist` declares a node
+   `Failed` after the configured suspect-to-confirm window (sub-second
+   to a few seconds depending on cluster size and probe interval).
+4. **Re-placement.** The placement code (`internal/cluster/placement.go`)
+   picks a new owner by power-of-two-choices over the remaining healthy
+   nodes weighted by capacity. The recovery path
+   (`internal/cluster/recovery_replication.go`,
+   `recovery_store.go`) re-instantiates the sandbox identity on the new
+   owner.
+5. **Mount reattachment.** The new owner's mount manager attaches the
+   same external volume. Because the storage is external (S3/NFS), the
+   bytes never moved. The new container sees the same filesystem the
+   old one wrote to.
+6. **Ingress cutover.** The Caddy route is updated to point at the new
+   owner. Clients hitting the public hostname (HTTP or raw TCP) are
+   routed to the new sandbox transparently. Long-lived TCP connections
+   are dropped at the cutover; clients reconnect.
+
+The honest caveats, because HN will ask:
+
+- **The cutover is not zero-RPO for in-flight writes that hadn't
+  reached the external store yet.** If you ran `psql` against a sandbox
+  whose Postgres had a transaction in shared buffers but not yet flushed
+  to the S3 mount when the host died, that transaction is lost. This is
+  the same property real Postgres has against a `kill -9` of the
+  process; we don't add durability the database doesn't have.
+- **The cutover is not zero-downtime.** Detection + re-placement +
+  mount + container start is on the order of a few seconds in normal
+  operation. Long-lived TCP connections drop and reconnect. HTTP
+  clients with retries handle it transparently; bespoke TCP clients
+  need a reconnect loop.
+- **The mount adapter must support concurrent-access semantics that
+  match your workload.** S3 with a single writer at a time is fine.
+  S3 with two writers concurrently is not, ever — and the cutover
+  window is technically a moment where the dying owner might still be
+  writing while the new owner is starting. We force-detach on the old
+  owner before the new one mounts; tested for the common cases but the
+  durability of your data is a function of the storage backend's
+  consistency model.
+- **You need at least one healthy node with capacity** for the
+  failed sandbox to land on. If the whole cluster is at capacity, the
+  sandbox stays unplaced until capacity frees up.
+
+With those caveats stated: **yes, kill the host, the sandbox respawns
+on a healthy node with its data, and the public hostname routes to the
+new sandbox.** Run your own Postgres, your own Redis, your own
+single-tenant MinIO inside a sandbox, and it survives node loss.
+
+I am not aware of another open-source sandbox runtime that does this.
+The closest comparable is running a Kubernetes StatefulSet with a PVC,
+which works but requires you to operate Kubernetes, find a CSI driver
+that maps to your storage, and accept that the workload is a pod, not a
+sandbox-with-an-SDK. See [Durability & Failover](/durability) for the
+operator-facing reference.
+
+## Differentiator 4: five SDKs in lockstep, plus drop-in E2B and Daytona facades
+
+Five SDKs (TypeScript, Python, Go, Rust, Java) ship from the same repo and
+the same release. They are not generated wrappers — each is hand-written to
+be idiomatic in its language, with matching method names and matching test
+coverage. Every new server feature is a five-package PR.
+
+On top of the native SDKs, AerolVM exposes two compatibility facades:
+
+- **`/daytona`** — speaks the Daytona SDK protocol. Point the official
+  Daytona SDK at this endpoint and your existing code runs unchanged.
+- **`/e2b`** — speaks the E2B SDK protocol, including the duplicate-body
+  retry dedupe described in
+  [Idempotency on a Single Writer](/engineering-idempotency).
+
+This is not a differentiator in the same league as "HA stateful
+sandboxes." It is a migration story. If you're already on E2B or Daytona
+and want to move to self-hosted, you change one URL.
+
+See [Using Daytona SDK](/using-daytona-sdk) and
+[Using E2B SDK](/using-e2b-sdk).
+
+## The competitive landscape, honestly
+
+I evaluated every project I could find in the adjacent space. Honest
+table, my best read as of writing — if I have any of this wrong, please
+correct me in the HN thread or via PR.
+
+| Project | Self-hostable | Multi-node | Raw TCP | HA stateful | SDKs | Notes |
+|---|---|---|---|---|---|---|
+| **AerolVM** | yes | yes | yes | yes | TS/Py/Go/Rust/Java + E2B + Daytona facades | This project. |
+| **E2B** | partial (lags cloud) | no (managed only) | no | no | TS/Py | Strongest cloud product. Self-host is an afterthought. |
+| **Daytona** | yes (AGPL) | unclear in OSS | no | no | TS/Py | Pivoted from dev-environment to agent runtime; managed-first. |
+| **Northflank** | no (BYOC) | yes (managed) | partial (managed addons) | yes (managed addons) | platform, not SDK | Strong product, not an OSS self-host story. |
+| **Modal** | no | no | no | no | Py | GPU-first, managed-only. |
+| **Beam** | yes | unclear | no | no | Py | runc/gVisor based, OSS, GPU-friendly. |
+| **Microsandbox** | yes | no | no | no | Rust core + bindings | Single-node, marked experimental. |
+| **Era** | yes | no | no | no | local CLI | Local dev sandboxes, microVM. |
+| **moru** | yes | no | no | no | TS | Agent runtime, single-node. |
+| **Cognitora** | yes (advertised) | unclear | no | no | TS/Py | Kata + Firecracker/Cloud HV. |
+| **Cloudflare Sandboxes** | no | no | no | no | TS (Workers) | V8 isolates, managed-only. |
+| **Vercel Sandbox** | no | no | no | no | TS | Beta, managed. |
+| **Fly Machines** | no | no (managed) | yes | yes (with volumes) | TS/Py/Go | Not pitched as a sandbox, but architecturally closest. |
+| **Kubernetes + KubeVirt** | yes | yes | yes (with work) | yes (with work) | n/a | Power user. Hundreds of moving parts. Not a sandbox runtime. |
+
+The row that matters: **AerolVM is the only project where every column is
+"yes."** Fly Machines comes closest but is a managed VM platform, not a
+self-hostable sandbox runtime. Kubernetes can be assembled into something
+similar, but assembling it is a small SRE team's quarter.
+
+## How this maps to actual workloads
+
+> **Video placeholder:** *Three workloads in one cluster — a coding agent
+> sandbox (ephemeral, agent SDK), a Postgres sandbox (HA stateful, raw
+> TCP), and a customer-facing live-preview sandbox (HTTP public URL).
+> Same binary, same cluster, same SDK shape.*
+
+This isn't theoretical. The use-cases section walks through real
+workloads, each of which leans on one or more of the differentiators
+above:
+
+- [Deploy your own Supabase](/use-cases/customer-facing-product-experiences/spawn-postgres) —
+  HA stateful + raw TCP.
+- [Impossible to Trace Burner VPN](/use-cases/customer-facing-product-experiences/secure-burner-vpn) —
+  raw TCP, per-sandbox network identity.
+- [Create your own Upstash Redis](/use-cases/customer-facing-product-experiences/create-upstash-redis) —
+  HA stateful + raw TCP.
+- [Live preview URLs for Web apps](/use-cases/customer-facing-product-experiences/ai-app-hosting) —
+  HTTP public URL with custom domain.
+- [Zero-shot code execution agent](/use-cases/coding-agents/large-scale-refactor-migration-agent) —
+  ephemeral agent execution.
+
+The same binary serves all of them.
+
+## What it looks like from a five-SDK perspective
+
+The shape that's interesting here is not the create call — every SDK has
+one. It's that the *same SDK* talks to a single-node `sandboxd` on a
+laptop and to a 50-node cluster, with no API surface change. The cluster
+is an operator concern. The SDK is unaware.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,   // single LB endpoint for the cluster
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    // Cluster picks an owner via power-of-two-choices. The SDK doesn't
+    // know or care which node ran this.
+    const pg = await client.create({
+      name: 'shared-postgres',           // cluster-wide unique
+      image: 'postgres:16',
+      cpu: 2,
+      memoryMB: 2048,
+      mounts: [{ source: 's3://my-bucket/pg-data', target: '/var/lib/postgresql/data' }],
+      env: { POSTGRES_PASSWORD: 'changeme' },
+    })
+
+    // Raw TCP, not HTTP. Caddy-l4 publishes 5432.
+    const port = await pg.exposeTcpPort(5432, { hostname: 'pg.example.com' })
+    console.log(`psql -h ${port.hostname} -p ${port.port}`)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url='https://cluster.example.com',
+        pat_token='your-token',
+    )
+
+    pg = client.create({
+        'name': 'shared-postgres',
+        'image': 'postgres:16',
+        'cpu': 2.0,
+        'memoryMB': 2048,
+        'mounts': [{'source': 's3://my-bucket/pg-data', 'target': '/var/lib/postgresql/data'}],
+        'env': {'POSTGRES_PASSWORD': 'changeme'},
+    })
+
+    port = pg.expose_tcp_port(5432, hostname='pg.example.com')
+    print(f"psql -h {port['hostname']} -p {port['port']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+        "os"
+
+        microvm  "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   os.Getenv("SB_API_URL"),
+        PATToken: os.Getenv("SB_PAT_TOKEN"),
+    })
+    if err != nil { log.Fatal(err) }
+
+    pg, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
+        Name:     "shared-postgres",
+        Image:    "postgres:16",
+        CPU:      2,
+        MemoryMB: 2048,
+        Mounts:   []sdktypes.Mount{{Source: "s3://my-bucket/pg-data", Target: "/var/lib/postgresql/data"}},
+        Env:      map[string]string{"POSTGRES_PASSWORD": "changeme"},
+    })
+    if err != nil { log.Fatal(err) }
+
+    port, err := pg.ExposeTCPPort(context.Background(), 5432, &sdktypes.ExposeTCPOptions{Hostname: "pg.example.com"})
+    if err != nil { log.Fatal(err) }
+    fmt.Printf("psql -h %s -p %d\n", port.Hostname, port.Port)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions, Mount, ExposeTcpOptions};
+
+    let client = Client::new(
+        Some("https://cluster.example.com"),
+        Some("your-token"),
+    )?;
+
+    let pg = client.create(CreateOptions {
+        name:      Some("shared-postgres".to_string()),
+        image:     "postgres:16".to_string(),
+        cpu:       Some(2),
+        memory_mb: Some(2048),
+        mounts:    vec![Mount { source: "s3://my-bucket/pg-data".into(),
+                                target: "/var/lib/postgresql/data".into() }],
+        env:       [("POSTGRES_PASSWORD".to_string(), "changeme".to_string())].into(),
+        ..Default::default()
+    })?;
+
+    let port = pg.expose_tcp_port(5432, ExposeTcpOptions { hostname: Some("pg.example.com".into()) })?;
+    println!("psql -h {} -p {}", port.hostname, port.port);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.Mount;
+    import ai.aerol.microvm.model.ExposeTcpResult;
+    import java.util.List;
+    import java.util.Map;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl("https://cluster.example.com")
+            .setPatToken(System.getenv("SB_PAT_TOKEN"))
+    );
+
+    Sandbox pg = client.create(
+        new CreateOptions()
+            .setName("shared-postgres")
+            .setImage("postgres:16")
+            .setCpu(2.0)
+            .setMemoryMb(2048)
+            .setMounts(List.of(new Mount("s3://my-bucket/pg-data", "/var/lib/postgresql/data")))
+            .setEnv(Map.of("POSTGRES_PASSWORD", "changeme"))
+    );
+
+    ExposeTcpResult port = pg.exposeTcpPort(5432, "pg.example.com");
+    System.out.println("psql -h " + port.hostname + " -p " + port.port);
+    ```
+  </TabItem>
+</Tabs>
+
+The same call shape works against `localhost` standalone and against a
+cluster. If the cluster's owner of `shared-postgres` dies, the next
+`psql` connect lands on the new owner with the data intact.
+
+## What I'm not claiming
+
+In the spirit of the rest of these engineering docs, the honest list of
+things AerolVM is *not*:
+
+- **Not a replacement for Kubernetes.** It does sandboxes well. Pods,
+  services, ingress for arbitrary container workloads, CRDs, operators
+  — Kubernetes does all of that, AerolVM does none of it. If you have
+  microservices, run them on Kubernetes.
+- **Not a replacement for managed databases.** HA Postgres in a sandbox
+  is honest single-writer Postgres on a host that might fail. If you
+  need streaming replication, point-in-time recovery, and read replicas,
+  you need a real database product. AerolVM gives you "Postgres that
+  comes back" — that is genuinely useful and not the same as "Postgres
+  that never goes down."
+- **Not feature-parity with E2B or Daytona on every endpoint.** The
+  facades cover the common paths (create, exec, file ops, lifecycle)
+  and we add coverage as needed. If you depend on a specific endpoint,
+  check before assuming.
+- **Not battle-hardened at hundreds-of-nodes scale.** Cluster mode is
+  tested at small-cluster sizes. There is no public benchmark of a
+  fifty-node deployment yet.
+
+If those caveats kill the use case for you, AerolVM is the wrong tool.
+If they don't, it's the only tool I'm aware of in its category.
+
+## What I want feedback on
+
+Three honest asks for the comment thread:
+
+1. **The "k8s-shaped, sandbox-sized" framing.** Is it the right
+   metaphor? It captures the shape (control plane + workers + ingress
+   + reconciliation) but invites unfair comparisons. What lands better?
+2. **The HA stateful claim.** I've stated the mechanism and the
+   caveats. Is there a failure mode I haven't surfaced that I should
+   document upfront? Database operators in particular — please press
+   on this.
+3. **The compatibility facades vs. a clean-sheet API.** Is
+   "drop-in for E2B and Daytona" a real migration path, or is it
+   technical debt I'll regret? The argument for the facades is that
+   nobody wants to rewrite their sandbox code. The argument against
+   is that I'm two version-skew bugs away from a perpetual chore.
+
+Repo, docs, and links to the other engineering deep-dives at the top
+of the page. The other three deep-dives — [Idempotency on a Single
+Writer](/engineering-idempotency), [Placement &
+Failover](/engineering-placement-failover), [Host-Mediated Trust
+Boundary](/engineering-trust-boundary), and the snapshot pair
+([Snapshot Clone Correctness](/engineering-snapshot-correctness),
+[The Frozen-Kernel Problem](/engineering-frozen-kernel-problem)) —
+cover the invariants this architecture leans on.

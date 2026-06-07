@@ -4,6 +4,7 @@ import { Image } from "./Image.js";
 import type {
   BuildImageOptions,
   BuildImageResult,
+  CloneGeneration,
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
@@ -149,6 +150,16 @@ export class MicroVM {
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {
     return this.client.mounts(sandboxID);
+  }
+
+  /**
+   * Read a sandbox's clone-generation token. The token changes whenever the
+   * sandbox is resumed from a snapshot, so a change signals "this is a clone."
+   * Read-only — the SDK cannot reseed a process inside the guest; see the
+   * "Randomness in cloned sandboxes" docs page for the in-guest reseed pattern.
+   */
+  async cloneGeneration(sandboxID: string): Promise<CloneGeneration> {
+    return this.client.cloneGeneration(sandboxID);
   }
 
   execStream(sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
