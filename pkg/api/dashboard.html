@@ -469,11 +469,13 @@ async function loadHealth() {
     const statusKind = h.status === "ok" ? "ok" : h.status === "degraded" ? "warn" : "bad";
     const dockerKind = h.docker === "ok" ? "ok" : "bad";
     const caddyKind = h.caddy === "ok" ? "ok" : "bad";
+    const firecrackerKind = h.firecracker === "ok" ? "ok" : h.firecracker === "disabled" ? "warn" : "bad";
     const sshKind = h.ssh_gateway === "ok" ? "ok" : h.ssh_gateway === "disabled" ? "warn" : "bad";
     el("health-row").innerHTML = `
       <div class="health-item"><span class="k">overall</span>${pill(h.status || "?", statusKind)}</div>
       <div class="health-item"><span class="k">docker</span>${pill(h.docker || "?", dockerKind)}</div>
       <div class="health-item"><span class="k">caddy</span>${pill(h.caddy || "?", caddyKind)}</div>
+      <div class="health-item"><span class="k">firecracker</span>${pill(h.firecracker || "?", firecrackerKind)}</div>
       <div class="health-item"><span class="k">ssh</span>${pill(h.ssh_gateway || "?", sshKind)}</div>
       <div class="health-item"><span class="k">live sandboxes</span><span class="mono">${fmtNum(h.sandboxes)}</span></div>
     `;

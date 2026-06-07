@@ -829,6 +829,7 @@ type HealthStatus struct {
 	Sandboxes       int    `json:"sandboxes"`
 	Docker          string `json:"docker"`
 	Caddy           string `json:"caddy"`
+	Firecracker     string `json:"firecracker,omitempty"`
 	SSHGateway      string `json:"ssh_gateway"`
 	ClusterTopology string `json:"cluster_topology,omitempty"`
 	ClusterNodes    int    `json:"cluster_nodes,omitempty"`

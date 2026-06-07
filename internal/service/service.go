@@ -2819,8 +2819,27 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		}
 	}
 
+	firecrackerStatus := "disabled"
+	if s.cfg.EnableFirecracker {
+		switch rt := s.firecracker.(type) {
+		case interface{ RuntimeHealth(context.Context) string }:
+			firecrackerStatus = rt.RuntimeHealth(ctx)
+		case nil:
+			firecrackerStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeFirecracker)
+		default:
+			if err := rt.Ping(ctx); err != nil {
+				firecrackerStatus = err.Error()
+			} else {
+				firecrackerStatus = "ok"
+			}
+		}
+	}
+
 	status := "ok"
 	if dockerStatus != "ok" || caddyStatus != "ok" {
+		status = "degraded"
+	}
+	if s.cfg.EnableFirecracker && firecrackerStatus != "ok" {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.
@@ -2847,6 +2866,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		Sandboxes:       live,
 		Docker:          dockerStatus,
 		Caddy:           caddyStatus,
+		Firecracker:     firecrackerStatus,
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
