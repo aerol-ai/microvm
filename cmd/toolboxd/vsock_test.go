@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/clonegen"
 )
 
 // recordingHandler tracks every callback invocation so the protocol
@@ -404,8 +406,8 @@ func TestQuiesceHandler_PostResume_QuiesceErrorIsNonFatal(t *testing.T) {
 // If you intend to gate the bump on reseed success, this test should fail
 // and force that decision to be explicit.
 func TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure(t *testing.T) {
-	cg := newCloneGeneration(t.TempDir()+"/clone-generation", nil)
-	initialToken, _ := cg.current()
+	cg := clonegen.New(t.TempDir()+"/clone-generation", nil)
+	initialToken, _ := cg.Current()
 
 	q := &fakeQuiesceOps{reseedErr: errors.New("entropy pool unavailable")}
 	h := newQuiesceHandler(nil, nil, cg)
@@ -416,7 +418,7 @@ func TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure(t *testing
 		t.Fatalf("OnPostResume returned %v; want nil", err)
 	}
 
-	gotToken, gotResumedAt := cg.current()
+	gotToken, gotResumedAt := cg.Current()
 	if gotToken == initialToken {
 		t.Errorf("clone-generation token unchanged after reseed failure (%q); bump must fire regardless of reseed result", gotToken)
 	}

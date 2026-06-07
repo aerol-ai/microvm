@@ -3,7 +3,7 @@
 // implementation is pkg/docker.Client, which talks to the local Docker daemon
 // and can drive either runc or runsc (gVisor) depending on per-sandbox /
 // host-default selection. Future implementations (e.g. native runsc without
-// Docker) plug in behind the same interface.
+// Docker, Firecracker, WASM) plug in behind the same interface.
 //
 // Methods that are intrinsically Docker-API-shaped — exec hijacking, the
 // /events stream — intentionally stay off this interface and on the concrete
@@ -18,9 +18,13 @@ import (
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
-// Runtime is the contract the service layer requires of any container runtime
-// driver. Implementations must be safe for concurrent use; the service serializes
-// per-sandbox operations but issues calls for different sandboxes in parallel.
+// Runtime is the core contract the service layer requires of any sandbox
+// runtime driver. Implementations must be safe for concurrent use; the
+// service serializes per-sandbox operations but issues calls for different
+// sandboxes in parallel.
+//
+// Network-rule methods (per-IP iptables, in-container toolbox allowlists) live
+// on ContainerRuntime instead — WASM satisfies only Runtime (see plans/wasm-runtime.md D17).
 type Runtime interface {
 	// Create provisions and starts a managed container. The caller owns the
 	// sandbox ID. The runtime sets it as the container's canonical name so
@@ -64,6 +68,13 @@ type Runtime interface {
 	// RemoveImage GCs an image from the runtime's local store. 404/409 are
 	// treated as success — see implementation notes.
 	RemoveImage(ctx context.Context, imageRef string) error
+}
+
+// ContainerRuntime extends Runtime with per-IP network rules and the in-container
+// toolbox port allowlist. Docker and Firecracker satisfy both; WASM satisfies
+// only Runtime and uses host-mediated sockets instead.
+type ContainerRuntime interface {
+	Runtime
 
 	// PushAllowedPorts updates the in-container toolbox's allowlist of ports
 	// reachable through its proxy. Best-effort; callers log on failure.
@@ -99,4 +110,11 @@ type Runtime interface {
 	// rule is shared, so the service must consult NetworkBlockAll before
 	// invoking this on a quota-clear path.
 	ClearNetworkBlockEgress(containerIP string) error
+}
+
+// AsContainerRuntime returns the network-rule surface when rt implements it.
+// WASM and other host-mediated runtimes return false.
+func AsContainerRuntime(rt Runtime) (ContainerRuntime, bool) {
+	cr, ok := rt.(ContainerRuntime)
+	return cr, ok
 }

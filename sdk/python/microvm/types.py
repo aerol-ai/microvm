@@ -157,7 +157,9 @@ class CreateOptions(TypedDict, total=False):
     # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
     # when running untrusted workloads. "kata" is reserved and rejected by the
     # API today. Not compatible with gpus.
-    runtime: Literal["docker", "gvisor", "kata", "firecracker"]
+    runtime: Literal["docker", "gvisor", "kata", "firecracker", "wasm"]
+    # Survival class across daemon restarts. Omit for the runtime default.
+    durability: Literal["ephemeral", "passivatable", "durable"]
     # Attach GPU resources to the sandbox. Omit for CPU-only workloads.
     # Not compatible with runtime="gvisor".
     gpus: GPUOptions
@@ -400,7 +402,8 @@ class SandboxData(TypedDict, total=False):
     failover: Failover
     # Container runtime this sandbox is running under. Empty string indicates
     # a pre-migration row that resolves to the host default at start time.
-    runtime: Literal["", "docker", "gvisor", "kata", "firecracker"]
+    runtime: Literal["", "docker", "gvisor", "kata", "firecracker", "wasm"]
+    durability: Literal["ephemeral", "passivatable", "durable"]
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
 

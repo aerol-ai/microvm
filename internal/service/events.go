@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -183,8 +184,10 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
 	}
 	if previousIP != "" {
-		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
-			s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
+			if err := cr.ClearNetworkRules(previousIP); err != nil {
+				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
 		}
 	}
 
@@ -246,8 +249,10 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		s.logger.Warn("unmount on destroy event failed", "sandbox_id", sandbox.ID, "error", err)
 	}
 	if previousIP != "" {
-		if err := s.docker.ClearNetworkRules(previousIP); err != nil {
-			s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
+			if err := cr.ClearNetworkRules(previousIP); err != nil {
+				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
 		}
 	}
 

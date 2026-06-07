@@ -363,6 +363,17 @@ type Config struct {
 	// sandbox to land on the new path. Existing Docker/gVisor sandboxes
 	// are untouched. SB_ENABLE_FIRECRACKER.
 	EnableFirecracker bool
+	// EnableWasm opts this host in to the WASM/WASI runtime
+	// (plans/wasm-runtime.md). False (the default) keeps WASM creates at
+	// ErrRuntimeNotImplemented unless the operator flips SB_ENABLE_WASM.
+	// SB_ENABLE_WASM.
+	EnableWasm bool
+	// WasmRunDir holds per-sandbox runtime state (worker sockets, scratch).
+	// Default /run/sandboxd/wasm. SB_WASM_RUN_DIR.
+	WasmRunDir string
+	// WasmModulesDir is the content-addressed module + checkpoint cache root.
+	// Required when EnableWasm is true. SB_WASM_MODULES_DIR.
+	WasmModulesDir string
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1119,6 +1130,9 @@ func Load() (Config, error) {
 		FleetLiveSampleInterval:          getEnvDuration("SB_FLEET_LIVE_SAMPLE_INTERVAL", 0),
 
 		EnableFirecracker:       getEnvBool("SB_ENABLE_FIRECRACKER", false),
+		EnableWasm:              getEnvBool("SB_ENABLE_WASM", false),
+		WasmRunDir:              getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
+		WasmModulesDir:          getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
@@ -1270,6 +1284,10 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select Firecracker per-sandbox via the API once SB_ENABLE_FIRECRACKER=true",
 			cfg.Runtime, models.RuntimeDocker)
 	}
+	if cfg.Runtime == models.RuntimeWasm {
+		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select WASM per-sandbox via the API once SB_ENABLE_WASM=true",
+			cfg.Runtime, models.RuntimeDocker)
+	}
 
 	// Firecracker host-side wiring is opt-in. The flag exists to gate the
 	// driver registration in cmd/sandboxd/main.go; when it's off the
@@ -1322,6 +1340,14 @@ func Load() (Config, error) {
 		}
 		if cfg.FirecrackerMkfs4Bin == "" {
 			return Config{}, errors.New("SB_FIRECRACKER_MKFS_BIN is required when SB_ENABLE_FIRECRACKER=true")
+		}
+	}
+	if cfg.EnableWasm {
+		if cfg.WasmRunDir == "" {
+			return Config{}, errors.New("SB_WASM_RUN_DIR is required when SB_ENABLE_WASM=true")
+		}
+		if cfg.WasmModulesDir == "" {
+			return Config{}, errors.New("SB_WASM_MODULES_DIR is required when SB_ENABLE_WASM=true")
 		}
 	}
 

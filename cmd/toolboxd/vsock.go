@@ -30,6 +30,8 @@ import (
 	"io"
 	"log/slog"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/clonegen"
 )
 
 // defaultVsockPort is the in-guest port the toolbox listens on. The host
@@ -200,10 +202,10 @@ type quiesceHandler struct {
 	logger   *slog.Logger
 	sessions sessionFlusher
 	quiesce  quiesceOps
-	cloneGen *cloneGeneration
+	cloneGen *clonegen.Generation
 }
 
-func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher, cloneGen *cloneGeneration) *quiesceHandler {
+func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher, cloneGen *clonegen.Generation) *quiesceHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -261,7 +263,7 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 	// and that failure is logged loudly just above; vmgenid is the real
 	// backstop. See TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure.
 	if h.cloneGen != nil {
-		h.cloneGen.bump(data.WallclockUnixNs)
+		h.cloneGen.Bump(data.WallclockUnixNs)
 	}
 	h.logger.Info("vsock: post_resume complete",
 		"wallclock_set", data.WallclockUnixNs > 0)

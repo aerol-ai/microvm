@@ -75,6 +75,10 @@ type Service struct {
 	// type-system payoff, and (b) the docker field stays the unconditional
 	// Default-runtime fast path for the >>99% docker case.
 	firecracker runtime.Runtime
+	// wasm is the third registered runtime (plans/wasm-runtime.md). Nil
+	// unless pkg/daemon has called SetWasmRuntime when cfg.EnableWasm is
+	// true.
+	wasm runtime.Runtime
 	// templateBuilder is the Phase 2 OCI→ext4 builder used by the
 	// template lifecycle (internal/service/template.go). Nil unless main
 	// has called SetTemplateBuilder — which only happens when
@@ -442,6 +446,12 @@ func (s *Service) SetFirecrackerRuntime(r runtime.Runtime) {
 	s.firecracker = r
 }
 
+// SetWasmRuntime registers the WASM driver. Called from pkg/daemon when
+// cfg.EnableWasm is true.
+func (s *Service) SetWasmRuntime(r runtime.Runtime) {
+	s.wasm = r
+}
+
 func (s *Service) isFirecrackerSandbox(sandbox *models.Sandbox) bool {
 	return sandbox != nil && sandbox.Runtime == models.RuntimeFirecracker
 }
@@ -454,6 +464,13 @@ func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, e
 		}
 		return s.firecracker, nil
 	}
+	if s.isWasmSandbox(sandbox) {
+		if s.wasm == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered: %w",
+				models.RuntimeWasm, models.ErrRuntimeNotImplemented)
+		}
+		return s.wasm, nil
+	}
 	return s.docker, nil
 }
 
@@ -462,6 +479,18 @@ func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
 		return sandbox.ID
 	}
 	return sandboxContainerRef(sandbox)
+}
+
+func (s *Service) containerRuntimeForSandbox(sandbox *models.Sandbox) (runtime.ContainerRuntime, error) {
+	rt, err := s.runtimeForSandbox(sandbox)
+	if err != nil {
+		return nil, err
+	}
+	cr, ok := runtime.AsContainerRuntime(rt)
+	if !ok {
+		return nil, fmt.Errorf("runtime %q does not support container network rules", sandbox.Runtime)
+	}
+	return cr, nil
 }
 
 func mergeManagedRuntimes(maps ...map[string]*models.SandboxRuntimeState) map[string]*models.SandboxRuntimeState {
@@ -866,6 +895,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	durability, err := models.NormalizeCreateDurability(req.Durability, chosenRuntime)
+	if err != nil {
+		return nil, err
+	}
+	req.Durability = durability
 	// "firecracker" is the second runtime, dispatched to the native
 	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
 	//
@@ -888,6 +922,18 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 		req.Runtime = chosenRuntime
 		return s.createFirecrackerSandbox(ctx, req, idOverride)
+	}
+	if chosenRuntime == models.RuntimeWasm {
+		if !s.cfg.EnableWasm {
+			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_WASM=true on this host (see plans/wasm-runtime.md): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		if s.wasm == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered (SB_ENABLE_WASM=true but daemon did not call SetWasmRuntime): %w",
+				chosenRuntime, models.ErrRuntimeNotImplemented)
+		}
+		req.Runtime = chosenRuntime
+		return s.createWasmSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
 
@@ -1024,6 +1070,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		RegistryAuthSealed:   sealedRegistry,
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
 		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
+		Durability:           req.Durability,
 	}
 	// Populate the in-memory CustomDomains slice so the initial route
 	// matcher sees the full hostname union. Status is pending_dns until
@@ -1259,6 +1306,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		// same template rather than re-resolving from the request.
 		TemplateID:    strings.TrimSpace(req.TemplateID),
 		OverlaySizeGB: req.OverlaySizeGB,
+		Durability:    req.Durability,
 	}
 	if len(req.CustomDomains) > 0 {
 		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))
@@ -1528,7 +1576,14 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	// otherwise come back without network isolation. Fail closed: if we can't
 	// reinstall the rule, stop the container and surface the error.
 	if sandbox.NetworkBlockAll {
-		if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+		cr, ok := runtime.AsContainerRuntime(rt)
+		if !ok {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			return nil, fmt.Errorf("apply network block on start: runtime %q does not support network_block_all", sandbox.Runtime)
+		}
+		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
 			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
@@ -2835,11 +2890,28 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		}
 	}
 
+	wasmStatus := "disabled"
+	if s.cfg.EnableWasm {
+		switch rt := s.wasm.(type) {
+		case nil:
+			wasmStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeWasm)
+		default:
+			if err := rt.Ping(ctx); err != nil {
+				wasmStatus = err.Error()
+			} else {
+				wasmStatus = "ok"
+			}
+		}
+	}
+
 	status := "ok"
 	if dockerStatus != "ok" || caddyStatus != "ok" {
 		status = "degraded"
 	}
 	if s.cfg.EnableFirecracker && firecrackerStatus != "ok" {
+		status = "degraded"
+	}
+	if s.cfg.EnableWasm && wasmStatus != "ok" {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.
@@ -2867,6 +2939,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		Docker:          dockerStatus,
 		Caddy:           caddyStatus,
 		Firecracker:     firecrackerStatus,
+		Wasm:            wasmStatus,
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
@@ -3021,7 +3094,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			return err
 		}
 	}
-	managed := mergeManagedRuntimes(dockerManaged, firecrackerManaged)
+	wasmManaged := map[string]*models.SandboxRuntimeState{}
+	if s.wasm != nil {
+		wasmManaged, err = s.wasm.ListManaged(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	managed := mergeManagedRuntimes(dockerManaged, firecrackerManaged, wasmManaged)
 
 	s.reconcileLocalClusterOwnership(ctx, known, managed)
 
@@ -3036,8 +3116,30 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if s.isFirecrackerSandbox(sandbox) {
 			runtimeManaged = firecrackerManaged
 		}
+		if s.isWasmSandbox(sandbox) {
+			runtimeManaged = wasmManaged
+		}
 		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
+			if s.isWasmSandbox(sandbox) {
+				switch sandbox.Status {
+				case models.SandboxStatusPassivated, models.SandboxStatusAwaitingRuntime:
+					continue
+				case models.SandboxStatusStopped:
+					if s.admitter != nil {
+						s.admitter.Release(sandbox.ID)
+					}
+					_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+					if sandbox.WakeArmed {
+						s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
+					} else {
+						for _, port := range sandbox.ExposedPorts {
+							_ = s.deleteExposedPortRoute(ctx, sandbox, port)
+						}
+					}
+					continue
+				}
+			}
 			if s.isFirecrackerSandbox(sandbox) && sandbox.Status == models.SandboxStatusStopped {
 				if s.admitter != nil {
 					s.admitter.Release(sandbox.ID)
@@ -3071,7 +3173,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 			}
-			if s.isFirecrackerSandbox(sandbox) {
+			if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) {
 				rt, err := s.runtimeForSandbox(sandbox)
 				if err != nil {
 					return err
@@ -3144,11 +3246,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// Catches host-side state loss: iptables flush, daemon restart
 			// rebuilding chains, or a missed Create/Start install.
 			if sandbox.NetworkBlockAll {
-				rt, err := s.runtimeForSandbox(sandbox)
+				cr, err := s.containerRuntimeForSandbox(sandbox)
 				if err != nil {
-					return err
-				}
-				if err := rt.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+					s.logger.Warn("reconcile reapply network block skipped",
+						"sandbox_id", sandbox.ID,
+						"error", err,
+					)
+				} else if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
 					s.logger.Warn("reconcile reapply network block failed",
 						"sandbox_id", sandbox.ID,
 						"ip", sandbox.ContainerIP,
@@ -3224,6 +3328,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	removeOrphans(s.docker, models.RuntimeDocker, dockerManaged)
 	if s.firecracker != nil {
 		removeOrphans(s.firecracker, models.RuntimeFirecracker, firecrackerManaged)
+	}
+	if s.wasm != nil {
+		removeOrphans(s.wasm, models.RuntimeWasm, wasmManaged)
 	}
 
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already
@@ -4333,12 +4440,11 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	for _, p := range sandbox.ExposedPorts {
 		ports = append(ports, p.Port)
 	}
-	rt, err := s.runtimeForSandbox(sandbox)
+	cr, err := s.containerRuntimeForSandbox(sandbox)
 	if err != nil {
-		s.logger.Warn("failed to resolve runtime for allowed ports sync", "sandbox_id", sandbox.ID, "error", err)
 		return
 	}
-	if err := rt.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
+	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
 }

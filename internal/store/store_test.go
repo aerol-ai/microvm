@@ -163,6 +163,36 @@ func TestStoreCases(t *testing.T) {
 			},
 		},
 		{
+			name: "durability_roundtrip_and_default",
+			run: func(t *testing.T) {
+				st := newTestStore(t)
+				sandbox := sampleSandbox("sb-dur")
+				sandbox.Durability = models.DurabilityEphemeral
+				if err := st.Create(ctx, sandbox); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				got, err := st.Get(ctx, sandbox.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if got.Durability != models.DurabilityEphemeral {
+					t.Fatalf("durability = %q, want %q", got.Durability, models.DurabilityEphemeral)
+				}
+
+				defaulted := sampleSandbox("sb-dur-default")
+				if err := st.Create(ctx, defaulted); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				gotDefault, err := st.Get(ctx, defaulted.ID)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				if gotDefault.Durability != models.DurabilityPassivatable {
+					t.Fatalf("default durability = %q, want %q", gotDefault.Durability, models.DurabilityPassivatable)
+				}
+			},
+		},
+		{
 			name: "create_duplicate_returns_error",
 			run: func(t *testing.T) {
 				st := newTestStore(t)
@@ -1890,6 +1920,7 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // wake_armed
 			"",             // template_id
 			0,              // overlay_size_gb
+			"passivatable", // durability
 			"",             // owner_ref
 			0,              // fleet_suspended
 		}}

@@ -416,6 +416,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 
+	if cfg.EnableWasm {
+		wireWasmRuntime(cfg, logger, svc)
+	}
+
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
 	// control-plane RPC, but no Raft transport and no placement FSM copy.

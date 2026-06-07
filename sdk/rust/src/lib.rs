@@ -1899,6 +1899,7 @@ mod tests {
             runtime: None,
             gpus: None,
             custom_domains: None,
+            durability: None,
         }
     }
 

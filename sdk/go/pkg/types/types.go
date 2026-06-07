@@ -91,6 +91,13 @@ const (
 	RuntimeGvisor      = models.RuntimeGvisor
 	RuntimeKata        = models.RuntimeKata
 	RuntimeFirecracker = models.RuntimeFirecracker
+	RuntimeWasm        = models.RuntimeWasm
+)
+
+const (
+	DurabilityEphemeral    = models.DurabilityEphemeral
+	DurabilityPassivatable = models.DurabilityPassivatable
+	DurabilityDurable      = models.DurabilityDurable
 )
 
 type NetworkUsage = models.NetworkUsage

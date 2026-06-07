@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/aerol-ai/microvm/pkg/daemon"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 var (
@@ -25,6 +26,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 // entire boot sequence lives in pkg/daemon.Run, which a managed build reuses by
 // supplying a real provider factory.
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
+		if err := worker.RunCLI(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

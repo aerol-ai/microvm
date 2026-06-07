@@ -206,6 +206,9 @@ pub struct CreateOptions {
     /// list via [`Sandbox::add_custom_domain`] / [`Sandbox::remove_custom_domain`].
     #[serde(rename = "custom_domains", skip_serializing_if = "Option::is_none")]
     pub custom_domains: Option<Vec<String>>,
+    /// Survival class across daemon restarts. Omit for the runtime default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durability: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -510,6 +513,9 @@ pub struct Sandbox {
     /// was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpus: Option<GPUOptions>,
+    /// Survival class this sandbox was created with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durability: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

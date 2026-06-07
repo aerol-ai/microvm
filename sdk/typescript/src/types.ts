@@ -1,4 +1,13 @@
-export type SandboxStatus = "creating" | "started" | "stopped" | "destroyed" | "error";
+export type SandboxStatus =
+  | "creating"
+  | "started"
+  | "stopped"
+  | "destroyed"
+  | "error"
+  | "passivated"
+  | "awaiting_runtime";
+
+export type Durability = "ephemeral" | "passivatable" | "durable";
 
 export interface RegistryAuth {
   server: string;
@@ -180,7 +189,13 @@ export interface CreateOptions {
    *
    * GPU access is not supported with `"gvisor"`.
    */
-  runtime?: "docker" | "gvisor" | "kata" | "firecracker";
+  runtime?: "docker" | "gvisor" | "kata" | "firecracker" | "wasm";
+  /**
+   * Survival class across daemon restarts. Omit for the runtime default:
+   * `passivatable` for docker/gvisor/firecracker, `ephemeral` for wasm.
+   * `durable` is wasm-only and not yet implemented.
+   */
+  durability?: Durability;
   /**
    * Attach GPU resources to the sandbox. Omit for CPU-only workloads.
    * Not compatible with runtime="gvisor".
@@ -407,7 +422,9 @@ export interface Sandbox {
    * Container runtime this sandbox is running under. Empty string indicates
    * a pre-migration row that resolves to the host default at start time.
    */
-  runtime: "" | "docker" | "gvisor" | "kata" | "firecracker";
+  runtime: "" | "docker" | "gvisor" | "kata" | "firecracker" | "wasm";
+  /** Survival class this sandbox was created with. */
+  durability?: Durability;
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
 }
