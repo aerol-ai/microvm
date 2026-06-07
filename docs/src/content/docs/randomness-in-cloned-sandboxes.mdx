@@ -19,12 +19,14 @@ A running Linux VM has random state at two layers, and they are reseeded differe
 
 ## What AerolVM does automatically
 
-On every resume-from-snapshot, the in-guest agent force-reseeds the **kernel** CSPRNG from fresh host entropy before your code runs again. This means:
+On every resume-from-snapshot, the in-guest agent force-reseeds the **kernel** CSPRNG from fresh host entropy. The reseed completes before any process you newly start through the SDK runs, which means:
 
 - Any process you start **after** the clone resumes (for example, each `exec` or code-run invocation spawns a fresh interpreter) seeds from the freshly-reseeded kernel and is already clone-distinct.
 - Anything that reads the OS CSPRNG per call — `crypto/rand`, Python's `secrets`, Node's `crypto`/WebCrypto, Java's `SecureRandom` — is safe with no action on your part.
 
 In short: **fresh processes and crypto RNGs are handled for you.**
+
+The one timing caveat is for a process *already running inside the template* when the clone resumes: it can be scheduled in the brief window before the agent's reseed lands. The engineering deep-dive covers that window and how Firecracker's vmgenid closes it where available — see [Snapshot Clone Correctness](/engineering-snapshot-correctness). It is the same long-lived-process case described next.
 
 ## The remaining gap: long-lived userspace PRNGs
 

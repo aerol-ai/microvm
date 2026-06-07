@@ -392,3 +392,35 @@ func TestQuiesceHandler_PostResume_QuiesceErrorIsNonFatal(t *testing.T) {
 		t.Errorf("OnPostResume returned %v; want nil despite quiesce errors", err)
 	}
 }
+
+// TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure pins the
+// deliberate coupling between the kernel reseed and the clone-generation
+// bump: the token MUST still change when ReseedRandom fails. The token is a
+// clone/migration detector first (SDK cloneGeneration() + in-guest pollers),
+// so a resume that failed to reseed must not also silently fail to register
+// as a clone. On that rare failure an in-guest poller reseeding userspace
+// from the (possibly stale) kernel is no worse than leaving its frozen seed
+// in place; the reseed failure is logged loudly and vmgenid is the backstop.
+// If you intend to gate the bump on reseed success, this test should fail
+// and force that decision to be explicit.
+func TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure(t *testing.T) {
+	cg := newCloneGeneration(t.TempDir()+"/clone-generation", nil)
+	initialToken, _ := cg.current()
+
+	q := &fakeQuiesceOps{reseedErr: errors.New("entropy pool unavailable")}
+	h := newQuiesceHandler(nil, nil, cg)
+	h.quiesce = q
+
+	if err := h.OnPostResume(context.Background(),
+		json.RawMessage(`{"wallclock_unix_ns":777}`)); err != nil {
+		t.Fatalf("OnPostResume returned %v; want nil", err)
+	}
+
+	gotToken, gotResumedAt := cg.current()
+	if gotToken == initialToken {
+		t.Errorf("clone-generation token unchanged after reseed failure (%q); bump must fire regardless of reseed result", gotToken)
+	}
+	if gotResumedAt != 777 {
+		t.Errorf("resumedAt = %d, want 777 (bump records resume time even on reseed failure)", gotResumedAt)
+	}
+}

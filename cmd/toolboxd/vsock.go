@@ -249,9 +249,17 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 	if err := h.quiesce.ReseedRandom(); err != nil {
 		h.logger.Warn("vsock post_resume: rng reseed failed", "error", err)
 	}
-	// Bump the clone-generation token AFTER the kernel reseed so an in-guest
-	// process that observes the new token can immediately reseed its own
-	// userspace PRNGs from a kernel that already has fresh entropy.
+	// Bump the clone-generation token on every resume, regardless of the
+	// reseed result above. The token is first a clone/migration *detector*
+	// (the SDK cloneGeneration() reader and in-guest pollers), so it must
+	// change even if the reseed failed — otherwise a clone goes undetected.
+	// Ordered after ReseedRandom so that on the happy path an in-guest poller
+	// reseeds its userspace PRNG from a kernel that already holds fresh
+	// entropy. On the rare reseed failure the kernel may still hold the
+	// snapshot's stale entropy, but reseeding userspace from it is no worse
+	// than leaving the frozen seed in place — both duplicate across clones —
+	// and that failure is logged loudly just above; vmgenid is the real
+	// backstop. See TestQuiesceHandler_PostResume_BumpsGenerationEvenOnReseedFailure.
 	if h.cloneGen != nil {
 		h.cloneGen.bump(data.WallclockUnixNs)
 	}

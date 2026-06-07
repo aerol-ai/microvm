@@ -151,3 +151,19 @@ func TestQuiesceHandler_PostResume_BumpsCloneGeneration(t *testing.T) {
 		t.Errorf("resumedAt = %d, want 1700000000000000000", resumedAt)
 	}
 }
+
+// TestCloneGeneration_NilReceiverIsSafe pins the cheap hardening that the
+// /clone-generation route relies on: a nil *cloneGeneration (a partial
+// server in a test, or future code that skips newCloneGeneration) must
+// report the baseline "never cloned" state instead of panicking. bump on a
+// nil receiver is likewise a no-op.
+func TestCloneGeneration_NilReceiverIsSafe(t *testing.T) {
+	var cg *cloneGeneration // nil
+
+	token, resumedAt := cg.current()
+	if token != "" || resumedAt != 0 {
+		t.Errorf("nil current() = (%q, %d), want (\"\", 0)", token, resumedAt)
+	}
+	// Must not panic.
+	cg.bump(123)
+}
