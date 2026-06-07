@@ -377,6 +377,21 @@ type Config struct {
 	// WasmMaxInstances caps live WASM sandboxes on this host. 0 = unlimited.
 	// SB_WASM_MAX_INSTANCES.
 	WasmMaxInstances int
+	// WasmDefaultMemoryMB is the guest linear-memory cap when a create omits memory_mb.
+	// SB_WASM_DEFAULT_MEMORY_MB.
+	WasmDefaultMemoryMB int
+	// WasmDefaultTimeout is the default wall-clock budget for guest invocations.
+	// SB_WASM_DEFAULT_TIMEOUT.
+	WasmDefaultTimeout time.Duration
+	// WasmPoolEnabled gates the in-memory warm-worker pool (Phase 5).
+	// SB_WASM_POOL_ENABLED.
+	WasmPoolEnabled bool
+	// WasmPoolDepthDefault is the target number of warm workers per module digest.
+	// SB_WASM_POOL_DEPTH_DEFAULT.
+	WasmPoolDepthDefault int
+	// WasmPoolRefillInterval is how often the refill loop tops up the pool.
+	// SB_WASM_POOL_REFILL_INTERVAL.
+	WasmPoolRefillInterval time.Duration
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1137,6 +1152,11 @@ func Load() (Config, error) {
 		WasmRunDir:              getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
 		WasmModulesDir:          getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
 		WasmMaxInstances:        getEnvInt("SB_WASM_MAX_INSTANCES", 0),
+		WasmDefaultMemoryMB:     getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
+		WasmDefaultTimeout:      getEnvDuration("SB_WASM_DEFAULT_TIMEOUT", 5*time.Minute),
+		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
+		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
+		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
@@ -1355,6 +1375,15 @@ func Load() (Config, error) {
 		}
 		if cfg.WasmMaxInstances < 0 {
 			return Config{}, errors.New("SB_WASM_MAX_INSTANCES must be >= 0")
+		}
+		if cfg.WasmDefaultMemoryMB < 0 {
+			return Config{}, errors.New("SB_WASM_DEFAULT_MEMORY_MB must be >= 0")
+		}
+		if cfg.WasmPoolDepthDefault < 0 {
+			return Config{}, errors.New("SB_WASM_POOL_DEPTH_DEFAULT must be >= 0")
+		}
+		if cfg.WasmPoolEnabled && cfg.WasmPoolDepthDefault <= 0 {
+			return Config{}, errors.New("SB_WASM_POOL_DEPTH_DEFAULT must be > 0 when SB_WASM_POOL_ENABLED=true")
 		}
 	}
 

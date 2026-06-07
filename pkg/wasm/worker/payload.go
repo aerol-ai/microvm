@@ -25,9 +25,10 @@ type execPayload struct {
 }
 
 type execResultPayload struct {
-	ExitCode int    `json:"exit_code"`
-	Stdout   string `json:"stdout,omitempty"`
-	Stderr   string `json:"stderr,omitempty"`
+	ExitCode int                   `json:"exit_code"`
+	Stdout   string                `json:"stdout,omitempty"`
+	Stderr   string                `json:"stderr,omitempty"`
+	Usage    wasmengine.UsageStats `json:"usage,omitempty"`
 }
 
 type errorPayload struct {

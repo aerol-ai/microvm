@@ -37,23 +37,31 @@ func (d *Driver) execSandbox(ctx context.Context, sandboxID string, req models.E
 
 	args := wasmExecArgs(req.Command, inst.baseArgs)
 	env := mergeEnv(inst.baseEnv, req.Env)
-	caps := wasmengine.Capabilities{
+	wallTimeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if wallTimeout <= 0 {
+		wallTimeout = d.cfg.DefaultWallTimeout
+	}
+	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:  env,
 		Args: args,
 		Preopens: []wasmengine.Preopen{{
 			GuestPath: "/",
 			HostPath:  inst.workDir,
 		}},
-	}
+	}, inst.memoryMB, wallTimeout)
 
 	client := d.newWorkerClient(inst.socketPath)
 	start := time.Now()
 	run, err := client.Exec(sandboxID, caps, inst.entryExport)
+	durationMS := run.Usage.WallDurationMs
+	if durationMS <= 0 {
+		durationMS = time.Since(start).Milliseconds()
+	}
 	result := models.ExecResult{
 		Stdout:     run.Stdout,
 		Stderr:     run.Stderr,
 		ExitCode:   run.ExitCode,
-		DurationMS: time.Since(start).Milliseconds(),
+		DurationMS: durationMS,
 	}
 	if err != nil && result.Stderr == "" {
 		result.Stderr = err.Error()

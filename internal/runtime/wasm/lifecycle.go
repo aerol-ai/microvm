@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -19,7 +20,11 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		return d.runtimeState(inst), nil
 	}
 
-	if err := d.supervisor.Ensure(ctx, sandboxID, inst.socketPath); err != nil {
+	workerKey := inst.workerKey
+	if workerKey == "" {
+		workerKey = sandboxID
+	}
+	if err := d.supervisor.Ensure(ctx, workerKey, inst.socketPath); err != nil {
 		return nil, fmt.Errorf("start worker: %w", err)
 	}
 	client := d.newWorkerClient(inst.socketPath)
@@ -29,10 +34,10 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if err := client.LoadModule(sandboxID, inst.modulePath); err != nil {
 		return nil, fmt.Errorf("load module: %w", err)
 	}
-	caps := wasmengine.Capabilities{
+	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Preopens: []wasmengine.Preopen{{GuestPath: "/", HostPath: inst.workDir}},
 		Args:     []string{"wasm"},
-	}
+	}, inst.memoryMB, d.cfg.DefaultWallTimeout)
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}
@@ -78,7 +83,14 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		d.net.ReleaseSandbox(sandboxID)
 	}
 	if d.supervisor != nil {
-		_ = d.supervisor.Stop(sandboxID)
+		workerKey := sandboxID
+		if inst != nil && inst.workerKey != "" {
+			workerKey = inst.workerKey
+		}
+		_ = d.supervisor.Stop(workerKey)
+	}
+	if inst != nil && inst.fromWarmPool && inst.socketPath != "" {
+		_ = os.RemoveAll(filepath.Dir(inst.socketPath))
 	}
 	workDir := d.sandboxDir(sandboxID)
 	if inst != nil && inst.workDir != "" {

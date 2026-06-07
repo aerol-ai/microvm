@@ -417,7 +417,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	if cfg.EnableWasm {
-		wireWasmRuntime(cfg, logger, svc)
+		wasmPool := wireWasmRuntime(ctx, cfg, logger, svc)
+		if wasmPool != nil {
+			defer func() {
+				if drained := wasmPool.Close(); drained > 0 {
+					logger.Info("wasm warm pool drained on shutdown", "slots", drained)
+				}
+			}()
+		}
 	}
 
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only

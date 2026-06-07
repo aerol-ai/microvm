@@ -16,6 +16,8 @@ type sandboxInstance struct {
 	moduleDigest string
 	socketPath   string
 	workDir      string
+	workerKey    string
+	fromWarmPool bool
 	status       models.SandboxStatus
 	entryExport  string
 	baseEnv      map[string]string

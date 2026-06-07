@@ -1,18 +1,25 @@
 package wasm
 
-import "github.com/aerol-ai/microvm/internal/config"
+import (
+	"time"
 
-// Config holds host-side WASM runtime settings. Phase 1 lands the shape;
-// later phases wire engine, module cache, and warm pool knobs through here.
+	"github.com/aerol-ai/microvm/internal/config"
+)
+
+// Config holds host-side WASM runtime settings.
 type Config struct {
-	RunDir     string
-	ModulesDir string
+	RunDir             string
+	ModulesDir         string
+	DefaultMemoryMB    int
+	DefaultWallTimeout time.Duration
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
 func FromDaemonConfig(cfg config.Config) Config {
 	return Config{
-		RunDir:     cfg.WasmRunDir,
-		ModulesDir: cfg.WasmModulesDir,
+		RunDir:             cfg.WasmRunDir,
+		ModulesDir:         cfg.WasmModulesDir,
+		DefaultMemoryMB:    cfg.WasmDefaultMemoryMB,
+		DefaultWallTimeout: cfg.WasmDefaultTimeout,
 	}
 }

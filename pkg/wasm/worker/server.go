@@ -6,14 +6,16 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 // Server holds one wazero engine per worker process (D11: one module per worker).
 type Server struct {
-	mu  sync.Mutex
-	eng wasmengine.Engine
+	mu       sync.Mutex
+	eng      wasmengine.Engine
+	lastCaps wasmengine.Capabilities
 }
 
 // Serve accepts framed control messages on conn until EOF or an unrecoverable error.
@@ -97,6 +99,9 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			err = s.eng.Instantiate(ctx, p.Caps)
+			if err == nil {
+				s.lastCaps = p.Caps
+			}
 			s.mu.Unlock()
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
@@ -138,6 +143,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				ExitCode: result.ExitCode,
 				Stdout:   result.Stdout,
 				Stderr:   result.Stderr,
+				Usage:    result.Usage,
 			})
 			if encErr != nil {
 				return encErr
@@ -164,7 +170,11 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			err = s.eng.InvokeExport(ctx, p.Export)
+			invokeCtx, cancel := wasmengine.WithInvocationDeadline(ctx, s.lastCaps)
+			start := time.Now()
+			err = s.eng.InvokeExport(invokeCtx, p.Export)
+			_ = time.Since(start) // wall time accounted on Exec path via RunResult
+			cancel()
 			s.mu.Unlock()
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {

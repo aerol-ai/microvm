@@ -32,11 +32,27 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
 	}
 
+	warmSlot, err := d.tryAcquireWarm(ctx, resolved.Digest, resolved.Path)
+	if err != nil {
+		return nil, fmt.Errorf("warm pool acquire: %w", err)
+	}
+
 	workDir := d.sandboxDir(sandboxID)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
 	}
+
 	socketPath := filepath.Join(workDir, "worker.sock")
+	workerKey := sandboxID
+	if warmSlot != nil {
+		socketPath = warmSlot.SocketPath
+		workerKey = warmSlot.WorkerKey
+	}
+
+	memoryMB := req.MemoryMB
+	if memoryMB <= 0 {
+		memoryMB = d.cfg.DefaultMemoryMB
+	}
 
 	inst := &sandboxInstance{
 		sandboxID:    sandboxID,
@@ -45,12 +61,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		moduleDigest: resolved.Digest,
 		socketPath:   socketPath,
 		workDir:      workDir,
+		workerKey:    workerKey,
+		fromWarmPool: warmSlot != nil,
 		status:       models.SandboxStatusCreating,
 		entryExport:  entryExportFromRequest(req),
 		baseEnv:      copyStringMap(req.Env),
 		baseArgs:     wasmArgs(req),
 		cpu:          req.CPU,
-		memoryMB:     req.MemoryMB,
+		memoryMB:     memoryMB,
 		diskGB:       req.DiskGB,
 	}
 
@@ -59,36 +77,43 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.mu.Unlock()
 
 	cleanup := func() {
-		_ = d.supervisor.Stop(sandboxID)
+		_ = d.supervisor.Stop(workerKey)
+		if warmSlot != nil {
+			_ = os.RemoveAll(filepath.Dir(warmSlot.SocketPath))
+		}
 		_ = os.RemoveAll(workDir)
 		d.mu.Lock()
 		delete(d.byID, sandboxID)
 		d.mu.Unlock()
 	}
 
-	if err := d.supervisor.Ensure(ctx, sandboxID, socketPath); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("start worker: %w", err)
-	}
-
 	client := d.newWorkerClient(socketPath)
+	if warmSlot == nil {
+		if err := d.supervisor.Ensure(ctx, sandboxID, socketPath); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("start worker: %w", err)
+		}
+	}
 	if err := d.waitWorker(ctx, client, sandboxID); err != nil {
 		cleanup()
 		return nil, err
 	}
-	if err := client.LoadModule(sandboxID, resolved.Path); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("load module: %w", err)
+	if warmSlot == nil {
+		if err := client.LoadModule(sandboxID, resolved.Path); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("load module: %w", err)
+		}
 	}
 
-	caps := wasmengine.Capabilities{
+	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:  req.Env,
 		Args: wasmArgs(req),
 		Preopens: []wasmengine.Preopen{{
 			GuestPath: "/",
 			HostPath:  workDir,
 		}},
-	}
+	}, memoryMB, d.cfg.DefaultWallTimeout)
+
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("instantiate module: %w", err)

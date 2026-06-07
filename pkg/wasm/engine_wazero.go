@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -15,18 +16,62 @@ import (
 )
 
 type wazeroEngine struct {
-	runtime  wazero.Runtime
-	compiled wazero.CompiledModule
-	module   api.Module
+	runtime     wazero.Runtime
+	compiled    wazero.CompiledModule
+	module      api.Module
+	moduleBytes []byte
+	memoryPages uint32
 }
 
 func newWazeroEngine(ctx context.Context) (*wazeroEngine, error) {
-	r := wazero.NewRuntime(ctx)
+	e := &wazeroEngine{}
+	if err := e.initRuntime(ctx, 0); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
+	if e.module != nil {
+		_ = e.module.Close(ctx)
+		e.module = nil
+	}
+	if e.compiled != nil {
+		_ = e.compiled.Close(ctx)
+		e.compiled = nil
+	}
+	if e.runtime != nil {
+		_ = e.runtime.Close(ctx)
+		e.runtime = nil
+	}
+	pages := MemoryLimitPages(memoryMB)
+	cfg := wazero.NewRuntimeConfig()
+	if pages > 0 {
+		cfg = cfg.WithMemoryLimitPages(pages)
+	}
+	r := wazero.NewRuntimeWithConfig(ctx, cfg)
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
 		_ = r.Close(ctx)
-		return nil, fmt.Errorf("wasi instantiate: %w", err)
+		return fmt.Errorf("wasi instantiate: %w", err)
 	}
-	return &wazeroEngine{runtime: r}, nil
+	e.runtime = r
+	e.memoryPages = pages
+	if len(e.moduleBytes) > 0 {
+		compiled, err := r.CompileModule(ctx, e.moduleBytes)
+		if err != nil {
+			return fmt.Errorf("compile module: %w", err)
+		}
+		e.compiled = compiled
+	}
+	return nil
+}
+
+func (e *wazeroEngine) ensureMemoryLimit(ctx context.Context, memoryMB int) error {
+	want := MemoryLimitPages(memoryMB)
+	if want == e.memoryPages {
+		return nil
+	}
+	return e.initRuntime(ctx, memoryMB)
 }
 
 func (e *wazeroEngine) LoadModule(ctx context.Context, path string) error {
@@ -42,6 +87,7 @@ func (e *wazeroEngine) LoadModule(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	e.moduleBytes = append([]byte(nil), b...)
 	compiled, err := e.runtime.CompileModule(ctx, b)
 	if err != nil {
 		return fmt.Errorf("compile module: %w", err)
@@ -51,6 +97,12 @@ func (e *wazeroEngine) LoadModule(ctx context.Context, path string) error {
 }
 
 func (e *wazeroEngine) Instantiate(ctx context.Context, caps Capabilities) error {
+	if len(e.moduleBytes) == 0 && e.compiled == nil {
+		return fmt.Errorf("no compiled module loaded")
+	}
+	if err := e.ensureMemoryLimit(ctx, caps.MemoryMB); err != nil {
+		return err
+	}
 	if e.compiled == nil {
 		return fmt.Errorf("no compiled module loaded")
 	}
@@ -58,10 +110,7 @@ func (e *wazeroEngine) Instantiate(ctx context.Context, caps Capabilities) error
 		_ = e.module.Close(ctx)
 		e.module = nil
 	}
-	cfg := wazero.NewModuleConfig().WithArgs(caps.Args...)
-	for k, v := range caps.Env {
-		cfg = cfg.WithEnv(k, v)
-	}
+	cfg := e.moduleConfig(caps)
 	fsCfg := wazero.NewFSConfig()
 	for _, p := range caps.Preopens {
 		guest := p.GuestPath
@@ -102,19 +151,32 @@ func (e *wazeroEngine) InvokeExport(ctx context.Context, name string) error {
 	return err
 }
 
+func (e *wazeroEngine) moduleConfig(caps Capabilities) wazero.ModuleConfig {
+	cfg := wazero.NewModuleConfig().WithArgs(caps.Args...)
+	for k, v := range caps.Env {
+		cfg = cfg.WithEnv(k, v)
+	}
+	return cfg
+}
+
 func (e *wazeroEngine) Run(ctx context.Context, caps Capabilities, export string) (RunResult, error) {
 	if export == "" {
 		export = "_start"
 	}
+	invokeCtx, cancel := WithInvocationDeadline(ctx, caps)
+	defer cancel()
+	start := time.Now()
+
 	var stdout, stderr bytes.Buffer
-	if err := e.instantiateWithIO(ctx, caps, &stdout, &stderr); err != nil {
+	if err := e.instantiateWithIO(invokeCtx, caps, &stdout, &stderr); err != nil {
 		return RunResult{}, err
 	}
-	exitCode, err := e.callExport(ctx, export)
+	exitCode, err := e.callExport(invokeCtx, export)
 	result := RunResult{
 		ExitCode: exitCode,
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
+		Usage:    UsageStats{WallDurationMs: time.Since(start).Milliseconds()},
 	}
 	if err != nil {
 		var exitErr *sys.ExitError
@@ -128,6 +190,9 @@ func (e *wazeroEngine) Run(ctx context.Context, caps Capabilities, export string
 }
 
 func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities, stdout, stderr *bytes.Buffer) error {
+	if err := e.ensureMemoryLimit(ctx, caps.MemoryMB); err != nil {
+		return err
+	}
 	if e.compiled == nil {
 		return fmt.Errorf("no compiled module loaded")
 	}
@@ -135,10 +200,7 @@ func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities,
 		_ = e.module.Close(ctx)
 		e.module = nil
 	}
-	cfg := wazero.NewModuleConfig().WithArgs(caps.Args...)
-	for k, v := range caps.Env {
-		cfg = cfg.WithEnv(k, v)
-	}
+	cfg := e.moduleConfig(caps)
 	if stdout != nil {
 		cfg = cfg.WithStdout(stdout)
 	}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
@@ -103,6 +104,59 @@ func TestNotImplementedMethods(t *testing.T) {
 	}
 	if err := d.RemoveImage(ctx, "img"); !errors.Is(err, models.ErrRuntimeNotImplemented) {
 		t.Fatalf("RemoveImage: %v", err)
+	}
+}
+
+type fakeWarmPool struct {
+	slot *wasmpool.Slot
+}
+
+func (p *fakeWarmPool) NoteModule(string, string) {}
+
+func (p *fakeWarmPool) Acquire(_ context.Context, _, _ string) (*wasmpool.Slot, error) {
+	if p.slot == nil {
+		return nil, wasmpool.ErrNoSlot
+	}
+	s := p.slot
+	p.slot = nil
+	return s, nil
+}
+
+func TestCreateWarmPathSkipsEnsureAndLoad(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	runDir := filepath.Join(dir, "run")
+	warmSock := filepath.Join(dir, "warm.sock")
+
+	sup := &fakeSupervisor{}
+	client := &recordingWorkerClient{}
+	d := New(Config{RunDir: runDir, ModulesDir: dir}, nil)
+	d.SetModuleResolver(fakeResolver{path: modPath, digest: "deadbeef"})
+	d.SetWorkerSupervisor(sup)
+	d.SetWorkerClientFactory(func(string) WorkerClient { return client })
+	d.SetWarmPool(&fakeWarmPool{slot: &wasmpool.Slot{
+		ID:           "pool-1",
+		ModuleDigest: "deadbeef",
+		ModulePath:   modPath,
+		SocketPath:   warmSock,
+		WorkerKey:    "pool-1",
+	}})
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-warm", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if sup.ensureCalls != 0 {
+		t.Fatalf("ensure calls = %d, want 0 on warm hit", sup.ensureCalls)
+	}
+	if client.loadPath != "" {
+		t.Fatalf("load path = %q, want empty on warm hit", client.loadPath)
+	}
+	inst, err := d.instance("sb-warm")
+	if err != nil {
+		t.Fatalf("instance: %v", err)
+	}
+	if inst.workerKey != "pool-1" || !inst.fromWarmPool {
+		t.Fatalf("workerKey=%q fromWarm=%v", inst.workerKey, inst.fromWarmPool)
 	}
 }
 

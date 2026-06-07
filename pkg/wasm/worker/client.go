@@ -120,6 +120,7 @@ func (c *Client) Exec(sandboxID string, caps wasmengine.Capabilities, export str
 		ExitCode: p.ExitCode,
 		Stdout:   p.Stdout,
 		Stderr:   p.Stderr,
+		Usage:    p.Usage,
 	}, nil
 }
 

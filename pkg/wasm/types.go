@@ -1,10 +1,12 @@
 package wasm
 
-// Capabilities configures WASI preopens, env, and args for an instance.
+// Capabilities configures WASI preopens, env, args, and resource limits for an instance.
 type Capabilities struct {
-	Env      map[string]string `json:"env,omitempty"`
-	Preopens []Preopen         `json:"preopens,omitempty"`
-	Args     []string          `json:"args,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	Preopens      []Preopen         `json:"preopens,omitempty"`
+	Args          []string          `json:"args,omitempty"`
+	MemoryMB      int               `json:"memory_mb,omitempty"`
+	WallTimeoutNs int64             `json:"wall_timeout_ns,omitempty"`
 }
 
 // Preopen maps a host directory into the guest filesystem.
@@ -13,9 +15,17 @@ type Preopen struct {
 	HostPath  string `json:"host_path"`
 }
 
+// UsageStats captures per-invocation metering for billing (UC-42a on wazero).
+type UsageStats struct {
+	WallDurationMs int64 `json:"wall_duration_ms"`
+	// Instructions is populated only on the wasmtime engine seam (UC-42b).
+	Instructions int64 `json:"instructions,omitempty"`
+}
+
 // RunResult captures a single invocation's outcome.
 type RunResult struct {
-	ExitCode int    `json:"exit_code"`
-	Stdout   string `json:"stdout,omitempty"`
-	Stderr   string `json:"stderr,omitempty"`
+	ExitCode int        `json:"exit_code"`
+	Stdout   string     `json:"stdout,omitempty"`
+	Stderr   string     `json:"stderr,omitempty"`
+	Usage    UsageStats `json:"usage,omitempty"`
 }

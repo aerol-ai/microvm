@@ -22,6 +22,7 @@ type Driver struct {
 	supervisor      WorkerSupervisor
 	newWorkerClient WorkerClientFactory
 	net             *networkGateway
+	warmPool        WarmPool
 
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance
