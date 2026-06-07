@@ -32,6 +32,9 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
 		cfg.StateKV = d.stateKV
 	}
+	if mgr, err := d.sessionsFor(inst); err == nil {
+		cfg.Sessions = mgr
+	}
 	host := toolhost.New(cfg)
 	host.Handler().ServeHTTP(w, r)
 }

@@ -37,11 +37,3 @@ func (h *Host) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, result)
 }
-
-func (h *Host) handleCodeRun(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "code-run is not implemented for wasm runtime; use process.execute")
-}
-
-func (h *Host) handleExecStream(w http.ResponseWriter, _ *http.Request) {
-	writeError(w, http.StatusNotImplemented, "exec stream is not implemented for wasm runtime")
-}

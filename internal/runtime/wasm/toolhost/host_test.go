@@ -135,6 +135,16 @@ func TestHostFilesAndExec(t *testing.T) {
 			t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 		}
 	})
+
+	t.Run("sessions list empty", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/sessions", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("sessions list status = %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 func TestHostStateKV(t *testing.T) {

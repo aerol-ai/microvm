@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -16,6 +17,7 @@ type Host struct {
 	authToken string
 	exec      Executor
 	stateKV   StateKV
+	sessions  *sessions.Manager
 }
 
 // Config wires a toolbox host for one sandbox.
@@ -25,6 +27,7 @@ type Config struct {
 	AuthToken string
 	Exec      Executor
 	StateKV   StateKV
+	Sessions  *sessions.Manager
 }
 
 // New constructs a toolbox host.
@@ -35,6 +38,7 @@ func New(cfg Config) *Host {
 		authToken: cfg.AuthToken,
 		exec:      cfg.Exec,
 		stateKV:   cfg.StateKV,
+		sessions:  cfg.Sessions,
 	}
 }
 

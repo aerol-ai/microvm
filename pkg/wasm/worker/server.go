@@ -152,6 +152,10 @@ func (s *Server) Serve(conn net.Conn) error {
 			}
 			result, err := s.eng.Run(ctx, p.Caps, p.Export)
 			s.mu.Unlock()
+			// Guest→host WASI output bytes until socket-level metering lands (UC-43).
+			if out := int64(len(result.Stdout) + len(result.Stderr)); out > 0 {
+				s.netUsageFor(env.SandboxID).bytesOut.Add(out)
+			}
 			if err != nil && result.ExitCode == 0 && result.Stderr == "" {
 				if replyErr(env.SandboxID, err) != nil {
 					return err

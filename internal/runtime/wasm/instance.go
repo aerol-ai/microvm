@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -26,6 +27,7 @@ type sandboxInstance struct {
 	memoryMB     int
 	diskGB       int
 	durability   string
+	sessions     *sessions.Manager
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {
