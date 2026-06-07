@@ -53,6 +53,10 @@ type restorePayload struct {
 	Caps wasmengine.Capabilities `json:"caps"`
 }
 
+type setCapabilityPayload struct {
+	Caps wasmengine.Capabilities `json:"caps"`
+}
+
 func encodePayload(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

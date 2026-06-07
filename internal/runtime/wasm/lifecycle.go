@@ -100,7 +100,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return nil
 }
 
-func (d *Driver) Resize(_ context.Context, sandboxID string, req models.ResizeSandboxRequest) error {
+func (d *Driver) Resize(ctx context.Context, sandboxID string, req models.ResizeSandboxRequest) error {
 	inst, err := d.instance(sandboxID)
 	if err != nil {
 		return err
@@ -114,6 +114,14 @@ func (d *Driver) Resize(_ context.Context, sandboxID string, req models.ResizeSa
 	if req.MemoryMB > 0 {
 		inst.memoryMB = req.MemoryMB
 	}
+	if inst.status == models.SandboxStatusStarted && req.MemoryMB > 0 {
+		client := d.newWorkerClient(inst.socketPath)
+		caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{}, inst.memoryMB, d.cfg.DefaultWallTimeout)
+		if err := client.SetCapability(sandboxID, caps); err != nil {
+			return fmt.Errorf("resize worker caps: %w", err)
+		}
+	}
+	_ = ctx
 	d.mu.Lock()
 	d.byID[sandboxID] = inst
 	d.mu.Unlock()

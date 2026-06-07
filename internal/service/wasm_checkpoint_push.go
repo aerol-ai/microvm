@@ -33,8 +33,13 @@ func NewWasmCheckpointPusher(cfg SnapshotPushConfig, logger *slog.Logger) (*Wasm
 	return &WasmCheckpointPusher{cfg: cfg, logger: logger}, nil
 }
 
-// DestRefFor returns the AOCR ref for sandboxID without pushing.
+// DestRefFor returns the AOCR :latest ref for sandboxID without pushing.
 func (p *WasmCheckpointPusher) DestRefFor(sandboxID string) string {
+	return p.DestRefTagged(sandboxID, "latest")
+}
+
+// DestRefTagged returns an AOCR ref with an explicit tag.
+func (p *WasmCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
 	if p == nil {
 		return ""
 	}
@@ -42,11 +47,16 @@ func (p *WasmCheckpointPusher) DestRefFor(sandboxID string) string {
 	if sandboxID == "" {
 		return ""
 	}
-	return wasmmod.WasmCheckpointRef(p.cfg.Host, p.cfg.ClusterID, sandboxID)
+	return wasmmod.WasmCheckpointRefTagged(p.cfg.Host, p.cfg.ClusterID, sandboxID, tag)
 }
 
-// PushOnce uploads memSnapDir to AOCR for sandboxID.
+// PushOnce uploads memSnapDir to AOCR :latest for sandboxID.
 func (p *WasmCheckpointPusher) PushOnce(ctx context.Context, sandboxID, memSnapDir string) (WasmCheckpointPushResult, error) {
+	return p.PushOnceTo(ctx, sandboxID, memSnapDir, p.DestRefFor(sandboxID))
+}
+
+// PushOnceTo uploads memSnapDir to an explicit AOCR ref.
+func (p *WasmCheckpointPusher) PushOnceTo(ctx context.Context, sandboxID, memSnapDir, dest string) (WasmCheckpointPushResult, error) {
 	if p == nil {
 		return WasmCheckpointPushResult{}, errors.New("wasm checkpoint push disabled (pusher is nil)")
 	}
@@ -55,8 +65,10 @@ func (p *WasmCheckpointPusher) PushOnce(ctx context.Context, sandboxID, memSnapD
 	if sandboxID == "" || memSnapDir == "" {
 		return WasmCheckpointPushResult{}, fmt.Errorf("wasm checkpoint push: sandbox id and mem.snap dir required")
 	}
-
-	dest := p.DestRefFor(sandboxID)
+	dest = strings.TrimSpace(dest)
+	if dest == "" {
+		return WasmCheckpointPushResult{}, fmt.Errorf("wasm checkpoint push: destination ref required")
+	}
 	orasCfg := wasmmod.ORASPushConfig{
 		Host:      p.cfg.Host,
 		ClusterID: p.cfg.ClusterID,

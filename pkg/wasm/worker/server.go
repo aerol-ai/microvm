@@ -277,6 +277,43 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
+		case MsgSetCapability:
+			var p setCapabilityPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mu.Lock()
+			if s.eng == nil {
+				s.mu.Unlock()
+				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
+					return err
+				}
+				continue
+			}
+			next := s.lastCaps
+			if p.Caps.MemoryMB > 0 {
+				next.MemoryMB = p.Caps.MemoryMB
+			}
+			if p.Caps.WallTimeoutNs > 0 {
+				next.WallTimeoutNs = p.Caps.WallTimeoutNs
+			}
+			err = s.eng.Instantiate(ctx, next)
+			if err == nil {
+				s.lastCaps = next
+			}
+			s.mu.Unlock()
+			if err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
 		default:
 			if err := writeFrame(conn, Envelope{
 				Type:      MsgInvokeResult,

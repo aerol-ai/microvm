@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/toolhost"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // ToolboxHost serves toolbox HTTP in-process for WASM sandboxes.
@@ -22,12 +23,16 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		writeToolboxError(w, http.StatusNotFound, "wasm sandbox not found")
 		return
 	}
-	host := toolhost.New(toolhost.Config{
+	cfg := toolhost.Config{
 		SandboxID: sandboxID,
 		WorkDir:   inst.workDir,
 		AuthToken: token,
 		Exec:      sandboxExecutor{driver: d, id: sandboxID},
-	})
+	}
+	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
+		cfg.StateKV = d.stateKV
+	}
+	host := toolhost.New(cfg)
 	host.Handler().ServeHTTP(w, r)
 }
 

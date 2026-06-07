@@ -401,6 +401,9 @@ type Config struct {
 	// WasmDurablePushInterval re-pushes durable checkpoints missing AOCR metadata.
 	// 0 = off (push still happens at passivation). SB_WASM_DURABLE_PUSH_INTERVAL.
 	WasmDurablePushInterval time.Duration
+	// WasmCheckpointKeepLastN retains the newest N AOCR push records per sandbox.
+	// 0 disables pruning. Default 3. SB_WASM_CHECKPOINT_KEEP_LAST_N.
+	WasmCheckpointKeepLastN int
 	// WasmModuleGCEnabled gates the wasm_modules catalogue janitor.
 	// SB_WASM_MODULE_GC_ENABLED.
 	WasmModuleGCEnabled bool
@@ -1174,6 +1177,7 @@ func Load() (Config, error) {
 		WasmDrainTimeout:        getEnvDuration("SB_WASM_DRAIN_TIMEOUT", 30*time.Second),
 		WasmCheckpointInterval:  getEnvDuration("SB_WASM_CHECKPOINT_INTERVAL", 0),
 		WasmDurablePushInterval: getEnvDuration("SB_WASM_DURABLE_PUSH_INTERVAL", 0),
+		WasmCheckpointKeepLastN: getEnvInt("SB_WASM_CHECKPOINT_KEEP_LAST_N", 3),
 		WasmModuleGCEnabled:     getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
 		WasmModuleGCInterval:    getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
 		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),

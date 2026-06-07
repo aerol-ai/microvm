@@ -397,6 +397,26 @@ func Open(path string) (*Store, error) {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at
 			ON wasm_modules(updated_at);`,
+		// wasm_state_kv backs the durable host-KV capability (§4.6).
+		`CREATE TABLE IF NOT EXISTS wasm_state_kv (
+			sandbox_id TEXT NOT NULL,
+			key TEXT NOT NULL,
+			value BLOB NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, key)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_state_kv_sandbox
+			ON wasm_state_kv(sandbox_id);`,
+		// wasm_checkpoint_pushes tracks AOCR push history for keep-last-N (§4.8).
+		`CREATE TABLE IF NOT EXISTS wasm_checkpoint_pushes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			sandbox_id TEXT NOT NULL,
+			registry_ref TEXT NOT NULL,
+			digest TEXT NOT NULL,
+			pushed_at DATETIME NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_checkpoint_pushes_sandbox
+			ON wasm_checkpoint_pushes(sandbox_id, pushed_at DESC);`,
 		// account_mappings records the identities resolved by the optional
 		// fleet control plane (managed builds only). owner_ref is the stable
 		// account key stamped onto sandboxes; external_id is informational.
@@ -4545,6 +4565,136 @@ func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, status, che
 	`, status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID)
 	if err != nil {
 		return fmt.Errorf("update wasm checkpoint: %w", err)
+	}
+	return nil
+}
+
+// PutWasmStateKV upserts one durable host-KV row (§4.6).
+func (s *Store) PutWasmStateKV(ctx context.Context, sandboxID, key string, value []byte) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	key = strings.TrimSpace(key)
+	if sandboxID == "" || key == "" {
+		return fmt.Errorf("wasm state kv: sandbox id and key required")
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_state_kv (sandbox_id, key, value, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id, key) DO UPDATE SET
+			value = excluded.value,
+			updated_at = excluded.updated_at
+	`, sandboxID, key, value, now)
+	if err != nil {
+		return fmt.Errorf("put wasm state kv: %w", err)
+	}
+	return nil
+}
+
+// GetWasmStateKV returns one durable host-KV value.
+func (s *Store) GetWasmStateKV(ctx context.Context, sandboxID, key string) ([]byte, bool, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	key = strings.TrimSpace(key)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT value FROM wasm_state_kv WHERE sandbox_id = ? AND key = ?`,
+		sandboxID, key)
+	var value []byte
+	err := row.Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("get wasm state kv: %w", err)
+	}
+	return value, true, nil
+}
+
+// DeleteWasmStateKV removes one durable host-KV row.
+func (s *Store) DeleteWasmStateKV(ctx context.Context, sandboxID, key string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	key = strings.TrimSpace(key)
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM wasm_state_kv WHERE sandbox_id = ? AND key = ?`,
+		sandboxID, key)
+	if err != nil {
+		return fmt.Errorf("delete wasm state kv: %w", err)
+	}
+	return nil
+}
+
+// ListWasmStateKVKeys lists keys for a sandbox.
+func (s *Store) ListWasmStateKVKeys(ctx context.Context, sandboxID string) ([]string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT key FROM wasm_state_kv WHERE sandbox_id = ? ORDER BY key`,
+		sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("list wasm state kv keys: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		out = append(out, key)
+	}
+	return out, rows.Err()
+}
+
+// WasmCheckpointPushRecord is one AOCR push history row.
+type WasmCheckpointPushRecord struct {
+	ID          int64
+	SandboxID   string
+	RegistryRef string
+	Digest      string
+	PushedAt    time.Time
+}
+
+// InsertWasmCheckpointPush records a successful AOCR push for keep-last-N retention.
+func (s *Store) InsertWasmCheckpointPush(ctx context.Context, sandboxID, registryRef, digest string) (int64, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_checkpoint_pushes (sandbox_id, registry_ref, digest, pushed_at)
+		VALUES (?, ?, ?, ?)`,
+		strings.TrimSpace(sandboxID), strings.TrimSpace(registryRef), strings.TrimSpace(digest), now)
+	if err != nil {
+		return 0, fmt.Errorf("insert wasm checkpoint push: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// ListWasmCheckpointPushes returns push history newest-first.
+func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) ([]WasmCheckpointPushRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, sandbox_id, registry_ref, digest, pushed_at
+		FROM wasm_checkpoint_pushes
+		WHERE sandbox_id = ?
+		ORDER BY pushed_at DESC, id DESC`, strings.TrimSpace(sandboxID))
+	if err != nil {
+		return nil, fmt.Errorf("list wasm checkpoint pushes: %w", err)
+	}
+	defer rows.Close()
+	var out []WasmCheckpointPushRecord
+	for rows.Next() {
+		var rec WasmCheckpointPushRecord
+		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// DeleteWasmCheckpointPush removes one push history row by id.
+func (s *Store) DeleteWasmCheckpointPush(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM wasm_checkpoint_pushes WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete wasm checkpoint push: %w", err)
 	}
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 // DrainWasmSandboxes checkpoints passivatable/durable live WASM sandboxes during
@@ -111,7 +112,9 @@ func (s *Service) checkpointWasmSandbox(ctx context.Context, host wasmruntime.Ch
 func (s *Service) pushWasmCheckpointBestEffort(sandboxID, memSnapDir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	result, err := s.wasmCheckpointPusher.PushOnce(ctx, sandboxID, memSnapDir)
+	tag := "latest"
+	dest := s.wasmCheckpointPusher.DestRefTagged(sandboxID, tag)
+	result, err := s.wasmCheckpointPusher.PushOnceTo(ctx, sandboxID, memSnapDir, dest)
 	if err != nil {
 		s.logger.Warn("wasm checkpoint AOCR push failed",
 			"sandbox_id", sandboxID,
@@ -119,11 +122,55 @@ func (s *Service) pushWasmCheckpointBestEffort(sandboxID, memSnapDir string) {
 		)
 		return
 	}
+	if digestTag := wasmmod.WasmCheckpointDigestTag(result.Digest); digestTag != "latest" {
+		if taggedDest := s.wasmCheckpointPusher.DestRefTagged(sandboxID, digestTag); taggedDest != dest {
+			if _, tagErr := s.wasmCheckpointPusher.PushOnceTo(ctx, sandboxID, memSnapDir, taggedDest); tagErr != nil {
+				s.logger.Warn("wasm checkpoint digest-tagged AOCR push failed",
+					"sandbox_id", sandboxID,
+					"tag", digestTag,
+					"error", tagErr,
+				)
+			} else {
+				result.RegistryRef = taggedDest
+			}
+		}
+	}
 	if err := s.store.UpdateWasmRegistryPush(ctx, sandboxID, result.RegistryRef, result.Digest); err != nil {
 		s.logger.Warn("wasm checkpoint AOCR push metadata persist failed",
 			"sandbox_id", sandboxID,
 			"error", err,
 		)
+	}
+	if _, err := s.store.InsertWasmCheckpointPush(ctx, sandboxID, result.RegistryRef, result.Digest); err != nil {
+		s.logger.Warn("wasm checkpoint push history persist failed",
+			"sandbox_id", sandboxID,
+			"error", err,
+		)
+	}
+	s.pruneWasmCheckpointPushes(ctx, sandboxID)
+}
+
+func (s *Service) pruneWasmCheckpointPushes(ctx context.Context, sandboxID string) {
+	keep := s.cfg.WasmCheckpointKeepLastN
+	if keep <= 0 {
+		return
+	}
+	recs, err := s.store.ListWasmCheckpointPushes(ctx, sandboxID)
+	if err != nil {
+		s.logger.Warn("wasm checkpoint push history list failed",
+			"sandbox_id", sandboxID,
+			"error", err,
+		)
+		return
+	}
+	for i := keep; i < len(recs); i++ {
+		if err := s.store.DeleteWasmCheckpointPush(ctx, recs[i].ID); err != nil {
+			s.logger.Warn("wasm checkpoint push history prune failed",
+				"sandbox_id", sandboxID,
+				"push_id", recs[i].ID,
+				"error", err,
+			)
+		}
 	}
 }
 

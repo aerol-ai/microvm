@@ -46,12 +46,34 @@ func (c ORASPushConfig) Validate() error {
 	return nil
 }
 
-// WasmCheckpointRef is the AOCR destination for a durable WASM checkpoint.
+// WasmCheckpointRef is the AOCR destination for a durable WASM checkpoint (:latest).
 func WasmCheckpointRef(host, clusterID, sandboxID string) string {
+	return WasmCheckpointRefTagged(host, clusterID, sandboxID, "latest")
+}
+
+// WasmCheckpointRefTagged builds an AOCR ref with an explicit tag (digest or latest).
+func WasmCheckpointRefTagged(host, clusterID, sandboxID, tag string) string {
 	host = strings.TrimRight(strings.TrimSpace(host), "/")
 	clusterID = strings.TrimSpace(clusterID)
 	sandboxID = strings.ToLower(strings.TrimSpace(sandboxID))
-	return fmt.Sprintf("%s/cluster/%s/wasm-checkpoints/%s:latest", host, clusterID, sandboxID)
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = "latest"
+	}
+	return fmt.Sprintf("%s/cluster/%s/wasm-checkpoints/%s:%s", host, clusterID, sandboxID, tag)
+}
+
+// WasmCheckpointDigestTag normalizes a manifest digest for use as an OCI tag.
+func WasmCheckpointDigestTag(digest string) string {
+	digest = strings.TrimSpace(digest)
+	digest = strings.TrimPrefix(digest, "sha256:")
+	if digest == "" {
+		return "latest"
+	}
+	if len(digest) > 64 {
+		return digest[:64]
+	}
+	return digest
 }
 
 // PushSnapshotArtifact uploads a local mem.snap directory to an OCI registry.

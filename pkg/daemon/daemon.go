@@ -417,7 +417,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	if cfg.EnableWasm {
-		wasmPool := wireWasmRuntime(ctx, cfg, logger, svc)
+		wasmPool := wireWasmRuntime(ctx, cfg, logger, svc, db)
 		if wasmPool != nil {
 			defer func() {
 				if drained := wasmPool.Close(); drained > 0 {

@@ -163,6 +163,19 @@ func (c *Client) Restore(sandboxID, dir string, caps wasmengine.Capabilities) er
 	return c.expectOK(reply)
 }
 
+// SetCapability hot-updates memory/wall-timeout caps on a running instance.
+func (c *Client) SetCapability(sandboxID string, caps wasmengine.Capabilities) error {
+	body, err := encodePayload(setCapabilityPayload{Caps: caps})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgSetCapability, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
 // StopInstance tears down the active instance inside the worker.
 func (c *Client) StopInstance(sandboxID string) error {
 	reply, err := c.roundTrip(Envelope{Type: MsgStopInstance, SandboxID: sandboxID})

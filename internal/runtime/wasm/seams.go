@@ -29,6 +29,7 @@ type WorkerClient interface {
 	StopInstance(sandboxID string) error
 	Checkpoint(sandboxID, outDir string, meta wasmengine.SnapshotConfig) error
 	Restore(sandboxID, dir string, caps wasmengine.Capabilities) error
+	SetCapability(sandboxID string, caps wasmengine.Capabilities) error
 }
 
 // WorkerClientFactory builds a client for a worker socket path.
@@ -72,4 +73,8 @@ func (a workerClientAdapter) Checkpoint(sandboxID, outDir string, meta wasmengin
 
 func (a workerClientAdapter) Restore(sandboxID, dir string, caps wasmengine.Capabilities) error {
 	return a.client.Restore(sandboxID, dir, caps)
+}
+
+func (a workerClientAdapter) SetCapability(sandboxID string, caps wasmengine.Capabilities) error {
+	return a.client.SetCapability(sandboxID, caps)
 }

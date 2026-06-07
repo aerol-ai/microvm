@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -23,6 +24,7 @@ type Driver struct {
 	newWorkerClient WorkerClientFactory
 	net             *networkGateway
 	warmPool        WarmPool
+	stateKV         statekv.Store
 
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance
@@ -59,6 +61,11 @@ func (d *Driver) SetWorkerClientFactory(f WorkerClientFactory) {
 	if f != nil {
 		d.newWorkerClient = f
 	}
+}
+
+// SetStateKV wires the durable host-KV store (§4.6).
+func (d *Driver) SetStateKV(kv statekv.Store) {
+	d.stateKV = kv
 }
 
 func (d *Driver) notImplemented(method string) error {

@@ -15,6 +15,7 @@ type Host struct {
 	workDir   string
 	authToken string
 	exec      Executor
+	stateKV   StateKV
 }
 
 // Config wires a toolbox host for one sandbox.
@@ -23,6 +24,7 @@ type Config struct {
 	WorkDir   string
 	AuthToken string
 	Exec      Executor
+	StateKV   StateKV
 }
 
 // New constructs a toolbox host.
@@ -32,6 +34,7 @@ func New(cfg Config) *Host {
 		workDir:   cfg.WorkDir,
 		authToken: cfg.AuthToken,
 		exec:      cfg.Exec,
+		stateKV:   cfg.StateKV,
 	}
 }
 
@@ -88,6 +91,11 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleListFiles(w, r)
+	case strings.HasPrefix(r.URL.Path, "/state/kv"):
+		if !h.requireAuth(w, r) {
+			return
+		}
+		h.handleStateKV(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/process/exec/stream":
 		if !h.requireAuth(w, r) {
 			return

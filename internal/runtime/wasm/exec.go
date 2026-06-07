@@ -69,6 +69,7 @@ func (d *Driver) execSandbox(ctx context.Context, sandboxID string, req models.E
 	if err != nil && result.ExitCode == 0 {
 		result.ExitCode = 1
 	}
+	recordWasmUsage(sandboxID, run.Usage)
 	return result, nil
 }
 

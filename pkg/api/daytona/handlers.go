@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
+	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -990,6 +991,27 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	}
 	if req.AutoDeleteInterval != nil && *req.AutoDeleteInterval > 0 {
 		lifecycle.DestroyIfIdleFor = durationFromMinutes(float32(*req.AutoDeleteInterval))
+	}
+
+	catalogueID := strings.TrimSpace(valueOrEmpty(req.Snapshot))
+	if catalogueID == "" {
+		catalogueID = strings.TrimSpace(valueOrEmpty(req.Name))
+	}
+	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, h.deps.Service, catalogueID, mapValue(req.Labels)); err != nil {
+		return models.CreateSandboxRequest{}, "", err
+	} else if ok {
+		wasmReq.CPU = float64(int32Value(req.Cpu, 0))
+		wasmReq.MemoryMB = int(int32Value(req.Memory, 0)) * 1024
+		wasmReq.DiskGB = int(int32Value(req.Disk, 0))
+		wasmReq.Env = cloneStringMap(mapValue(req.Env))
+		wasmReq.OSUser = trimmedString(req.User)
+		wasmReq.NetworkBlockAll = boolValue(req.NetworkBlockAll)
+		wasmReq.Name = trimmedString(req.Name)
+		wasmReq.Tags = cloneStringMap(mapValue(req.Labels))
+		if !lifecycle.IsZero() {
+			wasmReq.Lifecycle = &lifecycle
+		}
+		return wasmReq, "", nil
 	}
 
 	image, freshlyBuilt, err := h.createImage(ctx, req)
