@@ -108,9 +108,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
-		Env:      req.Env,
-		Args:     wasmArgs(req),
-		Preopens: preopensFromBinds(workDir, hostMounts),
+		Env:            req.Env,
+		Args:           wasmArgs(req),
+		Preopens:       preopensFromBinds(workDir, hostMounts),
+		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, memoryMB, d.cfg.DefaultWallTimeout)
 
 	if err := client.Instantiate(sandboxID, caps); err != nil {

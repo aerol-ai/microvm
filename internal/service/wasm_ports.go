@@ -44,7 +44,7 @@ func (s *Service) releaseWasmHTTPListener(sandboxID string, guestPort int) {
 	pg.ReleaseHTTPListener(sandboxID, guestPort)
 }
 
-func (s *Service) syncWasmAllowedPorts(sandbox *models.Sandbox) {
+func (s *Service) syncWasmAllowedPorts(ctx context.Context, sandbox *models.Sandbox) {
 	if sandbox == nil {
 		return
 	}
@@ -57,6 +57,11 @@ func (s *Service) syncWasmAllowedPorts(sandbox *models.Sandbox) {
 		ports = append(ports, p.Port)
 	}
 	pg.SyncAllowedPorts(sandbox.ID, ports)
+	if syncer, ok := s.wasm.(wasmruntime.GuestListenPortSyncer); ok {
+		if err := syncer.SyncGuestListenPorts(ctx, sandbox.ID, ports); err != nil {
+			s.logger.Warn("failed to sync wasm guest listen ports", "sandbox_id", sandbox.ID, "error", err)
+		}
+	}
 }
 
 func (s *Service) installWasmHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, guestPort int) error {

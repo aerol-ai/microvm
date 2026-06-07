@@ -37,13 +37,15 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Driver{
+	d := &Driver{
 		cfg:             cfg,
 		logger:          logger,
 		newWorkerClient: defaultWorkerClientFactory,
-		net:             newNetworkGateway(),
 		byID:            make(map[string]*sandboxInstance),
 	}
+	d.net = newNetworkGateway()
+	d.net.SetHTTPProxy(d.guestHTTPProxy)
+	return d
 }
 
 // SetModuleResolver injects the module resolver (pkg/wasmmod.Resolver in production).

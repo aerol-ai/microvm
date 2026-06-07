@@ -35,8 +35,9 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		return nil, fmt.Errorf("load module: %w", err)
 	}
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
-		Preopens: []wasmengine.Preopen{{GuestPath: "/", HostPath: inst.workDir}},
-		Args:     []string{"wasm"},
+		Preopens:       []wasmengine.Preopen{{GuestPath: "/", HostPath: inst.workDir}},
+		Args:           []string{"wasm"},
+		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, inst.memoryMB, d.cfg.DefaultWallTimeout)
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)

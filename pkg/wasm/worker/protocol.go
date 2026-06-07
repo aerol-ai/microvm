@@ -23,6 +23,9 @@ const (
 	MsgSetCapability    MessageType = "set_capability"
 	MsgNetstatsTick     MessageType = "netstats_tick"
 	MsgSetNetworkBlocks MessageType = "set_network_blocks"
+	MsgSetListenPort    MessageType = "set_listen_port"
+	MsgProxyHTTP        MessageType = "proxy_http"
+	MsgProxyHTTPResult  MessageType = "proxy_http_result"
 )
 
 // Envelope is the on-wire message body (after the length prefix).

@@ -4563,7 +4563,7 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 		return
 	}
 	if s.isWasmSandbox(sandbox) {
-		s.syncWasmAllowedPorts(sandbox)
+		s.syncWasmAllowedPorts(ctx, sandbox)
 		return
 	}
 	ports := make([]int, 0, len(sandbox.ExposedPorts))

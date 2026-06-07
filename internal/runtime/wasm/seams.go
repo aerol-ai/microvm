@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"context"
+	"net/http"
 
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -32,6 +33,8 @@ type WorkerClient interface {
 	SetCapability(sandboxID string, caps wasmengine.Capabilities) error
 	NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err error)
 	SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error
+	SetListenPort(sandboxID string, port int, host string) error
+	ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error
 }
 
 // WorkerClientFactory builds a client for a worker socket path.
@@ -87,4 +90,12 @@ func (a workerClientAdapter) NetstatsTick(sandboxID string) (int64, int64, error
 
 func (a workerClientAdapter) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error {
 	return a.client.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
+}
+
+func (a workerClientAdapter) SetListenPort(sandboxID string, port int, host string) error {
+	return a.client.SetListenPort(sandboxID, port, host)
+}
+
+func (a workerClientAdapter) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
+	return a.client.ProxyHTTP(sandboxID, guestPort, w, r)
 }

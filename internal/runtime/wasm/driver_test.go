@@ -3,6 +3,7 @@ package wasm
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -63,6 +64,10 @@ func (c *recordingWorkerClient) Restore(string, string, wasmengine.Capabilities)
 func (c *recordingWorkerClient) SetCapability(string, wasmengine.Capabilities) error   { return nil }
 func (c *recordingWorkerClient) NetstatsTick(string) (int64, int64, error)             { return 0, 0, nil }
 func (c *recordingWorkerClient) SetNetworkBlocks(string, bool, bool) error             { return nil }
+func (c *recordingWorkerClient) SetListenPort(string, int, string) error               { return nil }
+func (c *recordingWorkerClient) ProxyHTTP(string, int, http.ResponseWriter, *http.Request) error {
+	return nil
+}
 
 func TestDestroyNilSandboxIsNoop(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)

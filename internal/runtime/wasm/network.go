@@ -51,9 +51,10 @@ type networkGateway struct {
 	// sandboxID -> guestPort -> listener
 	listeners map[string]map[int]*httpListener
 	// sandboxID -> allowed guest ports (from expose_port / syncAllowedPorts)
-	allowed map[string]map[int]struct{}
-	usage   map[string]*sandboxNetUsage
-	blocked map[string]struct{ ingress, egress bool }
+	allowed   map[string]map[int]struct{}
+	usage     map[string]*sandboxNetUsage
+	blocked   map[string]struct{ ingress, egress bool }
+	httpProxy func(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error
 }
 
 func newNetworkGateway() *networkGateway {
@@ -63,6 +64,13 @@ func newNetworkGateway() *networkGateway {
 		usage:     make(map[string]*sandboxNetUsage),
 		blocked:   make(map[string]struct{ ingress, egress bool }),
 	}
+}
+
+// SetHTTPProxy registers the driver/worker bridge used for UC-31 guest HTTP.
+func (g *networkGateway) SetHTTPProxy(fn func(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error) {
+	g.mu.Lock()
+	g.httpProxy = fn
+	g.mu.Unlock()
 }
 
 func (g *networkGateway) usageFor(sandboxID string) *sandboxNetUsage {
@@ -182,21 +190,29 @@ func (g *networkGateway) serveHTTP(sandboxID string, guestPort int, w http.Respo
 		return
 	}
 	usage := g.usageForLocked(sandboxID)
+	proxy := g.httpProxy
 	g.mu.Unlock()
 
 	if r.Body != nil {
-		body := &byteCountReader{r: r.Body, counter: &usage.bytesIn}
-		_, _ = io.Copy(io.Discard, body)
-		_ = body.Close()
+		r.Body = &byteCountReader{r: r.Body, counter: &usage.bytesIn}
 	}
 	if block.egress {
 		http.Error(w, "network egress blocked", http.StatusForbidden)
 		return
 	}
-	// Guest wasi-http bridging is a later phase; the listener exists so Caddy
-	// and ingress can route end-to-end while the worker HTTP surface lands.
+	if proxy == nil {
+		if r.Body != nil {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+		}
+		cw := &byteCountWriter{ResponseWriter: w, counter: &usage.bytesOut}
+		http.Error(cw, "wasm guest http not connected", http.StatusServiceUnavailable)
+		return
+	}
 	cw := &byteCountWriter{ResponseWriter: w, counter: &usage.bytesOut}
-	http.Error(cw, "wasm guest http not connected", http.StatusServiceUnavailable)
+	if err := proxy(sandboxID, guestPort, cw, r); err != nil {
+		http.Error(cw, err.Error(), http.StatusBadGateway)
+	}
 }
 
 func (g *networkGateway) usageForLocked(sandboxID string) *sandboxNetUsage {

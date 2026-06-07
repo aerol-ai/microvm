@@ -29,7 +29,7 @@ func (e *wazeroEngine) ClearNetworkHook() {
 }
 
 func (e *wazeroEngine) withNetworkContext(ctx context.Context, caps Capabilities) context.Context {
-	if caps.WASIListenPort >= 0 {
+	if caps.ListenEnabled() {
 		host := caps.WASIListenHost
 		if host == "" {
 			host = "127.0.0.1"

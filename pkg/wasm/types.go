@@ -1,5 +1,8 @@
 package wasm
 
+// WASIListenPortDisabled means no wasip1 TCP listener is pre-opened (default).
+const WASIListenPortDisabled = -1
+
 // Capabilities configures WASI preopens, env, args, and resource limits for an instance.
 type Capabilities struct {
 	Env           map[string]string `json:"env,omitempty"`
@@ -11,6 +14,11 @@ type Capabilities struct {
 	// When unset, use -1 to disable.
 	WASIListenPort int    `json:"wasi_listen_port,omitempty"`
 	WASIListenHost string `json:"wasi_listen_host,omitempty"`
+}
+
+// ListenEnabled reports whether wasip1 pre-open TCP listeners are active.
+func (c Capabilities) ListenEnabled() bool {
+	return c.WASIListenPort >= 0
 }
 
 // Preopen maps a host directory into the guest filesystem.

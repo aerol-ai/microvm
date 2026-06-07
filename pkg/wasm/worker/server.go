@@ -400,6 +400,64 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
+		case MsgSetListenPort:
+			var p setListenPortPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mu.Lock()
+			if s.eng == nil {
+				s.mu.Unlock()
+				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
+					return err
+				}
+				continue
+			}
+			s.bindNetworkHook(env.SandboxID)
+			next := s.lastCaps
+			next.WASIListenPort = p.Port
+			if strings.TrimSpace(p.Host) != "" {
+				next.WASIListenHost = p.Host
+			}
+			err = s.eng.Instantiate(ctx, next)
+			if err == nil {
+				s.lastCaps = next
+			}
+			s.mu.Unlock()
+			if err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgProxyHTTP:
+			var p proxyHTTPPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			result, err := s.proxyGuestHTTPFromPayload(ctx, env.SandboxID, p)
+			if err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			body, encErr := encodePayload(result)
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgProxyHTTPResult, SandboxID: env.SandboxID, Payload: body}); err != nil {
+				return err
+			}
 		case MsgNetstatsTick:
 			sandboxID := strings.TrimSpace(env.SandboxID)
 			u := s.netUsageFor(sandboxID)

@@ -86,9 +86,10 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 		memoryMB = d.cfg.DefaultMemoryMB
 	}
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
-		Env:      sandbox.Env,
-		Args:     wasmArgsFromSandbox(sandbox),
-		Preopens: preopensFromBinds(workDir, hostMounts),
+		Env:            sandbox.Env,
+		Args:           wasmArgsFromSandbox(sandbox),
+		Preopens:       preopensFromBinds(workDir, hostMounts),
+		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, memoryMB, d.cfg.DefaultWallTimeout)
 
 	if err := client.Restore(sandbox.ID, checkpointPath, caps); err != nil {

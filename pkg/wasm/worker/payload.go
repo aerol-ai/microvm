@@ -67,6 +67,25 @@ type setNetworkBlocksPayload struct {
 	BlockEgress  bool `json:"block_egress"`
 }
 
+type setListenPortPayload struct {
+	Port int    `json:"port"`
+	Host string `json:"host,omitempty"`
+}
+
+type proxyHTTPPayload struct {
+	GuestPort  int                 `json:"guest_port"`
+	Method     string              `json:"method"`
+	RequestURI string              `json:"request_uri"`
+	Header     map[string][]string `json:"header,omitempty"`
+	Body       []byte              `json:"body,omitempty"`
+}
+
+type proxyHTTPResultPayload struct {
+	StatusCode int                 `json:"status_code"`
+	Header     map[string][]string `json:"header,omitempty"`
+	Body       []byte              `json:"body,omitempty"`
+}
+
 func encodePayload(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

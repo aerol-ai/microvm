@@ -44,14 +44,22 @@ func TestHTTPListenerAllowlist(t *testing.T) {
 	}
 
 	g.SyncAllowedPorts("sb-1", []int{3000})
+	g.SetHTTPProxy(func(_ string, _ int, w http.ResponseWriter, _ *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("guest-ok"))
+		return nil
+	})
 	resp, err = http.Get("http://" + dial + "/")
 	if err != nil {
 		t.Fatalf("GET after allow: %v", err)
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("after sync status = %d", resp.StatusCode)
+	}
+	if string(body) != "guest-ok" {
+		t.Fatalf("body = %q", body)
 	}
 }
 

@@ -22,3 +22,5 @@ type MigrationHost interface {
 var _ CheckpointHost = (*Driver)(nil)
 
 var _ MigrationHost = (*Driver)(nil)
+
+var _ GuestListenPortSyncer = (*Driver)(nil)

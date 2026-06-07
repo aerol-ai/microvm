@@ -1,0 +1,212 @@
+package wasm
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
+)
+
+type recordingProxyWorkerClient struct {
+	recordingWorkerClient
+	proxyCalls int
+	lastPort   int
+}
+
+func (c *recordingProxyWorkerClient) ProxyHTTP(_ string, guestPort int, w http.ResponseWriter, _ *http.Request) error {
+	c.proxyCalls++
+	c.lastPort = guestPort
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("via-worker"))
+	return nil
+}
+
+func (c *recordingProxyWorkerClient) SetListenPort(string, int, string) error { return nil }
+
+func TestDriverHTTPGatewayInvokesWorkerProxy(t *testing.T) {
+	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	proxyClient := &recordingProxyWorkerClient{}
+	d.newWorkerClient = func(string) WorkerClient { return proxyClient }
+	d.mu.Lock()
+	d.byID["sb-proxy"] = &sandboxInstance{
+		sandboxID:  "sb-proxy",
+		socketPath: "/tmp/fake.sock",
+		status:     models.SandboxStatusStarted,
+	}
+	d.mu.Unlock()
+
+	ctx := context.Background()
+	dial, err := d.EnsureHTTPListener(ctx, "sb-proxy", 8080)
+	if err != nil {
+		t.Fatalf("EnsureHTTPListener: %v", err)
+	}
+	d.SyncAllowedPorts("sb-proxy", []int{8080})
+
+	resp, err := http.Get("http://" + dial + "/hello")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	}
+	if string(body) != "via-worker" {
+		t.Fatalf("body=%q", body)
+	}
+	if proxyClient.proxyCalls != 1 || proxyClient.lastPort != 8080 {
+		t.Fatalf("proxy calls=%d port=%d", proxyClient.proxyCalls, proxyClient.lastPort)
+	}
+}
+
+func TestSyncGuestListenPortsUsesLowestPort(t *testing.T) {
+	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	listenClient := &listenPortRecordingClient{}
+	d.newWorkerClient = func(string) WorkerClient { return listenClient }
+	d.mu.Lock()
+	d.byID["sb-listen"] = &sandboxInstance{
+		sandboxID:  "sb-listen",
+		socketPath: "/tmp/fake.sock",
+		status:     models.SandboxStatusStarted,
+	}
+	d.mu.Unlock()
+
+	if err := d.SyncGuestListenPorts(context.Background(), "sb-listen", []int{9000, 8080, 8443}); err != nil {
+		t.Fatalf("SyncGuestListenPorts: %v", err)
+	}
+	if listenClient.port != 8080 {
+		t.Fatalf("listen port = %d, want 8080", listenClient.port)
+	}
+	if err := d.SyncGuestListenPorts(context.Background(), "sb-listen", nil); err != nil {
+		t.Fatalf("disable listen: %v", err)
+	}
+	if listenClient.port != wasmengine.WASIListenPortDisabled {
+		t.Fatalf("listen port = %d, want disabled", listenClient.port)
+	}
+}
+
+type listenPortRecordingClient struct {
+	recordingWorkerClient
+	port int
+	host string
+}
+
+func (c *listenPortRecordingClient) SetListenPort(_ string, port int, host string) error {
+	c.port = port
+	c.host = host
+	return nil
+}
+
+func TestWasmMigrateLiveTwoNodeWorkers(t *testing.T) {
+	dir := t.TempDir()
+	runDirA := filepath.Join(os.TempDir(), "aw-migrate-a")
+	runDirB := filepath.Join(os.TempDir(), "aw-migrate-b")
+	t.Cleanup(func() {
+		_ = os.RemoveAll(runDirA)
+		_ = os.RemoveAll(runDirB)
+	})
+	modulesDir := filepath.Join(dir, "modules")
+	if err := os.MkdirAll(modulesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	modPath := wasmmod.WriteCheckpointWasm(t, modulesDir, "demo.wasm")
+
+	supA := newInProcessSupervisor()
+	supB := newInProcessSupervisor()
+	t.Cleanup(func() {
+		for id := range supA.workers {
+			_ = supA.Stop(id)
+		}
+		for id := range supB.workers {
+			_ = supB.Stop(id)
+		}
+	})
+
+	driverA := New(Config{RunDir: runDirA, ModulesDir: modulesDir, DefaultMemoryMB: 64}, nil)
+	driverA.SetModuleResolver(fakeResolver{path: modPath, digest: "abc123"})
+	driverA.SetWorkerSupervisor(supA)
+
+	driverB := New(Config{RunDir: runDirB, ModulesDir: modulesDir, DefaultMemoryMB: 64}, nil)
+	driverB.SetModuleResolver(fakeResolver{path: modPath, digest: "abc123"})
+	driverB.SetWorkerSupervisor(supB)
+
+	sandboxID := "sb-migrate-live"
+	ctx := context.Background()
+	createReq := models.CreateSandboxRequest{
+		Image:      "demo.wasm",
+		Durability: models.DurabilityPassivatable,
+		MemoryMB:   64,
+	}
+	if _, err := driverA.Create(ctx, createReq, sandboxID, "", nil); err != nil {
+		t.Fatalf("Create on node A: %v", err)
+	}
+
+	sb := &models.Sandbox{
+		ID:           sandboxID,
+		Durability:   models.DurabilityPassivatable,
+		ModuleRef:    "demo.wasm",
+		ModuleDigest: "abc123",
+		MemoryMB:     64,
+	}
+	checkpointPath, cloneGen, err := driverA.MigrateSandbox(ctx, sb, filepath.Join(dir, "handoff"))
+	if err != nil {
+		t.Fatalf("MigrateSandbox: %v", err)
+	}
+	if checkpointPath == "" || cloneGen == "" {
+		t.Fatalf("checkpoint=%q gen=%q", checkpointPath, cloneGen)
+	}
+
+	destCheckpoint := driverB.checkpointDir(sandboxID)
+	if err := os.MkdirAll(filepath.Dir(destCheckpoint), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyDir(checkpointPath, destCheckpoint); err != nil {
+		t.Fatalf("copy checkpoint: %v", err)
+	}
+
+	sb.Status = models.SandboxStatusPassivated
+	sb.CheckpointPath = destCheckpoint
+	sb.CloneGeneration = cloneGen
+	state, err := driverB.RehydrateSandbox(ctx, sb, nil)
+	if err != nil {
+		t.Fatalf("RehydrateSandbox on node B: %v", err)
+	}
+	if state.Status != models.SandboxStatusStarted {
+		t.Fatalf("status = %q", state.Status)
+	}
+
+	managed, err := driverB.ListManaged(ctx)
+	if err != nil {
+		t.Fatalf("ListManaged: %v", err)
+	}
+	if len(managed) != 1 {
+		t.Fatalf("managed count = %d", len(managed))
+	}
+
+	inst, err := driverB.instance(sandboxID)
+	if err != nil {
+		t.Fatalf("instance: %v", err)
+	}
+	client := driverB.newWorkerClient(inst.socketPath)
+	run, err := client.Exec(sandboxID, wasmengine.Capabilities{Args: []string{"post-migrate"}}, "_start")
+	if err != nil {
+		t.Fatalf("Exec after migrate: %v", err)
+	}
+	if run.ExitCode != 0 {
+		t.Fatalf("exit=%d stderr=%q", run.ExitCode, run.Stderr)
+	}
+
+	managedA, err := driverA.ListManaged(ctx)
+	if err != nil {
+		t.Fatalf("ListManaged A: %v", err)
+	}
+	if len(managedA) != 0 {
+		t.Fatalf("node A still has %d live instances after migrate", len(managedA))
+	}
+}

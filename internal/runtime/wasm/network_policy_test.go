@@ -40,6 +40,11 @@ func (c *stubWorkerNetstatsClient) NetstatsTick(string) (int64, int64, error) {
 	return c.in, c.out, nil
 }
 func (c *stubWorkerNetstatsClient) SetNetworkBlocks(string, bool, bool) error { return nil }
+func (c *stubWorkerNetstatsClient) SetListenPort(string, int, string) error   { return nil }
+func (c *stubWorkerNetstatsClient) ProxyHTTP(_ string, _ int, w http.ResponseWriter, _ *http.Request) error {
+	w.WriteHeader(http.StatusBadGateway)
+	return nil
+}
 
 func TestDrainNetworkByteCountersMergesGatewayAndWorker(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
