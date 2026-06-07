@@ -1,6 +1,6 @@
 # WASM-based Sandboxes — Design & Implementation Plan
 
-Status: **Mostly implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover + multi-node owner-watcher WASM soak, UC-43 worker NetMediator + engine NetworkHook (`aerol/vm/net` egress + wasip1 listener context) + IPC byte accounting + gateway merge, UC-44 RemoveImage/module GC + warm-pool eviction, AOCR tag prune, wasm OTEL spans, toolhost sessions/exec-stream/code-run + Daytona `/process/session*` parity, UC-42b wasmtime CGo engine behind `-tags wasmtime` + `SB_WASM_ENGINE`, and interpreter routes matching toolboxd 501) · **wazero pinned at v1.12.0** (latest stable 1.x; bump on routine dep updates) · **UC-31/43 networking (pkg/wasm): wasip1 listener + `aerol/vm/net` egress + P2-shaped compat host modules + inbound byte metering landed; driver lifecycle wiring for expose→serve still open** · Owner: TBD · Created: 2026-06-07
+Status: **Mostly implemented** (Phases 1–7 core landed including cluster migrate/drain, UC-39 durable recreate/failover + multi-node owner-watcher WASM soak, UC-43 worker NetMediator + engine NetworkHook (`aerol/vm/net` egress + wasip1 listener context) + IPC byte accounting + gateway merge, UC-44 RemoveImage/module GC + warm-pool eviction, AOCR tag prune, wasm OTEL spans, toolhost sessions/exec-stream/code-run + Daytona `/process/session*` parity, UC-42b wasmtime CGo engine behind `-tags wasmtime` + `SB_WASM_ENGINE`, interpreter routes matching toolboxd 501, **UC-31 driver lifecycle** (`expose_port` → ephemeral wasip1 listen → background `_start` → host mediator → Caddy, driver e2e passing), and **wazero listen/preopen fd fix** (`/work` preopen + omit dirs when listen enabled)) · **wazero pinned at v1.12.0** (latest stable 1.x; bump on routine dep updates) · **Still open:** native WASI P2/component model (wazero 1.x), wasmtime wasip1 `ResolvedListenPort`, UC-33 custom domains, wasm networking docs page, full service-layer create+expose+Caddy integration test (service `ExposePort` unit tests exist; no live Caddy hop yet) · Owner: TBD · Created: 2026-06-07
 
 This plan adds a **fourth runtime** to AerolVM — WebAssembly (WASM/WASI) — as a
 peer to `docker`, `gvisor`, and `firecracker`. The design principle is the one
@@ -159,10 +159,23 @@ Component Model support (upstream explicitly defers that to other runtimes).
 - **P2-shaped compat:** Aerol host modules `wasi:sockets` / `wasi:http` map to
   `aerol/vm/net` for guests compiled against Preview 2 import names — **not**
   spec-faithful WASI P2 or the Component Model.
-- **Still open:** `internal/runtime/wasm` create/lifecycle does not yet enable
-  listen before `_start`, re-run `_start` after `SetListenPort`, or wire
-  ephemeral port-0 through `expose_port` → full UC-31 end-to-end without manual
-  worker steps.
+- **Driver lifecycle (shipped):** `internal/runtime/wasm` cold-instantiates with
+  listen disabled (no blocking `_start` on create). `SyncGuestListenPorts`
+  (called from `expose_port` via `touchAllowedPorts`) enables ephemeral wasip1
+  listen (`0` in caps), resolves the host port, starts `_start` in the background,
+  and waits for TCP accept. `guestHTTPProxy` dials via `ProxyHTTP(...,
+  guestPort=0)` using the resolved port. Driver e2e:
+  `TestDriverWasip1HTTPExposeEndToEnd` (create → expose → proxy).
+- **Wazero fd ordering (shipped):** wazero assigns directory preopens before TCP
+  listeners (`InitFSContext`). `engine_wazero.fsConfigForCaps` omits dir preopens
+  when `ListenEnabled()` so the wasip1 listener stays at `FdPreopen` (fd 3).
+  Sandbox workdir mounts at `/work` (UC-15); preopens remain in caps for the
+  next cold instantiate after listen is disabled.
+- **Still open:** `expose_port` API guest-port `0` as a routing key (service
+  rejects `port <= 0` today — exposed port numbers are Caddy routing keys only;
+  guest bind is always ephemeral via wasip1); wasmtime wasip1 listen path; native
+  P2/components on wazero; HTTP+FS guests that need `/work` preopen *while*
+  listening (re-enable dir mounts + dynamic listener fd discovery).
 
 **What is NOT possible / changes vs. firecracker** (honest limits, per the ask):
 

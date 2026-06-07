@@ -1,12 +1,15 @@
 package wasm
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -28,6 +31,9 @@ func (c *recordingProxyWorkerClient) ProxyHTTP(_ string, guestPort int, w http.R
 }
 
 func (c *recordingProxyWorkerClient) SetListenPort(string, int, string) error { return nil }
+func (c *recordingProxyWorkerClient) ResolvedListenPort(string) (int, error) {
+	return 18080, nil
+}
 
 func TestDriverHTTPGatewayInvokesWorkerProxy(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
@@ -67,6 +73,7 @@ func TestDriverHTTPGatewayInvokesWorkerProxy(t *testing.T) {
 
 func TestSyncGuestListenPortsUsesLowestPort(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	d.waitListenReady = func(string, int) error { return nil }
 	listenClient := &listenPortRecordingClient{}
 	d.newWorkerClient = func(string) WorkerClient { return listenClient }
 	d.mu.Lock()
@@ -80,8 +87,8 @@ func TestSyncGuestListenPortsUsesLowestPort(t *testing.T) {
 	if err := d.SyncGuestListenPorts(context.Background(), "sb-listen", []int{9000, 8080, 8443}); err != nil {
 		t.Fatalf("SyncGuestListenPorts: %v", err)
 	}
-	if listenClient.port != 8080 {
-		t.Fatalf("listen port = %d, want 8080", listenClient.port)
+	if listenClient.port != 0 {
+		t.Fatalf("listen port = %d, want ephemeral 0", listenClient.port)
 	}
 	if err := d.SyncGuestListenPorts(context.Background(), "sb-listen", nil); err != nil {
 		t.Fatalf("disable listen: %v", err)
@@ -101,6 +108,184 @@ func (c *listenPortRecordingClient) SetListenPort(_ string, port int, host strin
 	c.port = port
 	c.host = host
 	return nil
+}
+
+func (c *listenPortRecordingClient) ResolvedListenPort(string) (int, error) {
+	return 18080, nil
+}
+
+func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
+	modPath := filepath.Join("..", "..", "..", "pkg", "wasm", "testdata", "wasip1-http.wasm")
+	absMod, err := filepath.Abs(modPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(absMod); err != nil || st.Size() == 0 {
+		t.Skip("wasip1-http.wasm testdata missing")
+	}
+
+	dir := t.TempDir()
+	runDir := filepath.Join(os.TempDir(), "aw-http-baseline")
+	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	sup := newInProcessSupervisor()
+	t.Cleanup(func() {
+		for id := range sup.workers {
+			_ = sup.Stop(id)
+		}
+	})
+	driver := New(Config{RunDir: runDir, ModulesDir: dir, DefaultMemoryMB: 64}, nil)
+	driver.SetWorkerSupervisor(sup)
+
+	ctx := context.Background()
+	sandboxID := "sb-baseline"
+	workDir := filepath.Join(runDir, sandboxID)
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(workDir, "worker.sock")
+	if err := sup.Ensure(ctx, sandboxID, sock); err != nil {
+		t.Fatal(err)
+	}
+	wc := driver.newWorkerClient(sock)
+	if err := wc.LoadModule(sandboxID, absMod); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	caps := wasmengine.Capabilities{
+		WASIListenPort: 0,
+		WASIListenHost: "127.0.0.1",
+		Args:           []string{"wasi", "http"},
+	}
+	if err := wc.Instantiate(sandboxID, caps); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	go func() { _ = wc.Invoke(sandboxID, "_start") }()
+	time.Sleep(200 * time.Millisecond)
+	rec := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "http://guest/", bytes.NewReader([]byte("wazero")))
+	if err := wc.ProxyHTTP(sandboxID, 0, rec, req); err != nil {
+		t.Fatalf("ProxyHTTP: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSetListenPortAfterColdInstantiate(t *testing.T) {
+	modPath := filepath.Join("..", "..", "..", "pkg", "wasm", "testdata", "wasip1-http.wasm")
+	absMod, err := filepath.Abs(modPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(absMod); err != nil || st.Size() == 0 {
+		t.Skip("wasip1-http.wasm testdata missing")
+	}
+	dir := t.TempDir()
+	runDir := filepath.Join(os.TempDir(), "aw-http-setlisten")
+	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	sup := newInProcessSupervisor()
+	t.Cleanup(func() {
+		for id := range sup.workers {
+			_ = sup.Stop(id)
+		}
+	})
+	driver := New(Config{RunDir: runDir, ModulesDir: dir, DefaultMemoryMB: 64}, nil)
+	driver.SetWorkerSupervisor(sup)
+	ctx := context.Background()
+	sandboxID := "sb-setlisten"
+	workDir := filepath.Join(runDir, sandboxID)
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(workDir, "worker.sock")
+	if err := sup.Ensure(ctx, sandboxID, sock); err != nil {
+		t.Fatal(err)
+	}
+	wc := driver.newWorkerClient(sock)
+	if err := wc.LoadModule(sandboxID, absMod); err != nil {
+		t.Fatal(err)
+	}
+	cold := wasmengine.Capabilities{
+		Args:           []string{"wasi", "http"},
+		WASIListenPort: wasmengine.WASIListenPortDisabled,
+	}
+	if err := wc.Instantiate(sandboxID, cold); err != nil {
+		t.Fatalf("cold Instantiate: %v", err)
+	}
+	if err := wc.SetListenPort(sandboxID, 0, "127.0.0.1"); err != nil {
+		t.Fatalf("SetListenPort: %v", err)
+	}
+	go func() { _ = wc.Invoke(sandboxID, "_start") }()
+	time.Sleep(300 * time.Millisecond)
+	rec := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "http://guest/", bytes.NewReader([]byte("wazero")))
+	if err := wc.ProxyHTTP(sandboxID, 0, rec, req); err != nil {
+		t.Fatalf("ProxyHTTP: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDriverWasip1HTTPExposeEndToEnd(t *testing.T) {
+	modPath := filepath.Join("..", "..", "..", "pkg", "wasm", "testdata", "wasip1-http.wasm")
+	if st, err := os.Stat(modPath); err != nil || st.Size() == 0 {
+		t.Skip("wasip1-http.wasm testdata missing")
+	}
+	absMod, err := filepath.Abs(modPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	runDir := filepath.Join(os.TempDir(), "aw-http-e2e")
+	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+
+	sup := newInProcessSupervisor()
+	t.Cleanup(func() {
+		for id := range sup.workers {
+			_ = sup.Stop(id)
+		}
+	})
+
+	driver := New(Config{RunDir: runDir, ModulesDir: dir, DefaultMemoryMB: 64}, nil)
+	driver.SetModuleResolver(fakeResolver{path: absMod, digest: "wasip1-http"})
+	driver.SetWorkerSupervisor(sup)
+
+	ctx := context.Background()
+	sandboxID := "sb-http-e2e"
+	createReq := models.CreateSandboxRequest{
+		Image:            "wasip1-http.wasm",
+		ContainerCommand: []string{"wasi", "http"},
+	}
+	if _, err := driver.Create(ctx, createReq, sandboxID, "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := driver.SyncGuestListenPorts(ctx, sandboxID, []int{8080}); err != nil {
+		t.Fatalf("SyncGuestListenPorts: %v", err)
+	}
+	inst, err := driver.instance(sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.resolvedListenPort <= 0 {
+		t.Fatalf("resolved listen port = %d", inst.resolvedListenPort)
+	}
+
+	driver.SyncAllowedPorts(sandboxID, []int{8080})
+
+	// wazero test guest serves exactly one HTTP request per _start; exercise worker proxy first.
+	wc := driver.newWorkerClient(inst.socketPath)
+	directReq, err := http.NewRequest(http.MethodPost, "http://guest/", bytes.NewReader([]byte("wazero")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	if err := wc.ProxyHTTP(sandboxID, 0, rec, directReq); err != nil {
+		t.Fatalf("ProxyHTTP: %v", err)
+	}
+	if rec.Code != http.StatusOK || rec.Body.String() != "wazero\n" {
+		t.Fatalf("direct proxy status=%d body=%q", rec.Code, rec.Body.String())
+	}
 }
 
 func TestWasmMigrateLiveTwoNodeWorkers(t *testing.T) {

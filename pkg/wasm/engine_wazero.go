@@ -133,15 +133,7 @@ func (e *wazeroEngine) Instantiate(ctx context.Context, caps Capabilities) error
 		e.module = nil
 	}
 	cfg := e.moduleConfig(caps)
-	fsCfg := wazero.NewFSConfig()
-	for _, p := range caps.Preopens {
-		guest := p.GuestPath
-		if guest == "" {
-			guest = "/"
-		}
-		fsCfg = fsCfg.WithDirMount(p.HostPath, guest)
-	}
-	if len(caps.Preopens) > 0 {
+	if fsCfg := e.fsConfigForCaps(caps); fsCfg != nil {
 		cfg = cfg.WithFSConfig(fsCfg)
 	}
 	instCtx := e.withNetworkContext(ctx, caps)
@@ -179,12 +171,8 @@ func (e *wazeroEngine) InvokeExport(ctx context.Context, name string) error {
 
 func (e *wazeroEngine) moduleConfig(caps Capabilities) wazero.ModuleConfig {
 	cfg := wazero.NewModuleConfig().WithArgs(caps.Args...)
-	if caps.ListenEnabled() {
-		// Do not auto-run _start: guest HTTP servers bind listeners during instantiate
-		// and accept in _start; auto-start would block or tear down Sys before we
-		// can resolve the ephemeral listen port.
-		cfg = cfg.WithSysWalltime().WithSysNanotime().WithStartFunctions()
-	}
+	// Driver/worker invoke _start explicitly (background on create; after listen for HTTP).
+	cfg = cfg.WithSysWalltime().WithSysNanotime().WithStartFunctions()
 	for k, v := range caps.Env {
 		cfg = cfg.WithEnv(k, v)
 	}
@@ -239,15 +227,7 @@ func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities,
 	if stderr != nil {
 		cfg = cfg.WithStderr(stderr)
 	}
-	fsCfg := wazero.NewFSConfig()
-	for _, p := range caps.Preopens {
-		guest := p.GuestPath
-		if guest == "" {
-			guest = "/"
-		}
-		fsCfg = fsCfg.WithDirMount(p.HostPath, guest)
-	}
-	if len(caps.Preopens) > 0 {
+	if fsCfg := e.fsConfigForCaps(caps); fsCfg != nil {
 		cfg = cfg.WithFSConfig(fsCfg)
 	}
 	instCtx := e.withNetworkContext(ctx, caps)
@@ -260,6 +240,29 @@ func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities,
 	}
 	e.module = mod
 	return nil
+}
+
+// fsConfigForCaps builds wazero FS mounts. When wasip1 listen is enabled, directory
+// preopens are omitted: wazero assigns dir fds before TCP listeners (InitFSContext),
+// which breaks guests that expect the listener at FdPreopen (fd 3). Caps still
+// retain Preopens for the next cold instantiate after listen is disabled.
+func (e *wazeroEngine) fsConfigForCaps(caps Capabilities) wazero.FSConfig {
+	if caps.ListenEnabled() {
+		return nil
+	}
+	preopens := caps.Preopens
+	if len(preopens) == 0 {
+		return nil
+	}
+	fsCfg := wazero.NewFSConfig()
+	for _, p := range preopens {
+		guest := p.GuestPath
+		if guest == "" {
+			guest = "/work"
+		}
+		fsCfg = fsCfg.WithDirMount(p.HostPath, guest)
+	}
+	return fsCfg
 }
 
 func (e *wazeroEngine) callExport(ctx context.Context, name string) (int, error) {

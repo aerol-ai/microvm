@@ -45,7 +45,7 @@ func (d *Driver) execSandbox(ctx context.Context, sandboxID string, req models.E
 		Env:  env,
 		Args: args,
 		Preopens: []wasmengine.Preopen{{
-			GuestPath: "/",
+			GuestPath: "/work",
 			HostPath:  inst.workDir,
 		}},
 	}, inst.memoryMB, wallTimeout)

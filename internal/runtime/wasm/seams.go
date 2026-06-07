@@ -34,6 +34,7 @@ type WorkerClient interface {
 	NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err error)
 	SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error
 	SetListenPort(sandboxID string, port int, host string) error
+	ResolvedListenPort(sandboxID string) (int, error)
 	ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error
 }
 
@@ -94,6 +95,10 @@ func (a workerClientAdapter) SetNetworkBlocks(sandboxID string, blockIngress, bl
 
 func (a workerClientAdapter) SetListenPort(sandboxID string, port int, host string) error {
 	return a.client.SetListenPort(sandboxID, port, host)
+}
+
+func (a workerClientAdapter) ResolvedListenPort(sandboxID string) (int, error) {
+	return a.client.ResolvedListenPort(sandboxID)
 }
 
 func (a workerClientAdapter) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {

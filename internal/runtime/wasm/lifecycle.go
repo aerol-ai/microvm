@@ -35,17 +35,13 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		return nil, fmt.Errorf("load module: %w", err)
 	}
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
-		Preopens:       []wasmengine.Preopen{{GuestPath: "/", HostPath: inst.workDir}},
+		Preopens:       []wasmengine.Preopen{{GuestPath: "/work", HostPath: inst.workDir}},
 		Args:           []string{"wasm"},
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, inst.memoryMB, d.cfg.DefaultWallTimeout)
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}
-	if err := client.Invoke(sandboxID, inst.entryExport); err != nil {
-		return nil, fmt.Errorf("invoke %q: %w", inst.entryExport, err)
-	}
-
 	inst.status = models.SandboxStatusStarted
 	d.mu.Lock()
 	d.byID[sandboxID] = inst

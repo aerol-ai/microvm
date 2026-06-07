@@ -25,6 +25,8 @@ type Driver struct {
 	net             *networkGateway
 	warmPool        WarmPool
 	stateKV         statekv.Store
+	// waitListenReady overrides guest TCP readiness polling (tests).
+	waitListenReady func(host string, port int) error
 
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance

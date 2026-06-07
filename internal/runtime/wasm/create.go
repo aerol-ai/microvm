@@ -118,11 +118,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		cleanup()
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}
-	if err := client.Invoke(sandboxID, inst.entryExport); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("invoke %q: %w", inst.entryExport, err)
-	}
-
+	// _start is deferred until expose_port enables wasip1 listen (HTTP) or Exec/Invoke (one-shot).
 	inst.status = models.SandboxStatusStarted
 	d.mu.Lock()
 	d.byID[sandboxID] = inst
@@ -133,7 +129,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 func preopensFromBinds(workDir string, binds []mounts.ContainerBind) []wasmengine.Preopen {
 	preopens := []wasmengine.Preopen{{
-		GuestPath: "/",
+		GuestPath: "/work",
 		HostPath:  workDir,
 	}}
 	for _, b := range binds {

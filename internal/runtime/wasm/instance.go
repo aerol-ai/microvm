@@ -3,6 +3,7 @@ package wasm
 import (
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -28,6 +29,12 @@ type sandboxInstance struct {
 	diskGB       int
 	durability   string
 	sessions     *sessions.Manager
+
+	// Guest HTTP: resolved host port after ephemeral wasip1 bind (0 in caps).
+	resolvedListenPort int
+	runGeneration      uint64
+	guestServeGen      uint64
+	guestServeMu       sync.Mutex
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {
@@ -44,8 +51,6 @@ func moduleRefFromRequest(req models.CreateSandboxRequest) string {
 }
 
 func entryExportFromRequest(req models.CreateSandboxRequest) string {
-	if len(req.ContainerCommand) > 0 {
-		return req.ContainerCommand[0]
-	}
+	// WASI modules export _start; ContainerCommand is argv (see wasmArgs), not the export name.
 	return "_start"
 }
