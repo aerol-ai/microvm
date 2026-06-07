@@ -1942,6 +1942,7 @@ func TestStoreHelperCases(t *testing.T) {
 			0,              // overlay_size_gb
 			"passivatable", // durability
 			"", "",         // module_ref, module_digest
+			"", "", // checkpoint_path, clone_generation
 			"", // owner_ref
 			0,  // fleet_suspended
 		}}
@@ -2034,5 +2035,55 @@ func sampleSandbox(id string) *models.Sandbox {
 		UpdatedAt:        now,
 		LastActiveAt:     now,
 		Runtime:          models.RuntimeGvisor,
+	}
+}
+
+func TestWasmCheckpointColumnsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sb := sampleSandbox("sb-wasm-ckpt")
+	sb.Runtime = models.RuntimeWasm
+	sb.Durability = models.DurabilityPassivatable
+	sb.ModuleRef = "file:///tmp/demo.wasm"
+	sb.ModuleDigest = "deadbeef"
+	sb.CheckpointPath = "/var/lib/sandboxd/wasm/modules/sb-wasm-ckpt/mem.snap"
+	sb.CloneGeneration = "gen-abc"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.CheckpointPath != sb.CheckpointPath || got.CloneGeneration != sb.CloneGeneration {
+		t.Fatalf("checkpoint fields = %+v, want path=%q gen=%q", got, sb.CheckpointPath, sb.CloneGeneration)
+	}
+	if err := st.UpdateWasmCheckpoint(ctx, sb.ID, string(models.SandboxStatusPassivated), "/new/path", "gen-2", ""); err != nil {
+		t.Fatalf("UpdateWasmCheckpoint: %v", err)
+	}
+	got, err = st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get after update: %v", err)
+	}
+	if got.Status != models.SandboxStatusPassivated || got.CheckpointPath != "/new/path" || got.CloneGeneration != "gen-2" {
+		t.Fatalf("after update = status %q path %q gen %q", got.Status, got.CheckpointPath, got.CloneGeneration)
+	}
+	if err := st.CompareCloneGeneration(ctx, sb.ID, "gen-2"); err != nil {
+		t.Fatalf("CompareCloneGeneration match: %v", err)
+	}
+	if err := st.CompareCloneGeneration(ctx, sb.ID, "stale-gen"); !errors.Is(err, models.ErrSnapshotFenced) {
+		t.Fatalf("CompareCloneGeneration stale = %v, want ErrSnapshotFenced", err)
+	}
+	if err := st.UpsertWasmModule(ctx, WasmModuleRecord{
+		ID:              "mod-1",
+		ModuleRef:       "file:///tmp/demo.wasm",
+		Status:          "ready",
+		Digest:          "deadbeef",
+		Entrypoint:      "_start",
+		ModuleSizeBytes: 128,
+		CreatedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertWasmModule: %v", err)
 	}
 }

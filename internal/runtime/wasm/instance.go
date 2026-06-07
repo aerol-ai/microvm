@@ -25,6 +25,7 @@ type sandboxInstance struct {
 	cpu          float64
 	memoryMB     int
 	diskGB       int
+	durability   string
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {

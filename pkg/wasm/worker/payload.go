@@ -39,6 +39,20 @@ type okPayload struct {
 	OK bool `json:"ok"`
 }
 
+type checkpointPayload struct {
+	OutDir string                    `json:"out_dir"`
+	Meta   wasmengine.SnapshotConfig `json:"meta"`
+}
+
+type checkpointResultPayload struct {
+	CloneGeneration string `json:"clone_generation"`
+}
+
+type restorePayload struct {
+	Dir  string                  `json:"dir"`
+	Caps wasmengine.Capabilities `json:"caps"`
+}
+
 func encodePayload(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

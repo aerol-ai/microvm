@@ -26,6 +26,8 @@ type Driver struct {
 
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance
+
+	rehydrate sync.Map // sandboxID -> *sync.Mutex single-flight gates
 }
 
 // New constructs a WASM driver. The zero value is not usable.

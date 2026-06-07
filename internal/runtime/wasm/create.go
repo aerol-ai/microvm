@@ -70,6 +70,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		cpu:          req.CPU,
 		memoryMB:     memoryMB,
 		diskGB:       req.DiskGB,
+		durability:   req.Durability,
 	}
 
 	d.mu.Lock()

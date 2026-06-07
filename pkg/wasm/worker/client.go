@@ -137,6 +137,32 @@ func (c *Client) Invoke(sandboxID, export string) error {
 	return c.expectOK(reply)
 }
 
+// Checkpoint writes a mem.snap artifact to outDir.
+func (c *Client) Checkpoint(sandboxID, outDir string, meta wasmengine.SnapshotConfig) error {
+	body, err := encodePayload(checkpointPayload{OutDir: outDir, Meta: meta})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgCheckpoint, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
+// Restore loads a mem.snap artifact from dir into the active worker engine.
+func (c *Client) Restore(sandboxID, dir string, caps wasmengine.Capabilities) error {
+	body, err := encodePayload(restorePayload{Dir: dir, Caps: caps})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgRestore, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
 // StopInstance tears down the active instance inside the worker.
 func (c *Client) StopInstance(sandboxID string) error {
 	reply, err := c.roundTrip(Envelope{Type: MsgStopInstance, SandboxID: sandboxID})

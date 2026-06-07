@@ -32,6 +32,9 @@ const (
 	// SandboxStatusAwaitingRuntime marks a passivated/durable WASM row found
 	// when EnableWasm=false — reconcile holds the row until WASM is re-enabled.
 	SandboxStatusAwaitingRuntime SandboxStatus = "awaiting_runtime"
+	// SandboxStatusPassivateFailed marks a WASM sandbox whose drain checkpoint
+	// timed out or failed; durability is preserved for operator inspection.
+	SandboxStatusPassivateFailed SandboxStatus = "passivate_failed"
 )
 
 type RegistryAuth struct {
@@ -102,6 +105,10 @@ var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this b
 // checkpoints both surface this; the service layer intercepts with
 // errors.Is to mark the backing artifact unhealthy and kick rebuild.
 var ErrSnapshotCorrupt = errors.New("snapshot integrity verification failed")
+
+// ErrSnapshotFenced is returned when a snapshot's clone_generation is older
+// than the store row's current token (§4.8 zombie-write guard).
+var ErrSnapshotFenced = errors.New("snapshot clone generation fenced")
 
 // ErrTemplateNotRebuildable is returned by RequestTemplateRebuild when the
 // row is in a state where re-running the snapshot phase is unsafe or
@@ -719,6 +726,11 @@ type Sandbox struct {
 	ModuleRef string `json:"module_ref,omitempty"`
 	// ModuleDigest is the sha256 hex digest of the resolved .wasm bytes.
 	ModuleDigest string `json:"module_digest,omitempty"`
+	// CheckpointPath points at a local §4.8.1 mem.snap directory when status
+	// is passivated. Internal-only; not exposed over the wire.
+	CheckpointPath string `json:"-"`
+	// CloneGeneration is the §4.8 fencing token for checkpoint/clone writes.
+	CloneGeneration string `json:"-"`
 }
 
 // ModuleRefForCreate returns the WASM module reference from a create request.

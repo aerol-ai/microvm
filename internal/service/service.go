@@ -1521,6 +1521,12 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	if err != nil {
 		return nil, err
 	}
+	if s.isWasmSandbox(sandbox) && sandbox.Status == models.SandboxStatusPassivated {
+		sandbox, err = s.rehydrateWasmIfNeeded(ctx, sandbox)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Re-Admit against the host budget before touching Docker. StopSandbox
 	// (and the die/stop/oom event handler) releases the reservation, so a
@@ -3136,6 +3142,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
 			if s.isWasmSandbox(sandbox) {
+				if s.reconcileWasmOfflineRow(ctx, sandbox) {
+					continue
+				}
 				switch sandbox.Status {
 				case models.SandboxStatusPassivated, models.SandboxStatusAwaitingRuntime:
 					continue

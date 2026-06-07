@@ -16,6 +16,10 @@ type Engine interface {
 	Run(ctx context.Context, caps Capabilities, export string) (RunResult, error)
 	// StopInstance tears down the active instance but keeps the compiled module.
 	StopInstance(ctx context.Context) error
+	// CaptureSnapshot exports linear memory from the active instance.
+	CaptureSnapshot(ctx context.Context) (SnapshotCapture, error)
+	// RestoreSnapshot re-instantiates and loads memory from a capture.
+	RestoreSnapshot(ctx context.Context, snap SnapshotRestoreInput, caps Capabilities) error
 	// Close releases compiled module and any active instance.
 	Close(ctx context.Context) error
 }
@@ -24,3 +28,6 @@ type Engine interface {
 func NewEngine(ctx context.Context) (Engine, error) {
 	return newWazeroEngine(ctx)
 }
+
+// EngineNameWazero returns the §4.8.1 engine identifier for the default backend.
+func EngineNameWazero() string { return engineWazero }

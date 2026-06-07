@@ -262,6 +262,43 @@ func stringsTrimJoin(a, b string) string {
 	}
 }
 
+func (e *wazeroEngine) CaptureSnapshot(_ context.Context) (SnapshotCapture, error) {
+	if e.module == nil {
+		return SnapshotCapture{}, fmt.Errorf("no active instance")
+	}
+	mem := e.module.Memory()
+	if mem == nil {
+		return SnapshotCapture{}, fmt.Errorf("module has no memory export")
+	}
+	data, ok := mem.Read(0, mem.Size())
+	if !ok {
+		return SnapshotCapture{}, fmt.Errorf("read linear memory failed")
+	}
+	out := append([]byte(nil), data...)
+	return SnapshotCapture{
+		Memory:    out,
+		Globals:   []byte("[]"),
+		WASIState: []byte("{}"),
+	}, nil
+}
+
+func (e *wazeroEngine) RestoreSnapshot(ctx context.Context, snap SnapshotRestoreInput, caps Capabilities) error {
+	if err := e.Instantiate(ctx, caps); err != nil {
+		return err
+	}
+	if len(snap.Memory) == 0 {
+		return nil
+	}
+	mem := e.module.Memory()
+	if mem == nil {
+		return fmt.Errorf("module has no memory export")
+	}
+	if !mem.Write(0, snap.Memory) {
+		return fmt.Errorf("restore linear memory failed (guest size %d, snapshot %d)", mem.Size(), len(snap.Memory))
+	}
+	return nil
+}
+
 func (e *wazeroEngine) Close(ctx context.Context) error {
 	if e.module != nil {
 		_ = e.module.Close(ctx)

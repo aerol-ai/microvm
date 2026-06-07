@@ -154,6 +154,8 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		return nil, err
 	}
 
+	s.registerWasmModuleCatalogue(ctx, sandbox, "", 0)
+
 	s.logger.Info("audit sandbox created",
 		"sandbox_id", sandbox.ID,
 		"image", sandbox.Image,

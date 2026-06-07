@@ -392,6 +392,9 @@ type Config struct {
 	// WasmPoolRefillInterval is how often the refill loop tops up the pool.
 	// SB_WASM_POOL_REFILL_INTERVAL.
 	WasmPoolRefillInterval time.Duration
+	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
+	// SB_WASM_DRAIN_TIMEOUT.
+	WasmDrainTimeout time.Duration
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1154,6 +1157,7 @@ func Load() (Config, error) {
 		WasmMaxInstances:        getEnvInt("SB_WASM_MAX_INSTANCES", 0),
 		WasmDefaultMemoryMB:     getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
 		WasmDefaultTimeout:      getEnvDuration("SB_WASM_DEFAULT_TIMEOUT", 5*time.Minute),
+		WasmDrainTimeout:        getEnvDuration("SB_WASM_DRAIN_TIMEOUT", 30*time.Second),
 		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
 		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
 		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),

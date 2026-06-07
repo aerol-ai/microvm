@@ -379,6 +379,24 @@ func Open(path string) (*Store, error) {
 		// full scan once the catalogue grows beyond a handful of entries.
 		`CREATE INDEX IF NOT EXISTS idx_firecracker_templates_updated_at
 			ON firecracker_templates(updated_at);`,
+		// wasm_modules mirrors firecracker_templates for WASM module catalogue
+		// (plans/wasm-runtime.md Phase 6). One row per registered module ref.
+		`CREATE TABLE IF NOT EXISTS wasm_modules (
+			id TEXT PRIMARY KEY,
+			module_ref TEXT NOT NULL,
+			status TEXT NOT NULL,
+			module_path TEXT NOT NULL DEFAULT '',
+			module_size_bytes INTEGER NOT NULL DEFAULT 0,
+			digest TEXT NOT NULL DEFAULT '',
+			entrypoint TEXT NOT NULL DEFAULT '_start',
+			has_warm INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			ready_at DATETIME
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at
+			ON wasm_modules(updated_at);`,
 		// account_mappings records the identities resolved by the optional
 		// fleet control plane (managed builds only). owner_ref is the stable
 		// account key stamped onto sandboxes; external_id is informational.
@@ -538,6 +556,8 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN durability TEXT NOT NULL DEFAULT 'passivatable';`,
 		`ALTER TABLE sandboxes ADD COLUMN module_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN module_digest TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN checkpoint_path TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandboxes ADD COLUMN clone_generation TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -647,8 +667,9 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			overlay_size_gb,
 			durability,
 			module_ref, module_digest,
+			checkpoint_path, clone_generation,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -694,6 +715,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		sandboxDurability(sandbox),
 		strings.TrimSpace(sandbox.ModuleRef),
 		strings.TrimSpace(sandbox.ModuleDigest),
+		strings.TrimSpace(sandbox.CheckpointPath),
+		strings.TrimSpace(sandbox.CloneGeneration),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -771,8 +794,9 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			overlay_size_gb,
 			durability,
 			module_ref, module_digest,
+			checkpoint_path, clone_generation,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -812,6 +836,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			durability = excluded.durability,
 			module_ref = excluded.module_ref,
 			module_digest = excluded.module_digest,
+			checkpoint_path = excluded.checkpoint_path,
+			clone_generation = excluded.clone_generation,
 			owner_ref = excluded.owner_ref,
 			fleet_suspended = excluded.fleet_suspended
 	`,
@@ -859,6 +885,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandboxDurability(sandbox),
 		strings.TrimSpace(sandbox.ModuleRef),
 		strings.TrimSpace(sandbox.ModuleDigest),
+		strings.TrimSpace(sandbox.CheckpointPath),
+		strings.TrimSpace(sandbox.CloneGeneration),
 		strings.TrimSpace(sandbox.OwnerRef),
 		boolToInt(sandbox.FleetSuspended),
 	)
@@ -888,6 +916,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			overlay_size_gb,
 			durability,
 			module_ref, module_digest,
+			checkpoint_path, clone_generation,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE id = ?
@@ -933,6 +962,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			overlay_size_gb,
 			durability,
 			module_ref, module_digest,
+			checkpoint_path, clone_generation,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		ORDER BY created_at DESC
@@ -998,6 +1028,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			overlay_size_gb,
 			durability,
 			module_ref, module_digest,
+			checkpoint_path, clone_generation,
 			owner_ref, fleet_suspended
 		FROM sandboxes
 		WHERE owner_ref = ?
@@ -3274,6 +3305,8 @@ func scanSandbox(scanner interface {
 		&sandbox.Durability,
 		&sandbox.ModuleRef,
 		&sandbox.ModuleDigest,
+		&sandbox.CheckpointPath,
+		&sandbox.CloneGeneration,
 		&sandbox.OwnerRef,
 		&fleetSuspended,
 	)
@@ -4426,4 +4459,96 @@ func collectFirecrackerVMMSlots(rows *sql.Rows) ([]FirecrackerVMMSlot, error) {
 		return nil, fmt.Errorf("iter firecracker vmm slot rows: %w", err)
 	}
 	return out, nil
+}
+
+// WasmModuleRecord is one row in wasm_modules.
+type WasmModuleRecord struct {
+	ID              string
+	ModuleRef       string
+	Status          string
+	ModulePath      string
+	ModuleSizeBytes int64
+	Digest          string
+	Entrypoint      string
+	HasWarm         bool
+	LastError       string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	ReadyAt         *time.Time
+}
+
+// UpsertWasmModule inserts or updates a wasm_modules catalogue row.
+func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) error {
+	now := time.Now().UTC()
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = now
+	}
+	rec.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO wasm_modules (
+			id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			module_ref = excluded.module_ref,
+			status = excluded.status,
+			module_path = excluded.module_path,
+			module_size_bytes = excluded.module_size_bytes,
+			digest = excluded.digest,
+			entrypoint = excluded.entrypoint,
+			has_warm = excluded.has_warm,
+			last_error = excluded.last_error,
+			updated_at = excluded.updated_at,
+			ready_at = excluded.ready_at
+	`,
+		rec.ID,
+		strings.TrimSpace(rec.ModuleRef),
+		rec.Status,
+		rec.ModulePath,
+		rec.ModuleSizeBytes,
+		rec.Digest,
+		rec.Entrypoint,
+		boolToInt(rec.HasWarm),
+		rec.LastError,
+		rec.CreatedAt.UTC(),
+		rec.UpdatedAt.UTC(),
+		nullableTime(rec.ReadyAt),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert wasm module: %w", err)
+	}
+	return nil
+}
+
+// UpdateWasmCheckpoint persists passivation metadata on a sandbox row.
+func (s *Store) UpdateWasmCheckpoint(ctx context.Context, sandboxID, status, checkpointPath, cloneGen, lastError string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET status = ?, checkpoint_path = ?, clone_generation = ?, last_error = ?, updated_at = ?
+		WHERE id = ?
+	`, status, strings.TrimSpace(checkpointPath), strings.TrimSpace(cloneGen), lastError, now, sandboxID)
+	if err != nil {
+		return fmt.Errorf("update wasm checkpoint: %w", err)
+	}
+	return nil
+}
+
+// CompareCloneGeneration rejects stale snapshot writes when wantGen is older
+// than the row's current clone_generation (§4.8 fencing).
+func (s *Store) CompareCloneGeneration(ctx context.Context, sandboxID, snapshotGen string) error {
+	row := s.db.QueryRowContext(ctx, `SELECT clone_generation FROM sandboxes WHERE id = ?`, sandboxID)
+	var current string
+	if err := row.Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	current = strings.TrimSpace(current)
+	snapshotGen = strings.TrimSpace(snapshotGen)
+	if current == "" || snapshotGen == "" || current == snapshotGen {
+		return nil
+	}
+	return fmt.Errorf("clone generation mismatch (row=%s snapshot=%s): %w", current, snapshotGen, models.ErrSnapshotFenced)
 }

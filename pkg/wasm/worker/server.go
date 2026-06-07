@@ -200,6 +200,83 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
+		case MsgCheckpoint:
+			var p checkpointPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mu.Lock()
+			if s.eng == nil {
+				s.mu.Unlock()
+				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
+					return err
+				}
+				continue
+			}
+			capture, err := s.eng.CaptureSnapshot(ctx)
+			s.mu.Unlock()
+			if err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			capture.Config = p.Meta
+			if err := wasmengine.WriteSnapshotDir(p.OutDir, capture); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			body, encErr := encodePayload(checkpointResultPayload{
+				CloneGeneration: p.Meta.CloneGeneration,
+			})
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: env.SandboxID, Payload: body}); err != nil {
+				return err
+			}
+		case MsgRestore:
+			var p restorePayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			snap, err := wasmengine.ReadSnapshotDir(p.Dir, wasmengine.EngineNameWazero())
+			if err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mu.Lock()
+			if s.eng == nil {
+				s.mu.Unlock()
+				if replyErr(env.SandboxID, fmt.Errorf("engine not loaded")) != nil {
+					return err
+				}
+				continue
+			}
+			err = s.eng.RestoreSnapshot(ctx, snap, p.Caps)
+			if err == nil {
+				s.lastCaps = p.Caps
+			}
+			s.mu.Unlock()
+			if err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
 		default:
 			if err := writeFrame(conn, Envelope{
 				Type:      MsgInvokeResult,

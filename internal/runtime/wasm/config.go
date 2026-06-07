@@ -12,6 +12,7 @@ type Config struct {
 	ModulesDir         string
 	DefaultMemoryMB    int
 	DefaultWallTimeout time.Duration
+	DrainTimeout       time.Duration
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -21,5 +22,6 @@ func FromDaemonConfig(cfg config.Config) Config {
 		ModulesDir:         cfg.WasmModulesDir,
 		DefaultMemoryMB:    cfg.WasmDefaultMemoryMB,
 		DefaultWallTimeout: cfg.WasmDefaultTimeout,
+		DrainTimeout:       cfg.WasmDrainTimeout,
 	}
 }

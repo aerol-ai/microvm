@@ -781,6 +781,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
+	if cfg.EnableWasm {
+		if err := svc.DrainWasmSandboxes(shutdownCtx); err != nil {
+			logger.Warn("wasm drain checkpoint failed", "error", err)
+		}
+	}
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown failed", "error", err)
 	}
