@@ -232,6 +232,11 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	if hasL4Exposure(sandbox) {
 		return ErrCustomDomainProtocolConflict
 	}
+	if s.isWasmSandbox(sandbox) {
+		if err := s.validateWasmCustomDomainTargetPort(sandbox, targetPort); err != nil {
+			return err
+		}
+	}
 	// Per-sandbox cap is enforced here rather than in the store so the error
 	// surfaces with the canonical sentinel; the store would otherwise just
 	// insert and the count check would race with concurrent adds. Reads
@@ -300,6 +305,11 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
 		return fmt.Errorf("install caddy route for custom domain %q: %w", canonical, err)
 	}
+	if err := s.syncWasmCustomDomainRoutes(ctx, refreshed); err != nil {
+		_ = s.removeClusterCustomDomain(ctx, sandboxID, canonical)
+		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
+		return err
+	}
 	evictCustomDomainNegativeCache(canonical)
 	return nil
 }
@@ -362,6 +372,9 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 		// the hostname. The next ingress reconcile (or AddCustomDomain
 		// re-attaching the same hostname elsewhere) will converge it.
 		return fmt.Errorf("update caddy route after custom-domain delete %q: %w", canonical, err)
+	}
+	if err := s.syncWasmCustomDomainRoutes(ctx, refreshed); err != nil {
+		return err
 	}
 	// UpsertSandboxRoute only writes; it does not GC the per-hostname route
 	// for the detached domain. Drop it explicitly so the dial target stops

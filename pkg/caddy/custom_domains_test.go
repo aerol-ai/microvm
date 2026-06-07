@@ -122,6 +122,29 @@ func TestDeleteCustomDomainHTTPRoute(t *testing.T) {
 	}
 }
 
+func TestUpsertCustomDomainHTTPRouteWithDial(t *testing.T) {
+	fake := newFakeCaddy(t)
+	client := &Client{
+		enabled:    true,
+		domain:     "aerol.cloud",
+		serverID:   "srv0",
+		baseURL:    fake.URL,
+		httpClient: fake.Client,
+	}
+	wantDial := "127.0.0.1:54321"
+	if err := client.UpsertCustomDomainHTTPRouteWithDial(context.Background(), "sb-wasm", "api.acme.com", wantDial); err != nil {
+		t.Fatalf("UpsertCustomDomainHTTPRouteWithDial() error = %v", err)
+	}
+	routeID := IngressCustomDomainHTTPRouteID("sb-wasm", "api.acme.com")
+	route, ok := fake.routes[routeID]
+	if !ok {
+		t.Fatalf("route %q missing; routes=%+v", routeID, fake.routes)
+	}
+	if dial := mustDialFromRoute(t, route); dial != wantDial {
+		t.Fatalf("dial = %q, want %q", dial, wantDial)
+	}
+}
+
 func mustDialFromRoute(t *testing.T, route map[string]any) string {
 	t.Helper()
 	handlers, _ := route["handle"].([]any)

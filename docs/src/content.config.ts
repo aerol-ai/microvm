@@ -161,6 +161,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
               },
               {
                 type: 'link',
+                href: '/wasm-networking',
+                label: 'Networking',
+                description: 'HTTP expose_port, custom domains, and host-mediated ingress for WASM guests.',
+              },
+              {
+                type: 'link',
                 href: '/wasm-modules',
                 label: 'Modules',
                 description: 'Module refs, warm pool, and catalogue GC.',

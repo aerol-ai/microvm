@@ -160,6 +160,17 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		ModuleRef:            moduleRef,
 		ModuleDigest:         state.ModuleDigest,
 	}
+	if len(req.CustomDomains) > 0 {
+		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))
+		for _, h := range req.CustomDomains {
+			sandbox.CustomDomains = append(sandbox.CustomDomains, models.CustomDomain{
+				Hostname:  h,
+				Status:    models.CustomDomainPendingDNS,
+				CreatedAt: now,
+				UpdatedAt: now,
+			})
+		}
+	}
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
@@ -192,6 +203,25 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
+	}
+	if len(req.CustomDomains) > 0 {
+		storedCD, getErr := s.store.Get(ctx, sandbox.ID)
+		if getErr != nil {
+			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			_ = s.wasm.Destroy(ctx, sandbox)
+			cleanupMounts()
+			releaseAdmission()
+			return nil, getErr
+		}
+		if err := s.syncWasmCustomDomainRoutes(ctx, storedCD); err != nil {
+			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			_ = s.wasm.Destroy(ctx, sandbox)
+			cleanupMounts()
+			releaseAdmission()
+			return nil, err
+		}
 	}
 
 	s.registerWasmModuleCatalogue(ctx, sandbox, "", 0)

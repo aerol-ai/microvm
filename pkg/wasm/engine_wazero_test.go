@@ -8,6 +8,24 @@ import (
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
+func TestFSConfigOmitsPreopensWhenListenEnabled(t *testing.T) {
+	e := &wazeroEngine{}
+	caps := Capabilities{
+		WASIListenPort: 0,
+		Preopens: []Preopen{{
+			GuestPath: "/work",
+			HostPath:  t.TempDir(),
+		}},
+	}
+	if got := e.fsConfigForCaps(caps); got != nil {
+		t.Fatalf("fsConfigForCaps with listen enabled = %#v, want nil preopens", got)
+	}
+	caps.WASIListenPort = WASIListenPortDisabled
+	if got := e.fsConfigForCaps(caps); got == nil {
+		t.Fatal("fsConfigForCaps without listen should mount preopens")
+	}
+}
+
 func TestWazeroEngineLoadAndInvokeStart(t *testing.T) {
 	dir := t.TempDir()
 	path := wasmmod.WriteMinimalWasm(t, dir, "empty.wasm")

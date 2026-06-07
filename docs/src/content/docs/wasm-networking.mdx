@@ -1,0 +1,111 @@
+---
+title: WASM Networking
+description: Expose HTTP ports and custom domains for WASM sandboxes through the host-mediated ingress path.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+WASM sandboxes do not receive a routable container NIC. HTTP ingress is **host-mediated**: Caddy dials a loopback mediator on the worker, and sandboxd forwards requests into the guest wasip1 listener. The port you pass to `expose_port` is a **routing key** for public URLs, not the TCP port the guest binds inside WASI.
+
+For sandbox creation and durability, see [WASM Sandbox](/wasm-sandbox/). For operator-owned hostnames and TLS, see [Custom Domains](/custom-domains/).
+
+## Expose an HTTP port
+
+Call `exposePort` with protocol `http` (the default). The preview URL shape is `{sandbox-id}-{port}.{domain}`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const exposure = await sandbox.exposePort(8080, { protocol: 'http' })
+    console.log(exposure.url)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(8080, protocol='http')
+    print(exposure.url)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 8080, microvm.WithProtocol(sdktypes.ExposeProtocolHTTP))
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(exposure.PublicURL)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let exposure = sandbox.expose_port(8080, ExposeOptions::http())?;
+    if let ExposeResult::Http { url } = exposure {
+        println!("{}", url);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExposeResult exposure = sandbox.exposePort(8080);
+    System.out.println(exposure.url());
+    ```
+  </TabItem>
+</Tabs>
+
+`expose_port` is idempotent: retries return the same public URL without walking the port pool again.
+
+## Custom domains on WASM
+
+Attach a hostname with `target_port` selecting which logical service receives traffic:
+
+| `target_port` | Routes to |
+|---|---|
+| `0` | Toolbox (same dial shape as the default `{id}.{domain}` sandbox URL) |
+| Exposed HTTP port (e.g. `8080`) | Guest HTTP through the host mediator (same upstream as the preview URL) |
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.customDomains.add('api.acme.com', { port: 8080 })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.add_custom_domain('api.acme.com', port=8080)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := sandbox.AddCustomDomain(ctx, "api.acme.com", microvm.WithTargetPort(8080))
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.add_custom_domain(
+        "api.acme.com",
+        Some(AddCustomDomainOptions::with_port(8080)),
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.addCustomDomain("api.acme.com", 8080);
+    ```
+  </TabItem>
+</Tabs>
+
+You may attach a custom domain before `expose_port`; once the port is exposed, Caddy routes refresh automatically. If the sandbox already exposes HTTP ports, `target_port` must match one of them (or `0` for toolbox).
+
+## Guest requirements
+
+- **Ingress:** wasip1 HTTP server using the pre-open TCP listener (`WASIListenPort: 0` binds an ephemeral host port). TinyGo and production guests discover the listener via WASI socket APIs.
+- **Egress:** outbound TCP/UDP goes through the `aerol/vm/net` host hook (see [WASM Architecture](/wasm-architecture/)).
+- **Filesystem:** guests that serve files from `/work` while listening should use WASI socket discovery (listener fd may be greater than 3 when `/work` is pre-opened). Reference wazero test modules that hardcode fd 3 are for engine tests only.
+
+## Limits
+
+- TCP and TLS `expose_port` are not supported on WASM (`runtime not implemented`).
+- Native WASI Preview 2 / Component Model ingress is not available on the default wazero engine.
+- Custom domains cannot coexist with TCP/TLS exposed ports on the same sandbox (the same rule as Docker sandboxes).

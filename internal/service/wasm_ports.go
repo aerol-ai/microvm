@@ -62,6 +62,9 @@ func (s *Service) syncWasmAllowedPorts(ctx context.Context, sandbox *models.Sand
 			s.logger.Warn("failed to sync wasm guest listen ports", "sandbox_id", sandbox.ID, "error", err)
 		}
 	}
+	if err := s.syncWasmCustomDomainRoutes(ctx, sandbox); err != nil {
+		s.logger.Warn("failed to sync wasm custom-domain routes", "sandbox_id", sandbox.ID, "error", err)
+	}
 }
 
 func (s *Service) installWasmHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, guestPort int) error {

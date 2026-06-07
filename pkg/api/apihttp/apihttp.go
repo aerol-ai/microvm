@@ -119,7 +119,8 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
-	if errors.Is(err, models.ErrCustomDomainInvalidTargetPort) {
+	if errors.Is(err, models.ErrCustomDomainInvalidTargetPort) ||
+		errors.Is(err, service.ErrWasmCustomDomainPortNotExposed) {
 		WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
