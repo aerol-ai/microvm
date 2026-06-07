@@ -1038,6 +1038,17 @@ func vcpuFromRequest(cpu float64) int {
 //     leaving it on costs boot time for no benefit.
 //   - nomodules: rootfs has no /lib/modules tree.
 //   - quiet: suppresses the spammy kernel boot lines.
+//
+// Deliberately ABSENT: acpi=off. Firecracker surfaces its VM Generation ID
+// (vmgenid) through ACPI, and a guest kernel built with CONFIG_VMGENID uses
+// that device to reseed its CRNG synchronously on snapshot restore — before
+// userspace runs — which is the only thing that closes the entropy window
+// between Action(Resume) and the post_resume reseed (see
+// plans/snapshot-clone-rng-userspace.md Phase C and Hazard 2 of the
+// Snapshot Clone Correctness doc). pci=off is fine — ACPI is a separate bus
+// — but acpi=off would silently disable that pre-userspace reseed. The
+// bootArgsKeepACPI invariant (bootargs_test.go) guards this line so a future
+// edit can't reintroduce it.
 const baseBootArgs = "console=ttyS0 reboot=k panic=1 pci=off nomodules quiet"
 
 func defaultBootArgs() string {

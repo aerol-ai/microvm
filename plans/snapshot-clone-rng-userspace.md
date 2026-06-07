@@ -1,6 +1,9 @@
 # Snapshot-clone RNG correctness: kernel reseed hardening + userspace gap
 
-Status: Phases A and B implemented; C/D proposed.
+Status: Phases A and B implemented. Phase C in-repo parts (boot-args ACPI
+invariant + operator docs) implemented; its load-bearing preconditions are
+deploy-time artifacts (FC ≥ v1.8 binary, `CONFIG_VMGENID` guest kernel). Phase
+D deferred (latent until virtio-net lands in forks).
 Owner: runtime/firecracker + toolboxd.
 Related: `plans/snapshot-clone-fast-boot.md`, `cmd/toolboxd/quiesce_linux.go`.
 
@@ -112,13 +115,43 @@ template.
   PRNG + numpy for Python, etc.). Recommends lazy interpreter start over
   baking a started RNG-stateful process into a template.
 
-### Phase C — vmgenid in the VMM (P2, robust long-term)
+### Phase C — vmgenid (P2, robust long-term; in-repo parts DONE)
 
-Attach Firecracker's vmgenid device + ensure the guest kernel has
-`CONFIG_VMGENID`. The kernel then auto-reseeds on resume *before userspace
-runs*, closing the resume race Phase A can't, and future vmgenid-aware
-libc/openssl pick it up for free. Larger: touches guest-kernel build +
-machine config + template rebuild. Track separately.
+Correction made during implementation: there is **no daemon "attach vmgenid
+device" call**. Firecracker auto-manages the VM Generation ID — it regenerates
+the value and notifies the guest over ACPI on every snapshot restore (support
+landed in Firecracker v1.8). A guest kernel with `CONFIG_VMGENID` then reseeds
+the kernel CSPRNG *inside the resume path, before userspace runs*, closing the
+entropy window Phase A's reactive `post_resume` cannot. So "Phase C" is not a
+`pkg/firecracker` device — it is one in-code invariant plus two deploy-time
+artifact preconditions:
+
+- **In code (DONE).** vmgenid rides ACPI, so ACPI must stay enabled on the
+  kernel command line. `baseBootArgs`
+  (`internal/runtime/firecracker/driver.go`) deliberately omits `acpi=off`
+  (`pci=off` is unrelated and safe); a rationale comment records why and
+  `bootargs_test.go` (`TestBootArgsKeepACPI`) fails the build if a future edit
+  reintroduces a disabling flag. This is the only vmgenid lever the daemon
+  controls.
+- **In docs (DONE).** `engineering-snapshot-correctness.mdx` Hazard 2 gains a
+  "Closing the entropy window: vmgenid" subsection (synchronous in-kernel
+  reseed, composes with `post_resume` which still owns the clock); the
+  "Entropy window" known-gap bullet now points at it. The operator
+  precondition (FC ≥ v1.8 binary + `CONFIG_VMGENID=y` guest kernel) is stated
+  there.
+- **Deploy-time (operator, NOT daemon code).** `SB_FIRECRACKER_BINARY` ≥ v1.8
+  and `SB_FIRECRACKER_KERNEL` built with `CONFIG_VMGENID=y`. The repo does not
+  build the kernel or ship the FC binary (both are downloaded artifacts — see
+  Terraform `firecracker.kernel_url` / `binary_url`), so these are verified at
+  template-build / deploy time, not settable in Go. On a binary or kernel
+  without support, the system silently falls back to `post_resume`-only
+  (correct on the happy path; entropy window restored).
+
+Optional follow-up (not done): a one-shot `firecracker --version` preflight in
+`Driver.Ping` that warns when snapshot-clone is enabled against a pre-1.8
+binary. Deferred — it runs a subprocess on the health path and asserts a
+version constant; the doc precondition + boot-args guard cover the
+correctness-relevant surface without that risk.
 
 ### Phase D — kernel one-time secrets (P3, latent)
 
@@ -128,7 +161,9 @@ folds into Phase C or an explicit rekey.
 
 ## Sequencing
 
-A (done) → B (done) → C/D as follow-ups.
+A (done) → B (done) → C in-repo (done; boot-args invariant + docs) with
+deploy-time artifact preconditions to verify at rollout → D deferred until
+virtio-net lands in forks.
 
 ## Tests (A + B)
 
