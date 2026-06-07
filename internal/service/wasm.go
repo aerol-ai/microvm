@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -71,6 +72,16 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		sandboxID, err = generateSandboxID()
 		if err != nil {
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
+		}
+	}
+
+	if s.cfg.WasmMaxInstances > 0 {
+		managed, listErr := s.wasm.ListManaged(ctx)
+		if listErr != nil {
+			return nil, fmt.Errorf("wasm instance cap check: %w", listErr)
+		}
+		if len(managed) >= s.cfg.WasmMaxInstances {
+			return nil, fmt.Errorf("wasm instance cap %d reached: %w", s.cfg.WasmMaxInstances, capacity.ErrCapacityExceeded)
 		}
 	}
 

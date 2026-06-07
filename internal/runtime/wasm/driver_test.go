@@ -98,8 +98,8 @@ func TestNotImplementedMethods(t *testing.T) {
 	if _, err := d.CreateSnapshot(ctx, "id", "img"); !errors.Is(err, models.ErrRuntimeNotImplemented) {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
-	if err := d.Resize(ctx, "id", models.ResizeSandboxRequest{}); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("Resize: %v", err)
+	if err := d.Resize(ctx, "missing", models.ResizeSandboxRequest{CPU: 2.0}); err == nil {
+		t.Fatal("Resize on missing sandbox expected error")
 	}
 	if err := d.RemoveImage(ctx, "img"); !errors.Is(err, models.ErrRuntimeNotImplemented) {
 		t.Fatalf("RemoveImage: %v", err)
@@ -156,4 +156,41 @@ func TestCreateColdPathWithFakeWorker(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(runDir, "sb-1")); !os.IsNotExist(err) {
 		t.Fatalf("expected sandbox dir removed, stat err=%v", err)
 	}
+}
+
+func TestResizeUpdatesInstanceLimits(t *testing.T) {
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	runDir := filepath.Join(dir, "run")
+
+	d := New(Config{RunDir: runDir, ModulesDir: dir}, nil)
+	d.SetModuleResolver(fakeResolver{path: modPath, digest: "deadbeef"})
+	d.SetWorkerSupervisor(&fakeSupervisor{})
+	d.SetWorkerClientFactory(func(string) WorkerClient { return &recordingWorkerClient{} })
+
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{Image: "demo.wasm"}, "sb-rz", "tok", nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := d.Resize(context.Background(), "sb-rz", models.ResizeSandboxRequest{CPU: 4.0, MemoryMB: 512}); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	inst, err := d.instance("sb-rz")
+	if err != nil {
+		t.Fatalf("instance: %v", err)
+	}
+	if inst.cpu != 4.0 || inst.memoryMB != 512 {
+		t.Fatalf("limits cpu=%v mem=%d", inst.cpu, inst.memoryMB)
+	}
+}
+
+func TestEnsureHTTPListenerOnDriver(t *testing.T) {
+	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	dial, err := d.EnsureHTTPListener(context.Background(), "sb-net", 8080)
+	if err != nil {
+		t.Fatalf("EnsureHTTPListener: %v", err)
+	}
+	if dial == "" {
+		t.Fatal("expected dial address")
+	}
+	d.ReleaseHTTPListener("sb-net", 8080)
 }

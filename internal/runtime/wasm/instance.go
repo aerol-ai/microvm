@@ -20,6 +20,9 @@ type sandboxInstance struct {
 	entryExport  string
 	baseEnv      map[string]string
 	baseArgs     []string
+	cpu          float64
+	memoryMB     int
+	diskGB       int
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {

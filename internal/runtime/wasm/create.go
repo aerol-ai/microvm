@@ -49,6 +49,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		entryExport:  entryExportFromRequest(req),
 		baseEnv:      copyStringMap(req.Env),
 		baseArgs:     wasmArgs(req),
+		cpu:          req.CPU,
+		memoryMB:     req.MemoryMB,
+		diskGB:       req.DiskGB,
 	}
 
 	d.mu.Lock()

@@ -475,7 +475,7 @@ func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, e
 }
 
 func (s *Service) runtimeRef(sandbox *models.Sandbox) string {
-	if s.isFirecrackerSandbox(sandbox) {
+	if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) {
 		return sandbox.ID
 	}
 	return sandboxContainerRef(sandbox)
@@ -2087,6 +2087,9 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	if (canonicalProto == models.ExposedPortProtocolTCP || canonicalProto == models.ExposedPortProtocolTLS) && hasCustomDomains(sandbox) {
 		return models.ExposePortResponse{}, ErrCustomDomainProtocolConflict
 	}
+	if s.isWasmSandbox(sandbox) && canonicalProto != models.ExposedPortProtocolHTTP {
+		return models.ExposePortResponse{}, unsupportedWasmOption("expose_port protocol " + canonicalProto)
+	}
 
 	now := time.Now().UTC()
 	existingBefore := findExposure(sandbox, port)
@@ -2523,6 +2526,9 @@ func (s *Service) installHTTPPortRoute(ctx context.Context, sandbox *models.Sand
 // so the coalescer's drain can invoke it with a stable sandbox
 // snapshot. Not called directly outside the coalescer path.
 func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbox, port int) error {
+	if s.isWasmSandbox(sandbox) {
+		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
+	}
 	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
 	case RouteShapeDirect:
 		// Non-serverless callers (and serverless-bypass-off callers)
@@ -2645,6 +2651,7 @@ func (s *Service) serverlessWakeEnabled(sandbox *models.Sandbox) bool {
 // Both calls are idempotent and treat 404 as success, so calling this
 // without knowing which shape is currently live is safe and cheap.
 func (s *Service) removeHTTPPortRoute(ctx context.Context, id string, port int) error {
+	s.releaseWasmHTTPListener(id, port)
 	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
 		return err
 	}
@@ -2728,12 +2735,19 @@ func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) 
 		}
 		sandbox = fresh
 	}
-	if sandbox.ContainerIP == "" {
-		return PortEndpoint{}, errors.New("sandbox container IP is not available")
-	}
 	exposure := findExposure(sandbox, port)
 	if exposure == nil || (exposure.Protocol != "" && exposure.Protocol != models.ExposedPortProtocolHTTP) {
 		return PortEndpoint{}, fmt.Errorf("sandbox %s does not expose HTTP port %d", id, port)
+	}
+	if s.isWasmSandbox(sandbox) {
+		url, err := s.wasmHTTPUpstreamURL(ctx, id, port)
+		if err != nil {
+			return PortEndpoint{}, err
+		}
+		return PortEndpoint{URL: url}, nil
+	}
+	if sandbox.ContainerIP == "" {
+		return PortEndpoint{}, errors.New("sandbox container IP is not available")
 	}
 	return PortEndpoint{URL: fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, port)}, nil
 }
@@ -4434,6 +4448,10 @@ func (s *Service) imageGCWhitelisted(image string) bool {
 // this, /proxy/<port>/ on the public sandbox URL refuses every request.
 func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox) {
 	if sandbox == nil || sandbox.Status != models.SandboxStatusStarted || sandbox.ContainerIP == "" {
+		return
+	}
+	if s.isWasmSandbox(sandbox) {
+		s.syncWasmAllowedPorts(sandbox)
 		return
 	}
 	ports := make([]int, 0, len(sandbox.ExposedPorts))

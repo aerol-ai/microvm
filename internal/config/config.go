@@ -374,6 +374,9 @@ type Config struct {
 	// WasmModulesDir is the content-addressed module + checkpoint cache root.
 	// Required when EnableWasm is true. SB_WASM_MODULES_DIR.
 	WasmModulesDir string
+	// WasmMaxInstances caps live WASM sandboxes on this host. 0 = unlimited.
+	// SB_WASM_MAX_INSTANCES.
+	WasmMaxInstances int
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1133,6 +1136,7 @@ func Load() (Config, error) {
 		EnableWasm:              getEnvBool("SB_ENABLE_WASM", false),
 		WasmRunDir:              getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
 		WasmModulesDir:          getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
+		WasmMaxInstances:        getEnvInt("SB_WASM_MAX_INSTANCES", 0),
 		FirecrackerBinary:       getEnv("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
 		JailerBinary:            getEnv("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
 		FirecrackerKernelImage:  getEnv("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
@@ -1348,6 +1352,9 @@ func Load() (Config, error) {
 		}
 		if cfg.WasmModulesDir == "" {
 			return Config{}, errors.New("SB_WASM_MODULES_DIR is required when SB_ENABLE_WASM=true")
+		}
+		if cfg.WasmMaxInstances < 0 {
+			return Config{}, errors.New("SB_WASM_MAX_INSTANCES must be >= 0")
 		}
 	}
 

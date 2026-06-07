@@ -291,15 +291,25 @@ func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, po
 	if !c.enabled || c.domain == "" {
 		return nil
 	}
+	return c.UpsertPortRouteWithDial(ctx, id, port, fmt.Sprintf("%s:%d", containerIP, port))
+}
 
-	routeID := portRouteID(id, port)
+// UpsertPortRouteWithDial installs a per-port HTTP route whose public hostname
+// uses guestPort but dials an explicit upstream (used by WASM host-mediated
+// listeners where the loopback port differs from the guest port).
+func (c *Client) UpsertPortRouteWithDial(ctx context.Context, id string, guestPort int, dial string) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+
+	routeID := portRouteID(id, guestPort)
 	route := map[string]any{
 		"@id":   routeID,
-		"match": []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}},
+		"match": []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, guestPort, c.domain)}}},
 		"handle": []map[string]any{{
 			"handler": "reverse_proxy",
 			"upstreams": []map[string]string{{
-				"dial": fmt.Sprintf("%s:%d", containerIP, port),
+				"dial": dial,
 			}},
 		}},
 		"terminal": true,
@@ -326,6 +336,9 @@ func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, po
 func (c *Client) UpsertPortRouteWithRetry(ctx context.Context, id, containerIP string, port int, tryDuration time.Duration) error {
 	if !c.enabled || c.domain == "" {
 		return nil
+	}
+	if tryDuration <= 0 {
+		return c.UpsertPortRouteWithDial(ctx, id, port, fmt.Sprintf("%s:%d", containerIP, port))
 	}
 	routeID := portRouteID(id, port)
 	route := map[string]any{

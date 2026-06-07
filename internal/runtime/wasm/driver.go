@@ -21,6 +21,7 @@ type Driver struct {
 	resolver        ModuleResolver
 	supervisor      WorkerSupervisor
 	newWorkerClient WorkerClientFactory
+	net             *networkGateway
 
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance
@@ -35,6 +36,7 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		cfg:             cfg,
 		logger:          logger,
 		newWorkerClient: defaultWorkerClientFactory,
+		net:             newNetworkGateway(),
 		byID:            make(map[string]*sandboxInstance),
 	}
 }
@@ -63,10 +65,6 @@ func (d *Driver) notImplemented(method string) error {
 
 func (d *Driver) CreateSnapshot(context.Context, string, string) (string, error) {
 	return "", d.notImplemented("CreateSnapshot")
-}
-
-func (d *Driver) Resize(context.Context, string, models.ResizeSandboxRequest) error {
-	return d.notImplemented("Resize")
 }
 
 func (d *Driver) Inspect(_ context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {

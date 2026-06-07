@@ -74,6 +74,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	delete(d.byID, sandboxID)
 	d.mu.Unlock()
 
+	if d.net != nil {
+		d.net.ReleaseSandbox(sandboxID)
+	}
 	if d.supervisor != nil {
 		_ = d.supervisor.Stop(sandboxID)
 	}
@@ -82,6 +85,26 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		workDir = inst.workDir
 	}
 	_ = os.RemoveAll(workDir)
+	return nil
+}
+
+func (d *Driver) Resize(_ context.Context, sandboxID string, req models.ResizeSandboxRequest) error {
+	inst, err := d.instance(sandboxID)
+	if err != nil {
+		return err
+	}
+	if req.DiskGB > 0 && req.DiskGB != inst.diskGB {
+		return fmt.Errorf("wasm runtime: disk resize not supported on a live instance")
+	}
+	if req.CPU > 0 {
+		inst.cpu = req.CPU
+	}
+	if req.MemoryMB > 0 {
+		inst.memoryMB = req.MemoryMB
+	}
+	d.mu.Lock()
+	d.byID[sandboxID] = inst
+	d.mu.Unlock()
 	return nil
 }
 
