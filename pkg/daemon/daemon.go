@@ -479,6 +479,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				})
 			}
 		}
+		if cfg.EnableWasm {
+			if withModules, ok := clusterClient.(interface {
+				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
+			}); ok {
+				withModules.SetLocalWasmModuleIDsProvider(func() ([]string, bool) {
+					return svc.LocalReadyWasmModuleInventory(context.Background())
+				})
+			}
+		}
 		logger.Info("cluster mode enabled",
 			"node_id", clusterClient.SelfNodeID(),
 			"api_url", clusterClient.SelfAPIURL(),
@@ -593,6 +602,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// enable knob is off; per-tick cancellation is wired off ctx like
 		// the other long-running sweeps above.
 		svc.StartTemplateGC(ctx)
+		if cfg.EnableWasm {
+			svc.StartWasmModuleGC(ctx)
+			svc.StartWasmPeriodicCheckpoint(ctx)
+			svc.StartWasmDurablePushSweep(ctx)
+		}
 		svc.StartPendingImageGC(ctx)
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)

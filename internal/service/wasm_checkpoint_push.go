@@ -75,3 +75,24 @@ func (p *WasmCheckpointPusher) PushOnce(ctx context.Context, sandboxID, memSnapD
 	}
 	return WasmCheckpointPushResult{RegistryRef: dest, Digest: digest}, nil
 }
+
+// PullOnce downloads a durable checkpoint from AOCR into dstDir (§4.8 failover).
+func (p *WasmCheckpointPusher) PullOnce(ctx context.Context, registryRef, dstDir string) error {
+	if p == nil {
+		return errors.New("wasm checkpoint pull disabled (pusher is nil)")
+	}
+	registryRef = strings.TrimSpace(registryRef)
+	dstDir = strings.TrimSpace(dstDir)
+	if registryRef == "" || dstDir == "" {
+		return fmt.Errorf("wasm checkpoint pull: registry ref and destination dir required")
+	}
+	return wasmmod.PullSnapshotArtifact(ctx, p.orasPullConfig(), registryRef, dstDir)
+}
+
+func (p *WasmCheckpointPusher) orasPullConfig() wasmmod.ORASPullConfig {
+	return wasmmod.ORASPullConfig{
+		Host:      p.cfg.Host,
+		ClusterID: p.cfg.ClusterID,
+		PATPath:   p.cfg.PATPath,
+	}
+}

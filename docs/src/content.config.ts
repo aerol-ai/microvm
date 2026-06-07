@@ -149,6 +149,31 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
             description: 'Full microVM isolation with sub-100ms boot times.',
           },
           {
+            type: 'group',
+            label: 'WASM',
+            homePageHref: '/wasm-sandbox',
+            entries: [
+              {
+                type: 'link',
+                href: '/wasm-sandbox',
+                label: 'Create',
+                description: 'WebAssembly/WASI sandboxes with optional checkpoint durability.',
+              },
+              {
+                type: 'link',
+                href: '/wasm-modules',
+                label: 'Modules',
+                description: 'Module refs, warm pool, and catalogue GC.',
+              },
+              {
+                type: 'link',
+                href: '/wasm-architecture',
+                label: 'Architecture',
+                description: 'Workers, mem.snap checkpoints, and AOCR failover.',
+              },
+            ],
+          },
+          {
             type: 'link',
             href: '/gvisor-sandbox',
             label: 'gVisor',

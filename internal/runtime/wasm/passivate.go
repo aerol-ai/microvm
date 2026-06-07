@@ -10,11 +10,12 @@ import (
 	"sync"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 // RehydrateSandbox reloads a passivated sandbox from mem.snap (§4.3).
-func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox) (*models.SandboxRuntimeState, error) {
+func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	if sandbox == nil {
 		return nil, fmt.Errorf("rehydrate: nil sandbox")
 	}
@@ -85,12 +86,9 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox) 
 		memoryMB = d.cfg.DefaultMemoryMB
 	}
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
-		Env:  sandbox.Env,
-		Args: wasmArgsFromSandbox(sandbox),
-		Preopens: []wasmengine.Preopen{{
-			GuestPath: "/",
-			HostPath:  workDir,
-		}},
+		Env:      sandbox.Env,
+		Args:     wasmArgsFromSandbox(sandbox),
+		Preopens: preopensFromBinds(workDir, hostMounts),
 	}, memoryMB, d.cfg.DefaultWallTimeout)
 
 	if err := client.Restore(sandbox.ID, checkpointPath, caps); err != nil {

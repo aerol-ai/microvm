@@ -95,6 +95,9 @@ type Request struct {
 	GPUVendor  string
 	Runtime    string
 	TemplateID string
+	// ModuleRef, when set alongside Runtime="wasm", lets cluster placement
+	// prefer peers that already have the module cached locally.
+	ModuleRef string
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -172,6 +175,11 @@ type Snapshot struct {
 	// pre-feature behaviour, while known=true plus an empty list means
 	// "definitely no local templates here."
 	LocalTemplateIDs []string `json:"local_template_ids,omitempty"`
+	// LocalWasmModuleInventoryKnown mirrors LocalTemplateInventoryKnown for
+	// runtime=wasm module_ref placement (plans/wasm-runtime.md Phase 7).
+	LocalWasmModuleInventoryKnown bool `json:"local_wasm_module_inventory_known,omitempty"`
+	// LocalWasmModuleIDs lists module_ref values cached on this host.
+	LocalWasmModuleIDs []string `json:"local_wasm_module_ids,omitempty"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads

@@ -395,6 +395,20 @@ type Config struct {
 	// WasmDrainTimeout bounds graceful drain checkpoint per sandbox (§4.3).
 	// SB_WASM_DRAIN_TIMEOUT.
 	WasmDrainTimeout time.Duration
+	// WasmCheckpointInterval triggers periodic boundary checkpoints for live
+	// passivatable/durable WASM sandboxes. 0 = off. SB_WASM_CHECKPOINT_INTERVAL.
+	WasmCheckpointInterval time.Duration
+	// WasmDurablePushInterval re-pushes durable checkpoints missing AOCR metadata.
+	// 0 = off (push still happens at passivation). SB_WASM_DURABLE_PUSH_INTERVAL.
+	WasmDurablePushInterval time.Duration
+	// WasmModuleGCEnabled gates the wasm_modules catalogue janitor.
+	// SB_WASM_MODULE_GC_ENABLED.
+	WasmModuleGCEnabled bool
+	// WasmModuleGCInterval is the wasm_modules sweep cadence. SB_WASM_MODULE_GC_INTERVAL.
+	WasmModuleGCInterval time.Duration
+	// WasmModuleGCTTL drops unreferenced catalogue rows older than this.
+	// SB_WASM_MODULE_GC_TTL.
+	WasmModuleGCTTL time.Duration
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1158,6 +1172,11 @@ func Load() (Config, error) {
 		WasmDefaultMemoryMB:     getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
 		WasmDefaultTimeout:      getEnvDuration("SB_WASM_DEFAULT_TIMEOUT", 5*time.Minute),
 		WasmDrainTimeout:        getEnvDuration("SB_WASM_DRAIN_TIMEOUT", 30*time.Second),
+		WasmCheckpointInterval:  getEnvDuration("SB_WASM_CHECKPOINT_INTERVAL", 0),
+		WasmDurablePushInterval: getEnvDuration("SB_WASM_DURABLE_PUSH_INTERVAL", 0),
+		WasmModuleGCEnabled:     getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
+		WasmModuleGCInterval:    getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
+		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),
 		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
 		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
 		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),

@@ -66,8 +66,13 @@ func (d *Driver) notImplemented(method string) error {
 		method, models.ErrRuntimeNotImplemented)
 }
 
-func (d *Driver) CreateSnapshot(context.Context, string, string) (string, error) {
-	return "", d.notImplemented("CreateSnapshot")
+func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, _ string) (string, error) {
+	sb := &models.Sandbox{ID: sandboxID}
+	path, _, err := d.CheckpointSandbox(ctx, sb)
+	if err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (d *Driver) Inspect(_ context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {

@@ -4563,6 +4563,97 @@ func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, registryR
 	return nil
 }
 
+// ListReadyWasmModuleRefs returns module_ref values for ready catalogue rows.
+func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT module_ref FROM wasm_modules
+		WHERE status = 'ready' AND module_ref != ''
+		ORDER BY module_ref`)
+	if err != nil {
+		return nil, fmt.Errorf("list ready wasm module refs: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
+// ListWasmModulesOlderThan returns catalogue rows not updated since cutoff.
+func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) ([]WasmModuleRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+		FROM wasm_modules
+		WHERE updated_at < ?
+		ORDER BY updated_at ASC`, cutoff.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list wasm modules older than: %w", err)
+	}
+	defer rows.Close()
+	var out []WasmModuleRecord
+	for rows.Next() {
+		var rec WasmModuleRecord
+		var hasWarm int
+		var readyAt sql.NullTime
+		if err := rows.Scan(
+			&rec.ID, &rec.ModuleRef, &rec.Status, &rec.ModulePath, &rec.ModuleSizeBytes,
+			&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError,
+			&rec.CreatedAt, &rec.UpdatedAt, &readyAt,
+		); err != nil {
+			return nil, err
+		}
+		rec.HasWarm = hasWarm != 0
+		if readyAt.Valid {
+			t := readyAt.Time
+			rec.ReadyAt = &t
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// IsWasmModuleReferenced reports whether any sandbox still names moduleRef or digest id.
+func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef string) (bool, error) {
+	moduleID = strings.TrimSpace(moduleID)
+	moduleRef = strings.TrimSpace(moduleRef)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM sandboxes
+		WHERE module_ref = ? OR module_ref = ? OR module_digest = ?
+		LIMIT 1`, moduleRef, moduleID, moduleID)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DeleteWasmModule removes a wasm_modules catalogue row.
+func (s *Store) DeleteWasmModule(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("delete wasm module: id required")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM wasm_modules WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete wasm module: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // CompareCloneGeneration rejects stale snapshot writes when wantGen is older
 // than the row's current clone_generation (§4.8 fencing).
 func (s *Store) CompareCloneGeneration(ctx context.Context, sandboxID, snapshotGen string) error {

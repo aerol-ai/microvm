@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
-func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, _ string, hostMounts []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	if d.resolver == nil {
 		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
 	}
@@ -107,12 +108,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
-		Env:  req.Env,
-		Args: wasmArgs(req),
-		Preopens: []wasmengine.Preopen{{
-			GuestPath: "/",
-			HostPath:  workDir,
-		}},
+		Env:      req.Env,
+		Args:     wasmArgs(req),
+		Preopens: preopensFromBinds(workDir, hostMounts),
 	}, memoryMB, d.cfg.DefaultWallTimeout)
 
 	if err := client.Instantiate(sandboxID, caps); err != nil {
@@ -130,6 +128,25 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.mu.Unlock()
 
 	return d.runtimeState(inst), nil
+}
+
+func preopensFromBinds(workDir string, binds []mounts.ContainerBind) []wasmengine.Preopen {
+	preopens := []wasmengine.Preopen{{
+		GuestPath: "/",
+		HostPath:  workDir,
+	}}
+	for _, b := range binds {
+		guest := strings.TrimSpace(b.ContainerPath)
+		host := strings.TrimSpace(b.HostPath)
+		if guest == "" || host == "" {
+			continue
+		}
+		preopens = append(preopens, wasmengine.Preopen{
+			GuestPath: guest,
+			HostPath:  host,
+		})
+	}
+	return preopens
 }
 
 func copyStringMap(in map[string]string) map[string]string {

@@ -143,10 +143,14 @@ type Service struct {
 	// hammer SQLite (single-writer; MaxOpenConns=1). Same TTL window the
 	// capacity-lease loop uses, so a stale-by-one-tick reading is the
 	// worst case. Lazily populated on first Capacity() call.
-	localReadyTemplateIDsMu      sync.Mutex
-	localReadyTemplateIDsCache   []string
-	localReadyTemplateIDsKnown   bool
-	localReadyTemplateIDsExpires time.Time
+	localReadyTemplateIDsMu        sync.Mutex
+	localReadyTemplateIDsCache     []string
+	localReadyTemplateIDsKnown     bool
+	localReadyTemplateIDsExpires   time.Time
+	localReadyWasmModuleIDsMu      sync.Mutex
+	localReadyWasmModuleIDsCache   []string
+	localReadyWasmModuleIDsKnown   bool
+	localReadyWasmModuleIDsExpires time.Time
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -730,7 +734,29 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 // Only placements whose create spec opted into failover.policy=recreate reach
 // this path; default sandboxes remain non-HA and are orphaned on owner death.
 func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) error {
+	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
+		nodeID := ""
+		if c := s.Cluster(); c != nil {
+			nodeID = c.SelfNodeID()
+		}
+		merged, err := s.OpenClusterSecretsForNode(ctx, spec, secrets, nodeID)
+		if err != nil {
+			return fmt.Errorf("recreate %s: %w", id, err)
+		}
+		if err := s.recreateWasmDurableSandbox(ctx, id, merged, exposedPorts); err != nil {
+			return err
+		}
+		s.logger.Info("cluster: recreated durable wasm sandbox after failover",
+			"sandbox_id", id, "replayed_ports", len(exposedPorts))
+		return nil
+	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+		if s.isWasmSandbox(existing) && existing.Durability == models.DurabilityDurable &&
+			(existing.Status == models.SandboxStatusPassivated || existing.Status == models.SandboxStatusAwaitingRuntime) {
+			if _, err := s.rehydrateWasmIfNeeded(ctx, existing, nil); err != nil {
+				return fmt.Errorf("recreate %s: rehydrate wasm: %w", id, err)
+			}
+		}
 		// D1 reconstruction: on owner change, a Serverless && stopped row
 		// without wake_armed is the new owner's first chance to install
 		// wake routes and arm the bit. Done before port replay so the
@@ -772,8 +798,10 @@ func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, expo
 	return firstErr
 }
 
+const wasmWorkerOverheadMB = 8
+
 func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
-	return capacity.Request{
+	out := capacity.Request{
 		CPU:        req.CPU,
 		MemoryMB:   req.MemoryMB,
 		DiskGB:     diskGBForCapacity(req.DiskGB, req.Runtime, req.OverlaySizeGB),
@@ -781,14 +809,19 @@ func capacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		GPUs:       gpuCountForCapacity(req.GPUs),
 		GPUVendor:  gpuVendorForCapacity(req.GPUs),
 		TemplateID: req.TemplateID,
+		ModuleRef:  models.ModuleRefForCreate(req),
 	}
+	if req.Runtime == models.RuntimeWasm {
+		out.MemoryMB += wasmWorkerOverheadMB
+	}
+	return out
 }
 
 func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 	if sandbox == nil {
 		return capacity.Request{}
 	}
-	return capacity.Request{
+	out := capacity.Request{
 		CPU:        sandbox.CPU,
 		MemoryMB:   sandbox.MemoryMB,
 		DiskGB:     diskGBForCapacity(sandbox.DiskGB, sandbox.Runtime, sandbox.OverlaySizeGB),
@@ -796,7 +829,12 @@ func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 		GPUs:       gpuCountForCapacity(sandbox.GPUs),
 		GPUVendor:  gpuVendorForCapacity(sandbox.GPUs),
 		TemplateID: sandbox.TemplateID,
+		ModuleRef:  sandbox.ModuleRef,
 	}
+	if sandbox.Runtime == models.RuntimeWasm {
+		out.MemoryMB += wasmWorkerOverheadMB
+	}
+	return out
 }
 
 func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
@@ -1532,8 +1570,20 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	if err != nil {
 		return nil, err
 	}
-	if s.isWasmSandbox(sandbox) && sandbox.Status == models.SandboxStatusPassivated {
-		sandbox, err = s.rehydrateWasmIfNeeded(ctx, sandbox)
+	wasmPassivated := s.isWasmSandbox(sandbox) && sandbox.Status == models.SandboxStatusPassivated
+	var wasmRehydrateBinds []mounts.ContainerBind
+	if wasmPassivated {
+		specs, loadErr := s.loadMounts(ctx, id)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if len(specs) > 0 {
+			if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+				return nil, fmt.Errorf("reestablish mounts: %w", err)
+			}
+			wasmRehydrateBinds = s.mounts.HostBindsFor(id)
+		}
+		sandbox, err = s.rehydrateWasmIfNeeded(ctx, sandbox, wasmRehydrateBinds)
 		if err != nil {
 			return nil, err
 		}
@@ -2996,6 +3046,10 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalTemplateInventoryKnown = true
 		snap.LocalTemplateIDs = ids
 	}
+	if refs, known := s.LocalReadyWasmModuleInventory(context.Background()); known {
+		snap.LocalWasmModuleInventoryKnown = true
+		snap.LocalWasmModuleIDs = refs
+	}
 	return snap
 }
 
@@ -3054,6 +3108,42 @@ func (s *Service) LocalReadyTemplateInventory(ctx context.Context) ([]string, bo
 func (s *Service) LocalReadyTemplateIDs(ctx context.Context) []string {
 	ids, _ := s.LocalReadyTemplateInventory(ctx)
 	return ids
+}
+
+// LocalReadyWasmModuleInventory returns module_ref values present in the local
+// wasm_modules catalogue plus whether that inventory is authoritative.
+func (s *Service) LocalReadyWasmModuleInventory(ctx context.Context) ([]string, bool) {
+	if s == nil || s.store == nil || !s.cfg.EnableWasm {
+		return nil, false
+	}
+	now := time.Now()
+	s.localReadyWasmModuleIDsMu.Lock()
+	if now.Before(s.localReadyWasmModuleIDsExpires) {
+		out := append([]string(nil), s.localReadyWasmModuleIDsCache...)
+		known := s.localReadyWasmModuleIDsKnown
+		s.localReadyWasmModuleIDsMu.Unlock()
+		return out, known
+	}
+	s.localReadyWasmModuleIDsMu.Unlock()
+
+	refs, err := s.store.ListReadyWasmModuleRefs(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("local ready wasm module refs: list failed", "error", err)
+		}
+		s.localReadyWasmModuleIDsMu.Lock()
+		out := append([]string(nil), s.localReadyWasmModuleIDsCache...)
+		known := s.localReadyWasmModuleIDsKnown
+		s.localReadyWasmModuleIDsMu.Unlock()
+		return out, known
+	}
+	s.localReadyWasmModuleIDsMu.Lock()
+	s.localReadyWasmModuleIDsCache = refs
+	s.localReadyWasmModuleIDsKnown = true
+	s.localReadyWasmModuleIDsExpires = now.Add(5 * time.Second)
+	out := append([]string(nil), refs...)
+	s.localReadyWasmModuleIDsMu.Unlock()
+	return out, true
 }
 
 // ReplayReservations re-populates the admitter from persistent state. Without

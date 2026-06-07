@@ -1,0 +1,77 @@
+---
+title: WASM Modules
+description: Module references, local cache, and warm-worker pools for WASM sandboxes.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+WASM sandboxes are created from a **module reference** (`module_ref`). The daemon resolves the ref to a content-addressed file under `SB_WASM_MODULES_DIR` and records it in the `wasm_modules` catalogue.
+
+## Module references
+
+Supported forms mirror other artifact refs:
+
+- `file:///path/to/module.wasm` on the host
+- HTTP(S) URLs fetched into the module cache
+- AOCR refs when image distribution is configured
+
+## Warm pool
+
+When `SB_WASM_POOL_ENABLED=true`, the daemon keeps pre-spawned workers per module digest. Creates against a warm module skip cold worker boot.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      module_ref: 'https://example.com/builds/agent.wasm',
+      runtime: 'wasm',
+      memoryMB: 512,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'module_ref': 'https://example.com/builds/agent.wasm',
+        'runtime': 'wasm',
+        'memoryMB': 512,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sb, err := client.Create(ctx, types.CreateSandboxRequest{
+        ModuleRef: "https://example.com/builds/agent.wasm",
+        Runtime:   types.RuntimeWasm,
+        MemoryMB:  512,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.create(CreateSandboxRequest {
+        module_ref: Some("https://example.com/builds/agent.wasm".into()),
+        runtime: Some("wasm".into()),
+        memory_mb: Some(512),
+        ..Default::default()
+    }).await?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CreateSandboxRequest req = new CreateSandboxRequest();
+    req.setModuleRef("https://example.com/builds/agent.wasm");
+    req.setRuntime("wasm");
+    req.setMemoryMB(512);
+    client.create(req);
+    ```
+  </TabItem>
+</Tabs>
+
+## Cluster placement
+
+Peers gossip `local_wasm_module_ids` via `/v1/capacity`. Placement prefers nodes that already cache the requested `module_ref`.
+
+## Garbage collection
+
+Unreferenced catalogue rows older than `SB_WASM_MODULE_GC_TTL` are removed by the wasm module janitor when `SB_WASM_MODULE_GC_ENABLED=true`.

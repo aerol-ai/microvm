@@ -100,8 +100,8 @@ func TestPingRequiresModulesDir(t *testing.T) {
 func TestNotImplementedMethods(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
 	ctx := context.Background()
-	if _, err := d.CreateSnapshot(ctx, "id", "img"); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("CreateSnapshot: %v", err)
+	if _, err := d.CreateSnapshot(ctx, "id", "img"); err == nil {
+		t.Fatal("CreateSnapshot on missing sandbox expected error")
 	}
 	if err := d.Resize(ctx, "missing", models.ResizeSandboxRequest{CPU: 2.0}); err == nil {
 		t.Fatal("Resize on missing sandbox expected error")

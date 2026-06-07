@@ -1,6 +1,6 @@
 # WASM-based Sandboxes — Design & Implementation Plan
 
-Status: **Proposal** · Owner: TBD · Created: 2026-06-07
+Status: **Partially implemented** (Phases 1–6 core landed on `wasm-phase1-prerequisites`; Phase 7 cluster/live-migration stubs remain) · Owner: TBD · Created: 2026-06-07
 
 This plan adds a **fourth runtime** to AerolVM — WebAssembly (WASM/WASI) — as a
 peer to `docker`, `gvisor`, and `firecracker`. The design principle is the one

@@ -10,6 +10,7 @@ import (
 
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 // DrainWasmSandboxes checkpoints passivatable/durable live WASM sandboxes during
@@ -126,7 +127,7 @@ func (s *Service) pushWasmCheckpointBestEffort(sandboxID, memSnapDir string) {
 	}
 }
 
-func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.Sandbox) (*models.Sandbox, error) {
+func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.Sandbox, hostMounts []mounts.ContainerBind) (*models.Sandbox, error) {
 	if sandbox == nil || !s.isWasmSandbox(sandbox) {
 		return sandbox, nil
 	}
@@ -136,11 +137,18 @@ func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.San
 	if !s.cfg.EnableWasm {
 		return nil, fmt.Errorf("wasm runtime disabled; sandbox %s is passivated", sandbox.ID)
 	}
+	checkpointPath, err := s.ensureWasmCheckpointLocal(ctx, sandbox)
+	if err != nil {
+		return nil, err
+	}
+	if sandbox.CheckpointPath == "" {
+		sandbox.CheckpointPath = checkpointPath
+	}
 	host, ok := s.wasm.(wasmruntime.CheckpointHost)
 	if !ok {
 		return nil, fmt.Errorf("wasm checkpoint host not available")
 	}
-	state, err := host.RehydrateSandbox(ctx, sandbox)
+	state, err := host.RehydrateSandbox(ctx, sandbox, hostMounts)
 	if err != nil {
 		if errors.Is(err, models.ErrSnapshotCorrupt) || errors.Is(err, models.ErrSnapshotFenced) {
 			s.logger.Warn("wasm rehydrate failed; marking stopped",

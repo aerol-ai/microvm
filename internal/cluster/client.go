@@ -1193,6 +1193,14 @@ func (c *Cluster) SetLocalTemplateIDsProvider(fn func() ([]string, bool)) {
 	c.capacityLeases.SetLocalTemplateIDsProvider(fn)
 }
 
+// SetLocalWasmModuleIDsProvider registers the WASM module inventory callback.
+func (c *Cluster) SetLocalWasmModuleIDsProvider(fn func() ([]string, bool)) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetLocalWasmModuleIDsProvider(fn)
+}
+
 func (c *Cluster) membersWithCapacity() []Member {
 	members := c.gossip.members()
 	if c.capacityLeases == nil {

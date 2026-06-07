@@ -171,7 +171,7 @@ func TestCheckpointRehydrateRoundTrip(t *testing.T) {
 	sb.Status = models.SandboxStatusPassivated
 	sb.CheckpointPath = path
 	sb.CloneGeneration = gen
-	state2, err := d.RehydrateSandbox(ctx, sb)
+	state2, err := d.RehydrateSandbox(ctx, sb, nil)
 	if err != nil {
 		t.Fatalf("RehydrateSandbox: %v", err)
 	}

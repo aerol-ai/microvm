@@ -114,7 +114,7 @@ func TestWasmDispatch_ModuleRefWithoutImage(t *testing.T) {
 	}
 }
 
-func TestWasmDispatch_RejectsMounts(t *testing.T) {
+func TestWasmDispatch_RequiresMountManagerWhenMountsSet(t *testing.T) {
 	svc := &Service{cfg: config.Config{EnableWasm: true}}
 	svc.SetWasmRuntime(&wasmRecordingRuntime{})
 	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
@@ -122,7 +122,7 @@ func TestWasmDispatch_RejectsMounts(t *testing.T) {
 		Runtime: models.RuntimeWasm,
 		Mounts:  []models.MountSpec{{Type: models.MountTypeS3, Source: "s3://b/k", Target: "/data"}},
 	})
-	if err == nil || !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("expected mount rejection, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "mount manager not configured") {
+		t.Fatalf("expected mount manager error, got %v", err)
 	}
 }

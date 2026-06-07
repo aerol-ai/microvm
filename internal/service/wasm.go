@@ -9,6 +9,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 func (s *Service) isWasmSandbox(sandbox *models.Sandbox) bool {
@@ -20,10 +21,6 @@ func (s *Service) isWasmSandbox(sandbox *models.Sandbox) bool {
 // reserve admission, dispatch to the driver, persist the row. Create on the
 // driver still returns ErrRuntimeNotImplemented until Phase 2 lands the cold path.
 func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
-	if len(req.Mounts) > 0 {
-		return nil, fmt.Errorf("runtime %q does not yet support mounts (see plans/wasm-runtime.md): %w",
-			req.Runtime, models.ErrRuntimeNotImplemented)
-	}
 	if req.GPUs != nil {
 		return nil, fmt.Errorf("runtime %q does not yet support GPUs (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)
@@ -96,8 +93,36 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		}
 	}
 
-	state, err := s.wasm.Create(ctx, req, sandboxID, toolboxToken, nil)
+	var sealedMounts []byte
+	var binds []mounts.ContainerBind
+	cleanupMounts := func() {}
+	if len(req.Mounts) > 0 {
+		if s.mounts == nil {
+			releaseAdmission()
+			return nil, fmt.Errorf("mount manager not configured")
+		}
+		var sealErr error
+		sealedMounts, sealErr = s.sealMounts(req.Mounts)
+		if sealErr != nil {
+			releaseAdmission()
+			return nil, sealErr
+		}
+		var mountErr error
+		binds, mountErr = s.mounts.MountAll(ctx, sandboxID, req.Mounts)
+		if mountErr != nil {
+			releaseAdmission()
+			return nil, fmt.Errorf("mount external storage: %w", mountErr)
+		}
+		cleanupMounts = func() {
+			if err := s.mounts.UnmountAll(sandboxID); err != nil {
+				s.logger.Warn("cleanup unmount failed", "sandbox_id", sandboxID, "error", err)
+			}
+		}
+	}
+
+	state, err := s.wasm.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
+		cleanupMounts()
 		releaseAdmission()
 		return nil, err
 	}
@@ -137,19 +162,32 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
 		_ = s.wasm.Destroy(ctx, sandbox)
+		cleanupMounts()
 		releaseAdmission()
 		return nil, err
 	}
 	if err := s.store.Create(ctx, sandbox); err != nil {
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.wasm.Destroy(ctx, sandbox)
+		cleanupMounts()
 		releaseAdmission()
 		return nil, err
+	}
+	if len(sealedMounts) > 0 {
+		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
+			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+			_ = s.wasm.Destroy(ctx, sandbox)
+			cleanupMounts()
+			releaseAdmission()
+			return nil, err
+		}
 	}
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		_ = s.store.Delete(ctx, sandbox.ID)
 		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
 		_ = s.wasm.Destroy(ctx, sandbox)
+		cleanupMounts()
 		releaseAdmission()
 		return nil, err
 	}
