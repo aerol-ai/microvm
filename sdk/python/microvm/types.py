@@ -494,3 +494,26 @@ class Template(TypedDict, total=False):
     hasOverlay: bool
     pushState: TemplatePushState
     pushError: str
+
+
+WasmModuleStatus = Literal["ready", "failed"]
+
+
+class CreateWasmModuleOptions(TypedDict, total=False):
+    id: str
+    moduleRef: str  # required
+    entrypoint: str
+
+
+class WasmModule(TypedDict, total=False):
+    id: str
+    moduleRef: str
+    status: WasmModuleStatus
+    moduleSizeBytes: int
+    digest: str
+    entrypoint: str
+    hasWarm: bool
+    lastError: str
+    createdAt: str
+    updatedAt: str
+    readyAt: str

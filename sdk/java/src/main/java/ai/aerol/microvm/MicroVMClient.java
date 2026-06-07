@@ -31,6 +31,7 @@ import ai.aerol.microvm.model.CloneGeneration;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CreateTemplateOptions;
+import ai.aerol.microvm.model.CreateWasmModuleOptions;
 import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.DnsRecord;
@@ -54,6 +55,7 @@ import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 import ai.aerol.microvm.model.Template;
+import ai.aerol.microvm.model.WasmModule;
 
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
@@ -334,6 +336,34 @@ public class MicroVMClient {
 
     public void deleteTemplate(String templateId) {
         doNoContent("DELETE", versioned("/templates/" + templateId), null);
+    }
+
+    /**
+     * Register a WASM module in the host catalogue. Resolution is synchronous —
+     * the returned row is typically already
+     * {@link ai.aerol.microvm.model.WasmModuleStatus#READY}.
+     */
+    public WasmModule createWasmModule(CreateWasmModuleOptions options) {
+        if (options == null || trimToNull(options.moduleRef) == null) {
+            throw new MicroVMException("module_ref is required");
+        }
+        return doJson("POST", versioned("/wasm-modules"), options, WasmModule.class);
+    }
+
+    public List<WasmModule> listWasmModules() {
+        WasmModule[] response = doJson("GET", versioned("/wasm-modules"), null, WasmModule[].class);
+        if (response == null) {
+            return Collections.emptyList();
+        }
+        return java.util.Arrays.asList(response);
+    }
+
+    public WasmModule getWasmModule(String moduleId) {
+        return doJson("GET", versioned("/wasm-modules/" + moduleId), null, WasmModule.class);
+    }
+
+    public void deleteWasmModule(String moduleId) {
+        doNoContent("DELETE", versioned("/wasm-modules/" + moduleId), null);
     }
 
     /**

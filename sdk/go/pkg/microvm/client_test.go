@@ -806,6 +806,92 @@ func TestTemplateLifecycle(t *testing.T) {
 	}
 }
 
+func TestWasmModuleLifecycle(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	type seenReq struct {
+		method string
+		path   string
+		body   map[string]any
+	}
+	var seen seenReq
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.method = r.Method
+		seen.path = r.URL.Path
+		seen.body = nil
+		if r.ContentLength > 0 {
+			_ = json.NewDecoder(r.Body).Decode(&seen.body)
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/wasm-modules":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "mod-go", "module_ref": "file:///agent.wasm",
+				"status": "ready", "has_warm": true,
+				"created_at": now.Format(time.RFC3339Nano),
+				"updated_at": now.Format(time.RFC3339Nano),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/wasm-modules":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": "mod-go", "module_ref": "file:///agent.wasm",
+				"status": "ready", "has_warm": true,
+				"created_at": now.Format(time.RFC3339Nano),
+				"updated_at": now.Format(time.RFC3339Nano),
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/wasm-modules/mod-go":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "mod-go", "module_ref": "file:///agent.wasm",
+				"status": "ready", "has_warm": true,
+				"created_at": now.Format(time.RFC3339Nano),
+				"updated_at": now.Format(time.RFC3339Nano),
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/wasm-modules/mod-go":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		PATToken: "pat", APIUrl: server.URL, HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+
+	mod, err := client.CreateWasmModule(ctx, sdktypes.CreateWasmModuleOptions{
+		ModuleRef: "file:///agent.wasm",
+	})
+	if err != nil {
+		t.Fatalf("CreateWasmModule: %v", err)
+	}
+	if mod.ID != "mod-go" || mod.Status != sdktypes.WasmModuleStatusReady {
+		t.Fatalf("CreateWasmModule response = %+v", mod)
+	}
+	if seen.body["module_ref"] != "file:///agent.wasm" {
+		t.Fatalf("CreateWasmModule body = %+v", seen.body)
+	}
+
+	rows, err := client.ListWasmModules(ctx)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListWasmModules: %v rows=%+v", err, rows)
+	}
+
+	got, err := client.GetWasmModule(ctx, "mod-go")
+	if err != nil || got.ID != "mod-go" {
+		t.Fatalf("GetWasmModule: %v got=%+v", err, got)
+	}
+
+	if err := client.DeleteWasmModule(ctx, "mod-go"); err != nil {
+		t.Fatalf("DeleteWasmModule: %v", err)
+	}
+	if seen.method != http.MethodDelete || seen.path != "/v1/wasm-modules/mod-go" {
+		t.Fatalf("last call = %+v", seen)
+	}
+}
+
 // TestRebuildTemplate_412SurfacedAsError pins the operator-rebuild contract:
 // the daemon's 412 (template not in a rebuildable state) must surface as an
 // error from the SDK call, not as a silent zero-value response. Operator

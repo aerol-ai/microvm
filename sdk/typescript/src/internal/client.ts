@@ -16,6 +16,7 @@ import type {
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
+  CreateWasmModuleOptions,
   CustomDomain,
   CloneGeneration,
   CustomDomainDNSRecords,
@@ -48,6 +49,8 @@ import type {
   Template,
   TemplatePushState,
   TemplateStatus,
+  WasmModule,
+  WasmModuleStatus,
 } from "../types.js";
 
 type FetchLike = typeof fetch;
@@ -199,6 +202,20 @@ interface ApiTemplate {
   has_overlay: boolean;
   push_state?: TemplatePushState;
   push_error?: string;
+}
+
+interface ApiWasmModule {
+  id: string;
+  module_ref: string;
+  status: WasmModuleStatus;
+  module_size_bytes?: number;
+  digest?: string;
+  entrypoint?: string;
+  has_warm: boolean;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+  ready_at?: string;
 }
 
 interface ApiSandboxSnapshot {
@@ -753,6 +770,29 @@ export class APIClient {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/templates/${id}`);
   }
 
+  async createWasmModule(options: CreateWasmModuleOptions): Promise<WasmModule> {
+    const response = await this.doJSON<ApiWasmModule>("POST", this.versioned("/wasm-modules"), {
+      id: options.id,
+      module_ref: options.moduleRef,
+      entrypoint: options.entrypoint,
+    });
+    return fromApiWasmModule(response);
+  }
+
+  async listWasmModules(): Promise<WasmModule[]> {
+    const response = await this.doJSON<ApiWasmModule[]>("GET", this.versioned("/wasm-modules"));
+    return (response ?? []).map(fromApiWasmModule);
+  }
+
+  async getWasmModule(id: string): Promise<WasmModule> {
+    const response = await this.doJSON<ApiWasmModule>("GET", `${this.versionPrefix}/wasm-modules/${id}`);
+    return fromApiWasmModule(response);
+  }
+
+  async deleteWasmModule(id: string): Promise<void> {
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/wasm-modules/${id}`);
+  }
+
   async rebuildTemplate(id: string): Promise<Template> {
     const response = await this.doJSON<ApiTemplate>("POST", `${this.versionPrefix}/templates/${id}/rebuild`);
     return fromApiTemplate(response);
@@ -1168,6 +1208,22 @@ function fromApiTemplate(template: ApiTemplate): Template {
     hasOverlay: template.has_overlay,
     pushState: template.push_state,
     pushError: template.push_error,
+  };
+}
+
+function fromApiWasmModule(module: ApiWasmModule): WasmModule {
+  return {
+    id: module.id,
+    moduleRef: module.module_ref,
+    status: module.status,
+    moduleSizeBytes: module.module_size_bytes,
+    digest: module.digest,
+    entrypoint: module.entrypoint,
+    hasWarm: module.has_warm,
+    lastError: module.last_error,
+    createdAt: module.created_at,
+    updatedAt: module.updated_at,
+    readyAt: module.ready_at,
   };
 }
 

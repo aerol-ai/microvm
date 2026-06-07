@@ -623,3 +623,33 @@ export interface CreateTemplateOptions {
   /** Optional floor for the ext4 image size, in MiB. */
   minSizeMiB?: number;
 }
+
+/** Catalogue lifecycle for POST /v1/wasm-modules rows. */
+export type WasmModuleStatus = "ready" | "failed";
+
+/**
+ * A WASM module catalogue entry. Resolved synchronously on the host and
+ * referenced by `moduleRef` when creating `runtime: "wasm"` sandboxes.
+ */
+export interface WasmModule {
+  id: string;
+  moduleRef: string;
+  status: WasmModuleStatus;
+  moduleSizeBytes?: number;
+  digest?: string;
+  entrypoint?: string;
+  hasWarm: boolean;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  readyAt?: string;
+}
+
+export interface CreateWasmModuleOptions {
+  /** Optional explicit ID. Empty means the daemon uses the module digest. */
+  id?: string;
+  /** Module reference resolved on this host (file path, URL, etc.). */
+  moduleRef: string;
+  /** WASI entry export; defaults to `_start` on the daemon. */
+  entrypoint?: string;
+}

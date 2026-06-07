@@ -13,6 +13,7 @@ export type {
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
+  CreateWasmModuleOptions,
   CustomDomain,
   CustomDomainDNSRecords,
   CustomDomainStatus,
@@ -47,5 +48,7 @@ export type {
   Template,
   TemplatePushState,
   TemplateStatus,
+  WasmModule,
+  WasmModuleStatus,
   UpdateLifecycleOptions,
 } from "./types.js";

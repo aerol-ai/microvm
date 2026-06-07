@@ -1271,6 +1271,57 @@ class TemplateLifecycleTests(unittest.TestCase):
         client.delete_template("tpl-x")
         self.assertEqual(captured["calls"][0], ("DELETE", "/v1/templates/tpl-x", None))
 
+    def test_create_wasm_module_sends_request_and_maps_response(self):
+        api_response = {
+            "id": "abc123",
+            "module_ref": "file:///opt/mod.wasm",
+            "status": "ready",
+            "module_size_bytes": 4096,
+            "digest": "abc123",
+            "entrypoint": "_start",
+            "has_warm": True,
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:00:00Z",
+            "ready_at": "2026-05-27T10:00:00Z",
+        }
+        client, captured = self._client(response=api_response)
+        mod = client.create_wasm_module({"moduleRef": "file:///opt/mod.wasm", "entrypoint": "_start"})
+        self.assertEqual(captured["calls"][0][0], "POST")
+        self.assertEqual(captured["calls"][0][1], "/v1/wasm-modules")
+        self.assertEqual(captured["calls"][0][2], {"module_ref": "file:///opt/mod.wasm", "entrypoint": "_start"})
+        self.assertEqual(mod["id"], "abc123")
+        self.assertEqual(mod["status"], "ready")
+        self.assertEqual(mod["moduleRef"], "file:///opt/mod.wasm")
+        self.assertEqual(mod["hasWarm"], True)
+
+    def test_create_wasm_module_requires_module_ref(self):
+        client, _ = self._client(response={})
+        with self.assertRaises(client_module.MicroVMError):
+            client.create_wasm_module({"moduleRef": ""})
+
+    def test_list_wasm_modules_normalizes_null_to_empty(self):
+        client, _ = self._client(response=None)
+        rows = client.list_wasm_modules()
+        self.assertEqual(rows, [])
+
+    def test_get_wasm_module_targets_per_id_path(self):
+        client, captured = self._client(response={
+            "id": "mod-x",
+            "module_ref": "file:///a.wasm",
+            "status": "ready",
+            "created_at": "2026-05-27T10:00:00Z",
+            "updated_at": "2026-05-27T10:00:00Z",
+            "has_warm": False,
+        })
+        mod = client.get_wasm_module("mod-x")
+        self.assertEqual(captured["calls"][0], ("GET", "/v1/wasm-modules/mod-x", None))
+        self.assertEqual(mod["id"], "mod-x")
+
+    def test_delete_wasm_module_sends_delete(self):
+        client, captured = self._client(response=None)
+        client.delete_wasm_module("mod-x")
+        self.assertEqual(captured["calls"][0], ("DELETE", "/v1/wasm-modules/mod-x", None))
+
     def test_rebuild_template_posts_and_maps_unhealthy_response(self):
         api_response = {
             "id": "tpl-rebuild",

@@ -48,10 +48,13 @@ import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.CreateTemplateOptions;
+import ai.aerol.microvm.model.CreateWasmModuleOptions;
 import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 import ai.aerol.microvm.model.Template;
 import ai.aerol.microvm.model.TemplateStatus;
+import ai.aerol.microvm.model.WasmModule;
+import ai.aerol.microvm.model.WasmModuleStatus;
 
 class MicroVMClientTest {
     @Test
@@ -1332,6 +1335,70 @@ class MicroVMClientTest {
             client.deleteTemplate("tpl-x");
             assertEquals("DELETE", seenMethod.get());
             assertEquals("/v1/templates/tpl-x", seenPath.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createWasmModulePostsAndMapsResponse() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod());
+            assertEquals("/v1/wasm-modules", exchange.getRequestURI().getPath());
+            body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 201, mapOf(
+                "id", "mod-java",
+                "module_ref", "file:///agent.wasm",
+                "status", "ready",
+                "module_size_bytes", 4096,
+                "has_warm", true,
+                "created_at", "2026-05-27T10:00:00Z",
+                "updated_at", "2026-05-27T10:00:00Z",
+                "ready_at", "2026-05-27T10:00:00Z"
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            WasmModule module = client.createWasmModule(new CreateWasmModuleOptions()
+                .setModuleRef("file:///agent.wasm")
+                .setEntrypoint("_start"));
+            assertEquals("mod-java", module.id);
+            assertEquals(WasmModuleStatus.READY, module.status);
+            assertEquals("file:///agent.wasm", module.moduleRef);
+            assertTrue(module.hasWarm);
+            assertEquals("file:///agent.wasm", body.get().get("module_ref"));
+            assertEquals("_start", body.get().get("entrypoint"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createWasmModuleRejectsEmptyModuleRef() {
+        MicroVMClient client = new MicroVMClient(
+            new MicroVMConfig().setApiUrl("http://127.0.0.1:1").setPatToken("pat-token"),
+            HttpClient.newHttpClient(),
+            new FakeWebSocketConnector(),
+            name -> null
+        );
+        assertThrows(MicroVMException.class, () -> client.createWasmModule(new CreateWasmModuleOptions()));
+    }
+
+    @Test
+    void deleteWasmModuleSendsDelete() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenMethod.set(exchange.getRequestMethod());
+            seenPath.set(exchange.getRequestURI().getPath());
+            exchange.sendResponseHeaders(204, -1);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            client.deleteWasmModule("mod-x");
+            assertEquals("DELETE", seenMethod.get());
+            assertEquals("/v1/wasm-modules/mod-x", seenPath.get());
         } finally {
             server.stop(0);
         }

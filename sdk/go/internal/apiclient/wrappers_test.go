@@ -49,6 +49,14 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/templates/tpl-1/rebuild":
 			_ = json.NewEncoder(w).Encode(models.Template{ID: "tpl-1", Image: "img:1", Status: models.TemplateStatusPending, CreatedAt: now, UpdatedAt: now})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/wasm-modules":
+			_ = json.NewEncoder(w).Encode(models.WasmModule{ID: "mod-1", ModuleRef: "file:///a.wasm", Status: models.WasmModuleStatusReady, CreatedAt: now, UpdatedAt: now})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/wasm-modules":
+			_ = json.NewEncoder(w).Encode([]models.WasmModule{{ID: "mod-1", ModuleRef: "file:///a.wasm", Status: models.WasmModuleStatusReady, CreatedAt: now, UpdatedAt: now}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/wasm-modules/mod-1":
+			_ = json.NewEncoder(w).Encode(models.WasmModule{ID: "mod-1", ModuleRef: "file:///a.wasm", Status: models.WasmModuleStatusReady, CreatedAt: now, UpdatedAt: now})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/wasm-modules/mod-1":
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/images/build":
 			_ = json.NewEncoder(w).Encode(map[string]string{"image": "img:built"})
 		default:
@@ -110,6 +118,18 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if _, err := client.RebuildTemplate(ctx, "tpl-1"); err != nil {
 		t.Fatalf("RebuildTemplate() error = %v", err)
+	}
+	if _, err := client.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ModuleRef: "file:///a.wasm"}); err != nil {
+		t.Fatalf("CreateWasmModule() error = %v", err)
+	}
+	if _, err := client.ListWasmModules(ctx); err != nil {
+		t.Fatalf("ListWasmModules() error = %v", err)
+	}
+	if _, err := client.GetWasmModule(ctx, "mod-1"); err != nil {
+		t.Fatalf("GetWasmModule() error = %v", err)
+	}
+	if err := client.DeleteWasmModule(ctx, "mod-1"); err != nil {
+		t.Fatalf("DeleteWasmModule() error = %v", err)
 	}
 	if img, err := client.BuildImage(ctx, "FROM alpine"); err != nil || img != "img:built" {
 		t.Fatalf("BuildImage() got=%q err=%v", img, err)

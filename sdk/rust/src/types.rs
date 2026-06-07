@@ -773,6 +773,50 @@ pub struct CreateTemplateOptions {
     pub min_size_mib: Option<u32>,
 }
 
+/// Catalogue lifecycle for POST /v1/wasm-modules rows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmModuleStatus {
+    Ready,
+    Failed,
+}
+
+/// A WASM module catalogue entry on the host.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WasmModule {
+    pub id: String,
+    #[serde(rename = "module_ref")]
+    pub module_ref: String,
+    pub status: WasmModuleStatus,
+    #[serde(rename = "module_size_bytes", skip_serializing_if = "Option::is_none")]
+    pub module_size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    #[serde(rename = "has_warm")]
+    pub has_warm: bool,
+    #[serde(rename = "last_error", skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(rename = "created_at")]
+    pub created_at: String,
+    #[serde(rename = "updated_at")]
+    pub updated_at: String,
+    #[serde(rename = "ready_at", skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
+}
+
+/// Request body for [`Client::create_wasm_module`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CreateWasmModuleOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "module_ref")]
+    pub module_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+}
+
 /// Patch body for [`Client::set_network_limits`]. Each field is `Option`-wrapped
 /// so an unset key serializes as missing (server reads as "leave alone");
 /// `Some(0)` means unlimited.

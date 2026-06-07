@@ -411,6 +411,36 @@ func (c *Client) DeleteTemplate(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/templates/"+id, nil, nil)
 }
 
+// CreateWasmModule resolves module_ref on this host and upserts the catalogue.
+// Returns a ready row on success. Idempotent when opts.ID is supplied and
+// matches the same module_ref.
+func (c *Client) CreateWasmModule(ctx context.Context, opts models.CreateWasmModuleRequest) (models.WasmModule, error) {
+	if strings.TrimSpace(opts.ModuleRef) == "" {
+		return models.WasmModule{}, errors.New("module_ref is required")
+	}
+	var response models.WasmModule
+	err := c.doJSON(ctx, http.MethodPost, c.versioned("/wasm-modules"), opts, &response)
+	return response, err
+}
+
+func (c *Client) ListWasmModules(ctx context.Context) ([]models.WasmModule, error) {
+	var response []models.WasmModule
+	if err := c.doJSON(ctx, http.MethodGet, c.versioned("/wasm-modules"), nil, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (c *Client) GetWasmModule(ctx context.Context, id string) (models.WasmModule, error) {
+	var response models.WasmModule
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/wasm-modules/"+id, nil, &response)
+	return response, err
+}
+
+func (c *Client) DeleteWasmModule(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/wasm-modules/"+id, nil, nil)
+}
+
 // RebuildTemplate kicks an operator-triggered snapshot rebuild. Idempotent
 // under concurrent retry — the daemon's CAS collapses N parallel calls for
 // the same ready template into one rebuild kick. Returns the row in its

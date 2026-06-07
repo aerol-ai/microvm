@@ -23,6 +23,7 @@ from .types import (
     CreateOptions,
     CreateSessionOptions,
     CreateTemplateOptions,
+    CreateWasmModuleOptions,
     CustomDomain,
     CustomDomainDNSRecords,
     DNSRecord,
@@ -49,6 +50,7 @@ from .types import (
     SessionAttachOptions,
     SetNetworkLimitsOptions,
     Template,
+    WasmModule,
 )
 
 STREAM_PREFIX_STDOUT = 0x01
@@ -614,6 +616,42 @@ class MicroVM:
 
     def delete_template(self, template_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/templates/{template_id}", None)
+
+    def create_wasm_module(self, options: CreateWasmModuleOptions) -> WasmModule:
+        """Register a WASM module in the host catalogue.
+
+        Resolution is synchronous — the returned row is typically already
+        ``ready``. Idempotent when ``options["id"]`` is set and matches the
+        same ``moduleRef``.
+        """
+        body: Dict[str, Any] = {}
+        mod_id = str(_first_of(options, "id") or "").strip()
+        if mod_id:
+            body["id"] = mod_id
+        module_ref = str(_first_of(options, "moduleRef", "module_ref") or "").strip()
+        if not module_ref:
+            raise MicroVMError("moduleRef is required")
+        body["module_ref"] = module_ref
+        entrypoint = _first_of(options, "entrypoint")
+        if entrypoint not in (None, ""):
+            body["entrypoint"] = str(entrypoint)
+        response = self._do_json("POST", self._versioned("/wasm-modules"), body)
+        return _from_api_wasm_module(response)
+
+    def list_wasm_modules(self) -> List[WasmModule]:
+        response = self._do_json("GET", self._versioned("/wasm-modules"), None)
+        if response is None:
+            return []
+        if not isinstance(response, list):
+            raise MicroVMError("expected JSON array from /v1/wasm-modules")
+        return [_from_api_wasm_module(item) for item in response]
+
+    def get_wasm_module(self, module_id: str) -> WasmModule:
+        response = self._do_json("GET", f"{self._version_prefix}/wasm-modules/{module_id}", None)
+        return _from_api_wasm_module(response)
+
+    def delete_wasm_module(self, module_id: str) -> None:
+        self._do_json("DELETE", f"{self._version_prefix}/wasm-modules/{module_id}", None)
 
     def rebuild_template(self, template_id: str) -> Template:
         """Re-run the snapshot phase against an existing template.
@@ -1243,6 +1281,35 @@ def _from_api_template(template: Any) -> Template:
     push_err = _first_of(template, "push_error", "pushError")
     if push_err not in (None, ""):
         result["pushError"] = str(push_err)
+    return result
+
+
+def _from_api_wasm_module(module: Any) -> WasmModule:
+    if not isinstance(module, dict):
+        raise MicroVMError("expected JSON object for wasm module")
+    result: WasmModule = {
+        "id": str(_first_of(module, "id") or ""),
+        "moduleRef": str(_first_of(module, "module_ref", "moduleRef") or ""),
+        "status": str(_first_of(module, "status") or ""),  # type: ignore[typeddict-item]
+        "createdAt": str(_first_of(module, "created_at", "createdAt") or ""),
+        "updatedAt": str(_first_of(module, "updated_at", "updatedAt") or ""),
+        "hasWarm": bool(_first_of(module, "has_warm", "hasWarm") or False),
+    }
+    size = _first_of(module, "module_size_bytes", "moduleSizeBytes")
+    if size is not None:
+        result["moduleSizeBytes"] = int(size)
+    digest = _first_of(module, "digest")
+    if digest not in (None, ""):
+        result["digest"] = str(digest)
+    entrypoint = _first_of(module, "entrypoint")
+    if entrypoint not in (None, ""):
+        result["entrypoint"] = str(entrypoint)
+    last_error = _first_of(module, "last_error", "lastError")
+    if last_error not in (None, ""):
+        result["lastError"] = str(last_error)
+    ready_at = _first_of(module, "ready_at", "readyAt")
+    if ready_at not in (None, ""):
+        result["readyAt"] = str(ready_at)
     return result
 
 
