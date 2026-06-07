@@ -350,6 +350,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     entries: [
       {
         type: 'link',
+        href: '/engineering-distributed-sandbox-runtime',
+        label: 'The Sandbox Runtime Nobody Built',
+        description: 'Every self-hostable sandbox is single-node. Every multi-node sandbox is managed. AerolVM is one Go binary that runs as both, with raw TCP ingress and HA stateful sandboxes that survive host death.',
+      },
+      {
+        type: 'link',
         href: '/engineering-idempotency',
         label: 'Idempotency on a Single Writer',
         description: 'Partial unique indexes + request_idempotency replay + a one-writer SQLite core. Making concurrent-duplicate races structurally unrepresentable.',
