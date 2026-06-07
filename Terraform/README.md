@@ -172,8 +172,8 @@ making operators smuggle everything through `extra_user_data`.
 2. Fill the `firecracker` object in `config/terraform.tfvars`.
 3. Choose one of two bootstrap modes:
 
-- **Artifact-download mode**: set `firecracker.binary_url`, `firecracker.jailer_url`, and `firecracker.kernel_url`. Terraform bootstrap installs `skopeo`, `umoci`, `e2fsprogs`, and `iproute2`, downloads those artifacts, writes the matching `SB_ENABLE_FIRECRACKER` / `SB_FIRECRACKER_*` env vars into `/etc/sandboxd/cluster.env`, and restarts `sandboxd`.
-- **Pre-baked AMI mode**: leave the URLs empty and make sure the AMI already has the binaries and kernel at `firecracker.binary_path`, `firecracker.jailer_path`, and `firecracker.kernel_path`.
+- **Artifact-download mode**: set `firecracker.binary_url`, `firecracker.jailer_url`, and `firecracker.kernel_url`. Terraform bootstrap installs `skopeo`, `umoci`, `e2fsprogs`, and `iproute2`, downloads those artifacts plus the kernel config sidecar, writes the matching `SB_ENABLE_FIRECRACKER` / `SB_FIRECRACKER_*` env vars into `/etc/sandboxd/cluster.env`, and restarts `sandboxd`.
+- **Pre-baked AMI mode**: leave the URLs empty and make sure the AMI already has the binaries, kernel, and kernel config at `firecracker.binary_path`, `firecracker.jailer_path`, `firecracker.kernel_path`, and `firecracker.kernel_path + ".config"`.
 
 Example:
 
@@ -184,6 +184,7 @@ firecracker = {
   binary_url               = "https://example.com/firecracker"
   jailer_url               = "https://example.com/jailer"
   kernel_url               = "https://example.com/vmlinux"
+  kernel_config_url        = "https://example.com/vmlinux.config"
   kernel_path              = "/var/lib/sandboxd/firecracker/vmlinux"
   use_jailer               = true
   tap_base_cidr            = "172.16.0.0/20"

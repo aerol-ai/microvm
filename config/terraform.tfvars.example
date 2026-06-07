@@ -67,6 +67,7 @@ default_volume_type       = "gp3"
 #   binary_url               = "https://example.com/firecracker"
 #   jailer_url               = "https://example.com/jailer"
 #   kernel_url               = "https://example.com/vmlinux"
+#   kernel_config_url        = "https://example.com/vmlinux.config"
 #   kernel_path              = "/var/lib/sandboxd/firecracker/vmlinux"
 #   use_jailer               = true
 #   tap_base_cidr            = "172.16.0.0/20"

@@ -301,6 +301,8 @@
         # layout is firecracker-ci/<ci_version>/<arch>/vmlinux-<kernel_version>.
         firecracker_kernel_default_url: >-
           https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/{{ firecracker_kernel_ci_version }}/{{ firecracker_arch }}/vmlinux-{{ firecracker_kernel_version }}
+        firecracker_kernel_config_default_url: >-
+          https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/{{ firecracker_kernel_ci_version }}/{{ firecracker_arch }}/vmlinux-{{ firecracker_kernel_version }}.config
 
     - name: Ensure Firecracker install directories exist
       when: firecracker.enabled | default(false) | bool
@@ -438,6 +440,23 @@
         owner: root
         group: root
         force: no
+
+    - name: Download Firecracker guest kernel config
+      # sandboxd uses this sidecar to prove CONFIG_VMGENID=y before advertising
+      # snapshot-clone entropy correctness on /health.
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.get_url:
+        url: "{{ firecracker_kernel_config_url if (firecracker_kernel_config_url | length > 0) else (firecracker_kernel_url ~ '.config' if (firecracker_kernel_url | length > 0) else firecracker_kernel_config_default_url) }}"
+        dest: "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}.config"
+        mode: "0644"
+        owner: root
+        group: root
+        force: no
+
+    - name: Verify Firecracker guest kernel enables vmgenid
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.command: "grep -qx CONFIG_VMGENID=y {{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}.config"
+      changed_when: false
 
     # Upstream wrap key (Phase 4 F17). Two delivery modes:
     #   * shared SoT      -> aocr.upstream_wrap_key in config/secrets.yml

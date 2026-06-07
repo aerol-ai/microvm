@@ -493,9 +493,11 @@ What the play actually does, per host:
 4. Downloads `firecracker-<ver>-<arch>.tgz` + its `.sha256.txt` sidecar
    from `github.com/firecracker-microvm/firecracker/releases`, verifies with
    `sha256sum -c`, extracts, installs binary + jailer.
-5. Downloads the guest kernel from `s3.amazonaws.com/spec.ccfc.min`
-   (the upstream-blessed CI bucket) to `firecracker.kernel_path`. The
-   defaults are pinned to a known-good combination (see below).
+5. Downloads the guest kernel and matching `.config` sidecar from
+   `s3.amazonaws.com/spec.ccfc.min` (the upstream-blessed CI bucket) to
+   `firecracker.kernel_path` and `firecracker.kernel_path + ".config"`.
+   The defaults are pinned to a known-good combination (see below), and the
+   playbook fails fast if the config does not enable `CONFIG_VMGENID=y`.
 6. Creates `firecracker.run_dir`, `templates_dir`, and `jailer_chroot_base`.
 
 ### Pins and overrides
@@ -510,6 +512,7 @@ Defaults in `inventory/group_vars/all/defaults.yml`:
 | `firecracker_binary_url` | `""` | Set in `local.yml` to pull binary from a private mirror; bypasses upstream + checksum |
 | `firecracker_jailer_url` | `""` | Same for the jailer |
 | `firecracker_kernel_url` | `""` | Same for the kernel; useful if you ship a hand-built `vmlinux` |
+| `firecracker_kernel_config_url` | `""` | Same for the kernel config; defaults to `firecracker_kernel_url + ".config"` when the kernel URL is overridden |
 
 Bump the version pins together: when Firecracker releases `v1.16.0`, set
 `firecracker_version: "v1.16.0"` and `firecracker_kernel_ci_version: "v1.16"`,

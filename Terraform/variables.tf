@@ -311,12 +311,15 @@ variable "firecracker" {
     The *_url fields are optional so pre-baked AMIs remain supported:
     leave them empty if the AMI already ships the artifacts at the matching
     *_path values. kernel_path must point at a real vmlinux image on the host
-    by the time sandboxd restarts or config validation will fail at boot.
+    and kernel_path.config must point at that image's kernel config by the time
+    sandboxd restarts or health will degrade because vmgenid support cannot be
+    proven.
   EOT
   type = object({
     binary_url                   = optional(string, "")
     jailer_url                   = optional(string, "")
     kernel_url                   = optional(string, "")
+    kernel_config_url            = optional(string, "")
     binary_path                  = optional(string, "/usr/local/bin/firecracker")
     jailer_path                  = optional(string, "/usr/local/bin/jailer")
     kernel_path                  = optional(string, "/var/lib/sandboxd/firecracker/vmlinux")

@@ -56,6 +56,7 @@ resource "aws_instance" "seed" {
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
+    firecracker_kernel_config_url            = var.firecracker.kernel_config_url
     firecracker_binary_path                  = var.firecracker.binary_path
     firecracker_jailer_path                  = var.firecracker.jailer_path
     firecracker_kernel_path                  = var.firecracker.kernel_path
@@ -203,6 +204,7 @@ resource "aws_instance" "joiner" {
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
+    firecracker_kernel_config_url            = var.firecracker.kernel_config_url
     firecracker_binary_path                  = var.firecracker.binary_path
     firecracker_jailer_path                  = var.firecracker.jailer_path
     firecracker_kernel_path                  = var.firecracker.kernel_path

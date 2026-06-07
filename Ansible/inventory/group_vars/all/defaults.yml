@@ -76,8 +76,9 @@ sandboxd_auto_import_cluster_pat_src: ""
 #     firecracker_version, SHA256-verified against the release's published
 #     .sha256.txt sidecar (same trust model install.sh uses for runsc).
 #   - a guest kernel image from the AWS spec.ccfc.min bucket pinned to
-#     firecracker_kernel_ci_version / firecracker_kernel_version. Both
-#     x86_64 and aarch64 paths exist there; unsupported arches fail fast.
+#     firecracker_kernel_ci_version / firecracker_kernel_version, plus its
+#     .config sidecar so sandboxd can prove CONFIG_VMGENID=y.
+#     Both x86_64 and aarch64 paths exist there; unsupported arches fail fast.
 # Only x86_64 / aarch64 hosts are supported (Firecracker upstream constraint).
 # Override any of the *_url vars in local.yml to pull from a private mirror
 # instead — the override skips the upstream URL construction entirely.
@@ -87,3 +88,4 @@ firecracker_kernel_version: "5.10.245"
 firecracker_binary_url: ""
 firecracker_jailer_url: ""
 firecracker_kernel_url: ""
+firecracker_kernel_config_url: ""
