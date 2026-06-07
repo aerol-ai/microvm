@@ -24,6 +24,7 @@ const (
 	MsgNetstatsTick     MessageType = "netstats_tick"
 	MsgSetNetworkBlocks MessageType = "set_network_blocks"
 	MsgSetListenPort    MessageType = "set_listen_port"
+	MsgListenPort       MessageType = "listen_port"
 	MsgProxyHTTP        MessageType = "proxy_http"
 	MsgProxyHTTPResult  MessageType = "proxy_http_result"
 )

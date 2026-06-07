@@ -85,3 +85,6 @@ id_ed25519.pub
 !.env.example
 .aws/
 credentials.json
+
+# Compiled on first test run from wazero wasip1 stdlib guest (~9MB).
+pkg/wasm/testdata/wasip1-http.wasm

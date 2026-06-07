@@ -29,6 +29,7 @@ func (e *wazeroEngine) ClearNetworkHook() {
 }
 
 func (e *wazeroEngine) withNetworkContext(ctx context.Context, caps Capabilities) context.Context {
+	ctx = withWasip1Meter(ctx, e.netHook)
 	if caps.ListenEnabled() {
 		host := caps.WASIListenHost
 		if host == "" {
@@ -63,6 +64,14 @@ func (e *wazeroEngine) ensureNetworkHost(ctx context.Context) error {
 		WithGoModuleFunction(api.GoModuleFunc(host.tcpClose), []api.ValueType{api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
 		WithParameterNames("conn_id").
 		Export("tcp_close")
+	builder.NewFunctionBuilder().
+		WithGoModuleFunction(api.GoModuleFunc(host.tcpRead), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
+		WithParameterNames("conn_id", "buf_ptr", "buf_len").
+		Export("tcp_read")
+	builder.NewFunctionBuilder().
+		WithGoModuleFunction(api.GoModuleFunc(host.tcpWrite), []api.ValueType{api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32}, []api.ValueType{api.ValueTypeI32}).
+		WithParameterNames("conn_id", "buf_ptr", "buf_len").
+		Export("tcp_write")
 	if _, err := builder.Instantiate(ctx); err != nil {
 		return fmt.Errorf("aerol/vm/net host module: %w", err)
 	}
@@ -120,4 +129,79 @@ func (h *wazeroNetHost) tcpClose(_ context.Context, _ api.Module, stack []uint64
 		_ = conn.Close()
 	}
 	stack[0] = 0
+}
+
+func (h *wazeroNetHost) hookMeter() ByteMeter {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.hook == nil {
+		return nil
+	}
+	return h.hook.Meter
+}
+
+func (h *wazeroNetHost) tcpRead(_ context.Context, mod api.Module, stack []uint64) {
+	const (
+		errInvalid = int32(1)
+		errClosed  = int32(2)
+	)
+	connID := uint64(stack[0])
+	bufPtr := uint32(stack[1])
+	bufLen := uint32(stack[2])
+	stack[0] = uint64(errInvalid)
+
+	h.mu.Lock()
+	conn := h.conns[connID]
+	meter := h.hookMeter()
+	h.mu.Unlock()
+	if conn == nil {
+		stack[0] = uint64(errClosed)
+		return
+	}
+	buf, ok := mod.Memory().Read(bufPtr, bufLen)
+	if !ok {
+		return
+	}
+	n, err := conn.Read(buf)
+	if n > 0 && meter != nil {
+		meter.AddIn(int64(n))
+	}
+	if err != nil {
+		stack[0] = uint64(int32(n))
+		return
+	}
+	stack[0] = uint64(int32(n))
+}
+
+func (h *wazeroNetHost) tcpWrite(_ context.Context, mod api.Module, stack []uint64) {
+	const (
+		errInvalid = int32(1)
+		errClosed  = int32(2)
+	)
+	connID := uint64(stack[0])
+	bufPtr := uint32(stack[1])
+	bufLen := uint32(stack[2])
+	stack[0] = uint64(errInvalid)
+
+	h.mu.Lock()
+	conn := h.conns[connID]
+	meter := h.hookMeter()
+	h.mu.Unlock()
+	if conn == nil {
+		stack[0] = uint64(errClosed)
+		return
+	}
+	buf, ok := mod.Memory().Read(bufPtr, bufLen)
+	if !ok {
+		return
+	}
+	n, err := conn.Write(buf)
+	if n > 0 && meter != nil {
+		meter.AddOut(int64(n))
+	}
+	if err != nil {
+		stack[0] = uint64(int32(n))
+		return
+	}
+	stack[0] = uint64(int32(n))
 }

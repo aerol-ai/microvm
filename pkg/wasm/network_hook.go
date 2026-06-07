@@ -19,6 +19,8 @@ type NetDialer interface {
 type NetworkHook struct {
 	SandboxID string
 	Dial      NetDialer
+	// Meter receives wasip1 sock_accept/recv/send and host-module socket bytes.
+	Meter ByteMeter
 }
 
 // NetworkAwareEngine exposes per-sandbox network mediation on the default engine.

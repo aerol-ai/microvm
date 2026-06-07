@@ -72,6 +72,10 @@ type setListenPortPayload struct {
 	Host string `json:"host,omitempty"`
 }
 
+type listenPortResultPayload struct {
+	Port int `json:"port"`
+}
+
 type proxyHTTPPayload struct {
 	GuestPort  int                 `json:"guest_port"`
 	Method     string              `json:"method"`

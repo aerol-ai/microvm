@@ -25,6 +25,8 @@ type wasmtimeEngine struct {
 	linker      *wasmtime.Linker
 	wasi        *wasmtime.WasiConfig
 	lastCaps    Capabilities
+	netHook     *NetworkHook
+	netHost     *wasmtimeNetHost
 }
 
 func newWasmtimeEngine(_ context.Context) (Engine, error) {
@@ -56,6 +58,7 @@ func (e *wasmtimeEngine) LoadModule(_ context.Context, path string) error {
 func (e *wasmtimeEngine) dropInstance() {
 	e.instance = nil
 	e.linker = nil
+	e.netHost = nil
 	if e.store != nil {
 		e.store.Close()
 		e.store = nil
@@ -143,6 +146,11 @@ func (e *wasmtimeEngine) buildInstance(_ context.Context, caps Capabilities, std
 		wasi.Close()
 		store.Close()
 		return fmt.Errorf("define wasi: %w", err)
+	}
+	if err := e.ensureNetworkHost(linker); err != nil {
+		wasi.Close()
+		store.Close()
+		return err
 	}
 	instance, err := linker.Instantiate(store, e.module)
 	if err != nil {
@@ -298,9 +306,9 @@ func (e *wasmtimeEngine) RestoreSnapshot(ctx context.Context, snap SnapshotResto
 	return nil
 }
 
-func (e *wasmtimeEngine) SetNetworkHook(_ *NetworkHook) {}
-
-func (e *wasmtimeEngine) ClearNetworkHook() {}
+func (e *wasmtimeEngine) ResolvedListenPort() (int, bool) {
+	return 0, false
+}
 
 func (e *wasmtimeEngine) Close(_ context.Context) error {
 	e.dropInstance()

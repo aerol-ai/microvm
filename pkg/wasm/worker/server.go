@@ -45,6 +45,16 @@ func (s *Server) mediator() *NetMediator {
 	return s.net
 }
 
+// syncResolvedListenPort copies the host port for an ephemeral wasip1 listener into caps.
+func (s *Server) syncResolvedListenPort(caps *wasmengine.Capabilities) {
+	if caps == nil || !caps.ListenEnabled() || caps.WASIListenPort != 0 || s.eng == nil {
+		return
+	}
+	if port, ok := s.eng.ResolvedListenPort(); ok && port > 0 {
+		caps.WASIListenPort = port
+	}
+}
+
 type mediatorDialer struct {
 	m         *NetMediator
 	sandboxID string
@@ -52,6 +62,22 @@ type mediatorDialer struct {
 
 func (d mediatorDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return d.m.DialContext(ctx, d.sandboxID, network, address)
+}
+
+type workerByteMeter struct {
+	u *workerNetUsage
+}
+
+func (m *workerByteMeter) AddIn(n int64) {
+	if m != nil && m.u != nil {
+		m.u.bytesIn.Add(n)
+	}
+}
+
+func (m *workerByteMeter) AddOut(n int64) {
+	if m != nil && m.u != nil {
+		m.u.bytesOut.Add(n)
+	}
 }
 
 func (s *Server) bindNetworkHook(sandboxID string) {
@@ -63,9 +89,11 @@ func (s *Server) bindNetworkHook(sandboxID string) {
 		return
 	}
 	m := s.mediator()
+	usage := s.netUsageFor(sandboxID)
 	ne.SetNetworkHook(&wasmengine.NetworkHook{
 		SandboxID: sandboxID,
 		Dial:      mediatorDialer{m: m, sandboxID: sandboxID},
+		Meter:     &workerByteMeter{u: usage},
 	})
 }
 
@@ -166,6 +194,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			err = s.eng.Instantiate(ctx, p.Caps)
 			if err == nil {
 				s.lastCaps = p.Caps
+				s.syncResolvedListenPort(&s.lastCaps)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -197,8 +226,10 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			s.bindNetworkHook(env.SandboxID)
-			result, err := s.eng.Run(ctx, p.Caps, p.Export)
+			caps := p.Caps
+			eng := s.eng
 			s.mu.Unlock()
+			result, err := eng.Run(ctx, caps, p.Export)
 			// Guest→host WASI output bytes; socket bytes come from NetMediator (UC-43).
 			if out := int64(len(result.Stdout) + len(result.Stderr)); out > 0 {
 				s.netUsageFor(env.SandboxID).bytesOut.Add(out)
@@ -242,11 +273,12 @@ func (s *Server) Serve(conn net.Conn) error {
 			}
 			s.bindNetworkHook(env.SandboxID)
 			invokeCtx, cancel := wasmengine.WithInvocationDeadline(ctx, s.lastCaps)
+			eng := s.eng
+			s.mu.Unlock()
 			start := time.Now()
-			err = s.eng.InvokeExport(invokeCtx, p.Export)
+			err = eng.InvokeExport(invokeCtx, p.Export)
 			_ = time.Since(start) // wall time accounted on Exec path via RunResult
 			cancel()
-			s.mu.Unlock()
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
 					return err
@@ -339,6 +371,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			err = s.eng.RestoreSnapshot(ctx, snap, p.Caps)
 			if err == nil {
 				s.lastCaps = p.Caps
+				s.syncResolvedListenPort(&s.lastCaps)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -377,6 +410,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			err = s.eng.Instantiate(ctx, next)
 			if err == nil {
 				s.lastCaps = next
+				s.syncResolvedListenPort(&s.lastCaps)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -425,6 +459,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			err = s.eng.Instantiate(ctx, next)
 			if err == nil {
 				s.lastCaps = next
+				s.syncResolvedListenPort(&s.lastCaps)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -434,6 +469,17 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgListenPort:
+			s.mu.Lock()
+			port := s.lastCaps.WASIListenPort
+			s.mu.Unlock()
+			body, encErr := encodePayload(listenPortResultPayload{Port: port})
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: env.SandboxID, Payload: body}); err != nil {
 				return err
 			}
 		case MsgProxyHTTP:
@@ -483,7 +529,7 @@ func (s *Server) Serve(conn net.Conn) error {
 	}
 }
 
-// ServeSocketPath listens on a Unix domain socket and serves one connection at a time.
+// ServeSocketPath listens on a Unix domain socket and serves each connection concurrently.
 func ServeSocketPath(socketPath string) error {
 	_ = os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
@@ -497,8 +543,8 @@ func ServeSocketPath(socketPath string) error {
 		if err != nil {
 			return err
 		}
-		if err := srv.Serve(conn); err != nil {
-			return err
-		}
+		go func(c net.Conn) {
+			_ = srv.Serve(c)
+		}(conn)
 	}
 }

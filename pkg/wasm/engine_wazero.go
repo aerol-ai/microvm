@@ -24,6 +24,7 @@ type wazeroEngine struct {
 	memoryPages uint32
 	netHook     *NetworkHook
 	netHost     *wazeroNetHost
+	wasiCompat  bool
 }
 
 func newWazeroEngine(ctx context.Context) (*wazeroEngine, error) {
@@ -57,11 +58,8 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 		_ = r.Close(ctx)
 		return fmt.Errorf("wasi instantiate: %w", err)
 	}
-	if err := e.ensureNetworkHost(ctx); err != nil {
-		_ = r.Close(ctx)
-		return err
-	}
 	e.runtime = r
+	e.wasiCompat = false
 	e.memoryPages = pages
 	if len(e.moduleBytes) > 0 {
 		compiled, err := r.CompileModule(ctx, e.moduleBytes)
@@ -70,6 +68,23 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 		}
 		e.compiled = compiled
 	}
+	return nil
+}
+
+func (e *wazeroEngine) ensureWasiCompatHosts(ctx context.Context) error {
+	if e.wasiCompat || e.runtime == nil {
+		return nil
+	}
+	if err := e.ensureNetworkHost(ctx); err != nil {
+		return err
+	}
+	if err := e.ensureWasiSocketsHost(ctx); err != nil {
+		return err
+	}
+	if err := e.ensureWasiHTTPHost(ctx); err != nil {
+		return err
+	}
+	e.wasiCompat = true
 	return nil
 }
 
@@ -130,7 +145,7 @@ func (e *wazeroEngine) Instantiate(ctx context.Context, caps Capabilities) error
 		cfg = cfg.WithFSConfig(fsCfg)
 	}
 	instCtx := e.withNetworkContext(ctx, caps)
-	if err := e.ensureNetworkHost(instCtx); err != nil {
+	if err := e.ensureWasiCompatHosts(instCtx); err != nil {
 		return err
 	}
 	mod, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
@@ -164,6 +179,12 @@ func (e *wazeroEngine) InvokeExport(ctx context.Context, name string) error {
 
 func (e *wazeroEngine) moduleConfig(caps Capabilities) wazero.ModuleConfig {
 	cfg := wazero.NewModuleConfig().WithArgs(caps.Args...)
+	if caps.ListenEnabled() {
+		// Do not auto-run _start: guest HTTP servers bind listeners during instantiate
+		// and accept in _start; auto-start would block or tear down Sys before we
+		// can resolve the ephemeral listen port.
+		cfg = cfg.WithSysWalltime().WithSysNanotime().WithStartFunctions()
+	}
 	for k, v := range caps.Env {
 		cfg = cfg.WithEnv(k, v)
 	}
@@ -230,7 +251,7 @@ func (e *wazeroEngine) instantiateWithIO(ctx context.Context, caps Capabilities,
 		cfg = cfg.WithFSConfig(fsCfg)
 	}
 	instCtx := e.withNetworkContext(ctx, caps)
-	if err := e.ensureNetworkHost(instCtx); err != nil {
+	if err := e.ensureWasiCompatHosts(instCtx); err != nil {
 		return err
 	}
 	mod, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
@@ -312,6 +333,10 @@ func (e *wazeroEngine) RestoreSnapshot(ctx context.Context, snap SnapshotRestore
 		return fmt.Errorf("restore linear memory failed (guest size %d, snapshot %d)", mem.Size(), len(snap.Memory))
 	}
 	return nil
+}
+
+func (e *wazeroEngine) ResolvedListenPort() (int, bool) {
+	return ResolvedListenPort(e.module)
 }
 
 func (e *wazeroEngine) Close(ctx context.Context) error {

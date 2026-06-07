@@ -22,6 +22,8 @@ type Engine interface {
 	RestoreSnapshot(ctx context.Context, snap SnapshotRestoreInput, caps Capabilities) error
 	// Close releases compiled module and any active instance.
 	Close(ctx context.Context) error
+	// ResolvedListenPort returns the host port for an ephemeral wasip1 listener (0 in caps).
+	ResolvedListenPort() (int, bool)
 }
 
 // NewEngine constructs the default wazero-backed engine.

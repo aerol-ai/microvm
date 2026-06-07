@@ -176,6 +176,29 @@ func (c *Client) SetListenPort(sandboxID string, port int, host string) error {
 	return c.expectOK(reply)
 }
 
+// ResolvedListenPort returns the host port for the active wasip1 listener (after ephemeral bind).
+func (c *Client) ResolvedListenPort(sandboxID string) (int, error) {
+	reply, err := c.roundTrip(Envelope{Type: MsgListenPort, SandboxID: sandboxID})
+	if err != nil {
+		return 0, err
+	}
+	if reply.Type == MsgError {
+		var p errorPayload
+		if err := decodePayload(reply.Payload, &p); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("%s", p.Message)
+	}
+	if reply.Type != MsgOK {
+		return 0, fmt.Errorf("unexpected reply type %q", reply.Type)
+	}
+	var p listenPortResultPayload
+	if err := decodePayload(reply.Payload, &p); err != nil {
+		return 0, err
+	}
+	return p.Port, nil
+}
+
 // ProxyHTTP forwards one HTTP request to the guest wasip1 listener inside the worker.
 func (c *Client) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	payload, err := buildProxyHTTPPayload(guestPort, r)
