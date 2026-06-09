@@ -12,19 +12,6 @@ Use Firecracker when:
 - Your workload requires VM-level security boundaries (compliance, multi-tenant execution)
 - You want faster cold starts than full VMs while keeping stronger isolation than containers
 
-## Before you start
-
-Firecracker sandboxes require worker nodes that have Firecracker installed. On a cluster, set `with_firecracker = true` on worker nodes in `terraform.tfvars` and use bare-metal EC2 instance types. See [Cluster Setup](/cluster-setup#step-6---enable-firecracker-optional) for the provisioning steps.
-
-## Two creation paths
-
-| Path | How | Boot time |
-|---|---|---|
-| **Ad-hoc** | Pass any OCI image (`ubuntu:22.04`). The daemon converts it to a Firecracker rootfs on demand. | 10–60 seconds per create |
-| **Template-backed** | Pre-build a rootfs once using the Templates API, then pass `template_id` in the create request. | Under 100ms |
-
-The examples below use the ad-hoc path - it works without any setup beyond having Firecracker enabled on the node. For the fast template-backed path, see [Firecracker Templates](/firecracker-templates).
-
 ## Create a Firecracker sandbox
 
 Pass `runtime: "firecracker"` and an OCI image reference. The daemon pulls the image and builds a Firecracker-compatible rootfs from it.

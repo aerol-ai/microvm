@@ -7,10 +7,6 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 WASM sandboxes run guest modules inside isolated worker processes on the host. They boot quickly, share the same toolbox and routing model as Docker sandboxes, and support optional checkpoint durability for daemon restarts and cluster failover.
 
-## Before you start
-
-Enable WASM on worker nodes with `SB_ENABLE_WASM=true` and set `SB_WASM_MODULES_DIR`. For durable checkpoints replicated to AOCR, enable snapshot push (`SB_SNAPSHOT_PUSH_ENABLED`) with a cluster PAT.
-
 ## Create a WASM sandbox
 
 Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `durability` to `passivatable` or `durable` when you need restart survival.
