@@ -344,6 +344,12 @@ type Service struct {
 	ingressRouteCache     map[string]ingressRouteIntent
 	ingressLastFullGCUnix atomic.Int64
 	dnsResolver           DNSResolver
+
+	// probeContainerPortFn is the function used by exposePort to verify a
+	// container port is accepting connections before installing the Caddy route.
+	// nil falls back to the package-level probeContainerPort. Overridden in
+	// tests to avoid real TCP dials against non-routable container IPs.
+	probeContainerPortFn func(ctx context.Context, containerIP string, port int) error
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -867,6 +873,13 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	done := beginSandboxCreateMetric()
 	defer func() { done(err) }()
+	// Bound the entire create operation so a stalled image pull or a slow
+	// registry cannot block a goroutine forever. 0 disables the guard.
+	if t := s.cfg.CreateSandboxTimeout(); t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t)
+		defer cancel()
+	}
 	if err := s.ClusterTopologyError(); err != nil {
 		return nil, err
 	}
@@ -2199,6 +2212,22 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		}
 		if existingProto != canonicalProto {
 			return models.ExposePortResponse{}, fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existingProto)
+		}
+	}
+	// Probe the container port before routing traffic to it. Skipped on
+	// re-expose (existingBefore != nil — port was already reachable) and on
+	// WASM sandboxes (no direct container IP). Non-fatal: if the process has
+	// not yet bound we warn and proceed rather than holding the caller until
+	// it does; the operator can retry expose_port or the client can retry
+	// the request once the process is up.
+	if existingBefore == nil && sandbox.ContainerIP != "" && sandbox.Status == models.SandboxStatusStarted {
+		probeFn := s.probeContainerPortFn
+		if probeFn == nil {
+			probeFn = probeContainerPort
+		}
+		if err := probeFn(ctx, sandbox.ContainerIP, port); err != nil {
+			s.logger.Warn("expose_port: container port not yet accepting connections; route installed anyway",
+				"sandbox_id", id, "port", port, "error", err)
 		}
 	}
 	switch canonicalProto {
@@ -4622,6 +4651,24 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
+}
+
+// probeContainerPort dials containerIP:port with a 2-second timeout to verify
+// the in-container process has bound its port before Caddy starts routing
+// traffic to it. Called from exposePort on first-time exposures so clients do
+// not receive connection-refused from Caddy when they immediately hit the
+// returned URL. Non-fatal by design: the caller logs a warning and proceeds
+// rather than blocking exposePort indefinitely for slow-starting processes.
+func probeContainerPort(ctx context.Context, containerIP string, port int) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(probeCtx, "tcp", fmt.Sprintf("%s:%d", containerIP, port))
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
 }
 
 // probeSSHGateway opens a TCP connection to the gateway's listen address with

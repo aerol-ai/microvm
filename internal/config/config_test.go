@@ -1044,6 +1044,46 @@ func TestConfigMethodCases(t *testing.T) {
 				}
 			},
 		},
+		// Fix 3: CreateSandboxTimeout getter.
+		{
+			name: "create_sandbox_timeout_zero_disables",
+			run: func(t *testing.T) {
+				if got := (Config{CreateSandboxTimeoutSeconds: 0}).CreateSandboxTimeout(); got != 0 {
+					t.Fatalf("CreateSandboxTimeout() = %s, want 0 (disabled)", got)
+				}
+			},
+		},
+		{
+			name: "create_sandbox_timeout_negative_disables",
+			run: func(t *testing.T) {
+				if got := (Config{CreateSandboxTimeoutSeconds: -1}).CreateSandboxTimeout(); got != 0 {
+					t.Fatalf("CreateSandboxTimeout() = %s, want 0 (negative treated as disabled)", got)
+				}
+			},
+		},
+		{
+			name: "create_sandbox_timeout_uses_seconds",
+			run: func(t *testing.T) {
+				want := 600 * time.Second
+				if got := (Config{CreateSandboxTimeoutSeconds: 600}).CreateSandboxTimeout(); got != want {
+					t.Fatalf("CreateSandboxTimeout() = %s, want %s", got, want)
+				}
+			},
+		},
+		{
+			name: "create_sandbox_timeout_default_is_ten_minutes",
+			run: func(t *testing.T) {
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_CREATE_TIMEOUT_SEC", "")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.CreateSandboxTimeout() != 600*time.Second {
+					t.Fatalf("default CreateSandboxTimeout = %s, want 600s", cfg.CreateSandboxTimeout())
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
