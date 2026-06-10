@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -88,6 +89,140 @@ func TestNetworkByteCounters(t *testing.T) {
 	if d.BytesOut == 0 {
 		t.Fatalf("expected non-zero egress bytes for error response")
 	}
+}
+
+func TestEnsureHTTPListenerInvalidRequest(t *testing.T) {
+	g := newNetworkGateway()
+	if _, err := g.EnsureHTTPListener(context.Background(), "", 8080); err == nil {
+		t.Fatal("empty sandbox id expected error")
+	}
+	if _, err := g.EnsureHTTPListener(context.Background(), "sb", 0); err == nil {
+		t.Fatal("invalid port expected error")
+	}
+}
+
+func TestNetworkBlocksIngressAndEgress(t *testing.T) {
+	g := newNetworkGateway()
+	ctx := context.Background()
+	dial, err := g.EnsureHTTPListener(ctx, "sb-block", 9000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.SyncAllowedPorts("sb-block", []int{9000})
+
+	g.SetNetworkBlocks("sb-block", true, false)
+	resp, err := http.Get("http://" + dial + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("ingress block status = %d", resp.StatusCode)
+	}
+
+	g.SetNetworkBlocks("sb-block", false, true)
+	g.SetHTTPProxy(func(_ string, _ int, w http.ResponseWriter, _ *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	resp, err = http.Get("http://" + dial + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("egress block status = %d", resp.StatusCode)
+	}
+}
+
+func TestServeHTTPWithoutProxy(t *testing.T) {
+	g := newNetworkGateway()
+	ctx := context.Background()
+	dial, err := g.EnsureHTTPListener(ctx, "sb-noproxy", 7000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.SyncAllowedPorts("sb-noproxy", []int{7000})
+	resp, err := http.Get("http://" + dial + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+func TestServeHTTPProxyError(t *testing.T) {
+	g := newNetworkGateway()
+	ctx := context.Background()
+	dial, err := g.EnsureHTTPListener(ctx, "sb-proxyerr", 7100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.SyncAllowedPorts("sb-proxyerr", []int{7100})
+	g.SetHTTPProxy(func(_ string, _ int, _ http.ResponseWriter, _ *http.Request) error {
+		return fmt.Errorf("proxy failed")
+	})
+	resp, err := http.Get("http://" + dial + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+func TestReleaseSandboxClearsState(t *testing.T) {
+	g := newNetworkGateway()
+	ctx := context.Background()
+	if _, err := g.EnsureHTTPListener(ctx, "sb-rel", 7200); err != nil {
+		t.Fatal(err)
+	}
+	g.SyncAllowedPorts("sb-rel", []int{7200})
+	g.SetNetworkBlocks("sb-rel", true, true)
+	g.ReleaseSandbox("sb-rel")
+	if got := g.DrainNetworkByteCounters(); got != nil {
+		t.Fatalf("expected empty usage after release, got %+v", got)
+	}
+}
+
+func TestDriverPortsNilNet(t *testing.T) {
+	d := &Driver{}
+	d.ReleaseHTTPListener("sb", 80)
+	d.SyncAllowedPorts("sb", []int{80})
+}
+
+func TestUsageForCreatesEntry(t *testing.T) {
+	g := newNetworkGateway()
+	u := g.usageFor("sb-usage")
+	if u == nil {
+		t.Fatal("usageFor should allocate counter")
+	}
+	u.bytesIn.Add(3)
+	deltas := g.DrainNetworkByteCounters()
+	if deltas["sb-usage"].BytesIn != 3 {
+		t.Fatalf("bytes in = %d", deltas["sb-usage"].BytesIn)
+	}
+}
+
+func TestSyncAllowedPortsSkipsInvalid(t *testing.T) {
+	g := newNetworkGateway()
+	g.SyncAllowedPorts("", []int{80})
+	g.SyncAllowedPorts("sb", []int{0, 99999})
+	if len(g.allowed["sb"]) != 0 {
+		t.Fatalf("allowed = %#v", g.allowed["sb"])
+	}
+}
+
+func TestSetNetworkBlocksEmptySandbox(t *testing.T) {
+	g := newNetworkGateway()
+	g.SetNetworkBlocks("", true, true)
 }
 
 func TestReleaseHTTPListener(t *testing.T) {
