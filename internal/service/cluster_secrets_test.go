@@ -293,3 +293,54 @@ func TestDeleteClusterSecretsRemovesProviderRecord(t *testing.T) {
 		t.Fatalf("storeless DeleteClusterSecrets() error = %v", err)
 	}
 }
+
+func TestClusterSecretRedactionAndEnvelopeErrorBranches(t *testing.T) {
+	req := models.CreateSandboxRequest{
+		Image: "alpine",
+		Env:   map[string]string{"A": "1"},
+		Mounts: []models.MountSpec{{
+			Type:    models.MountTypeNFS,
+			Target:  "/srv",
+			Source:  "nfs.example:/export",
+			Options: map[string]string{"ro": "true"},
+		}},
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+	}
+	redacted := RedactClusterSecrets(req)
+	if redacted.Failover == nil || redacted.Failover == req.Failover || redacted.Failover.Policy != models.FailoverPolicyRecreate {
+		t.Fatalf("failover not deep-copied correctly: %+v", redacted.Failover)
+	}
+	if redacted.Env["A"] != "1" {
+		t.Fatalf("env not preserved: %+v", redacted.Env)
+	}
+	if redacted.Mounts[0].Options["ro"] != "true" {
+		t.Fatalf("mount options not preserved: %+v", redacted.Mounts[0].Options)
+	}
+
+	s := &Service{cipher: newTestCipher(t)}
+	dek := make([]byte, 32)
+	wrapped, err := s.cipher.EncryptWithAAD(dek, clusterSecretKeyAAD([]string{"*"}))
+	if err != nil {
+		t.Fatalf("EncryptWithAAD: %v", err)
+	}
+	sealed, err := json.Marshal(clusterSealedSecretsEnvelope{
+		Version:    clusterSecretEnvelopeVersion,
+		Recipients: []string{"*"},
+		WrappedKey: wrapped,
+		Payload:    []byte{1, 2},
+	})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if _, err := s.openClusterSecretPayload(sealed, ""); err == nil {
+		t.Fatal("openClusterSecretPayload should reject a short sealed payload")
+	}
+
+	if _, err := s.openClusterSecretPayload([]byte(`{"version":3,"recipients":["*"],"payload":"abc"}`), ""); err == nil {
+		t.Fatal("openClusterSecretPayload should reject missing wrapped data key")
+	}
+
+	if _, err := openClusterSecretEnvelopePayload(dek, []byte{1, 2, 3}, []string{"*"}); err == nil {
+		t.Fatal("openClusterSecretEnvelopePayload should reject too-short payloads")
+	}
+}

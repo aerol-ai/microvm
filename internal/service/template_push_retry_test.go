@@ -23,6 +23,7 @@ type fakeTemplatePushStore struct {
 	rows         map[string]*models.Template
 	stateUpdates atomic.Int64
 	distUpdates  atomic.Int64
+	stateErr     map[string]error
 }
 
 func newFakeTemplatePushStore() *fakeTemplatePushStore {
@@ -54,6 +55,11 @@ func (f *fakeTemplatePushStore) SetTemplatePushState(_ context.Context, id, stat
 	f.stateUpdates.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.stateErr != nil {
+		if err := f.stateErr[state]; err != nil {
+			return err
+		}
+	}
 	r, ok := f.rows[id]
 	if !ok {
 		return errors.New("not found")
@@ -327,6 +333,69 @@ func TestTemplatePushReconciler_MetadataUpdateFailureRollsToError(t *testing.T) 
 	}
 	if row.PushError == "" {
 		t.Error("PushError must carry the metadata error")
+	}
+}
+
+func TestTemplatePushReconcilerConstructorAndCancellationBranches(t *testing.T) {
+	if rec := NewTemplateArtifactPushReconciler(nil, newFakeTemplatePushStore(), nil, 0); rec != nil {
+		t.Fatal("nil pusher must produce nil reconciler")
+	}
+	if rec := NewTemplateArtifactPushReconciler(&TemplateArtifactPusher{}, nil, nil, 0); rec != nil {
+		t.Fatal("nil store must produce nil reconciler")
+	}
+
+	rec := NewTemplateArtifactPushReconciler(&TemplateArtifactPusher{}, newFakeTemplatePushStore(), nil, 0)
+	if rec == nil {
+		t.Fatal("expected reconciler")
+	}
+	if rec.maxInFlight != 2 {
+		t.Fatalf("maxInFlight = %d, want default 2", rec.maxInFlight)
+	}
+
+	var nilRec *TemplateArtifactPushReconciler
+	stats, err := nilRec.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("nil receiver RunOnce error = %v", err)
+	}
+	if stats != (TemplateArtifactPushStats{}) {
+		t.Fatalf("nil receiver stats = %+v, want zero value", stats)
+	}
+
+	store := newFakeTemplatePushStore()
+	store.seed(&models.Template{
+		ID:        "tpl-cancel",
+		Image:     "img:1",
+		Status:    models.TemplateStatusReady,
+		PushState: models.TemplatePushStatePending,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec, _ = newTestTemplateReconciler(t, store, &fakeTemplatePushDocker{})
+	if _, err := rec.RunOnce(ctx); err == nil {
+		t.Fatal("canceled context should abort RunOnce")
+	}
+
+	store = newFakeTemplatePushStore()
+	store.stateErr = map[string]error{
+		models.TemplatePushStateActive: errors.New("clear failed"),
+	}
+	rec, templatesDir := newTestTemplateReconciler(t, store, &fakeTemplatePushDocker{})
+	rootfs, mem, state := seedArtifactsOnDisk(t, templatesDir, "tpl-clear-fail")
+	store.seed(&models.Template{
+		ID:                 "tpl-clear-fail",
+		Image:              "img:2",
+		Status:             models.TemplateStatusReady,
+		PushState:          models.TemplatePushStatePending,
+		RootfsPath:         rootfs,
+		SnapshotMemoryPath: mem,
+		SnapshotStatePath:  state,
+	})
+	if _, err := rec.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce state-clear failure: %v", err)
+	}
+	row := store.get("tpl-clear-fail")
+	if row.PushState != models.TemplatePushStatePushing {
+		t.Fatalf("PushState = %q, want pushing after state-clear failure", row.PushState)
 	}
 }
 

@@ -271,3 +271,29 @@ func TestSnapshotNeedsPush(t *testing.T) {
 		})
 	}
 }
+
+func TestSnapshotPushConfigValidationAndConstructorBranches(t *testing.T) {
+	if err := (SnapshotPushConfig{Enabled: true}).Validate(); err == nil {
+		t.Fatal("missing host should fail validation")
+	}
+	if err := (SnapshotPushConfig{Enabled: true, Host: "aocr.test"}).Validate(); err == nil {
+		t.Fatal("missing cluster ID should fail validation")
+	}
+	if err := (SnapshotPushConfig{Enabled: true, Host: "aocr.test", ClusterID: "cluster-1"}).Validate(); err == nil {
+		t.Fatal("missing PAT path should fail validation")
+	}
+
+	patPath := writePATFile(t, "token")
+	pusher, err := NewSnapshotPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-1",
+		PATPath:   patPath,
+	}, &fakeSnapshotPushDocker{}, nil)
+	if err != nil {
+		t.Fatalf("NewSnapshotPusher with nil logger: %v", err)
+	}
+	if pusher == nil {
+		t.Fatal("NewSnapshotPusher returned nil for enabled config")
+	}
+}

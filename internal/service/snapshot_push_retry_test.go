@@ -346,3 +346,43 @@ func TestReconcilerEdgeBranches(t *testing.T) {
 		}
 	})
 }
+
+func TestSnapshotPushReconcilerConstructorAndCancellationBranches(t *testing.T) {
+	if rec := NewSnapshotPushReconciler(nil, newFakePushStore(), nil, 0); rec != nil {
+		t.Fatal("nil pusher must produce nil reconciler")
+	}
+	if rec := NewSnapshotPushReconciler(&SnapshotPusher{}, nil, nil, 0); rec != nil {
+		t.Fatal("nil store must produce nil reconciler")
+	}
+
+	rec := NewSnapshotPushReconciler(&SnapshotPusher{}, newFakePushStore(), nil, 0)
+	if rec == nil {
+		t.Fatal("expected reconciler")
+	}
+	if rec.maxInFlight != 2 {
+		t.Fatalf("maxInFlight = %d, want default 2", rec.maxInFlight)
+	}
+
+	var nilRec *SnapshotPushReconciler
+	stats, err := nilRec.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("nil receiver RunOnce error = %v", err)
+	}
+	if stats != (SnapshotPushReconcileStats{}) {
+		t.Fatalf("nil receiver stats = %+v, want zero value", stats)
+	}
+
+	store := newFakePushStore()
+	store.seed(&models.SandboxSnapshot{
+		Name:                  "snap-cancel",
+		Image:                 "img:1",
+		PushState:             models.SnapshotPushStatePending,
+		ImageDistributionMode: models.ImageDistributionLocalOnly,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec = newTestReconciler(t, store, &fakeSnapshotPushDocker{})
+	if _, err := rec.RunOnce(ctx); err == nil {
+		t.Fatal("canceled context should abort RunOnce")
+	}
+}

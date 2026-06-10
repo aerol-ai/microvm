@@ -130,6 +130,13 @@ func TestRunWasmModuleGCEdgeBranches(t *testing.T) {
 	if wasmPathUnderDir(root, filepath.Join(root, "..", "outside.wasm")) {
 		t.Fatalf("wasmPathUnderDir should reject path outside root")
 	}
+	bad := string([]byte{'a', 0, 'b'})
+	if wasmPathUnderDir(bad, nested) {
+		t.Fatalf("wasmPathUnderDir should reject invalid root %q", bad)
+	}
+	if wasmPathUnderDir(root, bad) {
+		t.Fatalf("wasmPathUnderDir should reject invalid path %q", bad)
+	}
 }
 
 type wasmModuleGCRuntime struct {
@@ -169,6 +176,8 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 	t.Run("start no-op branches", func(t *testing.T) {
 		var nilSvc *Service
 		nilSvc.StartWasmModuleGC(ctx)
+		disabled := &Service{cfg: config.Config{EnableWasm: false, WasmModuleGCEnabled: true, WasmModuleGCInterval: time.Millisecond}}
+		disabled.StartWasmModuleGC(ctx)
 		svc := &Service{cfg: config.Config{EnableWasm: true, WasmModuleGCEnabled: true, WasmModuleGCInterval: 0}}
 		svc.StartWasmModuleGC(ctx)
 	})

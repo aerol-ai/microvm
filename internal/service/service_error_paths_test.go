@@ -636,3 +636,122 @@ func TestUnexposePortDeletesLegacyHTTPRouteWhenRowMissing(t *testing.T) {
 		t.Fatalf("exposed ports after legacy unexpose = %+v, want none", got.ExposedPorts)
 	}
 }
+
+func TestServiceHelperErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("list mounts and toolbox target errors", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		seedStartedSandbox(t, st, "sb-list-mounts")
+
+		if _, err := svc.ListMounts(ctx, "missing"); err == nil {
+			t.Fatal("ListMounts(missing) should fail")
+		}
+
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:           "sb-toolbox-empty-ip",
+			Image:        "alpine:3.20",
+			Status:       models.SandboxStatusStarted,
+			Runtime:      models.RuntimeDocker,
+			ContainerID:  "ctr-toolbox-empty-ip",
+			ContainerIP:  "",
+			CPU:          1,
+			MemoryMB:     512,
+			DiskGB:       5,
+			CreatedAt:    time.Now().UTC(),
+			UpdatedAt:    time.Now().UTC(),
+			LastActiveAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("seed toolbox sandbox: %v", err)
+		}
+		svc.cfg.ToolboxPort = 4321
+		if _, err := svc.ToolboxTarget(ctx, "sb-toolbox-empty-ip"); err == nil {
+			t.Fatal("ToolboxTarget should fail when container IP is missing")
+		}
+	})
+
+	t.Run("wake aware port target missing route and empty ip", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableServerless = false
+
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:           "sb-port-missing",
+			Image:        "alpine:3.20",
+			Status:       models.SandboxStatusStarted,
+			Runtime:      models.RuntimeDocker,
+			ContainerID:  "ctr-port-missing",
+			ContainerIP:  "10.0.0.33",
+			CPU:          1,
+			MemoryMB:     512,
+			DiskGB:       5,
+			CreatedAt:    time.Now().UTC(),
+			UpdatedAt:    time.Now().UTC(),
+			LastActiveAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("seed port sandbox: %v", err)
+		}
+		if _, err := svc.WakeAwarePortTarget(ctx, "sb-port-missing", 8080); err == nil {
+			t.Fatal("WakeAwarePortTarget should fail when the port is not exposed")
+		}
+
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:           "sb-port-empty-ip",
+			Image:        "alpine:3.20",
+			Status:       models.SandboxStatusStarted,
+			Runtime:      models.RuntimeDocker,
+			ContainerID:  "ctr-port-empty-ip",
+			ContainerIP:  "",
+			CPU:          1,
+			MemoryMB:     512,
+			DiskGB:       5,
+			ExposedPorts: []models.ExposedPort{{Port: 8080, Protocol: models.ExposedPortProtocolHTTP}},
+			CreatedAt:    time.Now().UTC(),
+			UpdatedAt:    time.Now().UTC(),
+			LastActiveAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("seed empty-ip sandbox: %v", err)
+		}
+		if _, err := svc.WakeAwarePortTarget(ctx, "sb-port-empty-ip", 8080); err == nil {
+			t.Fatal("WakeAwarePortTarget should fail when container IP is missing")
+		}
+	})
+
+	t.Run("replay and gc error paths", func(t *testing.T) {
+		svc, st, admitter := newServiceRuntimeHarness(t, &recordingRuntime{})
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+
+		svc.ReplayReservations(ctx)
+		if snap := admitter.Snapshot(); snap.SandboxesActive != 0 {
+			t.Fatalf("admitter snapshot = %+v, want unchanged", snap)
+		}
+		if err := svc.gcClusterIngressRoutes(ctx); err == nil {
+			t.Fatal("gcClusterIngressRoutes should fail when the store is closed")
+		}
+	})
+
+	t.Run("pending image gc on closed store", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.ImageBuildGCEnabled = true
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		svc.refreshPendingImageGCOnUse(ctx, "alpine:latest")
+		svc.schedulePendingImageGC(ctx, "alpine:latest")
+	})
+
+	t.Run("cluster placement delete ignores foreign owners", func(t *testing.T) {
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableCluster = true
+		stub := &serviceClusterStub{
+			Noop:  cluster.NewNoop("self", "http://self", ""),
+			owner: cluster.OwnerInfo{NodeID: "peer", APIURL: "http://peer", IsSelf: false},
+		}
+		svc.AttachCluster(stub)
+		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-peer", "reason")
+		if len(stub.deleteCalls) != 0 {
+			t.Fatalf("foreign placement should not be deleted, got %v", stub.deleteCalls)
+		}
+	})
+}

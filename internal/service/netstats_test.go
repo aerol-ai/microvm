@@ -239,6 +239,84 @@ func TestNetstatsActivityIncludesOutboundAndActiveTCP(t *testing.T) {
 	}
 }
 
+func TestNetstatsErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("bootstrap validation", func(t *testing.T) {
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.NetstatsPollInterval = 0
+		svc.events = &docker.Client{}
+		if err := svc.EnsureNetstatsReady(ctx); err == nil {
+			t.Fatal("EnsureNetstatsReady should reject zero interval")
+		}
+
+		svc.cfg.NetstatsPollInterval = time.Second
+		svc.events = nil
+		if err := svc.EnsureNetstatsReady(ctx); err == nil {
+			t.Fatal("EnsureNetstatsReady should reject nil events client")
+		}
+	})
+
+	t.Run("limit validation and unsupported runtime", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:           "sb-fc",
+			Image:        "alpine:3.20",
+			Status:       models.SandboxStatusStarted,
+			Runtime:      models.RuntimeFirecracker,
+			ContainerID:  "ctr-fc",
+			ContainerIP:  "10.0.0.11",
+			CPU:          1,
+			MemoryMB:     256,
+			DiskGB:       5,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			LastActiveAt: now,
+		}); err != nil {
+			t.Fatalf("seed firecracker sandbox: %v", err)
+		}
+		if _, err := svc.SetNetworkLimits(ctx, "sb-fc", -1, 1); err == nil {
+			t.Fatal("SetNetworkLimits should reject negative limits")
+		}
+		if _, err := svc.SetNetworkLimits(ctx, "sb-fc", 1, 1); err == nil {
+			t.Fatal("SetNetworkLimits should reject firecracker network limits")
+		}
+	})
+
+	t.Run("quota state and target error paths", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		seedNetstatsSandbox(t, st, &models.Sandbox{
+			ID:          "sb-quota",
+			Image:       "alpine:3.20",
+			Status:      models.SandboxStatusStarted,
+			ContainerID: "ctr-quota",
+			ContainerIP: "10.0.0.12",
+			Runtime:     models.RuntimeDocker,
+			CPU:         1,
+			MemoryMB:    256,
+			DiskGB:      5,
+		})
+		svc.docker = noContainerRuntime{}
+		row, err := st.Get(ctx, "sb-quota")
+		if err != nil {
+			t.Fatalf("store.Get(): %v", err)
+		}
+		svc.applyNetworkQuotaState(ctx, row, true, true)
+		row.NetworkQuotaExceeded = true
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		svc.applyNetworkQuotaState(ctx, row, false, false)
+		if got := (netstatsServiceLister{svc: svc}).NetstatsTargets(ctx); got != nil {
+			t.Fatalf("NetstatsTargets on closed store = %v, want nil", got)
+		}
+		(netstatsServiceSink{svc: svc}).handleNetworkSamples(ctx, []netstats.Sample{
+			{SandboxID: "sb-quota", BytesIn: 1, BytesOut: 2, SampledAt: time.Now().UTC()},
+		})
+	})
+}
+
 func seedNetstatsSandbox(t *testing.T, st *storepkg.Store, sandbox *models.Sandbox) {
 	t.Helper()
 	now := time.Now().UTC()

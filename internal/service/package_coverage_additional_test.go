@@ -230,3 +230,82 @@ func TestServiceBackgroundLoopCoverage(t *testing.T) {
 		t.Fatal("EnsureClusterReady() without cluster should fail")
 	}
 }
+
+func TestServiceHelperCoverageRoundTwo(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+
+	if got := gpuCountForCapacity(nil); got != 0 {
+		t.Fatalf("gpuCountForCapacity(nil) = %d, want 0", got)
+	}
+	if got := gpuCountForCapacity(&models.GPURequest{Count: 3}); got != 3 {
+		t.Fatalf("gpuCountForCapacity(count) = %d, want 3", got)
+	}
+
+	if rt, err := svc.runtimeForSandbox(nil); err != nil || rt == nil {
+		t.Fatalf("runtimeForSandbox(nil) = (%T, %v), want docker runtime", rt, err)
+	}
+	if _, err := svc.runtimeForSandbox(&models.Sandbox{Runtime: models.RuntimeFirecracker}); err == nil || !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("runtimeForSandbox(firecracker without driver) = %v, want ErrRuntimeNotImplemented", err)
+	}
+	if _, err := svc.runtimeForSandbox(&models.Sandbox{Runtime: models.RuntimeWasm}); err == nil || !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("runtimeForSandbox(wasm without driver) = %v, want ErrRuntimeNotImplemented", err)
+	}
+
+	if got := svc.netstatsRecentActivityAt("missing"); !got.IsZero() {
+		t.Fatalf("netstatsRecentActivityAt(missing) = %v, want zero", got)
+	}
+	svc.recordNetstatsActivity("", time.Time{})
+	svc.recordNetstatsActivity("sb-activity", time.Now().UTC())
+	if got := svc.netstatsRecentActivityAt("sb-activity"); got.IsZero() {
+		t.Fatal("recordNetstatsActivity should persist a timestamp")
+	}
+	svc.forgetNetstatsActivity("")
+	svc.forgetNetstatsActivity("sb-activity")
+	if got := svc.netstatsRecentActivityAt("sb-activity"); !got.IsZero() {
+		t.Fatalf("forgetNetstatsActivity did not clear activity: %v", got)
+	}
+
+	now := time.Now().UTC()
+	sb := &models.Sandbox{
+		ID:           "sb-floor",
+		LastActiveAt: now.Add(-time.Hour),
+	}
+	if got := svc.activityFloorFor(sb, true); !got.Equal(sb.LastActiveAt) {
+		t.Fatalf("activityFloorFor fallback = %v, want LastActiveAt", got)
+	}
+	svc.cfg.HTTPWakeDirectBypassEnabled = true
+	svc.recordNetstatsActivity(sb.ID, now)
+	if got := svc.activityFloorFor(sb, false); !got.Equal(now) {
+		t.Fatalf("activityFloorFor netstats = %v, want %v", got, now)
+	}
+
+	var nilSvc *Service
+	if got := nilSvc.activityFloorFor(nil, false); !got.IsZero() {
+		t.Fatalf("activityFloorFor(nil) = %v, want zero", got)
+	}
+
+	disabledGC := &Service{cfg: config.Config{ImageBuildGCEnabled: false}}
+	disabledGC.StartBuiltImageGC(ctx)
+	enabledNoEvents := &Service{cfg: config.Config{ImageBuildGCEnabled: true, ImageBuildGCInterval: time.Millisecond}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	enabledNoEvents.StartBuiltImageGC(ctx)
+
+	zeroReconcile := &Service{cfg: config.Config{ReconcileInterval: 0}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	zeroReconcile.StartReconcileLoop(ctx)
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	enabledReconcile, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	enabledReconcile.cfg.ReconcileInterval = time.Millisecond
+	enabledReconcile.StartReconcileLoop(loopCtx)
+	cancel()
+
+	if err := (&Service{}).EnsureClusterReady(ctx); err == nil {
+		t.Fatal("EnsureClusterReady() without cluster should fail")
+	}
+	leaderSvc := &Service{cfg: config.Config{EnableCluster: true}}
+	leaderSvc.AttachCluster(&leaderCluster{Noop: cluster.NewNoop("self", "http://self", ""), leader: "self"})
+	if err := leaderSvc.EnsureClusterReady(ctx); err != nil {
+		t.Fatalf("EnsureClusterReady() with leader = %v", err)
+	}
+}

@@ -86,6 +86,22 @@ type serviceClusterStub struct {
 	ownerCalls  []string
 }
 
+type failingTemplateArtifactPushStore struct {
+	err error
+}
+
+func (s failingTemplateArtifactPushStore) ListTemplatesPendingPush(context.Context) ([]*models.Template, error) {
+	return nil, s.err
+}
+
+func (s failingTemplateArtifactPushStore) SetTemplatePushState(context.Context, string, string, string) error {
+	return nil
+}
+
+func (s failingTemplateArtifactPushStore) UpdateTemplatePushDistribution(context.Context, string, string, string) error {
+	return nil
+}
+
 func (s *serviceClusterStub) Leader() string { return s.leader }
 
 func (s *serviceClusterStub) Placements() []cluster.Placement {
@@ -665,6 +681,123 @@ func TestServiceClusterAndHealthBranches(t *testing.T) {
 		svc.cfg.EnableCluster = true
 		svc.caddy = caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second})
 		svc.StartClusterIngressReconcile(ctx)
+	})
+}
+
+func TestServiceHelperBranchCoverageRoundTwo(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("mount and template push helpers", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:           "sb-mounts",
+			Image:        "alpine",
+			Status:       models.SandboxStatusStarted,
+			Runtime:      models.RuntimeDocker,
+			ContainerID:  "ctr-mounts",
+			ContainerIP:  "10.0.0.91",
+			CPU:          1,
+			MemoryMB:     256,
+			DiskGB:       5,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			LastActiveAt: now,
+		}); err != nil {
+			t.Fatalf("seed sandbox: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if _, err := svc.ListMounts(ctx, "sb-mounts"); err == nil {
+			t.Fatal("closed store should fail ListMounts")
+		}
+
+		svc = &Service{
+			templateArtifactPusher: &TemplateArtifactPusher{},
+			store:                  st,
+			logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		if svc.markTemplateForPush(ctx, "tpl-missing") {
+			t.Fatal("closed store should not mark template for push")
+		}
+
+		r := &TemplateArtifactPushReconciler{
+			pusher:      &TemplateArtifactPusher{},
+			store:       failingTemplateArtifactPushStore{err: errors.New("push list failed")},
+			logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			maxInFlight: 1,
+		}
+		svc.templateArtifactPushReconciler = r
+		svc.kickTemplateArtifactPushReconciler("tpl-missing")
+		time.Sleep(20 * time.Millisecond)
+	})
+
+	t.Run("cluster ownership and gc helpers", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableCluster = true
+		svc.cfg.ImageBuildGCEnabled = true
+		svc.cfg.ImageGCWhitelist = []string{"whitelisted:latest"}
+		svc.admitter = nil
+
+		svc.deleteSelfOwnedClusterPlacement(ctx, "", "empty")
+		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-none", "no-cluster")
+
+		nonSelf := &serviceClusterStub{
+			Noop:     cluster.NewNoop("self", "http://self", ""),
+			owner:    cluster.OwnerInfo{NodeID: "peer", APIURL: "http://peer", IsSelf: false},
+			ownerErr: errors.New("owner lookup failed"),
+		}
+		svc.AttachCluster(nonSelf)
+		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-peer", "peer")
+
+		selfOwned := &serviceClusterStub{
+			Noop:  cluster.NewNoop("self", "http://self", ""),
+			owner: cluster.OwnerInfo{NodeID: "self", APIURL: "http://self", IsSelf: true},
+		}
+		svc.AttachCluster(selfOwned)
+		svc.deleteSelfOwnedClusterPlacement(ctx, "sb-self", "self")
+		if len(selfOwned.deleteCalls) != 1 || selfOwned.deleteCalls[0] != "sb-self" {
+			t.Fatalf("delete calls = %v, want [sb-self]", selfOwned.deleteCalls)
+		}
+
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		svc.ReplayReservations(ctx)
+		svc.refreshPendingImageGCOnUse(ctx, "alpine:latest")
+		svc.schedulePendingImageGC(ctx, "alpine:latest")
+		if err := svc.gcClusterIngressRoutes(ctx); err == nil {
+			t.Fatal("closed store should fail gcClusterIngressRoutes")
+		}
+	})
+
+	t.Run("toolbox and wake targets", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:           "sb-toolbox",
+			Image:        "alpine",
+			Status:       models.SandboxStatusStarted,
+			Runtime:      models.RuntimeDocker,
+			ContainerID:  "ctr-toolbox",
+			ContainerIP:  "",
+			CPU:          1,
+			MemoryMB:     256,
+			DiskGB:       5,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			LastActiveAt: now,
+		}); err != nil {
+			t.Fatalf("seed sandbox: %v", err)
+		}
+		svc.cfg.ToolboxPort = 4242
+		if _, err := svc.ToolboxTarget(ctx, "sb-toolbox"); err == nil {
+			t.Fatal("missing container IP should fail ToolboxTarget")
+		}
+		if _, err := svc.WakeAwarePortTarget(ctx, "sb-toolbox", 8080); err == nil {
+			t.Fatal("missing container IP should fail WakeAwarePortTarget")
+		}
 	})
 }
 

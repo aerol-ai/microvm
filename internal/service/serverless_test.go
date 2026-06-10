@@ -1795,3 +1795,22 @@ func TestReconstructWakeArmedSkipsWhenAllInstallsFail(t *testing.T) {
 		t.Fatalf("wake_armed flipped despite all wake-route upserts failing; expected non-arm fallback")
 	}
 }
+
+func TestServerlessWakeFlightAndForceReconcileErrorBranches(t *testing.T) {
+	w := &wakeFlight{}
+	w.recordSuccess()
+	w.gaugeHeld = true
+	w.recordSuccess()
+	if w.gaugeHeld {
+		t.Fatal("recordSuccess should clear the breaker gauge")
+	}
+
+	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	svc.cfg.EnableServerless = true
+	if err := svc.ForceReconcileHTTPWakeShape(context.Background()); err == nil {
+		t.Fatal("ForceReconcileHTTPWakeShape should fail when the store is closed")
+	}
+}

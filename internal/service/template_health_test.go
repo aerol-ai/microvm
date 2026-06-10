@@ -677,3 +677,34 @@ func TestRekickUnhealthyTemplatesAtStart_NoOpWithoutWiring(t *testing.T) {
 		t.Errorf("template status = %s, want unhealthy (scanner must not touch)", got.Status)
 	}
 }
+
+func TestTemplateHealthErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-health-errors")
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 1)})
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 1})
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	svc.RekickUnhealthyTemplatesAtStart(ctx)
+
+	if err := svc.MarkSnapshotCorrupt(ctx, "", "reason"); err == nil {
+		t.Fatal("MarkSnapshotCorrupt should reject empty template IDs")
+	}
+	if err := svc.MarkSnapshotCorrupt(ctx, tpl.ID, "store closed"); err == nil {
+		t.Fatal("closed store should fail MarkSnapshotCorrupt")
+	}
+	if err := svc.RebuildTemplateSnapshot(ctx, tpl.ID); err == nil {
+		t.Fatal("closed store should fail RebuildTemplateSnapshot")
+	}
+
+	zeroSvc, _, _ := newHealthHarness(t)
+	zeroSvc.cfg.FirecrackerTemplateBuildTimeout = 0
+	zeroSvc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 1)})
+	zeroSvc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 2})
+	zeroSvc.kickSnapshotRebuild("tpl-zero-timeout")
+	time.Sleep(25 * time.Millisecond)
+}

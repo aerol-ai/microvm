@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -89,7 +90,84 @@ func TestWasmPeriodicCheckpointEdgeBranches(t *testing.T) {
 	nilSvc.StartWasmPeriodicCheckpoint(ctx)
 	nilSvc.StartWasmDurablePushSweep(ctx)
 
-	svc := &Service{cfg: config.Config{EnableWasm: true, WasmCheckpointInterval: 0, WasmDurablePushInterval: 0}}
+	svc := &Service{cfg: config.Config{EnableWasm: false, WasmCheckpointInterval: time.Millisecond, WasmDurablePushInterval: time.Millisecond}, wasm: &recordingRuntime{}}
 	svc.StartWasmPeriodicCheckpoint(ctx)
 	svc.StartWasmDurablePushSweep(ctx)
+
+	svc = &Service{cfg: config.Config{EnableWasm: true, WasmCheckpointInterval: 0, WasmDurablePushInterval: 0}, wasm: &recordingRuntime{}}
+	svc.StartWasmPeriodicCheckpoint(ctx)
+	svc.StartWasmDurablePushSweep(ctx)
+}
+
+func TestRunWasmPeriodicCheckpointNonLiveHostIsNoop(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(&recordingRuntime{})
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:         "sb-non-live",
+		Runtime:    models.RuntimeWasm,
+		Status:     models.SandboxStatusStarted,
+		Durability: models.DurabilityDurable,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	if err := svc.runWasmPeriodicCheckpoint(ctx); err != nil {
+		t.Fatalf("runWasmPeriodicCheckpoint non-live host: %v", err)
+	}
+}
+
+func TestWasmPeriodicAndDurableSweepErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("periodic checkpoint list errors", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.SetWasmRuntime(&fakeCheckpointRuntime{})
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if err := svc.runWasmPeriodicCheckpoint(ctx); err == nil {
+			t.Fatal("runWasmPeriodicCheckpoint should fail when the store is closed")
+		}
+	})
+
+	t.Run("periodic checkpoint managed list error", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		rt := &fakeCheckpointDrainRuntime{
+			fakeCheckpointRuntime: fakeCheckpointRuntime{
+				wasmRecordingRuntime: wasmRecordingRuntime{
+					managed: map[string]*models.SandboxRuntimeState{},
+				},
+			},
+			listManagedErr: errors.New("managed list failed"),
+		}
+		svc.SetWasmRuntime(rt)
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:         "sb-periodic",
+			Runtime:    models.RuntimeWasm,
+			Status:     models.SandboxStatusStarted,
+			Durability: models.DurabilityPassivatable,
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("seed sandbox: %v", err)
+		}
+		if err := svc.runWasmPeriodicCheckpoint(ctx); err == nil {
+			t.Fatal("runWasmPeriodicCheckpoint should fail when ListManaged fails")
+		}
+	})
+
+	t.Run("durable push sweep list error", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.wasmCheckpointPusher = &recordingCheckpointStore{}
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		svc.runWasmDurablePushSweep(ctx)
+	})
 }

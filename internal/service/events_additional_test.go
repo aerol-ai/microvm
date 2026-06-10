@@ -187,3 +187,74 @@ func TestStartEventMonitorReconnectsAfterStreamError(t *testing.T) {
 	}
 	cancel()
 }
+
+type failingInspectRuntime struct {
+	*recordingRuntime
+	err error
+}
+
+func (r failingInspectRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
+	return nil, r.err
+}
+
+func TestHandleDockerEventErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("store error", func(t *testing.T) {
+		svc, _, st := newCapacityHarness(t, nil, nil)
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if err := svc.handleDockerEvent(ctx, dockerEvent("sb-missing", "stop")); err == nil {
+			t.Fatal("handleDockerEvent should fail when the store is closed")
+		}
+	})
+
+	t.Run("oom and exit codes update last error", func(t *testing.T) {
+		svc, admitter, st := newCapacityHarness(t, nil, nil)
+		seedSandbox(t, st, "sb-oom", models.SandboxStatusStarted, 1, 512)
+		admitter.Reserve("sb-oom", capacity.Request{CPU: 1, MemoryMB: 512})
+
+		if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: "sb-oom", Action: "oom", Time: time.Now().UTC()}); err != nil {
+			t.Fatalf("oom event: %v", err)
+		}
+		got, err := st.Get(ctx, "sb-oom")
+		if err != nil {
+			t.Fatalf("store.Get: %v", err)
+		}
+		if got.LastError != "container killed by OOM" {
+			t.Fatalf("oom last error = %q, want OOM message", got.LastError)
+		}
+
+		seedSandbox(t, st, "sb-die", models.SandboxStatusStarted, 1, 512)
+		admitter.Reserve("sb-die", capacity.Request{CPU: 1, MemoryMB: 512})
+		if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: "sb-die", Action: "die", ExitCode: 7, Time: time.Now().UTC()}); err != nil {
+			t.Fatalf("die event: %v", err)
+		}
+		got, err = st.Get(ctx, "sb-die")
+		if err != nil {
+			t.Fatalf("store.Get: %v", err)
+		}
+		if got.LastError != "container exited with code 7" {
+			t.Fatalf("die last error = %q, want exit code message", got.LastError)
+		}
+	})
+
+	t.Run("destroy and start edge cases", func(t *testing.T) {
+		svc, admitter, st := newCapacityHarness(t, nil, nil)
+		seedSandbox(t, st, "sb-destroy", models.SandboxStatusStarted, 1, 512)
+		admitter.Reserve("sb-destroy", capacity.Request{CPU: 1, MemoryMB: 512})
+		if err := svc.handleDockerEvent(ctx, dockerEvent("sb-destroy", "destroy")); err != nil {
+			t.Fatalf("destroy event: %v", err)
+		}
+		if _, err := st.Get(ctx, "sb-destroy"); err == nil {
+			t.Fatal("destroy should remove the sandbox row")
+		}
+
+		svc.docker = failingInspectRuntime{recordingRuntime: &recordingRuntime{}, err: fmt.Errorf("inspect failed")}
+		seedSandbox(t, st, "sb-start", models.SandboxStatusStopped, 1, 512)
+		if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: "sb-start", Action: "start", Time: time.Now().UTC()}); err == nil {
+			t.Fatal("start event should fail when inspect fails")
+		}
+	})
+}

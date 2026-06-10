@@ -271,3 +271,71 @@ func (s *wasmCheckpointPusherStub) PullOnce(ctx context.Context, registryRef, de
 func (s *wasmCheckpointPusherStub) DeleteRef(ctx context.Context, registryRef string) error {
 	return nil
 }
+
+type failingWasmCheckpointPusher struct{}
+
+func (f failingWasmCheckpointPusher) DestRefFor(string) string { return "test://checkpoint" }
+func (f failingWasmCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
+	return "test://" + sandboxID + ":" + tag
+}
+func (f failingWasmCheckpointPusher) PushOnceTo(context.Context, string, string, string) (WasmCheckpointPushResult, error) {
+	return WasmCheckpointPushResult{}, errors.New("push failed")
+}
+func (f failingWasmCheckpointPusher) PullOnce(context.Context, string, string) error { return nil }
+func (f failingWasmCheckpointPusher) DeleteRef(context.Context, string) error        { return nil }
+
+func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.cfg.WasmCheckpointKeepLastN = 1
+	svc.wasmCheckpointPusher = failingWasmCheckpointPusher{}
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:              "sb-wasm-push",
+		Runtime:         models.RuntimeWasm,
+		Status:          models.SandboxStatusPassivated,
+		Durability:      models.DurabilityDurable,
+		CheckpointPath:  "/tmp/checkpoint",
+		CloneGeneration: "gen-1",
+		WasmRegistryRef: "",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		LastActiveAt:    now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	// pushWasmCheckpointBestEffort should swallow the push error and return.
+	svc.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
+
+	// Reopen a fresh store so we can exercise the success/prune path.
+	svc2, st2, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc2.cfg.EnableWasm = true
+	svc2.cfg.WasmCheckpointKeepLastN = 1
+	pusher := &recordingCheckpointStore{destRef: "test://sb-wasm-push:latest"}
+	svc2.wasmCheckpointPusher = pusher
+	if err := st2.Create(ctx, &models.Sandbox{
+		ID:              "sb-wasm-push",
+		Runtime:         models.RuntimeWasm,
+		Status:          models.SandboxStatusPassivated,
+		Durability:      models.DurabilityDurable,
+		CheckpointPath:  "/tmp/checkpoint",
+		CloneGeneration: "gen-1",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		LastActiveAt:    now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
+	if len(pusher.deleteCalls) == 0 {
+		t.Fatal("expected prune to delete an older checkpoint ref")
+	}
+
+	if err := st2.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	svc2.pruneWasmCheckpointPushes(ctx, "sb-wasm-push")
+}

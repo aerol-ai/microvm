@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -332,4 +333,37 @@ func TestEnsureWasmSandboxRowForImport_UpdatesExistingRow(t *testing.T) {
 	if got.CheckpointPath != "/path" || got.CloneGeneration != "gen-same" {
 		t.Fatalf("checkpoint path or clonegen mismatch")
 	}
+}
+
+func TestWasmMigrationErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("export and import validation", func(t *testing.T) {
+		svc := &Service{cfg: config.Config{EnableWasm: false}}
+		if _, err := svc.ExportWasmMigration(ctx, "sb-any", io.Discard); err == nil {
+			t.Fatal("ExportWasmMigration should fail when wasm is disabled")
+		}
+		if err := svc.ImportWasmMigration(ctx, " ", "", bytes.NewReader(nil)); err == nil {
+			t.Fatal("ImportWasmMigration should reject blank sandbox IDs")
+		}
+	})
+
+	t.Run("migrate orchestration validation", func(t *testing.T) {
+		svc := &Service{}
+		if _, _, err := svc.MigrateWasmSandbox(ctx, "sb", t.TempDir()); err == nil {
+			t.Fatal("MigrateWasmSandbox should fail when wasm runtime is missing")
+		}
+		if _, err := svc.MigrateWasmSandboxToNode(ctx, "sb", "node-b"); err == nil {
+			t.Fatal("MigrateWasmSandboxToNode should fail when cluster is nil")
+		}
+
+		svc = &Service{cfg: config.Config{EnableWasm: true, WasmModulesDir: t.TempDir()}}
+		svc.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+		if _, err := svc.MigrateWasmSandboxToNode(ctx, " ", "node-b"); err == nil {
+			t.Fatal("MigrateWasmSandboxToNode should reject blank sandbox IDs")
+		}
+		if _, err := svc.MigrateWasmSandboxToNode(ctx, "sb", " "); err == nil {
+			t.Fatal("MigrateWasmSandboxToNode should reject blank target IDs")
+		}
+	})
 }

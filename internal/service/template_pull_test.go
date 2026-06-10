@@ -459,6 +459,12 @@ func TestTemplateArtifactPullerEdgeBranches(t *testing.T) {
 	if _, err := NewTemplateArtifactPuller(&fakeTemplatePullDocker{}, " ", nil); err == nil {
 		t.Fatal("blank templatesDir should be rejected")
 	}
+	if puller, err := NewTemplateArtifactPuller(&fakeTemplatePullDocker{}, t.TempDir(), nil); err != nil || puller == nil {
+		t.Fatalf("NewTemplateArtifactPuller with nil logger = (%v, %v)", puller, err)
+	}
+	if got := NewTemplateArtifactPullDockerAdapter(nil); got != nil {
+		t.Fatalf("nil docker client adapter = %v, want nil", got)
+	}
 
 	var nilPuller *TemplateArtifactPuller
 	if err := nilPuller.PullOnce(ctx, &models.Template{ID: "tpl", RegistryRef: "ref"}); err == nil {
@@ -485,6 +491,31 @@ func TestTemplateArtifactPullerEdgeBranches(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(puller.templatesDir, "tpl-export-fail.partial")); !os.IsNotExist(statErr) {
 		t.Fatalf("partial dir survived export failure: %v", statErr)
+	}
+
+	memPath := filepath.Join(t.TempDir(), "mem.snap")
+	statePath := filepath.Join(t.TempDir(), "state.snap")
+	if _, err := computeSnapshotChecksum(memPath, statePath); err == nil {
+		t.Fatal("computeSnapshotChecksum should fail when files are missing")
+	}
+	if _, err := hashFileSHA256(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("hashFileSHA256 should fail on missing file")
+	}
+
+	fallbackManifest := TemplateArtifactManifest{
+		SchemaVersion:    TemplateArtifactSchemaVersion,
+		TemplateID:       "tpl-fallback",
+		SnapshotChecksum: "sha256:" + sha256hex([]byte("m")) + "|sha256:" + sha256hex([]byte("s")),
+	}
+	fallbackDK := &fakeTemplatePullDocker{
+		exportBody: buildArtifactSaveBytes(t, fallbackManifest, []byte("r"), []byte("m"), []byte("s")),
+	}
+	fallbackPuller := newTestPuller(t, fallbackDK, t.TempDir())
+	if err := fallbackPuller.PullOnce(ctx, &models.Template{
+		ID:          "tpl-fallback",
+		RegistryRef: "aocr.test/cluster/c1/templates/tpl-fallback:latest",
+	}); err != nil {
+		t.Fatalf("PullOnce fallback checksum: %v", err)
 	}
 }
 
