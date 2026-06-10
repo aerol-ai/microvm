@@ -208,6 +208,49 @@ func TestNewSnapshotPusher_DisabledReturnsNil(t *testing.T) {
 	}
 }
 
+func TestSnapshotPusherEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+	patPath := writePATFile(t, "token")
+
+	if _, err := NewSnapshotPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-42",
+		PATPath:   patPath,
+	}, nil, slog.Default()); err == nil {
+		t.Fatal("expected docker required error")
+	}
+
+	pusher := newTestPusher(t, patPath, &fakeSnapshotPushDocker{})
+	var nilPusher *SnapshotPusher
+	if _, err := nilPusher.PushOnce(ctx, &models.SandboxSnapshot{Name: "snap", Image: "img:1"}); err == nil {
+		t.Fatal("nil pusher should reject PushOnce")
+	}
+	if _, err := pusher.PushOnce(ctx, nil); err == nil {
+		t.Fatal("nil snapshot should reject PushOnce")
+	}
+	if _, err := pusher.PushOnce(ctx, &models.SandboxSnapshot{Name: " ", Image: "img:1"}); err == nil {
+		t.Fatal("blank snapshot name should reject PushOnce")
+	}
+	if _, err := pusher.PushOnce(ctx, &models.SandboxSnapshot{Name: "snap", Image: " "}); err == nil {
+		t.Fatal("blank snapshot image should reject PushOnce")
+	}
+	if got := nilPusher.DestRefFor("snap"); got != "" {
+		t.Fatalf("nil pusher DestRefFor = %q, want empty", got)
+	}
+	if got := pusher.DestRefFor(" "); got != "" {
+		t.Fatalf("blank name DestRefFor = %q, want empty", got)
+	}
+
+	if _, err := readPATFile(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing PAT file should fail")
+	}
+	emptyPAT := writePATFile(t, " \n")
+	if _, err := readPATFile(emptyPAT); err == nil {
+		t.Fatal("empty PAT file should fail")
+	}
+}
+
 func TestSnapshotNeedsPush(t *testing.T) {
 	cases := []struct {
 		name string

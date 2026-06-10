@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,9 @@ type fakePushStore struct {
 	rows         map[string]*models.SandboxSnapshot
 	stateUpdates atomic.Int64
 	distUpdates  atomic.Int64
+	listErr      error
+	stateErr     map[string]error
+	distErr      error
 }
 
 func newFakePushStore() *fakePushStore {
@@ -34,6 +38,9 @@ func (f *fakePushStore) seed(snap *models.SandboxSnapshot) {
 }
 
 func (f *fakePushStore) ListSnapshotsPendingPush(_ context.Context) ([]*models.SandboxSnapshot, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]*models.SandboxSnapshot, 0)
@@ -48,6 +55,11 @@ func (f *fakePushStore) ListSnapshotsPendingPush(_ context.Context) ([]*models.S
 
 func (f *fakePushStore) SetSnapshotPushState(_ context.Context, name, state, errMsg string) error {
 	f.stateUpdates.Add(1)
+	if f.stateErr != nil {
+		if err := f.stateErr[state]; err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.rows[name]
@@ -61,6 +73,9 @@ func (f *fakePushStore) SetSnapshotPushState(_ context.Context, name, state, err
 
 func (f *fakePushStore) UpdateSnapshotImageDistribution(_ context.Context, name, mode, ref, digest string) error {
 	f.distUpdates.Add(1)
+	if f.distErr != nil {
+		return f.distErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.rows[name]
@@ -232,4 +247,102 @@ func TestReconciler_NewReconcilerNilWhenPusherNil(t *testing.T) {
 	if rec != nil {
 		t.Fatal("nil pusher must produce nil reconciler")
 	}
+}
+
+func TestReconcilerEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	if rec := NewSnapshotPushReconciler(nil, nil, nil, 0); rec != nil {
+		t.Fatal("nil pusher/store should produce nil reconciler")
+	}
+
+	t.Run("list error", func(t *testing.T) {
+		store := newFakePushStore()
+		store.listErr = errors.New("list failed")
+		rec := newTestReconciler(t, store, &fakeSnapshotPushDocker{})
+		if _, err := rec.RunOnce(ctx); err == nil || !strings.Contains(err.Error(), "list failed") {
+			t.Fatalf("RunOnce list error = %v", err)
+		}
+	})
+
+	t.Run("claim failure", func(t *testing.T) {
+		store := newFakePushStore()
+		store.seed(&models.SandboxSnapshot{
+			Name:                  "snap-claim",
+			Image:                 "img:1",
+			PushState:             models.SnapshotPushStatePending,
+			ImageDistributionMode: models.ImageDistributionLocalOnly,
+		})
+		store.stateErr = map[string]error{
+			models.SnapshotPushStatePushing: errors.New("claim failed"),
+		}
+		rec := newTestReconciler(t, store, &fakeSnapshotPushDocker{})
+		stats, err := rec.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		if stats.Failed != 1 {
+			t.Fatalf("stats = %+v, want 1 failed", stats)
+		}
+		row := store.get("snap-claim")
+		if row.PushState != models.SnapshotPushStatePending {
+			t.Fatalf("PushState = %q, want pending after claim failure", row.PushState)
+		}
+	})
+
+	t.Run("metadata failure", func(t *testing.T) {
+		store := newFakePushStore()
+		store.seed(&models.SandboxSnapshot{
+			Name:                  "snap-meta",
+			Image:                 "img:2",
+			PushState:             models.SnapshotPushStatePending,
+			ImageDistributionMode: models.ImageDistributionLocalOnly,
+		})
+		store.distErr = errors.New("metadata failed")
+		rec := newTestReconciler(t, store, &fakeSnapshotPushDocker{})
+		stats, err := rec.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		if stats.Failed != 1 {
+			t.Fatalf("stats = %+v, want 1 failed", stats)
+		}
+		row := store.get("snap-meta")
+		if row.PushState != models.SnapshotPushStateError {
+			t.Fatalf("PushState = %q, want error", row.PushState)
+		}
+	})
+
+	t.Run("state clear failure", func(t *testing.T) {
+		store := newFakePushStore()
+		store.seed(&models.SandboxSnapshot{
+			Name:                  "snap-clear",
+			Image:                 "img:3",
+			PushState:             models.SnapshotPushStatePending,
+			ImageDistributionMode: models.ImageDistributionLocalOnly,
+		})
+		store.stateErr = map[string]error{
+			models.SnapshotPushStateActive: errors.New("clear failed"),
+		}
+		rec := newTestReconciler(t, store, &fakeSnapshotPushDocker{})
+		stats, err := rec.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		if stats.Failed != 1 {
+			t.Fatalf("stats = %+v, want 1 failed", stats)
+		}
+		row := store.get("snap-clear")
+		if row.PushState != models.SnapshotPushStatePushing {
+			t.Fatalf("PushState = %q, want pushing after clear failure", row.PushState)
+		}
+	})
+
+	t.Run("nil snapshot skipped", func(t *testing.T) {
+		store := newFakePushStore()
+		rec := newTestReconciler(t, store, &fakeSnapshotPushDocker{})
+		if got := rec.pushOne(ctx, nil); got != snapshotPushSkipped {
+			t.Fatalf("pushOne(nil) = %v, want skipped", got)
+		}
+	})
 }

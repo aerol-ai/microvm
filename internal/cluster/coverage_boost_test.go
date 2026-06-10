@@ -71,9 +71,7 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if err := follower.forwardApplyToLeader(context.Background(), payload); err != nil {
-		t.Fatalf("forwardApplyToLeader internal: %v", err)
-	}
+	forwardApplyEventually(t, follower, payload)
 	if _, err := leader.OwnerOf("sb-int-fwd"); err != nil {
 		t.Fatalf("leader OwnerOf after internal forward: %v", err)
 	}
@@ -800,23 +798,7 @@ func TestFollowerForwardApplySharedTLSInternalChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	// ErrNotLeader is a retryable signal in production (the caller refreshes the
-	// leader and retries). Under the full test suite, leftover clusters gossiping
-	// on 127.0.0.1 can momentarily perturb leadership right as we forward, so
-	// mirror the real caller's retry-on-not-leader semantics instead of asserting
-	// a single shot lands.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		err := follower.forwardApplyToLeader(context.Background(), payload)
-		if err == nil {
-			break
-		}
-		if errors.Is(err, ErrNotLeader) && time.Now().Before(deadline) {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		t.Fatalf("forwardApplyToLeader tls internal: %v", err)
-	}
+	forwardApplyEventually(t, follower, payload)
 	if _, err := leader.OwnerOf("sb-tls-fwd"); err != nil {
 		t.Fatalf("leader OwnerOf after tls forward: %v", err)
 	}

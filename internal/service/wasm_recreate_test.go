@@ -25,7 +25,8 @@ var _ wasmruntime.CheckpointHost = (*fakeWasmRecreateRuntime)(nil)
 type fakeWasmRecreateRuntime struct {
 	wasmModuleAPINoopRuntime
 	noopWasmPortGateway
-	rehydrated []string
+	rehydrated   []string
+	rehydrateErr error
 }
 
 type noopWasmPortGateway struct{}
@@ -43,6 +44,9 @@ func (f *fakeWasmRecreateRuntime) CheckpointSandbox(context.Context, *models.San
 }
 
 func (f *fakeWasmRecreateRuntime) RehydrateSandbox(_ context.Context, sandbox *models.Sandbox, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	if f.rehydrateErr != nil {
+		return nil, f.rehydrateErr
+	}
 	if sandbox != nil {
 		f.rehydrated = append(f.rehydrated, sandbox.ID)
 	}
@@ -54,8 +58,10 @@ func (f *fakeWasmRecreateRuntime) RehydrateSandbox(_ context.Context, sandbox *m
 }
 
 type fakeWasmCheckpointStore struct {
-	pullSrc string
-	pulled  int
+	pullSrc   string
+	pulled    int
+	pullErr   error
+	afterPull func()
 }
 
 func (f *fakeWasmCheckpointStore) DestRefFor(id string) string { return "test://" + id + ":latest" }
@@ -70,10 +76,19 @@ func (f *fakeWasmCheckpointStore) PushOnceTo(context.Context, string, string, st
 
 func (f *fakeWasmCheckpointStore) PullOnce(_ context.Context, _, dstDir string) error {
 	f.pulled++
+	if f.pullErr != nil {
+		return f.pullErr
+	}
 	if err := os.MkdirAll(dstDir, 0o700); err != nil {
 		return err
 	}
-	return copyWasmSnapshotDir(f.pullSrc, dstDir)
+	if err := copyWasmSnapshotDir(f.pullSrc, dstDir); err != nil {
+		return err
+	}
+	if f.afterPull != nil {
+		f.afterPull()
+	}
+	return nil
 }
 
 func (f *fakeWasmCheckpointStore) DeleteRef(context.Context, string) error { return nil }
@@ -345,4 +360,91 @@ func TestRecreateSandboxWasmDurableFailoverReplaysPorts(t *testing.T) {
 	if len(rt.rehydrated) != 1 || rt.rehydrated[0] != "sb-wasm-ports" {
 		t.Fatalf("rehydrated = %v", rt.rehydrated)
 	}
+}
+
+func TestRecreateWasmDurableSandboxEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+	modulesDir := t.TempDir()
+
+	t.Run("store get error", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, &fakeWasmRecreateRuntime{}, nil, nil, nil, nil, nil)
+		if err := svc.recreateWasmDurableSandbox(ctx, "sb-closed", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+			t.Fatal("expected store get error")
+		}
+	})
+
+	t.Run("missing module ref", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, &fakeWasmRecreateRuntime{}, nil, nil, nil, nil, nil)
+		if err := svc.recreateWasmDurableSandbox(ctx, "sb-missing-ref", models.CreateSandboxRequest{Runtime: models.RuntimeWasm}, nil); err == nil {
+			t.Fatal("expected missing module_ref error")
+		}
+	})
+
+	t.Run("checkpoint pull failure", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		puller := &fakeWasmCheckpointStore{pullErr: errors.New("pull failed")}
+		rt := &fakeWasmRecreateRuntime{}
+		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+		svc.AttachWasmCheckpointPusher(puller)
+		if err := svc.recreateWasmDurableSandbox(ctx, "sb-pull-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+			t.Fatal("expected checkpoint pull failure")
+		}
+	})
+
+	t.Run("store upsert failure", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		remoteSnap := filepath.Join(t.TempDir(), "remote-mem.snap")
+		seedWasmSnapshot(t, remoteSnap, "gen-upsert")
+		puller := &fakeWasmCheckpointStore{
+			pullSrc: remoteSnap,
+			afterPull: func() {
+				_ = st.Close()
+			},
+		}
+		rt := &fakeWasmRecreateRuntime{}
+		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+		svc.AttachWasmCheckpointPusher(puller)
+		if err := svc.recreateWasmDurableSandbox(ctx, "sb-upsert-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+			t.Fatal("expected store upsert failure")
+		}
+	})
+
+	t.Run("rehydrate failure", func(t *testing.T) {
+		st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		remoteSnap := filepath.Join(t.TempDir(), "remote-mem.snap")
+		seedWasmSnapshot(t, remoteSnap, "gen-rehydrate")
+		puller := &fakeWasmCheckpointStore{pullSrc: remoteSnap}
+		rt := &fakeWasmRecreateRuntime{rehydrateErr: errors.New("rehydrate failed")}
+		svc := New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, rt, nil, nil, nil, nil, nil)
+		svc.SetWasmRuntime(rt)
+		svc.AttachWasmCheckpointPusher(puller)
+		if err := svc.recreateWasmDurableSandbox(ctx, "sb-rehydrate-fail", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}, nil); err == nil {
+			t.Fatal("expected rehydrate failure")
+		}
+	})
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -265,4 +266,117 @@ func TestWasmModuleAPIEdgeBranches(t *testing.T) {
 	if err := remover.DeleteWasmModule(ctx, "mod-remove"); err == nil || !strings.Contains(err.Error(), "remove failed") {
 		t.Fatalf("DeleteWasmModule remove failure = %v", err)
 	}
+}
+
+func dropSQLiteTable(t *testing.T, dbPath, table string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000&_foreign_keys=on&_journal_mode=WAL")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+		t.Fatalf("PRAGMA foreign_keys OFF: %v", err)
+	}
+	if _, err := db.Exec("DROP TABLE IF EXISTS " + table); err != nil {
+		t.Fatalf("DROP TABLE %s: %v", table, err)
+	}
+}
+
+type wasmModuleAPIDropTableRuntime struct {
+	wasmModuleAPINoopRuntime
+	dbPath string
+}
+
+func (r wasmModuleAPIDropTableRuntime) RemoveImage(context.Context, string) error {
+	db, err := sql.Open("sqlite3", r.dbPath+"?_busy_timeout=5000&_foreign_keys=on&_journal_mode=WAL")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+		return err
+	}
+	_, err = db.Exec("DROP TABLE IF EXISTS wasm_modules")
+	return err
+}
+
+func TestWasmModuleAPIStoreErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("create explicit-id store error", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		svc := New(config.Config{EnableWasm: true}, slog.New(slog.NewTextHandler(io.Discard, nil)), st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+		svc.SetWasmModuleResolver(stubWasmModuleResolver{path: filepath.Join(dir, "mod.wasm"), digest: "abc"})
+		if _, err := svc.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ID: "mod", ModuleRef: "file:///tmp/mod.wasm"}); err == nil {
+			t.Fatal("expected store error from closed DB")
+		}
+	})
+
+	t.Run("list store error", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := store.Open(filepath.Join(dir, "state.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		svc := New(config.Config{EnableWasm: true}, slog.New(slog.NewTextHandler(io.Discard, nil)), st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+		if _, err := svc.ListWasmModules(ctx); err == nil {
+			t.Fatal("expected list error from closed DB")
+		}
+	})
+
+	t.Run("delete reference check error", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		now := time.Now().UTC()
+		if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+			ID: "mod-ref", ModuleRef: "file:///tmp/ref.wasm", Status: "ready", CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("UpsertWasmModule: %v", err)
+		}
+		dropSQLiteTable(t, dbPath, "sandboxes")
+		svc := New(config.Config{EnableWasm: true}, slog.New(slog.NewTextHandler(io.Discard, nil)), st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+		if err := svc.DeleteWasmModule(ctx, "mod-ref"); err == nil {
+			t.Fatal("expected reference-check error after dropping sandboxes table")
+		}
+	})
+
+	t.Run("delete error after remove image", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		now := time.Now().UTC()
+		if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+			ID: "mod-del", ModuleRef: "file:///tmp/del.wasm", Status: "ready", CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("UpsertWasmModule: %v", err)
+		}
+		svc := New(config.Config{EnableWasm: true}, slog.New(slog.NewTextHandler(io.Discard, nil)), st, nil, nil, nil, nil, nil, nil)
+		svc.SetWasmRuntime(wasmModuleAPIDropTableRuntime{dbPath: dbPath})
+		if err := svc.DeleteWasmModule(ctx, "mod-del"); err == nil {
+			t.Fatal("expected delete error after table drop")
+		}
+	})
 }

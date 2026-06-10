@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -172,6 +173,28 @@ func TestFollowerWriteForwardsToLeader(t *testing.T) {
 // startInternalApplyServer mounts a minimal /v1/cluster/internal/apply route
 // onto the supplied listener and returns the running server. We can't import
 // pkg/api/v1 here without an import cycle, so the route contract is inlined.
+// forwardApplyEventually forwards an encoded command to the current leader,
+// retrying on ErrNotLeader until a short deadline. ErrNotLeader is a retryable
+// signal in production (the caller refreshes the leader and retries); under the
+// full suite, leftover clusters gossiping on 127.0.0.1 can momentarily perturb
+// leadership right as we forward, so single-shot asserts flake. This mirrors the
+// real caller's retry semantics.
+func forwardApplyEventually(t *testing.T, c *Cluster, payload []byte) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := c.forwardApplyToLeader(context.Background(), payload)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, ErrNotLeader) && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		t.Fatalf("forwardApplyToLeader: %v", err)
+	}
+}
+
 func startInternalApplyServer(t *testing.T, c *Cluster, ln net.Listener) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()

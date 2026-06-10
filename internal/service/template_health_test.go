@@ -215,6 +215,67 @@ func TestMarkSnapshotCorrupt_MissingTemplateIsNoop(t *testing.T) {
 	}
 }
 
+func TestTemplateHealthEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-edge")
+
+	if err := svc.MarkSnapshotCorrupt(ctx, "", "reason"); err == nil {
+		t.Fatal("empty template ID should fail MarkSnapshotCorrupt")
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	if err := svc.MarkSnapshotCorrupt(ctx, tpl.ID, "closed store"); err == nil {
+		t.Fatal("closed store should fail MarkSnapshotCorrupt")
+	}
+
+	svc, st, templatesDir = newHealthHarness(t)
+	tpl = seedReadyTemplate(t, st, templatesDir, "tpl-rekick-edge")
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	svc.RekickUnhealthyTemplatesAtStart(ctx)
+
+	svc, st, templatesDir = newHealthHarness(t)
+	tpl = seedReadyTemplate(t, st, templatesDir, "tpl-rebuild-edge")
+	if _, err := st.MarkTemplateUnhealthy(ctx, tpl.ID, "test setup"); err != nil {
+		t.Fatalf("MarkTemplateUnhealthy: %v", err)
+	}
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 1)})
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{allocateErr: errors.New("cid exhausted")})
+	if err := svc.RebuildTemplateSnapshot(ctx, tpl.ID); err == nil {
+		t.Fatal("CID allocation failure should return error")
+	}
+	got, err := st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatalf("GetTemplate: %v", err)
+	}
+	if got.Status != models.TemplateStatusReadyNoSnapshot {
+		t.Fatalf("status = %s, want ready_no_snapshot after alloc failure", got.Status)
+	}
+
+	svc, st, templatesDir = newHealthHarness(t)
+	tpl = &models.Template{
+		ID:         "tpl-no-rootfs",
+		Image:      "docker://alpine:3.19",
+		Status:     models.TemplateStatusUnhealthy,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+		RootfsPath: "",
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate no-rootfs: %v", err)
+	}
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 1)})
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+	if err := svc.RebuildTemplateSnapshot(ctx, tpl.ID); err == nil {
+		t.Fatal("missing rootfs path should fail rebuild")
+	}
+}
+
 // TestRebuildTemplateSnapshot_SnapshotterFailFlipsToReadyNoSnapshot is
 // the degraded recovery arm: the rootfs is fine but the snapshotter
 // itself fails (VMM boot timeout, etc.). The terminal state must be

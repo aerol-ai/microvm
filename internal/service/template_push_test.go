@@ -39,6 +39,14 @@ type importCall struct {
 	TarRaw  []byte
 }
 
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
 func (f *fakeTemplatePushDocker) ImportImage(_ context.Context, req docker.ImportImageRequest) error {
 	body, _ := io.ReadAll(req.Tar)
 	f.mu.Lock()
@@ -425,6 +433,92 @@ func TestTemplateArtifactPusher_DestRefFor(t *testing.T) {
 	}
 	if got := p.DestRefFor(""); got != "" {
 		t.Errorf("empty id DestRefFor = %q, want empty", got)
+	}
+}
+
+func TestTemplateArtifactPusherEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+	patPath := writePATFile(t, "token")
+
+	if _, err := NewTemplateArtifactPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-42",
+		PATPath:   patPath,
+	}, nil, t.TempDir(), nil); err == nil {
+		t.Fatal("expected docker required error")
+	}
+
+	pusher := newTestTemplatePusher(t, patPath, t.TempDir(), &fakeTemplatePushDocker{})
+	var nilPusher *TemplateArtifactPusher
+	if _, err := nilPusher.PushOnce(ctx, &models.Template{ID: "tpl", Image: "x"}); err == nil {
+		t.Fatal("nil pusher should reject PushOnce")
+	}
+	if _, err := pusher.PushOnce(ctx, nil); err == nil {
+		t.Fatal("nil template should reject PushOnce")
+	}
+	if _, err := pusher.PushOnce(ctx, &models.Template{ID: " ", Image: "x"}); err == nil {
+		t.Fatal("blank template ID should reject PushOnce")
+	}
+
+	emptyPAT := writePATFile(t, " \n")
+	patArtifactDir := t.TempDir()
+	rootfsPath := filepath.Join(patArtifactDir, templateRootfsFilename)
+	memPath := filepath.Join(patArtifactDir, snapshotMemoryFilename)
+	statePath := filepath.Join(patArtifactDir, snapshotStateFilename)
+	if err := os.WriteFile(rootfsPath, []byte("r"), 0o644); err != nil {
+		t.Fatalf("write rootfs: %v", err)
+	}
+	if err := os.WriteFile(memPath, []byte("m"), 0o644); err != nil {
+		t.Fatalf("write mem: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("s"), 0o644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+	pusher = newTestTemplatePusher(t, emptyPAT, patArtifactDir, &fakeTemplatePushDocker{})
+	_, err := pusher.PushOnce(ctx, &models.Template{
+		ID:                 "tpl-empty-pat",
+		Image:              "x",
+		RootfsPath:         rootfsPath,
+		SnapshotMemoryPath: memPath,
+		SnapshotStatePath:  statePath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "PAT file") {
+		t.Fatalf("empty PAT PushOnce = %v, want PAT file error", err)
+	}
+
+	artifactDir := t.TempDir()
+	rootfsDir := filepath.Join(artifactDir, "rootfs.ext4")
+	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
+		t.Fatalf("mkdir rootfs dir: %v", err)
+	}
+	memPath := filepath.Join(artifactDir, snapshotMemoryFilename)
+	statePath := filepath.Join(artifactDir, snapshotStateFilename)
+	if err := os.WriteFile(memPath, []byte("m"), 0o644); err != nil {
+		t.Fatalf("write mem: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("s"), 0o644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+	pusher = newTestTemplatePusher(t, patPath, artifactDir, &fakeTemplatePushDocker{})
+	_, err = pusher.PushOnce(ctx, &models.Template{
+		ID:                 "tpl-dir-rootfs",
+		Image:              "x",
+		RootfsPath:         rootfsDir,
+		SnapshotMemoryPath: memPath,
+		SnapshotStatePath:  statePath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory rootfs PushOnce = %v, want not regular file error", err)
+	}
+
+	tw := tar.NewWriter(failingWriter{err: errors.New("tar write failed")})
+	if err := writeTarRegular(tw, templateManifestFilename, 1, nil, []byte("x")); err == nil {
+		t.Fatal("writeTarRegular should fail on writer error")
+	}
+	tw = tar.NewWriter(io.Discard)
+	if err := writeTarFile(tw, templateRootfsFilename, filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("writeTarFile should fail on missing file")
 	}
 }
 

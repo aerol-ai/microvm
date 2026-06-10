@@ -449,3 +449,98 @@ func TestEnsureTemplateLocal_NoRegistryRefIsNoop(t *testing.T) {
 		t.Errorf("PullImage calls = %d, want 0 (no registry_ref)", dk.pullCalls.Load())
 	}
 }
+
+func TestTemplateArtifactPullerEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+	if _, err := NewTemplateArtifactPuller(nil, t.TempDir(), nil); err == nil {
+		t.Fatal("nil docker should be rejected")
+	}
+	if _, err := NewTemplateArtifactPuller(&fakeTemplatePullDocker{}, " ", nil); err == nil {
+		t.Fatal("blank templatesDir should be rejected")
+	}
+
+	var nilPuller *TemplateArtifactPuller
+	if err := nilPuller.PullOnce(ctx, &models.Template{ID: "tpl", RegistryRef: "ref"}); err == nil {
+		t.Fatal("nil puller should reject PullOnce")
+	}
+	if err := nilPuller.PullOnce(ctx, nil); err == nil {
+		t.Fatal("nil template should reject PullOnce")
+	}
+	if err := nilPuller.PullOnce(ctx, &models.Template{ID: " ", RegistryRef: "ref"}); err == nil {
+		t.Fatal("blank template ID should reject PullOnce")
+	}
+	if err := nilPuller.PullOnce(ctx, &models.Template{ID: "tpl", RegistryRef: " "}); err == nil {
+		t.Fatal("blank registry ref should reject PullOnce")
+	}
+
+	dk := &fakeTemplatePullDocker{exportErr: errors.New("save failed")}
+	puller := newTestPuller(t, dk, t.TempDir())
+	err := puller.PullOnce(ctx, &models.Template{
+		ID:          "tpl-export-fail",
+		RegistryRef: "aocr.test/cluster/c1/templates/tpl-export-fail:latest",
+	})
+	if err == nil || !strings.Contains(err.Error(), "save failed") {
+		t.Fatalf("PullOnce export failure = %v, want save failed", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(puller.templatesDir, "tpl-export-fail.partial")); !os.IsNotExist(statErr) {
+		t.Fatalf("partial dir survived export failure: %v", statErr)
+	}
+}
+
+func TestEnsureTemplateLocalEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	var nilSvc *Service
+	if err := nilSvc.EnsureTemplateLocal(ctx, &models.Template{ID: "tpl", RegistryRef: "ref"}); err != nil {
+		t.Fatalf("nil service should return nil, got %v", err)
+	}
+
+	svc := &Service{}
+	if err := svc.EnsureTemplateLocal(ctx, nil); err != nil {
+		t.Fatalf("nil template should return nil, got %v", err)
+	}
+	svc.AttachTemplateArtifactPuller(nil)
+	if err := svc.EnsureTemplateLocal(ctx, &models.Template{ID: "tpl", RegistryRef: "ref"}); err != nil {
+		t.Fatalf("nil puller should return nil, got %v", err)
+	}
+
+	patPath := writePATFile(t, "token")
+	rootfs := []byte("rootfs")
+	mem := []byte("mem")
+	state := []byte("state")
+	checksum := "sha256:" + sha256hex(mem) + "|sha256:" + sha256hex(state)
+	manifest := TemplateArtifactManifest{
+		SchemaVersion:    TemplateArtifactSchemaVersion,
+		TemplateID:       "tpl-retry",
+		SnapshotChecksum: checksum,
+	}
+	dk := &fakeTemplatePullDocker{
+		pullErr:    errors.New("pull failed"),
+		exportBody: buildArtifactSaveBytes(t, manifest, rootfs, mem, state),
+	}
+	puller := newTestPuller(t, dk, t.TempDir())
+	svc.AttachTemplateArtifactPuller(puller)
+
+	tpl := &models.Template{
+		ID:               "tpl-retry",
+		RegistryRef:      "aocr.test/cluster/c1/templates/tpl-retry:latest",
+		SnapshotChecksum: checksum,
+	}
+	if err := svc.EnsureTemplateLocal(ctx, tpl); err == nil || !strings.Contains(err.Error(), "pull failed") {
+		t.Fatalf("EnsureTemplateLocal first call = %v, want pull failed", err)
+	}
+	if dk.pullCalls.Load() != 1 {
+		t.Fatalf("PullImage calls after failure = %d, want 1", dk.pullCalls.Load())
+	}
+
+	dk.pullErr = nil
+	if err := svc.EnsureTemplateLocal(ctx, tpl); err != nil {
+		t.Fatalf("EnsureTemplateLocal second call: %v", err)
+	}
+	if dk.pullCalls.Load() != 2 {
+		t.Fatalf("PullImage calls after retry = %d, want 2", dk.pullCalls.Load())
+	}
+	if !templateLocalFilesPresent(filepath.Join(puller.templatesDir, tpl.ID), tpl) {
+		t.Fatalf("template files not present after successful retry")
+	}
+}
