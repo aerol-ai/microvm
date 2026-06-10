@@ -90,3 +90,6 @@ credentials.json
 pkg/wasm/testdata/wasip1-http.wasm
 ./*.wasm
 ./pkg/wasm/testdata/wasip1-http.wasm
+internal/store/invalid-dsn:::
+internal/store/invalid-dsn:::-shm
+internal/store/invalid-dsn:::-wal
