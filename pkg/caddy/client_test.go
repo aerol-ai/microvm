@@ -461,6 +461,176 @@ func TestRouteCases(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "upsert_custom_domain_http_route_with_dial",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+
+				if err := client.UpsertCustomDomainHTTPRouteWithDial(context.Background(), "abc", "myhost.com", "127.0.0.1:8080"); err != nil {
+					t.Fatalf("UpsertCustomDomainHTTPRouteWithDial error = %v", err)
+				}
+				route, ok := fake.routes[IngressCustomDomainHTTPRouteID("abc", "myhost.com")]
+				if !ok {
+					t.Fatalf("route missing")
+				}
+				assertRouteHostMatch(t, route, "myhost.com")
+				assertRouteDial(t, route, "127.0.0.1:8080")
+			},
+		},
+		{
+			name: "upsert_custom_domain_http_route_with_dial_disabled_or_empty_domain",
+			run: func(t *testing.T) {
+				client := &Client{enabled: false}
+				if err := client.UpsertCustomDomainHTTPRouteWithDial(context.Background(), "abc", "myhost.com", "127.0.0.1:8080"); err != nil {
+					t.Fatalf("expected nil")
+				}
+				client = &Client{enabled: true, domain: ""}
+				if err := client.UpsertCustomDomainHTTPRouteWithDial(context.Background(), "abc", "myhost.com", "127.0.0.1:8080"); err != nil {
+					t.Fatalf("expected nil")
+				}
+				client = &Client{enabled: true, domain: "example.com"}
+				if err := client.UpsertCustomDomainHTTPRouteWithDial(context.Background(), "abc", "", "127.0.0.1:8080"); err != nil {
+					t.Fatalf("expected nil")
+				}
+			},
+		},
+		{
+			name: "ensure_on_demand_tls_success_inserts_policy",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureOnDemandTLS(context.Background(), "http://ask", 10, time.Second); err != nil {
+					t.Fatalf("EnsureOnDemandTLS error = %v", err)
+				}
+				if !fake.hasOnDemand {
+					t.Fatalf("on_demand block missing")
+				}
+				if !fake.hasPolicy {
+					t.Fatalf("policy missing")
+				}
+			},
+		},
+		{
+			name: "ensure_on_demand_tls_skips_policy_if_exists",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				fake.hasPolicy = true
+				client := &Client{enabled: true, baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.EnsureOnDemandTLS(context.Background(), "http://ask", 10, time.Second); err != nil {
+					t.Fatalf("EnsureOnDemandTLS error = %v", err)
+				}
+				if countMethod(fake.records, http.MethodPost) != 0 {
+					t.Fatalf("should not POST policy if it exists")
+				}
+			},
+		},
+		{
+			name: "ensure_on_demand_tls_validations",
+			run: func(t *testing.T) {
+				client := &Client{enabled: true}
+				ctx := context.Background()
+				if err := client.EnsureOnDemandTLS(ctx, "", 10, time.Second); err == nil {
+					t.Fatalf("expected err for empty askURL")
+				}
+				if err := client.EnsureOnDemandTLS(ctx, "url", 0, time.Second); err == nil {
+					t.Fatalf("expected err for burst 0")
+				}
+				if err := client.EnsureOnDemandTLS(ctx, "url", 10, 0); err == nil {
+					t.Fatalf("expected err for interval 0")
+				}
+			},
+		},
+		{
+			name: "http_routes_early_returns",
+			run: func(t *testing.T) {
+				disabledClient := &Client{enabled: false}
+				emptyDomainClient := &Client{enabled: true, domain: ""}
+				ctx := context.Background()
+
+				// disabledClient covers !c.enabled for everything
+				for _, cl := range []*Client{disabledClient} {
+					if err := cl.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 80, nil); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertSandboxRouteToPeer(ctx, "abc", "peer", nil); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertPortRouteWithDial(ctx, "abc", 80, "dial"); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertPortRouteWithRetry(ctx, "abc", "ip", 80, time.Second); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertInFluxSandboxRoute(ctx, "abc"); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertInFluxPortRoute(ctx, "abc", 80); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				// emptyDomainClient covers c.domain == "" for these methods
+				if err := emptyDomainClient.UpsertPortRouteWithDial(ctx, "abc", 80, "dial"); err != nil {
+					t.Fatal(err)
+				}
+				if err := emptyDomainClient.UpsertPortRouteWithRetry(ctx, "abc", "ip", 80, time.Second); err != nil {
+					t.Fatal(err)
+				}
+				if err := emptyDomainClient.UpsertPortRouteWithRetry(ctx, "abc", "ip", 80, 0); err != nil {
+					t.Fatal(err)
+				}
+
+				// domainClient covers c.domain != "" for these methods
+				domainClient := &Client{enabled: true, domain: "sandbox.example.com"}
+				if err := domainClient.UpsertSandboxRouteToPeer(ctx, "abc", "peer", nil); err != nil {
+					t.Fatal(err)
+				}
+				if err := domainClient.UpsertPortRouteToPeer(ctx, "abc", 80, "peer"); err != nil {
+					t.Fatal(err)
+				}
+
+				// L4/TCP early returns
+				for _, cl := range []*Client{disabledClient} {
+					if err := cl.EnsureLayer4(ctx, "", ""); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertTCPRoute(ctx, "abc", "ip", 80, 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertWakeTCPRoute(ctx, "abc", 80, 80, "ip"); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "ip", 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertTLSSNIRoute(ctx, "abc", "sni", "ip", 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertWakeTLSSNIRoute(ctx, "abc", "sni", "ip", 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.UpsertSNIPassthroughRoute(ctx, "id", "sni", "peer", 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.DeleteTCPServer(ctx, "srv"); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.DeleteTCPRoute(ctx, 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.DeletePortRoute(ctx, "abc", 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.DeleteWakeHTTPPortRoute(ctx, "abc", 80); err != nil {
+						t.Fatal(err)
+					}
+					if err := cl.DeleteTLSSNIRoute(ctx, "abc", 80); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -826,18 +996,47 @@ func TestPublicEndpointHelpers(t *testing.T) {
 func TestClientErrors(t *testing.T) {
 	ctx := context.Background()
 
-	// Bad URL causes NewRequest to fail
-	client := &Client{enabled: true, baseURL: "http://\x00invalid", httpClient: http.DefaultClient}
-	if client.DeleteSandboxRoute(ctx, "abc") == nil {
+	badURL := "http://\x00invalid"
+	clientDomainModeBadURL := &Client{enabled: true, domain: "sandbox.example.com", baseURL: badURL, httpClient: http.DefaultClient}
+	clientIPModeBadURL := &Client{enabled: true, domain: "", baseURL: badURL, httpClient: http.DefaultClient}
+
+	if clientDomainModeBadURL.DeleteSandboxRoute(ctx, "abc") == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 80, nil) == nil {
+	if clientDomainModeBadURL.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 80, nil) == nil {
 		t.Fatal("expected err")
 	}
-	if client.EnsureLayer4(ctx, ":443", "10.0.0.1:80") == nil {
+	if clientDomainModeBadURL.EnsureLayer4(ctx, ":443", "10.0.0.1:80") == nil {
 		t.Fatal("expected err")
 	}
-	if client.DeleteTCPServer(ctx, "srv") == nil {
+	if clientDomainModeBadURL.DeleteTCPServer(ctx, "srv") == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.Ping(ctx) == nil {
+		t.Fatal("expected err")
+	}
+	if clientIPModeBadURL.UpsertSandboxRouteToPeer(ctx, "abc", "peer", nil) == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.UpsertPortRouteWithDial(ctx, "abc", 80, "dial") == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.UpsertPortRouteWithRetry(ctx, "abc", "ip", 80, time.Second) == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.UpsertInFluxSandboxRoute(ctx, "abc") == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.UpsertInFluxPortRoute(ctx, "abc", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.DeleteTCPRoute(ctx, 80) == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.UpsertWakeTLSSNIRoute(ctx, "abc", "sni", "dial", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if clientDomainModeBadURL.UpsertSNIPassthroughRoute(ctx, "id", "sni", "peer", 80) == nil {
 		t.Fatal("expected err")
 	}
 
@@ -847,65 +1046,133 @@ func TestClientErrors(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client = &Client{enabled: true, baseURL: server.URL, httpClient: server.Client()}
-	if client.DeleteSandboxRoute(ctx, "abc") == nil {
+	client500 := &Client{enabled: true, domain: "sandbox.example.com", baseURL: server.URL, httpClient: server.Client()}
+	clientIPMode500 := &Client{enabled: true, domain: "", baseURL: server.URL, httpClient: server.Client()}
+
+	if client500.DeleteSandboxRoute(ctx, "abc") == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 80, nil) == nil {
+	if client500.UpsertSandboxRoute(ctx, "abc", "10.0.0.1", 80, nil) == nil {
 		t.Fatal("expected err")
 	}
-	if client.EnsureLayer4(ctx, ":443", "10.0.0.1:80") == nil {
+	if client500.EnsureLayer4(ctx, ":443", "10.0.0.1:80") == nil {
 		t.Fatal("expected err")
 	}
-	if client.DeleteTCPServer(ctx, "srv") == nil {
+	if client500.DeleteTCPServer(ctx, "srv") == nil {
 		t.Fatal("expected err")
 	}
-	if _, err := client.Snapshot(ctx); err == nil {
+	if err := client500.UpsertTCPRoute(ctx, "abc", "ip", 80, 80); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if err := client500.UpsertWakeTCPRoute(ctx, "abc", 80, 80, "ip"); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if err := client500.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "ip", 80); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if err := client500.DeleteTCPRoute(ctx, 80); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if err := client500.UpsertTLSSNIRoute(ctx, "abc", "sni", "ip", 80); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if err := client500.UpsertWakeTLSSNIRoute(ctx, "abc", "sni", "ip", 80); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if err := client500.UpsertSNIPassthroughRoute(ctx, "abc", "sni", "ip", 80); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if _, err := client500.Snapshot(ctx); err == nil {
+		t.Fatal("expected err on 500 status")
+	}
+	if err := client500.EnsureOnDemandTLS(ctx, "http://localhost:8080", 1, time.Second); err == nil {
 		t.Fatal("expected err")
 	}
-	if err := client.EnsureOnDemandTLS(ctx, "http://localhost:8080", 1, time.Second); err == nil {
+	if client500.Ping(ctx) == nil {
+		t.Fatal("expected err")
+	}
+	if clientIPMode500.UpsertSandboxRouteToPeer(ctx, "abc", "peer", nil) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertPortRouteWithDial(ctx, "abc", 80, "dial") == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertPortRouteWithRetry(ctx, "abc", "ip", 80, time.Second) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertInFluxSandboxRoute(ctx, "abc") == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertInFluxPortRoute(ctx, "abc", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.DeleteTCPRoute(ctx, 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertWakeTLSSNIRoute(ctx, "abc", "sni", "dial", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertSNIPassthroughRoute(ctx, "id", "sni", "peer", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.DeletePortRoute(ctx, "abc", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.DeleteWakeHTTPPortRoute(ctx, "abc", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.DeleteTLSSNIRoute(ctx, "abc", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertTCPRoute(ctx, "abc", "10.0.0.1", 80, 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertTLSSNIRoute(ctx, "abc", "host", "10.0.0.1", 80) == nil {
+		t.Fatal("expected err")
+	}
+	if client500.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "10.0.0.1", 80) == nil {
 		t.Fatal("expected err")
 	}
 
 	// hostPort <= 0 tests
-	if client.UpsertTCPRoute(ctx, "abc", "1.1.1.1", 80, 0) == nil {
+	if client500.UpsertTCPRoute(ctx, "abc", "1.1.1.1", 80, 0) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertWakeTCPRoute(ctx, "abc", 80, 0, "1.1.1.1") == nil {
+	if client500.UpsertWakeTCPRoute(ctx, "abc", 80, 0, "1.1.1.1") == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertWakeTCPRoute(ctx, "abc", 80, 80, "") == nil {
+	if client500.UpsertWakeTCPRoute(ctx, "abc", 80, 80, "") == nil {
 		t.Fatal("expected err")
 	}
 
 	// proxy route input validations
-	if client.UpsertTCPProxyRoute(ctx, "abc", 80, 0, "ip", 80) == nil {
+	if client500.UpsertTCPProxyRoute(ctx, "abc", 80, 0, "ip", 80) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "", 80) == nil {
+	if client500.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "", 80) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "ip", 0) == nil {
+	if client500.UpsertTCPProxyRoute(ctx, "abc", 80, 80, "ip", 0) == nil {
 		t.Fatal("expected err")
 	}
 
 	// sni validations
-	if client.UpsertTLSSNIRoute(ctx, "abc", "", "ip", 80) == nil {
+	if client500.UpsertTLSSNIRoute(ctx, "abc", "", "ip", 80) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertWakeTLSSNIRoute(ctx, "abc", "", "ip", 80) == nil {
+	if client500.UpsertWakeTLSSNIRoute(ctx, "abc", "", "ip", 80) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertWakeTLSSNIRoute(ctx, "abc", "sni", "", 80) == nil {
+	if client500.UpsertWakeTLSSNIRoute(ctx, "abc", "sni", "", 80) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertSNIPassthroughRoute(ctx, "id", "", "ip", 80) == nil {
+	if client500.UpsertSNIPassthroughRoute(ctx, "id", "", "ip", 80) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertSNIPassthroughRoute(ctx, "id", "sni", "", 80) == nil {
+	if client500.UpsertSNIPassthroughRoute(ctx, "id", "sni", "", 80) == nil {
 		t.Fatal("expected err")
 	}
-	if client.UpsertSNIPassthroughRoute(ctx, "id", "sni", "ip", 0) == nil {
+	if client500.UpsertSNIPassthroughRoute(ctx, "id", "sni", "ip", 0) == nil {
 		t.Fatal("expected err")
 	}
 
@@ -924,6 +1191,37 @@ func TestClientErrors(t *testing.T) {
 	if _, err := disabledClient.Snapshot(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCaddyCoverage(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/config/apps/tls/automation/policies" {
+			w.Write([]byte(`[{"subjects": ["on-demand"], "on_demand": true}]`))
+			return
+		}
+		if r.URL.Path == "/config/apps/layer4/servers/srv0" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := New(config.Config{
+		CaddyAdminURL:     ts.URL,
+		CaddyServerID:     "srv0",
+		Domain:            "sandbox.example.com",
+		PublicHost:        "pub",
+		EnableCaddy:       true,
+		L4TLSListen:       ":443",
+		HTTPClientTimeout: time.Second,
+	})
+	c.httpClient = ts.Client()
+
+	_ = c.EnsureLayer4(ctx, "0.0.0.0", "1.1.1.1")
+	_, _ = c.hasOnDemandPolicy(ctx)
 }
 
 func TestWrapTransport_Nil(t *testing.T) {
@@ -1141,6 +1439,8 @@ type fakeCaddy struct {
 	routes       map[string]map[string]any
 	l4Servers    map[string]map[string]any
 	layer4Exists bool
+	hasOnDemand  bool
+	hasPolicy    bool
 }
 
 func newFakeCaddy(t *testing.T) *fakeCaddy {
@@ -1176,6 +1476,19 @@ func newFakeCaddy(t *testing.T) *fakeCaddy {
 			default:
 				t.Fatalf("unexpected method %s for %s", r.Method, r.URL.Path)
 			}
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/tls/automation/on_demand":
+			fake.hasOnDemand = true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/tls/automation/policies":
+			if !fake.hasPolicy {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode([]any{map[string]any{"on_demand": true}})
+		case r.Method == http.MethodPost && r.URL.Path == "/config/apps/tls/automation/policies":
+			fake.hasPolicy = true
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http/servers/srv0/routes/0":
 			route, err := decodeRoute(r.Body)
 			if err != nil {
