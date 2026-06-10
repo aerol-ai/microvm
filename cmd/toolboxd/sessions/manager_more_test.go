@@ -2,6 +2,8 @@ package sessions
 
 import (
 	"context"
+	crand "crypto/rand"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -40,8 +42,8 @@ func TestManagerHelpersAndSweepBranches(t *testing.T) {
 	mgr, err := New(logger, Config{
 		SandboxID:          "sb-test",
 		RecordingDir:       dir,
-		RecordingRetention: time.Millisecond,
-		SweepInterval:      time.Millisecond,
+		RecordingRetention: time.Minute,
+		SweepInterval:      time.Hour,
 		BufferBytes:        0,
 	})
 	if err != nil {
@@ -141,4 +143,73 @@ func TestManagerHelpersAndSweepBranches(t *testing.T) {
 	// sweepOnce should be a no-op when the directory is missing.
 	missing := &Manager{cfg: Config{RecordingDir: filepath.Join(t.TempDir(), "missing"), SandboxID: "sb-test"}}
 	missing.sweepOnce()
+
+	// runSweeper exits immediately when retention is disabled.
+	(&Manager{cfg: Config{RecordingRetention: 0}}).runSweeper()
 }
+
+func TestManagerCreateErrorAndFallbackBranches(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	mgr, err := New(logger, Config{
+		SandboxID:    "sb-test",
+		RecordingDir: dir,
+		BufferBytes:  1 << 14,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(mgr.Close)
+
+	if _, err := mgr.Create(context.Background(), models.CreateSessionRequest{
+		Name:    "bad-workdir",
+		Command: "true",
+		WorkDir: filepath.Join(dir, "missing-workdir"),
+	}); err == nil {
+		t.Fatal("expected Create with missing workdir to fail")
+	}
+
+	if _, err := mgr.Create(context.Background(), models.CreateSessionRequest{
+		Name:    "bad-pty-workdir",
+		Command: "true",
+		WorkDir: filepath.Join(dir, "missing-pty-workdir"),
+		PTY:     true,
+	}); err == nil {
+		t.Fatal("expected PTY Create with missing workdir to fail")
+	}
+
+	sandboxDir := filepath.Join(dir, "sb-test")
+	if err := os.RemoveAll(sandboxDir); err != nil {
+		t.Fatalf("RemoveAll sandbox dir: %v", err)
+	}
+	if err := os.WriteFile(sandboxDir, []byte("blocker"), 0o600); err != nil {
+		t.Fatalf("WriteFile sandbox blocker: %v", err)
+	}
+	sess, err := mgr.Create(context.Background(), models.CreateSessionRequest{
+		Name:    "no-recorder",
+		Command: "sleep 1",
+	})
+	if err != nil {
+		t.Fatalf("Create without recorder: %v", err)
+	}
+	if snap := sess.Snapshot(); snap.Recording {
+		t.Fatalf("expected recorder to be disabled when init fails, got %+v", snap)
+	}
+	_ = mgr.Delete(sess.ID())
+
+	oldReader := crand.Reader
+	crand.Reader = failingReader{}
+	t.Cleanup(func() { crand.Reader = oldReader })
+	if _, err := newSessionID(); err == nil {
+		t.Fatal("expected newSessionID failure when rand reader fails")
+	}
+
+	t.Setenv("PATH", "/definitely-not-a-real-path")
+	if got := detectShell(); got != "/bin/sh" {
+		t.Fatalf("detectShell fallback = %q, want /bin/sh", got)
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("rand failed") }

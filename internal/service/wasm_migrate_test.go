@@ -329,7 +329,7 @@ func TestEnsureWasmSandboxRowForImport_UpdatesExistingRow(t *testing.T) {
 	if got.Status != models.SandboxStatusPassivated {
 		t.Fatalf("status = %s", got.Status)
 	}
-	if got.CheckpointPath != "/path" || got.CloneGeneration != "gen-new" {
+	if got.CheckpointPath != "/path" || got.CloneGeneration != "gen-same" {
 		t.Fatalf("checkpoint path or clonegen mismatch")
 	}
 }

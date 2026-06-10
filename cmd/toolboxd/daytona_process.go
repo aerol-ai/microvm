@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -809,7 +810,7 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 
 func newDaytonaCommandID() (string, error) {
 	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil

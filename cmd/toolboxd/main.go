@@ -29,6 +29,28 @@ import (
 
 var userCommandPID int
 
+var (
+	hostnameFn = os.Hostname
+	statFn     = os.Stat
+	lookPathFn = exec.LookPath
+)
+
+type vsockServerAPI interface {
+	Serve(context.Context) error
+	Close() error
+}
+
+var (
+	sessionsNewFn            = sessions.New
+	startReaperFn            = startReaper
+	startUserCommandFn       = startUserCommand
+	forwardShutdownSignalsFn = forwardShutdownSignals
+	serveHTTPFn              = func(srv *http.Server) error { return srv.ListenAndServe() }
+	newVsockServerFn         = func(port uint32, handler VsockHandler, logger *slog.Logger) (vsockServerAPI, error) {
+		return newVsockServer(port, handler, logger)
+	}
+)
+
 type server struct {
 	logger    *slog.Logger
 	sandboxID string
@@ -95,9 +117,9 @@ func main() {
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
 	os.Unsetenv("SB_TOOLBOX_TOKEN")
 
-	startReaper(logger)
+	startReaperFn(logger)
 
-	sessionsMgr, err := sessions.New(logger, sessions.Config{
+	sessionsMgr, err := sessionsNewFn(logger, sessions.Config{
 		SandboxID:          srv.sandboxID,
 		RecordingDir:       envString("SB_RECORDING_DIR", "/var/lib/toolboxd/recordings"),
 		RecordingRetention: envDuration("SB_RECORDING_RETENTION", 7*24*time.Hour),
@@ -111,7 +133,7 @@ func main() {
 	}
 
 	if len(os.Args) > 1 {
-		startUserCommand(logger, os.Args[1:])
+		startUserCommandFn(logger, os.Args[1:])
 	}
 
 	addr := fmt.Sprintf(":%d", srv.port)
@@ -121,7 +143,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	go forwardShutdownSignals(logger, httpServer)
+	go forwardShutdownSignalsFn(logger, httpServer)
 
 	// Start the vsock listener alongside HTTP. On Linux guests with a
 	// virtio-vsock device this binds (CID 3, port 1024) and accepts
@@ -135,7 +157,7 @@ func main() {
 	// so the handler's pre_snapshot can fsync session recordings; nil
 	// is treated as "no sessions to flush" by the handler.
 	vsockHandler := newQuiesceHandler(logger, newSessionFlusher(srv.sessions), srv.cloneGen)
-	if vs, err := newVsockServer(defaultVsockPort, vsockHandler, logger); err != nil {
+	if vs, err := newVsockServerFn(defaultVsockPort, vsockHandler, logger); err != nil {
 		logger.Warn("vsock listener disabled", "error", err)
 	} else {
 		go func() {
@@ -147,7 +169,7 @@ func main() {
 	}
 
 	logger.Info("toolboxd listening", "addr", addr, "sandbox_id", srv.sandboxID, "version", version.Version)
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := serveHTTPFn(httpServer); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("toolboxd failed", "error", err)
 		os.Exit(1)
 	}
@@ -377,7 +399,7 @@ func (s *server) stripSandboxPrefix(r *http.Request) *http.Request {
 }
 
 func readSandboxID() string {
-	hostname, err := os.Hostname()
+	hostname, err := hostnameFn()
 	if err != nil {
 		return ""
 	}
@@ -676,10 +698,10 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func detectShell() (string, error) {
-	if _, err := os.Stat("/bin/sh"); err == nil {
+	if _, err := statFn("/bin/sh"); err == nil {
 		return "/bin/sh", nil
 	}
-	path, err := exec.LookPath("sh")
+	path, err := lookPathFn("sh")
 	if err == nil {
 		return path, nil
 	}

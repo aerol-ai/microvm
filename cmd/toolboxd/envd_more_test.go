@@ -405,3 +405,129 @@ func TestEnvdHandlerErrorBranches(t *testing.T) {
 		}
 	})
 }
+
+func TestEnvdFilesystemAndProcessSuccessBranches(t *testing.T) {
+	srv := newEnvdTestServer(t)
+
+	root := t.TempDir()
+	targetDir := filepath.Join(root, "dir")
+	makeDirReq := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/MakeDir", strings.NewReader(`{"path":"`+targetDir+`"}`))
+	makeDirRec := httptest.NewRecorder()
+	srv.handleEnvdFilesystemMakeDir(makeDirRec, makeDirReq)
+	if makeDirRec.Code != http.StatusOK {
+		t.Fatalf("make dir status = %d body=%s", makeDirRec.Code, makeDirRec.Body.String())
+	}
+
+	sourceFile := filepath.Join(targetDir, "source.txt")
+	if err := os.WriteFile(sourceFile, []byte("hello-envd"), 0o600); err != nil {
+		t.Fatalf("WriteFile source: %v", err)
+	}
+	destinationFile := filepath.Join(targetDir, "destination.txt")
+	moveReq := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/Move", strings.NewReader(`{"source":"`+sourceFile+`","destination":"`+destinationFile+`"}`))
+	moveRec := httptest.NewRecorder()
+	srv.handleEnvdFilesystemMove(moveRec, moveReq)
+	if moveRec.Code != http.StatusOK {
+		t.Fatalf("move status = %d body=%s", moveRec.Code, moveRec.Body.String())
+	}
+
+	listReq := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/ListDir", strings.NewReader(`{"path":"`+targetDir+`","depth":2}`))
+	listRec := httptest.NewRecorder()
+	srv.handleEnvdFilesystemListDir(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list dir status = %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	if !strings.Contains(listRec.Body.String(), "destination.txt") {
+		t.Fatalf("list dir body missing moved file: %s", listRec.Body.String())
+	}
+
+	statReq := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/Stat", strings.NewReader(`{"path":"`+destinationFile+`"}`))
+	statRec := httptest.NewRecorder()
+	srv.handleEnvdFilesystemStat(statRec, statReq)
+	if statRec.Code != http.StatusOK {
+		t.Fatalf("stat status = %d body=%s", statRec.Code, statRec.Body.String())
+	}
+
+	removeReq := httptest.NewRequest(http.MethodPost, envdPrefix+"/filesystem.Filesystem/Remove", strings.NewReader(`{"path":"`+destinationFile+`"}`))
+	removeRec := httptest.NewRecorder()
+	srv.handleEnvdFilesystemRemove(removeRec, removeReq)
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("remove status = %d body=%s", removeRec.Code, removeRec.Body.String())
+	}
+
+	oversizedHeader := make([]byte, connectEnvelopeHeaderLen)
+	binary.BigEndian.PutUint32(oversizedHeader[1:], connectJSONMaxPayloadLen+1)
+	if err := readConnectJSONRequest(httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/Start", bytes.NewReader(oversizedHeader)), &envdStartRequest{}); err == nil {
+		t.Fatal("expected oversize connect envelope to fail")
+	}
+	if err := writeConnectEnvelope(httptest.NewRecorder(), 0, make(chan int)); err == nil {
+		t.Fatal("expected writeConnectEnvelope marshal failure")
+	}
+
+	pipeSess, pipeState := makeEnvdRegisteredProcess(t, srv, "pipe-success", false, true)
+	pipePID := pipeState.PID
+
+	inputBody, err := json.Marshal(envdSendInputRequest{
+		Process: envdProcessSelector{PID: &pipePID},
+		Input:   envdProcessInput{Stdin: base64.StdEncoding.EncodeToString([]byte("hello"))},
+	})
+	if err != nil {
+		t.Fatalf("marshal send input request: %v", err)
+	}
+	inputRec := httptest.NewRecorder()
+	srv.handleEnvdProcessSendInput(inputRec, httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendInput", bytes.NewReader(inputBody)))
+	if inputRec.Code != http.StatusOK {
+		t.Fatalf("send input status = %d body=%s", inputRec.Code, inputRec.Body.String())
+	}
+
+	closeBody, err := json.Marshal(envdCloseStdinRequest{Process: envdProcessSelector{PID: &pipePID}})
+	if err != nil {
+		t.Fatalf("marshal close stdin request: %v", err)
+	}
+	closeRec := httptest.NewRecorder()
+	srv.handleEnvdProcessCloseStdin(closeRec, httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/CloseStdin", bytes.NewReader(closeBody)))
+	if closeRec.Code != http.StatusOK {
+		t.Fatalf("close stdin status = %d body=%s", closeRec.Code, closeRec.Body.String())
+	}
+
+	signalBody, err := json.Marshal(envdSendSignalRequest{
+		Process: envdProcessSelector{PID: &pipePID},
+		Signal:  "TERM",
+	})
+	if err != nil {
+		t.Fatalf("marshal send signal request: %v", err)
+	}
+	signalRec := httptest.NewRecorder()
+	srv.handleEnvdProcessSendSignal(signalRec, httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendSignal", bytes.NewReader(signalBody)))
+	if signalRec.Code != http.StatusOK {
+		t.Fatalf("send signal status = %d body=%s", signalRec.Code, signalRec.Body.String())
+	}
+
+	t.Cleanup(func() { _ = srv.sessions.Delete(pipeSess.ID()) })
+
+	ptySess, ptyState := makeEnvdRegisteredProcess(t, srv, "pty-success", true, true)
+	ptyPID := ptyState.PID
+	ptyInputBody, err := json.Marshal(envdSendInputRequest{
+		Process: envdProcessSelector{PID: &ptyPID},
+		Input:   envdProcessInput{PTY: base64.StdEncoding.EncodeToString([]byte("pty"))},
+	})
+	if err != nil {
+		t.Fatalf("marshal PTY send input request: %v", err)
+	}
+	ptyInputRec := httptest.NewRecorder()
+	srv.handleEnvdProcessSendInput(ptyInputRec, httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/SendInput", bytes.NewReader(ptyInputBody)))
+	if ptyInputRec.Code != http.StatusOK {
+		t.Fatalf("pty send input status = %d body=%s", ptyInputRec.Code, ptyInputRec.Body.String())
+	}
+
+	ptyCloseBody, err := json.Marshal(envdCloseStdinRequest{Process: envdProcessSelector{PID: &ptyPID}})
+	if err != nil {
+		t.Fatalf("marshal PTY close stdin request: %v", err)
+	}
+	ptyCloseRec := httptest.NewRecorder()
+	srv.handleEnvdProcessCloseStdin(ptyCloseRec, httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/CloseStdin", bytes.NewReader(ptyCloseBody)))
+	if ptyCloseRec.Code != http.StatusOK {
+		t.Fatalf("pty close stdin status = %d body=%s", ptyCloseRec.Code, ptyCloseRec.Body.String())
+	}
+
+	t.Cleanup(func() { _ = srv.sessions.Delete(ptySess.ID()) })
+}

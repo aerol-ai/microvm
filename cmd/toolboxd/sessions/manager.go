@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -379,7 +380,7 @@ var ErrNotFound = errors.New("session not found")
 
 func newSessionID() (string, error) {
 	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
 		return "", err
 	}
 	return "ses-" + hex.EncodeToString(buf), nil
