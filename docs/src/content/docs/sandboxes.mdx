@@ -180,6 +180,10 @@ created ──► running ──► stopped ──► running
   </TabItem>
 </Tabs>
 
+### Named sandboxes
+
+Pass a `name` field to pin a human-readable identifier to the sandbox. Names must be unique — if you call `create` with a name that belongs to an existing sandbox, the daemon returns **HTTP 409 Conflict** with `"sandbox name already in use"`. Omit the field (or leave it empty) to let the daemon generate a random ID.
+
 ## Connect to existing sandbox
 
 Retrieve a running sandbox by ID to get a fully usable sandbox object.
