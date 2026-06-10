@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	mathrand "math/rand"
 	"net"
@@ -4478,7 +4479,7 @@ func sandboxContainerRef(sandbox *models.Sandbox) string {
 
 func generateToolboxToken() (string, error) {
 	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
@@ -4497,7 +4498,7 @@ func GenerateSandboxID() (string, error) { return generateSandboxID() }
 // name, so it must satisfy Docker's name restrictions ([a-zA-Z0-9_.-]).
 func generateSandboxID() (string, error) {
 	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
 		return "", err
 	}
 	return "sb-" + hex.EncodeToString(buf), nil

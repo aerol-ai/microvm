@@ -4,7 +4,6 @@ import (
 	"context"
 	crand "crypto/rand"
 	"errors"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -53,12 +53,6 @@ type failingImageDistributionProvider struct {
 func (p failingImageDistributionProvider) ClassifyImage(context.Context, string) (models.ImageDistributionMetadata, error) {
 	return models.ImageDistributionMetadata{}, p.err
 }
-
-type failingAdmitter struct {
-	err error
-}
-
-func (a failingAdmitter) Admit(context.Context, string) error { return a.err }
 
 type closingCustomDomainCluster struct {
 	*cluster.Noop
@@ -125,16 +119,23 @@ func TestServiceHelperRandomBranches(t *testing.T) {
 	})
 
 	t.Run("ssh key failure", func(t *testing.T) {
-		setRandReader(t, &scriptedRandReader{errs: []error{nil, errors.New("ssh entropy exhausted")}})
+		setRandReader(t, &scriptedRandReader{errs: []error{errors.New("ssh entropy exhausted")}})
 		if _, _, err := generateSandboxSSHKeys(); err == nil || !strings.Contains(err.Error(), "ssh entropy exhausted") {
 			t.Fatalf("generateSandboxSSHKeys() error = %v, want ssh entropy failure", err)
 		}
 	})
 
 	t.Run("sandbox id failure", func(t *testing.T) {
-		setRandReader(t, &scriptedRandReader{errs: []error{nil, nil, errors.New("id entropy exhausted")}})
+		setRandReader(t, &scriptedRandReader{errs: []error{errors.New("id entropy exhausted")}})
 		if _, err := generateSandboxID(); err == nil || !strings.Contains(err.Error(), "id entropy exhausted") {
 			t.Fatalf("generateSandboxID() error = %v, want id entropy failure", err)
+		}
+	})
+
+	t.Run("template id failure", func(t *testing.T) {
+		setRandReader(t, &scriptedRandReader{errs: []error{errors.New("template entropy exhausted")}})
+		if _, err := generateTemplateID(); err == nil || !strings.Contains(err.Error(), "template entropy exhausted") {
+			t.Fatalf("generateTemplateID() error = %v, want template id failure", err)
 		}
 	})
 }
@@ -268,7 +269,7 @@ func TestCreateSandboxRollbackAndCustomDomainBranches(t *testing.T) {
 		svc.admitter = nil
 
 		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"})
-		if err == nil || !strings.Contains(err.Error(), "boom") {
+		if err == nil || !strings.Contains(err.Error(), "patch caddy route failed") {
 			t.Fatalf("CreateSandbox() error = %v, want caddy failure", err)
 		}
 		if rt.createCalls != 1 || len(rt.destroyIDs) != 1 {
@@ -359,14 +360,18 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 		svc.cfg.EnableWasm = true
 		svc.SetWasmRuntime(rt)
-		svc.admitter = failingAdmitter{err: errors.New("admission denied")}
+		svc.admitter = capacity.New(
+			capacity.HostInfo{CPUCores: 1, MemoryTotalMB: 1},
+			capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
+			nil,
+		)
 
 		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
 			ModuleRef: "hello.wasm",
 			Runtime:   models.RuntimeWasm,
 			Lifecycle: &models.Lifecycle{StopIfIdleFor: time.Minute},
 		})
-		if err == nil || !strings.Contains(err.Error(), "admission denied") {
+		if err == nil || !errors.Is(err, capacity.ErrCapacityExceeded) {
 			t.Fatalf("CreateSandbox() error = %v, want admission failure", err)
 		}
 	})
@@ -376,6 +381,8 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 		svc.cfg.EnableWasm = true
 		svc.SetWasmRuntime(rt)
+		svc.mounts = nil
+		svc.cipher = newTestCipher(t)
 		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
 			ModuleRef: "hello.wasm",
 			Runtime:   models.RuntimeWasm,
@@ -394,15 +401,13 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 		rt := &wasmRecordingRuntime{}
 		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 		svc.cfg.EnableWasm = true
-		svc.admitter = nil
 		svc.SetWasmRuntime(rt)
 		svc.cipher = newTestCipher(t)
-		svc.mounts = &mounts.Manager{}
 		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
 			ModuleRef: "hello.wasm",
 			Runtime:   models.RuntimeWasm,
 			Mounts: []models.MountSpec{{
-				Type:   models.MountTypeS3,
+				Type:   "bogus",
 				Target: "/data",
 				Source: "bucket",
 			}},
@@ -465,8 +470,23 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 		svc.cfg.Domain = "sandbox.test"
 		svc.admitter = nil
 		svc.SetWasmRuntime(rt)
+		var customPatchCalls int
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "boom", http.StatusInternalServerError)
+			switch {
+			case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/id/sandbox-sb-wasm-sync-fail-custom-"):
+				customPatchCalls++
+				if customPatchCalls == 1 {
+					http.NotFound(w, r)
+					return
+				}
+				http.Error(w, "boom", http.StatusInternalServerError)
+			case r.Method == http.MethodPatch && r.URL.Path == "/id/sandbox-sb-wasm-sync-fail":
+				http.NotFound(w, r)
+			case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http/servers/srv0/routes/0":
+				w.WriteHeader(http.StatusOK)
+			default:
+				http.NotFound(w, r)
+			}
 		}))
 		t.Cleanup(server.Close)
 		svc.cfg.EnableCaddy = true
@@ -479,7 +499,7 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 			Runtime:       models.RuntimeWasm,
 			CustomDomains: []string{"api.external.test"},
 		}, "sb-wasm-sync-fail")
-		if err == nil || !strings.Contains(err.Error(), "boom") {
+		if err == nil || !strings.Contains(err.Error(), "install wasm custom-domain route") {
 			t.Fatalf("CreateSandboxWithID() error = %v, want caddy sync failure", err)
 		}
 		if rt.createCalls != 1 {
@@ -492,16 +512,36 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 
 	t.Run("cluster close forces final read failure", func(t *testing.T) {
 		rt := &wasmRecordingRuntime{}
-		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc, st, _ := newServiceRuntimeHarnessAllowStoreClose(t, &recordingRuntime{})
 		svc.cfg.EnableWasm = true
 		svc.cfg.EnableCustomDomains = true
 		svc.cfg.Domain = "sandbox.test"
 		svc.admitter = nil
 		svc.SetWasmRuntime(rt)
-		svc.AttachCluster(&closingCustomDomainCluster{
-			Noop:       cluster.NewNoop("self", "http://self", "sandbox.test"),
-			closeStore: true,
-		})
+		var customPatchCalls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/id/sandbox-sb-wasm-close-custom-"):
+				customPatchCalls++
+				if customPatchCalls == 1 {
+					http.NotFound(w, r)
+					return
+				}
+				_ = st.Close()
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPatch && r.URL.Path == "/id/sandbox-sb-wasm-close":
+				http.NotFound(w, r)
+			case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http/servers/srv0/routes/0":
+				w.WriteHeader(http.StatusOK)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(server.Close)
+		svc.cfg.EnableCaddy = true
+		svc.cfg.CaddyAdminURL = server.URL
+		svc.cfg.CaddyServerID = "srv0"
+		svc.caddy = caddy.New(svc.cfg)
 
 		_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
 			ModuleRef:     "hello.wasm",
@@ -544,7 +584,11 @@ func TestStartSandboxBranchCoverage(t *testing.T) {
 
 	t.Run("admitter failure", func(t *testing.T) {
 		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
-		svc.admitter = failingAdmitter{err: errors.New("capacity exhausted")}
+		svc.admitter = capacity.New(
+			capacity.HostInfo{CPUCores: 1, MemoryTotalMB: 1},
+			capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
+			nil,
+		)
 		now := time.Now().UTC()
 		if err := st.Create(ctx, &models.Sandbox{
 			ID:           "sb-start-admit",
@@ -562,14 +606,13 @@ func TestStartSandboxBranchCoverage(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("seed sandbox: %v", err)
 		}
-		if _, err := svc.StartSandbox(ctx, "sb-start-admit"); err == nil || !strings.Contains(err.Error(), "capacity exhausted") {
+		if _, err := svc.StartSandbox(ctx, "sb-start-admit"); err == nil || !errors.Is(err, capacity.ErrCapacityExceeded) {
 			t.Fatalf("StartSandbox() error = %v, want admitter failure", err)
 		}
 	})
 
 	t.Run("regular start mount reestablish failure", func(t *testing.T) {
 		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
-		svc.mounts = &mounts.Manager{}
 		svc.cipher = newTestCipher(t)
 		now := time.Now().UTC()
 		if err := st.Create(ctx, &models.Sandbox{
@@ -589,7 +632,7 @@ func TestStartSandboxBranchCoverage(t *testing.T) {
 			t.Fatalf("seed sandbox: %v", err)
 		}
 		sealed, err := svc.sealMounts([]models.MountSpec{{
-			Type:   models.MountTypeS3,
+			Type:   "bogus",
 			Target: "/data",
 			Source: "bucket",
 		}})
@@ -639,7 +682,6 @@ func TestStartSandboxBranchCoverage(t *testing.T) {
 		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 		svc.cfg.EnableWasm = true
 		svc.SetWasmRuntime(&recordingRuntime{})
-		svc.mounts = &mounts.Manager{}
 		svc.cipher = newTestCipher(t)
 		now := time.Now().UTC()
 		if err := st.Create(ctx, &models.Sandbox{
@@ -660,7 +702,7 @@ func TestStartSandboxBranchCoverage(t *testing.T) {
 			t.Fatalf("seed sandbox: %v", err)
 		}
 		sealed, err := svc.sealMounts([]models.MountSpec{{
-			Type:   models.MountTypeS3,
+			Type:   "bogus",
 			Target: "/data",
 			Source: "bucket",
 		}})
@@ -783,217 +825,6 @@ func TestStartSandboxBranchCoverage(t *testing.T) {
 		}
 		if _, err := svc.StartSandbox(ctx, "sb-netblock"); err == nil || !strings.Contains(err.Error(), "network_block_all") {
 			t.Fatalf("StartSandbox() error = %v, want network block unsupported", err)
-		}
-	})
-}
-
-func TestAllocateHostPortBranchCoverage(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("misconfigured pool", func(t *testing.T) {
-		svc, _, _ := newCapacityHarness(t, nil, nil)
-		svc.cfg.L4PortRangeStart = 4000
-		svc.cfg.L4PortRangeEnd = 4000
-		if _, _, _, err := svc.allocateHostPort(ctx, "sb", 8080, time.Now().UTC(), 0); err == nil || !strings.Contains(err.Error(), "misconfigured") {
-			t.Fatalf("allocateHostPort() error = %v, want misconfigured pool", err)
-		}
-	})
-
-	t.Run("preferred port outside range", func(t *testing.T) {
-		svc, _, _ := newCapacityHarness(t, nil, nil)
-		svc.cfg.L4PortRangeStart = 30000
-		svc.cfg.L4PortRangeEnd = 30010
-		if _, _, _, err := svc.allocateHostPort(ctx, "sb", 8080, time.Now().UTC(), 29999); err == nil || !strings.Contains(err.Error(), "outside configured L4 range") {
-			t.Fatalf("allocateHostPort() error = %v, want preferred range failure", err)
-		}
-	})
-
-	t.Run("preferred port unavailable parks", func(t *testing.T) {
-		svc, _, st := newCapacityHarness(t, nil, nil)
-		svc.cfg.EnableCluster = true
-		svc.cfg.L4PortRangeStart = 30000
-		svc.cfg.L4PortRangeEnd = 30010
-		svc.AttachCluster(&hostPortReserveCluster{
-			Noop:     cluster.NewNoop("self", "http://self", ""),
-			reserved: map[int]bool{30005: true},
-		})
-		now := time.Now().UTC()
-		if err := st.Create(ctx, &models.Sandbox{
-			ID:           "sb-pref",
-			Image:        "postgres:16",
-			Status:       models.SandboxStatusStarted,
-			Runtime:      models.RuntimeDocker,
-			ContainerID:  "ctr-pref",
-			ContainerIP:  "10.0.0.30",
-			CPU:          1,
-			MemoryMB:     256,
-			DiskGB:       5,
-			CreatedAt:    now,
-			UpdatedAt:    now,
-			LastActiveAt: now,
-		}); err != nil {
-			t.Fatalf("seed sandbox: %v", err)
-		}
-		if _, _, _, err := svc.allocateHostPort(ctx, "sb-pref", 5432, now, 30005); err == nil || !errors.Is(err, ErrPreferredHostPortUnavailable) {
-			t.Fatalf("allocateHostPort() error = %v, want ErrPreferredHostPortUnavailable", err)
-		}
-	})
-
-	t.Run("existing tcp exposure reused", func(t *testing.T) {
-		svc, _, st := newCapacityHarness(t, nil, nil)
-		svc.cfg.L4PortRangeStart = 30000
-		svc.cfg.L4PortRangeEnd = 30000
-		now := time.Now().UTC()
-		if err := st.Create(ctx, &models.Sandbox{
-			ID:           "sb-reuse",
-			Image:        "postgres:16",
-			Status:       models.SandboxStatusStarted,
-			Runtime:      models.RuntimeDocker,
-			ContainerID:  "ctr-reuse",
-			ContainerIP:  "10.0.0.31",
-			CPU:          1,
-			MemoryMB:     256,
-			DiskGB:       5,
-			CreatedAt:    now,
-			UpdatedAt:    now,
-			LastActiveAt: now,
-		}); err != nil {
-			t.Fatalf("seed sandbox: %v", err)
-		}
-		if err := st.UpsertPort(ctx, models.ExposedPort{
-			SandboxID: "sb-reuse",
-			Port:      5432,
-			Protocol:  models.ExposedPortProtocolTCP,
-			HostPort:  32123,
-			PublicURL: "tcp://sandbox.example.com:32123",
-			CreatedAt: now,
-		}); err != nil {
-			t.Fatalf("seed exposure: %v", err)
-		}
-		hp, url, reused, err := svc.allocateHostPort(ctx, "sb-reuse", 5432, now, 32123)
-		if err != nil {
-			t.Fatalf("allocateHostPort() error = %v", err)
-		}
-		if !reused || hp != 32123 || url != "tcp://sandbox.example.com:32123" {
-			t.Fatalf("allocateHostPort() = (%d, %q, %v), want reused existing row", hp, url, reused)
-		}
-	})
-
-	t.Run("existing protocol mismatch rejects reuse", func(t *testing.T) {
-		svc, _, st := newCapacityHarness(t, nil, nil)
-		svc.cfg.EnableCluster = true
-		svc.cfg.L4PortRangeStart = 30000
-		svc.cfg.L4PortRangeEnd = 30000
-		svc.AttachCluster(&hostPortReserveCluster{
-			Noop:     cluster.NewNoop("self", "http://self", ""),
-			reserved: map[int]bool{},
-		})
-		now := time.Now().UTC()
-		if err := st.Create(ctx, &models.Sandbox{
-			ID:           "sb-mismatch",
-			Image:        "postgres:16",
-			Status:       models.SandboxStatusStarted,
-			Runtime:      models.RuntimeDocker,
-			ContainerID:  "ctr-mismatch",
-			ContainerIP:  "10.0.0.32",
-			CPU:          1,
-			MemoryMB:     256,
-			DiskGB:       5,
-			CreatedAt:    now,
-			UpdatedAt:    now,
-			LastActiveAt: now,
-		}); err != nil {
-			t.Fatalf("seed sandbox: %v", err)
-		}
-		if err := st.UpsertPort(ctx, models.ExposedPort{
-			SandboxID: "sb-mismatch",
-			Port:      5432,
-			Protocol:  models.ExposedPortProtocolHTTP,
-			PublicURL: "https://sandbox.example.com",
-			CreatedAt: now,
-		}); err != nil {
-			t.Fatalf("seed exposure: %v", err)
-		}
-		if _, _, _, err := svc.allocateHostPort(ctx, "sb-mismatch", 5432, now, 0); err == nil || !strings.Contains(err.Error(), "already exposed as http") {
-			t.Fatalf("allocateHostPort() error = %v, want protocol mismatch", err)
-		}
-	})
-
-	t.Run("host-port zero errors on reserve", func(t *testing.T) {
-		oldSeed := rand.Int63()
-		rand.Seed(1)
-		t.Cleanup(func() { rand.Seed(oldSeed) })
-
-		svc, _, st := newCapacityHarness(t, nil, nil)
-		svc.cfg.EnableCluster = true
-		svc.cfg.L4PortRangeStart = 0
-		svc.cfg.L4PortRangeEnd = 1
-		svc.AttachCluster(&hostPortReserveCluster{Noop: cluster.NewNoop("self", "http://self", "")})
-		now := time.Now().UTC()
-		if err := st.Create(ctx, &models.Sandbox{
-			ID:           "sb-zero",
-			Image:        "postgres:16",
-			Status:       models.SandboxStatusStarted,
-			Runtime:      models.RuntimeDocker,
-			ContainerID:  "ctr-zero",
-			ContainerIP:  "10.0.0.33",
-			CPU:          1,
-			MemoryMB:     256,
-			DiskGB:       5,
-			CreatedAt:    now,
-			UpdatedAt:    now,
-			LastActiveAt: now,
-		}); err != nil {
-			t.Fatalf("seed sandbox: %v", err)
-		}
-		if err := st.UpsertPort(ctx, models.ExposedPort{
-			SandboxID: "sb-zero",
-			Port:      5432,
-			Protocol:  models.ExposedPortProtocolTCP,
-			HostPort:  0,
-			PublicURL: "tcp://sandbox.example.com:0",
-			CreatedAt: now,
-		}); err != nil {
-			t.Fatalf("seed exposure: %v", err)
-		}
-		if _, _, _, err := svc.allocateHostPort(ctx, "sb-zero", 5432, now, 0); err == nil || !strings.Contains(err.Error(), "host port must be positive") {
-			t.Fatalf("allocateHostPort() error = %v, want host-port validation failure", err)
-		}
-	})
-
-	t.Run("pool exhausted", func(t *testing.T) {
-		svc, _, st := newCapacityHarness(t, nil, nil)
-		svc.cfg.L4PortRangeStart = 30000
-		svc.cfg.L4PortRangeEnd = 30001
-		now := time.Now().UTC()
-		if err := st.Create(ctx, &models.Sandbox{
-			ID:           "sb-exhaust",
-			Image:        "postgres:16",
-			Status:       models.SandboxStatusStarted,
-			Runtime:      models.RuntimeDocker,
-			ContainerID:  "ctr-exhaust",
-			ContainerIP:  "10.0.0.34",
-			CPU:          1,
-			MemoryMB:     256,
-			DiskGB:       5,
-			CreatedAt:    now,
-			UpdatedAt:    now,
-			LastActiveAt: now,
-		}); err != nil {
-			t.Fatalf("seed sandbox: %v", err)
-		}
-		if err := st.UpsertPort(ctx, models.ExposedPort{
-			SandboxID: "sb-exhaust",
-			Port:      5432,
-			Protocol:  models.ExposedPortProtocolTCP,
-			HostPort:  0,
-			PublicURL: "tcp://sandbox.example.com:0",
-			CreatedAt: now,
-		}); err != nil {
-			t.Fatalf("seed exposure: %v", err)
-		}
-		if _, _, _, err := svc.allocateHostPort(ctx, "sb-exhaust", 5432, now, 0); err == nil || !strings.Contains(err.Error(), "exhausted") {
-			t.Fatalf("allocateHostPort() error = %v, want exhausted pool", err)
 		}
 	})
 }

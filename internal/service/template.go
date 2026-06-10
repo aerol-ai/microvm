@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -569,7 +570,7 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 // immediately distinguishes a template from a sandbox.
 func generateTemplateID() (string, error) {
 	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
 		return "", err
 	}
 	return "tpl-" + hex.EncodeToString(buf), nil
