@@ -189,8 +189,8 @@ func TestClusterSecretsAndExposedPortHelpers(t *testing.T) {
 	if got := c.SecretsOf("sb-helpers"); got.Ref != "ref-1" || got.Version != 2 {
 		t.Fatalf("SecretsOf = %+v", got)
 	}
-	if sealed := c.SealedSecretsOf("sb-helpers"); string(sealed) != "sealed" {
-		t.Fatalf("SealedSecretsOf = %q", sealed)
+	if sealed := c.SealedSecretsOf("sb-helpers"); len(sealed) != 0 {
+		t.Fatalf("SealedSecretsOf with ref model = %q, want nil/empty", sealed)
 	}
 	if err := c.AddExposedPort(ctx, "sb-helpers", 3000, ExposedPortRoute{Protocol: "http"}); err != nil {
 		t.Fatalf("AddExposedPort: %v", err)
@@ -201,7 +201,7 @@ func TestClusterSecretsAndExposedPortHelpers(t *testing.T) {
 	if err := c.RemoveExposedPort(ctx, "sb-helpers", 3000); err != nil {
 		t.Fatalf("RemoveExposedPort: %v", err)
 	}
-	if ports := c.ExposedPortsOf("sb-helpers"); len(ports) != 0 {
+	if ports := c.ExposedPortsOf("sb-helpers"); ports != nil && len(ports) != 0 {
 		t.Fatalf("ExposedPortsOf after remove = %+v, want empty", ports)
 	}
 	if err := c.AddExposedPort(ctx, "sb-helpers", 0, ExposedPortRoute{}); err != nil {
@@ -404,8 +404,590 @@ func TestEvictDeadOwnerOrphansWithoutFailoverTarget(t *testing.T) {
 }
 
 func TestFSMSnapshotReleaseCallable(t *testing.T) {
-	var snap fsmSnapshot
-	snap.Release()
+	(&fsmSnapshot{}).Release()
+}
+
+func TestStartCapacityLeaseLoopStartsAndStops(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-lease-start", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 5*time.Second)
+
+	c.startCapacityLeaseLoop(0)
+	if c.capacityLeaseStop == nil {
+		t.Fatal("startCapacityLeaseLoop did not register stop func")
+	}
+	c.capacityLeaseStop()
+}
+
+func TestPeerForcedNonVoterRoleMatrix(t *testing.T) {
+	cases := []struct {
+		role string
+		want bool
+	}{
+		{"", false},
+		{config.NodeRoleServer, false},
+		{config.NodeRoleMixed, false},
+		{config.NodeRoleWorker, true},
+		{config.NodeRoleIngress, true},
+		{"worker,ingress", true},
+		{"server,worker", false},
+	}
+	for _, tc := range cases {
+		if got := isForcedNonVoterRole(tc.role); got != tc.want {
+			t.Fatalf("isForcedNonVoterRole(%q) = %v, want %v", tc.role, got, tc.want)
+		}
+	}
+	c := &Cluster{gossip: &gossipNode{memberIndex: newGossipMemberIndex()}}
+	c.gossip.memberIndex.upsert(Member{NodeID: "w1", Role: config.NodeRoleWorker})
+	if !c.peerForcedNonVoter("w1") {
+		t.Fatal("peerForcedNonVoter(worker) = false, want true")
+	}
+}
+
+func TestClusterSealedSecretsOfLegacyBag(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-legacy-sealed", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 5*time.Second)
+
+	sealed := []byte("legacy-bag")
+	if err := c.RecordPlacement(context.Background(), "sb-legacy-sealed", nil, PlacementSecrets{LegacySealed: sealed}); err != nil {
+		t.Fatalf("RecordPlacement: %v", err)
+	}
+	if got := c.SealedSecretsOf("sb-legacy-sealed"); string(got) != string(sealed) {
+		t.Fatalf("SealedSecretsOf = %q, want %q", got, sealed)
+	}
+}
+
+func TestHandleMemberJoinPromotesWorkerAsNonVoter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupLeader := newTestCluster(t, "ldr-join-worker", true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	worker, cleanupWorker := newTestAgentWithRole(t, "wkr-join-nv", config.NodeRoleWorker,
+		[]string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupWorker()
+	waitForGossipMember(t, leader, worker.SelfNodeID(), 10*time.Second)
+
+	leader.handleMemberJoin(worker.SelfNodeID())
+	cfgFuture := leader.raft.raft.GetConfiguration()
+	if err := cfgFuture.Error(); err != nil {
+		t.Fatalf("GetConfiguration: %v", err)
+	}
+	for _, srv := range cfgFuture.Configuration().Servers {
+		if string(srv.ID) == worker.SelfNodeID() {
+			t.Fatalf("worker %q should not be added to raft config", worker.SelfNodeID())
+		}
+	}
+}
+
+func TestAgentMembersNilGossipReturnsNil(t *testing.T) {
+	agent := &Agent{nodeID: "solo"}
+	if got := agent.Members(); got != nil {
+		t.Fatalf("Members() with nil gossip = %v, want nil", got)
+	}
+}
+
+func TestAgentAssertOwnershipRecordPlacementFailureOnFresh(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-place-fail":
+			http.Error(w, "not found", http.StatusNotFound)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, PublicInternalRecoveryPath):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+			http.Error(w, "apply denied", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	agent := &Agent{
+		nodeID:     "worker-self",
+		apiURL:     srv.URL,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: srv.Client(),
+		gossip: &gossipNode{
+			memberIndex: newGossipMemberIndex(),
+		},
+	}
+	agent.gossip.memberIndex.upsert(Member{
+		NodeID: "cp-leader", Alive: true, Role: config.NodeRoleServer, APIURL: srv.URL,
+	})
+
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:   "sb-place-fail",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+	}})
+	if err == nil {
+		t.Fatal("AssertOwnership expected RecordPlacement failure")
+	}
+}
+
+func TestAgentAssertOwnershipUpsertSpecFailureOnSelfOwned(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-upsert-fail":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-upsert-fail",
+				Placement: Placement{SandboxID: "sb-upsert-fail", OwnerNodeID: "worker-self"},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+			payload, _ := io.ReadAll(r.Body)
+			cmd, err := decodeCommand(payload)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if cmd.Op == opUpsertSpec {
+				http.Error(w, "upsert denied", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	agent := &Agent{
+		nodeID:     "worker-self",
+		apiURL:     srv.URL,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: srv.Client(),
+		gossip: &gossipNode{
+			memberIndex: newGossipMemberIndex(),
+		},
+	}
+	agent.gossip.memberIndex.upsert(Member{
+		NodeID: "cp-leader", Alive: true, Role: config.NodeRoleServer, APIURL: srv.URL,
+	})
+
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:   "sb-upsert-fail",
+		Spec: &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 2},
+	}})
+	if err == nil {
+		t.Fatal("AssertOwnership expected UpsertSpec failure")
+	}
+}
+
+func TestAgentCloseWithTLSInternalServer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupLeader := newTestClusterWithTLS(t, "ldr-agent-close-tls", true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	agent, _ := newTestAgentWithTLS(t, "wkr-close-tls", config.NodeRoleWorker,
+		[]string{leader.gossip.ml.LocalNode().Address()})
+	if err := agent.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+}
+
+func TestFollowerForwardRemoveMemberViaPublicAPI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupLeader := newTestCluster(t, "ldr-fwd-rm-pub", true, nil)
+	defer cleanupLeader()
+	follower, cleanupFollower := newTestCluster(t, "fol-fwd-rm-pub", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupFollower()
+	waitForLeader(t, leader, 10*time.Second)
+	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+
+	leader.gossip.memberIndex.upsert(Member{NodeID: "gone-node", Alive: false, Role: config.NodeRoleServer})
+	err := follower.forwardRemoveMemberToLeader(context.Background(), "gone-node", true)
+	if err == nil || errors.Is(err, ErrNotLeader) {
+		t.Fatalf("forwardRemoveMemberToLeader = %v", err)
+	}
+}
+
+func TestFSMReleaseCustomHostnameWrongOwner(t *testing.T) {
+	fsm := newPlacementFSM()
+	fsm.claimCustomHostnameLocked("sb-a", "host.example.com")
+	fsm.releaseCustomHostnameLocked("sb-b", "host.example.com")
+	if owner := fsm.customHostnameIndex["host.example.com"]; owner != "sb-a" {
+		t.Fatalf("stale release changed owner to %q, want sb-a", owner)
+	}
+	fsm.releaseCustomHostnameLocked("sb-a", "host.example.com")
+	if _, ok := fsm.customHostnameIndex["host.example.com"]; ok {
+		t.Fatal("expected hostname released for matching owner")
+	}
+}
+
+func TestFSMClaimPendingReservationReindexesOnOwnerChange(t *testing.T) {
+	fsm := newPlacementFSM()
+	past := time.Now().Add(-time.Minute).Unix()
+	future := time.Now().Add(time.Minute).Unix()
+	applyOp(t, fsm, command{
+		Op: opReserve, SandboxID: "sb-swap", OwnerNodeID: "owner-a",
+		Spec: &models.CreateSandboxRequest{CPU: 1}, ExpiresUnix: past,
+	})
+	got := applyOp(t, fsm, command{
+		Op: opReserve, SandboxID: "sb-swap", OwnerNodeID: "owner-b",
+		Spec: &models.CreateSandboxRequest{CPU: 2}, ExpiresUnix: future,
+	})
+	if got != nil {
+		t.Fatalf("re-reserve after expiry = %v", got)
+	}
+	if ids := fsm.pendingReservationIDsLocked("owner-a"); len(ids) != 0 {
+		t.Fatalf("owner-a pending ids = %v, want empty", ids)
+	}
+	if ids := fsm.pendingReservationIDsLocked("owner-b"); len(ids) != 1 || ids[0] != "sb-swap" {
+		t.Fatalf("owner-b pending ids = %v, want [sb-swap]", ids)
+	}
+}
+
+func TestGossipNodeCloseWithoutMemberlist(t *testing.T) {
+	g := &gossipNode{}
+	if err := g.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
+func TestHandleMemberJoinAddsNonvoterWhenVoterCapReached(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupLeader := newTestCluster(t, "ldr-cap-join", true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+	leader.cfg.ClusterMaxAutoVoters = 1
+
+	follower, cleanupFollower := newTestCluster(t, "fol-cap-join", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupFollower()
+	waitForServerSuffrage(t, leader, follower.nodeID, raft.Nonvoter, 20*time.Second)
+
+	leader.handleMemberJoin(follower.nodeID)
+	waitForServerSuffrage(t, leader, follower.nodeID, raft.Nonvoter, 5*time.Second)
+}
+
+func newAgentAssertOwnershipTestServer(
+	t *testing.T,
+	sandboxID string,
+	lookup PlacementLookupResponse,
+	lookupFound bool,
+	failOp opCode,
+) (*httptest.Server, *Agent) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+sandboxID:
+			if !lookupFound {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(lookup)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, PublicInternalRecoveryPath):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+			payload, _ := io.ReadAll(r.Body)
+			cmd, err := decodeCommand(payload)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if cmd.Op == failOp {
+				http.Error(w, "denied", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	agent := &Agent{
+		nodeID:     "worker-self",
+		apiURL:     srv.URL,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: srv.Client(),
+		gossip: &gossipNode{
+			memberIndex: newGossipMemberIndex(),
+		},
+	}
+	agent.gossip.memberIndex.upsert(Member{
+		NodeID: "cp-leader", Alive: true, Role: config.NodeRoleServer, APIURL: srv.URL,
+	})
+	return srv, agent
+}
+
+func TestAgentAssertOwnershipFreshExposedPortFailure(t *testing.T) {
+	srv, agent := newAgentAssertOwnershipTestServer(t, "sb-fresh-port", PlacementLookupResponse{}, false, opAddExposedPort)
+	defer srv.Close()
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:           "sb-fresh-port",
+		Spec:         &models.CreateSandboxRequest{Image: "alpine"},
+		ExposedPorts: map[int]ExposedPortRoute{3001: {Protocol: "http"}},
+	}})
+	if err == nil {
+		t.Fatal("expected AddExposedPort failure on fresh placement")
+	}
+}
+
+func TestAgentAssertOwnershipFreshCustomDomainFailure(t *testing.T) {
+	srv, agent := newAgentAssertOwnershipTestServer(t, "sb-fresh-host", PlacementLookupResponse{}, false, opAddCustomDomain)
+	defer srv.Close()
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:              "sb-fresh-host",
+		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		CustomHostnames: []string{"fresh.example.com"},
+	}})
+	if err == nil {
+		t.Fatal("expected AddCustomDomain failure on fresh placement")
+	}
+}
+
+func TestAgentAssertOwnershipReservedExposedPortFailure(t *testing.T) {
+	srv, agent := newAgentAssertOwnershipTestServer(t, "sb-res-port", PlacementLookupResponse{
+		SandboxID: "sb-res-port",
+		Placement: Placement{
+			SandboxID:   "sb-res-port",
+			OwnerNodeID: "worker-self",
+			State:       PlacementStateReserved,
+			ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		},
+	}, true, opAddExposedPort)
+	defer srv.Close()
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:           "sb-res-port",
+		Spec:         &models.CreateSandboxRequest{Image: "alpine"},
+		ExposedPorts: map[int]ExposedPortRoute{3002: {Protocol: "http"}},
+	}})
+	if err == nil {
+		t.Fatal("expected AddExposedPort failure on reserved placement")
+	}
+}
+
+func TestAgentAssertOwnershipReservedCustomDomainFailure(t *testing.T) {
+	srv, agent := newAgentAssertOwnershipTestServer(t, "sb-res-host", PlacementLookupResponse{
+		SandboxID: "sb-res-host",
+		Placement: Placement{
+			SandboxID:   "sb-res-host",
+			OwnerNodeID: "worker-self",
+			State:       PlacementStateReserved,
+			ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		},
+	}, true, opAddCustomDomain)
+	defer srv.Close()
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:              "sb-res-host",
+		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		CustomHostnames: []string{"reserved.example.com"},
+	}})
+	if err == nil {
+		t.Fatal("expected AddCustomDomain failure on reserved placement")
+	}
+}
+
+func TestAgentAssertOwnershipClaimOrphanCustomDomainFailure(t *testing.T) {
+	srv, agent := newAgentAssertOwnershipTestServer(t, "sb-orphan-host", PlacementLookupResponse{
+		SandboxID: "sb-orphan-host",
+		Placement: Placement{
+			SandboxID:           "sb-orphan-host",
+			OwnerState:          PlacementOwnerStateOrphaned,
+			OrphanedOwnerNodeID: "worker-self",
+		},
+		Orphaned: true,
+	}, true, opAddCustomDomain)
+	defer srv.Close()
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:              "sb-orphan-host",
+		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		CustomHostnames: []string{"orphan.example.com"},
+	}})
+	if err == nil {
+		t.Fatal("expected AddCustomDomain failure after orphan claim")
+	}
+}
+
+func TestAgentAssertOwnershipReservedRecordPlacementFailure(t *testing.T) {
+	srv, agent := newAgentAssertOwnershipTestServer(t, "sb-res-place", PlacementLookupResponse{
+		SandboxID: "sb-res-place",
+		Placement: Placement{
+			SandboxID:   "sb-res-place",
+			OwnerNodeID: "worker-self",
+			State:       PlacementStateReserved,
+			ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		},
+	}, true, opPlace)
+	defer srv.Close()
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:   "sb-res-place",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+	}})
+	if err == nil {
+		t.Fatal("expected RecordPlacement failure on reserved placement")
+	}
+}
+
+func TestAgentAssertOwnershipClaimOrphanExposedPortFailure(t *testing.T) {
+	srv, agent := newAgentAssertOwnershipTestServer(t, "sb-orphan-port", PlacementLookupResponse{
+		SandboxID: "sb-orphan-port",
+		Placement: Placement{
+			SandboxID:           "sb-orphan-port",
+			OwnerState:          PlacementOwnerStateOrphaned,
+			OrphanedOwnerNodeID: "worker-self",
+		},
+		Orphaned: true,
+	}, true, opAddExposedPort)
+	defer srv.Close()
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:           "sb-orphan-port",
+		Spec:         &models.CreateSandboxRequest{Image: "alpine"},
+		ExposedPorts: map[int]ExposedPortRoute{3003: {Protocol: "http"}},
+	}})
+	if err == nil {
+		t.Fatal("expected AddExposedPort failure after orphan claim")
+	}
+}
+
+func TestAgentAssertOwnershipAddExposedPortFailureOnSelfOwned(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-port-fail":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
+				SandboxID: "sb-port-fail",
+				Placement: Placement{
+					SandboxID:   "sb-port-fail",
+					OwnerNodeID: "worker-self",
+					Spec:        &models.CreateSandboxRequest{Image: "alpine"},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalApplyPath:
+			payload, _ := io.ReadAll(r.Body)
+			cmd, err := decodeCommand(payload)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if cmd.Op == opAddExposedPort {
+				http.Error(w, "port denied", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	agent := &Agent{
+		nodeID:     "worker-self",
+		apiURL:     srv.URL,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: srv.Client(),
+		gossip: &gossipNode{
+			memberIndex: newGossipMemberIndex(),
+		},
+	}
+	agent.gossip.memberIndex.upsert(Member{
+		NodeID: "cp-leader", Alive: true, Role: config.NodeRoleServer, APIURL: srv.URL,
+	})
+
+	err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
+		ID:           "sb-port-fail",
+		ExposedPorts: map[int]ExposedPortRoute{4444: {Protocol: "http"}},
+	}})
+	if err == nil {
+		t.Fatal("AssertOwnership expected AddExposedPort failure")
+	}
+}
+
+func TestClusterAssertOwnershipReturnsErrorOnDuplicateHostname(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-dup-host", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 5*time.Second)
+
+	ctx := context.Background()
+	host := "dup-host.example.com"
+	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
+		ID:              "sb-host-a",
+		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		CustomHostnames: []string{host},
+	}}); err != nil {
+		t.Fatalf("first AssertOwnership: %v", err)
+	}
+	err := c.AssertOwnership(ctx, []LocalSandboxState{{
+		ID:              "sb-host-b",
+		Spec:            &models.CreateSandboxRequest{Image: "alpine"},
+		CustomHostnames: []string{host},
+	}})
+	if err == nil {
+		t.Fatal("second AssertOwnership with duplicate hostname expected error")
+	}
+}
+
+func TestClusterAssertOwnershipUpsertSpecBackfillOnSelfOwned(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-upsert-backfill", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 5*time.Second)
+
+	ctx := context.Background()
+	if err := c.RecordPlacement(ctx, "sb-upsert-backfill", nil, PlacementSecrets{}); err != nil {
+		t.Fatalf("RecordPlacement: %v", err)
+	}
+	spec := &models.CreateSandboxRequest{Image: "alpine:3.20", CPU: 8}
+	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
+		ID:   "sb-upsert-backfill",
+		Spec: spec,
+	}}); err != nil {
+		t.Fatalf("AssertOwnership upsert backfill: %v", err)
+	}
+	got, ok := c.PlacementOf("sb-upsert-backfill")
+	if !ok || got.Spec == nil || got.Spec.CPU != 8 {
+		t.Fatalf("placement after upsert backfill = %+v ok=%v", got, ok)
+	}
+}
+
+func TestClusterSpecOfDeepCopiesMutableFields(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-spec-copy", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 5*time.Second)
+
+	spec := &models.CreateSandboxRequest{
+		Image:            "alpine",
+		Env:              map[string]string{"A": "1"},
+		Mounts:           []models.MountSpec{{Type: "tmpfs", Target: "/data"}},
+		ContainerCommand: []string{"sleep", "inf"},
+	}
+	if err := c.RecordPlacement(context.Background(), "sb-spec-copy", spec, PlacementSecrets{}); err != nil {
+		t.Fatalf("RecordPlacement: %v", err)
+	}
+	got := c.SpecOf("sb-spec-copy")
+	if got == nil {
+		t.Fatal("SpecOf returned nil")
+	}
+	got.Env["A"] = "mutated"
+	got.Mounts[0].Target = "/mutated"
+	got.ContainerCommand[0] = "mutated"
+	again := c.SpecOf("sb-spec-copy")
+	if again.Env["A"] != "1" || again.Mounts[0].Target != "/data" || again.ContainerCommand[0] != "sleep" {
+		t.Fatalf("SpecOf did not deep-copy mutable fields: %+v", again)
+	}
 }
 
 func TestGossipMembersFallsBackToScan(t *testing.T) {
