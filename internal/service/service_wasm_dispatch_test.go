@@ -3,13 +3,18 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 type wasmRecordingRuntime struct {
@@ -222,6 +227,39 @@ func TestWasmCreateSandboxSuccess(t *testing.T) {
 	}
 }
 
+func TestWasmCreateSandboxCustomDomainsPersistOnCreate(t *testing.T) {
+	ctx := context.Background()
+	rt := &wasmRecordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.cfg.EnableCustomDomains = true
+	svc.cfg.Domain = "sandbox.test"
+	svc.admitter = nil
+	svc.SetWasmRuntime(rt)
+
+	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
+		ModuleRef:     "hello.wasm",
+		Runtime:       models.RuntimeWasm,
+		CustomDomains: []string{"api.external.test", "www.external.test"},
+	}, "sb-wasm-custom-domains")
+	if err != nil {
+		t.Fatalf("CreateSandboxWithID() error = %v", err)
+	}
+	if rt.createCalls != 1 {
+		t.Fatalf("runtime Create calls = %d, want 1", rt.createCalls)
+	}
+	if resp.Runtime != models.RuntimeWasm {
+		t.Fatalf("response runtime = %q, want wasm", resp.Runtime)
+	}
+	stored, err := st.Get(ctx, resp.ID)
+	if err != nil {
+		t.Fatalf("store.Get() error = %v", err)
+	}
+	if len(stored.CustomDomains) != 2 {
+		t.Fatalf("stored custom domains = %+v, want 2 rows", stored.CustomDomains)
+	}
+}
+
 func TestWasmCreateSandboxValidation(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
@@ -320,4 +358,98 @@ func TestWasmCreateSandboxMaxInstances(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "wasm instance cap") {
 		t.Fatalf("expected wasm instance cap error, got %v", err)
 	}
+}
+
+func TestWasmCreateSandboxRollbackBranches(t *testing.T) {
+	t.Run("mount seal failure", func(t *testing.T) {
+		ctx := context.Background()
+		rt := &wasmRecordingRuntime{}
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.admitter = nil
+		svc.SetWasmRuntime(rt)
+		svc.cipher = &secrets.Cipher{}
+
+		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
+			Image:   "demo.wasm",
+			Runtime: models.RuntimeWasm,
+			Mounts: []models.MountSpec{{
+				Type:   models.MountTypeS3,
+				Target: "/data",
+				Source: "bucket",
+			}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "encrypt mounts") {
+			t.Fatalf("CreateSandbox() error = %v, want mount sealing failure", err)
+		}
+		if rt.createCalls != 0 {
+			t.Fatalf("runtime Create calls = %d, want 0 when mount sealing fails", rt.createCalls)
+		}
+	})
+
+	t.Run("caddy failure rolls back runtime", func(t *testing.T) {
+		ctx := context.Background()
+		rt := &wasmRecordingRuntime{}
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.admitter = nil
+		svc.SetWasmRuntime(rt)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		t.Cleanup(server.Close)
+		svc.caddy = caddy.New(config.Config{
+			EnableCaddy:       true,
+			CaddyAdminURL:     server.URL,
+			CaddyServerID:     "srv0",
+			HTTPClientTimeout: time.Second,
+		})
+
+		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
+			Image:   "demo.wasm",
+			Runtime: models.RuntimeWasm,
+		})
+		if err == nil || !strings.Contains(err.Error(), "patch caddy route failed") {
+			t.Fatalf("CreateSandbox() error = %v, want caddy failure", err)
+		}
+		if rt.createCalls != 1 {
+			t.Fatalf("runtime Create calls = %d, want 1", rt.createCalls)
+		}
+		if rt.destroyCalls != 1 {
+			t.Fatalf("runtime Destroy calls = %d, want 1 rollback", rt.destroyCalls)
+		}
+	})
+
+	t.Run("custom domain conflict rolls back runtime", func(t *testing.T) {
+		ctx := context.Background()
+		rt := &wasmRecordingRuntime{}
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.cfg.EnableCustomDomains = true
+		svc.cfg.Domain = "sandbox.test"
+		svc.admitter = nil
+		svc.SetWasmRuntime(rt)
+		svc.AttachCluster(&customDomainConflictCluster{
+			Noop: cluster.NewNoop("self", "http://self", "sandbox.test"),
+		})
+
+		_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
+			Image:         "demo.wasm",
+			Runtime:       models.RuntimeWasm,
+			CustomDomains: []string{"api.example.com", "www.example.com"},
+		}, "sb-wasm-domains")
+		if err == nil {
+			t.Fatal("expected custom-domain conflict")
+		}
+		if rt.createCalls != 1 {
+			t.Fatalf("runtime Create calls = %d, want 1", rt.createCalls)
+		}
+		if rt.destroyCalls != 1 {
+			t.Fatalf("runtime Destroy calls = %d, want 1 rollback", rt.destroyCalls)
+		}
+		if _, err := st.Get(ctx, "sb-wasm-domains"); err == nil {
+			t.Fatal("failed create should not leave a sandbox row")
+		}
+	})
 }

@@ -1057,6 +1057,92 @@ func TestReconcileMultiSandboxMixedStates(t *testing.T) {
 	}
 }
 
+func TestReconcileMixedRuntimeStates(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	dockerStartedID := "sb-docker-started"
+	dockerMissingID := "sb-docker-missing"
+	fireStartedID := "sb-fire-started"
+	fireMissingID := "sb-fire-missing"
+	wasmStartedID := "sb-wasm-started"
+	wasmMissingID := "sb-wasm-missing"
+
+	managedDocker := map[string]*models.SandboxRuntimeState{
+		dockerStartedID: {SandboxID: dockerStartedID, ContainerID: "ctr-" + dockerStartedID, ContainerIP: "10.0.0.50", Status: models.SandboxStatusStarted},
+		"docker-orphan": {SandboxID: "docker-orphan", ContainerID: "ctr-docker-orphan", ContainerIP: "10.0.0.51", Status: models.SandboxStatusStarted},
+	}
+	managedFire := map[string]*models.SandboxRuntimeState{
+		fireStartedID: {SandboxID: fireStartedID, ContainerID: "ctr-" + fireStartedID, ContainerIP: "10.0.0.52", Status: models.SandboxStatusStarted},
+		"fire-orphan": {SandboxID: "fire-orphan", ContainerID: "ctr-fire-orphan", ContainerIP: "10.0.0.53", Status: models.SandboxStatusStarted},
+	}
+	managedWasm := map[string]*models.SandboxRuntimeState{
+		wasmStartedID: {SandboxID: wasmStartedID, ContainerID: "ctr-" + wasmStartedID, ContainerIP: "10.0.0.54", Status: models.SandboxStatusStarted},
+		"wasm-orphan": {SandboxID: "wasm-orphan", ContainerID: "ctr-wasm-orphan", ContainerIP: "10.0.0.55", Status: models.SandboxStatusStarted},
+	}
+
+	svc, admitter, st := newCapacityHarness(t, managedDocker, nil)
+	svc.cfg.EnableFirecracker = true
+	svc.cfg.EnableWasm = true
+	svc.SetFirecrackerRuntime(&fakeCapacityRuntime{managed: managedFire})
+	svc.SetWasmRuntime(&fakeCapacityRuntime{managed: managedWasm})
+
+	seed := func(id, runtime string, cpu float64, mem int, ip string, networkBlockAll bool) {
+		t.Helper()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:              id,
+			Image:           "ubuntu:22.04",
+			Status:          models.SandboxStatusStarted,
+			ContainerID:     "ctr-" + id,
+			ContainerIP:     ip,
+			Runtime:         runtime,
+			CPU:             cpu,
+			MemoryMB:        mem,
+			DiskGB:          5,
+			NetworkBlockAll: networkBlockAll,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+			LastActiveAt:    now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	seed(dockerStartedID, models.RuntimeDocker, 1, 256, "10.0.0.50", false)
+	seed(dockerMissingID, models.RuntimeDocker, 4, 1024, "10.0.0.56", false)
+	seed(fireStartedID, models.RuntimeFirecracker, 2, 512, "10.0.0.52", true)
+	seed(fireMissingID, models.RuntimeFirecracker, 5, 1280, "10.0.0.57", false)
+	seed(wasmStartedID, models.RuntimeWasm, 3, 768, "10.0.0.54", false)
+	seed(wasmMissingID, models.RuntimeWasm, 6, 1536, "10.0.0.58", false)
+
+	admitter.Reserve(dockerMissingID, capacity.Request{CPU: 4, MemoryMB: 1024})
+	admitter.Reserve(fireMissingID, capacity.Request{CPU: 5, MemoryMB: 1280})
+	admitter.Reserve(wasmMissingID, capacity.Request{CPU: 6, MemoryMB: 1536})
+
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	snap := admitter.Snapshot()
+	if snap.SandboxesActive != 3 || snap.ReservedCPU != 6 {
+		t.Fatalf("mixed-runtime reconcile footprint: %+v", snap)
+	}
+	for _, id := range []string{dockerMissingID, fireMissingID, wasmMissingID} {
+		if _, err := st.Get(ctx, id); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("%s should have been destroyed, got %v", id, err)
+		}
+	}
+	for _, id := range []string{dockerStartedID, fireStartedID, wasmStartedID} {
+		got, err := st.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if got.Status != models.SandboxStatusStarted {
+			t.Fatalf("%s status = %s, want started", id, got.Status)
+		}
+	}
+}
+
 // TestStartEventReserveBeforeCaddyUpsert: the start-event handler must
 // Reserve before it tries to upsert caddy routes, otherwise a transient
 // caddy hiccup would let the container run un-billed. The proxy doesn't

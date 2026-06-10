@@ -11,6 +11,28 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
+type stepRandReader struct {
+	remaining int
+}
+
+func (r *stepRandReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, errors.New("rand exhausted")
+	}
+	n := len(p)
+	if n > r.remaining {
+		n = r.remaining
+	}
+	for i := 0; i < n; i++ {
+		p[i] = byte(i)
+	}
+	r.remaining -= n
+	if n < len(p) {
+		return n, errors.New("rand exhausted")
+	}
+	return n, nil
+}
+
 // Covers small pure helpers that carry rationale comments but had no
 // direct unit coverage: ID generation shape, audit-field shaping, the
 // stopMode String mapping, and the coalescer debug stringer.

@@ -302,6 +302,109 @@ func TestAllocateHostPortPreferredUnavailableParksInsteadOfReallocating(t *testi
 	}
 }
 
+func TestAllocateHostPortBranchCoverage(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	t.Run("misconfigured pool", func(t *testing.T) {
+		svc, _, _ := newCapacityHarness(t, nil, nil)
+		svc.cfg.L4PortRangeStart = 30010
+		svc.cfg.L4PortRangeEnd = 30009
+		_, _, _, err := svc.allocateHostPort(ctx, "sb-misconfigured", 5432, now, 0)
+		if err == nil || !strings.Contains(err.Error(), "misconfigured") {
+			t.Fatalf("allocateHostPort() error = %v, want misconfigured pool", err)
+		}
+	})
+
+	t.Run("preferred outside range", func(t *testing.T) {
+		svc, _, _ := newCapacityHarness(t, nil, nil)
+		svc.cfg.L4PortRangeStart = 32000
+		svc.cfg.L4PortRangeEnd = 32010
+		_, _, _, err := svc.allocateHostPort(ctx, "sb-preferred", 5432, now, 31999)
+		if err == nil || !strings.Contains(err.Error(), "outside configured L4 range") {
+			t.Fatalf("allocateHostPort() error = %v, want outside-range reject", err)
+		}
+	})
+
+	t.Run("reuses existing tcp reservation", func(t *testing.T) {
+		svc, _, st := newCapacityHarness(t, nil, nil)
+		svc.cfg.L4PortRangeStart = 33000
+		svc.cfg.L4PortRangeEnd = 33010
+		const sandboxID = "sb-reuse"
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:          sandboxID,
+			Image:       "postgres:16",
+			Status:      models.SandboxStatusStarted,
+			ContainerID: "ctr-reuse",
+			ContainerIP: "10.0.0.42",
+			CPU:         1,
+			MemoryMB:    512,
+			Runtime:     models.RuntimeDocker,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed sandbox: %v", err)
+		}
+		if err := st.UpsertPort(ctx, models.ExposedPort{
+			SandboxID: sandboxID,
+			Port:      5432,
+			Protocol:  models.ExposedPortProtocolTCP,
+			HostPort:  33005,
+			PublicURL: "tcp://sandbox.example.com:33005",
+			CreatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed exposure: %v", err)
+		}
+
+		hp, url, reused, err := svc.allocateHostPort(ctx, sandboxID, 5432, now, 33005)
+		if err != nil {
+			t.Fatalf("allocateHostPort() error = %v", err)
+		}
+		if !reused {
+			t.Fatal("expected existing tcp host port to be reused")
+		}
+		if hp != 33005 || url != "tcp://sandbox.example.com:33005" {
+			t.Fatalf("reuse = (%d, %q), want existing reservation", hp, url)
+		}
+	})
+
+	t.Run("existing non-tcp conflicts", func(t *testing.T) {
+		svc, _, st := newCapacityHarness(t, nil, nil)
+		svc.cfg.L4PortRangeStart = 34000
+		svc.cfg.L4PortRangeEnd = 34010
+		const sandboxID = "sb-conflict"
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:          sandboxID,
+			Image:       "postgres:16",
+			Status:      models.SandboxStatusStarted,
+			ContainerID: "ctr-conflict",
+			ContainerIP: "10.0.0.43",
+			CPU:         1,
+			MemoryMB:    512,
+			Runtime:     models.RuntimeDocker,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed sandbox: %v", err)
+		}
+		if err := st.UpsertPort(ctx, models.ExposedPort{
+			SandboxID: sandboxID,
+			Port:      5432,
+			Protocol:  models.ExposedPortProtocolHTTP,
+			HostPort:  34005,
+			PublicURL: "https://sandbox.example.com:34005",
+			CreatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed exposure: %v", err)
+		}
+
+		_, _, _, err := svc.allocateHostPort(ctx, sandboxID, 5432, now, 34005)
+		if err == nil || !strings.Contains(err.Error(), "already exposed as http") {
+			t.Fatalf("allocateHostPort() error = %v, want protocol conflict", err)
+		}
+	})
+}
+
 func TestDataPlaneHostForPlacementPrefersDedicatedHost(t *testing.T) {
 	p := cluster.Placement{
 		OwnerAPIURL:        "http://shared-api-lb.internal:21212",

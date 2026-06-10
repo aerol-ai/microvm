@@ -207,6 +207,36 @@ func TestCreateTemplate_DisabledRejects(t *testing.T) {
 	}
 }
 
+func TestCreateTemplateValidationAndIdentifierErrors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("builder missing", func(t *testing.T) {
+		svc, _, _ := newTemplateHarness(t)
+		_, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{Image: "docker://alpine"})
+		if err == nil || !contains(err.Error(), "template builder is not configured") {
+			t.Fatalf("CreateTemplate() error = %v, want missing builder", err)
+		}
+	})
+
+	t.Run("blank image", func(t *testing.T) {
+		svc, _, _ := newTemplateHarness(t)
+		svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+		_, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{Image: "   "})
+		if err == nil || !contains(err.Error(), "image is required") {
+			t.Fatalf("CreateTemplate() error = %v, want blank image rejection", err)
+		}
+	})
+
+	t.Run("negative min size", func(t *testing.T) {
+		svc, _, _ := newTemplateHarness(t)
+		svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+		_, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{Image: "docker://alpine", MinSizeMiB: -1})
+		if err == nil || !contains(err.Error(), "min_size_mib must be >= 0") {
+			t.Fatalf("CreateTemplate() error = %v, want min_size_mib rejection", err)
+		}
+	})
+}
+
 // TestDeleteTemplate_InUseRejected pins the IRON RULE: an active
 // sandbox holding template_id blocks the row delete with
 // ErrTemplateInUse. The Phase 2 API maps this to 409 so the operator
@@ -355,6 +385,25 @@ func TestRunTemplateGC_RemovesEligible(t *testing.T) {
 	}
 	if _, err := st.GetTemplate(ctx, "tpl-warm"); err != nil {
 		t.Fatalf("VMM-referenced row should survive: %v", err)
+	}
+}
+
+func TestRunTemplateGCDuringStoreFailure(t *testing.T) {
+	svc, st, _ := newTemplateHarness(t)
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	svc.runTemplateGC(context.Background(), time.Now())
+}
+
+func TestWriteTemplateManifestRejectsDirectoryPath(t *testing.T) {
+	if err := writeTemplateManifest(t.TempDir(), templateManifest{
+		SourceImage:      "docker://alpine:3.19",
+		SnapshotChecksum: "sha256:deadbeef",
+		VsockCID:         42,
+		CreatedAt:        time.Now().UTC(),
+	}); err == nil {
+		t.Fatal("writeTemplateManifest should fail when asked to write to a directory")
 	}
 }
 

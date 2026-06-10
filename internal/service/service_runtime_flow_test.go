@@ -19,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -781,6 +782,98 @@ func TestCreateSandboxValidationAndRollbackPaths(t *testing.T) {
 			t.Fatalf("conflicting sandbox leaked into store: %v", err)
 		}
 	})
+}
+
+func TestCreateSandboxSealMountsFailure(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, _, _ := newServiceRuntimeHarness(t, rt)
+	svc.admitter = nil
+	svc.cipher = &secrets.Cipher{}
+
+	_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
+		Image: "alpine:3.20",
+		Mounts: []models.MountSpec{
+			{Type: models.MountTypeS3, Target: "/data", Source: "bucket"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "encrypt mounts") {
+		t.Fatalf("CreateSandbox() error = %v, want mount sealing failure", err)
+	}
+	if rt.createCalls != 0 {
+		t.Fatalf("runtime Create calls = %d, want 0 when mount sealing fails", rt.createCalls)
+	}
+}
+
+func TestCreateSandboxSealRegistryFailureRollsBackRuntime(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	svc.admitter = nil
+	svc.cipher = &secrets.Cipher{}
+
+	_, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
+		Image: "alpine:3.20",
+		Registry: &models.RegistryAuth{
+			Server:   "ghcr.io",
+			Username: "alice",
+			Password: "top-secret",
+		},
+	}, "sb-registry-fail")
+	if err == nil || !strings.Contains(err.Error(), "encrypt registry auth") {
+		t.Fatalf("CreateSandboxWithID() error = %v, want registry sealing failure", err)
+	}
+	if rt.createCalls != 1 {
+		t.Fatalf("runtime Create calls = %d, want 1 before seal failure", rt.createCalls)
+	}
+	if len(rt.destroyIDs) != 1 || rt.destroyIDs[0] != "sb-registry-fail" {
+		t.Fatalf("runtime Destroy ids = %v, want [sb-registry-fail]", rt.destroyIDs)
+	}
+	if _, err := st.Get(ctx, "sb-registry-fail"); err == nil {
+		t.Fatal("failed create should not leave a sandbox row")
+	}
+}
+
+func TestCreateSandboxWithCustomDomainsPersistsRows(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	svc.cfg.EnableCustomDomains = true
+	svc.cfg.Domain = "sandbox.test"
+
+	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
+		Image:         "alpine:3.20",
+		Name:          "custom-domains",
+		CustomDomains: []string{"api.external.test", "www.external.test"},
+	}, "sb-custom-domains")
+	if err != nil {
+		t.Fatalf("CreateSandboxWithID() error = %v", err)
+	}
+	if rt.createCalls != 1 {
+		t.Fatalf("runtime Create calls = %d, want 1", rt.createCalls)
+	}
+	if resp.Runtime != models.RuntimeDocker {
+		t.Fatalf("response runtime = %q, want docker", resp.Runtime)
+	}
+	stored, err := st.Get(ctx, resp.ID)
+	if err != nil {
+		t.Fatalf("store.Get() error = %v", err)
+	}
+	if len(stored.CustomDomains) != 2 {
+		t.Fatalf("stored custom domains = %+v, want 2 rows", stored.CustomDomains)
+	}
+	gotHosts := map[string]struct{}{}
+	for _, cd := range stored.CustomDomains {
+		gotHosts[cd.Hostname] = struct{}{}
+		if cd.TargetPort != 0 {
+			t.Fatalf("custom domain target_port = %d, want toolbox default 0", cd.TargetPort)
+		}
+	}
+	for _, host := range []string{"api.external.test", "www.external.test"} {
+		if _, ok := gotHosts[host]; !ok {
+			t.Fatalf("missing persisted custom domain %q in %+v", host, stored.CustomDomains)
+		}
+	}
 }
 
 func TestExposeAndUnexposePortProtocols(t *testing.T) {

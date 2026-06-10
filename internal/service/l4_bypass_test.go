@@ -205,6 +205,25 @@ func dialsAddress(server map[string]any) string {
 	return dial
 }
 
+func tlsDialAddress(server map[string]any) string {
+	handles, _ := server["handle"].([]any)
+	if len(handles) < 2 {
+		return ""
+	}
+	handle, _ := handles[1].(map[string]any)
+	ups, _ := handle["upstreams"].([]any)
+	if len(ups) == 0 {
+		return ""
+	}
+	upstream, _ := ups[0].(map[string]any)
+	dials, _ := upstream["dial"].([]any)
+	if len(dials) == 0 {
+		return ""
+	}
+	dial, _ := dials[0].(string)
+	return dial
+}
+
 // proxyProtocolFor returns the proxy_protocol setting on the first
 // handle of the first route — wake-aware TCP sets "v1" so sandboxd can
 // recover the hostPort from the PROXY v1 header; direct upstreams omit
@@ -376,6 +395,73 @@ func TestInstallTCPPortRouteNonServerlessAlwaysDirect(t *testing.T) {
 	}
 	if got := proxyProtocolFor(srv); got != "" {
 		t.Fatalf("non-serverless must always be direct; got proxy_protocol %q", got)
+	}
+}
+
+func TestInstallTLSPortRouteDirectWakeAndNone(t *testing.T) {
+	fake := newL4Fake()
+	svc := newL4TestService(t, fake, config.Config{
+		EnableServerless:            true,
+		L4WakeDirectBypassEnabled:   true,
+		TLSWakeListenerCloseDelay:   0,
+		HTTPWakeDirectBypassEnabled: true,
+	})
+	ctx := context.Background()
+
+	directID := testTLSRouteID("tls-direct", 8443)
+	fake.tlsRoutes[directID] = map[string]any{"@id": directID}
+	if err := svc.installTLSPortRoute(ctx, &models.Sandbox{
+		ID:          "tls-direct",
+		Status:      models.SandboxStatusStarted,
+		ContainerIP: "10.0.0.60",
+		Lifecycle:   models.Lifecycle{Serverless: true},
+	}, 8443); err != nil {
+		t.Fatalf("installTLSPortRoute direct: %v", err)
+	}
+	if got := tlsDialAddress(fake.tlsRoutes[directID]); got != "10.0.0.60:8443" {
+		t.Fatalf("direct TLS dial = %q, want containerIP:port", got)
+	}
+
+	wakeID := testTLSRouteID("tls-wake", 8443)
+	fake.tlsRoutes[wakeID] = map[string]any{"@id": wakeID}
+	wakePath, err := svc.ensureTLSWakeListener("tls-wake", 8443)
+	if err != nil {
+		t.Fatalf("ensureTLSWakeListener(wake): %v", err)
+	}
+	if err := svc.installTLSPortRoute(ctx, &models.Sandbox{
+		ID:        "tls-wake",
+		Status:    models.SandboxStatusStopped,
+		WakeArmed: true,
+		Lifecycle: models.Lifecycle{Serverless: true},
+	}, 8443); err != nil {
+		t.Fatalf("installTLSPortRoute wake: %v", err)
+	}
+	if got := tlsDialAddress(fake.tlsRoutes[wakeID]); got != "unix//"+strings.TrimPrefix(wakePath, "/") {
+		t.Fatalf("wake TLS dial = %q, want unix wake socket", got)
+	}
+
+	noneID := testTLSRouteID("tls-none", 8443)
+	fake.tlsRoutes[noneID] = map[string]any{"@id": noneID}
+	if _, err := svc.ensureTLSWakeListener("tls-none", 8443); err != nil {
+		t.Fatalf("ensureTLSWakeListener(none): %v", err)
+	}
+	if err := svc.installTLSPortRoute(ctx, &models.Sandbox{
+		ID:        "tls-none",
+		Status:    models.SandboxStatusStopped,
+		WakeArmed: false,
+		Lifecycle: models.Lifecycle{Serverless: true},
+	}, 8443); err != nil {
+		t.Fatalf("installTLSPortRoute none: %v", err)
+	}
+	if fake.tlsRouteDeletes[noneID] == 0 {
+		t.Fatalf("none TLS route should be deleted, deletes=%+v", fake.tlsRouteDeletes)
+	}
+	if _, ok := svc.l4WakeTLS[tlsWakeKey("tls-none", 8443)]; ok {
+		t.Fatal("none shape should close the wake listener")
+	}
+	svc.closeAllTLSWakeListeners()
+	if len(svc.l4WakeTLS) != 0 {
+		t.Fatalf("closeAllTLSWakeListeners should clear all listeners, got %d", len(svc.l4WakeTLS))
 	}
 }
 

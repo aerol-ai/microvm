@@ -3,13 +3,18 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // fireRecordingRuntime is a minimal runtime.Runtime test double for the
@@ -29,7 +34,8 @@ type fireRecordingRuntime struct {
 	// the service layer's row build sees the right id). Lets one fake
 	// type cover both the "driver errored" and "driver succeeded"
 	// paths.
-	ok *models.SandboxRuntimeState
+	ok           *models.SandboxRuntimeState
+	destroyCalls int
 }
 
 func (r *fireRecordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
@@ -50,8 +56,11 @@ func (r *fireRecordingRuntime) Start(context.Context, string) (*models.SandboxRu
 	return nil, errors.New("not used")
 }
 
-func (r *fireRecordingRuntime) Stop(context.Context, string) error             { return nil }
-func (r *fireRecordingRuntime) Destroy(context.Context, *models.Sandbox) error { return nil }
+func (r *fireRecordingRuntime) Stop(context.Context, string) error { return nil }
+func (r *fireRecordingRuntime) Destroy(context.Context, *models.Sandbox) error {
+	r.destroyCalls++
+	return nil
+}
 func (r *fireRecordingRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	return "", nil
 }
@@ -311,6 +320,85 @@ func TestFirecrackerDispatch_TemplateIDRejectsExplicitDockerRuntime(t *testing.T
 	}
 }
 
+func TestFirecrackerDispatch_RegistrySealFailureRollsBackRuntime(t *testing.T) {
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fcreg/api.sock",
+			ContainerIP: "172.16.0.8",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
+	svc.cipher = &secrets.Cipher{}
+	svc.SetFirecrackerRuntime(rt)
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:    "alpine:3.20",
+		Runtime:  models.RuntimeFirecracker,
+		CPU:      1,
+		MemoryMB: 256,
+		DiskGB:   1,
+		Registry: &models.RegistryAuth{
+			Server:   "ghcr.io",
+			Username: "alice",
+			Password: "top-secret",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "encrypt registry auth") {
+		t.Fatalf("CreateSandbox() error = %v, want registry sealing failure", err)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("driver.Create calls = %d, want 1", rt.calls)
+	}
+	if rt.destroyCalls != 1 {
+		t.Fatalf("driver.Destroy calls = %d, want 1 rollback", rt.destroyCalls)
+	}
+	if rows, err := st.List(context.Background()); err != nil || len(rows) != 0 {
+		t.Fatalf("store rows after failed create = %v, err=%v, want empty", rows, err)
+	}
+}
+
+func TestFirecrackerDispatch_CustomDomainsPersistOnCreate(t *testing.T) {
+	ctx := context.Background()
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fc-custom-domains/api.sock",
+			ContainerIP: "172.16.0.9",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.cfg.EnableCustomDomains = true
+	svc.cfg.Domain = "sandbox.test"
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(rt)
+
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
+		Image:         "alpine:3.20",
+		Runtime:       models.RuntimeFirecracker,
+		CustomDomains: []string{"api.external.test", "www.external.test"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("driver.Create calls = %d, want 1", rt.calls)
+	}
+	if resp.Runtime != models.RuntimeFirecracker {
+		t.Fatalf("response runtime = %q, want firecracker", resp.Runtime)
+	}
+	stored, err := st.Get(ctx, resp.ID)
+	if err != nil {
+		t.Fatalf("store.Get() error = %v", err)
+	}
+	if len(stored.CustomDomains) != 2 {
+		t.Fatalf("stored custom domains = %+v, want 2 rows", stored.CustomDomains)
+	}
+}
+
 // TestFirecrackerDispatch_RejectsMountsForNow confirms the explicit
 // Phase 1 rejection of mounts on the firecracker path. Once virtio-fs
 // support lands, this test becomes a positive coverage point.
@@ -333,6 +421,83 @@ func TestFirecrackerDispatch_RejectsMountsForNow(t *testing.T) {
 	}
 	if rt.calls != 0 {
 		t.Errorf("driver should not be called when mounts are rejected; calls=%d", rt.calls)
+	}
+}
+
+func TestFirecrackerDispatch_RollsBackWhenCaddyUpsertFails(t *testing.T) {
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fc-route/api.sock",
+			ContainerIP: "172.16.0.5",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(rt)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	svc.caddy = caddy.New(config.Config{
+		EnableCaddy:       true,
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		HTTPClientTimeout: time.Second,
+	})
+
+	_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Image:   "alpine:3.20",
+		Runtime: models.RuntimeFirecracker,
+	})
+	if err == nil || !strings.Contains(err.Error(), "patch caddy route failed") {
+		t.Fatalf("expected caddy failure, got %v", err)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("driver Create calls = %d, want 1", rt.calls)
+	}
+	if rt.destroyCalls != 1 {
+		t.Fatalf("driver Destroy calls = %d, want 1 rollback", rt.destroyCalls)
+	}
+}
+
+func TestFirecrackerDispatch_RollsBackWhenCustomDomainPersistenceFails(t *testing.T) {
+	rt := &fireRecordingRuntime{
+		ok: &models.SandboxRuntimeState{
+			ContainerID: "/var/run/sb/fc-domains/api.sock",
+			ContainerIP: "172.16.0.6",
+			Status:      models.SandboxStatusStarted,
+		},
+	}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableFirecracker = true
+	svc.cfg.EnableCustomDomains = true
+	svc.cfg.Domain = "sandbox.test"
+	svc.admitter = nil
+	svc.SetFirecrackerRuntime(rt)
+	svc.AttachCluster(&customDomainConflictCluster{
+		Noop: cluster.NewNoop("self", "http://self", "sandbox.test"),
+	})
+
+	resp, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+		Image:         "alpine:3.20",
+		Runtime:       models.RuntimeFirecracker,
+		CustomDomains: []string{"api.example.com", "www.example.com"},
+	}, "sb-fc-domains")
+	t.Logf("custom-domain create error: %v", err)
+	if err == nil {
+		t.Fatalf("expected custom-domain conflict, got response %+v", resp)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("driver Create calls = %d, want 1", rt.calls)
+	}
+	if rt.destroyCalls != 1 {
+		t.Fatalf("driver Destroy calls = %d, want 1 rollback", rt.destroyCalls)
+	}
+	if _, err := st.Get(context.Background(), "sb-fc-domains"); err == nil {
+		t.Fatal("failed create should not leave a sandbox row")
 	}
 }
 
