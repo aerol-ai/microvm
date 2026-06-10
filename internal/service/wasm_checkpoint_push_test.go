@@ -47,3 +47,42 @@ func TestWasmCheckpointPusherPushOnceRequiresPaths(t *testing.T) {
 		t.Fatal("expected push error without PAT file")
 	}
 }
+
+func TestWasmCheckpointPusherPullOnce(t *testing.T) {
+	p, err := NewWasmCheckpointPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.example.com",
+		ClusterID: "c1",
+		PATPath:   filepath.Join(t.TempDir(), "nonexistent-pat"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewWasmCheckpointPusher: %v", err)
+	}
+
+	err = p.PullOnce(context.Background(), "", "/tmp")
+	if err == nil || err.Error() != "wasm checkpoint pull: registry ref and destination dir required" {
+		t.Fatalf("expected required params error, got %v", err)
+	}
+
+	err = p.PullOnce(context.Background(), "test://ref", "/tmp/x")
+	if err == nil {
+		t.Fatal("expected pull error without PAT file")
+	}
+}
+
+func TestWasmCheckpointPusherDeleteRef(t *testing.T) {
+	p, err := NewWasmCheckpointPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.example.com",
+		ClusterID: "c1",
+		PATPath:   filepath.Join(t.TempDir(), "nonexistent-pat"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewWasmCheckpointPusher: %v", err)
+	}
+
+	err = p.DeleteRef(context.Background(), "test://ref")
+	if err == nil {
+		t.Fatal("expected delete error without PAT file")
+	}
+}

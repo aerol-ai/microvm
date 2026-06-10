@@ -2,13 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/gorilla/websocket"
 )
 
 func TestSessionsRoute_DispatchAndErrors(t *testing.T) {
@@ -177,5 +184,151 @@ func TestSessionsRoute_DisabledManagerBranches(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("get with disabled sessions status = %d", rr.Code)
+	}
+}
+
+func TestSessionsRoute_DisabledManagerAdditionalBranches(t *testing.T) {
+	srv := &server{}
+	h := srv.routes()
+
+	cases := []struct {
+		name string
+		req  *http.Request
+		want int
+	}{
+		{name: "delete", req: httptest.NewRequest(http.MethodDelete, "/sessions/abc", nil), want: http.StatusNotFound},
+		{name: "signal", req: httptest.NewRequest(http.MethodPost, "/sessions/abc/signal", strings.NewReader(`{"signal":"TERM"}`)), want: http.StatusNotFound},
+		{name: "resize", req: httptest.NewRequest(http.MethodPost, "/sessions/abc/resize", strings.NewReader(`{"cols":1,"rows":1}`)), want: http.StatusNotFound},
+		{name: "log", req: httptest.NewRequest(http.MethodGet, "/sessions/abc/log", nil), want: http.StatusNotFound},
+		{name: "recording", req: httptest.NewRequest(http.MethodGet, "/sessions/abc/recording", nil), want: http.StatusNotFound},
+		{name: "attach", req: httptest.NewRequest(http.MethodGet, "/sessions/abc/attach", nil), want: http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, tc.req)
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rr.Code, tc.want)
+			}
+		})
+	}
+}
+
+type errWriter struct{}
+
+func (errWriter) Header() http.Header         { return http.Header{} }
+func (errWriter) WriteHeader(statusCode int)  {}
+func (errWriter) Write(p []byte) (int, error) { return 0, errors.New("write failed") }
+
+func TestCopyToResponseAndAttachmentErrorBranches(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "record.cast")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+
+	if total, err := copyToResponse(errWriter{}, f); err == nil || total != 0 {
+		t.Fatalf("copyToResponse error branch = (%d, %v), want write failure", total, err)
+	}
+
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	if total, err := copyToResponse(rec, f); !errors.Is(err, io.EOF) || total == 0 {
+		t.Fatalf("copyToResponse success = (%d, %v), want bytes with EOF", total, err)
+	}
+
+	srv := newDaytonaTestServer(t)
+	sess, err := srv.sessions.Create(context.Background(), models.CreateSessionRequest{Name: "attach-me", Command: "sleep 1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = srv.sessions.Delete(sess.ID()) }()
+
+	attachReq := httptest.NewRequest(http.MethodGet, "/sessions/"+sess.ID()+"/attach", nil)
+	attachRec := httptest.NewRecorder()
+	srv.handleSessionAttach(attachRec, attachReq, sess.ID())
+}
+
+func TestHandleSessionRecordingMissingFile(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+	sess, err := srv.sessions.Create(context.Background(), models.CreateSessionRequest{Name: "rec", Command: "true"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	path := sess.RecordingPath()
+	if path == "" {
+		t.Fatal("expected recording path")
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/sessions/"+sess.ID()+"/recording", nil)
+	rec := httptest.NewRecorder()
+	srv.handleSessionRecording(rec, req, sess.ID())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("handleSessionRecording missing file status = %d, want 500", rec.Code)
+	}
+}
+
+func TestSessionAttachStreamsAndExits(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !srv.handleSessionsRoute(w, r) {
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(httpSrv.Close)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(`{"name":"attach","command":"printf first; sleep 0.2; printf second"}`))
+	createRec := httptest.NewRecorder()
+	httpSrv.Config.Handler.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created models.Session
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	wsURL := strings.Replace(httpSrv.URL, "http://", "ws://", 1) + "/sessions/" + created.ID + "/attach"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	var collected []byte
+	seenExit := false
+	for !seenExit {
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read attach frame: %v", err)
+		}
+		switch msgType {
+		case websocket.BinaryMessage:
+			collected = append(collected, payload...)
+		case websocket.TextMessage:
+			var ctrl sessionAttachControlOut
+			if err := json.Unmarshal(payload, &ctrl); err != nil {
+				t.Fatalf("decode exit control: %v", err)
+			}
+			if ctrl.Type == "exit" {
+				seenExit = true
+			}
+		}
+	}
+	payload := bytes.ReplaceAll(collected, []byte{streamFramePrefixStdoutSession}, nil)
+	payload = bytes.ReplaceAll(payload, []byte{streamFramePrefixStderrSession}, nil)
+	if !strings.Contains(string(payload), "first") || !strings.Contains(string(payload), "second") {
+		t.Fatalf("attach payload = %q", payload)
 	}
 }

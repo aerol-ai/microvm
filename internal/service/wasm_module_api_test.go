@@ -142,3 +142,54 @@ func TestDeleteWasmModule_InUseRejected(t *testing.T) {
 		t.Fatalf("DeleteWasmModule error = %v, want ErrWasmModuleInUse", err)
 	}
 }
+
+func TestListWasmModules(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, _ := store.Open(filepath.Join(dir, "state.db"))
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	_ = st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+		ID: "mod-1", ModuleRef: "file://a", Status: "ready", CreatedAt: now, UpdatedAt: now,
+	})
+	_ = st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+		ID: "mod-2", ModuleRef: "file://b", Status: "ready", CreatedAt: now, UpdatedAt: now,
+	})
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := New(config.Config{EnableWasm: true}, logger, st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+
+	mods, err := svc.ListWasmModules(ctx)
+	if err != nil {
+		t.Fatalf("ListWasmModules: %v", err)
+	}
+	if len(mods) != 2 {
+		t.Fatalf("Expected 2 modules, got %d", len(mods))
+	}
+}
+
+func TestDeleteWasmModule(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, _ := store.Open(filepath.Join(dir, "state.db"))
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	_ = st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+		ID: "mod-1", ModuleRef: "file://a", Status: "ready", CreatedAt: now, UpdatedAt: now,
+	})
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := New(config.Config{EnableWasm: true}, logger, st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+
+	err := svc.DeleteWasmModule(ctx, "mod-1")
+	if err != nil {
+		t.Fatalf("DeleteWasmModule: %v", err)
+	}
+
+	_, err = svc.GetWasmModule(ctx, "mod-1")
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+}

@@ -19,6 +19,19 @@ func (r *wasmNetCounterRuntime) DrainNetworkByteCounters() map[string]struct{ By
 	return r.deltas
 }
 
+type fakeWasmNetworkPolicySink struct {
+	wasmRecordingRuntime
+	lastSandboxID string
+	lastBlockIn   bool
+	lastBlockOut  bool
+}
+
+func (f *fakeWasmNetworkPolicySink) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) {
+	f.lastSandboxID = sandboxID
+	f.lastBlockIn = blockIngress
+	f.lastBlockOut = blockEgress
+}
+
 func TestDrainWasmNetworkCountersRecordsSamples(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(t.TempDir() + "/test.db")
@@ -54,5 +67,28 @@ func TestDrainWasmNetworkCountersRecordsSamples(t *testing.T) {
 	}
 	if got.NetworkBytesIn != 11 || got.NetworkBytesOut != 22 {
 		t.Fatalf("counters = in:%d out:%d, want 11/22", got.NetworkBytesIn, got.NetworkBytesOut)
+	}
+}
+
+func TestSyncWasmNetworkPolicy(t *testing.T) {
+	svc := New(config.Config{EnableWasm: true}, nil, nil, nil, nil, nil, nil, nil, nil)
+	sink := &fakeWasmNetworkPolicySink{}
+	svc.SetWasmRuntime(sink)
+
+	sb := &models.Sandbox{
+		ID:              "sb-policy",
+		Runtime:         models.RuntimeWasm,
+		NetworkBlockAll: false,
+	}
+
+	svc.syncWasmNetworkPolicy(sb, true, false)
+	if sink.lastSandboxID != "sb-policy" || !sink.lastBlockIn || sink.lastBlockOut {
+		t.Fatalf("syncWasmNetworkPolicy failed: id=%s in=%v out=%v", sink.lastSandboxID, sink.lastBlockIn, sink.lastBlockOut)
+	}
+
+	sb.NetworkBlockAll = true
+	svc.syncWasmNetworkPolicy(sb, false, false)
+	if !sink.lastBlockIn || !sink.lastBlockOut {
+		t.Fatalf("syncWasmNetworkPolicy failed on blockAll: in=%v out=%v", sink.lastBlockIn, sink.lastBlockOut)
 	}
 }

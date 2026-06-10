@@ -132,8 +132,6 @@ func (h *wazeroNetHost) tcpClose(_ context.Context, _ api.Module, stack []uint64
 }
 
 func (h *wazeroNetHost) hookMeter() ByteMeter {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.hook == nil {
 		return nil
 	}

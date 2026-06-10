@@ -603,3 +603,174 @@ func TestHandleDaytonaSessionCommandLogsFollowReplaysFinishedCommand(t *testing.
 		t.Fatalf("replay payload = %q, want to contain 'replay-payload'", payload)
 	}
 }
+
+func TestDaytonaCommandStreamHelpers(t *testing.T) {
+	var nilStream *daytonaCommandStream
+	nilStream.broadcast(sessions.StreamStdout, nil)
+	nilStream.finish()
+	initial, ch, finished := nilStream.subscribe()
+	if !finished || len(initial) != 0 {
+		t.Fatalf("nil subscribe = (%q, %v), want closed/empty", initial, finished)
+	}
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected closed channel from nil subscribe")
+		}
+	default:
+		t.Fatal("expected closed channel from nil subscribe")
+	}
+
+	stream := newDaytonaCommandStream()
+	stream.broadcast(sessions.StreamStdout, []byte("out"))
+	stream.broadcast(sessions.StreamStderr, []byte("err"))
+
+	initial, ch, finished = stream.subscribe()
+	if finished || len(initial) == 0 || !bytes.Contains(initial, daytonaStdoutPrefix) || !bytes.Contains(initial, daytonaStderrPrefix) {
+		t.Fatalf("subscribe replay unexpected: initial=%q finished=%v", initial, finished)
+	}
+
+	stream.broadcast(sessions.StreamStdout, []byte("next"))
+	select {
+	case frame := <-ch:
+		if !bytes.Contains(frame, []byte("next")) {
+			t.Fatalf("unexpected frame: %q", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for live frame")
+	}
+
+	stream.finish()
+	stream.finish()
+	_, ch, finished = stream.subscribe()
+	if !finished {
+		t.Fatal("expected finished stream to report finished")
+	}
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected closed channel after finish")
+		}
+	default:
+		t.Fatal("expected closed channel after finish")
+	}
+}
+
+func TestDaytonaSessionStateHelpers(t *testing.T) {
+	state := &daytonaSessionState{}
+	state.setActive("missing")
+	state.finishCommand("missing", "out", "err", 1)
+
+	first := &daytonaCommandState{id: "cmd-a", command: "echo a", createdAt: time.Now().Add(-time.Minute), running: false}
+	second := &daytonaCommandState{id: "cmd-b", command: "echo b", createdAt: time.Now(), running: true}
+	state.addCommand(first)
+	state.addCommand(second)
+	state.setActive("cmd-b")
+
+	if !state.acceptsInput("cmd-b") {
+		t.Fatal("expected active running command to accept input")
+	}
+	if state.acceptsInput("cmd-a") {
+		t.Fatal("expected inactive command to reject input")
+	}
+
+	state.finishCommand("cmd-b", "stdout", "stderr", 7)
+	if state.acceptsInput("cmd-b") {
+		t.Fatal("finished command should not accept input")
+	}
+	if got, ok := state.command("missing"); ok || got != nil {
+		t.Fatalf("command(missing) = (%v, %v), want nil/false", got, ok)
+	}
+	if got, ok := state.commandPtr("missing"); ok || got != nil {
+		t.Fatalf("commandPtr(missing) = (%v, %v), want nil/false", got, ok)
+	}
+
+	snapshot := state.commandsSnapshot()
+	if len(snapshot) != 2 || snapshot[0].id != "cmd-a" || snapshot[1].id != "cmd-b" {
+		t.Fatalf("unexpected snapshot order: %+v", snapshot)
+	}
+}
+
+func TestDaytonaProcessRouteAndLookupErrorBranches(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("sessions_disabled", func(t *testing.T) {
+		srv := &server{logger: logger, sessions: nil}
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/process/session", nil)
+		if !srv.handleDaytonaProcessRoute(rr, req) {
+			t.Fatal("expected route to be handled")
+		}
+		if rr.Code != http.StatusNotImplemented {
+			t.Fatalf("status = %d, want 501", rr.Code)
+		}
+	})
+
+	t.Run("route_validation", func(t *testing.T) {
+		srv := newDaytonaTestServer(t)
+		cases := []struct {
+			name string
+			req  *http.Request
+			want int
+		}{
+			{name: "entrypoint", req: httptest.NewRequest(http.MethodGet, "/process/session/entrypoint", nil), want: http.StatusNotImplemented},
+			{name: "missing_session_id", req: httptest.NewRequest(http.MethodGet, "/process/session//exec", nil), want: http.StatusBadRequest},
+			{name: "session_method_not_allowed", req: httptest.NewRequest(http.MethodPost, "/process/session/abc", nil), want: http.StatusMethodNotAllowed},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rr := httptest.NewRecorder()
+				if !srv.handleDaytonaProcessRoute(rr, tc.req) {
+					t.Fatal("expected route to be handled")
+				}
+				if rr.Code != tc.want {
+					t.Fatalf("status = %d, want %d", rr.Code, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("command_route_errors", func(t *testing.T) {
+		srv := newDaytonaTestServer(t)
+		rr := httptest.NewRecorder()
+		srv.handleDaytonaSessionCommandRoute(rr, httptest.NewRequest(http.MethodGet, "/", nil), "sid", "")
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("empty command id status = %d, want 400", rr.Code)
+		}
+
+		rr = httptest.NewRecorder()
+		srv.handleDaytonaSessionCommandRoute(rr, httptest.NewRequest(http.MethodPost, "/", nil), "sid", "cid")
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("wrong method status = %d, want 405", rr.Code)
+		}
+	})
+
+	t.Run("lookup_stale_daytona_entry", func(t *testing.T) {
+		mgr, err := sessions.New(logger, sessions.Config{
+			SandboxID:    "sb-test",
+			RecordingDir: filepath.Join(t.TempDir(), "recordings"),
+			BufferBytes:  1 << 12,
+		})
+		if err != nil {
+			t.Fatalf("sessions.New: %v", err)
+		}
+		t.Cleanup(mgr.Close)
+
+		srv := &server{logger: logger, sessions: mgr, daytona: newDaytonaCompat()}
+		srv.daytona.ensureSession("ghost")
+		if sess, state, ok := srv.lookupDaytonaSession("ghost"); ok || sess != nil || state != nil {
+			t.Fatalf("lookupDaytonaSession(stale) = (%v, %v, %v), want false/nil/nil", sess, state, ok)
+		}
+		if ids := srv.daytona.listSessionIDs(); len(ids) != 0 {
+			t.Fatalf("stale session not removed: %v", ids)
+		}
+	})
+
+	t.Run("logs_upgrade_failure", func(t *testing.T) {
+		srv := newDaytonaTestServer(t)
+		cmd := &daytonaCommandState{id: "cid", command: "echo hi", stream: newDaytonaCommandStream()}
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/process/session/sid/command/cid/logs?follow=true", nil)
+		srv.streamDaytonaSessionCommandLogs(rr, req, cmd)
+	})
+}

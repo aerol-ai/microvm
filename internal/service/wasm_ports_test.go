@@ -74,3 +74,66 @@ func TestWasmExposePortRejectsTCP(t *testing.T) {
 		t.Fatalf("expected tcp rejection, got %v", err)
 	}
 }
+
+func TestInstallWasmHTTPPortRoute(t *testing.T) {
+	ctx := context.Background()
+	driver := wasmruntime.New(wasmruntime.Config{ModulesDir: t.TempDir()}, nil)
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(driver)
+
+	now := time.Now().UTC()
+	sb1 := &models.Sandbox{
+		ID:         "sb-wasm-route-1",
+		Runtime:    models.RuntimeWasm,
+		Status:     models.SandboxStatusStarted,
+		Durability: models.DurabilityEphemeral,
+		CreatedAt:  now, UpdatedAt: now,
+	}
+	_ = st.Create(ctx, sb1)
+
+	// Test RouteShapeDirect
+	err := svc.installWasmHTTPPortRoute(ctx, sb1, 8080)
+	if err != nil {
+		t.Fatalf("installWasmHTTPPortRoute Direct failed: %v", err)
+	}
+
+	// Test RouteShapeWake
+	sb2 := &models.Sandbox{
+		ID:         "sb-wasm-route-2",
+		Runtime:    models.RuntimeWasm,
+		Status:     models.SandboxStatusStarted,
+		Durability: models.DurabilityPassivatable,
+		CreatedAt:  now, UpdatedAt: now,
+	}
+	_ = st.Create(ctx, sb2)
+	err = svc.installWasmHTTPPortRoute(ctx, sb2, 8081)
+	if err != nil {
+		t.Fatalf("installWasmHTTPPortRoute Wake failed: %v", err)
+	}
+
+	// Test RouteShapeNone
+	sb3 := &models.Sandbox{
+		ID:         "sb-wasm-route-3",
+		Runtime:    models.RuntimeWasm,
+		Status:     models.SandboxStatusStopped,
+		Durability: models.DurabilityEphemeral,
+		CreatedAt:  now, UpdatedAt: now,
+	}
+	_ = st.Create(ctx, sb3)
+	err = svc.installWasmHTTPPortRoute(ctx, sb3, 8082)
+	if err != nil {
+		t.Fatalf("installWasmHTTPPortRoute None failed: %v", err)
+	}
+}
+
+func TestWasmHTTPPortRouteCleanup(t *testing.T) {
+	ctx := context.Background()
+	driver := wasmruntime.New(wasmruntime.Config{ModulesDir: t.TempDir()}, nil)
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(driver)
+
+	// Since we mock caddy, we just verify it doesn't panic and returns without error
+	svc.wasmHTTPPortRouteCleanup(ctx, "sb-clean", 8080)
+}

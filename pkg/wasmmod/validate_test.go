@@ -56,3 +56,26 @@ func TestValidateFileShortHeaderPassesMagic(t *testing.T) {
 		t.Fatalf("4-byte magic-only file should pass magic check, got: %v", err)
 	}
 }
+
+func TestValidateFileEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.wasm")
+	if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFile(path); err == nil {
+		t.Fatal("empty file should be rejected")
+	}
+}
+
+func TestValidateFileTooLarge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "huge.wasm")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Truncate(256<<20 + 1)
+	f.Close()
+	if err := ValidateFile(path); err == nil {
+		t.Fatal("large file should be rejected")
+	}
+}

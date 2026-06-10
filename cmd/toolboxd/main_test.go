@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,9 +13,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
+	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/clonegen"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -358,4 +363,191 @@ func TestMainHandlers_SuccessPaths(t *testing.T) {
 			t.Fatalf("proxy body = %q", rr.Body.String())
 		}
 	})
+}
+
+func TestMainVersionBranchAndSessionFlusher(t *testing.T) {
+	oldArgs := os.Args
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Stdout = oldStdout
+		os.Args = oldArgs
+		_ = r.Close()
+		_ = w.Close()
+	})
+
+	os.Stdout = w
+	os.Args = []string{"toolboxd", "--version"}
+	main()
+	_ = w.Close()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != version.Version {
+		t.Fatalf("version output = %q, want %q", got, version.Version)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr, err := sessions.New(logger, sessions.Config{
+		SandboxID:    "sb-test",
+		RecordingDir: t.TempDir(),
+		BufferBytes:  1 << 12,
+	})
+	if err != nil {
+		t.Fatalf("sessions.New: %v", err)
+	}
+	t.Cleanup(mgr.Close)
+
+	if got := newSessionFlusher(nil); got != nil {
+		t.Fatalf("newSessionFlusher(nil) = %T, want nil", got)
+	}
+
+	flusher, ok := newSessionFlusher(mgr).(*sessionFlusherAdapter)
+	if !ok {
+		t.Fatalf("newSessionFlusher returned %T, want *sessionFlusherAdapter", newSessionFlusher(mgr))
+	}
+	if ids := flusher.ListIDs(); len(ids) != 0 {
+		t.Fatalf("ListIDs() = %v, want empty", ids)
+	}
+
+	sess, err := mgr.Create(context.Background(), models.CreateSessionRequest{
+		Name:    "flush-me",
+		Command: "printf tool-box",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if ids := flusher.ListIDs(); len(ids) != 1 || ids[0] != sess.ID() {
+		t.Fatalf("ListIDs() = %v, want [%s]", ids, sess.ID())
+	}
+	if err := flusher.FlushRecording(sess.ID()); err != nil {
+		t.Fatalf("FlushRecording(active) = %v", err)
+	}
+	if err := flusher.FlushRecording("missing"); err != nil {
+		t.Fatalf("FlushRecording(missing) = %v, want nil", err)
+	}
+}
+
+func TestMainUtilityErrorBranches(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("start_user_command_error", func(t *testing.T) {
+		pidBefore := userCommandPID
+		t.Cleanup(func() { userCommandPID = pidBefore })
+
+		startUserCommand(logger, []string{filepath.Join(t.TempDir(), "does-not-exist")})
+		if userCommandPID != pidBefore {
+			t.Fatalf("userCommandPID changed to %d after failed start", userCommandPID)
+		}
+	})
+
+	t.Run("forward_shutdown_signals", func(t *testing.T) {
+		pidBefore := userCommandPID
+		t.Cleanup(func() { userCommandPID = pidBefore })
+		userCommandPID = 999999
+
+		srv := &http.Server{}
+		done := make(chan struct{})
+		go func() {
+			forwardShutdownSignals(logger, srv)
+			close(done)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		proc, err := os.FindProcess(os.Getpid())
+		if err != nil {
+			t.Fatalf("FindProcess: %v", err)
+		}
+		if err := proc.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("Signal: %v", err)
+		}
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("forwardShutdownSignals did not return")
+		}
+	})
+
+	t.Run("write_multipart_file_error", func(t *testing.T) {
+		src, err := os.CreateTemp(t.TempDir(), "input-*")
+		if err != nil {
+			t.Fatalf("CreateTemp: %v", err)
+		}
+		defer src.Close()
+		if _, err := src.WriteString("payload"); err != nil {
+			t.Fatalf("WriteString: %v", err)
+		}
+		if _, err := src.Seek(0, 0); err != nil {
+			t.Fatalf("Seek: %v", err)
+		}
+		if err := writeMultipartFile(t.TempDir(), src); err == nil {
+			t.Fatal("expected writeMultipartFile to fail for directory target")
+		}
+	})
+}
+
+func TestRoutesDispatchCoverage(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr, err := sessions.New(logger, sessions.Config{
+		SandboxID:    "sb-test",
+		RecordingDir: t.TempDir(),
+		BufferBytes:  1 << 12,
+	})
+	if err != nil {
+		t.Fatalf("sessions.New: %v", err)
+	}
+	t.Cleanup(mgr.Close)
+
+	srv := &server{
+		logger:       logger,
+		sandboxID:    "sb-test",
+		allowedPorts: map[int]struct{}{},
+		sessions:     mgr,
+		daytona:      newDaytonaCompat(),
+		envd:         newEnvdCompat(),
+		cloneGen:     clonegen.New(clonegen.DefaultPath, logger),
+	}
+	h := srv.routes()
+
+	cases := []struct {
+		name string
+		req  *http.Request
+	}{
+		{name: "root", req: httptest.NewRequest(http.MethodGet, "/sb-test/", nil)},
+		{name: "health", req: httptest.NewRequest(http.MethodGet, "/sb-test/health", nil)},
+		{name: "version", req: httptest.NewRequest(http.MethodGet, "/sb-test/version", nil)},
+		{name: "clone_generation", req: httptest.NewRequest(http.MethodGet, "/sb-test/clone-generation", nil)},
+		{name: "proxy", req: httptest.NewRequest(http.MethodGet, "/sb-test/proxy/abc", nil)},
+		{name: "envd_health", req: httptest.NewRequest(http.MethodGet, "/sb-test/envd/health", nil)},
+		{name: "process_execute", req: httptest.NewRequest(http.MethodPost, "/sb-test/process/execute", strings.NewReader("{bad"))},
+		{name: "process_code_run", req: httptest.NewRequest(http.MethodPost, "/sb-test/process/code-run", strings.NewReader("{bad"))},
+		{name: "process_interpreter", req: httptest.NewRequest(http.MethodGet, "/sb-test/process/interpreter/python", nil)},
+		{name: "process_session_list", req: httptest.NewRequest(http.MethodGet, "/sb-test/process/session", nil)},
+		{name: "process_session_create", req: httptest.NewRequest(http.MethodPost, "/sb-test/process/session", strings.NewReader("{bad"))},
+		{name: "files_upload", req: httptest.NewRequest(http.MethodPost, "/sb-test/files/upload", strings.NewReader("not multipart"))},
+		{name: "files_download", req: httptest.NewRequest(http.MethodGet, "/sb-test/files/download?path="+filepath.Join(t.TempDir(), "missing"), nil)},
+		{name: "files", req: httptest.NewRequest(http.MethodGet, "/sb-test/files?path="+t.TempDir(), nil)},
+		{name: "files_info", req: httptest.NewRequest(http.MethodGet, "/sb-test/files/info?path="+t.TempDir(), nil)},
+		{name: "files_move", req: httptest.NewRequest(http.MethodPost, "/sb-test/files/move?source=/missing&destination=/tmp/dest", nil)},
+		{name: "files_search", req: httptest.NewRequest(http.MethodGet, "/sb-test/files/search?path="+t.TempDir()+"&pattern=*", nil)},
+		{name: "files_find", req: httptest.NewRequest(http.MethodGet, "/sb-test/files/find?path="+t.TempDir()+"&pattern=x", nil)},
+		{name: "git_status", req: httptest.NewRequest(http.MethodGet, "/sb-test/git/status?path="+t.TempDir(), nil)},
+		{name: "allowed_ports", req: httptest.NewRequest(http.MethodPost, "/sb-test/admin/allowed-ports", strings.NewReader("{bad"))},
+		{name: "exec_stream", req: httptest.NewRequest(http.MethodGet, "/sb-test/process/exec/stream", nil)},
+		{name: "sessions", req: httptest.NewRequest(http.MethodGet, "/sb-test/sessions", nil)},
+		{name: "sessions_unknown", req: httptest.NewRequest(http.MethodGet, "/sb-test/sessions/missing", nil)},
+		{name: "not_found", req: httptest.NewRequest(http.MethodGet, "/sb-test/does-not-exist", nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, tc.req)
+		})
+	}
 }

@@ -48,3 +48,29 @@ func TestValidateRejectsGarbage(t *testing.T) {
 		t.Fatal("expected validation error")
 	}
 }
+
+func TestResolverEdgeCases(t *testing.T) {
+	r := NewResolver("")
+	_, err := r.Resolve(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected err for empty ref")
+	}
+
+	_, err = r.Resolve(context.Background(), "file.wasm")
+	if err == nil {
+		t.Fatal("expected err for relative path with no modules dir")
+	}
+
+	dir := t.TempDir()
+	path := writeTestWasm(t, dir, "demo.wasm")
+	r = NewResolver(dir)
+	got, err := r.Resolve(context.Background(), "file://"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != path {
+		t.Fatalf("expected path %q, got %q", path, got.Path)
+	}
+
+	_ = WriteCheckpointWasm(t, dir, "cp.wasm")
+}

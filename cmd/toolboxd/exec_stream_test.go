@@ -220,6 +220,15 @@ func TestExecStreamSignalAndEnvHelpers(t *testing.T) {
 	if sig := mapStreamSignal("SIGTERM"); sig != syscall.SIGTERM {
 		t.Fatalf("mapStreamSignal(SIGTERM) = %v", sig)
 	}
+	if sig := mapStreamSignal("KILL"); sig != syscall.SIGKILL {
+		t.Fatalf("mapStreamSignal(KILL) = %v", sig)
+	}
+	if sig := mapStreamSignal("HUP"); sig != syscall.SIGHUP {
+		t.Fatalf("mapStreamSignal(HUP) = %v", sig)
+	}
+	if sig := mapStreamSignal("QUIT"); sig != syscall.SIGQUIT {
+		t.Fatalf("mapStreamSignal(QUIT) = %v", sig)
+	}
 	if sig := mapStreamSignal("UNKNOWN"); sig != nil {
 		t.Fatalf("mapStreamSignal(UNKNOWN) = %v, want nil", sig)
 	}
@@ -239,4 +248,65 @@ func TestExecStreamSignalAndEnvHelpers(t *testing.T) {
 	// sendSignalToCmd should be a no-op for nil process references.
 	sendSignalToCmd(nil, "TERM")
 	sendSignalToCmd(&exec.Cmd{}, "TERM")
+}
+
+func TestExecStreamControlBranches(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ptmx, err := os.CreateTemp(t.TempDir(), "ptmx-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer ptmx.Close()
+
+	handlePTYControl(logger, execStreamControlIn{Type: "resize", Cols: 0, Rows: 0}, ptmx, nil)
+	handlePTYControl(logger, execStreamControlIn{Type: "resize", Cols: 80, Rows: 24}, ptmx, nil)
+	handlePTYControl(logger, execStreamControlIn{Type: "close"}, ptmx, nil)
+
+	cmd := exec.Command("/bin/sh", "-c", "sleep 1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	handlePTYControl(logger, execStreamControlIn{Type: "signal", Signal: "TERM"}, ptmx, cmd)
+	handlePTYControl(logger, execStreamControlIn{Type: "signal", Signal: "UNKNOWN"}, ptmx, cmd)
+	sendSignalToCmd(cmd, "UNKNOWN")
+}
+
+func TestExecStreamRejectsEmptyCommand(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := &server{logger: logger}
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleExecStream(w, r)
+	}))
+	defer httpSrv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial error: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	if err := conn.WriteJSON(map[string]any{"command": "", "tty": false}); err != nil {
+		t.Fatalf("write start message: %v", err)
+	}
+	msgType, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read control message: %v", err)
+	}
+	if msgType != websocket.TextMessage {
+		t.Fatalf("message type = %d, want text", msgType)
+	}
+	var ctrl execStreamControlOut
+	if err := json.Unmarshal(payload, &ctrl); err != nil {
+		t.Fatalf("decode control payload: %v", err)
+	}
+	if ctrl.Type != "error" || ctrl.Message != "command is required" {
+		t.Fatalf("unexpected control message: %+v", ctrl)
+	}
 }

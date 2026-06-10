@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -263,5 +265,72 @@ func TestRunGitNoRepoWithEnvAndErrors(t *testing.T) {
 		if !errors.As(err, &ge) {
 			t.Fatalf("expected gitCommandError, got %T", err)
 		}
+	}
+}
+
+type fakeFileInfo struct{}
+
+func (fakeFileInfo) Name() string       { return "fake" }
+func (fakeFileInfo) Size() int64        { return 0 }
+func (fakeFileInfo) Mode() os.FileMode  { return 0 }
+func (fakeFileInfo) ModTime() time.Time { return time.Unix(0, 0) }
+func (fakeFileInfo) IsDir() bool        { return false }
+func (fakeFileInfo) Sys() any           { return nil }
+
+func TestFileAndGitErrorMappers(t *testing.T) {
+	var nilGitErr *gitCommandError
+	if got := nilGitErr.Error(); got != "" {
+		t.Fatalf("nil gitCommandError.Error() = %q, want empty", got)
+	}
+
+	rec := httptest.NewRecorder()
+	writeFilesystemError(rec, os.ErrNotExist)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("writeFilesystemError(not exist) = %d, want 404", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	writeFilesystemError(rec, os.ErrPermission)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("writeFilesystemError(permission) = %d, want 403", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	writeFilesystemError(rec, os.ErrExist)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("writeFilesystemError(exist) = %d, want 500", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	writeGitError(rec, os.ErrNotExist)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("writeGitError(not exist) = %d, want 404", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	writeGitError(rec, os.ErrPermission)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("writeGitError(permission) = %d, want 403", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	writeGitError(rec, &gitCommandError{message: "bad git"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("writeGitError(git error) = %d, want 400", rec.Code)
+	}
+
+	if owner, group := fileOwnerGroup(fakeFileInfo{}); owner != "" || group != "" {
+		t.Fatalf("fileOwnerGroup(fake) = %q/%q, want empty strings", owner, group)
+	}
+
+	rec = httptest.NewRecorder()
+	writeGitError(rec, errors.New("boom"))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("writeGitError(default) = %d, want 500", rec.Code)
+	}
+
+	status := parseGitStatus("## feature\nx\n")
+	if status.CurrentBranch != "feature" || len(status.FileStatus) != 0 {
+		t.Fatalf("parseGitStatus short lines = %+v", status)
 	}
 }

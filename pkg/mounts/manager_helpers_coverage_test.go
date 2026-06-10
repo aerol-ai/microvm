@@ -1,6 +1,7 @@
 package mounts
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,4 +47,33 @@ func TestKillMountNil(t *testing.T) {
 	if err := killMount(nil); err != nil {
 		t.Fatalf("killMount(nil) = %v, want nil", err)
 	}
+}
+
+func TestWriteCredFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0400); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0700)
+	err := writeCredFile(filepath.Join(dir, "newdir", "cred.json"), []byte("data"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	dir2 := t.TempDir()
+	path2 := filepath.Join(dir2, "cred.json")
+	os.Mkdir(path2, 0700)
+	err = writeCredFile(path2, []byte("data"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestCleanupOrphanDirAndUnmountTree(t *testing.T) {
+	logger := slog.Default()
+	m, _ := New(logger, Config{RootDir: t.TempDir(), CredDir: t.TempDir()})
+	dir := filepath.Join(m.rootDir, "test-orphan")
+	os.Mkdir(dir, 0700)
+	m.cleanupOrphanDir(dir)
+	unmountTree(logger, dir)
 }

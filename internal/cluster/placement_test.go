@@ -415,6 +415,42 @@ func TestNodeFitsKnownEmptyTemplateInventoryRejected(t *testing.T) {
 // at all — empty TemplateID means "any host." Without this guard a
 // docker sandbox could be falsely rejected because the peer's
 // inventory doesn't list its (non-existent) template.
+func TestNodeFitsRejectsCanAdmitFalseWithReasons(t *testing.T) {
+	full := Member{NodeID: "full", APIURL: "http://full", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		CanAdmit: false,
+		Reasons:  []string{"at capacity"},
+	}}
+	if nodeFits(full, capacity.Request{CPU: 0.1, MemoryMB: 100}, capacity.Request{}) {
+		t.Fatal("node with CanAdmit=false and reasons should not fit")
+	}
+}
+
+func TestNodeFitsWasmModuleInventoryKnown(t *testing.T) {
+	withModule := Member{NodeID: "wasm-hot", APIURL: "http://w", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+		LocalWasmModuleInventoryKnown: true,
+		LocalWasmModuleIDs:            []string{"mod-a"},
+	}}
+	req := capacity.Request{CPU: 1, MemoryMB: 100, Runtime: models.RuntimeWasm, ModuleRef: "mod-a"}
+	if !nodeFits(withModule, req, capacity.Request{}) {
+		t.Fatal("node with cached wasm module should fit wasm request")
+	}
+	if nodeFits(withModule, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: models.RuntimeWasm, ModuleRef: "mod-b"}, capacity.Request{}) {
+		t.Fatal("node missing wasm module should reject wasm request when inventory is known")
+	}
+
+	legacy := Member{NodeID: "wasm-legacy", APIURL: "http://l", Alive: true, Capacity: capacity.Snapshot{
+		HostCPUCores: 8, HostMemoryTotalMB: 8000,
+		CPUBudget: 8, MemoryBudgetMB: 8000,
+	}}
+	if !nodeFits(legacy, capacity.Request{CPU: 1, MemoryMB: 100, Runtime: models.RuntimeWasm, ModuleRef: "mod-x"}, capacity.Request{}) {
+		t.Fatal("unknown wasm inventory should allow wasm request")
+	}
+}
+
 func TestNodeFitsNoTemplateRequestSkipsGate(t *testing.T) {
 	docker := Member{NodeID: "d", APIURL: "http://d", Alive: true, Capacity: capacity.Snapshot{
 		HostCPUCores: 8, HostMemoryTotalMB: 8000,

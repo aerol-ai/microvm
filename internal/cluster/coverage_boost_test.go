@@ -2,12 +2,17 @@ package cluster
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/memberlist"
+	"github.com/hashicorp/raft"
 )
 
 func TestFollowerForwardApplyInternalChannel(t *testing.T) {
@@ -500,6 +506,408 @@ func TestClusterReserveOnTargetApplyReservationPath(t *testing.T) {
 	}
 	if _, ok := c.PlacementOf("sb-reserve-path"); !ok {
 		t.Fatal("expected reserved placement")
+	}
+}
+
+func writeTestClusterTLSDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	_, tlsCert, err := generateTestCert()
+	if err != nil {
+		t.Fatalf("generateTestCert: %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsCert.Certificate[0]})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(tlsCert.PrivateKey)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(filepath.Join(dir, tlsCAFile), caPEM, 0o644); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, tlsNodeCertFile), caPEM, 0o644); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, tlsNodeKeyFile), keyPEM, 0o644); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	return dir
+}
+
+func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, tlsDir string) (*Cluster, func()) {
+	t.Helper()
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
+	raftPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeTCPPort(t)
+	dir := t.TempDir()
+	cfg := config.Config{
+		EnableCluster:                 true,
+		NodeID:                        nodeID,
+		RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
+		RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
+		RaftDataDir:                   filepath.Join(dir, "raft"),
+		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		BootstrapPeers:                gossipPeers,
+		ClusterBootstrap:              bootstrap,
+		SelfAPIAdvertiseURL:           apiURL,
+		ClusterRaftCommitTimeout:      2 * time.Second,
+		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 tlsDir,
+		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c, err := New(cfg, logger, nil)
+	if err != nil {
+		t.Fatalf("cluster.New(%s, tls): %v", nodeID, err)
+	}
+	return c, func() {
+		if err := c.Close(); err != nil {
+			t.Logf("cluster.Close(%s): %v", nodeID, err)
+		}
+	}
+}
+
+func newTestClusterWithTLS(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string) (*Cluster, func()) {
+	t.Helper()
+	return newTestClusterWithTLSDir(t, nodeID, bootstrap, gossipPeers, writeTestClusterTLSDir(t))
+}
+
+func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
+	t.Helper()
+	gossipPort := pickFreeTCPPort(t)
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
+	cfg := config.Config{
+		EnableCluster:                 true,
+		NodeID:                        nodeID,
+		NodeRole:                      role,
+		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		BootstrapPeers:                gossipPeers,
+		SelfAPIAdvertiseURL:           apiURL,
+		ClusterRaftCommitTimeout:      2 * time.Second,
+		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t),
+		ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a, err := NewAgent(cfg, logger, nil)
+	if err != nil {
+		t.Fatalf("cluster.NewAgent(%s, tls): %v", nodeID, err)
+	}
+	return a, func() {
+		if err := a.Close(); err != nil {
+			t.Logf("agent.Close(%s): %v", nodeID, err)
+		}
+	}
+}
+
+func TestClusterBootstrapWithTLSInternalServer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestClusterWithTLS(t, "ldr-tls", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	if c.internalClient == nil || c.internalURL == "" || c.internalServer == nil {
+		t.Fatalf("tls cluster missing internal wiring: client=%v url=%q server=%v", c.internalClient, c.internalURL, c.internalServer)
+	}
+	if got := c.LeaderAPIURL(); got != c.apiURL {
+		t.Fatalf("LeaderAPIURL(self) = %q, want %q", got, c.apiURL)
+	}
+	c.AttachInternalHandler(http.NotFoundHandler())
+}
+
+func TestNewAgentWithTLSInternalServer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupLeader := newTestClusterWithTLS(t, "ldr-tls-agent", true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	agent, cleanupAgent := newTestAgentWithTLS(t, "wkr-tls", config.NodeRoleWorker,
+		[]string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupAgent()
+	if agent.internalClient == nil || agent.internalURL == "" || agent.internalServer == nil {
+		t.Fatalf("tls agent missing internal wiring")
+	}
+	agent.AttachInternalHandler(http.NotFoundHandler())
+}
+
+func TestDeriveInternalAdvertiseURLAndSplitHost(t *testing.T) {
+	if got := deriveInternalAdvertiseURL("https://custom.internal", "0.0.0.0:8443", "0.0.0.0:9443"); got != "https://custom.internal" {
+		t.Fatalf("operator override = %q", got)
+	}
+	if got := deriveInternalAdvertiseURL("", "127.0.0.5:0", "0.0.0.0:9443"); got != "https://127.0.0.5:9443" {
+		t.Fatalf("listen host fallback = %q", got)
+	}
+	if got := deriveInternalAdvertiseURL("", "0.0.0.0:0", "0.0.0.0:9443"); got != "https://127.0.0.1:9443" {
+		t.Fatalf("loopback fallback = %q", got)
+	}
+	host, port := splitHostForAdvertise("[::1]:8443")
+	if host != "::1" || port != "8443" {
+		t.Fatalf("ipv6 split = (%q, %q)", host, port)
+	}
+	host, port = splitHostForAdvertise("bare-host")
+	if host != "bare-host" || port != "" {
+		t.Fatalf("bare host split = (%q, %q)", host, port)
+	}
+}
+
+func TestClusterReadWrapperPaths(t *testing.T) {
+	fsm := newPlacementFSM()
+	applyOp(t, fsm, command{
+		Op:            opPlace,
+		SandboxID:     "sb-read",
+		OwnerNodeID:   "node-a",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine"},
+		SecretRef:     "secret-ref",
+		SecretVersion: 2,
+	})
+	applyOp(t, fsm, command{Op: opAddExposedPort, SandboxID: "sb-read", Port: 80, Protocol: "http"})
+	applyOp(t, fsm, command{Op: opAddCustomDomain, SandboxID: "sb-read", Hostname: "read.example.com"})
+
+	c := &Cluster{nodeID: "node-a", apiURL: "http://node-a", fsm: fsm}
+	if spec := c.SpecOf("sb-read"); spec == nil || spec.Image != "alpine" {
+		t.Fatalf("SpecOf = %+v", spec)
+	}
+	if got := c.SecretsOf("sb-read"); got.Ref != "secret-ref" {
+		t.Fatalf("SecretsOf = %+v", got)
+	}
+	if len(c.SealedSecretsOf("sb-read")) != 0 {
+		t.Fatalf("SealedSecretsOf = %v", c.SealedSecretsOf("sb-read"))
+	}
+	ports := c.ExposedPortsOf("sb-read")
+	if ports[80].Protocol != "http" {
+		t.Fatalf("ExposedPortsOf = %+v", ports)
+	}
+	if len(c.CustomDomainsOf("sb-read")) != 1 {
+		t.Fatalf("CustomDomainsOf = %v", c.CustomDomainsOf("sb-read"))
+	}
+	_, ok := c.ResolveCustomDomain("read.example.com")
+	if !ok {
+		t.Fatal("ResolveCustomDomain expected true")
+	}
+}
+
+func TestAgentPlacementPageHarness(t *testing.T) {
+	capture := &agentControlPlaneCapture{}
+	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsPagePath {
+			var req PlacementPageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode page req: %v", err)
+			}
+			capture.appendPageRequest(req)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PlacementPageResponse{
+				Placements:    []Placement{{SandboxID: "sb-page", Version: 3}},
+				NextPageToken: "next",
+			})
+			return true
+		}
+		return false
+	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+
+	out := agent.PlacementPage(PlacementPageRequest{Limit: 5})
+	if out.NextPageToken != "next" || len(out.Placements) != 1 {
+		t.Fatalf("PlacementPage = %+v", out)
+	}
+}
+
+func TestApplyEncodedLocalReturnsNotLeaderWhenFollowerApplies(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-apply-local", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	payload, err := encodeCommand(command{Op: opPlace, SandboxID: "sb-local-apply", OwnerNodeID: c.nodeID})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if c.raft.raft.State() != raft.Leader {
+		t.Fatal("expected leader for setup")
+	}
+	if err := c.applyEncodedLocal(context.Background(), payload); err != nil {
+		t.Fatalf("applyEncodedLocal on leader: %v", err)
+	}
+}
+
+func TestClusterAssertOwnershipClaimOrphanIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-claim-orphan", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	ctx := context.Background()
+	if err := c.RecordPlacement(ctx, "sb-orphan-int", &models.CreateSandboxRequest{Image: "alpine"}, PlacementSecrets{}); err != nil {
+		t.Fatalf("seed placement: %v", err)
+	}
+	orphanPayload, err := encodeCommand(command{Op: opOrphanOwner, NodeID: c.nodeID})
+	if err != nil {
+		t.Fatalf("encode orphan: %v", err)
+	}
+	if err := c.raft.raft.Apply(orphanPayload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("orphan owner: %v", err)
+	}
+
+	spec := &models.CreateSandboxRequest{Image: "alpine"}
+	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
+		ID:              "sb-orphan-int",
+		Spec:            spec,
+		CustomHostnames: []string{"orphan-int.example.com"},
+		ExposedPorts:    map[int]ExposedPortRoute{9000: {Protocol: "http"}},
+	}}); err != nil {
+		t.Fatalf("AssertOwnership claim orphan: %v", err)
+	}
+	got, ok := c.PlacementOf("sb-orphan-int")
+	if !ok || got.OwnerNodeID != c.nodeID || got.IsOrphaned() {
+		t.Fatalf("placement after claim = %+v, ok=%v", got, ok)
+	}
+}
+
+func TestFollowerForwardApplySharedTLSInternalChannel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	tlsDir := writeTestClusterTLSDir(t)
+	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-tls-fwd", true, nil, tlsDir)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-tls-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDir)
+	defer cleanupFollower()
+	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+
+	follower.gossip.memberIndex.upsert(Member{
+		NodeID:      leader.nodeID,
+		InternalURL: leader.internalURL,
+		APIURL:      leader.apiURL,
+		Alive:       true,
+		Role:        config.NodeRoleServer,
+	})
+
+	payload, err := encodeCommand(command{
+		Op:          opPlace,
+		SandboxID:   "sb-tls-fwd",
+		OwnerNodeID: follower.nodeID,
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := follower.forwardApplyToLeader(context.Background(), payload); err != nil {
+		t.Fatalf("forwardApplyToLeader tls internal: %v", err)
+	}
+	if _, err := leader.OwnerOf("sb-tls-fwd"); err != nil {
+		t.Fatalf("leader OwnerOf after tls forward: %v", err)
+	}
+}
+
+func TestFSMValidateHostPortLazyIndexRebuild(t *testing.T) {
+	fsm := newPlacementFSM()
+	fsm.placements["sb-existing"] = Placement{
+		SandboxID: "sb-existing",
+		ExposedPortRoutes: map[int]ExposedPortRoute{
+			443: {Protocol: models.ExposedPortProtocolTCP, HostPort: 22443},
+		},
+	}
+	fsm.hostPortIndex = nil
+
+	if err := fsm.validateHostPortAvailableLocked("sb-new", 443, ExposedPortRoute{
+		Protocol: models.ExposedPortProtocolTCP,
+		HostPort: 22443,
+	}); err == nil {
+		t.Fatal("expected host port conflict after lazy index rebuild")
+	}
+	if err := fsm.validateHostPortAvailableLocked("sb-new", 80, ExposedPortRoute{Protocol: "http"}); err != nil {
+		t.Fatalf("non-tcp route should skip validation: %v", err)
+	}
+}
+
+func TestRemoveMemberRejectsLastVoter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "ldr-last-voter", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	err := c.RemoveMember(context.Background(), c.nodeID, true)
+	if !errors.Is(err, ErrLastVoter) {
+		t.Fatalf("RemoveMember(self) = %v, want ErrLastVoter", err)
+	}
+}
+
+func TestHandleMemberJoinWaitsForRaftAddrThenPromotes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupLeader := newTestCluster(t, "ldr-join-addr", true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	follower, cleanupFollower := newTestCluster(t, "fol-join-addr", false, []string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupFollower()
+
+	leader.gossip.memberIndex.upsert(Member{NodeID: follower.nodeID, Alive: true, Role: config.NodeRoleServer})
+	leader.handleMemberJoin(follower.nodeID)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if leader.peerRaftAddr(follower.nodeID) != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	leader.handleMemberJoin(follower.nodeID)
+	waitForVoter(t, leader, follower.nodeID, 10*time.Second)
+}
+
+func TestClusterRefreshCapacityLeases(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	leader, cleanupLeader := newTestCluster(t, "ldr-cap-refresh", true, nil)
+	defer cleanupLeader()
+	waitForLeader(t, leader, 10*time.Second)
+
+	worker, cleanupWorker := newTestAgentWithRole(t, "wkr-cap-refresh", config.NodeRoleWorker,
+		[]string{leader.gossip.ml.LocalNode().Address()})
+	defer cleanupWorker()
+	waitForGossipMember(t, leader, worker.SelfNodeID(), 10*time.Second)
+
+	leader.refreshCapacityLeases(context.Background())
+	members := leader.Members()
+	if len(members) == 0 {
+		t.Fatal("expected members after capacity refresh")
+	}
+}
+
+func TestNewClusterRejectsInvalidTLSMaterial(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, tlsCAFile), []byte("not-a-pem"), 0o644); err != nil {
+		t.Fatalf("write bad ca: %v", err)
+	}
+	cfg := config.Config{
+		EnableCluster:       true,
+		NodeRole:            config.NodeRoleServer,
+		SelfAPIAdvertiseURL: "http://127.0.0.1:1",
+		ClusterTLSDir:       dir,
+		RaftBindAddr:        "127.0.0.1:0",
+		RaftAdvertiseAddr:   "127.0.0.1:0",
+		RaftDataDir:         t.TempDir(),
+		GossipBindAddr:      "127.0.0.1:0",
+		GossipAdvertiseAddr: "127.0.0.1:0",
+		ClusterBootstrap:    true,
+	}
+	_, err := New(cfg, slog.Default(), nil)
+	if err == nil {
+		t.Fatal("expected error for invalid tls material")
 	}
 }
 

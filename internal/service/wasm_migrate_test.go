@@ -251,3 +251,85 @@ func TestPruneWasmCheckpointPushesKeepsLastN(t *testing.T) {
 		t.Fatalf("kept %d rows, want 1", len(recs))
 	}
 }
+
+func TestEnsureWasmSandboxRowForImport_CreatesNewRow(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+
+	snap := wasmengine.SnapshotRestoreInput{
+		Config: wasmengine.SnapshotConfig{
+			Durability: string(models.DurabilityPassivatable),
+			BaseModule: wasmengine.SnapshotBaseModule{Digest: "digest-1"},
+		},
+	}
+
+	// This should fail initially because we don't have a cluster spec and module ref is missing
+	err := svc.ensureWasmSandboxRowForImport(ctx, "sb-import-1", snap, "/path", "gen-1")
+	if err == nil {
+		t.Fatal("expected error missing cluster spec")
+	}
+
+	// Now we provide a fake cluster that returns a spec
+	fakeCluster := &wasmMigrateClusterStub{
+		Noop:   &cluster.Noop{},
+		selfID: "node-1",
+		spec: &models.CreateSandboxRequest{
+			Runtime:    models.RuntimeWasm,
+			ModuleRef:  "sha256:abcd",
+			Durability: models.DurabilityPassivatable,
+		},
+	}
+	svc.cfg.EnableCluster = true
+	svc.clusterMu.Lock()
+	svc.cluster = fakeCluster
+	svc.clusterMu.Unlock()
+
+	err = svc.ensureWasmSandboxRowForImport(ctx, "sb-import-1", snap, "/path", "gen-1")
+	if err != nil {
+		t.Fatalf("ensureWasmSandboxRowForImport failed: %v", err)
+	}
+
+	got, err := st.Get(ctx, "sb-import-1")
+	if err != nil {
+		t.Fatalf("get sandbox failed: %v", err)
+	}
+	if got.Status != models.SandboxStatusPassivated {
+		t.Fatalf("status = %s", got.Status)
+	}
+	if got.ModuleRef != "sha256:abcd" {
+		t.Fatalf("module_ref = %s", got.ModuleRef)
+	}
+}
+
+func TestEnsureWasmSandboxRowForImport_UpdatesExistingRow(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+
+	now := time.Now().UTC()
+	st.Create(ctx, &models.Sandbox{
+		ID:              "sb-import-exist",
+		Runtime:         models.RuntimeWasm,
+		Status:          models.SandboxStatusStarted,
+		CloneGeneration: "gen-same",
+		CreatedAt:       now, UpdatedAt: now,
+	})
+
+	snap := wasmengine.SnapshotRestoreInput{}
+	err := svc.ensureWasmSandboxRowForImport(ctx, "sb-import-exist", snap, "/path", "gen-same")
+	if err != nil {
+		t.Fatalf("ensureWasmSandboxRowForImport failed: %v", err)
+	}
+
+	got, err := st.Get(ctx, "sb-import-exist")
+	if err != nil {
+		t.Fatalf("get sandbox failed: %v", err)
+	}
+	if got.Status != models.SandboxStatusPassivated {
+		t.Fatalf("status = %s", got.Status)
+	}
+	if got.CheckpointPath != "/path" || got.CloneGeneration != "gen-new" {
+		t.Fatalf("checkpoint path or clonegen mismatch")
+	}
+}
