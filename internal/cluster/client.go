@@ -450,7 +450,10 @@ func (c *Cluster) SecretsOf(sandboxID string) PlacementSecrets {
 // the placement uses the secret-reference model. Caller-mutation is safe.
 func (c *Cluster) SealedSecretsOf(sandboxID string) []byte {
 	secrets := c.SecretsOf(sandboxID)
-	if len(secrets.LegacySealed) == 0 {
+	// The secret-reference model supersedes the legacy sealed bag: when a Ref
+	// is present, credentials are fetched by reference and any LegacySealed
+	// bytes are vestigial, so callers must not consume them.
+	if secrets.Ref != "" || len(secrets.LegacySealed) == 0 {
 		return nil
 	}
 	return secrets.LegacySealed
