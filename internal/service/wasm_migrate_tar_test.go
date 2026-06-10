@@ -1,7 +1,10 @@
 package service
 
 import (
+	"archive/tar"
 	"bytes"
+	"io"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -49,4 +52,83 @@ func TestWasmCheckpointTarRoundTrip(t *testing.T) {
 	if string(got.Memory) != string(cap.Memory) {
 		t.Fatalf("memory = %q, want %q", got.Memory, cap.Memory)
 	}
+}
+
+func TestWasmCheckpointTarHelperBranches(t *testing.T) {
+	t.Run("member helper", func(t *testing.T) {
+		if !wasmSnapshotTarMember("config.json") || wasmSnapshotTarMember("bad.json") {
+			t.Fatal("wasmSnapshotTarMember helper failed")
+		}
+	})
+
+	t.Run("missing source dir", func(t *testing.T) {
+		if err := writeWasmCheckpointTar(io.Discard, filepath.Join(t.TempDir(), "missing")); err == nil {
+			t.Fatal("expected error for missing mem.snap dir")
+		}
+	})
+
+	t.Run("unexpected tar entry", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		if err := tw.WriteHeader(&tar.Header{Name: "unexpected.bin", Mode: 0o644, Size: 4, Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		_, _ = tw.Write([]byte("oops"))
+		_ = tw.Close()
+		if err := extractWasmCheckpointTar(bytes.NewReader(buf.Bytes()), filepath.Join(t.TempDir(), "dst")); err == nil {
+			t.Fatal("expected unexpected tar entry error")
+		}
+	})
+
+	t.Run("invalid snapshot contents", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for _, name := range []string{"config.json", "memory.zstd", "globals.cbor", "wasi-state.cbor"} {
+			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len("bad")), Typeflag: tar.TypeReg}); err != nil {
+				t.Fatalf("write header %s: %v", name, err)
+			}
+			_, _ = tw.Write([]byte("bad"))
+		}
+		_ = tw.Close()
+		if err := extractWasmCheckpointTar(bytes.NewReader(buf.Bytes()), filepath.Join(t.TempDir(), "dst")); err == nil {
+			t.Fatal("expected invalid snapshot error")
+		}
+	})
+
+	t.Run("missing tar file", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		if err := tw.WriteHeader(&tar.Header{Name: "config.json", Mode: 0o644, Size: 4, Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		_, _ = tw.Write([]byte("{}{}"))
+		_ = tw.Close()
+		if err := extractWasmCheckpointTar(bytes.NewReader(buf.Bytes()), filepath.Join(t.TempDir(), "dst")); err == nil {
+			t.Fatal("expected missing tar member error")
+		}
+	})
+
+	t.Run("read tar error", func(t *testing.T) {
+		if err := extractWasmCheckpointTar(bytes.NewReader([]byte("not a tar")), filepath.Join(t.TempDir(), "dst")); err == nil {
+			t.Fatal("expected tar read error")
+		}
+	})
+
+	t.Run("write entry errors", func(t *testing.T) {
+		dir := t.TempDir()
+		filePath := filepath.Join(dir, "regular.txt")
+		if err := os.WriteFile(filePath, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		tw := tar.NewWriter(io.Discard)
+		if err := writeTarFileEntry(tw, "missing", filepath.Join(dir, "missing")); err == nil {
+			t.Fatal("expected stat error")
+		}
+		if err := writeTarFileEntry(tw, "dir", dir); err == nil {
+			t.Fatal("expected non-regular file error")
+		}
+		if err := writeTarFileEntry(tw, "file", filePath); err != nil {
+			t.Fatalf("writeTarFileEntry regular file: %v", err)
+		}
+	})
 }

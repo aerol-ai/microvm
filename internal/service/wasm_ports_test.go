@@ -137,3 +137,40 @@ func TestWasmHTTPPortRouteCleanup(t *testing.T) {
 	// Since we mock caddy, we just verify it doesn't panic and returns without error
 	svc.wasmHTTPPortRouteCleanup(ctx, "sb-clean", 8080)
 }
+
+func TestWasmHTTPDialErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:           "sb-wasm-dial",
+		Status:       models.SandboxStatusStarted,
+		Runtime:      models.RuntimeWasm,
+		ContainerIP:  "127.0.0.1",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	if _, err := svc.wasmHTTPDial(ctx, "sb-wasm-dial", 8080); err == nil {
+		t.Fatal("wasmHTTPDial should fail when the runtime driver is missing")
+	}
+	if _, err := svc.wasmHTTPUpstreamURL(ctx, "sb-wasm-dial", 8080); err == nil {
+		t.Fatal("wasmHTTPUpstreamURL should fail when the runtime driver is missing")
+	}
+	if err := svc.installWasmHTTPPortRoute(ctx, &models.Sandbox{ID: "sb-wasm-dial", Runtime: models.RuntimeWasm}, 8080); err == nil {
+		t.Fatal("installWasmHTTPPortRoute should fail when the runtime driver is missing")
+	}
+
+	svc.syncWasmAllowedPorts(ctx, nil)
+	svc.syncWasmAllowedPorts(ctx, &models.Sandbox{
+		ID:           "sb-wasm-dial",
+		Runtime:      models.RuntimeWasm,
+		ContainerIP:  "127.0.0.1",
+		ExposedPorts: []models.ExposedPort{{Port: 8080, Protocol: models.ExposedPortProtocolHTTP}},
+	})
+}

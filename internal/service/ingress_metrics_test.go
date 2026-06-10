@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -164,5 +165,44 @@ func TestRecordIngressReconcilePublishesRevisionAndShardMetrics(t *testing.T) {
 	recordIngressReconcile(reconcileErrored, time.Millisecond, counts, 56)
 	if got := ingressRouteFailedRevision.Value(); got != 56 {
 		t.Fatalf("failed revision = %d, want 56", got)
+	}
+}
+
+func TestIngressMetricsHelperBranches(t *testing.T) {
+	beforeMisses := ingressRouteMissesTotal.Value()
+	RecordRouteMiss()
+	RecordRouteMiss("custom_reason")
+	if got := ingressRouteMissesTotal.Value(); got < beforeMisses+2 {
+		t.Fatalf("route miss total = %d, want at least %d", got, beforeMisses+2)
+	}
+	if got := ingressRouteMissesByReason.String(); !strings.Contains(got, "custom_reason") {
+		t.Fatalf("route misses by reason = %s, want custom_reason", got)
+	}
+
+	ops := []func(context.Context) error{
+		func(context.Context) error { return nil },
+		func(context.Context) error { return errors.New("boom") },
+	}
+	if err := runIngressOpsBatched(context.Background(), ops, 1, 1); err == nil {
+		t.Fatal("runIngressOpsBatched should surface the first error")
+	}
+
+	prev := ingressPlacementVersionMax.Value()
+	defer ingressPlacementVersionMax.Set(prev)
+	ingressPlacementVersionMax.Set(10)
+	SetIngressRouteLag(8)
+	if got := ingressRouteLagVersions.Value(); got != 0 {
+		t.Fatalf("route lag = %d, want 0 when FSM is behind installed version", got)
+	}
+	SetIngressRouteLag(12)
+	if got := ingressRouteLagVersions.Value(); got != 2 {
+		t.Fatalf("route lag = %d, want 2", got)
+	}
+	if got := IngressInstalledVersion(); got != 10 {
+		t.Fatalf("IngressInstalledVersion = %d, want 10", got)
+	}
+	ingressPlacementVersionMax.Set(-1)
+	if got := IngressInstalledVersion(); got != 0 {
+		t.Fatalf("IngressInstalledVersion = %d, want 0 for negative state", got)
 	}
 }

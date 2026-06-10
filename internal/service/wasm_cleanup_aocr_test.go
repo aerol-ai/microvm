@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -35,6 +36,14 @@ func (r *recordingWasmCheckpointStore) PullOnce(context.Context, string, string)
 func (r *recordingWasmCheckpointStore) DeleteRef(_ context.Context, ref string) error {
 	r.deleted = append(r.deleted, ref)
 	return nil
+}
+
+type failingDeleteWasmCheckpointStore struct {
+	recordingWasmCheckpointStore
+}
+
+func (f *failingDeleteWasmCheckpointStore) DeleteRef(context.Context, string) error {
+	return errors.New("delete ref failed")
 }
 
 func newAOCRCleanupTestService(t *testing.T) (*Service, *store.Store, *recordingWasmCheckpointStore) {
@@ -159,5 +168,25 @@ func TestCleanupWasmSandboxArtifacts_NonWasmNoop(t *testing.T) {
 	}
 	if len(keys) != 1 {
 		t.Fatalf("non-wasm cleanup touched kv rows: %v", keys)
+	}
+}
+
+func TestCleanupWasmSandboxArtifacts_ErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newAOCRCleanupTestService(t)
+	svc.wasmCheckpointPusher = &failingDeleteWasmCheckpointStore{}
+	_ = st.Close()
+
+	sb := &models.Sandbox{
+		ID:              "wasm-err",
+		Image:           "registry/foo:wasm",
+		Runtime:         models.RuntimeWasm,
+		Status:          models.SandboxStatusPassivated,
+		Durability:      models.DurabilityDurable,
+		ModuleRef:       "registry/foo:wasm",
+		WasmRegistryRef: "aocr://wasm-err:sha256-newest",
+	}
+	if err := svc.cleanupWasmSandboxArtifacts(ctx, sb); err == nil {
+		t.Fatal("cleanupWasmSandboxArtifacts should return a store error when the DB is closed")
 	}
 }

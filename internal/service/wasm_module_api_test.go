@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +59,15 @@ func (s stubWasmModuleResolver) Resolve(_ context.Context, ref string) (*wasmmod
 		Digest:    s.digest,
 		SizeBytes: 4,
 	}, nil
+}
+
+type wasmModuleAPIRemoveErrorRuntime struct {
+	wasmModuleAPINoopRuntime
+	err error
+}
+
+func (r wasmModuleAPIRemoveErrorRuntime) RemoveImage(context.Context, string) error {
+	return r.err
 }
 
 func TestCreateWasmModule_HappyPath(t *testing.T) {
@@ -191,5 +201,68 @@ func TestDeleteWasmModule(t *testing.T) {
 	_, err = svc.GetWasmModule(ctx, "mod-1")
 	if err == nil {
 		t.Fatalf("Expected error, got nil")
+	}
+}
+
+func TestWasmModuleAPIEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	disabled := New(config.Config{}, logger, st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+	if _, err := disabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ModuleRef: "file:///tmp/x.wasm"}); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("disabled CreateWasmModule = %v, want ErrRuntimeNotImplemented", err)
+	}
+	if _, err := disabled.ListWasmModules(ctx); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("disabled ListWasmModules = %v, want ErrRuntimeNotImplemented", err)
+	}
+	if _, err := disabled.GetWasmModule(ctx, "x"); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("disabled GetWasmModule = %v, want ErrRuntimeNotImplemented", err)
+	}
+	if err := disabled.DeleteWasmModule(ctx, "x"); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("disabled DeleteWasmModule = %v, want ErrRuntimeNotImplemented", err)
+	}
+
+	enabled := New(config.Config{EnableWasm: true}, logger, st, wasmModuleAPINoopRuntime{}, nil, nil, nil, nil, nil)
+	if _, err := enabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ModuleRef: "file:///tmp/x.wasm"}); err == nil || !strings.Contains(err.Error(), "resolver is not configured") {
+		t.Fatalf("missing resolver = %v", err)
+	}
+	enabled.SetWasmModuleResolver(stubWasmModuleResolver{path: filepath.Join(dir, "mod.wasm"), digest: "sha256:abc"})
+	if _, err := enabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{}); err == nil || !strings.Contains(err.Error(), "module_ref is required") {
+		t.Fatalf("empty module_ref = %v", err)
+	}
+	now := time.Now().UTC()
+	if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{ID: "conflict", ModuleRef: "file:///tmp/different.wasm", Status: string(models.WasmModuleStatusReady), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertWasmModule: %v", err)
+	}
+	if _, err := enabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ID: "conflict", ModuleRef: "file:///tmp/x.wasm"}); !errors.Is(err, store.ErrWasmModuleIDConflict) {
+		t.Fatalf("explicit ID conflict = %v", err)
+	}
+	enabled.SetWasmModuleResolver(erroringWasmModuleResolver{err: errors.New("resolve failed")})
+	if _, err := enabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ID: "failed", ModuleRef: "file:///tmp/fail.wasm"}); err == nil || !strings.Contains(err.Error(), "resolve wasm module") {
+		t.Fatalf("resolver failure = %v", err)
+	}
+	failed, err := st.GetWasmModule(ctx, "failed")
+	if err != nil {
+		t.Fatalf("GetWasmModule failed row: %v", err)
+	}
+	if failed.Status != string(models.WasmModuleStatusFailed) || !strings.Contains(failed.LastError, "resolve failed") {
+		t.Fatalf("failed row = %+v", failed)
+	}
+	enabled.SetWasmModuleResolver(stubWasmModuleResolver{path: filepath.Join(dir, "mod.wasm"), digest: ""})
+	if _, err := enabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ModuleRef: "file:///tmp/empty-digest.wasm"}); err == nil || !strings.Contains(err.Error(), "empty digest") {
+		t.Fatalf("empty digest = %v", err)
+	}
+
+	remover := New(config.Config{EnableWasm: true}, logger, st, nil, nil, nil, nil, nil, nil)
+	remover.SetWasmRuntime(wasmModuleAPIRemoveErrorRuntime{err: errors.New("remove failed")})
+	_ = st.UpsertWasmModule(ctx, store.WasmModuleRecord{ID: "mod-remove", ModuleRef: "file:///tmp/remove.wasm", Status: string(models.WasmModuleStatusReady), CreatedAt: now, UpdatedAt: now})
+	if err := remover.DeleteWasmModule(ctx, "mod-remove"); err == nil || !strings.Contains(err.Error(), "remove failed") {
+		t.Fatalf("DeleteWasmModule remove failure = %v", err)
 	}
 }

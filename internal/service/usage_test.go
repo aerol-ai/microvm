@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -205,5 +206,63 @@ func TestEmitLifecycleStopUsage(t *testing.T) {
 	s.usageMu.Unlock()
 	if present {
 		t.Fatalf("destroy edge (drop=true) should forget the cursor")
+	}
+}
+
+type failingUsageReporter struct {
+	err error
+}
+
+func (f failingUsageReporter) Report(context.Context, []controlplane.Sample) error {
+	return f.err
+}
+
+func TestUsageHelperEdgeBranches(t *testing.T) {
+	s := newUsageService(failingUsageReporter{err: errors.New("delivery failed")})
+
+	// emitUsage should swallow reporter failures and keep going.
+	s.emitUsage(context.Background(), []controlplane.Sample{{
+		EventID: "evt-1",
+		Kind:    usageKindUptime,
+		Value:   1,
+		Unit:    usageUnitSeconds,
+	}})
+	s.emitUsage(context.Background(), nil)
+
+	// gpuReservedCount treats nil / zero / negative as one billable GPU only
+	// when the request exists.
+	if got := gpuReservedCount(nil); got != 0 {
+		t.Fatalf("gpuReservedCount(nil) = %d, want 0", got)
+	}
+	if got := gpuReservedCount(&models.GPURequest{Count: 0}); got != 1 {
+		t.Fatalf("gpuReservedCount(0) = %d, want 1", got)
+	}
+	if got := gpuReservedCount(&models.GPURequest{Count: -1}); got != 1 {
+		t.Fatalf("gpuReservedCount(-1) = %d, want 1", got)
+	}
+
+	start := time.Unix(1_700_000_100, 0).UTC()
+	s.advanceUsageCursor("sb-cursor", start)
+	if got := s.usageWindowStart("sb-cursor", start.Add(-time.Minute)); !got.Equal(start) {
+		t.Fatalf("usageWindowStart(cursor) = %v, want %v", got, start)
+	}
+	s.dropUsageCursor("sb-cursor")
+	if got := s.usageWindowStart("sb-cursor", start.Add(-time.Minute)); !got.Equal(start.Add(-time.Minute)) {
+		t.Fatalf("usageWindowStart(fallback) = %v, want fallback", got)
+	}
+}
+
+func TestUsageFallbackWindowStartBranches(t *testing.T) {
+	s := &Service{cfg: config.Config{ReconcileInterval: 0}}
+	now := time.Unix(1_700_000_200, 0).UTC()
+
+	old := &models.Sandbox{CreatedAt: now.Add(-10 * time.Minute)}
+	if got := s.reconcileFallbackWindowStart(old, now); !got.Equal(now.Add(-5 * time.Minute)) {
+		t.Fatalf("reconcileFallbackWindowStart(old) = %v, want now-5m", got)
+	}
+
+	newer := &models.Sandbox{CreatedAt: now.Add(-time.Minute)}
+	if got := s.reconcileFallbackWindowStart(newer, now); !got.Equal(newer.CreatedAt.UTC()) {
+		t.Fatalf("reconcileFallbackWindowStart(newer) = %v, want created_at", got)
 	}
 }

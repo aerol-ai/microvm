@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/store"
@@ -138,6 +139,84 @@ func TestFleetControllerFireWebhookIsNoErr(t *testing.T) {
 	if err := svc.FireWebhook(context.Background(), "acme", "warn"); err != nil {
 		t.Fatalf("FireWebhook: %v", err)
 	}
+}
+
+func TestFleetControllerErrorBranches(t *testing.T) {
+	bg := context.Background()
+
+	t.Run("stop errors are joined", func(t *testing.T) {
+		rt := &recordingRuntime{stopErr: errors.New("stop failed")}
+		svc, st, _ := newServiceRuntimeHarness(t, rt)
+		id := createOwned(t, svc, "acme", "sb-stop-err")
+		if err := svc.StopByOwner(bg, "acme"); err == nil {
+			t.Fatal("expected StopByOwner to return error")
+		}
+		got, err := st.Get(bg, id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Status != models.SandboxStatusStarted {
+			t.Fatalf("stop failure should leave sandbox running, got %s", got.Status)
+		}
+	})
+
+	t.Run("restore errors are joined", func(t *testing.T) {
+		rt := &recordingRuntime{startErr: errors.New("start failed")}
+		svc, st, _ := newServiceRuntimeHarness(t, rt)
+		id := createOwned(t, svc, "acme", "sb-restore-err")
+		if _, err := svc.StopSandbox(bg, id); err != nil {
+			t.Fatalf("StopSandbox: %v", err)
+		}
+		rt.startErr = errors.New("start failed")
+		if err := st.SetFleetSuspended(bg, id, true); err != nil {
+			t.Fatalf("SetFleetSuspended: %v", err)
+		}
+		if err := st.UpdateStatus(bg, id, models.SandboxStatusStopped, ""); err != nil {
+			t.Fatalf("UpdateStatus: %v", err)
+		}
+		if err := svc.RestoreByOwner(bg, "acme"); err == nil {
+			t.Fatal("expected RestoreByOwner to return error")
+		}
+		got, err := st.Get(bg, id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if !got.FleetSuspended {
+			t.Fatal("failed restore should preserve fleet-suspended marker")
+		}
+	})
+
+	t.Run("delete errors are surfaced", func(t *testing.T) {
+		rt := &recordingRuntime{destroyErr: errors.New("destroy failed")}
+		svc, _, _ := newServiceRuntimeHarness(t, rt)
+		createOwned(t, svc, "acme", "sb-delete-err")
+		if err := svc.DeleteByOwner(bg, "acme"); err == nil {
+			t.Fatal("expected DeleteByOwner to return error")
+		}
+	})
+
+	t.Run("list errors are returned", func(t *testing.T) {
+		rt := &recordingRuntime{}
+		svc, _, _ := newServiceRuntimeHarness(t, rt)
+		st2, err := store.Open(filepath.Join(t.TempDir(), "owner.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		svc.store = st2
+		createOwned(t, svc, "acme", "sb-owner-list")
+		if err := st2.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if err := svc.StopByOwner(bg, "acme"); err == nil {
+			t.Fatal("expected StopByOwner list failure")
+		}
+		if err := svc.RestoreByOwner(bg, "acme"); err == nil {
+			t.Fatal("expected RestoreByOwner list failure")
+		}
+		if err := svc.DeleteByOwner(bg, "acme"); err == nil {
+			t.Fatal("expected DeleteByOwner list failure")
+		}
+	})
 }
 
 func TestCreateGate(t *testing.T) {

@@ -92,3 +92,28 @@ func TestSyncWasmNetworkPolicy(t *testing.T) {
 		t.Fatalf("syncWasmNetworkPolicy failed on blockAll: in=%v out=%v", sink.lastBlockIn, sink.lastBlockOut)
 	}
 }
+
+func TestWasmNetworkNoOpBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+
+	// No runtime interface at all.
+	svc.SetWasmRuntime(&recordingRuntime{})
+	svc.drainWasmNetworkCounters(ctx)
+
+	// Empty and zero-only counter deltas are ignored.
+	svc.SetWasmRuntime(&wasmNetCounterRuntime{deltas: map[string]struct{ BytesIn, BytesOut int64 }{}})
+	svc.drainWasmNetworkCounters(ctx)
+	svc.SetWasmRuntime(&wasmNetCounterRuntime{deltas: map[string]struct{ BytesIn, BytesOut int64 }{
+		"sb-zero": {},
+	}})
+	svc.drainWasmNetworkCounters(ctx)
+
+	// Policy sync is inert for nil/non-WASM sandboxes and for runtimes that
+	// do not expose the policy sink.
+	svc.syncWasmNetworkPolicy(nil, true, true)
+	svc.syncWasmNetworkPolicy(&models.Sandbox{ID: "sb-docker", Runtime: models.RuntimeDocker}, true, true)
+	svc.SetWasmRuntime(&recordingRuntime{})
+	svc.syncWasmNetworkPolicy(&models.Sandbox{ID: "sb-wasm", Runtime: models.RuntimeWasm}, true, true)
+}

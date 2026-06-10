@@ -183,3 +183,33 @@ func TestRoundTripToolbox_Network(t *testing.T) {
 		t.Fatalf("Expected body net-toolbox, got %s", string(body))
 	}
 }
+
+func TestToolboxProxyErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(&recordingRuntime{})
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:           "sb-wasm-toolbox",
+		Runtime:      models.RuntimeWasm,
+		Status:       models.SandboxStatusStarted,
+		ToolboxToken: "token123",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		t.Fatalf("Create sandbox failed: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com/foo", nil)
+	rec := httptest.NewRecorder()
+	err := svc.ServeToolboxReverseProxy(ctx, "sb-wasm-toolbox", rec, req, "/foo")
+	if err == nil || !strings.Contains(err.Error(), "does not implement toolbox host") {
+		t.Fatalf("ServeToolboxReverseProxy error = %v, want toolbox-host error", err)
+	}
+
+	if _, err := svc.RoundTripToolbox(ctx, "sb-wasm-toolbox", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "does not implement toolbox host") {
+		t.Fatalf("RoundTripToolbox error = %v, want toolbox-host error", err)
+	}
+}

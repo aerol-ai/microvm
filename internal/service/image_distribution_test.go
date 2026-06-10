@@ -213,6 +213,55 @@ func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
 	}
 }
 
+func TestImageDistributionHelperBranches(t *testing.T) {
+	ctx := context.Background()
+
+	p := newDefaultImageDistributionProvider("")
+	if got, err := p.ClassifyImage(ctx, ""); err != nil || !got.IsZero() {
+		t.Fatalf("ClassifyImage(empty) = (%+v, %v), want zero/nil", got, err)
+	}
+	if got, err := p.ClassifyImage(ctx, docker.BuiltImageNamespace+"/abc123:latest"); err != nil || got.Mode != models.ImageDistributionLocalOnly {
+		t.Fatalf("ClassifyImage(local) = (%+v, %v), want local-only", got, err)
+	}
+	if got, err := p.ClassifyImage(ctx, "aocr.aerol.ai/team/app:latest"); err != nil || got.Mode != models.ImageDistributionAOCR || got.RegistryRef != "aocr.aerol.ai/team/app:latest" {
+		t.Fatalf("ClassifyImage(aocr) = (%+v, %v), want AOCR with ref", got, err)
+	}
+	if got, err := p.ClassifyImage(ctx, "ghcr.io/org/app:latest"); err != nil || got.Mode != models.ImageDistributionExternalRegistry || got.RegistryRef != "ghcr.io/org/app:latest" {
+		t.Fatalf("ClassifyImage(external) = (%+v, %v), want external with ref", got, err)
+	}
+
+	for _, tc := range []struct {
+		image string
+		want  string
+	}{
+		{"ghcr.io/org/app:latest", "ghcr.io"},
+		{"localhost:5000/team/app:latest", "localhost:5000"},
+		{"docker://aocr.aerol.ai/team/app:latest", "aocr.aerol.ai"},
+		{"busybox", ""},
+	} {
+		if got := imageRegistryHost(tc.image); got != tc.want {
+			t.Fatalf("imageRegistryHost(%q) = %q, want %q", tc.image, got, tc.want)
+		}
+	}
+
+	normalized, err := normalizeImageDistributionMetadata("ghcr.io/org/app:latest", models.ImageDistributionMetadata{})
+	if err != nil {
+		t.Fatalf("normalizeImageDistributionMetadata: %v", err)
+	}
+	if normalized.Mode != models.ImageDistributionExternalRegistry || normalized.RegistryRef != "ghcr.io/org/app:latest" {
+		t.Fatalf("normalized = %+v, want external registry ref", normalized)
+	}
+
+	svc := &Service{}
+	snap := &models.SandboxSnapshot{Image: "  ghcr.io/org/app:latest  "}
+	if err := svc.normalizeSnapshotImageDistribution(ctx, snap, true); err != nil {
+		t.Fatalf("normalizeSnapshotImageDistribution(force local): %v", err)
+	}
+	if snap.ImageDistributionMode != models.ImageDistributionLocalOnly {
+		t.Fatalf("forced snapshot mode = %q, want local-only", snap.ImageDistributionMode)
+	}
+}
+
 func openImageDistributionStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))

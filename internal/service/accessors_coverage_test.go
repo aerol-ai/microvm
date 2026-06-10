@@ -118,6 +118,29 @@ func TestIngressAndCustomDomainDNS(t *testing.T) {
 	}
 }
 
+func TestIngressAndCustomDomainDNSBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.AttachCluster(cluster.NewNoop("n1", "http://127.0.0.1:1", "sandbox.example.com"))
+	svc.cfg.EnableCustomDomains = true
+	svc.cfg.Domain = "sandbox.example.com"
+
+	seedStartedSandbox(t, st, "sb-dns-branches")
+	if err := st.AddCustomDomain(ctx, "sb-dns-branches", "api.sandbox.example.com", 0); err != nil {
+		t.Fatalf("AddCustomDomain: %v", err)
+	}
+	recs, err := svc.CustomDomainDNS(ctx, "sb-dns-branches")
+	if err != nil {
+		t.Fatalf("CustomDomainDNS(branches): %v", err)
+	}
+	if len(recs.Records) == 0 {
+		t.Fatal("expected non-empty DNS records for attached custom domain")
+	}
+	if recs.Target.Hostname == "" && len(recs.Target.IPs) == 0 {
+		t.Fatal("expected ingress target to be preserved")
+	}
+}
+
 func TestIngressInstalledVersion(t *testing.T) {
 	// Package-level expvar-backed read; just ensure it returns without panic.
 	_ = IngressInstalledVersion()

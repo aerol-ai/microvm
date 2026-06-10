@@ -236,3 +236,63 @@ func TestTemplateRotation_CutoffComputedFromNow(t *testing.T) {
 		t.Errorf("cutoff = %v, want %v", store.lastCutoff, wantCutoff)
 	}
 }
+
+func TestTemplateRotation_RunOnceEdgeBranches(t *testing.T) {
+	t.Run("nil receiver", func(t *testing.T) {
+		stats, err := (*TemplateRotationReconciler)(nil).RunOnce(context.Background())
+		if err != nil {
+			t.Fatalf("RunOnce(nil) error = %v, want nil", err)
+		}
+		if stats != (TemplateRotationStats{}) {
+			t.Fatalf("RunOnce(nil) stats = %+v, want zero", stats)
+		}
+	})
+
+	t.Run("skips nil and blank candidates", func(t *testing.T) {
+		store := &fakeRotationStore{
+			candidates: []*templateRotationCandidate{
+				nil,
+				{ID: ""},
+				{ID: "tpl-ok", ReadyAt: time.Now().Add(-31 * 24 * time.Hour)},
+			},
+		}
+		marker := &fakeRotationMarker{}
+		r := newTestRotationReconciler(t,
+			TemplateRotationConfig{Interval: time.Hour, MaxAge: 30 * 24 * time.Hour},
+			store, marker)
+
+		stats, err := r.RunOnce(context.Background())
+		if err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		if stats.Scanned != 3 || stats.Marked != 1 || stats.Skipped != 2 {
+			t.Fatalf("stats = %+v, want {Scanned:3 Marked:1 Skipped:2}", stats)
+		}
+		if len(marker.calls) != 1 || marker.calls[0].ID != "tpl-ok" {
+			t.Fatalf("marker.calls = %+v, want one replay for tpl-ok", marker.calls)
+		}
+	})
+
+	t.Run("canceled context returns error before first mark", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		store := &fakeRotationStore{
+			candidates: []*templateRotationCandidate{{ID: "tpl-a", ReadyAt: time.Now().Add(-31 * 24 * time.Hour)}},
+		}
+		marker := &fakeRotationMarker{}
+		r := newTestRotationReconciler(t,
+			TemplateRotationConfig{Interval: time.Hour, MaxAge: 30 * 24 * time.Hour},
+			store, marker)
+
+		stats, err := r.RunOnce(ctx)
+		if err == nil {
+			t.Fatal("RunOnce(ctx canceled) returned nil error")
+		}
+		if stats.Scanned != 1 || stats.Marked != 0 || stats.Skipped != 0 {
+			t.Fatalf("stats = %+v, want one scanned row and no marks", stats)
+		}
+		if len(marker.calls) != 0 {
+			t.Fatalf("marker.calls = %+v, want none after cancellation", marker.calls)
+		}
+	})
+}
