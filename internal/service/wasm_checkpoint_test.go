@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -34,6 +36,18 @@ func (f *fakeCheckpointRuntime) RehydrateSandbox(_ context.Context, sandbox *mod
 func (f *fakeCheckpointRuntime) CheckpointLiveSandbox(_ context.Context, sandbox *models.Sandbox) (string, string, error) {
 	f.liveCheckpointCalls++
 	return f.checkpointPath, f.cloneGen, f.liveCheckpointErr
+}
+
+type fakeCheckpointDrainRuntime struct {
+	fakeCheckpointRuntime
+	listManagedErr error
+}
+
+func (f *fakeCheckpointDrainRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
+	if f.listManagedErr != nil {
+		return nil, f.listManagedErr
+	}
+	return f.fakeCheckpointRuntime.ListManaged(context.Background())
 }
 
 func TestDrainWasmSandboxes(t *testing.T) {
@@ -179,6 +193,67 @@ func TestStartWasmDurablePushSweep(t *testing.T) {
 
 	svc.StartWasmDurablePushSweep(ctx)
 	time.Sleep(time.Millisecond * 30) // allow ticker to fire
+}
+
+func TestDrainWasmSandboxesEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("disabled or missing host are no-op", func(t *testing.T) {
+		var svc *Service
+		svc = &Service{}
+		if err := svc.DrainWasmSandboxes(ctx); err != nil {
+			t.Fatalf("empty service should no-op: %v", err)
+		}
+
+		svc = &Service{cfg: config.Config{EnableWasm: false}, wasm: &fakeCheckpointRuntime{}}
+		if err := svc.DrainWasmSandboxes(ctx); err != nil {
+			t.Fatalf("disabled service should no-op: %v", err)
+		}
+
+		svc = &Service{cfg: config.Config{EnableWasm: true}, wasm: wasmModuleAPINoopRuntime{}}
+		if err := svc.DrainWasmSandboxes(ctx); err != nil {
+			t.Fatalf("runtime without checkpoint host should no-op: %v", err)
+		}
+	})
+
+	t.Run("store list error", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.SetWasmRuntime(&fakeCheckpointRuntime{})
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if err := svc.DrainWasmSandboxes(ctx); err == nil {
+			t.Fatal("closed store should fail DrainWasmSandboxes")
+		}
+	})
+
+	t.Run("runtime list managed error", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		rt := &fakeCheckpointDrainRuntime{
+			fakeCheckpointRuntime: fakeCheckpointRuntime{
+				wasmRecordingRuntime: wasmRecordingRuntime{
+					managed: map[string]*models.SandboxRuntimeState{},
+				},
+			},
+			listManagedErr: errors.New("managed list failed"),
+		}
+		svc.SetWasmRuntime(rt)
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:         "sb-live",
+			Runtime:    models.RuntimeWasm,
+			Status:     models.SandboxStatusStarted,
+			Durability: models.DurabilityPassivatable,
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("Create sandbox: %v", err)
+		}
+		if err := svc.DrainWasmSandboxes(ctx); err == nil {
+			t.Fatal("managed list failure should fail DrainWasmSandboxes")
+		}
+	})
 }
 
 type wasmCheckpointPusherStub struct{}
