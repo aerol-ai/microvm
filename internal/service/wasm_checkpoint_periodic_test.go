@@ -81,3 +81,15 @@ func TestRunWasmPeriodicCheckpointKeepsSandboxStarted(t *testing.T) {
 		t.Fatalf("clone_generation = %q", got.CloneGeneration)
 	}
 }
+
+func TestWasmPeriodicCheckpointEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	var nilSvc *Service
+	nilSvc.StartWasmPeriodicCheckpoint(ctx)
+	nilSvc.StartWasmDurablePushSweep(ctx)
+
+	svc := &Service{cfg: config.Config{EnableWasm: true, WasmCheckpointInterval: 0, WasmDurablePushInterval: 0}}
+	svc.StartWasmPeriodicCheckpoint(ctx)
+	svc.StartWasmDurablePushSweep(ctx)
+}

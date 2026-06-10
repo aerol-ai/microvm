@@ -86,3 +86,41 @@ func TestWasmCheckpointPusherDeleteRef(t *testing.T) {
 		t.Fatal("expected delete error without PAT file")
 	}
 }
+
+func TestWasmCheckpointPusherEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	if _, err := NewWasmCheckpointPusher(SnapshotPushConfig{Enabled: true}, nil); err == nil {
+		t.Fatal("invalid config should fail NewWasmCheckpointPusher")
+	}
+	if p, err := NewWasmCheckpointPusher(SnapshotPushConfig{Enabled: false}, nil); err != nil || p != nil {
+		t.Fatalf("disabled config = (%v, %v), want (nil, nil)", p, err)
+	}
+
+	var nilPusher *WasmCheckpointPusher
+	if _, err := nilPusher.PushOnce(ctx, "sb", "/tmp"); err == nil {
+		t.Fatal("nil pusher should reject PushOnce")
+	}
+	if _, err := nilPusher.PushOnceTo(ctx, "sb", "/tmp", "dest"); err == nil {
+		t.Fatal("nil pusher should reject PushOnceTo")
+	}
+	if err := nilPusher.PullOnce(ctx, "ref", "/tmp"); err == nil {
+		t.Fatal("nil pusher should reject PullOnce")
+	}
+	if err := nilPusher.DeleteRef(ctx, "ref"); err == nil {
+		t.Fatal("nil pusher should reject DeleteRef")
+	}
+
+	p, err := NewWasmCheckpointPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.example.com",
+		ClusterID: "c1",
+		PATPath:   filepath.Join(t.TempDir(), "pat"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewWasmCheckpointPusher: %v", err)
+	}
+	if _, err := p.PushOnceTo(ctx, "sb", filepath.Join(t.TempDir(), "missing"), "dest"); err == nil {
+		t.Fatal("PushOnceTo should fail on missing checkpoint dir")
+	}
+}

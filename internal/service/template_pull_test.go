@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -504,7 +505,6 @@ func TestEnsureTemplateLocalEdgeBranches(t *testing.T) {
 		t.Fatalf("nil puller should return nil, got %v", err)
 	}
 
-	patPath := writePATFile(t, "token")
 	rootfs := []byte("rootfs")
 	mem := []byte("mem")
 	state := []byte("state")

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"io"
 	"log/slog"
@@ -396,6 +397,118 @@ func TestRunTemplateGCDuringStoreFailure(t *testing.T) {
 	svc.runTemplateGC(context.Background(), time.Now())
 }
 
+func TestRunTemplateGCEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("reference check error", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		templatesDir := filepath.Join(dir, "templates")
+		if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+			t.Fatalf("mkdir templates: %v", err)
+		}
+		svc := &Service{
+			cfg: config.Config{
+				EnableFirecracker:            true,
+				FirecrackerTemplatesDir:      templatesDir,
+				FirecrackerTemplateGCEnabled: true,
+				FirecrackerTemplateGCTTL:     time.Hour,
+			},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			store:  st,
+		}
+		tpl := &models.Template{
+			ID:              "tpl-gc-ref",
+			Image:           "docker://alpine:3.19",
+			Status:          models.TemplateStatusReady,
+			RootfsPath:      filepath.Join(templatesDir, "tpl-gc-ref", "rootfs.ext4"),
+			RootfsSizeBytes: 1,
+			CreatedAt:       time.Now().UTC().Add(-2 * time.Hour),
+			UpdatedAt:       time.Now().UTC().Add(-2 * time.Hour),
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate: %v", err)
+		}
+		dropSQLiteTable(t, dbPath, "sandboxes")
+		svc.runTemplateGC(ctx, time.Now())
+		if _, err := st.GetTemplate(ctx, tpl.ID); err != nil {
+			t.Fatalf("template should remain after reference-check error: %v", err)
+		}
+	})
+
+	t.Run("vmm reference check error", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		templatesDir := filepath.Join(dir, "templates")
+		if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+			t.Fatalf("mkdir templates: %v", err)
+		}
+		svc := &Service{
+			cfg: config.Config{
+				EnableFirecracker:            true,
+				FirecrackerTemplatesDir:      templatesDir,
+				FirecrackerTemplateGCEnabled: true,
+				FirecrackerTemplateGCTTL:     time.Hour,
+			},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			store:  st,
+		}
+		tpl := &models.Template{
+			ID:              "tpl-gc-vmm",
+			Image:           "docker://alpine:3.19",
+			Status:          models.TemplateStatusReady,
+			RootfsPath:      filepath.Join(templatesDir, "tpl-gc-vmm", "rootfs.ext4"),
+			RootfsSizeBytes: 1,
+			CreatedAt:       time.Now().UTC().Add(-2 * time.Hour),
+			UpdatedAt:       time.Now().UTC().Add(-2 * time.Hour),
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate: %v", err)
+		}
+		dropSQLiteTable(t, dbPath, "firecracker_vmm_pool")
+		svc.runTemplateGC(ctx, time.Now())
+		if _, err := st.GetTemplate(ctx, tpl.ID); err != nil {
+			t.Fatalf("template should remain after VMM reference-check error: %v", err)
+		}
+	})
+
+	t.Run("cid release error", func(t *testing.T) {
+		svc, st, templatesDir := newTemplateHarness(t)
+		now := time.Now().UTC()
+		tpl := &models.Template{
+			ID:              "tpl-gc-release",
+			Image:           "docker://alpine:3.19",
+			Status:          models.TemplateStatusReady,
+			RootfsPath:      filepath.Join(templatesDir, "tpl-gc-release", "rootfs.ext4"),
+			RootfsSizeBytes: 1,
+			HasSnapshot:     true,
+			CreatedAt:       now.Add(-48 * time.Hour),
+			UpdatedAt:       now.Add(-48 * time.Hour),
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate: %v", err)
+		}
+		alloc := &fakeCIDAllocator{releaseErr: errors.New("release failed")}
+		svc.SetTemplateCIDAllocator(alloc)
+		svc.runTemplateGC(ctx, time.Now())
+		alloc.mu.Lock()
+		defer alloc.mu.Unlock()
+		if len(alloc.releaseIDs) != 1 || alloc.releaseIDs[0] != tpl.ID {
+			t.Fatalf("releaseIDs = %v, want [%q]", alloc.releaseIDs, tpl.ID)
+		}
+	})
+}
+
 func TestWriteTemplateManifestRejectsDirectoryPath(t *testing.T) {
 	if err := writeTemplateManifest(t.TempDir(), templateManifest{
 		SourceImage:      "docker://alpine:3.19",
@@ -483,6 +596,7 @@ type fakeCIDAllocator struct {
 	releaseIDs  []string
 	cid         uint32
 	allocateErr error
+	releaseErr  error
 }
 
 func (a *fakeCIDAllocator) AllocateForTemplate(_ context.Context, _ string) (uint32, error) {
@@ -499,7 +613,7 @@ func (a *fakeCIDAllocator) ReleaseForTemplate(_ context.Context, id string) erro
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.releaseIDs = append(a.releaseIDs, id)
-	return nil
+	return a.releaseErr
 }
 
 // waitForStatus polls the row until it reaches `want` or the deadline
@@ -661,6 +775,64 @@ func TestCreateTemplate_CIDAllocFailFallsBackToReadyNoSnapshot(t *testing.T) {
 	}
 }
 
+func TestCreateTemplateEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("store create error", func(t *testing.T) {
+		svc, st, _ := newTemplateHarness(t)
+		svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if _, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{Image: "docker://alpine:3.19"}); err == nil {
+			t.Fatal("closed store should fail CreateTemplate")
+		}
+	})
+
+	t.Run("template id generation error", func(t *testing.T) {
+		old := crand.Reader
+		crand.Reader = &scriptedRandReader{errs: []error{errors.New("rand down")}}
+		t.Cleanup(func() { crand.Reader = old })
+
+		svc, _, _ := newTemplateHarness(t)
+		svc.SetTemplateBuilder(&fakeTemplateBuilder{})
+		if _, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{Image: "docker://alpine:3.19"}); err == nil || !contains(err.Error(), "rand down") {
+			t.Fatalf("CreateTemplate random failure = %v, want rand down", err)
+		}
+	})
+
+	t.Run("build side effects with closed store and manifest dir", func(t *testing.T) {
+		svc, st, templatesDir := newTemplateHarness(t)
+		done := make(chan struct{}, 1)
+		builder := &fakeTemplateBuilder{done: done}
+		svc.SetTemplateBuilder(builder)
+
+		tplDir := filepath.Join(templatesDir, "tpl-build-edge")
+		if err := os.MkdirAll(filepath.Join(tplDir, templateManifestFilename), 0o755); err != nil {
+			t.Fatalf("mkdir manifest dir: %v", err)
+		}
+
+		tpl, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "tpl-build-edge", Image: "docker://alpine:3.19"})
+		if err != nil {
+			t.Fatalf("CreateTemplate: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("builder never ran")
+		}
+		if builder.calls != 1 {
+			t.Fatalf("builder calls = %d, want 1", builder.calls)
+		}
+		if tpl.ID != "tpl-build-edge" {
+			t.Fatalf("template ID = %q, want tpl-build-edge", tpl.ID)
+		}
+	})
+}
+
 // TestDeleteTemplate_ReleasesCID pins the cleanup contract: deleting a
 // template with has_snapshot=true releases the per-template CID, so a
 // later CreateTemplate against the same id can re-reserve it.
@@ -691,6 +863,84 @@ func TestDeleteTemplate_ReleasesCID(t *testing.T) {
 	if len(alloc.releaseIDs) != 1 || alloc.releaseIDs[0] != "tpl-cid-del" {
 		t.Errorf("releaseIDs = %v, want [tpl-cid-del]", alloc.releaseIDs)
 	}
+}
+
+func TestDeleteTemplateEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("reference check error", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		templatesDir := filepath.Join(dir, "templates")
+		if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+			t.Fatalf("mkdir templates: %v", err)
+		}
+		svc := &Service{
+			cfg: config.Config{
+				EnableFirecracker:       true,
+				FirecrackerTemplatesDir: templatesDir,
+			},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			store:  st,
+		}
+		tpl := &models.Template{
+			ID:         "tpl-del-ref",
+			Image:      "docker://alpine:3.19",
+			Status:     models.TemplateStatusReady,
+			RootfsPath: filepath.Join(templatesDir, "tpl-del-ref", "rootfs.ext4"),
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate: %v", err)
+		}
+		dropSQLiteTable(t, dbPath, "sandboxes")
+		if err := svc.DeleteTemplate(ctx, tpl.ID); err == nil {
+			t.Fatal("dropping sandboxes table should fail DeleteTemplate")
+		}
+	})
+
+	t.Run("vmm reference check error", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		templatesDir := filepath.Join(dir, "templates")
+		if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+			t.Fatalf("mkdir templates: %v", err)
+		}
+		svc := &Service{
+			cfg: config.Config{
+				EnableFirecracker:       true,
+				FirecrackerTemplatesDir: templatesDir,
+			},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			store:  st,
+		}
+		tpl := &models.Template{
+			ID:         "tpl-del-vmm",
+			Image:      "docker://alpine:3.19",
+			Status:     models.TemplateStatusReady,
+			RootfsPath: filepath.Join(templatesDir, "tpl-del-vmm", "rootfs.ext4"),
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}
+		if err := st.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatalf("CreateTemplate: %v", err)
+		}
+		dropSQLiteTable(t, dbPath, "firecracker_vmm_pool")
+		if err := svc.DeleteTemplate(ctx, tpl.ID); err == nil {
+			t.Fatal("dropping firecracker_vmm_slots should fail DeleteTemplate")
+		}
+	})
 }
 
 func contains(s, substr string) bool {

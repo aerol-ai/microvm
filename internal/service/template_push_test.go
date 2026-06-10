@@ -492,8 +492,8 @@ func TestTemplateArtifactPusherEdgeBranches(t *testing.T) {
 	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
 		t.Fatalf("mkdir rootfs dir: %v", err)
 	}
-	memPath := filepath.Join(artifactDir, snapshotMemoryFilename)
-	statePath := filepath.Join(artifactDir, snapshotStateFilename)
+	memPath = filepath.Join(artifactDir, snapshotMemoryFilename)
+	statePath = filepath.Join(artifactDir, snapshotStateFilename)
 	if err := os.WriteFile(memPath, []byte("m"), 0o644); err != nil {
 		t.Fatalf("write mem: %v", err)
 	}

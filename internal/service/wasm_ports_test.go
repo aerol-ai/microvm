@@ -3,10 +3,14 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -172,5 +176,127 @@ func TestWasmHTTPDialErrorBranches(t *testing.T) {
 		Runtime:      models.RuntimeWasm,
 		ContainerIP:  "127.0.0.1",
 		ExposedPorts: []models.ExposedPort{{Port: 8080, Protocol: models.ExposedPortProtocolHTTP}},
+	})
+}
+
+type wasmPortsSyncErrRuntime struct {
+	wasmModuleAPINoopRuntime
+	noopWasmPortGateway
+	syncErr error
+}
+
+func (r wasmPortsSyncErrRuntime) SyncGuestListenPorts(context.Context, string, []int) error {
+	return r.syncErr
+}
+
+func TestInstallWasmHTTPPortRouteEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPatch:
+			http.NotFound(w, r)
+			return
+		case http.MethodPut:
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	t.Run("direct route error", func(t *testing.T) {
+		server := httptest.NewServer(handler)
+		t.Cleanup(server.Close)
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.cfg.EnableServerless = true
+		svc.cfg.HTTPWakeDirectBypassEnabled = true
+		svc.cfg.Domain = "sandbox.example.com"
+		svc.cfg.InternalIngressAddr = "127.0.0.1:1234"
+		svc.caddy = caddy.New(config.Config{
+			EnableCaddy:       true,
+			Domain:            "sandbox.example.com",
+			CaddyAdminURL:     server.URL,
+			CaddyServerID:     "srv0",
+			HTTPClientTimeout: time.Second,
+		})
+		svc.SetWasmRuntime(wasmPortsSyncErrRuntime{})
+		sandbox := &models.Sandbox{
+			ID:          "sb-wasm-direct",
+			Runtime:     models.RuntimeWasm,
+			Status:      models.SandboxStatusStarted,
+			ContainerIP: "127.0.0.1",
+			Lifecycle:   models.Lifecycle{Serverless: true},
+		}
+		if err := svc.installWasmHTTPPortRoute(ctx, sandbox, 8080); err == nil {
+			t.Fatal("expected direct route error")
+		}
+	})
+
+	t.Run("wake route error", func(t *testing.T) {
+		server := httptest.NewServer(handler)
+		t.Cleanup(server.Close)
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.cfg.EnableServerless = true
+		svc.cfg.HTTPWakeDirectBypassEnabled = false
+		svc.cfg.Domain = "sandbox.example.com"
+		svc.cfg.InternalIngressAddr = "127.0.0.1:1234"
+		svc.caddy = caddy.New(config.Config{
+			EnableCaddy:       true,
+			Domain:            "sandbox.example.com",
+			CaddyAdminURL:     server.URL,
+			CaddyServerID:     "srv0",
+			HTTPClientTimeout: time.Second,
+		})
+		svc.SetWasmRuntime(wasmPortsSyncErrRuntime{})
+		sandbox := &models.Sandbox{
+			ID:        "sb-wasm-wake",
+			Runtime:   models.RuntimeWasm,
+			Status:    models.SandboxStatusStopped,
+			WakeArmed: true,
+			Lifecycle: models.Lifecycle{Serverless: true},
+		}
+		if err := svc.installWasmHTTPPortRoute(ctx, sandbox, 8081); err == nil {
+			t.Fatal("expected wake route error")
+		}
+	})
+
+	t.Run("none route cleanup", func(t *testing.T) {
+		server := httptest.NewServer(handler)
+		t.Cleanup(server.Close)
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.cfg.EnableServerless = true
+		svc.cfg.HTTPWakeDirectBypassEnabled = true
+		svc.cfg.Domain = "sandbox.example.com"
+		svc.caddy = caddy.New(config.Config{
+			EnableCaddy:       true,
+			Domain:            "sandbox.example.com",
+			CaddyAdminURL:     server.URL,
+			CaddyServerID:     "srv0",
+			HTTPClientTimeout: time.Second,
+		})
+		svc.SetWasmRuntime(wasmPortsSyncErrRuntime{})
+		sandbox := &models.Sandbox{
+			ID:        "sb-wasm-none",
+			Runtime:   models.RuntimeWasm,
+			Status:    models.SandboxStatusStarted,
+			Lifecycle: models.Lifecycle{Serverless: true},
+		}
+		if err := svc.installWasmHTTPPortRoute(ctx, sandbox, 8082); err != nil {
+			t.Fatalf("installWasmHTTPPortRoute none = %v", err)
+		}
+	})
+
+	t.Run("guest port sync warning", func(t *testing.T) {
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.SetWasmRuntime(wasmPortsSyncErrRuntime{syncErr: errors.New("sync failed")})
+		svc.syncWasmAllowedPorts(ctx, &models.Sandbox{
+			ID:           "sb-sync",
+			Runtime:      models.RuntimeWasm,
+			ContainerIP:  "127.0.0.1",
+			ExposedPorts: []models.ExposedPort{{Port: 8080, Protocol: models.ExposedPortProtocolHTTP}},
+		})
 	})
 }
