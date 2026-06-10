@@ -98,6 +98,12 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 			apihttp.WriteError(w, http.StatusConflict, errNameConflict.Error())
 			return
 		}
+		// Service-side createSandbox timeout fires as DeadlineExceeded;
+		// map it to 504 consistent with the v1 and image-build handlers.
+		if errors.Is(err, context.DeadlineExceeded) {
+			apihttp.WriteError(w, http.StatusGatewayTimeout, "sandbox create exceeded timeout")
+			return
+		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}

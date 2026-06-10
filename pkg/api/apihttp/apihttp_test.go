@@ -260,3 +260,27 @@ func TestWriteStoreAwareError_LongMessageTruncated(t *testing.T) {
 		t.Errorf("message length = %d, want <= 200 (truncated)", len(msg))
 	}
 }
+
+// Fix 2: ErrSandboxNameConflict must map to 409 Conflict, not fall through to
+// the generic 400 Bad Request handler. Clients must be able to distinguish
+// "name already taken" from "invalid input".
+func TestWriteStoreAwareError_SandboxNameConflict(t *testing.T) {
+	code, msg := storeAwareErr(t, store.ErrSandboxNameConflict)
+	if code != http.StatusConflict {
+		t.Errorf("status = %d, want 409 Conflict", code)
+	}
+	if msg == "" {
+		t.Error("error body must carry the conflict message")
+	}
+}
+
+// Wrapped ErrSandboxNameConflict (e.g. via fmt.Errorf("...: %w", ...)) must
+// still resolve to 409 so middleware or helper wrappers don't accidentally
+// drop the sentinel.
+func TestWriteStoreAwareError_WrappedSandboxNameConflict(t *testing.T) {
+	wrapped := errors.Join(errors.New("outer"), store.ErrSandboxNameConflict)
+	code, _ := storeAwareErr(t, wrapped)
+	if code != http.StatusConflict {
+		t.Errorf("status = %d, want 409 for wrapped ErrSandboxNameConflict", code)
+	}
+}

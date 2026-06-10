@@ -1,7 +1,9 @@
 package v1
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -40,6 +42,16 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := h.deps.Service.CreateSandbox(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			apihttp.WriteError(w, http.StatusGatewayTimeout, "sandbox create exceeded timeout")
+			return
+		}
+		if errors.Is(err, context.Canceled) {
+			// Client disconnected mid-create; 503 avoids confusing client-disconnect
+			// events with validation errors in monitoring dashboards.
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox create cancelled")
+			return
+		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}

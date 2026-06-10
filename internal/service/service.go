@@ -344,6 +344,12 @@ type Service struct {
 	ingressRouteCache     map[string]ingressRouteIntent
 	ingressLastFullGCUnix atomic.Int64
 	dnsResolver           DNSResolver
+
+	// probeContainerPortFn is the function used by exposePort to verify a
+	// container port is accepting connections before installing the Caddy route.
+	// nil falls back to the package-level probeContainerPort. Overridden in
+	// tests to avoid real TCP dials against non-routable container IPs.
+	probeContainerPortFn func(ctx context.Context, containerIP string, port int) error
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient *docker.Client, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -867,6 +873,20 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	done := beginSandboxCreateMetric()
 	defer func() { done(err) }()
+	// Bound the entire create operation so a stalled image pull or a slow
+	// registry cannot block a goroutine forever. 0 disables the guard.
+	if t := s.cfg.CreateSandboxTimeout(); t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t)
+		defer cancel()
+	}
+	// cleanupCtx is detached from the createSandbox timeout so that rollback
+	// calls (docker.Destroy, caddy.DeleteSandboxRoute) are not immediately
+	// cancelled when the timeout fires mid-operation. Without this, orphaned
+	// containers are left running with no store row when the timeout fires
+	// after docker.Create has returned but before the store row is written.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cleanupCancel()
 	if err := s.ClusterTopologyError(); err != nil {
 		return nil, err
 	}
@@ -1090,7 +1110,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// rollback chain as any later store error below.
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.docker.Destroy(ctx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime})
+		_ = s.docker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime})
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -1144,7 +1164,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
-		_ = s.docker.Destroy(ctx, sandbox)
+		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -1152,8 +1172,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	sandbox.OwnerRef = ownerRef
 	if err := s.store.Create(ctx, sandbox); err != nil {
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-		_ = s.docker.Destroy(ctx, sandbox)
+		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -1170,8 +1190,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if len(sealedMounts) > 0 {
 		if err := s.store.PutMounts(ctx, sandbox.ID, sealedMounts); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
-			_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-			_ = s.docker.Destroy(ctx, sandbox)
+			_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+			_ = s.docker.Destroy(cleanupCtx, sandbox)
 			cleanupMounts()
 			releaseAdmission()
 			return nil, fmt.Errorf("persist sandbox mounts: %w", err)
@@ -1182,8 +1202,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		// Same rollback chain as a mount-persist failure. ErrCustomDomainConflict
 		// flows through unchanged so the API layer can map it to 409.
 		_ = s.store.Delete(ctx, sandbox.ID)
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-		_ = s.docker.Destroy(ctx, sandbox)
+		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -1234,6 +1254,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 // cleanup contract (TAP slot release, runDir teardown) sits inside
 // Destroy, so we don't have to know the driver's internals here.
 func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (*models.CreateSandboxResponse, error) {
+	// cleanupCtx is independent of ctx so that rollback calls succeed even
+	// when ctx was cancelled by the outer createSandbox timeout guard.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cleanupCancel()
+
 	if len(req.Mounts) > models.MaxMountsPerSandbox {
 		return nil, fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
 	}
@@ -1323,7 +1348,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.firecracker.Destroy(ctx, &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
+		_ = s.firecracker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
 		releaseAdmission()
 		return nil, err
 	}
@@ -1377,7 +1402,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	}
 
 	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
-		_ = s.firecracker.Destroy(ctx, sandbox)
+		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
 	}
@@ -1386,16 +1411,16 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// refreshed the account mapping before dispatching here.
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 	if err := s.store.Create(ctx, sandbox); err != nil {
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-		_ = s.firecracker.Destroy(ctx, sandbox)
+		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
 	}
 
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		_ = s.store.Delete(ctx, sandbox.ID)
-		_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
-		_ = s.firecracker.Destroy(ctx, sandbox)
+		_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
 	}
@@ -2199,6 +2224,22 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 		}
 		if existingProto != canonicalProto {
 			return models.ExposePortResponse{}, fmt.Errorf("port %d already exposed as %s; unexpose it first", port, existingProto)
+		}
+	}
+	// Probe the container port before routing traffic to it. Skipped on
+	// re-expose (existingBefore != nil — port was already reachable) and on
+	// WASM sandboxes (no direct container IP). Non-fatal: if the process has
+	// not yet bound we warn and proceed rather than holding the caller until
+	// it does; the operator can retry expose_port or the client can retry
+	// the request once the process is up.
+	if existingBefore == nil && sandbox.ContainerIP != "" && sandbox.Status == models.SandboxStatusStarted {
+		probeFn := s.probeContainerPortFn
+		if probeFn == nil {
+			probeFn = probeContainerPort
+		}
+		if err := probeFn(ctx, sandbox.ContainerIP, port); err != nil {
+			s.logger.Warn("expose_port: container port not yet accepting connections; route installed anyway",
+				"sandbox_id", id, "port", port, "error", err)
 		}
 	}
 	switch canonicalProto {
@@ -4622,6 +4663,35 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
+}
+
+// portProbeTimeout is the maximum time probeContainerPort waits for a container
+// port to accept a connection. Non-fatal by design — the caller proceeds on
+// timeout and logs a warning. 2 s is long enough to survive transient
+// scheduling jitter on a loaded host while short enough not to block
+// exposePort for slow-starting processes indefinitely.
+const portProbeTimeout = 2 * time.Second
+
+// probeContainerPort dials containerIP:port to verify the in-container process
+// has bound its port before Caddy starts routing traffic to it. Called from
+// exposePort on first-time exposures so clients do not receive
+// connection-refused from Caddy when they immediately hit the returned URL.
+// Non-fatal by design: the caller logs a warning and proceeds rather than
+// blocking exposePort indefinitely for slow-starting processes.
+func probeContainerPort(_ context.Context, containerIP string, port int) error {
+	// Use a detached context so the probe is not killed when the caller's
+	// request context (e.g. the exposePort HTTP request) is near its deadline.
+	// The probe is a best-effort liveness check — its 2s window is independent
+	// of the caller's remaining time.
+	probeCtx, cancel := context.WithTimeout(context.Background(), portProbeTimeout)
+	defer cancel()
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(probeCtx, "tcp", net.JoinHostPort(containerIP, strconv.Itoa(port)))
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
 }
 
 // probeSSHGateway opens a TCP connection to the gateway's listen address with

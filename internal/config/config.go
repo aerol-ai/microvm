@@ -96,21 +96,22 @@ func canonicalNodeRole(roles []string) string {
 }
 
 type Config struct {
-	PATToken            string
-	APIHost             string
-	APIPort             int
-	Domain              string
-	PublicHost          string
-	CaddyAdminURL       string
-	CaddyServerID       string
-	DBPath              string
-	DockerNetwork       string
-	ToolboxBinaryPath   string
-	ToolboxMountPath    string
-	ToolboxPort         int
-	IdleTimeoutMinutes  int
-	ContainerPrivileged bool
-	ResourceLimitsOff   bool
+	PATToken                    string
+	APIHost                     string
+	APIPort                     int
+	Domain                      string
+	PublicHost                  string
+	CaddyAdminURL               string
+	CaddyServerID               string
+	DBPath                      string
+	DockerNetwork               string
+	ToolboxBinaryPath           string
+	ToolboxMountPath            string
+	ToolboxPort                 int
+	IdleTimeoutMinutes          int
+	CreateSandboxTimeoutSeconds int
+	ContainerPrivileged         bool
+	ResourceLimitsOff           bool
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
@@ -1048,6 +1049,7 @@ func Load() (Config, error) {
 		ToolboxMountPath:                 getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
 		ToolboxPort:                      getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
 		IdleTimeoutMinutes:               getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		CreateSandboxTimeoutSeconds:      getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:              getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
 		Runtime:                          getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
@@ -1735,6 +1737,16 @@ func (c Config) IdleTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(c.IdleTimeoutMinutes) * time.Minute
+}
+
+// CreateSandboxTimeout is the maximum wall-clock time allowed for a single
+// createSandbox call (all runtimes). 0 means no limit. Configured via
+// SB_CREATE_TIMEOUT_SEC (default 600s / 10 minutes).
+func (c Config) CreateSandboxTimeout() time.Duration {
+	if c.CreateSandboxTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.CreateSandboxTimeoutSeconds) * time.Second
 }
 
 func getEnv(key, fallback string) string {
