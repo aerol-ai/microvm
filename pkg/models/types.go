@@ -519,6 +519,9 @@ type CreateSandboxRequest struct {
 	// unique index. Empty means no name; the sandbox can only be referenced
 	// by ID. The Daytona facade requires names; the native /v1 API and other
 	// facades may set or omit it.
+	//
+	// Duplicate names are rejected with HTTP 409 Conflict. Use a unique name
+	// per sandbox or omit this field to let the daemon assign an ID instead.
 	Name string `json:"name,omitempty"`
 	// Tags is an optional free-form key/value map associated with the
 	// sandbox. Used by facades that expose label-style metadata (Daytona

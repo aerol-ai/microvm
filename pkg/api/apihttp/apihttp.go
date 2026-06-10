@@ -76,7 +76,7 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		return
 	}
 	if errors.Is(err, store.ErrSandboxNameConflict) {
-		WriteError(w, http.StatusConflict, err.Error())
+		WriteError(w, http.StatusConflict, "sandbox name already in use")
 		return
 	}
 	if errors.Is(err, store.ErrSnapshotNameConflict) {

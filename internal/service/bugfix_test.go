@@ -9,9 +9,9 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,8 +35,10 @@ func TestProbeContainerPortSucceeds(t *testing.T) {
 	defer ln.Close()
 
 	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
-	var port int
-	fmt.Sscanf(portStr, "%d", &port)
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("strconv.Atoi(%q): %v", portStr, err)
+	}
 
 	if err := probeContainerPort(context.Background(), host, port); err != nil {
 		t.Fatalf("probeContainerPort on open port: %v", err)
@@ -55,19 +57,24 @@ func TestProbeContainerPortRefused(t *testing.T) {
 	ln.Close()
 
 	host, portStr, _ := net.SplitHostPort(addr)
-	var port int
-	fmt.Sscanf(portStr, "%d", &port)
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("strconv.Atoi(%q): %v", portStr, err)
+	}
 
 	if err := probeContainerPort(context.Background(), host, port); err == nil {
 		t.Fatal("probeContainerPort should fail on a closed port")
 	}
 }
 
-// TestProbeContainerPortCancelledContext verifies that a pre-cancelled context
-// causes the probe to fail immediately.
-func TestProbeContainerPortCancelledContext(t *testing.T) {
+// TestProbeContainerPortIgnoresCancelledContext verifies that probeContainerPort
+// uses its own independent timeout and is NOT affected by a pre-cancelled caller
+// context. The probe must reach an open port even when the caller's context is
+// already done — this is the intended behaviour so that exposePort works even
+// when the surrounding request context is near its deadline.
+func TestProbeContainerPortIgnoresCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	cancel() // pre-cancel the caller context
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -76,11 +83,15 @@ func TestProbeContainerPortCancelledContext(t *testing.T) {
 	defer ln.Close()
 
 	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
-	var port int
-	fmt.Sscanf(portStr, "%d", &port)
+	port, err2 := strconv.Atoi(portStr)
+	if err2 != nil {
+		t.Fatalf("strconv.Atoi(%q): %v", portStr, err2)
+	}
 
-	if err := probeContainerPort(ctx, host, port); err == nil {
-		t.Fatal("probeContainerPort should fail with a cancelled context")
+	// The port is open and the probe uses context.Background() internally,
+	// so it must succeed regardless of the cancelled caller context.
+	if err := probeContainerPort(ctx, host, port); err != nil {
+		t.Fatalf("probeContainerPort should succeed on an open port even with cancelled caller context: %v", err)
 	}
 }
 
@@ -269,8 +280,10 @@ func (h *captureWarnHandler) Handle(_ context.Context, r slog.Record) error {
 	*h.msgs = append(*h.msgs, r.Message)
 	return nil
 }
-func (h *captureWarnHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
-func (h *captureWarnHandler) WithGroup(name string) slog.Handler       { return h }
+func (h *captureWarnHandler) WithAttrs(_ []slog.Attr) slog.Handler {
+	return &captureWarnHandler{msgs: h.msgs}
+}
+func (h *captureWarnHandler) WithGroup(_ string) slog.Handler { return h }
 
 // ── Fix 3: createSandbox outer timeout ───────────────────────────────────────
 
