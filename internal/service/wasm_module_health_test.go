@@ -13,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func TestWasmPathUnderDir(t *testing.T) {
@@ -214,6 +215,17 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("UpsertWasmModule: %v", err)
 		}
+		freshDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatalf("sql.Open: %v", err)
+		}
+		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-ref"); err != nil {
+			_ = freshDB.Close()
+			t.Fatalf("update wasm_modules updated_at: %v", err)
+		}
+		if err := freshDB.Close(); err != nil {
+			t.Fatalf("freshDB.Close: %v", err)
+		}
 		dropSQLiteTable(t, dbPath, "sandboxes")
 		svc := &Service{
 			cfg:    config.Config{WasmModuleGCTTL: time.Hour},
@@ -239,6 +251,17 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 			ID: "mod-rm", ModuleRef: "file:///tmp/rm.wasm", Status: "ready", CreatedAt: now, UpdatedAt: now,
 		}); err != nil {
 			t.Fatalf("UpsertWasmModule: %v", err)
+		}
+		freshDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatalf("sql.Open: %v", err)
+		}
+		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-rm"); err != nil {
+			_ = freshDB.Close()
+			t.Fatalf("update wasm_modules updated_at: %v", err)
+		}
+		if err := freshDB.Close(); err != nil {
+			t.Fatalf("freshDB.Close: %v", err)
 		}
 		svc := &Service{
 			cfg:    config.Config{WasmModuleGCTTL: time.Hour},
@@ -266,6 +289,17 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("UpsertWasmModule: %v", err)
 		}
+		freshDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatalf("sql.Open: %v", err)
+		}
+		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-del"); err != nil {
+			_ = freshDB.Close()
+			t.Fatalf("update wasm_modules updated_at: %v", err)
+		}
+		if err := freshDB.Close(); err != nil {
+			t.Fatalf("freshDB.Close: %v", err)
+		}
 		svc := &Service{
 			cfg:    config.Config{WasmModuleGCTTL: time.Hour},
 			store:  st,
@@ -273,5 +307,235 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 			wasm:   wasmModuleGCDropRuntime{dbPath: dbPath},
 		}
 		svc.runWasmModuleGC(ctx, time.Now())
+	})
+}
+
+func TestWasmModuleGCBranchCoverage(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC().Add(-2 * time.Hour)
+	referencedRef := "file:///tmp/referenced.wasm"
+	unreferencedPath := filepath.Join(dir, "orphan.wasm")
+	if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+		ID:         "mod-ref",
+		ModuleRef:  referencedRef,
+		ModulePath: filepath.Join(dir, "referenced.wasm"),
+		Status:     "ready",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}); err != nil {
+		t.Fatalf("UpsertWasmModule(ref): %v", err)
+	}
+	if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+		ID:         "mod-orphan",
+		ModuleRef:  "",
+		ModulePath: unreferencedPath,
+		Status:     "ready",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}); err != nil {
+		t.Fatalf("UpsertWasmModule(orphan): %v", err)
+	}
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:        "sb-ref",
+		Runtime:   models.RuntimeWasm,
+		ModuleRef: referencedRef,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+
+	freshDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id IN (?, ?)`, now.Add(-2*time.Hour), "mod-ref", "mod-orphan"); err != nil {
+		_ = freshDB.Close()
+		t.Fatalf("update wasm_modules updated_at: %v", err)
+	}
+	if err := freshDB.Close(); err != nil {
+		t.Fatalf("freshDB.Close: %v", err)
+	}
+
+	svc := &Service{
+		cfg:    config.Config{WasmModuleGCTTL: time.Minute, WasmModulesDir: dir},
+		store:  st,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		wasm:   wasmModuleGCRuntime{},
+	}
+	svc.runWasmModuleGC(ctx, time.Now())
+
+	if _, err := st.GetWasmModule(ctx, "mod-ref"); err != nil {
+		t.Fatalf("referenced module should remain: %v", err)
+	}
+	if _, err := st.GetWasmModule(ctx, "mod-orphan"); err == nil {
+		t.Fatal("unreferenced module should be deleted")
+	}
+	if !wasmPathUnderDir(dir, dir) {
+		t.Fatalf("wasmPathUnderDir should accept identical paths")
+	}
+}
+
+func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("nil runtime removes stale on-disk module", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+
+		modPath := filepath.Join(dir, "orphan.wasm")
+		if err := os.WriteFile(modPath, []byte("wasm"), 0o600); err != nil {
+			t.Fatalf("write module: %v", err)
+		}
+		now := time.Now().UTC().Add(-2 * time.Hour)
+		if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+			ID:         "mod-file",
+			ModuleRef:  "",
+			ModulePath: modPath,
+			Status:     "ready",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}); err != nil {
+			t.Fatalf("UpsertWasmModule: %v", err)
+		}
+		freshDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatalf("sql.Open: %v", err)
+		}
+		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-file"); err != nil {
+			_ = freshDB.Close()
+			t.Fatalf("update wasm_modules updated_at: %v", err)
+		}
+		if err := freshDB.Close(); err != nil {
+			t.Fatalf("freshDB.Close: %v", err)
+		}
+
+		svc := &Service{
+			cfg:    config.Config{WasmModuleGCTTL: time.Minute, WasmModulesDir: dir},
+			store:  st,
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		svc.runWasmModuleGC(ctx, time.Now())
+
+		if _, err := os.Stat(modPath); !os.IsNotExist(err) {
+			t.Fatalf("module file should be deleted, stat err=%v", err)
+		}
+		if _, err := st.GetWasmModule(ctx, "mod-file"); err == nil {
+			t.Fatal("module row should be deleted")
+		}
+	})
+
+	t.Run("blank module ref falls back to module id for image removal", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+
+		now := time.Now().UTC().Add(-2 * time.Hour)
+		if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+			ID:         "mod-blank-ref",
+			ModuleRef:  "",
+			ModulePath: filepath.Join(dir, "blank-ref.wasm"),
+			Status:     "ready",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}); err != nil {
+			t.Fatalf("UpsertWasmModule: %v", err)
+		}
+		freshDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatalf("sql.Open: %v", err)
+		}
+		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-blank-ref"); err != nil {
+			_ = freshDB.Close()
+			t.Fatalf("update wasm_modules updated_at: %v", err)
+		}
+		if err := freshDB.Close(); err != nil {
+			t.Fatalf("freshDB.Close: %v", err)
+		}
+
+		rt := &recordingRuntime{}
+		svc := &Service{
+			cfg:    config.Config{WasmModuleGCTTL: time.Minute, WasmModulesDir: dir},
+			store:  st,
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			wasm:   rt,
+		}
+		svc.runWasmModuleGC(ctx, time.Now())
+
+		if len(rt.removeImages) != 1 || rt.removeImages[0] != "mod-blank-ref" {
+			t.Fatalf("removeImages = %v, want [mod-blank-ref]", rt.removeImages)
+		}
+		if _, err := st.GetWasmModule(ctx, "mod-blank-ref"); err == nil {
+			t.Fatal("blank-ref module row should be deleted")
+		}
+	})
+
+	t.Run("nil runtime leaves out-of-tree file alone but deletes row", func(t *testing.T) {
+		root := t.TempDir()
+		other := t.TempDir()
+		dbPath := filepath.Join(root, "state.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+
+		modPath := filepath.Join(other, "orphan-outside.wasm")
+		if err := os.WriteFile(modPath, []byte("wasm"), 0o600); err != nil {
+			t.Fatalf("write module: %v", err)
+		}
+		now := time.Now().UTC().Add(-2 * time.Hour)
+		if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+			ID:         "mod-outside",
+			ModuleRef:  "",
+			ModulePath: modPath,
+			Status:     "ready",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}); err != nil {
+			t.Fatalf("UpsertWasmModule: %v", err)
+		}
+		freshDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatalf("sql.Open: %v", err)
+		}
+		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-outside"); err != nil {
+			_ = freshDB.Close()
+			t.Fatalf("update wasm_modules updated_at: %v", err)
+		}
+		if err := freshDB.Close(); err != nil {
+			t.Fatalf("freshDB.Close: %v", err)
+		}
+
+		svc := &Service{
+			cfg:    config.Config{WasmModuleGCTTL: time.Minute, WasmModulesDir: root},
+			store:  st,
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		svc.runWasmModuleGC(ctx, time.Now())
+
+		if _, err := os.Stat(modPath); err != nil {
+			t.Fatalf("out-of-tree module file should remain, stat err=%v", err)
+		}
+		if _, err := st.GetWasmModule(ctx, "mod-outside"); err == nil {
+			t.Fatal("out-of-tree module row should be deleted")
+		}
 	})
 }

@@ -480,6 +480,54 @@ func TestTemplateArtifactPullerEdgeBranches(t *testing.T) {
 		t.Fatal("blank registry ref should reject PullOnce")
 	}
 
+	adapter := &templateArtifactPullDockerAdapter{}
+	for _, tc := range []struct {
+		name string
+		call func()
+	}{
+		{
+			name: "pull",
+			call: func() { _ = adapter.PullImage(ctx, "ref", &models.RegistryAuth{Server: "s"}) },
+		},
+		{
+			name: "export",
+			call: func() {
+				body, _ := adapter.ExportImageTar(ctx, "ref")
+				if body != nil {
+					_ = body.Close()
+				}
+			},
+		},
+		{
+			name: "remove",
+			call: func() { _ = adapter.RemoveImage(ctx, "ref") },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatal("expected nil client panic")
+				}
+			}()
+			tc.call()
+		})
+	}
+
+	memFile := filepath.Join(t.TempDir(), "mem.snap")
+	stateFile := filepath.Join(t.TempDir(), "state.snap")
+	if err := os.WriteFile(memFile, []byte("mem"), 0o644); err != nil {
+		t.Fatalf("write mem: %v", err)
+	}
+	if err := os.WriteFile(stateFile, []byte("state"), 0o644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+	if got, err := computeSnapshotChecksum(memFile, stateFile); err != nil || !strings.HasPrefix(got, "sha256:") {
+		t.Fatalf("computeSnapshotChecksum success = (%q, %v)", got, err)
+	}
+	if got, err := hashFileSHA256(memFile); err != nil || got == "" {
+		t.Fatalf("hashFileSHA256 success = (%q, %v)", got, err)
+	}
+
 	dk := &fakeTemplatePullDocker{exportErr: errors.New("save failed")}
 	puller := newTestPuller(t, dk, t.TempDir())
 	err := puller.PullOnce(ctx, &models.Template{

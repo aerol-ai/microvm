@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -296,4 +297,72 @@ func TestToolboxProxyRequestNormalizationAndHeaders(t *testing.T) {
 		t.Fatalf("RoundTripToolbox network: %v", err)
 	}
 	resp.Body.Close()
+}
+
+func TestToolboxProxyErrorBranchesMore(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:          "sb-net-error",
+		Runtime:     models.RuntimeDocker,
+		Status:      models.SandboxStatusStarted,
+		ContainerIP: "127.0.0.1",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("Create sandbox failed: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com/foo", nil)
+	rec := httptest.NewRecorder()
+	if err := svc.ServeToolboxReverseProxy(ctx, "missing-sandbox", rec, req, "/foo"); err == nil {
+		t.Fatal("ServeToolboxReverseProxy should fail for missing sandbox")
+	}
+	if _, err := svc.RoundTripToolbox(ctx, "missing-sandbox", http.MethodGet, "/foo", nil, nil, nil); err == nil {
+		t.Fatal("RoundTripToolbox should fail for missing sandbox")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("listener close: %v", err)
+	}
+	svc.cfg.ToolboxPort = port
+	if err := svc.ServeToolboxReverseProxy(ctx, "sb-net-error", rec, req, "/foo"); err != nil {
+		t.Fatalf("ServeToolboxReverseProxy proxy error path: %v", err)
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("ServeToolboxReverseProxy status = %d, want 502", rec.Code)
+	}
+
+	wasmSandbox := &models.Sandbox{
+		ID:           "sb-wasm-normalize",
+		Runtime:      models.RuntimeWasm,
+		Status:       models.SandboxStatusStarted,
+		ToolboxToken: "token123",
+		ContainerIP:  "127.0.0.1",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := st.Create(ctx, wasmSandbox); err != nil {
+		t.Fatalf("Create wasm sandbox failed: %v", err)
+	}
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(&fakeToolboxHost{})
+	resp, err := svc.RoundTripToolbox(ctx, "sb-wasm-normalize", http.MethodGet, "", url.Values{"q": {"1"}}, nil, http.Header{"X-Test": {"abc"}})
+	if err != nil {
+		t.Fatalf("RoundTripToolbox blank-path wasm: %v", err)
+	}
+	resp.Body.Close()
+	if _, err := svc.RoundTripToolbox(ctx, "sb-net-error", "BAD METHOD", "/foo", nil, nil, nil); err == nil {
+		t.Fatal("RoundTripToolbox should reject invalid network method")
+	}
+	if _, err := svc.newNetworkToolboxRequest(ctx, "sb-net-error", "BAD METHOD", "/foo", nil, nil, nil); err == nil {
+		t.Fatal("newNetworkToolboxRequest should reject invalid method")
+	}
 }

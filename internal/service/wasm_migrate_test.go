@@ -31,6 +31,16 @@ type fakeWasmMigrateRuntime struct {
 	cloneGen string
 }
 
+type emptyMigrateRuntime struct {
+	wasmModuleAPINoopRuntime
+	memSnapDir string
+	cloneGen   string
+}
+
+func (f *emptyMigrateRuntime) MigrateSandbox(_ context.Context, _ *models.Sandbox, _ string) (string, string, error) {
+	return f.memSnapDir, f.cloneGen, nil
+}
+
 func (f *fakeWasmMigrateRuntime) MigrateSandbox(_ context.Context, sandbox *models.Sandbox, destDir string) (string, string, error) {
 	id := "sandbox"
 	if sandbox != nil && sandbox.ID != "" {
@@ -364,6 +374,143 @@ func TestWasmMigrationErrorBranches(t *testing.T) {
 		}
 		if _, err := svc.MigrateWasmSandboxToNode(ctx, "sb", " "); err == nil {
 			t.Fatal("MigrateWasmSandboxToNode should reject blank target IDs")
+		}
+	})
+
+	t.Run("export tar creation and import clone mismatch", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := store.Open(filepath.Join(dir, "state.db"))
+		if err != nil {
+			t.Fatalf("store open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+
+		svc := New(config.Config{EnableWasm: true, WasmModulesDir: filepath.Join(dir, "modules")}, slog.Default(), st, nil, nil, nil, nil, nil, nil)
+		exportDir := t.TempDir()
+		svc.SetWasmRuntime(&emptyMigrateRuntime{memSnapDir: exportDir, cloneGen: "gen-export"})
+		insertWasmSandbox(t, st, "sb-export-empty")
+
+		var tarBuf bytes.Buffer
+		if _, err := svc.ExportWasmMigration(ctx, "sb-export-empty", &tarBuf); err == nil {
+			t.Fatal("ExportWasmMigration should fail when mem.snap files are missing")
+		}
+
+		src := filepath.Join(t.TempDir(), "mem.snap")
+		cap := wasmengine.SnapshotCapture{
+			Config: wasmengine.SnapshotConfig{
+				SchemaVersion:   1,
+				Engine:          wasmengine.EngineNameWazero(),
+				BaseModule:      wasmengine.SnapshotBaseModule{Digest: "sha256:abc", Size: 1},
+				Durability:      models.DurabilityPassivatable,
+				CloneGeneration: "gen-actual",
+			},
+			Memory:    []byte("mem"),
+			Globals:   []byte("[]"),
+			WASIState: []byte("{}"),
+		}
+		if err := wasmengine.WriteSnapshotDir(src, cap); err != nil {
+			t.Fatalf("WriteSnapshotDir: %v", err)
+		}
+		if err := writeWasmCheckpointTar(&tarBuf, src); err != nil {
+			t.Fatalf("writeWasmCheckpointTar: %v", err)
+		}
+
+		receiver := New(config.Config{EnableWasm: true, WasmModulesDir: filepath.Join(dir, "modules")}, slog.Default(), st, nil, nil, nil, nil, nil, nil)
+		if err := receiver.ImportWasmMigration(ctx, "sb-clone-mismatch", "gen-wrong", bytes.NewReader(tarBuf.Bytes())); err == nil || !strings.Contains(err.Error(), "fenced") {
+			t.Fatalf("ImportWasmMigration clone mismatch = %v", err)
+		}
+	})
+}
+
+func TestEvacuateLocalWasmSandboxesForDrainBranchCoverage(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no-op branches", func(t *testing.T) {
+		disabled := &Service{cfg: config.Config{EnableWasm: false}}
+		if err := disabled.EvacuateLocalWasmSandboxesForDrain(ctx); err != nil {
+			t.Fatalf("disabled service: %v", err)
+		}
+
+		noCluster := &Service{
+			cfg:    config.Config{EnableWasm: true},
+			wasm:   &recordingRuntime{},
+			store:  &store.Store{},
+			logger: slog.Default(),
+		}
+		if err := noCluster.EvacuateLocalWasmSandboxesForDrain(ctx); err != nil {
+			t.Fatalf("no cluster service: %v", err)
+		}
+	})
+
+	t.Run("store list error", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.SetWasmRuntime(&recordingRuntime{})
+		svc.AttachCluster(&wasmMigrationTargetClusterStub{
+			Noop:    cluster.NewNoop("node-a", "http://self", ""),
+			owner:   cluster.OwnerInfo{NodeID: "node-a", IsSelf: true},
+			members: []cluster.Member{{NodeID: "node-a", APIURL: "http://self", Alive: true, Role: config.NodeRoleWorker}},
+			drained: map[string]bool{},
+		})
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if err := svc.EvacuateLocalWasmSandboxesForDrain(ctx); err == nil {
+			t.Fatal("expected list error")
+		}
+	})
+
+	t.Run("no target", func(t *testing.T) {
+		now := time.Now().UTC()
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.SetWasmRuntime(&recordingRuntime{})
+		svc.AttachCluster(&wasmMigrationTargetClusterStub{
+			Noop:    cluster.NewNoop("node-a", "http://self", ""),
+			owner:   cluster.OwnerInfo{NodeID: "node-a", IsSelf: true},
+			members: []cluster.Member{{NodeID: "node-a", APIURL: "http://self", Alive: true, Role: config.NodeRoleWorker}},
+			drained: map[string]bool{},
+		})
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:         "sb-no-target",
+			Runtime:    models.RuntimeWasm,
+			Status:     models.SandboxStatusPassivated,
+			Durability: models.DurabilityDurable,
+			ModuleRef:  "file:///tmp/no-target.wasm",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}); err != nil {
+			t.Fatalf("Create sandbox: %v", err)
+		}
+		if err := svc.EvacuateLocalWasmSandboxesForDrain(ctx); err == nil || !strings.Contains(err.Error(), "no evacuation target") {
+			t.Fatalf("no target evacuation = %v", err)
+		}
+	})
+
+	t.Run("migration failure", func(t *testing.T) {
+		now := time.Now().UTC()
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.SetWasmRuntime(&recordingRuntime{})
+		svc.AttachCluster(&wasmMigrationTargetClusterStub{
+			Noop:    cluster.NewNoop("node-a", "http://self", ""),
+			owner:   cluster.OwnerInfo{NodeID: "node-a", IsSelf: true},
+			members: []cluster.Member{{NodeID: "node-a", APIURL: "http://self", Alive: true, Role: config.NodeRoleWorker}, {NodeID: "node-b", APIURL: "http://target", Alive: true, Role: config.NodeRoleWorker}},
+			drained: map[string]bool{},
+		})
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:         "sb-migrate-fail",
+			Runtime:    models.RuntimeWasm,
+			Status:     models.SandboxStatusPassivated,
+			Durability: models.DurabilityDurable,
+			ModuleRef:  "file:///tmp/migrate-fail.wasm",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}); err != nil {
+			t.Fatalf("Create sandbox: %v", err)
+		}
+		if err := svc.EvacuateLocalWasmSandboxesForDrain(ctx); err == nil || !strings.Contains(err.Error(), "export:") {
+			t.Fatalf("migrate failure evacuation = %v", err)
 		}
 	})
 }

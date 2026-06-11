@@ -264,6 +264,71 @@ func TestRehydrateWasmDurableSandbox_CorruptLocalCheckpointPullsAOCR(t *testing.
 	}
 }
 
+func TestRehydrateWasmIfNeededBranchCoverage(t *testing.T) {
+	ctx := context.Background()
+	modulesDir := t.TempDir()
+	checkpointPath := filepath.Join(modulesDir, "sb-branch", "mem.snap")
+	seedWasmSnapshot(t, checkpointPath, "gen-branch")
+
+	now := time.Now().UTC()
+	sb := &models.Sandbox{
+		ID:              "sb-branch",
+		Runtime:         models.RuntimeWasm,
+		Durability:      models.DurabilityDurable,
+		Status:          models.SandboxStatusPassivated,
+		CloneGeneration: "gen-branch",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	svc := &Service{cfg: config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, logger: slog.Default()}
+	if got, err := svc.rehydrateWasmIfNeeded(ctx, nil, nil); got != nil || err != nil {
+		t.Fatalf("rehydrate nil sandbox = (%v, %v)", got, err)
+	}
+	if got, err := svc.rehydrateWasmIfNeeded(ctx, &models.Sandbox{Runtime: models.RuntimeDocker}, nil); got == nil || err != nil {
+		t.Fatalf("rehydrate non-wasm sandbox = (%v, %v)", got, err)
+	}
+	if got, err := svc.rehydrateWasmIfNeeded(ctx, &models.Sandbox{Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted}, nil); got == nil || err != nil {
+		t.Fatalf("rehydrate started sandbox = (%v, %v)", got, err)
+	}
+
+	disabled := &Service{cfg: config.Config{EnableWasm: false, WasmModulesDir: modulesDir}, logger: slog.Default()}
+	if _, err := disabled.rehydrateWasmIfNeeded(ctx, sb, nil); err == nil {
+		t.Fatal("rehydrate should fail when wasm is disabled")
+	}
+
+	hostMissing := &Service{
+		cfg:    config.Config{EnableWasm: true, WasmModulesDir: modulesDir},
+		logger: slog.Default(),
+		wasm:   &recordingRuntime{},
+	}
+	if _, err := hostMissing.rehydrateWasmIfNeeded(ctx, sb, nil); err == nil {
+		t.Fatal("rehydrate should fail when checkpoint host is unavailable")
+	}
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("store.Create: %v", err)
+	}
+	corrupt := &fakeWasmRecreateRuntime{rehydrateErr: models.ErrSnapshotCorrupt}
+	svc = New(config.Config{EnableWasm: true, WasmModulesDir: modulesDir}, slog.Default(), st, corrupt, nil, nil, nil, nil, nil)
+	svc.SetWasmRuntime(corrupt)
+	if _, err := svc.rehydrateWasmIfNeeded(ctx, sb, nil); err == nil {
+		t.Fatal("rehydrate should surface corrupt snapshot error")
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Status != models.SandboxStatusStopped {
+		t.Fatalf("status = %q, want stopped after corrupt rehydrate", got.Status)
+	}
+}
+
 func TestRecreateSandboxWasmDurableFailoverE2E(t *testing.T) {
 	ctx := context.Background()
 	modulesDir := t.TempDir()

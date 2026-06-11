@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -293,6 +295,24 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 		t.Fatal("second full GC within interval should skip")
 	}
 
+	defaultProtocolPlacement := cluster.Placement{
+		SandboxID:   "sb-default-protocol",
+		OwnerNodeID: "peer-2",
+		OwnerAPIURL: "http://10.0.0.3:8080",
+		Version:     2,
+		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+			9090: {},
+		},
+	}
+	defaultIntents, defaultNeedL4 := svc.buildClusterIngressIntents([]cluster.Placement{defaultProtocolPlacement}, "self")
+	if !defaultNeedL4 {
+		t.Fatal("default protocol exposure should still need L4")
+	}
+	defaultKey := ingressIntentKey(ingressSurfaceTLS, caddy.IngressPortSNIRouteID("sb-default-protocol", 9090))
+	if _, ok := defaultIntents[defaultKey]; !ok {
+		t.Fatalf("default-protocol port intent missing: %s", defaultKey)
+	}
+
 	_ = routeShardFilterLogValue(cluster.IngressShardFilterForNode(nil, "self"))
 }
 
@@ -324,6 +344,145 @@ func TestGCUnexpectedClusterIngressRoutes(t *testing.T) {
 	if err := svc.gcUnexpectedClusterIngressRoutes(ctx, intents); err != nil {
 		t.Fatalf("gcUnexpectedClusterIngressRoutes: %v", err)
 	}
+}
+
+func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) {
+	ctx := context.Background()
+	fake := newCountingCaddyFake(0)
+	server := httptest.NewServer(fake.handler())
+	t.Cleanup(server.Close)
+
+	caddyCfg := config.Config{
+		EnableCaddy:       true,
+		Domain:            "example.test",
+		L4TLSListen:       ":8443",
+		CaddyAdminURL:     server.URL,
+		CaddyServerID:     "srv0",
+		HTTPClientTimeout: time.Second,
+	}
+	svc := &Service{
+		cfg:    caddyCfg,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy:  caddy.New(caddyCfg),
+	}
+
+	desired, needL4 := svc.buildClusterIngressIntents([]cluster.Placement{
+		{
+			SandboxID:          "sb-live",
+			OwnerNodeID:        "peer-1",
+			OwnerAPIURL:        "http://10.0.0.7:21212",
+			OwnerDataPlaneHost: "10.0.0.7",
+			Version:            1,
+			CustomHostnames:    []string{"api.acme.com"},
+			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+				8080: {Protocol: models.ExposedPortProtocolHTTP},
+				5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 25432},
+				8443: {Protocol: models.ExposedPortProtocolTLS},
+				3306: {Protocol: models.ExposedPortProtocolTCP},
+			},
+		},
+		{
+			SandboxID:   "sb-flux",
+			OwnerNodeID: "peer-2",
+			Version:     2,
+			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+				9000: {Protocol: models.ExposedPortProtocolHTTP},
+			},
+		},
+	}, "self")
+	if !needL4 {
+		t.Fatal("expected L4 to be required for cluster ingress intents")
+	}
+	ops, commit := svc.planClusterIngressDelta(desired)
+	if len(ops) == 0 {
+		t.Fatal("expected initial delta ops")
+	}
+	for i, op := range ops {
+		if err := op(ctx); err != nil {
+			t.Fatalf("apply op %d: %v", i, err)
+		}
+	}
+	commit()
+
+	if ops, _ = svc.planClusterIngressDelta(desired); len(ops) != 0 {
+		t.Fatalf("identical desired state produced %d ops, want 0", len(ops))
+	}
+
+	ops, _ = svc.planClusterIngressDelta(map[string]ingressRouteIntent{})
+	if len(ops) == 0 {
+		t.Fatal("expected delete ops when desired state is empty")
+	}
+	for i, op := range ops {
+		if err := op(ctx); err != nil {
+			t.Fatalf("delete op %d: %v", i, err)
+		}
+	}
+	if atomic.LoadInt64(&fake.totalCalls) == 0 {
+		t.Fatal("expected caddy admin calls to be issued")
+	}
+}
+
+func TestGCUnexpectedClusterIngressRoutesBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("disabled caddy returns nil", func(t *testing.T) {
+		svc := &Service{
+			cfg:   config.Config{EnableCluster: true},
+			caddy: caddy.New(config.Config{EnableCaddy: false}),
+		}
+		if err := svc.gcUnexpectedClusterIngressRoutes(ctx, nil); err != nil {
+			t.Fatalf("disabled caddy: %v", err)
+		}
+	})
+
+	t.Run("store list failure", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableCluster = true
+		svc.caddy = caddy.New(config.Config{
+			EnableCaddy:       true,
+			CaddyAdminURL:     "http://127.0.0.1:1",
+			CaddyServerID:     "srv0",
+			HTTPClientTimeout: time.Second,
+		})
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close: %v", err)
+		}
+		if err := svc.gcUnexpectedClusterIngressRoutes(ctx, nil); err == nil {
+			t.Fatal("expected store list failure")
+		}
+	})
+
+	t.Run("deletes unexpected entries", func(t *testing.T) {
+		fake := newGCCaddyFake()
+		fake.httpRouteIDs["sandbox-zombie"] = struct{}{}
+		fake.httpRouteIDs["sandbox-zombie-port-3000"] = struct{}{}
+		fake.l4TCPServerIDs["tcp-port-39999"] = struct{}{}
+		fake.l4TLSRouteIDs["sandbox-zombie-port-8443-tls"] = struct{}{}
+		server := httptest.NewServer(fake.handler(t))
+		t.Cleanup(server.Close)
+
+		svc := &Service{
+			cfg: config.Config{EnableCluster: true},
+			caddy: caddy.New(config.Config{
+				EnableCaddy:       true,
+				CaddyAdminURL:     server.URL,
+				CaddyServerID:     "srv0",
+				HTTPClientTimeout: time.Second,
+			}),
+		}
+		if err := svc.gcUnexpectedClusterIngressRoutes(ctx, nil); err != nil {
+			t.Fatalf("gcUnexpectedClusterIngressRoutes: %v", err)
+		}
+		if got := fake.keys(fake.httpRouteIDs); len(got) != 0 {
+			t.Fatalf("unexpected HTTP routes remain: %v", got)
+		}
+		if got := fake.keys(fake.l4TCPServerIDs); len(got) != 0 {
+			t.Fatalf("unexpected TCP servers remain: %v", got)
+		}
+		if got := fake.keys(fake.l4TLSRouteIDs); len(got) != 0 {
+			t.Fatalf("unexpected TLS routes remain: %v", got)
+		}
+	})
 }
 
 // --- usage_live.go ---
@@ -457,6 +616,175 @@ func TestStartL4WakeProxyDisabled(t *testing.T) {
 	if err := svc.StartL4WakeProxy(context.Background()); err != nil {
 		t.Fatalf("disabled: %v", err)
 	}
+}
+
+func TestStartL4WakeProxyListenError(t *testing.T) {
+	svc := &Service{
+		cfg: config.Config{
+			EnableServerless:   true,
+			InternalL4WakeAddr: "not-a-real-listener-address",
+		},
+		caddy:  caddy.New(config.Config{EnableCaddy: true, HTTPClientTimeout: time.Second}),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := svc.StartL4WakeProxy(context.Background()); err == nil {
+		t.Fatal("expected listen error from invalid wake address")
+	}
+}
+
+func TestHandleL4WakeTCPConnBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("invalid header", func(t *testing.T) {
+		svc := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		server, client := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			_, _ = client.Write([]byte("garbage\n"))
+			_ = client.Close()
+			close(done)
+		}()
+		svc.handleL4WakeTCPConn(server)
+		<-done
+	})
+
+	t.Run("missing exposure and non-tcp exposure", func(t *testing.T) {
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+		server, client := net.Pipe()
+		go func() {
+			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = client.Close()
+		}()
+		svc.handleL4WakeTCPConn(server)
+
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID:          "sb-l4-http",
+			Image:       "alpine",
+			Status:      models.SandboxStatusStarted,
+			ContainerID: "ctr-l4-http",
+			ContainerIP: "10.0.0.77",
+			Runtime:     models.RuntimeDocker,
+			CPU:         1,
+			MemoryMB:    512,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed sandbox: %v", err)
+		}
+		if err := st.UpsertPort(ctx, models.ExposedPort{
+			SandboxID: "sb-l4-http",
+			Port:      8080,
+			Protocol:  models.ExposedPortProtocolHTTP,
+			HostPort:  40123,
+			CreatedAt: now,
+		}); err != nil {
+			t.Fatalf("UpsertPort: %v", err)
+		}
+		server, client = net.Pipe()
+		go func() {
+			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = client.Close()
+		}()
+		svc.handleL4WakeTCPConn(server)
+	})
+}
+
+func TestProxyL4WakeConnDialError(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:          "sb-l4-proxy",
+		Image:       "alpine",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-l4-proxy",
+		ContainerIP: "10.0.0.88",
+		Runtime:     models.RuntimeDocker,
+		CPU:         1,
+		MemoryMB:    512,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: "sb-l4-proxy",
+		Port:      5432,
+		Protocol:  models.ExposedPortProtocolTCP,
+		HostPort:  25432,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertPort: %v", err)
+	}
+
+	oldDial := dialL4Upstream
+	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+		return nil, errors.New("dial failed")
+	}
+	defer func() { dialL4Upstream = oldDial }()
+
+	server, client := net.Pipe()
+	go func() {
+		defer client.Close()
+		_, _ = client.Write([]byte("ping"))
+	}()
+	svc.proxyL4WakeConn(ctx, "sb-l4-proxy", 5432, server, nil)
+}
+
+func TestTLSWakeListenerAcceptBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc.cfg.InternalL4WakeDir = shortSockDir(t)
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:          "sb-tls-accept",
+		Image:       "alpine",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-tls-accept",
+		ContainerIP: "10.0.0.99",
+		Runtime:     models.RuntimeDocker,
+		CPU:         1,
+		MemoryMB:    512,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	if err := st.UpsertPort(ctx, models.ExposedPort{
+		SandboxID: "sb-tls-accept",
+		Port:      8443,
+		Protocol:  models.ExposedPortProtocolTCP,
+		HostPort:  28443,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertPort: %v", err)
+	}
+
+	oldDial := dialL4Upstream
+	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+		return nil, errors.New("dial failed")
+	}
+	defer func() { dialL4Upstream = oldDial }()
+
+	socketPath, err := svc.ensureTLSWakeListener("sb-tls-accept", 8443)
+	if err != nil {
+		t.Fatalf("ensureTLSWakeListener: %v", err)
+	}
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial unix wake listener: %v", err)
+	}
+	_, _ = conn.Write([]byte("hello"))
+	_ = conn.Close()
+	time.Sleep(50 * time.Millisecond)
+	svc.closeTLSWakeListener("sb-tls-accept", 8443)
 }
 
 // --- service.go create paths ---

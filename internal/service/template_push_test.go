@@ -522,6 +522,69 @@ func TestTemplateArtifactPusherEdgeBranches(t *testing.T) {
 	}
 }
 
+func TestTemplateArtifactPusherHelperBranches(t *testing.T) {
+	patPath := writePATFile(t, "token")
+	pusher, err := NewTemplateArtifactPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-42",
+		PATPath:   patPath,
+	}, &fakeTemplatePushDocker{}, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewTemplateArtifactPusher(nil logger): %v", err)
+	}
+	if pusher == nil {
+		t.Fatal("NewTemplateArtifactPusher returned nil with valid config")
+	}
+
+	if err := assertRegularFile(" "); err == nil {
+		t.Fatal("assertRegularFile should reject blank path")
+	}
+	nonFile := t.TempDir()
+	if err := assertRegularFile(nonFile); err == nil {
+		t.Fatal("assertRegularFile should reject directories")
+	}
+
+	workDir := t.TempDir()
+	rootfsPath := filepath.Join(workDir, templateRootfsFilename)
+	memPath := filepath.Join(workDir, snapshotMemoryFilename)
+	statePath := filepath.Join(workDir, snapshotStateFilename)
+	if err := os.WriteFile(rootfsPath, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("write rootfs: %v", err)
+	}
+	if err := os.WriteFile(memPath, []byte("mem"), 0o644); err != nil {
+		t.Fatalf("write mem: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("state"), 0o644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+	if err := assertRegularFile(rootfsPath); err != nil {
+		t.Fatalf("assertRegularFile regular file: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- writeTemplateArtifactTar(pw, TemplateArtifactManifest{
+			SchemaVersion: TemplateArtifactSchemaVersion,
+			TemplateID:    "tpl",
+		}, filepath.Join(workDir, "missing-rootfs"), memPath, statePath)
+	}()
+	_, _ = io.ReadAll(pr)
+	if err := <-errCh; err == nil {
+		t.Fatal("writeTemplateArtifactTar should fail on missing rootfs")
+	}
+
+	failingTar := tar.NewWriter(failingWriter{err: errors.New("tar write failed")})
+	if err := writeTarRegular(failingTar, templateManifestFilename, 1, nil, []byte("x")); err == nil {
+		t.Fatal("writeTarRegular should fail on writer error")
+	}
+	failingTar = tar.NewWriter(failingWriter{err: errors.New("tar write failed")})
+	if err := writeTarFile(failingTar, templateRootfsFilename, rootfsPath); err == nil {
+		t.Fatal("writeTarFile should fail on writer error")
+	}
+}
+
 // TestTemplateNeedsPush pins the "only ready rows" guard the
 // reconciler uses. Unhealthy templates (Phase 6 PR-A's corrupt-at-
 // load-time state) must NOT be pushed — propagating known-corrupt

@@ -163,6 +163,9 @@ func TestWasmCustomDomainHelperBranches(t *testing.T) {
 	if dial, err := svc.wasmCustomDomainDial(ctx, &models.Sandbox{ContainerIP: "10.0.0.2"}, 0); err != nil || dial != "10.0.0.2:4321" {
 		t.Fatalf("wasmCustomDomainDial(toolbox) = (%q, %v), want toolbox dial", dial, err)
 	}
+	if _, err := svc.wasmCustomDomainDial(ctx, nil, 8080); err == nil {
+		t.Fatal("wasmCustomDomainDial should reject nil sandbox")
+	}
 
 	svc.SetWasmRuntime(&recordingRuntime{})
 	wasmRow := &models.Sandbox{
@@ -175,6 +178,9 @@ func TestWasmCustomDomainHelperBranches(t *testing.T) {
 	}
 	if _, err := svc.wasmCustomDomainDial(ctx, wasmRow, 8080); err == nil {
 		t.Fatal("wasmCustomDomainDial should fail when the runtime lacks a port gateway")
+	}
+	if err := svc.installWasmCustomDomainHTTPRoute(ctx, nil, "api.acme.com", 8080); err == nil {
+		t.Fatal("installWasmCustomDomainHTTPRoute should reject nil sandbox")
 	}
 
 	if err := svc.syncWasmCustomDomainRoutes(ctx, nil); err != nil {

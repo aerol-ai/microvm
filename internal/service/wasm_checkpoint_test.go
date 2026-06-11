@@ -256,6 +256,23 @@ func TestDrainWasmSandboxesEdgeBranches(t *testing.T) {
 	})
 }
 
+func TestWasmShouldCheckpoint(t *testing.T) {
+	cases := []struct {
+		durability string
+		want       bool
+	}{
+		{models.DurabilityPassivatable, true},
+		{models.DurabilityDurable, true},
+		{"", false},
+		{"transient", false},
+	}
+	for _, tc := range cases {
+		if got := wasmShouldCheckpoint(tc.durability); got != tc.want {
+			t.Fatalf("wasmShouldCheckpoint(%q) = %v, want %v", tc.durability, got, tc.want)
+		}
+	}
+}
+
 type wasmCheckpointPusherStub struct{}
 
 func (s *wasmCheckpointPusherStub) DestRefFor(sandboxID string) string { return "test://sb" }

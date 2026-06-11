@@ -6,6 +6,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TestBuildClusterIngressIntents_DomainModeAddsPerCustomHostnameSNI:
@@ -129,5 +130,57 @@ func TestBuildClusterIngressIntents_IPModePropagatesHostnamesInFingerprint(t *te
 	if withFP, withoutFP := with[key].fingerprint, without[key].fingerprint; withFP == withoutFP {
 		t.Fatalf("fingerprint did not change when CustomHostnames went nil → [%q]; without=%d with=%d",
 			"api.acme.com", withoutFP, withFP)
+	}
+}
+
+func TestBuildClusterIngressIntentsSkipAndInfluxBranches(t *testing.T) {
+	svc := &Service{cfg: config.Config{EnableCluster: true, Domain: "sb.example.com"}}
+
+	intents, needL4 := svc.buildClusterIngressIntents([]cluster.Placement{
+		{SandboxID: "", OwnerNodeID: "peer-1"},
+		{SandboxID: "sb-self", OwnerNodeID: "self", OwnerAPIURL: "http://self", Version: 1},
+		{
+			SandboxID:   "sb-influx",
+			OwnerNodeID: "",
+			Version:     7,
+			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+				8080: {Protocol: models.ExposedPortProtocolHTTP},
+			},
+		},
+	}, "self")
+	if !needL4 {
+		t.Fatal("needL4 should be true when adding an in-flux placement")
+	}
+	key := ingressIntentKey(ingressSurfaceHTTP, caddy.InFluxSandboxRouteID("sb-influx"))
+	if _, ok := intents[key]; !ok {
+		t.Fatalf("in-flux intent missing for %s", key)
+	}
+}
+
+func TestBuildClusterIngressIntentsDomainWithoutTLSPortSkipsRoutes(t *testing.T) {
+	svc := &Service{
+		cfg: config.Config{
+			EnableCluster: true,
+			Domain:        "sb.example.com",
+		},
+	}
+
+	intents, needL4 := svc.buildClusterIngressIntents([]cluster.Placement{
+		{
+			SandboxID:       "sb-no-l4",
+			OwnerNodeID:     "peer-1",
+			OwnerAPIURL:     "http://10.0.0.2:21212",
+			Version:         3,
+			CustomHostnames: []string{"api.acme.com"},
+			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+				8080: {Protocol: models.ExposedPortProtocolHTTP},
+			},
+		},
+	}, "self")
+	if !needL4 {
+		t.Fatal("needL4 should stay true in domain mode")
+	}
+	if len(intents) != 0 {
+		t.Fatalf("expected no routes when L4 TLS listener port is absent, got %d", len(intents))
 	}
 }

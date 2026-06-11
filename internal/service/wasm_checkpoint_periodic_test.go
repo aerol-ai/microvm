@@ -171,3 +171,50 @@ func TestWasmPeriodicAndDurableSweepErrorBranches(t *testing.T) {
 		svc.runWasmDurablePushSweep(ctx)
 	})
 }
+
+func TestWasmPeriodicAndDurableSweepFilterBranches(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.cfg.WasmCheckpointMaxParallel = 2
+	svc.cfg.WasmModulesDir = t.TempDir()
+
+	rt := &fakeLiveCheckpointRuntime{
+		live: map[string]*models.SandboxRuntimeState{
+			"sb-live-a": {SandboxID: "sb-live-a", Status: models.SandboxStatusStarted},
+		},
+	}
+	svc.SetWasmRuntime(rt)
+
+	now := time.Now().UTC()
+	seeds := []*models.Sandbox{
+		{ID: "sb-live-a", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted, Durability: models.DurabilityDurable, CreatedAt: now, UpdatedAt: now},
+		{ID: "sb-live-b", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted, Durability: models.DurabilityPassivatable, CreatedAt: now, UpdatedAt: now},
+		{ID: "sb-stopped", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStopped, Durability: models.DurabilityDurable, CreatedAt: now, UpdatedAt: now},
+		{ID: "sb-nonwasm", Runtime: models.RuntimeDocker, Status: models.SandboxStatusStarted, Durability: models.DurabilityDurable, CreatedAt: now, UpdatedAt: now},
+	}
+	for _, sb := range seeds {
+		if err := st.Create(ctx, sb); err != nil {
+			t.Fatalf("Create(%s): %v", sb.ID, err)
+		}
+	}
+	if err := svc.runWasmPeriodicCheckpoint(ctx); err != nil {
+		t.Fatalf("runWasmPeriodicCheckpoint: %v", err)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("live checkpoint calls = %d, want 1", rt.calls)
+	}
+
+	svc.wasmCheckpointPusher = &recordingCheckpointStore{destRef: "test://sb-durable-a:latest"}
+	for _, sb := range []*models.Sandbox{
+		{ID: "sb-durable-a", Runtime: models.RuntimeWasm, Status: models.SandboxStatusPassivated, Durability: models.DurabilityDurable, CreatedAt: now, UpdatedAt: now},
+		{ID: "sb-durable-b", Runtime: models.RuntimeWasm, Status: models.SandboxStatusPassivateFailed, Durability: models.DurabilityDurable, CreatedAt: now, UpdatedAt: now},
+		{ID: "sb-with-ref", Runtime: models.RuntimeWasm, Status: models.SandboxStatusPassivated, Durability: models.DurabilityDurable, WasmRegistryRef: "test://existing", CreatedAt: now, UpdatedAt: now},
+		{ID: "sb-wrong-status", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted, Durability: models.DurabilityDurable, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := st.Upsert(ctx, sb); err != nil {
+			t.Fatalf("Upsert(%s): %v", sb.ID, err)
+		}
+	}
+	svc.runWasmDurablePushSweep(ctx)
+}

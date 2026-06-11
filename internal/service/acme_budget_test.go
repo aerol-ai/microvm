@@ -83,6 +83,12 @@ func TestACMEBudgetNilAlwaysAllows(t *testing.T) {
 			t.Fatalf("nil budget denied: ok=%v retry=%v", ok, retry)
 		}
 	}
+	if got := b.InWindow(); got != 0 {
+		t.Fatalf("nil budget InWindow = %d, want 0", got)
+	}
+	if got := b.Threshold(); got != 0 {
+		t.Fatalf("nil budget Threshold = %d, want 0", got)
+	}
 }
 
 // TestNewACMEBudgetRejectsBadConfig: invalid config returns nil rather
