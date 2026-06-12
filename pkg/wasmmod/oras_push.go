@@ -11,8 +11,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
-	"oras.land/oras-go/v2/registry/remote"
-	"oras.land/oras-go/v2/registry/remote/auth"
 )
 
 var snapshotLayerMediaTypes = map[string]string{
@@ -131,15 +129,9 @@ func PushSnapshotArtifact(ctx context.Context, cfg ORASPushConfig, memSnapDir, r
 		return "", fmt.Errorf("oras push: pack manifest: %w", err)
 	}
 
-	repo, err := remote.NewRepository(registryRef)
+	repo, err := newAuthedRepo(registryRef, cfg.ClusterID, pat)
 	if err != nil {
-		return "", fmt.Errorf("oras push: repository: %w", err)
-	}
-	repoHost := registryHost(registryRef)
-	repo.Client = &auth.Client{
-		Client:     auth.DefaultClient.Client,
-		Cache:      auth.DefaultCache,
-		Credential: auth.StaticCredential(repoHost, auth.Credential{Username: cfg.ClusterID, Password: pat}),
+		return "", err
 	}
 
 	tag := registryTag(registryRef)
