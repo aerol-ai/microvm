@@ -660,6 +660,12 @@ type Sandbox struct {
 	// the credentials back to the new owner's docker pull. Never serialized
 	// over the API — it is internal store ↔ service plumbing.
 	RegistryAuthSealed []byte `json:"-"`
+	// RegistryAuth is the transient, UNSEALED registry credential. It is never
+	// persisted (no column) nor serialized (json:"-"); the service unseals
+	// RegistryAuthSealed into it in-memory right before a WASM start/rehydrate
+	// so a failover peer can re-pull a private oci:// module under the tenant's
+	// identity (codex C4). Nil on the create/public path.
+	RegistryAuth *RegistryAuth `json:"-"`
 	// NetworkBytesIn / NetworkBytesOut are cumulative byte counters
 	// maintained by the netstats poller. They survive container restarts —
 	// a new veth resets in-memory baseline math but the persisted total is

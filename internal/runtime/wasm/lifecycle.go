@@ -43,12 +43,27 @@ func resolveWithRequestAuth(ctx context.Context, r ModuleResolver, ref string, r
 	return r.Resolve(ctx, ref)
 }
 
+// moduleAuthFromSandbox builds the per-tenant registry credential from a
+// sandbox's transient (unsealed) RegistryAuth, used so a failover peer pulls a
+// private oci:// module under the tenant's identity (codex C4). Nil when the
+// sandbox carries no creds (public/standard module).
+func moduleAuthFromSandbox(sandbox *models.Sandbox) *wasmmod.ModuleAuth {
+	if sandbox == nil || sandbox.RegistryAuth == nil {
+		return nil
+	}
+	ra := sandbox.RegistryAuth
+	if strings.TrimSpace(ra.Username) == "" && strings.TrimSpace(ra.Password) == "" {
+		return nil
+	}
+	return &wasmmod.ModuleAuth{Username: ra.Username, PAT: ra.Password}
+}
+
 // resolvePinned resolves a sandbox's module preferring the digest pinned at
 // create over the (mutable) ref. On a frozen-copy cache hit it boots the exact
-// original bytes; on a miss it re-resolves the ref but REFUSES to boot if the
-// bytes drifted from the pin — turning codex C2's silent code-swap into a loud,
-// recoverable error.
-func (d *Driver) resolvePinned(ctx context.Context, ref, pinnedDigest string) (*wasmmod.ResolvedModule, error) {
+// original bytes; on a miss it re-resolves the ref (under authOverride creds
+// when set) but REFUSES to boot if the bytes drifted from the pin — turning
+// codex C2's silent code-swap into a loud, recoverable error.
+func (d *Driver) resolvePinned(ctx context.Context, ref, pinnedDigest string, authOverride *wasmmod.ModuleAuth) (*wasmmod.ResolvedModule, error) {
 	pinnedDigest = strings.TrimSpace(pinnedDigest)
 	if pinnedDigest != "" {
 		if dr, ok := d.resolver.(digestResolver); ok {
@@ -57,7 +72,7 @@ func (d *Driver) resolvePinned(ctx context.Context, ref, pinnedDigest string) (*
 			}
 		}
 	}
-	resolved, err := d.resolver.Resolve(ctx, ref)
+	resolved, err := d.resolveRef(ctx, ref, authOverride)
 	if err != nil {
 		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
 	}
@@ -66,6 +81,17 @@ func (d *Driver) resolvePinned(ctx context.Context, ref, pinnedDigest string) (*
 			ref, pinnedDigest, resolved.Digest, wasmmod.ErrModuleDigestMismatch)
 	}
 	return resolved, nil
+}
+
+// resolveRef resolves under authOverride creds when set and the resolver
+// supports the auth seam, else plain Resolve.
+func (d *Driver) resolveRef(ctx context.Context, ref string, authOverride *wasmmod.ModuleAuth) (*wasmmod.ResolvedModule, error) {
+	if authOverride != nil {
+		if ar, ok := d.resolver.(authResolver); ok {
+			return ar.ResolveWithAuth(ctx, ref, authOverride)
+		}
+	}
+	return d.resolver.Resolve(ctx, ref)
 }
 
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
@@ -129,7 +155,7 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 	}
 	// Boot the digest pinned at create, not whatever the alias/tag points at
 	// now (codex C2). On drift with no frozen copy this fails loudly.
-	resolved, err := d.resolvePinned(ctx, ref, sandbox.ModuleDigest)
+	resolved, err := d.resolvePinned(ctx, ref, sandbox.ModuleDigest, moduleAuthFromSandbox(sandbox))
 	if err != nil {
 		return nil, err
 	}

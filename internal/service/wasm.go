@@ -135,6 +135,16 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		return nil, err
 	}
 
+	// Seal the per-tenant registry creds onto the row so a failover peer can
+	// re-pull a PRIVATE oci:// module under the tenant's identity (codex C4),
+	// mirroring the Docker image path. Nil/empty creds seal to nil.
+	sealedRegistry, err := s.sealRegistry(req.Registry)
+	if err != nil {
+		cleanupMounts()
+		releaseAdmission()
+		return nil, err
+	}
+
 	now := time.Now().UTC()
 	sandbox := &models.Sandbox{
 		ID:                   state.SandboxID,
@@ -165,6 +175,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		Durability:           req.Durability,
 		ModuleRef:            moduleRef,
 		ModuleDigest:         state.ModuleDigest,
+		RegistryAuthSealed:   sealedRegistry,
 	}
 	if len(req.CustomDomains) > 0 {
 		sandbox.CustomDomains = make([]models.CustomDomain, 0, len(req.CustomDomains))

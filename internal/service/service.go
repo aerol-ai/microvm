@@ -1482,6 +1482,26 @@ func (s *Service) UnsealRegistry(sealed []byte) (*models.RegistryAuth, error) {
 	return &auth, nil
 }
 
+// attachWasmRegistryAuth unseals the sandbox's persisted registry creds into
+// its transient RegistryAuth field, so the WASM runtime can re-pull a private
+// oci:// module under the tenant's identity on a node that lacks it (codex C4).
+// Best-effort: an unseal failure is logged and leaves RegistryAuth nil, which
+// degrades to a public/system-identity pull rather than blocking start.
+func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) {
+	if sandbox == nil || len(sandbox.RegistryAuthSealed) == 0 {
+		return
+	}
+	auth, err := s.UnsealRegistry(sandbox.RegistryAuthSealed)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("wasm: unseal registry auth failed; private module pull may fail on this node",
+				"sandbox_id", sandbox.ID, "err", err)
+		}
+		return
+	}
+	sandbox.RegistryAuth = auth
+}
+
 // sealMounts marshals the user's mount specs and encrypts the JSON for
 // at-rest storage. Returns nil when there are no mounts.
 func (s *Service) sealMounts(specs []models.MountSpec) ([]byte, error) {
@@ -1659,6 +1679,10 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	if s.isWasmSandbox(sandbox) {
 		if host, ok := s.wasm.(wasmruntime.StartHost); ok {
 			hostBinds := s.mounts.HostBindsFor(id)
+			// Unseal per-tenant registry creds so a private oci:// module
+			// re-pulls under the tenant's identity if this node lacks it
+			// (codex C4). Transient: never persisted or serialized.
+			s.attachWasmRegistryAuth(sandbox)
 			state, err = host.StartSandbox(ctx, sandbox, hostBinds)
 			if err != nil {
 				_ = s.mounts.UnmountAll(id)
