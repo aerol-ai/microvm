@@ -88,6 +88,32 @@ jobs:
           flags: go-main
           fail_ci_if_error: false
 
+  wasm-integration:
+    # Live-AOCR round-trip for the BYO module push/pull path (plan §7.2): proves
+    # the .wasm mediaType survives a real registry, which mocks can't. Gated
+    # behind the `integration` build tag AND the presence of AOCR creds — the
+    # test self-skips when AEROL_WASM_IT_* are unset, so forks and credential-less
+    # PRs stay green. Runs only when daemon Go code changed.
+    needs: changes
+    if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_main == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run WASM module registry integration test
+        env:
+          AEROL_WASM_IT_REF: ${{ secrets.AEROL_WASM_IT_REF }}
+          AEROL_WASM_IT_USERNAME: ${{ secrets.AEROL_WASM_IT_USERNAME }}
+          AEROL_WASM_IT_TOKEN: ${{ secrets.AEROL_WASM_IT_TOKEN }}
+        run: go test -count=1 -tags integration -run TestIntegrationModulePushPullRoundTrip ./pkg/wasmmod/...
+
   go-sdk-tests:
     needs: changes
     if: needs.changes.outputs.docs != 'true' && needs.changes.outputs.go_sdk == 'true'

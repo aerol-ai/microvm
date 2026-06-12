@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -27,6 +28,11 @@ func (s *Service) StartWasmModuleGC(ctx context.Context) {
 			case <-ticker.C:
 				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				s.runWasmModuleGC(sweepCtx, time.Now())
+				// Catalogue GC reclaims rows; cache GC reclaims the on-disk
+				// content-addressed bytes those rows (and bare oci:// pulls) leave
+				// behind. Run it second so a row deleted above frees its digest for
+				// eviction in the same sweep.
+				s.runWasmCacheGC(sweepCtx, time.Now())
 				cancel()
 			}
 		}
@@ -71,6 +77,114 @@ func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
 		}
 		s.invalidateWasmModuleInventoryCache()
 		s.logger.Info("wasm module gc removed unreferenced catalogue row", "module_id", rec.ID)
+	}
+}
+
+// runWasmCacheGC evicts content-addressed oci:// cache files
+// (CacheDir/<digest>.wasm) that no live sandbox or catalogue row references.
+// Two independent triggers, both refcount-gated:
+//
+//   - TTL: a file untouched (by mtime) for longer than WasmCacheGCTTL.
+//   - Size cap: when the cache total exceeds WasmCacheMaxBytes, evict
+//     unreferenced files oldest-first until back under the cap.
+//
+// Referenced files are NEVER evicted regardless of age or pressure — they still
+// count toward the total, so a cache full of in-use modules simply stops
+// shrinking rather than yanking live bytes (boot-path safety over disk).
+func (s *Service) runWasmCacheGC(ctx context.Context, now time.Time) {
+	ttl := s.cfg.WasmCacheGCTTL
+	maxBytes := s.cfg.WasmCacheMaxBytes
+	if ttl <= 0 && maxBytes <= 0 {
+		return
+	}
+	cacheDir := strings.TrimSpace(s.cfg.WasmCacheDir)
+	if cacheDir == "" {
+		cacheDir = filepath.Join(s.cfg.WasmModulesDir, "cache")
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			s.logger.Warn("wasm cache gc readdir failed", "dir", cacheDir, "error", err)
+		}
+		return
+	}
+
+	type cacheFile struct {
+		path   string
+		digest string
+		size   int64
+		mod    time.Time
+	}
+	var files []cacheFile
+	var total int64
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".wasm") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		f := cacheFile{
+			path:   filepath.Join(cacheDir, name),
+			digest: strings.TrimSuffix(name, ".wasm"),
+			size:   info.Size(),
+			mod:    info.ModTime(),
+		}
+		files = append(files, f)
+		total += f.size
+	}
+	// Oldest-first so both TTL and size-pressure eviction reclaim the least
+	// recently used bytes first.
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+
+	ttlCutoff := now.UTC().Add(-ttl)
+	for _, f := range files {
+		overCap := maxBytes > 0 && total > maxBytes
+		expired := ttl > 0 && f.mod.UTC().Before(ttlCutoff)
+		if !overCap && !expired {
+			// Files are sorted oldest-first: once we hit one that's neither
+			// expired nor needed for cap relief, every later file is younger and
+			// the total only shrinks, so nothing remaining can qualify.
+			break
+		}
+		// Refcount gate: skip (but keep counting) anything still in use.
+		referenced, err := s.store.IsWasmModuleReferenced(ctx, "", "", f.digest)
+		if err != nil {
+			s.logger.Warn("wasm cache gc reference check failed", "digest", f.digest, "error", err)
+			continue
+		}
+		if !referenced {
+			catalogued, err := s.store.IsWasmDigestCatalogued(ctx, f.digest)
+			if err != nil {
+				s.logger.Warn("wasm cache gc catalogue check failed", "digest", f.digest, "error", err)
+				continue
+			}
+			referenced = catalogued
+		}
+		if referenced {
+			continue
+		}
+		if err := os.Remove(f.path); err != nil {
+			if !os.IsNotExist(err) {
+				s.logger.Warn("wasm cache gc delete failed", "path", f.path, "error", err)
+			}
+			continue
+		}
+		total -= f.size
+		s.logger.Info("wasm cache gc evicted module", "digest", f.digest, "size_bytes", f.size, "reason", evictReason(expired, overCap))
+	}
+}
+
+func evictReason(expired, overCap bool) string {
+	switch {
+	case expired && overCap:
+		return "ttl+cap"
+	case expired:
+		return "ttl"
+	default:
+		return "cap"
 	}
 }
 

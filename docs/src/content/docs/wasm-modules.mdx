@@ -277,4 +277,14 @@ Peers gossip `local_wasm_module_ids` via `/v1/capacity`. Placement prefers nodes
 
 ## Garbage collection
 
-Unreferenced catalogue rows older than `SB_WASM_MODULE_GC_TTL` are removed by the wasm module janitor when `SB_WASM_MODULE_GC_ENABLED=true`.
+When `SB_WASM_MODULE_GC_ENABLED=true`, the wasm module janitor runs two sweeps
+each `SB_WASM_MODULE_GC_INTERVAL`:
+
+- **Catalogue rows.** Unreferenced rows older than `SB_WASM_MODULE_GC_TTL` are
+  removed.
+- **`oci://` cache bytes.** Content-addressed files under `SB_WASM_CACHE_DIR`
+  (`<digest>.wasm`) are evicted when older than `SB_WASM_CACHE_GC_TTL` (default
+  24h), or oldest-first when the cache exceeds `SB_WASM_CACHE_MAX_BYTES`
+  (default unlimited). A digest still referenced by a sandbox or a catalogue row
+  is **never** evicted, regardless of age or disk pressure — eviction only
+  reclaims pull-on-create modules that nothing depends on.

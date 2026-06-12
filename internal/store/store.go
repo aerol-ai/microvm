@@ -4848,6 +4848,27 @@ func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef,
 	return true, nil
 }
 
+// IsWasmDigestCatalogued reports whether any wasm_modules row pins this content
+// digest. The cache evictor consults it (alongside IsWasmModuleReferenced) so a
+// digest that backs a catalogue id — resolvable later by a fresh create — is
+// never reclaimed out from under the catalogue, even with no live sandbox.
+func (s *Store) IsWasmDigestCatalogued(ctx context.Context, digest string) (bool, error) {
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return false, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM wasm_modules WHERE digest = ? LIMIT 1`, digest)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ErrWasmModuleIDConflict is returned when POST /v1/wasm-modules reuses an id
 // bound to a different module_ref.
 var ErrWasmModuleIDConflict = errors.New("wasm module id already in use")

@@ -455,6 +455,17 @@ type Config struct {
 	// WasmModuleGCTTL drops unreferenced catalogue rows older than this.
 	// SB_WASM_MODULE_GC_TTL.
 	WasmModuleGCTTL time.Duration
+	// WasmCacheGCTTL evicts a content-addressed oci:// cache file
+	// (CacheDir/<digest>.wasm) whose mtime is older than this AND that no
+	// sandbox or catalogue row still references. Guards against unbounded disk
+	// growth from pull-on-create modules that were never registered. 0 disables
+	// TTL eviction. SB_WASM_CACHE_GC_TTL.
+	WasmCacheGCTTL time.Duration
+	// WasmCacheMaxBytes is a soft cap on the total size of the oci:// cache. When
+	// the cache exceeds it, the janitor evicts unreferenced files oldest-first
+	// until back under the cap, independent of TTL. 0 = unlimited.
+	// SB_WASM_CACHE_MAX_BYTES.
+	WasmCacheMaxBytes int64
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1241,6 +1252,8 @@ func Load() (Config, error) {
 		WasmModuleGCEnabled:     getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
 		WasmModuleGCInterval:    getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
 		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),
+		WasmCacheGCTTL:          getEnvDuration("SB_WASM_CACHE_GC_TTL", 24*time.Hour),
+		WasmCacheMaxBytes:       getEnvInt64("SB_WASM_CACHE_MAX_BYTES", 0),
 		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
 		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
 		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
@@ -1797,6 +1810,18 @@ func getEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fallback
 	}

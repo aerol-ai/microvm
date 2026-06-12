@@ -37,6 +37,86 @@ func TestWasmPathUnderDir(t *testing.T) {
 	}
 }
 
+// writeCacheFile drops a fake <digest>.wasm into dir with the given mtime.
+func writeCacheFile(t *testing.T, dir, digest string, size int, mod time.Time) string {
+	t.Helper()
+	p := filepath.Join(dir, digest+".wasm")
+	if err := os.WriteFile(p, make([]byte, size), 0o600); err != nil {
+		t.Fatalf("write cache file: %v", err)
+	}
+	if err := os.Chtimes(p, mod, mod); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	return p
+}
+
+func TestRunWasmCacheGCTTLEvictsUnreferenced(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheGCTTL = time.Hour
+
+	old := time.Now().Add(-2 * time.Hour)
+	fresh := time.Now()
+	stale := writeCacheFile(t, cacheDir, "deadbeefstale", 10, old)
+	young := writeCacheFile(t, cacheDir, "deadbeefyoung", 10, fresh)
+
+	// A catalogued digest must survive eviction even though it's old.
+	pinned := writeCacheFile(t, cacheDir, "deadbeefpinned", 10, old)
+	if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+		ID: "mod-pinned", ModuleRef: "oci://h/r:t", Digest: "deadbeefpinned", ModulePath: pinned,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	svc.runWasmCacheGC(ctx, time.Now())
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("expected stale unreferenced file evicted, stat err=%v", err)
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Errorf("expected fresh file kept: %v", err)
+	}
+	if _, err := os.Stat(pinned); err != nil {
+		t.Errorf("expected catalogued digest kept: %v", err)
+	}
+}
+
+func TestRunWasmCacheGCSizeCapEvictsOldestFirst(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheMaxBytes = 150 // room for one 100-byte file, not two
+
+	now := time.Now()
+	oldest := writeCacheFile(t, cacheDir, "aaa", 100, now.Add(-2*time.Hour))
+	newest := writeCacheFile(t, cacheDir, "bbb", 100, now)
+
+	svc.runWasmCacheGC(ctx, now)
+
+	if _, err := os.Stat(oldest); !os.IsNotExist(err) {
+		t.Errorf("expected oldest file evicted under cap, stat err=%v", err)
+	}
+	if _, err := os.Stat(newest); err != nil {
+		t.Errorf("expected newest file kept under cap: %v", err)
+	}
+}
+
+func TestRunWasmCacheGCDisabledNoop(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	// both knobs zero => disabled
+	f := writeCacheFile(t, cacheDir, "ccc", 10, time.Now().Add(-100*time.Hour))
+	svc.runWasmCacheGC(ctx, time.Now())
+	if _, err := os.Stat(f); err != nil {
+		t.Errorf("expected file untouched when cache gc disabled: %v", err)
+	}
+}
+
 func TestStartWasmModuleGC(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
