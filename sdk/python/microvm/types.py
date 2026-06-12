@@ -517,3 +517,17 @@ class WasmModule(TypedDict, total=False):
     createdAt: str
     updatedAt: str
     readyAt: str
+
+
+class PushWasmModuleOptions(TypedDict, total=False):
+    name: str  # required: target repo path, e.g. "tenant/my-app"
+    tag: str  # defaults to "latest"
+    module: bytes  # required: compiled core-wasip1 bytes
+    registryUsername: str
+    registryToken: str  # required: your registry PAT
+
+
+class PushWasmModuleResult(TypedDict, total=False):
+    moduleRef: str
+    digest: str
+    sizeBytes: int

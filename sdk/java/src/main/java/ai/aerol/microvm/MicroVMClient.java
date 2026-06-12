@@ -10,7 +10,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,6 +34,8 @@ import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CreateTemplateOptions;
 import ai.aerol.microvm.model.CreateWasmModuleOptions;
+import ai.aerol.microvm.model.PushWasmModuleOptions;
+import ai.aerol.microvm.model.PushWasmModuleResponse;
 import ai.aerol.microvm.model.CustomDomain;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.DnsRecord;
@@ -364,6 +368,40 @@ public class MicroVMClient {
 
     public void deleteWasmModule(String moduleId) {
         doNoContent("DELETE", versioned("/wasm-modules/" + moduleId), null);
+    }
+
+    /**
+     * Upload a compiled core-wasip1 module to the registry under your own
+     * credentials and get back the {@code oci://} ref to use as
+     * {@code moduleRef} on a later create. The daemon validates and forwards
+     * the bytes; it never stores them.
+     */
+    public PushWasmModuleResponse pushWasmModule(PushWasmModuleOptions options) {
+        if (options == null || options.getName() == null || options.getName().isBlank()) {
+            throw new MicroVMException("name is required");
+        }
+        if (options.getRegistryToken() == null || options.getRegistryToken().isBlank()) {
+            throw new MicroVMException("registryToken is required");
+        }
+        String tag = (options.getTag() == null || options.getTag().isBlank()) ? "latest" : options.getTag();
+        String path = versioned("/wasm-modules/push")
+            + "?name=" + encodeQueryValue(options.getName())
+            + "&tag=" + encodeQueryValue(tag);
+        Map<String, String> headers = new HashMap<>();
+        headers.put("X-Registry-Token", options.getRegistryToken());
+        if (options.getRegistryUsername() != null && !options.getRegistryUsername().isBlank()) {
+            headers.put("X-Registry-Username", options.getRegistryUsername());
+        }
+        byte[] module = options.getModule() != null ? options.getModule() : new byte[0];
+        HttpResponse<byte[]> response = sendRequest(
+            "POST",
+            path,
+            HttpRequest.BodyPublishers.ofByteArray(module),
+            "application/octet-stream",
+            headers
+        );
+        ensureSuccess(response);
+        return JsonSupport.read(response.body(), PushWasmModuleResponse.class);
     }
 
     /**
@@ -884,16 +922,25 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType) {
+        return sendRequest(method, path, bodyPublisher, contentType, null);
+    }
+
+    private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders) {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
-        
+
         Exception lastException = null;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
             if (contentType != null) {
                 builder.header("Content-Type", contentType);
+            }
+            if (extraHeaders != null) {
+                for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
+                    builder.header(entry.getKey(), entry.getValue());
+                }
             }
             builder.header("Authorization", authorizationHeaderValue());
 

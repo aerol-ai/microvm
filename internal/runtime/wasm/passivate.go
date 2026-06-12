@@ -50,9 +50,11 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	moduleDigest := sandbox.ModuleDigest
 	moduleRef := sandbox.ModuleRef
 	if d.resolver != nil && moduleRef != "" {
-		resolved, resolveErr := d.resolver.Resolve(ctx, moduleRef)
+		// Rehydrate the digest pinned at create, not the current alias/tag
+		// target (codex C2). Fails loudly on drift with no frozen copy.
+		resolved, resolveErr := d.resolvePinned(ctx, moduleRef, sandbox.ModuleDigest, moduleAuthFromSandbox(sandbox))
 		if resolveErr != nil {
-			return nil, fmt.Errorf("resolve module %q: %w", moduleRef, resolveErr)
+			return nil, resolveErr
 		}
 		modulePath = resolved.Path
 		if moduleDigest == "" {

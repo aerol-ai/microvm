@@ -375,6 +375,33 @@ type Config struct {
 	// WasmModulesDir is the content-addressed module + checkpoint cache root.
 	// Required when EnableWasm is true. SB_WASM_MODULES_DIR.
 	WasmModulesDir string
+	// WasmCacheDir holds oci:// pulled modules as <digest>.wasm, kept separate
+	// from the checkpoint root so eviction never touches a sandbox's mem.snap.
+	// Default WasmModulesDir/cache. SB_WASM_CACHE_DIR.
+	WasmCacheDir string
+	// WasmRegistryAllowlist is the set of registry hosts an oci:// module_ref
+	// may pull from. Empty = deny all remote pulls (the SSRF-safe default).
+	// Comma-separated. SB_WASM_REGISTRY_ALLOWLIST.
+	WasmRegistryAllowlist []string
+	// WasmPullTimeout bounds a single oci:// module pull so it cannot stall
+	// sandbox boot. 0 = no timeout. SB_WASM_PULL_TIMEOUT.
+	WasmPullTimeout time.Duration
+	// WasmStandardModules maps reserved-keyword aliases to staged filenames
+	// under WasmModulesDir (e.g. "python=python.wasm,javascript=quickjs.wasm").
+	// Provisioned identically on every node by Ansible — the fleet-wide
+	// standard-module contract, deliberately NOT DB-backed. SB_WASM_STANDARD_MODULES.
+	WasmStandardModules map[string]string
+	// WasmRegistryUsername is the AOCR login used for oci:// module pulls when
+	// the create request carries no per-tenant credentials. SB_WASM_REGISTRY_USERNAME.
+	WasmRegistryUsername string
+	// WasmRegistryPATPath is the file holding the AOCR token for module pulls.
+	// SB_WASM_REGISTRY_PAT_PATH.
+	WasmRegistryPATPath string
+	// WasmRegistryPushHost is the AOCR host the stateless module-push proxy
+	// (POST /v1/wasm-modules/push) forwards uploads to. Empty disables the
+	// proxy. The daemon never stores the bytes — it validates and forwards to
+	// AOCR under the caller's own PAT. SB_WASM_REGISTRY_PUSH_HOST.
+	WasmRegistryPushHost string
 	// WasmEngine selects the guest engine backend (wazero or wasmtime). Default wazero.
 	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
 	WasmEngine string
@@ -428,6 +455,17 @@ type Config struct {
 	// WasmModuleGCTTL drops unreferenced catalogue rows older than this.
 	// SB_WASM_MODULE_GC_TTL.
 	WasmModuleGCTTL time.Duration
+	// WasmCacheGCTTL evicts a content-addressed oci:// cache file
+	// (CacheDir/<digest>.wasm) whose mtime is older than this AND that no
+	// sandbox or catalogue row still references. Guards against unbounded disk
+	// growth from pull-on-create modules that were never registered. 0 disables
+	// TTL eviction. SB_WASM_CACHE_GC_TTL.
+	WasmCacheGCTTL time.Duration
+	// WasmCacheMaxBytes is a soft cap on the total size of the oci:// cache. When
+	// the cache exceeds it, the janitor evicts unreferenced files oldest-first
+	// until back under the cap, independent of TTL. 0 = unlimited.
+	// SB_WASM_CACHE_MAX_BYTES.
+	WasmCacheMaxBytes int64
 	// FirecrackerBinary is the absolute path to the `firecracker` VMM
 	// binary on this host. Required only when EnableFirecracker is true.
 	// Default /usr/local/bin/firecracker matches a typical install.
@@ -1188,6 +1226,13 @@ func Load() (Config, error) {
 		EnableWasm:                getEnvBool("SB_ENABLE_WASM", false),
 		WasmRunDir:                getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
 		WasmModulesDir:            getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
+		WasmCacheDir:              getEnv("SB_WASM_CACHE_DIR", ""),
+		WasmRegistryAllowlist:     parseImageGCWhitelist(getEnv("SB_WASM_REGISTRY_ALLOWLIST", "")),
+		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
+		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
+		WasmRegistryUsername:      getEnv("SB_WASM_REGISTRY_USERNAME", ""),
+		WasmRegistryPATPath:       getEnv("SB_WASM_REGISTRY_PAT_PATH", ""),
+		WasmRegistryPushHost:      getEnv("SB_WASM_REGISTRY_PUSH_HOST", ""),
 		WasmEngine:                strings.ToLower(strings.TrimSpace(getEnv("SB_WASM_ENGINE", "wazero"))),
 		WasmMaxInstances:          getEnvInt("SB_WASM_MAX_INSTANCES", 0),
 		WasmDefaultMemoryMB:       getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
@@ -1207,6 +1252,8 @@ func Load() (Config, error) {
 		WasmModuleGCEnabled:     getEnvBool("SB_WASM_MODULE_GC_ENABLED", true),
 		WasmModuleGCInterval:    getEnvDuration("SB_WASM_MODULE_GC_INTERVAL", 15*time.Minute),
 		WasmModuleGCTTL:         getEnvDuration("SB_WASM_MODULE_GC_TTL", 7*24*time.Hour),
+		WasmCacheGCTTL:          getEnvDuration("SB_WASM_CACHE_GC_TTL", 24*time.Hour),
+		WasmCacheMaxBytes:       getEnvInt64("SB_WASM_CACHE_MAX_BYTES", 0),
 		WasmPoolEnabled:         getEnvBool("SB_WASM_POOL_ENABLED", false),
 		WasmPoolDepthDefault:    getEnvInt("SB_WASM_POOL_DEPTH_DEFAULT", 0),
 		WasmPoolRefillInterval:  getEnvDuration("SB_WASM_POOL_REFILL_INTERVAL", 5*time.Second),
@@ -1769,6 +1816,18 @@ func getEnvInt(key string, fallback int) int {
 	return parsed
 }
 
+func getEnvInt64(key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
 func getEnvBool(key string, fallback bool) bool {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -1820,6 +1879,28 @@ func parseImageGCWhitelist(raw string) []string {
 		if entry := strings.TrimSpace(part); entry != "" {
 			out = append(out, entry)
 		}
+	}
+	return out
+}
+
+// parseWasmStandardModules parses the comma-separated alias=filename list for
+// SB_WASM_STANDARD_MODULES into a reserved-keyword map. Aliases are lowercased
+// (case-insensitive lookup). Malformed entries are skipped silently so one
+// typo doesn't drop the rest. Returns a non-nil map for unconditional reads.
+func parseWasmStandardModules(raw string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		alias, filename, ok := strings.Cut(part, "=")
+		alias = strings.ToLower(strings.TrimSpace(alias))
+		filename = strings.TrimSpace(filename)
+		if !ok || alias == "" || filename == "" {
+			continue
+		}
+		out[alias] = filename
 	}
 	return out
 }

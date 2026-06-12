@@ -11,8 +11,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
-	"oras.land/oras-go/v2/registry/remote"
-	"oras.land/oras-go/v2/registry/remote/auth"
 )
 
 var snapshotLayerMediaTypes = map[string]string{
@@ -131,15 +129,9 @@ func PushSnapshotArtifact(ctx context.Context, cfg ORASPushConfig, memSnapDir, r
 		return "", fmt.Errorf("oras push: pack manifest: %w", err)
 	}
 
-	repo, err := remote.NewRepository(registryRef)
+	repo, err := newAuthedRepo(registryRef, cfg.ClusterID, pat)
 	if err != nil {
-		return "", fmt.Errorf("oras push: repository: %w", err)
-	}
-	repoHost := registryHost(registryRef)
-	repo.Client = &auth.Client{
-		Client:     auth.DefaultClient.Client,
-		Cache:      auth.DefaultCache,
-		Credential: auth.StaticCredential(repoHost, auth.Credential{Username: cfg.ClusterID, Password: pat}),
+		return "", err
 	}
 
 	tag := registryTag(registryRef)
@@ -160,9 +152,23 @@ func registryHost(ref string) string {
 	return ref
 }
 
+// registryTag returns the tag or digest portion of a registry ref. The host
+// (and any :port on it) is stripped first so "host:port/repo" no longer parses
+// the port colon as a tag, and a "host/repo@sha256:<digest>" pin resolves to
+// the digest reference rather than treating the last colon as a tag delimiter
+// (codex P2). Used by push (always a tag) and pull/resolve (tag OR digest).
 func registryTag(ref string) string {
-	if i := strings.LastIndex(ref, ":"); i >= 0 && i < len(ref)-1 {
-		return ref[i+1:]
+	ref = strings.TrimSpace(ref)
+	rest := ref
+	if i := strings.Index(ref, "/"); i >= 0 {
+		rest = ref[i+1:]
+	}
+	// A digest pin (repo@sha256:<hex>) wins over tag parsing.
+	if i := strings.Index(rest, "@"); i >= 0 && i < len(rest)-1 {
+		return rest[i+1:]
+	}
+	if i := strings.LastIndex(rest, ":"); i >= 0 && i < len(rest)-1 {
+		return rest[i+1:]
 	}
 	return "latest"
 }

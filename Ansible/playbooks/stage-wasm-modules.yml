@@ -1,0 +1,90 @@
+---
+# Pre-stage the curated WASM standard modules onto every node.
+#
+# Reads wasm.standard_modules from ../../config/cluster.yml (the same SoT
+# configure-ops.yml derives SB_WASM_STANDARD_MODULES from) and fetches each
+# entry's .wasm into wasm.modules_dir as "<alias>.wasm", verifying its sha256.
+# Idempotent: get_url / the digest check skip an already-correct file.
+#
+#   ansible-playbook playbooks/stage-wasm-modules.yml
+#
+# This is the fleet-wide reserved-keyword contract: after staging, tenants
+# reference a module as `module_ref: "<alias>"`. Run it whenever the standard
+# set changes, and as part of new-node bring-up.
+
+- name: Stage WASM standard modules
+  hosts: all
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+
+  vars_files:
+    - "../../config/cluster.yml"
+
+  tasks:
+    - name: Ensure WASM modules dir exists
+      ansible.builtin.file:
+        path: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: wasm.enabled | default(false) | bool
+
+    - name: Fetch URL-sourced standard modules (checksum-verified)
+      ansible.builtin.get_url:
+        url: "{{ item.ref }}"
+        dest: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm"
+        checksum: "{{ item.digest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ wasm.standard_modules | default([]) | selectattr('source', 'equalto', 'url') | list }}"
+      loop_control:
+        label: "{{ item.alias }}"
+      when: wasm.enabled | default(false) | bool
+
+    - name: Pull OCI-sourced standard modules via oras
+      # oras pull writes the module layer (module.wasm) into a temp dir; we
+      # move it to "<alias>.wasm". The digest is verified afterwards so a
+      # tampered registry artifact never goes live.
+      ansible.builtin.shell:
+        cmd: >
+          set -euo pipefail;
+          tmp="$(mktemp -d)";
+          oras pull "{{ item.ref }}" -o "$tmp" >/dev/null;
+          src="$(find "$tmp" -name '*.wasm' -type f | head -1)";
+          test -n "$src";
+          install -m 0644 "$src" "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm";
+          rm -rf "$tmp"
+      args:
+        creates: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm"
+      loop: "{{ wasm.standard_modules | default([]) | selectattr('source', 'equalto', 'oci') | list }}"
+      loop_control:
+        label: "{{ item.alias }}"
+      when: wasm.enabled | default(false) | bool
+
+    - name: Verify staged module digests
+      ansible.builtin.stat:
+        path: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm"
+        checksum_algorithm: sha256
+      register: staged_modules
+      loop: "{{ wasm.standard_modules | default([]) | list }}"
+      loop_control:
+        label: "{{ item.alias }}"
+      when: wasm.enabled | default(false) | bool
+
+    - name: Fail if any staged module digest mismatches
+      ansible.builtin.fail:
+        msg: >
+          Staged module {{ item.item.alias }} digest {{ item.stat.checksum }}
+          != expected {{ item.item.digest | regex_replace('^sha256:', '') }}
+      loop: "{{ staged_modules.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.alias | default('?') }}"
+      when:
+        - wasm.enabled | default(false) | bool
+        - item.stat is defined
+        - item.stat.exists | default(false)
+        - (item.item.digest | regex_replace('^sha256:', '')) != item.stat.checksum

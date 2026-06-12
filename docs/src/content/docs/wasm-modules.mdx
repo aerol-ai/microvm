@@ -9,11 +9,157 @@ WASM sandboxes are created from a **module reference** (`module_ref`). The daemo
 
 ## Module references
 
-Supported forms mirror other artifact refs:
+A `module_ref` is resolved in this precedence order:
 
-- `file:///path/to/module.wasm` on the host
-- HTTP(S) URLs fetched into the module cache
-- AOCR refs when image distribution is configured
+1. **Standard-module keyword** — a short alias your operator staged on every
+   node (e.g. `python`, `javascript`). Recommended: no host paths, identical
+   fleet-wide. See [Standard modules](#standard-modules).
+2. **`oci://host/repo:tag`** — a registry artifact, pulled under your own
+   credentials and cached content-addressed. See
+   [Bring your own module](#bring-your-own-module).
+3. **Catalogue id** — a digest id returned by `createWasmModule`.
+4. **`file:///path/to/module.wasm`** / bare filename under `SB_WASM_MODULES_DIR`
+   — for self-managed hosts.
+
+Whatever the form, the daemon validates the artifact is a **core wasip1**
+module (WASI components are rejected), records the resolved digest, and pins it
+to the sandbox so a restart or failover boots the exact same bytes. Remote
+`oci://` pulls are restricted to the hosts in `SB_WASM_REGISTRY_ALLOWLIST`.
+
+## Standard modules
+
+Operators pre-stage a curated set of language modules on every node (via the
+`stage-wasm-modules` playbook) and expose them as reserved keywords through
+`SB_WASM_STANDARD_MODULES`. You reference one by name — no upload, no path:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.create({ module_ref: 'python', runtime: 'wasm' })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.create({'module_ref': 'python', 'runtime': 'wasm'})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client.Create(ctx, types.CreateSandboxRequest{ModuleRef: "python", Runtime: types.RuntimeWasm})
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.create(CreateSandboxRequest {
+        module_ref: Some("python".into()),
+        runtime: Some("wasm".into()),
+        ..Default::default()
+    }).await?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CreateSandboxRequest req = new CreateSandboxRequest();
+    req.setModuleRef("python");
+    req.setRuntime("wasm");
+    client.create(req);
+    ```
+  </TabItem>
+</Tabs>
+
+A standard-module keyword always wins over a same-named file in the modules
+dir, so the curated runtime can never be shadowed.
+
+## Bring your own module
+
+Compile your program to a **core wasip1** module (`GOOS=wasip1` for Go,
+`--target wasm32-wasip1` for Rust), then push it to the registry under your own
+credentials. The daemon **validates and forwards** the bytes — it never stores
+them or acts as a registry — and returns the `oci://` ref to use on create.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { readFile } from 'node:fs/promises'
+
+    const wasm = await readFile('app.wasm')
+    const pushed = await client.pushWasmModule({
+      name: 'tenant/app',
+      tag: 'v1',
+      module: new Uint8Array(wasm),
+      registryUsername: process.env.AOCR_USER,
+      registryToken: process.env.AOCR_TOKEN!,
+    })
+    await client.create({ module_ref: pushed.moduleRef, runtime: 'wasm' })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    with open('app.wasm', 'rb') as f:
+        module = f.read()
+    pushed = client.push_wasm_module({
+        'name': 'tenant/app',
+        'tag': 'v1',
+        'module': module,
+        'registryUsername': os.environ['AOCR_USER'],
+        'registryToken': os.environ['AOCR_TOKEN'],
+    })
+    client.create({'module_ref': pushed['moduleRef'], 'runtime': 'wasm'})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    wasm, _ := os.ReadFile("app.wasm")
+    pushed, err := client.PushWasmModule(ctx, types.PushWasmModuleOptions{
+        Name:             "tenant/app",
+        Tag:              "v1",
+        Module:           wasm,
+        RegistryUsername: os.Getenv("AOCR_USER"),
+        RegistryToken:    os.Getenv("AOCR_TOKEN"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    client.Create(ctx, types.CreateSandboxRequest{ModuleRef: pushed.ModuleRef, Runtime: types.RuntimeWasm})
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let module = std::fs::read("app.wasm")?;
+    let pushed = client.push_wasm_module(PushWasmModuleOptions {
+        name: "tenant/app".into(),
+        tag: "v1".into(),
+        module,
+        registry_username: std::env::var("AOCR_USER")?,
+        registry_token: std::env::var("AOCR_TOKEN")?,
+    })?;
+    client.create(CreateSandboxRequest {
+        module_ref: Some(pushed.module_ref),
+        runtime: Some("wasm".into()),
+        ..Default::default()
+    }).await?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    byte[] module = Files.readAllBytes(Path.of("app.wasm"));
+    PushWasmModuleResponse pushed = client.pushWasmModule(new PushWasmModuleOptions()
+        .setName("tenant/app")
+        .setTag("v1")
+        .setModule(module)
+        .setRegistryUsername(System.getenv("AOCR_USER"))
+        .setRegistryToken(System.getenv("AOCR_TOKEN")));
+    CreateSandboxRequest req = new CreateSandboxRequest();
+    req.setModuleRef(pushed.moduleRef);
+    req.setRuntime("wasm");
+    client.create(req);
+    ```
+  </TabItem>
+</Tabs>
+
+You can also `oras push` your module to the registry directly and skip the
+daemon — then create with the `oci://` ref plus your `registry` credentials.
+Either way the registry is the source of truth and the daemon only pulls to run.
 
 ## Catalogue API
 
@@ -131,4 +277,14 @@ Peers gossip `local_wasm_module_ids` via `/v1/capacity`. Placement prefers nodes
 
 ## Garbage collection
 
-Unreferenced catalogue rows older than `SB_WASM_MODULE_GC_TTL` are removed by the wasm module janitor when `SB_WASM_MODULE_GC_ENABLED=true`.
+When `SB_WASM_MODULE_GC_ENABLED=true`, the wasm module janitor runs two sweeps
+each `SB_WASM_MODULE_GC_INTERVAL`:
+
+- **Catalogue rows.** Unreferenced rows older than `SB_WASM_MODULE_GC_TTL` are
+  removed.
+- **`oci://` cache bytes.** Content-addressed files under `SB_WASM_CACHE_DIR`
+  (`<digest>.wasm`) are evicted when older than `SB_WASM_CACHE_GC_TTL` (default
+  24h), or oldest-first when the cache exceeds `SB_WASM_CACHE_MAX_BYTES`
+  (default unlimited). A digest still referenced by a sandbox or a catalogue row
+  is **never** evicted, regardless of age or disk pressure — eviction only
+  reclaims pull-on-create modules that nothing depends on.

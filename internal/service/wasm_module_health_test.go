@@ -37,6 +37,217 @@ func TestWasmPathUnderDir(t *testing.T) {
 	}
 }
 
+// writeCacheFile drops a fake <digest>.wasm into dir with the given mtime.
+func writeCacheFile(t *testing.T, dir, digest string, size int, mod time.Time) string {
+	t.Helper()
+	p := filepath.Join(dir, digest+".wasm")
+	if err := os.WriteFile(p, make([]byte, size), 0o600); err != nil {
+		t.Fatalf("write cache file: %v", err)
+	}
+	if err := os.Chtimes(p, mod, mod); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	return p
+}
+
+func TestRunWasmCacheGCTTLEvictsUnreferenced(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheGCTTL = time.Hour
+
+	old := time.Now().Add(-2 * time.Hour)
+	fresh := time.Now()
+	stale := writeCacheFile(t, cacheDir, "deadbeefstale", 10, old)
+	young := writeCacheFile(t, cacheDir, "deadbeefyoung", 10, fresh)
+
+	// A catalogued digest must survive eviction even though it's old.
+	pinned := writeCacheFile(t, cacheDir, "deadbeefpinned", 10, old)
+	if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
+		ID: "mod-pinned", ModuleRef: "oci://h/r:t", Digest: "deadbeefpinned", ModulePath: pinned,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	svc.runWasmCacheGC(ctx, time.Now())
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("expected stale unreferenced file evicted, stat err=%v", err)
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Errorf("expected fresh file kept: %v", err)
+	}
+	if _, err := os.Stat(pinned); err != nil {
+		t.Errorf("expected catalogued digest kept: %v", err)
+	}
+}
+
+func TestRunWasmCacheGCSizeCapEvictsOldestFirst(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheMaxBytes = 150 // room for one 100-byte file, not two
+
+	now := time.Now()
+	oldest := writeCacheFile(t, cacheDir, "aaa", 100, now.Add(-2*time.Hour))
+	newest := writeCacheFile(t, cacheDir, "bbb", 100, now)
+
+	svc.runWasmCacheGC(ctx, now)
+
+	if _, err := os.Stat(oldest); !os.IsNotExist(err) {
+		t.Errorf("expected oldest file evicted under cap, stat err=%v", err)
+	}
+	if _, err := os.Stat(newest); err != nil {
+		t.Errorf("expected newest file kept under cap: %v", err)
+	}
+}
+
+func TestEvictReasonBranches(t *testing.T) {
+	if evictReason(true, true) != "ttl+cap" {
+		t.Fatal("ttl+cap")
+	}
+	if evictReason(true, false) != "ttl" {
+		t.Fatal("ttl")
+	}
+	if evictReason(false, true) != "cap" {
+		t.Fatal("cap")
+	}
+	if evictReason(false, false) != "cap" {
+		t.Fatal("default cap branch")
+	}
+}
+
+// P1: sandbox module_digest pins must protect cache files even when the
+// digest is absent from wasm_modules.
+func TestRunWasmCacheGCKeepsSandboxReferencedDigest(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheGCTTL = time.Hour
+
+	old := time.Now().Add(-2 * time.Hour)
+	pinned := writeCacheFile(t, cacheDir, "sandboxonly", 10, old)
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID:           "sb-pin",
+		Runtime:      models.RuntimeWasm,
+		ModuleDigest: "sandboxonly",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	svc.runWasmCacheGC(ctx, time.Now())
+	if _, err := os.Stat(pinned); err != nil {
+		t.Fatalf("sandbox-referenced digest should survive gc: %v", err)
+	}
+}
+
+func TestRunWasmCacheGCInUseQueryError(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	cacheDir := t.TempDir()
+	writeCacheFile(t, cacheDir, "gone", 10, time.Now().Add(-2*time.Hour))
+	svc := &Service{
+		cfg:    config.Config{WasmCacheDir: cacheDir, WasmCacheGCTTL: time.Hour},
+		store:  st,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	svc.runWasmCacheGC(ctx, time.Now())
+	if _, err := os.Stat(filepath.Join(cacheDir, "gone.wasm")); err != nil {
+		t.Fatalf("file should remain when in-use query fails: %v", err)
+	}
+}
+
+func TestRunWasmCacheGCReaddirFailure(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(cacheFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc.cfg.WasmCacheDir = cacheFile
+	svc.cfg.WasmCacheGCTTL = time.Hour
+	svc.runWasmCacheGC(ctx, time.Now())
+}
+
+func TestRunWasmCacheGCEvictsTTLAndCapTogether(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheGCTTL = time.Hour
+	svc.cfg.WasmCacheMaxBytes = 50
+
+	old := time.Now().Add(-2 * time.Hour)
+	writeCacheFile(t, cacheDir, "evictme", 100, old)
+
+	svc.runWasmCacheGC(ctx, time.Now())
+	if _, err := os.Stat(filepath.Join(cacheDir, "evictme.wasm")); !os.IsNotExist(err) {
+		t.Fatalf("expected eviction under ttl+cap, stat err=%v", err)
+	}
+}
+
+func TestRunWasmCacheGCStopsAtYoungUnreferencedFiles(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheGCTTL = time.Hour
+
+	now := time.Now()
+	old := writeCacheFile(t, cacheDir, "oldfile", 10, now.Add(-2*time.Hour))
+	young := writeCacheFile(t, cacheDir, "youngfile", 10, now)
+
+	svc.runWasmCacheGC(ctx, now)
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("old file should be evicted")
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Fatalf("young file should remain: %v", err)
+	}
+}
+
+func TestRunWasmCacheGCSkipsDirectories(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	svc.cfg.WasmCacheGCTTL = time.Hour
+	if err := os.Mkdir(filepath.Join(cacheDir, ".manifest"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := writeCacheFile(t, cacheDir, "onlywasm", 10, time.Now().Add(-2*time.Hour))
+	svc.runWasmCacheGC(ctx, time.Now())
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("expected stale wasm evicted")
+	}
+}
+
+func TestRunWasmCacheGCDisabledNoop(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	cacheDir := t.TempDir()
+	svc.cfg.WasmCacheDir = cacheDir
+	// both knobs zero => disabled
+	f := writeCacheFile(t, cacheDir, "ccc", 10, time.Now().Add(-100*time.Hour))
+	svc.runWasmCacheGC(ctx, time.Now())
+	if _, err := os.Stat(f); err != nil {
+		t.Errorf("expected file untouched when cache gc disabled: %v", err)
+	}
+}
+
 func TestStartWasmModuleGC(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -86,9 +297,12 @@ func TestRunWasmModuleGCWithRuntimeRemovesImages(t *testing.T) {
 		t.Fatalf("write module: %v", err)
 	}
 	now := time.Now().UTC().Add(-2 * time.Hour)
+	// GC reclaims by the recorded content digest (a local-only RemoveImage
+	// path), never by the ref — an oci:// ref would re-pull during cleanup.
 	if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
 		ID:         "mod-rt",
-		ModuleRef:  "sha256:rt",
+		ModuleRef:  "oci://h/r:t",
+		Digest:     "rtdigest",
 		Status:     "ready",
 		ModulePath: modPath,
 		CreatedAt:  now,
@@ -99,8 +313,8 @@ func TestRunWasmModuleGCWithRuntimeRemovesImages(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	svc.runWasmModuleGC(ctx, time.Now().UTC())
-	if len(rt.removeImages) != 1 || rt.removeImages[0] != "sha256:rt" {
-		t.Fatalf("removeImages = %v, want [sha256:rt]", rt.removeImages)
+	if len(rt.removeImages) != 1 || rt.removeImages[0] != "rtdigest" {
+		t.Fatalf("removeImages = %v, want [rtdigest]", rt.removeImages)
 	}
 	if _, err := st.GetWasmModule(ctx, "mod-rt"); err == nil {
 		t.Fatal("module should have been deleted")
@@ -238,7 +452,11 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("remove image error", func(t *testing.T) {
+	t.Run("remove image error does not strand row", func(t *testing.T) {
+		// A failed best-effort artifact delete must NOT strand the catalogue row:
+		// the row is the source of placement inventory, so leaving it behind on a
+		// transient remove error accumulates vacuum (codex P1). GC ignores the
+		// error and still deletes the row; cache GC reclaims the bytes later.
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "state.db")
 		st, err := store.Open(dbPath)
@@ -248,7 +466,7 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 		t.Cleanup(func() { _ = st.Close() })
 		now := time.Now().UTC().Add(-2 * time.Hour)
 		if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
-			ID: "mod-rm", ModuleRef: "file:///tmp/rm.wasm", Status: "ready", CreatedAt: now, UpdatedAt: now,
+			ID: "mod-rm", ModuleRef: "oci://h/r:t", Digest: "rmdigest", Status: "ready", CreatedAt: now, UpdatedAt: now,
 		}); err != nil {
 			t.Fatalf("UpsertWasmModule: %v", err)
 		}
@@ -270,8 +488,8 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 			wasm:   wasmModuleGCRuntime{removeErr: errors.New("remove failed")},
 		}
 		svc.runWasmModuleGC(ctx, time.Now())
-		if _, err := st.GetWasmModule(ctx, "mod-rm"); err != nil {
-			t.Fatalf("module should remain after remove failure: %v", err)
+		if _, err := st.GetWasmModule(ctx, "mod-rm"); err == nil {
+			t.Fatal("row should be deleted despite remove failure")
 		}
 	})
 
@@ -438,7 +656,10 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("blank module ref falls back to module id for image removal", func(t *testing.T) {
+	t.Run("digest row reclaims by content digest", func(t *testing.T) {
+		// A row carrying a content digest reclaims via the local-only,
+		// digest-keyed RemoveImage path (which also drops the warm-pool entry),
+		// never via the ref.
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "state.db")
 		st, err := store.Open(dbPath)
@@ -449,8 +670,9 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 
 		now := time.Now().UTC().Add(-2 * time.Hour)
 		if err := st.UpsertWasmModule(ctx, store.WasmModuleRecord{
-			ID:         "mod-blank-ref",
-			ModuleRef:  "",
+			ID:         "mod-digest",
+			ModuleRef:  "oci://h/r:t",
+			Digest:     "blankdigest",
 			ModulePath: filepath.Join(dir, "blank-ref.wasm"),
 			Status:     "ready",
 			CreatedAt:  now,
@@ -462,7 +684,7 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 		if err != nil {
 			t.Fatalf("sql.Open: %v", err)
 		}
-		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-blank-ref"); err != nil {
+		if _, err := freshDB.ExecContext(ctx, `UPDATE wasm_modules SET updated_at = ? WHERE id = ?`, now.Add(-2*time.Hour), "mod-digest"); err != nil {
 			_ = freshDB.Close()
 			t.Fatalf("update wasm_modules updated_at: %v", err)
 		}
@@ -479,11 +701,11 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 		}
 		svc.runWasmModuleGC(ctx, time.Now())
 
-		if len(rt.removeImages) != 1 || rt.removeImages[0] != "mod-blank-ref" {
-			t.Fatalf("removeImages = %v, want [mod-blank-ref]", rt.removeImages)
+		if len(rt.removeImages) != 1 || rt.removeImages[0] != "blankdigest" {
+			t.Fatalf("removeImages = %v, want [blankdigest]", rt.removeImages)
 		}
-		if _, err := st.GetWasmModule(ctx, "mod-blank-ref"); err == nil {
-			t.Fatal("blank-ref module row should be deleted")
+		if _, err := st.GetWasmModule(ctx, "mod-digest"); err == nil {
+			t.Fatal("digest module row should be deleted")
 		}
 	})
 

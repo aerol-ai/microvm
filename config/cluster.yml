@@ -85,6 +85,52 @@ firecracker:
   enabled: false
   kernel_path: "/var/lib/sandboxd/firecracker/vmlinux"
 
+# --- WASM runtime + module distribution -----------------------------------
+# enabled=true turns on the WASM/WASI runtime. registry_allowlist is the set
+# of registry hosts an oci:// module_ref may pull from (empty = deny all
+# remote pulls — the SSRF-safe default; list AOCR to allow BYO modules).
+# standard_modules pre-stages curated language-interpreter modules on every
+# node (the fleet-wide reserved-keyword contract): each entry's .wasm is
+# fetched into modules_dir and exposed as `module_ref: "<alias>"`. push_host
+# enables the stateless BYO upload proxy (POST /v1/wasm-modules/push); empty
+# disables it.
+wasm:
+  enabled: false
+  modules_dir: "/var/lib/sandboxd/wasm/modules"
+  cache_dir: "/var/lib/sandboxd/wasm/cache"
+  registry_allowlist: "aocr.aerol.ai"
+  pull_timeout: "60s"
+  push_host: ""
+  # registry login used only to pull the standard modules below (system
+  # identity). Tenant BYO pulls/pushes use per-request credentials, never this.
+  registry_username: ""
+  registry_pat_path: ""
+  # Curated standard modules. alias is the reserved keyword tenants reference
+  # (module_ref: "<alias>"); source is "url" or "oci"; ref is the URL or oci
+  # ref; digest is the sha256 the staging step verifies before the module goes
+  # live. Filename is "<alias>.wasm" under modules_dir. Run
+  # `ansible-playbook playbooks/stage-wasm-modules.yml` after editing this list.
+  #
+  # To populate it: grab (or build) a core-wasip1 .wasm, push it to AOCR under
+  # the protected wasm/std/* namespace (reaper-exempt, pull-only for tenants),
+  # capture its digest, and uncomment an entry below.
+  #
+  #   oras push aocr.aerol.ai/wasm/std/python:3.12 python.wasm:application/wasm
+  #   sha256sum python.wasm
+  #
+  # Public prebuilt runtimes you can source from instead of building:
+  #   Python     https://github.com/vmware-labs/webassembly-language-runtimes (wasi builds)
+  #   JavaScript https://github.com/bytecodealliance/javy (qjs/quickjs wasm)
+  standard_modules: []
+  #  - alias: python
+  #    source: oci
+  #    ref: "aocr.aerol.ai/wasm/std/python:3.12"
+  #    digest: "sha256:<sha256sum of the pushed python.wasm>"
+  #  - alias: javascript
+  #    source: url
+  #    ref: "https://example.com/quickjs.wasm"
+  #    digest: "sha256:<sha256sum of quickjs.wasm>"
+
 # --- AOCR mirror (Phase 4) ------------------------------------------------
 # Empty host disables mirror rewriting entirely. Upstreams maps upstream
 # hostnames to repository prefixes inside the mirror.

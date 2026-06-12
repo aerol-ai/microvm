@@ -51,6 +51,8 @@ from .types import (
     SetNetworkLimitsOptions,
     Template,
     WasmModule,
+    PushWasmModuleOptions,
+    PushWasmModuleResult,
 )
 
 STREAM_PREFIX_STDOUT = 0x01
@@ -653,6 +655,35 @@ class MicroVM:
     def delete_wasm_module(self, module_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/wasm-modules/{module_id}", None)
 
+    def push_wasm_module(self, options: PushWasmModuleOptions) -> PushWasmModuleResult:
+        """Upload a compiled core-wasip1 module to the registry under your own
+        credentials, returning the ``oci://`` ref to use as ``moduleRef`` on a
+        later ``create``. The daemon validates and forwards the bytes; it never
+        stores them.
+        """
+        name = options.get("name", "")
+        query = urllib.parse.urlencode(
+            {"name": name, "tag": options["tag"]} if options.get("tag") else {"name": name}
+        )
+        headers: Dict[str, str] = {"X-Registry-Token": options.get("registryToken", "")}
+        username = options.get("registryUsername")
+        if username:
+            headers["X-Registry-Username"] = username
+        url = f"{self._url(self._versioned('/wasm-modules/push'))}?{query}"
+        raw = self._request(
+            "POST",
+            url,
+            body=options.get("module", b""),
+            content_type="application/octet-stream",
+            extra_headers=headers,
+        )
+        data = json.loads(raw.decode("utf-8")) if raw else {}
+        return PushWasmModuleResult(
+            moduleRef=data.get("module_ref", ""),
+            digest=data.get("digest", ""),
+            sizeBytes=data.get("size_bytes", 0),
+        )
+
     def rebuild_template(self, template_id: str) -> Template:
         """Re-run the snapshot phase against an existing template.
 
@@ -896,18 +927,20 @@ class MicroVM:
     def _url(self, path: str) -> str:
         return f"{self.api_url}{path}"
 
-    def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None) -> bytes:
+    def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None) -> bytes:
         max_retries = self._retry_config["maxRetries"]
         base_delay_ms = self._retry_config["baseDelayMs"]
         max_delay_ms = self._retry_config["maxDelayMs"]
-        
+
         last_exc: Optional[Exception] = None
-        
+
         for attempt in range(max_retries + 1):
             request = urllib.request.Request(url, data=body, method=method)
             request.add_header("Authorization", f"Bearer {self.pat_token}")
             if content_type is not None:
                 request.add_header("Content-Type", content_type)
+            for header_key, header_val in (extra_headers or {}).items():
+                request.add_header(header_key, header_val)
 
             try:
                 with urllib.request.urlopen(request) as response:

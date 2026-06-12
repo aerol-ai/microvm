@@ -2089,6 +2089,110 @@ func TestWasmCheckpointColumnsRoundTrip(t *testing.T) {
 	}
 }
 
+// A module is "referenced" when a sandbox shares its content digest, even
+// though that sandbox's module_ref names a different alias/tag (codex C5).
+// Deleting/evicting purely by ref would otherwise stomp shared bytes.
+func TestIsWasmModuleReferencedByDigest(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Sandbox booted from alias "python" but pinned to digest sha256X.
+	sb := sampleSandbox("sb-ref-digest")
+	sb.ModuleRef = "python"
+	sb.ModuleDigest = "sha256X"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// A catalogue row whose id/ref differ from the sandbox's, but whose
+	// resolved digest is the same bytes, must read as referenced.
+	referenced, err := st.IsWasmModuleReferenced(ctx, "some-other-id", "oci://aocr/x:latest", "sha256X")
+	if err != nil {
+		t.Fatalf("IsWasmModuleReferenced: %v", err)
+	}
+	if !referenced {
+		t.Fatal("module sharing the sandbox's digest must be referenced (C5)")
+	}
+
+	// An unrelated digest with no ref/id match is free to delete.
+	referenced, err = st.IsWasmModuleReferenced(ctx, "unrelated-id", "unrelated-ref", "sha256-OTHER")
+	if err != nil {
+		t.Fatalf("IsWasmModuleReferenced: %v", err)
+	}
+	if referenced {
+		t.Fatal("unrelated module must not be referenced")
+	}
+}
+
+// WasmDigestsInUse batches sandbox + catalogue membership for cache GC instead
+// of per-file probes (codex P1).
+func TestWasmDigestsInUse(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sb := sampleSandbox("sb-digest-in-use")
+	sb.ModuleDigest = "digest-sandbox"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := st.UpsertWasmModule(ctx, WasmModuleRecord{
+		ID: "mod-cat", ModuleRef: "oci://h/r:t", Digest: "digest-catalogue",
+		Status: "ready", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertWasmModule: %v", err)
+	}
+
+	inUse, err := st.WasmDigestsInUse(ctx, []string{
+		"digest-sandbox", "digest-catalogue", "digest-free",
+	})
+	if err != nil {
+		t.Fatalf("WasmDigestsInUse: %v", err)
+	}
+	if _, ok := inUse["digest-sandbox"]; !ok {
+		t.Fatal("sandbox digest should be in use")
+	}
+	if _, ok := inUse["digest-catalogue"]; !ok {
+		t.Fatal("catalogue digest should be in use")
+	}
+	if _, ok := inUse["digest-free"]; ok {
+		t.Fatal("unreferenced digest must not be in use")
+	}
+
+	empty, err := st.WasmDigestsInUse(ctx, nil)
+	if err != nil {
+		t.Fatalf("WasmDigestsInUse empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty input should return empty set, got %v", empty)
+	}
+
+	// Chunking: >400 digests exercises the batched query path.
+	batch := make([]string, 0, 450)
+	for i := 0; i < 450; i++ {
+		batch = append(batch, fmt.Sprintf("free-%04d", i))
+	}
+	batch = append(batch, "digest-sandbox")
+	got, err := st.WasmDigestsInUse(ctx, batch)
+	if err != nil {
+		t.Fatalf("WasmDigestsInUse chunked: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("chunked in-use = %v, want only digest-sandbox", got)
+	}
+}
+
+func TestWasmDigestsInUseQueryError(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := st.WasmDigestsInUse(ctx, []string{"x"}); err == nil {
+		t.Fatal("expected error on closed store")
+	}
+}
+
 func TestWasmStateKVCRUD(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

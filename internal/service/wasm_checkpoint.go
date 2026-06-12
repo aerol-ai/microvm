@@ -283,6 +283,9 @@ func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.San
 	if !ok {
 		return nil, fmt.Errorf("wasm checkpoint host not available")
 	}
+	// Unseal per-tenant registry creds so a failover peer re-pulls a private
+	// oci:// base module under the tenant's identity (codex C4).
+	s.attachWasmRegistryAuth(sandbox)
 	state, err := host.RehydrateSandbox(ctx, sandbox, hostMounts)
 	if err != nil {
 		if errors.Is(err, models.ErrSnapshotCorrupt) || errors.Is(err, models.ErrSnapshotFenced) {

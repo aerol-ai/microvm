@@ -165,6 +165,22 @@ locals {
     token            = local.fleet_enabled ? local.cluster_secrets.fleet.token : ""
     contract_refresh = local.fleet_enabled ? local.cluster_ops.fleet_control_plane.contract_refresh : "5m"
   }
+
+  # WASM runtime + module distribution. standard_modules is flattened into the
+  # SB_WASM_STANDARD_MODULES "alias=alias.wasm,..." reserved-keyword contract so
+  # Terraform and Ansible render identical env on every node. try() keeps older
+  # cluster.yml files (no wasm: block) working.
+  wasm_cfg = {
+    enabled            = try(local.cluster_ops.wasm.enabled, false) ? "true" : "false"
+    modules_dir        = try(local.cluster_ops.wasm.modules_dir, "/var/lib/sandboxd/wasm/modules")
+    cache_dir          = try(local.cluster_ops.wasm.cache_dir, "")
+    registry_allowlist = try(local.cluster_ops.wasm.registry_allowlist, "")
+    pull_timeout       = try(local.cluster_ops.wasm.pull_timeout, "60s")
+    push_host          = try(local.cluster_ops.wasm.push_host, "")
+    registry_username  = try(local.cluster_ops.wasm.registry_username, "")
+    registry_pat_path  = try(local.cluster_ops.wasm.registry_pat_path, "")
+    standard_modules   = join(",", [for m in try(local.cluster_ops.wasm.standard_modules, []) : "${m.alias}=${m.alias}.wasm"])
+  }
 }
 
 # Plan-time validation of values that come from local.cluster_ops. Terraform

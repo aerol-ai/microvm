@@ -2,8 +2,12 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -11,6 +15,75 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
+
+// maxPushBytes caps a BYO upload body, mirroring wasmmod's 256MiB artifact cap.
+const maxPushBytes = 256 << 20
+
+// PushWasmModule is a STATELESS proxy: it validates a BYO .wasm upload
+// (core-wasip1, size) and forwards it to the registry under the caller's own
+// per-tenant credentials, returning the oci:// ref for a later create. The
+// daemon never stores or serves the bytes — AOCR is the registry, this is just
+// orchestration convenience for clients without oras/docker.
+func (s *Service) PushWasmModule(ctx context.Context, name, tag, username, token string, data io.Reader) (*models.PushWasmModuleResponse, error) {
+	if !s.cfg.EnableWasm {
+		return nil, fmt.Errorf("wasm module push requires SB_ENABLE_WASM: %w", models.ErrRuntimeNotImplemented)
+	}
+	host := strings.TrimRight(strings.TrimSpace(s.cfg.WasmRegistryPushHost), "/")
+	if host == "" {
+		return nil, errors.New("wasm module push is not configured (SB_WASM_REGISTRY_PUSH_HOST)")
+	}
+	name = strings.Trim(strings.TrimSpace(name), "/")
+	if name == "" || strings.Contains(name, "://") || strings.ContainsAny(name, " \t") {
+		return nil, fmt.Errorf("invalid module name %q", name)
+	}
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = "latest"
+	}
+
+	tmp, err := os.CreateTemp("", "aerol-wasm-push-*.wasm")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	// Bounded copy + streaming digest: one read computes size + content sha256
+	// and writes the temp file. Reading one byte past the cap lets us reject an
+	// oversized upload without buffering it all.
+	h := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(data, maxPushBytes+1))
+	_ = tmp.Close()
+	if copyErr != nil {
+		return nil, copyErr
+	}
+	if n > maxPushBytes {
+		return nil, fmt.Errorf("%w: upload exceeds %d bytes", wasmmod.ErrModuleTooLarge, int64(maxPushBytes))
+	}
+
+	if err := wasmmod.ValidateFile(tmpPath); err != nil {
+		return nil, err
+	}
+	digest := hex.EncodeToString(h.Sum(nil))
+
+	registryRef := fmt.Sprintf("%s/%s:%s", host, name, tag)
+	// Per-tenant creds from the request are required — the daemon forwards
+	// under the CALLER's identity, never a global one. The system config
+	// identity (WasmRegistryPATPath) exists only for pulling standard modules,
+	// not for tenant pushes.
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("registry credentials required: supply X-Registry-Token")
+	}
+	auth := wasmmod.ModuleAuth{Username: strings.TrimSpace(username), PAT: strings.TrimSpace(token)}
+	if _, err := wasmmod.PushModuleArtifact(ctx, auth, tmpPath, registryRef); err != nil {
+		return nil, err
+	}
+	return &models.PushWasmModuleResponse{
+		ModuleRef: "oci://" + registryRef,
+		Digest:    digest,
+		SizeBytes: n,
+	}, nil
+}
 
 // WasmModuleResolver resolves a module reference to a local .wasm artifact.
 type WasmModuleResolver interface {
@@ -142,7 +215,7 @@ func (s *Service) DeleteWasmModule(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	referenced, err := s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef)
+	referenced, err := s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef, rec.Digest)
 	if err != nil {
 		return err
 	}

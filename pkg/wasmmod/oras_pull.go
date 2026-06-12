@@ -8,8 +8,6 @@ import (
 
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
-	"oras.land/oras-go/v2/registry/remote"
-	"oras.land/oras-go/v2/registry/remote/auth"
 )
 
 // ORASPullConfig wires AOCR auth for WASM checkpoint pull (failover-from-snapshot).
@@ -59,15 +57,9 @@ func PullSnapshotArtifact(ctx context.Context, cfg ORASPullConfig, registryRef, 
 	}
 	defer fs.Close()
 
-	repo, err := remote.NewRepository(registryRef)
+	repo, err := newAuthedRepo(registryRef, cfg.ClusterID, pat)
 	if err != nil {
-		return fmt.Errorf("oras pull: repository: %w", err)
-	}
-	repoHost := registryHost(registryRef)
-	repo.Client = &auth.Client{
-		Client:     auth.DefaultClient.Client,
-		Cache:      auth.DefaultCache,
-		Credential: auth.StaticCredential(repoHost, auth.Credential{Username: cfg.ClusterID, Password: pat}),
+		return err
 	}
 
 	tag := registryTag(registryRef)

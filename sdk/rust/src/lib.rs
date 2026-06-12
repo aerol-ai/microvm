@@ -35,7 +35,8 @@ pub use types::{
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
     SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
-    UpdateLifecycleOptions, WasmModule, WasmModuleStatus,
+    UpdateLifecycleOptions, WasmModule, WasmModuleStatus, PushWasmModuleOptions,
+    PushWasmModuleResponse,
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
@@ -895,6 +896,46 @@ impl Client {
             &format!("{}/wasm-modules/{}", self.version_prefix(), id),
             None,
         )
+    }
+
+    /// Upload a compiled core-wasip1 module to the registry under your own
+    /// credentials and get back the `oci://` ref to use as `module_ref` on a
+    /// later `create`. The daemon validates and forwards the bytes; it never
+    /// stores them.
+    pub fn push_wasm_module(
+        &self,
+        opts: PushWasmModuleOptions,
+    ) -> Result<PushWasmModuleResponse, Error> {
+        if opts.name.trim().is_empty() {
+            return Err(Error::Api("name is required".to_string()));
+        }
+        if opts.registry_token.trim().is_empty() {
+            return Err(Error::Api("registry_token is required".to_string()));
+        }
+        let tag = if opts.tag.trim().is_empty() {
+            "latest"
+        } else {
+            opts.tag.as_str()
+        };
+        let path = format!(
+            "{}/wasm-modules/push?name={}&tag={}",
+            self.version_prefix(),
+            urlencoding::encode(&opts.name),
+            urlencoding::encode(tag),
+        );
+        let url = self.full_url(&path);
+        let mut builder = self
+            .inner
+            .post(&url)
+            .bearer_auth(&self.pat_token)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Registry-Token", &opts.registry_token)
+            .body(opts.module);
+        if !opts.registry_username.trim().is_empty() {
+            builder = builder.header("X-Registry-Username", &opts.registry_username);
+        }
+        let response = self.handle_response(builder.send()?)?;
+        response.json().map_err(Error::Reqwest)
     }
 
     /// Re-run the snapshot phase against an existing template. Idempotent

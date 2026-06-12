@@ -94,6 +94,23 @@ func TestRegistryHelpers(t *testing.T) {
 	if registryTag("host/path") != "latest" {
 		t.Fatal("registryTag failed")
 	}
+	// codex P2: a :port on the host must not be parsed as the tag, and an
+	// @sha256:<digest> pin must resolve to the digest reference.
+	cases := map[string]string{
+		"host:5000/repo:v1":           "v1",
+		"host:5000/repo":              "latest",
+		"host/repo@sha256:abc123":     "sha256:abc123",
+		"host:5000/ns/repo@sha256:de": "sha256:de",
+		"host:5000/ns/repo":           "latest",
+	}
+	for ref, want := range cases {
+		if got := registryTag(ref); got != want {
+			t.Fatalf("registryTag(%q) = %q, want %q", ref, got, want)
+		}
+	}
+	if registryHost("host:5000/repo:v1") != "host:5000" {
+		t.Fatal("registryHost should preserve :port")
+	}
 }
 
 func TestORASPushConfigValidation(t *testing.T) {

@@ -330,6 +330,13 @@ func (c *Client) GetWasmModule(ctx context.Context, id string) (sdktypes.WasmMod
 	return c.inner.GetWasmModule(ctx, id)
 }
 
+// PushWasmModule uploads a compiled core-wasip1 module to the registry under
+// your own credentials and returns the oci:// ref to use as ModuleRef on a
+// later Create. The daemon validates and forwards the bytes; it never stores them.
+func (c *Client) PushWasmModule(ctx context.Context, opts sdktypes.PushWasmModuleOptions) (sdktypes.PushWasmModuleResponse, error) {
+	return c.inner.PushWasmModule(ctx, opts)
+}
+
 func (c *Client) DeleteWasmModule(ctx context.Context, id string) error {
 	return c.inner.DeleteWasmModule(ctx, id)
 }

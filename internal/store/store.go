@@ -399,6 +399,11 @@ func Open(path string) (*Store, error) {
 			ON wasm_modules(updated_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_status_ref
 			ON wasm_modules(status, module_ref);`,
+		// Cache GC probes catalogued digests by content digest every sweep; without
+		// this index that degrades to a full wasm_modules scan per cache file at
+		// large cache/catalogue sizes (codex P1).
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_digest
+			ON wasm_modules(digest) WHERE digest <> '';`,
 		// wasm_state_kv backs the durable host-KV capability (§4.6).
 		`CREATE TABLE IF NOT EXISTS wasm_state_kv (
 			sandbox_id TEXT NOT NULL,
@@ -4823,13 +4828,20 @@ func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) 
 }
 
 // IsWasmModuleReferenced reports whether any sandbox still names moduleRef or digest id.
-func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef string) (bool, error) {
+// IsWasmModuleReferenced reports whether any sandbox row still depends on this
+// module. The check spans ref, id, AND the resolved content digest: two
+// aliases/tags can share the same bytes, so deleting/evicting purely by ref
+// would yank a digest still in use by another sandbox (codex C5). A blank
+// moduleDigest simply contributes no extra match.
+func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef, moduleDigest string) (bool, error) {
 	moduleID = strings.TrimSpace(moduleID)
 	moduleRef = strings.TrimSpace(moduleRef)
+	moduleDigest = strings.TrimSpace(moduleDigest)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT 1 FROM sandboxes
-		WHERE module_ref = ? OR module_ref = ? OR module_digest = ?
-		LIMIT 1`, moduleRef, moduleID, moduleID)
+		WHERE module_ref = ? OR module_ref = ? OR module_digest = ? OR
+		      (? <> '' AND module_digest = ?)
+		LIMIT 1`, moduleRef, moduleID, moduleID, moduleDigest, moduleDigest)
 	var one int
 	err := row.Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -4839,6 +4851,77 @@ func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef 
 		return false, err
 	}
 	return true, nil
+}
+
+// IsWasmDigestCatalogued reports whether any wasm_modules row pins this content
+// digest. The cache evictor consults it (alongside IsWasmModuleReferenced) so a
+// digest that backs a catalogue id — resolvable later by a fresh create — is
+// never reclaimed out from under the catalogue, even with no live sandbox.
+func (s *Store) IsWasmDigestCatalogued(ctx context.Context, digest string) (bool, error) {
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return false, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM wasm_modules WHERE digest = ? LIMIT 1`, digest)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// WasmDigestsInUse returns the subset of digests that are still referenced by a
+// live sandbox OR pinned by a catalogue row. The cache evictor calls this ONCE
+// per sweep with every candidate digest instead of two probes per file, so a
+// large cache no longer issues O(files) serialized queries against the
+// single-writer DB (codex P1). Digests are chunked to stay under SQLite's bound
+// parameter limit.
+func (s *Store) WasmDigestsInUse(ctx context.Context, digests []string) (map[string]struct{}, error) {
+	inUse := make(map[string]struct{})
+	const chunk = 400 // half the 999 bound-param limit (used twice per row)
+	for start := 0; start < len(digests); start += chunk {
+		end := start + chunk
+		if end > len(digests) {
+			end = len(digests)
+		}
+		batch := digests[start:end]
+		ph := make([]string, len(batch))
+		// One arg list reused for both the sandboxes and wasm_modules predicate.
+		args := make([]any, 0, len(batch)*2)
+		for i, d := range batch {
+			ph[i] = "?"
+			args = append(args, d)
+		}
+		for _, d := range batch {
+			args = append(args, d)
+		}
+		in := strings.Join(ph, ",")
+		q := `SELECT module_digest FROM sandboxes WHERE module_digest IN (` + in + `)
+		      UNION
+		      SELECT digest FROM wasm_modules WHERE digest IN (` + in + `)`
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("wasm digests in use: %w", err)
+		}
+		for rows.Next() {
+			var d string
+			if err := rows.Scan(&d); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			inUse[d] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return inUse, nil
 }
 
 // ErrWasmModuleIDConflict is returned when POST /v1/wasm-modules reuses an id

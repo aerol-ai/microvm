@@ -11,7 +11,88 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
+
+// digestResolver is the optional capability a ModuleResolver exposes to boot a
+// sandbox from its content-addressed frozen copy. Type-asserted so test fakes
+// that only implement Resolve keep working.
+type digestResolver interface {
+	ResolveByDigest(digest string) (*wasmmod.ResolvedModule, bool)
+}
+
+// authResolver is the optional capability to resolve under caller-supplied
+// per-tenant registry credentials. Type-asserted so simple fakes still work.
+type authResolver interface {
+	ResolveWithAuth(ctx context.Context, ref string, authOverride *wasmmod.ModuleAuth) (*wasmmod.ResolvedModule, error)
+}
+
+// resolveWithRequestAuth resolves ref, passing the request's registry
+// credentials (per-tenant) through to an oci:// pull when present. When the
+// request carries no creds, or the resolver predates the auth seam, it falls
+// back to the plain Resolve (system identity).
+func resolveWithRequestAuth(ctx context.Context, r ModuleResolver, ref string, reg *models.RegistryAuth) (*wasmmod.ResolvedModule, error) {
+	if reg != nil && (strings.TrimSpace(reg.Username) != "" || strings.TrimSpace(reg.Password) != "") {
+		if ar, ok := r.(authResolver); ok {
+			return ar.ResolveWithAuth(ctx, ref, &wasmmod.ModuleAuth{
+				Username: reg.Username,
+				PAT:      reg.Password,
+			})
+		}
+	}
+	return r.Resolve(ctx, ref)
+}
+
+// moduleAuthFromSandbox builds the per-tenant registry credential from a
+// sandbox's transient (unsealed) RegistryAuth, used so a failover peer pulls a
+// private oci:// module under the tenant's identity (codex C4). Nil when the
+// sandbox carries no creds (public/standard module).
+func moduleAuthFromSandbox(sandbox *models.Sandbox) *wasmmod.ModuleAuth {
+	if sandbox == nil || sandbox.RegistryAuth == nil {
+		return nil
+	}
+	ra := sandbox.RegistryAuth
+	if strings.TrimSpace(ra.Username) == "" && strings.TrimSpace(ra.Password) == "" {
+		return nil
+	}
+	return &wasmmod.ModuleAuth{Username: ra.Username, PAT: ra.Password}
+}
+
+// resolvePinned resolves a sandbox's module preferring the digest pinned at
+// create over the (mutable) ref. On a frozen-copy cache hit it boots the exact
+// original bytes; on a miss it re-resolves the ref (under authOverride creds
+// when set) but REFUSES to boot if the bytes drifted from the pin — turning
+// codex C2's silent code-swap into a loud, recoverable error.
+func (d *Driver) resolvePinned(ctx context.Context, ref, pinnedDigest string, authOverride *wasmmod.ModuleAuth) (*wasmmod.ResolvedModule, error) {
+	pinnedDigest = strings.TrimSpace(pinnedDigest)
+	if pinnedDigest != "" {
+		if dr, ok := d.resolver.(digestResolver); ok {
+			if resolved, hit := dr.ResolveByDigest(pinnedDigest); hit {
+				return resolved, nil
+			}
+		}
+	}
+	resolved, err := d.resolveRef(ctx, ref, authOverride)
+	if err != nil {
+		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
+	}
+	if pinnedDigest != "" && resolved.Digest != "" && resolved.Digest != pinnedDigest {
+		return nil, fmt.Errorf("module %q pinned %s but now resolves to %s: %w",
+			ref, pinnedDigest, resolved.Digest, wasmmod.ErrModuleDigestMismatch)
+	}
+	return resolved, nil
+}
+
+// resolveRef resolves under authOverride creds when set and the resolver
+// supports the auth seam, else plain Resolve.
+func (d *Driver) resolveRef(ctx context.Context, ref string, authOverride *wasmmod.ModuleAuth) (*wasmmod.ResolvedModule, error) {
+	if authOverride != nil {
+		if ar, ok := d.resolver.(authResolver); ok {
+			return ar.ResolveWithAuth(ctx, ref, authOverride)
+		}
+	}
+	return d.resolver.Resolve(ctx, ref)
+}
 
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
 	inst, err := d.instance(sandboxID)
@@ -72,9 +153,11 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 	if d.resolver == nil {
 		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
 	}
-	resolved, err := d.resolver.Resolve(ctx, ref)
+	// Boot the digest pinned at create, not whatever the alias/tag points at
+	// now (codex C2). On drift with no frozen copy this fails loudly.
+	resolved, err := d.resolvePinned(ctx, ref, sandbox.ModuleDigest, moduleAuthFromSandbox(sandbox))
 	if err != nil {
-		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
+		return nil, err
 	}
 
 	workDir := d.sandboxDir(sandbox.ID)

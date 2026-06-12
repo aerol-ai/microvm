@@ -17,6 +17,8 @@ import type {
   CreateSessionOptions,
   CreateTemplateOptions,
   CreateWasmModuleOptions,
+  PushWasmModuleOptions,
+  PushWasmModuleResult,
   CustomDomain,
   CloneGeneration,
   CustomDomainDNSRecords,
@@ -791,6 +793,30 @@ export class APIClient {
 
   async deleteWasmModule(id: string): Promise<void> {
     await this.doJSON<void>("DELETE", `${this.versionPrefix}/wasm-modules/${id}`);
+  }
+
+  async pushWasmModule(options: PushWasmModuleOptions): Promise<PushWasmModuleResult> {
+    const params = new URLSearchParams({ name: options.name });
+    if (options.tag) {
+      params.set("tag", options.tag);
+    }
+    const headers: Record<string, string> = {
+      "Content-Type": "application/octet-stream",
+      "X-Registry-Token": options.registryToken,
+    };
+    if (options.registryUsername) {
+      headers["X-Registry-Username"] = options.registryUsername;
+    }
+    const response = await this.request(
+      "POST",
+      this.versioned(`/wasm-modules/push?${params.toString()}`),
+      { body: options.module as unknown as BodyInit, headers },
+    );
+    if (!response.ok) {
+      throw await decodeError(response);
+    }
+    const r = (await response.json()) as { module_ref: string; digest: string; size_bytes: number };
+    return { moduleRef: r.module_ref, digest: r.digest, sizeBytes: r.size_bytes };
   }
 
   async rebuildTemplate(id: string): Promise<Template> {

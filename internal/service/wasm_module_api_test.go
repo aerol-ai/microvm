@@ -62,6 +62,65 @@ func (s stubWasmModuleResolver) Resolve(_ context.Context, ref string) (*wasmmod
 	}, nil
 }
 
+// codex P0: reserved standard-module aliases are config/filesystem-backed and
+// never written to wasm_modules, so without folding them into local inventory a
+// fresh cluster node advertises known-but-empty inventory and placement rejects
+// every `module_ref: "python"` create. The resolvable aliases must appear.
+func TestLocalInventoryIncludesReservedAliases(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.cfg.WasmStandardModules = map[string]string{"python": "python.wasm"}
+	svc.SetWasmModuleResolver(stubWasmModuleResolver{path: "/staged/python.wasm", digest: "pydigest"})
+
+	refs, known := svc.LocalReadyWasmModuleInventory(ctx)
+	if !known {
+		t.Fatal("inventory should be known")
+	}
+	found := false
+	for _, r := range refs {
+		if r == "python" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected reserved alias 'python' advertised, got %v", refs)
+	}
+}
+
+// An alias whose staged file does not resolve on this host must NOT be
+// advertised — otherwise placement routes work to a node that can't run it.
+// P1: auto-register must not write a ready row with an empty module_path.
+func TestRegisterWasmModuleCatalogueSkipsEmptyPath(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.registerWasmModuleCatalogue(ctx, &models.Sandbox{
+		ID:           "sb-wasm",
+		Runtime:      models.RuntimeWasm,
+		ModuleRef:    "python",
+		ModuleDigest: "pydigest",
+	}, "", 0)
+	if _, err := st.GetWasmModule(ctx, "python"); err == nil {
+		t.Fatal("catalogue row with empty path must not be registered")
+	}
+}
+
+func TestLocalInventoryExcludesUnresolvableReserved(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.cfg.WasmStandardModules = map[string]string{"python": "python.wasm"}
+	svc.SetWasmModuleResolver(erroringWasmModuleResolver{err: errors.New("not staged")})
+
+	refs, _ := svc.LocalReadyWasmModuleInventory(ctx)
+	for _, r := range refs {
+		if r == "python" {
+			t.Fatalf("unresolvable alias must not be advertised, got %v", refs)
+		}
+	}
+}
+
 type wasmModuleAPIRemoveErrorRuntime struct {
 	wasmModuleAPINoopRuntime
 	err error

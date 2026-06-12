@@ -28,7 +28,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("wasm runtime: module_ref or image is required")
 	}
 
-	resolved, err := d.resolver.Resolve(ctx, ref)
+	// Per-tenant registry creds ride the request (req.Registry), never global
+	// config — so a private oci:// module pulls under the caller's own AOCR
+	// identity. Falls back to the resolver's system identity when absent.
+	resolved, err := resolveWithRequestAuth(ctx, d.resolver, ref, req.Registry)
 	if err != nil {
 		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
 	}
@@ -59,6 +62,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		sandboxID:    sandboxID,
 		moduleRef:    ref,
 		modulePath:   resolved.Path,
+		moduleSize:   resolved.SizeBytes,
 		moduleDigest: resolved.Digest,
 		socketPath:   socketPath,
 		workDir:      workDir,
@@ -174,12 +178,14 @@ func (d *Driver) runtimeState(inst *sandboxInstance) *models.SandboxRuntimeState
 		return nil
 	}
 	return &models.SandboxRuntimeState{
-		SandboxID:    inst.sandboxID,
-		ContainerID:  "wasm:" + inst.sandboxID,
-		ContainerIP:  wasmLoopbackIP,
-		Status:       inst.status,
-		ModuleRef:    inst.moduleRef,
-		ModuleDigest: inst.moduleDigest,
+		SandboxID:       inst.sandboxID,
+		ContainerID:     "wasm:" + inst.sandboxID,
+		ContainerIP:     wasmLoopbackIP,
+		Status:          inst.status,
+		ModuleRef:       inst.moduleRef,
+		ModuleDigest:    inst.moduleDigest,
+		ModulePath:      inst.modulePath,
+		ModuleSizeBytes: inst.moduleSize,
 	}
 }
 

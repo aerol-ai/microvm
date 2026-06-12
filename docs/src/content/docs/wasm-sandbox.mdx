@@ -9,7 +9,12 @@ WASM sandboxes run guest modules inside isolated worker processes on the host. T
 
 ## Create a WASM sandbox
 
-Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `durability` to `passivatable` or `durable` when you need restart survival.
+Pass `runtime: "wasm"` and a `module_ref`. The simplest `module_ref` is a
+**standard-module keyword** your operator has staged on every node — e.g.
+`"python"` or `"javascript"` — so you never reference a host path. A
+`module_ref` can also be an `oci://` registry ref (for your own modules, see
+[WASM modules](/wasm-modules)) or, for self-managed hosts, a file path. Set
+`durability` to `passivatable` or `durable` when you need restart survival.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -22,7 +27,7 @@ Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `dur
     })
 
     const sandbox = await client.create({
-      module_ref: 'file:///var/lib/sandboxd/wasm/modules/app.wasm',
+      module_ref: 'python',
       runtime: 'wasm',
       cpu: 0.5,
       memoryMB: 256,
@@ -42,7 +47,7 @@ Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `dur
     )
 
     sandbox = client.create({
-        'module_ref': 'file:///var/lib/sandboxd/wasm/modules/app.wasm',
+        'module_ref': 'python',
         'runtime': 'wasm',
         'cpu': 0.5,
         'memoryMB': 256,
@@ -72,7 +77,7 @@ Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `dur
     }
 
     sb, err := client.Create(context.Background(), types.CreateSandboxRequest{
-        ModuleRef:  "file:///var/lib/sandboxd/wasm/modules/app.wasm",
+        ModuleRef:  "python",
         Runtime:    types.RuntimeWasm,
         CPU:        0.5,
         MemoryMB:   256,
@@ -93,7 +98,7 @@ Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `dur
         let client = Client::new("https://sandbox.example.com", "your-token")?;
         let sandbox = client
             .create(CreateSandboxRequest {
-                module_ref: Some("file:///var/lib/sandboxd/wasm/modules/app.wasm".into()),
+                module_ref: Some("python".into()),
                 runtime: Some("wasm".into()),
                 cpu: Some(0.5),
                 memory_mb: Some(256),
@@ -115,7 +120,7 @@ Pass `runtime: "wasm"` and a `module_ref` (or use `image` as an alias). Set `dur
         public static void main(String[] args) throws Exception {
             MicroVM client = new MicroVM("https://sandbox.example.com", "your-token");
             CreateSandboxRequest req = new CreateSandboxRequest();
-            req.setModuleRef("file:///var/lib/sandboxd/wasm/modules/app.wasm");
+            req.setModuleRef("python");
             req.setRuntime("wasm");
             req.setCpu(0.5);
             req.setMemoryMB(256);

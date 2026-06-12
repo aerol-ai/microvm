@@ -55,6 +55,12 @@ type SandboxRuntimeState struct {
 	// WASM-only: resolved module metadata returned by the wasm driver on create.
 	ModuleRef    string
 	ModuleDigest string
+	// ModulePath / ModuleSizeBytes are the resolved local artifact location and
+	// size. The service persists them onto the catalogue row so the row is
+	// resolvable by catalogue id instead of a misleading empty-path "ready" row
+	// (codex P1). Empty when resolution did not yield a local path.
+	ModulePath      string
+	ModuleSizeBytes int64
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and
@@ -660,6 +666,12 @@ type Sandbox struct {
 	// the credentials back to the new owner's docker pull. Never serialized
 	// over the API — it is internal store ↔ service plumbing.
 	RegistryAuthSealed []byte `json:"-"`
+	// RegistryAuth is the transient, UNSEALED registry credential. It is never
+	// persisted (no column) nor serialized (json:"-"); the service unseals
+	// RegistryAuthSealed into it in-memory right before a WASM start/rehydrate
+	// so a failover peer can re-pull a private oci:// module under the tenant's
+	// identity (codex C4). Nil on the create/public path.
+	RegistryAuth *RegistryAuth `json:"-"`
 	// NetworkBytesIn / NetworkBytesOut are cumulative byte counters
 	// maintained by the netstats poller. They survive container restarts —
 	// a new veth resets in-memory baseline math but the persisted total is
@@ -1167,4 +1179,25 @@ type CreateWasmModuleRequest struct {
 	ID         string `json:"id,omitempty"`
 	ModuleRef  string `json:"module_ref"`
 	Entrypoint string `json:"entrypoint,omitempty"`
+}
+
+// PushWasmModuleOptions is the SDK-side input for a BYO module upload. The
+// wire form is the raw .wasm body plus name/tag query params and the caller's
+// registry credentials as headers; this struct is the Go SDK's ergonomic shape.
+type PushWasmModuleOptions struct {
+	Name             string
+	Tag              string
+	Module           []byte
+	RegistryUsername string
+	RegistryToken    string
+}
+
+// PushWasmModuleResponse is returned by POST /v1/wasm-modules/push after the
+// daemon validates a BYO .wasm upload and forwards it to the registry. The
+// daemon stores nothing; the caller references ModuleRef (an oci:// ref) on a
+// subsequent create.
+type PushWasmModuleResponse struct {
+	ModuleRef string `json:"module_ref"`
+	Digest    string `json:"digest"`
+	SizeBytes int64  `json:"size_bytes"`
 }

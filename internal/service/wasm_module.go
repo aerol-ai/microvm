@@ -18,6 +18,14 @@ func (s *Service) registerWasmModuleCatalogue(ctx context.Context, sandbox *mode
 	if ref == "" {
 		return
 	}
+	// Don't auto-register a row the catalogue resolver can't honor: a "ready"
+	// row with no local path is refused on lookup yet still advertised as
+	// inventory, which is misleading (codex P1). The digest-based GC protection
+	// a live sandbox needs already comes from its own sandboxes.module_digest
+	// row, so skipping here costs nothing.
+	if strings.TrimSpace(modulePath) == "" {
+		return
+	}
 	id := ref
 	if strings.Contains(ref, "://") {
 		id = sandbox.ModuleDigest

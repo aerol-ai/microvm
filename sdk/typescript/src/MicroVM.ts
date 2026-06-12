@@ -9,6 +9,8 @@ import type {
   CreateSessionOptions,
   CreateTemplateOptions,
   CreateWasmModuleOptions,
+  PushWasmModuleOptions,
+  PushWasmModuleResult,
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
@@ -249,6 +251,15 @@ export class MicroVM {
 
   async deleteWasmModule(id: string): Promise<void> {
     await this.client.deleteWasmModule(id);
+  }
+
+  /**
+   * Upload a compiled core-wasip1 module to the registry under your own
+   * credentials and get back the `oci://` ref to use as `moduleRef` on create.
+   * The daemon validates and forwards the bytes; it never stores them.
+   */
+  async pushWasmModule(options: PushWasmModuleOptions): Promise<PushWasmModuleResult> {
+    return this.client.pushWasmModule(options);
   }
 
   /**

@@ -10,6 +10,10 @@ import (
 
 var wasmMagic = []byte{0x00, 0x61, 0x73, 0x6d} // \0asm
 
+// maxModuleBytes caps a .wasm artifact (256MiB). Enforced both post-download
+// (ValidateFile) and as the pre-download manifest-size bound on oci:// pulls.
+const maxModuleBytes = 256 << 20
+
 // ErrComponentModelUnsupported flags a WASI Component Model artifact. Neither
 // engine in this repo (wazero, nor wasmtime-go which has no component API) can
 // instantiate a component — both run core wasip1 modules only. Detecting it here
@@ -28,7 +32,7 @@ func ValidateFile(path string) error {
 	if st.Size() == 0 {
 		return fmt.Errorf("wasm module %q is empty", path)
 	}
-	if st.Size() > 256<<20 {
+	if st.Size() > maxModuleBytes {
 		return fmt.Errorf("wasm module %q exceeds 256MiB cap", path)
 	}
 	head := make([]byte, 8)
