@@ -135,9 +135,15 @@ Pass `runtime: "wasm"` and a `module_ref`. The simplest `module_ref` is a
 
 ## Durability
 
+`durability` is the same cross-runtime create field documented under
+[Durability and Failover](/durability#durability-class) — WASM just **defaults to
+`ephemeral`** (worker processes die with the daemon) instead of `passivatable`,
+and is the only runtime that currently implements `durable`. The values below
+describe how WASM backs each class:
+
 | Class | Behavior |
 |---|---|
-| `ephemeral` | Default. Lost on daemon restart. |
+| `ephemeral` | Default for WASM. Lost on daemon restart. |
 | `passivatable` | Checkpointed to local `mem.snap` on drain; rehydrates on start. |
 | `durable` | Local checkpoint plus AOCR push for cross-node failover. |
 

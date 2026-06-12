@@ -8,6 +8,72 @@ A sandbox's container is ephemeral. Files written into the container's writable 
 
 This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle. Add cluster mode and *the sandbox* is also treated as cattle - a fresh `Create` is the way to recover.
 
+## Durability class
+
+`durability` is a top-level create field on **every** runtime, not a WASM-only knob. It selects how hard the daemon tries to keep a sandbox alive across its own restarts.
+
+| Class | Behavior |
+|---|---|
+| `ephemeral` | Lost on daemon restart. |
+| `passivatable` | Checkpointed locally on drain and rehydrated on start. |
+| `durable` | Local checkpoint plus cross-node failover push. |
+
+The only runtime-specific behavior is the **default** when you omit the field, because container/VM runtimes survive a daemon restart natively while WASM workers do not:
+
+| Runtime | Default when omitted |
+|---|---|
+| `docker`, `firecracker`, `gvisor` | `passivatable` |
+| `wasm` | `ephemeral` |
+
+`durable` is currently implemented for WASM only; requesting it on another runtime is rejected at create time. The field name, values, and SDK shape are identical everywhere — see [WASM Sandbox](/wasm-sandbox) for the checkpoint mechanics that back it on WASM.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      durability: 'passivatable',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'durability': 'passivatable',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:      "ubuntu:22.04",
+        Durability: "passivatable",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image:      "ubuntu:22.04".to_string(),
+        durability: Some("passivatable".to_string()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setDurability("passivatable")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Durability class governs survival across *daemon* restarts. The rest of this page covers the orthogonal concerns of *workspace state* (mounts) and *cluster owner death* (failover policy).
+
 ## What survives, what does not
 
 | Asset | Single-node `Destroy` | Single-node host crash | Cluster-mode owner death |
