@@ -181,3 +181,75 @@ func (r *repeatReader) Read(p []byte) (int, error) {
 	r.i += n
 	return n, nil
 }
+
+func TestProxyHTTPRecorder(t *testing.T) {
+	rec := newLimitedProxyResponseRecorder(10) // tiny limit
+
+	if rec.StatusCode() != http.StatusOK {
+		t.Fatalf("expected default 200 OK")
+	}
+
+	rec.WriteHeader(http.StatusNotFound)
+	if rec.StatusCode() != http.StatusNotFound {
+		t.Fatalf("expected 404")
+	}
+
+	// Test normal write
+	n, err := rec.Write([]byte("12345"))
+	if err != nil || n != 5 {
+		t.Fatalf("expected 5 bytes written")
+	}
+
+	// Test overflow
+	n, err = rec.Write([]byte("6789012345"))
+	if err != nil || n != 10 {
+		t.Fatalf("expected write success")
+	}
+	if !rec.Overflowed() {
+		t.Fatalf("expected overflowed=true")
+	}
+
+	body := rec.Body()
+	if string(body) != "1234567890" {
+		t.Fatalf("expected 10 bytes, got %q", string(body))
+	}
+}
+
+func TestResolvedListenPort(t *testing.T) {
+	c := NewClient("dummy")
+
+	// Test OK
+	c.dial = mockDialer(t, Envelope{Type: MsgOK, Payload: []byte(`{"port":8080}`)})
+	port, err := c.ResolvedListenPort("dummy")
+	if err != nil || port != 8080 {
+		t.Fatalf("expected 8080")
+	}
+
+	// Test Not Found (no port or 0)
+	c.dial = mockDialer(t, Envelope{Type: MsgOK, Payload: []byte(`{"port":0}`)})
+	port, err = c.ResolvedListenPort("dummy")
+	if err != nil || port != 0 {
+		t.Fatalf("expected port 0 without error")
+	}
+
+	// Test Error
+	payload, _ := encodePayload(errorPayload{Message: "boom"})
+	c.dial = mockDialer(t, Envelope{Type: MsgError, Payload: payload})
+	_, err = c.ResolvedListenPort("dummy")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestProxyHTTPError(t *testing.T) {
+	c := NewClient("dummy")
+	payload, _ := encodePayload(errorPayload{Message: "proxy boom"})
+	c.dial = mockDialer(t, Envelope{Type: MsgError, Payload: payload})
+
+	req, _ := http.NewRequest(http.MethodGet, "http://gateway/", nil)
+	rec := httptest.NewRecorder()
+	err := c.ProxyHTTP("dummy", 8080, rec, req)
+	if err == nil {
+		t.Fatalf("expected error from ProxyHTTP")
+	}
+}

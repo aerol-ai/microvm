@@ -138,3 +138,91 @@ func TestClient_Methods(t *testing.T) {
 		})
 	}
 }
+
+func TestClient_MoreMethods(t *testing.T) {
+	sb := "sb-123"
+
+	tests := []struct {
+		name    string
+		run     func(c *Client) error
+		wantErr bool
+	}{
+		{
+			name: "LoadModule_OK",
+			run: func(c *Client) error {
+				c.dial = mockDialer(t, Envelope{Type: MsgOK})
+				return c.LoadModule(sb, "path/to/module")
+			},
+		},
+		{
+			name: "LoadModule_Error",
+			run: func(c *Client) error {
+				payload, _ := encodePayload(errorPayload{Message: "boom"})
+				c.dial = mockDialer(t, Envelope{Type: MsgError, Payload: payload})
+				return c.LoadModule(sb, "path/to/module")
+			},
+			wantErr: true,
+		},
+		{
+			name: "Instantiate_OK",
+			run: func(c *Client) error {
+				c.dial = mockDialer(t, Envelope{Type: MsgOK})
+				return c.Instantiate(sb, wasmengine.Capabilities{})
+			},
+		},
+		{
+			name: "Instantiate_Error",
+			run: func(c *Client) error {
+				payload, _ := encodePayload(errorPayload{Message: "boom"})
+				c.dial = mockDialer(t, Envelope{Type: MsgError, Payload: payload})
+				return c.Instantiate(sb, wasmengine.Capabilities{})
+			},
+			wantErr: true,
+		},
+		{
+			name: "Exec_OK",
+			run: func(c *Client) error {
+				payload, _ := encodePayload(execResultPayload{ExitCode: 0})
+				c.dial = mockDialer(t, Envelope{Type: MsgInvokeResult, Payload: payload})
+				_, err := c.Exec(sb, wasmengine.Capabilities{}, "cmd")
+				return err
+			},
+		},
+		{
+			name: "Exec_Error",
+			run: func(c *Client) error {
+				payload, _ := encodePayload(errorPayload{Message: "boom"})
+				c.dial = mockDialer(t, Envelope{Type: MsgError, Payload: payload})
+				_, err := c.Exec(sb, wasmengine.Capabilities{}, "cmd")
+				return err
+			},
+			wantErr: true,
+		},
+		{
+			name: "Invoke_OK",
+			run: func(c *Client) error {
+				c.dial = mockDialer(t, Envelope{Type: MsgOK})
+				return c.Invoke(sb, "funcName")
+			},
+		},
+		{
+			name: "Invoke_Error",
+			run: func(c *Client) error {
+				payload, _ := encodePayload(errorPayload{Message: "boom"})
+				c.dial = mockDialer(t, Envelope{Type: MsgError, Payload: payload})
+				return c.Invoke(sb, "funcName")
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewClient("dummy")
+			err := tt.run(c)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("expected error: %v, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}

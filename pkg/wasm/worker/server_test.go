@@ -115,3 +115,43 @@ func TestServeSocketPath(t *testing.T) {
 	// Since ServeSocketPath uses ln.Accept() in a loop, if we delete the file, it doesn't close the listener immediately,
 	// but this is enough to finish the test. We don't actually need to wait for ServeSocketPath to exit if we just let the test finish.
 }
+
+func TestServer_ServeErrors(t *testing.T) {
+	s := &Server{}
+
+	// Server error on read frame
+	c1, c2 := net.Pipe()
+	c1.Close()
+	if err := s.Serve(c2); err == nil {
+		t.Fatalf("expected error on readFrame")
+	}
+	c2.Close()
+
+	// Server error on bad payload
+	c1, c2 = net.Pipe()
+	go func() {
+		_ = writeFrame(c1, Envelope{Type: MsgLoadModule, Payload: []byte("bad json")})
+		c1.Close()
+	}()
+	_ = s.Serve(c2)
+}
+
+func TestWorkerByteMeter(t *testing.T) {
+	u := &workerNetUsage{}
+	m := workerByteMeter{u: u}
+	m.AddIn(10)
+	m.AddOut(20)
+	if u.bytesIn.Load() != 10 || u.bytesOut.Load() != 20 {
+		t.Fatalf("expected 10/20")
+	}
+}
+
+func TestMediatorDialer(t *testing.T) {
+	m := newNetMediator()
+	m.SetBlocks("sb1", false, true) // block egress
+	d := mediatorDialer{m: m, sandboxID: "sb1"}
+	_, err := d.DialContext(context.Background(), "tcp", "127.0.0.1:0")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}

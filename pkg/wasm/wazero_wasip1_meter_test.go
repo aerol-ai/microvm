@@ -98,3 +98,22 @@ func TestWithWasip1Meter(t *testing.T) {
 		t.Fatal("expected same context")
 	}
 }
+
+func TestWasip1MeterFactory_Nil(t *testing.T) {
+	if newWasip1MeterFactory(nil) != nil {
+		t.Fatal("expected nil")
+	}
+
+	// Test After missing requirements
+	l := &wasip1SockRecvMeter{}
+	l.After(context.Background(), nil, nil, nil)
+	l.Abort(context.Background(), nil, nil, nil)
+
+	l2 := &wasip1SockSendMeter{}
+	l2.After(context.Background(), nil, nil, nil)
+	l2.Abort(context.Background(), nil, nil, nil)
+
+	l3 := &wasip1SockAcceptMeter{}
+	l3.After(context.Background(), nil, nil, nil)
+	l3.Abort(context.Background(), nil, nil, nil)
+}

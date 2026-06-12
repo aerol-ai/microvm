@@ -174,3 +174,108 @@ func TestWazeroNetHost_tcpDial(t *testing.T) {
 		t.Fatalf("expected errClosed, got %v", writeStack[0])
 	}
 }
+
+type mockMeter struct {
+	in  atomic.Int64
+	out atomic.Int64
+}
+
+func (m *mockMeter) AddIn(n int64) {
+	m.in.Add(n)
+}
+
+func (m *mockMeter) AddOut(n int64) {
+	m.out.Add(n)
+}
+
+func TestWazeroNetHost_tcpDial_Errors(t *testing.T) {
+	ctx := context.Background()
+	dialer := &countingDialer{}
+	hook := &NetworkHook{Dial: dialer}
+	host := &wazeroNetHost{
+		hook:  hook,
+		conns: make(map[uint64]net.Conn),
+	}
+
+	mod := &mockModule{mem: &mockMemory{buf: []byte("127.0.0.1:80")}}
+	stack := []uint64{0, 12, 0}
+
+	// Test Memory Read Out of Bounds
+	host.tcpDial(ctx, mod, []uint64{1000, 1000, 0})
+
+	// Test Dial Error
+	mod.mem.buf = []byte("invalid-address")
+	stack = []uint64{0, uint64(len("invalid-address")), 0}
+	host.tcpDial(ctx, mod, stack)
+	if stack[0] != 2 { // errDial
+		t.Fatalf("expected errDial(2), got %v", stack[0])
+	}
+
+	// Test Egress Blocked
+}
+
+type mockBlockedDialer struct{}
+
+func (m *mockBlockedDialer) DialContext(_ context.Context, network, address string) (net.Conn, error) {
+	return nil, ErrNetworkEgressBlocked
+}
+
+func TestWazeroNetHost_tcpDial_Blocked(t *testing.T) {
+	ctx := context.Background()
+	hook := &NetworkHook{Dial: &mockBlockedDialer{}}
+	host := &wazeroNetHost{
+		hook:  hook,
+		conns: make(map[uint64]net.Conn),
+	}
+	mod := &mockModule{mem: &mockMemory{buf: []byte("127.0.0.1:80")}}
+	stack := []uint64{0, 12, 0}
+	host.tcpDial(ctx, mod, stack)
+	if stack[0] != 3 { // errBlocked
+		t.Fatalf("expected errBlocked(3), got %v", stack[0])
+	}
+}
+
+func TestWazeroNetHost_tcpReadWrite_Errors(t *testing.T) {
+	ctx := context.Background()
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+
+	meter := &mockMeter{}
+	dialer := &countingDialer{}
+	hook := &NetworkHook{Dial: dialer, Meter: meter}
+	host := &wazeroNetHost{
+		hook:  hook,
+		conns: make(map[uint64]net.Conn),
+	}
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close() // immediately close to cause read/write errors
+		}
+	}()
+
+	mod := &mockModule{mem: &mockMemory{buf: []byte(ln.Addr().String())}}
+	stack := []uint64{0, uint64(len(ln.Addr().String())), 0}
+	host.tcpDial(ctx, mod, stack)
+	connID := stack[0]
+
+	// Test read memory out of bounds
+	host.tcpRead(ctx, mod, []uint64{connID, 1000, 1000})
+
+	// Test write memory out of bounds
+	host.tcpWrite(ctx, mod, []uint64{connID, 1000, 1000})
+
+	// Test hookMeter
+	if m := host.hookMeter(); m == nil {
+		t.Fatalf("expected meter")
+	}
+	host.hook = nil
+	if m := host.hookMeter(); m != nil {
+		t.Fatalf("expected nil meter")
+	}
+}

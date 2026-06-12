@@ -136,3 +136,98 @@ func TestWasiHTTPHost(t *testing.T) {
 		t.Fatalf("expected errRequest(3), got %v", stack[0])
 	}
 }
+
+func TestWasiSocketsHost_Ensure(t *testing.T) {
+	ctx := context.Background()
+	e, _ := newWazeroEngine(ctx)
+	defer e.Close(ctx)
+
+	e.SetNetworkHook(&NetworkHook{Dial: &countingDialer{}})
+
+	// Test runtime nil
+	e.runtime = nil
+	if err := e.ensureWasiSocketsHost(ctx); err != nil {
+		t.Fatalf("expected nil err, got %v", err)
+	}
+
+	// Re-init runtime to test instantiation
+	e2, _ := newWazeroEngine(ctx)
+	defer e2.Close(ctx)
+	e2.SetNetworkHook(&NetworkHook{Dial: &countingDialer{}})
+	if err := e2.ensureWasiSocketsHost(ctx); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	// Ensure again returns nil
+	if err := e2.ensureWasiSocketsHost(ctx); err != nil {
+		t.Fatalf("ensure again: %v", err)
+	}
+}
+
+func TestWasiHTTPHost_Ensure(t *testing.T) {
+	ctx := context.Background()
+	e, _ := newWazeroEngine(ctx)
+	defer e.Close(ctx)
+	e.SetNetworkHook(&NetworkHook{Dial: &countingDialer{}})
+
+	e.runtime = nil
+	if err := e.ensureWasiHTTPHost(ctx); err != nil {
+		t.Fatalf("expected nil err, got %v", err)
+	}
+
+	e2, _ := newWazeroEngine(ctx)
+	defer e2.Close(ctx)
+	e2.SetNetworkHook(&NetworkHook{Dial: &countingDialer{}})
+	if err := e2.ensureWasiHTTPHost(ctx); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := e2.ensureWasiHTTPHost(ctx); err != nil {
+		t.Fatalf("ensure again: %v", err)
+	}
+}
+
+func TestWasiHTTPHost_Errors(t *testing.T) {
+	ctx := context.Background()
+	hook := &NetworkHook{Dial: &countingDialer{}, Meter: &mockMeter{}}
+	netHost := &wazeroNetHost{hook: hook}
+	host := &wasiHTTPHost{net: netHost}
+
+	memSize := 1024
+	memBuf := make([]byte, memSize)
+	mod := &mockModule{mem: &mockMemory{buf: memBuf}}
+
+	// Test Out of Bounds URL Read
+	stack := []uint64{2000, 2000, 0, 0}
+	host.httpGet(ctx, mod, stack)
+
+	// Test client.Get Error
+	urlBytes := []byte("http://127.0.0.1:1") // connection refused
+	copy(memBuf, urlBytes)
+	stack = []uint64{0, uint64(len(urlBytes)), 512, 512}
+	host.httpGet(ctx, mod, stack)
+	if stack[0] != 3 { // errRequest
+		t.Fatalf("expected errRequest(3), got %v", stack[0])
+	}
+
+	// Test client.Get Blocked Error
+	netHost.hook.Dial = &mockBlockedDialer{}
+	stack = []uint64{0, uint64(len(urlBytes)), 512, 512}
+	host.httpGet(ctx, mod, stack)
+	if stack[0] != 2 { // errBlocked
+		t.Fatalf("expected errBlocked(2), got %v", stack[0])
+	}
+	netHost.hook.Dial = &countingDialer{}
+
+	// Test Write Error (out of bounds write)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello world"))
+	}))
+	defer ts.Close()
+	urlBytes = []byte(ts.URL)
+	copy(memBuf, urlBytes)
+	stack = []uint64{0, uint64(len(urlBytes)), 2000, 512} // bodyPtr out of bounds
+	host.httpGet(ctx, mod, stack)
+	if stack[0] != 1 { // errInvalid
+		t.Fatalf("expected errInvalid(1), got %v", stack[0])
+	}
+}

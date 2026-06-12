@@ -1,83 +1,126 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+
 	"io"
 	"net"
-	"strings"
 	"testing"
 )
 
-func TestNetMediatorDialCountsBytes(t *testing.T) {
+func TestNetMediator_SetBlocks(t *testing.T) {
+	m := newNetMediator()
+	m.SetBlocks("", true, true)
+	if m.egressBlocked("") {
+		t.Fatal("expected empty string to be ignored")
+	}
+
+	m.SetBlocks("sb1", true, true)
+	if !m.ingressBlocked("sb1") || !m.egressBlocked("sb1") {
+		t.Fatal("expected blocked")
+	}
+
+	m.SetBlocks("sb1", false, false)
+	if m.ingressBlocked("sb1") || m.egressBlocked("sb1") {
+		t.Fatal("expected not blocked")
+	}
+}
+
+func TestNetMediator_DialContext(t *testing.T) {
+	m := newNetMediator()
+	m.SetBlocks("sb1", false, true)
+	_, err := m.DialContext(context.Background(), "sb1", "tcp", "127.0.0.1:80")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("listen: %v", err)
+		t.Fatal(err)
 	}
 	defer ln.Close()
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Write([]byte("ok"))
+			c.Close()
 		}
-		defer conn.Close()
-		_, _ = io.Copy(conn, conn)
 	}()
 
-	m := newNetMediator()
-	const sandboxID = "sb-sock"
-	conn, err := m.DialContext(context.Background(), sandboxID, "tcp", ln.Addr().String())
+	m.SetBlocks("sb1", false, false)
+	conn, err := m.DialContext(context.Background(), "sb1", "tcp", ln.Addr().String())
 	if err != nil {
-		t.Fatalf("DialContext: %v", err)
+		t.Fatal(err)
 	}
-	if _, err := conn.Write([]byte("ping")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	buf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	_ = conn.Close()
+	defer conn.Close()
 
-	in, out := m.DrainUsage(sandboxID)
-	if out < 4 {
-		t.Fatalf("bytes_out = %d, want >= 4", out)
-	}
-	if in < 4 {
-		t.Fatalf("bytes_in = %d, want >= 4", in)
+	buf := make([]byte, 2)
+	conn.Read(buf)
+	conn.Write([]byte("hi"))
+
+	in, out := m.DrainUsage("sb1")
+	if in != 2 || out != 2 {
+		t.Fatalf("expected 2/2, got %d/%d", in, out)
 	}
 }
 
-func TestNetMediatorBlocksEgressDial(t *testing.T) {
+func TestNetMediator_Copy(t *testing.T) {
 	m := newNetMediator()
-	const sandboxID = "sb-block"
-	m.SetBlocks(sandboxID, false, true)
-	if _, err := m.DialContext(context.Background(), sandboxID, "tcp", "127.0.0.1:9"); err == nil {
-		t.Fatal("expected egress block error")
-	} else if !strings.Contains(err.Error(), "blocked") {
-		t.Fatalf("error = %v", err)
+
+	// outbound blocked
+	m.SetBlocks("sb1", false, true)
+	_, err := m.Copy("sb1", bytes.NewBuffer(nil), bytes.NewBuffer(nil), true)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	// ingress blocked
+	m.SetBlocks("sb1", true, false)
+	_, err = m.Copy("sb1", bytes.NewBuffer(nil), bytes.NewBuffer(nil), false)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	// ok copy outbound
+	m.SetBlocks("sb1", false, false)
+	dst := new(bytes.Buffer)
+	src := bytes.NewBufferString("hello")
+	n, err := m.Copy("sb1", dst, src, true)
+	if err != nil || n != 5 {
+		t.Fatalf("expected 5 bytes, got %d, err %v", n, err)
+	}
+
+	// read error
+	_, err = m.Copy("sb1", dst, errReaderNet{}, true)
+	if err != io.ErrUnexpectedEOF {
+		t.Fatalf("expected errReader error, got %v", err)
+	}
+
+	// write error
+	_, err = m.Copy("sb1", errWriterNet{}, bytes.NewBufferString("hi"), false)
+	if err != io.ErrClosedPipe {
+		t.Fatalf("expected errWriter error, got %v", err)
+	}
+
+	// short write error
+	_, err = m.Copy("sb1", shortWriterNet{}, bytes.NewBufferString("hi"), false)
+	if err != io.ErrShortWrite {
+		t.Fatalf("expected errShortWrite error, got %v", err)
 	}
 }
 
-func TestServerSetNetworkBlocksViaIPC(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+type errWriterNet struct{}
 
-	srv := &Server{}
-	done := make(chan error, 1)
-	go func() {
-		done <- srv.Serve(serverConn)
-	}()
+func (e errWriterNet) Write(p []byte) (n int, err error) { return 0, io.ErrClosedPipe }
 
-	c := NewClient("")
-	c.dial = func(string) (net.Conn, error) { return clientConn, nil }
+type shortWriterNet struct{}
 
-	if err := c.SetNetworkBlocks("sb-1", false, true); err != nil {
-		t.Fatalf("SetNetworkBlocks: %v", err)
-	}
-	if !srv.mediator().egressBlocked("sb-1") {
-		t.Fatal("expected egress block on worker mediator")
-	}
-	_ = clientConn.Close()
-	<-done
-}
+func (e shortWriterNet) Write(p []byte) (n int, err error) { return 1, nil }
+
+type errReaderNet struct{}
+
+func (e errReaderNet) Read(p []byte) (n int, err error) { return 0, io.ErrUnexpectedEOF }

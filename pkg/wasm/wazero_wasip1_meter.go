@@ -64,7 +64,9 @@ func (l *wasip1SockRecvMeter) After(_ context.Context, _ api.Module, _ api.Funct
 	}
 }
 
-func (l *wasip1SockRecvMeter) Abort(context.Context, api.Module, api.FunctionDefinition, error) {}
+func (l *wasip1SockRecvMeter) Abort(context.Context, api.Module, api.FunctionDefinition, error) {
+	_ = l
+}
 
 type wasip1SockSendMeter struct {
 	meter         ByteMeter
@@ -89,7 +91,9 @@ func (l *wasip1SockSendMeter) After(_ context.Context, _ api.Module, _ api.Funct
 	}
 }
 
-func (l *wasip1SockSendMeter) Abort(context.Context, api.Module, api.FunctionDefinition, error) {}
+func (l *wasip1SockSendMeter) Abort(context.Context, api.Module, api.FunctionDefinition, error) {
+	_ = l
+}
 
 // wasip1SockAcceptMeter counts inbound accepts as a 1-byte ingress pulse so
 // netstats reflects listener activity even before recv/send.
@@ -115,7 +119,9 @@ func (l *wasip1SockAcceptMeter) After(_ context.Context, _ api.Module, _ api.Fun
 	}
 }
 
-func (l *wasip1SockAcceptMeter) Abort(context.Context, api.Module, api.FunctionDefinition, error) {}
+func (l *wasip1SockAcceptMeter) Abort(context.Context, api.Module, api.FunctionDefinition, error) {
+	_ = l
+}
 
 func withWasip1Meter(ctx context.Context, hook *NetworkHook) context.Context {
 	if hook == nil || hook.Meter == nil {
