@@ -24,4 +24,9 @@ var (
 	// ErrModuleTooLarge: the artifact exceeded the size cap mid-stream. We
 	// abort the pull rather than buffer an unbounded body.
 	ErrModuleTooLarge = errors.New("wasm module exceeds size cap")
+	// ErrModuleDigestMismatch: a sandbox pinned digest X at create, but the
+	// alias/tag it referenced now resolves to different bytes and the frozen
+	// copy is gone. We fail loudly rather than silently boot different code on
+	// restart/failover (codex C2).
+	ErrModuleDigestMismatch = errors.New("wasm module digest drift")
 )

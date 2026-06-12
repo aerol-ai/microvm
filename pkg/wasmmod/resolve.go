@@ -187,6 +187,23 @@ func (r *ModuleResolver) resolveOCI(ctx context.Context, ref string, authOverrid
 	return &ResolvedModule{Ref: ref, Path: final, Digest: digest, SizeBytes: size}, nil
 }
 
+// ResolveByDigest returns the content-addressed cached module for digest, if a
+// frozen copy exists in CacheDir. start/rehydrate use this to boot the EXACT
+// bytes pinned at create rather than re-resolving a mutable alias/tag (codex
+// C2). Reports ok=false on a cache miss; the caller then falls back to ref
+// resolution with a digest-match assertion.
+func (r *ModuleResolver) ResolveByDigest(digest string) (*ResolvedModule, bool) {
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return nil, false
+	}
+	p := filepath.Join(r.CacheDir, digest+".wasm")
+	if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		return &ResolvedModule{Ref: digest, Path: p, Digest: digest, SizeBytes: st.Size()}, true
+	}
+	return nil, false
+}
+
 func fsyncFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

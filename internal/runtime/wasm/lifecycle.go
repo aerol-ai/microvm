@@ -11,7 +11,40 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
+
+// digestResolver is the optional capability a ModuleResolver exposes to boot a
+// sandbox from its content-addressed frozen copy. Type-asserted so test fakes
+// that only implement Resolve keep working.
+type digestResolver interface {
+	ResolveByDigest(digest string) (*wasmmod.ResolvedModule, bool)
+}
+
+// resolvePinned resolves a sandbox's module preferring the digest pinned at
+// create over the (mutable) ref. On a frozen-copy cache hit it boots the exact
+// original bytes; on a miss it re-resolves the ref but REFUSES to boot if the
+// bytes drifted from the pin — turning codex C2's silent code-swap into a loud,
+// recoverable error.
+func (d *Driver) resolvePinned(ctx context.Context, ref, pinnedDigest string) (*wasmmod.ResolvedModule, error) {
+	pinnedDigest = strings.TrimSpace(pinnedDigest)
+	if pinnedDigest != "" {
+		if dr, ok := d.resolver.(digestResolver); ok {
+			if resolved, hit := dr.ResolveByDigest(pinnedDigest); hit {
+				return resolved, nil
+			}
+		}
+	}
+	resolved, err := d.resolver.Resolve(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
+	}
+	if pinnedDigest != "" && resolved.Digest != "" && resolved.Digest != pinnedDigest {
+		return nil, fmt.Errorf("module %q pinned %s but now resolves to %s: %w",
+			ref, pinnedDigest, resolved.Digest, wasmmod.ErrModuleDigestMismatch)
+	}
+	return resolved, nil
+}
 
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
 	inst, err := d.instance(sandboxID)
@@ -72,9 +105,11 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 	if d.resolver == nil {
 		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
 	}
-	resolved, err := d.resolver.Resolve(ctx, ref)
+	// Boot the digest pinned at create, not whatever the alias/tag points at
+	// now (codex C2). On drift with no frozen copy this fails loudly.
+	resolved, err := d.resolvePinned(ctx, ref, sandbox.ModuleDigest)
 	if err != nil {
-		return nil, fmt.Errorf("resolve module %q: %w", ref, err)
+		return nil, err
 	}
 
 	workDir := d.sandboxDir(sandbox.ID)
