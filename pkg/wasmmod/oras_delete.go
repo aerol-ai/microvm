@@ -28,6 +28,7 @@ func DeleteSnapshotRef(ctx context.Context, cfg ORASPushConfig, registryRef stri
 		return fmt.Errorf("oras delete: repository: %w", err)
 	}
 	repoHost := registryHost(registryRef)
+	repo.PlainHTTP = registryPlainHTTP(repoHost)
 	repo.Client = &auth.Client{
 		Client:     auth.DefaultClient.Client,
 		Cache:      auth.DefaultCache,

@@ -41,12 +41,29 @@ func newAuthedRepo(registryRef, username, pat string) (*remote.Repository, error
 		return nil, fmt.Errorf("oras: repository %q: %w", registryRef, err)
 	}
 	host := registryHost(registryRef)
+	repo.PlainHTTP = registryPlainHTTP(host)
 	repo.Client = &auth.Client{
 		Client:     auth.DefaultClient.Client,
 		Cache:      auth.DefaultCache,
 		Credential: auth.StaticCredential(host, auth.Credential{Username: username, Password: pat}),
 	}
 	return repo, nil
+}
+
+// registryPlainHTTP enables cleartext transport for loopback registries (local
+// dev mirrors, httptest in unit tests). Production AOCR hosts stay on HTTPS.
+func registryPlainHTTP(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	switch {
+	case host == "localhost", strings.HasPrefix(host, "localhost:"):
+		return true
+	case host == "127.0.0.1", strings.HasPrefix(host, "127.0.0.1:"):
+		return true
+	case host == "[::1]", strings.HasPrefix(host, "[::1]:"):
+		return true
+	default:
+		return false
+	}
 }
 
 // ModuleAuth carries the registry credentials for a BYO module pull/push.

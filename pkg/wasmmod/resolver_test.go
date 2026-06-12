@@ -74,3 +74,10 @@ func TestResolverEdgeCases(t *testing.T) {
 
 	_ = WriteCheckpointWasm(t, dir, "cp.wasm")
 }
+
+func TestResolverFileDigestMissing(t *testing.T) {
+	_, _, err := fileDigest(filepath.Join(t.TempDir(), "missing"))
+	if err == nil {
+		t.Fatal("expected open error")
+	}
+}
