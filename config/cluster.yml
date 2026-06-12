@@ -105,18 +105,31 @@ wasm:
   # identity). Tenant BYO pulls/pushes use per-request credentials, never this.
   registry_username: ""
   registry_pat_path: ""
-  # Curated standard modules. alias is the reserved keyword tenants reference;
-  # source is "url" or "oci"; ref is the URL or oci ref; digest is the sha256
-  # the staging step verifies. Filename is "<alias>.wasm" under modules_dir.
+  # Curated standard modules. alias is the reserved keyword tenants reference
+  # (module_ref: "<alias>"); source is "url" or "oci"; ref is the URL or oci
+  # ref; digest is the sha256 the staging step verifies before the module goes
+  # live. Filename is "<alias>.wasm" under modules_dir. Run
+  # `ansible-playbook playbooks/stage-wasm-modules.yml` after editing this list.
+  #
+  # To populate it: grab (or build) a core-wasip1 .wasm, push it to AOCR under
+  # the protected wasm/std/* namespace (reaper-exempt, pull-only for tenants),
+  # capture its digest, and uncomment an entry below.
+  #
+  #   oras push aocr.aerol.ai/wasm/std/python:3.12 python.wasm:application/wasm
+  #   sha256sum python.wasm
+  #
+  # Public prebuilt runtimes you can source from instead of building:
+  #   Python     https://github.com/vmware-labs/webassembly-language-runtimes (wasi builds)
+  #   JavaScript https://github.com/bytecodealliance/javy (qjs/quickjs wasm)
   standard_modules: []
   #  - alias: python
   #    source: oci
   #    ref: "aocr.aerol.ai/wasm/std/python:3.12"
-  #    digest: "sha256:..."
+  #    digest: "sha256:<sha256sum of the pushed python.wasm>"
   #  - alias: javascript
   #    source: url
   #    ref: "https://example.com/quickjs.wasm"
-  #    digest: "sha256:..."
+  #    digest: "sha256:<sha256sum of quickjs.wasm>"
 
 # --- AOCR mirror (Phase 4) ------------------------------------------------
 # Empty host disables mirror rewriting entirely. Upstreams maps upstream
