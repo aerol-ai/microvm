@@ -2,7 +2,6 @@ package v1
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -36,7 +35,7 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -123,7 +122,7 @@ func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateSandboxSnapshotRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -137,7 +136,7 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 	var req models.ResizeSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -154,7 +153,7 @@ func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) updateLifecycle(w http.ResponseWriter, r *http.Request) {
 	var req models.UpdateLifecycleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -181,7 +180,7 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 	// working unchanged.
 	var req models.ExposePortRequest
 	if r.ContentLength > 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 			apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
@@ -229,7 +228,7 @@ func (h *handlers) unexposePort(w http.ResponseWriter, r *http.Request) {
 // 404 = sandbox not found.
 func (h *handlers) addCustomDomain(w http.ResponseWriter, r *http.Request) {
 	var req models.AddCustomDomainRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -321,7 +320,7 @@ func (h *handlers) getNetworkUsage(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) updateNetworkLimits(w http.ResponseWriter, r *http.Request) {
 	var req models.UpdateNetworkLimitsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

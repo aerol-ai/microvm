@@ -126,3 +126,32 @@ func TestWriteGCManifestError(t *testing.T) {
 		t.Fatal("writeGCManifest() accepted a non-directory path")
 	}
 }
+
+func TestPlacementRecoveryFileStorePutTempError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o755)
+	})
+
+	store := &placementRecoveryFileStore{dir: dir}
+	if _, err := store.Put("sandbox-temp-fail", placementRecovery{}); err == nil {
+		t.Fatal("Put() accepted a read-only directory")
+	}
+}
+
+func TestPlacementRecoveryFileStorePutMkdirError(t *testing.T) {
+	file, err := os.CreateTemp("", "recovery-put-file")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+
+	store := &placementRecoveryFileStore{dir: file.Name()}
+	if _, err := store.Put("sandbox-mkdir-fail", placementRecovery{}); err == nil {
+		t.Fatal("Put() accepted a file path as its directory")
+	}
+}

@@ -689,6 +689,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		Addr:              cfg.ListenAddr(),
 		Handler:           server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// No ReadTimeout/WriteTimeout: exec/log streams and WebSocket
+		// attaches are long-lived by design. IdleTimeout only reaps
+		// keep-alive connections sitting between requests, so it can't
+		// kill an in-flight stream but does bound idle-connection buildup.
+		IdleTimeout: 2 * time.Minute,
 	}
 
 	go func() {
@@ -769,6 +774,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			Addr:              cfg.InternalIngressAddr,
 			Handler:           ingressMux,
 			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       2 * time.Minute,
 		}
 		logger.Info("ingress proxy listening",
 			"addr", cfg.InternalIngressAddr,

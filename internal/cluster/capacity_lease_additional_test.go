@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
@@ -93,5 +96,48 @@ func TestFetchMemberCapacityFallsBackToPublicAPI(t *testing.T) {
 	}
 	if snap.HostCPUCores != 8 || snap.HostMemoryTotalMB != 16384 {
 		t.Fatalf("fetchMemberCapacity() snapshot = %+v", snap)
+	}
+}
+
+func TestRefreshCapacityLeasesHandlesErrorsAndFallbacks(t *testing.T) {
+	internalError := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer internalError.Close()
+
+	internalFallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("retry public"))
+	}))
+	defer internalFallback.Close()
+
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 6, HostMemoryTotalMB: 12288})
+	}))
+	defer public.Close()
+
+	c := &Cluster{
+		nodeID:         "self",
+		httpClient:     public.Client(),
+		internalClient: internalError.Client(),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		capacityLeases: newCapacityLeaseCache("self", capacity.New(capacity.HostInfo{CPUCores: 2}, capacity.Limits{}, nil), time.Second, nil),
+		gossip: &gossipNode{
+			memberIndex: newGossipMemberIndex(),
+		},
+	}
+	c.gossip.memberIndex.upsert(Member{NodeID: "skip-empty", Alive: true, Role: config.NodeRoleWorker})
+	c.gossip.memberIndex.upsert(Member{NodeID: "dead-node", Alive: false, Role: config.NodeRoleWorker, APIURL: public.URL})
+	c.gossip.memberIndex.upsert(Member{NodeID: "error-node", Alive: true, Role: config.NodeRoleWorker, APIURL: public.URL, InternalURL: internalError.URL})
+	c.gossip.memberIndex.upsert(Member{NodeID: "fallback-node", Alive: true, Role: config.NodeRoleWorker, APIURL: public.URL, InternalURL: internalFallback.URL})
+
+	c.refreshCapacityLeases(context.Background())
+
+	if lease, ok := c.capacityLeases.leases["fallback-node"]; !ok || lease.snapshot.HostCPUCores != 6 || lease.snapshot.HostMemoryTotalMB != 12288 {
+		t.Fatalf("refreshCapacityLeases() fallback lease = %+v ok=%v", lease, ok)
+	}
+	if _, ok := c.capacityLeases.leases["skip-empty"]; ok {
+		t.Fatal("refreshCapacityLeases() created a lease for skip-empty member")
 	}
 }

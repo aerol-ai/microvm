@@ -1,6 +1,6 @@
 module github.com/aerol-ai/microvm
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/bytecodealliance/wasmtime-go/v37 v37.0.0

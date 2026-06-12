@@ -2,7 +2,6 @@ package v1
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -49,7 +48,7 @@ type buildImageResponse struct {
 
 func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 	var req buildImageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

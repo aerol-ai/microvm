@@ -1,7 +1,6 @@
 package v1
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
@@ -12,7 +11,7 @@ import (
 
 func (h *handlers) createWasmModule(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateWasmModuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

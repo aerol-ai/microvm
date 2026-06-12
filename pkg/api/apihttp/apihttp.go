@@ -25,6 +25,22 @@ import (
 // a client retries promptly once the control plane's first standing poll lands.
 const admissionRetryAfterSeconds = 15
 
+// MaxJSONBodyBytes caps JSON request bodies decoded via DecodeJSON. Control
+// requests are small (a create payload with env vars is well under 64 KiB);
+// the cap exists so an authed caller can't balloon daemon memory with a
+// multi-GiB body. Bulk payloads (file uploads, build contexts) stream through
+// dedicated handlers and don't go through DecodeJSON.
+const MaxJSONBodyBytes = 1 << 20 // 1 MiB
+
+// DecodeJSON decodes a JSON request body into dst with the body capped at
+// MaxJSONBodyBytes. All versioned handlers must use this instead of
+// json.NewDecoder(r.Body) directly so the size cap is uniform across v1 and
+// the facades. The caller writes its own error envelope on failure.
+func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes)
+	return json.NewDecoder(r.Body).Decode(dst)
+}
+
 // WriteJSON serializes value as JSON and writes it with the given status.
 func WriteJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"net"
@@ -43,6 +44,14 @@ func extractBearerToken(r *http.Request) string {
 	return ""
 }
 
+// isPATToken compares a caller credential against the operator PAT in
+// constant time — the PAT grants fleet-wide access, so a byte-wise `==`
+// would leak match-prefix length as a timing side channel.
+func (s *Server) isPATToken(candidate string) bool {
+	return candidate != "" &&
+		subtle.ConstantTimeCompare([]byte(candidate), []byte(s.patToken)) == 1
+}
+
 // requireAuth wraps next with bearer-token authentication. All API versions
 // share this middleware via the Deps.Auth callback in their RegisterRoutes —
 // there is no per-version auth.
@@ -58,7 +67,7 @@ func extractBearerToken(r *http.Request) string {
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
-		if token == s.patToken {
+		if s.isPATToken(token) {
 			next.ServeHTTP(w, s.withOperatorAccess(r))
 			return
 		}
@@ -74,7 +83,7 @@ func (s *Server) requireE2BAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
 		apiKey := strings.TrimSpace(r.Header.Get("X-API-KEY"))
-		if apiKey == s.patToken || token == s.patToken {
+		if s.isPATToken(apiKey) || s.isPATToken(token) {
 			next.ServeHTTP(w, s.withOperatorAccess(r))
 			return
 		}

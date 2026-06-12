@@ -608,6 +608,14 @@ func TestFollowerForwardRemoveMemberViaPublicAPI(t *testing.T) {
 	waitForLeader(t, leader, 10*time.Second)
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.HasPrefix(follower.LeaderAPIURL(), "http://") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	leader.gossip.memberIndex.upsert(Member{NodeID: "gone-node", Alive: false, Role: config.NodeRoleServer})
 	err := follower.forwardRemoveMemberToLeader(context.Background(), "gone-node", true)
 	if err == nil || errors.Is(err, ErrNotLeader) {
