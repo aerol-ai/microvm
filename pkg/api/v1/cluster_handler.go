@@ -1039,7 +1039,7 @@ func (h *handlers) clusterInternalPlacementsQuery(w http.ResponseWriter, r *http
 		return
 	}
 	var filter cluster.PlacementShardFilter
-	if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &filter); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -1057,7 +1057,7 @@ func (h *handlers) clusterInternalPlacementsPage(w http.ResponseWriter, r *http.
 		return
 	}
 	var req cluster.PlacementPageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -1085,7 +1085,7 @@ func (h *handlers) clusterInternalRecoveryPut(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var blob cluster.RecoveryBlob
-	if err := json.NewDecoder(r.Body).Decode(&blob); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &blob); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -1133,7 +1133,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 		return
 	}
 	var req cluster.SelectPlacementRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -1166,7 +1166,7 @@ func (h *handlers) clusterWasmMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req service.WasmMigrateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

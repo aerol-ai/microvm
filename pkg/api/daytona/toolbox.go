@@ -128,7 +128,7 @@ func normalizeToolboxPath(path string) string {
 
 func (h *handlers) executeCommand(w http.ResponseWriter, r *http.Request, sandboxID string) {
 	var req executeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -224,7 +224,7 @@ func (h *handlers) bulkUpload(w http.ResponseWriter, r *http.Request, sandboxID 
 
 func (h *handlers) bulkDownload(w http.ResponseWriter, r *http.Request, sandboxID string) {
 	var req filesDownloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

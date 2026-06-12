@@ -35,7 +35,7 @@ func newHandlers(d Deps) *handlers {
 
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -236,7 +236,7 @@ func (h *handlers) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
 // state=active synchronously, so its poll loop exits on the first read.
 func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Request) {
 	var req createSnapshotRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -461,7 +461,7 @@ func (h *handlers) stopSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxSnapshotRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -493,7 +493,7 @@ func (h *handlers) resizeSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req resizeSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -554,7 +554,7 @@ func (h *handlers) replaceLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req sandboxLabelsResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

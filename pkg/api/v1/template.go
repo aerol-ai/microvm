@@ -1,7 +1,6 @@
 package v1
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
@@ -21,7 +20,7 @@ import (
 // /v1/templates/{id} to observe READY (or FAILED with last_error).
 func (h *handlers) createTemplate(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateTemplateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

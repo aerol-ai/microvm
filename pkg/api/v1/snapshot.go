@@ -2,7 +2,6 @@ package v1
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,7 +46,7 @@ type registerSnapshotRequest struct {
 // non-empty ContextHashes return 501 today.
 func (h *handlers) registerSnapshot(w http.ResponseWriter, r *http.Request) {
 	var req registerSnapshotRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

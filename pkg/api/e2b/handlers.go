@@ -19,6 +19,7 @@ import (
 
 	svcmetrics "github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -44,7 +45,7 @@ func newHandlers(d Deps) *handlers {
 
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
@@ -250,7 +251,7 @@ func (h *handlers) deleteSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 	var req connectSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
@@ -331,7 +332,7 @@ func (h *handlers) pauseSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 	var req timeoutRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
@@ -370,7 +371,7 @@ func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	var req createSnapshotRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
