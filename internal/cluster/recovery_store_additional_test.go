@@ -112,3 +112,17 @@ func TestPathForRefError(t *testing.T) {
 		t.Errorf("expected error for wrong length")
 	}
 }
+
+func TestWriteGCManifestError(t *testing.T) {
+	file, err := os.CreateTemp("", "recovery-gc-file")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+
+	store := &placementRecoveryFileStore{dir: file.Name()}
+	if err := store.writeGCManifest(placementRecoveryGCManifest{}); err == nil {
+		t.Fatal("writeGCManifest() accepted a non-directory path")
+	}
+}

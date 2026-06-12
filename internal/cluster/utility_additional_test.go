@@ -245,6 +245,22 @@ func TestNewTLSStreamLayerRequiresConfigs(t *testing.T) {
 	}
 }
 
+func TestNewTLSStreamLayerBindError(t *testing.T) {
+	cert := mustSelfSignedCert(t)
+	serverCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	clientCfg := &tls.Config{InsecureSkipVerify: true}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer ln.Close()
+
+	if _, err := newTLSStreamLayer(ln.Addr().String(), ln.Addr(), serverCfg, clientCfg); err == nil {
+		t.Fatal("newTLSStreamLayer() accepted an occupied bind address")
+	}
+}
+
 func mustSelfSignedCert(t *testing.T) tls.Certificate {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

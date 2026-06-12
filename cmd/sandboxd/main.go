@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	runDaemon = daemon.Run
-	osExit    = os.Exit
+	runDaemon        = daemon.Run
+	runWasmWorkerCLI = worker.RunCLI
+	osExit           = os.Exit
 )
 
 func run(ctx context.Context, logger *slog.Logger) error {
@@ -27,7 +28,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 // supplying a real provider factory.
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
-		if err := worker.RunCLI(os.Args[2:]); err != nil {
+		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")
 			osExit(1)
 		}
