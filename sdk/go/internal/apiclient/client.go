@@ -441,6 +441,49 @@ func (c *Client) DeleteWasmModule(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/wasm-modules/"+id, nil, nil)
 }
 
+// PushWasmModule uploads a compiled core-wasip1 module to the registry under
+// the caller's own credentials and returns the oci:// ref to use as ModuleRef
+// on a later create. The daemon validates and forwards the bytes; it never
+// stores them.
+func (c *Client) PushWasmModule(ctx context.Context, opts models.PushWasmModuleOptions) (models.PushWasmModuleResponse, error) {
+	if strings.TrimSpace(opts.Name) == "" {
+		return models.PushWasmModuleResponse{}, errors.New("name is required")
+	}
+	if strings.TrimSpace(opts.RegistryToken) == "" {
+		return models.PushWasmModuleResponse{}, errors.New("registry token is required")
+	}
+	query := url.Values{"name": {opts.Name}}
+	if strings.TrimSpace(opts.Tag) != "" {
+		query.Set("tag", opts.Tag)
+	}
+	path := c.baseURL + c.versioned("/wasm-modules/push") + "?" + query.Encode()
+	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(opts.Module))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("X-Registry-Token", opts.RegistryToken)
+		if strings.TrimSpace(opts.RegistryUsername) != "" {
+			req.Header.Set("X-Registry-Username", opts.RegistryUsername)
+		}
+		c.addAuth(req)
+		return req, nil
+	})
+	if err != nil {
+		return models.PushWasmModuleResponse{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 400 {
+		return models.PushWasmModuleResponse{}, decodeError(response)
+	}
+	var out models.PushWasmModuleResponse
+	if err := json.NewDecoder(response.Body).Decode(&out); err != nil {
+		return models.PushWasmModuleResponse{}, err
+	}
+	return out, nil
+}
+
 // RebuildTemplate kicks an operator-triggered snapshot rebuild. Idempotent
 // under concurrent retry — the daemon's CAS collapses N parallel calls for
 // the same ready template into one rebuild kick. Returns the row in its

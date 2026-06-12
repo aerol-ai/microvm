@@ -817,6 +817,36 @@ pub struct CreateWasmModuleOptions {
     pub entrypoint: Option<String>,
 }
 
+/// Input for [`Client::push_wasm_module`]: a BYO compiled core-wasip1 upload.
+/// The daemon validates and forwards the bytes to the registry under your own
+/// credentials; it never stores them.
+#[derive(Debug, Clone, Default)]
+pub struct PushWasmModuleOptions {
+    /// Target repository path, e.g. `tenant/my-app`.
+    pub name: String,
+    /// Image tag; defaults to `latest` when empty.
+    pub tag: String,
+    /// The compiled core-wasip1 module bytes.
+    pub module: Vec<u8>,
+    /// Registry login (your AOCR username).
+    pub registry_username: String,
+    /// Registry token (your AOCR PAT). Required.
+    pub registry_token: String,
+}
+
+/// Result of [`Client::push_wasm_module`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PushWasmModuleResponse {
+    /// The `oci://` ref to pass as `module_ref` on create.
+    #[serde(rename = "module_ref")]
+    pub module_ref: String,
+    /// sha256 content digest of the uploaded module.
+    pub digest: String,
+    /// Uploaded size in bytes.
+    #[serde(rename = "size_bytes")]
+    pub size_bytes: i64,
+}
+
 /// Patch body for [`Client::set_network_limits`]. Each field is `Option`-wrapped
 /// so an unset key serializes as missing (server reads as "leave alone");
 /// `Some(0)` means unlimited.

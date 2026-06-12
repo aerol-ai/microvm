@@ -50,5 +50,7 @@ export type {
   TemplateStatus,
   WasmModule,
   WasmModuleStatus,
+  PushWasmModuleOptions,
+  PushWasmModuleResult,
   UpdateLifecycleOptions,
 } from "./types.js";

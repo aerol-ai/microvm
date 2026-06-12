@@ -653,3 +653,31 @@ export interface CreateWasmModuleOptions {
   /** WASI entry export; defaults to `_start` on the daemon. */
   entrypoint?: string;
 }
+
+/**
+ * Upload a compiled core-wasip1 `.wasm` to the registry. The daemon validates
+ * and forwards it under YOUR registry credentials — it never stores the bytes.
+ * The returned {@link PushWasmModuleResult.moduleRef} is what you pass as
+ * `moduleRef` on a later `create`.
+ */
+export interface PushWasmModuleOptions {
+  /** Target repository path, e.g. `tenant/my-app`. */
+  name: string;
+  /** Image tag; defaults to `latest`. */
+  tag?: string;
+  /** The compiled core-wasip1 module bytes. */
+  module: Uint8Array;
+  /** Registry login (your AOCR username). */
+  registryUsername?: string;
+  /** Registry token (your AOCR PAT). Required. */
+  registryToken: string;
+}
+
+export interface PushWasmModuleResult {
+  /** The `oci://` ref to pass as `moduleRef` on create. */
+  moduleRef: string;
+  /** sha256 content digest of the uploaded module. */
+  digest: string;
+  /** Uploaded size in bytes. */
+  sizeBytes: number;
+}

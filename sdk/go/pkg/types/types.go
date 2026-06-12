@@ -47,6 +47,12 @@ type WasmModule = models.WasmModule
 // CreateWasmModuleOptions is the request body for Client.CreateWasmModule.
 type CreateWasmModuleOptions = models.CreateWasmModuleRequest
 
+// PushWasmModuleOptions is the input for Client.PushWasmModule (BYO upload).
+type PushWasmModuleOptions = models.PushWasmModuleOptions
+
+// PushWasmModuleResponse is the result of Client.PushWasmModule.
+type PushWasmModuleResponse = models.PushWasmModuleResponse
+
 // WasmModuleStatus is the catalogue lifecycle for WASM modules.
 type WasmModuleStatus = models.WasmModuleStatus
 

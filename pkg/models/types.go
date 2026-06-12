@@ -1175,6 +1175,17 @@ type CreateWasmModuleRequest struct {
 	Entrypoint string `json:"entrypoint,omitempty"`
 }
 
+// PushWasmModuleOptions is the SDK-side input for a BYO module upload. The
+// wire form is the raw .wasm body plus name/tag query params and the caller's
+// registry credentials as headers; this struct is the Go SDK's ergonomic shape.
+type PushWasmModuleOptions struct {
+	Name             string
+	Tag              string
+	Module           []byte
+	RegistryUsername string
+	RegistryToken    string
+}
+
 // PushWasmModuleResponse is returned by POST /v1/wasm-modules/push after the
 // daemon validates a BYO .wasm upload and forwards it to the registry. The
 // daemon stores nothing; the caller references ModuleRef (an oci:// ref) on a
