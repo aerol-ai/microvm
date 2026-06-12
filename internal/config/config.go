@@ -375,6 +375,28 @@ type Config struct {
 	// WasmModulesDir is the content-addressed module + checkpoint cache root.
 	// Required when EnableWasm is true. SB_WASM_MODULES_DIR.
 	WasmModulesDir string
+	// WasmCacheDir holds oci:// pulled modules as <digest>.wasm, kept separate
+	// from the checkpoint root so eviction never touches a sandbox's mem.snap.
+	// Default WasmModulesDir/cache. SB_WASM_CACHE_DIR.
+	WasmCacheDir string
+	// WasmRegistryAllowlist is the set of registry hosts an oci:// module_ref
+	// may pull from. Empty = deny all remote pulls (the SSRF-safe default).
+	// Comma-separated. SB_WASM_REGISTRY_ALLOWLIST.
+	WasmRegistryAllowlist []string
+	// WasmPullTimeout bounds a single oci:// module pull so it cannot stall
+	// sandbox boot. 0 = no timeout. SB_WASM_PULL_TIMEOUT.
+	WasmPullTimeout time.Duration
+	// WasmStandardModules maps reserved-keyword aliases to staged filenames
+	// under WasmModulesDir (e.g. "python=python.wasm,javascript=quickjs.wasm").
+	// Provisioned identically on every node by Ansible — the fleet-wide
+	// standard-module contract, deliberately NOT DB-backed. SB_WASM_STANDARD_MODULES.
+	WasmStandardModules map[string]string
+	// WasmRegistryUsername is the AOCR login used for oci:// module pulls when
+	// the create request carries no per-tenant credentials. SB_WASM_REGISTRY_USERNAME.
+	WasmRegistryUsername string
+	// WasmRegistryPATPath is the file holding the AOCR token for module pulls.
+	// SB_WASM_REGISTRY_PAT_PATH.
+	WasmRegistryPATPath string
 	// WasmEngine selects the guest engine backend (wazero or wasmtime). Default wazero.
 	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
 	WasmEngine string
@@ -1188,6 +1210,12 @@ func Load() (Config, error) {
 		EnableWasm:                getEnvBool("SB_ENABLE_WASM", false),
 		WasmRunDir:                getEnv("SB_WASM_RUN_DIR", "/run/sandboxd/wasm"),
 		WasmModulesDir:            getEnv("SB_WASM_MODULES_DIR", "/var/lib/sandboxd/wasm/modules"),
+		WasmCacheDir:              getEnv("SB_WASM_CACHE_DIR", ""),
+		WasmRegistryAllowlist:     parseImageGCWhitelist(getEnv("SB_WASM_REGISTRY_ALLOWLIST", "")),
+		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
+		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
+		WasmRegistryUsername:      getEnv("SB_WASM_REGISTRY_USERNAME", ""),
+		WasmRegistryPATPath:       getEnv("SB_WASM_REGISTRY_PAT_PATH", ""),
 		WasmEngine:                strings.ToLower(strings.TrimSpace(getEnv("SB_WASM_ENGINE", "wazero"))),
 		WasmMaxInstances:          getEnvInt("SB_WASM_MAX_INSTANCES", 0),
 		WasmDefaultMemoryMB:       getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),
@@ -1820,6 +1848,28 @@ func parseImageGCWhitelist(raw string) []string {
 		if entry := strings.TrimSpace(part); entry != "" {
 			out = append(out, entry)
 		}
+	}
+	return out
+}
+
+// parseWasmStandardModules parses the comma-separated alias=filename list for
+// SB_WASM_STANDARD_MODULES into a reserved-keyword map. Aliases are lowercased
+// (case-insensitive lookup). Malformed entries are skipped silently so one
+// typo doesn't drop the rest. Returns a non-nil map for unconditional reads.
+func parseWasmStandardModules(raw string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		alias, filename, ok := strings.Cut(part, "=")
+		alias = strings.ToLower(strings.TrimSpace(alias))
+		filename = strings.TrimSpace(filename)
+		if !ok || alias == "" || filename == "" {
+			continue
+		}
+		out[alias] = filename
 	}
 	return out
 }

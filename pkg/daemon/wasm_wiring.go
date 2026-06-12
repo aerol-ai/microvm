@@ -22,7 +22,20 @@ import (
 // it on daemon shutdown.
 func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store) *wasmpool.Pool {
 	driver := wasmruntime.New(wasmruntime.FromDaemonConfig(cfg), logger)
-	resolver := wasmmod.NewResolver(cfg.WasmModulesDir)
+	// One ModuleResolver chokepoint shared by the runtime driver (create-time
+	// resolution) and the service (CreateWasmModule registration), so allowlist
+	// + validation + content-addressed pull happen in exactly one place.
+	resolver := wasmmod.NewModuleResolver(cfg.WasmModulesDir, cfg.WasmCacheDir)
+	resolver.Reserved = cfg.WasmStandardModules
+	resolver.Allowlist = make(map[string]struct{}, len(cfg.WasmRegistryAllowlist))
+	for _, h := range cfg.WasmRegistryAllowlist {
+		resolver.Allowlist[h] = struct{}{}
+	}
+	resolver.PullTimeout = cfg.WasmPullTimeout
+	resolver.Auth = wasmmod.ModuleAuth{
+		Username: cfg.WasmRegistryUsername,
+		PATPath:  cfg.WasmRegistryPATPath,
+	}
 	supervisor := worker.NewSupervisor(worker.DefaultSpawner)
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)
