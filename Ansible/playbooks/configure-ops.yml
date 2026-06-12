@@ -90,6 +90,18 @@
       SB_FLEET_ENDPOINT: "{{ fleet_control_plane.endpoint }}"
       SB_FLEET_TOKEN: "{{ fleet.token }}"
       SB_FLEET_CONTRACT_REFRESH: "{{ fleet_control_plane.contract_refresh }}"
+      # WASM runtime + module distribution. SB_WASM_STANDARD_MODULES is derived
+      # from wasm.standard_modules so the reserved-keyword contract (alias ->
+      # "<alias>.wasm") is identical on every node — never DB-backed.
+      SB_ENABLE_WASM: "{{ wasm.enabled | default(false) | bool | string | lower }}"
+      SB_WASM_MODULES_DIR: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}"
+      SB_WASM_CACHE_DIR: "{{ wasm.cache_dir | default('') }}"
+      SB_WASM_REGISTRY_ALLOWLIST: "{{ wasm.registry_allowlist | default('') }}"
+      SB_WASM_PULL_TIMEOUT: "{{ wasm.pull_timeout | default('60s') }}"
+      SB_WASM_REGISTRY_PUSH_HOST: "{{ wasm.push_host | default('') }}"
+      SB_WASM_REGISTRY_USERNAME: "{{ wasm.registry_username | default('') }}"
+      SB_WASM_REGISTRY_PAT_PATH: "{{ wasm.registry_pat_path | default('') }}"
+      SB_WASM_STANDARD_MODULES: "{{ wasm.standard_modules | default([]) | map(attribute='alias') | map('regex_replace', '^(.*)$', '\\1=\\1.wasm') | join(',') }}"
 
   pre_tasks:
     - name: Check base sandboxd env file

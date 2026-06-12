@@ -450,6 +450,18 @@ SB_FLEET_ENABLED=${fleet_enabled}
 SB_FLEET_ENDPOINT=${fleet_endpoint}
 SB_FLEET_TOKEN=${fleet_token}
 SB_FLEET_CONTRACT_REFRESH=${fleet_contract_refresh}
+# WASM runtime + module distribution. SB_WASM_STANDARD_MODULES is the
+# reserved-keyword contract (alias=alias.wasm,...); stage the .wasm files with
+# Ansible playbooks/stage-wasm-modules.yml so every node has identical bytes.
+SB_ENABLE_WASM=${wasm_cfg.enabled}
+SB_WASM_MODULES_DIR=${wasm_cfg.modules_dir}
+SB_WASM_CACHE_DIR=${wasm_cfg.cache_dir}
+SB_WASM_REGISTRY_ALLOWLIST=${wasm_cfg.registry_allowlist}
+SB_WASM_PULL_TIMEOUT=${wasm_cfg.pull_timeout}
+SB_WASM_REGISTRY_PUSH_HOST=${wasm_cfg.push_host}
+SB_WASM_REGISTRY_USERNAME=${wasm_cfg.registry_username}
+SB_WASM_REGISTRY_PAT_PATH=${wasm_cfg.registry_pat_path}
+SB_WASM_STANDARD_MODULES=${wasm_cfg.standard_modules}
 EOF
 %{ endif ~}
 

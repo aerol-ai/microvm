@@ -141,6 +141,7 @@ resource "aws_instance" "seed" {
     fleet_endpoint         = local.fleet.endpoint
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
+    wasm_cfg               = local.wasm_cfg
   })
 
   tags = merge(
@@ -289,6 +290,7 @@ resource "aws_instance" "joiner" {
     fleet_endpoint         = local.fleet.endpoint
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
+    wasm_cfg               = local.wasm_cfg
   })
 
   depends_on = [aws_instance.seed]
