@@ -123,6 +123,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 
 	// WASM module catalogue (plans/wasm-runtime.md). Per-host like templates.
 	mux.Handle("POST "+PathPrefix+"/wasm-modules", d.Auth(http.HandlerFunc(h.createWasmModule)))
+	mux.Handle("POST "+PathPrefix+"/wasm-modules/push", d.Auth(http.HandlerFunc(h.pushWasmModule)))
 	mux.Handle("GET "+PathPrefix+"/wasm-modules", d.Auth(http.HandlerFunc(h.listWasmModules)))
 	mux.Handle("GET "+PathPrefix+"/wasm-modules/{id}", d.Auth(http.HandlerFunc(h.getWasmModule)))
 	mux.Handle("DELETE "+PathPrefix+"/wasm-modules/{id}", d.Auth(http.HandlerFunc(h.deleteWasmModule)))

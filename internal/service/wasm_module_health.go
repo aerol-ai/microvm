@@ -45,7 +45,7 @@ func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, rec := range records {
-		referenced, err := s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef)
+		referenced, err := s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef, rec.Digest)
 		if err != nil {
 			s.logger.Warn("wasm module gc reference check failed", "module_id", rec.ID, "error", err)
 			continue

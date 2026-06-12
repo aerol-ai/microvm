@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 // admissionRetryAfterSeconds is the Retry-After hint sent with a 503 when the
@@ -130,6 +131,35 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	}
 	if errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		WriteError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	// WASM module resolution taxonomy (plans/wasm-standard-modules-distribution.md).
+	// The SDK branches on these statuses: 404 = wrong ref, 403 = registry not
+	// allowlisted (SSRF guard) or digest drift, 401 = fix your token, 413 =
+	// too big, 422 = unsupported artifact, 502+Retry-After = transient, retry.
+	if errors.Is(err, wasmmod.ErrModuleNotFound) {
+		WriteError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if errors.Is(err, wasmmod.ErrRegistryNotAllowed) || errors.Is(err, wasmmod.ErrModuleDigestMismatch) {
+		WriteError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if errors.Is(err, wasmmod.ErrRegistryAuth) {
+		WriteError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if errors.Is(err, wasmmod.ErrModuleTooLarge) {
+		WriteError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	if errors.Is(err, wasmmod.ErrComponentModelUnsupported) {
+		WriteError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if errors.Is(err, wasmmod.ErrRegistryUnavailable) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	// Capacity rejections are 503 with a Retry-After hint so well-behaved

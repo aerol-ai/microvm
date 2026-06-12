@@ -4823,13 +4823,20 @@ func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) 
 }
 
 // IsWasmModuleReferenced reports whether any sandbox still names moduleRef or digest id.
-func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef string) (bool, error) {
+// IsWasmModuleReferenced reports whether any sandbox row still depends on this
+// module. The check spans ref, id, AND the resolved content digest: two
+// aliases/tags can share the same bytes, so deleting/evicting purely by ref
+// would yank a digest still in use by another sandbox (codex C5). A blank
+// moduleDigest simply contributes no extra match.
+func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef, moduleDigest string) (bool, error) {
 	moduleID = strings.TrimSpace(moduleID)
 	moduleRef = strings.TrimSpace(moduleRef)
+	moduleDigest = strings.TrimSpace(moduleDigest)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT 1 FROM sandboxes
-		WHERE module_ref = ? OR module_ref = ? OR module_digest = ?
-		LIMIT 1`, moduleRef, moduleID, moduleID)
+		WHERE module_ref = ? OR module_ref = ? OR module_digest = ? OR
+		      (? <> '' AND module_digest = ?)
+		LIMIT 1`, moduleRef, moduleID, moduleID, moduleDigest, moduleDigest)
 	var one int
 	err := row.Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {

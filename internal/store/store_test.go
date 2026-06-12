@@ -2089,6 +2089,41 @@ func TestWasmCheckpointColumnsRoundTrip(t *testing.T) {
 	}
 }
 
+// A module is "referenced" when a sandbox shares its content digest, even
+// though that sandbox's module_ref names a different alias/tag (codex C5).
+// Deleting/evicting purely by ref would otherwise stomp shared bytes.
+func TestIsWasmModuleReferencedByDigest(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Sandbox booted from alias "python" but pinned to digest sha256X.
+	sb := sampleSandbox("sb-ref-digest")
+	sb.ModuleRef = "python"
+	sb.ModuleDigest = "sha256X"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// A catalogue row whose id/ref differ from the sandbox's, but whose
+	// resolved digest is the same bytes, must read as referenced.
+	referenced, err := st.IsWasmModuleReferenced(ctx, "some-other-id", "oci://aocr/x:latest", "sha256X")
+	if err != nil {
+		t.Fatalf("IsWasmModuleReferenced: %v", err)
+	}
+	if !referenced {
+		t.Fatal("module sharing the sandbox's digest must be referenced (C5)")
+	}
+
+	// An unrelated digest with no ref/id match is free to delete.
+	referenced, err = st.IsWasmModuleReferenced(ctx, "unrelated-id", "unrelated-ref", "sha256-OTHER")
+	if err != nil {
+		t.Fatalf("IsWasmModuleReferenced: %v", err)
+	}
+	if referenced {
+		t.Fatal("unrelated module must not be referenced")
+	}
+}
+
 func TestWasmStateKVCRUD(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

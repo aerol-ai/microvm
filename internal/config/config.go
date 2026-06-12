@@ -397,6 +397,10 @@ type Config struct {
 	// WasmRegistryPATPath is the file holding the AOCR token for module pulls.
 	// SB_WASM_REGISTRY_PAT_PATH.
 	WasmRegistryPATPath string
+	// WasmRegistryPushHost is the AOCR host BYO module uploads
+	// (POST /v1/wasm-modules/push) are pushed to. Empty disables push.
+	// SB_WASM_REGISTRY_PUSH_HOST.
+	WasmRegistryPushHost string
 	// WasmEngine selects the guest engine backend (wazero or wasmtime). Default wazero.
 	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
 	WasmEngine string
@@ -1216,6 +1220,7 @@ func Load() (Config, error) {
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
 		WasmRegistryUsername:      getEnv("SB_WASM_REGISTRY_USERNAME", ""),
 		WasmRegistryPATPath:       getEnv("SB_WASM_REGISTRY_PAT_PATH", ""),
+		WasmRegistryPushHost:      getEnv("SB_WASM_REGISTRY_PUSH_HOST", ""),
 		WasmEngine:                strings.ToLower(strings.TrimSpace(getEnv("SB_WASM_ENGINE", "wazero"))),
 		WasmMaxInstances:          getEnvInt("SB_WASM_MAX_INSTANCES", 0),
 		WasmDefaultMemoryMB:       getEnvInt("SB_WASM_DEFAULT_MEMORY_MB", 256),

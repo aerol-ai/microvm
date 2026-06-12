@@ -24,6 +24,20 @@ func (h *handlers) createWasmModule(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusCreated, mod)
 }
 
+// pushWasmModule accepts a raw .wasm body (application/octet-stream) and the
+// target repo as ?name=<repo>&tag=<tag>, pushes it to the registry, and returns
+// the oci:// ref the caller uses on create.
+func (h *handlers) pushWasmModule(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	tag := r.URL.Query().Get("tag")
+	resp, err := h.deps.Service.PushWasmModule(r.Context(), name, tag, r.Body)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusCreated, resp)
+}
+
 func (h *handlers) listWasmModules(w http.ResponseWriter, r *http.Request) {
 	mods, err := h.deps.Service.ListWasmModules(r.Context())
 	if err != nil {
