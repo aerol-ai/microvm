@@ -55,6 +55,12 @@ type SandboxRuntimeState struct {
 	// WASM-only: resolved module metadata returned by the wasm driver on create.
 	ModuleRef    string
 	ModuleDigest string
+	// ModulePath / ModuleSizeBytes are the resolved local artifact location and
+	// size. The service persists them onto the catalogue row so the row is
+	// resolvable by catalogue id instead of a misleading empty-path "ready" row
+	// (codex P1). Empty when resolution did not yield a local path.
+	ModulePath      string
+	ModuleSizeBytes int64
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and

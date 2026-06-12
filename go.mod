@@ -15,9 +15,9 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/klauspost/compress v1.17.11
+	github.com/mattn/go-sqlite3 v1.14.45
 	github.com/opencontainers/image-spec v1.1.0
 	github.com/tetratelabs/wazero v1.12.0
-	github.com/mattn/go-sqlite3 v1.14.45
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
 	oras.land/oras-go/v2 v2.5.0
@@ -57,7 +57,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
-	github.com/miekg/dns v1.1.68 // indirect
+	github.com/miekg/dns v1.1.68
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

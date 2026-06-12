@@ -7,6 +7,16 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/singleflight"
+)
+
+// ociResolveManifestFunc and ociPullArtifactFunc are the network boundary for
+// resolveOCI. Tests swap them to exercise cache/single-flight without a live
+// registry.
+var (
+	ociResolveManifestFunc = ResolveModuleManifestDigest
+	ociPullArtifactFunc    = PullModuleArtifact
 )
 
 // ModuleResolver is the single resolution chokepoint for every module_ref
@@ -49,6 +59,14 @@ type ModuleResolver struct {
 	// CatalogueLookup resolves a BYO catalogue id to an already-local path +
 	// digest. Optional; nil disables step 3.
 	CatalogueLookup func(ctx context.Context, id string) (path, digest string, ok bool)
+
+	// pullGroup collapses concurrent oci:// blob downloads of the same manifest
+	// digest to a single network pull. N duplicate creates of one module_ref
+	// (e.g. a 100k-wide warm-up of "oci://…/python:1") download once and share
+	// the published cache file, instead of each racing its own pull (codex P0).
+	// Keyed on the manifest digest, NOT the ref, so each caller has already
+	// passed its own credentialed manifest resolve before joining the group.
+	pullGroup singleflight.Group
 }
 
 // NewModuleResolver builds a chokepoint over modulesDir. cacheDir defaults to
@@ -115,10 +133,12 @@ func (r *ModuleResolver) ResolveWithAuth(ctx context.Context, ref string, authOv
 	return resolved, nil
 }
 
-// resolveOCI enforces the allowlist, then pulls (single artifact) into a temp
-// dir, validates, digests, and atomically publishes to CacheDir/<digest>.wasm.
-// A cache hit (same digest already published) skips the network entirely on
-// the second-and-later resolve of the same bytes.
+// resolveOCI enforces the allowlist, resolves the manifest digest with the
+// caller's own credentials (cheap, no blob download), and short-circuits to the
+// content-addressed cache when that manifest's bytes are already local — so the
+// second-and-later resolve of the same tag does ZERO blob I/O. Only on a true
+// cache miss does it pull, and that pull is single-flighted on the manifest
+// digest so 100k concurrent duplicate creates download exactly once (codex P0).
 func (r *ModuleResolver) resolveOCI(ctx context.Context, ref string, authOverride *ModuleAuth) (*ResolvedModule, error) {
 	registryRef := strings.TrimPrefix(ref, "oci://")
 	host := registryHost(registryRef)
@@ -145,13 +165,77 @@ func (r *ModuleResolver) resolveOCI(ctx context.Context, ref string, authOverrid
 		defer cancel()
 	}
 
+	// Per-caller credentialed manifest resolve: this both authorizes the caller
+	// against the registry AND yields the cache key, all without fetching a blob.
+	// A registry that refuses our token fails here, so the cache shortcut below
+	// can never serve bytes to an unauthorized caller.
+	manifestDigest, err := ociResolveManifestFunc(pullCtx, auth, registryRef)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache shortcut: the manifest digest points at a previously-published
+	// content file. No blob download, no single-flight needed.
+	if rm, ok := r.lookupByManifest(manifestDigest); ok {
+		rm.Ref = ref
+		return rm, nil
+	}
+
+	// True miss: single-flight the blob pull on the manifest digest so duplicate
+	// concurrent creates collapse to one download. Every joiner already passed
+	// its own manifest resolve above.
+	v, err, _ := r.pullGroup.Do(manifestDigest, func() (interface{}, error) {
+		// Re-check the cache inside the group: an earlier in-flight pull for this
+		// same manifest may have published while we were queued.
+		if rm, ok := r.lookupByManifest(manifestDigest); ok {
+			return rm, nil
+		}
+		return r.pullAndPublish(pullCtx, registryRef, manifestDigest, auth)
+	})
+	if err != nil {
+		return nil, err
+	}
+	rm := *(v.(*ResolvedModule))
+	rm.Ref = ref
+	return &rm, nil
+}
+
+// manifestPointer is the on-disk hint mapping a manifest digest to the content
+// digest of the published .wasm, so a repeat resolve of a mutable tag can hit
+// the cache after a single credentialed manifest resolve (no blob download).
+func (r *ModuleResolver) manifestPointer(manifestDigest string) string {
+	return filepath.Join(r.CacheDir, ".manifest", sanitizeDigest(manifestDigest))
+}
+
+// lookupByManifest returns the published module for a manifest digest if both
+// the pointer and the content file it names are present.
+func (r *ModuleResolver) lookupByManifest(manifestDigest string) (*ResolvedModule, bool) {
+	b, err := os.ReadFile(r.manifestPointer(manifestDigest))
+	if err != nil {
+		return nil, false
+	}
+	contentDigest := strings.TrimSpace(string(b))
+	if contentDigest == "" {
+		return nil, false
+	}
+	final := filepath.Join(r.CacheDir, contentDigest+".wasm")
+	st, err := os.Stat(final)
+	if err != nil || st.IsDir() {
+		return nil, false
+	}
+	return &ResolvedModule{Path: final, Digest: contentDigest, SizeBytes: st.Size()}, true
+}
+
+// pullAndPublish downloads, validates, digests, atomically publishes the blob,
+// and records the manifest→content pointer. Runs under the single-flight group.
+func (r *ModuleResolver) pullAndPublish(ctx context.Context, registryRef, manifestDigest string, auth ModuleAuth) (*ResolvedModule, error) {
 	tmpDir, err := os.MkdirTemp(r.CacheDir, ".pull-*")
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	wasmPath, err := PullModuleArtifact(pullCtx, auth, registryRef, tmpDir, r.MaxBytes)
+	wasmPath, err := ociPullArtifactFunc(ctx, auth, registryRef, tmpDir, r.MaxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +251,8 @@ func (r *ModuleResolver) resolveOCI(ctx context.Context, ref string, authOverrid
 	final := filepath.Join(r.CacheDir, digest+".wasm")
 	if st, statErr := os.Stat(final); statErr == nil && !st.IsDir() {
 		// Cache hit: identical bytes already published by a prior resolve.
-		return &ResolvedModule{Ref: ref, Path: final, Digest: digest, SizeBytes: st.Size()}, nil
+		r.writeManifestPointer(manifestDigest, digest)
+		return &ResolvedModule{Path: final, Digest: digest, SizeBytes: st.Size()}, nil
 	}
 
 	// Atomic publish: fsync the temp file, then rename into place. A reader
@@ -180,11 +265,41 @@ func (r *ModuleResolver) resolveOCI(ctx context.Context, ref string, authOverrid
 		// Lost a publish race with a concurrent resolve of the same digest;
 		// the existing file is byte-identical, so treat it as a hit.
 		if st, statErr := os.Stat(final); statErr == nil && !st.IsDir() {
-			return &ResolvedModule{Ref: ref, Path: final, Digest: digest, SizeBytes: st.Size()}, nil
+			r.writeManifestPointer(manifestDigest, digest)
+			return &ResolvedModule{Path: final, Digest: digest, SizeBytes: st.Size()}, nil
 		}
 		return nil, err
 	}
-	return &ResolvedModule{Ref: ref, Path: final, Digest: digest, SizeBytes: size}, nil
+	r.writeManifestPointer(manifestDigest, digest)
+	return &ResolvedModule{Path: final, Digest: digest, SizeBytes: size}, nil
+}
+
+// writeManifestPointer records the manifest→content hint atomically. Best
+// effort: a failed write only costs a future blob re-pull, never correctness.
+func (r *ModuleResolver) writeManifestPointer(manifestDigest, contentDigest string) {
+	dir := filepath.Join(r.CacheDir, ".manifest")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(dir, ".ptr-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	_, werr := tmp.WriteString(contentDigest)
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, r.manifestPointer(manifestDigest)); err != nil {
+		_ = os.Remove(tmpName)
+	}
+}
+
+// sanitizeDigest makes a manifest digest ("sha256:abc…") safe as a filename.
+func sanitizeDigest(d string) string {
+	return strings.ReplaceAll(strings.TrimSpace(d), ":", "-")
 }
 
 // ResolveByDigest returns the content-addressed cached module for digest, if a

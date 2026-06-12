@@ -62,6 +62,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		sandboxID:    sandboxID,
 		moduleRef:    ref,
 		modulePath:   resolved.Path,
+		moduleSize:   resolved.SizeBytes,
 		moduleDigest: resolved.Digest,
 		socketPath:   socketPath,
 		workDir:      workDir,
@@ -177,12 +178,14 @@ func (d *Driver) runtimeState(inst *sandboxInstance) *models.SandboxRuntimeState
 		return nil
 	}
 	return &models.SandboxRuntimeState{
-		SandboxID:    inst.sandboxID,
-		ContainerID:  "wasm:" + inst.sandboxID,
-		ContainerIP:  wasmLoopbackIP,
-		Status:       inst.status,
-		ModuleRef:    inst.moduleRef,
-		ModuleDigest: inst.moduleDigest,
+		SandboxID:       inst.sandboxID,
+		ContainerID:     "wasm:" + inst.sandboxID,
+		ContainerIP:     wasmLoopbackIP,
+		Status:          inst.status,
+		ModuleRef:       inst.moduleRef,
+		ModuleDigest:    inst.moduleDigest,
+		ModulePath:      inst.modulePath,
+		ModuleSizeBytes: inst.moduleSize,
 	}
 }
 

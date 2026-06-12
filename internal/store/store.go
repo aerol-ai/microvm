@@ -399,6 +399,11 @@ func Open(path string) (*Store, error) {
 			ON wasm_modules(updated_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_status_ref
 			ON wasm_modules(status, module_ref);`,
+		// Cache GC probes catalogued digests by content digest every sweep; without
+		// this index that degrades to a full wasm_modules scan per cache file at
+		// large cache/catalogue sizes (codex P1).
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_digest
+			ON wasm_modules(digest) WHERE digest <> '';`,
 		// wasm_state_kv backs the durable host-KV capability (§4.6).
 		`CREATE TABLE IF NOT EXISTS wasm_state_kv (
 			sandbox_id TEXT NOT NULL,
@@ -4867,6 +4872,56 @@ func (s *Store) IsWasmDigestCatalogued(ctx context.Context, digest string) (bool
 		return false, err
 	}
 	return true, nil
+}
+
+// WasmDigestsInUse returns the subset of digests that are still referenced by a
+// live sandbox OR pinned by a catalogue row. The cache evictor calls this ONCE
+// per sweep with every candidate digest instead of two probes per file, so a
+// large cache no longer issues O(files) serialized queries against the
+// single-writer DB (codex P1). Digests are chunked to stay under SQLite's bound
+// parameter limit.
+func (s *Store) WasmDigestsInUse(ctx context.Context, digests []string) (map[string]struct{}, error) {
+	inUse := make(map[string]struct{})
+	const chunk = 400 // half the 999 bound-param limit (used twice per row)
+	for start := 0; start < len(digests); start += chunk {
+		end := start + chunk
+		if end > len(digests) {
+			end = len(digests)
+		}
+		batch := digests[start:end]
+		ph := make([]string, len(batch))
+		// One arg list reused for both the sandboxes and wasm_modules predicate.
+		args := make([]any, 0, len(batch)*2)
+		for i, d := range batch {
+			ph[i] = "?"
+			args = append(args, d)
+		}
+		for _, d := range batch {
+			args = append(args, d)
+		}
+		in := strings.Join(ph, ",")
+		q := `SELECT module_digest FROM sandboxes WHERE module_digest IN (` + in + `)
+		      UNION
+		      SELECT digest FROM wasm_modules WHERE digest IN (` + in + `)`
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("wasm digests in use: %w", err)
+		}
+		for rows.Next() {
+			var d string
+			if err := rows.Scan(&d); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			inUse[d] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return inUse, nil
 }
 
 // ErrWasmModuleIDConflict is returned when POST /v1/wasm-modules reuses an id

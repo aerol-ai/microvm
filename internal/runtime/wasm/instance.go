@@ -16,6 +16,7 @@ type sandboxInstance struct {
 	sandboxID    string
 	moduleRef    string
 	modulePath   string
+	moduleSize   int64
 	moduleDigest string
 	socketPath   string
 	workDir      string

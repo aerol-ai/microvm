@@ -155,6 +155,12 @@ type Service struct {
 	localReadyWasmModuleIDsCache   []string
 	localReadyWasmModuleIDsKnown   bool
 	localReadyWasmModuleIDsExpires time.Time
+	// Reserved standard-module aliases that actually resolve on this host,
+	// computed once: each resolve hashes a staged file up to 256MiB, so it must
+	// not run on every 5s inventory refresh (hard rule 2). Staged modules are
+	// immutable fleet-wide, so a single probe at first use is authoritative.
+	reservedModuleRefsOnce sync.Once
+	reservedModuleRefs     []string
 	// l4Ready latches true once caddy.EnsureLayer4 has succeeded — either at
 	// boot or lazily on the first TCP/TLS expose call. Boot bootstrap is
 	// best-effort (caddy may not be reachable yet on a cold start), so the
@@ -3235,6 +3241,14 @@ func (s *Service) LocalReadyWasmModuleInventory(ctx context.Context) ([]string, 
 		s.localReadyWasmModuleIDsMu.Unlock()
 		return out, known
 	}
+	// Reserved-keyword standard modules ("python", …) are filesystem/config
+	// backed and deliberately never DB-backed, so they never appear in the
+	// catalogue query above. Without folding them into local inventory, a
+	// fresh node advertises known-but-empty inventory and cluster placement
+	// rejects every `module_ref: "python"` create — yet the only way a row
+	// would ever appear is a create that placement just refused (codex P0
+	// deadlock). Advertise the staged aliases that actually resolve locally.
+	refs = s.appendResolvableReservedModules(ctx, refs)
 	s.localReadyWasmModuleIDsMu.Lock()
 	s.localReadyWasmModuleIDsCache = refs
 	s.localReadyWasmModuleIDsKnown = true
@@ -3242,6 +3256,41 @@ func (s *Service) LocalReadyWasmModuleInventory(ctx context.Context) ([]string, 
 	out := append([]string(nil), refs...)
 	s.localReadyWasmModuleIDsMu.Unlock()
 	return out, true
+}
+
+// appendResolvableReservedModules unions the reserved standard-module aliases
+// that resolve locally into refs (deduped). Resolution is probed once and
+// memoized — staged modules are immutable per node, and the resolve hashes a
+// large file, so it must not repeat on the inventory hot path.
+func (s *Service) appendResolvableReservedModules(ctx context.Context, refs []string) []string {
+	s.reservedModuleRefsOnce.Do(func() {
+		if s.wasmModuleResolver == nil || len(s.cfg.WasmStandardModules) == 0 {
+			return
+		}
+		for alias := range s.cfg.WasmStandardModules {
+			if _, err := s.wasmModuleResolver.Resolve(ctx, alias); err != nil {
+				if s.logger != nil {
+					s.logger.Warn("reserved wasm module not advertised: did not resolve",
+						"alias", alias, "error", err)
+				}
+				continue
+			}
+			s.reservedModuleRefs = append(s.reservedModuleRefs, alias)
+		}
+	})
+	if len(s.reservedModuleRefs) == 0 {
+		return refs
+	}
+	seen := make(map[string]struct{}, len(refs))
+	for _, r := range refs {
+		seen[r] = struct{}{}
+	}
+	for _, alias := range s.reservedModuleRefs {
+		if _, ok := seen[alias]; !ok {
+			refs = append(refs, alias)
+		}
+	}
+	return refs
 }
 
 // ReplayReservations re-populates the admitter from persistent state. Without

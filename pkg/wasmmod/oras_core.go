@@ -131,6 +131,32 @@ func PushModuleArtifact(ctx context.Context, a ModuleAuth, wasmPath, registryRef
 	return manifestDesc.Digest.String(), nil
 }
 
+// ResolveModuleManifestDigest performs a credentialed manifest HEAD/GET and
+// returns the manifest content digest WITHOUT downloading any layer blob. It is
+// the cheap, per-caller authorization + cache-key step the resolver runs before
+// a full pull: every caller still authenticates to the registry here (so a
+// cache shortcut never bypasses registry authz), but only ONE of N concurrent
+// duplicate creates goes on to download the blobs (codex P0 single-flight).
+func ResolveModuleManifestDigest(ctx context.Context, a ModuleAuth, registryRef string) (string, error) {
+	registryRef = strings.TrimSpace(registryRef)
+	if registryRef == "" {
+		return "", fmt.Errorf("oras resolve module: registry ref required")
+	}
+	pat, err := a.token()
+	if err != nil {
+		return "", fmt.Errorf("oras resolve module: %w", err)
+	}
+	repo, err := newAuthedRepo(registryRef, a.Username, pat)
+	if err != nil {
+		return "", err
+	}
+	desc, err := repo.Resolve(ctx, registryTag(registryRef))
+	if err != nil {
+		return "", fmt.Errorf("oras resolve module: resolve %s: %w", registryRef, classifyRegistryErr(err))
+	}
+	return desc.Digest.String(), nil
+}
+
 // PullModuleArtifact downloads a single-layer .wasm artifact from registryRef
 // into dstDir and returns the unpacked file path. The caller is responsible
 // for validation (ValidateFile) and content-addressed publishing — this

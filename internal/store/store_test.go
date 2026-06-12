@@ -2124,6 +2124,75 @@ func TestIsWasmModuleReferencedByDigest(t *testing.T) {
 	}
 }
 
+// WasmDigestsInUse batches sandbox + catalogue membership for cache GC instead
+// of per-file probes (codex P1).
+func TestWasmDigestsInUse(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sb := sampleSandbox("sb-digest-in-use")
+	sb.ModuleDigest = "digest-sandbox"
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := st.UpsertWasmModule(ctx, WasmModuleRecord{
+		ID: "mod-cat", ModuleRef: "oci://h/r:t", Digest: "digest-catalogue",
+		Status: "ready", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertWasmModule: %v", err)
+	}
+
+	inUse, err := st.WasmDigestsInUse(ctx, []string{
+		"digest-sandbox", "digest-catalogue", "digest-free",
+	})
+	if err != nil {
+		t.Fatalf("WasmDigestsInUse: %v", err)
+	}
+	if _, ok := inUse["digest-sandbox"]; !ok {
+		t.Fatal("sandbox digest should be in use")
+	}
+	if _, ok := inUse["digest-catalogue"]; !ok {
+		t.Fatal("catalogue digest should be in use")
+	}
+	if _, ok := inUse["digest-free"]; ok {
+		t.Fatal("unreferenced digest must not be in use")
+	}
+
+	empty, err := st.WasmDigestsInUse(ctx, nil)
+	if err != nil {
+		t.Fatalf("WasmDigestsInUse empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty input should return empty set, got %v", empty)
+	}
+
+	// Chunking: >400 digests exercises the batched query path.
+	batch := make([]string, 0, 450)
+	for i := 0; i < 450; i++ {
+		batch = append(batch, fmt.Sprintf("free-%04d", i))
+	}
+	batch = append(batch, "digest-sandbox")
+	got, err := st.WasmDigestsInUse(ctx, batch)
+	if err != nil {
+		t.Fatalf("WasmDigestsInUse chunked: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("chunked in-use = %v, want only digest-sandbox", got)
+	}
+}
+
+func TestWasmDigestsInUseQueryError(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := st.WasmDigestsInUse(ctx, []string{"x"}); err == nil {
+		t.Fatal("expected error on closed store")
+	}
+}
+
 func TestWasmStateKVCRUD(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

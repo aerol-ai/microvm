@@ -59,15 +59,15 @@ func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
 		if referenced {
 			continue
 		}
-		if s.wasm != nil {
-			ref := rec.ModuleRef
-			if ref == "" {
-				ref = rec.ID
-			}
-			if err := s.wasm.RemoveImage(ctx, ref); err != nil {
-				s.logger.Warn("wasm module gc artifact delete failed", "module_id", rec.ID, "ref", ref, "error", err)
-				continue
-			}
+		// GC is strictly local — never hand a ref to RemoveImage here. An oci://
+		// ref would re-resolve during cleanup, re-pulling from the registry (and
+		// failing without the tenant's creds), which both does network I/O on the
+		// janitor and strands the row when it errors (codex P1). Reclaim by the
+		// recorded content digest (a local-only RemoveImage path that also drops
+		// the warm-pool entry) or, lacking a digest, the recorded local path; the
+		// content-addressed cache file is evicted separately by cache GC below.
+		if s.wasm != nil && rec.Digest != "" {
+			_ = s.wasm.RemoveImage(ctx, rec.Digest)
 		} else if wasmPathUnderDir(s.cfg.WasmModulesDir, rec.ModulePath) {
 			_ = os.RemoveAll(rec.ModulePath)
 		}
@@ -139,6 +139,19 @@ func (s *Service) runWasmCacheGC(ctx context.Context, now time.Time) {
 	// recently used bytes first.
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
 
+	// Resolve the in-use set (sandbox-referenced ∪ catalogued) in ONE batched
+	// query for the whole sweep, rather than two DB probes per file against the
+	// single-writer store (codex P1). Membership is then an O(1) map lookup.
+	digests := make([]string, 0, len(files))
+	for _, f := range files {
+		digests = append(digests, f.digest)
+	}
+	inUse, err := s.store.WasmDigestsInUse(ctx, digests)
+	if err != nil {
+		s.logger.Warn("wasm cache gc in-use check failed", "error", err)
+		return
+	}
+
 	ttlCutoff := now.UTC().Add(-ttl)
 	for _, f := range files {
 		overCap := maxBytes > 0 && total > maxBytes
@@ -150,20 +163,7 @@ func (s *Service) runWasmCacheGC(ctx context.Context, now time.Time) {
 			break
 		}
 		// Refcount gate: skip (but keep counting) anything still in use.
-		referenced, err := s.store.IsWasmModuleReferenced(ctx, "", "", f.digest)
-		if err != nil {
-			s.logger.Warn("wasm cache gc reference check failed", "digest", f.digest, "error", err)
-			continue
-		}
-		if !referenced {
-			catalogued, err := s.store.IsWasmDigestCatalogued(ctx, f.digest)
-			if err != nil {
-				s.logger.Warn("wasm cache gc catalogue check failed", "digest", f.digest, "error", err)
-				continue
-			}
-			referenced = catalogued
-		}
-		if referenced {
+		if _, ok := inUse[f.digest]; ok {
 			continue
 		}
 		if err := os.Remove(f.path); err != nil {
