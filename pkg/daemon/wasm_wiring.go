@@ -101,8 +101,15 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		"engine", cfg.WasmEngine,
 		"pool_enabled", cfg.WasmPoolEnabled,
 	)
+	if wasmWiringTestHook != nil {
+		wasmWiringTestHook(resolver)
+	}
 	return pool
 }
+
+// wasmWiringTestHook is invoked at the end of wireWasmRuntime so tests can
+// exercise the wired resolver without exporting it from service.
+var wasmWiringTestHook func(*wasmmod.ModuleResolver)
 
 // seedStandardModules resolves each reserved keyword to its content digest +
 // path and registers it as a warm-pool refill target, so the standard runtimes

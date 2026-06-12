@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type runTestPaths struct {
@@ -254,6 +257,131 @@ func TestRun_MountManagerErrorReturnsWrappedError(t *testing.T) {
 	}
 }
 
+func pickFreeTCPPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pickFreeTCPPort: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func TestRun_GracefulShutdownWithFleetEnabled(t *testing.T) {
+	setBaseRunEnv(t)
+	t.Setenv("SB_FLEET_ENABLED", "true")
+	t.Setenv("SB_FLEET_ENDPOINT", "https://fleet.example")
+	t.Setenv("SB_FLEET_TOKEN", "fleet-token")
+	t.Setenv("SB_FLEET_LIVE_SAMPLE_INTERVAL", "10ms")
+
+	err := runWithAutoCancel(t, 150*time.Millisecond, func(_ context.Context, fc FleetConfig) (controlplane.Provider, error) {
+		if !fc.Enabled {
+			t.Fatal("fleet config Enabled = false, want true")
+		}
+		if fc.Endpoint != "https://fleet.example" || fc.Token != "fleet-token" {
+			t.Fatalf("unexpected fleet config: %+v", fc)
+		}
+		return controlplane.Noop(), nil
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRun_GracefulShutdownClusterServerIngress(t *testing.T) {
+	setBaseRunEnv(t)
+	raftPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeTCPPort(t)
+
+	t.Setenv("SB_NODE_ROLE", "server,ingress")
+	t.Setenv("SB_ENABLE_CLUSTER", "true")
+	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_CLUSTER_INTERNAL_LISTEN", fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)))
+	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)))
+
+	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRun_GracefulShutdownWithHostCapacityOverrides(t *testing.T) {
+	setBaseRunEnv(t)
+	t.Setenv("SB_HOST_CPU_CORES", "8")
+	t.Setenv("SB_HOST_MEMORY_MB", "16384")
+	t.Setenv("SB_HOST_DISK_GB", "100")
+	t.Setenv("SB_HOST_GPU_COUNT", "1")
+	t.Setenv("SB_HOST_GPU_VENDOR", "nvidia")
+
+	if err := runWithAutoCancel(t, 120*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRun_GracefulShutdownWithClusterBootstrap(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	raftPort := pickFreeTCPPort(t)
+	gossipPort := pickFreeTCPPort(t)
+
+	t.Setenv("SB_ENABLE_CLUSTER", "true")
+	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
+	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_DATA_DIR", filepath.Join(paths.rootDir, "raft"))
+	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
+
+	if err := runWithAutoCancel(t, 250*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRun_GracefulShutdownWithMirrorEnabled(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	t.Setenv("SB_MIRROR_HOST", "mirror.example")
+	t.Setenv("SB_MIRROR_UPSTREAMS", "docker.io:dockerhub")
+	t.Setenv("SB_UPSTREAM_WRAP_KEY_PATH", writeWrapKeyFile(t))
+
+	if err := runWithAutoCancel(t, 150*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	_ = paths
+}
+
+func TestRun_GracefulShutdownWithWasmEnabled(t *testing.T) {
+	paths := setBaseRunEnv(t)
+
+	wasmRunDir := filepath.Join(paths.rootDir, "wasm-run")
+	wasmModulesDir := filepath.Join(paths.rootDir, "wasm-modules")
+	if err := os.MkdirAll(wasmRunDir, 0o755); err != nil {
+		t.Fatalf("mkdir wasm run: %v", err)
+	}
+	if err := os.MkdirAll(wasmModulesDir, 0o755); err != nil {
+		t.Fatalf("mkdir wasm modules: %v", err)
+	}
+
+	t.Setenv("SB_ENABLE_WASM", "true")
+	t.Setenv("SB_WASM_RUN_DIR", wasmRunDir)
+	t.Setenv("SB_WASM_MODULES_DIR", wasmModulesDir)
+	t.Setenv("SB_WASM_POOL_ENABLED", "true")
+	t.Setenv("SB_WASM_POOL_DEPTH_DEFAULT", "1")
+	t.Setenv("SB_WASM_POOL_REFILL_INTERVAL", "5ms")
+	t.Setenv("SB_WASM_STATEKV_WRITES_PER_SEC", "10")
+	t.Setenv("SB_WASM_STATEKV_BURST", "20")
+
+	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
 func TestRun_NetstatsBootstrapErrorIsNonFatal(t *testing.T) {
 	setBaseRunEnv(t)
 	t.Setenv("SB_NETSTATS_POLL_INTERVAL", "0s")
@@ -315,6 +443,38 @@ func TestAttachTemplateArtifactPuller_BuildError(t *testing.T) {
 		EnableFirecracker:       true,
 		FirecrackerTemplatesDir: t.TempDir(),
 	}, svc, nil)
+}
+
+func TestStartTemplateRotationReconciler_EnabledSweep(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+
+	now := time.Now().UTC()
+	stale := now.Add(-48 * time.Hour)
+	if err := st.CreateTemplate(ctx, &models.Template{
+		ID: "tpl-rotate", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusReady, ReadyAt: &stale,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	startTemplateRotationReconciler(t.Context(), testLogger(), config.Config{
+		EnableFirecracker:                   true,
+		FirecrackerTemplateRotationInterval: 5 * time.Millisecond,
+		FirecrackerTemplateMaxAge:           time.Hour,
+	}, st, svc)
+	time.Sleep(25 * time.Millisecond)
+}
+
+func TestStartTemplateRotationReconciler_ReconcilerBuildError(t *testing.T) {
+	st := openTestStore(t)
+	startTemplateRotationReconciler(t.Context(), testLogger(), config.Config{
+		EnableFirecracker:                   true,
+		FirecrackerTemplateRotationInterval: time.Second,
+		FirecrackerTemplateMaxAge:           time.Hour,
+	}, st, nil)
 }
 
 func TestStartTemplateRotationReconciler_IntervalWithoutMaxAge(t *testing.T) {

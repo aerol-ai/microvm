@@ -99,11 +99,11 @@ func (c *Generation) writeFileLocked(token string) {
 		c.logger.Debug("clone-generation: temp write failed", "path", c.path, "error", err)
 		return
 	}
-	if err := tmp.Chmod(0o644); err != nil {
+	if err := cloneGenChmod(tmp, 0o644); err != nil {
 		c.logger.Debug("clone-generation: temp chmod failed", "path", c.path, "error", err)
 		return
 	}
-	if err := tmp.Close(); err != nil {
+	if err := cloneGenClose(tmp); err != nil {
 		c.logger.Debug("clone-generation: temp close failed", "path", c.path, "error", err)
 		return
 	}
@@ -116,6 +116,11 @@ var fallbackCounter atomic.Uint64
 
 // RandRead is the entropy source for randomToken. Tests may replace it.
 var RandRead = rand.Read
+
+var (
+	cloneGenChmod = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
+	cloneGenClose = func(f *os.File) error { return f.Close() }
+)
 
 func randomToken(resumeUnixNs int64) string {
 	var b [16]byte

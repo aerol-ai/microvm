@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type countingDialer struct {
@@ -155,6 +156,17 @@ func TestWazeroNetHost_tcpDial(t *testing.T) {
 		t.Fatalf("expected write 5 bytes, got %v", int32(writeStack[0]))
 	}
 
+	// Wait for remote to close
+	time.Sleep(10 * time.Millisecond)
+
+	// Test second read (remote closed -> EOF -> err!=nil)
+	readStack[0] = connID
+	host.tcpRead(ctx, mod, readStack)
+
+	// Test second write (remote closed -> err!=nil)
+	writeStack[0] = connID
+	host.tcpWrite(ctx, mod, writeStack)
+
 	// Test close
 	closeStack := []uint64{connID}
 	host.tcpClose(ctx, mod, closeStack)
@@ -162,16 +174,20 @@ func TestWazeroNetHost_tcpDial(t *testing.T) {
 		t.Fatalf("expected close success, got %v", closeStack[0])
 	}
 
-	// Test read on closed
+	// Test read on locally closed (conn == nil)
+	readStack[0] = connID
 	host.tcpRead(ctx, mod, readStack)
 	if readStack[0] != 2 { // errClosed
 		t.Fatalf("expected errClosed, got %v", readStack[0])
 	}
 
-	// Test write on closed
+	// Test write on locally closed (conn == nil)
+	writeStack[0] = connID
 	host.tcpWrite(ctx, mod, writeStack)
 	if writeStack[0] != 2 { // errClosed
 		t.Fatalf("expected errClosed, got %v", writeStack[0])
+	}
+	if closeStack[0] != 0 {
 	}
 }
 
@@ -277,5 +293,27 @@ func TestWazeroNetHost_tcpReadWrite_Errors(t *testing.T) {
 	host.hook = nil
 	if m := host.hookMeter(); m != nil {
 		t.Fatalf("expected nil meter")
+	}
+}
+
+func TestEnsureNetworkHost_Multiple(t *testing.T) {
+	ctx := context.Background()
+	e, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close(ctx)
+
+	e.SetNetworkHook(&NetworkHook{Dial: &countingDialer{}})
+	e.initRuntime(ctx, 128)
+
+	err = e.ensureNetworkHost(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = e.ensureNetworkHost(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

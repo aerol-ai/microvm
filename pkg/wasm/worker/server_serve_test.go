@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
@@ -41,14 +42,15 @@ func TestServer_Serve_AllPaths(t *testing.T) {
 
 	runServeWithPayload := func(env Envelope) Envelope {
 		c1, c2 := net.Pipe()
+		var reply Envelope
 		go func() {
 			_ = writeFrame(c1, env)
+			reply, _ = readFrame(c1)
+			time.Sleep(10 * time.Millisecond)
 			c1.Close()
 		}()
 		_ = s.Serve(c2)
-		// We can't easily read the response this way since Serve returns when c2 is closed.
-		// Wait, Serve loops until readFrame fails. So if we close c1, readFrame gets EOF and Serve returns.
-		return Envelope{}
+		return reply
 	}
 
 	// OK paths
@@ -106,6 +108,16 @@ func TestServer_Serve_AllPaths(t *testing.T) {
 	runServeWithPayload(Envelope{Type: MsgSetListenPort, Payload: bad})
 	runServeWithPayload(Envelope{Type: MsgProxyHTTP, Payload: bad})
 
+	// Proxy HTTP error paths
+	p12, _ := encodePayload(proxyHTTPPayload{Method: "GET", GuestPort: -1})
+	runServeWithPayload(Envelope{Type: MsgProxyHTTP, Payload: p12})
+
+	p13, _ := encodePayload(proxyHTTPPayload{Method: " \x00 "})
+	runServeWithPayload(Envelope{Type: MsgProxyHTTP, Payload: p13})
+
+	// Unknown message type
+	runServeWithPayload(Envelope{Type: MessageType("999")})
+
 	// Error paths (eng error)
 	s.eng = &mockEngine{err: errors.New("eng err")}
 	runServeWithPayload(Envelope{Type: MsgLoadModule, Payload: p1})
@@ -118,4 +130,54 @@ func TestServer_Serve_AllPaths(t *testing.T) {
 	runServeWithPayload(Envelope{Type: MsgNetstatsTick})
 	runServeWithPayload(Envelope{Type: MsgListenPort})
 	runServeWithPayload(Envelope{Type: MsgStopInstance})
+}
+
+func TestServer_Serve_WriteErrors(t *testing.T) {
+	s := &Server{eng: &mockEngine{}}
+
+	runServeWithWriteError := func(env Envelope) {
+		c1, c2 := net.Pipe()
+		go func() {
+			_ = writeFrame(c1, env)
+			c1.Close() // immediately close so server writeFrame fails
+		}()
+		_ = s.Serve(c2)
+	}
+
+	p1, _ := encodePayload(loadModulePayload{})
+	p2, _ := encodePayload(instantiatePayload{})
+	p3, _ := encodePayload(execPayload{})
+	p4, _ := encodePayload(invokePayload{})
+	p5, _ := encodePayload(checkpointPayload{})
+	p6, _ := encodePayload(restorePayload{})
+	p7, _ := encodePayload(setCapabilityPayload{})
+	p8, _ := encodePayload(setNetworkBlocksPayload{})
+	p9, _ := encodePayload(setListenPortPayload{})
+	p10, _ := encodePayload(proxyHTTPPayload{Method: "GET"})
+
+	// Write error paths (OK payload, but c2 closed before response)
+	runServeWithWriteError(Envelope{Type: MsgHealthPing})
+	runServeWithWriteError(Envelope{Type: MsgInstanceStatus})
+	runServeWithWriteError(Envelope{Type: MsgLoadModule, Payload: p1})
+	runServeWithWriteError(Envelope{Type: MsgInstantiate, Payload: p2})
+	runServeWithWriteError(Envelope{Type: MsgExec, Payload: p3})
+	runServeWithWriteError(Envelope{Type: MsgInvoke, Payload: p4})
+	runServeWithWriteError(Envelope{Type: MsgCheckpoint, Payload: p5})
+	runServeWithWriteError(Envelope{Type: MsgRestore, Payload: p6})
+	runServeWithWriteError(Envelope{Type: MsgSetCapability, Payload: p7})
+	runServeWithWriteError(Envelope{Type: MsgSetNetworkBlocks, Payload: p8})
+	runServeWithWriteError(Envelope{Type: MsgSetListenPort, Payload: p9})
+	runServeWithWriteError(Envelope{Type: MsgListenPort})
+	runServeWithWriteError(Envelope{Type: MsgStopInstance})
+	runServeWithWriteError(Envelope{Type: MsgProxyHTTP, Payload: p10})
+
+	// Write error paths for engine errors
+	s.eng = &mockEngine{err: errors.New("eng err")}
+	runServeWithWriteError(Envelope{Type: MsgLoadModule, Payload: p1})
+	runServeWithWriteError(Envelope{Type: MsgInstantiate, Payload: p2})
+	runServeWithWriteError(Envelope{Type: MsgExec, Payload: p3})
+	runServeWithWriteError(Envelope{Type: MsgInvoke, Payload: p4})
+	runServeWithWriteError(Envelope{Type: MsgCheckpoint, Payload: p5})
+	runServeWithWriteError(Envelope{Type: MsgRestore, Payload: p6})
+	runServeWithWriteError(Envelope{Type: MsgSetCapability, Payload: p7})
 }

@@ -1,30 +1,41 @@
 package worker
 
 import (
+	"context"
 	"net/http"
 	"testing"
 )
 
-func TestProxyHTTP_MissingPaths(t *testing.T) {
+func TestGuestHTTPTarget_Errors(t *testing.T) {
+	s := &Server{}
+
+	s.lastCaps.WASIListenPort = -1
+	_, err := s.guestHTTPTarget(0)
+	if err == nil {
+		t.Error("expected error on negative port")
+	}
+
+	// Test host == ""
+	s.lastCaps.WASIListenHost = ""
+	target, _ := s.guestHTTPTarget(80)
+	if target != "127.0.0.1:80" {
+		t.Errorf("expected 127.0.0.1:80, got %v", target)
+	}
+
+	// Test url.Parse error by using a bad host
+	s.lastCaps.WASIListenPort = 80
+	s.lastCaps.WASIListenHost = " \x00 "
 	req, _ := http.NewRequest("GET", "http://localhost", nil)
-	_, err := buildProxyHTTPPayload(80, req)
-	if err != nil {
-		t.Fatal(err)
+	err = s.proxyGuestHTTP(context.Background(), "sb", 0, nil, req)
+	if err == nil {
+		t.Error("expected error on proxyGuestHTTP url parse")
 	}
+}
 
-	// newLimitedProxyResponseRecorder Write missing path
-	w := newLimitedProxyResponseRecorder(1024 * 1024)
-
-	// Write more than limit to trigger overflow
-	buf := make([]byte, 2*1024*1024)
-	w.Write(buf)
-	if !w.Overflowed() {
-		t.Fatal("expected overflow")
-	}
-
-	// Check headers and status code defaults
-	w2 := newLimitedProxyResponseRecorder(1024 * 1024)
-	if w2.StatusCode() != http.StatusOK {
-		t.Fatal("expected 200")
+func TestServer_ServeSocketPath(t *testing.T) {
+	// Use an invalid socket path to test listen error
+	err := ServeSocketPath("/invalid/path/that/does/not/exist/foo/bar.sock")
+	if err == nil {
+		t.Error("expected error listening on invalid path")
 	}
 }

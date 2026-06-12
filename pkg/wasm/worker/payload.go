@@ -94,11 +94,11 @@ type proxyHTTPResultPayload struct {
 	Body       []byte              `json:"body,omitempty"`
 }
 
-func encodePayload(v any) ([]byte, error) {
+var encodePayload = func(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-func decodePayload(data []byte, v any) error {
+var decodePayload = func(data []byte, v any) error {
 	if len(data) == 0 {
 		return fmt.Errorf("empty payload")
 	}

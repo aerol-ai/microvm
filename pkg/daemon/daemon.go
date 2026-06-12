@@ -827,10 +827,14 @@ func replayClusterOwnership(ctx context.Context, svc *service.Service, logger *s
 	return true
 }
 
+// clusterOwnershipReplayTick is the retry interval for ownership replay.
+// Tests shrink it so the goroutine body is exercised without a 10s wait.
+var clusterOwnershipReplayTick = 10 * time.Second
+
 func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
 	logger.Warn("cluster: scheduling ownership replay retry")
 	go func() {
-		t := time.NewTicker(10 * time.Second)
+		t := time.NewTicker(clusterOwnershipReplayTick)
 		defer t.Stop()
 		for {
 			select {

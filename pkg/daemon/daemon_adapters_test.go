@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/oci"
 )
 
 func testLogger() *slog.Logger {
@@ -242,6 +243,46 @@ func TestTemplateResolverAdapter_Resolve(t *testing.T) {
 	}
 	if _, err := a.Resolve(ctx, "does-not-exist"); err == nil {
 		t.Fatalf("expected not-found error")
+	}
+}
+
+func TestFirecrackerRootfsAdapter_BuildSuccess(t *testing.T) {
+	cfg, work := ociHappyConfig(t)
+	builder, err := oci.New(cfg)
+	if err != nil {
+		t.Fatalf("oci.New: %v", err)
+	}
+	a := &firecrackerRootfsAdapter{inner: builder}
+	out := filepath.Join(work, "rootfs.ext4")
+	res, err := a.Build(context.Background(), fcruntime.RootfsBuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if res == nil || res.RootfsPath != out {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+func TestTemplateBuilderAdapter_BuildSuccess(t *testing.T) {
+	cfg, work := ociHappyConfig(t)
+	builder, err := oci.New(cfg)
+	if err != nil {
+		t.Fatalf("oci.New: %v", err)
+	}
+	a := &templateBuilderAdapter{inner: builder}
+	out := filepath.Join(work, "tpl-rootfs.ext4")
+	res, err := a.Build(context.Background(), service.TemplateBuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if res == nil || res.RootfsPath != out {
+		t.Fatalf("unexpected result: %+v", res)
 	}
 }
 

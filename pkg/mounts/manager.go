@@ -304,7 +304,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	}
 	state.cmd = cmd
 
-	if err := waitForMount(hostPath, m.waitTimeout); err != nil {
+	if err := waitForMountProbe(hostPath, m.waitTimeout); err != nil {
 		_ = killMount(cmd)
 		m.cleanupCred(plan)
 		return nil, ContainerBind{}, err
@@ -431,6 +431,10 @@ func writeCredFile(path string, data []byte) error {
 	return nil
 }
 
+// waitForMountProbe is the mount-readiness probe mountOne uses. Tests may
+// replace it to avoid requiring a real FUSE/kernel mount in unit tests.
+var waitForMountProbe = waitForMount
+
 // waitForMount polls until the host path appears mounted (its underlying
 // device differs from the parent dir's). Falls back to a sentinel-file probe
 // if the parent is itself a mount point. Returns ErrTimeout after waitTimeout.
@@ -481,8 +485,13 @@ func killMount(cmd *exec.Cmd) error {
 
 // unmountPath calls /bin/umount, then a lazy umount as a fallback. Best-effort.
 func unmountPath(path string) error {
-	if err := exec.Command("umount", path).Run(); err == nil {
+	if err := runUmount(path); err == nil {
 		return nil
 	}
-	return exec.Command("umount", "-l", path).Run()
+	return runLazyUmount(path)
 }
+
+var (
+	runUmount     = func(path string) error { return exec.Command("umount", path).Run() }
+	runLazyUmount = func(path string) error { return exec.Command("umount", "-l", path).Run() }
+)

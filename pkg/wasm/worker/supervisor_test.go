@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"errors"
+
 	"context"
 	"os/exec"
 	"testing"
@@ -118,5 +120,25 @@ func TestRunCLI(t *testing.T) {
 	err = RunCLI([]string{"/invalid/path/that/does/not/exist.sock"})
 	if err == nil {
 		t.Fatal("expected error on invalid socket path")
+	}
+}
+
+func TestSupervisor_StartErrors(t *testing.T) {
+	s := NewSupervisor(func(ctx context.Context, socketPath string) (*exec.Cmd, error) {
+		return nil, errors.New("mock spawn error")
+	})
+
+	err := s.Ensure(context.Background(), "sb", "socket")
+	if err == nil {
+		t.Error("expected spawn error")
+	}
+
+	s2 := NewSupervisor(func(ctx context.Context, socketPath string) (*exec.Cmd, error) {
+		return exec.CommandContext(ctx, "nonexistent-command-1234"), nil
+	})
+
+	err = s2.Ensure(context.Background(), "sb", "socket")
+	if err == nil {
+		t.Error("expected start error")
 	}
 }

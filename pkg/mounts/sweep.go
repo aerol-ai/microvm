@@ -63,7 +63,7 @@ func killFUSEProcessesInRoot(logger *slog.Logger, dir, procRoot string) {
 // mountpoint (its st_dev differs from its parent's). Lazy umount as a fallback.
 func unmountTree(logger *slog.Logger, dir string) {
 	parent := filepath.Dir(dir)
-	parentDev := devOf(parent)
+	parentDev := pathDevOf(parent)
 
 	// Unmount deepest paths first so parents become unmountable.
 	type entry struct {
@@ -78,7 +78,7 @@ func unmountTree(logger *slog.Logger, dir string) {
 		if !d.IsDir() {
 			return nil
 		}
-		dev := devOf(path)
+		dev := pathDevOf(path)
 		if dev != 0 && dev != parentDev {
 			found = append(found, entry{path: path, dev: dev})
 		}
@@ -87,14 +87,23 @@ func unmountTree(logger *slog.Logger, dir string) {
 
 	for i := len(found) - 1; i >= 0; i-- {
 		path := found[i].path
-		if err := exec.Command("umount", path).Run(); err == nil {
+		if err := sweepUmount(path); err == nil {
 			continue
 		}
-		if err := exec.Command("umount", "-l", path).Run(); err != nil {
+		if err := sweepLazyUmount(path); err != nil {
 			logger.Warn("mounts sweep: umount failed", "path", path, "error", err)
 		}
 	}
 }
+
+var (
+	sweepUmount     = func(path string) error { return exec.Command("umount", path).Run() }
+	sweepLazyUmount = func(path string) error { return exec.Command("umount", "-l", path).Run() }
+)
+
+// pathDevOf returns the st_dev for path. Tests may override it to simulate a
+// mountpoint without a real FUSE mount (see unmountTree tests).
+var pathDevOf = devOf
 
 func devOf(path string) uint64 {
 	st, err := os.Stat(path)

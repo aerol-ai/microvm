@@ -108,6 +108,46 @@ func TestRun_ProviderFactoryErrorReturnsError(t *testing.T) {
 	}
 }
 
+type domainStubCluster struct {
+	*cluster.Noop
+	hosts map[string]string
+}
+
+func (d *domainStubCluster) ResolveCustomDomain(hostname string) (string, bool) {
+	id, ok := d.hosts[hostname]
+	return id, ok
+}
+
+func TestClusterAwareDomainResolver_ClusterAndStore(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-domain", Image: "alpine:3.20", Status: models.SandboxStatusStarted,
+		Runtime: models.RuntimeDocker, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := st.AddCustomDomain(ctx, "sb-domain", "store.example", 0); err != nil {
+		t.Fatalf("AddCustomDomain: %v", err)
+	}
+
+	clusterHit := &domainStubCluster{
+		Noop:  cluster.NewNoop("node-a", "http://node-a", ""),
+		hosts: map[string]string{"cluster.example": "sb-cluster"},
+	}
+	resolver := clusterAwareDomainResolver{cluster: clusterHit, store: st}
+
+	id, err := resolver.ResolveCustomDomain(ctx, "cluster.example")
+	if err != nil || id != "sb-cluster" {
+		t.Fatalf("cluster resolve = (%q, %v), want sb-cluster", id, err)
+	}
+	id, err = resolver.ResolveCustomDomain(ctx, "store.example")
+	if err != nil || id != "sb-domain" {
+		t.Fatalf("store resolve = (%q, %v), want sb-domain", id, err)
+	}
+}
+
 // TestConfigureMirror walks every branch: the disabled early-return, the
 // no-wrap-key-path info path, the unreadable-wrap-key warn path, and the
 // successful ring load. None of these talk to Docker — ConfigureMirror just
@@ -217,6 +257,55 @@ func TestStartClusterOwnershipReplayRetry_StopsOnCtxCancel(t *testing.T) {
 	// or panic, and cleanup-time ctx cancellation stops the goroutine.
 }
 
+func TestStartClusterOwnershipReplayRetry_SucceedsOnTick(t *testing.T) {
+	oldTick := clusterOwnershipReplayTick
+	clusterOwnershipReplayTick = 5 * time.Millisecond
+	t.Cleanup(func() { clusterOwnershipReplayTick = oldTick })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st := openTestStore(t)
+	svc := service.New(config.Config{EnableCluster: true}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(cluster.NewNoop("node-a", "http://node-a", ""))
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-retry", Image: "alpine:3.20", Status: models.SandboxStatusStarted,
+		Runtime: models.RuntimeDocker, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("store.Create: %v", err)
+	}
+
+	startClusterOwnershipReplayRetry(ctx, svc, testLogger())
+	// First tick replays ownership successfully and the goroutine exits.
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+}
+
+func TestStartClusterOwnershipReplayRetry_RetriesOnFailure(t *testing.T) {
+	oldTick := clusterOwnershipReplayTick
+	clusterOwnershipReplayTick = 5 * time.Millisecond
+	t.Cleanup(func() { clusterOwnershipReplayTick = oldTick })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	svc := service.New(config.Config{EnableCluster: true}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(cluster.NewNoop("node-a", "http://node-a", ""))
+	_ = st.Close()
+
+	startClusterOwnershipReplayRetry(ctx, svc, testLogger())
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+}
+
 // TestStartAutoImportReconciler_PATUnreadable: enabled but the PAT file is
 // missing — the feature logs and stays off without scheduling a goroutine.
 func TestStartAutoImportReconciler_PATUnreadable(t *testing.T) {
@@ -259,11 +348,15 @@ func TestStartSnapshotPushReconciler_Enabled(t *testing.T) {
 	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
 	dc := newTestDockerClient(t)
 
+	patPath := filepath.Join(t.TempDir(), "pat")
+	if err := os.WriteFile(patPath, []byte("cluster-pat\n"), 0o600); err != nil {
+		t.Fatalf("write pat: %v", err)
+	}
 	startSnapshotPushReconciler(t.Context(), testLogger(), config.Config{
 		SnapshotPushEnabled:           true,
 		MirrorPushHost:                "push.example",
 		AutoImportClusterID:           "cluster-1",
-		AutoImportClusterPATPath:      filepath.Join(t.TempDir(), "pat"),
+		AutoImportClusterPATPath:      patPath,
 		SnapshotPushReconcileInterval: 5 * time.Millisecond,
 		SnapshotPushMaxInFlight:       1,
 	}, st, svc, dc)

@@ -38,6 +38,34 @@ type mockWazeroFS struct{}
 
 func (f *mockWazeroFS) LookupFile(fd int32) (interface{}, bool) { return nil, false }
 
+type mockWazeroFSNilEntry struct{}
+
+func (f *mockWazeroFSNilEntry) LookupFile(fd int32) (interface{}, bool) {
+	var p *struct{}
+	return p, true
+}
+
+type mockWazeroModNilEntry struct {
+	api.Module
+	Sys *mockWazeroSysNilEntry
+}
+type mockWazeroSysNilEntry struct{}
+
+func (s *mockWazeroSysNilEntry) FS() *mockWazeroFSNilEntry { return &mockWazeroFSNilEntry{} }
+
+type mockWazeroFSNoFile struct{}
+
+func (f *mockWazeroFSNoFile) LookupFile(fd int32) (interface{}, bool) {
+	return struct{ Foo string }{}, true
+}
+
+type mockWazeroModNoFile struct {
+	api.Module
+	Sys *mockWazeroSysNoFile
+}
+type mockWazeroSysNoFile struct{}
+
+func (s *mockWazeroSysNoFile) FS() *mockWazeroFSNoFile { return &mockWazeroFSNoFile{} }
 func TestModuleLookupFile_Errors(t *testing.T) {
 	// Test nil
 	var typedNil *mockWazeroModNoSys
@@ -66,6 +94,16 @@ func TestModuleLookupFile_Errors(t *testing.T) {
 
 	// Test valid FS but LookupFile returns false
 	if _, ok := moduleLookupFile(&mockWazeroModValidFS{}, 3); ok {
+		t.Fatal("expected false")
+	}
+
+	// Test nil entry
+	if _, ok := moduleLookupFile(&mockWazeroModNilEntry{}, 3); ok {
+		t.Fatal("expected false")
+	}
+
+	// Test no File field
+	if _, ok := moduleLookupFile(&mockWazeroModNoFile{}, 3); ok {
 		t.Fatal("expected false")
 	}
 
