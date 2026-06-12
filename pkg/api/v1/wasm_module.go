@@ -24,13 +24,16 @@ func (h *handlers) createWasmModule(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusCreated, mod)
 }
 
-// pushWasmModule accepts a raw .wasm body (application/octet-stream) and the
-// target repo as ?name=<repo>&tag=<tag>, pushes it to the registry, and returns
-// the oci:// ref the caller uses on create.
+// pushWasmModule is a stateless proxy: it accepts a raw .wasm body
+// (application/octet-stream) with the target repo as ?name=<repo>&tag=<tag>,
+// validates and forwards it to the registry under the caller's own PAT (from
+// request headers), and returns the oci:// ref. The daemon stores nothing.
 func (h *handlers) pushWasmModule(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	tag := r.URL.Query().Get("tag")
-	resp, err := h.deps.Service.PushWasmModule(r.Context(), name, tag, r.Body)
+	username := r.Header.Get("X-Registry-Username")
+	token := r.Header.Get("X-Registry-Token")
+	resp, err := h.deps.Service.PushWasmModule(r.Context(), name, tag, username, token, r.Body)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return

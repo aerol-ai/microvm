@@ -50,11 +50,34 @@ func newAuthedRepo(registryRef, username, pat string) (*remote.Repository, error
 }
 
 // ModuleAuth carries the registry credentials for a BYO module pull/push.
-// Username is the AOCR login (tenant). PATPath is re-read on every call so a
-// rotated token takes effect without a restart, matching checkpoint semantics.
+// Username is the AOCR login.
+//
+// Two credential sources, by design:
+//   - PAT: an inline token. This is the PER-TENANT path — the token rides the
+//     create/push request (req.Registry.Password) and is never persisted in
+//     plaintext. Thousands of tenants each supply their own; nothing is
+//     configured globally.
+//   - PATPath: a token file. This is the SYSTEM path — the operator's identity
+//     for pulling the curated standard modules. Set once, re-read each call so
+//     rotation needs no restart.
+//
+// PAT wins when both are set.
 type ModuleAuth struct {
 	Username string
+	PAT      string
 	PATPath  string
+}
+
+// token resolves the effective credential: the inline per-tenant PAT if
+// present, else the system token file.
+func (a ModuleAuth) token() (string, error) {
+	if strings.TrimSpace(a.PAT) != "" {
+		return strings.TrimSpace(a.PAT), nil
+	}
+	if strings.TrimSpace(a.PATPath) == "" {
+		return "", fmt.Errorf("no registry credential: neither inline token nor PAT file set")
+	}
+	return readPATFile(a.PATPath)
 }
 
 // PushModuleArtifact uploads a single local .wasm file to registryRef as a
@@ -66,9 +89,9 @@ func PushModuleArtifact(ctx context.Context, a ModuleAuth, wasmPath, registryRef
 	if wasmPath == "" || registryRef == "" {
 		return "", fmt.Errorf("oras push module: wasm path and registry ref required")
 	}
-	pat, err := readPATFile(a.PATPath)
+	pat, err := a.token()
 	if err != nil {
-		return "", fmt.Errorf("oras push module: read PAT: %w", err)
+		return "", fmt.Errorf("oras push module: %w", err)
 	}
 
 	staging, err := os.MkdirTemp("", "aerol-wasm-module-push-*")
@@ -123,9 +146,9 @@ func PullModuleArtifact(ctx context.Context, a ModuleAuth, registryRef, dstDir s
 	if registryRef == "" || dstDir == "" {
 		return "", fmt.Errorf("oras pull module: registry ref and dst dir required")
 	}
-	pat, err := readPATFile(a.PATPath)
+	pat, err := a.token()
 	if err != nil {
-		return "", fmt.Errorf("oras pull module: read PAT: %w", err)
+		return "", fmt.Errorf("oras pull module: %w", err)
 	}
 	if err := os.MkdirAll(dstDir, 0o700); err != nil {
 		return "", err

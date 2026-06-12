@@ -21,6 +21,28 @@ type digestResolver interface {
 	ResolveByDigest(digest string) (*wasmmod.ResolvedModule, bool)
 }
 
+// authResolver is the optional capability to resolve under caller-supplied
+// per-tenant registry credentials. Type-asserted so simple fakes still work.
+type authResolver interface {
+	ResolveWithAuth(ctx context.Context, ref string, authOverride *wasmmod.ModuleAuth) (*wasmmod.ResolvedModule, error)
+}
+
+// resolveWithRequestAuth resolves ref, passing the request's registry
+// credentials (per-tenant) through to an oci:// pull when present. When the
+// request carries no creds, or the resolver predates the auth seam, it falls
+// back to the plain Resolve (system identity).
+func resolveWithRequestAuth(ctx context.Context, r ModuleResolver, ref string, reg *models.RegistryAuth) (*wasmmod.ResolvedModule, error) {
+	if reg != nil && (strings.TrimSpace(reg.Username) != "" || strings.TrimSpace(reg.Password) != "") {
+		if ar, ok := r.(authResolver); ok {
+			return ar.ResolveWithAuth(ctx, ref, &wasmmod.ModuleAuth{
+				Username: reg.Username,
+				PAT:      reg.Password,
+			})
+		}
+	}
+	return r.Resolve(ctx, ref)
+}
+
 // resolvePinned resolves a sandbox's module preferring the digest pinned at
 // create over the (mutable) ref. On a frozen-copy cache hit it boots the exact
 // original bytes; on a miss it re-resolves the ref but REFUSES to boot if the

@@ -1169,10 +1169,10 @@ type CreateWasmModuleRequest struct {
 	Entrypoint string `json:"entrypoint,omitempty"`
 }
 
-// PushWasmModuleResponse is returned by POST /v1/wasm-modules/push after a BYO
-// .wasm upload is validated and pushed to the registry. The caller references
-// ModuleRef (an oci:// ref) on a subsequent create, or registers it in the
-// catalogue.
+// PushWasmModuleResponse is returned by POST /v1/wasm-modules/push after the
+// daemon validates a BYO .wasm upload and forwards it to the registry. The
+// daemon stores nothing; the caller references ModuleRef (an oci:// ref) on a
+// subsequent create.
 type PushWasmModuleResponse struct {
 	ModuleRef string `json:"module_ref"`
 	Digest    string `json:"digest"`

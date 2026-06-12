@@ -397,9 +397,10 @@ type Config struct {
 	// WasmRegistryPATPath is the file holding the AOCR token for module pulls.
 	// SB_WASM_REGISTRY_PAT_PATH.
 	WasmRegistryPATPath string
-	// WasmRegistryPushHost is the AOCR host BYO module uploads
-	// (POST /v1/wasm-modules/push) are pushed to. Empty disables push.
-	// SB_WASM_REGISTRY_PUSH_HOST.
+	// WasmRegistryPushHost is the AOCR host the stateless module-push proxy
+	// (POST /v1/wasm-modules/push) forwards uploads to. Empty disables the
+	// proxy. The daemon never stores the bytes — it validates and forwards to
+	// AOCR under the caller's own PAT. SB_WASM_REGISTRY_PUSH_HOST.
 	WasmRegistryPushHost string
 	// WasmEngine selects the guest engine backend (wazero or wasmtime). Default wazero.
 	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
