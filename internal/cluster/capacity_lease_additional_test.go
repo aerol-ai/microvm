@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -63,5 +64,34 @@ func TestFetchMemberCapacityNoUrl(t *testing.T) {
 	_, err := c.fetchMemberCapacity(context.Background(), Member{NodeID: "m1", APIURL: ""})
 	if err == nil || err.Error() != "node m1 has no API URL for capacity heartbeat" {
 		t.Errorf("expected missing url error, got %v", err)
+	}
+}
+
+func TestFetchMemberCapacityFallsBackToPublicAPI(t *testing.T) {
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("try public"))
+	}))
+	defer internal.Close()
+
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16384})
+	}))
+	defer public.Close()
+
+	c := &Cluster{
+		httpClient:     public.Client(),
+		internalClient: internal.Client(),
+	}
+	snap, err := c.fetchMemberCapacity(context.Background(), Member{
+		NodeID:      "m1",
+		APIURL:      public.URL,
+		InternalURL: internal.URL,
+	})
+	if err != nil {
+		t.Fatalf("fetchMemberCapacity() error = %v", err)
+	}
+	if snap.HostCPUCores != 8 || snap.HostMemoryTotalMB != 16384 {
+		t.Fatalf("fetchMemberCapacity() snapshot = %+v", snap)
 	}
 }
