@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -22,51 +23,58 @@ func (s *Service) cleanupWasmSandboxArtifacts(ctx context.Context, sandbox *mode
 	// a rolling :latest tag; sandbox.WasmRegistryRef only names the most recent
 	// digest tag. Deleting just that ref would leak the older N-1 digest tags and
 	// the :latest tag in the registry — and once the wasm_checkpoint_pushes rows
-	// are gone there is no record left to GC them by, so the leak is permanent.
-	// Enumerate every tracked ref (+ :latest) and delete each first. Registry
-	// deletes are best-effort with loud logging, mirroring the caddy/image
-	// cleanup discipline elsewhere in the destroy path: a registry hiccup must
-	// not block the sandbox row from being removed.
+	// are gone there is no record left to GC them by, so the leak would be
+	// permanent.
 	//
-	// Residual tradeoff (phase 1): if a DeleteRef transiently fails we still drop
-	// the push-history rows below, so that specific manifest becomes an
-	// unrecoverable registry leak. Accepted because destroy cannot block on the
-	// registry; a future hardening is to hand failed refs to a janitor (like
-	// pending_image_gc) instead of dropping their tracking rows.
-	if s.wasmCheckpointPusher != nil {
-		refs := make(map[string]struct{})
-		if s.store != nil {
-			pushes, err := s.store.ListWasmCheckpointPushes(ctx, sandbox.ID)
-			if err != nil {
-				s.logger.Warn("wasm checkpoint push history list failed during cleanup",
-					"sandbox_id", sandbox.ID,
-					"error", err,
-				)
-			} else {
-				for _, p := range pushes {
-					if ref := strings.TrimSpace(p.RegistryRef); ref != "" {
-						refs[ref] = struct{}{}
-					}
-				}
-			}
+	// No-vacuum rule: a push-history row is the only record that ties a sandbox
+	// to its registry manifest, so a row is dropped ONLY after its ref is
+	// confirmed gone (DeleteRef returns nil — which now includes already-absent
+	// refs, see DeleteSnapshotRef). A ref whose delete transiently fails keeps
+	// its row, and the orphan-ref sweep in runWasmDurablePushSweep retries it
+	// after the sandbox row itself is gone. Destroy never blocks on the registry;
+	// it just declines to forget what it could not yet clean up.
+	if s.wasmCheckpointPusher != nil && s.store != nil {
+		pushes, err := s.store.ListWasmCheckpointPushes(ctx, sandbox.ID)
+		if err != nil {
+			s.logger.Warn("wasm checkpoint push history list failed during cleanup",
+				"sandbox_id", sandbox.ID,
+				"error", err,
+			)
 		}
-		if ref := strings.TrimSpace(sandbox.WasmRegistryRef); ref != "" {
-			refs[ref] = struct{}{}
-		}
-		if latest := strings.TrimSpace(s.wasmCheckpointPusher.DestRefTagged(sandbox.ID, "latest")); latest != "" {
-			refs[latest] = struct{}{}
-		}
-		for ref := range refs {
+		// The :latest rolling tag and any WasmRegistryRef not yet tracked by a
+		// push row have no tracking row to strand, so they are pure best-effort —
+		// a failure here is retried only via the per-row refs below or a manual
+		// cleanup, never leaving an untracked row behind.
+		for _, ref := range s.untrackedWasmRefs(sandbox, pushes) {
 			if err := s.wasmCheckpointPusher.DeleteRef(ctx, ref); err != nil {
 				s.logger.Warn("delete wasm checkpoint AOCR ref failed",
-					"sandbox_id", sandbox.ID,
-					"registry_ref", ref,
-					"error", err,
-				)
+					"sandbox_id", sandbox.ID, "registry_ref", ref, "error", err)
 			}
 		}
+		// Per-row refs: drop the row only when its manifest is confirmed gone.
+		for _, p := range pushes {
+			ref := strings.TrimSpace(p.RegistryRef)
+			if ref != "" {
+				if err := s.wasmCheckpointPusher.DeleteRef(ctx, ref); err != nil {
+					s.logger.Warn("delete wasm checkpoint AOCR ref failed; retaining tracking row for retry",
+						"sandbox_id", sandbox.ID, "registry_ref", ref, "error", err)
+					continue
+				}
+			}
+			if err := s.store.DeleteWasmCheckpointPush(ctx, p.ID); err != nil {
+				s.logger.Warn("delete wasm checkpoint push row failed",
+					"sandbox_id", sandbox.ID, "push_id", p.ID, "error", err)
+			}
+		}
+		if err := s.store.DeleteAllWasmStateKV(ctx, sandbox.ID); err != nil {
+			return err
+		}
+		return nil
 	}
 
+	// No pusher (durable AOCR push disabled — the common single-node / local
+	// case): there is no registry to leak into, so the tracking rows carry no
+	// recoverable obligation. Bulk-delete them as before.
 	if s.store != nil {
 		if err := s.store.DeleteAllWasmStateKV(ctx, sandbox.ID); err != nil {
 			return err
@@ -76,4 +84,30 @@ func (s *Service) cleanupWasmSandboxArtifacts(ctx context.Context, sandbox *mode
 		}
 	}
 	return nil
+}
+
+// untrackedWasmRefs returns the registry refs that have no push-history row to
+// strand — the rolling :latest tag and a WasmRegistryRef that is not already
+// covered by one of the supplied push rows. Deleting these is pure best-effort
+// (no row is dropped on success), so a transient failure here cannot leave an
+// orphaned tracking row.
+func (s *Service) untrackedWasmRefs(sandbox *models.Sandbox, pushes []store.WasmCheckpointPushRecord) []string {
+	tracked := make(map[string]struct{}, len(pushes))
+	for _, p := range pushes {
+		if ref := strings.TrimSpace(p.RegistryRef); ref != "" {
+			tracked[ref] = struct{}{}
+		}
+	}
+	var out []string
+	if latest := strings.TrimSpace(s.wasmCheckpointPusher.DestRefTagged(sandbox.ID, "latest")); latest != "" {
+		if _, ok := tracked[latest]; !ok {
+			out = append(out, latest)
+		}
+	}
+	if ref := strings.TrimSpace(sandbox.WasmRegistryRef); ref != "" {
+		if _, ok := tracked[ref]; !ok {
+			out = append(out, ref)
+		}
+	}
+	return out
 }

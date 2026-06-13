@@ -171,6 +171,99 @@ func TestCleanupWasmSandboxArtifacts_NonWasmNoop(t *testing.T) {
 	}
 }
 
+// flakyDeleteWasmCheckpointStore fails the first failBudget DeleteRef calls,
+// then succeeds. Lets the test prove a transient registry failure retains the
+// tracking row (no premature drop) and the orphan-ref sweep reclaims it later.
+type flakyDeleteWasmCheckpointStore struct {
+	recordingWasmCheckpointStore
+	failBudget int
+}
+
+func (f *flakyDeleteWasmCheckpointStore) DeleteRef(_ context.Context, ref string) error {
+	if f.failBudget > 0 {
+		f.failBudget--
+		return errors.New("transient registry failure")
+	}
+	f.deleted = append(f.deleted, ref)
+	return nil
+}
+
+// TestCleanupWasmSandboxArtifacts_NoVacuumOnDeleteFailure is the regression test
+// for the data-vacuum fix: when a registry DeleteRef fails transiently, destroy
+// must NOT drop the push-history row (doing so would strand the manifest with no
+// record left to GC by — a permanent leak). The row is retained, and once the
+// sandbox itself is gone the orphan-ref sweep retries the delete and reclaims
+// the row, leaving zero vacuum.
+func TestCleanupWasmSandboxArtifacts_NoVacuumOnDeleteFailure(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Every DeleteRef during cleanup fails; the per-digest tracking row must
+	// survive so the sweep can retry it.
+	pusher := &flakyDeleteWasmCheckpointStore{failBudget: 1 << 30}
+	svc := &Service{
+		logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:                st,
+		wasmCheckpointPusher: pusher,
+	}
+	ctx := context.Background()
+
+	const id = "wasm-leak"
+	sb := &models.Sandbox{
+		ID: id, Image: "registry/foo:wasm", Runtime: models.RuntimeWasm,
+		Status: models.SandboxStatusPassivated, Durability: models.DurabilityDurable,
+		ModuleRef: "registry/foo:wasm", WasmRegistryRef: "aocr://" + id + ":sha256-x",
+	}
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("store.Create: %v", err)
+	}
+	if _, err := st.InsertWasmCheckpointPush(ctx, id, "aocr://"+id+":sha256-x", "d"); err != nil {
+		t.Fatalf("InsertWasmCheckpointPush: %v", err)
+	}
+
+	if err := svc.cleanupWasmSandboxArtifacts(ctx, sb); err != nil {
+		t.Fatalf("cleanupWasmSandboxArtifacts: %v", err)
+	}
+	// The failed delete must have RETAINED the tracking row.
+	pushes, err := st.ListWasmCheckpointPushes(ctx, id)
+	if err != nil {
+		t.Fatalf("ListWasmCheckpointPushes: %v", err)
+	}
+	if len(pushes) != 1 {
+		t.Fatalf("failed DeleteRef should retain the tracking row, got %d rows", len(pushes))
+	}
+
+	// Sandbox row goes away (destroy completes). The row is now orphaned but the
+	// sweep should not yet reclaim it while DeleteRef keeps failing.
+	if err := st.Delete(ctx, id); err != nil {
+		t.Fatalf("store.Delete: %v", err)
+	}
+	orphans, err := st.ListOrphanedWasmCheckpointPushes(ctx, 0)
+	if err != nil {
+		t.Fatalf("ListOrphanedWasmCheckpointPushes: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("expected 1 orphaned push row, got %d", len(orphans))
+	}
+	svc.runWasmOrphanRefSweep(ctx) // DeleteRef still failing → row retained
+	if orphans, _ := st.ListOrphanedWasmCheckpointPushes(ctx, 0); len(orphans) != 1 {
+		t.Fatalf("orphan row must survive a failed sweep, got %d", len(orphans))
+	}
+
+	// Registry recovers: the next sweep deletes the ref and drops the row.
+	pusher.failBudget = 0
+	svc.runWasmOrphanRefSweep(ctx)
+	if orphans, _ := st.ListOrphanedWasmCheckpointPushes(ctx, 0); len(orphans) != 0 {
+		t.Fatalf("orphan-ref sweep must reclaim the row once DeleteRef succeeds, got %d", len(orphans))
+	}
+	if len(pusher.deleted) != 1 || pusher.deleted[0] != "aocr://"+id+":sha256-x" {
+		t.Fatalf("sweep deleted refs = %v, want the retained per-digest ref", pusher.deleted)
+	}
+}
+
 func TestCleanupWasmSandboxArtifacts_ErrorBranches(t *testing.T) {
 	ctx := context.Background()
 	svc, st, _ := newAOCRCleanupTestService(t)
