@@ -22,7 +22,8 @@ const (
 	EnvBaseURL  = "AEROL_BASE_URL" // e.g. https://abc.itest.example.com or http://localhost:21212
 	EnvPAT      = "AEROL_PAT"
 	EnvScenario = "AEROL_SCENARIO"
-	EnvCaps     = "AEROL_CAPS" // path to the scenario caps.yml
+	EnvCaps     = "AEROL_CAPS"   // path to the scenario caps.yml
+	EnvDomain   = "AEROL_DOMAIN" // leased apex domain; empty in local-mode
 )
 
 // LoadScenario builds a Scenario from the environment. It reads the caps file
@@ -61,7 +62,13 @@ func LoadScenario() (*Scenario, error) {
 	for _, c := range cf.Capabilities {
 		caps[c] = true
 	}
-	return &Scenario{Name: name, BaseURL: base, PAT: pat, caps: caps}, nil
+	return &Scenario{
+		Name:    name,
+		BaseURL: base,
+		PAT:     pat,
+		Domain:  os.Getenv(EnvDomain),
+		caps:    caps,
+	}, nil
 }
 
 // parseCaps is split out so skip_test.go can exercise capability parsing with

@@ -1,11 +1,19 @@
 # Integration Test Harness — Plan
 
-Status: **Phase 0 BUILT** (branch `integration-test-harness`). Offline parts
-verified: harness self-tests, report classifier, prod-safety tripwires all pass
-in `make test`; the live suite compiles under `-tags=integration`; Terraform
-validates with a config_dir + spot dynamic block. The actual on-AWS green run is
-the operator's to trigger (`make integration-single`) — it needs creds +
-`domains.yml`. Phases 1-3 below are not built yet.
+Status: **Phases 0-3 BUILT** (branch `integration-test-harness`). All 65 use
+cases (UC-01..UC-66) have tests; all four scenarios (local-mode, single-node,
+cluster-3-mixed, cluster-hetero) have tfvars + caps; `--metal-on-demand` is
+wired (`force_on_demand` flips firecracker bare-metal off spot, zero-diff for
+prod); the config overlay enables wasm per the scenario's caps; a
+`workflow_dispatch` CI (`.github/workflows/integration.yml`) runs any scenario
+on demand. Offline parts verified: harness self-tests, report classifier,
+prod-safety tripwires pass in `make test`; the full live suite compiles under
+`-tags=integration`; `terraform validate`/`fmt` clean. The actual on-AWS green
+runs are the operator's to trigger (`make integration-single` /
+`integration-cluster-mixed` / `integration-cluster-hetero`) — they need creds +
+`domains.yml`. Per-SDK live smoke (the optional tail of Phase 3) is intentionally
+deferred — the Go suite already provides live SDK coverage; revisit only if
+cross-SDK parity needs live proof.
 
 ## 1. Goal
 

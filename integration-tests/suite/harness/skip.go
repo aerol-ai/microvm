@@ -7,7 +7,12 @@ type Scenario struct {
 	Name    string
 	BaseURL string
 	PAT     string
-	caps    map[Capability]bool
+	// Domain is the leased apex domain for domain-bearing scenarios (empty in
+	// local-mode). Tests that build hostnames under the wildcard zone — e.g.
+	// the custom-domain reachability use case — read it. The wildcard
+	// *.<Domain> record already points at ingress, so any label resolves.
+	Domain string
+	caps   map[Capability]bool
 }
 
 // Has reports whether the scenario advertises a capability.

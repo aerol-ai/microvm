@@ -282,6 +282,12 @@ variable "nodes" {
 # Install.sh feature defaults (per-node overrides live in var.nodes)
 ###############################################################################
 
+variable "force_on_demand" {
+  description = "When true, firecracker (bare-metal) nodes are launched on-demand even if their node spec sets spot=true. The integration harness sets this via --metal-on-demand when *.metal spot capacity is scarce. Cheap t3 spot nodes are unaffected. Defaults false so production (which never sets spot) renders identically."
+  type        = bool
+  default     = false
+}
+
 variable "default_with_firecracker" {
   description = "Enable Firecracker runtime wiring on nodes that do not override it. Worker-capable nodes only. Bootstrap installs host deps, optionally downloads firecracker/jailer/kernel artifacts, and writes SB_ENABLE_FIRECRACKER + related SB_FIRECRACKER_* env."
   type        = bool

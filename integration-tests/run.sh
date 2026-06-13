@@ -64,7 +64,8 @@ teardown() {
   TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
     terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
-    -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" || \
+    -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
+    -var="force_on_demand=$(on_demand_tfvar)" || \
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
 }
 
@@ -74,10 +75,27 @@ lease_domain() {
   yq -r '.itest.domains[0]' "$DOMAINS_FILE"
 }
 
+# on_demand_tfvar maps the --metal-on-demand flag to the force_on_demand TF var
+# (flips firecracker bare-metal nodes off spot; cheap t3 spot nodes unaffected).
+on_demand_tfvar() {
+  [[ "$METAL_ON_DEMAND" == "1" ]] && echo "true" || echo "false"
+}
+
 run_one() {
   local scenario="$1"
   local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
   local overlay="${sdir}/config"
+
+  # Preflight: a scenario is fully described by its tfvars + caps.yml. Fail
+  # cleanly here rather than mid-terraform when one is missing (e.g. `all`
+  # running before a scenario's files exist).
+  local tfvars_file="${HERE}/scenarios/${scenario}.tfvars"
+  local caps_file="${HERE}/scenarios/${scenario}.caps.yml"
+  if [[ ! -f "$tfvars_file" || ! -f "$caps_file" ]]; then
+    echo "scenario ${scenario}: missing $(basename "$tfvars_file") or $(basename "$caps_file")" >&2
+    return 2
+  fi
+
   mkdir -p "$overlay"
 
   local prod_domain leased cluster_name state_key
@@ -85,9 +103,12 @@ run_one() {
   cluster_name="aerolvm-itest-${scenario}"
   state_key="integration/${scenario}/terraform.tfstate"
 
-  local caps_domain
-  caps_domain=$(grep -q 'domain' "${HERE}/scenarios/${scenario}.caps.yml" && echo 1 || echo 0)
-  if [[ "$caps_domain" == "1" ]]; then
+  # Capability checks read the structured list (not a substring grep, which
+  # would false-match the word "domain" in a caps-file comment).
+  local caps_domain caps_wasm
+  caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file")
+  caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
+  if [[ "$caps_domain" == "true" ]]; then
     leased=$(lease_domain)
   else
     leased="" # local-mode: no domain
@@ -100,9 +121,13 @@ run_one() {
   # set the leased domain. Secrets are symlinked (never copied).
   local acme_issuer="https://acme-staging-v02.api.letsencrypt.org/directory"
   [[ "$PROD_TLS" == "1" ]] && acme_issuer="" # empty -> Caddy default (prod LE)
+  # wasm.enabled follows the scenario's wasm capability so the wasm worker can
+  # actually run modules (the wasm-runtime UCs still gate on a staged module
+  # ref via AEROL_WASM_MODULE_REF; this just turns the runtime on).
   yq '.auto_import.enabled = false
       | .mirror.host = ""
       | .fleet_control_plane.enabled = false
+      | .wasm.enabled = '"$caps_wasm"'
       | (.ingress.acme_ca // "") = "'"$acme_issuer"'"
       | (.ingress.domain_name) = "'"${leased}"'"' \
     "$CONFIG_CLUSTER" > "${overlay}/cluster.yml"
@@ -116,7 +141,8 @@ run_one() {
   # shellcheck disable=SC2046
   TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" apply -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
-    -var="config_dir=${overlay}"
+    -var="config_dir=${overlay}" \
+    -var="force_on_demand=$(on_demand_tfvar)"
 
   # Discover endpoint.
   local targets base_url pat
@@ -124,7 +150,7 @@ run_one() {
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
 
   local inconclusive=0
-  if [[ "$caps_domain" == "1" ]]; then
+  if [[ "$caps_domain" == "true" ]]; then
     base_url=$(echo "$targets" | jq -r '.base_url')
     wait_for_dns "$leased" || inconclusive=1
     wait_for_tls "$leased" || inconclusive=1
@@ -137,6 +163,11 @@ run_one() {
     base_url="http://localhost:21212"
     wait_for_health "$base_url" "$pat" || inconclusive=1
   fi
+
+  # Expected cluster size, if the scenario's caps.yml declares one. Drives
+  # AEROL_EXPECTED_MEMBERS so the cluster UCs assert an exact node count.
+  local expected_members
+  expected_members=$(yq -r '.expected_members // ""' "$caps_file")
 
   mkdir -p "${HERE}/reports"
   local json_out="${sdir}/test.json"
@@ -151,7 +182,9 @@ run_one() {
   echo "=== running suite against ${base_url} ==="
   set +e
   AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
-    AEROL_CAPS="${HERE}/scenarios/${scenario}.caps.yml" \
+    AEROL_CAPS="${caps_file}" \
+    AEROL_DOMAIN="${leased}" \
+    AEROL_EXPECTED_MEMBERS="${expected_members}" \
     go test -tags=integration -json ./integration-tests/suite/... > "$json_out"
   set -e
 
