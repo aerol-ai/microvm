@@ -101,6 +101,25 @@ func TestDeleteSnapshotRefMissingManifest(t *testing.T) {
 	}
 }
 
+// TestDeleteSnapshotRefResolveError covers the non-not-found resolve branch: a
+// transport-level failure (registry unreachable) must surface as an error, NOT
+// be swallowed like not-found — otherwise the caller would wrongly drop a
+// tracking row for a manifest that may still exist.
+func TestDeleteSnapshotRefResolveError(t *testing.T) {
+	reg := startTestOCIRegistry(t, "cluster/wasm-checkpoints/unreachable")
+	ref := reg.ref("latest")
+	reg.close() // server down → Resolve gets a connection error, not a 404
+
+	patFile := filepath.Join(t.TempDir(), "pat")
+	if err := os.WriteFile(patFile, []byte("cluster-pat"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}
+	if err := DeleteSnapshotRef(context.Background(), cfg, ref); err == nil {
+		t.Fatal("a transport error must not be treated as success")
+	}
+}
+
 func TestDeleteSnapshotRefRoundTrip(t *testing.T) {
 	reg := startTestOCIRegistry(t, "cluster/wasm-checkpoints/sb-del")
 	defer reg.close()

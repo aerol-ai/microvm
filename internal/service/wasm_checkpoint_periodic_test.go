@@ -170,6 +170,12 @@ func TestWasmPeriodicAndDurableSweepErrorBranches(t *testing.T) {
 		}
 		svc.runWasmDurablePushSweep(ctx)
 	})
+
+	t.Run("orphan-ref sweep no-op without pusher", func(t *testing.T) {
+		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.wasmCheckpointPusher = nil // push disabled (single-node / local)
+		svc.runWasmOrphanRefSweep(ctx) // must return without touching the store
+	})
 }
 
 func TestWasmPeriodicAndDurableSweepFilterBranches(t *testing.T) {

@@ -77,3 +77,22 @@ func TestListOrphanedWasmCheckpointPushes(t *testing.T) {
 		t.Fatalf("orphans = %+v, want exactly [sb-gone]", orphans)
 	}
 }
+
+// TestListByRuntime_QueryErrorOnClosedDB covers the query-error branch.
+func TestListByRuntime_QueryErrorOnClosedDB(t *testing.T) {
+	st := newTestStore(t)
+	_ = st.Close()
+	if _, err := st.ListByRuntime(context.Background(), models.RuntimeWasm); err == nil {
+		t.Fatal("ListByRuntime on a closed DB must return an error")
+	}
+}
+
+// TestListOrphanedWasmCheckpointPushes_QueryErrorOnClosedDB covers the
+// query-error branch.
+func TestListOrphanedWasmCheckpointPushes_QueryErrorOnClosedDB(t *testing.T) {
+	st := newTestStore(t)
+	_ = st.Close()
+	if _, err := st.ListOrphanedWasmCheckpointPushes(context.Background(), 0); err == nil {
+		t.Fatal("ListOrphanedWasmCheckpointPushes on a closed DB must return an error")
+	}
+}
