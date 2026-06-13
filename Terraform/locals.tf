@@ -4,14 +4,17 @@ locals {
   # into /etc/sandboxd/cluster.env so day-0 (terraform apply) and day-2
   # (ansible-playbook configure-ops.yml) can't drift. Tool-specific concerns
   # — cluster topology, cloud creds — stay in terraform.tfvars.
-  cluster_ops = yamldecode(file("${path.module}/../config/cluster.yml"))
+  # config_dir resolves to the override when set, else the repo's ../config.
+  # Centralised so both the cluster.yml and secrets.yml reads use one source.
+  config_dir  = var.config_dir != "" ? var.config_dir : "${path.module}/../config"
+  cluster_ops = yamldecode(file("${local.config_dir}/cluster.yml"))
 
   # Cluster SECRETS (shared SB_PAT_TOKEN + AOCR wrap key + cluster PAT) live
   # in the parallel SoT file ../config/secrets.yml. Gitignored; operators
   # bootstrap with `cp config/secrets.example.yml config/secrets.yml`.
   # sensitive() marks the whole decoded tree so values stay redacted in plan
   # / apply output and propagate through any references into resource args.
-  cluster_secrets = sensitive(yamldecode(file("${path.module}/../config/secrets.yml")))
+  cluster_secrets = sensitive(yamldecode(file("${local.config_dir}/secrets.yml")))
 
   # Shared cluster-identity values that both Terraform (day-0 cloud-init +
   # DNS records) and Ansible (day-2 rotation) read from the SoT. Lifted into
@@ -53,6 +56,7 @@ locals {
       idle_timeout_min = n.idle_timeout_min == null ? var.default_idle_timeout_min : n.idle_timeout_min
       extra_user_data  = n.extra_user_data
       tags             = n.tags
+      spot             = n.spot
     }
   }
 

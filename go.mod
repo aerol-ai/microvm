@@ -20,10 +20,11 @@ require (
 	github.com/tetratelabs/wazero v1.12.0
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
+	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.5.0
 )
 
-require github.com/opencontainers/go-digest v1.0.0 // indirect
+require github.com/opencontainers/go-digest v1.0.0
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect

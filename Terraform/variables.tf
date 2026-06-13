@@ -23,6 +23,17 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+# config_dir lets a caller point Terraform at an alternative directory holding
+# cluster.yml + secrets.yml instead of the repo's ../config. The integration
+# test harness uses this to feed a scenario-specific overlay (generated at
+# runtime) WITHOUT touching the operator's real config/. Default preserves the
+# original hardcoded path exactly, so prod behaviour is unchanged.
+variable "config_dir" {
+  description = "Directory containing cluster.yml + secrets.yml. Defaults to the repo ../config. Override only for integration tests."
+  type        = string
+  default     = ""
+}
+
 variable "aws_profile" {
   description = "Optional AWS shared-credentials profile name. Empty to use the default chain (env vars, instance role, etc)."
   type        = string
@@ -199,6 +210,10 @@ variable "nodes" {
     idle_timeout_min  = optional(number)
     extra_user_data   = optional(string, "")
     tags              = optional(map(string), {})
+    # spot requests this node as an EC2 spot instance (one-time, terminate on
+    # reclaim). Default false → on-demand, identical to prior behaviour. Only
+    # the integration test harness sets this true; prod node maps omit it.
+    spot = optional(bool, false)
   }))
   default = {
     node1 = { role = "mixed", seed = true }

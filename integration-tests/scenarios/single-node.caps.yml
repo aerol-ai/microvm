@@ -1,0 +1,6 @@
+# Capabilities the single-node scenario can satisfy. The suite skips any use
+# case whose required capabilities aren't all present here.
+name: single-node
+capabilities:
+  - docker
+  - domain

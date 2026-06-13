@@ -93,3 +93,8 @@ pkg/wasm/testdata/wasip1-http.wasm
 internal/store/invalid-dsn:::
 internal/store/invalid-dsn:::-shm
 internal/store/invalid-dsn:::-wal
+# Integration test harness (plans/integration-tests.md)
+integration-tests/.tf/                       
+integration-tests/reports/*                  
+!integration-tests/reports/.gitignore
+integration-tests/scenarios/domains.yml

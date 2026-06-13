@@ -1,7 +1,8 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean
+.PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
+	integration-local integration-single integration-cluster-mixed integration-cluster-hetero integration-all integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -41,3 +42,26 @@ docs-build:
 
 clean:
 	rm -rf $(BIN_DIR)
+
+# Integration test harness (see integration-tests/README.md). These provision
+# REAL AWS via the prod TF module against isolated state — they cost money and
+# need creds + integration-tests/scenarios/domains.yml. The suite itself is
+# behind the `integration` build tag, so `make test` above never touches AWS.
+integration-local:
+	integration-tests/run.sh local-mode
+
+integration-single:
+	integration-tests/run.sh single-node
+
+integration-cluster-mixed:
+	integration-tests/run.sh cluster-3-mixed
+
+integration-cluster-hetero:
+	integration-tests/run.sh cluster-hetero
+
+integration-all:
+	integration-tests/run.sh all
+
+# Cost safety net: terminate leaked itest instances past their ttl.
+integration-reap:
+	scripts/integration-reap.sh

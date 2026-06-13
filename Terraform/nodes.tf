@@ -36,6 +36,21 @@ resource "aws_instance" "seed" {
     http_put_response_hop_limit = 2
   }
 
+  # Spot is opt-in per node. The dynamic block emits ZERO blocks when spot is
+  # false, so an on-demand (prod) node renders byte-identical to before this
+  # field existed — `terraform plan` shows no diff. one-time + terminate means
+  # a reclaimed integration node is gone, not stopped (ephemeral test intent).
+  dynamic "instance_market_options" {
+    for_each = local.seed_node.spot ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        spot_instance_type             = "one-time"
+        instance_interruption_behavior = "terminate"
+      }
+    }
+  }
+
   user_data_replace_on_change = true
 
   user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
@@ -183,6 +198,19 @@ resource "aws_instance" "joiner" {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
     http_put_response_hop_limit = 2
+  }
+
+  # See the seed resource for the rationale: zero blocks when spot=false keeps
+  # on-demand (prod) joiners diff-free.
+  dynamic "instance_market_options" {
+    for_each = each.value.spot ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        spot_instance_type             = "one-time"
+        instance_interruption_behavior = "terminate"
+      }
+    }
   }
 
   user_data_replace_on_change = true

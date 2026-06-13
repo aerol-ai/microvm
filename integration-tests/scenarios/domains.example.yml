@@ -1,0 +1,17 @@
+# Test-domain pool. Copy to domains.yml (gitignored) and fill in REAL FQDNs you
+# control in the same Cloudflare account. These MUST be distinct from your prod
+# domain (the tripwire in provision.sh aborts on a collision).
+#
+#   cp integration-tests/scenarios/domains.example.yml \
+#      integration-tests/scenarios/domains.yml
+#
+# One domain is leased per domain-bearing scenario so each gets its own Let's
+# Encrypt quota. custom_domain is a separate FQDN (not under any pool entry)
+# for the custom-domain use cases (UC-35/36), which the server rejects if the
+# hostname sits under the deployment base domain.
+itest:
+  domains:
+    - one.itest.example.com
+    - two.itest.example.com
+    - three.itest.example.com
+  custom_domain: customer.example.net
