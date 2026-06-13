@@ -131,6 +131,15 @@ run_one() {
       | (.ingress.acme_ca // "") = "'"$acme_issuer"'"
       | (.ingress.domain_name) = "'"${leased}"'"' \
     "$CONFIG_CLUSTER" > "${overlay}/cluster.yml"
+
+  # When the scenario advertises wasm, stage the curated language runtimes by
+  # splicing fixtures/wasm/modules.yml (url + sha256 per module) into
+  # wasm.standard_modules. Nodes fetch + verify them at boot under their alias
+  # (python/ruby/php), so the wasm-runtime UC has something real to run.
+  if [[ "$caps_wasm" == "true" ]]; then
+    yq -i '.wasm.standard_modules = load("'"${HERE}/fixtures/wasm/modules.yml"'").standard_modules' \
+      "${overlay}/cluster.yml"
+  fi
   ln -sf "${REPO_ROOT}/config/secrets.yml" "${overlay}/secrets.yml"
 
   trap "teardown '${scenario}'" EXIT INT TERM
@@ -169,6 +178,11 @@ run_one() {
   local expected_members
   expected_members=$(yq -r '.expected_members // ""' "$caps_file")
 
+  # For wasm-capable scenarios the runtime UC references a staged standard
+  # module by alias; default to python (override by exporting the env var).
+  local wasm_ref=""
+  [[ "$caps_wasm" == "true" ]] && wasm_ref="${AEROL_WASM_MODULE_REF:-python}"
+
   mkdir -p "${HERE}/reports"
   local json_out="${sdir}/test.json"
   if [[ "$inconclusive" == "1" ]]; then
@@ -185,6 +199,7 @@ run_one() {
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
+    AEROL_WASM_MODULE_REF="${wasm_ref}" \
     go test -tags=integration -json ./integration-tests/suite/... > "$json_out"
   set -e
 

@@ -100,9 +100,12 @@ func TestWasmModuleRegisterListGet(t *testing.T) {
 	harness.Require(t, sc, "UC-51")
 	c := client(t)
 
-	ref := os.Getenv("AEROL_WASM_MODULE_REF")
+	// Distinct from AEROL_WASM_MODULE_REF (a staged standard-module alias the
+	// runtime UC uses): registering via the catalogue API needs a ref the node
+	// can actually pull, inside wasm.registry_allowlist. Operator-supplied.
+	ref := os.Getenv("AEROL_WASM_REGISTER_REF")
 	if ref == "" {
-		t.Skip("AEROL_WASM_MODULE_REF not set (oci ref of a staged .wasm)")
+		t.Skip("AEROL_WASM_REGISTER_REF not set (allowlisted oci ref to register)")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
