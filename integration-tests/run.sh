@@ -104,7 +104,7 @@ run_one() {
       | .mirror.host = ""
       | .fleet_control_plane.enabled = false
       | (.ingress.acme_ca // "") = "'"$acme_issuer"'"
-      | (.ingress.domain_name) = "'"${leased:-localhost}"'"' \
+      | (.ingress.domain_name) = "'"${leased}"'"' \
     "$CONFIG_CLUSTER" > "${overlay}/cluster.yml"
   ln -sf "${REPO_ROOT}/config/secrets.yml" "${overlay}/secrets.yml"
 

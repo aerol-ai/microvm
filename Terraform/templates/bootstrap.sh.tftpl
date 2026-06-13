@@ -101,6 +101,12 @@ if [ -n '${domain}' ]; then
     --dns-provider cloudflare
     --dns-api-token '${cloudflare_api_token}'
   )
+else
+  # No domain => local-mode install: no Caddy, no DNS-01 TLS, API bound on
+  # localhost:21212. Used by the integration harness's local-mode scenario,
+  # which reaches the box over an SSH tunnel. Prod/cluster always set a domain,
+  # so this branch never fires for them.
+  INSTALL_ARGS+=(--local)
 fi
 # Register an ACME contact email so Let's Encrypt can notify on cert expiry,
 # revocation, and rate-limit triage. Empty string => omit the flag and Caddy

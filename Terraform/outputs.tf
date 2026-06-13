@@ -35,8 +35,8 @@ output "ingress_hostname" {
 # No public ingress (e.g. a pure local-mode box) → empty; the harness falls
 # back to an SSH-tunnelled http://localhost:21212.
 output "api_base_url" {
-  description = "Base URL for the control-plane API. https://<domain> in domain mode, empty when there is no public ingress."
-  value       = local.has_public_ingress ? "https://${local.domain_name}" : ""
+  description = "Base URL for the control-plane API. https://<domain> in domain mode, empty in local-mode (no domain) where the harness tunnels to localhost:21212."
+  value       = local.has_domain ? "https://${local.domain_name}" : ""
 }
 
 # Machine-readable target descriptor so run.sh doesn't have to parse the human
@@ -45,7 +45,7 @@ output "api_base_url" {
 output "integration_targets" {
   description = "Structured targets for the integration harness: base URL, ingress IP, domain, and per-node role/IPs."
   value = {
-    base_url   = local.has_public_ingress ? "https://${local.domain_name}" : ""
+    base_url   = local.has_domain ? "https://${local.domain_name}" : ""
     domain     = local.domain_name
     ingress_ip = local.has_public_ingress ? local.all_instances[local.ingress_node_names[0]].public_ip : ""
     seed_ip    = aws_instance.seed.public_ip
