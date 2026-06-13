@@ -217,6 +217,10 @@ func Open(path string) (*Store, error) {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
+		// idx_sandboxes_runtime backs ListByRuntime so the per-runtime background
+		// sweeps (wasm periodic checkpoint, wasm durable-push retry) scan only
+		// their own rows instead of the full mixed-runtime fleet on every tick.
+		`CREATE INDEX IF NOT EXISTS idx_sandboxes_runtime ON sandboxes(runtime);`,
 		// idx_sandboxes_image powers HasActiveImageRef so image GC stays
 		// constant-cost as the destroyed-row history grows beyond the live
 		// sandbox count. Plain (image) is sufficient: SQLite filters on
@@ -1124,6 +1128,57 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by owner: %w", err)
+	}
+	return sandboxes, nil
+}
+
+// ListByRuntime returns the sandboxes for one runtime ("wasm", "firecracker",
+// "docker"), newest first. It is the runtime-scoped counterpart of List: the
+// per-runtime background sweeps (wasm periodic checkpoint, wasm durable-push
+// retry) use it instead of List so they scan only their own rows rather than
+// the whole fleet on every tick — at a node packing thousands of mixed-runtime
+// sandboxes, List would load (and scanSandbox-decode) every docker/firecracker
+// row just to filter them back out. Like ListByOwner, ports and custom domains
+// are not attached: the sweep callers only need identity + lifecycle fields.
+func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sandbox, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
+			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
+			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
+			failover_policy,
+			runtime, gpus_json,
+			net_bytes_in, net_bytes_out, net_bytes_in_limit, net_bytes_out_limit,
+			net_quota_exceeded, net_quota_exceeded_at,
+			registry_auth_sealed,
+			auto_import_pending,
+			serverless, wake_armed,
+			template_id,
+			overlay_size_gb,
+			durability,
+			module_ref, module_digest,
+			checkpoint_path, clone_generation,
+			wasm_registry_ref, wasm_registry_digest,
+			owner_ref, fleet_suspended
+		FROM sandboxes
+		WHERE runtime = ?
+		ORDER BY created_at DESC
+	`, strings.TrimSpace(runtime))
+	if err != nil {
+		return nil, fmt.Errorf("list sandboxes by runtime: %w", err)
+	}
+	defer rows.Close()
+
+	var sandboxes []*models.Sandbox
+	for rows.Next() {
+		sandbox, err := scanSandbox(rows)
+		if err != nil {
+			return nil, err
+		}
+		sandboxes = append(sandboxes, sandbox)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sandboxes by runtime: %w", err)
 	}
 	return sandboxes, nil
 }
@@ -4734,6 +4789,38 @@ func (s *Store) ListWasmCheckpointPushes(ctx context.Context, sandboxID string) 
 		ORDER BY pushed_at DESC, id DESC`, strings.TrimSpace(sandboxID))
 	if err != nil {
 		return nil, fmt.Errorf("list wasm checkpoint pushes: %w", err)
+	}
+	defer rows.Close()
+	var out []WasmCheckpointPushRecord
+	for rows.Next() {
+		var rec WasmCheckpointPushRecord
+		if err := rows.Scan(&rec.ID, &rec.SandboxID, &rec.RegistryRef, &rec.Digest, &rec.PushedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// ListOrphanedWasmCheckpointPushes returns push-history rows whose sandbox no
+// longer exists, capped at limit (<=0 means a default cap). These are the rows
+// a destroy/reconcile retained because its registry DeleteRef had not yet
+// succeeded; the orphan-ref sweep retries each ref and drops the row once the
+// manifest is confirmed gone, so the tracking table can never leak unbounded
+// rows for sandboxes that are already gone.
+func (s *Store) ListOrphanedWasmCheckpointPushes(ctx context.Context, limit int) ([]WasmCheckpointPushRecord, error) {
+	if limit <= 0 {
+		limit = 256
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT p.id, p.sandbox_id, p.registry_ref, p.digest, p.pushed_at
+		FROM wasm_checkpoint_pushes p
+		LEFT JOIN sandboxes s ON s.id = p.sandbox_id
+		WHERE s.id IS NULL
+		ORDER BY p.pushed_at ASC, p.id ASC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list orphaned wasm checkpoint pushes: %w", err)
 	}
 	defer rows.Close()
 	var out []WasmCheckpointPushRecord

@@ -83,6 +83,11 @@ func TestPushPullSnapshotArtifactRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDeleteSnapshotRefMissingManifest pins the documented contract: a ref that
+// is already absent is the success state for a delete. This is load-bearing for
+// the no-vacuum checkpoint cleanup — the caller drops its tracking row only when
+// DeleteRef returns nil, so an already-gone manifest must NOT look like a
+// failure (otherwise the row would be retained and retried forever).
 func TestDeleteSnapshotRefMissingManifest(t *testing.T) {
 	reg := startTestOCIRegistry(t, "cluster/wasm-checkpoints/missing")
 	defer reg.close()
@@ -91,8 +96,8 @@ func TestDeleteSnapshotRefMissingManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := ORASPushConfig{Host: "h", ClusterID: "c1", PATPath: patFile}
-	if err := DeleteSnapshotRef(context.Background(), cfg, reg.ref("latest")); err == nil {
-		t.Fatal("expected resolve error for missing manifest")
+	if err := DeleteSnapshotRef(context.Background(), cfg, reg.ref("latest")); err != nil {
+		t.Fatalf("missing manifest must be treated as success, got: %v", err)
 	}
 }
 

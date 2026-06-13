@@ -490,20 +490,9 @@ func (s *Service) StartTemplateGC(ctx context.Context) {
 	if interval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(interval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				s.runTemplateGC(sweepCtx, time.Now())
-				cancel()
-			}
-		}
-	}()
+	s.startPeriodic(ctx, interval, 30*time.Second, func(c context.Context) {
+		s.runTemplateGC(c, time.Now())
+	})
 }
 
 // runTemplateGC is one pass of the template janitor. Split from

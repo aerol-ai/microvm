@@ -3680,8 +3680,15 @@ func (s *Service) reconcileMissingSelfOwnedPlacements(ctx context.Context, known
 // fallback for sandboxes that don't declare any per-sandbox timers. Without
 // either configured, the sweep still runs but is a no-op — kept on so a
 // later UpdateLifecycle call doesn't need to start a goroutine.
-func (s *Service) StartLifecycleSweep(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
+// startPeriodic runs sweep on an interval ticker in its own goroutine until ctx
+// is cancelled, handing each invocation a fresh timeout-bounded context. It is
+// the single home for the daemon's background-sweep skeleton: reconcile, the
+// lifecycle sweep, both image janitors, the template janitor, and the wasm
+// module/checkpoint sweeps were each an identical copy of this select-loop
+// before. Callers keep their own enable/interval guards (the cadence and
+// preconditions differ per task); only the loop boilerplate is shared here.
+func (s *Service) startPeriodic(ctx context.Context, interval, timeout time.Duration, sweep func(context.Context)) {
+	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
 		for {
@@ -3689,12 +3696,16 @@ func (s *Service) StartLifecycleSweep(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				s.runLifecycleSweep(sweepCtx)
+				sweepCtx, cancel := context.WithTimeout(ctx, timeout)
+				sweep(sweepCtx)
 				cancel()
 			}
 		}
 	}()
+}
+
+func (s *Service) StartLifecycleSweep(ctx context.Context) {
+	s.startPeriodic(ctx, time.Minute, 30*time.Second, s.runLifecycleSweep)
 }
 
 func (s *Service) runLifecycleSweep(ctx context.Context) {
@@ -4105,20 +4116,9 @@ func (s *Service) StartBuiltImageGC(ctx context.Context) {
 		s.logger.Warn("built-image GC disabled: docker events client is nil")
 		return
 	}
-	ticker := time.NewTicker(interval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				s.runBuiltImageGC(sweepCtx, s.events.ListBuiltImages)
-				cancel()
-			}
-		}
-	}()
+	s.startPeriodic(ctx, interval, 30*time.Second, func(c context.Context) {
+		s.runBuiltImageGC(c, s.events.ListBuiltImages)
+	})
 }
 
 // builtImageListFn is the indirection runBuiltImageGC takes so tests can
@@ -4177,20 +4177,7 @@ func (s *Service) StartPendingImageGC(ctx context.Context) {
 	if interval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(interval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				s.runPendingImageGC(sweepCtx)
-				cancel()
-			}
-		}
-	}()
+	s.startPeriodic(ctx, interval, 30*time.Second, s.runPendingImageGC)
 }
 
 // pendingImageGCSweepLimit caps how many ledger rows one sweep
@@ -4277,22 +4264,11 @@ func (s *Service) StartReconcileLoop(ctx context.Context) {
 	if interval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(interval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				if err := s.Reconcile(reconcileCtx); err != nil {
-					s.logger.Warn("periodic reconcile failed", "error", err)
-				}
-				cancel()
-			}
+	s.startPeriodic(ctx, interval, 30*time.Second, func(c context.Context) {
+		if err := s.Reconcile(c); err != nil {
+			s.logger.Warn("periodic reconcile failed", "error", err)
 		}
-	}()
+	})
 }
 
 func (s *Service) StartClusterIngressReconcile(ctx context.Context) {

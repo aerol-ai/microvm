@@ -18,25 +18,14 @@ func (s *Service) StartWasmModuleGC(ctx context.Context) {
 	if interval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(interval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				s.runWasmModuleGC(sweepCtx, time.Now())
-				// Catalogue GC reclaims rows; cache GC reclaims the on-disk
-				// content-addressed bytes those rows (and bare oci:// pulls) leave
-				// behind. Run it second so a row deleted above frees its digest for
-				// eviction in the same sweep.
-				s.runWasmCacheGC(sweepCtx, time.Now())
-				cancel()
-			}
-		}
-	}()
+	s.startPeriodic(ctx, interval, 30*time.Second, func(c context.Context) {
+		s.runWasmModuleGC(c, time.Now())
+		// Catalogue GC reclaims rows; cache GC reclaims the on-disk
+		// content-addressed bytes those rows (and bare oci:// pulls) leave
+		// behind. Run it second so a row deleted above frees its digest for
+		// eviction in the same sweep.
+		s.runWasmCacheGC(c, time.Now())
+	})
 }
 
 func (s *Service) runWasmModuleGC(ctx context.Context, now time.Time) {
