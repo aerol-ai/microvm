@@ -153,13 +153,12 @@ func TestMarkSnapshotCorrupt_IdempotentUnderConcurrency(t *testing.T) {
 		t.Fatal("rebuild never fired; MarkSnapshotCorrupt's first observer must kick a rebuild")
 	}
 
-	// After the rebuild succeeds the row is back in ready.
-	got, err := st.GetTemplate(context.Background(), tpl.ID)
-	if err != nil {
-		t.Fatalf("GetTemplate: %v", err)
-	}
-	if got.Status != models.TemplateStatusReady {
-		t.Errorf("post-rebuild status = %s, want ready", got.Status)
+	// snap.done fires when SnapshotTemplate returns, which is BEFORE the
+	// rebuild goroutine persists status=ready + has_snapshot=true. Poll for the
+	// terminal state rather than reading once, otherwise we race the persist.
+	got := waitForStatus(t, st, tpl.ID, models.TemplateStatusReady, 3*time.Second)
+	if got == nil || got.Status != models.TemplateStatusReady {
+		t.Fatalf("post-rebuild status = %v, want ready", got)
 	}
 	if !got.HasSnapshot {
 		t.Errorf("HasSnapshot = false after successful rebuild")
@@ -410,14 +409,13 @@ func TestRekickUnhealthyTemplatesAtStart_RekicksEachUnhealthyRow(t *testing.T) {
 		t.Errorf("snapshotter calls = %d, want 2 (one per unhealthy row)", calls)
 	}
 
-	// Both targets recovered; healthy row untouched.
+	// Both targets recovered; healthy row untouched. snap.done fires when
+	// SnapshotTemplate returns, before the rebuild goroutine persists ready, so
+	// poll for the terminal state rather than reading once.
 	for _, id := range []string{tplA.ID, tplB.ID} {
-		got, err := st.GetTemplate(context.Background(), id)
-		if err != nil {
-			t.Fatalf("GetTemplate %s: %v", id, err)
-		}
-		if got.Status != models.TemplateStatusReady {
-			t.Errorf("template %s post-rebuild status = %s, want ready", id, got.Status)
+		got := waitForStatus(t, st, id, models.TemplateStatusReady, 3*time.Second)
+		if got == nil || got.Status != models.TemplateStatusReady {
+			t.Errorf("template %s post-rebuild status = %v, want ready", id, got)
 		}
 	}
 	gotHealthy, err := st.GetTemplate(context.Background(), healthy.ID)
@@ -462,7 +460,13 @@ func TestRequestTemplateRebuild_ReadyTransitionsAndKicks(t *testing.T) {
 	svc, st, templatesDir := newHealthHarness(t)
 	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-op-rebuild")
 
-	snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 4)}
+	// Block the snapshotter so the kicked rebuild stays in flight while we
+	// assert the row left 'ready'. Without this the fake rebuild completes
+	// instantly and can flip the row back to ready before RequestTemplateRebuild
+	// re-reads it (a benign production outcome — the operator polls until ready —
+	// but a non-deterministic one to assert on). The block makes the
+	// "row is no longer ready" contract observable; we release it below.
+	snap := &fakeTemplateSnapshotter{done: make(chan struct{}, 4), block: make(chan struct{})}
 	svc.SetTemplateSnapshotter(snap)
 	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
 
@@ -473,14 +477,14 @@ func TestRequestTemplateRebuild_ReadyTransitionsAndKicks(t *testing.T) {
 	if got == nil {
 		t.Fatal("RequestTemplateRebuild returned nil template")
 	}
-	// MarkSnapshotCorrupt may have already been overtaken by the
-	// rebuild goroutine flipping the row to snapshotting/ready by the
-	// time we re-read. The contract is "row is no longer ready" — the
-	// rebuild is in flight.
+	// Rebuild is held in flight by snap.block, so the row is unhealthy or
+	// snapshotting — never back to ready yet.
 	if got.Status == models.TemplateStatusReady {
-		t.Errorf("status = ready after rebuild request; expected unhealthy/snapshotting/ready_no_snapshot or post-rebuild ready")
+		t.Errorf("status = ready after rebuild request; expected unhealthy/snapshotting/ready_no_snapshot")
 	}
 
+	// Release the blocked rebuild and confirm it fired exactly once.
+	close(snap.block)
 	select {
 	case <-snap.done:
 	case <-time.After(3 * time.Second):
