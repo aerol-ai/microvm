@@ -32,6 +32,7 @@ fn main() {
             gpus: None,
             custom_domains: None,
             durability: None,
+            module_ref: None,
         })
         .expect("sandbox creation failed");
 
