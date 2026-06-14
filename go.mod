@@ -14,7 +14,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/klauspost/compress v1.17.11
+	github.com/klauspost/compress v1.18.6
 	github.com/mattn/go-sqlite3 v1.14.45
 	github.com/opencontainers/image-spec v1.1.0
 	github.com/tetratelabs/wazero v1.12.0
