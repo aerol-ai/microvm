@@ -11,7 +11,7 @@
     "deploy": "astro build && wrangler deploy"
   },
   "dependencies": {
-    "@astrojs/starlight": "0.39.3",
+    "@astrojs/starlight": "0.40.0",
     "@fontsource/ibm-plex-sans-condensed": "^5.2.8",
     "@fontsource/inter": "^5.1.1",
     "@fontsource/space-mono": "^5.1.1",
