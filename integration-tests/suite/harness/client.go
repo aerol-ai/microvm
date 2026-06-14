@@ -44,7 +44,7 @@ func (c *Client) SDK() *microvm.Client { return c.sdk }
 // Require skips the test unless the scenario satisfies the use case's
 // capabilities. The skip message names the missing capabilities so the report
 // (and a human) can see exactly why it didn't run.
-func Require(t *testing.T, sc *Scenario, ucID string) UseCase {
+func Require(t *testing.T, sc *Scenario, ucID string, alsoCovers ...string) UseCase {
 	t.Helper()
 	uc, ok := Lookup(ucID)
 	if !ok {
@@ -55,7 +55,15 @@ func Require(t *testing.T, sc *Scenario, ucID string) UseCase {
 	// the id never reaches the test-event name; this log line — captured by
 	// `go test -json` for pass/fail/skip alike — is how report/gen.go joins a
 	// result row to its UC. Keep the "ucid=" prefix in sync with gen.go's regex.
+	//
+	// alsoCovers lets a parent test that fans out into UC-named subtests claim
+	// those UCs too. Otherwise, when the parent is capability-skipped on its
+	// primary UC, the subtests never run and their UCs read as "missing" (a
+	// hard-fail) instead of "skip". The gate below still keys off the primary.
 	t.Logf("ucid=%s", ucID)
+	for _, id := range alsoCovers {
+		t.Logf("ucid=%s", id)
+	}
 	if !sc.Satisfies(uc) {
 		t.Skipf("scenario %q lacks capabilities %v for %s", sc.Name, sc.MissingCaps(uc), ucID)
 	}

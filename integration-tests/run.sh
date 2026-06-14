@@ -26,6 +26,13 @@ KEEP=0
 PROD_TLS=0
 METAL_ON_DEMAND=0
 SCENARIO=""
+# PID of the local-mode SSH port-forward, so teardown can reap it. Without this
+# the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
+# run's forward fails ("Address already in use") and its health probe talks to a
+# dead tunnel pointing at a destroyed box for the full 300s timeout.
+SSH_TUNNEL_PID=""
+# Local port the harness forwards to the seed's 127.0.0.1:21212.
+LOCAL_API_PORT=21212
 
 for arg in "$@"; do
   case "$arg" in
@@ -55,6 +62,13 @@ tf_varfile_args() {
 
 teardown() {
   local scenario="$1"
+  # Always reap the SSH tunnel, even under --keep: the forward is a local
+  # process tied to THIS run, not infra, and a survivor would block the next
+  # run's bind on :21212.
+  if [[ -n "$SSH_TUNNEL_PID" ]]; then
+    kill "$SSH_TUNNEL_PID" 2>/dev/null || true
+    SSH_TUNNEL_PID=""
+  fi
   if [[ "$KEEP" == "1" ]]; then
     echo "--keep set: leaving ${scenario} infra up. Reap later with: make integration-reap"
     return
@@ -172,9 +186,26 @@ run_one() {
     local seed_ip
     seed_ip=$(echo "$targets" | jq -r '.seed_ip')
     if wait_for_cloud_init "ubuntu@${seed_ip}"; then
-      ssh -fN "${SSH_OPTS[@]}" -L 21212:localhost:21212 "ubuntu@${seed_ip}"
-      base_url="http://localhost:21212"
-      wait_for_health "$base_url" "$pat" || inconclusive=1
+      # Reap any tunnel a previous (crashed) run leaked on this port — it would
+      # otherwise win the bind and point the health probe at a destroyed box.
+      pkill -f "ssh.* -L ${LOCAL_API_PORT}:localhost:21212 " 2>/dev/null || true
+      # Foreground-backgrounded (not -f) so we keep the PID for teardown.
+      # ExitOnForwardFailure makes ssh exit immediately if the local bind
+      # fails, instead of staying up forwarding nothing for 300s of health.
+      ssh -N -o ExitOnForwardFailure=yes "${SSH_OPTS[@]}" \
+        -L "${LOCAL_API_PORT}:localhost:21212" "ubuntu@${seed_ip}" &
+      SSH_TUNNEL_PID=$!
+      base_url="http://localhost:${LOCAL_API_PORT}"
+      # Give ssh a beat to bind (or die on a bad forward) before probing, so a
+      # bind failure surfaces as a clear message rather than a health timeout.
+      sleep 2
+      if ! kill -0 "$SSH_TUNNEL_PID" 2>/dev/null; then
+        echo "local-mode: SSH port-forward failed to start (is :${LOCAL_API_PORT} already in use?)" >&2
+        SSH_TUNNEL_PID=""
+        inconclusive=1
+      else
+        wait_for_health "$base_url" "$pat" || inconclusive=1
+      fi
     else
       inconclusive=1
     fi

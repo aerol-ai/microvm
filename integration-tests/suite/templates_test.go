@@ -36,7 +36,9 @@ func TestBuildImageFromDockerfile(t *testing.T) {
 
 // UC-47/48/49/50 — Template lifecycle: create, list+get, rebuild, delete.
 func TestTemplateLifecycle(t *testing.T) {
-	harness.Require(t, sc, "UC-47") // create gates the rest
+	// create gates the rest; declare the subtests' UCs so a firecracker-skip
+	// marks them skipped (not missing) when the subtests never run.
+	harness.Require(t, sc, "UC-47", "UC-48", "UC-49", "UC-50")
 	c := client(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)

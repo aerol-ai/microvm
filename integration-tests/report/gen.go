@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -51,6 +52,11 @@ type Result struct {
 	ID     string `json:"id"`
 	Title  string `json:"title"`
 	Status Status `json:"status"`
+	// Reason explains a non-pass status: the capability-skip message for skips,
+	// the assertion/error output for fails, a fixed note for missing. Empty for
+	// passes. Surfaced in the JSON and the markdown "Detail" column so a red run
+	// is debuggable without re-reading the raw test.json.
+	Reason string `json:"reason,omitempty"`
 }
 
 // Report is the serialized per-scenario artifact.
@@ -76,42 +82,54 @@ var ucMarkerRE = regexp.MustCompile(`ucid=(UC-[0-9]+[a-z]?)`)
 // tested in gen_test.go. forceInconclusive marks every implemented row
 // inconclusive (used when provisioning reported a spot reclaim mid-run).
 func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool) []Result {
-	// First pass: associate each test name with its UC id from the `ucid=...`
-	// marker harness.Require logs. Flat-named tests (TestSnapshotCreate) carry
-	// the id only here, not in the test name.
-	testToUC := map[string]string{}
+	// First pass: per test name, collect (a) every UC id it claims via the
+	// `ucid=...` markers harness.Require logs — a parent fanning out into
+	// subtests claims several — and (b) its non-boilerplate output lines, which
+	// carry the skip/fail reason. Flat-named tests (TestSnapshotCreate) surface
+	// the id only through the marker, not the test name.
+	testToUC := map[string][]string{}
+	testOut := map[string][]string{}
 	for _, ev := range events {
 		if ev.Action != "output" || ev.Test == "" {
 			continue
 		}
 		if m := ucMarkerRE.FindStringSubmatch(ev.Output); m != nil {
-			testToUC[ev.Test] = m[1]
+			testToUC[ev.Test] = appendUnique(testToUC[ev.Test], m[1])
+			continue // the marker line itself is not a reason
+		}
+		if line := meaningfulLine(ev.Output); line != "" {
+			testOut[ev.Test] = append(testOut[ev.Test], line)
 		}
 	}
 
-	// Last terminal action per UC id (pass/fail/skip). A UC can surface via a
-	// parent test or subtest; the UC id comes from the test name (golden
-	// TestX/UC-NN form) or, failing that, the logged marker.
-	got := map[string]Status{}
+	// Last terminal action per UC id (pass/fail/skip), with the reason captured
+	// from the same test's output. A UC can surface via the test name (golden
+	// TestX/UC-NN form) or the logged marker(s). fail wins over pass/skip.
+	type outcome struct {
+		st     Status
+		reason string
+	}
+	got := map[string]outcome{}
 	for _, ev := range events {
 		switch ev.Action {
 		case "pass", "fail", "skip":
 		default:
 			continue
 		}
-		id := ucRE.FindString(ev.Test)
-		if id == "" {
-			id = testToUC[ev.Test]
-		}
-		if id == "" {
-			continue
+		var ids []string
+		if id := ucRE.FindString(ev.Test); id != "" {
+			ids = []string{id}
+		} else {
+			ids = testToUC[ev.Test]
 		}
 		st := Status(ev.Action) // "pass"|"fail"|"skip" line up with Status values
-		// fail wins over pass/skip if both seen for the same id (defensive).
-		if prev, ok := got[id]; ok && prev == StatusFail {
-			continue
+		reason := reasonFor(st, testOut[ev.Test])
+		for _, id := range ids {
+			if prev, ok := got[id]; ok && prev.st == StatusFail {
+				continue // fail is sticky
+			}
+			got[id] = outcome{st: st, reason: reason}
 		}
-		got[id] = st
 	}
 
 	results := make([]Result, 0, len(reg))
@@ -123,17 +141,64 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 		case forceInconclusive:
 			r.Status = StatusInconclusive
 		default:
-			if st, ok := got[uc.ID]; ok {
-				r.Status = st
+			if o, ok := got[uc.ID]; ok {
+				r.Status = o.st
+				r.Reason = o.reason
 			} else {
 				// Implemented but produced no terminal event — surface as
 				// missing (counts against the run) rather than silently green.
 				r.Status = StatusMissing
+				r.Reason = "implemented but no test event observed (test never ran or crashed before reporting)"
 			}
 		}
 		results = append(results, r)
 	}
 	return results
+}
+
+// appendUnique adds id to ids if not already present (markers can repeat).
+func appendUnique(ids []string, id string) []string {
+	if slices.Contains(ids, id) {
+		return ids
+	}
+	return append(ids, id)
+}
+
+// meaningfulLine trims a raw output line and drops go-test boilerplate
+// (=== RUN, --- PASS/FAIL/SKIP, bare PASS/FAIL/ok) so only assertion/skip
+// messages remain as candidate reasons.
+func meaningfulLine(raw string) string {
+	s := strings.TrimSpace(raw)
+	switch {
+	case s == "", s == "PASS", s == "FAIL":
+		return ""
+	case strings.HasPrefix(s, "=== "), strings.HasPrefix(s, "--- "), strings.HasPrefix(s, "ok "):
+		return ""
+	}
+	return s
+}
+
+// reasonFor distills a one-line explanation for a non-pass status from a test's
+// collected output. Skips surface the capability-gate message; fails surface
+// the assertion text; passes need no reason.
+func reasonFor(st Status, lines []string) string {
+	switch st {
+	case StatusSkip:
+		for _, l := range lines {
+			if strings.Contains(l, "lacks capabilities") || strings.Contains(strings.ToLower(l), "skip") {
+				return l
+			}
+		}
+		if len(lines) > 0 {
+			return lines[len(lines)-1]
+		}
+	case StatusFail:
+		if len(lines) > 0 {
+			return strings.Join(lines, " | ")
+		}
+		return "failed (no output captured)"
+	}
+	return ""
 }
 
 func summarize(rs []Result) Summary {
@@ -187,15 +252,32 @@ func icon(s Status) string {
 	return "?"
 }
 
+// mdCell makes a reason safe for a markdown table cell: escape pipes (column
+// separators), collapse newlines, and cap the length so one verbose failure
+// doesn't blow out the table. The full text is always in the JSON report.
+func mdCell(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "|", "\\|")
+	const max = 200
+	if len(s) > max {
+		s = s[:max-1] + "…"
+	}
+	return s
+}
+
 func renderMarkdown(rep Report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Integration report — %s\n\n", rep.Scenario)
 	s := rep.Summary
 	fmt.Fprintf(&b, "pass %d · fail %d · skip %d · pending %d · inconclusive %d · missing %d · total %d\n\n",
 		s.Pass, s.Fail, s.Skip, s.Pending, s.Inconclusive, s.Missing, s.Total)
-	b.WriteString("| UC | Title | Status |\n|----|-------|--------|\n")
+	b.WriteString("| UC | Title | Status | Detail |\n|----|-------|--------|--------|\n")
 	for _, r := range rep.Results {
-		fmt.Fprintf(&b, "| %s | %s | %s %s |\n", r.ID, r.Title, icon(r.Status), r.Status)
+		fmt.Fprintf(&b, "| %s | %s | %s %s | %s |\n",
+			r.ID, r.Title, icon(r.Status), r.Status, mdCell(r.Reason))
 	}
 	return b.String()
 }

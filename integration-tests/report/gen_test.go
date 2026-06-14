@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
@@ -66,6 +67,46 @@ func TestClassifyFlatNamedViaMarker(t *testing.T) {
 		if want[r.ID] != r.Status {
 			t.Errorf("%s = %s, want %s", r.ID, r.Status, want[r.ID])
 		}
+	}
+}
+
+func TestClassifyParentSkipCoversSubUCs(t *testing.T) {
+	// A parent test gates on UC-11 and also covers UC-30 (a subtest's UC); when
+	// the parent is capability-skipped, the subtest never runs. Because the
+	// parent's Require logged a marker for BOTH, UC-30 must read as skip — not
+	// missing — and inherit the skip reason.
+	events := []testEvent{
+		{Action: "output", Test: "TestFanout", Output: "    client.go:54: ucid=UC-11\n"},
+		{Action: "output", Test: "TestFanout", Output: "    client.go:54: ucid=UC-30\n"},
+		{Action: "output", Test: "TestFanout", Output: `    skip.go:53: scenario "local-mode" lacks capabilities [domain] for UC-11` + "\n"},
+		{Action: "skip", Test: "TestFanout"},
+	}
+	got := classify(events, []harness.UseCase{
+		{ID: "UC-11", Implemented: true},
+		{ID: "UC-30", Implemented: true},
+	}, false)
+	for _, r := range got {
+		if r.Status != StatusSkip {
+			t.Errorf("%s = %s, want skip", r.ID, r.Status)
+		}
+		if !strings.Contains(r.Reason, "lacks capabilities [domain]") {
+			t.Errorf("%s reason = %q, want capability-skip message", r.ID, r.Reason)
+		}
+	}
+}
+
+func TestClassifyFailReasonCaptured(t *testing.T) {
+	events := []testEvent{
+		{Action: "output", Test: "TestSnap", Output: "    client.go:54: ucid=UC-20\n"},
+		{Action: "output", Test: "TestSnap", Output: "    lifecycle_more_test.go:185: create snapshot: 400 must be lowercase\n"},
+		{Action: "fail", Test: "TestSnap"},
+	}
+	got := classify(events, []harness.UseCase{{ID: "UC-20", Implemented: true}}, false)
+	if got[0].Status != StatusFail {
+		t.Fatalf("UC-20 = %s, want fail", got[0].Status)
+	}
+	if !strings.Contains(got[0].Reason, "must be lowercase") {
+		t.Fatalf("UC-20 reason = %q, want the assertion text", got[0].Reason)
 	}
 }
 

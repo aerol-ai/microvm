@@ -197,7 +197,9 @@ func TestSandboxIndexConsistent(t *testing.T) {
 // it. We pick a worker-roled member so we never drain the node we're talking
 // through. Eviction semantics are not asserted (drain is admission-only).
 func TestDrainAndUncordon(t *testing.T) {
-	harness.Require(t, sc, "UC-56")
+	// Declare UC-57 (the uncordon subtest) so a cluster-skip marks it skipped,
+	// not missing, when the subtest never runs.
+	harness.Require(t, sc, "UC-56", "UC-57")
 	c := client(t)
 	members := getMembers(t, c)
 	var target string
