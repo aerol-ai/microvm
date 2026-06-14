@@ -41,6 +41,34 @@ func TestClassifyMixed(t *testing.T) {
 	}
 }
 
+func TestClassifyFlatNamedViaMarker(t *testing.T) {
+	// The real suite uses flat test names (TestSnapshotCreate), not TestX/UC-NN
+	// subtests, and surfaces the UC id only through the `ucid=UC-NN` marker that
+	// harness.Require logs. The join must work off that marker; without it every
+	// implemented UC would (wrongly) read as missing.
+	events := []testEvent{
+		{Action: "run", Test: "TestAuth"},
+		{Action: "output", Test: "TestAuth", Output: "    client.go:54: ucid=UC-10\n"},
+		{Action: "pass", Test: "TestAuth"},
+		{Action: "output", Test: "TestCreate", Output: "    client.go:54: ucid=UC-11\n"},
+		{Action: "fail", Test: "TestCreate"},
+		{Action: "output", Test: "TestReach", Output: "    client.go:54: ucid=UC-30\n"},
+		{Action: "skip", Test: "TestReach"},
+	}
+	got := classify(events, reg(), false)
+	want := map[string]Status{
+		"UC-10": StatusPass,
+		"UC-11": StatusFail,
+		"UC-30": StatusSkip,
+		"UC-24": StatusPending,
+	}
+	for _, r := range got {
+		if want[r.ID] != r.Status {
+			t.Errorf("%s = %s, want %s", r.ID, r.Status, want[r.ID])
+		}
+	}
+}
+
 func TestClassifyMissingImplementedIsNotSilentGreen(t *testing.T) {
 	// UC-10 is implemented but produced NO event (e.g. the test binary crashed
 	// before reaching it). It must surface as missing, never as a silent pass.

@@ -66,12 +66,32 @@ type Summary struct {
 
 var ucRE = regexp.MustCompile(`UC-[0-9]+[a-z]?`)
 
+// ucMarkerRE matches the `ucid=UC-NN` line harness.Require logs for every test.
+// The suite tests are flat-named (TestSnapshotCreate), not TestX/UC-NN
+// subtests, so the UC id never appears in the test-event name — this marker in
+// the test's output is the only place it surfaces for a passing test.
+var ucMarkerRE = regexp.MustCompile(`ucid=(UC-[0-9]+[a-z]?)`)
+
 // classify joins observed test events with the registry. Pure: no I/O, golden-
 // tested in gen_test.go. forceInconclusive marks every implemented row
 // inconclusive (used when provisioning reported a spot reclaim mid-run).
 func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool) []Result {
+	// First pass: associate each test name with its UC id from the `ucid=...`
+	// marker harness.Require logs. Flat-named tests (TestSnapshotCreate) carry
+	// the id only here, not in the test name.
+	testToUC := map[string]string{}
+	for _, ev := range events {
+		if ev.Action != "output" || ev.Test == "" {
+			continue
+		}
+		if m := ucMarkerRE.FindStringSubmatch(ev.Output); m != nil {
+			testToUC[ev.Test] = m[1]
+		}
+	}
+
 	// Last terminal action per UC id (pass/fail/skip). A UC can surface via a
-	// parent test or subtest; the UC id is parsed from the test name.
+	// parent test or subtest; the UC id comes from the test name (golden
+	// TestX/UC-NN form) or, failing that, the logged marker.
 	got := map[string]Status{}
 	for _, ev := range events {
 		switch ev.Action {
@@ -80,6 +100,9 @@ func classify(events []testEvent, reg []harness.UseCase, forceInconclusive bool)
 			continue
 		}
 		id := ucRE.FindString(ev.Test)
+		if id == "" {
+			id = testToUC[ev.Test]
+		}
 		if id == "" {
 			continue
 		}

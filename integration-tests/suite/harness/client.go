@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +50,12 @@ func Require(t *testing.T, sc *Scenario, ucID string) UseCase {
 	if !ok {
 		t.Fatalf("unknown use case %q (not in registry)", ucID)
 	}
+	// Emit a stable marker so the report generator can map this (flat-named)
+	// test back to its UC id. The tests aren't named TestX/UC-NN subtests, so
+	// the id never reaches the test-event name; this log line — captured by
+	// `go test -json` for pass/fail/skip alike — is how report/gen.go joins a
+	// result row to its UC. Keep the "ucid=" prefix in sync with gen.go's regex.
+	t.Logf("ucid=%s", ucID)
 	if !sc.Satisfies(uc) {
 		t.Skipf("scenario %q lacks capabilities %v for %s", sc.Name, sc.MissingCaps(uc), ucID)
 	}
@@ -86,5 +93,10 @@ func (c *Client) NewSandbox(t *testing.T, opts sdktypes.CreateSandboxOptions) *m
 // or repeated runs never collide: "<scenario>-<test>-<unixnano>".
 func UniqueName(sc *Scenario, t *testing.T) string {
 	t.Helper()
-	return fmt.Sprintf("%s-%s-%d", sc.Name, t.Name(), time.Now().UnixNano())
+	// Lowercased and slash-free: the name flows into sandbox names AND snapshot
+	// image refs, and Docker rejects an image repository with uppercase or '/'
+	// segments ("invalid reference format ... must be lowercase"). t.Name() is
+	// CamelCase (and '/'-separated for subtests), so sanitize here once.
+	raw := fmt.Sprintf("%s-%s-%d", sc.Name, t.Name(), time.Now().UnixNano())
+	return strings.ToLower(strings.ReplaceAll(raw, "/", "-"))
 }

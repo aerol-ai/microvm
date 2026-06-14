@@ -102,10 +102,14 @@ var Registry = []UseCase{
 
 	// F. Templates, images, wasm modules
 	{ID: "UC-46", Title: "Build image from Dockerfile", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-47", Title: "Create template", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-48", Title: "List + get template", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-49", Title: "Rebuild template", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-50", Title: "Delete template", Requires: []Capability{CapDocker}, Implemented: true},
+	// Templates build root filesystems for the Firecracker runtime; on a
+	// docker-only build the server rejects create with "requires
+	// SB_ENABLE_FIRECRACKER". Gate on firecracker so docker-only scenarios
+	// (local-mode, single-node) skip rather than hard-fail.
+	{ID: "UC-47", Title: "Create template", Requires: []Capability{CapFirecracker}, Implemented: true},
+	{ID: "UC-48", Title: "List + get template", Requires: []Capability{CapFirecracker}, Implemented: true},
+	{ID: "UC-49", Title: "Rebuild template", Requires: []Capability{CapFirecracker}, Implemented: true},
+	{ID: "UC-50", Title: "Delete template", Requires: []Capability{CapFirecracker}, Implemented: true},
 	{ID: "UC-51", Title: "Register wasm module + list/get", Requires: []Capability{CapWasm}, Implemented: true},
 	{ID: "UC-52", Title: "Push wasm module to registry", Requires: []Capability{CapWasm}, Implemented: true},
 
