@@ -1,0 +1,4 @@
+# Local-mode has docker but no public domain/TLS — domain-gated use cases skip.
+name: local-mode
+capabilities:
+  - docker

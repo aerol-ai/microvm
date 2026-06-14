@@ -1,0 +1,10 @@
+# 3× mixed cluster: docker workers, public domain/TLS, and cluster mode (Raft +
+# forwarding). No firecracker/gvisor/wasm — those land in cluster-hetero.
+name: cluster-3-mixed
+capabilities:
+  - docker
+  - domain
+  - cluster
+
+# Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
+expected_members: 3

@@ -1,0 +1,14 @@
+# Heterogeneous cluster: every runtime plus cluster mode and public domain/TLS.
+# This is the only scenario that satisfies the firecracker/gvisor/wasm-gated
+# use cases.
+name: cluster-hetero
+capabilities:
+  - docker
+  - gvisor
+  - firecracker
+  - wasm
+  - domain
+  - cluster
+
+# Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
+expected_members: 8

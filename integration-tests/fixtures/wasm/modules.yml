@@ -1,0 +1,34 @@
+# Curated WASM language runtimes for the integration suite's wasm use cases.
+#
+# These are standalone WASI interpreter modules from VMware's "WebAssembly
+# Language Runtimes" project — pinned releases, each with its sha256 so a
+# tampered download is caught. The `.wasm` binaries themselves are large
+# (13-25 MB) and gitignored; fetch.sh downloads + verifies them locally, and
+# the SAME url+digest pairs below are spliced into config `wasm.standard_modules`
+# at deploy time by run.sh (when a scenario advertises the `wasm` capability),
+# so every node pre-stages them under the reserved alias.
+#
+# The shape below is exactly config/cluster.yml's `wasm.standard_modules`, so it
+# can be loaded verbatim. To run the wasm UCs the suite references the `python`
+# alias by default (override with AEROL_WASM_MODULE_REF).
+#
+# JavaScript is provided by quickjs-ng's standalone qjs-wasi build (the
+# bytecodealliance/javy release is only a *compiler CLI*, not a runnable module,
+# so it isn't used here).
+standard_modules:
+  - alias: python
+    source: url
+    ref: "https://github.com/vmware-labs/webassembly-language-runtimes/releases/download/python/3.12.0%2B20231211-040d5a6/python-3.12.0.wasm"
+    digest: "sha256:e5dc5a398b07b54ea8fdb503bf68fb583d533f10ec3f930963e02b9505f7a763"
+  - alias: ruby
+    source: url
+    ref: "https://github.com/vmware-labs/webassembly-language-runtimes/releases/download/ruby/3.2.2%2B20230714-11be424/ruby-3.2.2.wasm"
+    digest: "sha256:8b4abc0da1cfca2bc6d04c9b4e89ac6cd52340e020c3bf974fb6139b8195d8ac"
+  - alias: php
+    source: url
+    ref: "https://github.com/vmware-labs/webassembly-language-runtimes/releases/download/php/8.2.6%2B20230714-11be424/php-cgi-8.2.6.wasm"
+    digest: "sha256:edb29de7cd80597292670499846db56929af1166459c4a776ef606aef357c93b"
+  - alias: javascript
+    source: url
+    ref: "https://github.com/quickjs-ng/quickjs/releases/download/v0.15.1/qjs-wasi.wasm"
+    digest: "sha256:b4071ef2fbb2bb693c0bbcfc07cb9d28639fd9cea2fd986824a57aeac929817b"

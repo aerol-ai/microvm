@@ -1,0 +1,3 @@
+# Generated integration reports land here; keep the dir, ignore the contents.
+*
+!.gitignore

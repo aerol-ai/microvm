@@ -30,6 +30,37 @@ output "ingress_hostname" {
   value = local.domain_name
 }
 
+# api_base_url is the single endpoint the integration harness points its SDK at.
+# Domain mode → https://<domain> (Caddy serves the control-plane API there).
+# No public ingress (e.g. a pure local-mode box) → empty; the harness falls
+# back to an SSH-tunnelled http://localhost:21212.
+output "api_base_url" {
+  description = "Base URL for the control-plane API. https://<domain> in domain mode, empty in local-mode (no domain) where the harness tunnels to localhost:21212."
+  value       = local.has_domain ? "https://${local.domain_name}" : ""
+}
+
+# Machine-readable target descriptor so run.sh doesn't have to parse the human
+# `nodes` output. Mirrors what the harness needs: where to talk, which node is
+# which, and the leased domain.
+output "integration_targets" {
+  description = "Structured targets for the integration harness: base URL, ingress IP, domain, and per-node role/IPs."
+  value = {
+    base_url   = local.has_domain ? "https://${local.domain_name}" : ""
+    domain     = local.domain_name
+    ingress_ip = local.has_public_ingress ? local.all_instances[local.ingress_node_names[0]].public_ip : ""
+    seed_ip    = aws_instance.seed.public_ip
+    nodes = [
+      for n, inst in local.all_instances : {
+        name       = n
+        role       = local.nodes_resolved[n].role
+        public_ip  = inst.public_ip
+        private_ip = inst.private_ip
+        spot       = local.nodes_resolved[n].spot
+      }
+    ]
+  }
+}
+
 output "bundle_bucket" {
   description = "S3 bucket used to ferry the gossip key + TLS bundle from seed to joiners. Safe to leave empty after the cluster forms."
   value       = aws_s3_bucket.bundle.bucket

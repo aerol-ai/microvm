@@ -36,6 +36,25 @@ resource "aws_instance" "seed" {
     http_put_response_hop_limit = 2
   }
 
+  # Spot is opt-in per node. The dynamic block emits ZERO blocks when spot is
+  # false, so an on-demand (prod) node renders byte-identical to before this
+  # field existed — `terraform plan` shows no diff. one-time + terminate means
+  # a reclaimed integration node is gone, not stopped (ephemeral test intent).
+  dynamic "instance_market_options" {
+    # force_on_demand flips ONLY firecracker (bare-metal) nodes off spot —
+    # *.metal spot capacity is thin and a reclaim mid-run is disruptive, so the
+    # operator can opt the expensive node into on-demand without losing spot on
+    # the cheap t3 workers. Defaults false, so prod stays byte-identical.
+    for_each = local.seed_node.spot && !(var.force_on_demand && local.seed_node.with_firecracker) ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        spot_instance_type             = "one-time"
+        instance_interruption_behavior = "terminate"
+      }
+    }
+  }
+
   user_data_replace_on_change = true
 
   user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
@@ -183,6 +202,20 @@ resource "aws_instance" "joiner" {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
     http_put_response_hop_limit = 2
+  }
+
+  # See the seed resource for the rationale: zero blocks when spot=false keeps
+  # on-demand (prod) joiners diff-free.
+  dynamic "instance_market_options" {
+    # See the seed block: force_on_demand pulls firecracker nodes off spot only.
+    for_each = each.value.spot && !(var.force_on_demand && each.value.with_firecracker) ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        spot_instance_type             = "one-time"
+        instance_interruption_behavior = "terminate"
+      }
+    }
   }
 
   user_data_replace_on_change = true
