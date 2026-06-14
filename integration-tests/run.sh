@@ -165,12 +165,19 @@ run_one() {
     wait_for_tls "$leased" || inconclusive=1
     wait_for_health "$base_url" "$pat" || inconclusive=1
   else
-    # local-mode: SSH tunnel to the seed, talk to localhost:21212.
+    # local-mode: SSH tunnel to the seed, talk to localhost:21212. Unlike the
+    # domain branch there's no DNS/TLS wait to absorb boot time, so wait for
+    # cloud-init to finish before opening the tunnel — otherwise the lone health
+    # budget would race a still-installing box and false-flag inconclusive.
     local seed_ip
     seed_ip=$(echo "$targets" | jq -r '.seed_ip')
-    ssh -fN -o StrictHostKeyChecking=no -L 21212:localhost:21212 "ubuntu@${seed_ip}"
-    base_url="http://localhost:21212"
-    wait_for_health "$base_url" "$pat" || inconclusive=1
+    if wait_for_cloud_init "ubuntu@${seed_ip}"; then
+      ssh -fN "${SSH_OPTS[@]}" -L 21212:localhost:21212 "ubuntu@${seed_ip}"
+      base_url="http://localhost:21212"
+      wait_for_health "$base_url" "$pat" || inconclusive=1
+    else
+      inconclusive=1
+    fi
   fi
 
   # Expected cluster size, if the scenario's caps.yml declares one. Drives
@@ -187,6 +194,23 @@ run_one() {
   local json_out="${sdir}/test.json"
   if [[ "$inconclusive" == "1" ]]; then
     echo "scenario ${scenario}: infra not ready (spot reclaim / propagation) — marking inconclusive" >&2
+    # Capture daemon logs before teardown nukes the box. local-mode runs no
+    # Caddy (API bound on 127.0.0.1), so only sandboxd exists; domain scenarios
+    # (single-node + cluster) front the API with Caddy, so grab both per node.
+    local logfile="${HERE}/reports/${scenario}-failure-logs.txt"
+    echo "collecting failure logs -> ${logfile}" >&2
+    {
+      echo "### failure logs for scenario ${scenario} ($(date -u +%FT%TZ)) ###"
+      if [[ "$caps_domain" == "true" ]]; then
+        while IFS= read -r ip; do
+          [[ -n "$ip" ]] || continue
+          dump_service_logs "ubuntu@${ip}" sandboxd
+          dump_service_logs "ubuntu@${ip}" caddy
+        done < <(echo "$targets" | jq -r '.nodes[].public_ip')
+      else
+        dump_service_logs "ubuntu@$(echo "$targets" | jq -r '.seed_ip')" sandboxd
+      fi
+    } > "$logfile" 2>&1
     : > "$json_out"
     AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" -inconclusive \
       -json "$json_out" -out "${HERE}/reports"
