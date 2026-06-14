@@ -4,6 +4,75 @@
 # All waits are bounded with backoff so slow DNS/TLS propagation produces a
 # clear timeout, never a hang and never a false "ready".
 
+# SSH_OPTS — shared non-interactive options for every harness SSH call. No host
+# key prompts (throwaway boxes) and a short connect timeout so a not-yet-booted
+# instance fails fast into the retry loop instead of hanging ~2 minutes on the
+# kernel TCP timeout.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o ConnectTimeout=10 -o BatchMode=yes)
+
+# wait_for_cloud_init <ssh_target> [timeout_s]
+# Blocks until the instance's user-data (cloud-init) has finished. Domain
+# scenarios get this slack for free from the DNS+TLS waits that run before the
+# health probe; local-mode has neither, so without this the single health
+# budget starts the moment `terraform apply` returns — which is when the
+# instance reaches "running", well before apt/sandboxd-download/docker/daemon
+# start finish. `cloud-init status --wait` is the canonical "box is ready"
+# signal: it blocks server-side until user-data completes, then exits non-zero
+# iff user-data errored (which we surface rather than racing the daemon).
+wait_for_cloud_init() {
+  local target="$1" timeout="${2:-600}"
+  local deadline=$(( $(date +%s) + timeout ))
+  # Outer loop: tolerate the window where sshd itself isn't up yet. Each
+  # attempt blocks in `--wait`, so a single success ends it.
+  while (( $(date +%s) < deadline )); do
+    local out rc
+    out=$(ssh "${SSH_OPTS[@]}" "$target" 'sudo cloud-init status --wait' 2>&1)
+    rc=$?
+    if (( rc == 0 )); then
+      echo "cloud-init: ${target} done"
+      return 0
+    fi
+    # rc 2 == cloud-init finished with a recoverable warning ("degraded done");
+    # the daemon may still be fine, so treat it as ready but note it.
+    if grep -q 'status: done' <<<"$out"; then
+      echo "cloud-init: ${target} done (with warnings)"
+      return 0
+    fi
+    sleep 10
+  done
+  echo "cloud-init: ${target} did not finish after ${timeout}s" >&2
+  return 1
+}
+
+# dump_service_logs <ssh_target> <service> [lines]
+# Best-effort dump of a systemd unit's STATE + journal from a remote node. The
+# journal alone doesn't answer "is the app actually running?" — a unit can be
+# crash-looping (active=activating, restart-counting), dead after exhausting its
+# restart budget, or never installed. So we lead with is-active / is-enabled and
+# the `systemctl status` header (load/active/sub state, main PID, last exit
+# code, NRestarts) before the log tail, then probe whether anything is listening
+# on the API port. Never fails the caller — this runs on the already-broken
+# inconclusive path, so a node we can't SSH into (spot reclaim) must not mask the
+# original problem.
+dump_service_logs() {
+  local target="$1" svc="$2" lines="${3:-200}"
+  echo "===== ${svc} @ ${target} ====="
+  if ! ssh "${SSH_OPTS[@]}" "$target" "
+      echo '--- is-active / is-enabled ---'
+      systemctl is-active ${svc}; systemctl is-enabled ${svc} 2>/dev/null || true
+      echo '--- systemctl status (state, main PID, last exit, restarts) ---'
+      sudo systemctl status ${svc} --no-pager -n 0 || true
+      echo '--- listeners on :21212 (is the API actually bound?) ---'
+      sudo ss -ltnp 2>/dev/null | grep -E ':21212\b' || echo '(nothing listening on 21212)'
+      echo '--- journal (last ${lines} lines) ---'
+      sudo journalctl -u ${svc} --no-pager -n ${lines}
+    " 2>&1; then
+    echo "(could not reach ${target} or unit ${svc} absent)"
+  fi
+  echo "===== end ${svc} @ ${target} ====="
+}
+
 # wait_for_health <base_url> <pat> [timeout_s]
 # Polls /v1/capacity (authenticated) until HTTP 200 or timeout.
 wait_for_health() {

@@ -487,6 +487,20 @@ if [[ "$BUILD_FROM_SOURCE" != "true" ]]; then
 	fi
 fi
 
+# ensure_docker installs and starts the Docker engine if it isn't already
+# present. sandboxd's systemd unit hard-Requires docker.service, so this must
+# run on every Linux install path — including --local, which otherwise skips
+# install_packages entirely and leaves the daemon unable to start (the unit's
+# Requires=docker.service can't be satisfied, so `enable --now` is a silent
+# no-op: enabled but dead, no ExecStart, no journal). Idempotent.
+ensure_docker() {
+	if ! command -v docker >/dev/null 2>&1; then
+		apt-get update
+		apt-get install -y docker.io
+		systemctl enable --now docker
+	fi
+}
+
 install_packages() {
 	if command -v apt-get >/dev/null 2>&1; then
 		apt-get update
@@ -515,10 +529,7 @@ install_packages() {
 				rm -f "$tmp_deb"
 			fi
 		fi
-		if ! command -v docker >/dev/null 2>&1; then
-			apt-get install -y docker.io
-			systemctl enable --now docker
-		fi
+		ensure_docker
 		if ! command -v caddy >/dev/null 2>&1; then
 			apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
 			curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -1294,6 +1305,10 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		write_launchd_plist
 		launchctl load /Library/LaunchDaemons/com.aerol.sandboxd.plist
 	else
+		# The local unit hard-Requires docker.service; on Linux we must install
+		# the engine here since this branch skips install_packages. (macOS local
+		# mode assumes Docker Desktop is already running.)
+		ensure_docker
 		write_local_systemd_unit
 		write_healthcheck_script
 		write_healthcheck_units
