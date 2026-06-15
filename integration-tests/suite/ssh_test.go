@@ -16,9 +16,10 @@ import (
 
 // UC-43 — SSH into a sandbox using the per-sandbox key returned at create.
 //
-// The gateway routes by the sandbox's authorized ed25519 key. We dial the
-// gateway on the leased domain (port from AEROL_SSH_PORT, default 2222), auth
-// with the private key Create handed back exactly once, and run a command.
+// The gateway routes by username (the sandbox ID) and then authorizes against
+// that sandbox's authorized ed25519 key. We dial the gateway on the leased
+// domain (port from AEROL_SSH_PORT, default 2220), auth with the private key
+// Create handed back exactly once, and run a command.
 func TestSSHWithPerSandboxKey(t *testing.T) {
 	harness.Require(t, sc, "UC-43")
 	c := client(t)
@@ -51,13 +52,18 @@ func TestSSHWithPerSandboxKey(t *testing.T) {
 
 	port := os.Getenv("AEROL_SSH_PORT")
 	if port == "" {
-		port = "2222"
+		// Matches SB_SSH_LISTEN_ADDR's default (0.0.0.0:2220) on the daemon.
+		port = "2220"
 	}
 	addr := net.JoinHostPort(sc.Domain, port)
 
 	cfg := &ssh.ClientConfig{
-		// The gateway authorizes by key, not username; any user works.
-		User:            "sandbox",
+		// The gateway routes by username: it must be the sandbox ID (optionally
+		// "<id>+<session>"). It looks the sandbox up by that ID and then checks
+		// the key against that sandbox's authorized key — a literal user fails
+		// the lookup before the key is ever compared. See parseSSHUser /
+		// publicKeyCallback in pkg/sshgateway/gateway.go.
+		User:            sb.ID,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // throwaway test gateway
 		Timeout:         15 * time.Second,

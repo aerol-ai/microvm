@@ -149,3 +149,31 @@ resource "aws_security_group_rule" "public_http" {
   cidr_blocks       = ["0.0.0.0/0"]
   description       = "Public ingress TCP ${each.key}"
 }
+
+# Raw-TCP (L4) sandbox exposures allocate a host port from this pool and serve
+# it directly on the ingress node, so the whole range must be publicly reachable.
+# Keep var.l4_port_range in sync with SB_L4_PORT_RANGE_START/END on the daemon.
+resource "aws_security_group_rule" "public_l4_pool" {
+  count             = local.has_public_ingress ? 1 : 0
+  type              = "ingress"
+  security_group_id = aws_security_group.node.id
+  protocol          = "tcp"
+  from_port         = var.l4_port_range.start
+  to_port           = var.l4_port_range.end
+  cidr_blocks       = ["0.0.0.0/0"]
+  description       = "Public raw-TCP (L4) exposure pool ${var.l4_port_range.start}-${var.l4_port_range.end}"
+}
+
+# Per-sandbox SSH gateway. Distinct from admin SSH (22): this is the public
+# Ed25519-keyed gateway clients reach to shell into their sandbox. Keep
+# var.ssh_gateway_port in sync with SB_SSH_LISTEN_ADDR on the daemon.
+resource "aws_security_group_rule" "public_ssh_gateway" {
+  count             = local.has_public_ingress ? 1 : 0
+  type              = "ingress"
+  security_group_id = aws_security_group.node.id
+  protocol          = "tcp"
+  from_port         = var.ssh_gateway_port
+  to_port           = var.ssh_gateway_port
+  cidr_blocks       = ["0.0.0.0/0"]
+  description       = "Public per-sandbox SSH gateway ${var.ssh_gateway_port}"
+}

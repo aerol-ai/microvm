@@ -29,6 +29,16 @@ const (
 	// env) advertise this, so the custom-domain UCs skip instead of hard-failing
 	// where the feature is off.
 	CapCustomDomains Capability = "custom-domains"
+	// CapExternalDNSZone gates the custom-domain verification path (UC-35/36).
+	// A real custom domain must, by design, live OUTSIDE the deployment base
+	// domain (the API rejects hosts under the wildcard zone) AND prove ownership
+	// via a `_aerol-verify.<host>` TXT record before attach succeeds. Satisfying
+	// that requires the harness to control a second DNS zone it can provision
+	// verification (and CNAME) records in — the leased base zone is not enough.
+	// Scenarios advertise this only when they wire up such a zone; otherwise the
+	// custom-domain reachability UCs skip instead of failing against a gate they
+	// structurally cannot pass.
+	CapExternalDNSZone Capability = "external-dns-zone"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -93,8 +103,8 @@ var Registry = []UseCase{
 	{ID: "UC-32", Title: "Default <id>.<domain> reachable", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-33", Title: "Unexpose port -> route gone", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-34", Title: "L4 raw TCP host-port reachable", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
-	{ID: "UC-35", Title: "Add custom domain -> DNS instructions", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains}, Implemented: true},
-	{ID: "UC-36", Title: "Custom domain reachable after CNAME", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains}, Implemented: true},
+	{ID: "UC-35", Title: "Add custom domain -> DNS instructions", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains, CapExternalDNSZone}, Implemented: true},
+	{ID: "UC-36", Title: "Custom domain reachable after CNAME", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains, CapExternalDNSZone}, Implemented: true},
 	{ID: "UC-37", Title: "Network usage counters returned", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-38", Title: "Network limits patch enforced", Requires: []Capability{CapDocker}, Implemented: true},
 

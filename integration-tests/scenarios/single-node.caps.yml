@@ -4,7 +4,13 @@ name: single-node
 capabilities:
   - docker
   - domain
-  # custom-domains gates UC-35/36. single-node.tfvars sets
-  # enable_custom_domains=true, and the Terraform bootstrap injects
-  # SB_ENABLE_CUSTOM_DOMAINS into the daemon env, so the feature is live here.
+  # custom-domains advertises that the AddCustomDomain API is enabled
+  # (single-node.tfvars sets enable_custom_domains=true and the Terraform
+  # bootstrap injects SB_ENABLE_CUSTOM_DOMAINS), so the feature is live here.
   - custom-domains
+  # NOTE: UC-35/36 additionally require external-dns-zone, which this scenario
+  # does NOT advertise. A real custom domain must live OUTSIDE the base domain
+  # (the API rejects hosts under the wildcard) and prove ownership via a TXT
+  # record, which needs a second DNS zone the harness controls. We only control
+  # the leased base zone, so UC-35/36 skip here rather than fail. Add
+  # external-dns-zone + export AEROL_CUSTOM_DOMAIN to enable them.

@@ -24,6 +24,11 @@ const (
 	EnvScenario = "AEROL_SCENARIO"
 	EnvCaps     = "AEROL_CAPS"   // path to the scenario caps.yml
 	EnvDomain   = "AEROL_DOMAIN" // leased apex domain; empty in local-mode
+	// EnvCustomDomain is a real hostname OUTSIDE the deployment base domain that
+	// the operator has already provisioned for custom-domain tests (UC-35/36):
+	// a `_aerol-verify.<host>` TXT record proving ownership and a CNAME pointing
+	// at ingress. Only scenarios advertising CapExternalDNSZone export it.
+	EnvCustomDomain = "AEROL_CUSTOM_DOMAIN"
 )
 
 // LoadScenario builds a Scenario from the environment. It reads the caps file
@@ -63,11 +68,12 @@ func LoadScenario() (*Scenario, error) {
 		caps[c] = true
 	}
 	return &Scenario{
-		Name:    name,
-		BaseURL: base,
-		PAT:     pat,
-		Domain:  os.Getenv(EnvDomain),
-		caps:    caps,
+		Name:         name,
+		BaseURL:      base,
+		PAT:          pat,
+		Domain:       os.Getenv(EnvDomain),
+		CustomDomain: os.Getenv(EnvCustomDomain),
+		caps:         caps,
 	}, nil
 }
 

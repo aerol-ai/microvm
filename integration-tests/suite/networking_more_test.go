@@ -160,7 +160,13 @@ func TestCustomDomainDNSInstructions(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	host := fmt.Sprintf("cd-%d.example.test", time.Now().UnixNano())
+	// CapExternalDNSZone guarantees a real hostname (outside the base domain)
+	// whose ownership TXT record is already provisioned, so the attach passes
+	// the verification gate instead of failing on an unverifiable fake domain.
+	host := sc.CustomDomain
+	if host == "" {
+		t.Skip("scenario advertises external-dns-zone but AEROL_CUSTOM_DOMAIN is unset")
+	}
 	if _, err := sb.AddCustomDomain(ctx, host, microvm.WithTargetPort(8080)); err != nil {
 		t.Fatalf("add custom domain: %v", err)
 	}
@@ -176,20 +182,20 @@ func TestCustomDomainDNSInstructions(t *testing.T) {
 	_ = recs // presence of a non-error response is the contract; shape varies.
 }
 
-// UC-36 — A custom hostname under the leased wildcard zone (which already
-// resolves to ingress) is reachable over HTTPS after attach. This exercises the
-// real custom-domain serving path without needing the test to mint new DNS.
+// UC-36 — A real custom hostname (outside the deployment base domain, with its
+// verification TXT + a CNAME to ingress already provisioned) is reachable over
+// HTTPS after attach. The hostname MUST live outside the base domain: the API
+// rejects hosts under the wildcard zone because the wildcard already covers
+// them, so this can only be exercised against an externally controlled zone.
 func TestCustomDomainReachable(t *testing.T) {
 	harness.Require(t, sc, "UC-36")
 	c := client(t)
 	sb := httpServerSandbox(t, c)
 
-	// sc.Domain is the leased apex; *.<domain> already points at ingress via
-	// the wildcard record Terraform created, so an arbitrary label resolves.
-	if sc.Domain == "" {
-		t.Skip("scenario has no leased domain to build a custom hostname under")
+	host := sc.CustomDomain
+	if host == "" {
+		t.Skip("scenario advertises external-dns-zone but AEROL_CUSTOM_DOMAIN is unset")
 	}
-	host := fmt.Sprintf("custom-%d.%s", time.Now().UnixNano(), sc.Domain)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

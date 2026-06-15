@@ -12,7 +12,11 @@ type Scenario struct {
 	// the custom-domain reachability use case — read it. The wildcard
 	// *.<Domain> record already points at ingress, so any label resolves.
 	Domain string
-	caps   map[Capability]bool
+	// CustomDomain is a real hostname OUTSIDE the base domain, pre-provisioned
+	// with a verification TXT record + CNAME to ingress. Populated only for
+	// scenarios advertising CapExternalDNSZone; UC-35/36 read it.
+	CustomDomain string
+	caps         map[Capability]bool
 }
 
 // Has reports whether the scenario advertises a capability.

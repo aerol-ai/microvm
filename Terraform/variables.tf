@@ -86,6 +86,24 @@ variable "public_http_ports" {
   default     = [80, 443]
 }
 
+variable "l4_port_range" {
+  description = "Public TCP port pool for raw-TCP (L4) sandbox exposures. Must match SB_L4_PORT_RANGE_START/END on the daemon (defaults 22000-23000). Opened on ingress-bearing nodes."
+  type = object({
+    start = number
+    end   = number
+  })
+  default = {
+    start = 22000
+    end   = 23000
+  }
+}
+
+variable "ssh_gateway_port" {
+  description = "Public TCP port for the per-sandbox SSH gateway. Must match SB_SSH_LISTEN_ADDR on the daemon (default 0.0.0.0:2220). Opened on ingress-bearing nodes."
+  type        = number
+  default     = 2220
+}
+
 variable "cluster_internal_tcp_ports" {
   description = "Cluster-internal TCP ports (raft / gossip-tcp / internal-mtls). Restricted to the VPC CIDR."
   type        = list(number)
