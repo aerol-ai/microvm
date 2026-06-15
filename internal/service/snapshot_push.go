@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -37,7 +38,24 @@ type SnapshotPushConfig struct {
 	// Docker registry password. File-sourced so rotation is just a
 	// file write; never logged.
 	PATPath string
+	// TagSuffix is an optional AOCR retention suffix appended to the
+	// pushed tag (`latest<suffix>`), e.g. "--ttl-1h" or "--idle-30d".
+	// AOCR's reaper parses `--(ttl|idle)-<dur>` off the END of the tag, so
+	// `latest--ttl-1h` expires 1h after push. Empty (the default and prod
+	// behavior) pushes a plain `latest` tag, which the reaper keeps
+	// latest-only forever. Because "suffixes are real tags" in AOCR, the
+	// pull side (DestRefFor) must use the same suffix — both go through
+	// snapshotAOCRRef, so they stay consistent. Used by ephemeral clusters
+	// (e.g. integration tests) that want their snapshots auto-reaped.
+	TagSuffix string
 }
+
+// retentionSuffixPattern matches the AOCR retention tag suffix
+// (`--ttl-<dur>` / `--idle-<dur>`), mirroring the registry's reaper regex
+// `^(.*)--(ttl|idle)-([a-z0-9]+)$`. Validation here is intentionally lax on
+// the duration token — AOCR is the authority on which durations exist; we only
+// guarantee the suffix is well-formed so a typo fails at boot, not at push.
+var retentionSuffixPattern = regexp.MustCompile(`^--(ttl|idle)-[a-z0-9]+$`)
 
 // Validate enforces the consistency rules the snapshot pusher relies on.
 // Returns nil for a disabled config so callers can validate unconditionally.
@@ -53,6 +71,9 @@ func (c SnapshotPushConfig) Validate() error {
 	}
 	if strings.TrimSpace(c.PATPath) == "" {
 		return errors.New("SnapshotPushConfig: PATPath required when Enabled")
+	}
+	if s := strings.TrimSpace(c.TagSuffix); s != "" && !retentionSuffixPattern.MatchString(s) {
+		return fmt.Errorf("SnapshotPushConfig: TagSuffix %q must be a retention suffix like --ttl-1h or --idle-30d", s)
 	}
 	return nil
 }
@@ -141,7 +162,7 @@ func (p *SnapshotPusher) PushOnce(ctx context.Context, snapshot *models.SandboxS
 		return SnapshotPushResult{}, fmt.Errorf("snapshot push: read PAT: %w", err)
 	}
 
-	dest := snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name)
+	dest := snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name, p.cfg.TagSuffix)
 
 	var digest string
 	pushed, err := p.docker.PushImage(ctx, docker.PushImageRequest{
@@ -187,19 +208,23 @@ func (p *SnapshotPusher) DestRefFor(snapshotName string) string {
 	if name == "" {
 		return ""
 	}
-	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name)
+	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name, p.cfg.TagSuffix)
 }
 
 // snapshotAOCRRef is the AOCR destination convention for cluster-local
-// snapshots: `<host>/cluster/<id>/snapshots/<name>:latest`. Mirrors the
-// auto-import path's `cluster/<id>/_imported/...` namespace pattern.
-// Tag is always "latest" — snapshot names are themselves unique (the
-// store enforces a PRIMARY KEY on `name`).
-func snapshotAOCRRef(host, clusterID, snapshotName string) string {
+// snapshots: `<host>/cluster/<id>/snapshots/<name>:latest<suffix>`. Mirrors the
+// auto-import path's `cluster/<id>/_imported/...` namespace pattern. The base
+// tag is "latest" — snapshot names are themselves unique (the store enforces a
+// PRIMARY KEY on `name`). An optional retention suffix (`--ttl-*` / `--idle-*`)
+// is appended so the registry reaper can age the tag out; empty means a plain
+// `latest` tag that is kept indefinitely. Push and pull must agree on the tag,
+// so every caller routes through here.
+func snapshotAOCRRef(host, clusterID, snapshotName, tagSuffix string) string {
 	host = strings.TrimRight(strings.TrimSpace(host), "/")
 	clusterID = strings.TrimSpace(clusterID)
 	snapshotName = strings.ToLower(strings.TrimSpace(snapshotName))
-	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest", host, clusterID, snapshotName)
+	tagSuffix = strings.ToLower(strings.TrimSpace(tagSuffix))
+	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest%s", host, clusterID, snapshotName, tagSuffix)
 }
 
 // readPATFile reads the bearer token from disk. Trailing whitespace

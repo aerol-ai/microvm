@@ -141,9 +141,10 @@ run_one() {
 
   # Capability checks read the structured list (not a substring grep, which
   # would false-match the word "domain" in a caps-file comment).
-  local caps_domain caps_wasm
+  local caps_domain caps_wasm caps_cluster
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file")
   caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
+  caps_cluster=$(yq -r '.capabilities | contains(["cluster"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
     leased=$(lease_domain)
   else
@@ -160,13 +161,43 @@ run_one() {
   # wasm.enabled follows the scenario's wasm capability so the wasm worker can
   # actually run modules (the wasm-runtime UCs still gate on a staged module
   # ref via AEROL_WASM_MODULE_REF; this just turns the runtime on).
+  # Upstream auto-import (pulling private prod images through AOCR hooks) and
+  # the fleet control plane are prod-only side effects we always neutralize.
   yq '.auto_import.enabled = false
-      | .mirror.host = ""
       | .fleet_control_plane.enabled = false
       | .wasm.enabled = '"$caps_wasm"'
       | (.ingress.acme_ca // "") = "'"$acme_issuer"'"
       | (.ingress.domain_name) = "'"${leased}"'"' \
     "$CONFIG_CLUSTER" > "${overlay}/cluster.yml"
+
+  # AOCR mirror + snapshot distribution. Single-node/local-mode don't need
+  # cross-node image sharing, so the mirror is fully neutralized there. Cluster
+  # scenarios KEEP the mirror and turn snapshot push ON so a sandbox created
+  # from a peer node's snapshot can pull it (UC-21) — mirroring prod.
+  #
+  # We deliberately do NOT override auto_import.cluster_id: the AOCR cluster PAT
+  # (symlinked from config/secrets.yml, reused as the push credential) is bound
+  # server-side to one cluster_id, and AOCR only authorizes pushes to that PAT's
+  # own `cluster/<id>/...` namespace (auth/src/clusterPat.ts evaluateClusterPatScope).
+  # A scenario-specific id would land outside the PAT's namespace and 403, so the
+  # config's cluster_id (which the PAT is registered for) must be used as-is.
+  #
+  # Cleanup: snapshots push to `cluster/<id>/snapshots/<name>:latest<suffix>`.
+  # We append an AOCR TTL suffix so the registry reaper auto-deletes each test
+  # snapshot 1h after push (AOCR parses `--ttl-<dur>` off the tag end). Without
+  # it, every uniquely-named test snapshot becomes its own repo that the
+  # keep-latest rule never expires, leaking repos into the shared namespace.
+  if [[ "$caps_cluster" == "true" ]]; then
+    yq -i '.mirror.push_host = "aocr.aerol.ai"
+        | .mirror.snapshot_push_enabled = true
+        | .mirror.snapshot_push_tag_suffix = "--ttl-1h"' \
+      "${overlay}/cluster.yml"
+  else
+    yq -i '.mirror.host = ""
+        | .mirror.push_host = ""
+        | .mirror.snapshot_push_enabled = false' \
+      "${overlay}/cluster.yml"
+  fi
 
   # When the scenario advertises wasm, stage the curated language runtimes by
   # splicing fixtures/wasm/modules.yml (url + sha256 per module) into

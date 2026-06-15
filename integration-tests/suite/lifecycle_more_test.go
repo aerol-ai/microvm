@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -204,9 +205,34 @@ func TestRegisterSnapshotAndCreateFrom(t *testing.T) {
 	}
 
 	// Create a new sandbox directly from the snapshot's image reference.
-	derived := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Image: snap.Image,
-		Name:  harness.UniqueName(sc, t),
+	//
+	// In cluster mode the snapshot is distributed to AOCR by a background push
+	// kicked at create time. Until that push reaches "active" the snapshot is
+	// only locally-pinned, so a derived create that lands on a non-source node
+	// (the leased domain load-balances across nodes) can briefly 404 pulling the
+	// not-yet-pushed AOCR ref. Retry the create until the push has propagated
+	// rather than hard-failing on that transient window. Single-node always
+	// succeeds on the first attempt (the image is local).
+	derivedName := harness.UniqueName(sc, t)
+	var derived *microvm.Sandbox
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		derived, err = c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+			Image: snap.Image,
+			Name:  derivedName,
+		})
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("create from snapshot never succeeded: %v", err)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().Destroy(cctx, derived.ID)
 	})
 	waitRunning(t, derived)
 }

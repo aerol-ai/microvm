@@ -251,6 +251,56 @@ func TestSnapshotPusherEdgeBranches(t *testing.T) {
 	}
 }
 
+// TestSnapshotPusher_TagSuffix verifies the optional AOCR retention suffix is
+// appended to BOTH the pushed dest ref and the DestRefFor pull ref (they must
+// match — "suffixes are real tags" in AOCR), and that a malformed suffix is
+// rejected at construction. Without this, ephemeral test snapshots push as a
+// plain `latest` tag the reaper keeps forever.
+func TestSnapshotPusher_TagSuffix(t *testing.T) {
+	patPath := writePATFile(t, "token")
+
+	fake := &fakeSnapshotPushDocker{}
+	pusher, err := NewSnapshotPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-42",
+		PATPath:   patPath,
+		TagSuffix: "--ttl-1h",
+	}, fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewSnapshotPusher: %v", err)
+	}
+
+	wantRef := "aocr.test/cluster/cluster-42/snapshots/snap:latest--ttl-1h"
+	if got := pusher.DestRefFor("snap"); got != wantRef {
+		t.Fatalf("DestRefFor = %q, want %q", got, wantRef)
+	}
+
+	if _, err := pusher.PushOnce(context.Background(), &models.SandboxSnapshot{Name: "snap", Image: "img:1"}); err != nil {
+		t.Fatalf("PushOnce: %v", err)
+	}
+	if got := fake.lastCall().DestRef; got != wantRef {
+		t.Fatalf("pushed DestRef = %q, want %q", got, wantRef)
+	}
+
+	// Empty suffix keeps the plain latest tag (prod-default behavior).
+	plain := newTestPusher(t, patPath, &fakeSnapshotPushDocker{})
+	if got := plain.DestRefFor("snap"); got != "aocr.test/cluster/cluster-42/snapshots/snap:latest" {
+		t.Fatalf("plain DestRefFor = %q, want :latest", got)
+	}
+
+	// A malformed suffix fails fast at construction.
+	if _, err := NewSnapshotPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-42",
+		PATPath:   patPath,
+		TagSuffix: "1h",
+	}, fake, slog.Default()); err == nil {
+		t.Fatal("expected error for malformed TagSuffix")
+	}
+}
+
 func TestSnapshotNeedsPush(t *testing.T) {
 	cases := []struct {
 		name string
