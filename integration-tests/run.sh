@@ -255,7 +255,7 @@ run_one() {
     AEROL_DOMAIN="${leased}" \
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
     AEROL_WASM_MODULE_REF="${wasm_ref}" \
-    go test -tags=integration -json ./integration-tests/suite/... > "$json_out"
+    go test -tags=integration -count=1 -json ./integration-tests/suite/... > "$json_out"
   set -e
 
   AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" \
