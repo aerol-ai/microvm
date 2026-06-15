@@ -4,3 +4,7 @@ name: single-node
 capabilities:
   - docker
   - domain
+  # custom-domains gates UC-35/36. single-node.tfvars sets
+  # enable_custom_domains=true, and the Terraform bootstrap injects
+  # SB_ENABLE_CUSTOM_DOMAINS into the daemon env, so the feature is live here.
+  - custom-domains

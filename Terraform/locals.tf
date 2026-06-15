@@ -20,8 +20,13 @@ locals {
   # DNS records) and Ansible (day-2 rotation) read from the SoT. Lifted into
   # named locals so the rest of the .tf files don't sprinkle
   # local.cluster_ops.ingress.* / local.cluster_secrets.cluster.* everywhere.
-  domain_name                    = local.cluster_ops.ingress.domain_name
-  acme_email                     = local.cluster_ops.ingress.acme_email
+  domain_name = local.cluster_ops.ingress.domain_name
+  acme_email  = local.cluster_ops.ingress.acme_email
+  # Custom domains require a public domain (the daemon refuses to boot with
+  # SB_ENABLE_CUSTOM_DOMAINS=true and no SB_DOMAIN). AND with domain presence so
+  # the no-domain local-mode scenario — which still inherits the shared config's
+  # enable flag — emits false instead of a boot-breaking true.
+  enable_custom_domains          = try(local.cluster_ops.ingress.enable_custom_domains, false) && local.domain_name != ""
   custom_domain_txt_prefix       = local.cluster_ops.ingress.custom_domain_txt_prefix
   custom_domain_txt_value_prefix = local.cluster_ops.ingress.custom_domain_txt_value_prefix
   pat_token                      = local.cluster_secrets.cluster.pat_token

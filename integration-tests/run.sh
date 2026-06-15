@@ -83,10 +83,32 @@ teardown() {
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
 }
 
-# lease_domain picks a test domain for the scenario (round-robin by index in the
-# pool). Phase 0: index 0. Later phases rotate via a persisted lease file.
+# lease_domain picks a RANDOM test domain from the pool, never repeating the
+# previous run's pick. Reusing one name re-requests the same cert set and trips
+# Let's Encrypt's duplicate-certificate limit (5 identical sets/week); random
+# selection spreads runs across the pool so each gets a fresh quota, and the
+# "exclude last" rule guarantees we never hit the same FQDN twice in a row (the
+# one case that actually accumulates against the duplicate limit). The persisted
+# lease file under .tf/ (gitignored) only remembers the last index for that
+# exclusion. With a single-domain pool there's nothing to rotate to, so it
+# degrades to always returning that one.
 lease_domain() {
-  yq -r '.itest.domains[0]' "$DOMAINS_FILE"
+  local n last idx
+  local lease_file="${REPO_ROOT}/integration-tests/.tf/.domain-lease"
+  n=$(yq -r '.itest.domains | length' "$DOMAINS_FILE")
+  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || { echo "domains pool empty in $DOMAINS_FILE" >&2; return 1; }
+  last=-1
+  [[ -f "$lease_file" ]] && last=$(cat "$lease_file" 2>/dev/null || echo -1)
+  [[ "$last" =~ ^-?[0-9]+$ ]] || last=-1
+  idx=$(( RANDOM % n ))
+  # Re-roll off a collision with the previous pick (only meaningful when n>1);
+  # a single deterministic bump is enough and keeps the result uniform-ish.
+  if [[ "$n" -gt 1 && "$idx" -eq "$last" ]]; then
+    idx=$(( (idx + 1) % n ))
+  fi
+  mkdir -p "$(dirname "$lease_file")"
+  echo "$idx" > "$lease_file"
+  yq -r ".itest.domains[$idx]" "$DOMAINS_FILE"
 }
 
 # on_demand_tfvar maps the --metal-on-demand flag to the force_on_demand TF var

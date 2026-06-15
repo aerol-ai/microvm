@@ -22,6 +22,13 @@ const (
 	CapGPU         Capability = "gpu"         // a GPU worker
 	CapDomain      Capability = "domain"      // public domain + TLS (not local-mode)
 	CapCluster     Capability = "cluster"     // multi-node cluster (raft/forwarding)
+	// CapCustomDomains gates the custom-domain attach path (UC-35/36). It's
+	// distinct from CapDomain: a deployment can have a public domain + TLS yet
+	// run with SB_ENABLE_CUSTOM_DOMAINS=false, in which case the API rejects
+	// AddCustomDomain. Only scenarios that opt the feature on (and provision the
+	// env) advertise this, so the custom-domain UCs skip instead of hard-failing
+	// where the feature is off.
+	CapCustomDomains Capability = "custom-domains"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -86,8 +93,8 @@ var Registry = []UseCase{
 	{ID: "UC-32", Title: "Default <id>.<domain> reachable", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-33", Title: "Unexpose port -> route gone", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-34", Title: "L4 raw TCP host-port reachable", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
-	{ID: "UC-35", Title: "Add custom domain -> DNS instructions", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
-	{ID: "UC-36", Title: "Custom domain reachable after CNAME", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
+	{ID: "UC-35", Title: "Add custom domain -> DNS instructions", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains}, Implemented: true},
+	{ID: "UC-36", Title: "Custom domain reachable after CNAME", Requires: []Capability{CapDocker, CapDomain, CapCustomDomains}, Implemented: true},
 	{ID: "UC-37", Title: "Network usage counters returned", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-38", Title: "Network limits patch enforced", Requires: []Capability{CapDocker}, Implemented: true},
 
