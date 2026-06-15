@@ -1051,6 +1051,7 @@ func startSnapshotPushReconciler(ctx context.Context, logger *slog.Logger, cfg c
 		Host:      host,
 		ClusterID: cfg.AutoImportClusterID,
 		PATPath:   cfg.AutoImportClusterPATPath,
+		TagSuffix: cfg.SnapshotPushTagSuffix,
 	}, dockerClient, logger)
 	if err != nil {
 		logger.Warn("snapshot push: pusher build failed; feature stays off",

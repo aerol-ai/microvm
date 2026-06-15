@@ -280,6 +280,7 @@ Operators enable it at the daemon level - there is no SDK toggle, because the ch
 | `SB_MIRROR_PUSH_HOST` | Push destination (e.g. `aocr.aerol.ai`). Falls back to `SB_IMAGE_DISTRIBUTION_AOCR_HOST` when unset. |
 | `SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL` | Reconciler tick. Default `5m`. |
 | `SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT` | Per-tick fan-out cap. Default `2`. |
+| `SB_SNAPSHOT_PUSH_TAG_SUFFIX` | Optional AOCR retention suffix appended to the pushed tag (`latest<suffix>`), e.g. `--ttl-7d` or `--idle-30d`. Empty (default) pushes a plain `latest` tag the reaper keeps indefinitely — correct for durable failover snapshots. Ephemeral clusters set a short TTL so their snapshots auto-reap. Push and pull use the same suffix. |
 
 Each snapshot row carries a `pushState` field you can read back to watch the lifecycle: `active` (no push needed, or push complete), `pending` / `pushing` (queued for the reconciler), or `error` (last push attempt failed; the reconciler will retry on the next tick and the `pushError` field will explain why).
 

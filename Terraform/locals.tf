@@ -158,6 +158,20 @@ locals {
     request_timeout     = local.aocr_enabled ? local.cluster_ops.auto_import.request_timeout : "15s"
     reconcile_interval  = local.aocr_enabled ? local.cluster_ops.auto_import.reconcile_interval : "5m"
     max_in_flight       = local.aocr_enabled ? local.cluster_ops.auto_import.max_in_flight : 4
+
+    # Snapshot distribution (push sandbox snapshots + firecracker templates to
+    # AOCR). Gated on aocr being enabled AND a push_host being set — without a
+    # write vhost there is nowhere to push, so the daemon would refuse to boot
+    # with the feature on. try() keeps older config/cluster.yml files (no
+    # mirror.snapshot_push_* keys) valid by defaulting the feature off.
+    snapshot_push_enabled = (
+      local.aocr_enabled
+      && local.cluster_ops.mirror.push_host != ""
+      && try(local.cluster_ops.mirror.snapshot_push_enabled, false)
+    )
+    snapshot_push_reconcile_interval = try(local.cluster_ops.mirror.snapshot_push_reconcile_interval, "5m")
+    snapshot_push_max_in_flight      = try(local.cluster_ops.mirror.snapshot_push_max_in_flight, 2)
+    snapshot_push_tag_suffix         = try(local.cluster_ops.mirror.snapshot_push_tag_suffix, "")
   }
 
   # Fleet control plane (optional managed integration) — resolved view for
@@ -217,6 +231,22 @@ resource "terraform_data" "validate_cluster_ops" {
         || can(regex("^[A-Za-z0-9_-]{1,64}$", local.cluster_ops.auto_import.cluster_id))
       )
       error_message = "auto_import.cluster_id must match ^[A-Za-z0-9_-]{1,64}$ (matches AOCR ImportAPI validation)."
+    }
+
+    # Snapshot push needs a write vhost (mirror.push_host) plus the cluster
+    # identity it reuses for auth (cluster_id + the cluster PAT secret).
+    # sandboxd refuses to boot with SB_SNAPSHOT_PUSH_ENABLED=true and these
+    # unset, so fail at plan time rather than after cloud-init.
+    precondition {
+      condition = (
+        !try(local.cluster_ops.mirror.snapshot_push_enabled, false)
+        || (
+          local.cluster_ops.mirror.push_host != ""
+          && local.cluster_ops.auto_import.cluster_id != ""
+          && local.cluster_secrets.aocr.cluster_pat != ""
+        )
+      )
+      error_message = "When mirror.snapshot_push_enabled = true in config/cluster.yml, mirror.push_host, auto_import.cluster_id, and aocr.cluster_pat in config/secrets.yml are all required (sandboxd refuses to boot otherwise)."
     }
 
     precondition {

@@ -134,10 +134,28 @@ wasm:
 # --- AOCR mirror (Phase 4) ------------------------------------------------
 # Empty host disables mirror rewriting entirely. Upstreams maps upstream
 # hostnames to repository prefixes inside the mirror.
+#
+# push_host is the AOCR write vhost. It is required for snapshot distribution
+# (snapshot_push below): snapshots are pushed to
+# <push_host>/cluster/<auto_import.cluster_id>/snapshots/<name> so any node can
+# pull a sandbox created from a peer's snapshot. Without it a snapshot stays a
+# local-only commit and a derived sandbox placed on another node fails to pull.
 mirror:
   host: "mirror.aocr.aerol.ai"
-  push_host: ""
+  push_host: "aocr.aerol.ai"
   upstreams: "docker.io=docker,ghcr.io=ghcr,gcr.io=gcr,quay.io=quay,registry.k8s.io=k8s"
+  # Background push of sandbox snapshots (and firecracker templates) to AOCR so
+  # they are reachable cluster-wide. Reuses the auto_import cluster PAT as the
+  # registry password and requires auto_import.cluster_id + push_host above.
+  snapshot_push_enabled: true
+  snapshot_push_reconcile_interval: "5m"
+  snapshot_push_max_in_flight: 2
+  # Optional AOCR retention suffix appended to pushed snapshot tags
+  # (latest<suffix>), e.g. "--ttl-7d" or "--idle-30d". Empty keeps a plain
+  # latest tag the reaper never expires — the right posture for durable
+  # failover snapshots in prod. Ephemeral clusters set a short TTL so their
+  # snapshots auto-reap (the integration overlay sets "--ttl-1h").
+  snapshot_push_tag_suffix: ""
 
 # --- AOCR auto-import (Phase 4) -------------------------------------------
 # enabled=true requires hooks_url + cluster_id + a cluster PAT (delivered as

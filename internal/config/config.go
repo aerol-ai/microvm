@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -15,6 +16,12 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// snapshotRetentionSuffixPattern validates SB_SNAPSHOT_PUSH_TAG_SUFFIX. It
+// mirrors AOCR's reaper suffix grammar (`--(ttl|idle)-<dur>`); the duration
+// token is left to the registry to accept or reject, so a typo fails at boot
+// rather than silently pushing an un-reaped tag.
+var snapshotRetentionSuffixPattern = regexp.MustCompile(`^--(ttl|idle)-[a-z0-9]+$`)
 
 const defaultToolboxPort = 2280
 
@@ -1026,6 +1033,14 @@ type Config struct {
 	// AOCR registry. Default 2 — pushes are I/O-heavy per snapshot.
 	// SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT.
 	SnapshotPushMaxInFlight int
+	// SnapshotPushTagSuffix is an optional AOCR retention suffix appended to
+	// pushed snapshot tags (`latest<suffix>`), e.g. "--ttl-1h" or
+	// "--idle-30d". Empty (the default) pushes a plain `latest` tag the reaper
+	// keeps indefinitely — the right posture for durable failover snapshots.
+	// Ephemeral clusters (integration tests) set it so their snapshots are
+	// auto-reaped. Validated at startup against `--(ttl|idle)-<dur>`.
+	// SB_SNAPSHOT_PUSH_TAG_SUFFIX.
+	SnapshotPushTagSuffix string
 
 	// FleetControlPlaneEnabled gates the optional managed control-plane
 	// integration (caller-token validation + fleet usage telemetry +
@@ -1215,6 +1230,7 @@ func Load() (Config, error) {
 		SnapshotPushEnabled:              getEnvBool("SB_SNAPSHOT_PUSH_ENABLED", false),
 		SnapshotPushReconcileInterval:    getEnvDuration("SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL", 5*time.Minute),
 		SnapshotPushMaxInFlight:          getEnvInt("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT", 2),
+		SnapshotPushTagSuffix:            strings.TrimSpace(getEnv("SB_SNAPSHOT_PUSH_TAG_SUFFIX", "")),
 
 		FleetControlPlaneEnabled:         getEnvBool("SB_FLEET_ENABLED", false),
 		FleetControlPlaneEndpoint:        strings.TrimSpace(os.Getenv("SB_FLEET_ENDPOINT")),
@@ -1362,6 +1378,9 @@ func Load() (Config, error) {
 		}
 		if cfg.SnapshotPushMaxInFlight <= 0 {
 			return Config{}, errors.New("SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT must be > 0 when snapshot push is enabled")
+		}
+		if s := cfg.SnapshotPushTagSuffix; s != "" && !snapshotRetentionSuffixPattern.MatchString(s) {
+			return Config{}, fmt.Errorf("SB_SNAPSHOT_PUSH_TAG_SUFFIX %q must be a retention suffix like --ttl-1h or --idle-30d", s)
 		}
 	}
 
