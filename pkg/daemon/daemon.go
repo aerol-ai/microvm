@@ -657,11 +657,21 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	if cfg.EnableSSHGateway && cfg.IsWorker() {
-		gw, err := sshgateway.New(logger, sshgateway.Config{
+		sshCfg := sshgateway.Config{
 			ListenAddr:  cfg.SSHListenAddr,
 			HostKeyPath: cfg.SSHHostKeyPath,
 			ToolboxPort: cfg.ToolboxPort,
-		}, svc, dockerClient)
+		}
+		// In cluster mode an SSH connection can land on a node that does not own
+		// the target sandbox. Point the gateway at this node's own v1 API
+		// (loopback) so the cross-node session is bridged via clusterForwardWrap
+		// to the owner. Empty in single-node mode → the remote path is never
+		// taken and behaviour is unchanged.
+		if cfg.EnableCluster {
+			sshCfg.RemoteAPIBaseURL = loopbackAPIBaseURL(cfg.ListenAddr())
+			sshCfg.RemoteAPIToken = cfg.PATToken
+		}
+		gw, err := sshgateway.New(logger, sshCfg, svc, dockerClient)
 		if err != nil {
 			return fmt.Errorf("create ssh gateway: %w", err)
 		}
@@ -1637,4 +1647,16 @@ func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([
 		})
 	}
 	return out, nil
+}
+
+// loopbackAPIBaseURL turns the daemon's listen address (e.g. "0.0.0.0:8080",
+// ":8080", or "127.0.0.1:8080") into a loopback base URL the in-process SSH
+// gateway can call its own v1 API on. The gateway uses this only in cluster
+// mode to bridge cross-node SSH sessions through clusterForwardWrap.
+func loopbackAPIBaseURL(listenAddr string) string {
+	port := listenAddr
+	if i := strings.LastIndex(listenAddr, ":"); i >= 0 {
+		port = listenAddr[i+1:]
+	}
+	return "http://127.0.0.1:" + port
 }

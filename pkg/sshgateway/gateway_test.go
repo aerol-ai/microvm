@@ -398,7 +398,7 @@ func TestFindOrCreateSession(t *testing.T) {
 	t.Run("returns-running-session-from-list", func(t *testing.T) {
 		list := `{"sessions":[{"id":"s-1","name":"build","status":"running"}]}`
 		g, sb, _, _ := newGatewayWithServer(t, list, http.StatusCreated, `{"id":"new"}`, "tok")
-		id, err := g.findOrCreateSession(context.Background(), sb, "build", &sessionState{ptyCols: 120, ptyRows: 40})
+		id, err := g.findOrCreateSession(context.Background(), localSessionEndpoint(sb.ContainerIP, g.toolboxPort, sb.ToolboxToken), "build", &sessionState{ptyCols: 120, ptyRows: 40})
 		if err != nil {
 			t.Fatalf("findOrCreateSession: %v", err)
 		}
@@ -427,7 +427,7 @@ func TestFindOrCreateSession(t *testing.T) {
 		port, _ := strconv.Atoi(portStr)
 		g := &Gateway{toolboxPort: port}
 		sb := &models.Sandbox{ContainerIP: host, ToolboxToken: "tok"}
-		id, err := g.findOrCreateSession(context.Background(), sb, "dev", &sessionState{ptyCols: 100, ptyRows: 30})
+		id, err := g.findOrCreateSession(context.Background(), localSessionEndpoint(sb.ContainerIP, g.toolboxPort, sb.ToolboxToken), "dev", &sessionState{ptyCols: 100, ptyRows: 30})
 		if err != nil {
 			t.Fatalf("findOrCreateSession: %v", err)
 		}
@@ -446,14 +446,14 @@ func TestFindOrCreateSession(t *testing.T) {
 
 	t.Run("errors-on-list-decode", func(t *testing.T) {
 		g, sb, _, _ := newGatewayWithServer(t, `{bad-json`, http.StatusCreated, `{"id":"x"}`, "")
-		if _, err := g.findOrCreateSession(context.Background(), sb, "x", &sessionState{}); err == nil {
+		if _, err := g.findOrCreateSession(context.Background(), localSessionEndpoint(sb.ContainerIP, g.toolboxPort, sb.ToolboxToken), "x", &sessionState{}); err == nil {
 			t.Fatalf("expected decode sessions error")
 		}
 	})
 
 	t.Run("errors-on-create-status", func(t *testing.T) {
 		g, sb, _, _ := newGatewayWithServer(t, `{"sessions":[]}`, http.StatusUnauthorized, `{"error":"denied"}`, "")
-		if _, err := g.findOrCreateSession(context.Background(), sb, "x", &sessionState{}); err == nil {
+		if _, err := g.findOrCreateSession(context.Background(), localSessionEndpoint(sb.ContainerIP, g.toolboxPort, sb.ToolboxToken), "x", &sessionState{}); err == nil {
 			t.Fatalf("expected create session status error")
 		}
 	})
@@ -465,7 +465,7 @@ func TestHandleSessionSandboxUnavailableWritesErrorAndExit(t *testing.T) {
 	g := &Gateway{logger: logger, svc: &fakeLookup{err: os.ErrNotExist}}
 	requests := make(chan *ssh.Request)
 	close(requests)
-	g.handleSession(context.Background(), "sb-1", "exec", "", &fakeChannel{stdout: io.Discard, stderr: stderr}, requests)
+	g.handleSession(context.Background(), "sb-1", "exec", "", false, &fakeChannel{stdout: io.Discard, stderr: stderr}, requests)
 	if !bytes.Contains(stderr.Bytes(), []byte("sandbox unavailable")) {
 		t.Fatalf("stderr = %q, want sandbox unavailable", stderr.String())
 	}
@@ -523,7 +523,7 @@ func TestAttachToSessionDialFailure(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	channel := &fakeChannel{stdout: stdout, stderr: stderr}
 	g := &Gateway{logger: logger, toolboxPort: port}
-	code := g.attachToSession(context.Background(), channel, &models.Sandbox{ContainerIP: host}, "prod", &sessionState{})
+	code := g.attachToSession(context.Background(), channel, localSessionEndpoint(host, g.toolboxPort, ""), "prod", &sessionState{})
 	if code != 1 {
 		t.Fatalf("attachToSession exit code = %d, want 1", code)
 	}
@@ -562,7 +562,7 @@ func TestAttachToSessionCloseWithoutExit(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	channel := &fakeChannel{stdout: stdout, stderr: stderr}
 	g := &Gateway{logger: logger, toolboxPort: port}
-	code := g.attachToSession(context.Background(), channel, &models.Sandbox{ContainerIP: host}, "", &sessionState{})
+	code := g.attachToSession(context.Background(), channel, localSessionEndpoint(host, g.toolboxPort, ""), "", &sessionState{})
 	if code != 1 {
 		t.Fatalf("attachToSession exit code = %d, want 1", code)
 	}
@@ -752,7 +752,7 @@ func TestHandleSessionRequestBranches(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleSession(context.Background(), "sb-1", "session", "prod", channel, requests)
+		g.handleSession(context.Background(), "sb-1", "session", "prod", false, channel, requests)
 	}()
 	requests <- &ssh.Request{Type: "pty-req", Payload: []byte{0, 0, 0, 1, 'x'}}
 	requests <- &ssh.Request{Type: "env", Payload: []byte{0, 0, 0, 1}}
@@ -778,7 +778,7 @@ func TestHandleSessionShellFallbackExec(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleSession(context.Background(), "sb-1", "session", "prod", channel, requests)
+		g.handleSession(context.Background(), "sb-1", "session", "prod", false, channel, requests)
 	}()
 	requests <- &ssh.Request{Type: "pty-req", Payload: bytes.Join([][]byte{
 		encodeString("xterm-256color"),
@@ -833,7 +833,7 @@ func TestHandleSessionExecWithoutPTY(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleSession(context.Background(), "sb-1", "exec", "", channel, requests)
+		g.handleSession(context.Background(), "sb-1", "exec", "", false, channel, requests)
 	}()
 	requests <- &ssh.Request{Type: "exec", Payload: encodeString("printf hello")}
 	close(requests)
@@ -869,7 +869,7 @@ func TestHandleConnExecMode(t *testing.T) {
 	requests := make(chan *ssh.Request, 4)
 	done := make(chan struct{})
 	go func() {
-		g.handleSession(context.Background(), "sb-1", "exec", "", channel, requests)
+		g.handleSession(context.Background(), "sb-1", "exec", "", false, channel, requests)
 		close(done)
 	}()
 
@@ -972,7 +972,7 @@ func TestHandleConnSessionModeAttach(t *testing.T) {
 	requests := make(chan *ssh.Request, 2)
 	done := make(chan struct{})
 	go func() {
-		g.handleSession(context.Background(), "sb-1", "session", "prod", channel, requests)
+		g.handleSession(context.Background(), "sb-1", "session", "prod", false, channel, requests)
 		close(done)
 	}()
 
@@ -1207,7 +1207,7 @@ func TestHandleSessionSandboxNotRunningWritesErrorAndExit(t *testing.T) {
 	requests := make(chan *ssh.Request)
 	close(requests)
 
-	g.handleSession(context.Background(), "sb-1", "exec", "", &fakeChannel{stdout: io.Discard, stderr: stderr}, requests)
+	g.handleSession(context.Background(), "sb-1", "exec", "", false, &fakeChannel{stdout: io.Discard, stderr: stderr}, requests)
 	if !strings.Contains(stderr.String(), "sandbox not running") {
 		t.Errorf("expected not running error, got %q", stderr.String())
 	}
@@ -1263,7 +1263,7 @@ func TestFindOrCreateSessionErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 	defer cancel()
 
-	_, err := gw.findOrCreateSession(ctx, sb, "test-name", state)
+	_, err := gw.findOrCreateSession(ctx, localSessionEndpoint(sb.ContainerIP, gw.toolboxPort, sb.ToolboxToken), "test-name", state)
 	if err == nil {
 		t.Error("expected error from findOrCreateSession with tiny timeout/bad IP")
 	}
@@ -1292,7 +1292,7 @@ func TestFindOrCreateSessionHttp(t *testing.T) {
 	}
 	state := &sessionState{}
 
-	id, err := gw.findOrCreateSession(context.Background(), sb, "test-name", state)
+	id, err := gw.findOrCreateSession(context.Background(), localSessionEndpoint(sb.ContainerIP, gw.toolboxPort, sb.ToolboxToken), "test-name", state)
 	if err != nil {
 		t.Fatalf("findOrCreateSession error: %v", err)
 	}
@@ -1320,7 +1320,7 @@ func TestFindOrCreateSessionHttpCreate(t *testing.T) {
 	sb := &models.Sandbox{ContainerIP: u.Hostname()}
 	state := &sessionState{}
 
-	id, err := gw.findOrCreateSession(context.Background(), sb, "test-name", state)
+	id, err := gw.findOrCreateSession(context.Background(), localSessionEndpoint(sb.ContainerIP, gw.toolboxPort, sb.ToolboxToken), "test-name", state)
 	if err != nil {
 		t.Fatalf("findOrCreateSession error: %v", err)
 	}

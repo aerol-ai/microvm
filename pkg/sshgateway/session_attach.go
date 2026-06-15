@@ -3,10 +3,12 @@ package sshgateway
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,11 +23,50 @@ const (
 	streamFramePrefixStderr byte = 0x02
 )
 
-// attachToSession opens a WebSocket to the in-container toolboxd session
-// API, creating the named session if necessary, and pumps bytes between
-// the SSH channel and the WS. Returns the session's exit code (or 1 if the
-// transport itself failed).
-func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, sandbox *models.Sandbox, sessionName string, state *sessionState) int {
+// sessionEndpoint locates a toolboxd /sessions API surface plus the auth header
+// to reach it. It exists so the same attach/bridge logic serves two callers:
+//
+//   - local (single-node / self-owned): the in-container toolboxd, reached
+//     directly at ws://<ContainerIP>:<toolboxPort>/sessions with the per-sandbox
+//     toolbox token.
+//   - remote (cluster, sandbox owned by another node): this node's own v1 API
+//     at /v1/sandboxes/<id>/sessions, which clusterForwardWrap transparently
+//     reverse-proxies (WebSocket upgrade included) to the owner over the
+//     cert-pinned mTLS channel. The PAT authenticates the loopback hop; the
+//     owner injects the real toolbox token on its side.
+//
+// baseURL is the http(s) /sessions root (no trailing slash); wsURL is the
+// matching ws(s) root; auth is the full Authorization header value or "".
+type sessionEndpoint struct {
+	baseURL string
+	wsURL   string
+	auth    string
+}
+
+// localSessionEndpoint targets the in-container toolboxd directly. This is the
+// single-node / self-owned path and must stay byte-for-byte identical to the
+// pre-cluster behaviour.
+func localSessionEndpoint(containerIP string, toolboxPort int, toolboxToken string) sessionEndpoint {
+	root := fmt.Sprintf("%s:%d/sessions", containerIP, toolboxPort)
+	return sessionEndpoint{
+		baseURL: "http://" + root,
+		wsURL:   "ws://" + root,
+		auth:    bearer(toolboxToken),
+	}
+}
+
+func bearer(token string) string {
+	if token == "" {
+		return ""
+	}
+	return "Bearer " + token
+}
+
+// attachToSession opens a WebSocket to a toolboxd session API (local container
+// or owner-forwarded v1), creating the named session if necessary, and pumps
+// bytes between the SSH channel and the WS. Returns the session's exit code (or
+// 1 if the transport itself failed).
+func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, ep sessionEndpoint, sessionName string, state *sessionState) int {
 	if sessionName == "" {
 		sessionName = "default"
 	}
@@ -34,18 +75,23 @@ func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, sand
 	// returned ID for new ones; for existing ones we ask /sessions and pick
 	// the matching name. Cleaner: POST always with idempotency via a
 	// "lookup-or-create" flag. We don't have that yet, so list first.
-	sessionID, err := g.findOrCreateSession(ctx, sandbox, sessionName, state)
+	sessionID, err := g.findOrCreateSession(ctx, ep, sessionName, state)
 	if err != nil {
 		g.writeStderr(channel, fmt.Sprintf("attach failed: %v\r\n", err))
 		return 1
 	}
 
-	wsURL := fmt.Sprintf("ws://%s:%d/sessions/%s/attach", sandbox.ContainerIP, g.toolboxPort, url.PathEscape(sessionID))
+	wsURL := fmt.Sprintf("%s/%s/attach", ep.wsURL, url.PathEscape(sessionID))
 	header := http.Header{}
-	if sandbox.ToolboxToken != "" {
-		header.Set("Authorization", "Bearer "+sandbox.ToolboxToken)
+	if ep.auth != "" {
+		header.Set("Authorization", ep.auth)
 	}
 	dialer := *websocket.DefaultDialer
+	// The remote path dials this node's own v1 API over loopback (ws://), so
+	// TLS is normally unused. Tolerate wss:// for completeness.
+	if strings.HasPrefix(ep.wsURL, "wss://") {
+		dialer.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 	dialer.HandshakeTimeout = 10 * time.Second
 	conn, _, err := dialer.DialContext(ctx, wsURL, header)
 	if err != nil {
@@ -61,6 +107,13 @@ func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, sand
 			"cols": int(state.ptyCols),
 			"rows": int(state.ptyRows),
 		})
+	}
+
+	// Cross-node one-shot exec: there is no local container to docker-exec
+	// into, so the command is injected as the session's first stdin line and
+	// the shell is asked to exit afterwards so the exit status propagates.
+	if state.execCommand != "" {
+		_ = conn.WriteMessage(websocket.BinaryMessage, []byte(state.execCommand+"\nexit\n"))
 	}
 
 	exitCh := make(chan int, 1)
@@ -134,14 +187,13 @@ func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, sand
 
 // findOrCreateSession looks up the named session via toolboxd's HTTP API and
 // returns its ID, creating it if absent. Synchronous; uses small timeouts.
-func (g *Gateway) findOrCreateSession(ctx context.Context, sandbox *models.Sandbox, name string, state *sessionState) (string, error) {
-	listURL := fmt.Sprintf("http://%s:%d/sessions", sandbox.ContainerIP, g.toolboxPort)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
+func (g *Gateway) findOrCreateSession(ctx context.Context, ep sessionEndpoint, name string, state *sessionState) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.baseURL, nil)
 	if err != nil {
 		return "", err
 	}
-	if sandbox.ToolboxToken != "" {
-		req.Header.Set("Authorization", "Bearer "+sandbox.ToolboxToken)
+	if ep.auth != "" {
+		req.Header.Set("Authorization", ep.auth)
 	}
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Do(req)
@@ -167,14 +219,13 @@ func (g *Gateway) findOrCreateSession(ctx context.Context, sandbox *models.Sandb
 		Cols: int(state.ptyCols),
 		Rows: int(state.ptyRows),
 	})
-	createURL := fmt.Sprintf("http://%s:%d/sessions", sandbox.ContainerIP, g.toolboxPort)
-	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(createBody))
+	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.baseURL, bytes.NewReader(createBody))
 	if err != nil {
 		return "", err
 	}
 	createReq.Header.Set("Content-Type", "application/json")
-	if sandbox.ToolboxToken != "" {
-		createReq.Header.Set("Authorization", "Bearer "+sandbox.ToolboxToken)
+	if ep.auth != "" {
+		createReq.Header.Set("Authorization", ep.auth)
 	}
 	createResp, err := httpClient.Do(createReq)
 	if err != nil {
