@@ -350,7 +350,9 @@ func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionNam
 			replyRequest(req, true)
 			if mode == "session" && g.toolboxPort > 0 && sandbox.ContainerIP != "" {
 				ep := localSessionEndpoint(sandbox.ContainerIP, g.toolboxPort, sandbox.ToolboxToken)
-				exitCode := g.attachToSession(ctx, channel, ep, sessionName, state)
+				// Local session-attach does not forward mid-session resize
+				// (unchanged pre-cluster behaviour); pass nil.
+				exitCode := g.attachToSession(ctx, channel, ep, sessionName, state, nil)
 				_ = sendExitStatus(channel, uint32(exitCode))
 				return
 			}
@@ -403,8 +405,9 @@ type sessionState struct {
 	envVars []string
 	execID  string
 	// execCommand is set only on the cross-node one-shot exec path
-	// (handleRemoteSession): the command is injected as the session's first
-	// stdin line because there is no local container to docker-exec into.
+	// (handleRemoteSession): the command runs as its own short-lived toolbox
+	// session on the owner (via CreateSessionRequest.Command) so its exact exit
+	// status propagates, since there is no local container to docker-exec into.
 	execCommand string
 }
 

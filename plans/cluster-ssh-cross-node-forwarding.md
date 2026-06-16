@@ -293,12 +293,36 @@ Modified:
 - `pkg/daemon/daemon.go` — pass loopback v1 base URL + PAT to the gateway in
   cluster mode (`loopbackAPIBaseURL`).
 
-### Not done / deferred from the proposal
+### Follow-up batch (completed after the initial commit)
+
+- **UC-7 / UC-8 — exact remote exec/exit codes.** A cross-node one-shot exec now
+  runs as its own short-lived toolbox session via `CreateSessionRequest.Command`
+  (`sh -c <cmd>`); the session's exit status is reported back over the attach WS
+  `exit` frame, so exit codes are exact (no more stdin `cmd\nexit` injection).
+- **UC-9 — mid-session resize on the remote path.** `handleRemoteSession` now
+  runs the attach concurrently with the request loop and forwards
+  `window-change` events as toolbox `resize` control messages
+  (`attachToSession` gained a resize channel). (The *local* session path still
+  only applies the initial size — a pre-existing, unchanged limitation.)
+- **UC-22 — shared SSH host key.** Optional shared host key distributed by
+  Terraform (`ssh_host_key_pem`) and Ansible (`ssh.host_key` /
+  `sandboxd_ssh_host_key_src`) to every ingress node; documented in
+  `docs/.../ssh-access.mdx`. Default stays per-node.
+- **UC-23 — correlated observability.** A `forward_id` is generated per
+  forwarded session, stamped on the `X-Aerol-Ssh-Forward-Id` header of the
+  cross-node calls and logged on both the edge (gateway) and owner
+  (`ServeToolboxReverseProxy`) sides.
+- **UC-24 — metrics.** Cross-node SSH rides `ForwardHTTP`, so it is already
+  counted by the existing `beginOwnerForward` metric family (no new code).
+- **UC-25 — negative integration test.** Added `UC-67` (`Cross-node SSH rejects
+  a forged key`) to the registry + `TestSSHCrossNodeForgedKeyRejected`.
+
+### Still not done
 
 - No new `internal/cluster` endpoints, no `Client` interface change, no Noop
   change (the reuse made them unnecessary).
-- Shared SSH host key (UC-22) — still per-node; clients use the leased domain.
-- Mid-session `window-change` resize on the remote path is best-effort/ignored
-  (matches the local session path, which only applies the initial PTY size).
-- A dedicated negative integration UC; UC-43 already runs in cluster scenarios
-  and now exercises the cross-node path.
+- **Live multi-node validation** — the implementation is unit-tested in
+  isolation but has NOT been run against a real cluster. UC-43 + UC-67 in the
+  integration harness need an actual cluster deploy to confirm end-to-end.
+- Local (single-node) session-attach mid-session resize remains unaddressed
+  (pre-existing; out of scope for the cross-node fix).

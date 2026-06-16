@@ -140,6 +140,7 @@ var Registry = []UseCase{
 	{ID: "UC-58b", Title: "Recreate-via-failover preserves identity", Requires: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-59", Title: "WASM live-migrate across nodes", Requires: []Capability{CapCluster, CapWasm}, Implemented: true},
 	{ID: "UC-60", Title: "Orphan reclaim-local + delete-orphan", Requires: []Capability{CapCluster}, Implemented: true},
+	{ID: "UC-67", Title: "Cross-node SSH rejects a forged key", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
 
 	// H. Capacity, admission, ops, idempotency
 	{ID: "UC-61", Title: "/v1/capacity reports host capacity", Requires: nil, Implemented: true},

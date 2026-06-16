@@ -523,7 +523,7 @@ func TestAttachToSessionDialFailure(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	channel := &fakeChannel{stdout: stdout, stderr: stderr}
 	g := &Gateway{logger: logger, toolboxPort: port}
-	code := g.attachToSession(context.Background(), channel, localSessionEndpoint(host, g.toolboxPort, ""), "prod", &sessionState{})
+	code := g.attachToSession(context.Background(), channel, localSessionEndpoint(host, g.toolboxPort, ""), "prod", &sessionState{}, nil)
 	if code != 1 {
 		t.Fatalf("attachToSession exit code = %d, want 1", code)
 	}
@@ -562,7 +562,7 @@ func TestAttachToSessionCloseWithoutExit(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	channel := &fakeChannel{stdout: stdout, stderr: stderr}
 	g := &Gateway{logger: logger, toolboxPort: port}
-	code := g.attachToSession(context.Background(), channel, localSessionEndpoint(host, g.toolboxPort, ""), "", &sessionState{})
+	code := g.attachToSession(context.Background(), channel, localSessionEndpoint(host, g.toolboxPort, ""), "", &sessionState{}, nil)
 	if code != 1 {
 		t.Fatalf("attachToSession exit code = %d, want 1", code)
 	}

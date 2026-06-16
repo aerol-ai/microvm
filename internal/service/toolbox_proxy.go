@@ -17,6 +17,12 @@ import (
 // ServeToolboxReverseProxy forwards a toolbox request to the sandbox toolbox.
 // WASM sandboxes are served in-process via the driver's ToolboxHost.
 func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string, w http.ResponseWriter, r *http.Request, path string) error {
+	// Cross-node SSH sessions stamp a correlation ID on the forwarded call
+	// (see pkg/sshgateway/forward.go). Logging it on the owner side lets an
+	// operator join the edge and owner halves of one forwarded SSH session.
+	if fid := r.Header.Get("X-Aerol-Ssh-Forward-Id"); fid != "" && s.logger != nil {
+		s.logger.Info("ssh forward: owner serving session", "sandbox_id", sandboxID, "forward_id", fid, "path", path)
+	}
 	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID); err != nil {
 		return err
 	}

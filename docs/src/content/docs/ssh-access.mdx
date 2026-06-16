@@ -82,13 +82,46 @@ ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123@<host>
 ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123+myshell@<host>
 ```
 
+## Cluster mode
+
+In a multi-node cluster a sandbox is owned by exactly one node, but the leased
+SSH domain load-balances connections across every ingress node. You connect the
+same way regardless of which node owns your sandbox:
+
+```bash
+ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123@<leased-domain>
+```
+
+If your connection lands on a node that does not own the sandbox, the gateway
+authenticates you against the owner's authoritative key and bridges the session
+to the owner over the cluster's internal mTLS channel. Only your sandbox's
+*public* key and the session bytes cross between nodes; the per-sandbox toolbox
+token never leaves the owner. Key revocation is honored immediately — the
+authorized key is re-fetched from the owner on every connection, not cached.
+
+### Stable host identity
+
+By default each node generates its own SSH host key, so as the leased domain
+rotates you across nodes your client may warn that the host key changed. To give
+clients one stable identity, distribute the **same** host key to every
+ingress-bearing node:
+
+- **Terraform:** set the `ssh_host_key_pem` variable (sensitive) to a shared
+  OpenSSH ed25519 private key; bootstrap writes it to `SB_SSH_HOST_KEY_PATH` on
+  every node.
+- **Ansible:** set `ssh.host_key` in `config/secrets.yml` (or point
+  `sandboxd_ssh_host_key_src` at a control-node file); `configure-ops.yml`
+  installs it.
+
+Leave both unset to keep per-node keys.
+
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---|---|---|
 | `SB_ENABLE_SSH_GATEWAY` | `true` | Enable or disable the SSH gateway. |
 | `SB_SSH_LISTEN_ADDR` | `0.0.0.0:2220` | Address and port for the SSH server. |
-| `SB_SSH_HOST_KEY_PATH` | `/var/lib/aerolvm/ssh_host_ed25519_key` | Host key path. Generated on first start if absent. |
+| `SB_SSH_HOST_KEY_PATH` | `/var/lib/aerolvm/ssh_host_ed25519_key` | Host key path. Generated on first start if absent. In cluster mode, point every node at a shared key for a stable host identity. |
 
 
 Each sandbox accepts exactly one authorized key. There is no shared host-level access.
