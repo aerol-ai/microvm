@@ -18,24 +18,7 @@ fn main() {
             cpu: Some(1),
             memory_mb: Some(1024),
             disk_gb: Some(10),
-            env: None,
-            os_user: None,
-            network_block_all: None,
-            network_allow_out: None,
-            network_deny_out: None,
-            allow_public_traffic: None,
-            network_bytes_in_limit: None,
-            network_bytes_out_limit: None,
-            registry: None,
-            container_command: None,
-            mounts: None,
-            lifecycle: None,
-            failover: None,
-            runtime: None,
-            gpus: None,
-            custom_domains: None,
-            durability: None,
-            module_ref: None,
+            ..Default::default()
         })
         .expect("sandbox creation failed");
 
