@@ -149,6 +149,24 @@ var Registry = []UseCase{
 	{ID: "UC-64", Title: "/v1/metrics scrape returns output", Requires: nil, Implemented: true},
 	{ID: "UC-65", Title: "Concurrent duplicate create (serial)", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-66", Title: "mounts list", Requires: []Capability{CapDocker}, Implemented: true},
+
+	// I. SDK API surface — gap-fill. These exercise SDK methods that the suite
+	// above leaves untested even though the daemon supports them: the streaming
+	// exec transport, the full session lifecycle (beyond create+log), tag-filtered
+	// list, the build-then-create / register-snapshot ergonomic wrappers, the
+	// clone-generation token, the rich Dockerfile builder, and the DNS ingress
+	// target. The suite doubles as the Go-SDK integration test (see client.go), so
+	// an SDK method with no UC here is an untested public method.
+	{ID: "UC-68", Title: "Interactive exec stream (stdin -> stdout, exit code)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-69", Title: "Exec with workdir + env", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-70", Title: "Session lifecycle (list/get/signal/resize)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-71", Title: "Session recording downloadable", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-72", Title: "Clone-generation token returned", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-73", Title: "List filtered by tags", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-74", Title: "Create with built image graph (CreateWithImage)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-75", Title: "Register snapshot + create from it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-76", Title: "Rich Dockerfile builder (env/workdir/entrypoint/cmd/user/expose)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-77", Title: "DNS ingress target published", Requires: []Capability{CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
