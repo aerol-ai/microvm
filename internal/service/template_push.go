@@ -285,7 +285,8 @@ func templateAOCRRef(host, clusterID, templateID string) string {
 	host = strings.TrimRight(strings.TrimSpace(host), "/")
 	clusterID = strings.TrimSpace(clusterID)
 	templateID = strings.ToLower(strings.TrimSpace(templateID))
-	return fmt.Sprintf("%s/cluster/%s/templates/%s:latest", host, clusterID, templateID)
+	archSfx := archTagSuffix(hostSnapshotArch())
+	return fmt.Sprintf("%s/cluster/%s/templates/%s:latest%s", host, clusterID, templateID, archSfx)
 }
 
 // localTemplateImageTag is the intermediate local tag the imported

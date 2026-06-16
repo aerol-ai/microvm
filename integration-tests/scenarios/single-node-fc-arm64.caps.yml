@@ -1,0 +1,8 @@
+# Single-node Firecracker on Graviton (arm64). Exercises the same firecracker
+# use cases as cluster-hetero's worker-fc but on a homogeneous arm64 host.
+name: single-node-fc-arm64
+capabilities:
+  - docker
+  - firecracker
+  - domain
+  - custom-domains

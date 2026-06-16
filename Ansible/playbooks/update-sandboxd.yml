@@ -48,6 +48,21 @@
       register: local_bin_stat
       failed_when: not local_bin_stat.stat.exists
 
+    - name: Gather hardware facts for architecture preflight
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - hardware
+
+    - name: Assert homogeneous CPU architecture across play hosts
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts | map('extract', hostvars, 'ansible_architecture') | unique | length == 1
+        fail_msg: >-
+          Mixed CPU architectures detected across inventory hosts.
+          AerolVM clusters must be single-arch (see plans/arm64-firecracker-hosts.md).
+
   tasks:
     - name: "[{{ inventory_hostname }}] Stage new binary at /tmp/sandboxd.new (local upload)"
       when: sandboxd_local_binary is defined

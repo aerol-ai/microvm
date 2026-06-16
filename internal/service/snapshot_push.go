@@ -224,7 +224,8 @@ func snapshotAOCRRef(host, clusterID, snapshotName, tagSuffix string) string {
 	clusterID = strings.TrimSpace(clusterID)
 	snapshotName = strings.ToLower(strings.TrimSpace(snapshotName))
 	tagSuffix = strings.ToLower(strings.TrimSpace(tagSuffix))
-	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest%s", host, clusterID, snapshotName, tagSuffix)
+	archSfx := archTagSuffix(hostSnapshotArch())
+	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest%s%s", host, clusterID, snapshotName, tagSuffix, archSfx)
 }
 
 // readPATFile reads the bearer token from disk. Trailing whitespace

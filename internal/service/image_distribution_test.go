@@ -171,7 +171,7 @@ func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
 			name:      "bare name with pusher rewrites to AOCR ref",
 			image:     "my-snap",
 			pusher:    pusher,
-			wantImage: "aocr.test/cluster/cluster-7/snapshots/my-snap:latest",
+			wantImage: pusher.DestRefFor("my-snap"),
 			wantMode:  models.ImageDistributionAOCR,
 		},
 		{
@@ -229,6 +229,25 @@ func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
 				t.Fatalf("ImageDistributionMode = %q, want %q", req.ImageDistributionMode, tc.wantMode)
 			}
 		})
+	}
+}
+
+func TestNormalizeCreateImageDistribution_RejectsForeignArchSnapshot(t *testing.T) {
+	host := hostSnapshotArch()
+	foreign := snapshotArchAMD64
+	if host == snapshotArchAMD64 {
+		foreign = snapshotArchARM64
+	}
+	foreignRef := "aocr.test/cluster/c1/snapshots/snap:latest--arch-" + foreign
+
+	svc := &Service{images: newDefaultImageDistributionProvider("aocr.test")}
+	req := &models.CreateSandboxRequest{Image: foreignRef}
+	req.ApplyImageDistribution(models.ImageDistributionMetadata{
+		Mode:        models.ImageDistributionAOCR,
+		RegistryRef: foreignRef,
+	})
+	if err := svc.NormalizeCreateImageDistribution(context.Background(), req); err == nil {
+		t.Fatal("expected foreign-arch AOCR ref to be rejected")
 	}
 }
 

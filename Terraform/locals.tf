@@ -41,6 +41,18 @@ locals {
   # Normalise each node entry with its effective values (per-node overrides
   # win, then var.default_*). Doing this once here keeps nodes.tf / dns.tf
   # readable.
+  #
+  # node_arch derives CPU architecture from an explicit nodes[*].arch field
+  # or from the instance type (Graviton families use a 'g' size token).
+  graviton_instance_re = "([a-z][0-9]+g|a1|t4g)\\."
+
+  node_arch = {
+    for name, n in var.nodes : name => coalesce(
+      try(n.arch, null),
+      can(regex(local.graviton_instance_re, coalesce(n.instance_type, var.default_instance_type))) ? "arm64" : "amd64"
+    )
+  }
+
   nodes_resolved = {
     for name, n in var.nodes : name => {
       name              = name
@@ -51,7 +63,13 @@ locals {
       volume_type       = coalesce(n.volume_type, var.default_volume_type)
       volume_iops       = coalesce(n.volume_iops, var.default_volume_iops)
       volume_throughput = coalesce(n.volume_throughput, var.default_volume_throughput)
-      ami_id            = coalesce(n.ami_id, var.ami_id, data.aws_ami.ubuntu.id)
+      arch              = local.node_arch[name]
+      ami_id = coalesce(
+        n.ami_id,
+        local.node_arch[name] == "arm64" ? data.aws_ami.ubuntu_arm64.id : (
+          var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu_amd64.id
+        )
+      )
       # bool defaults need explicit null handling — coalesce treats `false` as
       # a real value, but optional() without a default returns null.
       with_firecracker = n.with_firecracker == null ? var.default_with_firecracker : n.with_firecracker
@@ -213,6 +231,11 @@ locals {
 # config/cluster.yml became the source of those fields.
 resource "terraform_data" "validate_cluster_ops" {
   lifecycle {
+    precondition {
+      condition = length(distinct([for name, arch in local.node_arch : arch])) == 1
+      error_message = "All nodes in a cluster must share one CPU architecture; mixed x86/arm64 clusters are unsupported (see plans/arm64-firecracker-hosts.md)."
+    }
+
     precondition {
       condition = (
         !local.cluster_ops.auto_import.enabled

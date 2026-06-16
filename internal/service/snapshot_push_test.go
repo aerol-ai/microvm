@@ -89,7 +89,7 @@ func TestSnapshotPusher_HappyPath(t *testing.T) {
 		t.Fatalf("PushOnce: %v", err)
 	}
 
-	want := "aocr.test/cluster/cluster-42/snapshots/my-snap:latest"
+	want := testHostAOCRRef("aocr.test/cluster/cluster-42/snapshots/my-snap:latest")
 	if result.RegistryRef != want {
 		t.Fatalf("RegistryRef = %q, want %q", result.RegistryRef, want)
 	}
@@ -271,7 +271,7 @@ func TestSnapshotPusher_TagSuffix(t *testing.T) {
 		t.Fatalf("NewSnapshotPusher: %v", err)
 	}
 
-	wantRef := "aocr.test/cluster/cluster-42/snapshots/snap:latest--ttl-1h"
+	wantRef := "aocr.test/cluster/cluster-42/snapshots/snap:latest--ttl-1h" + archTagSuffix(hostSnapshotArch())
 	if got := pusher.DestRefFor("snap"); got != wantRef {
 		t.Fatalf("DestRefFor = %q, want %q", got, wantRef)
 	}
@@ -285,7 +285,7 @@ func TestSnapshotPusher_TagSuffix(t *testing.T) {
 
 	// Empty suffix keeps the plain latest tag (prod-default behavior).
 	plain := newTestPusher(t, patPath, &fakeSnapshotPushDocker{})
-	if got := plain.DestRefFor("snap"); got != "aocr.test/cluster/cluster-42/snapshots/snap:latest" {
+	if got := plain.DestRefFor("snap"); got != "aocr.test/cluster/cluster-42/snapshots/snap:latest"+archTagSuffix(hostSnapshotArch()) {
 		t.Fatalf("plain DestRefFor = %q, want :latest", got)
 	}
 

@@ -430,6 +430,9 @@ func (s *Service) EnsureTemplateLocal(ctx context.Context, tpl *models.Template)
 		// proceed against whatever local files exist.
 		return nil
 	}
+	if err := ValidateSnapshotRefArch(tpl.RegistryRef, hostSnapshotArch()); err != nil {
+		return fmt.Errorf("template pull %s: %w", id, err)
+	}
 
 	entry := s.templateLocalReadyEntry(id)
 	if entry.ready.Load() {

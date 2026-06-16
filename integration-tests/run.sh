@@ -6,7 +6,8 @@
 #   integration-tests/run.sh <scenario> [--keep] [--prod-tls] [--metal-on-demand]
 #   integration-tests/run.sh all       [flags]
 #
-# Scenarios: single-node | local-mode | cluster-3-mixed | cluster-hetero
+# Scenarios: single-node | local-mode | cluster-3-mixed | cluster-hetero |
+#            single-node-fc-arm64 | cluster-arm64
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -334,7 +335,7 @@ collect_failure_logs() {
 }
 
 if [[ "$SCENARIO" == "all" ]]; then
-  for s in single-node cluster-3-mixed cluster-hetero; do
+  for s in single-node cluster-3-mixed cluster-hetero single-node-fc-arm64 cluster-arm64; do
     ( run_one "$s" )
   done
 else

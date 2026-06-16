@@ -142,7 +142,7 @@ func TestTemplateArtifactPusher_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PushOnce: %v", err)
 	}
-	wantRef := "aocr.test/cluster/cluster-42/templates/tpl-happy:latest"
+	wantRef := testHostAOCRRef("aocr.test/cluster/cluster-42/templates/tpl-happy:latest")
 	if res.RegistryRef != wantRef {
 		t.Errorf("RegistryRef = %q, want %q", res.RegistryRef, wantRef)
 	}
@@ -417,7 +417,7 @@ func TestTemplateArtifactPusher_DisabledReturnsNil(t *testing.T) {
 func TestTemplateArtifactPusher_DestRefFor(t *testing.T) {
 	patPath := writePATFile(t, "tok")
 	p := newTestTemplatePusher(t, patPath, t.TempDir(), &fakeTemplatePushDocker{})
-	want := "aocr.test/cluster/cluster-42/templates/tpl-abc:latest"
+	want := "aocr.test/cluster/cluster-42/templates/tpl-abc:latest" + archTagSuffix(hostSnapshotArch())
 	if got := p.DestRefFor("tpl-abc"); got != want {
 		t.Errorf("DestRefFor = %q, want %q", got, want)
 	}

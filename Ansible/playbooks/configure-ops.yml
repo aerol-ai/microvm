@@ -21,6 +21,22 @@
   any_errors_fatal: true
   gather_facts: false
 
+  pre_tasks:
+    - name: Gather hardware facts for architecture preflight
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - hardware
+
+    - name: Assert homogeneous CPU architecture across play hosts
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts | map('extract', hostvars, 'ansible_architecture') | unique | length == 1
+        fail_msg: >-
+          Mixed CPU architectures detected across inventory hosts.
+          AerolVM clusters must be single-arch (see plans/arm64-firecracker-hosts.md).
+
   # Shared SoT files Terraform also reads (Terraform/locals.tf: cluster_ops
   # and cluster_secrets). Paths are relative to this playbook file; both
   # tools point at the same on-disk files so day-0 and day-2 rollouts render

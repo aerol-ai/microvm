@@ -3,7 +3,7 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
-	integration-cluster-hetero integration-all integration-reap
+	integration-cluster-hetero integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -73,6 +73,14 @@ integration-cluster-hetero:
 	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
 	# so --metal-on-demand is unnecessary here.
 	integration-tests/run.sh cluster-hetero
+
+integration-arm64-single:
+	integration-tests/run.sh single-node-fc-arm64
+
+integration-arm64-cluster:
+	integration-tests/run.sh cluster-arm64
+
+integration-arm64: integration-arm64-single integration-arm64-cluster
 
 integration-all:
 	integration-tests/run.sh all

@@ -1,0 +1,11 @@
+# Homogeneous arm64 cluster: three Graviton mixed nodes. Proves cluster paths
+# (Raft, placement, forwarding, snapshot push/pull between arm64 nodes).
+name: cluster-arm64
+capabilities:
+  - docker
+  - firecracker
+  - domain
+  - cluster
+  - mixed-arch-negative
+
+expected_members: 3

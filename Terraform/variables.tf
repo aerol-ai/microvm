@@ -150,7 +150,7 @@ variable "ssh_public_key_path" {
 ###############################################################################
 
 variable "ami_id" {
-  description = "AMI ID for every node. Empty string auto-resolves the latest Canonical Ubuntu 22.04 LTS amd64 in the region."
+  description = "Optional cluster-wide AMI override for amd64 nodes. Empty string auto-resolves the latest Canonical Ubuntu 22.04 LTS amd64 in the region. arm64 nodes always resolve the matching arm64 AMI unless nodes[*].ami_id overrides."
   type        = string
   default     = ""
 }
@@ -210,7 +210,8 @@ variable "nodes" {
       volume_type      (string,  default var.default_volume_type)
       volume_iops      (number,  default var.default_volume_iops)
       volume_throughput(number,  default var.default_volume_throughput)
-      ami_id           (string,  default var.ami_id resolved to Ubuntu 22.04)
+      ami_id           (string,  default var.ami_id resolved to Ubuntu 22.04 for the node's arch)
+      arch             (string,  optional "amd64" or "arm64"; derived from instance_type when unset)
       with_firecracker (bool,    default var.default_with_firecracker)
       with_gvisor      (bool,    default var.default_with_gvisor)
       with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
@@ -228,6 +229,7 @@ variable "nodes" {
     volume_iops       = optional(number)
     volume_throughput = optional(number)
     ami_id            = optional(string)
+    arch              = optional(string)
     with_firecracker  = optional(bool)
     with_gvisor       = optional(bool)
     with_nvidia_gpu   = optional(bool)
@@ -300,6 +302,14 @@ variable "nodes" {
       coalesce(v.role, "mixed") == "mixed"
     ])
     error_message = "nodes[*].with_firecracker may only be set on worker-capable nodes (role contains \"worker\" or equals \"mixed\")."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      try(v.arch, null) == null || contains(["amd64", "arm64"], v.arch)
+    ])
+    error_message = "nodes[*].arch must be \"amd64\" or \"arm64\" when set."
   }
 }
 

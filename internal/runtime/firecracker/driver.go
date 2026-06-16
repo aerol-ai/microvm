@@ -36,6 +36,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1056,16 +1057,28 @@ func vcpuFromRequest(cpu float64) int {
 // plans/snapshot-clone-rng-userspace.md Phase C and Hazard 2 of the
 // Snapshot Clone Correctness doc). pci=off is fine — ACPI is a separate bus
 // — but acpi=off would silently disable that pre-userspace reseed. The
-// bootArgsKeepACPI invariant (bootargs_test.go) guards this line so a future
-// edit can't reintroduce it.
-const baseBootArgs = "console=ttyS0 reboot=k panic=1 pci=off nomodules quiet"
+// bootArgsKeepVMGenid invariant (bootargs_test.go) guards these lines so a
+// future edit can't silently disable pre-userspace CRNG reseed on restore.
+const (
+	baseBootArgsAMD64 = "console=ttyS0 reboot=k panic=1 pci=off nomodules quiet"
+	// aarch64 Firecracker has no ACPI; vmgenid is delivered via FDT. ttyAMA0
+	// is the PL011 UART Firecracker wires on Graviton hosts.
+	baseBootArgsARM64 = "console=ttyAMA0 reboot=k panic=1 nomodules quiet"
+)
+
+func baseBootArgsFor(goarch string) string {
+	if goarch == "arm64" {
+		return baseBootArgsARM64
+	}
+	return baseBootArgsAMD64
+}
 
 func defaultBootArgs() string {
 	// Phase 1 does NOT pass an init= override yet — the kernel runs the
 	// guest's normal /sbin/init. The toolbox-in-guest is responsible
 	// for bringing up the vsock listener; how exactly that's wired
 	// (systemd unit, /etc/inittab line, etc.) is a Phase 2 concern.
-	return baseBootArgs
+	return baseBootArgsFor(runtime.GOARCH)
 }
 
 // macFromSlot derives a deterministic guest MAC from a Slot. The vsock
