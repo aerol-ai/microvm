@@ -57,6 +57,9 @@ integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed
 
 integration-cluster-hetero:
+	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):
+	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
+	# so --metal-on-demand is unnecessary here.
 	integration-tests/run.sh cluster-hetero
 
 integration-all:

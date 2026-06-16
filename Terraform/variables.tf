@@ -292,7 +292,7 @@ variable "nodes" {
   validation {
     condition = alltrue([
       for k, v in var.nodes :
-      !(try(v.with_firecracker, false)) ||
+      !coalesce(v.with_firecracker, false) ||
       contains(
         split(",", replace(coalesce(v.role, "mixed"), " ", "")),
         "worker",

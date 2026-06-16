@@ -281,20 +281,7 @@ run_one() {
     # Capture daemon logs before teardown nukes the box. local-mode runs no
     # Caddy (API bound on 127.0.0.1), so only sandboxd exists; domain scenarios
     # (single-node + cluster) front the API with Caddy, so grab both per node.
-    local logfile="${HERE}/reports/${scenario}-failure-logs.txt"
-    echo "collecting failure logs -> ${logfile}" >&2
-    {
-      echo "### failure logs for scenario ${scenario} ($(date -u +%FT%TZ)) ###"
-      if [[ "$caps_domain" == "true" ]]; then
-        while IFS= read -r ip; do
-          [[ -n "$ip" ]] || continue
-          dump_service_logs "ubuntu@${ip}" sandboxd
-          dump_service_logs "ubuntu@${ip}" caddy
-        done < <(echo "$targets" | jq -r '.nodes[].public_ip')
-      else
-        dump_service_logs "ubuntu@$(echo "$targets" | jq -r '.seed_ip')" sandboxd
-      fi
-    } > "$logfile" 2>&1
+    collect_failure_logs "$scenario" "$caps_domain" "$targets"
     : > "$json_out"
     AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" -inconclusive \
       -json "$json_out" -out "${HERE}/reports"
@@ -309,10 +296,41 @@ run_one() {
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
     AEROL_WASM_MODULE_REF="${wasm_ref}" \
     go test -tags=integration -count=1 -json ./integration-tests/suite/... > "$json_out"
+  local test_rc=$?
   set -e
+
+  # On any suite failure, grab sandboxd + caddy logs from every node BEFORE the
+  # EXIT trap tears the boxes down — otherwise a real test failure (as opposed
+  # to infra-not-ready above) leaves nothing to debug. Mirrors the inconclusive
+  # path's collection.
+  if [[ "$test_rc" != "0" ]]; then
+    collect_failure_logs "$scenario" "$caps_domain" "$targets"
+  fi
 
   AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" \
     -json "$json_out" -out "${HERE}/reports"
+}
+
+# collect_failure_logs dumps sandboxd + caddy journals/status from every node
+# (domain scenarios) or the seed node (IP/local scenarios) into
+# reports/<scenario>-failure-logs.txt. Shared by the inconclusive path and the
+# suite-failure path so both produce the same artifact.
+collect_failure_logs() {
+  local scenario="$1" caps_domain="$2" targets="$3"
+  local logfile="${HERE}/reports/${scenario}-failure-logs.txt"
+  echo "collecting failure logs -> ${logfile}" >&2
+  {
+    echo "### failure logs for scenario ${scenario} ($(date -u +%FT%TZ)) ###"
+    if [[ "$caps_domain" == "true" ]]; then
+      while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        dump_service_logs "ubuntu@${ip}" sandboxd
+        dump_service_logs "ubuntu@${ip}" caddy
+      done < <(echo "$targets" | jq -r '.nodes[].public_ip')
+    else
+      dump_service_logs "ubuntu@$(echo "$targets" | jq -r '.seed_ip')" sandboxd
+    fi
+  } > "$logfile" 2>&1
 }
 
 if [[ "$SCENARIO" == "all" ]]; then

@@ -9,10 +9,11 @@
 #       worker-wasm    — WASM runtime (enabled via config overlay)
 #       worker-fc      — Firecracker; needs /dev/kvm → bare-metal (c5.metal)
 #
-# Cost control is by instance sizing (servers/ingress are t3.small). The metal
-# firecracker node is the one expensive box; it requests spot to cut ~60-70%.
-# Spot reclaim → scenario marked inconclusive (not failed). If *.metal spot
-# capacity is scarce, run with --metal-on-demand to launch just it on-demand.
+# Cost control is by instance sizing (servers/ingress are t3.small). Every node
+# runs On-Demand (spot = false): the bare-metal firecracker box alone exceeds the
+# account Spot vCPU quota (MaxSpotInstanceCountExceeded), and spot reclaim of any
+# node mid-run makes the multi-node convergence flaky. The modest extra cost buys
+# a deterministic 8-node bring-up.
 #
 # AWS access (profile, region, ssh_key_name) is inherited from
 # config/terraform.tfvars (chained first by run.sh).
@@ -31,16 +32,15 @@ caddy_shared_cert_storage = {
 }
 
 nodes = {
-  server-1  = { role = "server", seed = true, instance_type = "t3.small", volume_size_gb = 20, spot = true }
-  server-2  = { role = "server", instance_type = "t3.small", volume_size_gb = 20, spot = true }
-  server-3  = { role = "server", instance_type = "t3.small", volume_size_gb = 20, spot = true }
-  ingress-1 = { role = "ingress", instance_type = "t3.small", volume_size_gb = 20, spot = true }
+  server-1  = { role = "server", seed = true, instance_type = "t3.small", volume_size_gb = 20, spot = false }
+  server-2  = { role = "server", instance_type = "t3.small", volume_size_gb = 20, spot = false }
+  server-3  = { role = "server", instance_type = "t3.small", volume_size_gb = 20, spot = false }
+  ingress-1 = { role = "ingress", instance_type = "t3.small", volume_size_gb = 20, spot = false }
 
-  worker-docker = { role = "worker", instance_type = "t3.medium", spot = true }
-  worker-gvisor = { role = "worker", instance_type = "t3.medium", with_gvisor = true, spot = true }
-  worker-wasm   = { role = "worker", instance_type = "t3.medium", spot = true }
+  worker-docker = { role = "worker", instance_type = "t3.medium", spot = false }
+  worker-gvisor = { role = "worker", instance_type = "t3.medium", with_gvisor = true, spot = false }
+  worker-wasm   = { role = "worker", instance_type = "t3.medium", spot = false }
 
-  # Firecracker needs KVM → bare metal. spot=true for cost; --metal-on-demand
-  # (force_on_demand) flips ONLY this node to on-demand when spot is scarce.
-  worker-fc = { role = "worker", instance_type = "c5.metal", volume_size_gb = 80, with_firecracker = true, spot = true }
+  # Firecracker needs KVM → bare metal. On-Demand like the rest (spot = false).
+  worker-fc = { role = "worker", instance_type = "c5.metal", volume_size_gb = 80, with_firecracker = true, spot = false }
 }

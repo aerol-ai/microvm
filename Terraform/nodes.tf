@@ -57,7 +57,12 @@ resource "aws_instance" "seed" {
 
   user_data_replace_on_change = true
 
-  user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
+  # gzip+base64 the rendered bootstrap. Firecracker nodes render a much larger
+  # script (the full SB_FIRECRACKER_* env block) that blows past EC2's 16 KiB
+  # user_data ceiling as plain text. cloud-init transparently decompresses
+  # gzipped user-data, so we hand it the compressed form and the 16 KiB limit
+  # then applies to the (far smaller) compressed payload.
+  user_data_base64 = base64gzip(templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
     node_name                                = "${var.cluster_name}-${local.seed_node.name}"
     role                                     = local.seed_node.role
     is_seed                                  = true
@@ -167,7 +172,7 @@ resource "aws_instance" "seed" {
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
     wasm_cfg               = local.wasm_cfg
-  })
+  }))
 
   tags = merge(
     {
@@ -226,7 +231,10 @@ resource "aws_instance" "joiner" {
 
   user_data_replace_on_change = true
 
-  user_data = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
+  # gzip+base64: see the seed resource above. Firecracker joiners (worker-fc in
+  # cluster-hetero) render the largest scripts and exceed the 16 KiB plain-text
+  # user_data limit; cloud-init decompresses gzipped user-data transparently.
+  user_data_base64 = base64gzip(templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
     node_name                                = "${var.cluster_name}-${each.value.name}"
     role                                     = each.value.role
     is_seed                                  = false
@@ -336,7 +344,7 @@ resource "aws_instance" "joiner" {
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
     wasm_cfg               = local.wasm_cfg
-  })
+  }))
 
   depends_on = [aws_instance.seed]
 
