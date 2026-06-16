@@ -78,7 +78,7 @@ func TestRegistryWellFormed(t *testing.T) {
 		seen[uc.ID] = true
 		for _, c := range uc.Requires {
 			switch c {
-			case CapDocker, CapFirecracker, CapGvisor, CapWasm, CapGPU, CapDomain, CapCluster:
+			case CapDocker, CapFirecracker, CapGvisor, CapWasm, CapGPU, CapDomain, CapCluster, CapCustomDomains, CapExternalDNSZone:
 			default:
 				t.Fatalf("%s requires unknown capability %q", uc.ID, c)
 			}
