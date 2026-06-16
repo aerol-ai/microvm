@@ -1,0 +1,17 @@
+# Single-node scenario with the WASM runtime turned on. Same topology as
+# single-node (one mixed box + public domain/TLS) but advertises `wasm`, so
+# run.sh enables wasm.enabled and splices the curated standard modules
+# (fixtures/wasm/modules.yml) into the config overlay. WASM runs in-process on
+# the worker — no KVM / bare metal needed — so the cheap t3.medium box suffices.
+#
+# This is the smallest scenario that exercises the wasm-runtime use cases; the
+# only other wasm-capable scenario is the full 8-node cluster-hetero.
+name: single-node-wasm
+capabilities:
+  - docker
+  - wasm
+  - domain
+  - custom-domains
+  # See single-node.caps.yml for why UC-35/36 (external-dns-zone) still skip
+  # here: we only control the leased base zone, not a second zone for the TXT
+  # ownership proof a real custom domain needs.

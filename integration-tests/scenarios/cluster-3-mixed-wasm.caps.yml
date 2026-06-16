@@ -1,0 +1,17 @@
+# 3× mixed cluster with the WASM runtime turned on. Same topology as
+# cluster-3-mixed (docker workers + public domain/TLS + cluster mode: Raft +
+# forwarding) but advertises `wasm`, so run.sh enables wasm.enabled and splices
+# the curated standard modules (fixtures/wasm/modules.yml) onto every node.
+# WASM runs in-process — no KVM / bare metal — so the cheap t3 boxes suffice.
+#
+# This pairs the wasm-runtime use cases with cluster placement/forwarding: a
+# wasm sandbox can be created on any node and reached through any ingress.
+name: cluster-3-mixed-wasm
+capabilities:
+  - docker
+  - wasm
+  - domain
+  - cluster
+
+# Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
+expected_members: 3

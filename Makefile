@@ -2,7 +2,8 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-cluster-mixed integration-cluster-hetero integration-all integration-reap
+	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
+	integration-cluster-hetero integration-all integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -53,8 +54,19 @@ integration-local:
 integration-single:
 	integration-tests/run.sh single-node
 
+# Single-node with the WASM runtime enabled (wasm.enabled + staged standard
+# modules, driven entirely by the `wasm` capability in single-node-wasm.caps.yml).
+# Smallest scenario that exercises the wasm-runtime use cases.
+integration-single-wasm:
+	integration-tests/run.sh single-node-wasm
+
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed
+
+# 3× mixed cluster with the WASM runtime enabled — pairs the wasm-runtime use
+# cases with cluster placement/forwarding (see cluster-3-mixed-wasm.caps.yml).
+integration-cluster-mixed-wasm:
+	integration-tests/run.sh cluster-3-mixed-wasm
 
 integration-cluster-hetero:
 	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):
