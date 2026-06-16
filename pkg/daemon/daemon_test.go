@@ -3,8 +3,10 @@ package daemon
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -109,5 +111,31 @@ func TestAppendRuntimeIfMissing(t *testing.T) {
 	got = appendRuntimeIfMissing([]string{models.RuntimeDocker}, " ")
 	if len(got) != 1 || got[0] != models.RuntimeDocker {
 		t.Fatalf("appendRuntimeIfMissing blank changed runtimes: %v", got)
+	}
+}
+
+// TestSupportedRuntimesForConfig is the regression guard for the cluster
+// placement bug: a wasm-enabled host that never advertised "wasm" in
+// SupportedRuntimes made every wasm create fail with ErrNoPlacementTarget (the
+// firecracker advertisement existed, the wasm one was missing). Each enable
+// flag must surface its runtime; SB_HOST_RUNTIMES overrides the docker default.
+func TestSupportedRuntimesForConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config.Config
+		want []string
+	}{
+		{name: "docker_only_default", cfg: config.Config{}, want: []string{models.RuntimeDocker}},
+		{name: "wasm_enabled_advertises_wasm", cfg: config.Config{EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeWasm}},
+		{name: "firecracker_enabled_advertises_fc", cfg: config.Config{EnableFirecracker: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
+		{name: "both_enabled", cfg: config.Config{EnableFirecracker: true, EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker, models.RuntimeWasm}},
+		{name: "explicit_host_runtimes_override", cfg: config.Config{HostSupportedRuntimes: []string{models.RuntimeGvisor}, EnableWasm: true}, want: []string{models.RuntimeGvisor, models.RuntimeWasm}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := supportedRuntimesForConfig(tt.cfg); !slices.Equal(got, tt.want) {
+				t.Fatalf("supportedRuntimesForConfig = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
