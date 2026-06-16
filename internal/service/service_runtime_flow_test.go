@@ -162,6 +162,8 @@ func (r *recordingRuntime) PushAllowedPorts(_ context.Context, containerIP, tool
 
 func (r *recordingRuntime) ClearNetworkRules(string) error { return nil }
 
+func (r *recordingRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (r *recordingRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
 func (r *recordingRuntime) ApplyNetworkBlockAll(containerIP string) error {
 	r.applyNetworkBlockAllCalls = append(r.applyNetworkBlockAllCalls, containerIP)
 	return nil

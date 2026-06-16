@@ -77,6 +77,8 @@ func (f *fakeReconcileRuntime) PushAllowedPorts(context.Context, string, string,
 func (f *fakeReconcileRuntime) ClearNetworkRules(string) error {
 	return nil
 }
+func (f *fakeReconcileRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeReconcileRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
 func (f *fakeReconcileRuntime) ApplyNetworkBlockAll(containerIP string) error {
 	f.networkBlockAllCalls = append(f.networkBlockAllCalls, containerIP)
 	return nil

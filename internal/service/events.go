@@ -190,6 +190,12 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
+			// Selective-egress rules are comment-tagged, so ClearNetworkRules
+			// above does not remove them — clear them from the persisted policy
+			// before the IP is recycled to another container.
+			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
 		}
 	}
 
@@ -256,6 +262,12 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
+			// Selective-egress rules are comment-tagged, so ClearNetworkRules
+			// above does not remove them — clear them from the persisted policy
+			// before the IP is recycled to another container.
+			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
 		}
 	}

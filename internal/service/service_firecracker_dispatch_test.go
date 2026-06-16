@@ -78,11 +78,13 @@ func (r *fireRecordingRuntime) RemoveImage(context.Context, string) error { retu
 func (r *fireRecordingRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	return nil
 }
-func (r *fireRecordingRuntime) ClearNetworkRules(string) error        { return nil }
-func (r *fireRecordingRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (r *fireRecordingRuntime) ApplyNetworkBlockIngress(string) error { return nil }
-func (r *fireRecordingRuntime) ClearNetworkBlockIngress(string) error { return nil }
-func (r *fireRecordingRuntime) ClearNetworkBlockEgress(string) error  { return nil }
+func (r *fireRecordingRuntime) ClearNetworkRules(string) error                     { return nil }
+func (r *fireRecordingRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (r *fireRecordingRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (r *fireRecordingRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (r *fireRecordingRuntime) ApplyNetworkBlockIngress(string) error              { return nil }
+func (r *fireRecordingRuntime) ClearNetworkBlockIngress(string) error              { return nil }
+func (r *fireRecordingRuntime) ClearNetworkBlockEgress(string) error               { return nil }
 
 // TestFirecrackerDispatch_NotEnabled covers the operator-facing failure
 // mode: SB_ENABLE_FIRECRACKER is off and a sandbox arrives with

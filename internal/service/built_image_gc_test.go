@@ -86,11 +86,13 @@ func (*recordingRemoveRuntime) Ping(context.Context) error { panic("Ping not use
 func (*recordingRemoveRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	panic("PushAllowedPorts not used")
 }
-func (*recordingRemoveRuntime) ClearNetworkRules(string) error        { panic("not used") }
-func (*recordingRemoveRuntime) ApplyNetworkBlockAll(string) error     { panic("not used") }
-func (*recordingRemoveRuntime) ApplyNetworkBlockIngress(string) error { panic("not used") }
-func (*recordingRemoveRuntime) ClearNetworkBlockIngress(string) error { panic("not used") }
-func (*recordingRemoveRuntime) ClearNetworkBlockEgress(string) error  { panic("not used") }
+func (*recordingRemoveRuntime) ClearNetworkRules(string) error                     { panic("not used") }
+func (*recordingRemoveRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (*recordingRemoveRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (*recordingRemoveRuntime) ApplyNetworkBlockAll(string) error                  { panic("not used") }
+func (*recordingRemoveRuntime) ApplyNetworkBlockIngress(string) error              { panic("not used") }
+func (*recordingRemoveRuntime) ClearNetworkBlockIngress(string) error              { panic("not used") }
+func (*recordingRemoveRuntime) ClearNetworkBlockEgress(string) error               { panic("not used") }
 
 func TestBuiltImageGCRemovesOldUnreferenced(t *testing.T) {
 	svc, _, removed := newBuiltImageGCHarness(t, time.Hour)

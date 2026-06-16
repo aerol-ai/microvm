@@ -204,20 +204,25 @@ func loadE2BSandboxMeta(ctx context.Context, st *store.Store, sandboxID string) 
 	return sandboxMetaFromState(state, sandbox)
 }
 
-func TestCreateSandboxRejectsUnsupportedNetworkAllowOut(t *testing.T) {
+func TestCreateSandboxAcceptsNetworkAllowOut(t *testing.T) {
 	_, _, handler := newE2BHandlerTestEnv(t)
+	// A valid CIDR allowlist is now honored (selective egress) and creates.
+	req := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","network":{"allowOut":["1.1.1.0/24","8.8.8.8/32"]}}`))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+}
+
+func TestCreateSandboxRejectsInvalidEgressCIDR(t *testing.T) {
+	_, _, handler := newE2BHandlerTestEnv(t)
+	// A bare IP is not a CIDR — the service validates and rejects with 400.
 	req := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","network":{"allowOut":["1.1.1.1"]}}`))
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
-	if rr.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusNotImplemented, rr.Body.String())
-	}
-	var resp errorResponse
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode error response error = %v", err)
-	}
-	if resp.Code != http.StatusNotImplemented {
-		t.Fatalf("resp.Code = %d, want %d", resp.Code, http.StatusNotImplemented)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
 	}
 }
 
@@ -568,6 +573,8 @@ func (f *fakeE2BRuntime) RemoveImage(_ context.Context, imageRef string) error {
 
 func (f *fakeE2BRuntime) PushAllowedPorts(context.Context, string, string, []int) error { return nil }
 func (f *fakeE2BRuntime) ClearNetworkRules(string) error                                { return nil }
+func (f *fakeE2BRuntime) ApplyEgressPolicy(string, []string, []string) error            { return nil }
+func (f *fakeE2BRuntime) ClearEgressPolicy(string, []string, []string) error            { return nil }
 func (f *fakeE2BRuntime) ApplyNetworkBlockAll(string) error                             { return nil }
 func (f *fakeE2BRuntime) ApplyNetworkBlockIngress(string) error                         { return nil }
 func (f *fakeE2BRuntime) ClearNetworkBlockIngress(string) error                         { return nil }

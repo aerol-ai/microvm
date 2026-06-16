@@ -1093,6 +1093,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	if err := validateEgressPolicy(req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+		releaseAdmission()
+		return nil, err
+	}
+
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
 	if err != nil {
 		releaseAdmission()
@@ -1117,7 +1122,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// rollback chain as any later store error below.
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.docker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime})
+		_ = s.docker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime, ContainerIP: state.ContainerIP, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut})
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -1137,6 +1142,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		OSUser:               req.OSUser,
 		Env:                  req.Env,
 		NetworkBlockAll:      req.NetworkBlockAll,
+		NetworkAllowOut:      req.NetworkAllowOut,
+		NetworkDenyOut:       req.NetworkDenyOut,
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -1298,6 +1305,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if req.NetworkBlockAll {
 		return nil, unsupportedFirecrackerOption("network_block_all")
 	}
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out)")
+	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
@@ -1374,6 +1384,8 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		OSUser:               req.OSUser,
 		Env:                  req.Env,
 		NetworkBlockAll:      req.NetworkBlockAll,
+		NetworkAllowOut:      req.NetworkAllowOut,
+		NetworkDenyOut:       req.NetworkDenyOut,
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -1733,6 +1745,25 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			releaseAdmission()
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			return nil, fmt.Errorf("apply network block on start: %w", err)
+		}
+	}
+	// Reapply the selective-egress policy for the same reason — the stop event
+	// clears it. Comment-tagged rules are distinct from the blanket block, so
+	// this composes with NetworkBlockAll above. Fail closed on error.
+	if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+		cr, ok := runtime.AsContainerRuntime(rt)
+		if !ok {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			return nil, fmt.Errorf("apply egress policy on start: runtime %q does not support selective egress", sandbox.Runtime)
+		}
+		if err := cr.ApplyEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+			return nil, fmt.Errorf("apply egress policy on start: %w", err)
 		}
 	}
 
@@ -3542,6 +3573,24 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					)
 				}
 			}
+			// Heal the selective-egress policy the same way. Comment-tagged
+			// rules survive independently of the blanket block, and the
+			// netrules Exists check keeps the reapply idempotent.
+			if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+				cr, err := s.containerRuntimeForSandbox(sandbox)
+				if err != nil {
+					s.logger.Warn("reconcile reapply egress policy skipped",
+						"sandbox_id", sandbox.ID,
+						"error", err,
+					)
+				} else if err := cr.ApplyEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+					s.logger.Warn("reconcile reapply egress policy failed",
+						"sandbox_id", sandbox.ID,
+						"ip", sandbox.ContainerIP,
+						"error", err,
+					)
+				}
+			}
 			// Heal quota-driven blocks. The flag is the source of truth for
 			// "we previously decided to block"; re-evaluate against the
 			// current cumulative counters so a quota raised over the wire
@@ -4713,6 +4762,30 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
+}
+
+// validateEgressPolicy enforces the selective-egress invariants shared by every
+// API surface (native /v1 and the E2B facade): the allowlist and blocklist are
+// mutually exclusive, every entry must parse as a CIDR, and a deny of the whole
+// address space must be expressed as NetworkBlockAll — a 0.0.0.0/0 catch-all
+// DROP would duplicate the blanket block and confuse cleanup.
+func validateEgressPolicy(allowOut, denyOut []string) error {
+	if len(allowOut) > 0 && len(denyOut) > 0 {
+		return errors.New("network_allow_out and network_deny_out are mutually exclusive")
+	}
+	for _, list := range [][]string{allowOut, denyOut} {
+		for _, cidr := range list {
+			if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+				return fmt.Errorf("invalid egress CIDR %q: %w", cidr, err)
+			}
+		}
+	}
+	for _, cidr := range denyOut {
+		if strings.TrimSpace(cidr) == "0.0.0.0/0" {
+			return errors.New("network_deny_out of 0.0.0.0/0 must be expressed as network_block_all")
+		}
+	}
+	return nil
 }
 
 // portProbeTimeout is the maximum time probeContainerPort waits for a container

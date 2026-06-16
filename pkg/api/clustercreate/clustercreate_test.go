@@ -203,11 +203,13 @@ func (f *fakeRuntime) RemoveImage(context.Context, string) error {
 func (f *fakeRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	return nil
 }
-func (f *fakeRuntime) ClearNetworkRules(string) error        { return nil }
-func (f *fakeRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (f *fakeRuntime) ApplyNetworkBlockIngress(string) error { return nil }
-func (f *fakeRuntime) ClearNetworkBlockIngress(string) error { return nil }
-func (f *fakeRuntime) ClearNetworkBlockEgress(string) error  { return nil }
+func (f *fakeRuntime) ClearNetworkRules(string) error                     { return nil }
+func (f *fakeRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (f *fakeRuntime) ApplyNetworkBlockIngress(string) error              { return nil }
+func (f *fakeRuntime) ClearNetworkBlockIngress(string) error              { return nil }
+func (f *fakeRuntime) ClearNetworkBlockEgress(string) error               { return nil }
 
 func (f *fakeRuntime) lookup(containerRef string) (*models.SandboxRuntimeState, bool) {
 	if state, ok := f.states[containerRef]; ok {

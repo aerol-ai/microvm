@@ -258,6 +258,27 @@ func (c *Client) ClearNetworkBlockEgress(containerIP string) error {
 	return c.networkRules.ClearBlockAllEgress(containerIP)
 }
 
+// ApplyEgressPolicy installs the selective-egress CIDR policy. Idempotent —
+// called on Create (initial install), StartSandbox (after a Stop+Start cycle
+// drops the rules on the stop event), and reconcile (to heal host-side state
+// loss). A no-op when no policy is set or network rules are disabled.
+func (c *Client) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error {
+	if containerIP == "" {
+		return nil
+	}
+	return c.networkRules.ApplyEgressPolicy(containerIP, allowCIDRs, denyCIDRs)
+}
+
+// ClearEgressPolicy removes the selective-egress rules for the IP. Called on
+// stop/destroy before Docker recycles the IP — a stale ACCEPT/DROP would
+// otherwise re-attach to whoever next gets this IP from the IPAM pool.
+func (c *Client) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error {
+	if containerIP == "" {
+		return nil
+	}
+	return c.networkRules.ClearEgressPolicy(containerIP, allowCIDRs, denyCIDRs)
+}
+
 func (c *Client) Ping(ctx context.Context) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/_ping", nil)
 	if err != nil {
@@ -517,6 +538,18 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		if err := c.networkRules.ApplyEgressPolicy(runtime.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+			// Fail closed, same rationale as NetworkBlockAll: the user opted
+			// into a restricted egress policy, so a sandbox that came up with
+			// only a partial rule set must not be left running. Roll the
+			// partial policy back and tear the container down.
+			_ = c.networkRules.ClearEgressPolicy(runtime.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut)
+			_ = c.removeContainer(ctx, created.ID, true)
+			return nil, fmt.Errorf("apply egress policy: %w", err)
+		}
+	}
+
 	runtime.SandboxID = sandboxID
 	return runtime, nil
 }
@@ -537,6 +570,10 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		// Clear both directions: a stale ingress DROP would re-attach to whoever
 		// next gets this IP from Docker's IPAM pool.
 		_ = c.ClearNetworkRules(sandbox.ContainerIP)
+		// The selective-egress rules are comment-tagged and keyed by allow/deny
+		// CIDR, so the blanket clear above does not touch them — clear them
+		// explicitly from the persisted policy before the IP is recycled.
+		_ = c.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
 	}
 	if sandbox == nil {
 		return nil

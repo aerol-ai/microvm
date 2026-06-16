@@ -75,9 +75,11 @@ func (r *apiRecordingRuntime) Start(_ context.Context, sandboxID string) (*model
 
 func (r *apiRecordingRuntime) Stop(_ context.Context, _ string) error { return nil }
 
-func (r *apiRecordingRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (r *apiRecordingRuntime) ClearNetworkBlockEgress(string) error  { return nil }
-func (r *apiRecordingRuntime) ClearNetworkBlockIngress(string) error { return nil }
+func (r *apiRecordingRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (r *apiRecordingRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (r *apiRecordingRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (r *apiRecordingRuntime) ClearNetworkBlockEgress(string) error               { return nil }
+func (r *apiRecordingRuntime) ClearNetworkBlockIngress(string) error              { return nil }
 
 type promoteStubCluster struct {
 	*cluster.Noop

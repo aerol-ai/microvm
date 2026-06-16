@@ -68,6 +68,8 @@ func Open(path string) (*Store, error) {
 			os_user TEXT NOT NULL,
 			env_json TEXT NOT NULL,
 			network_block_all INTEGER NOT NULL DEFAULT 0,
+			network_allow_out_json TEXT NOT NULL DEFAULT '[]',
+			network_deny_out_json TEXT NOT NULL DEFAULT '[]',
 			toolbox_enabled INTEGER NOT NULL DEFAULT 1,
 			toolbox_token TEXT NOT NULL DEFAULT '',
 			ssh_public_key TEXT NOT NULL DEFAULT '',
@@ -614,6 +616,12 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE sandboxes ADD COLUMN clone_generation TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_ref TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN wasm_registry_digest TEXT NOT NULL DEFAULT '';`,
+		// Selective-egress CIDR policy (E2B network.allowOut / denyOut). JSON
+		// arrays so the start/reconcile paths can reinstall the host-firewall
+		// rules after a restart, the same way network_block_all is reapplied.
+		// Empty '[]' for every pre-migration row and the no-policy common path.
+		`ALTER TABLE sandboxes ADD COLUMN network_allow_out_json TEXT NOT NULL DEFAULT '[]';`,
+		`ALTER TABLE sandboxes ADD COLUMN network_deny_out_json TEXT NOT NULL DEFAULT '[]';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -721,7 +729,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -738,7 +746,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -752,6 +760,8 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.OSUser,
 		envJSON,
 		boolToInt(sandbox.NetworkBlockAll),
+		mustMarshalStringSlice(sandbox.NetworkAllowOut),
+		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		boolToInt(sandbox.ToolboxEnabled),
 		sandbox.ToolboxToken,
 		sandbox.SSHPublicKey,
@@ -798,6 +808,20 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		return fmt.Errorf("insert sandbox: %w", err)
 	}
 	return nil
+}
+
+// mustMarshalStringSlice JSON-encodes a string slice for a TEXT column,
+// returning "[]" for nil/empty (and on the practically impossible marshal
+// error) so a sandbox write never fails on a network-policy column.
+func mustMarshalStringSlice(v []string) string {
+	if len(v) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }
 
 // nullableBlob normalizes a nil byte slice to an empty one so SQLite stores
@@ -851,7 +875,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -868,7 +892,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -881,6 +905,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			os_user = excluded.os_user,
 			env_json = excluded.env_json,
 			network_block_all = excluded.network_block_all,
+			network_allow_out_json = excluded.network_allow_out_json,
+			network_deny_out_json = excluded.network_deny_out_json,
 			toolbox_enabled = excluded.toolbox_enabled,
 			toolbox_token = excluded.toolbox_token,
 			ssh_public_key = excluded.ssh_public_key,
@@ -927,6 +953,8 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		sandbox.OSUser,
 		envJSON,
 		boolToInt(sandbox.NetworkBlockAll),
+		mustMarshalStringSlice(sandbox.NetworkAllowOut),
+		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		boolToInt(sandbox.ToolboxEnabled),
 		sandbox.ToolboxToken,
 		sandbox.SSHPublicKey,
@@ -978,7 +1006,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1025,7 +1053,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1092,7 +1120,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1143,7 +1171,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -3389,6 +3417,7 @@ func scanSandbox(scanner interface {
 	var serverless int
 	var wakeArmed int
 	var fleetSuspended int
+	var allowOutJSON, denyOutJSON string
 
 	err := scanner.Scan(
 		&sandbox.ID,
@@ -3403,6 +3432,8 @@ func scanSandbox(scanner interface {
 		&sandbox.OSUser,
 		&envJSON,
 		&networkBlocked,
+		&allowOutJSON,
+		&denyOutJSON,
 		&toolboxEnabled,
 		&sandbox.ToolboxToken,
 		&sandbox.SSHPublicKey,
@@ -3479,6 +3510,16 @@ func scanSandbox(scanner interface {
 	}
 
 	sandbox.NetworkBlockAll = networkBlocked == 1
+	if allowOutJSON != "" {
+		if err := json.Unmarshal([]byte(allowOutJSON), &sandbox.NetworkAllowOut); err != nil {
+			return nil, fmt.Errorf("decode network allow out: %w", err)
+		}
+	}
+	if denyOutJSON != "" {
+		if err := json.Unmarshal([]byte(denyOutJSON), &sandbox.NetworkDenyOut); err != nil {
+			return nil, fmt.Errorf("decode network deny out: %w", err)
+		}
+	}
 	sandbox.ToolboxEnabled = toolboxEnabled == 1
 	sandbox.Lifecycle = models.Lifecycle{
 		StopIfIdleFor:    time.Duration(stopIfIdleNs),

@@ -26,8 +26,6 @@ func TestE2BCreateSandboxNotImplemented(t *testing.T) {
 	}{
 		{"mcp", `{"templateID":"base","mcp":{}}`},
 		{"volumeMounts", `{"templateID":"base","volumeMounts":[{"name":"vol"}]}`},
-		{"networkAllowOut", `{"templateID":"base","network":{"allowOut":["1.1.1.1"]}}`},
-		{"networkDenyOut", `{"templateID":"base","network":{"denyOut":["1.1.1.1"]}}`},
 		{"networkAllowPublicTraffic", `{"templateID":"base","network":{"allowPublicTraffic":false}}`},
 		{"networkMaskRequestHost", `{"templateID":"base","network":{"maskRequestHost":"host"}}`},
 	}

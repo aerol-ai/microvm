@@ -1492,6 +1492,14 @@ func (d *Driver) ApplyNetworkBlockAll(_ string) error {
 	return methodNotImplemented("ApplyNetworkBlockAll")
 }
 
+func (d *Driver) ApplyEgressPolicy(_ string, _, _ []string) error {
+	return methodNotImplemented("ApplyEgressPolicy")
+}
+
+func (d *Driver) ClearEgressPolicy(_ string, _, _ []string) error {
+	return methodNotImplemented("ClearEgressPolicy")
+}
+
 func (d *Driver) ApplyNetworkBlockIngress(_ string) error {
 	return methodNotImplemented("ApplyNetworkBlockIngress")
 }
