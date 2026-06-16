@@ -17,6 +17,12 @@ public class CreateOptions {
     public Map<String, String> env;
     public String osUser;
     public Boolean networkBlockAll;
+    /** Egress allowlist of CIDRs; sandbox may reach only these. Mutually exclusive with networkDenyOut. */
+    @JsonProperty("network_allow_out")
+    public List<String> networkAllowOut;
+    /** Egress blocklist of CIDRs; sandbox may reach anything except these. Mutually exclusive with networkAllowOut. */
+    @JsonProperty("network_deny_out")
+    public List<String> networkDenyOut;
     @JsonProperty("network_bytes_in_limit")
     public Long networkBytesInLimit;
     @JsonProperty("network_bytes_out_limit")
@@ -76,6 +82,16 @@ public class CreateOptions {
 
     public CreateOptions setNetworkBlockAll(Boolean networkBlockAll) {
         this.networkBlockAll = networkBlockAll;
+        return this;
+    }
+
+    public CreateOptions setNetworkAllowOut(List<String> networkAllowOut) {
+        this.networkAllowOut = networkAllowOut;
+        return this;
+    }
+
+    public CreateOptions setNetworkDenyOut(List<String> networkDenyOut) {
+        this.networkDenyOut = networkDenyOut;
         return this;
     }
 

@@ -326,6 +326,15 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(client_module.MicroVMError, "does not support Image builds"):
             client.build_image(Image.base("alpine"))
 
+    def test_create_serializes_selective_egress(self):
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04", "networkAllowOut": ["1.1.1.0/24", "8.8.8.8/32"]})
+        _, path, payload = client.calls[0]
+        self.assertEqual(path, "/v1/sandboxes")
+        self.assertEqual(payload["network_allow_out"], ["1.1.1.0/24", "8.8.8.8/32"])
+        # network_deny_out is unset, so _compact() drops it from the body.
+        self.assertNotIn("network_deny_out", payload)
+
     def test_create_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         sandbox = client.create(

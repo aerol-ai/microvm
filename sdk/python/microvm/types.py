@@ -143,6 +143,12 @@ class CreateOptions(TypedDict, total=False):
     env: Dict[str, str]
     osUser: str
     networkBlockAll: bool
+    # Egress allowlist / blocklist of CIDRs enforced by the host firewall.
+    # networkAllowOut: sandbox may reach ONLY these; everything else is dropped.
+    # networkDenyOut: sandbox may reach anything EXCEPT these. The two are
+    # mutually exclusive; a full block is networkBlockAll, not a 0.0.0.0/0 deny.
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
     # Caps on network bytes the sandbox may receive (in) / send (out) before
     # per-IP iptables block fires. 0 (default) means unlimited; both can be
     # raised or lifted at runtime via set_network_limits.
