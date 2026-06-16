@@ -549,6 +549,31 @@ func TestRouteCases(t *testing.T) {
 			},
 		},
 		{
+			name: "upsert_custom_domain_http_route_with_mask_rewrites_host",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+
+				err := client.UpsertCustomDomainHTTPRouteWithDial(
+					context.Background(),
+					"abc",
+					"myhost.com",
+					"127.0.0.1:8080",
+					HTTPRouteOptions{MaskRequestHost: "localhost"},
+				)
+				if err != nil {
+					t.Fatalf("UpsertCustomDomainHTTPRouteWithDial error = %v", err)
+				}
+				route, ok := fake.routes[IngressCustomDomainHTTPRouteID("abc", "myhost.com")]
+				if !ok {
+					t.Fatalf("route missing")
+				}
+				assertRouteHostMatch(t, route, "myhost.com")
+				assertRouteHostRewrite(t, route, "localhost")
+				assertRouteDial(t, route, "127.0.0.1:8080")
+			},
+		},
+		{
 			name: "upsert_custom_domain_http_route_with_dial_disabled_or_empty_domain",
 			run: func(t *testing.T) {
 				client := &Client{enabled: false}

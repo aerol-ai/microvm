@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -62,7 +63,11 @@ func (s *Service) installWasmCustomDomainHTTPRoute(ctx context.Context, sandbox 
 	if err != nil {
 		return err
 	}
-	return s.caddy.UpsertCustomDomainHTTPRouteWithDial(ctx, sandbox.ID, hostname, dial)
+	routeOpts := caddy.HTTPRouteOptions{}
+	if targetPort > 0 {
+		routeOpts.MaskRequestHost = sandbox.MaskRequestHost
+	}
+	return s.caddy.UpsertCustomDomainHTTPRouteWithDial(ctx, sandbox.ID, hostname, dial, routeOpts)
 }
 
 // syncWasmCustomDomainRoutes re-PATCHes every attached custom hostname so WASM

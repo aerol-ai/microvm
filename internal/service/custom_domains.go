@@ -99,7 +99,11 @@ func sandboxCustomHostnames(sandbox *models.Sandbox) []caddy.CustomHostnameRoute
 		if cd.Hostname == "" {
 			continue
 		}
-		out = append(out, caddy.CustomHostnameRoute{Hostname: cd.Hostname, TargetPort: cd.TargetPort})
+		route := caddy.CustomHostnameRoute{Hostname: cd.Hostname, TargetPort: cd.TargetPort}
+		if cd.TargetPort > 0 {
+			route.MaskRequestHost = strings.TrimSpace(sandbox.MaskRequestHost)
+		}
+		out = append(out, route)
 	}
 	if len(out) == 0 {
 		return nil

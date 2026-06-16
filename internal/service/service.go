@@ -985,6 +985,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	req.Durability = durability
+	if err := validateMaskRequestHost(req.MaskRequestHost); err != nil {
+		return nil, err
+	}
 	// "firecracker" is the second runtime, dispatched to the native
 	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
 	//
@@ -1099,11 +1102,6 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 
 	if err := validateEgressPolicy(req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
-		releaseAdmission()
-		return nil, err
-	}
-
-	if err := validateMaskRequestHost(req.MaskRequestHost); err != nil {
 		releaseAdmission()
 		return nil, err
 	}

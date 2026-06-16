@@ -162,6 +162,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
+		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,

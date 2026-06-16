@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +44,50 @@ func TestValidateMaskRequestHost(t *testing.T) {
 				t.Fatalf("validateMaskRequestHost(%q) = %v, want nil", tc.mask, err)
 			}
 		})
+	}
+}
+
+func TestCreateSandboxRejectsInvalidMaskBeforeRuntimeDispatch(t *testing.T) {
+	for _, runtimeName := range []string{models.RuntimeWasm, models.RuntimeFirecracker} {
+		t.Run(runtimeName, func(t *testing.T) {
+			rt := &recordingRuntime{}
+			svc, _, _ := newServiceRuntimeHarness(t, rt)
+			_, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+				Image:           "alpine:3.20",
+				ModuleRef:       "file:///tmp/module.wasm",
+				Runtime:         runtimeName,
+				MaskRequestHost: "evil\r\nX-Injected: 1",
+			})
+			if err == nil || !strings.Contains(err.Error(), "mask_request_host") {
+				t.Fatalf("CreateSandbox(%s) error = %v, want mask_request_host validation", runtimeName, err)
+			}
+			if rt.createCalls != 0 {
+				t.Fatalf("runtime Create calls = %d, want 0", rt.createCalls)
+			}
+		})
+	}
+}
+
+func TestCreateWasmSandboxPersistsMaskRequestHost(t *testing.T) {
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(rt)
+
+	resp, err := svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{
+		Runtime:         models.RuntimeWasm,
+		ModuleRef:       "file:///tmp/module.wasm",
+		MaskRequestHost: " localhost ",
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox wasm: %v", err)
+	}
+	got, err := st.Get(context.Background(), resp.Sandbox.ID)
+	if err != nil {
+		t.Fatalf("Get wasm sandbox: %v", err)
+	}
+	if got.MaskRequestHost != "localhost" {
+		t.Fatalf("MaskRequestHost = %q, want localhost", got.MaskRequestHost)
 	}
 }
 
