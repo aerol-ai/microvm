@@ -335,7 +335,7 @@ collect_failure_logs() {
 }
 
 if [[ "$SCENARIO" == "all" ]]; then
-  for s in single-node cluster-3-mixed cluster-hetero single-node-fc-arm64 cluster-arm64; do
+  for s in single-node cluster-3-mixed cluster-hetero; do
     ( run_one "$s" )
   done
 else

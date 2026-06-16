@@ -79,7 +79,7 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 					ref = strings.TrimSpace(req.Image)
 				}
 				if ref != "" {
-					if err := ValidateSnapshotRefArch(ref, hostSnapshotArch()); err != nil {
+					if err := validateClusterArtifactRefArch(ref, hostSnapshotArch()); err != nil {
 						return err
 					}
 				}
@@ -102,7 +102,7 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			// classifier below.
 			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) && !imageRefHasTagOrDigest(req.Image) {
 				if dest := s.snapshotPusher.DestRefFor(req.Image); dest != "" {
-					if err := ValidateSnapshotRefArch(dest, hostSnapshotArch()); err != nil {
+					if err := validateClusterArtifactRefArch(dest, hostSnapshotArch()); err != nil {
 						return err
 					}
 					req.Image = dest
@@ -126,7 +126,7 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 		meta = classified
 	}
 	if meta.Mode == models.ImageDistributionAOCR && meta.RegistryRef != "" {
-		if err := ValidateSnapshotRefArch(meta.RegistryRef, hostSnapshotArch()); err != nil {
+		if err := validateClusterArtifactRefArch(meta.RegistryRef, hostSnapshotArch()); err != nil {
 			return err
 		}
 	}

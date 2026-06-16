@@ -38,11 +38,11 @@ type SnapshotPushConfig struct {
 	// Docker registry password. File-sourced so rotation is just a
 	// file write; never logged.
 	PATPath string
-	// TagSuffix is an optional AOCR retention suffix appended to the
-	// pushed tag (`latest<suffix>`), e.g. "--ttl-1h" or "--idle-30d".
+	// TagSuffix is an optional AOCR retention suffix appended at the end of the
+	// pushed tag (`latest<arch><suffix>`), e.g. "--ttl-1h" or "--idle-30d".
 	// AOCR's reaper parses `--(ttl|idle)-<dur>` off the END of the tag, so
-	// `latest--ttl-1h` expires 1h after push. Empty (the default and prod
-	// behavior) pushes a plain `latest` tag, which the reaper keeps
+	// `latest--arch-arm64--ttl-1h` expires 1h after push. Empty (the default
+	// and prod behavior) pushes a plain `latest` tag, which the reaper keeps
 	// latest-only forever. Because "suffixes are real tags" in AOCR, the
 	// pull side (DestRefFor) must use the same suffix — both go through
 	// snapshotAOCRRef, so they stay consistent. Used by ephemeral clusters
@@ -212,20 +212,20 @@ func (p *SnapshotPusher) DestRefFor(snapshotName string) string {
 }
 
 // snapshotAOCRRef is the AOCR destination convention for cluster-local
-// snapshots: `<host>/cluster/<id>/snapshots/<name>:latest<suffix>`. Mirrors the
+// snapshots: `<host>/cluster/<id>/snapshots/<name>:latest<arch><suffix>`. Mirrors the
 // auto-import path's `cluster/<id>/_imported/...` namespace pattern. The base
 // tag is "latest" — snapshot names are themselves unique (the store enforces a
 // PRIMARY KEY on `name`). An optional retention suffix (`--ttl-*` / `--idle-*`)
-// is appended so the registry reaper can age the tag out; empty means a plain
-// `latest` tag that is kept indefinitely. Push and pull must agree on the tag,
-// so every caller routes through here.
+// stays at the end of the tag so the registry reaper can age the tag out; empty
+// means a plain `latest` tag that is kept indefinitely. Push and pull must agree
+// on the tag, so every caller routes through here.
 func snapshotAOCRRef(host, clusterID, snapshotName, tagSuffix string) string {
 	host = strings.TrimRight(strings.TrimSpace(host), "/")
 	clusterID = strings.TrimSpace(clusterID)
 	snapshotName = strings.ToLower(strings.TrimSpace(snapshotName))
 	tagSuffix = strings.ToLower(strings.TrimSpace(tagSuffix))
 	archSfx := archTagSuffix(hostSnapshotArch())
-	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest%s%s", host, clusterID, snapshotName, tagSuffix, archSfx)
+	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest%s%s", host, clusterID, snapshotName, archSfx, tagSuffix)
 }
 
 // readPATFile reads the bearer token from disk. Trailing whitespace

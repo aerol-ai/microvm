@@ -23,6 +23,28 @@ func TestNodeArchFromX86InstanceType(t *testing.T) {
 	}
 }
 
+func TestExplicitArchMatchesInstance(t *testing.T) {
+	cases := []struct {
+		name         string
+		explicitArch string
+		instanceType string
+		want         bool
+	}{
+		{name: "unset uses derived", instanceType: "c7g.metal", want: true},
+		{name: "arm matches graviton", explicitArch: "arm64", instanceType: "c7g.metal", want: true},
+		{name: "amd matches x86", explicitArch: "amd64", instanceType: "c5.metal", want: true},
+		{name: "arm on x86 rejected", explicitArch: "arm64", instanceType: "c5.metal", want: false},
+		{name: "amd on graviton rejected", explicitArch: "amd64", instanceType: "c7g.metal", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ExplicitArchMatchesInstance(tc.explicitArch, tc.instanceType); got != tc.want {
+				t.Fatalf("ExplicitArchMatchesInstance(%q, %q) = %v, want %v", tc.explicitArch, tc.instanceType, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHomogeneousClusterArchPassesSingleArch(t *testing.T) {
 	if got := HomogeneousClusterArch(map[string]string{
 		"a": "arm64",

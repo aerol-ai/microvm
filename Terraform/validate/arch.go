@@ -17,10 +17,25 @@ func NodeArch(explicit, instanceType string) string {
 	if explicit != "" {
 		return explicit
 	}
+	return DerivedNodeArch(instanceType)
+}
+
+// DerivedNodeArch returns amd64 or arm64 from the instance type alone.
+func DerivedNodeArch(instanceType string) string {
 	if gravitonInstanceRE.MatchString(instanceType) {
 		return "arm64"
 	}
 	return "amd64"
+}
+
+// ExplicitArchMatchesInstance mirrors Terraform's guard that prevents selecting
+// arm artifacts/AMIs for x86 instances or x86 artifacts/AMIs for Graviton.
+func ExplicitArchMatchesInstance(explicit, instanceType string) bool {
+	explicit = strings.TrimSpace(explicit)
+	if explicit == "" {
+		return true
+	}
+	return explicit == DerivedNodeArch(instanceType)
 }
 
 // FirecrackerUpstreamArch maps cluster arch to Firecracker release bucket arch.

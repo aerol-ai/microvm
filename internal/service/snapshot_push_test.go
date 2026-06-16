@@ -271,7 +271,7 @@ func TestSnapshotPusher_TagSuffix(t *testing.T) {
 		t.Fatalf("NewSnapshotPusher: %v", err)
 	}
 
-	wantRef := "aocr.test/cluster/cluster-42/snapshots/snap:latest--ttl-1h" + archTagSuffix(hostSnapshotArch())
+	wantRef := "aocr.test/cluster/cluster-42/snapshots/snap:latest" + archTagSuffix(hostSnapshotArch()) + "--ttl-1h"
 	if got := pusher.DestRefFor("snap"); got != wantRef {
 		t.Fatalf("DestRefFor = %q, want %q", got, wantRef)
 	}

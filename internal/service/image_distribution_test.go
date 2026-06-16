@@ -251,6 +251,26 @@ func TestNormalizeCreateImageDistribution_RejectsForeignArchSnapshot(t *testing.
 	}
 }
 
+func TestNormalizeCreateImageDistribution_DoesNotArchRejectNonArtifactAOCRRefs(t *testing.T) {
+	cases := []string{
+		"aocr.test/cluster/c1/_imported/ghcr/org/img:latest--idle-90d",
+		"aocr.test/team/app:latest",
+	}
+	for _, ref := range cases {
+		t.Run(ref, func(t *testing.T) {
+			svc := &Service{images: newDefaultImageDistributionProvider("aocr.test")}
+			req := &models.CreateSandboxRequest{Image: ref}
+			req.ApplyImageDistribution(models.ImageDistributionMetadata{
+				Mode:        models.ImageDistributionAOCR,
+				RegistryRef: ref,
+			})
+			if err := svc.NormalizeCreateImageDistribution(context.Background(), req); err != nil {
+				t.Fatalf("NormalizeCreateImageDistribution(%q): %v", ref, err)
+			}
+		})
+	}
+}
+
 func TestImageDistributionHelperBranches(t *testing.T) {
 	ctx := context.Background()
 

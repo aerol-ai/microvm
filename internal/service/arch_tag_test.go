@@ -23,6 +23,7 @@ func TestArchFromImageRef(t *testing.T) {
 		{"aocr.test/cluster/c1/snapshots/snap:latest", snapshotArchAMD64},
 		{"aocr.test/cluster/c1/snapshots/snap:latest--ttl-1h", snapshotArchAMD64},
 		{"aocr.test/cluster/c1/snapshots/snap:latest--arch-arm64", snapshotArchARM64},
+		{"aocr.test/cluster/c1/snapshots/snap:latest--arch-arm64--ttl-1h", snapshotArchARM64},
 		{"aocr.test/cluster/c1/snapshots/snap:latest--ttl-1h--arch-amd64", snapshotArchAMD64},
 	}
 	for _, tc := range cases {
@@ -48,6 +49,31 @@ func TestValidateSnapshotRefArch(t *testing.T) {
 	}
 	if err := ValidateSnapshotRefArch(sameRef, host); err != nil {
 		t.Fatalf("same-arch ref should pass: %v", err)
+	}
+}
+
+func TestClusterArtifactRefRequiresArchGuard(t *testing.T) {
+	cases := []struct {
+		ref  string
+		want bool
+	}{
+		{"aocr.test/cluster/c1/snapshots/snap:latest", true},
+		{"docker://aocr.test/cluster/c1/templates/tpl:latest", true},
+		{"aocr.test/cluster/c1/_imported/ghcr/org/img:latest--idle-90d", false},
+		{"aocr.test/team/app:latest", false},
+		{"ubuntu:22.04", false},
+	}
+	for _, tc := range cases {
+		if got := clusterArtifactRefRequiresArchGuard(tc.ref); got != tc.want {
+			t.Fatalf("clusterArtifactRefRequiresArchGuard(%q) = %v, want %v", tc.ref, got, tc.want)
+		}
+	}
+}
+
+func TestValidateClusterArtifactRefArchSkipsImportedRefs(t *testing.T) {
+	ref := "aocr.test/cluster/c1/_imported/ghcr/org/img:latest--idle-90d"
+	if err := validateClusterArtifactRefArch(ref, snapshotArchARM64); err != nil {
+		t.Fatalf("imported AOCR refs are not arch-specific firecracker artifacts: %v", err)
 	}
 }
 

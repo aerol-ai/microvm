@@ -33,6 +33,29 @@ func archTagSuffix(arch string) string {
 	return archTagMarker + arch
 }
 
+func clusterArtifactRefRequiresArchGuard(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return false
+	}
+	if _, after, ok := strings.Cut(ref, "://"); ok {
+		ref = after
+	}
+	firstSlash := strings.Index(ref, "/")
+	if firstSlash < 0 {
+		return false
+	}
+	segments := strings.Split(ref[firstSlash+1:], "/")
+	return len(segments) >= 4 && segments[0] == "cluster" && (segments[2] == "snapshots" || segments[2] == "templates")
+}
+
+func validateClusterArtifactRefArch(ref, hostArch string) error {
+	if !clusterArtifactRefRequiresArchGuard(ref) {
+		return nil
+	}
+	return ValidateSnapshotRefArch(ref, hostArch)
+}
+
 // archFromImageRef parses the --arch-<goarch> suffix from a registry ref tag.
 // Refs without an arch suffix are treated as amd64 (legacy x86 snapshots).
 func archFromImageRef(ref string) string {
@@ -44,8 +67,10 @@ func archFromImageRef(ref string) string {
 	if i := strings.LastIndex(ref, ":"); i >= 0 {
 		tag = ref[i+1:]
 	}
-	if i := strings.LastIndex(tag, archTagMarker); i >= 0 {
-		return strings.TrimSpace(tag[i+len(archTagMarker):])
+	for _, part := range strings.Split(tag, "--") {
+		if arch, ok := strings.CutPrefix(part, "arch-"); ok {
+			return strings.TrimSpace(arch)
+		}
 	}
 	return snapshotArchAMD64
 }
