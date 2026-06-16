@@ -55,6 +55,21 @@ func writeWrapKeyFile(t *testing.T) string {
 // config.Load fail, and Run must surface that as a wrapped error rather than
 // exiting the process. This is the boot-failure path that os.Exit previously
 // made impossible to assert.
+func TestLoopbackAPIBaseURL(t *testing.T) {
+	cases := map[string]string{
+		"0.0.0.0:8080":   "http://127.0.0.1:8080",
+		":8080":          "http://127.0.0.1:8080",
+		"127.0.0.1:9999": "http://127.0.0.1:9999",
+		"[::]:8080":      "http://127.0.0.1:8080",
+		"8080":           "http://127.0.0.1:8080", // no colon → whole string is the port
+	}
+	for in, want := range cases {
+		if got := loopbackAPIBaseURL(in); got != want {
+			t.Errorf("loopbackAPIBaseURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestRun_ConfigLoadFailureReturnsError(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", "") // config.Load rejects an empty PAT first.
 	err := Run(context.Background(), testLogger(), nil)

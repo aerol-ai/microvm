@@ -1,17 +1,23 @@
 package sshgateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -146,6 +152,225 @@ func TestPublicKeyCallback_LocalWins(t *testing.T) {
 	}
 	if perms.Extensions["remote"] == "1" {
 		t.Fatal("local sandbox must not be marked remote")
+	}
+}
+
+// ownerSessionStub stands in for the owner's v1 sessions surface that this
+// node's clusterForwardWrap reverse-proxies to. It serves the list/create REST
+// calls and upgrades the attach path to a WebSocket that streams a stdout frame
+// then an exit frame. Every request's forward-id correlation header and PAT are
+// captured so the cross-node call shape can be asserted.
+type capturedCall struct {
+	method    string
+	path      string
+	auth      string
+	forwardID string
+	body      []byte
+}
+
+func ownerSessionStub(t *testing.T, sandboxID, sessionID string, exitCode int, onAttach func(conn *websocket.Conn)) (string, int, *[]capturedCall) {
+	t.Helper()
+	calls := &[]capturedCall{}
+	base := "/v1/sandboxes/" + sandboxID + "/sessions"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := capturedCall{method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization"), forwardID: r.Header.Get(forwardIDHeader)}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == base:
+			*calls = append(*calls, rec)
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		case r.Method == http.MethodPost && r.URL.Path == base:
+			rec.body, _ = io.ReadAll(r.Body)
+			*calls = append(*calls, rec)
+			_, _ = w.Write([]byte(`{"id":"` + sessionID + `","name":"s","status":"running"}`))
+		case r.Method == http.MethodGet && r.URL.Path == base+"/"+sessionID+"/attach":
+			*calls = append(*calls, rec)
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			if onAttach != nil {
+				onAttach(conn)
+			}
+			_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{streamFramePrefixStdout}, []byte("remote-ok")...))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"exit","code":`+strconv.Itoa(exitCode)+`}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	host, portStr, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi: %v", err)
+	}
+	return "http://" + net.JoinHostPort(host, portStr), port, calls
+}
+
+// TestHandleRemoteSession_Shell drives the cross-node interactive-shell path:
+// the edge node bridges a shell to the owner's session API, forwards a
+// mid-session resize, and reports the owner's exit code back over the channel.
+func TestHandleRemoteSession_Shell(t *testing.T) {
+	gotResize := make(chan struct{}, 1)
+	baseURL, _, calls := ownerSessionStub(t, "sb-remote", "sess-r", 9, func(conn *websocket.Conn) {
+		// Wait for the forwarded resize control message before exiting so the
+		// attachToSession resize goroutine is exercised.
+		for {
+			mt, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if mt == websocket.TextMessage && bytes.Contains(data, []byte(`"resize"`)) {
+				select {
+				case gotResize <- struct{}{}:
+				default:
+				}
+				return
+			}
+		}
+	})
+
+	g := &Gateway{
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		remoteBaseURL: baseURL,
+		remotePAT:     "pat-z",
+	}
+	channel := &fakeChannel{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	requests := make(chan *ssh.Request, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+	}()
+
+	requests <- &ssh.Request{Type: "pty-req", Payload: bytes.Join([][]byte{
+		encodeString("xterm"), encodeUint32(80), encodeUint32(24), encodeUint32(0), encodeUint32(0), encodeString(""),
+	}, nil)}
+	requests <- &ssh.Request{Type: "shell"}
+	requests <- &ssh.Request{Type: "window-change", Payload: bytes.Join([][]byte{
+		encodeUint32(132), encodeUint32(43), encodeUint32(0), encodeUint32(0),
+	}, nil)}
+
+	select {
+	case <-gotResize:
+	case <-time.After(5 * time.Second):
+		t.Fatal("owner never received the forwarded resize")
+	}
+	close(requests)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleRemoteSession did not return")
+	}
+
+	if got := channel.exitStatus(); got != 9 {
+		t.Fatalf("exit status = %d, want 9", got)
+	}
+	// Every forwarded call must carry the PAT and a correlation id.
+	if len(*calls) == 0 {
+		t.Fatal("owner saw no calls")
+	}
+	for _, c := range *calls {
+		if c.auth != "Bearer pat-z" {
+			t.Fatalf("call %s %s auth = %q, want Bearer pat-z", c.method, c.path, c.auth)
+		}
+		if c.forwardID == "" {
+			t.Fatalf("call %s %s missing forward-id header", c.method, c.path)
+		}
+	}
+}
+
+// TestHandleRemoteSession_Exec drives the cross-node one-shot exec path: the
+// command runs as a fresh owner session (POST carries Command) and its exit
+// status propagates exactly.
+func TestHandleRemoteSession_Exec(t *testing.T) {
+	baseURL, _, calls := ownerSessionStub(t, "sb-remote", "sess-x", 3, nil)
+	g := &Gateway{
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		remoteBaseURL: baseURL,
+		remotePAT:     "pat-z",
+	}
+	channel := &fakeChannel{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	requests := make(chan *ssh.Request, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+	}()
+	requests <- &ssh.Request{Type: "exec", Payload: encodeString("echo hi")}
+	close(requests)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleRemoteSession did not return")
+	}
+
+	if got := channel.exitStatus(); got != 3 {
+		t.Fatalf("exit status = %d, want 3", got)
+	}
+	// A one-shot exec skips the list step and POSTs the command directly.
+	var posted *capturedCall
+	for i := range *calls {
+		if (*calls)[i].method == http.MethodPost {
+			posted = &(*calls)[i]
+		}
+		if (*calls)[i].method == http.MethodGet && strings.HasSuffix((*calls)[i].path, "/sessions") {
+			t.Fatalf("exec path should not list sessions, saw GET %s", (*calls)[i].path)
+		}
+	}
+	if posted == nil {
+		t.Fatal("no create POST observed for exec")
+	}
+	var cr models.CreateSessionRequest
+	if err := json.Unmarshal(posted.body, &cr); err != nil {
+		t.Fatalf("decode create body: %v", err)
+	}
+	if cr.Command != "echo hi" {
+		t.Fatalf("create command = %q, want echo hi", cr.Command)
+	}
+}
+
+// TestHandleRemoteSession_ClientClosesBeforeStart covers the request-channel
+// close arriving before any shell/exec was started: the resize channel must be
+// closed and the function must return without blocking on the attach.
+func TestHandleRemoteSession_ClientClosesBeforeStart(t *testing.T) {
+	baseURL, _, _ := ownerSessionStub(t, "sb-remote", "sess-r", 0, nil)
+	g := &Gateway{
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		remoteBaseURL: baseURL,
+	}
+	channel := &fakeChannel{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	requests := make(chan *ssh.Request)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+	}()
+	close(requests)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleRemoteSession did not return on early close")
+	}
+}
+
+// TestRemoteSessionEndpoint asserts the loopback endpoint targets this node's
+// own v1 sessions surface, carries the PAT, and converts http→ws.
+func TestRemoteSessionEndpoint(t *testing.T) {
+	g := &Gateway{remoteBaseURL: "http://127.0.0.1:8080", remotePAT: "pat"}
+	ep := g.remoteSessionEndpoint("sb-1", "fwd-123")
+	if ep.baseURL != "http://127.0.0.1:8080/v1/sandboxes/sb-1/sessions" {
+		t.Fatalf("baseURL = %q", ep.baseURL)
+	}
+	if ep.wsURL != "ws://127.0.0.1:8080/v1/sandboxes/sb-1/sessions" {
+		t.Fatalf("wsURL = %q", ep.wsURL)
+	}
+	if ep.auth != "Bearer pat" || ep.forwardID != "fwd-123" {
+		t.Fatalf("auth/forwardID = %q/%q", ep.auth, ep.forwardID)
 	}
 }
 
