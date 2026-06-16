@@ -563,6 +563,13 @@ type CreateSandboxRequest struct {
 	// NetworkAllowOut. Blocking the entire space is expressed as
 	// NetworkBlockAll, not a denyOut of 0.0.0.0/0.
 	NetworkDenyOut []string `json:"network_deny_out,omitempty"`
+	// AllowPublicTraffic controls whether the sandbox may be exposed to the
+	// public internet. Nil (default) and true allow public exposure; false
+	// makes expose_port fail — the sandbox stays reachable only via the
+	// platform's own paths (toolbox exec/file proxy, SSH gateway), which do
+	// not route through the public ingress. There is no auth-gated public
+	// route concept, so "no public traffic" is enforced by refusing exposure.
+	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
 	// CustomDomains attaches operator-provided public hostnames to the
 	// sandbox at create time. Each hostname must resolve (via DNS) to the
 	// cluster's ingress host before HTTPS can serve traffic — see
@@ -698,6 +705,10 @@ type Sandbox struct {
 	// NetworkBlockAll). Mutually exclusive; at most one is non-empty.
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
 	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	// AllowPublicTraffic mirrors the create-time flag. Nil means "not set"
+	// (treated as allowed); a non-nil false makes ExposePort refuse to install
+	// a public route. Persisted so the gate survives restarts.
+	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
 	// NetworkQuotaExceeded reflects whether either lifetime byte counter has
 	// crossed its limit. The reconcile loop installs DROP rules when this is
 	// true; clearing requires raising the limit (or zeroing it for unlimited).

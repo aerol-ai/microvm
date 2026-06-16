@@ -280,6 +280,61 @@ The policy is persisted with the sandbox and reapplied automatically across stop
 
 ---
 
+## Disabling Public Exposure
+
+The options above control **outbound** traffic. To stop a sandbox from being reachable from the public internet at all, set **`allowPublicTraffic`** to `false` at create time. The sandbox can then never be exposed — `exposePort` returns an error — while the platform's own access paths (the toolbox `exec`/file proxy and the SSH gateway) keep working, since they do not route through the public ingress.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      allowPublicTraffic: false,
+    })
+    // sandbox.exposePort(80) now rejects — no public URL is ever created.
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'allowPublicTraffic': False,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    publicOff := false
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:              "ubuntu:22.04",
+        AllowPublicTraffic: &publicOff,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        allow_public_traffic: Some(false),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setAllowPublicTraffic(false)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Because AerolVM has no auth-gated public route, "no public traffic" is enforced by **refusing exposure** rather than by serving a private URL. Omit the field (or set it to `true`) to keep the default behaviour, where exposed ports are publicly reachable.
+
+---
+
 ## Fine-Grained Quotas vs. Blanket Blocking
 
 If you do not want to block all network traffic permanently, you can use the SDK's **Network Usage & Quotas** features to set limits on total bytes sent or received. 

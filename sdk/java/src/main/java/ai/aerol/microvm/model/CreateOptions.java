@@ -23,6 +23,9 @@ public class CreateOptions {
     /** Egress blocklist of CIDRs; sandbox may reach anything except these. Mutually exclusive with networkAllowOut. */
     @JsonProperty("network_deny_out")
     public List<String> networkDenyOut;
+    /** Whether the sandbox may be exposed publicly. Null/true allow it; false makes exposePort fail. */
+    @JsonProperty("allow_public_traffic")
+    public Boolean allowPublicTraffic;
     @JsonProperty("network_bytes_in_limit")
     public Long networkBytesInLimit;
     @JsonProperty("network_bytes_out_limit")
@@ -92,6 +95,11 @@ public class CreateOptions {
 
     public CreateOptions setNetworkDenyOut(List<String> networkDenyOut) {
         this.networkDenyOut = networkDenyOut;
+        return this;
+    }
+
+    public CreateOptions setAllowPublicTraffic(Boolean allowPublicTraffic) {
+        this.allowPublicTraffic = allowPublicTraffic;
         return this;
     }
 

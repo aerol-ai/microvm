@@ -335,6 +335,12 @@ class ClientTests(unittest.TestCase):
         # network_deny_out is unset, so _compact() drops it from the body.
         self.assertNotIn("network_deny_out", payload)
 
+    def test_create_serializes_allow_public_traffic(self):
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04", "allowPublicTraffic": False})
+        _, _, payload = client.calls[0]
+        self.assertEqual(payload["allow_public_traffic"], False)
+
     def test_create_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         sandbox = client.create(

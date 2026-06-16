@@ -174,6 +174,12 @@ export interface CreateOptions {
    */
   networkDenyOut?: string[];
   /**
+   * Whether the sandbox may be exposed to the public internet. Defaults to
+   * true; set `false` to make `exposePort` fail — the sandbox stays reachable
+   * only via the toolbox proxy and SSH gateway, not a public URL.
+   */
+  allowPublicTraffic?: boolean;
+  /**
    * Cap on bytes the sandbox may receive from outside the container before its
    * ingress is dropped via per-IP iptables rule. `0` (default) is unlimited.
    * Limits can be raised or lifted at runtime via `setNetworkLimits`.

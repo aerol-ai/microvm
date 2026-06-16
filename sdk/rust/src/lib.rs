@@ -1970,6 +1970,7 @@ mod tests {
             network_block_all: None,
             network_allow_out: None,
             network_deny_out: None,
+            allow_public_traffic: None,
             network_bytes_in_limit: None,
             network_bytes_out_limit: None,
             registry: None,
@@ -1994,11 +1995,13 @@ mod tests {
     fn create_options_serializes_selective_egress() {
         let mut opts = minimal_create_options();
         opts.network_allow_out = Some(vec!["1.1.1.0/24".to_string(), "8.8.8.8/32".to_string()]);
+        opts.allow_public_traffic = Some(false);
         let value = serde_json::to_value(&opts).expect("serialize create options");
         assert_eq!(
             value["network_allow_out"],
             serde_json::json!(["1.1.1.0/24", "8.8.8.8/32"])
         );
+        assert_eq!(value["allow_public_traffic"], serde_json::json!(false));
         // network_deny_out is None, so skip_serializing_if omits it entirely.
         assert!(value.get("network_deny_out").is_none());
     }

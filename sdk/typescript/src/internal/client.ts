@@ -1101,6 +1101,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_block_all: options.networkBlockAll,
     network_allow_out: options.networkAllowOut,
     network_deny_out: options.networkDenyOut,
+    allow_public_traffic: options.allowPublicTraffic,
     network_bytes_in_limit: options.networkBytesInLimit,
     network_bytes_out_limit: options.networkBytesOutLimit,
     registry: options.registry,

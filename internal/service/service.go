@@ -54,6 +54,11 @@ const allocatorRandomAttempts = 16
 // contract behind the client's back.
 var ErrPreferredHostPortUnavailable = errors.New("preferred host port unavailable on this node; exposure parked")
 
+// ErrPublicTrafficDisabled is returned by ExposePort when the sandbox was
+// created with allow_public_traffic=false. There is no public route to install
+// — the sandbox is reachable only through the toolbox proxy and SSH gateway.
+var ErrPublicTrafficDisabled = errors.New("public traffic is disabled for this sandbox; expose is not available")
+
 const clusterIngressReconcileInterval = 5 * time.Second
 
 type Service struct {
@@ -1144,6 +1149,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		NetworkBlockAll:      req.NetworkBlockAll,
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
+		AllowPublicTraffic:   req.AllowPublicTraffic,
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -1386,6 +1392,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		NetworkBlockAll:      req.NetworkBlockAll,
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
+		AllowPublicTraffic:   req.AllowPublicTraffic,
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -2256,6 +2263,14 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return models.ExposePortResponse{}, err
+	}
+	// A sandbox created with allow_public_traffic=false must never get a public
+	// route. AerolVM has no auth-gated public route, so the only honest way to
+	// enforce "no public traffic" is to refuse exposure outright — the sandbox
+	// stays reachable through the toolbox proxy and SSH gateway, which do not
+	// route through the public ingress. Nil/true keep the default (allowed).
+	if sandbox.AllowPublicTraffic != nil && !*sandbox.AllowPublicTraffic {
+		return models.ExposePortResponse{}, ErrPublicTrafficDisabled
 	}
 	if port <= 0 || port > 65535 {
 		return models.ExposePortResponse{}, errors.New("invalid port")

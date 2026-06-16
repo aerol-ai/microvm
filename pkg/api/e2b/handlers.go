@@ -566,9 +566,6 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		allowPublicTraffic = cloneBoolPtr(req.Network.AllowPublicTraffic)
 		maskRequestHost = strings.TrimSpace(req.Network.MaskRequestHost)
 	}
-	if allowPublicTraffic != nil && !*allowPublicTraffic {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("network.allowPublicTraffic=false is not implemented yet")
-	}
 	if maskRequestHost != "" {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("network.maskRequestHost is not implemented yet")
 	}
@@ -640,6 +637,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		}
 		wasmReq.Env = envVars
 		wasmReq.NetworkBlockAll = networkBlockAll
+		wasmReq.AllowPublicTraffic = allowPublicTraffic
 		wasmReq.Lifecycle = lifecycle
 		wasmReq.Tags = cloneStringMap(metadata)
 		meta := sandboxMeta{
@@ -664,12 +662,13 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	}
 
 	serviceReq := models.CreateSandboxRequest{
-		Image:           resolvedImage,
-		Env:             envVars,
-		NetworkBlockAll: networkBlockAll,
-		NetworkAllowOut: egressAllowOut,
-		NetworkDenyOut:  egressDenyOut,
-		Lifecycle:       lifecycle,
+		Image:              resolvedImage,
+		Env:                envVars,
+		NetworkBlockAll:    networkBlockAll,
+		NetworkAllowOut:    egressAllowOut,
+		NetworkDenyOut:     egressDenyOut,
+		AllowPublicTraffic: allowPublicTraffic,
+		Lifecycle:          lifecycle,
 		// E2B's metadata is the same shape as Daytona's labels — write it
 		// into the native tags column so it round-trips through any API
 		// surface, not just /e2b.

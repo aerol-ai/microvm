@@ -62,6 +62,22 @@ test("internal client create serializes selective egress CIDRs", async () => {
   assert.equal(body.network_deny_out, undefined);
 });
 
+test("internal client create serializes allowPublicTraffic=false", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-nopublic"));
+    },
+  });
+  await client.create({ image: "ubuntu:22.04", allowPublicTraffic: false });
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as Record<string, unknown>;
+  assert.equal(body.allow_public_traffic, false);
+});
+
 test("internal client create maps request and response", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

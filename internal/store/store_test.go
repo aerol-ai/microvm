@@ -1920,6 +1920,7 @@ func TestStoreHelperCases(t *testing.T) {
 			0,                           // network_blocked
 			"[]",                        // network_allow_out_json
 			"[]",                        // network_deny_out_json
+			1,                           // allow_public_traffic
 			1,                           // toolbox_enabled
 			"",                          // toolbox_token
 			"",                          // ssh_public_key
@@ -2087,6 +2088,40 @@ func TestEgressPolicyColumnsRoundTrip(t *testing.T) {
 	}
 	if len(got.NetworkAllowOut) != 0 || len(got.NetworkDenyOut) != 0 {
 		t.Fatalf("no-policy round-trip = allow %+v deny %+v, want both empty", got.NetworkAllowOut, got.NetworkDenyOut)
+	}
+}
+
+func TestAllowPublicTrafficColumnRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Explicit false persists and reads back as a non-nil false.
+	deny := sampleSandbox("sb-no-public")
+	denyVal := false
+	deny.AllowPublicTraffic = &denyVal
+	if err := st.Create(ctx, deny); err != nil {
+		t.Fatalf("Create deny: %v", err)
+	}
+	got, err := st.Get(ctx, deny.ID)
+	if err != nil {
+		t.Fatalf("Get deny: %v", err)
+	}
+	if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic {
+		t.Fatalf("AllowPublicTraffic = %v, want non-nil false", got.AllowPublicTraffic)
+	}
+
+	// Unset (nil) defaults to allowed (column default 1) on read-back.
+	dflt := sampleSandbox("sb-default-public")
+	dflt.AllowPublicTraffic = nil
+	if err := st.Create(ctx, dflt); err != nil {
+		t.Fatalf("Create default: %v", err)
+	}
+	got, err = st.Get(ctx, dflt.ID)
+	if err != nil {
+		t.Fatalf("Get default: %v", err)
+	}
+	if got.AllowPublicTraffic == nil || !*got.AllowPublicTraffic {
+		t.Fatalf("default AllowPublicTraffic = %v, want non-nil true", got.AllowPublicTraffic)
 	}
 }
 
