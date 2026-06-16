@@ -345,6 +345,9 @@ func TestForwardRemoveMemberToLeaderInternalMock(t *testing.T) {
 	follower, cleanupFollower := newTestCluster(t, "fol-rm-fwd", false, []string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	// forwardRemoveMemberToLeader resolves the leader via the follower's own raft
+	// state; wait until that has propagated, otherwise Leader() is briefly empty.
+	waitForLeader(t, follower, 20*time.Second)
 
 	var deleted string
 	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
