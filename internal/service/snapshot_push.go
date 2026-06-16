@@ -224,7 +224,7 @@ func snapshotAOCRRef(host, clusterID, snapshotName, tagSuffix string) string {
 	clusterID = strings.TrimSpace(clusterID)
 	snapshotName = strings.ToLower(strings.TrimSpace(snapshotName))
 	tagSuffix = strings.ToLower(strings.TrimSpace(tagSuffix))
-	archSfx := archTagSuffix(hostSnapshotArch())
+	archSfx := archTagSuffix(snapshotRefArch())
 	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest%s%s", host, clusterID, snapshotName, archSfx, tagSuffix)
 }
 

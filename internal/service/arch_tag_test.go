@@ -5,7 +5,28 @@ import (
 	"testing"
 )
 
+func TestHostSnapshotArchBranches(t *testing.T) {
+	old := hostGOARCH
+	t.Cleanup(func() { hostGOARCH = old })
+
+	hostGOARCH = "arm64"
+	if got := hostSnapshotArch(); got != snapshotArchARM64 {
+		t.Fatalf("arm64 branch = %q", got)
+	}
+	hostGOARCH = "amd64"
+	if got := hostSnapshotArch(); got != snapshotArchAMD64 {
+		t.Fatalf("amd64 branch = %q", got)
+	}
+	hostGOARCH = "386"
+	if got := hostSnapshotArch(); got != snapshotArchAMD64 {
+		t.Fatalf("default branch = %q", got)
+	}
+}
+
 func TestArchTagSuffix(t *testing.T) {
+	if got := archTagSuffix(""); got != "" {
+		t.Fatalf("empty suffix = %q, want empty", got)
+	}
 	if got := archTagSuffix(snapshotArchAMD64); got != "" {
 		t.Fatalf("amd64 suffix = %q, want empty", got)
 	}
@@ -50,6 +71,9 @@ func TestValidateSnapshotRefArch(t *testing.T) {
 	if err := ValidateSnapshotRefArch(sameRef, host); err != nil {
 		t.Fatalf("same-arch ref should pass: %v", err)
 	}
+	if err := ValidateSnapshotRefArch(sameRef, ""); err != nil {
+		t.Fatalf("empty hostArch should default to host arch: %v", err)
+	}
 }
 
 func TestClusterArtifactRefRequiresArchGuard(t *testing.T) {
@@ -57,6 +81,8 @@ func TestClusterArtifactRefRequiresArchGuard(t *testing.T) {
 		ref  string
 		want bool
 	}{
+		{"", false},
+		{"docker://onlyhost", false},
 		{"aocr.test/cluster/c1/snapshots/snap:latest", true},
 		{"docker://aocr.test/cluster/c1/templates/tpl:latest", true},
 		{"aocr.test/cluster/c1/_imported/ghcr/org/img:latest--idle-90d", false},

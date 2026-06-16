@@ -6,6 +6,10 @@ import (
 	"strings"
 )
 
+// hostGOARCH is runtime.GOARCH in production; tests override to exercise both
+// snapshot arch branches on any builder.
+var hostGOARCH = runtime.GOARCH
+
 const (
 	snapshotArchAMD64 = "amd64"
 	snapshotArchARM64 = "arm64"
@@ -16,13 +20,17 @@ const (
 // and template refs pushed from this process. Untagged refs imply amd64 for
 // back-compat with snapshots pushed before arch tagging landed.
 func hostSnapshotArch() string {
-	switch runtime.GOARCH {
+	switch hostGOARCH {
 	case "arm64":
 		return snapshotArchARM64
 	default:
 		return snapshotArchAMD64
 	}
 }
+
+// snapshotRefArch selects the arch tag embedded in AOCR snapshot refs. Defaults
+// to hostSnapshotArch; tests override to exercise foreign-arch guard paths.
+var snapshotRefArch = hostSnapshotArch
 
 // archTagSuffix returns the AOCR tag suffix for arch (empty on amd64).
 func archTagSuffix(arch string) string {
