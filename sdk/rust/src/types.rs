@@ -175,6 +175,12 @@ pub struct CreateOptions {
     /// only via the toolbox proxy and SSH gateway.
     #[serde(rename = "allow_public_traffic", skip_serializing_if = "Option::is_none")]
     pub allow_public_traffic: Option<bool>,
+    /// Rewrite the upstream `Host` header on ingress to exposed HTTP ports to
+    /// this value so frameworks that validate Host (Vite, Django, webpack-dev-
+    /// server) accept the request. `None`/empty passes it through. HTTP-only;
+    /// TCP/TLS exposures ignore it.
+    #[serde(rename = "mask_request_host", skip_serializing_if = "Option::is_none")]
+    pub mask_request_host: Option<String>,
     /// Cap on bytes the sandbox may receive before its ingress is dropped via
     /// per-IP iptables rule. `0` (or omit) means unlimited. Limits can be
     /// raised or lifted at runtime via [`Client::set_network_limits`].

@@ -26,6 +26,11 @@ public class CreateOptions {
     /** Whether the sandbox may be exposed publicly. Null/true allow it; false makes exposePort fail. */
     @JsonProperty("allow_public_traffic")
     public Boolean allowPublicTraffic;
+    /** Rewrite the upstream Host header on ingress to exposed HTTP ports to this value
+     * so frameworks that validate Host (Vite, Django, webpack-dev-server) accept the
+     * request. Null/empty passes it through. HTTP-only; TCP/TLS exposures ignore it. */
+    @JsonProperty("mask_request_host")
+    public String maskRequestHost;
     @JsonProperty("network_bytes_in_limit")
     public Long networkBytesInLimit;
     @JsonProperty("network_bytes_out_limit")
@@ -100,6 +105,11 @@ public class CreateOptions {
 
     public CreateOptions setAllowPublicTraffic(Boolean allowPublicTraffic) {
         this.allowPublicTraffic = allowPublicTraffic;
+        return this;
+    }
+
+    public CreateOptions setMaskRequestHost(String maskRequestHost) {
+        this.maskRequestHost = maskRequestHost;
         return this;
     }
 

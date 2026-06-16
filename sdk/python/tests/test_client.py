@@ -341,6 +341,12 @@ class ClientTests(unittest.TestCase):
         _, _, payload = client.calls[0]
         self.assertEqual(payload["allow_public_traffic"], False)
 
+    def test_create_serializes_mask_request_host(self):
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04", "maskRequestHost": "localhost"})
+        _, _, payload = client.calls[0]
+        self.assertEqual(payload["mask_request_host"], "localhost")
+
     def test_create_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
         sandbox = client.create(

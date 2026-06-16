@@ -462,6 +462,76 @@ func TestRouteCases(t *testing.T) {
 			},
 		},
 		{
+			// maskRequestHost: a non-empty mask adds a request Host rewrite to
+			// the reverse_proxy handler so frameworks that validate Host accept
+			// ingress traffic.
+			name: "upsert_port_route_with_mask_rewrites_host",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertPortRoute(context.Background(), "abc", "10.0.0.2", 3000, HTTPRouteOptions{MaskRequestHost: "localhost"}); err != nil {
+					t.Fatalf("UpsertPortRoute() error = %v", err)
+				}
+				route := fake.routes["sandbox-abc-port-3000"]
+				assertRouteHostRewrite(t, route, "localhost")
+				// Dial and load_balancing semantics are unchanged.
+				assertRouteDial(t, route, "10.0.0.2:3000")
+				handle := route["handle"].([]any)[0].(map[string]any)
+				if _, present := handle["load_balancing"]; present {
+					t.Fatalf("masked UpsertPortRoute leaked load_balancing block: %+v", handle)
+				}
+			},
+		},
+		{
+			// Empty mask MUST NOT emit a headers block — guards the byte-for-byte
+			// JSON the route-shape regression tests depend on.
+			name: "upsert_port_route_without_mask_has_no_headers_block",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				// Both the no-opts and explicit-empty-mask forms must be clean.
+				if err := client.UpsertPortRoute(context.Background(), "abc", "10.0.0.2", 3000, HTTPRouteOptions{MaskRequestHost: "  "}); err != nil {
+					t.Fatalf("UpsertPortRoute() error = %v", err)
+				}
+				route := fake.routes["sandbox-abc-port-3000"]
+				handle := route["handle"].([]any)[0].(map[string]any)
+				if _, present := handle["headers"]; present {
+					t.Fatalf("empty mask leaked a headers block: %+v", handle)
+				}
+			},
+		},
+		{
+			// The mask must coexist with the serverless warm-bypass retry block.
+			name: "upsert_port_route_with_retry_and_mask",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertPortRouteWithRetry(context.Background(), "abc", "10.0.0.2", 3000, 2*time.Second, HTTPRouteOptions{MaskRequestHost: "app.local"}); err != nil {
+					t.Fatalf("UpsertPortRouteWithRetry() error = %v", err)
+				}
+				route := fake.routes["sandbox-abc-port-3000"]
+				assertRouteHostRewrite(t, route, "app.local")
+				handle := route["handle"].([]any)[0].(map[string]any)
+				if _, ok := handle["load_balancing"].(map[string]any); !ok {
+					t.Fatalf("load_balancing missing alongside mask: %+v", handle)
+				}
+			},
+		},
+		{
+			// WASM host-mediated dial route honors the mask too.
+			name: "upsert_port_route_with_dial_and_mask",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+				if err := client.UpsertPortRouteWithDial(context.Background(), "abc", 3000, "127.0.0.1:40001", HTTPRouteOptions{MaskRequestHost: "localhost"}); err != nil {
+					t.Fatalf("UpsertPortRouteWithDial() error = %v", err)
+				}
+				route := fake.routes["sandbox-abc-port-3000"]
+				assertRouteHostRewrite(t, route, "localhost")
+				assertRouteDial(t, route, "127.0.0.1:40001")
+			},
+		},
+		{
 			name: "upsert_custom_domain_http_route_with_dial",
 			run: func(t *testing.T) {
 				fake := newFakeCaddy(t)
@@ -475,6 +545,31 @@ func TestRouteCases(t *testing.T) {
 					t.Fatalf("route missing")
 				}
 				assertRouteHostMatch(t, route, "myhost.com")
+				assertRouteDial(t, route, "127.0.0.1:8080")
+			},
+		},
+		{
+			name: "upsert_custom_domain_http_route_with_mask_rewrites_host",
+			run: func(t *testing.T) {
+				fake := newFakeCaddy(t)
+				client := &Client{enabled: true, domain: "sandbox.example.com", serverID: "srv0", baseURL: fake.URL, httpClient: fake.Client}
+
+				err := client.UpsertCustomDomainHTTPRouteWithDial(
+					context.Background(),
+					"abc",
+					"myhost.com",
+					"127.0.0.1:8080",
+					HTTPRouteOptions{MaskRequestHost: "localhost"},
+				)
+				if err != nil {
+					t.Fatalf("UpsertCustomDomainHTTPRouteWithDial error = %v", err)
+				}
+				route, ok := fake.routes[IngressCustomDomainHTTPRouteID("abc", "myhost.com")]
+				if !ok {
+					t.Fatalf("route missing")
+				}
+				assertRouteHostMatch(t, route, "myhost.com")
+				assertRouteHostRewrite(t, route, "localhost")
 				assertRouteDial(t, route, "127.0.0.1:8080")
 			},
 		},
@@ -1659,5 +1754,35 @@ func assertRouteDial(t *testing.T, body map[string]any, want string) {
 	upstream, _ := upstreams[0].(map[string]any)
 	if got, _ := upstream["dial"].(string); got != want {
 		t.Fatalf("dial = %q, want %q", got, want)
+	}
+}
+
+// assertRouteHostRewrite checks handle[0].headers.request.set.Host == [want]
+// after the JSON round-trip through the fake Caddy admin endpoint.
+func assertRouteHostRewrite(t *testing.T, body map[string]any, want string) {
+	t.Helper()
+	handles, ok := body["handle"].([]any)
+	if !ok || len(handles) == 0 {
+		t.Fatalf("missing handle field: %#v", body)
+	}
+	handle, _ := handles[0].(map[string]any)
+	headers, ok := handle["headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing headers block: %#v", handle)
+	}
+	request, ok := headers["request"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing headers.request: %#v", headers)
+	}
+	set, ok := request["set"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing headers.request.set: %#v", request)
+	}
+	hosts, ok := set["Host"].([]any)
+	if !ok || len(hosts) == 0 {
+		t.Fatalf("missing headers.request.set.Host: %#v", set)
+	}
+	if got, _ := hosts[0].(string); got != want {
+		t.Fatalf("Host rewrite = %q, want %q", got, want)
 	}
 }

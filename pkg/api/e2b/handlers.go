@@ -566,9 +566,6 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		allowPublicTraffic = cloneBoolPtr(req.Network.AllowPublicTraffic)
 		maskRequestHost = strings.TrimSpace(req.Network.MaskRequestHost)
 	}
-	if maskRequestHost != "" {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("network.maskRequestHost is not implemented yet")
-	}
 
 	secure := true
 	if req.Secure != nil {
@@ -638,6 +635,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		wasmReq.Env = envVars
 		wasmReq.NetworkBlockAll = networkBlockAll
 		wasmReq.AllowPublicTraffic = allowPublicTraffic
+		wasmReq.MaskRequestHost = maskRequestHost
 		wasmReq.Lifecycle = lifecycle
 		wasmReq.Tags = cloneStringMap(metadata)
 		meta := sandboxMeta{
@@ -668,6 +666,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		NetworkAllowOut:    egressAllowOut,
 		NetworkDenyOut:     egressDenyOut,
 		AllowPublicTraffic: allowPublicTraffic,
+		MaskRequestHost:    maskRequestHost,
 		Lifecycle:          lifecycle,
 		// E2B's metadata is the same shape as Daytona's labels — write it
 		// into the native tags column so it round-trips through any API

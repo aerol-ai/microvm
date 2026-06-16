@@ -151,6 +151,9 @@ func (c *Client) TLSPublicEndpoint(id string, port int, l4Listen string) string 
 type CustomHostnameRoute struct {
 	Hostname   string
 	TargetPort int
+	// MaskRequestHost is only set by service for user HTTP-port custom
+	// domains. Toolbox-targeted domains keep the platform agent's Host intact.
+	MaskRequestHost string
 }
 
 // UpsertSandboxRoute installs the HTTP ingress route for a sandbox owned by
@@ -212,7 +215,7 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 		if port <= 0 {
 			port = toolboxPort
 		}
-		if err := c.upsertCustomDomainHTTPRoute(ctx, id, host, containerIP, port); err != nil {
+		if err := c.upsertCustomDomainHTTPRoute(ctx, id, host, containerIP, port, HTTPRouteOptions{MaskRequestHost: cd.MaskRequestHost}); err != nil {
 			return fmt.Errorf("install custom-domain route %q: %w", host, err)
 		}
 	}
@@ -223,15 +226,15 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 // route for a single (sandbox, custom hostname). The route ID is stable
 // across calls (IngressCustomDomainHTTPRouteID) so a re-add with the same
 // port is a no-op PUT, and a port change replaces the leaf in place.
-func (c *Client) upsertCustomDomainHTTPRoute(ctx context.Context, sandboxID, hostname, containerIP string, port int) error {
-	return c.UpsertCustomDomainHTTPRouteWithDial(ctx, sandboxID, hostname, fmt.Sprintf("%s:%d", containerIP, port))
+func (c *Client) upsertCustomDomainHTTPRoute(ctx context.Context, sandboxID, hostname, containerIP string, port int, opts ...HTTPRouteOptions) error {
+	return c.UpsertCustomDomainHTTPRouteWithDial(ctx, sandboxID, hostname, fmt.Sprintf("%s:%d", containerIP, port), opts...)
 }
 
 // UpsertCustomDomainHTTPRouteWithDial installs (or replaces) the per-hostname HTTP
 // route for a single (sandbox, custom hostname) using an explicit upstream dial
 // target. WASM sandboxes use this to point at the host HTTP mediator rather than
 // containerIP:guestPort.
-func (c *Client) UpsertCustomDomainHTTPRouteWithDial(ctx context.Context, sandboxID, hostname, dial string) error {
+func (c *Client) UpsertCustomDomainHTTPRouteWithDial(ctx context.Context, sandboxID, hostname, dial string, opts ...HTTPRouteOptions) error {
 	if !c.enabled || c.domain == "" {
 		return nil
 	}
@@ -241,14 +244,9 @@ func (c *Client) UpsertCustomDomainHTTPRouteWithDial(ctx context.Context, sandbo
 	}
 	routeID := IngressCustomDomainHTTPRouteID(sandboxID, host)
 	route := map[string]any{
-		"@id":   routeID,
-		"match": []map[string]any{{"host": []string{host}}},
-		"handle": []map[string]any{{
-			"handler": "reverse_proxy",
-			"upstreams": []map[string]string{{
-				"dial": dial,
-			}},
-		}},
+		"@id":      routeID,
+		"match":    []map[string]any{{"host": []string{host}}},
+		"handle":   []map[string]any{reverseProxyHandle(dial, firstRouteOption(opts))},
 		"terminal": true,
 	}
 	return c.upsertRoute(ctx, routeID, route)
@@ -302,31 +300,70 @@ func (c *Client) DeleteSandboxRoute(ctx context.Context, id string) error {
 	return c.deleteRoute(ctx, sandboxRouteID(id))
 }
 
-func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, port int) error {
+func (c *Client) UpsertPortRoute(ctx context.Context, id, containerIP string, port int, opts ...HTTPRouteOptions) error {
 	if !c.enabled || c.domain == "" {
 		return nil
 	}
-	return c.UpsertPortRouteWithDial(ctx, id, port, fmt.Sprintf("%s:%d", containerIP, port))
+	return c.UpsertPortRouteWithDial(ctx, id, port, fmt.Sprintf("%s:%d", containerIP, port), opts...)
+}
+
+// HTTPRouteOptions tunes the reverse_proxy handler for a per-port HTTP route.
+// Passed variadically so existing callers (and their regression tests) compile
+// unchanged; only the mask-aware service path supplies a value.
+type HTTPRouteOptions struct {
+	// MaskRequestHost, when non-empty, rewrites the upstream Host header to
+	// this value (E2B network.maskRequestHost) so frameworks that validate the
+	// Host (Vite, webpack-dev-server, Django) accept the request. Empty => no
+	// headers block is emitted and the route JSON is byte-for-byte identical to
+	// a route built without options, keeping the route-shape regression tests
+	// valid. This is the DIRECT-route enforcement point; the serverless wake
+	// path enforces the same mask in the loopback ingress proxy instead, since
+	// that proxy overwrites Host on re-dial (see pkg/api/ingressproxy).
+	MaskRequestHost string
+}
+
+func firstRouteOption(opts []HTTPRouteOptions) HTTPRouteOptions {
+	if len(opts) > 0 {
+		return opts[0]
+	}
+	return HTTPRouteOptions{}
+}
+
+// reverseProxyHandle builds the reverse_proxy handler map for a per-port HTTP
+// route. When opts.MaskRequestHost is set it adds a request Host rewrite;
+// otherwise the returned map is exactly what the pre-options code emitted.
+func reverseProxyHandle(dial string, opts HTTPRouteOptions) map[string]any {
+	handle := map[string]any{
+		"handler": "reverse_proxy",
+		"upstreams": []map[string]string{{
+			"dial": dial,
+		}},
+	}
+	if mask := strings.TrimSpace(opts.MaskRequestHost); mask != "" {
+		handle["headers"] = map[string]any{
+			"request": map[string]any{
+				"set": map[string][]string{
+					"Host": {mask},
+				},
+			},
+		}
+	}
+	return handle
 }
 
 // UpsertPortRouteWithDial installs a per-port HTTP route whose public hostname
 // uses guestPort but dials an explicit upstream (used by WASM host-mediated
 // listeners where the loopback port differs from the guest port).
-func (c *Client) UpsertPortRouteWithDial(ctx context.Context, id string, guestPort int, dial string) error {
+func (c *Client) UpsertPortRouteWithDial(ctx context.Context, id string, guestPort int, dial string, opts ...HTTPRouteOptions) error {
 	if !c.enabled || c.domain == "" {
 		return nil
 	}
 
 	routeID := portRouteID(id, guestPort)
 	route := map[string]any{
-		"@id":   routeID,
-		"match": []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, guestPort, c.domain)}}},
-		"handle": []map[string]any{{
-			"handler": "reverse_proxy",
-			"upstreams": []map[string]string{{
-				"dial": dial,
-			}},
-		}},
+		"@id":      routeID,
+		"match":    []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, guestPort, c.domain)}}},
+		"handle":   []map[string]any{reverseProxyHandle(dial, firstRouteOption(opts))},
 		"terminal": true,
 	}
 
@@ -348,27 +385,23 @@ func (c *Client) UpsertPortRouteWithDial(ctx context.Context, id string, guestPo
 // instead. UpsertPortRoute is kept byte-for-byte identical so the
 // non-serverless surface does not inherit retry semantics it never
 // asked for.
-func (c *Client) UpsertPortRouteWithRetry(ctx context.Context, id, containerIP string, port int, tryDuration time.Duration) error {
+func (c *Client) UpsertPortRouteWithRetry(ctx context.Context, id, containerIP string, port int, tryDuration time.Duration, opts ...HTTPRouteOptions) error {
 	if !c.enabled || c.domain == "" {
 		return nil
 	}
 	if tryDuration <= 0 {
-		return c.UpsertPortRouteWithDial(ctx, id, port, fmt.Sprintf("%s:%d", containerIP, port))
+		return c.UpsertPortRouteWithDial(ctx, id, port, fmt.Sprintf("%s:%d", containerIP, port), opts...)
 	}
 	routeID := portRouteID(id, port)
+	handle := reverseProxyHandle(fmt.Sprintf("%s:%d", containerIP, port), firstRouteOption(opts))
+	handle["load_balancing"] = map[string]any{
+		"try_duration": tryDuration.String(),
+		"try_interval": "100ms",
+	}
 	route := map[string]any{
-		"@id":   routeID,
-		"match": []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}},
-		"handle": []map[string]any{{
-			"handler": "reverse_proxy",
-			"upstreams": []map[string]string{{
-				"dial": fmt.Sprintf("%s:%d", containerIP, port),
-			}},
-			"load_balancing": map[string]any{
-				"try_duration": tryDuration.String(),
-				"try_interval": "100ms",
-			},
-		}},
+		"@id":      routeID,
+		"match":    []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}},
+		"handle":   []map[string]any{handle},
 		"terminal": true,
 	}
 	return c.upsertRoute(ctx, routeID, route)

@@ -570,6 +570,15 @@ type CreateSandboxRequest struct {
 	// not route through the public ingress. There is no auth-gated public
 	// route concept, so "no public traffic" is enforced by refusing exposure.
 	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
+	// MaskRequestHost, when non-empty, rewrites the upstream Host header on
+	// ingress to exposed HTTP ports to this value. Dev servers and frameworks
+	// that validate the Host header (Vite allowedHosts, webpack-dev-server,
+	// Django ALLOWED_HOSTS, Rails host authorization) reject requests whose
+	// Host is the per-sandbox public hostname; masking it to a value the app
+	// accepts (e.g. "localhost") unblocks them. Empty = pass through whatever
+	// the route would otherwise send (today's behavior). HTTP-only; TCP/TLS
+	// exposures ignore it (no Host header in raw passthrough).
+	MaskRequestHost string `json:"mask_request_host,omitempty"`
 	// CustomDomains attaches operator-provided public hostnames to the
 	// sandbox at create time. Each hostname must resolve (via DNS) to the
 	// cluster's ingress host before HTTPS can serve traffic — see
@@ -709,6 +718,11 @@ type Sandbox struct {
 	// (treated as allowed); a non-nil false makes ExposePort refuse to install
 	// a public route. Persisted so the gate survives restarts.
 	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
+	// MaskRequestHost mirrors the create-time flag: the value the ingress layer
+	// rewrites the upstream Host header to for exposed HTTP ports. Persisted so
+	// the direct Caddy route (baked at install time) and the serverless wake
+	// proxy (read per request) agree on the same value after a restart.
+	MaskRequestHost string `json:"mask_request_host,omitempty"`
 	// NetworkQuotaExceeded reflects whether either lifetime byte counter has
 	// crossed its limit. The reconcile loop installs DROP rules when this is
 	// true; clearing requires raising the limit (or zeroing it for unlimited).

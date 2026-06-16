@@ -1094,6 +1094,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "network_allow_out": _first_of(options, "networkAllowOut", "network_allow_out"),
             "network_deny_out": _first_of(options, "networkDenyOut", "network_deny_out"),
             "allow_public_traffic": _first_of(options, "allowPublicTraffic", "allow_public_traffic"),
+            "mask_request_host": _first_of(options, "maskRequestHost", "mask_request_host"),
             "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
             "network_bytes_out_limit": _first_of(options, "networkBytesOutLimit", "network_bytes_out_limit"),
             "registry": _first_of(options, "registry"),

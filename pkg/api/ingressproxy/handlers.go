@@ -224,7 +224,17 @@ func (h *handlers) httpWake(w http.ResponseWriter, r *http.Request) {
 			pr.SetURL(target)
 			pr.Out.URL.Path = upstreamPath
 			pr.Out.URL.RawPath = ""
-			pr.Out.Host = target.Host
+			// maskRequestHost (E2B network.maskRequestHost): rewrite the
+			// upstream Host so frameworks that validate it (Vite, Django,
+			// webpack-dev-server) accept the request. This is the wake-path
+			// enforcement point — the direct Caddy route can't reach here
+			// because we overwrite Host below. Empty mask keeps today's
+			// behavior (the container sees its own IP:port as Host).
+			if endpoint.MaskRequestHost != "" {
+				pr.Out.Host = endpoint.MaskRequestHost
+			} else {
+				pr.Out.Host = target.Host
+			}
 			pr.SetXForwarded()
 		},
 		// FlushInterval=-1 disables buffering so streaming responses

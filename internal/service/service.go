@@ -985,6 +985,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	req.Durability = durability
+	if err := validateMaskRequestHost(req.MaskRequestHost); err != nil {
+		return nil, err
+	}
 	// "firecracker" is the second runtime, dispatched to the native
 	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
 	//
@@ -1150,6 +1153,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
+		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -1393,6 +1397,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
+		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -2746,18 +2751,22 @@ func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbo
 	if s.isWasmSandbox(sandbox) {
 		return s.installWasmHTTPPortRoute(ctx, sandbox, port)
 	}
+	// The direct route is where DIRECT-path Host masking is enforced; the
+	// serverless wake route can't carry it (the loopback ingress proxy
+	// overwrites Host on re-dial), so that path masks in the proxy instead.
+	routeOpts := caddy.HTTPRouteOptions{MaskRequestHost: sandbox.MaskRequestHost}
 	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
 	case RouteShapeDirect:
 		// Non-serverless callers (and serverless-bypass-off callers)
-		// fall through to UpsertPortRoute byte-for-byte, so the
-		// non-serverless JSON regression test stays valid. Only the
-		// warm-bypass path adopts the retry window.
+		// fall through to UpsertPortRoute byte-for-byte (empty mask emits no
+		// headers block), so the non-serverless JSON regression test stays
+		// valid. Only the warm-bypass path adopts the retry window.
 		if s.serverlessWakeEnabled(sandbox) && s.cfg.HTTPWakeDirectBypassEnabled {
-			if err := s.caddy.UpsertPortRouteWithRetry(ctx, sandbox.ID, sandbox.ContainerIP, port, s.cfg.HTTPWakeDirectRouteRetryDuration); err != nil {
+			if err := s.caddy.UpsertPortRouteWithRetry(ctx, sandbox.ID, sandbox.ContainerIP, port, s.cfg.HTTPWakeDirectRouteRetryDuration, routeOpts); err != nil {
 				return err
 			}
 		} else {
-			if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port); err != nil {
+			if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, routeOpts); err != nil {
 				return err
 			}
 		}
@@ -2932,6 +2941,13 @@ func (s *Service) WakeAwareToolboxTarget(ctx context.Context, id string) (Toolbo
 // exposed-port request. URL has the form http://{containerIP}:{port}.
 type PortEndpoint struct {
 	URL string
+	// MaskRequestHost is the value the loopback ingress proxy must rewrite the
+	// upstream Host header to before re-dialing the container. Empty = keep the
+	// proxy's default (the upstream URL host). This is the serverless wake-path
+	// enforcement point for E2B network.maskRequestHost; the direct Caddy route
+	// enforces the same value via caddy.HTTPRouteOptions. Both read the one
+	// sandbox row, so they can't disagree.
+	MaskRequestHost string
 }
 
 // WakeAwarePortTarget resolves a sandbox's exposed-port upstream URL,
@@ -2956,17 +2972,18 @@ func (s *Service) WakeAwarePortTarget(ctx context.Context, id string, port int) 
 	if exposure == nil || (exposure.Protocol != "" && exposure.Protocol != models.ExposedPortProtocolHTTP) {
 		return PortEndpoint{}, fmt.Errorf("sandbox %s does not expose HTTP port %d", id, port)
 	}
+	mask := strings.TrimSpace(sandbox.MaskRequestHost)
 	if s.isWasmSandbox(sandbox) {
 		url, err := s.wasmHTTPUpstreamURL(ctx, id, port)
 		if err != nil {
 			return PortEndpoint{}, err
 		}
-		return PortEndpoint{URL: url}, nil
+		return PortEndpoint{URL: url, MaskRequestHost: mask}, nil
 	}
 	if sandbox.ContainerIP == "" {
 		return PortEndpoint{}, errors.New("sandbox container IP is not available")
 	}
-	return PortEndpoint{URL: fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, port)}, nil
+	return PortEndpoint{URL: fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, port), MaskRequestHost: mask}, nil
 }
 
 // TouchSandbox bumps last_active_at for id with per-sandbox debounce.
@@ -4807,6 +4824,33 @@ func validateEgressPolicy(allowOut, denyOut []string) error {
 	for _, cidr := range denyOut {
 		if strings.TrimSpace(cidr) == "0.0.0.0/0" {
 			return errors.New("network_deny_out of 0.0.0.0/0 must be expressed as network_block_all")
+		}
+	}
+	return nil
+}
+
+// maxMaskRequestHostLen bounds the stored value at the DNS name maximum so a
+// pathological client can't balloon the column; a real Host (optionally with a
+// :port suffix) never approaches this.
+const maxMaskRequestHostLen = 253
+
+// validateMaskRequestHost guards the Host-rewrite value. It is forwarded
+// verbatim as an HTTP Host header, so it must be a single-line token: reject
+// CR/LF (header-injection / response-splitting) and any other control or space
+// character. Empty (after trim) is valid and means "no rewrite".
+func validateMaskRequestHost(mask string) error {
+	mask = strings.TrimSpace(mask)
+	if mask == "" {
+		return nil
+	}
+	if len(mask) > maxMaskRequestHostLen {
+		return fmt.Errorf("mask_request_host must be at most %d characters", maxMaskRequestHostLen)
+	}
+	for _, r := range mask {
+		// ASCII space and below covers CR, LF, tab, and other control chars;
+		// DEL (0x7f) is rejected too. A Host token has no use for any of these.
+		if r <= ' ' || r == 0x7f {
+			return errors.New("mask_request_host must not contain spaces or control characters")
 		}
 	}
 	return nil

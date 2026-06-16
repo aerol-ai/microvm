@@ -871,6 +871,7 @@ public class MicroVMClient {
         copy.networkAllowOut = source.networkAllowOut;
         copy.networkDenyOut = source.networkDenyOut;
         copy.allowPublicTraffic = source.allowPublicTraffic;
+        copy.maskRequestHost = source.maskRequestHost;
         copy.networkBytesInLimit = source.networkBytesInLimit;
         copy.networkBytesOutLimit = source.networkBytesOutLimit;
         copy.registry = source.registry;

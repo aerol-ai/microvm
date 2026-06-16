@@ -84,6 +84,21 @@ func routeDial(t *testing.T, route map[string]any) string {
 	return dial
 }
 
+func routeHostRewrite(t *testing.T, route map[string]any) string {
+	t.Helper()
+	handlers, _ := route["handle"].([]any)
+	rp, _ := handlers[0].(map[string]any)
+	headers, _ := rp["headers"].(map[string]any)
+	request, _ := headers["request"].(map[string]any)
+	set, _ := request["set"].(map[string]any)
+	hosts, _ := set["Host"].([]any)
+	if len(hosts) == 0 {
+		return ""
+	}
+	host, _ := hosts[0].(string)
+	return host
+}
+
 func TestWasmHTTPIngressIntegration(t *testing.T) {
 	ctx := context.Background()
 	rec, srv, caddyClient := newRecordingHTTPRouteCaddy(t)
@@ -102,13 +117,14 @@ func TestWasmHTTPIngressIntegration(t *testing.T) {
 
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           "sb-wasm-ingress",
-		Status:       models.SandboxStatusStarted,
-		Runtime:      models.RuntimeWasm,
-		ContainerIP:  "127.0.0.1",
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:              "sb-wasm-ingress",
+		Status:          models.SandboxStatusStarted,
+		Runtime:         models.RuntimeWasm,
+		ContainerIP:     "127.0.0.1",
+		MaskRequestHost: "localhost",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		LastActiveAt:    now,
 	}); err != nil {
 		t.Fatalf("create sandbox: %v", err)
 	}
@@ -134,6 +150,9 @@ func TestWasmHTTPIngressIntegration(t *testing.T) {
 	if dial := routeDial(t, route); dial != wantDial {
 		t.Fatalf("preview dial = %q want %q", dial, wantDial)
 	}
+	if host := routeHostRewrite(t, route); host != "localhost" {
+		t.Fatalf("preview Host rewrite = %q want localhost", host)
+	}
 
 	if err := svc.installWasmCustomDomainHTTPRoute(ctx, sandbox, "api.customer.com", 8080); err != nil {
 		t.Fatalf("installWasmCustomDomainHTTPRoute: %v", err)
@@ -145,5 +164,8 @@ func TestWasmHTTPIngressIntegration(t *testing.T) {
 	}
 	if dial := routeDial(t, cdRoute); dial != wantDial {
 		t.Fatalf("custom domain dial = %q want %q", dial, wantDial)
+	}
+	if host := routeHostRewrite(t, cdRoute); host != "localhost" {
+		t.Fatalf("custom domain Host rewrite = %q want localhost", host)
 	}
 }
