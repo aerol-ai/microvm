@@ -334,8 +334,9 @@ Synthesized from this review. P1 blocks ship; P2 same branch; P3 follow-up.
   - Surfaced by: Arch I2 (SSRF). Files: `pkg/wasmmod/resolve.go`, `internal/config/config.go`. Verify: rejects internal IP / non-allowlisted host.
 - [ ] **T3 (P1)** — wasmmod — Extract shared ORAS transport; add Pull/PushModuleArtifact
   - Surfaced by: CodeQual I5. Files: `pkg/wasmmod/oras_core.go`, `oras_pull.go`, `oras_push.go`. Verify: module + checkpoint roundtrip via one auth path.
-- [ ] **T4 (P1)** — service/runtime — Pin resolved digest at create; start/rehydrate/recreate boot frozen digest
+- [x] **T4 (P1)** — service/runtime — Pin resolved digest at create; start/rehydrate/recreate boot frozen digest
   - Surfaced by: Codex C2 (correctness). Files: `internal/runtime/wasm/lifecycle.go`, `passivate.go`, store column. Verify: alias retarget → restart boots original bytes.
+  - Done: `resolvePinned` (`lifecycle.go:66`) prefers the create-time digest via the frozen content-addressed copy and refuses to boot drifted bytes (`ErrModuleDigestMismatch`); wired into `StartSandbox` (`lifecycle.go:158`) and `RehydrateSandbox` (`passivate.go:55`); `module_digest` persisted (`store.go:612`). Regression test `internal/runtime/wasm/digest_pin_test.go` drives the alias-retarget scenario end-to-end through the public entry points — success branch (frozen copy → boots original bytes), loud-failure branch (no frozen copy → `ErrModuleDigestMismatch`), and the rehydrate path. Recreate/failover digest sourcing (checkpoint metadata) is covered under T7.
 - [ ] **T5 (P1)** — store — alias + module_digest + refcount columns (host-port-pool test discipline)
   - Surfaced by: Test review + C5. Files: `internal/store/store.go`. Verify: `store_test.go`.
 - [ ] **T6 (P1)** — service — Single-flight pull latch on create
