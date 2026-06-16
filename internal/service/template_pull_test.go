@@ -387,7 +387,7 @@ func TestEnsureTemplateLocal_SingleFlight(t *testing.T) {
 	svc.AttachTemplateArtifactPuller(puller)
 	tpl := &models.Template{
 		ID:               id,
-		RegistryRef:      "aocr.test/cluster/c1/templates/tpl-collapse:latest",
+		RegistryRef:      testHostAOCRRef("aocr.test/cluster/c1/templates/tpl-collapse:latest"),
 		SnapshotChecksum: checksum,
 	}
 
@@ -602,7 +602,7 @@ func TestEnsureTemplateLocalEdgeBranches(t *testing.T) {
 
 	tpl := &models.Template{
 		ID:               "tpl-retry",
-		RegistryRef:      "aocr.test/cluster/c1/templates/tpl-retry:latest",
+		RegistryRef:      testHostAOCRRef("aocr.test/cluster/c1/templates/tpl-retry:latest"),
 		SnapshotChecksum: checksum,
 	}
 	if err := svc.EnsureTemplateLocal(ctx, tpl); err == nil || !strings.Contains(err.Error(), "pull failed") {

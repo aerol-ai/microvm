@@ -150,7 +150,7 @@ variable "ssh_public_key_path" {
 ###############################################################################
 
 variable "ami_id" {
-  description = "AMI ID for every node. Empty string auto-resolves the latest Canonical Ubuntu 22.04 LTS amd64 in the region."
+  description = "Optional cluster-wide AMI override for amd64 nodes. Empty string auto-resolves the latest Canonical Ubuntu 22.04 LTS amd64 in the region. arm64 nodes always resolve the matching arm64 AMI unless nodes[*].ami_id overrides."
   type        = string
   default     = ""
 }
@@ -210,7 +210,8 @@ variable "nodes" {
       volume_type      (string,  default var.default_volume_type)
       volume_iops      (number,  default var.default_volume_iops)
       volume_throughput(number,  default var.default_volume_throughput)
-      ami_id           (string,  default var.ami_id resolved to Ubuntu 22.04)
+      ami_id           (string,  default var.ami_id resolved to Ubuntu 22.04 for the node's arch)
+      arch             (string,  optional "amd64" or "arm64"; derived from instance_type when unset)
       with_firecracker (bool,    default var.default_with_firecracker)
       with_gvisor      (bool,    default var.default_with_gvisor)
       with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
@@ -228,6 +229,7 @@ variable "nodes" {
     volume_iops       = optional(number)
     volume_throughput = optional(number)
     ami_id            = optional(string)
+    arch              = optional(string)
     with_firecracker  = optional(bool)
     with_gvisor       = optional(bool)
     with_nvidia_gpu   = optional(bool)
@@ -301,6 +303,14 @@ variable "nodes" {
     ])
     error_message = "nodes[*].with_firecracker may only be set on worker-capable nodes (role contains \"worker\" or equals \"mixed\")."
   }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodes :
+      try(v.arch, null) == null || contains(["amd64", "arm64"], v.arch)
+    ])
+    error_message = "nodes[*].arch must be \"amd64\" or \"arm64\" when set."
+  }
 }
 
 ###############################################################################
@@ -356,7 +366,10 @@ variable "firecracker" {
 
     The *_url fields are optional so pre-baked AMIs remain supported:
     leave them empty if the AMI already ships the artifacts at the matching
-    *_path values. kernel_path must point at a real vmlinux image on the host
+    *_path values. When all *_url fields are empty and auto_install_artifacts
+    is true (default), bootstrap downloads the arch-matched upstream Firecracker
+    release + spec.ccfc.min guest kernel (same pins as Ansible configure-ops.yml).
+    kernel_path must point at a real vmlinux image on the host
     and kernel_path.config must point at that image's kernel config by the time
     sandboxd restarts or health will degrade because vmgenid support cannot be
     proven.
@@ -366,6 +379,10 @@ variable "firecracker" {
     jailer_url                   = optional(string, "")
     kernel_url                   = optional(string, "")
     kernel_config_url            = optional(string, "")
+    version                      = optional(string, "v1.15.1")
+    kernel_ci_version            = optional(string, "v1.15")
+    kernel_version               = optional(string, "5.10.245")
+    auto_install_artifacts       = optional(bool, true)
     binary_path                  = optional(string, "/usr/local/bin/firecracker")
     jailer_path                  = optional(string, "/usr/local/bin/jailer")
     kernel_path                  = optional(string, "/var/lib/sandboxd/firecracker/vmlinux")

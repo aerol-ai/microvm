@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -171,7 +172,7 @@ func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
 			name:      "bare name with pusher rewrites to AOCR ref",
 			image:     "my-snap",
 			pusher:    pusher,
-			wantImage: "aocr.test/cluster/cluster-7/snapshots/my-snap:latest",
+			wantImage: pusher.DestRefFor("my-snap"),
 			wantMode:  models.ImageDistributionAOCR,
 		},
 		{
@@ -232,6 +233,45 @@ func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
 	}
 }
 
+func TestNormalizeCreateImageDistribution_RejectsForeignArchSnapshot(t *testing.T) {
+	host := hostSnapshotArch()
+	foreign := snapshotArchAMD64
+	if host == snapshotArchAMD64 {
+		foreign = snapshotArchARM64
+	}
+	foreignRef := "aocr.test/cluster/c1/snapshots/snap:latest--arch-" + foreign
+
+	svc := &Service{images: newDefaultImageDistributionProvider("aocr.test")}
+	req := &models.CreateSandboxRequest{Image: foreignRef}
+	req.ApplyImageDistribution(models.ImageDistributionMetadata{
+		Mode:        models.ImageDistributionAOCR,
+		RegistryRef: foreignRef,
+	})
+	if err := svc.NormalizeCreateImageDistribution(context.Background(), req); err == nil {
+		t.Fatal("expected foreign-arch AOCR ref to be rejected")
+	}
+}
+
+func TestNormalizeCreateImageDistribution_DoesNotArchRejectNonArtifactAOCRRefs(t *testing.T) {
+	cases := []string{
+		"aocr.test/cluster/c1/_imported/ghcr/org/img:latest--idle-90d",
+		"aocr.test/team/app:latest",
+	}
+	for _, ref := range cases {
+		t.Run(ref, func(t *testing.T) {
+			svc := &Service{images: newDefaultImageDistributionProvider("aocr.test")}
+			req := &models.CreateSandboxRequest{Image: ref}
+			req.ApplyImageDistribution(models.ImageDistributionMetadata{
+				Mode:        models.ImageDistributionAOCR,
+				RegistryRef: ref,
+			})
+			if err := svc.NormalizeCreateImageDistribution(context.Background(), req); err != nil {
+				t.Fatalf("NormalizeCreateImageDistribution(%q): %v", ref, err)
+			}
+		})
+	}
+}
+
 func TestImageDistributionHelperBranches(t *testing.T) {
 	ctx := context.Background()
 
@@ -278,6 +318,167 @@ func TestImageDistributionHelperBranches(t *testing.T) {
 	}
 	if snap.ImageDistributionMode != models.ImageDistributionLocalOnly {
 		t.Fatalf("forced snapshot mode = %q, want local-only", snap.ImageDistributionMode)
+	}
+
+	snapClassify := &models.SandboxSnapshot{Image: "ghcr.io/org/app:latest"}
+	if err := svc.normalizeSnapshotImageDistribution(ctx, snapClassify, false); err != nil {
+		t.Fatalf("normalizeSnapshotImageDistribution(classify): %v", err)
+	}
+	if snapClassify.ImageDistributionMode != models.ImageDistributionExternalRegistry {
+		t.Fatalf("classified mode = %q, want external", snapClassify.ImageDistributionMode)
+	}
+	if err := svc.normalizeSnapshotImageDistribution(ctx, nil, false); err != nil {
+		t.Fatalf("normalizeSnapshotImageDistribution(nil): %v", err)
+	}
+	if err := svc.normalizeSnapshotImageDistribution(ctx, snapClassify, false); err != nil {
+		t.Fatalf("second classify: %v", err)
+	}
+}
+
+func TestNormalizeCreateImageDistributionNilAndProviderErrors(t *testing.T) {
+	ctx := context.Background()
+	var nilSvc *Service
+	if err := nilSvc.NormalizeCreateImageDistribution(ctx, nil); err != nil {
+		t.Fatalf("nil req: %v", err)
+	}
+
+	svc := &Service{images: failingImageDistributionProvider{err: errors.New("classifier down")}}
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+	if err := svc.NormalizeCreateImageDistribution(ctx, &req); err == nil {
+		t.Fatal("expected classifier error")
+	}
+
+	svcSnap := &Service{images: failingImageDistributionProvider{err: errors.New("snap classify down")}}
+	if err := svcSnap.normalizeSnapshotImageDistribution(ctx, &models.SandboxSnapshot{Image: "alpine:3.20"}, false); err == nil {
+		t.Fatal("expected snapshot classifier error")
+	}
+}
+
+func TestNormalizeCreateImageDistribution_SnapshotRowAOCRArchGuard(t *testing.T) {
+	ctx := context.Background()
+	st := openImageDistributionStore(t)
+	defer st.Close()
+
+	host := hostSnapshotArch()
+	foreign := snapshotArchAMD64
+	if host == snapshotArchAMD64 {
+		foreign = snapshotArchARM64
+	}
+	foreignRef := "aocr.test/cluster/c1/snapshots/snap:latest--arch-" + foreign
+	sameRef := testHostAOCRRef("aocr.test/cluster/c1/snapshots/snap:latest")
+
+	snapshot := &models.SandboxSnapshot{
+		Name:                  "snap-row",
+		Image:                 sameRef,
+		SourceSandboxID:       "sb-1",
+		CreatedAt:             time.Now().UTC(),
+		ImageDistributionMode: models.ImageDistributionAOCR,
+		ImageRegistryRef:      "",
+	}
+	if err := st.CreateSnapshot(ctx, snapshot); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	svc := &Service{store: st}
+	req := models.CreateSandboxRequest{Image: snapshot.Name}
+	if err := svc.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+		t.Fatalf("same-arch snapshot row: %v", err)
+	}
+	if req.Image != sameRef {
+		t.Fatalf("Image = %q, want %q", req.Image, sameRef)
+	}
+
+	foreignSnap := &models.SandboxSnapshot{
+		Name:                  "snap-foreign",
+		Image:                 foreignRef,
+		SourceSandboxID:       "sb-2",
+		CreatedAt:             time.Now().UTC(),
+		ImageDistributionMode: models.ImageDistributionAOCR,
+		ImageRegistryRef:      foreignRef,
+	}
+	if err := st.CreateSnapshot(ctx, foreignSnap); err != nil {
+		t.Fatalf("CreateSnapshot foreign: %v", err)
+	}
+	reqForeign := models.CreateSandboxRequest{Image: foreignSnap.Name}
+	if err := svc.NormalizeCreateImageDistribution(ctx, &reqForeign); err == nil {
+		t.Fatal("expected foreign-arch snapshot row to be rejected")
+	}
+}
+
+func TestNormalizeCreateImageDistribution_CrossNodeForeignArchRejected(t *testing.T) {
+	ctx := context.Background()
+	st := openImageDistributionStore(t)
+	defer st.Close()
+
+	foreign := snapshotArchAMD64
+	if hostSnapshotArch() == snapshotArchAMD64 {
+		foreign = snapshotArchARM64
+	}
+	old := snapshotRefArch
+	snapshotRefArch = func() string { return foreign }
+	t.Cleanup(func() { snapshotRefArch = old })
+
+	patPath := writePATFile(t, "token")
+	pusher, err := NewSnapshotPusher(SnapshotPushConfig{
+		Enabled:   true,
+		Host:      "aocr.test",
+		ClusterID: "cluster-7",
+		PATPath:   patPath,
+	}, &fakeSnapshotPushDocker{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewSnapshotPusher: %v", err)
+	}
+
+	svc := &Service{store: st, snapshotPusher: pusher}
+	req := models.CreateSandboxRequest{Image: "peer-snap"}
+	if err := svc.NormalizeCreateImageDistribution(ctx, &req); err == nil {
+		t.Fatal("expected cross-node AOCR ref with foreign arch tag to be rejected")
+	}
+}
+
+func TestNormalizeImageDistributionMetadataInvalidMode(t *testing.T) {
+	_, err := normalizeImageDistributionMetadata("img", models.ImageDistributionMetadata{Mode: "bogus"})
+	if err == nil {
+		t.Fatal("expected invalid mode error")
+	}
+
+	svc := &Service{}
+	if err := svc.normalizeSnapshotImageDistribution(context.Background(), &models.SandboxSnapshot{
+		Image:                 "img",
+		ImageDistributionMode: "bogus",
+	}, false); err == nil {
+		t.Fatal("expected snapshot normalize invalid mode error")
+	}
+
+	req := models.CreateSandboxRequest{Image: "img"}
+	req.ApplyImageDistribution(models.ImageDistributionMetadata{Mode: "bogus"})
+	if err := (&Service{}).NormalizeCreateImageDistribution(context.Background(), &req); err == nil {
+		t.Fatal("expected create normalize invalid mode error")
+	}
+}
+
+func TestImageRefHelpersEdgeCases(t *testing.T) {
+	if imageRefHasTagOrDigest("") {
+		t.Fatal("empty ref should not have tag/digest")
+	}
+	if !imageRefHasTagOrDigest("repo/app@sha256:abc") {
+		t.Fatal("digest ref should match")
+	}
+	if !imageRefHasTagOrDigest("registry.io:5000/team/app:latest") {
+		t.Fatal("tag in final path component should match")
+	}
+	if imageRegistryHost("") != "" {
+		t.Fatal("empty image host should be empty")
+	}
+
+	p := newDefaultImageDistributionProvider("  ")
+	if p.(defaultImageDistributionProvider).aocrHost != defaultAOCRRegistryHost {
+		t.Fatalf("empty aocr host should default to %q", defaultAOCRRegistryHost)
+	}
+
+	svc := &Service{images: newDefaultImageDistributionProvider("aocr.test")}
+	if _, ok := svc.imageDistributionProvider().(defaultImageDistributionProvider); !ok {
+		t.Fatal("expected default provider when images is set")
 	}
 }
 

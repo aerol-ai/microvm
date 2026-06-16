@@ -187,7 +187,7 @@ func TestTemplatePushReconciler_PendingToActive(t *testing.T) {
 	if row.PushError != "" {
 		t.Errorf("PushError = %q, want empty after success", row.PushError)
 	}
-	wantRef := "aocr.test/cluster/cluster-1/templates/tpl-ok:latest"
+	wantRef := testHostAOCRRef("aocr.test/cluster/cluster-1/templates/tpl-ok:latest")
 	if row.RegistryRef != wantRef {
 		t.Errorf("RegistryRef = %q, want %q", row.RegistryRef, wantRef)
 	}

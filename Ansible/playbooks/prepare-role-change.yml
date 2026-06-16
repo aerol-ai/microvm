@@ -15,6 +15,22 @@
   any_errors_fatal: true
   gather_facts: false
 
+  pre_tasks:
+    - name: Gather hardware facts for architecture preflight
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - hardware
+
+    - name: Assert homogeneous CPU architecture across play hosts
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts | map('extract', hostvars, 'ansible_architecture') | unique | length == 1
+        fail_msg: >-
+          Mixed CPU architectures detected across inventory hosts.
+          AerolVM clusters must be single-arch (see plans/arm64-firecracker-hosts.md).
+
   tasks:
     - name: Refuse to run without an explicit --limit (or confirm_drain_all=true)
       # `hosts: all` is intentional so an operator can target any single node

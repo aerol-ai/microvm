@@ -162,7 +162,7 @@ func TestReconciler_PendingToActive(t *testing.T) {
 	if row.ImageDistributionMode != models.ImageDistributionAOCR {
 		t.Fatalf("ImageDistributionMode = %q, want aocr", row.ImageDistributionMode)
 	}
-	wantRef := "aocr.test/cluster/cluster-1/snapshots/snap:latest"
+	wantRef := "aocr.test/cluster/cluster-1/snapshots/snap:latest" + archTagSuffix(hostSnapshotArch())
 	if row.ImageRegistryRef != wantRef {
 		t.Fatalf("ImageRegistryRef = %q, want %q", row.ImageRegistryRef, wantRef)
 	}

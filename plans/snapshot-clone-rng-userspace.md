@@ -142,10 +142,17 @@ artifact preconditions:
 - **Deploy-time (operator, NOT daemon code).** `SB_FIRECRACKER_BINARY` ≥ v1.8
   and `SB_FIRECRACKER_KERNEL` built with `CONFIG_VMGENID=y`. The repo does not
   build the kernel or ship the FC binary (both are downloaded artifacts — see
-  Terraform `firecracker.kernel_url` / `binary_url`), so these are verified at
-  template-build / deploy time, not settable in Go. On a binary or kernel
-  without support, the system silently falls back to `post_resume`-only
-  (correct on the happy path; entropy window restored).
+  Terraform `firecracker.kernel_url` / `binary_url`, or upstream auto-install
+  when URLs are empty), so these are verified at template-build / deploy time,
+  not settable in Go. On a binary or kernel without support, the system silently
+  falls back to `post_resume`-only (correct on the happy path; entropy window
+  restored).
+- **arm64 (Graviton).** vmgenid is delivered via the device tree (FDT), not ACPI.
+  `baseBootArgs` on arm64 uses `console=ttyAMA0` and deliberately omits `pci=off`
+  (unlike amd64's `ttyS0`). ACPI stays enabled on amd64 for the ACPI vmgenid path.
+  The upstream spec.ccfc.min aarch64 kernels pulled by Terraform/Ansible include
+  `CONFIG_VMGENID=y`; UC-80 asserts distinct kernel CRNG across template clones
+  on whichever arch the integration scenario runs.
 
 Optional follow-up (not done): a one-shot `firecracker --version` preflight in
 `Driver.Ping` that warns when snapshot-clone is enabled against a pre-1.8

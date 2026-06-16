@@ -31,6 +31,10 @@ make integration-single                 # single-node scenario (Phase 0)
 make integration-local                  # local-mode (--local install on a throwaway box)
 integration-tests/run.sh single-node --keep        # leave infra up for debugging
 integration-tests/run.sh single-node --prod-tls    # use real Let's Encrypt instead of staging
+make integration-cluster-hetero           # 8-node heterogeneous cluster (x86 fc)
+make integration-arm64                    # arm64 firecracker single + cluster scenarios
+make integration-arm64-single             # single-node-fc-arm64 (Graviton metal)
+make integration-arm64-cluster            # cluster-arm64 (homogeneous arm64)
 make integration-reap                   # terminate any leaked itest instances past ttl
 ```
 

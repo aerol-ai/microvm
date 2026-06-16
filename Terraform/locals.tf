@@ -41,6 +41,21 @@ locals {
   # Normalise each node entry with its effective values (per-node overrides
   # win, then var.default_*). Doing this once here keeps nodes.tf / dns.tf
   # readable.
+  #
+  # node_arch derives CPU architecture from an explicit nodes[*].arch field
+  # or from the instance type (Graviton families use a 'g' size token).
+  graviton_instance_re = "([a-z][0-9]+g|a1|t4g)\\."
+
+  derived_node_arch = {
+    for name, n in var.nodes : name => (
+      can(regex(local.graviton_instance_re, coalesce(n.instance_type, var.default_instance_type))) ? "arm64" : "amd64"
+    )
+  }
+
+  node_arch = {
+    for name, n in var.nodes : name => coalesce(try(n.arch, null), local.derived_node_arch[name])
+  }
+
   nodes_resolved = {
     for name, n in var.nodes : name => {
       name              = name
@@ -51,7 +66,13 @@ locals {
       volume_type       = coalesce(n.volume_type, var.default_volume_type)
       volume_iops       = coalesce(n.volume_iops, var.default_volume_iops)
       volume_throughput = coalesce(n.volume_throughput, var.default_volume_throughput)
-      ami_id            = coalesce(n.ami_id, var.ami_id, data.aws_ami.ubuntu.id)
+      arch              = local.node_arch[name]
+      ami_id = coalesce(
+        n.ami_id,
+        local.node_arch[name] == "arm64" ? data.aws_ami.ubuntu_arm64.id : (
+          var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu_amd64.id
+        )
+      )
       # bool defaults need explicit null handling — coalesce treats `false` as
       # a real value, but optional() without a default returns null.
       with_firecracker = n.with_firecracker == null ? var.default_with_firecracker : n.with_firecracker
@@ -204,6 +225,14 @@ locals {
     registry_pat_path  = try(local.cluster_ops.wasm.registry_pat_path, "")
     standard_modules   = join(",", [for m in try(local.cluster_ops.wasm.standard_modules, []) : "${m.alias}=${m.alias}.wasm"])
   }
+
+  # Homogeneous per-arch clusters (D5): one GOARCH for snapshot tagging and
+  # Firecracker upstream artifact selection. The precondition on
+  # validate_cluster_ops enforces a single distinct arch across nodes.
+  cluster_arch_values = distinct([for _, arch in local.node_arch : arch])
+  cluster_arch        = length(local.cluster_arch_values) == 1 ? local.cluster_arch_values[0] : "mixed"
+
+  firecracker_upstream_arch = local.cluster_arch == "arm64" ? "aarch64" : "x86_64"
 }
 
 # Plan-time validation of values that come from local.cluster_ops. Terraform
@@ -213,6 +242,19 @@ locals {
 # config/cluster.yml became the source of those fields.
 resource "terraform_data" "validate_cluster_ops" {
   lifecycle {
+    precondition {
+      condition     = length(distinct([for name, arch in local.node_arch : arch])) == 1
+      error_message = "All nodes in a cluster must share one CPU architecture; mixed x86/arm64 clusters are unsupported (see plans/arm64-firecracker-hosts.md)."
+    }
+
+    precondition {
+      condition = alltrue([
+        for name, n in var.nodes :
+        try(n.arch, null) == null || local.node_arch[name] == local.derived_node_arch[name]
+      ])
+      error_message = "nodes[*].arch must match the node's instance_type-derived CPU architecture; do not pair Graviton instances with arch=\"amd64\" or x86 instances with arch=\"arm64\"."
+    }
+
     precondition {
       condition = (
         !local.cluster_ops.auto_import.enabled

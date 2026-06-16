@@ -73,6 +73,17 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			if req.ImageDistribution().IsZero() {
 				req.ApplyImageDistribution(snapshot.ImageDistribution())
 			}
+			if meta := req.ImageDistribution(); meta.Mode == models.ImageDistributionAOCR {
+				ref := strings.TrimSpace(meta.RegistryRef)
+				if ref == "" {
+					ref = strings.TrimSpace(req.Image)
+				}
+				if ref != "" {
+					if err := validateClusterArtifactRefArch(ref, hostSnapshotArch()); err != nil {
+						return err
+					}
+				}
+			}
 		case errors.Is(err, store.ErrNotFound) && s.snapshotPusher != nil:
 			// Cross-node snapshot lookup: a peer node took the snapshot,
 			// pushed it under the deterministic AOCR namespace, but the
@@ -91,6 +102,9 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			// classifier below.
 			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) && !imageRefHasTagOrDigest(req.Image) {
 				if dest := s.snapshotPusher.DestRefFor(req.Image); dest != "" {
+					if err := validateClusterArtifactRefArch(dest, hostSnapshotArch()); err != nil {
+						return err
+					}
 					req.Image = dest
 					if req.ImageDistribution().IsZero() {
 						req.ApplyImageDistribution(models.ImageDistributionMetadata{
@@ -110,6 +124,11 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			return err
 		}
 		meta = classified
+	}
+	if meta.Mode == models.ImageDistributionAOCR && meta.RegistryRef != "" {
+		if err := validateClusterArtifactRefArch(meta.RegistryRef, hostSnapshotArch()); err != nil {
+			return err
+		}
 	}
 	normalized, err := normalizeImageDistributionMetadata(req.Image, meta)
 	if err != nil {

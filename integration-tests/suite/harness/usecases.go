@@ -22,6 +22,9 @@ const (
 	CapGPU         Capability = "gpu"         // a GPU worker
 	CapDomain      Capability = "domain"      // public domain + TLS (not local-mode)
 	CapCluster     Capability = "cluster"     // multi-node cluster (raft/forwarding)
+	// CapMixedArchNegative gates UC-79: inject a foreign-arch snapshot ref and
+	// assert the arm64 cluster refuses to resume it.
+	CapMixedArchNegative Capability = "mixed-arch-negative"
 	// CapCustomDomains gates the custom-domain attach path (UC-35/36). It's
 	// distinct from CapDomain: a deployment can have a public domain + TLS yet
 	// run with SB_ENABLE_CUSTOM_DOMAINS=false, in which case the API rejects
@@ -167,6 +170,11 @@ var Registry = []UseCase{
 	{ID: "UC-75", Title: "Register snapshot + create from it", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-76", Title: "Rich Dockerfile builder (env/workdir/entrypoint/cmd/user/expose)", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-77", Title: "DNS ingress target published", Requires: []Capability{CapDomain}, Implemented: true},
+
+	// J. Architecture homogeneity (arm64 Firecracker hosts)
+	{ID: "UC-78", Title: "Foreign-arch snapshot ref rejected (offline guard)", Requires: nil, Implemented: true},
+	{ID: "UC-79", Title: "Foreign-arch snapshot rejected on arm64 cluster (live)", Requires: []Capability{CapCluster, CapFirecracker, CapMixedArchNegative}, Implemented: true},
+	{ID: "UC-80", Title: "Firecracker template clones have distinct kernel entropy", Requires: []Capability{CapFirecracker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
