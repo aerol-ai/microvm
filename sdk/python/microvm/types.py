@@ -152,6 +152,11 @@ class CreateOptions(TypedDict, total=False):
     # Whether the sandbox may be exposed publicly. Defaults to True; False makes
     # expose_port fail (reachable only via the toolbox proxy and SSH gateway).
     allowPublicTraffic: bool
+    # Rewrite the upstream Host header on ingress to exposed HTTP ports to this
+    # value so frameworks that validate Host (Vite, Django ALLOWED_HOSTS,
+    # webpack-dev-server) accept the request. Empty/unset passes it through.
+    # HTTP-only; TCP/TLS exposures ignore it.
+    maskRequestHost: str
     # Caps on network bytes the sandbox may receive (in) / send (out) before
     # per-IP iptables block fires. 0 (default) means unlimited; both can be
     # raised or lifted at runtime via set_network_limits.

@@ -1921,6 +1921,7 @@ func TestStoreHelperCases(t *testing.T) {
 			"[]",                        // network_allow_out_json
 			"[]",                        // network_deny_out_json
 			1,                           // allow_public_traffic
+			"",                          // mask_request_host
 			1,                           // toolbox_enabled
 			"",                          // toolbox_token
 			"",                          // ssh_public_key
@@ -2122,6 +2123,38 @@ func TestAllowPublicTrafficColumnRoundTrip(t *testing.T) {
 	}
 	if got.AllowPublicTraffic == nil || !*got.AllowPublicTraffic {
 		t.Fatalf("default AllowPublicTraffic = %v, want non-nil true", got.AllowPublicTraffic)
+	}
+}
+
+func TestMaskRequestHostColumnRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// A set value persists and reads back verbatim.
+	masked := sampleSandbox("sb-masked")
+	masked.MaskRequestHost = "localhost"
+	if err := st.Create(ctx, masked); err != nil {
+		t.Fatalf("Create masked: %v", err)
+	}
+	got, err := st.Get(ctx, masked.ID)
+	if err != nil {
+		t.Fatalf("Get masked: %v", err)
+	}
+	if got.MaskRequestHost != "localhost" {
+		t.Fatalf("MaskRequestHost = %q, want %q", got.MaskRequestHost, "localhost")
+	}
+
+	// Unset defaults to empty (column default '') on read-back.
+	plain := sampleSandbox("sb-plain")
+	if err := st.Create(ctx, plain); err != nil {
+		t.Fatalf("Create plain: %v", err)
+	}
+	got, err = st.Get(ctx, plain.ID)
+	if err != nil {
+		t.Fatalf("Get plain: %v", err)
+	}
+	if got.MaskRequestHost != "" {
+		t.Fatalf("default MaskRequestHost = %q, want empty", got.MaskRequestHost)
 	}
 }
 

@@ -78,6 +78,22 @@ test("internal client create serializes allowPublicTraffic=false", async () => {
   assert.equal(body.allow_public_traffic, false);
 });
 
+test("internal client create serializes maskRequestHost", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-mask"));
+    },
+  });
+  await client.create({ image: "ubuntu:22.04", maskRequestHost: "localhost" });
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as Record<string, unknown>;
+  assert.equal(body.mask_request_host, "localhost");
+});
+
 test("internal client create maps request and response", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

@@ -180,6 +180,14 @@ export interface CreateOptions {
    */
   allowPublicTraffic?: boolean;
   /**
+   * Rewrite the upstream `Host` header on ingress to exposed HTTP ports to this
+   * value. Frameworks that validate the Host (Vite `allowedHosts`,
+   * webpack-dev-server, Django `ALLOWED_HOSTS`) reject the per-sandbox public
+   * hostname; set this to a value they accept (e.g. `"localhost"`). Empty/unset
+   * passes the host through unchanged. HTTP-only; TCP/TLS exposures ignore it.
+   */
+  maskRequestHost?: string;
+  /**
    * Cap on bytes the sandbox may receive from outside the container before its
    * ingress is dropped via per-IP iptables rule. `0` (default) is unlimited.
    * Limits can be raised or lifted at runtime via `setNetworkLimits`.

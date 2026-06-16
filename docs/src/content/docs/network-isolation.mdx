@@ -335,6 +335,65 @@ Because AerolVM has no auth-gated public route, "no public traffic" is enforced 
 
 ---
 
+## Masking the Request Host
+
+When you expose a port, traffic reaches your app through the per-sandbox public hostname (e.g. `3000-<sandbox-id>.<your-domain>`), and that value arrives as the HTTP `Host` header. Many dev servers and frameworks **reject requests whose Host they don't recognize**:
+
+- Vite (`server.allowedHosts`) — *"Blocked request. This host is not allowed."*
+- webpack-dev-server (`allowedHosts`)
+- Django (`ALLOWED_HOSTS`), Rails host authorization
+
+Set **`maskRequestHost`** to rewrite the upstream `Host` header to a value your app accepts — typically `localhost`. The public URL is unchanged; only the header your service sees changes. Leave it unset to pass the host through untouched.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'node:22',
+      maskRequestHost: 'localhost',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'node:22',
+        'maskRequestHost': 'localhost',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "node:22",
+        MaskRequestHost: "localhost",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "node:22".to_string(),
+        mask_request_host: Some("localhost".to_string()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("node:22")
+            .setMaskRequestHost("localhost")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+The rewrite applies to HTTP port exposures only and is enforced consistently whether the sandbox serves traffic directly or wakes from a paused state. Raw TCP and TLS-passthrough exposures carry no `Host` header, so the value is ignored for them.
+
+---
+
 ## Fine-Grained Quotas vs. Blanket Blocking
 
 If you do not want to block all network traffic permanently, you can use the SDK's **Network Usage & Quotas** features to set limits on total bytes sent or received. 

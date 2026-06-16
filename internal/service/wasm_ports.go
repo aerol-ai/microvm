@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
+	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -72,9 +73,10 @@ func (s *Service) installWasmHTTPPortRoute(ctx context.Context, sandbox *models.
 	if err != nil {
 		return err
 	}
+	routeOpts := caddy.HTTPRouteOptions{MaskRequestHost: sandbox.MaskRequestHost}
 	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
 	case RouteShapeDirect:
-		if err := s.caddy.UpsertPortRouteWithDial(ctx, sandbox.ID, guestPort, dial); err != nil {
+		if err := s.caddy.UpsertPortRouteWithDial(ctx, sandbox.ID, guestPort, dial, routeOpts); err != nil {
 			return err
 		}
 		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)

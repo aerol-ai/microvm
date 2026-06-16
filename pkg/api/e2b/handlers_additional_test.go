@@ -26,7 +26,6 @@ func TestE2BCreateSandboxNotImplemented(t *testing.T) {
 	}{
 		{"mcp", `{"templateID":"base","mcp":{}}`},
 		{"volumeMounts", `{"templateID":"base","volumeMounts":[{"name":"vol"}]}`},
-		{"networkMaskRequestHost", `{"templateID":"base","network":{"maskRequestHost":"host"}}`},
 	}
 
 	for _, tc := range cases {

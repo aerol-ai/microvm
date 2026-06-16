@@ -1971,6 +1971,7 @@ mod tests {
             network_allow_out: None,
             network_deny_out: None,
             allow_public_traffic: None,
+            mask_request_host: None,
             network_bytes_in_limit: None,
             network_bytes_out_limit: None,
             registry: None,
@@ -2004,6 +2005,17 @@ mod tests {
         assert_eq!(value["allow_public_traffic"], serde_json::json!(false));
         // network_deny_out is None, so skip_serializing_if omits it entirely.
         assert!(value.get("network_deny_out").is_none());
+    }
+
+    #[test]
+    fn create_options_serializes_mask_request_host() {
+        let mut opts = minimal_create_options();
+        opts.mask_request_host = Some("localhost".to_string());
+        let value = serde_json::to_value(&opts).expect("serialize create options");
+        assert_eq!(value["mask_request_host"], serde_json::json!("localhost"));
+        // Unset by default => skip_serializing_if omits it.
+        let plain = serde_json::to_value(minimal_create_options()).expect("serialize");
+        assert!(plain.get("mask_request_host").is_none());
     }
 
     #[test]

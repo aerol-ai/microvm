@@ -215,6 +215,30 @@ func TestCreateSandboxAcceptsNetworkAllowOut(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxAcceptsMaskRequestHost(t *testing.T) {
+	_, _, handler := newE2BHandlerTestEnv(t)
+	// network.maskRequestHost is now implemented (Caddy + wake-proxy Host
+	// rewrite), so a valid value creates instead of returning 501.
+	req := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","network":{"maskRequestHost":"localhost"}}`))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+}
+
+func TestCreateSandboxRejectsInvalidMaskRequestHost(t *testing.T) {
+	_, _, handler := newE2BHandlerTestEnv(t)
+	// A CR/LF in the Host value is a header-injection vector — the service
+	// validates and rejects with 400.
+	req := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","network":{"maskRequestHost":"evil\r\nX-Injected: 1"}}`))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+}
+
 func TestCreateSandboxRejectsInvalidEgressCIDR(t *testing.T) {
 	_, _, handler := newE2BHandlerTestEnv(t)
 	// A bare IP is not a CIDR — the service validates and rejects with 400.

@@ -71,6 +71,7 @@ func Open(path string) (*Store, error) {
 			network_allow_out_json TEXT NOT NULL DEFAULT '[]',
 			network_deny_out_json TEXT NOT NULL DEFAULT '[]',
 			allow_public_traffic INTEGER NOT NULL DEFAULT 1,
+			mask_request_host TEXT NOT NULL DEFAULT '',
 			toolbox_enabled INTEGER NOT NULL DEFAULT 1,
 			toolbox_token TEXT NOT NULL DEFAULT '',
 			ssh_public_key TEXT NOT NULL DEFAULT '',
@@ -627,6 +628,11 @@ func Open(path string) (*Store, error) {
 		// Defaults to 1 (public allowed) so every pre-migration row keeps its
 		// current behaviour; 0 makes ExposePort refuse to install a public route.
 		`ALTER TABLE sandboxes ADD COLUMN allow_public_traffic INTEGER NOT NULL DEFAULT 1;`,
+		// mask_request_host rewrites the upstream Host header on exposed HTTP
+		// ports (E2B network.maskRequestHost). Empty '' for every pre-migration
+		// row and the common no-mask path = pass through whatever the route
+		// would otherwise send.
+		`ALTER TABLE sandboxes ADD COLUMN mask_request_host TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -734,7 +740,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -751,7 +757,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -768,6 +774,7 @@ func (s *Store) Create(ctx context.Context, sandbox *models.Sandbox) error {
 		mustMarshalStringSlice(sandbox.NetworkAllowOut),
 		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		allowPublicTrafficToInt(sandbox.AllowPublicTraffic),
+		strings.TrimSpace(sandbox.MaskRequestHost),
 		boolToInt(sandbox.ToolboxEnabled),
 		sandbox.ToolboxToken,
 		sandbox.SSHPublicKey,
@@ -891,7 +898,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -908,7 +915,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			checkpoint_path, clone_generation,
 			wasm_registry_ref, wasm_registry_digest,
 			owner_ref, fleet_suspended
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image = excluded.image,
 			status = excluded.status,
@@ -924,6 +931,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			network_allow_out_json = excluded.network_allow_out_json,
 			network_deny_out_json = excluded.network_deny_out_json,
 			allow_public_traffic = excluded.allow_public_traffic,
+			mask_request_host = excluded.mask_request_host,
 			toolbox_enabled = excluded.toolbox_enabled,
 			toolbox_token = excluded.toolbox_token,
 			ssh_public_key = excluded.ssh_public_key,
@@ -973,6 +981,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		mustMarshalStringSlice(sandbox.NetworkAllowOut),
 		mustMarshalStringSlice(sandbox.NetworkDenyOut),
 		allowPublicTrafficToInt(sandbox.AllowPublicTraffic),
+		strings.TrimSpace(sandbox.MaskRequestHost),
 		boolToInt(sandbox.ToolboxEnabled),
 		sandbox.ToolboxToken,
 		sandbox.SSHPublicKey,
@@ -1024,7 +1033,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1071,7 +1080,7 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1138,7 +1147,7 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -1189,7 +1198,7 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
-			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, toolbox_enabled, toolbox_token, ssh_public_key,
+			os_user, env_json, network_block_all, network_allow_out_json, network_deny_out_json, allow_public_traffic, mask_request_host, toolbox_enabled, toolbox_token, ssh_public_key,
 			last_error, container_command_json, name, tags_json, created_at, updated_at, last_active_at,
 			stop_if_idle_for_ns, destroy_if_idle_for_ns, stop_at_age_ns, destroy_at_age_ns,
 			failover_policy,
@@ -3454,6 +3463,7 @@ func scanSandbox(scanner interface {
 		&allowOutJSON,
 		&denyOutJSON,
 		&allowPublicTraffic,
+		&sandbox.MaskRequestHost,
 		&toolboxEnabled,
 		&sandbox.ToolboxToken,
 		&sandbox.SSHPublicKey,

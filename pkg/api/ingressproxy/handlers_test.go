@@ -33,6 +33,9 @@ type fakeResolver struct {
 	// it to true to assert buffering is skipped.
 	started    bool
 	startedErr error
+	// mask, when set, is returned as PortEndpoint.MaskRequestHost so wake-path
+	// Host-rewrite behavior can be exercised.
+	mask string
 }
 
 func (f *fakeResolver) WakeAwarePortTarget(_ context.Context, id string, port int) (service.PortEndpoint, error) {
@@ -42,7 +45,7 @@ func (f *fakeResolver) WakeAwarePortTarget(_ context.Context, id string, port in
 	if f.err != nil {
 		return service.PortEndpoint{}, f.err
 	}
-	return service.PortEndpoint{URL: f.target}, nil
+	return service.PortEndpoint{URL: f.target, MaskRequestHost: f.mask}, nil
 }
 
 func (f *fakeResolver) TouchSandbox(_ context.Context, id string) error {
@@ -105,6 +108,52 @@ func TestHTTPWakeProxiesToUpstream(t *testing.T) {
 	}
 	if gotBody != "payload" {
 		t.Fatalf("upstream body = %q", gotBody)
+	}
+}
+
+func TestHTTPWakeAppliesMaskRequestHost(t *testing.T) {
+	// maskRequestHost: the upstream must see the masked Host, not the
+	// container IP:port the proxy would otherwise force.
+	var gotHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	h := newHandler(&fakeResolver{target: upstream.URL, mask: "localhost", started: true}, 1024)
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/abc/3000/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rec.Code, rec.Body.String())
+	}
+	if gotHost != "localhost" {
+		t.Fatalf("upstream Host = %q, want %q", gotHost, "localhost")
+	}
+}
+
+func TestHTTPWakeKeepsTargetHostWhenNoMask(t *testing.T) {
+	// Regression: with no mask the container keeps seeing the upstream URL's
+	// host (today's behavior) — masking must not change the default path.
+	var gotHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	h := newHandler(&fakeResolver{target: upstream.URL, started: true}, 1024)
+	req := httptest.NewRequest(http.MethodGet, "/__ingress/http/abc/3000/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// target.Host is the httptest server's host:port, never "localhost".
+	wantHost := strings.TrimPrefix(upstream.URL, "http://")
+	if gotHost != wantHost {
+		t.Fatalf("upstream Host = %q, want %q", gotHost, wantHost)
 	}
 }
 
