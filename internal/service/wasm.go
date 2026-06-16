@@ -150,7 +150,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		ID:                   state.SandboxID,
 		Image:                req.Image,
 		Status:               state.Status,
-		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		PublicURL:            s.sandboxPublicURL(state.SandboxID, req.AllowPublicTraffic),
 		ContainerID:          state.ContainerID,
 		ContainerIP:          state.ContainerIP,
 		CPU:                  req.CPU,
@@ -158,6 +158,10 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		DiskGB:               req.DiskGB,
 		OSUser:               req.OSUser,
 		Env:                  req.Env,
+		NetworkBlockAll:      req.NetworkBlockAll,
+		NetworkAllowOut:      req.NetworkAllowOut,
+		NetworkDenyOut:       req.NetworkDenyOut,
+		AllowPublicTraffic:   req.AllowPublicTraffic,
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -190,7 +194,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	}
 	sandbox.OwnerRef = ownerRefForCreate(ctx)
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		_ = s.wasm.Destroy(ctx, sandbox)
 		cleanupMounts()
 		releaseAdmission()

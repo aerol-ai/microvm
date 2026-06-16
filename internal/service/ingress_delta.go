@@ -49,6 +49,9 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 		if p.SandboxID == "" || p.OwnerNodeID == self {
 			continue
 		}
+		if !placementAllowsPublicTraffic(p) {
+			continue
+		}
 
 		ownerHost := dataPlaneHostForPlacement(p)
 		if p.OwnerNodeID == "" || ownerHost == "" {

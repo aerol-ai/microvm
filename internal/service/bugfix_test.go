@@ -228,6 +228,33 @@ func TestExposePortSkipsProbeOnStoppedSandbox(t *testing.T) {
 	}
 }
 
+// TestExposePortRejectedWhenPublicTrafficDisabled verifies that a sandbox
+// created with allow_public_traffic=false cannot be exposed: ExposePort returns
+// ErrPublicTrafficDisabled instead of installing a public route.
+func TestExposePortRejectedWhenPublicTrafficDisabled(t *testing.T) {
+	ctx := context.Background()
+	svc, st := newProbeSvc(t, func(_ context.Context, _ string, _ int) error { return nil })
+
+	now := time.Now().UTC()
+	deny := false
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-no-public", Image: "alpine:3.20",
+		Status:      models.SandboxStatusStarted,
+		ContainerID: "ctr-no-public", ContainerIP: "10.0.0.20",
+		Runtime: models.RuntimeDocker,
+		CPU:     1, MemoryMB: 256, DiskGB: 5,
+		AllowPublicTraffic: &deny,
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	_, err := svc.ExposePort(ctx, "sb-no-public", 8080, models.ExposedPortProtocolHTTP)
+	if !errors.Is(err, ErrPublicTrafficDisabled) {
+		t.Fatalf("ExposePort err = %v, want ErrPublicTrafficDisabled", err)
+	}
+}
+
 // TestExposePortProceedsWhenProbeFailsAndLogsWarning verifies that a failing
 // probe (port not yet bound) is non-fatal: the route is still installed and
 // the error is surfaced only as a log warning, not as an ExposePort failure.

@@ -181,10 +181,14 @@ func TestRecreateWasmDurableSandbox_AOCRPullThenRehydrates(t *testing.T) {
 	svc.SetWasmRuntime(rt)
 	svc.AttachWasmCheckpointPusher(puller)
 
+	denyPublic := false
 	spec := models.CreateSandboxRequest{
-		Runtime:    models.RuntimeWasm,
-		Durability: models.DurabilityDurable,
-		ModuleRef:  "file:///tmp/demo.wasm",
+		Runtime:            models.RuntimeWasm,
+		Durability:         models.DurabilityDurable,
+		ModuleRef:          "file:///tmp/demo.wasm",
+		NetworkBlockAll:    true,
+		NetworkAllowOut:    []string{"10.0.0.0/24"},
+		AllowPublicTraffic: &denyPublic,
 	}
 	if err := svc.recreateWasmDurableSandbox(ctx, "sb-failover-pull", spec, nil); err != nil {
 		t.Fatalf("recreateWasmDurableSandbox: %v", err)
@@ -208,6 +212,15 @@ func TestRecreateWasmDurableSandbox_AOCRPullThenRehydrates(t *testing.T) {
 	}
 	if got.Status != models.SandboxStatusStarted {
 		t.Fatalf("status = %q, want started", got.Status)
+	}
+	if !got.NetworkBlockAll {
+		t.Fatal("NetworkBlockAll = false, want true")
+	}
+	if len(got.NetworkAllowOut) != 1 || got.NetworkAllowOut[0] != "10.0.0.0/24" {
+		t.Fatalf("NetworkAllowOut = %v, want [10.0.0.0/24]", got.NetworkAllowOut)
+	}
+	if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic {
+		t.Fatalf("AllowPublicTraffic = %v, want false", got.AllowPublicTraffic)
 	}
 }
 

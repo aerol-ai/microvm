@@ -76,6 +76,10 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	if errors.Is(err, service.ErrPublicTrafficDisabled) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if errors.Is(err, store.ErrSnapshotNameConflict) {
 		WriteError(w, http.StatusConflict, "Snapshot name already in use")
 		return

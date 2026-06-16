@@ -56,11 +56,13 @@ func (fakeToolboxRouteRuntime) RemoveImage(context.Context, string) error { retu
 func (fakeToolboxRouteRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	return nil
 }
-func (fakeToolboxRouteRuntime) ClearNetworkRules(string) error        { return nil }
-func (fakeToolboxRouteRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (fakeToolboxRouteRuntime) ApplyNetworkBlockIngress(string) error { return nil }
-func (fakeToolboxRouteRuntime) ClearNetworkBlockIngress(string) error { return nil }
-func (fakeToolboxRouteRuntime) ClearNetworkBlockEgress(string) error  { return nil }
+func (fakeToolboxRouteRuntime) ClearNetworkRules(string) error                     { return nil }
+func (fakeToolboxRouteRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (fakeToolboxRouteRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (fakeToolboxRouteRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (fakeToolboxRouteRuntime) ApplyNetworkBlockIngress(string) error              { return nil }
+func (fakeToolboxRouteRuntime) ClearNetworkBlockIngress(string) error              { return nil }
+func (fakeToolboxRouteRuntime) ClearNetworkBlockEgress(string) error               { return nil }
 
 // toolboxProxyTestEnv wires a fake "toolbox daemon" httptest.Server into the
 // daytona facade so we can drive real HTTP and WebSocket traffic through the

@@ -92,6 +92,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	if errors.Is(err, service.ErrPublicTrafficDisabled) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if errors.Is(err, store.ErrSandboxNameConflict) {
 		WriteError(w, http.StatusConflict, "sandbox name already in use")
 		return

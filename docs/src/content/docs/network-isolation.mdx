@@ -170,6 +170,171 @@ Services running inside the sandbox remain reachable via their exposed public UR
 
 ---
 
+## Selective Egress (Allowlist / Blocklist)
+
+A blanket block is often too strict — an agent may need to reach one specific API while everything else stays blocked. Use **`networkAllowOut`** or **`networkDenyOut`** to define a per-CIDR egress policy, enforced by the same host firewall:
+
+- **`networkAllowOut`** — the sandbox may reach **only** these CIDRs; all other outbound traffic is dropped.
+- **`networkDenyOut`** — the sandbox may reach anything **except** these CIDRs.
+
+The two are mutually exclusive. A full block is still expressed with `networkBlockAll` rather than a `0.0.0.0/0` deny.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Allow only 1.1.1.0/24 and 8.8.8.8; block everything else.
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      networkAllowOut: ['1.1.1.0/24', '8.8.8.8/32'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'networkAllowOut': ['1.1.1.0/24', '8.8.8.8/32'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "ubuntu:22.04",
+        NetworkAllowOut: []string{"1.1.1.0/24", "8.8.8.8/32"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        network_allow_out: Some(vec!["1.1.1.0/24".to_string(), "8.8.8.8/32".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import java.util.List;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setNetworkAllowOut(List.of("1.1.1.0/24", "8.8.8.8/32"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+To invert the policy — block a few destinations and allow the rest — pass the same shape to `networkDenyOut` instead:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      networkDenyOut: ['10.0.0.0/8'], // block the internal range, allow the rest
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'networkDenyOut': ['10.0.0.0/8'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "ubuntu:22.04",
+        NetworkDenyOut: []string{"10.0.0.0/8"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        network_deny_out: Some(vec!["10.0.0.0/8".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import java.util.List;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setNetworkDenyOut(List.of("10.0.0.0/8"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+The policy is persisted with the sandbox and reapplied automatically across stop/start cycles and host restarts, just like `networkBlockAll`.
+
+---
+
+## Disabling Public Exposure
+
+The options above control **outbound** traffic. To stop a sandbox from being reachable from the public internet at all, set **`allowPublicTraffic`** to `false` at create time. The sandbox can then never be exposed — `exposePort` returns an error — while the platform's own access paths (the toolbox `exec`/file proxy and the SSH gateway) keep working, since they do not route through the public ingress.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      allowPublicTraffic: false,
+    })
+    // sandbox.exposePort(80) now rejects — no public URL is ever created.
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'allowPublicTraffic': False,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    publicOff := false
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:              "ubuntu:22.04",
+        AllowPublicTraffic: &publicOff,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        allow_public_traffic: Some(false),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setAllowPublicTraffic(false)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Because AerolVM has no auth-gated public route, "no public traffic" is enforced by **refusing exposure** rather than by serving a private URL. Omit the field (or set it to `true`) to keep the default behaviour, where exposed ports are publicly reachable.
+
+---
+
 ## Fine-Grained Quotas vs. Blanket Blocking
 
 If you do not want to block all network traffic permanently, you can use the SDK's **Network Usage & Quotas** features to set limits on total bytes sent or received. 
@@ -186,4 +351,4 @@ For details on setting up quotas, see the [Network Usage & Quotas](/network-usag
 ## Limitations
 
 - **IPv4 Only**: Network isolation and byte limits are applied to IPv4 routes. If the sandbox has IPv6 routing enabled, those connections are not blocked.
-- **No Domain Allowlist/DNS-Only Mode**: Currently, setting `networkBlockAll: true` is a blanket egress block. There is no support for allowing only specific domains or allowing only DNS resolution.
+- **CIDR-based, not domain-based**: Selective egress (`networkAllowOut` / `networkDenyOut`) matches on IP CIDRs, not hostnames. There is no domain allowlist or DNS-only mode — allow the CIDRs your destination resolves to.

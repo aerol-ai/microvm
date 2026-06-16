@@ -160,6 +160,21 @@ pub struct CreateOptions {
     pub os_user: Option<String>,
     #[serde(rename = "network_block_all", skip_serializing_if = "Option::is_none")]
     pub network_block_all: Option<bool>,
+    /// Egress allowlist of CIDRs: when set, the sandbox may reach only these
+    /// destinations and all other outbound traffic is dropped by the host
+    /// firewall. Mutually exclusive with `network_deny_out`; use
+    /// `network_block_all` for a full block.
+    #[serde(rename = "network_allow_out", skip_serializing_if = "Option::is_none")]
+    pub network_allow_out: Option<Vec<String>>,
+    /// Egress blocklist of CIDRs: the sandbox may reach anything except these
+    /// destinations. Mutually exclusive with `network_allow_out`.
+    #[serde(rename = "network_deny_out", skip_serializing_if = "Option::is_none")]
+    pub network_deny_out: Option<Vec<String>>,
+    /// Whether the sandbox may be exposed publicly. `None`/`Some(true)` allow
+    /// it; `Some(false)` makes `expose_port` fail — the sandbox stays reachable
+    /// only via the toolbox proxy and SSH gateway.
+    #[serde(rename = "allow_public_traffic", skip_serializing_if = "Option::is_none")]
+    pub allow_public_traffic: Option<bool>,
     /// Cap on bytes the sandbox may receive before its ingress is dropped via
     /// per-IP iptables rule. `0` (or omit) means unlimited. Limits can be
     /// raised or lifted at runtime via [`Client::set_network_limits`].

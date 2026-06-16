@@ -121,6 +121,9 @@ func (s *Service) validateCreateCustomDomains(req *models.CreateSandboxRequest) 
 	if req == nil || len(req.CustomDomains) == 0 {
 		return nil
 	}
+	if !allowPublicTrafficEnabled(req.AllowPublicTraffic) {
+		return ErrPublicTrafficDisabled
+	}
 	if !s.cfg.EnableCustomDomains {
 		return ErrCustomDomainNotSupported
 	}
@@ -229,6 +232,9 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	if err != nil {
 		return err
 	}
+	if !sandboxAllowsPublicTraffic(sandbox) {
+		return ErrPublicTrafficDisabled
+	}
 	if hasL4Exposure(sandbox) {
 		return ErrCustomDomainProtocolConflict
 	}
@@ -295,7 +301,7 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 		_ = s.store.RemoveCustomDomain(ctx, sandboxID, canonical)
 		return fmt.Errorf("reload sandbox after custom-domain insert: %w", err)
 	}
-	if err := s.caddy.UpsertSandboxRoute(ctx, refreshed.ID, refreshed.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(refreshed)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, refreshed); err != nil {
 		// Store first / caddy second with rollback on caddy failure. Same
 		// shape as the create path. We deliberately keep the row OUT of the
 		// store on a partial failure rather than leaving an orphan row that
@@ -366,7 +372,7 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	if err != nil {
 		return fmt.Errorf("reload sandbox after custom-domain delete: %w", err)
 	}
-	if err := s.caddy.UpsertSandboxRoute(ctx, refreshed.ID, refreshed.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(refreshed)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, refreshed); err != nil {
 		// Caddy is the source of truth for routing; if we couldn't refresh the
 		// route set, the row is gone from the store but Caddy may still serve
 		// the hostname. The next ingress reconcile (or AddCustomDomain

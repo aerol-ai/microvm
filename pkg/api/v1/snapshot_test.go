@@ -453,8 +453,10 @@ func (noopRuntime) RemoveImage(context.Context, string) error { return nil }
 func (noopRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	panic("unexpected PushAllowedPorts")
 }
-func (noopRuntime) ClearNetworkRules(string) error        { return nil }
-func (noopRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (noopRuntime) ApplyNetworkBlockIngress(string) error { return nil }
-func (noopRuntime) ClearNetworkBlockIngress(string) error { return nil }
-func (noopRuntime) ClearNetworkBlockEgress(string) error  { return nil }
+func (noopRuntime) ClearNetworkRules(string) error                     { return nil }
+func (noopRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (noopRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (noopRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (noopRuntime) ApplyNetworkBlockIngress(string) error              { return nil }
+func (noopRuntime) ClearNetworkBlockIngress(string) error              { return nil }
+func (noopRuntime) ClearNetworkBlockEgress(string) error               { return nil }

@@ -551,11 +551,13 @@ func (f *fakeDaytonaSnapshotRuntime) PushAllowedPorts(context.Context, string, s
 	panic("unexpected PushAllowedPorts")
 }
 
-func (f *fakeDaytonaSnapshotRuntime) ClearNetworkRules(string) error        { return nil }
-func (f *fakeDaytonaSnapshotRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (f *fakeDaytonaSnapshotRuntime) ApplyNetworkBlockIngress(string) error { return nil }
-func (f *fakeDaytonaSnapshotRuntime) ClearNetworkBlockIngress(string) error { return nil }
-func (f *fakeDaytonaSnapshotRuntime) ClearNetworkBlockEgress(string) error  { return nil }
+func (f *fakeDaytonaSnapshotRuntime) ClearNetworkRules(string) error                     { return nil }
+func (f *fakeDaytonaSnapshotRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeDaytonaSnapshotRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeDaytonaSnapshotRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (f *fakeDaytonaSnapshotRuntime) ApplyNetworkBlockIngress(string) error              { return nil }
+func (f *fakeDaytonaSnapshotRuntime) ClearNetworkBlockIngress(string) error              { return nil }
+func (f *fakeDaytonaSnapshotRuntime) ClearNetworkBlockEgress(string) error               { return nil }
 
 func newSnapshotHandlerTestEnv(t *testing.T) (*service.Service, *store.Store, *fakeDaytonaSnapshotRuntime, http.Handler) {
 	t.Helper()

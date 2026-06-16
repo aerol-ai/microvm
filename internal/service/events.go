@@ -190,6 +190,12 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
+			// Selective-egress rules are comment-tagged, so ClearNetworkRules
+			// above does not remove them — clear them from the persisted policy
+			// before the IP is recycled to another container.
+			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
 		}
 	}
 
@@ -256,6 +262,12 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		if cr, ok := runtime.AsContainerRuntime(s.docker); ok {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
+			}
+			// Selective-egress rules are comment-tagged, so ClearNetworkRules
+			// above does not remove them — clear them from the persisted policy
+			// before the IP is recycled to another container.
+			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
 		}
 	}
@@ -332,11 +344,11 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 		s.admitter.Reserve(sandbox.ID, capacityRequestFromSandbox(sandbox))
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		return fmt.Errorf("upsert sandbox route: %w", err)
 	}
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+		if err := s.syncExposedPortRoute(ctx, sandbox, port); err != nil {
 			s.logger.Warn("upsert port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 		}
 	}

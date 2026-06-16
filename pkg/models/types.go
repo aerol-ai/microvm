@@ -553,6 +553,23 @@ type CreateSandboxRequest struct {
 	// Crossing the limit installs an egress DROP rule via the same primitive
 	// NetworkBlockAll uses.
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
+	// NetworkAllowOut is an egress allowlist of CIDRs: when non-empty the
+	// sandbox may reach only these destinations and everything else is
+	// dropped. Mutually exclusive with NetworkDenyOut. Enforced by the host
+	// firewall (EnableNetworkRules) and a no-op when network rules are off.
+	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
+	// NetworkDenyOut is an egress blocklist of CIDRs: the sandbox may reach
+	// anything except these destinations. Mutually exclusive with
+	// NetworkAllowOut. Blocking the entire space is expressed as
+	// NetworkBlockAll, not a denyOut of 0.0.0.0/0.
+	NetworkDenyOut []string `json:"network_deny_out,omitempty"`
+	// AllowPublicTraffic controls whether the sandbox may be exposed to the
+	// public internet. Nil (default) and true allow public exposure; false
+	// makes expose_port fail — the sandbox stays reachable only via the
+	// platform's own paths (toolbox exec/file proxy, SSH gateway), which do
+	// not route through the public ingress. There is no auth-gated public
+	// route concept, so "no public traffic" is enforced by refusing exposure.
+	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
 	// CustomDomains attaches operator-provided public hostnames to the
 	// sandbox at create time. Each hostname must resolve (via DNS) to the
 	// cluster's ingress host before HTTPS can serve traffic — see
@@ -682,6 +699,16 @@ type Sandbox struct {
 	// created or patched with. Zero = unlimited.
 	NetworkBytesInLimit  int64 `json:"network_bytes_in_limit"`
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit"`
+	// NetworkAllowOut / NetworkDenyOut are the egress CIDR policy the sandbox
+	// was created with, persisted so the start and reconcile paths can
+	// reinstall the host-firewall rules after a restart (parity with
+	// NetworkBlockAll). Mutually exclusive; at most one is non-empty.
+	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
+	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	// AllowPublicTraffic mirrors the create-time flag. Nil means "not set"
+	// (treated as allowed); a non-nil false makes ExposePort refuse to install
+	// a public route. Persisted so the gate survives restarts.
+	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
 	// NetworkQuotaExceeded reflects whether either lifetime byte counter has
 	// crossed its limit. The reconcile loop installs DROP rules when this is
 	// true; clearing requires raising the limit (or zeroing it for unlimited).

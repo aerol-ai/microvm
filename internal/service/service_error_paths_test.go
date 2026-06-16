@@ -41,6 +41,8 @@ type startHookRuntime struct {
 	afterStart func()
 }
 
+func (r *networkBlockFailRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (r *networkBlockFailRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
 func (r *networkBlockFailRuntime) ApplyNetworkBlockAll(containerIP string) error {
 	r.applyNetworkBlockAllCalls = append(r.applyNetworkBlockAllCalls, containerIP)
 	return r.applyErr

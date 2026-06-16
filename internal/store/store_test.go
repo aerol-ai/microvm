@@ -1918,6 +1918,9 @@ func TestStoreHelperCases(t *testing.T) {
 			"root",                      // os_user
 			"{bad json",                 // env_json — triggers the failure
 			0,                           // network_blocked
+			"[]",                        // network_allow_out_json
+			"[]",                        // network_deny_out_json
+			1,                           // allow_public_traffic
 			1,                           // toolbox_enabled
 			"",                          // toolbox_token
 			"",                          // ssh_public_key
@@ -2036,6 +2039,89 @@ func sampleSandbox(id string) *models.Sandbox {
 		UpdatedAt:        now,
 		LastActiveAt:     now,
 		Runtime:          models.RuntimeGvisor,
+	}
+}
+
+func TestEgressPolicyColumnsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Allowlist round-trips through Create + Get.
+	allow := sampleSandbox("sb-egress-allow")
+	allow.NetworkBlockAll = false
+	allow.NetworkAllowOut = []string{"1.1.1.0/24", "8.8.8.8/32"}
+	if err := st.Create(ctx, allow); err != nil {
+		t.Fatalf("Create allow: %v", err)
+	}
+	got, err := st.Get(ctx, allow.ID)
+	if err != nil {
+		t.Fatalf("Get allow: %v", err)
+	}
+	if !reflect.DeepEqual(got.NetworkAllowOut, allow.NetworkAllowOut) || len(got.NetworkDenyOut) != 0 {
+		t.Fatalf("allow round-trip = allow %+v deny %+v, want %+v / empty", got.NetworkAllowOut, got.NetworkDenyOut, allow.NetworkAllowOut)
+	}
+
+	// Blocklist round-trips through Upsert.
+	deny := sampleSandbox("sb-egress-deny")
+	deny.NetworkBlockAll = false
+	deny.NetworkDenyOut = []string{"10.0.0.0/8"}
+	if err := st.Upsert(ctx, deny); err != nil {
+		t.Fatalf("Upsert deny: %v", err)
+	}
+	got, err = st.Get(ctx, deny.ID)
+	if err != nil {
+		t.Fatalf("Get deny: %v", err)
+	}
+	if !reflect.DeepEqual(got.NetworkDenyOut, deny.NetworkDenyOut) || len(got.NetworkAllowOut) != 0 {
+		t.Fatalf("deny round-trip = deny %+v allow %+v, want %+v / empty", got.NetworkDenyOut, got.NetworkAllowOut, deny.NetworkDenyOut)
+	}
+
+	// A sandbox with no policy reads back as empty, not a stray '[]' artifact.
+	none := sampleSandbox("sb-egress-none")
+	none.NetworkBlockAll = false
+	if err := st.Create(ctx, none); err != nil {
+		t.Fatalf("Create none: %v", err)
+	}
+	got, err = st.Get(ctx, none.ID)
+	if err != nil {
+		t.Fatalf("Get none: %v", err)
+	}
+	if len(got.NetworkAllowOut) != 0 || len(got.NetworkDenyOut) != 0 {
+		t.Fatalf("no-policy round-trip = allow %+v deny %+v, want both empty", got.NetworkAllowOut, got.NetworkDenyOut)
+	}
+}
+
+func TestAllowPublicTrafficColumnRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Explicit false persists and reads back as a non-nil false.
+	deny := sampleSandbox("sb-no-public")
+	denyVal := false
+	deny.AllowPublicTraffic = &denyVal
+	if err := st.Create(ctx, deny); err != nil {
+		t.Fatalf("Create deny: %v", err)
+	}
+	got, err := st.Get(ctx, deny.ID)
+	if err != nil {
+		t.Fatalf("Get deny: %v", err)
+	}
+	if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic {
+		t.Fatalf("AllowPublicTraffic = %v, want non-nil false", got.AllowPublicTraffic)
+	}
+
+	// Unset (nil) defaults to allowed (column default 1) on read-back.
+	dflt := sampleSandbox("sb-default-public")
+	dflt.AllowPublicTraffic = nil
+	if err := st.Create(ctx, dflt); err != nil {
+		t.Fatalf("Create default: %v", err)
+	}
+	got, err = st.Get(ctx, dflt.ID)
+	if err != nil {
+		t.Fatalf("Get default: %v", err)
+	}
+	if got.AllowPublicTraffic == nil || !*got.AllowPublicTraffic {
+		t.Fatalf("default AllowPublicTraffic = %v, want non-nil true", got.AllowPublicTraffic)
 	}
 }
 

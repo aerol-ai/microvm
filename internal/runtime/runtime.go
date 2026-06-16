@@ -110,6 +110,18 @@ type ContainerRuntime interface {
 	// rule is shared, so the service must consult NetworkBlockAll before
 	// invoking this on a quota-clear path.
 	ClearNetworkBlockEgress(containerIP string) error
+
+	// ApplyEgressPolicy installs the selective-egress CIDR policy (E2B
+	// network.allowOut / denyOut). At most one of allowCIDRs / denyCIDRs is
+	// non-empty. Comment-tagged so it composes with, rather than collides
+	// with, the NetworkBlockAll / quota DROP. Idempotent — reapplied on Start
+	// and reconcile just like ApplyNetworkBlockAll.
+	ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error
+
+	// ClearEgressPolicy removes the rules ApplyEgressPolicy installed for the
+	// same (containerIP, allowCIDRs, denyCIDRs). Callers pass the policy from
+	// the sandbox row so cleanup is exact and the blanket DROP is untouched.
+	ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error
 }
 
 // AsContainerRuntime returns the network-rule surface when rt implements it.

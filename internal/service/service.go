@@ -54,6 +54,11 @@ const allocatorRandomAttempts = 16
 // contract behind the client's back.
 var ErrPreferredHostPortUnavailable = errors.New("preferred host port unavailable on this node; exposure parked")
 
+// ErrPublicTrafficDisabled is returned when the sandbox was created with
+// allow_public_traffic=false and the caller asks for a public ingress route.
+// The sandbox stays reachable through the toolbox proxy and SSH gateway.
+var ErrPublicTrafficDisabled = errors.New("public traffic is disabled for this sandbox; expose is not available")
+
 const clusterIngressReconcileInterval = 5 * time.Second
 
 type Service struct {
@@ -1093,6 +1098,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	if err := validateEgressPolicy(req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+		releaseAdmission()
+		return nil, err
+	}
+
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
 	if err != nil {
 		releaseAdmission()
@@ -1117,7 +1127,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// rollback chain as any later store error below.
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.docker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime})
+		_ = s.docker.Destroy(cleanupCtx, &models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime, ContainerIP: state.ContainerIP, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut})
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -1128,7 +1138,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		ID:                   state.SandboxID,
 		Image:                req.Image,
 		Status:               state.Status,
-		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		PublicURL:            s.sandboxPublicURL(state.SandboxID, req.AllowPublicTraffic),
 		ContainerID:          state.ContainerID,
 		ContainerIP:          state.ContainerIP,
 		CPU:                  req.CPU,
@@ -1137,6 +1147,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		OSUser:               req.OSUser,
 		Env:                  req.Env,
 		NetworkBlockAll:      req.NetworkBlockAll,
+		NetworkAllowOut:      req.NetworkAllowOut,
+		NetworkDenyOut:       req.NetworkDenyOut,
+		AllowPublicTraffic:   req.AllowPublicTraffic,
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -1170,7 +1183,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -1298,6 +1311,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if req.NetworkBlockAll {
 		return nil, unsupportedFirecrackerOption("network_block_all")
 	}
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out)")
+	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
@@ -1365,7 +1381,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		ID:                   state.SandboxID,
 		Image:                req.Image,
 		Status:               state.Status,
-		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		PublicURL:            s.sandboxPublicURL(state.SandboxID, req.AllowPublicTraffic),
 		ContainerID:          state.ContainerID,
 		ContainerIP:          state.ContainerIP,
 		CPU:                  req.CPU,
@@ -1374,6 +1390,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		OSUser:               req.OSUser,
 		Env:                  req.Env,
 		NetworkBlockAll:      req.NetworkBlockAll,
+		NetworkAllowOut:      req.NetworkAllowOut,
+		NetworkDenyOut:       req.NetworkDenyOut,
+		AllowPublicTraffic:   req.AllowPublicTraffic,
 		ToolboxEnabled:       true,
 		ToolboxToken:         toolboxToken,
 		SSHPublicKey:         authorizedKey,
@@ -1408,7 +1427,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
@@ -1735,12 +1754,31 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			return nil, fmt.Errorf("apply network block on start: %w", err)
 		}
 	}
+	// Reapply the selective-egress policy for the same reason — the stop event
+	// clears it. Comment-tagged rules are distinct from the blanket block, so
+	// this composes with NetworkBlockAll above. Fail closed on error.
+	if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+		cr, ok := runtime.AsContainerRuntime(rt)
+		if !ok {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			return nil, fmt.Errorf("apply egress policy on start: runtime %q does not support selective egress", sandbox.Runtime)
+		}
+		if err := cr.ApplyEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+			return nil, fmt.Errorf("apply egress policy on start: %w", err)
+		}
+	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		return nil, err
 	}
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+		if err := s.syncExposedPortRoute(ctx, sandbox, port); err != nil {
 			return nil, err
 		}
 	}
@@ -2195,7 +2233,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 		priorSandbox.Lifecycle.Serverless != updated.Lifecycle.Serverless &&
 		updated.Status == models.SandboxStatusStarted {
 		for _, port := range updated.ExposedPorts {
-			if err := s.upsertExposedPortRoute(ctx, updated, port); err != nil {
+			if err := s.syncExposedPortRoute(ctx, updated, port); err != nil {
 				if s.logger != nil {
 					s.logger.Warn("re-install port route after lifecycle change failed",
 						"sandbox_id", id, "port", port.Port, "err", err)
@@ -2225,6 +2263,14 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return models.ExposePortResponse{}, err
+	}
+	// A sandbox created with allow_public_traffic=false must never get a public
+	// route. AerolVM has no auth-gated public route, so the only honest way to
+	// enforce "no public traffic" is to refuse exposure outright — the sandbox
+	// stays reachable through the toolbox proxy and SSH gateway, which do not
+	// route through the public ingress. Nil/true keep the default (allowed).
+	if sandbox.AllowPublicTraffic != nil && !*sandbox.AllowPublicTraffic {
+		return models.ExposePortResponse{}, ErrPublicTrafficDisabled
 	}
 	if port <= 0 || port > 65535 {
 		return models.ExposePortResponse{}, errors.New("invalid port")
@@ -3494,7 +3540,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		sandbox.ContainerID = state.ContainerID
 		sandbox.ContainerIP = state.ContainerIP
 		sandbox.Status = state.Status
-		sandbox.PublicURL = s.caddy.SandboxPublicURL(sandbox.ID)
+		sandbox.PublicURL = s.sandboxPublicURL(sandbox.ID, sandbox.AllowPublicTraffic)
 		sandbox.UpdatedAt = time.Now().UTC()
 		// Keep admitter accounting in sync with observed runtime state. The
 		// API and event paths handle the common transitions; this branch
@@ -3520,6 +3566,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if state.Status == models.SandboxStatusStopped {
 			s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
 		}
+		if err := s.cleanupPublicTrafficDisabledIngressState(ctx, sandbox); err != nil {
+			return err
+		}
 		if state.Status == models.SandboxStatusStarted {
 			sandbox.WakeArmed = false
 			// Heal the per-IP egress DROP rule for sandboxes opted into
@@ -3542,6 +3591,24 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					)
 				}
 			}
+			// Heal the selective-egress policy the same way. Comment-tagged
+			// rules survive independently of the blanket block, and the
+			// netrules Exists check keeps the reapply idempotent.
+			if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+				cr, err := s.containerRuntimeForSandbox(sandbox)
+				if err != nil {
+					s.logger.Warn("reconcile reapply egress policy skipped",
+						"sandbox_id", sandbox.ID,
+						"error", err,
+					)
+				} else if err := cr.ApplyEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+					s.logger.Warn("reconcile reapply egress policy failed",
+						"sandbox_id", sandbox.ID,
+						"ip", sandbox.ContainerIP,
+						"error", err,
+					)
+				}
+			}
 			// Heal quota-driven blocks. The flag is the source of truth for
 			// "we previously decided to block"; re-evaluate against the
 			// current cumulative counters so a quota raised over the wire
@@ -3553,11 +3620,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
 				s.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
 			}
-			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+			if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 				return err
 			}
 			for _, port := range sandbox.ExposedPorts {
-				if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+				if err := s.syncExposedPortRoute(ctx, sandbox, port); err != nil {
 					return err
 				}
 			}
@@ -3949,6 +4016,9 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		if sb == nil || sb.Status == models.SandboxStatusDestroyed {
 			continue
 		}
+		if !sandboxAllowsPublicTraffic(sb) {
+			continue
+		}
 		// The toolbox route lives at @id "sandbox-<id>"; per-port HTTP routes
 		// at "sandbox-<id>-port-<p>". Keep both unconditionally — the rest
 		// of Reconcile guarantees they're upserted for running sandboxes,
@@ -4034,6 +4104,9 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 	self := c.SelfNodeID()
 	for _, p := range c.PlacementsForShards(clusterIngressShardFilter(c, self)) {
 		if p.SandboxID == "" || p.OwnerNodeID == self {
+			continue
+		}
+		if !placementAllowsPublicTraffic(p) {
 			continue
 		}
 		// Orphaned placement: the in-flux 503 routes are the expected
@@ -4713,6 +4786,30 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
+}
+
+// validateEgressPolicy enforces the selective-egress invariants shared by every
+// API surface (native /v1 and the E2B facade): the allowlist and blocklist are
+// mutually exclusive, every entry must parse as a CIDR, and a deny of the whole
+// address space must be expressed as NetworkBlockAll — a 0.0.0.0/0 catch-all
+// DROP would duplicate the blanket block and confuse cleanup.
+func validateEgressPolicy(allowOut, denyOut []string) error {
+	if len(allowOut) > 0 && len(denyOut) > 0 {
+		return errors.New("network_allow_out and network_deny_out are mutually exclusive")
+	}
+	for _, list := range [][]string{allowOut, denyOut} {
+		for _, cidr := range list {
+			if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+				return fmt.Errorf("invalid egress CIDR %q: %w", cidr, err)
+			}
+		}
+	}
+	for _, cidr := range denyOut {
+		if strings.TrimSpace(cidr) == "0.0.0.0/0" {
+			return errors.New("network_deny_out of 0.0.0.0/0 must be expressed as network_block_all")
+		}
+	}
+	return nil
 }
 
 // portProbeTimeout is the maximum time probeContainerPort waits for a container

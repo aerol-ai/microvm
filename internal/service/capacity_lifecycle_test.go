@@ -79,11 +79,13 @@ func (f *fakeCapacityRuntime) RemoveImage(context.Context, string) error { retur
 func (f *fakeCapacityRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	return nil
 }
-func (f *fakeCapacityRuntime) ClearNetworkRules(string) error        { return nil }
-func (f *fakeCapacityRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (f *fakeCapacityRuntime) ApplyNetworkBlockIngress(string) error { return nil }
-func (f *fakeCapacityRuntime) ClearNetworkBlockIngress(string) error { return nil }
-func (f *fakeCapacityRuntime) ClearNetworkBlockEgress(string) error  { return nil }
+func (f *fakeCapacityRuntime) ClearNetworkRules(string) error                     { return nil }
+func (f *fakeCapacityRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeCapacityRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeCapacityRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (f *fakeCapacityRuntime) ApplyNetworkBlockIngress(string) error              { return nil }
+func (f *fakeCapacityRuntime) ClearNetworkBlockIngress(string) error              { return nil }
+func (f *fakeCapacityRuntime) ClearNetworkBlockEgress(string) error               { return nil }
 
 func newCapacityHarness(t *testing.T, managed, inspect map[string]*models.SandboxRuntimeState) (*Service, *capacity.Admitter, *store.Store) {
 	t.Helper()

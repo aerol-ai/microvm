@@ -37,12 +37,13 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spe
 	}
 	checkpointPath := wasmCheckpointDir(s.cfg.WasmModulesDir, id)
 	seed := &models.Sandbox{
-		ID:         id,
-		Runtime:    models.RuntimeWasm,
-		Durability: models.DurabilityDurable,
-		ModuleRef:  moduleRef,
-		Image:      strings.TrimSpace(spec.Image),
-		Status:     models.SandboxStatusPassivated,
+		ID:                 id,
+		Runtime:            models.RuntimeWasm,
+		Durability:         models.DurabilityDurable,
+		ModuleRef:          moduleRef,
+		Image:              strings.TrimSpace(spec.Image),
+		Status:             models.SandboxStatusPassivated,
+		AllowPublicTraffic: spec.AllowPublicTraffic,
 	}
 	if _, err := s.ensureWasmCheckpointLocal(ctx, seed); err != nil {
 		return fmt.Errorf("recreate %s: pull checkpoint: %w", id, err)
@@ -59,6 +60,9 @@ func (s *Service) recreateWasmDurableSandbox(ctx context.Context, id string, spe
 	seed.MemoryMB = spec.MemoryMB
 	seed.DiskGB = spec.DiskGB
 	seed.Env = spec.Env
+	seed.NetworkBlockAll = spec.NetworkBlockAll
+	seed.NetworkAllowOut = spec.NetworkAllowOut
+	seed.NetworkDenyOut = spec.NetworkDenyOut
 	seed.ContainerCommand = spec.ContainerCommand
 	seed.CreatedAt = now
 	seed.UpdatedAt = now

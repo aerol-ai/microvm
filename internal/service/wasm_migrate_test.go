@@ -282,13 +282,17 @@ func TestEnsureWasmSandboxRowForImport_CreatesNewRow(t *testing.T) {
 	}
 
 	// Now we provide a fake cluster that returns a spec
+	deny := false
 	fakeCluster := &wasmMigrateClusterStub{
 		Noop:   &cluster.Noop{},
 		selfID: "node-1",
 		spec: &models.CreateSandboxRequest{
-			Runtime:    models.RuntimeWasm,
-			ModuleRef:  "sha256:abcd",
-			Durability: models.DurabilityPassivatable,
+			Runtime:            models.RuntimeWasm,
+			ModuleRef:          "sha256:abcd",
+			Durability:         models.DurabilityPassivatable,
+			NetworkBlockAll:    true,
+			NetworkAllowOut:    []string{"10.0.0.0/24"},
+			AllowPublicTraffic: &deny,
 		},
 	}
 	svc.cfg.EnableCluster = true
@@ -310,6 +314,15 @@ func TestEnsureWasmSandboxRowForImport_CreatesNewRow(t *testing.T) {
 	}
 	if got.ModuleRef != "sha256:abcd" {
 		t.Fatalf("module_ref = %s", got.ModuleRef)
+	}
+	if got.AllowPublicTraffic == nil || *got.AllowPublicTraffic {
+		t.Fatalf("AllowPublicTraffic = %v, want false", got.AllowPublicTraffic)
+	}
+	if !got.NetworkBlockAll {
+		t.Fatal("NetworkBlockAll = false, want true")
+	}
+	if len(got.NetworkAllowOut) != 1 || got.NetworkAllowOut[0] != "10.0.0.0/24" {
+		t.Fatalf("NetworkAllowOut = %v, want [10.0.0.0/24]", got.NetworkAllowOut)
 	}
 }
 

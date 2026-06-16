@@ -566,15 +566,6 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		allowPublicTraffic = cloneBoolPtr(req.Network.AllowPublicTraffic)
 		maskRequestHost = strings.TrimSpace(req.Network.MaskRequestHost)
 	}
-	if len(networkAllowOut) > 0 {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("network.allowOut is not implemented yet")
-	}
-	if len(networkDenyOut) > 0 && !(len(networkDenyOut) == 1 && networkDenyOut[0] == "0.0.0.0/0") {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("network.denyOut is only supported for blocking all outbound traffic")
-	}
-	if allowPublicTraffic != nil && !*allowPublicTraffic {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("network.allowPublicTraffic=false is not implemented yet")
-	}
 	if maskRequestHost != "" {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("network.maskRequestHost is not implemented yet")
 	}
@@ -594,6 +585,17 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 			value := false
 			allowInternetAccess = &value
 		}
+	}
+
+	// Effective egress CIDR policy handed to the service. A full block is
+	// carried by NetworkBlockAll (the blanket DROP), so we must not also pass a
+	// 0.0.0.0/0 deny — the service rejects it and it would duplicate the block.
+	// allowOut/denyOut are mutually exclusive per the E2B schema.
+	egressAllowOut := networkAllowOut
+	egressDenyOut := networkDenyOut
+	if networkBlockAll {
+		egressAllowOut = nil
+		egressDenyOut = nil
 	}
 
 	timeoutSeconds := defaultSandboxTimeout
@@ -627,8 +629,15 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, h.deps.Service, templateID, metadata); err != nil {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	} else if ok {
+		// WASM sandboxes are host-mediated with no container IP, so the
+		// DOCKER-USER egress rules cannot be enforced on them — reject rather
+		// than silently leave the workload unrestricted.
+		if len(egressAllowOut) > 0 || len(egressDenyOut) > 0 {
+			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("selective egress (network.allowOut / network.denyOut) is not supported for wasm sandboxes")
+		}
 		wasmReq.Env = envVars
 		wasmReq.NetworkBlockAll = networkBlockAll
+		wasmReq.AllowPublicTraffic = allowPublicTraffic
 		wasmReq.Lifecycle = lifecycle
 		wasmReq.Tags = cloneStringMap(metadata)
 		meta := sandboxMeta{
@@ -653,10 +662,13 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	}
 
 	serviceReq := models.CreateSandboxRequest{
-		Image:           resolvedImage,
-		Env:             envVars,
-		NetworkBlockAll: networkBlockAll,
-		Lifecycle:       lifecycle,
+		Image:              resolvedImage,
+		Env:                envVars,
+		NetworkBlockAll:    networkBlockAll,
+		NetworkAllowOut:    egressAllowOut,
+		NetworkDenyOut:     egressDenyOut,
+		AllowPublicTraffic: allowPublicTraffic,
+		Lifecycle:          lifecycle,
 		// E2B's metadata is the same shape as Daytona's labels — write it
 		// into the native tags column so it round-trips through any API
 		// surface, not just /e2b.

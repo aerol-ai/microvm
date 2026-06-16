@@ -71,11 +71,13 @@ func (f *fakeHandlerRuntime) RemoveImage(context.Context, string) error { return
 func (f *fakeHandlerRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	return nil
 }
-func (f *fakeHandlerRuntime) ClearNetworkRules(string) error        { return nil }
-func (f *fakeHandlerRuntime) ApplyNetworkBlockAll(string) error     { return nil }
-func (f *fakeHandlerRuntime) ApplyNetworkBlockIngress(string) error { return nil }
-func (f *fakeHandlerRuntime) ClearNetworkBlockIngress(string) error { return nil }
-func (f *fakeHandlerRuntime) ClearNetworkBlockEgress(string) error  { return nil }
+func (f *fakeHandlerRuntime) ClearNetworkRules(string) error                     { return nil }
+func (f *fakeHandlerRuntime) ApplyEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeHandlerRuntime) ClearEgressPolicy(string, []string, []string) error { return nil }
+func (f *fakeHandlerRuntime) ApplyNetworkBlockAll(string) error                  { return nil }
+func (f *fakeHandlerRuntime) ApplyNetworkBlockIngress(string) error              { return nil }
+func (f *fakeHandlerRuntime) ClearNetworkBlockIngress(string) error              { return nil }
+func (f *fakeHandlerRuntime) ClearNetworkBlockEgress(string) error               { return nil }
 
 func newHandlerExtraTestEnv(t *testing.T) (*service.Service, *store.Store, *fakeHandlerRuntime, http.Handler) {
 	t.Helper()
