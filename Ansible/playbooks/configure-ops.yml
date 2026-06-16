@@ -75,6 +75,10 @@
       SB_AUTO_IMPORT_CLUSTER_ID: "{{ auto_import.cluster_id }}"
       # Same secrets.yml-vs-src split as the wrap key.
       SB_AUTO_IMPORT_CLUSTER_PAT_PATH: "{{ sandboxd_auto_import_cluster_pat_path if ((sandboxd_auto_import_cluster_pat_src | length > 0) or (aocr.cluster_pat | length > 0)) else '' }}"
+      # Shared SSH host key path (UC-22). Always the default location; the
+      # host-key tasks below write a shared key there only when one is provided,
+      # otherwise sandboxd generates a per-node key at this path on first boot.
+      SB_SSH_HOST_KEY_PATH: "{{ sandboxd_ssh_host_key_path }}"
       SB_AUTO_IMPORT_RETENTION_SUFFIX: "{{ auto_import.retention_suffix }}"
       SB_AUTO_IMPORT_REQUEST_TIMEOUT: "{{ auto_import.request_timeout }}"
       SB_AUTO_IMPORT_RECONCILE_INTERVAL: "{{ auto_import.reconcile_interval }}"
@@ -516,6 +520,44 @@
       ansible.builtin.copy:
         src: "{{ sandboxd_auto_import_cluster_pat_src }}"
         dest: "{{ sandboxd_auto_import_cluster_pat_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      notify: Apply sandboxd ops config
+
+    # Shared SSH host key (UC-22). Same two-mode pattern as the secrets above:
+    # config/secrets.yml `ssh.host_key` wins over a control-node file. When
+    # neither is set the tasks skip and sandboxd generates a per-node key at
+    # sandboxd_ssh_host_key_path on first boot.
+    - name: Ensure sandboxd state directory exists (shared SSH host key)
+      when: >-
+        ((ssh | default({})).host_key | default('') | length > 0)
+        or (sandboxd_ssh_host_key_src | length > 0)
+      ansible.builtin.file:
+        path: "{{ sandboxd_ssh_host_key_path | dirname }}"
+        state: directory
+        mode: "0700"
+        owner: root
+        group: root
+
+    - name: Install shared SSH host key (from config/secrets.yml)
+      when: (ssh | default({})).host_key | default('') | length > 0
+      ansible.builtin.copy:
+        content: "{{ (ssh | default({})).host_key }}\n"
+        dest: "{{ sandboxd_ssh_host_key_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      no_log: true
+      notify: Apply sandboxd ops config
+
+    - name: Install shared SSH host key (from control-node file)
+      when:
+        - sandboxd_ssh_host_key_src | length > 0
+        - ((ssh | default({})).host_key | default('') | length) == 0
+      ansible.builtin.copy:
+        src: "{{ sandboxd_ssh_host_key_src }}"
+        dest: "{{ sandboxd_ssh_host_key_path }}"
         mode: "0600"
         owner: root
         group: root

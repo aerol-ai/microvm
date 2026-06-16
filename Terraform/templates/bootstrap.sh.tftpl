@@ -427,6 +427,22 @@ sudo chown root:root /etc/sandboxd/secrets/cluster-pat
 sudo chmod 0600 /etc/sandboxd/secrets/cluster-pat
 %{ endif ~}
 
+%{ if ssh_host_key_pem != "" ~}
+# Shared SSH host key (UC-22). Distributing the SAME private host key to every
+# ingress-bearing node gives clients a stable host identity: as the leased SSH
+# domain load-balances them across nodes they no longer see
+# "REMOTE HOST IDENTIFICATION HAS CHANGED" warnings. Omit the var to keep
+# per-node keys (sandboxd generates one on first boot). The daemon reads this
+# path via SB_SSH_HOST_KEY_PATH.
+umask 077
+sudo install -d -m 0700 -o root -g root /var/lib/sandboxd
+cat > /var/lib/sandboxd/ssh_host_ed25519_key <<'EOF'
+${ssh_host_key_pem}
+EOF
+sudo chown root:root /var/lib/sandboxd/ssh_host_ed25519_key
+sudo chmod 0600 /var/lib/sandboxd/ssh_host_ed25519_key
+%{ endif ~}
+
 cat >> /tmp/aerolvm-ops.env <<'EOF'
 
 # Managed by Terraform bootstrap: AOCR mirror + auto-import (Phase 4).

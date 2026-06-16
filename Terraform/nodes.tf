@@ -152,6 +152,7 @@ resource "aws_instance" "seed" {
     aocr_hooks_url                        = local.aocr.hooks_url
     aocr_cluster_id                       = local.aocr.cluster_id
     aocr_cluster_pat                      = local.aocr.cluster_pat
+    ssh_host_key_pem                      = var.ssh_host_key_pem
     aocr_retention_suffix                 = local.aocr.retention_suffix
     aocr_request_timeout                  = local.aocr.request_timeout
     aocr_reconcile_interval               = local.aocr.reconcile_interval
@@ -320,6 +321,7 @@ resource "aws_instance" "joiner" {
     aocr_hooks_url                        = local.aocr.hooks_url
     aocr_cluster_id                       = local.aocr.cluster_id
     aocr_cluster_pat                      = local.aocr.cluster_pat
+    ssh_host_key_pem                      = var.ssh_host_key_pem
     aocr_retention_suffix                 = local.aocr.retention_suffix
     aocr_request_timeout                  = local.aocr.request_timeout
     aocr_reconcile_interval               = local.aocr.reconcile_interval

@@ -49,6 +49,17 @@ type Config struct {
 	// session-attach mode to dial the WebSocket directly. If zero, session
 	// mode is disabled and the gateway falls back to one-shot exec.
 	ToolboxPort int
+	// RemoteAPIBaseURL enables cross-node SSH routing. When non-empty (cluster
+	// mode), a connection for a sandbox NOT owned by this node is authenticated
+	// against the owner's authoritative key and its session is bridged through
+	// this node's own v1 API, which clusterForwardWrap reverse-proxies to the
+	// owner over the cert-pinned mTLS channel. Empty (single-node) disables the
+	// remote path entirely — behaviour is byte-for-byte the pre-cluster gateway.
+	// Conventionally the loopback API address, e.g. "http://127.0.0.1:8080".
+	RemoteAPIBaseURL string
+	// RemoteAPIToken is the PAT presented on the loopback v1 call. Only used
+	// when RemoteAPIBaseURL is set.
+	RemoteAPIToken string
 }
 
 // Gateway terminates SSH connections on the host and bridges accepted shell /
@@ -65,6 +76,12 @@ type Gateway struct {
 	svc         SandboxLookup
 	dockerCli   DockerExec
 	toolboxPort int
+
+	// remoteBaseURL / remotePAT enable the cluster cross-node path (see
+	// Config.RemoteAPIBaseURL). Empty remoteBaseURL means single-node: the
+	// remote branch is never taken.
+	remoteBaseURL string
+	remotePAT     string
 }
 
 // New constructs a Gateway. It loads or generates the host key. Returns an
@@ -88,6 +105,9 @@ func New(logger *slog.Logger, cfg Config, svc SandboxLookup, dockerCli DockerExe
 		svc:         svc,
 		dockerCli:   dockerCli,
 		toolboxPort: cfg.ToolboxPort,
+
+		remoteBaseURL: strings.TrimRight(strings.TrimSpace(cfg.RemoteAPIBaseURL), "/"),
+		remotePAT:     strings.TrimSpace(cfg.RemoteAPIToken),
 	}, nil
 }
 
@@ -139,12 +159,14 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 	sandboxID := ""
 	mode := "exec"
 	sessionName := ""
+	remoteOwned := false
 	if serverConn.Permissions != nil {
 		sandboxID = serverConn.Permissions.Extensions["sandbox_id"]
 		mode = serverConn.Permissions.Extensions["mode"]
 		sessionName = serverConn.Permissions.Extensions["session_name"]
+		remoteOwned = serverConn.Permissions.Extensions["remote"] == "1"
 	}
-	g.logger.Info("ssh connection accepted", "remote", remote, "sandbox_id", sandboxID, "mode", mode, "session_name", sessionName)
+	g.logger.Info("ssh connection accepted", "remote", remote, "sandbox_id", sandboxID, "mode", mode, "session_name", sessionName, "remote_owned", remoteOwned)
 
 	go ssh.DiscardRequests(reqs)
 
@@ -158,7 +180,7 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 			g.logger.Warn("ssh channel accept failed", "error", err)
 			continue
 		}
-		go g.handleSession(ctx, sandboxID, mode, sessionName, channel, requests)
+		go g.handleSession(ctx, sandboxID, mode, sessionName, remoteOwned, channel, requests)
 	}
 }
 
@@ -199,39 +221,70 @@ func (g *Gateway) publicKeyCallback(ctx context.Context) func(ssh.ConnMetadata, 
 		}
 		// Constant-time-ish auth regardless of which side fails: any failure
 		// becomes "permission denied" without leaking which step blew up.
+		//
+		// Resolution order: the local store first (single-node and self-owned
+		// sandboxes — the hot path, no network hop). If the sandbox is not held
+		// locally AND cross-node routing is enabled, ask the owner via this
+		// node's own v1 API (clusterForwardWrap reverse-proxies the GET to the
+		// owner over mTLS and returns its authoritative public key). The key
+		// fetch is per-connection — no durable cache — so a key rotated/revoked
+		// on the owner is honored immediately.
 		sandbox, err := g.svc.GetSandbox(ctx, sandboxID)
-		if err != nil || sandbox == nil {
-			g.logger.Info("ssh auth: sandbox lookup failed", "username", username, "error", err)
-			return nil, errors.New("permission denied")
+		if err == nil && sandbox != nil {
+			if authErr := authorizeLocalSSH(sandbox, key); authErr != nil {
+				g.logger.Info("ssh auth: local sandbox not authorized", "sandbox_id", sandbox.ID, "error", authErr)
+				return nil, errors.New("permission denied")
+			}
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"sandbox_id":   sandbox.ID,
+					"container_id": sandbox.ContainerID,
+					"mode":         mode,
+					"session_name": sessionName,
+				},
+			}, nil
 		}
-		if sandbox.Status != models.SandboxStatusStarted {
-			g.logger.Info("ssh auth: sandbox not running", "sandbox_id", sandbox.ID, "status", string(sandbox.Status))
-			return nil, errors.New("permission denied")
+
+		if g.remoteBaseURL != "" {
+			if perms, ok := g.authorizeRemoteSSH(ctx, sandboxID, mode, sessionName, key); ok {
+				return perms, nil
+			}
 		}
-		if sandbox.ContainerID == "" {
-			return nil, errors.New("permission denied")
-		}
-		if sandbox.SSHPublicKey == "" {
-			g.logger.Info("ssh auth: sandbox has no authorized key", "sandbox_id", sandbox.ID)
-			return nil, errors.New("permission denied")
-		}
-		authorized, parseErr := ParseAuthorizedKey(sandbox.SSHPublicKey)
-		if parseErr != nil {
-			g.logger.Warn("ssh auth: stored authorized key is invalid", "sandbox_id", sandbox.ID, "error", parseErr)
-			return nil, errors.New("permission denied")
-		}
-		if !keysEqual(key, authorized) {
-			return nil, errors.New("permission denied")
-		}
-		return &ssh.Permissions{
-			Extensions: map[string]string{
-				"sandbox_id":   sandbox.ID,
-				"container_id": sandbox.ContainerID,
-				"mode":         mode,
-				"session_name": sessionName,
-			},
-		}, nil
+		g.logger.Info("ssh auth: sandbox lookup failed", "username", username, "error", err)
+		return nil, errors.New("permission denied")
 	}
+}
+
+// authorizeLocalSSH enforces the per-sandbox auth invariants against a sandbox
+// row read from the local store. Returns nil only when the offered key is the
+// sandbox's authorized key and the sandbox is in a serviceable state. Errors are
+// for logging; the caller collapses them all to "permission denied".
+func authorizeLocalSSH(sandbox *models.Sandbox, key ssh.PublicKey) error {
+	if sandbox.Status != models.SandboxStatusStarted {
+		return fmt.Errorf("sandbox not running: status=%s", sandbox.Status)
+	}
+	if sandbox.ContainerID == "" {
+		return errors.New("sandbox has no container")
+	}
+	return authorizeKey(sandbox.SSHPublicKey, key)
+}
+
+// authorizeKey parses the sandbox's stored authorized key and compares it to the
+// offered key. golang.org/x/crypto/ssh has already verified the client proved
+// possession of the offered key's private half before calling us, so an exact
+// match is a complete authentication.
+func authorizeKey(authorizedKey string, offered ssh.PublicKey) error {
+	if authorizedKey == "" {
+		return errors.New("sandbox has no authorized key")
+	}
+	authorized, err := ParseAuthorizedKey(authorizedKey)
+	if err != nil {
+		return fmt.Errorf("stored authorized key is invalid: %w", err)
+	}
+	if !keysEqual(offered, authorized) {
+		return errors.New("key mismatch")
+	}
+	return nil
 }
 
 // handleSession services a single SSH session channel. It implements the
@@ -241,8 +294,17 @@ func (g *Gateway) publicKeyCallback(ctx context.Context) func(ssh.ConnMetadata, 
 // mode: "session" → on shell, attach to/create a named toolboxd session
 // (default name "default"). "exec" → behave like the old one-shot path,
 // running every shell/exec via docker exec.
-func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionName string, channel ssh.Channel, requests <-chan *ssh.Request) {
+func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionName string, remoteOwned bool, channel ssh.Channel, requests <-chan *ssh.Request) {
 	defer channel.Close()
+
+	// Cross-node path: the sandbox is owned by another node. The container and
+	// its toolboxd live there, so the session is bridged through this node's own
+	// v1 API, which forwards to the owner. Auth already happened at the edge in
+	// publicKeyCallback against the owner's authoritative key.
+	if remoteOwned {
+		g.handleRemoteSession(ctx, sandboxID, sessionName, channel, requests)
+		return
+	}
 
 	sandbox, err := g.svc.GetSandbox(ctx, sandboxID)
 	if err != nil || sandbox == nil {
@@ -287,7 +349,10 @@ func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionNam
 		case "shell":
 			replyRequest(req, true)
 			if mode == "session" && g.toolboxPort > 0 && sandbox.ContainerIP != "" {
-				exitCode := g.attachToSession(ctx, channel, sandbox, sessionName, state)
+				ep := localSessionEndpoint(sandbox.ContainerIP, g.toolboxPort, sandbox.ToolboxToken)
+				// Local session-attach does not forward mid-session resize
+				// (unchanged pre-cluster behaviour); pass nil.
+				exitCode := g.attachToSession(ctx, channel, ep, sessionName, state, nil)
 				_ = sendExitStatus(channel, uint32(exitCode))
 				return
 			}
@@ -339,6 +404,11 @@ type sessionState struct {
 	ptyCols uint32
 	envVars []string
 	execID  string
+	// execCommand is set only on the cross-node one-shot exec path
+	// (handleRemoteSession): the command runs as its own short-lived toolbox
+	// session on the owner (via CreateSessionRequest.Command) so its exact exit
+	// status propagates, since there is no local container to docker-exec into.
+	execCommand string
 }
 
 // runExec starts the docker exec, copies bytes between the SSH channel and
