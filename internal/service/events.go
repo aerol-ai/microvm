@@ -344,11 +344,11 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 		s.admitter.Reserve(sandbox.ID, capacityRequestFromSandbox(sandbox))
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		return fmt.Errorf("upsert sandbox route: %w", err)
 	}
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+		if err := s.syncExposedPortRoute(ctx, sandbox, port); err != nil {
 			s.logger.Warn("upsert port route failed", "sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
 		}
 	}

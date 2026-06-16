@@ -52,6 +52,34 @@ func TestBuildClusterIngressIntents_DomainModeAddsPerCustomHostnameSNI(t *testin
 	}
 }
 
+func TestBuildClusterIngressIntentsSkipsPublicDisabledPlacement(t *testing.T) {
+	svc := &Service{
+		cfg: config.Config{
+			EnableCluster: true,
+			Domain:        "sb.example.com",
+			L4TLSListen:   ":8443",
+		},
+	}
+	deny := false
+	placement := cluster.Placement{
+		SandboxID:          "sb-no-public",
+		OwnerNodeID:        "peer-1",
+		OwnerDataPlaneHost: "10.0.0.7",
+		Version:            1,
+		Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: &deny},
+		CustomHostnames:    []string{"api.acme.com"},
+		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
+			8080: {Protocol: models.ExposedPortProtocolHTTP},
+			5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 22432},
+		},
+	}
+
+	intents, _ := svc.buildClusterIngressIntents([]cluster.Placement{placement}, "self")
+	if len(intents) != 0 {
+		t.Fatalf("public-disabled placement produced intents: %+v", intents)
+	}
+}
+
 // TestBuildClusterIngressIntents_CustomHostnameDeltaFiresApply: a
 // hostname added on the next FSM version must produce a single new
 // intent (and bump the placement version so the delta planner emits an

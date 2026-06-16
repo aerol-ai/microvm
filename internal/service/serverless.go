@@ -279,6 +279,9 @@ func (s *Service) shouldArmWake(sandbox *models.Sandbox, mode stopMode) bool {
 	if sandbox == nil || mode == stopModeManual {
 		return false
 	}
+	if !sandboxAllowsPublicTraffic(sandbox) {
+		return false
+	}
 	if !s.cfg.EnableServerless {
 		return false
 	}
@@ -323,6 +326,23 @@ func (s *Service) shouldArmWake(sandbox *models.Sandbox, mode stopMode) bool {
 // true so steady-state reconcile passes do not churn the row.
 func (s *Service) ReconstructWakeArmedIfNeeded(ctx context.Context, sandbox *models.Sandbox) {
 	if sandbox == nil {
+		return
+	}
+	if !sandboxAllowsPublicTraffic(sandbox) {
+		for _, port := range sandbox.ExposedPorts {
+			if err := s.deleteExposedPortRoute(ctx, sandbox, port); err != nil {
+				s.logger.Warn("delete wake route for public-disabled sandbox failed",
+					"sandbox_id", sandbox.ID, "port", port.Port, "protocol", port.Protocol, "error", err)
+			}
+		}
+		if sandbox.WakeArmed && s.store != nil {
+			if err := s.store.SetWakeArmed(ctx, sandbox.ID, false); err != nil && !errors.Is(err, store.ErrNotFound) {
+				s.logger.Warn("clear wake_armed for public-disabled sandbox failed",
+					"sandbox_id", sandbox.ID, "error", err)
+			} else {
+				sandbox.WakeArmed = false
+			}
+		}
 		return
 	}
 	if !s.cfg.EnableServerless {

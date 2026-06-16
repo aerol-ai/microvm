@@ -172,19 +172,22 @@ func (s *Service) specFromSandbox(sb *models.Sandbox) *models.CreateSandboxReque
 		return nil
 	}
 	spec := &models.CreateSandboxRequest{
-		Image:            sb.Image,
-		CPU:              sb.CPU,
-		MemoryMB:         sb.MemoryMB,
-		DiskGB:           sb.DiskGB,
-		Env:              sb.Env,
-		OSUser:           sb.OSUser,
-		NetworkBlockAll:  sb.NetworkBlockAll,
-		ContainerCommand: sb.ContainerCommand,
-		Runtime:          sb.Runtime,
-		GPUs:             sb.GPUs,
-		Failover:         sb.Failover,
-		TemplateID:       sb.TemplateID,
-		OverlaySizeGB:    sb.OverlaySizeGB,
+		Image:              sb.Image,
+		CPU:                sb.CPU,
+		MemoryMB:           sb.MemoryMB,
+		DiskGB:             sb.DiskGB,
+		Env:                sb.Env,
+		OSUser:             sb.OSUser,
+		NetworkBlockAll:    sb.NetworkBlockAll,
+		NetworkAllowOut:    sb.NetworkAllowOut,
+		NetworkDenyOut:     sb.NetworkDenyOut,
+		AllowPublicTraffic: sb.AllowPublicTraffic,
+		ContainerCommand:   sb.ContainerCommand,
+		Runtime:            sb.Runtime,
+		GPUs:               sb.GPUs,
+		Failover:           sb.Failover,
+		TemplateID:         sb.TemplateID,
+		OverlaySizeGB:      sb.OverlaySizeGB,
 	}
 	lc := sb.Lifecycle
 	spec.Lifecycle = &lc

@@ -54,9 +54,9 @@ const allocatorRandomAttempts = 16
 // contract behind the client's back.
 var ErrPreferredHostPortUnavailable = errors.New("preferred host port unavailable on this node; exposure parked")
 
-// ErrPublicTrafficDisabled is returned by ExposePort when the sandbox was
-// created with allow_public_traffic=false. There is no public route to install
-// — the sandbox is reachable only through the toolbox proxy and SSH gateway.
+// ErrPublicTrafficDisabled is returned when the sandbox was created with
+// allow_public_traffic=false and the caller asks for a public ingress route.
+// The sandbox stays reachable through the toolbox proxy and SSH gateway.
 var ErrPublicTrafficDisabled = errors.New("public traffic is disabled for this sandbox; expose is not available")
 
 const clusterIngressReconcileInterval = 5 * time.Second
@@ -1138,7 +1138,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		ID:                   state.SandboxID,
 		Image:                req.Image,
 		Status:               state.Status,
-		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		PublicURL:            s.sandboxPublicURL(state.SandboxID, req.AllowPublicTraffic),
 		ContainerID:          state.ContainerID,
 		ContainerIP:          state.ContainerIP,
 		CPU:                  req.CPU,
@@ -1183,7 +1183,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		_ = s.docker.Destroy(cleanupCtx, sandbox)
 		cleanupMounts()
 		releaseAdmission()
@@ -1381,7 +1381,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		ID:                   state.SandboxID,
 		Image:                req.Image,
 		Status:               state.Status,
-		PublicURL:            s.caddy.SandboxPublicURL(state.SandboxID),
+		PublicURL:            s.sandboxPublicURL(state.SandboxID, req.AllowPublicTraffic),
 		ContainerID:          state.ContainerID,
 		ContainerIP:          state.ContainerIP,
 		CPU:                  req.CPU,
@@ -1427,7 +1427,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		_ = s.firecracker.Destroy(cleanupCtx, sandbox)
 		releaseAdmission()
 		return nil, err
@@ -1774,11 +1774,11 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 
-	if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 		return nil, err
 	}
 	for _, port := range sandbox.ExposedPorts {
-		if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+		if err := s.syncExposedPortRoute(ctx, sandbox, port); err != nil {
 			return nil, err
 		}
 	}
@@ -2233,7 +2233,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 		priorSandbox.Lifecycle.Serverless != updated.Lifecycle.Serverless &&
 		updated.Status == models.SandboxStatusStarted {
 		for _, port := range updated.ExposedPorts {
-			if err := s.upsertExposedPortRoute(ctx, updated, port); err != nil {
+			if err := s.syncExposedPortRoute(ctx, updated, port); err != nil {
 				if s.logger != nil {
 					s.logger.Warn("re-install port route after lifecycle change failed",
 						"sandbox_id", id, "port", port.Port, "err", err)
@@ -3540,7 +3540,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		sandbox.ContainerID = state.ContainerID
 		sandbox.ContainerIP = state.ContainerIP
 		sandbox.Status = state.Status
-		sandbox.PublicURL = s.caddy.SandboxPublicURL(sandbox.ID)
+		sandbox.PublicURL = s.sandboxPublicURL(sandbox.ID, sandbox.AllowPublicTraffic)
 		sandbox.UpdatedAt = time.Now().UTC()
 		// Keep admitter accounting in sync with observed runtime state. The
 		// API and event paths handle the common transitions; this branch
@@ -3565,6 +3565,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		// non-serverless rows and for sandboxes already armed.
 		if state.Status == models.SandboxStatusStopped {
 			s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
+		}
+		if err := s.cleanupPublicTrafficDisabledIngressState(ctx, sandbox); err != nil {
+			return err
 		}
 		if state.Status == models.SandboxStatusStarted {
 			sandbox.WakeArmed = false
@@ -3617,11 +3620,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
 				s.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
 			}
-			if err := s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox)); err != nil {
+			if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
 				return err
 			}
 			for _, port := range sandbox.ExposedPorts {
-				if err := s.upsertExposedPortRoute(ctx, sandbox, port); err != nil {
+				if err := s.syncExposedPortRoute(ctx, sandbox, port); err != nil {
 					return err
 				}
 			}
@@ -4013,6 +4016,9 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		if sb == nil || sb.Status == models.SandboxStatusDestroyed {
 			continue
 		}
+		if !sandboxAllowsPublicTraffic(sb) {
+			continue
+		}
 		// The toolbox route lives at @id "sandbox-<id>"; per-port HTTP routes
 		// at "sandbox-<id>-port-<p>". Keep both unconditionally — the rest
 		// of Reconcile guarantees they're upserted for running sandboxes,
@@ -4098,6 +4104,9 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 	self := c.SelfNodeID()
 	for _, p := range c.PlacementsForShards(clusterIngressShardFilter(c, self)) {
 		if p.SandboxID == "" || p.OwnerNodeID == self {
+			continue
+		}
+		if !placementAllowsPublicTraffic(p) {
 			continue
 		}
 		// Orphaned placement: the in-flux 503 routes are the expected

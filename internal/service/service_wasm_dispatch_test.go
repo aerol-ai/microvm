@@ -200,10 +200,14 @@ func TestWasmCreateSandboxSuccess(t *testing.T) {
 	svc.cfg.EnableWasm = true
 	svc.SetWasmRuntime(rt)
 
+	denyPublic := false
 	req := models.CreateSandboxRequest{
-		ModuleRef: "hello.wasm",
-		Runtime:   models.RuntimeWasm,
-		Name:      "test-wasm",
+		ModuleRef:          "hello.wasm",
+		Runtime:            models.RuntimeWasm,
+		Name:               "test-wasm",
+		NetworkBlockAll:    true,
+		NetworkAllowOut:    []string{"10.0.0.0/24"},
+		AllowPublicTraffic: &denyPublic,
 	}
 
 	resp, err := svc.CreateSandboxWithID(ctx, req, "sb-wasm-success")
@@ -224,6 +228,18 @@ func TestWasmCreateSandboxSuccess(t *testing.T) {
 	}
 	if sandbox.ModuleDigest != "sha256:fake" {
 		t.Fatalf("expected module digest sha256:fake, got %s", sandbox.ModuleDigest)
+	}
+	if !sandbox.NetworkBlockAll {
+		t.Fatal("expected NetworkBlockAll to be persisted")
+	}
+	if len(sandbox.NetworkAllowOut) != 1 || sandbox.NetworkAllowOut[0] != "10.0.0.0/24" {
+		t.Fatalf("NetworkAllowOut = %v, want [10.0.0.0/24]", sandbox.NetworkAllowOut)
+	}
+	if sandbox.AllowPublicTraffic == nil || *sandbox.AllowPublicTraffic {
+		t.Fatalf("AllowPublicTraffic = %v, want false", sandbox.AllowPublicTraffic)
+	}
+	if resp.PublicURL != "" || sandbox.PublicURL != "" {
+		t.Fatalf("public URL should be empty when public traffic is disabled: resp=%q row=%q", resp.PublicURL, sandbox.PublicURL)
 	}
 }
 

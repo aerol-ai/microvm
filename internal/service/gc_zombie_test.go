@@ -225,6 +225,53 @@ func TestGCZombieCaddyEntries(t *testing.T) {
 	}
 }
 
+func TestGCZombieCaddyEntriesDropsPublicDisabledSandboxRoutes(t *testing.T) {
+	fake := newGCCaddyFake()
+	deny := false
+	sandbox := &models.Sandbox{
+		ID:                 "no-public",
+		Status:             models.SandboxStatusStarted,
+		AllowPublicTraffic: &deny,
+		ExposedPorts: []models.ExposedPort{
+			{SandboxID: "no-public", Port: 8080, Protocol: models.ExposedPortProtocolHTTP},
+			{SandboxID: "no-public", Port: 5432, Protocol: models.ExposedPortProtocolTCP, HostPort: 22432},
+			{SandboxID: "no-public", Port: 8443, Protocol: models.ExposedPortProtocolTLS},
+		},
+		CustomDomains: []models.CustomDomain{{Hostname: "api.example.com"}},
+	}
+	fake.httpRouteIDs[caddy.SandboxRouteID(sandbox.ID)] = struct{}{}
+	fake.httpRouteIDs[caddy.PortRouteID(sandbox.ID, 8080)] = struct{}{}
+	fake.httpRouteIDs[caddy.WakePortRouteID(sandbox.ID, 8080)] = struct{}{}
+	fake.httpRouteIDs[caddy.IngressCustomDomainHTTPRouteID(sandbox.ID, "api.example.com")] = struct{}{}
+	fake.l4TCPServerIDs["tcp-port-22432"] = struct{}{}
+	fake.l4TLSRouteIDs[caddy.IngressPortSNIRouteID(sandbox.ID, 8443)] = struct{}{}
+	fake.httpRouteIDs["unrelated-route"] = struct{}{}
+
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+
+	svc := &Service{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		caddy: caddy.New(config.Config{
+			CaddyAdminURL:     server.URL,
+			CaddyServerID:     "srv0",
+			EnableCaddy:       true,
+			HTTPClientTimeout: 5 * time.Second,
+		}),
+	}
+	svc.gcZombieCaddyEntries(context.Background(), []*models.Sandbox{sandbox})
+
+	if got := fake.keys(fake.httpRouteIDs); !equalSorted(got, []string{"unrelated-route"}) {
+		t.Fatalf("http routes after gc: got %v", got)
+	}
+	if got := fake.keys(fake.l4TCPServerIDs); len(got) != 0 {
+		t.Fatalf("tcp routes after gc: got %v", got)
+	}
+	if got := fake.keys(fake.l4TLSRouteIDs); len(got) != 0 {
+		t.Fatalf("tls routes after gc: got %v", got)
+	}
+}
+
 func TestGCZombieCaddyEntriesKeepsRemoteClusterIngressRoutes(t *testing.T) {
 	fake := newGCCaddyFake()
 	fake.httpRouteIDs["sandbox-remote"] = struct{}{}
