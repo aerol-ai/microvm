@@ -222,6 +222,13 @@ locals {
     registry_pat_path  = try(local.cluster_ops.wasm.registry_pat_path, "")
     standard_modules   = join(",", [for m in try(local.cluster_ops.wasm.standard_modules, []) : "${m.alias}=${m.alias}.wasm"])
   }
+
+  # Homogeneous per-arch clusters (D5): one GOARCH for snapshot tagging and
+  # Firecracker upstream artifact selection. The precondition on
+  # validate_cluster_ops enforces a single distinct arch across nodes.
+  cluster_arch = length(local.node_arch) > 0 ? one(distinct([for _, arch in local.node_arch : arch])) : "amd64"
+
+  firecracker_upstream_arch = local.cluster_arch == "arm64" ? "aarch64" : "x86_64"
 }
 
 # Plan-time validation of values that come from local.cluster_ops. Terraform

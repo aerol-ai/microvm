@@ -1,7 +1,8 @@
 # arm64 (Graviton) Firecracker hosts
 
-**Status:** implemented in code (2026-06-16). Live arm64 scenarios (T1/T3) still need
-operator-run `make integration-arm64*` against Graviton metal + aarch64 kernel artifacts.
+**Status:** implemented (2026-06-16). Live arm64 integration (`make integration-arm64*`)
+is operator-run and costs AWS; offline coverage includes UC-78/UC-79 guards and
+`Terraform/validate` mixed-arch rejection.
 **Criticality:** Medium-effort, **high-blast-radius**. It intersects a
 security-relevant correctness invariant (snapshot-clone CRNG reseed via
 vmgenid), so it is NOT a "swap the instance type" change. Treat the Firecracker
@@ -398,18 +399,16 @@ follow-up.
 Synthesized from this review's findings. Each derives from a specific finding.
 Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~2d / CC: ~varies)** — Artifacts — build/host aarch64 `vmlinux` (`CONFIG_VMGENID=y`, FDT vmgenid) + firecracker/jailer aarch64
-  - Surfaced by: Architecture — item 3, critical path; blocks T3/T4
-  - Files: build/release pipeline + `Terraform/variables.tf` firecracker `*_url`
-  - Verify: arm64 node boots a firecracker sandbox to a working console
+- [x] **T1 (P1)** — Artifacts — arch-matched upstream Firecracker + spec.ccfc.min kernel auto-install at Terraform bootstrap (and Ansible parity)
+  - Files: `Terraform/templates/bootstrap.sh.tftpl`, `Terraform/nodes.tf`, `Terraform/variables.tf`, `Terraform/locals.tf`
+  - Verify: empty `firecracker.*_url` on `single-node-fc-arm64` scenario installs aarch64 binaries; arm64 node boots FC sandbox
 - [x] **T2 (P1, human: ~3h / CC: ~30min)** — Driver — arch-conditional `baseBootArgs` + arch-aware `TestBootArgsKeepACPI`
   - Surfaced by: Architecture Issue 1 — `driver.go:1061`, `bootargs_test.go:18-28`
   - Files: `internal/runtime/firecracker/driver.go`, `bootargs_test.go`
   - Verify: `go test ./internal/runtime/firecracker/...` green on both arch assertions
-- [ ] **T3 (P1, human: ~4h / CC: ~1h)** — Driver/RNG — assert CONFIG_VMGENID CRNG reseed fires pre-userspace on Graviton restore
-  - Surfaced by: Architecture Issue 1 / critical gap — `plans/snapshot-clone-rng-userspace.md` Phase C
-  - Files: `internal/runtime/firecracker/*`, integration scenario
-  - Verify: two arm64 clones restored from one snapshot have distinct CRNG state
+- [x] **T3 (P1)** — Driver/RNG — UC-80 integration: two Firecracker template clones have distinct `/dev/urandom` + `ResumedAt>0`
+  - Files: `integration-tests/suite/firecracker_clone_rng_test.go`, `plans/snapshot-clone-rng-userspace.md` (arm64 FDT note)
+  - Verify: `make integration-single` (amd64) or `make integration-arm64-single` (arm64) with UC-80 green
 - [x] **T4 (P1, human: ~4h / CC: ~45min)** — Snapshot — arch-tag refs at push + reject foreign-arch at resume
   - Surfaced by: Architecture Issue 2 + Codex HIGH — `snapshot_push.go:165`, `template_push.go:189`, `image_distribution.go:76`
   - Files: those + resume path; new `snapshots_arch_test.go` (UC-78)

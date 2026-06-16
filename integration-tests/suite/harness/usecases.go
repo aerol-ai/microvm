@@ -174,6 +174,7 @@ var Registry = []UseCase{
 	// J. Architecture homogeneity (arm64 Firecracker hosts)
 	{ID: "UC-78", Title: "Foreign-arch snapshot ref rejected (offline guard)", Requires: nil, Implemented: true},
 	{ID: "UC-79", Title: "Foreign-arch snapshot rejected on arm64 cluster (live)", Requires: []Capability{CapCluster, CapFirecracker, CapMixedArchNegative}, Implemented: true},
+	{ID: "UC-80", Title: "Firecracker template clones have distinct kernel entropy", Requires: []Capability{CapFirecracker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

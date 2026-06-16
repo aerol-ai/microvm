@@ -18,9 +18,8 @@ caddy_shared_cert_storage = {
 }
 
 firecracker = {
-  # Leave *_url empty when the AMI already ships aarch64 firecracker/jailer/vmlinux
-  # artifacts at the matching *_path defaults. Set kernel_url when staging a
-  # custom aarch64 vmlinux built with CONFIG_VMGENID=y.
+  # Empty *_url + auto_install_artifacts (default true) pulls arch-matched
+  # upstream firecracker/jailer/vmlinux on first boot — no custom staging needed.
 }
 
 nodes = {

@@ -170,10 +170,11 @@ making operators smuggle everything through `extra_user_data`.
 
 1. Mark worker-capable nodes with `with_firecracker = true`.
 2. Fill the `firecracker` object in `config/terraform.tfvars`.
-3. Choose one of two bootstrap modes:
+3. Choose one of three bootstrap modes:
 
-- **Artifact-download mode**: set `firecracker.binary_url`, `firecracker.jailer_url`, and `firecracker.kernel_url`. Terraform bootstrap installs `skopeo`, `umoci`, `e2fsprogs`, and `iproute2`, downloads those artifacts plus the kernel config sidecar, writes the matching `SB_ENABLE_FIRECRACKER` / `SB_FIRECRACKER_*` env vars into `/etc/sandboxd/cluster.env`, and restarts `sandboxd`.
-- **Pre-baked AMI mode**: leave the URLs empty and make sure the AMI already has the binaries, kernel, and kernel config at `firecracker.binary_path`, `firecracker.jailer_path`, `firecracker.kernel_path`, and `firecracker.kernel_path + ".config"`.
+- **Upstream auto-install (default)**: leave `firecracker.binary_url`, `jailer_url`, and `kernel_url` empty and keep `auto_install_artifacts = true` (default). Bootstrap downloads the arch-matched Firecracker release tarball and the spec.ccfc.min guest kernel for the cluster's homogeneous arch (`x86_64` on amd64 metal, `aarch64` on Graviton). Pins match Ansible `configure-ops.yml` (`version`, `kernel_ci_version`, `kernel_version` are overridable).
+- **Custom artifact URLs**: set `firecracker.binary_url`, `firecracker.jailer_url`, and `firecracker.kernel_url` (and optional `kernel_config_url`). Bootstrap curls those instead of upstream.
+- **Pre-baked AMI**: set `auto_install_artifacts = false`, leave URLs empty, and ship binaries/kernel at `firecracker.binary_path`, `firecracker.jailer_path`, `firecracker.kernel_path`, and `firecracker.kernel_path + ".config"`.
 
 Example:
 
