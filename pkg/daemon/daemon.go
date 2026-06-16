@@ -196,13 +196,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	host.DiskTotalGB = max(cfg.HostDiskGB, 0)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
-	host.SupportedRuntimes = cfg.HostSupportedRuntimes
-	if len(host.SupportedRuntimes) == 0 {
-		host.SupportedRuntimes = []string{models.RuntimeDocker}
-	}
-	if cfg.EnableFirecracker {
-		host.SupportedRuntimes = appendRuntimeIfMissing(host.SupportedRuntimes, models.RuntimeFirecracker)
-	}
+	host.SupportedRuntimes = supportedRuntimesForConfig(cfg)
 	// Phase 5: the per-VMM RSS sampler is constructed up front when
 	// firecracker is enabled so admission can be wired against it from
 	// the start (capacity holds the RSSSource by reference, not value).
@@ -1358,6 +1352,30 @@ func readBypassMarker(path string) bool {
 		return false
 	}
 	return string(bytesTrimSpace(data)) == "true"
+}
+
+// supportedRuntimesForConfig builds the host's advertised runtime list from the
+// daemon config. This is what cluster placement (placement.go nodeFits) filters
+// candidate nodes against: a runtime absent here makes the host an invalid
+// placement target for that runtime and every create is rejected with
+// ErrNoPlacementTarget — even single-node, which runs as a 1-member cluster.
+//
+// SB_HOST_RUNTIMES (cfg.HostSupportedRuntimes) is the explicit override; when
+// unset we default to docker and then advertise each runtime the host actually
+// has enabled. Firecracker and WASM each gate on their own enable flag so a
+// host that wired the driver also tells the cluster it can place that runtime.
+func supportedRuntimesForConfig(cfg config.Config) []string {
+	runtimes := cfg.HostSupportedRuntimes
+	if len(runtimes) == 0 {
+		runtimes = []string{models.RuntimeDocker}
+	}
+	if cfg.EnableFirecracker {
+		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeFirecracker)
+	}
+	if cfg.EnableWasm {
+		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeWasm)
+	}
+	return runtimes
 }
 
 func appendRuntimeIfMissing(runtimes []string, runtimeName string) []string {

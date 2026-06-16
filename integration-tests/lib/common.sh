@@ -73,6 +73,78 @@ dump_service_logs() {
   echo "===== end ${svc} @ ${target} ====="
 }
 
+# stage_wasm_modules <fixtures_dir> <config_cluster_yml> <caps_domain> <targets_json>
+# Copies the curated standard .wasm modules onto every node's modules_dir under
+# their reserved alias filename, then restarts sandboxd. Returns non-zero on any
+# failure so the caller can mark the scenario inconclusive.
+#
+# WHY this exists: the harness provisions with Terraform ONLY (never Ansible).
+# Terraform flattens wasm.standard_modules to the "alias=alias.wasm" contract
+# (SB_WASM_STANDARD_MODULES) but does NOT stage the bytes — that is Ansible's
+# playbooks/stage-wasm-modules.yml. sandboxd's seedStandardModules resolves each
+# alias to a PRE-STAGED local file and does not fetch URL-sourced modules at
+# boot. So without this step modules_dir is empty, the node advertises no wasm
+# inventory, and cluster placement (every scenario runs cluster-init, so even
+# single-node is a 1-member real cluster) rejects each wasm create with
+# ErrNoPlacementTarget. This mirrors what stage-wasm-modules.yml does, but reuses
+# the committed, digest-verified fixture bytes instead of re-downloading on-box.
+stage_wasm_modules() {
+  local fxdir="$1" config_cluster="$2" caps_domain="$3" targets="$4"
+  local modules_dir
+  modules_dir=$(yq -r '.wasm.modules_dir // "/var/lib/sandboxd/wasm/modules"' "$config_cluster")
+
+  # Ensure the (gitignored) fixture bytes exist + match their pinned sha256.
+  if ! bash "${fxdir}/fetch.sh"; then
+    echo "stage_wasm: fetching fixture modules failed" >&2
+    return 1
+  fi
+
+  # Resolve the per-node IP set: domain scenarios stage every node so a sandbox
+  # can be placed anywhere; IP/local scenarios have only the seed.
+  local ips=()
+  if [[ "$caps_domain" == "true" ]]; then
+    while IFS= read -r ip; do [[ -n "$ip" ]] && ips+=("$ip"); done \
+      < <(echo "$targets" | jq -r '.nodes[].public_ip')
+  else
+    ips+=("$(echo "$targets" | jq -r '.seed_ip')")
+  fi
+  [[ "${#ips[@]}" -gt 0 ]] || { echo "stage_wasm: no node IPs in targets" >&2; return 1; }
+
+  local n
+  n=$(yq -r '.standard_modules | length' "${fxdir}/modules.yml")
+  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || { echo "stage_wasm: no modules in ${fxdir}/modules.yml" >&2; return 1; }
+
+  local ip tgt i alias ref file
+  for ip in "${ips[@]}"; do
+    tgt="ubuntu@${ip}"
+    if ! ssh "${SSH_OPTS[@]}" "$tgt" "sudo mkdir -p '${modules_dir}'"; then
+      echo "stage_wasm: mkdir ${modules_dir} on ${tgt} failed" >&2
+      return 1
+    fi
+    for i in $(seq 0 $((n - 1))); do
+      alias=$(yq -r ".standard_modules[$i].alias" "${fxdir}/modules.yml")
+      ref=$(yq -r ".standard_modules[$i].ref" "${fxdir}/modules.yml")
+      # fetch.sh names each local file after the URL basename (sans query).
+      file="${fxdir}/$(basename "${ref%\?*}")"
+      # ubuntu can't write modules_dir directly; land in /tmp then sudo-install
+      # under the reserved alias filename SB_WASM_STANDARD_MODULES expects.
+      if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm" \
+        || ! ssh "${SSH_OPTS[@]}" "$tgt" \
+             "sudo install -m 0644 '/tmp/${alias}.wasm' '${modules_dir}/${alias}.wasm' && rm -f '/tmp/${alias}.wasm'"; then
+        echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
+        return 1
+      fi
+    done
+    # sandboxd seeds standard modules only at boot, so restart to pick up the
+    # now-staged files and re-advertise the node's wasm inventory to placement.
+    if ! ssh "${SSH_OPTS[@]}" "$tgt" "sudo systemctl restart sandboxd"; then
+      echo "stage_wasm: restarting sandboxd on ${tgt} failed" >&2
+      return 1
+    fi
+    echo "stage_wasm: ${tgt} staged ${n} modules + restarted sandboxd"
+  done
+}
+
 # wait_for_health <base_url> <pat> [timeout_s]
 # Polls /v1/capacity (authenticated) until HTTP 200 or timeout.
 wait_for_health() {

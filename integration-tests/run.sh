@@ -265,6 +265,21 @@ run_one() {
     fi
   fi
 
+  # Stage the curated wasm standard modules before the suite runs. Terraform
+  # only renders the SB_WASM_STANDARD_MODULES alias contract; the bytes are
+  # normally staged by Ansible (which the harness never runs), and sandboxd does
+  # not fetch them at boot. Without this every wasm create fails placement with
+  # ErrNoPlacementTarget. Restarts sandboxd, so re-probe health afterwards.
+  if [[ "$inconclusive" != "1" && "$caps_wasm" == "true" ]]; then
+    echo "=== staging wasm standard modules on ${scenario} ==="
+    if stage_wasm_modules "${HERE}/fixtures/wasm" "${overlay}/cluster.yml" "$caps_domain" "$targets"; then
+      wait_for_health "$base_url" "$pat" || inconclusive=1
+    else
+      echo "scenario ${scenario}: wasm module staging failed" >&2
+      inconclusive=1
+    fi
+  fi
+
   # Expected cluster size, if the scenario's caps.yml declares one. Drives
   # AEROL_EXPECTED_MEMBERS so the cluster UCs assert an exact node count.
   local expected_members
