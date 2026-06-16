@@ -310,6 +310,7 @@ class MicroVMClientTest {
                     .setMemoryMb(2048)
                     .setNetworkBlockAll(true)
                     .setNetworkAllowOut(List.of("1.1.1.0/24", "8.8.8.8/32"))
+                    .setAllowPublicTraffic(false)
                     .setMounts(List.of(
                         new MountSpec()
                             .setType("s3")
@@ -336,6 +337,7 @@ class MicroVMClientTest {
             assertEquals(2048, ((Number) payload.get("memory_mb")).intValue());
             assertEquals(Boolean.TRUE, payload.get("network_block_all"));
             assertEquals(List.of("1.1.1.0/24", "8.8.8.8/32"), payload.get("network_allow_out"));
+            assertEquals(Boolean.FALSE, payload.get("allow_public_traffic"));
             Map<String, Object> lifecycle = castMap(payload.get("lifecycle"));
             assertEquals(3_600_000_000_000L, ((Number) lifecycle.get("stop_if_idle_for")).longValue());
             assertEquals(86_400_000_000_000L, ((Number) lifecycle.get("destroy_at_age")).longValue());

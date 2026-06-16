@@ -170,6 +170,11 @@ pub struct CreateOptions {
     /// destinations. Mutually exclusive with `network_allow_out`.
     #[serde(rename = "network_deny_out", skip_serializing_if = "Option::is_none")]
     pub network_deny_out: Option<Vec<String>>,
+    /// Whether the sandbox may be exposed publicly. `None`/`Some(true)` allow
+    /// it; `Some(false)` makes `expose_port` fail — the sandbox stays reachable
+    /// only via the toolbox proxy and SSH gateway.
+    #[serde(rename = "allow_public_traffic", skip_serializing_if = "Option::is_none")]
+    pub allow_public_traffic: Option<bool>,
     /// Cap on bytes the sandbox may receive before its ingress is dropped via
     /// per-IP iptables rule. `0` (or omit) means unlimited. Limits can be
     /// raised or lifted at runtime via [`Client::set_network_limits`].

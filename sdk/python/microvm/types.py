@@ -149,6 +149,9 @@ class CreateOptions(TypedDict, total=False):
     # mutually exclusive; a full block is networkBlockAll, not a 0.0.0.0/0 deny.
     networkAllowOut: List[str]
     networkDenyOut: List[str]
+    # Whether the sandbox may be exposed publicly. Defaults to True; False makes
+    # expose_port fail (reachable only via the toolbox proxy and SSH gateway).
+    allowPublicTraffic: bool
     # Caps on network bytes the sandbox may receive (in) / send (out) before
     # per-IP iptables block fires. 0 (default) means unlimited; both can be
     # raised or lifted at runtime via set_network_limits.
