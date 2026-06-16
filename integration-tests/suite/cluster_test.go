@@ -37,16 +37,20 @@ func expectedMembers() (int, bool) {
 	return 3, false
 }
 
-// getMembers fetches and decodes the gossiped member list.
-func getMembers(t *testing.T, c *harness.Client) []clusterMember {
+// getMembers fetches and decodes the gossiped member list. It returns the error
+// rather than fataling so callers polling for convergence can ride through
+// transient ingress hiccups (e.g. a momentary Caddy on-demand-TLS handshake
+// error: "remote error: tls: internal error") the way the leader/count polls
+// already do — a single blip must not kill a multi-minute convergence wait.
+func getMembers(t *testing.T, c *harness.Client) ([]clusterMember, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var mr membersResponse
 	if err := c.GetJSON(ctx, "/v1/cluster/members", &mr); err != nil {
-		t.Fatalf("get cluster members: %v", err)
+		return nil, err
 	}
-	return mr.Members
+	return mr.Members, nil
 }
 
 // UC-03 — A multi-node cluster forms and gossips its members.
@@ -54,11 +58,17 @@ func TestClusterForms(t *testing.T) {
 	harness.Require(t, sc, "UC-03")
 	c := client(t)
 	want, exact := expectedMembers()
-	// Gossip convergence can lag node boot; poll.
+	// Gossip convergence can lag node boot; poll. Tolerate transient fetch
+	// errors (a single ingress TLS blip must not fail the whole wait).
 	deadline := time.Now().Add(3 * time.Minute)
 	var members []clusterMember
 	for time.Now().Before(deadline) {
-		members = getMembers(t, c)
+		m, err := getMembers(t, c)
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		members = m
 		if (exact && len(members) == want) || (!exact && len(members) >= want) {
 			return
 		}
@@ -71,9 +81,22 @@ func TestClusterForms(t *testing.T) {
 func TestClusterRolesMatch(t *testing.T) {
 	harness.Require(t, sc, "UC-04")
 	c := client(t)
-	members := getMembers(t, c)
-	if len(members) == 0 {
-		t.Fatal("no members reported")
+	// Retry briefly: the members fetch can hit a transient ingress TLS blip.
+	var members []clusterMember
+	deadline := time.Now().Add(1 * time.Minute)
+	for {
+		m, err := getMembers(t, c)
+		if err == nil && len(m) > 0 {
+			members = m
+			break
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				t.Fatalf("get cluster members: %v", err)
+			}
+			t.Fatal("no members reported")
+		}
+		time.Sleep(5 * time.Second)
 	}
 	for _, m := range members {
 		if m.NodeID == "" {
@@ -113,7 +136,12 @@ func TestMemberCountExpected(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Minute)
 	var n int
 	for time.Now().Before(deadline) {
-		n = len(getMembers(t, c))
+		m, err := getMembers(t, c)
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		n = len(m)
 		if n == want {
 			return
 		}
@@ -201,7 +229,10 @@ func TestDrainAndUncordon(t *testing.T) {
 	// not missing, when the subtest never runs.
 	harness.Require(t, sc, "UC-56", "UC-57")
 	c := client(t)
-	members := getMembers(t, c)
+	members, err := getMembers(t, c)
+	if err != nil {
+		t.Fatalf("get cluster members: %v", err)
+	}
 	var target string
 	for _, m := range members {
 		if m.Role == "worker" && !m.Drained {
