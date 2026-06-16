@@ -182,6 +182,25 @@ func TestNormalizeCreateImageDistributionAOCRFallback(t *testing.T) {
 			wantMode:  models.ImageDistributionExternalRegistry,
 		},
 		{
+			// Regression: a tagged base image (no registry host) must NOT be
+			// mistaken for a cross-node snapshot. snapshotAOCRRef appends
+			// `:latest`, which would yield the double-tagged, Docker-rejected
+			// ref `snapshots/alpine:3.20:latest`. It must fall through to the
+			// classifier as a normal external-registry pull.
+			name:      "tagged base image is not treated as a snapshot",
+			image:     "alpine:3.20",
+			pusher:    pusher,
+			wantImage: "alpine:3.20",
+			wantMode:  models.ImageDistributionExternalRegistry,
+		},
+		{
+			name:      "digest-pinned base image is not treated as a snapshot",
+			image:     "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			pusher:    pusher,
+			wantImage: "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			wantMode:  models.ImageDistributionExternalRegistry,
+		},
+		{
 			name:      "registry ref is left alone",
 			image:     "ghcr.io/org/img:latest",
 			pusher:    pusher,

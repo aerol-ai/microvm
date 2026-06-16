@@ -82,7 +82,14 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			// check. Only applies to bare identifiers — anything that
 			// looks like a registry ref or a local-only build tag goes
 			// through the normal classifier below.
-			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) {
+			// snapshotAOCRRef always appends `:latest`, so a cross-node
+			// snapshot name must be a bare identifier with no tag/digest of
+			// its own — otherwise we'd build a double-tagged ref like
+			// `snapshots/alpine:3.20:latest` that Docker rejects as
+			// "invalid reference format". A tagged ref (e.g. `alpine:3.20`)
+			// is a plain base image, not a snapshot, so fall through to the
+			// classifier below.
+			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) && !imageRefHasTagOrDigest(req.Image) {
 				if dest := s.snapshotPusher.DestRefFor(req.Image); dest != "" {
 					req.Image = dest
 					if req.ImageDistribution().IsZero() {
@@ -163,6 +170,24 @@ func normalizeImageDistributionMetadata(image string, meta models.ImageDistribut
 
 func ImageRequiresLocalPlacement(req models.CreateSandboxRequest) bool {
 	return req.ImageDistributionMode == models.ImageDistributionLocalOnly || docker.IsLocalOnlyImageRef(req.Image)
+}
+
+// imageRefHasTagOrDigest reports whether image carries an explicit `:tag` or
+// `@digest`. It inspects only the final path component so a registry host port
+// (e.g. `host:5000/repo`) is not mistaken for a tag.
+func imageRefHasTagOrDigest(image string) bool {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return false
+	}
+	if strings.Contains(image, "@") {
+		return true
+	}
+	last := image
+	if idx := strings.LastIndex(image, "/"); idx >= 0 {
+		last = image[idx+1:]
+	}
+	return strings.Contains(last, ":")
 }
 
 func imageRegistryHost(image string) string {
