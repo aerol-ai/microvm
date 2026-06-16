@@ -53,6 +53,30 @@ these axes):
    regression). Cluster-mode code must remain a no-op when `cfg.EnableCluster`
    is false — `Noop` exists for that.
 
+### Testing & coverage
+
+The Go tree (`./cmd/... ./internal/... ./pkg/...`) sits at **~85% line
+coverage** and CI uploads the profile to Codecov on every push
+(`.github/workflows/test.yml`). There is no hard CI gate, so the bar is a
+team convention you must uphold — **new code ships with tests that keep its
+package at or above 85%.** Don't let a feature land with a bare handful of
+tests.
+
+1. **Every new package / file gets a `_test.go` next to it.** A new driver,
+   pool, resolver, or handler is not done until its package is back at ~85%.
+   Run `/maintain-coverage` (or the recipe in that skill) to find the gap
+   before opening the PR.
+2. **The fragile areas above already mandate regression tests** (host-port
+   pool, L4 latch, cluster FSM, `network/tap` allocator). Those are the
+   floor, not the ceiling.
+3. **`make test` is offline and never touches AWS.** Live behavior that mocks
+   can't prove goes in `integration-tests/` behind the `integration` build
+   tag, or in a tag-gated test like `test-acme-e2e` / the `wasm-integration`
+   CI job. Never put network/AWS calls in a plain `_test.go`.
+4. **Match the existing table-driven style** of the package you're testing;
+   don't invent a new harness when `store_test.go` / `layer4_bootstrap_test.go`
+   already show the pattern.
+
 ## Repository map
 
 ```
@@ -69,8 +93,27 @@ internal/
                  the cross-node HTTP reverse proxy. High-risk area — touching
                  anything in here needs the same care as the TCP pool.
   config/        Env-driven config loader.
+  network/       Host networking primitives for VM runtimes. network/tap/ is
+                 the TAP+IPv4 slot allocator (pool.go = allocation bookkeeping,
+                 host.go = realization via `ip`). Idempotent Ensure/Remove.
+                 FRAGILE like the TCP host-port pool — changes need a
+                 regression test next to the file.
   observability/ OTEL traces + expvar metrics exporter for sandboxd.
-  runtime/       Runtime.Runtime interface (Docker today, gVisor/Kata later).
+  pool/          Warm pools for fast boot. pool/vmm/ holds pre-booted
+                 Firecracker snapshots (snapshot-load fast-boot); pool/wasm/
+                 holds pre-spawned WASM workers. Both publish expvar
+                 hit/miss/orphan metrics and refill on a ticker.
+  runtime/       Runtime.Runtime interface + drivers. runtime.go defines
+                 Runtime (Create/Start/Stop/Destroy/Snapshot/Inspect/…) and
+                 ContainerRuntime (adds the network-rule methods); use
+                 AsContainerRuntime to test for the latter. Drivers:
+                 docker (pkg/docker/client.go, both interfaces),
+                 firecracker/ (both interfaces, Jailer + TAP + vsock),
+                 wasm/ (Runtime only — host-mediated networking, no per-IP
+                 iptables; wasm/toolhost/ is the host-side file/exec/sessions
+                 HTTP handler, wasm/statekv/ is the durable per-sandbox KV
+                 store backed by the wasm_state_kv table). See "Runtime
+                 drivers" below.
   scaleobs/      Scale-out observability metrics (admission / placement).
   service/       Business logic. Version-agnostic. Owns Service struct,
                  CreateSandbox / CreateSandboxWithID / RecreateSandbox entry
@@ -92,6 +135,18 @@ pkg/
     daytona/     Daytona-SDK compatibility facade (/daytona/...).
   caddy/         Caddy admin API client (L7 routes + L4 routes for TCP).
   capacity/      Host capacity detection + admission control (Admitter).
+  clonegen/      Clone-generation token (detects a sandbox resumed from a
+                 snapshot); shared by in-guest toolboxd + WASM checkpoint
+                 fencing.
+  controlplane/  Neutral seam for a managed control plane (token validation,
+                 usage reporting, fleet enforcement). Open-source build wires
+                 a no-op Provider — keep it a no-op by default.
+  daemon/        Boot sequence (Run). Wires config → store → docker → caddy →
+                 runtimes → pools → service → api server. Shared between the
+                 open-source and managed builds; cmd/sandboxd is a thin shim
+                 over this.
+  firecracker/   Thin HTTP-over-Unix-socket REST client for the Firecracker
+                 VMM API (mirrors pkg/caddy/client.go). client.go.
   docker/        Docker client, /events stream, image GC, netrules (egress fw).
   models/        Wire types + validation (CreateSandboxRequest, Sandbox,
                  ExposedPort, Lifecycle, Mount, Runtime constants, E2B/Daytona
@@ -99,8 +154,18 @@ pkg/
                  facades depend on it.
   mounts/        External-storage mount manager (S3, NFS, SSHFS, rclone).
                  Mount inputs run on the host — see pr-review.md §5.
+  oci/           OCI image → ext4 rootfs builder (skopeo + umoci +
+                 mkfs.ext4 pipeline). Used by the Firecracker cold-boot path
+                 when a prebuilt template isn't available.
   secrets/       Credential AEAD cipher (env_json + sealed mount blobs).
   sshgateway/    SSH gateway for per-sandbox Ed25519 keys.
+  wasm/          WASM engine abstraction. wazero is the default backend;
+                 wasmtime is optional behind `//go:build wasmtime`. Owns the
+                 network hook, snapshot codec, and fuel metering.
+                 NewEngineFor(ctx, name) selects the backend.
+  wasmmod/       WASM module resolver + OCI registry (ORAS push/pull/delete).
+                 Resolves a ref (path, file://, bare name) → local .wasm and
+                 validates the artifact.
 sdk/
   typescript/    @aerol-ai/aerolvm-sdk. src/MicroVM.ts + Sandbox.ts; transport
                  in src/internal/api/v1/.
@@ -112,6 +177,12 @@ sdk/
 docs/
   src/content/docs/   Astro/Starlight .md / .mdx pages.
   src/content.config.ts   Sidebar nav config (register new pages here).
+integration-tests/   Live AWS integration suite (provisions REAL AWS via the
+  suite/             prod TF module against isolated state — costs money).
+  suite/harness/     Behind the `integration` build tag, so `make test` never
+  reports/           touches it. harness/ holds the scenario loader + use-case
+                     registry; reports/ gets per-scenario .md/.json matrices.
+                     Run with the `make integration-*` targets. See its README.
 plans/
   sdk-compatibility/  Daytona + E2B compat planning & support matrices.
   *.md                Active design docs.
@@ -140,12 +211,22 @@ Makefile         fmt, test, build, build-sandboxd, build-toolboxd, docs-*.
 
 ```
 make fmt                          # go fmt ./...
-make test                         # go test ./...   (server + SDK Go)
+make test                         # go test ./...   (server + SDK Go; offline)
 go test ./internal/service/...    # narrow run
 go test -run TestEnsureLayer4 ./internal/service/...
 make build                        # sandboxd + toolboxd into bin/
 make docs-dev                     # local Astro dev server
 make docs-build                   # static docs build
+
+# Coverage (mirrors the CI step in .github/workflows/test.yml) — keep ~85%:
+go test -count=1 -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
+go tool cover -func=coverage.out | tail -n 1          # total %
+go tool cover -func=coverage.out | grep <pkg>         # per-function gaps
+go tool cover -html=coverage.out                      # visual gaps
+
+# Tag-gated tests (not run by `make test`):
+make test-acme-e2e                # ACME end-to-end, needs local Docker
+go test -tags=integration ./...   # wasm-integration etc., needs creds
 ```
 
 Per-SDK tests:
@@ -161,6 +242,11 @@ Per-SDK tests:
 CI is path-filtered (`.github/workflows/test.yml`): touching `docs/**`
 short-circuits the Go and SDK jobs, and each SDK only runs when its own folder
 changes.
+
+Live integration runs (`make integration-single`, `integration-cluster-*`,
+`integration-all`) provision **real AWS** via the prod Terraform module and
+cost money — they are operator-run, not part of `make test`. `make
+integration-reap` terminates leaked instances. See `integration-tests/README.md`.
 
 ## Project skills
 
@@ -179,12 +265,19 @@ exact files to touch. Prefer invoking the skill over working from memory.
 | `/add-daytona-route` | Adding to the Daytona compatibility facade |
 | `/add-e2b-route` | Adding to the (planned) E2B compatibility facade |
 | `/add-mount-adapter` | Adding an external-storage mount adapter |
+| `/maintain-coverage` | Before opening any PR — find under-tested new/changed Go code and bring its package back to the ~85% bar |
 
 For changes that don't match a skill, the file-level "where to look" map is:
 
 | Task | Start here |
 |---|---|
 | Add server business logic | `internal/service/service.go` (or new file in same package) |
+| Firecracker VM runtime / Jailer / snapshots | `internal/runtime/firecracker/driver.go`, REST client `pkg/firecracker/client.go`, warm pool `internal/pool/vmm/`, rootfs `pkg/oci/`, TAP `internal/network/tap/` |
+| WASM runtime / engine / modules | `internal/runtime/wasm/driver.go`, host handler `internal/runtime/wasm/toolhost/`, KV `internal/runtime/wasm/statekv/`, engine `pkg/wasm/`, modules `pkg/wasmmod/`, warm pool `internal/pool/wasm/` |
+| Add/run a runtime driver (the interface itself) | `internal/runtime/runtime.go` (Runtime + ContainerRuntime) |
+| Daemon boot wiring (new subsystem into Run) | `pkg/daemon/` |
+| Managed control-plane seam | `pkg/controlplane/` (keep open-source build a no-op) |
+| Live AWS integration scenarios | `integration-tests/suite/` + `harness/`; run via `make integration-*` |
 | Cluster placement / Raft FSM / gossip / failover | `internal/cluster/` — see `cluster.go` for the package overview, `fsm.go` + `placement.go` for owner assignment, `recovery_*.go` for failover replicas |
 | OTEL traces / expvar metrics exporter | `internal/observability/` |
 | Caddy route / TLS / L4 wiring | `pkg/caddy/client.go` |
