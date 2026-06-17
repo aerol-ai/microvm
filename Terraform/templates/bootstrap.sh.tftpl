@@ -523,9 +523,20 @@ SB_FLEET_ENABLED=${fleet_enabled}
 SB_FLEET_ENDPOINT=${fleet_endpoint}
 SB_FLEET_TOKEN=${fleet_token}
 SB_FLEET_CONTRACT_REFRESH=${fleet_contract_refresh}
-# WASM runtime + module distribution. SB_WASM_STANDARD_MODULES is the
-# reserved-keyword contract (alias=alias.wasm,...); stage the .wasm files with
-# Ansible playbooks/stage-wasm-modules.yml so every node has identical bytes.
+EOF
+%{ endif ~}
+
+# WASM runtime + module distribution. Written UNCONDITIONALLY: wasm enablement
+# is independent of the fleet control plane, so it must not be nested in the
+# fleet_enabled block above. (It once was, which silently left SB_ENABLE_WASM
+# unset on every fleet-disabled deploy — e.g. the integration harness, which
+# always disables fleet — so the daemon booted with EnableWasm=false and every
+# wasm create failed placement with ErrNoPlacementTarget.) SB_WASM_STANDARD_MODULES
+# is the reserved-keyword contract (alias=alias.wasm,...); stage the .wasm files
+# with Ansible playbooks/stage-wasm-modules.yml so every node has identical bytes.
+cat >> /tmp/aerolvm-ops.env <<'EOF'
+
+# Managed by Terraform bootstrap: WASM runtime + module distribution.
 SB_ENABLE_WASM=${wasm_cfg.enabled}
 SB_WASM_MODULES_DIR=${wasm_cfg.modules_dir}
 SB_WASM_CACHE_DIR=${wasm_cfg.cache_dir}
@@ -536,7 +547,6 @@ SB_WASM_REGISTRY_USERNAME=${wasm_cfg.registry_username}
 SB_WASM_REGISTRY_PAT_PATH=${wasm_cfg.registry_pat_path}
 SB_WASM_STANDARD_MODULES=${wasm_cfg.standard_modules}
 EOF
-%{ endif ~}
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
 sudo systemctl restart sandboxd
