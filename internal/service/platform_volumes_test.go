@@ -3,13 +3,26 @@ package service
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/volumes"
 )
+
+func volumesTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
 
 func enabledS3Cfg() config.Config {
 	return config.Config{
@@ -130,12 +143,12 @@ func TestResolvePlatformVolumes_OperatorScope(t *testing.T) {
 	}
 }
 
-// UC-13b: within-request quota is enforced even before the store-backed count
-// exists — a single create cannot exceed the per-tenant cap.
+// UC-13b: within-request quota — two volumes in one create against a cap of 1
+// is rejected even with no pre-existing rows.
 func TestResolvePlatformVolumes_QuotaWithinRequest(t *testing.T) {
 	cfg := enabledS3Cfg()
 	cfg.PlatformVolumes.MaxPerTenant = 1
-	s := &Service{cfg: cfg}
+	s := &Service{cfg: cfg, store: volumesTestStore(t)}
 	req := models.CreateSandboxRequest{
 		PlatformVolumes: []models.PlatformVolumeMount{
 			{Name: "a", Path: "/a"},
@@ -146,6 +159,40 @@ func TestResolvePlatformVolumes_QuotaWithinRequest(t *testing.T) {
 	if !errors.Is(err, models.ErrPlatformVolumeQuota) {
 		t.Fatalf("err = %v, want ErrPlatformVolumeQuota", err)
 	}
+}
+
+// UC-13b: cross-request quota — a tenant already at the cap (rows in the store)
+// is rejected on the next single-volume create.
+func TestResolvePlatformVolumes_QuotaAcrossRequests(t *testing.T) {
+	cfg := enabledS3Cfg()
+	cfg.PlatformVolumes.MaxPerTenant = 2
+	st := volumesTestStore(t)
+	s := &Service{cfg: cfg, store: st}
+	ctx := context.Background()
+
+	tenant, err := tenantScopeForTest(s, ctx)
+	if err != nil {
+		t.Fatalf("tenant scope: %v", err)
+	}
+	// Pre-seed the tenant at the cap.
+	for _, id := range []string{"v1", "v2"} {
+		if err := st.CreateVolume(ctx, &models.Volume{ID: id, Tenant: tenant, Name: id, Backend: "s3"}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	req := models.CreateSandboxRequest{
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "c", Path: "/c"}},
+	}
+	if err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker); !errors.Is(err, models.ErrPlatformVolumeQuota) {
+		t.Fatalf("err = %v, want ErrPlatformVolumeQuota (tenant already at cap)", err)
+	}
+}
+
+// tenantScopeForTest resolves the scope the service would compute for the
+// background (operator) context, so a test can seed store rows under the same
+// tenant key resolvePlatformVolumes will count.
+func tenantScopeForTest(s *Service, ctx context.Context) (string, error) {
+	return volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
 }
 
 // An invalid volume name surfaces as an error (not a silent skip).

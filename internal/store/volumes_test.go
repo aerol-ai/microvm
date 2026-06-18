@@ -1,0 +1,146 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
+)
+
+func TestVolumeCRUD(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	v := &models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3"}
+	if err := st.CreateVolume(ctx, v); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if v.CreatedAt.IsZero() {
+		t.Fatal("CreatedAt not stamped")
+	}
+
+	got, err := st.GetVolume(ctx, "t-a", "data")
+	if err != nil {
+		t.Fatalf("GetVolume: %v", err)
+	}
+	if got.ID != "vol-1" || got.Backend != "s3" {
+		t.Fatalf("GetVolume = %+v", got)
+	}
+
+	byID, err := st.GetVolumeByID(ctx, "t-a", "vol-1")
+	if err != nil {
+		t.Fatalf("GetVolumeByID: %v", err)
+	}
+	if byID.Name != "data" {
+		t.Fatalf("GetVolumeByID = %+v", byID)
+	}
+}
+
+// REGRESSION: the unique(tenant,name) index is the idempotency + isolation
+// boundary. A duplicate within a tenant must fail loudly; the same name under a
+// different tenant must succeed (cross-tenant isolation).
+func TestVolumeUniqueTenantName(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3"}); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	// Duplicate (tenant, name) → ErrVolumeExists, no second row.
+	err := st.CreateVolume(ctx, &models.Volume{ID: "v2", Tenant: "t-a", Name: "data", Backend: "s3"})
+	if !errors.Is(err, ErrVolumeExists) {
+		t.Fatalf("dup create err = %v, want ErrVolumeExists", err)
+	}
+	// Same name, different tenant → allowed.
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v3", Tenant: "t-b", Name: "data", Backend: "s3"}); err != nil {
+		t.Fatalf("cross-tenant same name should succeed: %v", err)
+	}
+
+	n, err := st.CountVolumes(ctx, "t-a")
+	if err != nil {
+		t.Fatalf("CountVolumes: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("tenant t-a count = %d, want 1 (dup not inserted)", n)
+	}
+}
+
+func TestVolumeNotFoundAndScoping(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := st.GetVolume(ctx, "t-a", "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetVolume missing err = %v, want ErrNotFound", err)
+	}
+	// Tenant b cannot resolve tenant a's volume id.
+	if _, err := st.GetVolumeByID(ctx, "t-b", "v1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant GetVolumeByID err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestVolumeListAndDelete(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	// Empty list is a non-nil zero-length slice.
+	empty, err := st.ListVolumes(ctx, "t-a")
+	if err != nil {
+		t.Fatalf("ListVolumes empty: %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty list = %v, want non-nil len 0", empty)
+	}
+
+	for _, id := range []string{"v1", "v2", "v3"} {
+		if err := st.CreateVolume(ctx, &models.Volume{ID: id, Tenant: "t-a", Name: id, Backend: "s3"}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	// A volume under another tenant must not leak into t-a's list.
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "x", Tenant: "t-b", Name: "x", Backend: "nfs"}); err != nil {
+		t.Fatalf("create other-tenant: %v", err)
+	}
+
+	list, err := st.ListVolumes(ctx, "t-a")
+	if err != nil {
+		t.Fatalf("ListVolumes: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("list len = %d, want 3", len(list))
+	}
+
+	// Delete is tenant-scoped: t-b cannot delete t-a's volume.
+	if err := st.DeleteVolume(ctx, "t-b", "v1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant delete err = %v, want ErrNotFound", err)
+	}
+	if err := st.DeleteVolume(ctx, "t-a", "v1"); err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+	if err := st.DeleteVolume(ctx, "t-a", "v1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("re-delete err = %v, want ErrNotFound", err)
+	}
+	if n, _ := st.CountVolumes(ctx, "t-a"); n != 2 {
+		t.Fatalf("count after delete = %d, want 2", n)
+	}
+}
+
+func TestCreateVolumeValidation(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	bad := []*models.Volume{
+		nil,
+		{ID: "", Tenant: "t", Name: "n", Backend: "s3"},
+		{ID: "i", Tenant: "", Name: "n", Backend: "s3"},
+		{ID: "i", Tenant: "t", Name: "", Backend: "s3"},
+		{ID: "i", Tenant: "t", Name: "n", Backend: ""},
+	}
+	for i, v := range bad {
+		if err := st.CreateVolume(ctx, v); err == nil {
+			t.Fatalf("case %d: expected validation error", i)
+		}
+	}
+}

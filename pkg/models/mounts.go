@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 )
 
 // MountType identifies the storage backend the user wants mounted inside their
@@ -65,6 +66,20 @@ type PlatformVolumeMount struct {
 	Name     string `json:"name"`
 	Path     string `json:"path"`
 	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+// Volume is a first-class, operator-backed persistent volume object. E2B
+// references volumes by name only (no object), but the Daytona facade exposes
+// full CRUD, so a volume needs a durable row: a stable id, the owning tenant,
+// the user-facing name, and which backend it lives on. The backing storage
+// (S3 prefix / NFS dir) is derived deterministically from (tenant, name) — the
+// row is metadata, not the data itself.
+type Volume struct {
+	ID        string    `json:"id"`
+	Tenant    string    `json:"tenant"`
+	Name      string    `json:"name"`
+	Backend   string    `json:"backend"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 var (

@@ -102,11 +102,13 @@ func backendFromConfig(p config.PlatformVolumesConfig) volumes.Backend {
 }
 
 // existingPlatformVolumeCount returns how many distinct volumes the tenant
-// already has, for cross-request quota enforcement.
-//
-// TODO(T4): query the `volumes` store table once it exists. Until then this
-// returns 0, so only within-request quota is enforced (a single create cannot
-// exceed the cap). Cross-request total enforcement lands with the store table.
-func (s *Service) existingPlatformVolumeCount(_ context.Context, _ string) (int, error) {
-	return 0, nil
+// already has, for cross-request quota enforcement. Combined with the
+// within-request index in resolvePlatformVolumes, this enforces the per-tenant
+// cap across the tenant's whole volume set, not just one create.
+func (s *Service) existingPlatformVolumeCount(ctx context.Context, tenant string) (int, error) {
+	// No cap configured means we never need the count; skip the query.
+	if s.cfg.PlatformVolumes.MaxPerTenant <= 0 {
+		return 0, nil
+	}
+	return s.store.CountVolumes(ctx, tenant)
 }

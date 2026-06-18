@@ -455,6 +455,20 @@ func Open(path string) (*Store, error) {
 			first_seen DATETIME NOT NULL,
 			last_seen DATETIME NOT NULL
 		);`,
+		// volumes holds first-class platform-volume objects. The backing
+		// storage (S3 prefix / NFS dir) is derived deterministically from
+		// (tenant, name), so this table is metadata only. The unique index on
+		// (tenant, name) is the isolation + idempotency boundary: two tenants
+		// may share a name, one tenant may not duplicate it.
+		`CREATE TABLE IF NOT EXISTS volumes (
+			id TEXT PRIMARY KEY,
+			tenant TEXT NOT NULL,
+			name TEXT NOT NULL,
+			backend TEXT NOT NULL,
+			created_at DATETIME NOT NULL
+		);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_volumes_tenant_name ON volumes(tenant, name);`,
+		`CREATE INDEX IF NOT EXISTS idx_volumes_tenant ON volumes(tenant);`,
 	}
 
 	for _, stmt := range stmts {

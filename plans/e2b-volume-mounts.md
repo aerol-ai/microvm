@@ -461,10 +461,9 @@ AI-compression scale (human / CC).
   - Surfaced by: §3.5, §3.6, §5.3 — reject firecracker/wasm; operator creds through `sealMounts`
   - Landed: neutral `models.PlatformVolumeMount` + `CreateSandboxRequest.PlatformVolumes` field (`types.go`); sentinels `ErrPlatformVolumesDisabled` / `ErrPlatformVolumesUnsupportedRuntime` / `ErrPlatformVolumeQuota` (`mounts.go`); `internal/service/platform_volumes.go` (`resolvePlatformVolumes` translation, runtime gate rejecting **firecracker + wasm** while allowing docker/gvisor, tenant scope from `controlplane.AccessFromContext`, within-request quota) wired into `createSandbox` before the runtime dispatch; `platform_volumes_test.go` (UC-15, UC-16, UC-13b + docker/gvisor/operator paths). Synthesized specs flow through the existing `sealMounts` → `MountAll` path unchanged. **TODO(T4):** `existingPlatformVolumeCount` returns 0 until the `volumes` table backs cross-request quota.
   - **PR call-out (`/touch-create-sandbox`):** first-attach adds S3/NFS FUSE mount latency on the `MountAll` boot step; idempotent (deterministic prefix); failure rolls back via existing `MountAll` rollback. UC-21 (cred sealing) is inherited — operator creds ride `sealMounts` like any mount.
-- [ ] **T4 (P1, human: ~1d / CC: ~30min)** — store — `volumes` table + CRUD + unique(tenant,name)
+- [x] **T4 (P1)** — store — `volumes` table + CRUD + unique(tenant,name) ✅ DONE
   - Surfaced by: §3.8, §5.5, §8 — Daytona objects + reference-aware delete need persistence
-  - Files: `internal/store/store.go` (`/add-store-column`)
-  - Verify: `go test ./internal/store/...`; UC-28, UC-31; mandatory regression test
+  - Landed: `volumes` table + `idx_volumes_tenant_name` (unique) + `idx_volumes_tenant` in the schema slice (`store.go`); `models.Volume` (`mounts.go`); `internal/store/volumes.go` (`CreateVolume`→`ErrVolumeExists` on dup, `GetVolume`, `GetVolumeByID` tenant-scoped, `ListVolumes`, `CountVolumes`, `DeleteVolume`→`ErrNotFound`); `internal/store/volumes_test.go` (**regression test** on unique(tenant,name) + cross-tenant isolation + tenant-scoped get/delete; UC-28, UC-31). Wired `existingPlatformVolumeCount` → `store.CountVolumes`, so **cross-request quota is now live** (T3's stub is resolved); added `TestResolvePlatformVolumes_QuotaAcrossRequests`.
 - [ ] **T5 (P1, human: ~4h / CC: ~25min)** — e2b — un-reject + translate + 412 gate + wasm reject + echo + sealed meta
   - Surfaced by: §1, §5.4 — remove `handlers.go:546`; carry name+path (no creds) in meta blob
   - Files: `pkg/api/e2b/handlers.go`, `pkg/api/e2b/meta.go`
