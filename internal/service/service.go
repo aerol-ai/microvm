@@ -988,6 +988,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := validateMaskRequestHost(req.MaskRequestHost); err != nil {
 		return nil, err
 	}
+	// Translate named platform volumes into synthesized, tenant-scoped mounts
+	// appended to req.Mounts. Runs before the firecracker/wasm dispatch so the
+	// runtime gate applies uniformly, and before mount validation/seal/MountAll
+	// so the synthesized specs ride the existing mount pipeline.
+	if err := s.resolvePlatformVolumes(ctx, &req, chosenRuntime); err != nil {
+		return nil, err
+	}
 	// "firecracker" is the second runtime, dispatched to the native
 	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
 	//

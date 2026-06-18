@@ -53,8 +53,34 @@ type MountSpecFile struct {
 }
 
 // MaxMountsPerSandbox caps fan-out so a malicious request can't make sandboxd
-// build an arbitrarily large container spec.
+// build an arbitrarily large container spec. Platform volumes count against the
+// same cap as external mounts (a single shared budget).
 const MaxMountsPerSandbox = 8
+
+// PlatformVolumeMount is a request to attach a named, operator-backed
+// persistent volume at Path inside the sandbox. Name is sanitized and scoped to
+// the caller's tenant by the service; the user supplies nothing else (no
+// bucket, no credentials). See plans/e2b-volume-mounts.md.
+type PlatformVolumeMount struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+var (
+	// ErrPlatformVolumesDisabled is returned when a request references platform
+	// volumes but the operator has not enabled them. Facades map this to 412
+	// Precondition Failed.
+	ErrPlatformVolumesDisabled = errors.New("platform volumes are not enabled on this deployment")
+	// ErrPlatformVolumesUnsupportedRuntime is returned when platform volumes are
+	// requested on a runtime that cannot bind-mount host paths. Firecracker
+	// (ext4 block-device rootfs) and wasm (host-mediated, no container FS) both
+	// silently drop binds, so they are rejected up front.
+	ErrPlatformVolumesUnsupportedRuntime = errors.New("platform volumes are not supported on the firecracker or wasm runtime")
+	// ErrPlatformVolumeQuota is returned when a tenant would exceed its
+	// configured volume-count cap.
+	ErrPlatformVolumeQuota = errors.New("tenant platform-volume quota reached")
+)
 
 // MaxCredentialKeys / MaxCredentialBytes bound credential payload size so a
 // malicious request can't blow up daemon memory.

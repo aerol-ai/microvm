@@ -453,14 +453,14 @@ AI-compression scale (human / CC).
 
 - [x] **T1 (P1)** — config — platform-volume config block + fail-fast validation ✅ DONE
   - Surfaced by: §3.3, §5.1 — gating matrix + `BACKEND=s3|nfs`
-  - Landed: `internal/config/config.go` (`PlatformVolumesConfig` + `Validate()` + loader + boot check), `internal/config/platform_volumes_test.go` (UC-17). **Still TODO:** `pkg/daemon/` wiring into the service (part of T3).
+  - Landed: `internal/config/config.go` (`PlatformVolumesConfig` + `Validate()` + loader + boot check), `internal/config/platform_volumes_test.go` (UC-17). Daemon wiring is automatic — `Service` already takes the whole `config.Config`, so no `pkg/daemon` change was needed.
 - [x] **T2 (P1)** — volumes — translation layer (sanitize, tenant-scope, backend mapping, quota) ✅ DONE
   - Surfaced by: §3.1, §3.2, §3.9, §7 Q1 — name→source mapping + tenant isolation + per-tenant cap
   - Landed: new `pkg/volumes/volumes.go` (`SanitizeVolumeName`, `TenantScope`, `BuildMountSpec` s3+nfs, `CheckQuota`), `pkg/volumes/volumes_test.go` — **98.5% coverage**, UC-07/08/09/13b/18/22/25/26/27. Pure package, no config/auth import. **Quota counting** (currentCount source) wires in at T3/T4.
-- [ ] **T3 (P1, human: ~4h / CC: ~25min)** — service — wire synthesized volume mounts into create + runtime gate
+- [x] **T3 (P1)** — service — wire synthesized volume mounts into create + runtime gate ✅ DONE
   - Surfaced by: §3.5, §3.6, §5.3 — reject firecracker/wasm; operator creds through `sealMounts`
-  - Files: `internal/service/service.go`
-  - Verify: `go test ./internal/service/...`; UC-15, UC-21, boot-latency call-out in PR (`/touch-create-sandbox`)
+  - Landed: neutral `models.PlatformVolumeMount` + `CreateSandboxRequest.PlatformVolumes` field (`types.go`); sentinels `ErrPlatformVolumesDisabled` / `ErrPlatformVolumesUnsupportedRuntime` / `ErrPlatformVolumeQuota` (`mounts.go`); `internal/service/platform_volumes.go` (`resolvePlatformVolumes` translation, runtime gate rejecting **firecracker + wasm** while allowing docker/gvisor, tenant scope from `controlplane.AccessFromContext`, within-request quota) wired into `createSandbox` before the runtime dispatch; `platform_volumes_test.go` (UC-15, UC-16, UC-13b + docker/gvisor/operator paths). Synthesized specs flow through the existing `sealMounts` → `MountAll` path unchanged. **TODO(T4):** `existingPlatformVolumeCount` returns 0 until the `volumes` table backs cross-request quota.
+  - **PR call-out (`/touch-create-sandbox`):** first-attach adds S3/NFS FUSE mount latency on the `MountAll` boot step; idempotent (deterministic prefix); failure rolls back via existing `MountAll` rollback. UC-21 (cred sealing) is inherited — operator creds ride `sealMounts` like any mount.
 - [ ] **T4 (P1, human: ~1d / CC: ~30min)** — store — `volumes` table + CRUD + unique(tenant,name)
   - Surfaced by: §3.8, §5.5, §8 — Daytona objects + reference-aware delete need persistence
   - Files: `internal/store/store.go` (`/add-store-column`)

@@ -518,8 +518,16 @@ type CreateSandboxRequest struct {
 	Registry         *RegistryAuth     `json:"registry,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
 	Mounts           []MountSpec       `json:"mounts,omitempty"`
-	Lifecycle        *Lifecycle        `json:"lifecycle,omitempty"`
-	Failover         *Failover         `json:"failover,omitempty"`
+	// PlatformVolumes references named, operator-backed persistent volumes by
+	// name only — the user never supplies storage coordinates or credentials.
+	// The service translates each entry into a synthesized, tenant-scoped
+	// MountSpec against the operator's shared backend (see
+	// plans/e2b-volume-mounts.md). All facades (E2B volumeMounts, Daytona
+	// volumes) and the native SDKs populate this single neutral field so the
+	// translation lives in one version-agnostic place.
+	PlatformVolumes []PlatformVolumeMount `json:"platform_volumes,omitempty"`
+	Lifecycle       *Lifecycle            `json:"lifecycle,omitempty"`
+	Failover        *Failover             `json:"failover,omitempty"`
 	// Name is an optional human-readable identifier. When set, it must be
 	// unique across all sandboxes — the store enforces this with a partial
 	// unique index. Empty means no name; the sandbox can only be referenced
