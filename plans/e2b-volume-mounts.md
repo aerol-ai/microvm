@@ -451,14 +451,12 @@ Synthesized from this review's findings. Each derives from a specific decision
 above. P1 blocks ship; P2 lands same branch; P3 is a follow-up. Effort uses the
 AI-compression scale (human / CC).
 
-- [ ] **T1 (P1, human: ~3h / CC: ~20min)** — config — platform-volume config block + fail-fast validation
+- [x] **T1 (P1)** — config — platform-volume config block + fail-fast validation ✅ DONE
   - Surfaced by: §3.3, §5.1 — gating matrix + `BACKEND=s3|nfs`
-  - Files: `internal/config/config.go`, `pkg/daemon/`
-  - Verify: `go test ./internal/config/...`; UC-16, UC-17 (disabled → 412 wiring; misconfigured → boot fail)
-- [ ] **T2 (P1, human: ~1d / CC: ~40min)** — volumes — translation layer (sanitize, tenant-scope, backend mapping, quota)
+  - Landed: `internal/config/config.go` (`PlatformVolumesConfig` + `Validate()` + loader + boot check), `internal/config/platform_volumes_test.go` (UC-17). **Still TODO:** `pkg/daemon/` wiring into the service (part of T3).
+- [x] **T2 (P1)** — volumes — translation layer (sanitize, tenant-scope, backend mapping, quota) ✅ DONE
   - Surfaced by: §3.1, §3.2, §3.9, §7 Q1 — name→source mapping + tenant isolation + per-tenant cap
-  - Files: new `pkg/volumes/` (or `internal/service/platform_volumes.go`)
-  - Verify: `go test ./pkg/volumes/...`; UC-07/08/09/13b/18/22/27
+  - Landed: new `pkg/volumes/volumes.go` (`SanitizeVolumeName`, `TenantScope`, `BuildMountSpec` s3+nfs, `CheckQuota`), `pkg/volumes/volumes_test.go` — **98.5% coverage**, UC-07/08/09/13b/18/22/25/26/27. Pure package, no config/auth import. **Quota counting** (currentCount source) wires in at T3/T4.
 - [ ] **T3 (P1, human: ~4h / CC: ~25min)** — service — wire synthesized volume mounts into create + runtime gate
   - Surfaced by: §3.5, §3.6, §5.3 — reject firecracker/wasm; operator creds through `sealMounts`
   - Files: `internal/service/service.go`
