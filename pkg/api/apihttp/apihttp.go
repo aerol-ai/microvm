@@ -128,6 +128,23 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusPreconditionFailed, err.Error())
 		return
 	}
+	// Platform-volume sentinels (plans/e2b-volume-mounts.md). 412 distinguishes
+	// "this deployment hasn't enabled platform volumes" (operator must
+	// configure shared storage) from a malformed request (400). The runtime
+	// gate is a client-input problem (volumes on firecracker/wasm) → 400; the
+	// per-tenant quota is a 409 capacity conflict.
+	if errors.Is(err, models.ErrPlatformVolumesDisabled) {
+		WriteError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrPlatformVolumesUnsupportedRuntime) {
+		WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrPlatformVolumeQuota) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	// Custom-domain sentinels (plans/custom-domains.md). 412 distinguishes
 	// "this deployment can't do custom domains at all" (feature flag off /
 	// IP mode) from "your input is malformed" (400). 409 covers both the

@@ -464,10 +464,9 @@ AI-compression scale (human / CC).
 - [x] **T4 (P1)** — store — `volumes` table + CRUD + unique(tenant,name) ✅ DONE
   - Surfaced by: §3.8, §5.5, §8 — Daytona objects + reference-aware delete need persistence
   - Landed: `volumes` table + `idx_volumes_tenant_name` (unique) + `idx_volumes_tenant` in the schema slice (`store.go`); `models.Volume` (`mounts.go`); `internal/store/volumes.go` (`CreateVolume`→`ErrVolumeExists` on dup, `GetVolume`, `GetVolumeByID` tenant-scoped, `ListVolumes`, `CountVolumes`, `DeleteVolume`→`ErrNotFound`); `internal/store/volumes_test.go` (**regression test** on unique(tenant,name) + cross-tenant isolation + tenant-scoped get/delete; UC-28, UC-31). Wired `existingPlatformVolumeCount` → `store.CountVolumes`, so **cross-request quota is now live** (T3's stub is resolved); added `TestResolvePlatformVolumes_QuotaAcrossRequests`.
-- [ ] **T5 (P1, human: ~4h / CC: ~25min)** — e2b — un-reject + translate + 412 gate + wasm reject + echo + sealed meta
+- [x] **T5 (P1)** — e2b — un-reject + translate + 412 gate + wasm reject + echo + sealed meta ✅ DONE
   - Surfaced by: §1, §5.4 — remove `handlers.go:546`; carry name+path (no creds) in meta blob
-  - Files: `pkg/api/e2b/handlers.go`, `pkg/api/e2b/meta.go`
-  - Verify: `go test ./pkg/api/e2b/...`; UC-01, UC-14, UC-16, UC-19, UC-20
+  - Landed: removed the `notImplemented` reject; `translateCreateSandboxRequest` maps `volumeMounts[{Name,Path}]` → `serviceReq.PlatformVolumes` (read-write; E2B has no RO flag); wasm branch rejects volumes; `VolumeMounts` added to `sandboxMeta` + `compatBlob` (`volume_mounts`, **name+path only, no creds**) with `cloneVolumeMounts` through `sandboxMetaToState`/`sandboxMetaFromNative`; both response builders echo `meta.VolumeMounts`. Sentinel→HTTP mapping (412 disabled / 400 unsupported-runtime / 409 quota) added to **both** `apihttp.WriteStoreAwareError` and the E2B-local `writeStoreAwareError`. Tests: `TestE2BVolumeMountsRejectedWhenDisabled` (UC-16, 412), `TestVolumeMountsRoundTripThroughCompatBlob` (UC-19/20), `cloneVolumeMounts` edge cases; updated the stale 501 not-implemented case. Full happy-path create (live S3 mount) is T10 integration.
 - [ ] **T6 (P1, human: ~6h / CC: ~35min)** — daytona — full /volumes CRUD + reference-aware delete (409 while attached)
   - Surfaced by: §3.8, §3.10, §5.5 — replace `volumesNotSupported`
   - Files: `pkg/api/daytona/handlers.go`, `pkg/api/daytona/routes.go`
