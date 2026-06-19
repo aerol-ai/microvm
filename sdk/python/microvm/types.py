@@ -74,6 +74,14 @@ class MountSpec(TypedDict, total=False):
     readOnly: bool
 
 
+class PlatformVolumeMount(TypedDict, total=False):
+    # Named, operator-backed persistent volume to attach by name. The operator
+    # configures the shared backend (S3/NFS); the caller supplies nothing else.
+    name: str
+    path: str
+    readOnly: bool
+
+
 class MountSpecRedacted(TypedDict, total=False):
     type: MountType
     target: str
@@ -165,6 +173,9 @@ class CreateOptions(TypedDict, total=False):
     registry: RegistryAuth
     containerCommand: List[str]
     mounts: List[MountSpec]
+    # Named, operator-backed persistent volumes to attach by name. Requires the
+    # operator to have enabled platform volumes (else the create returns 412).
+    platformVolumes: List[PlatformVolumeMount]
     lifecycle: Lifecycle
     failover: Failover
     # Container runtime to use for this sandbox. Omit to inherit the host

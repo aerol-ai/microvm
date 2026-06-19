@@ -114,6 +114,17 @@ pub struct MountSpecRedacted {
     pub has_credentials: bool,
 }
 
+/// A named, operator-backed persistent volume to attach by name. The operator
+/// configures the shared backend (S3/NFS); the caller supplies nothing else.
+/// Persists across the sandbox lifecycle and can be re-attached by name.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlatformVolumeMount {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "read_only", skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
 /// GPU hardware vendor for sandbox GPU allocation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -204,6 +215,10 @@ pub struct CreateOptions {
     pub container_command: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mounts: Option<Vec<MountSpec>>,
+    /// Named, operator-backed persistent volumes to attach by name. Requires the
+    /// operator to have enabled platform volumes (else the create returns 412).
+    #[serde(rename = "platform_volumes", skip_serializing_if = "Option::is_none")]
+    pub platform_volumes: Option<Vec<PlatformVolumeMount>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<Lifecycle>,
     /// Owner-node death policy. Omit for non-HA sandboxes; set

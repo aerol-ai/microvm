@@ -95,6 +95,11 @@ var (
 	// ErrPlatformVolumeQuota is returned when a tenant would exceed its
 	// configured volume-count cap.
 	ErrPlatformVolumeQuota = errors.New("tenant platform-volume quota reached")
+
+	// ErrPlatformVolumeInUse is returned when a delete is attempted while one or
+	// more live sandboxes still have the volume attached. Facades map this to
+	// 409 Conflict.
+	ErrPlatformVolumeInUse = errors.New("volume is still attached to one or more sandboxes")
 )
 
 // MaxCredentialKeys / MaxCredentialBytes bound credential payload size so a

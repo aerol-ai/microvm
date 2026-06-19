@@ -62,6 +62,33 @@ test("internal client create serializes selective egress CIDRs", async () => {
   assert.equal(body.network_deny_out, undefined);
 });
 
+test("internal client create serializes platform volumes", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse(apiSandbox("sb-vol"));
+    },
+  });
+  await client.create({
+    image: "ubuntu:22.04",
+    platformVolumes: [
+      { name: "data", path: "/workspace" },
+      { name: "cache", path: "/cache", readOnly: true },
+    ],
+  });
+  assert.ok(seenRequest);
+  const body = (await seenRequest.json()) as Record<string, unknown>;
+  // read_only is omitted (undefined) for the read-write entry after JSON
+  // serialization, and present+true for the read-only one.
+  assert.deepEqual(body.platform_volumes, [
+    { name: "data", path: "/workspace" },
+    { name: "cache", path: "/cache", read_only: true },
+  ]);
+});
+
 test("internal client create serializes allowPublicTraffic=false", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({

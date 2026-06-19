@@ -32,7 +32,8 @@ pub use types::{
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
     ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
-    MountSpec, MountSpecRedacted, MountType, NetworkUsage, RegisterSnapshotOptions, RegistryAuth,
+    MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlatformVolumeMount,
+    RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
     SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
     UpdateLifecycleOptions, WasmModule, WasmModuleStatus, PushWasmModuleOptions,
@@ -1977,6 +1978,7 @@ mod tests {
             registry: None,
             container_command: None,
             mounts: None,
+            platform_volumes: None,
             lifecycle: None,
             failover: None,
             runtime: None,
@@ -2005,6 +2007,38 @@ mod tests {
         assert_eq!(value["allow_public_traffic"], serde_json::json!(false));
         // network_deny_out is None, so skip_serializing_if omits it entirely.
         assert!(value.get("network_deny_out").is_none());
+    }
+
+    #[test]
+    fn create_options_serializes_platform_volumes() {
+        let mut opts = minimal_create_options();
+        opts.platform_volumes = Some(vec![
+            PlatformVolumeMount {
+                name: "data".to_string(),
+                path: "/workspace".to_string(),
+                read_only: None,
+            },
+            PlatformVolumeMount {
+                name: "cache".to_string(),
+                path: "/cache".to_string(),
+                read_only: Some(true),
+            },
+        ]);
+        let value = serde_json::to_value(&opts).expect("serialize create options");
+        assert_eq!(value["platform_volumes"][0]["name"], serde_json::json!("data"));
+        assert_eq!(
+            value["platform_volumes"][0]["path"],
+            serde_json::json!("/workspace")
+        );
+        // read_only is None on the first => omitted; Some(true) on the second.
+        assert!(value["platform_volumes"][0].get("read_only").is_none());
+        assert_eq!(
+            value["platform_volumes"][1]["read_only"],
+            serde_json::json!(true)
+        );
+        // Unset by default => skip_serializing_if omits the field.
+        let plain = serde_json::to_value(minimal_create_options()).expect("serialize");
+        assert!(plain.get("platform_volumes").is_none());
     }
 
     #[test]

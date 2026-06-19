@@ -40,6 +40,7 @@ import type {
   MountSpec,
   MountSpecRedacted,
   NetworkUsage,
+  PlatformVolumeMount,
   RegisterSnapshotOptions,
   SetNetworkLimitsOptions,
   ResizeOptions,
@@ -296,6 +297,12 @@ interface ApiMountSpecRedacted {
 
 interface ApiMountList {
   mounts: ApiMountSpecRedacted[];
+}
+
+interface ApiPlatformVolumeMount {
+  name: string;
+  path: string;
+  read_only?: boolean;
 }
 
 interface ApiNetworkUsage {
@@ -1108,6 +1115,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     registry: options.registry,
     container_command: options.containerCommand,
     mounts: options.mounts?.map(toApiMountSpec),
+    platform_volumes: options.platformVolumes?.map(toApiPlatformVolumeMount),
     lifecycle: options.lifecycle ? toApiLifecycle(options.lifecycle) : undefined,
     failover: options.failover ? toApiFailover(options.failover) : undefined,
     runtime: options.runtime,
@@ -1363,6 +1371,14 @@ function toApiMountSpec(mount: MountSpec): ApiMountSpec {
     options: mount.options,
     credentials: mount.credentials,
     read_only: mount.readOnly,
+  };
+}
+
+function toApiPlatformVolumeMount(volume: PlatformVolumeMount): ApiPlatformVolumeMount {
+  return {
+    name: volume.name,
+    path: volume.path,
+    read_only: volume.readOnly,
   };
 }
 

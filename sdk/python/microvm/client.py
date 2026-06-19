@@ -41,6 +41,7 @@ from .types import (
     MountSpec,
     MountSpecRedacted,
     NetworkUsage,
+    PlatformVolumeMount,
     RegisterSnapshotOptions,
     ResizeOptions,
     RetryConfig,
@@ -1100,6 +1101,10 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "registry": _first_of(options, "registry"),
             "container_command": _first_of(options, "containerCommand", "container_command"),
             "mounts": [_to_api_mount_spec(item) for item in (_first_of(options, "mounts") or [])],
+            "platform_volumes": [
+                _to_api_platform_volume(item)
+                for item in (_first_of(options, "platformVolumes", "platform_volumes") or [])
+            ],
             "lifecycle": _to_api_lifecycle(lifecycle) if isinstance(lifecycle, dict) else None,
             "failover": _to_api_failover(failover) if isinstance(failover, dict) else None,
             "custom_domains": _first_of(options, "customDomains", "custom_domains"),
@@ -1408,6 +1413,16 @@ def _to_api_mount_spec(mount: MountSpec) -> Dict[str, Any]:
             "options": _first_of(mount, "options"),
             "credentials": _first_of(mount, "credentials"),
             "read_only": _first_of(mount, "readOnly", "read_only"),
+        }
+    )
+
+
+def _to_api_platform_volume(volume: "PlatformVolumeMount") -> Dict[str, Any]:
+    return _compact(
+        {
+            "name": _first_of(volume, "name"),
+            "path": _first_of(volume, "path"),
+            "read_only": _first_of(volume, "readOnly", "read_only"),
         }
     )
 

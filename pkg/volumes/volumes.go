@@ -156,14 +156,13 @@ func BuildMountSpec(b Backend, tenant, name, target string, readOnly bool) (mode
 		return models.MountSpec{}, err
 	}
 
+	source, err := MountSource(b, tenant, safeName)
+	if err != nil {
+		return models.MountSpec{}, err
+	}
+
 	switch b.Kind {
 	case BackendS3:
-		if strings.TrimSpace(b.S3Bucket) == "" {
-			return models.MountSpec{}, errors.New("s3 backend is missing a bucket")
-		}
-		// Source is "bucket/prefix/tenant/name" — parseS3Source in the adapter
-		// splits on the first "/" into bucket + key prefix.
-		source := path.Join(b.S3Bucket, strings.Trim(b.S3Prefix, "/"), tenant, safeName)
 		spec := models.MountSpec{
 			Type:     models.MountTypeS3,
 			Source:   source,
@@ -179,15 +178,9 @@ func BuildMountSpec(b Backend, tenant, name, target string, readOnly bool) (mode
 		return spec, nil
 
 	case BackendNFS:
-		if strings.TrimSpace(b.NFSServer) == "" || strings.TrimSpace(b.NFSExport) == "" {
-			return models.MountSpec{}, errors.New("nfs backend is missing server or export")
-		}
-		// Source must look like host:/path (validateSource enforces ":/" and no
-		// leading "/"). The NFS adapter reads mount options from Options["opts"].
-		exportPath := "/" + path.Join(strings.Trim(b.NFSExport, "/"), tenant, safeName)
 		spec := models.MountSpec{
 			Type:     models.MountTypeNFS,
-			Source:   b.NFSServer + ":" + exportPath,
+			Source:   source,
 			Target:   target,
 			ReadOnly: readOnly,
 		}
@@ -198,6 +191,30 @@ func BuildMountSpec(b Backend, tenant, name, target string, readOnly bool) (mode
 
 	default:
 		return models.MountSpec{}, fmt.Errorf("unknown platform-volume backend %q", b.Kind)
+	}
+}
+
+// MountSource computes the deterministic backend coordinate for a volume. name
+// must already be sanitized. It is the single source of truth shared by
+// BuildMountSpec (to mount) and the attacher check (to recognize an existing
+// mount of a given volume), so the two can never drift.
+func MountSource(b Backend, tenant, sanitizedName string) (string, error) {
+	switch b.Kind {
+	case BackendS3:
+		if strings.TrimSpace(b.S3Bucket) == "" {
+			return "", errors.New("s3 backend is missing a bucket")
+		}
+		// "bucket/prefix/tenant/name" — parseS3Source in the adapter splits on
+		// the first "/" into bucket + key prefix.
+		return path.Join(b.S3Bucket, strings.Trim(b.S3Prefix, "/"), tenant, sanitizedName), nil
+	case BackendNFS:
+		if strings.TrimSpace(b.NFSServer) == "" || strings.TrimSpace(b.NFSExport) == "" {
+			return "", errors.New("nfs backend is missing server or export")
+		}
+		// host:/path — validateSource enforces ":/" and no leading "/".
+		return b.NFSServer + ":/" + path.Join(strings.Trim(b.NFSExport, "/"), tenant, sanitizedName), nil
+	default:
+		return "", fmt.Errorf("unknown platform-volume backend %q", b.Kind)
 	}
 }
 

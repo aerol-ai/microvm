@@ -1,12 +1,15 @@
 package daytona_test
 
 import (
-	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 )
 
@@ -32,10 +35,16 @@ func TestRegisterRoutesAllUseDaytonaPrefix(t *testing.T) {
 	}
 }
 
-func TestVolumeRoutesReturn405NotImplemented(t *testing.T) {
+// With platform volumes disabled (the default), every /volumes route returns
+// 412 Precondition Failed — a clear "configure shared storage to enable this"
+// signal, replacing the old blanket 405.
+func TestVolumeRoutesReturn412WhenDisabled(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, nil, nil, nil, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	daytona.RegisterRoutes(mux, daytona.Deps{
-		Auth: func(h http.Handler) http.Handler { return h },
+		Auth:    func(h http.Handler) http.Handler { return h },
+		Service: svc,
 	})
 
 	cases := []struct {
@@ -51,21 +60,16 @@ func TestVolumeRoutesReturn405NotImplemented(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, nil)
+			var body io.Reader
+			if tc.method == http.MethodPost {
+				body = strings.NewReader(`{"name":"data"}`)
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
 
-			if rr.Code != http.StatusMethodNotAllowed {
-				t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusMethodNotAllowed, rr.Body.String())
-			}
-			var body struct {
-				Error string `json:"error"`
-			}
-			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
-				t.Fatalf("decode body: %v", err)
-			}
-			if !strings.Contains(body.Error, "future release") {
-				t.Fatalf("body.Error = %q, want it to mention future release", body.Error)
+			if rr.Code != http.StatusPreconditionFailed {
+				t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusPreconditionFailed, rr.Body.String())
 			}
 		})
 	}
