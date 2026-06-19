@@ -43,7 +43,7 @@ func TestResolvePlatformVolumes_Disabled(t *testing.T) {
 	req := models.CreateSandboxRequest{
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 	}
-	err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker)
+	_, err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker)
 	if !errors.Is(err, models.ErrPlatformVolumesDisabled) {
 		t.Fatalf("err = %v, want ErrPlatformVolumesDisabled", err)
 	}
@@ -53,7 +53,7 @@ func TestResolvePlatformVolumes_Disabled(t *testing.T) {
 func TestResolvePlatformVolumes_NoneIsNoop(t *testing.T) {
 	s := &Service{cfg: config.Config{}}
 	req := models.CreateSandboxRequest{Mounts: []models.MountSpec{{Type: models.MountTypeS3, Source: "b", Target: "/x"}}}
-	if err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker); err != nil {
+	if _, err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(req.Mounts) != 1 {
@@ -70,7 +70,7 @@ func TestResolvePlatformVolumes_RuntimeGate(t *testing.T) {
 			req := models.CreateSandboxRequest{
 				PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 			}
-			err := s.resolvePlatformVolumes(context.Background(), &req, rt)
+			_, err := s.resolvePlatformVolumes(context.Background(), &req, rt)
 			if !errors.Is(err, models.ErrPlatformVolumesUnsupportedRuntime) {
 				t.Fatalf("runtime %q: err = %v, want ErrPlatformVolumesUnsupportedRuntime", rt, err)
 			}
@@ -80,22 +80,26 @@ func TestResolvePlatformVolumes_RuntimeGate(t *testing.T) {
 
 // gvisor binds work just like docker, so platform volumes are allowed there.
 func TestResolvePlatformVolumes_GvisorAllowed(t *testing.T) {
-	s := &Service{cfg: enabledS3Cfg()}
+	s := &Service{cfg: enabledS3Cfg(), store: volumesTestStore(t)}
 	req := models.CreateSandboxRequest{
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 	}
-	if err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeGvisor); err != nil {
+	attachments, err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeGvisor)
+	if err != nil {
 		t.Fatalf("gvisor should allow platform volumes: %v", err)
 	}
 	if len(req.Mounts) != 1 {
 		t.Fatalf("expected 1 synthesized mount, got %d", len(req.Mounts))
+	}
+	if len(attachments) != 1 || attachments[0].VolumeID == "" || attachments[0].Source != req.Mounts[0].Source {
+		t.Fatalf("attachments = %+v, mount = %+v", attachments, req.Mounts[0])
 	}
 }
 
 // Docker happy path: a named volume becomes a tenant-scoped s3 MountSpec
 // appended to req.Mounts, preserving any pre-existing mounts.
 func TestResolvePlatformVolumes_DockerS3(t *testing.T) {
-	s := &Service{cfg: enabledS3Cfg()}
+	s := &Service{cfg: enabledS3Cfg(), store: volumesTestStore(t)}
 	// Authenticated user token → per-tenant scope (t- prefix).
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "tenant-xyz"},
@@ -105,7 +109,8 @@ func TestResolvePlatformVolumes_DockerS3(t *testing.T) {
 		Mounts:          []models.MountSpec{{Type: models.MountTypeS3, Source: "other", Target: "/pre"}},
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "Data", Path: "/workspace", ReadOnly: true}},
 	}
-	if err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker); err != nil {
+	attachments, err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(req.Mounts) != 2 {
@@ -125,17 +130,23 @@ func TestResolvePlatformVolumes_DockerS3(t *testing.T) {
 	if err := vol.Validate(s.cfg.ToolboxMountPath); err != nil {
 		t.Fatalf("synthesized volume fails MountSpec.Validate: %v", err)
 	}
+	if len(attachments) != 1 {
+		t.Fatalf("attachments len = %d, want 1", len(attachments))
+	}
+	if attachments[0].Target != "/workspace" || attachments[0].Source != vol.Source || !strings.HasPrefix(attachments[0].Tenant, "t-") {
+		t.Fatalf("attachment = %+v, mount = %+v", attachments[0], vol)
+	}
 }
 
 // Operator PAT path (no per-tenant identity) falls back to the op- scope and
 // still works for single-tenant self-host.
 func TestResolvePlatformVolumes_OperatorScope(t *testing.T) {
-	s := &Service{cfg: enabledS3Cfg()}
+	s := &Service{cfg: enabledS3Cfg(), store: volumesTestStore(t)}
 	req := models.CreateSandboxRequest{
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 	}
 	// No access in context → operator/internal path.
-	if err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker); err != nil {
+	if _, err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !strings.Contains(req.Mounts[0].Source, "/op-") {
@@ -155,7 +166,7 @@ func TestResolvePlatformVolumes_QuotaWithinRequest(t *testing.T) {
 			{Name: "b", Path: "/b"},
 		},
 	}
-	err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker)
+	_, err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker)
 	if !errors.Is(err, models.ErrPlatformVolumeQuota) {
 		t.Fatalf("err = %v, want ErrPlatformVolumeQuota", err)
 	}
@@ -183,8 +194,74 @@ func TestResolvePlatformVolumes_QuotaAcrossRequests(t *testing.T) {
 	req := models.CreateSandboxRequest{
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "c", Path: "/c"}},
 	}
-	if err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker); !errors.Is(err, models.ErrPlatformVolumeQuota) {
+	if _, err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker); !errors.Is(err, models.ErrPlatformVolumeQuota) {
 		t.Fatalf("err = %v, want ErrPlatformVolumeQuota (tenant already at cap)", err)
+	}
+}
+
+func TestResolvePlatformVolumes_ExistingVolumeDoesNotConsumeQuota(t *testing.T) {
+	cfg := enabledS3Cfg()
+	cfg.PlatformVolumes.MaxPerTenant = 1
+	st := volumesTestStore(t)
+	s := &Service{cfg: cfg, store: st}
+	ctx := context.Background()
+
+	tenant, err := tenantScopeForTest(s, ctx)
+	if err != nil {
+		t.Fatalf("tenant scope: %v", err)
+	}
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v-existing", Tenant: tenant, Name: "data", Backend: "s3"}); err != nil {
+		t.Fatalf("seed volume: %v", err)
+	}
+
+	req := models.CreateSandboxRequest{
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/data"}},
+	}
+	attachments, err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker)
+	if err != nil {
+		t.Fatalf("existing volume should not consume quota: %v", err)
+	}
+	if len(attachments) != 1 || attachments[0].VolumeID != "v-existing" {
+		t.Fatalf("attachments = %+v, want existing id", attachments)
+	}
+}
+
+func TestCreateSandboxPlatformVolumeRollbackOnValidationFailure(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	s, st, _ := newServiceRuntimeHarness(t, rt)
+	s.cfg.PATToken = "operator-pat"
+	s.cfg.PlatformVolumes = config.PlatformVolumesConfig{
+		Enabled:  true,
+		Backend:  config.PlatformVolumesBackendS3,
+		S3Bucket: "aerol-volumes",
+		S3Prefix: "volumes",
+	}
+
+	tenant, err := tenantScopeForTest(s, ctx)
+	if err != nil {
+		t.Fatalf("tenant scope: %v", err)
+	}
+	_, err = s.CreateSandbox(ctx, models.CreateSandboxRequest{
+		Image:  "alpine:3.20",
+		CPU:    1,
+		DiskGB: 1,
+		Mounts: []models.MountSpec{{
+			Type:   models.MountTypeNFS,
+			Source: "nfs.example:/export",
+			Target: "/data",
+		}},
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/data"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate mount target") {
+		t.Fatalf("CreateSandbox err = %v, want duplicate mount target", err)
+	}
+	count, err := st.CountVolumes(ctx, tenant)
+	if err != nil {
+		t.Fatalf("CountVolumes: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("volume count after failed create = %d, want 0", count)
 	}
 }
 
@@ -201,7 +278,7 @@ func TestResolvePlatformVolumes_BadName(t *testing.T) {
 	req := models.CreateSandboxRequest{
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "../escape", Path: "/x"}},
 	}
-	if err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker); err == nil {
+	if _, err := s.resolvePlatformVolumes(context.Background(), &req, models.RuntimeDocker); err == nil {
 		t.Fatal("expected error for traversal name")
 	}
 }

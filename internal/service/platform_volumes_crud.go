@@ -37,33 +37,14 @@ func (s *Service) CreatePlatformVolume(ctx context.Context, name string) (*model
 		return nil, err
 	}
 
-	// Idempotent: if it already exists, return it instead of failing.
-	if existing, err := s.store.GetVolume(ctx, tenant, safeName); err == nil {
-		return existing, nil
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-
-	// Quota is checked only for genuinely new volumes.
-	if cap := s.cfg.PlatformVolumes.MaxPerTenant; cap > 0 {
-		count, err := s.store.CountVolumes(ctx, tenant)
-		if err != nil {
-			return nil, err
-		}
-		if err := volumes.CheckQuota(count, cap); err != nil {
-			return nil, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
-		}
-	}
-
 	id, err := generateVolumeID()
 	if err != nil {
 		return nil, err
 	}
-	v := &models.Volume{ID: id, Tenant: tenant, Name: safeName, Backend: s.cfg.PlatformVolumes.Backend}
-	if err := s.store.CreateVolume(ctx, v); err != nil {
-		// Lost a race with a concurrent create of the same name — return the winner.
-		if errors.Is(err, store.ErrVolumeExists) {
-			return s.store.GetVolume(ctx, tenant, safeName)
+	v, _, err := s.store.GetOrCreateVolume(ctx, &models.Volume{ID: id, Tenant: tenant, Name: safeName, Backend: s.cfg.PlatformVolumes.Backend}, s.cfg.PlatformVolumes.MaxPerTenant)
+	if err != nil {
+		if errors.Is(err, store.ErrVolumeQuotaExceeded) {
+			return nil, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
 		}
 		return nil, err
 	}
@@ -116,9 +97,9 @@ func (s *Service) ListPlatformVolumes(ctx context.Context) ([]models.Volume, err
 // workload. Returns models.ErrPlatformVolumeInUse (→ 409) when attachers remain,
 // models.ErrNotFound when the id is unknown.
 //
-// NOTE: this deletes the metadata row only. Reclaiming the backing storage (the
-// S3 prefix / NFS directory) is an operator/lifecycle concern exercised by the
-// integration suite (UC-30); we never delete remote data from the request path.
+// The store writes a pending cleanup ledger row before removing the metadata
+// row, so backend bytes retain durable reconciliation coordinates even if a
+// request-path cleanup worker or operator lifecycle policy is delayed.
 func (s *Service) DeletePlatformVolume(ctx context.Context, id string) error {
 	if !s.cfg.PlatformVolumes.Enabled {
 		return models.ErrPlatformVolumesDisabled
@@ -131,47 +112,17 @@ func (s *Service) DeletePlatformVolume(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	attachers, err := s.platformVolumeAttacherCount(ctx, tenant, vol.Name, vol.Backend)
+	source, err := volumes.MountSource(volumeBackendFor(s.cfg.PlatformVolumes, vol.Backend), tenant, vol.Name)
 	if err != nil {
 		return err
 	}
-	if attachers > 0 {
-		return fmt.Errorf("%w (%d attached)", models.ErrPlatformVolumeInUse, attachers)
-	}
-	return s.store.DeleteVolume(ctx, tenant, id)
-}
-
-// platformVolumeAttacherCount counts live sandboxes whose mounts include the
-// given volume. It recomputes the volume's deterministic backend source and
-// compares it against each sandbox's unsealed mount sources — the same source
-// string BuildMountSpec produces, so the two can never drift. Destroyed
-// sandboxes are skipped (their mounts are gone).
-func (s *Service) platformVolumeAttacherCount(ctx context.Context, tenant, name, backend string) (int, error) {
-	wantSource, err := volumes.MountSource(volumeBackendFor(s.cfg.PlatformVolumes, backend), tenant, name)
-	if err != nil {
-		return 0, err
-	}
-	sandboxes, err := s.store.List(ctx)
-	if err != nil {
-		return 0, err
-	}
-	count := 0
-	for _, sb := range sandboxes {
-		if sb == nil || sb.Status == models.SandboxStatusDestroyed {
-			continue
+	if err := s.store.DeleteVolumeIfUnattached(ctx, tenant, id, source); err != nil {
+		if errors.Is(err, store.ErrVolumeInUse) {
+			return fmt.Errorf("%w: %v", models.ErrPlatformVolumeInUse, err)
 		}
-		specs, err := s.loadMounts(ctx, sb.ID)
-		if err != nil {
-			return 0, err
-		}
-		for _, spec := range specs {
-			if spec.Source == wantSource {
-				count++
-				break
-			}
-		}
+		return err
 	}
-	return count, nil
+	return nil
 }
 
 // volumeTenant resolves the calling tenant's scope segment from the request

@@ -82,6 +82,32 @@ type Volume struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// VolumeAttachment is the indexed store-side reference from a sandbox to a
+// platform volume. It deliberately duplicates the deterministic source so delete
+// and reconciliation paths never need to decrypt sandbox_mounts or rebuild the
+// source from mutable operator config just to answer "is this attached?".
+type VolumeAttachment struct {
+	Tenant        string    `json:"tenant"`
+	VolumeID      string    `json:"volume_id"`
+	SandboxID     string    `json:"sandbox_id"`
+	Target        string    `json:"target"`
+	Source        string    `json:"source"`
+	CreatedAt     time.Time `json:"created_at"`
+	CreatedVolume bool      `json:"-"`
+}
+
+// PendingVolumeDeletion is a durable cleanup ledger row. Daytona delete removes
+// the user-visible metadata row only after this record exists, so a backend
+// cleanup failure never leaves remote data without coordinates to reconcile.
+type PendingVolumeDeletion struct {
+	VolumeID  string    `json:"volume_id"`
+	Tenant    string    `json:"tenant"`
+	Name      string    `json:"name"`
+	Backend   string    `json:"backend"`
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 var (
 	// ErrPlatformVolumesDisabled is returned when a request references platform
 	// volumes but the operator has not enabled them. Facades map this to 412

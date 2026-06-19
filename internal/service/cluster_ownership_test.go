@@ -128,11 +128,52 @@ func TestClusterOwnershipHelpers(t *testing.T) {
 	svc.cipher = newTestCipher(t)
 	badRegistry := *sandbox
 	badRegistry.RegistryAuthSealed = []byte("bad-seal")
-	if spec := svc.specFromSandbox(&badRegistry); spec == nil || spec.Registry != nil {
+	if spec := svc.specFromSandbox(context.Background(), &badRegistry); spec == nil || spec.Registry != nil {
 		t.Fatalf("specFromSandbox should ignore invalid sealed registry, got %+v", spec)
 	}
-	if spec := svc.specFromSandbox(nil); spec != nil {
+	if spec := svc.specFromSandbox(context.Background(), nil); spec != nil {
 		t.Fatalf("specFromSandbox(nil) = %+v, want nil", spec)
+	}
+}
+
+func TestLocalSandboxStateForClusterIncludesStoredMounts(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableCluster = true
+	svc.cipher = newTestCipher(t)
+
+	now := time.Now().UTC()
+	sb := &models.Sandbox{
+		ID:           "sb-mounted",
+		Runtime:      models.RuntimeDocker,
+		Status:       models.SandboxStatusStarted,
+		Image:        "alpine:3.20",
+		CPU:          1,
+		MemoryMB:     256,
+		DiskGB:       2,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastActiveAt: now,
+	}
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	mountSpec := models.MountSpec{Type: models.MountTypeNFS, Source: "nfs.example:/export", Target: "/data"}
+	sealed, err := svc.sealMounts([]models.MountSpec{mountSpec})
+	if err != nil {
+		t.Fatalf("seal mounts: %v", err)
+	}
+	if err := st.PutMounts(ctx, sb.ID, sealed); err != nil {
+		t.Fatalf("PutMounts: %v", err)
+	}
+
+	c := &fakeOwnershipCluster{
+		Noop:       cluster.NewNoop("self", "http://self", "self.example.com"),
+		placements: map[string]cluster.Placement{},
+	}
+	state := svc.localSandboxStateForCluster(ctx, c, sb)
+	if state.Spec == nil || len(state.Spec.Mounts) != 1 || state.Spec.Mounts[0].Target != "/data" {
+		t.Fatalf("localSandboxStateForCluster mounts = %+v", state.Spec)
 	}
 }
 

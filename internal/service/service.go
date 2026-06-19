@@ -14,6 +14,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -865,6 +866,22 @@ func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
 	return base
 }
 
+func validateUniqueMountTargets(mounts []models.MountSpec) error {
+	seen := make(map[string]int, len(mounts))
+	for i, m := range mounts {
+		target := strings.TrimSpace(m.Target)
+		if target == "" {
+			continue
+		}
+		cleaned := path.Clean(target)
+		if prev, ok := seen[cleaned]; ok {
+			return fmt.Errorf("duplicate mount target %q at mounts %d and %d", cleaned, prev, i)
+		}
+		seen[cleaned] = i
+	}
+	return nil
+}
+
 func gpuCountForCapacity(req *models.GPURequest) int {
 	if req == nil {
 		return 0
@@ -992,9 +1009,16 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// appended to req.Mounts. Runs before the firecracker/wasm dispatch so the
 	// runtime gate applies uniformly, and before mount validation/seal/MountAll
 	// so the synthesized specs ride the existing mount pipeline.
-	if err := s.resolvePlatformVolumes(ctx, &req, chosenRuntime); err != nil {
+	platformAttachments, err := s.resolvePlatformVolumes(ctx, &req, chosenRuntime)
+	if err != nil {
 		return nil, err
 	}
+	platformVolumesCommitted := false
+	defer func() {
+		if !platformVolumesCommitted {
+			s.cleanupCreatedPlatformVolumes(cleanupCtx, platformAttachments)
+		}
+	}()
 	// "firecracker" is the second runtime, dispatched to the native
 	// Firecracker driver per plans/snapshot-clone-fast-boot.md.
 	//
@@ -1042,6 +1066,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := req.Mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
 			return nil, fmt.Errorf("mount %d: %w", i, err)
 		}
+	}
+	if err := validateUniqueMountTargets(req.Mounts); err != nil {
+		return nil, err
 	}
 
 	var lifecycle models.Lifecycle
@@ -1210,6 +1237,20 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 
+	if len(platformAttachments) > 0 {
+		for i := range platformAttachments {
+			platformAttachments[i].SandboxID = sandbox.ID
+		}
+		if err := s.store.PutVolumeAttachments(ctx, platformAttachments); err != nil {
+			_ = s.store.Delete(ctx, sandbox.ID)
+			_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
+			_ = s.docker.Destroy(cleanupCtx, sandbox)
+			cleanupMounts()
+			releaseAdmission()
+			return nil, fmt.Errorf("persist platform volume attachments: %w", err)
+		}
+	}
+
 	// Push any pending GC deadline for this image forward — a fresh
 	// create proves the image is back in active use, so the next
 	// destroy should restart the full TTL clock instead of inheriting
@@ -1249,6 +1290,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		"network_block_all", sandbox.NetworkBlockAll,
 		"mount_count", len(req.Mounts),
 	)
+	platformVolumesCommitted = true
 	stored, err := s.store.Get(ctx, sandbox.ID)
 	if err != nil {
 		return nil, err

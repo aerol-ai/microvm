@@ -66,6 +66,38 @@ func TestVolumeUniqueTenantName(t *testing.T) {
 	}
 }
 
+func TestGetOrCreateVolumeQuotaAndIdempotency(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	created, didCreate, err := st.GetOrCreateVolume(ctx, &models.Volume{
+		ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3",
+	}, 1)
+	if err != nil {
+		t.Fatalf("GetOrCreateVolume create: %v", err)
+	}
+	if !didCreate || created.ID != "v1" {
+		t.Fatalf("create = %+v, created=%v", created, didCreate)
+	}
+
+	existing, didCreate, err := st.GetOrCreateVolume(ctx, &models.Volume{
+		ID: "v2", Tenant: "t-a", Name: "data", Backend: "s3",
+	}, 1)
+	if err != nil {
+		t.Fatalf("GetOrCreateVolume existing: %v", err)
+	}
+	if didCreate || existing.ID != "v1" {
+		t.Fatalf("existing = %+v, created=%v, want original id", existing, didCreate)
+	}
+
+	_, _, err = st.GetOrCreateVolume(ctx, &models.Volume{
+		ID: "v3", Tenant: "t-a", Name: "logs", Backend: "s3",
+	}, 1)
+	if !errors.Is(err, ErrVolumeQuotaExceeded) {
+		t.Fatalf("new volume at cap err = %v, want ErrVolumeQuotaExceeded", err)
+	}
+}
+
 func TestVolumeNotFoundAndScoping(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -125,6 +157,99 @@ func TestVolumeListAndDelete(t *testing.T) {
 	}
 	if n, _ := st.CountVolumes(ctx, "t-a"); n != 2 {
 		t.Fatalf("count after delete = %d, want 2", n)
+	}
+}
+
+func TestVolumeAttachmentsBlockDeleteAndPendingLedger(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	vol := &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3"}
+	if err := st.CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if err := st.Create(ctx, sampleSandbox("sb-attach")); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+	attachment := models.VolumeAttachment{
+		Tenant:    "t-a",
+		VolumeID:  "v1",
+		SandboxID: "sb-attach",
+		Target:    "/data",
+		Source:    "bucket/prefix/t-a/data",
+	}
+	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{attachment}); err != nil {
+		t.Fatalf("PutVolumeAttachments: %v", err)
+	}
+	count, err := st.CountVolumeAttachments(ctx, "t-a", "v1")
+	if err != nil {
+		t.Fatalf("CountVolumeAttachments: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("attachment count = %d, want 1", count)
+	}
+	if err := st.DeleteVolumeIfUnattached(ctx, "t-a", "v1", attachment.Source); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("DeleteVolumeIfUnattached attached err = %v, want ErrVolumeInUse", err)
+	}
+
+	if err := st.Delete(ctx, "sb-attach"); err != nil {
+		t.Fatalf("Delete sandbox: %v", err)
+	}
+	count, err = st.CountVolumeAttachments(ctx, "t-a", "v1")
+	if err != nil {
+		t.Fatalf("CountVolumeAttachments after sandbox delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("attachment count after cascade = %d, want 0", count)
+	}
+	if err := st.DeleteVolumeIfUnattached(ctx, "t-a", "v1", attachment.Source); err != nil {
+		t.Fatalf("DeleteVolumeIfUnattached released: %v", err)
+	}
+	if _, err := st.GetVolumeByID(ctx, "t-a", "v1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetVolumeByID deleted err = %v, want ErrNotFound", err)
+	}
+	pending, err := st.ListPendingVolumeDeletions(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingVolumeDeletions: %v", err)
+	}
+	if len(pending) != 1 || pending[0].VolumeID != "v1" || pending[0].Source != attachment.Source {
+		t.Fatalf("pending deletions = %+v, want v1 coordinates", pending)
+	}
+}
+
+func TestGetOrCreateVolumeClearsPendingDeletionForRecreatedCoordinates(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v-old", Tenant: "t-a", Name: "data", Backend: "s3"}); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if err := st.DeleteVolumeIfUnattached(ctx, "t-a", "v-old", "bucket/prefix/t-a/data"); err != nil {
+		t.Fatalf("DeleteVolumeIfUnattached: %v", err)
+	}
+	pending, err := st.ListPendingVolumeDeletions(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingVolumeDeletions before recreate: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending before recreate = %+v, want one row", pending)
+	}
+
+	recreated, created, err := st.GetOrCreateVolume(ctx, &models.Volume{
+		ID: "v-new", Tenant: "t-a", Name: "data", Backend: "s3",
+	}, 0)
+	if err != nil {
+		t.Fatalf("GetOrCreateVolume recreate: %v", err)
+	}
+	if !created || recreated.ID != "v-new" {
+		t.Fatalf("recreated = %+v, created=%v", recreated, created)
+	}
+	pending, err = st.ListPendingVolumeDeletions(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingVolumeDeletions after recreate: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending after recreate = %+v, want cleared", pending)
 	}
 }
 

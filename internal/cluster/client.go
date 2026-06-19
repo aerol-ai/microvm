@@ -487,6 +487,11 @@ func (c *Cluster) SpecOf(sandboxID string) *models.CreateSandboxRequest {
 		copy(ms, cp.Mounts)
 		cp.Mounts = ms
 	}
+	if cp.PlatformVolumes != nil {
+		pv := make([]models.PlatformVolumeMount, len(cp.PlatformVolumes))
+		copy(pv, cp.PlatformVolumes)
+		cp.PlatformVolumes = pv
+	}
 	if cp.ContainerCommand != nil {
 		cmd := make([]string, len(cp.ContainerCommand))
 		copy(cmd, cp.ContainerCommand)

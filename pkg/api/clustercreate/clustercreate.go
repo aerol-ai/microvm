@@ -196,6 +196,10 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		}
 		return nil, err
 	}
+	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
+		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		return nil, err
+	}
 
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

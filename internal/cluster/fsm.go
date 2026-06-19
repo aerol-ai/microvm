@@ -2131,6 +2131,9 @@ func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSa
 			out.Mounts[i].Credentials = cloneStringMap(in.Mounts[i].Credentials)
 		}
 	}
+	if len(in.PlatformVolumes) > 0 {
+		out.PlatformVolumes = append([]models.PlatformVolumeMount(nil), in.PlatformVolumes...)
+	}
 	if in.Registry != nil {
 		registry := *in.Registry
 		out.Registry = &registry

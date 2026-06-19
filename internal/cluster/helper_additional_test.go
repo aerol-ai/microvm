@@ -47,6 +47,7 @@ func TestAgentSpecOfUsesControlPlaneAndReturnsDeepCopy(t *testing.T) {
 		Image:            "alpine:3.20",
 		Env:              map[string]string{"A": "1"},
 		Mounts:           []models.MountSpec{{Source: "tmpfs", Target: "/workspace"}},
+		PlatformVolumes:  []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 		ContainerCommand: []string{"sh", "-c", "echo hi"},
 	}
 	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,6 +69,7 @@ func TestAgentSpecOfUsesControlPlaneAndReturnsDeepCopy(t *testing.T) {
 	}
 	got.Env["A"] = "mutated"
 	got.Mounts[0].Target = "/mutated"
+	got.PlatformVolumes[0].Path = "/mutated"
 	got.ContainerCommand[0] = "bash"
 
 	again := agent.SpecOf("sb-agent-spec")
@@ -79,6 +81,9 @@ func TestAgentSpecOfUsesControlPlaneAndReturnsDeepCopy(t *testing.T) {
 	}
 	if again.Mounts[0].Target != "/workspace" {
 		t.Fatalf("SpecOf() mount mutation leaked: %q", again.Mounts[0].Target)
+	}
+	if again.PlatformVolumes[0].Path != "/workspace" {
+		t.Fatalf("SpecOf() platform volume mutation leaked: %q", again.PlatformVolumes[0].Path)
 	}
 	if again.ContainerCommand[0] != "sh" {
 		t.Fatalf("SpecOf() command mutation leaked: %q", again.ContainerCommand[0])
@@ -206,6 +211,7 @@ func TestClusterSpecOfReturnsDeepCopy(t *testing.T) {
 			Image:            "alpine:3.20",
 			Env:              map[string]string{"A": "1"},
 			Mounts:           []models.MountSpec{{Source: "tmpfs", Target: "/workspace"}},
+			PlatformVolumes:  []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 			ContainerCommand: []string{"sh", "-c", "echo hi"},
 		},
 	})
@@ -223,6 +229,7 @@ func TestClusterSpecOfReturnsDeepCopy(t *testing.T) {
 	}
 	got.Env["A"] = "mutated"
 	got.Mounts[0].Target = "/mutated"
+	got.PlatformVolumes[0].Path = "/mutated"
 	got.ContainerCommand[0] = "bash"
 
 	again := cluster.SpecOf("sb-cluster-spec")
@@ -234,6 +241,9 @@ func TestClusterSpecOfReturnsDeepCopy(t *testing.T) {
 	}
 	if again.Mounts[0].Target != "/workspace" {
 		t.Fatalf("SpecOf() mount mutation leaked: %q", again.Mounts[0].Target)
+	}
+	if again.PlatformVolumes[0].Path != "/workspace" {
+		t.Fatalf("SpecOf() platform volume mutation leaked: %q", again.PlatformVolumes[0].Path)
 	}
 	if again.ContainerCommand[0] != "sh" {
 		t.Fatalf("SpecOf() command mutation leaked: %q", again.ContainerCommand[0])

@@ -17,6 +17,11 @@ import (
 // get-or-create semantics.
 var ErrVolumeExists = errors.New("volume already exists for this tenant")
 
+// ErrVolumeQuotaExceeded is returned by GetOrCreateVolume when inserting a new
+// row would exceed the tenant's configured volume-count cap. Existing rows are
+// returned idempotently and do not consume quota again.
+var ErrVolumeQuotaExceeded = errors.New("tenant volume quota exceeded")
+
 // CreateVolume inserts a new volume row. The (tenant, name) unique index makes
 // this the idempotency boundary: a duplicate returns ErrVolumeExists rather
 // than a second row. CreatedAt is stamped here when the caller leaves it zero.
@@ -47,6 +52,93 @@ func (s *Store) CreateVolume(ctx context.Context, v *models.Volume) error {
 	}
 	v.ID, v.Tenant, v.Name, v.Backend, v.CreatedAt = id, tenant, name, backend, created.UTC()
 	return nil
+}
+
+// GetOrCreateVolume returns the existing (tenant,name) volume or inserts v as a
+// new row when absent. The existence check, quota check, and insert run in one
+// transaction so concurrent creates for different names cannot both observe the
+// same pre-insert count and overshoot maxPerTenant. created is true only when a
+// row was inserted by this call.
+func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerTenant int) (*models.Volume, bool, error) {
+	if v == nil {
+		return nil, false, fmt.Errorf("get or create volume: nil volume")
+	}
+	id := strings.TrimSpace(v.ID)
+	tenant := strings.TrimSpace(v.Tenant)
+	name := strings.TrimSpace(v.Name)
+	backend := strings.TrimSpace(v.Backend)
+	if id == "" || tenant == "" || name == "" || backend == "" {
+		return nil, false, fmt.Errorf("get or create volume: id, tenant, name, and backend are required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin get or create volume: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	existing, err := scanVolumeRow(tx.QueryRowContext(ctx, `
+		SELECT id, tenant, name, backend, created_at
+		FROM volumes
+		WHERE tenant = ? AND name = ?
+	`, tenant, name), "get existing volume")
+	if err == nil {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("commit existing volume: %w", err)
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
+	}
+
+	if maxPerTenant > 0 {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM volumes WHERE tenant = ?`, tenant).Scan(&count); err != nil {
+			return nil, false, fmt.Errorf("count volumes: %w", err)
+		}
+		if count >= maxPerTenant {
+			return nil, false, ErrVolumeQuotaExceeded
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM pending_volume_deletions
+		WHERE tenant = ? AND name = ? AND backend = ?
+	`, tenant, name, backend); err != nil {
+		return nil, false, fmt.Errorf("clear pending volume deletion: %w", err)
+	}
+
+	created := v.CreatedAt
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO volumes (id, tenant, name, backend, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, id, tenant, name, backend, created.UTC()); err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			// A duplicate can only happen if another process wrote the same DB
+			// concurrently. Return the winner so callers remain idempotent.
+			existing, getErr := scanVolumeRow(tx.QueryRowContext(ctx, `
+				SELECT id, tenant, name, backend, created_at
+				FROM volumes
+				WHERE tenant = ? AND name = ?
+			`, tenant, name), "get raced volume")
+			if getErr != nil {
+				return nil, false, getErr
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, false, fmt.Errorf("commit raced volume: %w", err)
+			}
+			return existing, false, nil
+		}
+		return nil, false, fmt.Errorf("insert volume: %w", err)
+	}
+	out := &models.Volume{ID: id, Tenant: tenant, Name: name, Backend: backend, CreatedAt: created.UTC()}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("commit new volume: %w", err)
+	}
+	return out, true, nil
 }
 
 // GetVolume returns the volume named name owned by tenant, or ErrNotFound.
@@ -130,6 +222,161 @@ func (s *Store) DeleteVolume(ctx context.Context, tenant, id string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// PutVolumeAttachments upserts the platform-volume attachments for a sandbox.
+// The volume_id and sandbox_id foreign keys make create/delete races explicit:
+// if a volume is deleted before the sandbox can persist its attachment, the
+// insert fails and the service rolls the sandbox create back.
+func (s *Store) PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin put volume attachments: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC()
+	for i := range attachments {
+		a := attachments[i]
+		tenant := strings.TrimSpace(a.Tenant)
+		volumeID := strings.TrimSpace(a.VolumeID)
+		sandboxID := strings.TrimSpace(a.SandboxID)
+		target := strings.TrimSpace(a.Target)
+		source := strings.TrimSpace(a.Source)
+		if tenant == "" || volumeID == "" || sandboxID == "" || target == "" || source == "" {
+			return fmt.Errorf("put volume attachment: tenant, volume_id, sandbox_id, target, and source are required")
+		}
+		created := a.CreatedAt
+		if created.IsZero() {
+			created = now
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO volume_attachments (tenant, volume_id, sandbox_id, target, source, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(tenant, volume_id, sandbox_id, target) DO UPDATE SET
+				source = excluded.source,
+				created_at = excluded.created_at
+		`, tenant, volumeID, sandboxID, target, source, created.UTC()); err != nil {
+			return fmt.Errorf("put volume attachment: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit volume attachments: %w", err)
+	}
+	return nil
+}
+
+// CountVolumeAttachments returns how many sandbox references currently point at
+// volumeID for tenant. It is backed by idx_volume_attachments_volume and is used
+// on Daytona delete instead of scanning every sandbox's encrypted mounts.
+func (s *Store) CountVolumeAttachments(ctx context.Context, tenant, volumeID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM volume_attachments
+		WHERE tenant = ? AND volume_id = ?
+	`, strings.TrimSpace(tenant), strings.TrimSpace(volumeID)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count volume attachments: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteVolumeIfUnattached schedules backend cleanup and removes the volume row
+// only when no indexed attachments remain. The pending cleanup row is inserted
+// in the same transaction before the metadata row is removed, so remote data
+// never loses its reconciliation coordinates.
+func (s *Store) DeleteVolumeIfUnattached(ctx context.Context, tenant, id, source string) error {
+	tenant = strings.TrimSpace(tenant)
+	id = strings.TrimSpace(id)
+	source = strings.TrimSpace(source)
+	if tenant == "" || id == "" || source == "" {
+		return fmt.Errorf("delete volume if unattached: tenant, id, and source are required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete volume: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	vol, err := scanVolumeRow(tx.QueryRowContext(ctx, `
+		SELECT id, tenant, name, backend, created_at
+		FROM volumes
+		WHERE tenant = ? AND id = ?
+	`, tenant, id), "get volume for delete")
+	if err != nil {
+		return err
+	}
+
+	var attachers int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM volume_attachments
+		WHERE tenant = ? AND volume_id = ?
+	`, tenant, id).Scan(&attachers); err != nil {
+		return fmt.Errorf("count volume attachments: %w", err)
+	}
+	if attachers > 0 {
+		return fmt.Errorf("%w: %d attachments", ErrVolumeInUse, attachers)
+	}
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pending_volume_deletions (volume_id, tenant, name, backend, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(volume_id) DO UPDATE SET
+			tenant = excluded.tenant,
+			name = excluded.name,
+			backend = excluded.backend,
+			source = excluded.source,
+			created_at = excluded.created_at
+	`, vol.ID, vol.Tenant, vol.Name, vol.Backend, source, now); err != nil {
+		return fmt.Errorf("schedule volume deletion: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM volumes WHERE tenant = ? AND id = ?`, tenant, id)
+	if err != nil {
+		return fmt.Errorf("delete volume: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete volume: %w", err)
+	}
+	return nil
+}
+
+// ErrVolumeInUse is returned by DeleteVolumeIfUnattached when indexed
+// attachments still reference the volume.
+var ErrVolumeInUse = errors.New("volume is still attached")
+
+// ListPendingVolumeDeletions exposes the durable cleanup ledger for tests and
+// future backend-specific reclaim loops.
+func (s *Store) ListPendingVolumeDeletions(ctx context.Context) ([]models.PendingVolumeDeletion, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT volume_id, tenant, name, backend, source, created_at
+		FROM pending_volume_deletions
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending volume deletions: %w", err)
+	}
+	defer rows.Close()
+	out := []models.PendingVolumeDeletion{}
+	for rows.Next() {
+		var p models.PendingVolumeDeletion
+		if err := rows.Scan(&p.VolumeID, &p.Tenant, &p.Name, &p.Backend, &p.Source, &p.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan pending volume deletion: %w", err)
+		}
+		p.CreatedAt = p.CreatedAt.UTC()
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending volume deletions: %w", err)
+	}
+	return out, nil
 }
 
 func scanVolumeRow(row *sql.Row, op string) (*models.Volume, error) {

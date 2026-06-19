@@ -103,6 +103,13 @@ func TestPlatformVolumeDeleteNoAttachers(t *testing.T) {
 	if _, err := s.GetPlatformVolume(ctx, v.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("post-delete get = %v, want ErrNotFound", err)
 	}
+	pending, err := s.store.ListPendingVolumeDeletions(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingVolumeDeletions: %v", err)
+	}
+	if len(pending) != 1 || pending[0].VolumeID != v.ID || pending[0].Source == "" {
+		t.Fatalf("pending deletions = %+v, want deleted volume coordinates", pending)
+	}
 }
 
 // UC-29: a volume still attached to a live sandbox cannot be deleted — 409.
@@ -114,8 +121,8 @@ func TestPlatformVolumeDeleteWhileAttached(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	// Seed a live sandbox whose sealed mounts include the volume's synthesized
-	// source (exactly what resolvePlatformVolumes would have produced).
+	// Seed a live sandbox and the indexed attachment that createSandbox writes
+	// after resolvePlatformVolumes synthesizes the underlying mount.
 	tenant, err := s.volumeTenant(ctx)
 	if err != nil {
 		t.Fatalf("tenant: %v", err)
@@ -131,21 +138,24 @@ func TestPlatformVolumeDeleteWhileAttached(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
-	sealed, err := s.sealMounts([]models.MountSpec{spec})
-	if err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-	if err := s.store.PutMounts(ctx, "sb-attached", sealed); err != nil {
-		t.Fatalf("PutMounts: %v", err)
+	if err := s.store.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
+		Tenant:    tenant,
+		VolumeID:  v.ID,
+		SandboxID: "sb-attached",
+		Target:    spec.Target,
+		Source:    spec.Source,
+	}}); err != nil {
+		t.Fatalf("PutVolumeAttachments: %v", err)
 	}
 
 	if err := s.DeletePlatformVolume(ctx, v.ID); !errors.Is(err, models.ErrPlatformVolumeInUse) {
 		t.Fatalf("delete while attached = %v, want ErrPlatformVolumeInUse", err)
 	}
 
-	// Destroying the sandbox releases the attachment; delete then succeeds.
-	if err := s.store.UpdateStatus(ctx, "sb-attached", models.SandboxStatusDestroyed, ""); err != nil {
-		t.Fatalf("destroy status: %v", err)
+	// Deleting the sandbox row releases the attachment through FK cascade;
+	// delete then succeeds.
+	if err := s.store.Delete(ctx, "sb-attached"); err != nil {
+		t.Fatalf("delete sandbox: %v", err)
 	}
 	if err := s.DeletePlatformVolume(ctx, v.ID); err != nil {
 		t.Fatalf("delete after release: %v", err)

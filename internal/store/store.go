@@ -461,14 +461,44 @@ func Open(path string) (*Store, error) {
 		// (tenant, name) is the isolation + idempotency boundary: two tenants
 		// may share a name, one tenant may not duplicate it.
 		`CREATE TABLE IF NOT EXISTS volumes (
-			id TEXT PRIMARY KEY,
-			tenant TEXT NOT NULL,
-			name TEXT NOT NULL,
-			backend TEXT NOT NULL,
-			created_at DATETIME NOT NULL
-		);`,
+				id TEXT PRIMARY KEY,
+				tenant TEXT NOT NULL,
+				name TEXT NOT NULL,
+				backend TEXT NOT NULL,
+				created_at DATETIME NOT NULL
+			);`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_volumes_tenant_name ON volumes(tenant, name);`,
 		`CREATE INDEX IF NOT EXISTS idx_volumes_tenant ON volumes(tenant);`,
+		// volume_attachments is the indexed live-reference table for platform
+		// volumes. It avoids decrypting every sandbox_mounts row when Daytona
+		// delete asks whether a volume is still attached. FK cascade removes
+		// attachments when a sandbox is destroyed; volumes cannot be deleted
+		// while this table still has rows for the volume.
+		`CREATE TABLE IF NOT EXISTS volume_attachments (
+				tenant TEXT NOT NULL,
+				volume_id TEXT NOT NULL,
+				sandbox_id TEXT NOT NULL,
+				target TEXT NOT NULL,
+				source TEXT NOT NULL,
+				created_at DATETIME NOT NULL,
+				PRIMARY KEY (tenant, volume_id, sandbox_id, target),
+				FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE,
+				FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+			);`,
+		`CREATE INDEX IF NOT EXISTS idx_volume_attachments_volume ON volume_attachments(tenant, volume_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_volume_attachments_sandbox ON volume_attachments(sandbox_id);`,
+		// pending_volume_deletions is the durable cleanup ledger. The request
+		// path writes this before deleting the user-visible volume row so a
+		// backend cleanup/reconcile loop always has the exact coordinates.
+		`CREATE TABLE IF NOT EXISTS pending_volume_deletions (
+				volume_id TEXT PRIMARY KEY,
+				tenant TEXT NOT NULL,
+				name TEXT NOT NULL,
+				backend TEXT NOT NULL,
+				source TEXT NOT NULL,
+				created_at DATETIME NOT NULL
+			);`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_volume_deletions_created_at ON pending_volume_deletions(created_at);`,
 	}
 
 	for _, stmt := range stmts {

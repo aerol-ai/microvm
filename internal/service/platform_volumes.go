@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/volumes"
@@ -27,48 +29,141 @@ import (
 //	      ▼
 //	volumes.BuildMountSpec(backend, tenantScope, name, path) → MountSpec{s3|nfs}
 //	      ▼  appended to req.Mounts (counts against MaxMountsPerSandbox)
-func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.CreateSandboxRequest, chosenRuntime string) error {
+func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.CreateSandboxRequest, chosenRuntime string) ([]models.VolumeAttachment, error) {
 	if len(req.PlatformVolumes) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	pv := s.cfg.PlatformVolumes
 	if !pv.Enabled {
-		return models.ErrPlatformVolumesDisabled
+		return nil, models.ErrPlatformVolumesDisabled
 	}
 
 	// Runtime gate: firecracker and wasm cannot bind-mount host paths, so a
 	// volume would silently never appear. Reject before we do any storage work.
 	if chosenRuntime == models.RuntimeFirecracker || chosenRuntime == models.RuntimeWasm {
-		return fmt.Errorf("%w (got %q)", models.ErrPlatformVolumesUnsupportedRuntime, chosenRuntime)
+		return nil, fmt.Errorf("%w (got %q)", models.ErrPlatformVolumesUnsupportedRuntime, chosenRuntime)
 	}
 
 	tenant, err := volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
 	if err != nil {
-		return fmt.Errorf("scope platform volume: %w", err)
+		return nil, fmt.Errorf("scope platform volume: %w", err)
+	}
+	if s.store == nil {
+		return nil, errors.New("platform volume store is not configured")
 	}
 
-	// Quota: a tenant's existing volume count plus the new ones in this request
-	// must not exceed the configured cap. existingPlatformVolumeCount returns 0
-	// until the volumes store table lands (T4); within-request enforcement holds
-	// regardless so a single create can never blow the cap.
-	existing, err := s.existingPlatformVolumeCount(ctx, tenant)
-	if err != nil {
-		return fmt.Errorf("count platform volumes: %w", err)
+	type resolvedVolume struct {
+		vol     *models.Volume
+		created bool
 	}
-
-	backend := backendFromConfig(pv)
-	for i, ref := range req.PlatformVolumes {
-		if err := volumes.CheckQuota(existing+i, pv.MaxPerTenant); err != nil {
-			return fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
+	byName := map[string]resolvedVolume{}
+	attachments := make([]models.VolumeAttachment, 0, len(req.PlatformVolumes))
+	for _, ref := range req.PlatformVolumes {
+		safeName, err := volumes.SanitizeVolumeName(ref.Name)
+		if err != nil {
+			return nil, fmt.Errorf("platform volume %q: %w", ref.Name, err)
 		}
-		spec, err := volumes.BuildMountSpec(backend, tenant, ref.Name, ref.Path, ref.ReadOnly)
+		resolved := byName[safeName]
+		if resolved.vol == nil {
+			id, err := generateVolumeID()
+			if err != nil {
+				return nil, fmt.Errorf("generate platform volume id: %w", err)
+			}
+			vol, created, err := s.store.GetOrCreateVolume(ctx, &models.Volume{
+				ID:      id,
+				Tenant:  tenant,
+				Name:    safeName,
+				Backend: pv.Backend,
+			}, pv.MaxPerTenant)
+			if err != nil {
+				if errors.Is(err, store.ErrVolumeQuotaExceeded) {
+					return nil, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
+				}
+				return nil, err
+			}
+			resolved = resolvedVolume{vol: vol, created: created}
+			byName[safeName] = resolved
+		}
+		spec, err := volumes.BuildMountSpec(volumeBackendFor(pv, resolved.vol.Backend), tenant, safeName, ref.Path, ref.ReadOnly)
+		if err != nil {
+			return nil, fmt.Errorf("platform volume %q: %w", ref.Name, err)
+		}
+		req.Mounts = append(req.Mounts, spec)
+		attachments = append(attachments, models.VolumeAttachment{
+			Tenant:        tenant,
+			VolumeID:      resolved.vol.ID,
+			Target:        spec.Target,
+			Source:        spec.Source,
+			CreatedVolume: resolved.created,
+		})
+	}
+	return attachments, nil
+}
+
+// ResolvePlatformVolumesForReplication rewrites platform-volume references into
+// concrete MountSpecs for the cluster-replicated create spec. That preserves the
+// already-resolved tenant prefix across failover/recreate, where there is no
+// original user auth context to derive the tenant from. It intentionally does no
+// quota or volume-row writes; createSandbox already did those before the sandbox
+// was admitted.
+func (s *Service) ResolvePlatformVolumesForReplication(ctx context.Context, req *models.CreateSandboxRequest) error {
+	if req == nil || len(req.PlatformVolumes) == 0 {
+		return nil
+	}
+	pv := s.cfg.PlatformVolumes
+	if !pv.Enabled {
+		return models.ErrPlatformVolumesDisabled
+	}
+	if s.store == nil {
+		return errors.New("platform volume store is not configured")
+	}
+	tenant, err := volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
+	if err != nil {
+		return fmt.Errorf("scope platform volume for replication: %w", err)
+	}
+	for _, ref := range req.PlatformVolumes {
+		safeName, err := volumes.SanitizeVolumeName(ref.Name)
+		if err != nil {
+			return fmt.Errorf("platform volume %q: %w", ref.Name, err)
+		}
+		vol, err := s.store.GetVolume(ctx, tenant, safeName)
+		if err != nil {
+			return fmt.Errorf("get platform volume %q for replication: %w", ref.Name, err)
+		}
+		spec, err := volumes.BuildMountSpec(volumeBackendFor(pv, vol.Backend), tenant, safeName, ref.Path, ref.ReadOnly)
 		if err != nil {
 			return fmt.Errorf("platform volume %q: %w", ref.Name, err)
 		}
 		req.Mounts = append(req.Mounts, spec)
 	}
+	req.PlatformVolumes = nil
 	return nil
+}
+
+func (s *Service) cleanupCreatedPlatformVolumes(ctx context.Context, attachments []models.VolumeAttachment) {
+	if s.store == nil || len(attachments) == 0 {
+		return
+	}
+	seen := map[string]struct{}{}
+	for _, a := range attachments {
+		if !a.CreatedVolume {
+			continue
+		}
+		key := a.Tenant + "\x00" + a.VolumeID
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if err := s.store.DeleteVolumeIfUnattached(ctx, a.Tenant, a.VolumeID, a.Source); err != nil &&
+			!errors.Is(err, store.ErrNotFound) &&
+			!errors.Is(err, store.ErrVolumeInUse) {
+			if s.logger != nil {
+				s.logger.Warn("cleanup platform volume created by failed sandbox create failed",
+					"volume_id", a.VolumeID, "tenant", a.Tenant, "err", err)
+			}
+		}
+	}
 }
 
 // callerFromContext maps the authenticated request context to the tenant
@@ -99,16 +194,4 @@ func backendFromConfig(p config.PlatformVolumesConfig) volumes.Backend {
 		NFSExport:         p.NFSExport,
 		NFSOptions:        p.NFSOptions,
 	}
-}
-
-// existingPlatformVolumeCount returns how many distinct volumes the tenant
-// already has, for cross-request quota enforcement. Combined with the
-// within-request index in resolvePlatformVolumes, this enforces the per-tenant
-// cap across the tenant's whole volume set, not just one create.
-func (s *Service) existingPlatformVolumeCount(ctx context.Context, tenant string) (int, error) {
-	// No cap configured means we never need the count; skip the query.
-	if s.cfg.PlatformVolumes.MaxPerTenant <= 0 {
-		return 0, nil
-	}
-	return s.store.CountVolumes(ctx, tenant)
 }

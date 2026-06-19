@@ -143,7 +143,7 @@ func placementMissingLocalPorts(p cluster.Placement, sb *models.Sandbox) bool {
 }
 
 func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Client, sb *models.Sandbox) cluster.LocalSandboxState {
-	spec := s.specFromSandbox(sb)
+	spec := s.specFromSandbox(ctx, sb)
 	var secrets cluster.PlacementSecrets
 	if spec != nil {
 		handle, err := s.PutClusterSecretsForRecipient(ctx, sb.ID, *spec, c.SelfNodeID())
@@ -167,9 +167,12 @@ func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Cli
 	}
 }
 
-func (s *Service) specFromSandbox(sb *models.Sandbox) *models.CreateSandboxRequest {
+func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) *models.CreateSandboxRequest {
 	if sb == nil {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	spec := &models.CreateSandboxRequest{
 		Image:              sb.Image,
@@ -203,6 +206,17 @@ func (s *Service) specFromSandbox(sb *models.Sandbox) *models.CreateSandboxReque
 		}
 	} else {
 		spec.Registry = auth
+	}
+	if s.store != nil && s.cipher != nil {
+		mounts, err := s.loadMounts(ctx, sb.ID)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("cluster: load sandbox mounts failed; spec backfill will omit mounts",
+					"sandbox_id", sb.ID, "err", err)
+			}
+		} else if len(mounts) > 0 {
+			spec.Mounts = mounts
+		}
 	}
 	return spec
 }

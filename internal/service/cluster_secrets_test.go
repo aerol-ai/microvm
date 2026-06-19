@@ -41,6 +41,7 @@ func TestSealClusterSecretsRoundTrip(t *testing.T) {
 				Credentials: map[string]string{"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "shh"}},
 			{Type: models.MountTypeNFS, Target: "/srv", Source: "nfs.example:/export"},
 		},
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 	}
 
 	sealed, err := s.SealClusterSecrets(req)
@@ -80,6 +81,10 @@ func TestSealClusterSecretsRoundTrip(t *testing.T) {
 	}
 	if req.Mounts[0].Credentials["AWS_ACCESS_KEY_ID"] != "AKIA" {
 		t.Fatal("Redact mutated the source request's mount credentials")
+	}
+	redacted.PlatformVolumes[0].Path = "/mutated"
+	if req.PlatformVolumes[0].Path != "/workspace" {
+		t.Fatal("Redact mutated the source request's platform volumes")
 	}
 
 	merged, err := s.UnsealClusterSecrets(redacted, sealed)
