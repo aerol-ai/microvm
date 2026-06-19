@@ -478,10 +478,9 @@ AI-compression scale (human / CC).
   - Surfaced by: §3.1, §7 Q5 — second backend; export-layout mapping
   - Files: `pkg/volumes/` (backend branch), reuses `pkg/mounts/adapters/nfs.go`
   - Verify: `go test ./pkg/volumes/... ./pkg/mounts/...`; UC-25, UC-26, UC-27
-- [ ] **T9 (P2, human: ~4h / CC: ~30min)** — docs — new `.mdx` (5 SDK tabs) + operator setup + sidebar
+- [x] **T9 (P2)** — docs — new `.mdx` (5 SDK tabs) + operator setup + sidebar ✅ DONE
   - Surfaced by: §5.7 — top-level feature → new page
-  - Files: `docs/src/content/docs/*.mdx`, `docs/src/content.config.ts`
-  - Verify: `make docs-build`; no raw curl; five `syncKey="lang"` tabs
+  - Landed: `docs/src/content/docs/platform-volumes.mdx` — attach-at-create + re-attach examples in all five languages under two `<Tabs syncKey="lang">` blocks (no raw curl), an external-storage-vs-platform-volume comparison, semantics (persistence/tenant isolation/quota/concurrent-writer/cluster), and an **operator setup** section (S3 + NFS env vars + gating matrix). Registered in `content.config.ts` as "Platform Volumes". Added the Go `sdktypes.PlatformVolumeMount` alias so the Go tab reads ergonomically. `make docs-build` ✓ (71 pages).
 - [ ] **T10 (P2, human: ~4h / CC: ~30min)** — integration — live S3 + NFS scenarios behind `integration` tag
   - Surfaced by: §12 Test Plan — mocks can't prove real FUSE mount + cross-node reattach
   - Files: `integration-tests/suite/`, `integration-tests/suite/harness/`
