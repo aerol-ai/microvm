@@ -481,10 +481,9 @@ AI-compression scale (human / CC).
 - [x] **T9 (P2)** — docs — new `.mdx` (5 SDK tabs) + operator setup + sidebar ✅ DONE
   - Surfaced by: §5.7 — top-level feature → new page
   - Landed: `docs/src/content/docs/platform-volumes.mdx` — attach-at-create + re-attach examples in all five languages under two `<Tabs syncKey="lang">` blocks (no raw curl), an external-storage-vs-platform-volume comparison, semantics (persistence/tenant isolation/quota/concurrent-writer/cluster), and an **operator setup** section (S3 + NFS env vars + gating matrix). Registered in `content.config.ts` as "Platform Volumes". Added the Go `sdktypes.PlatformVolumeMount` alias so the Go tab reads ergonomically. `make docs-build` ✓ (71 pages).
-- [ ] **T10 (P2, human: ~4h / CC: ~30min)** — integration — live S3 + NFS scenarios behind `integration` tag
+- [x] **T10 (P2)** — integration — live S3 + NFS scenarios behind `integration` tag ✅ DONE
   - Surfaced by: §12 Test Plan — mocks can't prove real FUSE mount + cross-node reattach
-  - Files: `integration-tests/suite/`, `integration-tests/suite/harness/`
-  - Verify: `make integration-*` (operator-run); UC-03, UC-06, UC-26, UC-30
+  - Landed: `CapPlatformVolumes` capability + registry rows UC-81..UC-84 (`harness/usecases.go`, allowlisted in `harness/skip_test.go`); `integration-tests/suite/platform_volumes_test.go` (`//go:build integration`) — **UC-81** write+read-back, **UC-82** persistence-across-destroy + re-attach-by-name (cross-node when the scenario is a cluster — the v2 source-of-truth proof), **UC-83** two sandboxes share one volume, **UC-84** read-only mount rejects writes. Backend-agnostic (S3 or NFS, whichever the scenario configured); eventual-consistency-aware read retries. Operator opts a deployment in by adding `platform-volumes` to its `caps.yml` + setting `SB_PLATFORM_VOLUMES_*`. `go vet -tags=integration` ✓; harness unit tests ✓. Daytona volume CRUD + reference-aware delete are covered offline (native SDK harness has no volume-CRUD surface); operator-run via `make integration-*`.
 
 ---
 

@@ -42,6 +42,14 @@ const (
 	// custom-domain reachability UCs skip instead of failing against a gate they
 	// structurally cannot pass.
 	CapExternalDNSZone Capability = "external-dns-zone"
+	// CapPlatformVolumes gates the platform-volume UCs (UC-81..UC-84). A
+	// deployment advertises it only when the operator has enabled platform
+	// volumes AND configured a shared backend (SB_PLATFORM_VOLUMES_ENABLED=true
+	// + an S3 bucket or NFS export). The tests are backend-agnostic — they
+	// attach by name, write, and read back — so the same UCs run whether the
+	// scenario configured S3 or NFS. Where the feature is off, the UCs skip
+	// (not-applicable) rather than fail against a 412.
+	CapPlatformVolumes Capability = "platform-volumes"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -175,6 +183,15 @@ var Registry = []UseCase{
 	{ID: "UC-78", Title: "Foreign-arch snapshot ref rejected (offline guard)", Requires: nil, Implemented: true},
 	{ID: "UC-79", Title: "Foreign-arch snapshot rejected on arm64 cluster (live)", Requires: []Capability{CapCluster, CapFirecracker, CapMixedArchNegative}, Implemented: true},
 	{ID: "UC-80", Title: "Firecracker template clones have distinct kernel entropy", Requires: []Capability{CapFirecracker}, Implemented: true},
+
+	// K. Platform volumes (named, operator-backed persistent storage).
+	// Backend-agnostic (S3 or NFS, whatever the scenario configured). Exercised
+	// through the native SDK's platformVolumes field; Daytona volume CRUD +
+	// reference-aware delete are covered offline (service/facade unit tests).
+	{ID: "UC-81", Title: "Attach platform volume; write + read-back inside sandbox", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
+	{ID: "UC-82", Title: "Volume persists across destroy; re-attach by name sees data", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
+	{ID: "UC-83", Title: "Two sandboxes share one volume (both read same data)", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
+	{ID: "UC-84", Title: "Read-only volume mount rejects writes", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
