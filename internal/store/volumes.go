@@ -40,17 +40,18 @@ func (s *Store) CreateVolume(ctx context.Context, v *models.Volume) error {
 	if created.IsZero() {
 		created = time.Now().UTC()
 	}
+	source := strings.TrimSpace(v.Source)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO volumes (id, tenant, name, backend, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, id, tenant, name, backend, created.UTC())
+		INSERT INTO volumes (id, tenant, name, backend, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, id, tenant, name, backend, source, created.UTC())
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
 			return ErrVolumeExists
 		}
 		return fmt.Errorf("create volume: %w", err)
 	}
-	v.ID, v.Tenant, v.Name, v.Backend, v.CreatedAt = id, tenant, name, backend, created.UTC()
+	v.ID, v.Tenant, v.Name, v.Backend, v.Source, v.CreatedAt = id, tenant, name, backend, source, created.UTC()
 	return nil
 }
 
@@ -78,7 +79,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 	defer func() { _ = tx.Rollback() }()
 
 	existing, err := scanVolumeRow(tx.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, created_at
+		SELECT id, tenant, name, backend, source, created_at
 		FROM volumes
 		WHERE tenant = ? AND name = ?
 	`, tenant, name), "get existing volume")
@@ -101,26 +102,29 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 			return nil, false, ErrVolumeQuotaExceeded
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM pending_volume_deletions
-		WHERE tenant = ? AND name = ? AND backend = ?
-	`, tenant, name, backend); err != nil {
-		return nil, false, fmt.Errorf("clear pending volume deletion: %w", err)
-	}
+	// Deliberately do NOT clear a pending_volume_deletions row for this
+	// (tenant,name) here. The source is deterministic, so a delete-then-recreate
+	// of the same name reuses the same backend coordinate; silently dropping the
+	// ledger row both permanently cancels reclaim of the prior generation and can
+	// resurrect not-yet-reclaimed data. The reclaim worker is responsible for
+	// skipping backend deletion when a live volume row still resolves to the same
+	// source, so a recreate keeps its data without the request path racing the
+	// ledger.
 
 	created := v.CreatedAt
 	if created.IsZero() {
 		created = time.Now().UTC()
 	}
+	source := strings.TrimSpace(v.Source)
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO volumes (id, tenant, name, backend, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, id, tenant, name, backend, created.UTC()); err != nil {
+		INSERT INTO volumes (id, tenant, name, backend, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, id, tenant, name, backend, source, created.UTC()); err != nil {
 		if isSQLiteUniqueConstraint(err) {
 			// A duplicate can only happen if another process wrote the same DB
 			// concurrently. Return the winner so callers remain idempotent.
 			existing, getErr := scanVolumeRow(tx.QueryRowContext(ctx, `
-				SELECT id, tenant, name, backend, created_at
+				SELECT id, tenant, name, backend, source, created_at
 				FROM volumes
 				WHERE tenant = ? AND name = ?
 			`, tenant, name), "get raced volume")
@@ -134,7 +138,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 		}
 		return nil, false, fmt.Errorf("insert volume: %w", err)
 	}
-	out := &models.Volume{ID: id, Tenant: tenant, Name: name, Backend: backend, CreatedAt: created.UTC()}
+	out := &models.Volume{ID: id, Tenant: tenant, Name: name, Backend: backend, Source: source, CreatedAt: created.UTC()}
 	if err := tx.Commit(); err != nil {
 		return nil, false, fmt.Errorf("commit new volume: %w", err)
 	}
@@ -144,7 +148,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, v *models.Volume, maxPerT
 // GetVolume returns the volume named name owned by tenant, or ErrNotFound.
 func (s *Store) GetVolume(ctx context.Context, tenant, name string) (*models.Volume, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, created_at
+		SELECT id, tenant, name, backend, source, created_at
 		FROM volumes
 		WHERE tenant = ? AND name = ?
 	`, strings.TrimSpace(tenant), strings.TrimSpace(name))
@@ -155,7 +159,7 @@ func (s *Store) GetVolume(ctx context.Context, tenant, name string) (*models.Vol
 // tenant cannot resolve another's id), or ErrNotFound.
 func (s *Store) GetVolumeByID(ctx context.Context, tenant, id string) (*models.Volume, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, created_at
+		SELECT id, tenant, name, backend, source, created_at
 		FROM volumes
 		WHERE tenant = ? AND id = ?
 	`, strings.TrimSpace(tenant), strings.TrimSpace(id))
@@ -166,7 +170,7 @@ func (s *Store) GetVolumeByID(ctx context.Context, tenant, id string) (*models.V
 // is a zero-length slice, never nil.
 func (s *Store) ListVolumes(ctx context.Context, tenant string) ([]models.Volume, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, tenant, name, backend, created_at
+		SELECT id, tenant, name, backend, source, created_at
 		FROM volumes
 		WHERE tenant = ?
 		ORDER BY created_at DESC, name ASC
@@ -288,12 +292,16 @@ func (s *Store) CountVolumeAttachments(ctx context.Context, tenant, volumeID str
 // only when no indexed attachments remain. The pending cleanup row is inserted
 // in the same transaction before the metadata row is removed, so remote data
 // never loses its reconciliation coordinates.
-func (s *Store) DeleteVolumeIfUnattached(ctx context.Context, tenant, id, source string) error {
+//
+// fallbackSource is used only for rows created before the source column existed
+// (vol.Source == ""); the frozen vol.Source is authoritative when present, so
+// reclaim always targets exactly what was created even if config later changed.
+func (s *Store) DeleteVolumeIfUnattached(ctx context.Context, tenant, id, fallbackSource string) error {
 	tenant = strings.TrimSpace(tenant)
 	id = strings.TrimSpace(id)
-	source = strings.TrimSpace(source)
-	if tenant == "" || id == "" || source == "" {
-		return fmt.Errorf("delete volume if unattached: tenant, id, and source are required")
+	fallbackSource = strings.TrimSpace(fallbackSource)
+	if tenant == "" || id == "" {
+		return fmt.Errorf("delete volume if unattached: tenant and id are required")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -303,7 +311,7 @@ func (s *Store) DeleteVolumeIfUnattached(ctx context.Context, tenant, id, source
 	defer func() { _ = tx.Rollback() }()
 
 	vol, err := scanVolumeRow(tx.QueryRowContext(ctx, `
-		SELECT id, tenant, name, backend, created_at
+		SELECT id, tenant, name, backend, source, created_at
 		FROM volumes
 		WHERE tenant = ? AND id = ?
 	`, tenant, id), "get volume for delete")
@@ -320,6 +328,14 @@ func (s *Store) DeleteVolumeIfUnattached(ctx context.Context, tenant, id, source
 	}
 	if attachers > 0 {
 		return fmt.Errorf("%w: %d attachments", ErrVolumeInUse, attachers)
+	}
+
+	source := strings.TrimSpace(vol.Source)
+	if source == "" {
+		source = fallbackSource
+	}
+	if source == "" {
+		return fmt.Errorf("delete volume if unattached: volume %q has no stored source and no fallback was provided", id)
 	}
 
 	now := time.Now().UTC()
@@ -379,6 +395,37 @@ func (s *Store) ListPendingVolumeDeletions(ctx context.Context) ([]models.Pendin
 	return out, nil
 }
 
+// DeletePendingVolumeDeletion removes a reclaim-ledger row once its backend
+// bytes have been deleted (or skipped because a live volume reclaimed the
+// source). Idempotent: a missing row is success, so the reclaim loop can run
+// at-least-once without tracking which rows it already cleared.
+func (s *Store) DeletePendingVolumeDeletion(ctx context.Context, volumeID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM pending_volume_deletions WHERE volume_id = ?
+	`, strings.TrimSpace(volumeID))
+	if err != nil {
+		return fmt.Errorf("delete pending volume deletion: %w", err)
+	}
+	return nil
+}
+
+// LiveVolumeExistsForSource reports whether any current volume row resolves to
+// source. The reclaim worker calls this before deleting backend bytes: because
+// sources are deterministic, a delete-then-recreate of the same name produces a
+// new volume row pointing at the same coordinate. When that live row exists the
+// worker must NOT delete the bytes — they now belong to the recreated volume —
+// and simply drops the stale ledger row instead.
+func (s *Store) LiveVolumeExistsForSource(ctx context.Context, source string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM volumes WHERE source = ?
+	`, strings.TrimSpace(source)).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("live volume for source: %w", err)
+	}
+	return n > 0, nil
+}
+
 func scanVolumeRow(row *sql.Row, op string) (*models.Volume, error) {
 	v, err := scanVolume(row)
 	if err != nil {
@@ -394,7 +441,7 @@ func scanVolume(scanner interface {
 	Scan(dest ...any) error
 }) (*models.Volume, error) {
 	var v models.Volume
-	if err := scanner.Scan(&v.ID, &v.Tenant, &v.Name, &v.Backend, &v.CreatedAt); err != nil {
+	if err := scanner.Scan(&v.ID, &v.Tenant, &v.Name, &v.Backend, &v.Source, &v.CreatedAt); err != nil {
 		return nil, err
 	}
 	v.CreatedAt = v.CreatedAt.UTC()

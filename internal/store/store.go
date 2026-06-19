@@ -465,6 +465,7 @@ func Open(path string) (*Store, error) {
 				tenant TEXT NOT NULL,
 				name TEXT NOT NULL,
 				backend TEXT NOT NULL,
+				source TEXT NOT NULL DEFAULT '',
 				created_at DATETIME NOT NULL
 			);`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_volumes_tenant_name ON volumes(tenant, name);`,
@@ -546,6 +547,11 @@ func Open(path string) (*Store, error) {
 		// rejects two reservations on the same host_port without preventing
 		// many rows at the default 0.
 		`ALTER TABLE exposed_ports ADD COLUMN host_port INTEGER NOT NULL DEFAULT 0;`,
+		// Backend coordinate frozen at volume-creation time. Pre-migration rows
+		// get '' and fall back to recomputing the source from current operator
+		// config; new volumes store the resolved location so delete/reclaim
+		// targets exactly what was created even if config later changes.
+		`ALTER TABLE volumes ADD COLUMN source TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_out INTEGER NOT NULL DEFAULT 0;`,
 		`ALTER TABLE sandboxes ADD COLUMN net_bytes_in_limit INTEGER NOT NULL DEFAULT 0;`,

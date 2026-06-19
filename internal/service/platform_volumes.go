@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -70,11 +71,17 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 			if err != nil {
 				return nil, fmt.Errorf("generate platform volume id: %w", err)
 			}
+			// Freeze the backend coordinate at creation (see CreatePlatformVolume).
+			source, err := volumes.MountSource(backendFromConfig(pv), tenant, safeName)
+			if err != nil {
+				return nil, fmt.Errorf("platform volume %q: %w", ref.Name, err)
+			}
 			vol, created, err := s.store.GetOrCreateVolume(ctx, &models.Volume{
 				ID:      id,
 				Tenant:  tenant,
 				Name:    safeName,
 				Backend: pv.Backend,
+				Source:  source,
 			}, pv.MaxPerTenant)
 			if err != nil {
 				if errors.Is(err, store.ErrVolumeQuotaExceeded) {
@@ -85,7 +92,7 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 			resolved = resolvedVolume{vol: vol, created: created}
 			byName[safeName] = resolved
 		}
-		spec, err := volumes.BuildMountSpec(volumeBackendFor(pv, resolved.vol.Backend), tenant, safeName, ref.Path, ref.ReadOnly)
+		spec, err := mountSpecForVolume(volumeBackendFor(pv, resolved.vol.Backend), resolved.vol, tenant, safeName, ref.Path, ref.ReadOnly)
 		if err != nil {
 			return nil, fmt.Errorf("platform volume %q: %w", ref.Name, err)
 		}
@@ -99,6 +106,18 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 		})
 	}
 	return attachments, nil
+}
+
+// mountSpecForVolume builds the mount for a resolved volume from its frozen
+// source. An existing row's stored source is authoritative so the data mounts
+// where it was created even if operator config changed since; only a
+// pre-migration row with no stored source falls back to deriving it from the
+// current backend config.
+func mountSpecForVolume(b volumes.Backend, vol *models.Volume, tenant, safeName, target string, readOnly bool) (models.MountSpec, error) {
+	if vol != nil && strings.TrimSpace(vol.Source) != "" {
+		return volumes.BuildMountSpecForSource(b, vol.Source, target, readOnly)
+	}
+	return volumes.BuildMountSpec(b, tenant, safeName, target, readOnly)
 }
 
 // ResolvePlatformVolumesForReplication rewrites platform-volume references into
@@ -131,7 +150,7 @@ func (s *Service) ResolvePlatformVolumesForReplication(ctx context.Context, req 
 		if err != nil {
 			return fmt.Errorf("get platform volume %q for replication: %w", ref.Name, err)
 		}
-		spec, err := volumes.BuildMountSpec(volumeBackendFor(pv, vol.Backend), tenant, safeName, ref.Path, ref.ReadOnly)
+		spec, err := mountSpecForVolume(volumeBackendFor(pv, vol.Backend), vol, tenant, safeName, ref.Path, ref.ReadOnly)
 		if err != nil {
 			return fmt.Errorf("platform volume %q: %w", ref.Name, err)
 		}

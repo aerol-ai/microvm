@@ -1098,6 +1098,22 @@ type PlatformVolumesConfig struct {
 	// 0 means unlimited.
 	MaxPerTenant int
 
+	// ReclaimInterval is how often the backend-reclaim janitor drains the
+	// pending_volume_deletions ledger (deleting the S3 prefix / NFS directory of
+	// deleted volumes). 0 disables the worker, leaving the ledger for an external
+	// reconciler — the metadata delete still succeeds, only byte reclaim pauses.
+	ReclaimInterval time.Duration
+
+	// ReclaimMountRoot is the root-owned scratch dir transient NFS reclaim mounts
+	// are created under. Ignored for the S3 backend.
+	ReclaimMountRoot string
+
+	// ReclaimConcurrency bounds how many backend deletes a single reclaim tick
+	// runs in parallel. Each delete is a serial CLI / mount round-trip, so some
+	// parallelism keeps a burst-delete backlog draining without unbounded fanout
+	// against the backend. <=1 means serial.
+	ReclaimConcurrency int
+
 	// S3 backend (Backend == "s3").
 	S3Bucket          string
 	S3Prefix          string
@@ -1213,18 +1229,21 @@ func Load() (Config, error) {
 		MountsCredentialsRuntimeDir:      getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                 getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
 		PlatformVolumes: PlatformVolumesConfig{
-			Enabled:           getEnvBool("SB_PLATFORM_VOLUMES_ENABLED", false),
-			Backend:           strings.ToLower(strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_BACKEND", PlatformVolumesBackendS3))),
-			MaxPerTenant:      getEnvInt("SB_PLATFORM_VOLUMES_MAX_PER_TENANT", 0),
-			S3Bucket:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_BUCKET")),
-			S3Prefix:          strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_S3_PREFIX", "volumes")),
-			S3Region:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_REGION")),
-			S3Endpoint:        strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_ENDPOINT")),
-			S3AccessKeyID:     strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_ACCESS_KEY_ID")),
-			S3SecretAccessKey: strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_SECRET_ACCESS_KEY")),
-			NFSServer:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_SERVER")),
-			NFSExport:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_EXPORT")),
-			NFSOptions:        strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_OPTIONS")),
+			Enabled:            getEnvBool("SB_PLATFORM_VOLUMES_ENABLED", false),
+			Backend:            strings.ToLower(strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_BACKEND", PlatformVolumesBackendS3))),
+			MaxPerTenant:       getEnvInt("SB_PLATFORM_VOLUMES_MAX_PER_TENANT", 0),
+			ReclaimInterval:    getEnvDuration("SB_PLATFORM_VOLUMES_RECLAIM_INTERVAL", 5*time.Minute),
+			ReclaimMountRoot:   strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_RECLAIM_MOUNT_ROOT", "/var/lib/aerolvm/volume-reclaim")),
+			ReclaimConcurrency: getEnvInt("SB_PLATFORM_VOLUMES_RECLAIM_CONCURRENCY", 8),
+			S3Bucket:           strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_BUCKET")),
+			S3Prefix:           strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_S3_PREFIX", "volumes")),
+			S3Region:           strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_REGION")),
+			S3Endpoint:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_ENDPOINT")),
+			S3AccessKeyID:      strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_ACCESS_KEY_ID")),
+			S3SecretAccessKey:  strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_SECRET_ACCESS_KEY")),
+			NFSServer:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_SERVER")),
+			NFSExport:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_EXPORT")),
+			NFSOptions:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_OPTIONS")),
 		},
 		LogLevel:                 strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
 		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),

@@ -160,6 +160,23 @@ func BuildMountSpec(b Backend, tenant, name, target string, readOnly bool) (mode
 	if err != nil {
 		return models.MountSpec{}, err
 	}
+	return BuildMountSpecForSource(b, source, target, readOnly)
+}
+
+// BuildMountSpecForSource synthesizes a MountSpec for an explicit, already-known
+// backend coordinate. This is the path callers use for an existing volume whose
+// source was frozen at creation (volumes.source): the data must mount exactly
+// where it was created even if the operator later reconfigured the bucket/prefix
+// or export, so the stored source — not a recompute from current config — is
+// authoritative. BuildMountSpec is the create-time wrapper that derives source
+// from (tenant, name) and delegates here.
+func BuildMountSpecForSource(b Backend, source, target string, readOnly bool) (models.MountSpec, error) {
+	if strings.TrimSpace(source) == "" {
+		return models.MountSpec{}, errors.New("mount source is required")
+	}
+	if strings.TrimSpace(target) == "" {
+		return models.MountSpec{}, errors.New("volume mount path is required")
+	}
 
 	switch b.Kind {
 	case BackendS3:

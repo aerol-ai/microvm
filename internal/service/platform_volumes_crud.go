@@ -41,7 +41,13 @@ func (s *Service) CreatePlatformVolume(ctx context.Context, name string) (*model
 	if err != nil {
 		return nil, err
 	}
-	v, _, err := s.store.GetOrCreateVolume(ctx, &models.Volume{ID: id, Tenant: tenant, Name: safeName, Backend: s.cfg.PlatformVolumes.Backend}, s.cfg.PlatformVolumes.MaxPerTenant)
+	// Freeze the backend coordinate at creation so a later config change cannot
+	// move where this volume mounts or what its delete/reclaim targets.
+	source, err := volumes.MountSource(backendFromConfig(s.cfg.PlatformVolumes), tenant, safeName)
+	if err != nil {
+		return nil, err
+	}
+	v, _, err := s.store.GetOrCreateVolume(ctx, &models.Volume{ID: id, Tenant: tenant, Name: safeName, Backend: s.cfg.PlatformVolumes.Backend, Source: source}, s.cfg.PlatformVolumes.MaxPerTenant)
 	if err != nil {
 		if errors.Is(err, store.ErrVolumeQuotaExceeded) {
 			return nil, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
@@ -129,6 +135,14 @@ func (s *Service) DeletePlatformVolume(ctx context.Context, id string) error {
 // context, falling back to the operator scope for the PAT path.
 func (s *Service) volumeTenant(ctx context.Context) (string, error) {
 	return volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
+}
+
+// VolumeTenantScope exposes the per-tenant scope segment to the API facades so
+// they can route volume CRUD to a deterministic owner node in cluster mode. It
+// is the same value the service uses internally, so a forwarded request resolves
+// the identical tenant on the owner.
+func (s *Service) VolumeTenantScope(ctx context.Context) (string, error) {
+	return s.volumeTenant(ctx)
 }
 
 // volumeBackendFor builds the volumes.Backend for a stored volume's backend.

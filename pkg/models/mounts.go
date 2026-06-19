@@ -75,10 +75,17 @@ type PlatformVolumeMount struct {
 // (S3 prefix / NFS dir) is derived deterministically from (tenant, name) — the
 // row is metadata, not the data itself.
 type Volume struct {
-	ID        string    `json:"id"`
-	Tenant    string    `json:"tenant"`
-	Name      string    `json:"name"`
-	Backend   string    `json:"backend"`
+	ID      string `json:"id"`
+	Tenant  string `json:"tenant"`
+	Name    string `json:"name"`
+	Backend string `json:"backend"`
+	// Source is the backend coordinate (S3 bucket/prefix or NFS host:/path)
+	// frozen at creation time. Delete and reconciliation read this stored value
+	// rather than recomputing it from mutable operator config, so a volume keeps
+	// mounting and reclaiming the exact location it was created against even if
+	// the operator later changes the configured bucket/prefix/export. Empty for
+	// rows created before this column existed; callers fall back to recompute.
+	Source    string    `json:"source"`
 	CreatedAt time.Time `json:"created_at"`
 }
 

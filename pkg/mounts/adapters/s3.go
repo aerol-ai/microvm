@@ -19,10 +19,17 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		return Plan{}, fmt.Errorf("s3 source missing bucket: %q", spec.Source)
 	}
 
-	credFile := filepath.Join(credDir, fmt.Sprintf("%s-%d.aws", sandboxID, index))
-	credBody := buildAWSCredentialsFile(spec.Credentials)
+	// When no static keys are supplied the operator is relying on ambient
+	// credentials (an EC2 instance role / IRSA / the host's default chain).
+	// Pinning --profile sandbox + AWS_PROFILE to an empty credentials file
+	// would shadow that chain and break the mount, so in that case we write no
+	// profile at all and let mount-s3 resolve credentials from the environment.
+	useStaticCreds := hasS3Credentials(spec.Credentials)
 
-	argv := []string{"mount-s3", bucket, hostTarget, "--profile", "sandbox", "--foreground"}
+	argv := []string{"mount-s3", bucket, hostTarget, "--foreground"}
+	if useStaticCreds {
+		argv = append(argv, "--profile", "sandbox")
+	}
 	if prefix != "" {
 		argv = append(argv, "--prefix", strings.TrimPrefix(prefix, "/"))
 	}
@@ -41,6 +48,12 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		argv = append(argv, strings.Fields(extra)...)
 	}
 
+	if !useStaticCreds {
+		// No profile file; ambient instance-role credentials are used.
+		return Plan{Argv: argv}, nil
+	}
+
+	credFile := filepath.Join(credDir, fmt.Sprintf("%s-%d.aws", sandboxID, index))
 	env := []string{
 		"AWS_SHARED_CREDENTIALS_FILE=" + credFile,
 		"AWS_PROFILE=sandbox",
@@ -50,9 +63,17 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		Argv:       argv,
 		Env:        env,
 		CredFile:   credFile,
-		CredBody:   credBody,
+		CredBody:   buildAWSCredentialsFile(spec.Credentials),
 		UnlinkCred: true, // mount-s3 reads creds once at startup
 	}, nil
+}
+
+// hasS3Credentials reports whether the spec carries static keys. An access key
+// alone (or with a secret) means the operator wants the sandbox profile; an
+// empty map means fall back to the ambient credential chain.
+func hasS3Credentials(creds map[string]string) bool {
+	return strings.TrimSpace(creds["access_key_id"]) != "" ||
+		strings.TrimSpace(creds["secret_access_key"]) != ""
 }
 
 func parseS3Source(source string) (bucket, prefix string) {

@@ -117,6 +117,10 @@ type Service struct {
 	mounts   *mounts.Manager
 	admitter *capacity.Admitter
 	images   ImageDistributionProvider
+	// volumeReclaimer deletes the backing bytes (S3 prefix / NFS dir) of deleted
+	// platform volumes. Non-nil only when the daemon wired a backend reclaimer;
+	// nil leaves the pending_volume_deletions ledger for an external reconciler.
+	volumeReclaimer VolumeReclaimer
 	// snapshotPusher + snapshotPushReconciler are non-nil only when
 	// cfg.SnapshotPushEnabled is true. The snapshot-create path checks
 	// snapshotPusher for nil to decide whether to mark a new row as

@@ -138,6 +138,46 @@ func TestResolvePlatformVolumes_DockerS3(t *testing.T) {
 	}
 }
 
+// An existing volume must mount from its frozen source even after the operator
+// reconfigures the bucket/prefix — the stored coordinate is authoritative, so a
+// config change can never silently move a live volume to a new location.
+func TestResolvePlatformVolumes_UsesFrozenSourceAfterConfigChange(t *testing.T) {
+	st := volumesTestStore(t)
+	s := &Service{cfg: enabledS3Cfg(), store: st}
+	ctx := context.Background()
+
+	// Create the volume under the original config.
+	first, err := s.CreatePlatformVolume(ctx, "data")
+	if err != nil {
+		t.Fatalf("CreatePlatformVolume: %v", err)
+	}
+	if first.Source == "" {
+		t.Fatal("created volume has no frozen source")
+	}
+
+	// Operator reconfigures the bucket/prefix after the volume exists.
+	moved := enabledS3Cfg()
+	moved.PlatformVolumes.S3Bucket = "different-bucket"
+	moved.PlatformVolumes.S3Prefix = "newprefix"
+	s.cfg = moved
+
+	req := models.CreateSandboxRequest{
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
+	}
+	if _, err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker); err != nil {
+		t.Fatalf("resolvePlatformVolumes: %v", err)
+	}
+	if len(req.Mounts) != 1 {
+		t.Fatalf("want 1 mount, got %d", len(req.Mounts))
+	}
+	if req.Mounts[0].Source != first.Source {
+		t.Fatalf("mount source = %q, want frozen %q (config change must not move it)", req.Mounts[0].Source, first.Source)
+	}
+	if strings.Contains(req.Mounts[0].Source, "different-bucket") {
+		t.Fatal("mount followed the new config instead of the frozen source")
+	}
+}
+
 // Operator PAT path (no per-tenant identity) falls back to the op- scope and
 // still works for single-tenant self-host.
 func TestResolvePlatformVolumes_OperatorScope(t *testing.T) {

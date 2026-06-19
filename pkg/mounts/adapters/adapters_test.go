@@ -45,7 +45,7 @@ func TestS3Build(t *testing.T) {
 	if err != nil {
 		t.Fatalf("S3.Build: %v", err)
 	}
-	wantPrefix := []string{"mount-s3", "bucket", "/mnt/target", "--profile", "sandbox", "--foreground", "--prefix", "prefix/sub"}
+	wantPrefix := []string{"mount-s3", "bucket", "/mnt/target", "--foreground", "--profile", "sandbox", "--prefix", "prefix/sub"}
 	if !reflect.DeepEqual(plan.Argv[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("argv prefix mismatch: got=%v want=%v", plan.Argv[:len(wantPrefix)], wantPrefix)
 	}
@@ -73,6 +73,27 @@ func TestS3Build(t *testing.T) {
 	cred := string(plan.CredBody)
 	if !strings.Contains(cred, "[sandbox]") || !strings.Contains(cred, "aws_access_key_id = AKIA...") || !strings.Contains(cred, "aws_secret_access_key = secret") || !strings.Contains(cred, "aws_session_token = token") {
 		t.Fatalf("unexpected creds file:\n%s", cred)
+	}
+}
+
+// With no static keys the operator relies on an ambient instance role; the
+// adapter must not pin --profile/AWS_PROFILE to an empty credentials file, which
+// would shadow the ambient chain and break the mount.
+func TestS3Build_InstanceRole(t *testing.T) {
+	plan, err := (S3{}).Build("sb-2", 0, models.MountSpec{
+		Source: "s3://bucket/data",
+	}, "/mnt/target", "/creds")
+	if err != nil {
+		t.Fatalf("S3.Build: %v", err)
+	}
+	if contains(plan.Argv, "--profile") {
+		t.Fatalf("argv should omit --profile for instance-role creds: %v", plan.Argv)
+	}
+	if len(plan.Env) != 0 {
+		t.Fatalf("env should be empty for instance-role creds: %v", plan.Env)
+	}
+	if plan.CredFile != "" || len(plan.CredBody) != 0 || plan.UnlinkCred {
+		t.Fatalf("no credentials file expected: %+v", plan)
 	}
 }
 

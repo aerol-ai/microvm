@@ -584,3 +584,80 @@ thinking (operator-cred handling). Implementation is the next step, not more
 review.
 
 NO UNRESOLVED DECISIONS
+
+---
+
+## Post-review remediation (PR 222 follow-up)
+
+A two-pass review found correctness gaps in the first implementation. Status:
+
+**Fixed:**
+
+1. **Source frozen at creation.** The `volumes` row now stores `source` (the S3
+   bucket/prefix or NFS host:/path) stamped at create time. Delete/reclaim read
+   the stored value instead of recomputing from mutable operator config, so a
+   volume always targets exactly what it was created against. Pre-migration rows
+   (`source == ''`) fall back to recompute.
+2. **Backend reclaim worker.** `Service.runVolumeReclaim` drains
+   `pending_volume_deletions`: it deletes the S3 prefix (`aws s3 rm --recursive`)
+   or NFS directory (transient mount + empty + unmount) via
+   `pkg/volumes.Reclaimer`, then removes the ledger row. Idempotent and
+   retry-on-failure. Wired in `pkg/daemon` on worker nodes; no-op when platform
+   volumes are disabled or no reclaimer is configured.
+3. **Resurrection guard.** `GetOrCreateVolume` no longer clears a pending
+   deletion on recreate. The reclaim worker checks `LiveVolumeExistsForSource`
+   before deleting bytes: a delete-then-recreate of the same deterministic name
+   keeps its data (the live row owns the source) and the stale ledger row is
+   dropped without a backend delete.
+4. **S3 instance-role.** The S3 adapter only pins `--profile sandbox` /
+   `AWS_PROFILE` when static keys are supplied; with none it lets `mount-s3`
+   resolve ambient instance-role / IRSA credentials.
+5. **Cluster CRUD routing.** Volume CRUD routes are wrapped with
+   `clusterVolumeForwardWrap`, which forwards a tenant's requests to a
+   deterministic owner node via rendezvous (HRW) hashing over live members, so
+   metadata stays single-writer per tenant behind a load balancer. No-op in
+   single-node mode.
+
+**Second remediation pass:**
+
+6. **Mounting uses the frozen source.** `resolvePlatformVolumes` (and the
+   replication path) build the mount from the existing row's stored `source` via
+   `volumes.BuildMountSpecForSource`, not a recompute from current config. A
+   bucket/prefix/export change can no longer silently move a live volume.
+   Pre-migration rows (`source == ''`) still fall back to recompute.
+7. **HRW excludes dead members.** `pickVolumeOwner` only considers `Alive`
+   members, so a tenant is never routed to a gossip-dead node; the owner moves to
+   a live node when the winner dies.
+8. **S3 reclaim uses configured static credentials.** The reclaimer passes
+   `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from the operator's config to the
+   AWS CLI (mirroring the mount path), falling back to the ambient chain only
+   when no keys are configured. The daemon now wires those keys into the
+   reclaimer backend (previously omitted).
+9. **NFS reclaim scratch dir is created.** The daemon `os.MkdirAll`s
+   `ReclaimMountRoot` (0700) at startup so the first NFS reclaim doesn't fail on
+   a missing dir.
+10. **Bounded reclaim concurrency.** Each tick drains up to
+    `volumeReclaimSweepLimit` rows across `SB_PLATFORM_VOLUMES_RECLAIM_CONCURRENCY`
+    (default 8) workers, so burst-delete backlogs drain faster without unbounded
+    backend fanout. Reclaim remains eventual, not synchronous.
+
+**Deferred — needs FSM replication or cross-node queries (tracked, not in this PR):**
+
+Volume metadata (id↔name rows + attachments + quota) is still per-node SQLite.
+HRW forwarding keeps CRUD/quota consistent only while membership is stable, and
+it does NOT make the *delete-while-live* / *reclaim-while-live* checks
+cluster-wide:
+
+- A sandbox failed over to a recovery node does not re-register its
+  `volume_attachments` there (the recovery spec carries concrete Mounts, not the
+  named-volume reference, and the recovery node has no volume row to FK against);
+  and attachments live wherever a sandbox *runs*, which is not the tenant's HRW
+  owner, so a forwarded delete still can't see them.
+- The reclaim worker's `LiveVolumeExistsForSource` check inspects volume *rows*,
+  not running sandboxes on other nodes.
+
+The *data* is never mis-located — sources are deterministic and frozen — but the
+cluster-wide "is anyone still using this?" question needs either replicated
+attachments in the Raft FSM or a scatter-gather across members at delete/reclaim
+time. Until then, delete-while-live is correct on a single node and best-effort
+across a cluster.

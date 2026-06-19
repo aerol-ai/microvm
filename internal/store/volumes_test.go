@@ -217,14 +217,18 @@ func TestVolumeAttachmentsBlockDeleteAndPendingLedger(t *testing.T) {
 	}
 }
 
-func TestGetOrCreateVolumeClearsPendingDeletionForRecreatedCoordinates(t *testing.T) {
+// Recreating a deleted name must NOT silently drop the prior generation's
+// pending-deletion ledger row. Dropping it would both cancel reclaim of the old
+// backend bytes forever and resurrect not-yet-reclaimed data. The reclaim worker
+// owns the live-source check that decides whether the bytes survive.
+func TestGetOrCreateVolumePreservesPendingDeletionOnRecreate(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	if err := st.CreateVolume(ctx, &models.Volume{ID: "v-old", Tenant: "t-a", Name: "data", Backend: "s3"}); err != nil {
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v-old", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/prefix/t-a/data"}); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if err := st.DeleteVolumeIfUnattached(ctx, "t-a", "v-old", "bucket/prefix/t-a/data"); err != nil {
+	if err := st.DeleteVolumeIfUnattached(ctx, "t-a", "v-old", ""); err != nil {
 		t.Fatalf("DeleteVolumeIfUnattached: %v", err)
 	}
 	pending, err := st.ListPendingVolumeDeletions(ctx)
@@ -236,7 +240,7 @@ func TestGetOrCreateVolumeClearsPendingDeletionForRecreatedCoordinates(t *testin
 	}
 
 	recreated, created, err := st.GetOrCreateVolume(ctx, &models.Volume{
-		ID: "v-new", Tenant: "t-a", Name: "data", Backend: "s3",
+		ID: "v-new", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/prefix/t-a/data",
 	}, 0)
 	if err != nil {
 		t.Fatalf("GetOrCreateVolume recreate: %v", err)
@@ -248,8 +252,67 @@ func TestGetOrCreateVolumeClearsPendingDeletionForRecreatedCoordinates(t *testin
 	if err != nil {
 		t.Fatalf("ListPendingVolumeDeletions after recreate: %v", err)
 	}
+	if len(pending) != 1 {
+		t.Fatalf("pending after recreate = %+v, want preserved for the reclaim worker", pending)
+	}
+}
+
+// A row created before the source column existed (Source == "") still deletes,
+// falling back to the caller-supplied source for the ledger coordinate.
+func TestDeleteVolumeIfUnattachedFallbackSource(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v-legacy", Tenant: "t-a", Name: "data", Backend: "s3"}); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if err := st.DeleteVolumeIfUnattached(ctx, "t-a", "v-legacy", "bucket/prefix/t-a/data"); err != nil {
+		t.Fatalf("DeleteVolumeIfUnattached: %v", err)
+	}
+	pending, err := st.ListPendingVolumeDeletions(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingVolumeDeletions: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Source != "bucket/prefix/t-a/data" {
+		t.Fatalf("pending = %+v, want fallback source recorded", pending)
+	}
+}
+
+func TestDeletePendingVolumeDeletionIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/t-a/data"}); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if err := st.DeleteVolumeIfUnattached(ctx, "t-a", "v1", ""); err != nil {
+		t.Fatalf("DeleteVolumeIfUnattached: %v", err)
+	}
+	if err := st.DeletePendingVolumeDeletion(ctx, "v1"); err != nil {
+		t.Fatalf("DeletePendingVolumeDeletion: %v", err)
+	}
+	// Second delete of an already-gone row is a no-op success.
+	if err := st.DeletePendingVolumeDeletion(ctx, "v1"); err != nil {
+		t.Fatalf("DeletePendingVolumeDeletion idempotent: %v", err)
+	}
+	pending, _ := st.ListPendingVolumeDeletions(ctx)
 	if len(pending) != 0 {
-		t.Fatalf("pending after recreate = %+v, want cleared", pending)
+		t.Fatalf("ledger not empty: %+v", pending)
+	}
+}
+
+func TestLiveVolumeExistsForSource(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if ok, err := st.LiveVolumeExistsForSource(ctx, "bucket/t-a/data"); err != nil || ok {
+		t.Fatalf("expected no live volume, got ok=%v err=%v", ok, err)
+	}
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/t-a/data"}); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if ok, err := st.LiveVolumeExistsForSource(ctx, "bucket/t-a/data"); err != nil || !ok {
+		t.Fatalf("expected live volume, got ok=%v err=%v", ok, err)
 	}
 }
 
