@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
@@ -42,6 +43,7 @@ import ai.aerol.microvm.model.Failover;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 import ai.aerol.microvm.model.MountSpecRedacted;
+import ai.aerol.microvm.model.PlatformVolumeMount;
 import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.RegisterSnapshotOptions;
 import ai.aerol.microvm.model.SandboxData;
@@ -318,6 +320,10 @@ class MicroVMClientTest {
                             .setTarget("/workspace")
                             .setSource("s3://bucket/prefix")
                     ))
+                    .setPlatformVolumes(List.of(
+                        new PlatformVolumeMount().setName("data").setPath("/workspace"),
+                        new PlatformVolumeMount().setName("cache").setPath("/cache").setReadOnly(true)
+                    ))
                     .setLifecycle(new Lifecycle()
                         .setStopIfIdleFor(3_600_000_000_000L)
                         .setDestroyAtAge(86_400_000_000_000L))
@@ -345,6 +351,14 @@ class MicroVMClientTest {
             assertEquals(86_400_000_000_000L, ((Number) lifecycle.get("destroy_at_age")).longValue());
             Map<String, Object> failover = castMap(payload.get("failover"));
             assertEquals("recreate", failover.get("policy"));
+            List<?> platformVolumes = (List<?>) payload.get("platform_volumes");
+            assertEquals(2, platformVolumes.size());
+            Map<String, Object> firstVolume = castMap(platformVolumes.get(0));
+            assertEquals("data", firstVolume.get("name"));
+            assertEquals("/workspace", firstVolume.get("path"));
+            assertNull(firstVolume.get("read_only"));
+            Map<String, Object> secondVolume = castMap(platformVolumes.get(1));
+            assertEquals(Boolean.TRUE, secondVolume.get("read_only"));
         } finally {
             server.stop(0);
         }

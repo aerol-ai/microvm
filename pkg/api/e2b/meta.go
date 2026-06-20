@@ -74,6 +74,10 @@ type sandboxMeta struct {
 	NetworkDenyOut      []string
 	AllowPublicTraffic  *bool
 	MaskRequestHost     string
+	// VolumeMounts echoes the named platform volumes attached at create. Only
+	// name+path are kept (never credentials/storage coordinates) so GET/list
+	// can surface them after a restart from the sealed compat blob.
+	VolumeMounts []sandboxVolumeMountPayload
 }
 
 // compatBlob is the persisted JSON shape inside sandbox_compat_state.state_json
@@ -81,15 +85,16 @@ type sandboxMeta struct {
 // live here — Metadata, the timeout, and the internet-access flag are
 // derived from the native sandbox row on read.
 type compatBlob struct {
-	TemplateID         string   `json:"template_id,omitempty"`
-	TemplateAlias      string   `json:"template_alias,omitempty"`
-	OnTimeout          string   `json:"on_timeout,omitempty"`
-	AutoResume         bool     `json:"auto_resume,omitempty"`
-	Secure             bool     `json:"secure,omitempty"`
-	NetworkAllowOut    []string `json:"network_allow_out,omitempty"`
-	NetworkDenyOut     []string `json:"network_deny_out,omitempty"`
-	AllowPublicTraffic *bool    `json:"allow_public_traffic,omitempty"`
-	MaskRequestHost    string   `json:"mask_request_host,omitempty"`
+	TemplateID         string                      `json:"template_id,omitempty"`
+	TemplateAlias      string                      `json:"template_alias,omitempty"`
+	OnTimeout          string                      `json:"on_timeout,omitempty"`
+	AutoResume         bool                        `json:"auto_resume,omitempty"`
+	Secure             bool                        `json:"secure,omitempty"`
+	NetworkAllowOut    []string                    `json:"network_allow_out,omitempty"`
+	NetworkDenyOut     []string                    `json:"network_deny_out,omitempty"`
+	AllowPublicTraffic *bool                       `json:"allow_public_traffic,omitempty"`
+	MaskRequestHost    string                      `json:"mask_request_host,omitempty"`
+	VolumeMounts       []sandboxVolumeMountPayload `json:"volume_mounts,omitempty"`
 }
 
 func defaultSandboxMeta(sandbox *models.Sandbox) sandboxMeta {
@@ -112,6 +117,7 @@ func sandboxMetaFromNative(sandbox *models.Sandbox, blob compatBlob) sandboxMeta
 		NetworkDenyOut:     cloneStringSlice(blob.NetworkDenyOut),
 		AllowPublicTraffic: cloneBoolPtr(blob.AllowPublicTraffic),
 		MaskRequestHost:    strings.TrimSpace(blob.MaskRequestHost),
+		VolumeMounts:       cloneVolumeMounts(blob.VolumeMounts),
 	}
 	if meta.NetworkAllowOut == nil {
 		meta.NetworkAllowOut = []string{}
@@ -167,6 +173,7 @@ func sandboxMetaToState(meta sandboxMeta) (string, error) {
 		NetworkDenyOut:     cloneStringSlice(meta.NetworkDenyOut),
 		AllowPublicTraffic: cloneBoolPtr(meta.AllowPublicTraffic),
 		MaskRequestHost:    strings.TrimSpace(meta.MaskRequestHost),
+		VolumeMounts:       cloneVolumeMounts(meta.VolumeMounts),
 	}
 	encoded, err := json.Marshal(blob)
 	if err != nil {
@@ -217,6 +224,20 @@ func cloneStringSlice(values []string) []string {
 		if trimmed != "" {
 			cloned = append(cloned, trimmed)
 		}
+	}
+	return cloned
+}
+
+// cloneVolumeMounts returns a defensive copy of the echoed volume mounts,
+// dropping any entry missing a name or path. Always returns a non-nil slice so
+// response builders can index into it.
+func cloneVolumeMounts(values []sandboxVolumeMountPayload) []sandboxVolumeMountPayload {
+	cloned := make([]sandboxVolumeMountPayload, 0, len(values))
+	for _, v := range values {
+		if strings.TrimSpace(v.Name) == "" || strings.TrimSpace(v.Path) == "" {
+			continue
+		}
+		cloned = append(cloned, sandboxVolumeMountPayload{Name: v.Name, Path: v.Path})
 	}
 	return cloned
 }

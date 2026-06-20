@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 )
 
 // MountType identifies the storage backend the user wants mounted inside their
@@ -53,8 +54,86 @@ type MountSpecFile struct {
 }
 
 // MaxMountsPerSandbox caps fan-out so a malicious request can't make sandboxd
-// build an arbitrarily large container spec.
+// build an arbitrarily large container spec. Platform volumes count against the
+// same cap as external mounts (a single shared budget).
 const MaxMountsPerSandbox = 8
+
+// PlatformVolumeMount is a request to attach a named, operator-backed
+// persistent volume at Path inside the sandbox. Name is sanitized and scoped to
+// the caller's tenant by the service; the user supplies nothing else (no
+// bucket, no credentials). See plans/e2b-volume-mounts.md.
+type PlatformVolumeMount struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+// Volume is a first-class, operator-backed persistent volume object. E2B
+// references volumes by name only (no object), but the Daytona facade exposes
+// full CRUD, so a volume needs a durable row: a stable id, the owning tenant,
+// the user-facing name, and which backend it lives on. The backing storage
+// (S3 prefix / NFS dir) is derived deterministically from (tenant, name) — the
+// row is metadata, not the data itself.
+type Volume struct {
+	ID      string `json:"id"`
+	Tenant  string `json:"tenant"`
+	Name    string `json:"name"`
+	Backend string `json:"backend"`
+	// Source is the backend coordinate (S3 bucket/prefix or NFS host:/path)
+	// frozen at creation time. Delete and reconciliation read this stored value
+	// rather than recomputing it from mutable operator config, so a volume keeps
+	// mounting and reclaiming the exact location it was created against even if
+	// the operator later changes the configured bucket/prefix/export. Empty for
+	// rows created before this column existed; callers fall back to recompute.
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// VolumeAttachment is the indexed store-side reference from a sandbox to a
+// platform volume. It deliberately duplicates the deterministic source so delete
+// and reconciliation paths never need to decrypt sandbox_mounts or rebuild the
+// source from mutable operator config just to answer "is this attached?".
+type VolumeAttachment struct {
+	Tenant        string    `json:"tenant"`
+	VolumeID      string    `json:"volume_id"`
+	SandboxID     string    `json:"sandbox_id"`
+	Target        string    `json:"target"`
+	Source        string    `json:"source"`
+	CreatedAt     time.Time `json:"created_at"`
+	CreatedVolume bool      `json:"-"`
+}
+
+// PendingVolumeDeletion is a durable cleanup ledger row. Daytona delete removes
+// the user-visible metadata row only after this record exists, so a backend
+// cleanup failure never leaves remote data without coordinates to reconcile.
+type PendingVolumeDeletion struct {
+	VolumeID  string    `json:"volume_id"`
+	Tenant    string    `json:"tenant"`
+	Name      string    `json:"name"`
+	Backend   string    `json:"backend"`
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+var (
+	// ErrPlatformVolumesDisabled is returned when a request references platform
+	// volumes but the operator has not enabled them. Facades map this to 412
+	// Precondition Failed.
+	ErrPlatformVolumesDisabled = errors.New("platform volumes are not enabled on this deployment")
+	// ErrPlatformVolumesUnsupportedRuntime is returned when platform volumes are
+	// requested on a runtime that cannot bind-mount host paths. Firecracker
+	// (ext4 block-device rootfs) and wasm (host-mediated, no container FS) both
+	// silently drop binds, so they are rejected up front.
+	ErrPlatformVolumesUnsupportedRuntime = errors.New("platform volumes are not supported on the firecracker or wasm runtime")
+	// ErrPlatformVolumeQuota is returned when a tenant would exceed its
+	// configured volume-count cap.
+	ErrPlatformVolumeQuota = errors.New("tenant platform-volume quota reached")
+
+	// ErrPlatformVolumeInUse is returned when a delete is attempted while one or
+	// more live sandboxes still have the volume attached. Facades map this to
+	// 409 Conflict.
+	ErrPlatformVolumeInUse = errors.New("volume is still attached to one or more sandboxes")
+)
 
 // MaxCredentialKeys / MaxCredentialBytes bound credential payload size so a
 // malicious request can't blow up daemon memory.

@@ -395,6 +395,7 @@ class ClientTests(unittest.TestCase):
                             "read_only": True,
                         }
                     ],
+                    "platform_volumes": [],
                     "lifecycle": {
                         "stop_if_idle_for": 3_600_000_000_000,
                         "destroy_at_age": 86_400_000_000_000,
@@ -492,6 +493,7 @@ class ClientTests(unittest.TestCase):
                 {
                     "image": "ubuntu:22.04",
                     "mounts": [],
+                    "platform_volumes": [],
                     "lifecycle": {
                         "stop_if_idle_for": 300_000_000_000,
                         "serverless": True,
@@ -636,6 +638,26 @@ class ClientTests(unittest.TestCase):
             ],
         )
 
+    def test_create_serializes_platform_volumes(self):
+        client = RecordingMicroVM()
+        client.create(
+            {
+                "image": "ubuntu:22.04",
+                "platformVolumes": [
+                    {"name": "data", "path": "/workspace"},
+                    {"name": "cache", "path": "/cache", "readOnly": True},
+                ],
+            }
+        )
+        body = client.calls[0][2]
+        self.assertEqual(
+            body["platform_volumes"],
+            [
+                {"name": "data", "path": "/workspace"},
+                {"name": "cache", "path": "/cache", "read_only": True},
+            ],
+        )
+
     def test_create_with_network_byte_limits_maps_snake_case_fields(self):
         client = RecordingMicroVM()
         client.create(
@@ -655,6 +677,7 @@ class ClientTests(unittest.TestCase):
                     "network_bytes_in_limit": 1048576,
                     "network_bytes_out_limit": 524288,
                     "mounts": [],
+                    "platform_volumes": [],
                 },
             ),
         )

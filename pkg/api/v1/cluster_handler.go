@@ -1019,6 +1019,51 @@ func (h *handlers) writeInternalPlacement(w http.ResponseWriter, id string) {
 	apihttp.WriteJSON(w, http.StatusOK, cluster.PlacementLookupResponse{SandboxID: id, Placement: p, Owner: owner})
 }
 
+// clusterInternalVolume answers an agent-role node's volume metadata read from
+// this server node's replicated FSM. Kinds: id, name, list, source. Writes never
+// hit this path — they flow through the generic apply endpoint.
+func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	q := r.URL.Query()
+	tenant := q.Get("tenant")
+	switch q.Get("kind") {
+	case "id":
+		v, err := c.VolumeByID(r.Context(), tenant, q.Get("id"))
+		if err != nil {
+			apihttp.WriteError(w, http.StatusNotFound, "no such volume")
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Volume: &v})
+	case "name":
+		v, err := c.VolumeByName(r.Context(), tenant, q.Get("name"))
+		if err != nil {
+			apihttp.WriteError(w, http.StatusNotFound, "no such volume")
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Volume: &v})
+	case "list":
+		vols, err := c.VolumesForTenant(r.Context(), tenant)
+		if err != nil {
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Volumes: vols})
+	case "source":
+		exists, err := c.VolumeExistsForSource(r.Context(), q.Get("source"))
+		if err != nil {
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Exists: exists})
+	default:
+		apihttp.WriteError(w, http.StatusBadRequest, "unknown volume query kind")
+	}
+}
+
 func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {

@@ -10,6 +10,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type errorResponse struct {
@@ -106,6 +107,22 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 			w.Header().Set("Retry-After", "300")
 		}
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	// Platform-volume sentinels (plans/e2b-volume-mounts.md). 412 = deployment
+	// hasn't enabled platform volumes; 400 = volumes on an unsupported runtime
+	// (client input); 409 = per-tenant quota. Mirrors apihttp.WriteStoreAwareError
+	// because the E2B facade keeps its own envelope writer.
+	if errors.Is(err, models.ErrPlatformVolumesDisabled) {
+		WriteError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrPlatformVolumesUnsupportedRuntime) {
+		WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrPlatformVolumeQuota) {
+		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
 	if logger != nil {

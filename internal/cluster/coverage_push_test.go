@@ -980,6 +980,7 @@ func TestClusterSpecOfDeepCopiesMutableFields(t *testing.T) {
 		Image:            "alpine",
 		Env:              map[string]string{"A": "1"},
 		Mounts:           []models.MountSpec{{Type: "tmpfs", Target: "/data"}},
+		PlatformVolumes:  []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
 		ContainerCommand: []string{"sleep", "inf"},
 	}
 	if err := c.RecordPlacement(context.Background(), "sb-spec-copy", spec, PlacementSecrets{}); err != nil {
@@ -991,9 +992,10 @@ func TestClusterSpecOfDeepCopiesMutableFields(t *testing.T) {
 	}
 	got.Env["A"] = "mutated"
 	got.Mounts[0].Target = "/mutated"
+	got.PlatformVolumes[0].Path = "/mutated"
 	got.ContainerCommand[0] = "mutated"
 	again := c.SpecOf("sb-spec-copy")
-	if again.Env["A"] != "1" || again.Mounts[0].Target != "/data" || again.ContainerCommand[0] != "sleep" {
+	if again.Env["A"] != "1" || again.Mounts[0].Target != "/data" || again.PlatformVolumes[0].Path != "/workspace" || again.ContainerCommand[0] != "sleep" {
 		t.Fatalf("SpecOf did not deep-copy mutable fields: %+v", again)
 	}
 }

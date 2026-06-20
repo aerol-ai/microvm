@@ -38,6 +38,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
+	"github.com/aerol-ai/microvm/pkg/volumes"
 )
 
 // FleetConfig is the subset of daemon configuration a control-plane provider
@@ -602,6 +603,35 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			svc.StartWasmDurablePushSweep(ctx)
 		}
 		svc.StartPendingImageGC(ctx)
+		// Backend-reclaim janitor for deleted platform volumes. No-op unless
+		// platform volumes are enabled; deletes the S3 prefix / NFS directory
+		// recorded in the pending_volume_deletions ledger.
+		if cfg.PlatformVolumes.Enabled {
+			pv := cfg.PlatformVolumes
+			// The NFS reclaimer creates transient mounts under ReclaimMountRoot;
+			// ensure it exists (root-owned) so the first reclaim doesn't fail on a
+			// missing scratch dir. Best-effort: a failure here only disables NFS
+			// byte reclaim, not the metadata delete path.
+			if pv.Backend == config.PlatformVolumesBackendNFS && pv.ReclaimMountRoot != "" {
+				if err := os.MkdirAll(pv.ReclaimMountRoot, 0o700); err != nil {
+					logger.Warn("platform volume reclaim scratch dir create failed",
+						"path", pv.ReclaimMountRoot, "error", err)
+				}
+			}
+			svc.SetVolumeReclaimer(volumes.NewReclaimer(volumes.Backend{
+				Kind:              pv.Backend,
+				S3Bucket:          pv.S3Bucket,
+				S3Prefix:          pv.S3Prefix,
+				S3Region:          pv.S3Region,
+				S3Endpoint:        pv.S3Endpoint,
+				S3AccessKeyID:     pv.S3AccessKeyID,
+				S3SecretAccessKey: pv.S3SecretAccessKey,
+				NFSServer:         pv.NFSServer,
+				NFSExport:         pv.NFSExport,
+				NFSOptions:        pv.NFSOptions,
+			}, pv.ReclaimMountRoot, volumes.ExecRunner))
+			svc.StartVolumeReclaim(ctx)
+		}
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
 		startSnapshotPushReconciler(ctx, logger, cfg, db, svc, dockerClient)
 		startTemplateArtifactPushReconciler(ctx, logger, cfg, db, svc, dockerClient)

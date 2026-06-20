@@ -262,6 +262,9 @@ func RedactClusterSecrets(req models.CreateSandboxRequest) models.CreateSandboxR
 		}
 		out.Mounts = ms
 	}
+	if len(out.PlatformVolumes) > 0 {
+		out.PlatformVolumes = append([]models.PlatformVolumeMount(nil), out.PlatformVolumes...)
+	}
 	if len(out.Env) > 0 {
 		env := make(map[string]string, len(out.Env))
 		for k, v := range out.Env {

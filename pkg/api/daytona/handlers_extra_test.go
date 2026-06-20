@@ -509,14 +509,14 @@ func TestHandlersErrorPaths(t *testing.T) {
 			t.Fatalf("expected 400, got %d", rr3.Code)
 		}
 
-		// 4. Volumes unsupported
+		// 4. Volume entry missing mountPath → 400 validation error.
 		reqReq2 := createSandboxRequest{Volumes: []map[string]any{{"volumeId": "vol-1"}}}
 		bodyBytes2, _ := json.Marshal(reqReq2)
 		req4 := httptest.NewRequest(http.MethodPost, "/daytona/sandbox", strings.NewReader(string(bodyBytes2)))
 		rr4 := httptest.NewRecorder()
 		handler.ServeHTTP(rr4, req4)
-		if rr4.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("expected 405, got %d", rr4.Code)
+		if rr4.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rr4.Code)
 		}
 	})
 
@@ -807,15 +807,6 @@ func TestDaytonaHelperFunctions(t *testing.T) {
 		}
 		if got := firstFloat32Ptr(nil, &f2); got == nil || *got != 2.5 {
 			t.Fatalf("expected 2.5, got %v", got)
-		}
-	})
-
-	t.Run("volumesNotSupported", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/daytona/volumes", nil)
-		rr := httptest.NewRecorder()
-		volumesNotSupported(rr, req)
-		if rr.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("expected 405, got %d", rr.Code)
 		}
 	})
 
@@ -1149,15 +1140,18 @@ func TestCreateSandbox_HTTP_Errors(t *testing.T) {
 		}
 	})
 
-	t.Run("volumes_unsupported", func(t *testing.T) {
+	t.Run("volumes_disabled", func(t *testing.T) {
+		// Platform volumes are disabled in the test env, so a create that
+		// attaches a (well-formed) volume is rejected with 412 — replacing the
+		// old blanket 405.
 		_, _, _, handler := newHandlerExtraTestEnv(t)
-		body := `{"name": "sb-volumes", "volumes": [{"volumeId": "vol-1"}]}`
+		body := `{"name": "sb-volumes", "volumes": [{"volumeId": "vol-1", "mountPath": "/data"}]}`
 		req := httptest.NewRequest(http.MethodPost, "/daytona/sandbox", strings.NewReader(body))
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
 
-		if rr.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("expected 405, got %d", rr.Code)
+		if rr.Code != http.StatusPreconditionFailed {
+			t.Fatalf("expected 412, got %d", rr.Code)
 		}
 	})
 

@@ -67,7 +67,7 @@ func legacyPortProtocols(routes map[int]cluster.ExposedPortRoute) map[int]string
 
 func TestSpecFromSandboxPreservesFirecrackerTemplateFields(t *testing.T) {
 	svc := &Service{}
-	spec := svc.specFromSandbox(&models.Sandbox{
+	spec := svc.specFromSandbox(context.Background(), &models.Sandbox{
 		ID:            "sb-fc-spec",
 		Image:         "alpine:3.20",
 		Runtime:       models.RuntimeFirecracker,

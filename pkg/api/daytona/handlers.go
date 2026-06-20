@@ -42,12 +42,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	placementReq, err := h.clusterPlacementRequest(r.Context(), req)
 	if err != nil {
-		switch {
-		case errors.Is(err, errVolumesUnsupported):
-			apihttp.WriteError(w, http.StatusMethodNotAllowed, err.Error())
-		default:
-			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-		}
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteError, clustercreate.PrepareOptions{})
@@ -68,8 +63,8 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 			apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
 		case errors.Is(err, errBuildOperational):
 			apihttp.WriteError(w, http.StatusBadGateway, err.Error())
-		case errors.Is(err, errVolumesUnsupported):
-			apihttp.WriteError(w, http.StatusMethodNotAllowed, err.Error())
+		case errors.Is(err, models.ErrPlatformVolumesDisabled):
+			apihttp.WriteError(w, http.StatusPreconditionFailed, err.Error())
 		default:
 			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		}
@@ -133,9 +128,9 @@ func (h *handlers) clusterPlacementRequest(ctx context.Context, req createSandbo
 	if req.Gpu != nil && *req.Gpu > 0 {
 		return models.CreateSandboxRequest{}, errors.New("gpu allocation is not supported by the Daytona facade")
 	}
-	if len(req.Volumes) > 0 {
-		return models.CreateSandboxRequest{}, errVolumesUnsupported
-	}
+	// Volumes are resolved + gated on the real create path
+	// (translateCreateSandboxRequest + the service); placement doesn't need the
+	// mount set, so we let volume-bearing requests through here.
 	image := "daytona-create"
 	var distribution models.ImageDistributionMetadata
 	if snapshotName := strings.TrimSpace(valueOrEmpty(req.Snapshot)); snapshotName != "" {
@@ -987,8 +982,12 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if req.Gpu != nil && *req.Gpu > 0 {
 		return models.CreateSandboxRequest{}, "", errors.New("gpu allocation is not supported by the Daytona facade")
 	}
-	if len(req.Volumes) > 0 {
-		return models.CreateSandboxRequest{}, "", errVolumesUnsupported
+	// Resolve attach-at-create volumes ({volumeId, mountPath}) to the neutral
+	// platform-volume references the service mounts. The id → name lookup is
+	// tenant-scoped, so a caller can only attach its own volumes.
+	platformVolumes, err := h.resolveDaytonaVolumes(ctx, req.Volumes)
+	if err != nil {
+		return models.CreateSandboxRequest{}, "", err
 	}
 
 	lifecycle := models.Lifecycle{}
@@ -1006,6 +1005,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, h.deps.Service, catalogueID, mapValue(req.Labels)); err != nil {
 		return models.CreateSandboxRequest{}, "", err
 	} else if ok {
+		// WASM has no container filesystem, so a bind-mounted volume could
+		// never appear. Reject rather than silently drop it.
+		if len(platformVolumes) > 0 {
+			return models.CreateSandboxRequest{}, "", errors.New("volume mounts are not supported for wasm sandboxes")
+		}
 		wasmReq.CPU = float64(int32Value(req.Cpu, 0))
 		wasmReq.MemoryMB = int(int32Value(req.Memory, 0)) * 1024
 		wasmReq.DiskGB = int(int32Value(req.Disk, 0))
@@ -1035,11 +1039,44 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		NetworkBlockAll: boolValue(req.NetworkBlockAll),
 		Name:            trimmedString(req.Name),
 		Tags:            cloneStringMap(mapValue(req.Labels)),
+		PlatformVolumes: platformVolumes,
 	}
 	if !lifecycle.IsZero() {
 		serviceReq.Lifecycle = &lifecycle
 	}
 	return serviceReq, freshlyBuilt, nil
+}
+
+// resolveDaytonaVolumes turns the Daytona attach-at-create shape
+// (volumes: [{volumeId, mountPath}]) into neutral platform-volume references.
+// Each volumeId is resolved to its name through the tenant-scoped store, so a
+// caller can only mount volumes it owns; an unknown id surfaces as a 400/404
+// upstream via the service's store.ErrNotFound.
+func (h *handlers) resolveDaytonaVolumes(ctx context.Context, raw []map[string]any) ([]models.PlatformVolumeMount, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]models.PlatformVolumeMount, 0, len(raw))
+	for _, entry := range raw {
+		volumeID := strings.TrimSpace(stringFromAny(entry["volumeId"]))
+		mountPath := strings.TrimSpace(stringFromAny(entry["mountPath"]))
+		if volumeID == "" || mountPath == "" {
+			return nil, errors.New("each volume requires volumeId and mountPath")
+		}
+		vol, err := h.deps.Service.GetPlatformVolume(ctx, volumeID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, models.PlatformVolumeMount{Name: vol.Name, Path: mountPath})
+	}
+	return out, nil
+}
+
+func stringFromAny(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (string, string, error) {
@@ -1159,21 +1196,6 @@ func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest)
 // daytona createSandbox handler maps it to HTTP 502 so that retries and
 // alerting can distinguish "daemon is sad" from "client sent garbage".
 var errBuildOperational = errors.New("build operational error")
-
-// errVolumesUnsupported flags requests that name persistent Daytona volumes.
-// The facade has no volume backend yet; the dedicated /volumes routes and
-// the volumes[] field on createSandbox both surface as HTTP 405 so SDK
-// clients see a single, consistent "not yet implemented" signal.
-var errVolumesUnsupported = errors.New(volumesUnsupportedMessage)
-
-const volumesUnsupportedMessage = "volumes are not supported by the Daytona facade; this will be supported in a future release"
-
-// volumesNotSupported is the shared handler for every /volumes endpoint the
-// Daytona SDK reaches for. Returning 405 (rather than 404) tells clients the
-// route is recognized but the operation isn't available yet.
-func volumesNotSupported(w http.ResponseWriter, _ *http.Request) {
-	apihttp.WriteError(w, http.StatusMethodNotAllowed, volumesUnsupportedMessage)
-}
 
 // singleLineFromImage detects the legacy `FROM <image>` shape and returns
 // the base image when matched. Comments and blank lines are ignored.

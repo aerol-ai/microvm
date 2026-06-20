@@ -301,6 +301,7 @@ type Config struct {
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
+	PlatformVolumes             PlatformVolumesConfig
 	LogLevel                    string
 	ShutdownTimeout             time.Duration
 	HTTPClientTimeout           time.Duration
@@ -1084,6 +1085,87 @@ type MirrorUpstreamMapping struct {
 	Shortname string
 }
 
+// PlatformVolumesConfig holds the operator-level shared-storage settings that
+// back named persistent volumes. Unlike per-sandbox external mounts, the
+// *operator* owns the bucket/export and credentials here; end users reference
+// volumes only by name. When Enabled is false every volume API returns 412 and
+// none of the backend fields are read. See plans/e2b-volume-mounts.md.
+type PlatformVolumesConfig struct {
+	Enabled bool
+	// Backend selects the storage protocol: "s3" or "nfs". Both ship in v1.
+	Backend string
+	// MaxPerTenant caps how many distinct volumes a single tenant may create.
+	// 0 means unlimited.
+	MaxPerTenant int
+
+	// ReclaimInterval is how often the backend-reclaim janitor drains the
+	// pending_volume_deletions ledger (deleting the S3 prefix / NFS directory of
+	// deleted volumes). 0 disables the worker, leaving the ledger for an external
+	// reconciler — the metadata delete still succeeds, only byte reclaim pauses.
+	ReclaimInterval time.Duration
+
+	// ReclaimMountRoot is the root-owned scratch dir transient NFS reclaim mounts
+	// are created under. Ignored for the S3 backend.
+	ReclaimMountRoot string
+
+	// ReclaimConcurrency bounds how many backend deletes a single reclaim tick
+	// runs in parallel. Each delete is a serial CLI / mount round-trip, so some
+	// parallelism keeps a burst-delete backlog draining without unbounded fanout
+	// against the backend. <=1 means serial.
+	ReclaimConcurrency int
+
+	// S3 backend (Backend == "s3").
+	S3Bucket          string
+	S3Prefix          string
+	S3Region          string
+	S3Endpoint        string
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+
+	// NFS backend (Backend == "nfs"). NFS is a credential-free kernel mount;
+	// NFSExport is the base export path under which per-tenant/per-name
+	// directories live.
+	NFSServer  string
+	NFSExport  string
+	NFSOptions string
+}
+
+// Backend protocol constants for PlatformVolumesConfig.Backend.
+const (
+	PlatformVolumesBackendS3  = "s3"
+	PlatformVolumesBackendNFS = "nfs"
+)
+
+// Validate enforces the gating contract: when platform volumes are enabled the
+// selected backend's required fields must be present, so the daemon fails fast
+// at boot rather than 500-ing on the first volume request. A disabled config is
+// always valid (the backend fields are ignored).
+func (p PlatformVolumesConfig) Validate() error {
+	if !p.Enabled {
+		return nil
+	}
+	if p.MaxPerTenant < 0 {
+		return errors.New("SB_PLATFORM_VOLUMES_MAX_PER_TENANT must be >= 0")
+	}
+	switch p.Backend {
+	case PlatformVolumesBackendS3:
+		if strings.TrimSpace(p.S3Bucket) == "" {
+			return errors.New("SB_PLATFORM_VOLUMES_S3_BUCKET is required when platform volumes use the s3 backend")
+		}
+	case PlatformVolumesBackendNFS:
+		if strings.TrimSpace(p.NFSServer) == "" {
+			return errors.New("SB_PLATFORM_VOLUMES_NFS_SERVER is required when platform volumes use the nfs backend")
+		}
+		if strings.TrimSpace(p.NFSExport) == "" {
+			return errors.New("SB_PLATFORM_VOLUMES_NFS_EXPORT is required when platform volumes use the nfs backend")
+		}
+	default:
+		return fmt.Errorf("SB_PLATFORM_VOLUMES_BACKEND must be %q or %q, got %q",
+			PlatformVolumesBackendS3, PlatformVolumesBackendNFS, p.Backend)
+	}
+	return nil
+}
+
 func Load() (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
@@ -1146,21 +1228,38 @@ func Load() (Config, error) {
 		MountsRootPath:                   getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:      getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                 getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
-		LogLevel:                         strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
-		ShutdownTimeout:                  getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
-		HTTPClientTimeout:                getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
-		DockerRuntimeWaitTimeout:         getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
-		ToolboxWaitTimeout:               getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
-		ReconcileInterval:                getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
-		NetstatsPollInterval:             getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
-		UploadMaxBytes:                   int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
-		OTELMetricsEnabled:               getEnvBool("SB_OTEL_METRICS_ENABLED", false),
-		OTELMetricsEndpoint:              firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
-		OTELMetricsInterval:              getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
-		OTELTracesEnabled:                getEnvBool("SB_OTEL_TRACES_ENABLED", false),
-		OTELTracesEndpoint:               firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
-		OTELTracesSampleRatio:            getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
-		OTELServiceName:                  getEnv("OTEL_SERVICE_NAME", "sandboxd"),
+		PlatformVolumes: PlatformVolumesConfig{
+			Enabled:            getEnvBool("SB_PLATFORM_VOLUMES_ENABLED", false),
+			Backend:            strings.ToLower(strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_BACKEND", PlatformVolumesBackendS3))),
+			MaxPerTenant:       getEnvInt("SB_PLATFORM_VOLUMES_MAX_PER_TENANT", 0),
+			ReclaimInterval:    getEnvDuration("SB_PLATFORM_VOLUMES_RECLAIM_INTERVAL", 5*time.Minute),
+			ReclaimMountRoot:   strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_RECLAIM_MOUNT_ROOT", "/var/lib/aerolvm/volume-reclaim")),
+			ReclaimConcurrency: getEnvInt("SB_PLATFORM_VOLUMES_RECLAIM_CONCURRENCY", 8),
+			S3Bucket:           strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_BUCKET")),
+			S3Prefix:           strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_S3_PREFIX", "volumes")),
+			S3Region:           strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_REGION")),
+			S3Endpoint:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_ENDPOINT")),
+			S3AccessKeyID:      strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_ACCESS_KEY_ID")),
+			S3SecretAccessKey:  strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_S3_SECRET_ACCESS_KEY")),
+			NFSServer:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_SERVER")),
+			NFSExport:          strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_EXPORT")),
+			NFSOptions:         strings.TrimSpace(os.Getenv("SB_PLATFORM_VOLUMES_NFS_OPTIONS")),
+		},
+		LogLevel:                 strings.ToLower(getEnv("SB_LOG_LEVEL", "info")),
+		ShutdownTimeout:          getEnvDuration("SB_SHUTDOWN_TIMEOUT", 10*time.Second),
+		HTTPClientTimeout:        getEnvDuration("SB_HTTP_CLIENT_TIMEOUT", 180*time.Second),
+		DockerRuntimeWaitTimeout: getEnvDuration("SB_DOCKER_WAIT_TIMEOUT", 30*time.Second),
+		ToolboxWaitTimeout:       getEnvDuration("SB_TOOLBOX_WAIT_TIMEOUT", 30*time.Second),
+		ReconcileInterval:        getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
+		NetstatsPollInterval:     getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
+		UploadMaxBytes:           int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		OTELMetricsEnabled:       getEnvBool("SB_OTEL_METRICS_ENABLED", false),
+		OTELMetricsEndpoint:      firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
+		OTELMetricsInterval:      getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		OTELTracesEnabled:        getEnvBool("SB_OTEL_TRACES_ENABLED", false),
+		OTELTracesEndpoint:       firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+		OTELTracesSampleRatio:    getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
+		OTELServiceName:          getEnv("OTEL_SERVICE_NAME", "sandboxd"),
 
 		CPUReservationRatio:       getEnvFloat("SB_CPU_RESERVATION_RATIO", 0.9),
 		MemoryReservationRatio:    getEnvFloat("SB_MEMORY_RESERVATION_RATIO", 0.85),
@@ -1325,6 +1424,10 @@ func Load() (Config, error) {
 
 	if cfg.PATToken == "" {
 		return Config{}, errors.New("SB_PAT_TOKEN is required")
+	}
+
+	if err := cfg.PlatformVolumes.Validate(); err != nil {
+		return Config{}, err
 	}
 
 	if cfg.DBPath == "" {

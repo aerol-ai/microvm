@@ -82,6 +82,21 @@ export interface MountSpecRedacted {
   hasCredentials: boolean;
 }
 
+/**
+ * A named, operator-backed persistent volume to attach by name. The operator
+ * configures the shared backend (S3/NFS); you never supply storage coordinates
+ * or credentials. Persists across the sandbox lifecycle and can be re-attached
+ * by name from another sandbox.
+ */
+export interface PlatformVolumeMount {
+  /** Volume name, scoped to your tenant. */
+  name: string;
+  /** Absolute path to mount it at inside the sandbox. */
+  path: string;
+  /** Mount read-only. Defaults to read-write. */
+  readOnly?: boolean;
+}
+
 export interface Lifecycle {
   /** Duration in integer nanoseconds. */
   stopIfIdleFor?: number;
@@ -203,6 +218,12 @@ export interface CreateOptions {
   registry?: RegistryAuth;
   containerCommand?: string[];
   mounts?: MountSpec[];
+  /**
+   * Named, operator-backed persistent volumes to attach by name. Requires the
+   * operator to have enabled platform volumes; otherwise the create is rejected
+   * with 412. Only supported on the docker/gvisor runtimes.
+   */
+  platformVolumes?: PlatformVolumeMount[];
   lifecycle?: Lifecycle;
   failover?: Failover;
   /**

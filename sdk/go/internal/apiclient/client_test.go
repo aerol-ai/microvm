@@ -272,6 +272,46 @@ func TestCreateForwardsServerlessLifecycleFlag(t *testing.T) {
 	}
 }
 
+// TestCreateForwardsPlatformVolumes proves the Go SDK serializes the
+// platform_volumes field over the wire. CreateSandboxOptions aliases
+// pkg/models.CreateSandboxRequest, so this needs no SDK-side mapping — the test
+// guards that the wire shape (snake_case key, name/path/read_only) is intact.
+func TestCreateForwardsPlatformVolumes(t *testing.T) {
+	ctx := context.Background()
+	var seen map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+			Sandbox: models.Sandbox{ID: "sb-vol", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	if _, _, err := client.Create(ctx, CreateOptions{
+		Image: "ubuntu:22.04",
+		PlatformVolumes: []models.PlatformVolumeMount{
+			{Name: "data", Path: "/workspace"},
+			{Name: "cache", Path: "/cache", ReadOnly: true},
+		},
+	}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	raw, ok := seen["platform_volumes"].([]any)
+	if !ok || len(raw) != 2 {
+		t.Fatalf("platform_volumes wire shape = %#v", seen["platform_volumes"])
+	}
+	first := raw[0].(map[string]any)
+	if first["name"] != "data" || first["path"] != "/workspace" {
+		t.Fatalf("first volume = %#v", first)
+	}
+	if ro, _ := raw[1].(map[string]any)["read_only"].(bool); !ro {
+		t.Fatalf("second volume read_only not serialized: %#v", raw[1])
+	}
+}
+
 // TestRegisterSnapshotSendsImagePath verifies the image-only happy path:
 // fields land on the wire under their snake_case names, the URL targets
 // /v1/snapshots, and the daemon's response is round-tripped back to the

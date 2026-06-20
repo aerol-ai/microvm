@@ -199,6 +199,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
         description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
       },
       {
+        type: 'link',
+        href: '/platform-volumes',
+        label: 'Platform Volumes',
+        description: 'Named, operator-backed persistent volumes referenced by name.',
+      },
+      {
         type: 'group',
         homePageHref: '/preview',
         label: 'Preview Publicly',

@@ -35,6 +35,7 @@ export type {
   MountSpec,
   MountSpecRedacted,
   MountType,
+  PlatformVolumeMount,
   RegisterSnapshotOptions,
   RegistryAuth,
   ResizeOptions,

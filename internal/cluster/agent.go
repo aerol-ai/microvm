@@ -33,6 +33,7 @@ const (
 	PublicInternalPlacementsPagePath    = "/v1/cluster/internal/placements/page"
 	PublicInternalRecoveryPath          = "/v1/cluster/internal/recovery/"
 	PublicInternalSelectPlacementPath   = "/v1/cluster/internal/select-placement"
+	PublicInternalVolumePath            = "/v1/cluster/internal/volume"
 	PublicInternalDrainStatePath        = "/v1/cluster/internal/drain/"
 	PublicInternalClusterLeaderPath     = "/v1/cluster/leader"
 	controlPlaneRequestTimeout          = 5 * time.Second

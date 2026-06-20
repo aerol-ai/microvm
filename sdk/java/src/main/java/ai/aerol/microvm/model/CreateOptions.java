@@ -38,6 +38,10 @@ public class CreateOptions {
     public RegistryAuth registry;
     public List<String> containerCommand;
     public List<MountSpec> mounts;
+    /** Named, operator-backed persistent volumes to attach by name. Requires the
+     * operator to have enabled platform volumes (else the create returns 412). */
+    @JsonProperty("platform_volumes")
+    public List<PlatformVolumeMount> platformVolumes;
     public Lifecycle lifecycle;
     public Failover failover;
     public String runtime;
@@ -135,6 +139,11 @@ public class CreateOptions {
 
     public CreateOptions setMounts(List<MountSpec> mounts) {
         this.mounts = mounts;
+        return this;
+    }
+
+    public CreateOptions setPlatformVolumes(List<PlatformVolumeMount> platformVolumes) {
+        this.platformVolumes = platformVolumes;
         return this;
     }
 

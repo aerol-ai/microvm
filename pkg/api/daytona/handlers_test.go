@@ -585,17 +585,22 @@ func boolPtr(value bool) *bool {
 	return &value
 }
 
-func TestTranslateCreateSandboxRequestRejectsVolumesAsUnsupported(t *testing.T) {
-	req := createSandboxRequest{
-		Volumes: []map[string]any{{"volumeId": "vol-1", "mountPath": "/data"}},
-	}
-
+// A volume entry missing volumeId or mountPath is rejected before any store
+// lookup, so no Service is needed.
+func TestResolveDaytonaVolumesValidation(t *testing.T) {
 	h := newHandlers(Deps{})
-	_, _, err := h.translateCreateSandboxRequest(context.Background(), req)
-	if err == nil {
-		t.Fatal("expected error when volumes field is set")
+	cases := [][]map[string]any{
+		{{"volumeId": "vol-1"}},               // missing mountPath
+		{{"mountPath": "/data"}},              // missing volumeId
+		{{"volumeId": "", "mountPath": "/x"}}, // empty volumeId
 	}
-	if !errors.Is(err, errVolumesUnsupported) {
-		t.Fatalf("err = %v, want errVolumesUnsupported", err)
+	for i, raw := range cases {
+		if _, err := h.resolveDaytonaVolumes(context.Background(), raw); err == nil {
+			t.Fatalf("case %d: expected validation error", i)
+		}
+	}
+	// No volumes is a clean no-op.
+	if got, err := h.resolveDaytonaVolumes(context.Background(), nil); err != nil || got != nil {
+		t.Fatalf("empty volumes = (%v, %v), want (nil, nil)", got, err)
 	}
 }

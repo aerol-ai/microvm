@@ -199,7 +199,7 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			ContainerCommand:   []string{"entry"},
 		}
 
-		spec := svc.specFromSandbox(sb)
+		spec := svc.specFromSandbox(context.Background(), sb)
 		if spec == nil || spec.Registry == nil || spec.Registry.Password != "secret" {
 			t.Fatalf("specFromSandbox registry = %+v", spec.Registry)
 		}

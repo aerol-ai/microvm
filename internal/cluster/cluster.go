@@ -533,6 +533,26 @@ type Client interface {
 	// receiving node has imported a §4.8.1 checkpoint.
 	ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error
 
+	// Platform-volume metadata replication. These keep a Daytona volume's
+	// id/name/source consistent cluster-wide so get/list/delete-by-id survive the
+	// tenant's API ownership moving between nodes. The data itself is
+	// deterministic in S3/NFS and is never replicated.
+	//
+	// VolumeUpsert is an idempotent get-or-create: a duplicate (tenant, name)
+	// converges on the existing row. It returns the canonical row and whether
+	// this call created it, or ErrVolumeQuotaExceeded.
+	VolumeUpsert(ctx context.Context, v models.Volume, maxPerTenant int) (models.Volume, bool, error)
+	// VolumeDelete removes the (tenant, id) row, or returns ErrUnknownVolume.
+	VolumeDelete(ctx context.Context, tenant, id string) error
+	// VolumeByID / VolumeByName resolve a single row or return ErrUnknownVolume.
+	VolumeByID(ctx context.Context, tenant, id string) (models.Volume, error)
+	VolumeByName(ctx context.Context, tenant, name string) (models.Volume, error)
+	// VolumesForTenant lists the tenant's rows, newest first.
+	VolumesForTenant(ctx context.Context, tenant string) ([]models.Volume, error)
+	// VolumeExistsForSource reports whether any replicated row points at source
+	// (the reclaim worker's cluster-wide live-data guard).
+	VolumeExistsForSource(ctx context.Context, source string) (bool, error)
+
 	// RemoveMember explicitly removes nodeID from the raft configuration after
 	// marking it drained and orphaning any placements it owned. Unknown raft
 	// members return ErrUnknownMember. Live members require force=true so an

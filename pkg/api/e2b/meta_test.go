@@ -9,6 +9,51 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
+// UC-19/UC-20: volume mounts attached at create round-trip through the sealed
+// compat blob, so GET/list can echo them (name+path only) after a restart.
+func TestVolumeMountsRoundTripThroughCompatBlob(t *testing.T) {
+	in := sandboxMeta{
+		TemplateID: "base",
+		Secure:     true,
+		OnTimeout:  "kill",
+		VolumeMounts: []sandboxVolumeMountPayload{
+			{Name: "data", Path: "/workspace"},
+			{Name: "cache", Path: "/cache"},
+		},
+	}
+	encoded, err := sandboxMetaToState(in)
+	if err != nil {
+		t.Fatalf("sandboxMetaToState: %v", err)
+	}
+	if !strings.Contains(encoded, "volume_mounts") {
+		t.Fatalf("blob missing volume_mounts: %s", encoded)
+	}
+	out, err := sandboxMetaFromState(&models.SandboxCompatState{StateJSON: encoded}, nil)
+	if err != nil {
+		t.Fatalf("sandboxMetaFromState: %v", err)
+	}
+	if len(out.VolumeMounts) != 2 {
+		t.Fatalf("round-trip volume mounts = %d, want 2", len(out.VolumeMounts))
+	}
+	if out.VolumeMounts[0].Name != "data" || out.VolumeMounts[0].Path != "/workspace" {
+		t.Fatalf("round-trip = %+v", out.VolumeMounts)
+	}
+}
+
+// A blob with no volume mounts yields a non-nil empty slice (response builders
+// index into it).
+func TestVolumeMountsEmptyIsNonNil(t *testing.T) {
+	out := cloneVolumeMounts(nil)
+	if out == nil || len(out) != 0 {
+		t.Fatalf("cloneVolumeMounts(nil) = %v, want non-nil empty", out)
+	}
+	// Entries missing name or path are dropped.
+	dropped := cloneVolumeMounts([]sandboxVolumeMountPayload{{Name: "x"}, {Path: "/y"}, {Name: "ok", Path: "/ok"}})
+	if len(dropped) != 1 {
+		t.Fatalf("expected 1 valid entry, got %d", len(dropped))
+	}
+}
+
 func TestServerlessFromMetadata(t *testing.T) {
 	cases := []struct {
 		m    map[string]string

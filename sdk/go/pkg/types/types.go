@@ -87,6 +87,7 @@ type HealthStatus = models.HealthStatus
 type Sandbox = models.Sandbox
 type MountSpec = models.MountSpec
 type MountSpecRedacted = models.MountSpecRedacted
+type PlatformVolumeMount = models.PlatformVolumeMount
 type MountType = models.MountType
 type CreateSessionOptions = models.CreateSessionRequest
 type Session = models.Session

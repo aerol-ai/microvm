@@ -543,8 +543,22 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if req.MCP != nil {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("MCP template startup is not implemented yet")
 	}
-	if len(req.VolumeMounts) > 0 {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("E2B volume mounts are not implemented yet")
+	// Translate E2B volumeMounts → the neutral platform-volume references the
+	// service resolves against the operator's shared backend. The facade only
+	// carries name+path; the service owns tenant scoping, credentials, and the
+	// enabled/runtime/quota gates. E2B's DTO has no read-only flag, so volumes
+	// mount read-write.
+	platformVolumes := make([]models.PlatformVolumeMount, 0, len(req.VolumeMounts))
+	volumeMountPayloads := make([]sandboxVolumeMountPayload, 0, len(req.VolumeMounts))
+	for _, vm := range req.VolumeMounts {
+		platformVolumes = append(platformVolumes, models.PlatformVolumeMount{
+			Name: vm.Name,
+			Path: vm.Path,
+		})
+		volumeMountPayloads = append(volumeMountPayloads, sandboxVolumeMountPayload{
+			Name: vm.Name,
+			Path: vm.Path,
+		})
 	}
 
 	metadata, err := stringMap(req.Metadata, "metadata")
@@ -632,6 +646,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		if len(egressAllowOut) > 0 || len(egressDenyOut) > 0 {
 			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("selective egress (network.allowOut / network.denyOut) is not supported for wasm sandboxes")
 		}
+		// WASM has no container filesystem, so a bind-mounted volume could
+		// never appear. Reject rather than silently drop it.
+		if len(platformVolumes) > 0 {
+			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("volume mounts are not supported for wasm sandboxes")
+		}
 		wasmReq.Env = envVars
 		wasmReq.NetworkBlockAll = networkBlockAll
 		wasmReq.AllowPublicTraffic = allowPublicTraffic
@@ -667,6 +686,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		NetworkDenyOut:     egressDenyOut,
 		AllowPublicTraffic: allowPublicTraffic,
 		MaskRequestHost:    maskRequestHost,
+		PlatformVolumes:    platformVolumes,
 		Lifecycle:          lifecycle,
 		// E2B's metadata is the same shape as Daytona's labels — write it
 		// into the native tags column so it round-trips through any API
@@ -686,6 +706,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		NetworkDenyOut:      networkDenyOut,
 		AllowPublicTraffic:  allowPublicTraffic,
 		MaskRequestHost:     maskRequestHost,
+		VolumeMounts:        volumeMountPayloads,
 	}
 	return serviceReq, meta, nil
 }
@@ -867,7 +888,7 @@ func (h *handlers) toListedSandboxResponse(sandbox *models.Sandbox, meta sandbox
 		TemplateID:   firstNonEmpty(meta.TemplateID, sandbox.Image),
 		Alias:        meta.TemplateAlias,
 		Metadata:     cloneStringMap(meta.Metadata),
-		VolumeMounts: []sandboxVolumeMountPayload{},
+		VolumeMounts: cloneVolumeMounts(meta.VolumeMounts),
 	}
 }
 
@@ -891,7 +912,7 @@ func (h *handlers) toSandboxDetailResponse(r *http.Request, sandbox *models.Sand
 		Lifecycle:           lifecyclePayload(meta),
 		Metadata:            cloneStringMap(meta.Metadata),
 		Network:             networkPayload(meta),
-		VolumeMounts:        []sandboxVolumeMountPayload{},
+		VolumeMounts:        cloneVolumeMounts(meta.VolumeMounts),
 	}
 }
 

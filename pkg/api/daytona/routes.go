@@ -76,13 +76,16 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle(ToolboxPrefix+"/{id}", d.Auth(h.clusterForwardWrap("id", http.HandlerFunc(h.toolbox))))
 	mux.Handle(ToolboxPrefix+"/{id}/{path...}", d.Auth(h.clusterForwardWrap("id", http.HandlerFunc(h.toolbox))))
 
-	// Volumes — the Daytona SDK probes these five routes when callers use
-	// daytona.volume.{list,get,create,delete}. The facade has no volume
-	// backend yet; respond with 405 so clients see a clear "recognized but
-	// not implemented" signal rather than a 404 they'd retry through.
-	mux.Handle("GET "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(volumesNotSupported)))
-	mux.Handle("POST "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(volumesNotSupported)))
-	mux.Handle("GET "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(volumesNotSupported)))
-	mux.Handle("DELETE "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(volumesNotSupported)))
-	mux.Handle("GET "+PathPrefix+"/volumes/by-name/{name}", d.Auth(http.HandlerFunc(volumesNotSupported)))
+	// Volumes — first-class platform volumes backed by the operator's shared
+	// storage (plans/e2b-volume-mounts.md). The handlers gate on whether the
+	// operator enabled platform volumes (412 when off), so the SDK still gets a
+	// clear signal on deployments that haven't configured a backend.
+	// Volume metadata is replicated through the cluster FSM (or local SQLite in
+	// single-node mode), so any node answers these consistently — no per-tenant
+	// owner routing needed.
+	mux.Handle("GET "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(h.listVolumes)))
+	mux.Handle("POST "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(h.createVolume)))
+	mux.Handle("GET "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(h.getVolume)))
+	mux.Handle("DELETE "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(h.deleteVolume)))
+	mux.Handle("GET "+PathPrefix+"/volumes/by-name/{name}", d.Auth(http.HandlerFunc(h.getVolumeByName)))
 }

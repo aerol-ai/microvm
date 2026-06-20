@@ -25,7 +25,6 @@ func TestE2BCreateSandboxNotImplemented(t *testing.T) {
 		body string
 	}{
 		{"mcp", `{"templateID":"base","mcp":{}}`},
-		{"volumeMounts", `{"templateID":"base","volumeMounts":[{"name":"vol"}]}`},
 	}
 
 	for _, tc := range cases {
@@ -37,6 +36,20 @@ func TestE2BCreateSandboxNotImplemented(t *testing.T) {
 				t.Fatalf("expected 501, got %d for %s", rr.Code, tc.name)
 			}
 		})
+	}
+}
+
+// UC-16: with platform volumes disabled (the default test env), a create that
+// references volumeMounts is rejected with 412 Precondition Failed — not the
+// old 501, and not a silent success.
+func TestE2BVolumeMountsRejectedWhenDisabled(t *testing.T) {
+	_, _, handler := newE2BHandlerTestEnv(t)
+	body := `{"templateID":"base","volumeMounts":[{"name":"data","path":"/workspace"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d", rr.Code)
 	}
 }
 

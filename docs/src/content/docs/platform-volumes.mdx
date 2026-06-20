@@ -1,0 +1,246 @@
+---
+title: Platform Volumes
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Platform volumes are **named, persistent storage that the operator backs with
+shared cloud storage and you reference by name.** Unlike [external
+storage](/external-storage), you never supply a bucket URL or credentials — the
+operator configures one shared backend, and you just ask for a volume by name.
+
+A platform volume:
+
+- has a **name**, scoped to your tenant;
+- **persists across the sandbox lifecycle** — it survives stop *and* destroy;
+- can be **re-attached by the same name** from a later sandbox and see the same
+  data, **on any node** (it is backed by shared storage, not a host directory);
+- can be **shared** by multiple sandboxes.
+
+## When to use which
+
+| | External storage | Platform volume |
+|---|---|---|
+| Who owns the backend | You (your bucket + creds) | The operator (shared bucket) |
+| What you pass | `source` + `credentials` | just a `name` |
+| Lifetime | Remote data outlives the mount | Volume persists, re-attach by name |
+| Cluster | Works (you point at your store) | Works — shared storage is the source of truth |
+
+## Prerequisites
+
+Platform volumes must be **enabled by the operator** (see [Operator
+setup](#operator-setup)). If they are not configured, every volume request is
+rejected with **412 Precondition Failed**. Volumes are supported on the
+`docker` and `gvisor` runtimes only — `firecracker` and `wasm` reject them.
+Platform volumes count against the same per-sandbox cap as external mounts (8
+total).
+
+## Attach a volume at create
+
+First use of a name creates the volume; reuse re-attaches the same data. The
+volume is mounted read-write by default.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      platformVolumes: [
+        { name: 'data', path: '/workspace' },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'platformVolumes': [
+            {'name': 'data', 'path': '/workspace'},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        PlatformVolumes: []sdktypes.PlatformVolumeMount{
+            {Name: "data", Path: "/workspace"},
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        platform_volumes: Some(vec![aerolvm_sdk::PlatformVolumeMount {
+            name: "data".to_string(),
+            path: "/workspace".to_string(),
+            read_only: None,
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.PlatformVolumeMount;
+    import java.util.List;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setPlatformVolumes(List.of(
+                new PlatformVolumeMount().setName("data").setPath("/workspace")
+            ))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Re-attach the same volume from another sandbox
+
+Reference the same name from a second sandbox to see the data the first one
+wrote. Because the volume lives in shared storage, the second sandbox can land
+on a different node and still read it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // First sandbox writes into the volume.
+    const a = await client.create({
+      image: 'ubuntu:22.04',
+      platformVolumes: [{ name: 'data', path: '/workspace' }],
+    })
+    // Later, a second sandbox mounts the same volume read-only.
+    const b = await client.create({
+      image: 'ubuntu:22.04',
+      platformVolumes: [{ name: 'data', path: '/workspace', readOnly: true }],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    a = client.create({
+        'image': 'ubuntu:22.04',
+        'platformVolumes': [{'name': 'data', 'path': '/workspace'}],
+    })
+    b = client.create({
+        'image': 'ubuntu:22.04',
+        'platformVolumes': [{'name': 'data', 'path': '/workspace', 'readOnly': True}],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    a, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "ubuntu:22.04",
+        PlatformVolumes: []sdktypes.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
+    })
+    b, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "ubuntu:22.04",
+        PlatformVolumes: []sdktypes.PlatformVolumeMount{{Name: "data", Path: "/workspace", ReadOnly: true}},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let a = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        platform_volumes: Some(vec![aerolvm_sdk::PlatformVolumeMount {
+            name: "data".to_string(),
+            path: "/workspace".to_string(),
+            read_only: None,
+        }]),
+        ..Default::default()
+    })?;
+    let b = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        platform_volumes: Some(vec![aerolvm_sdk::PlatformVolumeMount {
+            name: "data".to_string(),
+            path: "/workspace".to_string(),
+            read_only: Some(true),
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox a = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setPlatformVolumes(List.of(
+                new PlatformVolumeMount().setName("data").setPath("/workspace")
+            ))
+    );
+    Sandbox b = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setPlatformVolumes(List.of(
+                new PlatformVolumeMount().setName("data").setPath("/workspace").setReadOnly(true)
+            ))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## Semantics
+
+- **Persistence.** Destroying a sandbox tears down the mount but never deletes
+  the volume's data. Re-attach by name to get it back.
+- **Naming.** Names are lowercased and limited to `[a-z0-9._-]`; path separators
+  and `..` are rejected.
+- **Tenant isolation.** Volume names are scoped per tenant — two tenants using
+  the name `data` get separate, isolated storage.
+- **Quotas.** Operators can cap the number of volumes per tenant; exceeding it
+  returns a `409`.
+- **Concurrent writers.** The default S3 backend is eventually consistent with
+  no file locking — concurrent writers to the same volume can lose data. Use
+  one writer plus read-only attachers, or coordinate at the application layer.
+- **Cluster.** Shared storage is the single source of truth, so a volume works
+  no matter which node a sandbox is placed on. No node affinity is required.
+
+## Operator setup
+
+Platform volumes are off by default. Enable them by pointing the daemon at a
+shared storage backend.
+
+S3 (or any S3-compatible store such as Cloudflare R2 or MinIO):
+
+```
+SB_PLATFORM_VOLUMES_ENABLED=true
+SB_PLATFORM_VOLUMES_BACKEND=s3
+SB_PLATFORM_VOLUMES_S3_BUCKET=my-org-volumes
+SB_PLATFORM_VOLUMES_S3_PREFIX=volumes            # optional, default "volumes"
+SB_PLATFORM_VOLUMES_S3_REGION=us-east-1
+SB_PLATFORM_VOLUMES_S3_ENDPOINT=                 # optional, for R2/MinIO
+SB_PLATFORM_VOLUMES_S3_ACCESS_KEY_ID=...         # omit to use an instance role
+SB_PLATFORM_VOLUMES_S3_SECRET_ACCESS_KEY=...
+SB_PLATFORM_VOLUMES_MAX_PER_TENANT=0             # 0 = unlimited
+```
+
+NFS (a credential-free kernel mount against a shared export):
+
+```
+SB_PLATFORM_VOLUMES_ENABLED=true
+SB_PLATFORM_VOLUMES_BACKEND=nfs
+SB_PLATFORM_VOLUMES_NFS_SERVER=10.0.0.5
+SB_PLATFORM_VOLUMES_NFS_EXPORT=/exports/volumes
+SB_PLATFORM_VOLUMES_NFS_OPTIONS=vers=4.1         # optional
+```
+
+Gating:
+
+| Condition | Behavior |
+|---|---|
+| Disabled / unset | Volume APIs return **412** |
+| Enabled but misconfigured | Daemon fails fast at startup |
+| Enabled + configured | Volumes attach normally |
+
+The operator owns and pays for the backing store, and is responsible for any
+storage-side lifecycle or retention policy. Operator credentials are sealed at
+rest, never returned by any read API, and never enter the sandbox — the mount
+runs on the host.
