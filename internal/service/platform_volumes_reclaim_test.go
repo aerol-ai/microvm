@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -79,6 +80,34 @@ func TestRunVolumeReclaimSkipsLiveSource(t *testing.T) {
 	pending, _ := s.store.ListPendingVolumeDeletions(ctx)
 	if len(pending) != 0 {
 		t.Fatalf("stale ledger row should be cleared: %+v", pending)
+	}
+}
+
+func TestRunVolumeReclaimKeepsLedgerWhenDeleteStillApplying(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	s.logger = slog.Default()
+	fr := &fakeReclaimer{}
+	s.SetVolumeReclaimer(fr)
+	ctx := context.Background()
+
+	v, err := s.CreatePlatformVolume(ctx, "data")
+	if err != nil {
+		t.Fatalf("CreatePlatformVolume: %v", err)
+	}
+	if err := s.store.SchedulePendingVolumeDeletion(ctx, *v, v.Source); err != nil {
+		t.Fatalf("SchedulePendingVolumeDeletion: %v", err)
+	}
+
+	s.runVolumeReclaim(ctx)
+
+	if len(fr.calls) != 0 {
+		t.Fatalf("reclaimer must not run before delete applies, got %+v", fr.calls)
+	}
+	pending, _ := s.store.ListPendingVolumeDeletions(ctx)
+	if len(pending) != 1 {
+		t.Fatalf("ledger row should remain while same volume is live: %+v", pending)
 	}
 }
 

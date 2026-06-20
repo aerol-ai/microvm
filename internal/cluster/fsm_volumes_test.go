@@ -94,6 +94,55 @@ func TestFSMVolumeDelete(t *testing.T) {
 	}
 }
 
+func TestFSMVolumeAttachmentsBlockDeleteUntilSandboxReleased(t *testing.T) {
+	fsm := newPlacementFSM()
+	fsm.Apply(&raft.Log{Index: 1, Data: mustEncode(t, volCmd(models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d"}, 0))})
+	attach := models.VolumeAttachment{Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "s/d"}
+	if got := fsm.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{attach}})}); got != nil {
+		t.Fatalf("put attachment returned %v", got)
+	}
+	if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 1 {
+		t.Fatalf("attachment count = %d, want 1", n)
+	}
+	got := fsm.Apply(&raft.Log{Index: 3, Data: mustEncode(t, command{Op: opDeleteVolume, VolumeTenant: "t-a", VolumeID: "vol-1"})})
+	if err, _ := got.(error); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("delete attached volume = %v, want ErrVolumeInUse", got)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{Op: opDeleteVolumeAttach, VolumeSandboxID: "sb-1"})}); got != nil {
+		t.Fatalf("delete attachments returned %v", got)
+	}
+	if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 0 {
+		t.Fatalf("attachment count after release = %d, want 0", n)
+	}
+	if got := fsm.Apply(&raft.Log{Index: 5, Data: mustEncode(t, command{Op: opDeleteVolume, VolumeTenant: "t-a", VolumeID: "vol-1"})}); got != nil {
+		t.Fatalf("delete after release returned %v", got)
+	}
+}
+
+func TestFSMVolumeAttachmentsSurviveSnapshotRoundtrip(t *testing.T) {
+	src := newPlacementFSM()
+	src.Apply(&raft.Log{Index: 1, Data: mustEncode(t, volCmd(models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d"}, 0))})
+	src.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{{
+		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "s/d",
+	}}})})
+
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	sink := &fakeSnapshotSink{Buffer: &bytes.Buffer{}}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	dst := newPlacementFSM()
+	if err := dst.Restore(io.NopCloser(sink.Buffer)); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if n := dst.VolumeAttachmentCount("t-a", "vol-1"); n != 1 {
+		t.Fatalf("restored attachment count = %d, want 1", n)
+	}
+}
+
 // The replicated volume table must survive a snapshot/restore cold start —
 // otherwise a follower resync or leader restart would lose every Daytona volume.
 func TestFSMVolumesSurviveSnapshotRoundtrip(t *testing.T) {

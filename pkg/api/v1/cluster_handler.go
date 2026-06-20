@@ -1059,6 +1059,13 @@ func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Exists: exists})
+	case "attachment_count":
+		count, err := c.VolumeAttachmentCount(r.Context(), tenant, q.Get("id"))
+		if err != nil {
+			apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, cluster.VolumeQueryResponse{Count: count})
 	default:
 		apihttp.WriteError(w, http.StatusBadRequest, "unknown volume query kind")
 	}

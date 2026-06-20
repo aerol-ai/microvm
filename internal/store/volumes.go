@@ -288,6 +288,20 @@ func (s *Store) CountVolumeAttachments(ctx context.Context, tenant, volumeID str
 	return n, nil
 }
 
+// DeleteVolumeAttachmentsForSandbox removes the indexed platform-volume
+// references for sandboxID. SQLite normally reaches this through the sandbox FK
+// cascade, but the explicit method lets service code share the cluster-mode
+// cleanup path and is idempotent for rollback.
+func (s *Store) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM volume_attachments WHERE sandbox_id = ?
+	`, strings.TrimSpace(sandboxID))
+	if err != nil {
+		return fmt.Errorf("delete volume attachments for sandbox: %w", err)
+	}
+	return nil
+}
+
 // DeleteVolumeIfUnattached schedules backend cleanup and removes the volume row
 // only when no indexed attachments remain. The pending cleanup row is inserted
 // in the same transaction before the metadata row is removed, so remote data

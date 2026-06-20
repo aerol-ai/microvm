@@ -95,3 +95,26 @@ func (c *Cluster) VolumesForTenant(_ context.Context, tenant string) ([]models.V
 func (c *Cluster) VolumeExistsForSource(_ context.Context, source string) (bool, error) {
 	return c.fsm.LiveVolumeExistsForSource(source), nil
 }
+
+func (c *Cluster) VolumeAttachmentCount(_ context.Context, tenant, id string) (int, error) {
+	return c.fsm.VolumeAttachmentCount(tenant, id), nil
+}
+
+func (c *Cluster) PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	err := c.applyCommand(ctx, command{Op: opPutVolumeAttach, VolumeAttachments: attachments})
+	if errors.Is(err, ErrUnknownVolume) {
+		return ErrUnknownVolume
+	}
+	return err
+}
+
+func (c *Cluster) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	return c.applyCommand(ctx, command{Op: opDeleteVolumeAttach, VolumeSandboxID: sandboxID})
+}

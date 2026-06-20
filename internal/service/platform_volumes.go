@@ -174,13 +174,44 @@ func (s *Service) cleanupCreatedPlatformVolumes(ctx context.Context, attachments
 			continue
 		}
 		seen[key] = struct{}{}
-		if err := s.deleteVolumeRowIfUnattached(ctx, models.Volume{ID: a.VolumeID, Tenant: a.Tenant, Source: a.Source}); err != nil &&
+		vol, err := s.volumeMeta().ByID(ctx, a.Tenant, a.VolumeID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			}
+			if s.logger != nil {
+				s.logger.Warn("cleanup platform volume lookup failed",
+					"volume_id", a.VolumeID, "tenant", a.Tenant, "err", err)
+			}
+			continue
+		}
+		if err := s.deleteVolumeRowIfUnattached(ctx, *vol); err != nil &&
 			!errors.Is(err, store.ErrNotFound) &&
 			!errors.Is(err, store.ErrVolumeInUse) {
 			if s.logger != nil {
 				s.logger.Warn("cleanup platform volume created by failed sandbox create failed",
 					"volume_id", a.VolumeID, "tenant", a.Tenant, "err", err)
 			}
+		}
+	}
+}
+
+func (s *Service) cleanupPlatformVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) {
+	if len(attachments) == 0 {
+		return
+	}
+	seen := map[string]struct{}{}
+	for _, a := range attachments {
+		if a.SandboxID == "" {
+			continue
+		}
+		if _, ok := seen[a.SandboxID]; ok {
+			continue
+		}
+		seen[a.SandboxID] = struct{}{}
+		if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, a.SandboxID); err != nil && s.logger != nil {
+			s.logger.Warn("cleanup platform volume attachments failed",
+				"sandbox_id", a.SandboxID, "err", err)
 		}
 	}
 }

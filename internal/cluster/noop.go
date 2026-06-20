@@ -24,9 +24,12 @@ type Noop struct {
 	// happens to route through the cluster seam). Real deployments with
 	// EnableCluster=false use the SQLite store directly; this just keeps the
 	// interface honest rather than silently dropping writes.
-	volMu    sync.Mutex
-	volumes  map[string]models.Volume // key: tenant\x00id
-	volNames map[string]string        // key: tenant\x00name -> id
+	volMu                   sync.Mutex
+	volumes                 map[string]models.Volume // key: tenant\x00id
+	volNames                map[string]string        // key: tenant\x00name -> id
+	volAttachments          map[string]models.VolumeAttachment
+	volAttachmentsByVolume  map[string]map[string]struct{}
+	volAttachmentsBySandbox map[string]map[string]struct{}
 }
 
 // NewNoop returns a single-node Client. nodeID and apiURL are reported back
@@ -137,6 +140,9 @@ func (n *Noop) VolumeDelete(_ context.Context, tenant, id string) error {
 	if !ok {
 		return ErrUnknownVolume
 	}
+	if n.volumeAttachmentCountLocked(tenant, id) > 0 {
+		return ErrVolumeInUse
+	}
 	delete(n.volumes, volumeKey(tenant, id))
 	delete(n.volNames, volumeNameKey(tenant, row.Name))
 	return nil
@@ -186,6 +192,108 @@ func (n *Noop) VolumeExistsForSource(_ context.Context, source string) (bool, er
 		}
 	}
 	return false, nil
+}
+
+func (n *Noop) VolumeAttachmentCount(_ context.Context, tenant, id string) (int, error) {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	return n.volumeAttachmentCountLocked(strings.TrimSpace(tenant), strings.TrimSpace(id)), nil
+}
+
+func (n *Noop) PutVolumeAttachments(_ context.Context, attachments []models.VolumeAttachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	n.ensureVolumeAttachmentMapsLocked()
+	for _, a := range attachments {
+		tenant := strings.TrimSpace(a.Tenant)
+		volumeID := strings.TrimSpace(a.VolumeID)
+		sandboxID := strings.TrimSpace(a.SandboxID)
+		target := strings.TrimSpace(a.Target)
+		source := strings.TrimSpace(a.Source)
+		if tenant == "" || volumeID == "" || sandboxID == "" || target == "" || source == "" {
+			return ErrUnknownVolume
+		}
+		if _, ok := n.volumes[volumeKey(tenant, volumeID)]; !ok {
+			return ErrUnknownVolume
+		}
+		a.Tenant, a.VolumeID, a.SandboxID, a.Target, a.Source = tenant, volumeID, sandboxID, target, source
+		if a.CreatedAt.IsZero() {
+			a.CreatedAt = time.Now().UTC()
+		}
+		n.putVolumeAttachmentLocked(a)
+	}
+	return nil
+}
+
+func (n *Noop) DeleteVolumeAttachmentsForSandbox(_ context.Context, sandboxID string) error {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	n.releaseVolumeAttachmentsForSandboxLocked(strings.TrimSpace(sandboxID))
+	return nil
+}
+
+func (n *Noop) ensureVolumeAttachmentMapsLocked() {
+	if n.volAttachments == nil {
+		n.volAttachments = make(map[string]models.VolumeAttachment)
+		n.volAttachmentsByVolume = make(map[string]map[string]struct{})
+		n.volAttachmentsBySandbox = make(map[string]map[string]struct{})
+	}
+}
+
+func (n *Noop) volumeAttachmentCountLocked(tenant, volumeID string) int {
+	if tenant == "" || volumeID == "" {
+		return 0
+	}
+	return len(n.volAttachmentsByVolume[volumeKey(tenant, volumeID)])
+}
+
+func (n *Noop) putVolumeAttachmentLocked(a models.VolumeAttachment) {
+	n.ensureVolumeAttachmentMapsLocked()
+	key := volumeAttachmentKey(a.Tenant, a.VolumeID, a.SandboxID, a.Target)
+	if existing, ok := n.volAttachments[key]; ok {
+		n.releaseVolumeAttachmentKeyLocked(key, existing)
+	}
+	n.volAttachments[key] = a
+	vKey := volumeKey(a.Tenant, a.VolumeID)
+	if n.volAttachmentsByVolume[vKey] == nil {
+		n.volAttachmentsByVolume[vKey] = make(map[string]struct{})
+	}
+	n.volAttachmentsByVolume[vKey][key] = struct{}{}
+	if n.volAttachmentsBySandbox[a.SandboxID] == nil {
+		n.volAttachmentsBySandbox[a.SandboxID] = make(map[string]struct{})
+	}
+	n.volAttachmentsBySandbox[a.SandboxID][key] = struct{}{}
+}
+
+func (n *Noop) releaseVolumeAttachmentKeyLocked(key string, a models.VolumeAttachment) {
+	delete(n.volAttachments, key)
+	vKey := volumeKey(a.Tenant, a.VolumeID)
+	if refs := n.volAttachmentsByVolume[vKey]; refs != nil {
+		delete(refs, key)
+		if len(refs) == 0 {
+			delete(n.volAttachmentsByVolume, vKey)
+		}
+	}
+	if refs := n.volAttachmentsBySandbox[a.SandboxID]; refs != nil {
+		delete(refs, key)
+		if len(refs) == 0 {
+			delete(n.volAttachmentsBySandbox, a.SandboxID)
+		}
+	}
+}
+
+func (n *Noop) releaseVolumeAttachmentsForSandboxLocked(sandboxID string) {
+	if sandboxID == "" {
+		return
+	}
+	for key := range n.volAttachmentsBySandbox[sandboxID] {
+		if a, ok := n.volAttachments[key]; ok {
+			n.releaseVolumeAttachmentKeyLocked(key, a)
+		}
+	}
 }
 func (n *Noop) RemoveMember(ctx context.Context, nodeID string, force bool) error {
 	return ErrUnknownMember
