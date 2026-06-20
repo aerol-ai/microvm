@@ -12,8 +12,8 @@
 
   <licenses>
     <license>
-      <name>GNU Affero General Public License v3.0</name>
-      <url>https://github.com/aerol-ai/microvm/blob/main/LICENSE</url>
+      <name>MIT License</name>
+      <url>https://github.com/aerol-ai/microvm/blob/main/sdk/LICENSE</url>
       <distribution>repo</distribution>
     </license>
   </licenses>
