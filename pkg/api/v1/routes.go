@@ -168,5 +168,6 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("PUT "+cluster.PublicInternalRecoveryPath+"{ref}", d.Auth(http.HandlerFunc(h.clusterInternalRecoveryPut)))
 	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", d.Auth(http.HandlerFunc(h.clusterInternalRecoveryGet)))
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, d.Auth(http.HandlerFunc(h.clusterInternalSelectPlacement)))
+	mux.Handle("GET "+cluster.PublicInternalVolumePath, d.Auth(http.HandlerFunc(h.clusterInternalVolume)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", d.Auth(http.HandlerFunc(h.clusterInternalDrainState)))
 }

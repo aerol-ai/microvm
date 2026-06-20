@@ -37,6 +37,8 @@ const (
 	opReserveBatch       opCode = 12 // hold capacity + names for a create burst in one raft entry
 	opAddCustomDomain    opCode = 13 // bind one user hostname to a placement (cluster-wide unique)
 	opRemoveCustomDomain opCode = 14 // release one previously-bound hostname
+	opUpsertVolume       opCode = 15 // get-or-create a platform-volume metadata row (cluster-wide)
+	opDeleteVolume       opCode = 16 // remove a platform-volume metadata row
 )
 
 // command is the wire format for one raft log entry. New writers externalize
@@ -89,6 +91,15 @@ type command struct {
 	// Reservations is populated by opReserveBatch. The single opReserve fields
 	// above are retained for wire compatibility and the normal one-create path.
 	Reservations []reservationCommand `json:"reservations,omitempty"`
+
+	// Volume / VolumeTenant / VolumeID / MaxPerTenant carry platform-volume
+	// metadata for opUpsertVolume / opDeleteVolume. The volume row is replicated
+	// so any node answers Daytona get/list/delete-by-id after tenant ownership
+	// moves; the data itself is deterministic in S3/NFS and never in raft.
+	Volume       *models.Volume `json:"volume,omitempty"`
+	VolumeTenant string         `json:"volume_tenant,omitempty"`
+	VolumeID     string         `json:"volume_id,omitempty"`
+	MaxPerTenant int            `json:"max_per_tenant,omitempty"`
 }
 
 type reservationCommand struct {
@@ -253,6 +264,15 @@ type placementFSM struct {
 	// Placement.CustomHostnames slices so older snapshots still load cleanly.
 	customHostnameIndex map[string]string
 
+	// volumes holds replicated platform-volume metadata rows, keyed by
+	// volumeKey(tenant, id). volumeNameIndex maps volumeNameKey(tenant, name) →
+	// id for get-by-name, idempotent get-or-create, and per-tenant quota. These
+	// live in the FSM (not per-node SQLite) so a Daytona volume's id/name/source
+	// survive the tenant's API ownership moving to another node. The backing data
+	// is deterministic in S3/NFS, so only this small metadata table is replicated.
+	volumes         map[string]models.Volume
+	volumeNameIndex map[string]string
+
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
 	// then takes subMu to fan out.
@@ -323,8 +343,16 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		reservedIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
 		customHostnameIndex:          make(map[string]string),
+		volumes:                      make(map[string]models.Volume),
+		volumeNameIndex:              make(map[string]string),
 	}
 }
+
+// volumeKey / volumeNameKey are the FSM index keys. The NUL separator can't
+// appear in a tenant scope (hash hex) or a sanitized volume name, so the
+// concatenation is unambiguous.
+func volumeKey(tenant, id string) string       { return tenant + "\x00" + id }
+func volumeNameKey(tenant, name string) string { return tenant + "\x00" + name }
 
 func newPlacementIDIndex() *btree.BTreeG[string] {
 	return btree.NewG[string](32, func(a, b string) bool { return a < b })
@@ -835,6 +863,59 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		} else {
 			delete(f.drainedNodes, cmd.NodeID)
 		}
+		return nil
+	case opUpsertVolume:
+		// Idempotent get-or-create. A duplicate create (same tenant+name)
+		// converges on the existing row rather than inserting a second, so the
+		// op is safe under retry and concurrent duplicate calls. Quota is
+		// enforced here, on the authoritative ordered log, so two creates for
+		// different names can't both observe the same pre-insert count.
+		if cmd.Volume == nil {
+			return fmt.Errorf("placementFSM: opUpsertVolume requires a volume")
+		}
+		v := *cmd.Volume
+		tenant := strings.TrimSpace(v.Tenant)
+		name := strings.TrimSpace(v.Name)
+		id := strings.TrimSpace(v.ID)
+		if tenant == "" || name == "" || id == "" || strings.TrimSpace(v.Backend) == "" {
+			return fmt.Errorf("placementFSM: opUpsertVolume requires tenant, name, id, backend")
+		}
+		if _, exists := f.volumeNameIndex[volumeNameKey(tenant, name)]; exists {
+			// Already present — keep the existing row (idempotent). Readers fetch
+			// the canonical row by name afterward.
+			return nil
+		}
+		if cmd.MaxPerTenant > 0 {
+			count := 0
+			for k := range f.volumes {
+				if strings.HasPrefix(k, tenant+"\x00") {
+					count++
+				}
+			}
+			if count >= cmd.MaxPerTenant {
+				return ErrVolumeQuotaExceeded
+			}
+		}
+		if v.CreatedAt.IsZero() {
+			v.CreatedAt = time.Unix(now, 0).UTC()
+		}
+		v.Tenant, v.Name, v.ID = tenant, name, id
+		f.volumes[volumeKey(tenant, id)] = v
+		f.volumeNameIndex[volumeNameKey(tenant, name)] = id
+		return nil
+	case opDeleteVolume:
+		tenant := strings.TrimSpace(cmd.VolumeTenant)
+		id := strings.TrimSpace(cmd.VolumeID)
+		if tenant == "" || id == "" {
+			return fmt.Errorf("placementFSM: opDeleteVolume requires tenant and id")
+		}
+		key := volumeKey(tenant, id)
+		row, ok := f.volumes[key]
+		if !ok {
+			return ErrUnknownVolume
+		}
+		delete(f.volumes, key)
+		delete(f.volumeNameIndex, volumeNameKey(tenant, row.Name))
 		return nil
 	default:
 		return fmt.Errorf("placementFSM: unknown op %d", cmd.Op)
@@ -1873,6 +1954,9 @@ type fsmSnapshotPayload struct {
 	Placements   map[string]Placement
 	Recovery     map[string]placementRecovery
 	DrainedNodes map[string]bool
+	// Volumes is the replicated platform-volume metadata. Optional; older
+	// snapshots decode it as nil and the FSM treats that as "no volumes."
+	Volumes []models.Volume
 }
 
 type placementSnapshotRow struct {
@@ -1899,7 +1983,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	for k, v := range f.drainedNodes {
 		drained[k] = v
 	}
-	return &fsmSnapshot{version: version, rows: rows, drainedNodes: drained, recoveryStore: f.recoveryStore, recoveryRefs: recoveryRefs}, nil
+	return &fsmSnapshot{version: version, rows: rows, drainedNodes: drained, volumes: f.volumesSnapshotLocked(), recoveryStore: f.recoveryStore, recoveryRefs: recoveryRefs}, nil
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -1968,6 +2052,20 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.customHostnameIndex = make(map[string]string)
+	// Rebuild the replicated volume table + name index from the snapshot.
+	f.volumes = make(map[string]models.Volume, len(payload.Volumes))
+	f.volumeNameIndex = make(map[string]string, len(payload.Volumes))
+	for _, v := range payload.Volumes {
+		tenant := strings.TrimSpace(v.Tenant)
+		id := strings.TrimSpace(v.ID)
+		if tenant == "" || id == "" {
+			continue
+		}
+		f.volumes[volumeKey(tenant, id)] = v
+		if name := strings.TrimSpace(v.Name); name != "" {
+			f.volumeNameIndex[volumeNameKey(tenant, name)] = id
+		}
+	}
 	for id, p := range payload.Placements {
 		full := p
 		if full.SandboxID == "" {
@@ -2022,6 +2120,7 @@ type fsmSnapshot struct {
 	version       uint64
 	rows          []placementSnapshotRow
 	drainedNodes  map[string]bool
+	volumes       []models.Volume
 	recoveryStore placementRecoveryStore
 	recoveryRefs  []string
 }
@@ -2033,7 +2132,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		recordSnapshotPersist(time.Since(start), counting.bytes, len(s.rows), err)
 	}()
 	enc := gob.NewEncoder(counting)
-	if err := enc.Encode(fsmSnapshotPayload{Version: s.version, Rows: s.rows, DrainedNodes: s.drainedNodes}); err != nil {
+	if err := enc.Encode(fsmSnapshotPayload{Version: s.version, Rows: s.rows, DrainedNodes: s.drainedNodes, Volumes: s.volumes}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
 	}

@@ -641,23 +641,38 @@ A two-pass review found correctness gaps in the first implementation. Status:
     (default 8) workers, so burst-delete backlogs drain faster without unbounded
     backend fanout. Reclaim remains eventual, not synchronous.
 
-**Deferred — needs FSM replication or cross-node queries (tracked, not in this PR):**
+**Third remediation pass — volume metadata is now Raft-replicated:**
 
-Volume metadata (id↔name rows + attachments + quota) is still per-node SQLite.
-HRW forwarding keeps CRUD/quota consistent only while membership is stable, and
-it does NOT make the *delete-while-live* / *reclaim-while-live* checks
-cluster-wide:
+HRW forwarding was a routing workaround that lost a tenant's volume rows when
+membership moved its owner. That is replaced with real replication:
 
-- A sandbox failed over to a recovery node does not re-register its
-  `volume_attachments` there (the recovery spec carries concrete Mounts, not the
-  named-volume reference, and the recovery node has no volume row to FK against);
-  and attachments live wherever a sandbox *runs*, which is not the tenant's HRW
-  owner, so a forwarded delete still can't see them.
-- The reclaim worker's `LiveVolumeExistsForSource` check inspects volume *rows*,
-  not running sandboxes on other nodes.
+11. **Volume metadata lives in the Raft FSM.** Two op codes (`opUpsertVolume`,
+    `opDeleteVolume`) replicate the id→{tenant,name,source,backend} row plus a
+    `(tenant,name)→id` index through the placement FSM, with apply, snapshot
+    `Persist`, and `Restore` round-trip coverage (`fsm_volumes_test.go`).
+    `opUpsertVolume` is an idempotent get-or-create and enforces per-tenant quota
+    on the authoritative ordered log. Any raft-voter node now answers
+    get/list/delete-by-id consistently after the tenant's API ownership moves or
+    a node dies — the scenario HRW forwarding could not handle.
+12. **CRUD routes through the cluster, reads from the local replica.** The
+    service selects `clusterVolumeMeta` when `EnableCluster` is set (else the
+    SQLite store). `VolumeUpsert` proposes the create then reads back the
+    canonical row (handling follower apply lag); reads come from the local FSM
+    replica with no extra hop, so the Daytona HRW forward wrapper is removed.
+13. **Agent-role nodes** (non-voters) forward volume reads to a server peer via a
+    new consolidated internal endpoint (`/v1/cluster/internal/volume`) and writes
+    via the existing generic apply channel.
+14. **Reclaim is cluster-aware.** The worker's live-source guard now queries the
+    replicated FSM, so it never deletes bytes a recreated volume still owns on any
+    node.
 
-The *data* is never mis-located — sources are deterministic and frozen — but the
-cluster-wide "is anyone still using this?" question needs either replicated
-attachments in the Raft FSM or a scatter-gather across members at delete/reclaim
-time. Until then, delete-while-live is correct on a single node and best-effort
-across a cluster.
+**Still deferred — cluster-wide delete-while-live for attachments (tracked):**
+
+The `volume_attachments` index remains per-node SQLite, so the
+delete-while-live check is authoritative on a single node and best-effort across
+a cluster: a sandbox failed over to another node doesn't re-register its
+attachment where a delete is evaluated. The volume *metadata* and *data* are now
+both safe cluster-wide; only the "is a sandbox on another node still mounting
+this?" question needs replicated attachments (or a scatter-gather at delete
+time). That is the next increment, deliberately scoped out of this PR because it
+adds up to ~one row per sandbox (~100k) to the raft snapshot.

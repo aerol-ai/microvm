@@ -395,6 +395,33 @@ func (s *Store) ListPendingVolumeDeletions(ctx context.Context) ([]models.Pendin
 	return out, nil
 }
 
+// SchedulePendingVolumeDeletion writes (or refreshes) the durable reclaim-ledger
+// row for a volume whose metadata row lives outside this SQLite store (the
+// cluster-FSM path), so the per-node reclaim worker still has the coordinates to
+// delete the S3 prefix / NFS dir. The single-node path uses
+// DeleteVolumeIfUnattached, which does this in one transaction with the row
+// delete; this is the split-store equivalent.
+func (s *Store) SchedulePendingVolumeDeletion(ctx context.Context, v models.Volume, source string) error {
+	source = strings.TrimSpace(source)
+	if strings.TrimSpace(v.ID) == "" || strings.TrimSpace(v.Tenant) == "" || source == "" {
+		return fmt.Errorf("schedule pending volume deletion: id, tenant, and source are required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO pending_volume_deletions (volume_id, tenant, name, backend, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(volume_id) DO UPDATE SET
+			tenant = excluded.tenant,
+			name = excluded.name,
+			backend = excluded.backend,
+			source = excluded.source,
+			created_at = excluded.created_at
+	`, strings.TrimSpace(v.ID), strings.TrimSpace(v.Tenant), strings.TrimSpace(v.Name), strings.TrimSpace(v.Backend), source, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("schedule pending volume deletion: %w", err)
+	}
+	return nil
+}
+
 // DeletePendingVolumeDeletion removes a reclaim-ledger row once its backend
 // bytes have been deleted (or skipped because a live volume reclaimed the
 // source). Idempotent: a missing row is success, so the reclaim loop can run

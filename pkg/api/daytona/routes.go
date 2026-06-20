@@ -80,12 +80,12 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// storage (plans/e2b-volume-mounts.md). The handlers gate on whether the
 	// operator enabled platform volumes (412 when off), so the SDK still gets a
 	// clear signal on deployments that haven't configured a backend.
-	// Volume metadata is per-node SQLite, so in cluster mode every volume route
-	// is wrapped to forward to the tenant's deterministic owner node (no-op in
-	// single-node mode). See clusterVolumeForwardWrap.
-	mux.Handle("GET "+PathPrefix+"/volumes", d.Auth(h.clusterVolumeForwardWrap(http.HandlerFunc(h.listVolumes))))
-	mux.Handle("POST "+PathPrefix+"/volumes", d.Auth(h.clusterVolumeForwardWrap(http.HandlerFunc(h.createVolume))))
-	mux.Handle("GET "+PathPrefix+"/volumes/{volumeId}", d.Auth(h.clusterVolumeForwardWrap(http.HandlerFunc(h.getVolume))))
-	mux.Handle("DELETE "+PathPrefix+"/volumes/{volumeId}", d.Auth(h.clusterVolumeForwardWrap(http.HandlerFunc(h.deleteVolume))))
-	mux.Handle("GET "+PathPrefix+"/volumes/by-name/{name}", d.Auth(h.clusterVolumeForwardWrap(http.HandlerFunc(h.getVolumeByName))))
+	// Volume metadata is replicated through the cluster FSM (or local SQLite in
+	// single-node mode), so any node answers these consistently — no per-tenant
+	// owner routing needed.
+	mux.Handle("GET "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(h.listVolumes)))
+	mux.Handle("POST "+PathPrefix+"/volumes", d.Auth(http.HandlerFunc(h.createVolume)))
+	mux.Handle("GET "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(h.getVolume)))
+	mux.Handle("DELETE "+PathPrefix+"/volumes/{volumeId}", d.Auth(http.HandlerFunc(h.deleteVolume)))
+	mux.Handle("GET "+PathPrefix+"/volumes/by-name/{name}", d.Auth(http.HandlerFunc(h.getVolumeByName)))
 }

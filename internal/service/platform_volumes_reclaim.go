@@ -107,7 +107,7 @@ func (s *Service) runVolumeReclaim(ctx context.Context) {
 // owns the source (resurrection guard), otherwise delete the backend bytes and
 // clear the row. Errors are logged and the row left for the next tick to retry.
 func (s *Service) reclaimOne(ctx context.Context, p models.PendingVolumeDeletion) {
-	live, err := s.store.LiveVolumeExistsForSource(ctx, p.Source)
+	live, err := s.volumeMeta().ExistsForSource(ctx, p.Source)
 	if err != nil {
 		s.logger.Warn("volume reclaim live-source check failed", "volume_id", p.VolumeID, "error", err)
 		return

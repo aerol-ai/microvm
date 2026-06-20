@@ -47,7 +47,7 @@ func (s *Service) CreatePlatformVolume(ctx context.Context, name string) (*model
 	if err != nil {
 		return nil, err
 	}
-	v, _, err := s.store.GetOrCreateVolume(ctx, &models.Volume{ID: id, Tenant: tenant, Name: safeName, Backend: s.cfg.PlatformVolumes.Backend, Source: source}, s.cfg.PlatformVolumes.MaxPerTenant)
+	v, _, err := s.volumeMeta().GetOrCreate(ctx, &models.Volume{ID: id, Tenant: tenant, Name: safeName, Backend: s.cfg.PlatformVolumes.Backend, Source: source}, s.cfg.PlatformVolumes.MaxPerTenant)
 	if err != nil {
 		if errors.Is(err, store.ErrVolumeQuotaExceeded) {
 			return nil, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
@@ -66,7 +66,7 @@ func (s *Service) GetPlatformVolume(ctx context.Context, id string) (*models.Vol
 	if err != nil {
 		return nil, err
 	}
-	return s.store.GetVolumeByID(ctx, tenant, id)
+	return s.volumeMeta().ByID(ctx, tenant, id)
 }
 
 // GetPlatformVolumeByName returns the tenant's volume by name, or
@@ -83,7 +83,7 @@ func (s *Service) GetPlatformVolumeByName(ctx context.Context, name string) (*mo
 	if err != nil {
 		return nil, err
 	}
-	return s.store.GetVolume(ctx, tenant, safeName)
+	return s.volumeMeta().ByName(ctx, tenant, safeName)
 }
 
 // ListPlatformVolumes returns all of the tenant's volumes.
@@ -95,7 +95,7 @@ func (s *Service) ListPlatformVolumes(ctx context.Context) ([]models.Volume, err
 	if err != nil {
 		return nil, err
 	}
-	return s.store.ListVolumes(ctx, tenant)
+	return s.volumeMeta().List(ctx, tenant)
 }
 
 // DeletePlatformVolume removes a volume, but only when no live sandbox still has
@@ -114,15 +114,11 @@ func (s *Service) DeletePlatformVolume(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	vol, err := s.store.GetVolumeByID(ctx, tenant, id)
+	vol, err := s.volumeMeta().ByID(ctx, tenant, id)
 	if err != nil {
 		return err
 	}
-	source, err := volumes.MountSource(volumeBackendFor(s.cfg.PlatformVolumes, vol.Backend), tenant, vol.Name)
-	if err != nil {
-		return err
-	}
-	if err := s.store.DeleteVolumeIfUnattached(ctx, tenant, id, source); err != nil {
+	if err := s.deleteVolumeRowIfUnattached(ctx, *vol); err != nil {
 		if errors.Is(err, store.ErrVolumeInUse) {
 			return fmt.Errorf("%w: %v", models.ErrPlatformVolumeInUse, err)
 		}
@@ -131,18 +127,39 @@ func (s *Service) DeletePlatformVolume(ctx context.Context, id string) error {
 	return nil
 }
 
+// deleteVolumeRowIfUnattached enforces the no-live-attacher rule, schedules
+// backend reclaim, then removes the metadata row (from SQLite or the cluster FSM
+// per volumeMeta). The attachment index is still per-node SQLite, so this check
+// is authoritative on a single node and best-effort across a cluster (cluster-
+// wide attachment visibility is the tracked follow-up). The pending-deletion
+// ledger is written BEFORE the row is removed so backend bytes never lose their
+// reconciliation coordinates; the row's frozen Source is authoritative, falling
+// back to a recompute only for pre-migration rows.
+func (s *Service) deleteVolumeRowIfUnattached(ctx context.Context, vol models.Volume) error {
+	attachers, err := s.store.CountVolumeAttachments(ctx, vol.Tenant, vol.ID)
+	if err != nil {
+		return err
+	}
+	if attachers > 0 {
+		return fmt.Errorf("%w: %d attachments", store.ErrVolumeInUse, attachers)
+	}
+	source := vol.Source
+	if source == "" {
+		source, err = volumes.MountSource(volumeBackendFor(s.cfg.PlatformVolumes, vol.Backend), vol.Tenant, vol.Name)
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.store.SchedulePendingVolumeDeletion(ctx, vol, source); err != nil {
+		return err
+	}
+	return s.volumeMeta().DeleteRow(ctx, vol.Tenant, vol.ID)
+}
+
 // volumeTenant resolves the calling tenant's scope segment from the request
 // context, falling back to the operator scope for the PAT path.
 func (s *Service) volumeTenant(ctx context.Context) (string, error) {
 	return volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
-}
-
-// VolumeTenantScope exposes the per-tenant scope segment to the API facades so
-// they can route volume CRUD to a deterministic owner node in cluster mode. It
-// is the same value the service uses internally, so a forwarded request resolves
-// the identical tenant on the owner.
-func (s *Service) VolumeTenantScope(ctx context.Context) (string, error) {
-	return s.volumeTenant(ctx)
 }
 
 // volumeBackendFor builds the volumes.Backend for a stored volume's backend.

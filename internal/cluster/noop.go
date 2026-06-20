@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -16,6 +18,15 @@ type Noop struct {
 	nodeID     string
 	apiURL     string
 	publicHost string
+
+	// In-memory platform-volume metadata so the single-node Client is a correct
+	// standalone store (useful in tests and any clustering-off code path that
+	// happens to route through the cluster seam). Real deployments with
+	// EnableCluster=false use the SQLite store directly; this just keeps the
+	// interface honest rather than silently dropping writes.
+	volMu    sync.Mutex
+	volumes  map[string]models.Volume // key: tenant\x00id
+	volNames map[string]string        // key: tenant\x00name -> id
 }
 
 // NewNoop returns a single-node Client. nodeID and apiURL are reported back
@@ -81,6 +92,100 @@ func (n *Noop) SetNodeDrainState(ctx context.Context, nodeID string, drained boo
 }
 func (n *Noop) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
 	return nil
+}
+
+func (n *Noop) VolumeUpsert(_ context.Context, v models.Volume, maxPerTenant int) (models.Volume, bool, error) {
+	tenant := strings.TrimSpace(v.Tenant)
+	name := strings.TrimSpace(v.Name)
+	if tenant == "" || name == "" || strings.TrimSpace(v.ID) == "" {
+		return models.Volume{}, false, ErrUnknownVolume
+	}
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	if n.volumes == nil {
+		n.volumes = make(map[string]models.Volume)
+		n.volNames = make(map[string]string)
+	}
+	if id, ok := n.volNames[volumeNameKey(tenant, name)]; ok {
+		return n.volumes[volumeKey(tenant, id)], false, nil
+	}
+	if maxPerTenant > 0 {
+		count := 0
+		for k := range n.volumes {
+			if strings.HasPrefix(k, tenant+"\x00") {
+				count++
+			}
+		}
+		if count >= maxPerTenant {
+			return models.Volume{}, false, ErrVolumeQuotaExceeded
+		}
+	}
+	if v.CreatedAt.IsZero() {
+		v.CreatedAt = time.Now().UTC()
+	}
+	n.volumes[volumeKey(tenant, v.ID)] = v
+	n.volNames[volumeNameKey(tenant, name)] = v.ID
+	return v, true, nil
+}
+
+func (n *Noop) VolumeDelete(_ context.Context, tenant, id string) error {
+	tenant = strings.TrimSpace(tenant)
+	id = strings.TrimSpace(id)
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	row, ok := n.volumes[volumeKey(tenant, id)]
+	if !ok {
+		return ErrUnknownVolume
+	}
+	delete(n.volumes, volumeKey(tenant, id))
+	delete(n.volNames, volumeNameKey(tenant, row.Name))
+	return nil
+}
+
+func (n *Noop) VolumeByID(_ context.Context, tenant, id string) (models.Volume, error) {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	v, ok := n.volumes[volumeKey(strings.TrimSpace(tenant), strings.TrimSpace(id))]
+	if !ok {
+		return models.Volume{}, ErrUnknownVolume
+	}
+	return v, nil
+}
+
+func (n *Noop) VolumeByName(_ context.Context, tenant, name string) (models.Volume, error) {
+	tenant = strings.TrimSpace(tenant)
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	id, ok := n.volNames[volumeNameKey(tenant, strings.TrimSpace(name))]
+	if !ok {
+		return models.Volume{}, ErrUnknownVolume
+	}
+	return n.volumes[volumeKey(tenant, id)], nil
+}
+
+func (n *Noop) VolumesForTenant(_ context.Context, tenant string) ([]models.Volume, error) {
+	prefix := strings.TrimSpace(tenant) + "\x00"
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	out := []models.Volume{}
+	for k, v := range n.volumes {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+func (n *Noop) VolumeExistsForSource(_ context.Context, source string) (bool, error) {
+	source = strings.TrimSpace(source)
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	for _, v := range n.volumes {
+		if v.Source == source {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 func (n *Noop) RemoveMember(ctx context.Context, nodeID string, force bool) error {
 	return ErrUnknownMember

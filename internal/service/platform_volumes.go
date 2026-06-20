@@ -76,7 +76,7 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 			if err != nil {
 				return nil, fmt.Errorf("platform volume %q: %w", ref.Name, err)
 			}
-			vol, created, err := s.store.GetOrCreateVolume(ctx, &models.Volume{
+			vol, created, err := s.volumeMeta().GetOrCreate(ctx, &models.Volume{
 				ID:      id,
 				Tenant:  tenant,
 				Name:    safeName,
@@ -146,7 +146,7 @@ func (s *Service) ResolvePlatformVolumesForReplication(ctx context.Context, req 
 		if err != nil {
 			return fmt.Errorf("platform volume %q: %w", ref.Name, err)
 		}
-		vol, err := s.store.GetVolume(ctx, tenant, safeName)
+		vol, err := s.volumeMeta().ByName(ctx, tenant, safeName)
 		if err != nil {
 			return fmt.Errorf("get platform volume %q for replication: %w", ref.Name, err)
 		}
@@ -174,7 +174,7 @@ func (s *Service) cleanupCreatedPlatformVolumes(ctx context.Context, attachments
 			continue
 		}
 		seen[key] = struct{}{}
-		if err := s.store.DeleteVolumeIfUnattached(ctx, a.Tenant, a.VolumeID, a.Source); err != nil &&
+		if err := s.deleteVolumeRowIfUnattached(ctx, models.Volume{ID: a.VolumeID, Tenant: a.Tenant, Source: a.Source}); err != nil &&
 			!errors.Is(err, store.ErrNotFound) &&
 			!errors.Is(err, store.ErrVolumeInUse) {
 			if s.logger != nil {
