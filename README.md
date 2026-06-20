@@ -24,7 +24,7 @@
   <a href="https://github.com/aerol-ai/microvm/actions/workflows/test.yml"><img src="https://github.com/aerol-ai/microvm/actions/workflows/test.yml/badge.svg?branch=main" alt="Tests"></a>
   <a href="https://codecov.io/gh/aerol-ai/microvm"><img src="https://codecov.io/gh/aerol-ai/microvm/branch/main/graph/badge.svg" alt="Coverage"></a>
   <a href="https://github.com/aerol-ai/microvm/actions/workflows/release.yml"><img src="https://github.com/aerol-ai/microvm/actions/workflows/release.yml/badge.svg?event=release" alt="Release"></a>
-  <a href="https://github.com/aerol-ai/microvm/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://github.com/aerol-ai/microvm/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
 </p>
 
 &nbsp;
@@ -63,7 +63,7 @@ AerolVM beats the two most common alternatives on the axes that matter most for 
 | **Drop-in SDK compat** | ✅ `/daytona` and `/e2b` facades | ✗ | ✗ |
 | **Price (100 × 2vCPU/4GB sandboxes/mo)** | ~$4,000 on your infra | ~$12,000 | ~$12,000 |
 | **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python, Ruby, Go, Java |
-| **Open source** | ✅ MIT | ✗ | ✅ AGPL |
+| **Open source** | ✅ AGPL core; cluster requires a commercial license | ✗ | ✅ AGPL |
 
 [See the full comparison →](https://microvm.aerol.ai/comparison)
 
@@ -263,7 +263,7 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 
 ## Contributing
 
-AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
+AerolVM is open source under the [GNU Affero General Public License v3.0](LICENSE), with cluster-mode code separately licensed for development and testing only. Production cluster use, hosted cluster use, distribution, resale, or use to provide a managed service requires a separate commercial license from Aerol AI, Inc.; see [`internal/cluster/LICENSE`](internal/cluster/LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
 
 ```bash
 make fmt      # format Go code
@@ -273,4 +273,4 @@ make build    # build sandboxd + toolboxd into bin/
 
 ## License
 
-[MIT](LICENSE) · © Aerol AI, Inc.
+[AGPL-3.0](LICENSE) · Cluster mode requires a separate commercial license; see [`internal/cluster/LICENSE`](internal/cluster/LICENSE). · © Aerol AI, Inc.

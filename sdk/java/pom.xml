@@ -12,7 +12,7 @@
 
   <licenses>
     <license>
-      <name>MIT License</name>
+      <name>GNU Affero General Public License v3.0</name>
       <url>https://github.com/aerol-ai/microvm/blob/main/LICENSE</url>
       <distribution>repo</distribution>
     </license>

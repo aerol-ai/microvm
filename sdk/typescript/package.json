@@ -2,6 +2,7 @@
   "name": "@aerol-ai/aerolvm-sdk",
   "version": "0.5.3",
   "private": false,
+  "license": "AGPL-3.0-only",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

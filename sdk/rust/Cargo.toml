@@ -4,7 +4,7 @@ version = "0.5.3"
 edition = "2021"
 authors = ["Aerol AI"]
 description = "A Rust SDK for the Aerol.ai MicroVM sandbox API"
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/aerol-ai/microvm"
 
 [dependencies]
