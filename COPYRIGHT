@@ -7,3 +7,6 @@ has contributed to this repository.
 Unless otherwise noted, such as with a LICENSE file in a directory, or a
 specific copyright notice on a file, all files in this repository are
 licensed under the AGPL 3.0 license.
+
+Client libraries under sdk/ are licensed under the MIT license. See
+sdk/LICENSE.

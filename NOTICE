@@ -4,4 +4,7 @@ Copyright the various AerolVM software authors.
 The initial developer of the software is Aerol AI, Inc. (https://aerol.ai).
 Copyright 2026 Aerol AI, Inc. All Rights Reserved.
 
+Client libraries under sdk/ are licensed under the MIT license. See
+sdk/LICENSE.
+
 Cluster-mode code is separately licensed. See internal/cluster/LICENSE.

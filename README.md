@@ -273,4 +273,4 @@ make build    # build sandboxd + toolboxd into bin/
 
 ## License
 
-[AGPL-3.0](LICENSE) · Cluster mode requires a separate commercial license; see [`internal/cluster/LICENSE`](internal/cluster/LICENSE). · © Aerol AI, Inc.
+[AGPL-3.0](LICENSE) · Client libraries under [`sdk/`](sdk/LICENSE) are [MIT](sdk/LICENSE) · Cluster mode requires a separate commercial license; see [`internal/cluster/LICENSE`](internal/cluster/LICENSE). · © Aerol AI, Inc.
