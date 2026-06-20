@@ -86,7 +86,7 @@ Reference: [Daytona README](https://github.com/daytonaio/daytona/blob/main/READM
 
 16. **Add a Contributing section** following the Daytona pattern: one NOTE callout with links to the license and a CONTRIBUTING.md (create the file if absent, or point to the PR template).
 
-17. **Add a License line** at the bottom: `MIT · © Aerol AI, Inc.` with a link to LICENSE.
+17. **Add a License line** at the bottom: `AGPL-3.0 · © Aerol AI, Inc.` with a link to LICENSE and a note that cluster mode is separately licensed.
 
 18. **Add a "Start Here" navigation table** (already exists in the current README but is buried) in a more prominent position, covering: Quick Start, Server Setup, SDK Setup, Comparison, Cluster Setup.
 

@@ -1,0 +1,22 @@
+AerolVM Cluster License
+
+Copyright 2026 Aerol AI, Inc. All Rights Reserved.
+
+The software in this directory implements AerolVM cluster mode, including
+Raft placement, gossip membership, recovery replication, cross-node
+forwarding, and related high-availability behavior.
+
+This software is source-available for review, development, and testing, but
+it is not licensed under the repository-level AGPL 3.0 license. Production
+use, hosted use, distribution, resale, or use to provide a managed service
+requires a separate commercial license from Aerol AI, Inc.
+
+You may not remove or obscure this notice.
+
+Unless you have received a separate commercial license from Aerol AI, Inc.,
+this software is provided "AS IS", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose, and noninfringement. In no event shall
+Aerol AI, Inc. or contributors be liable for any claim, damages, or other
+liability arising from, out of, or in connection with this software or its
+use.

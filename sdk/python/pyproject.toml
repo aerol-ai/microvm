@@ -4,7 +4,7 @@ version = "0.5.3"
 description = "A Python client for the Aerol.ai MicroVM sandbox API."
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+license = "AGPL-3.0-only"
 authors = [
   { name = "Aerol AI" }
 ]
