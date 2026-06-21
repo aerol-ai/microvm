@@ -112,6 +112,58 @@ func TestVolumeMetaClusterAttachmentsBlockDelete(t *testing.T) {
 	}
 }
 
+func TestVolumeMetaClusterExistsForSource(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	ctx := context.Background()
+
+	if exists, err := s.volumeMeta().ExistsForSource(ctx, "bucket/t-a/missing"); err != nil || exists {
+		t.Fatalf("ExistsForSource missing = %v, %v", exists, err)
+	}
+	v, err := s.CreatePlatformVolume(ctx, "data")
+	if err != nil {
+		t.Fatalf("CreatePlatformVolume: %v", err)
+	}
+	exists, err := s.volumeMeta().ExistsForSource(ctx, v.Source)
+	if err != nil || !exists {
+		t.Fatalf("ExistsForSource live = %v, %v", exists, err)
+	}
+}
+
+func TestVolumeMetaClusterPutAttachmentsEmpty(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	if err := s.volumeMeta().PutAttachments(context.Background(), nil); err != nil {
+		t.Fatalf("PutAttachments empty: %v", err)
+	}
+}
+
+func TestVolumeMetaClusterPutAttachmentsUnknownVolume(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	err := s.volumeMeta().PutAttachments(context.Background(), []models.VolumeAttachment{{
+		Tenant: "t-a", VolumeID: "missing", SandboxID: "sb-1", Target: "/data", Source: "s/x",
+	}})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("PutAttachments unknown volume = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMapVolumeNotFoundSentinels(t *testing.T) {
+	if !errors.Is(mapVolumeNotFound(cluster.ErrUnknownVolume), store.ErrNotFound) {
+		t.Fatal("expected ErrNotFound for ErrUnknownVolume")
+	}
+	if !errors.Is(mapVolumeNotFound(cluster.ErrVolumeInUse), store.ErrVolumeInUse) {
+		t.Fatal("expected ErrVolumeInUse for ErrVolumeInUse")
+	}
+	if err := mapVolumeNotFound(errors.New("other")); err.Error() != "other" {
+		t.Fatalf("unexpected passthrough: %v", err)
+	}
+}
+
 func TestCleanupCreatedPlatformVolumesPreservesClusterBackend(t *testing.T) {
 	s := enabledVolumeService(t)
 	s.cfg.EnableCluster = true
