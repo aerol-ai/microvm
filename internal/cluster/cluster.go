@@ -552,6 +552,12 @@ type Client interface {
 	// VolumeExistsForSource reports whether any replicated row points at source
 	// (the reclaim worker's cluster-wide live-data guard).
 	VolumeExistsForSource(ctx context.Context, source string) (bool, error)
+	// VolumeAttachmentCount returns the cluster-wide live attachment count for a
+	// volume. Put/Delete keep this index in the same raft log as volume metadata
+	// so Daytona delete cannot miss a sandbox that lives on another worker.
+	VolumeAttachmentCount(ctx context.Context, tenant, id string) (int, error)
+	PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
+	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error
 
 	// RemoveMember explicitly removes nodeID from the raft configuration after
 	// marking it drained and orphaning any placements it owned. Unknown raft

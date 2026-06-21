@@ -25,6 +25,9 @@ type volumeMetaStore interface {
 	List(ctx context.Context, tenant string) ([]models.Volume, error)
 	DeleteRow(ctx context.Context, tenant, id string) error
 	ExistsForSource(ctx context.Context, source string) (bool, error)
+	AttachmentCount(ctx context.Context, tenant, id string) (int, error)
+	PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
+	DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error
 }
 
 // volumeMeta returns the cluster-FSM-backed store when clustering is enabled and
@@ -60,6 +63,15 @@ func (m sqliteVolumeMeta) DeleteRow(ctx context.Context, tenant, id string) erro
 }
 func (m sqliteVolumeMeta) ExistsForSource(ctx context.Context, source string) (bool, error) {
 	return m.store.LiveVolumeExistsForSource(ctx, source)
+}
+func (m sqliteVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string) (int, error) {
+	return m.store.CountVolumeAttachments(ctx, tenant, id)
+}
+func (m sqliteVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
+	return m.store.PutVolumeAttachments(ctx, attachments)
+}
+func (m sqliteVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+	return m.store.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
 }
 
 // clusterVolumeMeta adapts the replicated cluster volume API to the service
@@ -100,10 +112,25 @@ func (m clusterVolumeMeta) DeleteRow(ctx context.Context, tenant, id string) err
 func (m clusterVolumeMeta) ExistsForSource(ctx context.Context, source string) (bool, error) {
 	return m.c.VolumeExistsForSource(ctx, source)
 }
+func (m clusterVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string) (int, error) {
+	return m.c.VolumeAttachmentCount(ctx, tenant, id)
+}
+func (m clusterVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
+	if err := m.c.PutVolumeAttachments(ctx, attachments); err != nil {
+		return mapVolumeNotFound(err)
+	}
+	return nil
+}
+func (m clusterVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+	return m.c.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
+}
 
 func mapVolumeNotFound(err error) error {
 	if errors.Is(err, cluster.ErrUnknownVolume) {
 		return store.ErrNotFound
+	}
+	if errors.Is(err, cluster.ErrVolumeInUse) {
+		return store.ErrVolumeInUse
 	}
 	return err
 }

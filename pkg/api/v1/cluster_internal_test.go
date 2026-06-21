@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func newClusterInternalHandler(t *testing.T) *handlers {
@@ -151,6 +154,57 @@ func TestClusterInternalHandlers_BasicCoverage(t *testing.T) {
 		h.clusterInternalDrainState(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rr.Code)
+		}
+	})
+
+	t.Run("volume_query_kinds", func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		svc := service.New(config.Config{EnableCluster: true, PATToken: "op"}, logger, nil, nil, nil, nil, nil, nil, nil)
+		c := cluster.NewNoop("self", "http://self", "")
+		svc.AttachCluster(c)
+		h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+		ctx := context.Background()
+		v := models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/t-a/data"}
+		if _, _, err := c.VolumeUpsert(ctx, v, 0); err != nil {
+			t.Fatalf("seed volume: %v", err)
+		}
+		_ = c.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
+			Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "bucket/t-a/data",
+		}})
+
+		cases := []struct {
+			kind   string
+			query  string
+			status int
+		}{
+			{"id", "kind=id&tenant=t-a&id=vol-1", http.StatusOK},
+			{"name", "kind=name&tenant=t-a&name=data", http.StatusOK},
+			{"list", "kind=list&tenant=t-a", http.StatusOK},
+			{"source", "kind=source&source=bucket/t-a/data", http.StatusOK},
+			{"attachment_count", "kind=attachment_count&tenant=t-a&id=vol-1", http.StatusOK},
+			{"missing id", "kind=id&tenant=t-a&id=missing", http.StatusNotFound},
+			{"bad kind", "kind=unknown", http.StatusBadRequest},
+		}
+		for _, tc := range cases {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v1/cluster/internal/volume?"+tc.query, nil)
+			h.clusterInternalVolume(rr, req)
+			if rr.Code != tc.status {
+				t.Fatalf("%s: status = %d, want %d; body=%s", tc.kind, rr.Code, tc.status, rr.Body.String())
+			}
+		}
+	})
+
+	t.Run("volume_no_cluster", func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		svc := service.New(config.Config{EnableCluster: true}, logger, nil, nil, nil, nil, nil, nil, nil)
+		svc.ClearClusterForTest()
+		h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/cluster/internal/volume?kind=id&tenant=t-a&id=vol-1", nil)
+		h.clusterInternalVolume(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rr.Code)
 		}
 	})
 }

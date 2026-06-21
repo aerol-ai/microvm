@@ -301,6 +301,54 @@ func TestDeletePendingVolumeDeletionIdempotent(t *testing.T) {
 	}
 }
 
+func TestSchedulePendingVolumeDeletion(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	v := models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/t-a/data"}
+	if err := st.SchedulePendingVolumeDeletion(ctx, v, v.Source); err != nil {
+		t.Fatalf("SchedulePendingVolumeDeletion: %v", err)
+	}
+	pending, err := st.ListPendingVolumeDeletions(ctx)
+	if err != nil || len(pending) != 1 || pending[0].Backend != "s3" || pending[0].Name != "data" {
+		t.Fatalf("pending = %+v, %v", pending, err)
+	}
+	// Refresh the same row (idempotent upsert).
+	if err := st.SchedulePendingVolumeDeletion(ctx, v, "override-source"); err != nil {
+		t.Fatalf("SchedulePendingVolumeDeletion refresh: %v", err)
+	}
+	pending, _ = st.ListPendingVolumeDeletions(ctx)
+	if len(pending) != 1 || pending[0].Source != "override-source" {
+		t.Fatalf("refresh pending = %+v", pending)
+	}
+}
+
+func TestDeleteVolumeAttachmentsForSandbox(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/t-a/data"}); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if err := st.Create(ctx, sampleSandbox("sb-1")); err != nil {
+		t.Fatalf("Create sandbox: %v", err)
+	}
+	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
+		Tenant: "t-a", VolumeID: "v1", SandboxID: "sb-1", Target: "/data", Source: "bucket/t-a/data",
+	}}); err != nil {
+		t.Fatalf("PutVolumeAttachments: %v", err)
+	}
+	if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil {
+		t.Fatalf("DeleteVolumeAttachmentsForSandbox: %v", err)
+	}
+	count, err := st.CountVolumeAttachments(ctx, "t-a", "v1")
+	if err != nil || count != 0 {
+		t.Fatalf("CountVolumeAttachments after explicit delete = %d, %v", count, err)
+	}
+	if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil {
+		t.Fatalf("idempotent delete: %v", err)
+	}
+}
+
 func TestLiveVolumeExistsForSource(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

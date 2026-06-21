@@ -22,6 +22,7 @@ type VolumeQueryResponse struct {
 	Volume  *models.Volume  `json:"volume,omitempty"`
 	Volumes []models.Volume `json:"volumes,omitempty"`
 	Exists  bool            `json:"exists,omitempty"`
+	Count   int             `json:"count,omitempty"`
 }
 
 func (a *Agent) VolumeUpsert(ctx context.Context, v models.Volume, maxPerTenant int) (models.Volume, bool, error) {
@@ -119,6 +120,34 @@ func (a *Agent) VolumeExistsForSource(ctx context.Context, source string) (bool,
 		return false, err
 	}
 	return resp.Exists, nil
+}
+
+func (a *Agent) VolumeAttachmentCount(ctx context.Context, tenant, id string) (int, error) {
+	q := url.Values{"kind": {"attachment_count"}, "tenant": {tenant}, "id": {id}}
+	resp, err := a.queryVolumes(ctx, q)
+	if err != nil {
+		return 0, err
+	}
+	return resp.Count, nil
+}
+
+func (a *Agent) PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	err := a.applyCommand(ctx, command{Op: opPutVolumeAttach, VolumeAttachments: attachments})
+	if errors.Is(err, ErrUnknownVolume) {
+		return ErrUnknownVolume
+	}
+	return err
+}
+
+func (a *Agent) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	return a.applyCommand(ctx, command{Op: opDeleteVolumeAttach, VolumeSandboxID: sandboxID})
 }
 
 func (a *Agent) queryVolumes(ctx context.Context, q url.Values) (VolumeQueryResponse, error) {

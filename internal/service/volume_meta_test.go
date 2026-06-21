@@ -79,3 +79,113 @@ func TestVolumeMetaClusterQuota(t *testing.T) {
 		t.Fatalf("expected quota error, got %v", err)
 	}
 }
+
+func TestVolumeMetaClusterAttachmentsBlockDelete(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	c := cluster.NewNoop("self", "http://self", "")
+	s.AttachCluster(c)
+	ctx := context.Background()
+
+	v, err := s.CreatePlatformVolume(ctx, "data")
+	if err != nil {
+		t.Fatalf("CreatePlatformVolume: %v", err)
+	}
+	if err := s.volumeMeta().PutAttachments(ctx, []models.VolumeAttachment{{
+		Tenant:    v.Tenant,
+		VolumeID:  v.ID,
+		SandboxID: "sb-remote",
+		Target:    "/data",
+		Source:    v.Source,
+	}}); err != nil {
+		t.Fatalf("PutAttachments: %v", err)
+	}
+
+	if err := s.DeletePlatformVolume(ctx, v.ID); !errors.Is(err, models.ErrPlatformVolumeInUse) {
+		t.Fatalf("DeletePlatformVolume attached = %v, want ErrPlatformVolumeInUse", err)
+	}
+	if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, "sb-remote"); err != nil {
+		t.Fatalf("DeleteAttachmentsForSandbox: %v", err)
+	}
+	if err := s.DeletePlatformVolume(ctx, v.ID); err != nil {
+		t.Fatalf("DeletePlatformVolume after detach: %v", err)
+	}
+}
+
+func TestVolumeMetaClusterExistsForSource(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	ctx := context.Background()
+
+	if exists, err := s.volumeMeta().ExistsForSource(ctx, "bucket/t-a/missing"); err != nil || exists {
+		t.Fatalf("ExistsForSource missing = %v, %v", exists, err)
+	}
+	v, err := s.CreatePlatformVolume(ctx, "data")
+	if err != nil {
+		t.Fatalf("CreatePlatformVolume: %v", err)
+	}
+	exists, err := s.volumeMeta().ExistsForSource(ctx, v.Source)
+	if err != nil || !exists {
+		t.Fatalf("ExistsForSource live = %v, %v", exists, err)
+	}
+}
+
+func TestVolumeMetaClusterPutAttachmentsEmpty(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	if err := s.volumeMeta().PutAttachments(context.Background(), nil); err != nil {
+		t.Fatalf("PutAttachments empty: %v", err)
+	}
+}
+
+func TestVolumeMetaClusterPutAttachmentsUnknownVolume(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	err := s.volumeMeta().PutAttachments(context.Background(), []models.VolumeAttachment{{
+		Tenant: "t-a", VolumeID: "missing", SandboxID: "sb-1", Target: "/data", Source: "s/x",
+	}})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("PutAttachments unknown volume = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMapVolumeNotFoundSentinels(t *testing.T) {
+	if !errors.Is(mapVolumeNotFound(cluster.ErrUnknownVolume), store.ErrNotFound) {
+		t.Fatal("expected ErrNotFound for ErrUnknownVolume")
+	}
+	if !errors.Is(mapVolumeNotFound(cluster.ErrVolumeInUse), store.ErrVolumeInUse) {
+		t.Fatal("expected ErrVolumeInUse for ErrVolumeInUse")
+	}
+	if err := mapVolumeNotFound(errors.New("other")); err.Error() != "other" {
+		t.Fatalf("unexpected passthrough: %v", err)
+	}
+}
+
+func TestCleanupCreatedPlatformVolumesPreservesClusterBackend(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	s.AttachCluster(cluster.NewNoop("self", "http://self", ""))
+	ctx := context.Background()
+
+	v, err := s.CreatePlatformVolume(ctx, "data")
+	if err != nil {
+		t.Fatalf("CreatePlatformVolume: %v", err)
+	}
+	s.cleanupCreatedPlatformVolumes(ctx, []models.VolumeAttachment{{
+		Tenant:        v.Tenant,
+		VolumeID:      v.ID,
+		Source:        v.Source,
+		CreatedVolume: true,
+	}})
+
+	pending, err := s.store.ListPendingVolumeDeletions(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingVolumeDeletions: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Backend != "s3" || pending[0].Name != "data" {
+		t.Fatalf("pending deletion = %+v, want backend/name from full cluster volume row", pending)
+	}
+}

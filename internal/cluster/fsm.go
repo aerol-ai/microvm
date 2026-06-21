@@ -39,6 +39,8 @@ const (
 	opRemoveCustomDomain opCode = 14 // release one previously-bound hostname
 	opUpsertVolume       opCode = 15 // get-or-create a platform-volume metadata row (cluster-wide)
 	opDeleteVolume       opCode = 16 // remove a platform-volume metadata row
+	opPutVolumeAttach    opCode = 17 // upsert platform-volume attachment rows (cluster-wide)
+	opDeleteVolumeAttach opCode = 18 // drop all platform-volume attachments for one sandbox
 )
 
 // command is the wire format for one raft log entry. New writers externalize
@@ -96,10 +98,12 @@ type command struct {
 	// metadata for opUpsertVolume / opDeleteVolume. The volume row is replicated
 	// so any node answers Daytona get/list/delete-by-id after tenant ownership
 	// moves; the data itself is deterministic in S3/NFS and never in raft.
-	Volume       *models.Volume `json:"volume,omitempty"`
-	VolumeTenant string         `json:"volume_tenant,omitempty"`
-	VolumeID     string         `json:"volume_id,omitempty"`
-	MaxPerTenant int            `json:"max_per_tenant,omitempty"`
+	Volume            *models.Volume            `json:"volume,omitempty"`
+	VolumeTenant      string                    `json:"volume_tenant,omitempty"`
+	VolumeID          string                    `json:"volume_id,omitempty"`
+	MaxPerTenant      int                       `json:"max_per_tenant,omitempty"`
+	VolumeAttachments []models.VolumeAttachment `json:"volume_attachments,omitempty"`
+	VolumeSandboxID   string                    `json:"volume_sandbox_id,omitempty"`
 }
 
 type reservationCommand struct {
@@ -272,6 +276,12 @@ type placementFSM struct {
 	// is deterministic in S3/NFS, so only this small metadata table is replicated.
 	volumes         map[string]models.Volume
 	volumeNameIndex map[string]string
+	// volumeAttachments is the cluster-wide live-reference index. It mirrors the
+	// single-node SQLite volume_attachments table but lives in raft so a delete
+	// request on any node sees sandboxes attached on every worker.
+	volumeAttachments          map[string]models.VolumeAttachment
+	volumeAttachmentsByVolume  map[string]map[string]struct{}
+	volumeAttachmentsBySandbox map[string]map[string]struct{}
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -345,6 +355,9 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		customHostnameIndex:          make(map[string]string),
 		volumes:                      make(map[string]models.Volume),
 		volumeNameIndex:              make(map[string]string),
+		volumeAttachments:            make(map[string]models.VolumeAttachment),
+		volumeAttachmentsByVolume:    make(map[string]map[string]struct{}),
+		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
 	}
 }
 
@@ -353,6 +366,9 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 // concatenation is unambiguous.
 func volumeKey(tenant, id string) string       { return tenant + "\x00" + id }
 func volumeNameKey(tenant, name string) string { return tenant + "\x00" + name }
+func volumeAttachmentKey(tenant, volumeID, sandboxID, target string) string {
+	return tenant + "\x00" + volumeID + "\x00" + sandboxID + "\x00" + target
+}
 
 func newPlacementIDIndex() *btree.BTreeG[string] {
 	return btree.NewG[string](32, func(a, b string) bool { return a < b })
@@ -550,6 +566,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
 		}
+		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		return nil
@@ -914,8 +931,45 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if !ok {
 			return ErrUnknownVolume
 		}
+		if n := f.volumeAttachmentCountLocked(tenant, id); n > 0 {
+			return fmt.Errorf("%w: %d attachments", ErrVolumeInUse, n)
+		}
 		delete(f.volumes, key)
 		delete(f.volumeNameIndex, volumeNameKey(tenant, row.Name))
+		return nil
+	case opPutVolumeAttach:
+		if len(cmd.VolumeAttachments) == 0 {
+			return nil
+		}
+		cleaned := make([]models.VolumeAttachment, 0, len(cmd.VolumeAttachments))
+		for _, a := range cmd.VolumeAttachments {
+			tenant := strings.TrimSpace(a.Tenant)
+			volumeID := strings.TrimSpace(a.VolumeID)
+			sandboxID := strings.TrimSpace(a.SandboxID)
+			target := strings.TrimSpace(a.Target)
+			source := strings.TrimSpace(a.Source)
+			if tenant == "" || volumeID == "" || sandboxID == "" || target == "" || source == "" {
+				return fmt.Errorf("placementFSM: opPutVolumeAttach requires tenant, volume_id, sandbox_id, target, and source")
+			}
+			if _, ok := f.volumes[volumeKey(tenant, volumeID)]; !ok {
+				return ErrUnknownVolume
+			}
+			a.Tenant, a.VolumeID, a.SandboxID, a.Target, a.Source = tenant, volumeID, sandboxID, target, source
+			if a.CreatedAt.IsZero() {
+				a.CreatedAt = time.Unix(now, 0).UTC()
+			}
+			cleaned = append(cleaned, a)
+		}
+		for _, a := range cleaned {
+			f.putVolumeAttachmentLocked(a)
+		}
+		return nil
+	case opDeleteVolumeAttach:
+		sandboxID := strings.TrimSpace(cmd.VolumeSandboxID)
+		if sandboxID == "" {
+			return fmt.Errorf("placementFSM: opDeleteVolumeAttach requires sandbox_id")
+		}
+		f.releaseVolumeAttachmentsForSandboxLocked(sandboxID)
 		return nil
 	default:
 		return fmt.Errorf("placementFSM: unknown op %d", cmd.Op)
@@ -1956,7 +2010,8 @@ type fsmSnapshotPayload struct {
 	DrainedNodes map[string]bool
 	// Volumes is the replicated platform-volume metadata. Optional; older
 	// snapshots decode it as nil and the FSM treats that as "no volumes."
-	Volumes []models.Volume
+	Volumes           []models.Volume
+	VolumeAttachments []models.VolumeAttachment
 }
 
 type placementSnapshotRow struct {
@@ -1983,7 +2038,15 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	for k, v := range f.drainedNodes {
 		drained[k] = v
 	}
-	return &fsmSnapshot{version: version, rows: rows, drainedNodes: drained, volumes: f.volumesSnapshotLocked(), recoveryStore: f.recoveryStore, recoveryRefs: recoveryRefs}, nil
+	return &fsmSnapshot{
+		version:           version,
+		rows:              rows,
+		drainedNodes:      drained,
+		volumes:           f.volumesSnapshotLocked(),
+		volumeAttachments: f.volumeAttachmentsSnapshotLocked(),
+		recoveryStore:     f.recoveryStore,
+		recoveryRefs:      recoveryRefs,
+	}, nil
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -2055,6 +2118,9 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	// Rebuild the replicated volume table + name index from the snapshot.
 	f.volumes = make(map[string]models.Volume, len(payload.Volumes))
 	f.volumeNameIndex = make(map[string]string, len(payload.Volumes))
+	f.volumeAttachments = make(map[string]models.VolumeAttachment, len(payload.VolumeAttachments))
+	f.volumeAttachmentsByVolume = make(map[string]map[string]struct{})
+	f.volumeAttachmentsBySandbox = make(map[string]map[string]struct{})
 	for _, v := range payload.Volumes {
 		tenant := strings.TrimSpace(v.Tenant)
 		id := strings.TrimSpace(v.ID)
@@ -2065,6 +2131,20 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		if name := strings.TrimSpace(v.Name); name != "" {
 			f.volumeNameIndex[volumeNameKey(tenant, name)] = id
 		}
+	}
+	for _, a := range payload.VolumeAttachments {
+		a.Tenant = strings.TrimSpace(a.Tenant)
+		a.VolumeID = strings.TrimSpace(a.VolumeID)
+		a.SandboxID = strings.TrimSpace(a.SandboxID)
+		a.Target = strings.TrimSpace(a.Target)
+		a.Source = strings.TrimSpace(a.Source)
+		if a.Tenant == "" || a.VolumeID == "" || a.SandboxID == "" || a.Target == "" || a.Source == "" {
+			continue
+		}
+		if _, ok := f.volumes[volumeKey(a.Tenant, a.VolumeID)]; !ok {
+			continue
+		}
+		f.putVolumeAttachmentLocked(a)
 	}
 	for id, p := range payload.Placements {
 		full := p
@@ -2117,12 +2197,13 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 }
 
 type fsmSnapshot struct {
-	version       uint64
-	rows          []placementSnapshotRow
-	drainedNodes  map[string]bool
-	volumes       []models.Volume
-	recoveryStore placementRecoveryStore
-	recoveryRefs  []string
+	version           uint64
+	rows              []placementSnapshotRow
+	drainedNodes      map[string]bool
+	volumes           []models.Volume
+	volumeAttachments []models.VolumeAttachment
+	recoveryStore     placementRecoveryStore
+	recoveryRefs      []string
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
@@ -2132,7 +2213,13 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		recordSnapshotPersist(time.Since(start), counting.bytes, len(s.rows), err)
 	}()
 	enc := gob.NewEncoder(counting)
-	if err := enc.Encode(fsmSnapshotPayload{Version: s.version, Rows: s.rows, DrainedNodes: s.drainedNodes, Volumes: s.volumes}); err != nil {
+	if err := enc.Encode(fsmSnapshotPayload{
+		Version:           s.version,
+		Rows:              s.rows,
+		DrainedNodes:      s.drainedNodes,
+		Volumes:           s.volumes,
+		VolumeAttachments: s.volumeAttachments,
+	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
 	}

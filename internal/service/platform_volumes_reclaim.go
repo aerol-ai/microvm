@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -107,7 +109,17 @@ func (s *Service) runVolumeReclaim(ctx context.Context) {
 // owns the source (resurrection guard), otherwise delete the backend bytes and
 // clear the row. Errors are logged and the row left for the next tick to retry.
 func (s *Service) reclaimOne(ctx context.Context, p models.PendingVolumeDeletion) {
-	live, err := s.volumeMeta().ExistsForSource(ctx, p.Source)
+	meta := s.volumeMeta()
+	if v, err := meta.ByID(ctx, p.Tenant, p.VolumeID); err == nil && v.Source == p.Source {
+		// The delete path writes the ledger before removing the user-visible row.
+		// If the janitor catches that in-between state, keep the row so the next
+		// tick can reclaim after the delete commits.
+		return
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logger.Warn("volume reclaim live-row check failed", "volume_id", p.VolumeID, "error", err)
+		return
+	}
+	live, err := meta.ExistsForSource(ctx, p.Source)
 	if err != nil {
 		s.logger.Warn("volume reclaim live-source check failed", "volume_id", p.VolumeID, "error", err)
 		return

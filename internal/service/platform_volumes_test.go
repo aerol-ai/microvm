@@ -138,6 +138,34 @@ func TestResolvePlatformVolumes_DockerS3(t *testing.T) {
 	}
 }
 
+func TestResolvePlatformVolumesForReplication(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.cfg.EnableCluster = true
+	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "tenant-xyz"},
+		Operator: false,
+	})
+	v, err := s.CreatePlatformVolume(ctx, "data")
+	if err != nil {
+		t.Fatalf("CreatePlatformVolume: %v", err)
+	}
+	req := models.CreateSandboxRequest{
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace", ReadOnly: true}},
+	}
+	if err := s.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
+		t.Fatalf("ResolvePlatformVolumesForReplication: %v", err)
+	}
+	if len(req.PlatformVolumes) != 0 {
+		t.Fatalf("PlatformVolumes not cleared: %+v", req.PlatformVolumes)
+	}
+	if len(req.Mounts) != 1 || req.Mounts[0].Source != v.Source {
+		t.Fatalf("mounts = %+v, want frozen source %q", req.Mounts, v.Source)
+	}
+	if err := s.ResolvePlatformVolumesForReplication(ctx, nil); err != nil {
+		t.Fatalf("nil req: %v", err)
+	}
+}
+
 // An existing volume must mount from its frozen source even after the operator
 // reconfigures the bucket/prefix — the stored coordinate is authoritative, so a
 // config change can never silently move a live volume to a new location.

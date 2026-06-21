@@ -21,6 +21,9 @@ var (
 	// ErrUnknownVolume is returned by volume reads/deletes when no replicated row
 	// exists for the (tenant, id).
 	ErrUnknownVolume = errors.New("cluster: unknown volume")
+	// ErrVolumeInUse is returned when a delete races with or follows a sandbox
+	// attachment that still points at the volume.
+	ErrVolumeInUse = errors.New("cluster: volume is still attached")
 )
 
 // VolumeByID returns the replicated row for (tenant, id) or ErrUnknownVolume.
@@ -86,6 +89,21 @@ func (f *placementFSM) VolumeCountForTenant(tenant string) int {
 	return n
 }
 
+// VolumeAttachmentCount returns the number of live replicated sandbox
+// attachments for (tenant, volumeID).
+func (f *placementFSM) VolumeAttachmentCount(tenant, volumeID string) int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.volumeAttachmentCountLocked(strings.TrimSpace(tenant), strings.TrimSpace(volumeID))
+}
+
+func (f *placementFSM) volumeAttachmentCountLocked(tenant, volumeID string) int {
+	if tenant == "" || volumeID == "" {
+		return 0
+	}
+	return len(f.volumeAttachmentsByVolume[volumeKey(tenant, volumeID)])
+}
+
 // LiveVolumeExistsForSource reports whether any replicated row resolves to
 // source. The reclaim worker uses it cluster-wide instead of a single node's
 // SQLite so it never deletes bytes a recreated volume still owns.
@@ -109,4 +127,59 @@ func (f *placementFSM) volumesSnapshotLocked() []models.Volume {
 		out = append(out, v)
 	}
 	return out
+}
+
+func (f *placementFSM) volumeAttachmentsSnapshotLocked() []models.VolumeAttachment {
+	out := make([]models.VolumeAttachment, 0, len(f.volumeAttachments))
+	for _, a := range f.volumeAttachments {
+		out = append(out, a)
+	}
+	return out
+}
+
+func (f *placementFSM) putVolumeAttachmentLocked(a models.VolumeAttachment) {
+	key := volumeAttachmentKey(a.Tenant, a.VolumeID, a.SandboxID, a.Target)
+	if existing, ok := f.volumeAttachments[key]; ok {
+		f.releaseVolumeAttachmentKeyLocked(key, existing)
+	}
+	f.volumeAttachments[key] = a
+	vKey := volumeKey(a.Tenant, a.VolumeID)
+	if f.volumeAttachmentsByVolume[vKey] == nil {
+		f.volumeAttachmentsByVolume[vKey] = make(map[string]struct{})
+	}
+	f.volumeAttachmentsByVolume[vKey][key] = struct{}{}
+	if f.volumeAttachmentsBySandbox[a.SandboxID] == nil {
+		f.volumeAttachmentsBySandbox[a.SandboxID] = make(map[string]struct{})
+	}
+	f.volumeAttachmentsBySandbox[a.SandboxID][key] = struct{}{}
+}
+
+func (f *placementFSM) releaseVolumeAttachmentKeyLocked(key string, a models.VolumeAttachment) {
+	delete(f.volumeAttachments, key)
+	vKey := volumeKey(a.Tenant, a.VolumeID)
+	if refs := f.volumeAttachmentsByVolume[vKey]; refs != nil {
+		delete(refs, key)
+		if len(refs) == 0 {
+			delete(f.volumeAttachmentsByVolume, vKey)
+		}
+	}
+	if refs := f.volumeAttachmentsBySandbox[a.SandboxID]; refs != nil {
+		delete(refs, key)
+		if len(refs) == 0 {
+			delete(f.volumeAttachmentsBySandbox, a.SandboxID)
+		}
+	}
+}
+
+func (f *placementFSM) releaseVolumeAttachmentsForSandboxLocked(sandboxID string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return
+	}
+	refs := f.volumeAttachmentsBySandbox[sandboxID]
+	for key := range refs {
+		if a, ok := f.volumeAttachments[key]; ok {
+			f.releaseVolumeAttachmentKeyLocked(key, a)
+		}
+	}
 }

@@ -1020,6 +1020,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	platformVolumesCommitted := false
 	defer func() {
 		if !platformVolumesCommitted {
+			s.cleanupPlatformVolumeAttachments(cleanupCtx, platformAttachments)
 			s.cleanupCreatedPlatformVolumes(cleanupCtx, platformAttachments)
 		}
 	}()
@@ -1245,7 +1246,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		for i := range platformAttachments {
 			platformAttachments[i].SandboxID = sandbox.ID
 		}
-		if err := s.store.PutVolumeAttachments(ctx, platformAttachments); err != nil {
+		if err := s.volumeMeta().PutAttachments(ctx, platformAttachments); err != nil {
 			_ = s.store.Delete(ctx, sandbox.ID)
 			_ = s.caddy.DeleteSandboxRoute(cleanupCtx, sandbox.ID)
 			_ = s.docker.Destroy(cleanupCtx, sandbox)
@@ -1893,6 +1894,11 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
+	}
+	if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, id); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("platform volume attachment cleanup after destroy failed", "sandbox_id", id, "error", err)
+		}
 	}
 	if err := s.cleanupWasmSandboxArtifacts(ctx, sandbox); err != nil {
 		return err
