@@ -3,7 +3,7 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
-	integration-cluster-hetero integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-reap
+	integration-cluster-hetero integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -48,43 +48,82 @@ clean:
 # REAL AWS via the prod TF module against isolated state — they cost money and
 # need creds + integration-tests/scenarios/domains.yml. The suite itself is
 # behind the `integration` build tag, so `make test` above never touches AWS.
+#
+# Two ways to pass run.sh flags. `make` eats anything starting with `--` as its
+# OWN option (so `make ... --keep` errors before the recipe runs), so we accept
+# bare words instead and add the dashes for you:
+#   make integration-cluster-hetero keep                # -> run.sh ... --keep
+#   make integration-cluster-hetero keep prod-tls       # -> ... --keep --prod-tls
+# The explicit form still works if you prefer it:
+#   make integration-cluster-hetero FLAGS=--keep
+# Supported words: keep (leave infra up), prod-tls (real Let's Encrypt),
+# metal-on-demand (force firecracker bare-metal off spot).
+FLAGS ?=
+INTEGRATION_FLAG_WORDS := keep prod-tls metal-on-demand
+RUN_EXTRA := $(filter $(INTEGRATION_FLAG_WORDS),$(MAKECMDGOALS))
+RUN_FLAGS := $(strip $(FLAGS) $(patsubst %,--%,$(RUN_EXTRA)))
+# Swallow the bare flag-words as no-op goals so `make` doesn't try to build them
+# ("No rule to make target 'keep'").
+ifneq ($(RUN_EXTRA),)
+.PHONY: $(RUN_EXTRA)
+$(foreach w,$(RUN_EXTRA),$(eval $(w): ; @:))
+endif
 integration-local:
-	integration-tests/run.sh local-mode
+	integration-tests/run.sh local-mode $(RUN_FLAGS)
 
 integration-single:
-	integration-tests/run.sh single-node
+	integration-tests/run.sh single-node $(RUN_FLAGS)
 
 # Single-node with the WASM runtime enabled (wasm.enabled + staged standard
 # modules, driven entirely by the `wasm` capability in single-node-wasm.caps.yml).
 # Smallest scenario that exercises the wasm-runtime use cases.
 integration-single-wasm:
-	integration-tests/run.sh single-node-wasm
+	integration-tests/run.sh single-node-wasm $(RUN_FLAGS)
 
 integration-cluster-mixed:
-	integration-tests/run.sh cluster-3-mixed
+	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)
 
 # 3× mixed cluster with the WASM runtime enabled — pairs the wasm-runtime use
 # cases with cluster placement/forwarding (see cluster-3-mixed-wasm.caps.yml).
 integration-cluster-mixed-wasm:
-	integration-tests/run.sh cluster-3-mixed-wasm
+	integration-tests/run.sh cluster-3-mixed-wasm $(RUN_FLAGS)
 
 integration-cluster-hetero:
 	# Every hetero node runs On-Demand (spot = false in cluster-hetero.tfvars):
 	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
-	# so --metal-on-demand is unnecessary here.
-	integration-tests/run.sh cluster-hetero
+	# so --metal-on-demand is unnecessary here. Pass FLAGS=--keep to debug.
+	integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
 
 integration-arm64-single:
-	integration-tests/run.sh single-node-fc-arm64
+	integration-tests/run.sh single-node-fc-arm64 $(RUN_FLAGS)
 
 integration-arm64-cluster:
-	integration-tests/run.sh cluster-arm64
+	integration-tests/run.sh cluster-arm64 $(RUN_FLAGS)
 
 integration-arm64: integration-arm64-single integration-arm64-cluster
 
 integration-all:
-	integration-tests/run.sh all
+	integration-tests/run.sh all $(RUN_FLAGS)
 
-# Cost safety net: terminate leaked itest instances past their ttl.
+# Collect full per-node forensics (bootstrap + cluster-init/join logs, rendered
+# cluster.env, listening ports, seed reachability probe, cluster membership view,
+# sandboxd + caddy journals) from an ALREADY-RUNNING scenario brought up with
+# `run.sh <scenario> --keep`. No apply, no teardown. Defaults to cluster-hetero.
+#   make integration-collect-logs                       # cluster-hetero
+#   make integration-collect-logs SCENARIO=cluster-3-mixed
+integration-collect-logs:
+	integration-tests/run.sh $(or $(SCENARIO),cluster-hetero) --collect-logs-only
+
+# Full teardown of a scenario brought up with `keep` — runs terraform destroy
+# (VPC, S3, IAM, instances) and clears the isolated state. This is the REAL
+# cleanup; integration-reap only terminates EC2 instances. Defaults to
+# cluster-hetero; override with SCENARIO=.
+#   make integration-destroy
+#   make integration-destroy SCENARIO=cluster-3-mixed
+integration-destroy:
+	integration-tests/run.sh $(or $(SCENARIO),cluster-hetero) --destroy-only
+
+# Cost safety net: terminate leaked itest instances past their ttl. Faster than
+# integration-destroy but instance-only — leaves VPC/S3/IAM + TF state behind.
 integration-reap:
 	scripts/integration-reap.sh

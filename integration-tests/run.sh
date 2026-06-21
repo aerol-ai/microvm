@@ -26,6 +26,8 @@ PROVISION="${HERE}/lib/provision.sh"
 KEEP=0
 PROD_TLS=0
 METAL_ON_DEMAND=0
+COLLECT_LOGS_ONLY=0
+DESTROY_ONLY=0
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -40,11 +42,20 @@ for arg in "$@"; do
     --keep) KEEP=1 ;;
     --prod-tls) PROD_TLS=1 ;;
     --metal-on-demand) METAL_ON_DEMAND=1 ;;
+    # Collect logs from an ALREADY-RUNNING scenario (provisioned earlier with
+    # --keep) and exit. No apply, no suite, no teardown — just dump every node's
+    # forensics into reports/<scenario>-failure-logs.txt. Use this to iterate on
+    # a stuck cluster without paying another bring-up.
+    --collect-logs-only) COLLECT_LOGS_ONLY=1 ;;
+    # Full terraform destroy of a scenario kept up with --keep (VPC, S3, IAM,
+    # instances — everything, and clears the TF state). Unlike integration-reap
+    # (which only terminates EC2 instances), this is the real cleanup.
+    --destroy-only) DESTROY_ONLY=1 ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--collect-logs-only] [--destroy-only]" >&2; exit 2; }
 
 DOMAINS_FILE="${HERE}/scenarios/domains.yml"
 CONFIG_CLUSTER="${REPO_ROOT}/config/cluster.yml"
@@ -306,7 +317,7 @@ run_one() {
     # Capture daemon logs before teardown nukes the box. local-mode runs no
     # Caddy (API bound on 127.0.0.1), so only sandboxd exists; domain scenarios
     # (single-node + cluster) front the API with Caddy, so grab both per node.
-    collect_failure_logs "$scenario" "$caps_domain" "$targets"
+    collect_failure_logs "$scenario" "$caps_domain" "$targets" "$pat"
     : > "$json_out"
     AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" -inconclusive \
       -json "$json_out" -out "${HERE}/reports"
@@ -329,7 +340,7 @@ run_one() {
   # to infra-not-ready above) leaves nothing to debug. Mirrors the inconclusive
   # path's collection.
   if [[ "$test_rc" != "0" ]]; then
-    collect_failure_logs "$scenario" "$caps_domain" "$targets"
+    collect_failure_logs "$scenario" "$caps_domain" "$targets" "$pat"
   fi
 
   AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$scenario" \
@@ -340,25 +351,98 @@ run_one() {
 # (domain scenarios) or the seed node (IP/local scenarios) into
 # reports/<scenario>-failure-logs.txt. Shared by the inconclusive path and the
 # suite-failure path so both produce the same artifact.
+#
+# A cluster that never forms is the hardest failure to debug, and the old
+# collector made it nearly impossible: it dumped bare IPs with no hint which
+# was the seed/server tier (where gossip + Raft live), and it skipped the seed
+# entirely if it wasn't in the nodes[] list. So a hetero-cluster bring-up that
+# produced one isolated worker yielded a report of one anonymous node spinning
+# "no live server-role control-plane members" with nothing to point at. Now we
+# lead with a roster (so "only N of the expected nodes exist" is obvious at a
+# glance), label every dump with name+role+seed, always include the seed, dedupe
+# by IP, and snapshot each node's own /v1/cluster/members + leader view so a
+# split (each node an island) is visible per-node.
 collect_failure_logs() {
-  local scenario="$1" caps_domain="$2" targets="$3"
+  local scenario="$1" caps_domain="$2" targets="$3" pat="${4:-}"
   local logfile="${HERE}/reports/${scenario}-failure-logs.txt"
   echo "collecting failure logs -> ${logfile}" >&2
   {
     echo "### failure logs for scenario ${scenario} ($(date -u +%FT%TZ)) ###"
+
+    # Roster first: how many nodes terraform actually produced, and which role
+    # each plays. If this shows fewer rows than the scenario expects, the
+    # failure is bring-up (partial apply / quota), not cluster logic.
+    echo "--- node roster (name / role / seed / public_ip / private_ip) ---"
+    echo "$targets" | jq -r '
+      (.nodes // [])
+      | map([.name, .role, (if .seed then "SEED" else "-" end), .public_ip, .private_ip] | join("\t"))
+      | if length == 0 then "(no nodes in integration_targets output)" else .[] end'
+
+    # The seed's PRIVATE IP is what every joiner was told to gossip to
+    # (--peers <seed-private-ip>:7001 in the bootstrap template), so it is the
+    # right target for each node's reachability probe.
+    local seed_ip seed_private_ip
+    seed_ip=$(echo "$targets" | jq -r '.seed_ip // empty')
+    seed_private_ip=$(echo "$targets" | jq -r --arg s "$seed_ip" '
+      ((.nodes // []) | map(select(.public_ip == $s)) | .[0].private_ip) // empty')
+
     if [[ "$caps_domain" == "true" ]]; then
-      while IFS= read -r ip; do
-        [[ -n "$ip" ]] || continue
-        dump_service_logs "ubuntu@${ip}" sandboxd
+      # Build a deduped IP list, always including the seed_ip even if it is not
+      # present in nodes[] (a partial apply can drop it from the per-node list
+      # while seed_ip still resolves). Carry a "name (role)" label per IP.
+      declare -A seen=()
+      while IFS=$'\t' read -r ip label; do
+        [[ -n "$ip" && "$ip" != "null" ]] || continue
+        [[ -n "${seen[$ip]:-}" ]] && continue
+        seen[$ip]=1
+        dump_node_diagnostics "ubuntu@${ip}" "$seed_private_ip" "$label"
+        dump_cluster_membership "ubuntu@${ip}" "$pat" "$label"
+        dump_service_logs "ubuntu@${ip}" sandboxd 500
         dump_service_logs "ubuntu@${ip}" caddy
-      done < <(echo "$targets" | jq -r '.nodes[].public_ip')
+      done < <(
+        echo "$targets" | jq -r '
+          (.nodes // [])[]
+          | [.public_ip, ((.name // "?") + " (" + (.role // "?") + (if .seed then ",seed" else "" end) + ")")]
+          | @tsv'
+        [[ -n "$seed_ip" ]] && printf '%s\t%s\n' "$seed_ip" "seed_ip (fallback)"
+      )
     else
-      dump_service_logs "ubuntu@$(echo "$targets" | jq -r '.seed_ip')" sandboxd
+      dump_node_diagnostics "ubuntu@${seed_ip}" "$seed_private_ip" "seed"
+      dump_cluster_membership "ubuntu@${seed_ip}" "$pat" "seed"
+      dump_service_logs "ubuntu@${seed_ip}" sandboxd 500
     fi
   } > "$logfile" 2>&1
 }
 
-if [[ "$SCENARIO" == "all" ]]; then
+# collect_logs_only reads an already-applied scenario's TF state and dumps the
+# full per-node forensics without provisioning or tearing anything down. Pairs
+# with a prior `run.sh <scenario> --keep`: bring the cluster up once, then pull
+# logs as many times as you need while you debug.
+collect_logs_only() {
+  local scenario="$1"
+  local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  local caps_file="${HERE}/scenarios/${scenario}.caps.yml"
+  if [[ ! -d "$sdir" ]]; then
+    echo "no TF state at ${sdir} — run 'run.sh ${scenario} --keep' first" >&2
+    exit 2
+  fi
+  local targets pat caps_domain
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+    || { echo "could not read integration_targets from ${sdir} — is the cluster still up?" >&2; exit 2; }
+  pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
+  caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file" 2>/dev/null || echo true)
+  mkdir -p "${HERE}/reports"
+  collect_failure_logs "$scenario" "$caps_domain" "$targets" "$pat"
+  echo "logs written to ${HERE}/reports/${scenario}-failure-logs.txt" >&2
+}
+
+if [[ "$DESTROY_ONLY" == "1" ]]; then
+  # teardown() returns early when KEEP=1; force a real destroy here.
+  KEEP=0
+  teardown "$SCENARIO"
+elif [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
+  collect_logs_only "$SCENARIO"
+elif [[ "$SCENARIO" == "all" ]]; then
   for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-wasm cluster-hetero single-node-fc-arm64 cluster-arm64; do
     ( run_one "$s" )
   done

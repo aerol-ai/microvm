@@ -73,6 +73,91 @@ dump_service_logs() {
   echo "===== end ${svc} @ ${target} ====="
 }
 
+# dump_cluster_membership <ssh_target> <pat> [label]
+# Snapshot what ONE node believes the cluster looks like, hit on its own
+# loopback API (127.0.0.1:21212) so the answer is that node's local view rather
+# than whatever the ingress/LB happens to route to. Prints the member list and
+# the current Raft leader. The whole point on a failed bring-up is to see a
+# split: if every node reports members=1 and no leader, gossip never converged
+# and the control-plane tier is unreachable (firewall, key mismatch, or the
+# seed/server nodes never came up). Never fails the caller — best-effort, runs
+# on the already-broken path next to dump_service_logs.
+dump_cluster_membership() {
+  local target="$1" pat="$2" label="${3:-}"
+  echo "===== cluster view @ ${target} ${label:+(${label})} ====="
+  if ! ssh "${SSH_OPTS[@]}" "$target" "
+      auth=''
+      [[ -n '${pat}' ]] && auth='-H \"Authorization: Bearer ${pat}\"'
+      echo '--- /v1/cluster/members (this node'\''s local view) ---'
+      eval curl -s --max-time 5 \$auth http://127.0.0.1:21212/v1/cluster/members | jq . 2>/dev/null \
+        || echo '(members query failed — API down or not in cluster mode)'
+      echo '--- /v1/cluster/leader ---'
+      eval curl -s --max-time 5 \$auth http://127.0.0.1:21212/v1/cluster/leader | jq . 2>/dev/null \
+        || echo '(leader query failed)'
+    " 2>&1; then
+    echo "(could not reach ${target})"
+  fi
+  echo "===== end cluster view @ ${target} ====="
+}
+
+# dump_node_diagnostics <ssh_target> [seed_private_ip] [label]
+# Deep per-node forensics for a cluster that won't form. The journal alone never
+# explains a failed JOIN, because the join happens in user-data long before
+# sandboxd's own logs: the bootstrap template runs cluster-init.sh (seed) or
+# polls S3 for the seed's gossip key + TLS bundle and runs cluster-join.sh
+# (joiner), all teed to /var/log/aerolvm-bootstrap.log. This grabs that file
+# plus the rendered cluster.env (peers / role / bind+advertise addrs — secrets
+# redacted), the actual listening sockets on the raft/gossip/API ports, and a
+# live TCP reachability probe from this node to the seed's raft (7000) and
+# gossip-tcp (7001) ports. Together those answer the three real questions:
+# did the join script run and succeed? is the daemon bound on the cluster
+# ports? and can this node even reach the seed across the security group?
+# Best-effort: never fails the caller (runs on the already-broken path).
+dump_node_diagnostics() {
+  local target="$1" seed_private_ip="${2:-}" label="${3:-}"
+  echo "===== node diagnostics @ ${target} ${label:+(${label})} ====="
+  if ! ssh "${SSH_OPTS[@]}" "$target" "
+      echo '--- identity (hostname / role tag / ip / routes) ---'
+      hostname; echo
+      ip -4 -o addr show scope global 2>/dev/null || true
+      echo
+      echo '--- bootstrap + cluster-init/join log (/var/log/aerolvm-bootstrap.log) ---'
+      sudo cat /var/log/aerolvm-bootstrap.log 2>/dev/null || echo '(no bootstrap log — user-data may not have run)'
+      echo
+      echo '--- cloud-init tail (/var/log/cloud-init-output.log, last 120) ---'
+      sudo tail -n 120 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init-output.log)'
+      echo
+      echo '--- cloud-init status ---'
+      sudo cloud-init status --long 2>/dev/null || true
+      echo
+      echo '--- rendered cluster config (/etc/sandboxd/cluster.env, secrets redacted) ---'
+      if sudo test -f /etc/sandboxd/cluster.env; then
+        sudo sed -E 's/^(SB_GOSSIP_SECRET_KEY|SB_CREDENTIAL_ENCRYPTION_KEY)=.*/\1=<redacted>/' /etc/sandboxd/cluster.env
+      else
+        echo '(no cluster.env — this node never ran cluster-init/join; it is NOT in cluster mode)'
+      fi
+      echo
+      echo '--- listeners on cluster ports (7000 raft / 7001 gossip / 7002 mTLS / 21212 api) ---'
+      sudo ss -ltnup 2>/dev/null | grep -E ':(7000|7001|7002|21212)\b' || echo '(nothing listening on cluster ports)'
+      echo
+      echo '--- reachability probe to seed (${seed_private_ip}) ---'
+      if [[ -n '${seed_private_ip}' ]]; then
+        for port in 7000 7001; do
+          if timeout 3 bash -c \"echo > /dev/tcp/${seed_private_ip}/\$port\" 2>/dev/null; then
+            echo \"  seed ${seed_private_ip}:\$port  OPEN\"
+          else
+            echo \"  seed ${seed_private_ip}:\$port  UNREACHABLE (security group / seed down / not bound)\"
+          fi
+        done
+      else
+        echo '  (seed private IP unknown — skipping probe)'
+      fi
+    " 2>&1; then
+    echo "(could not reach ${target})"
+  fi
+  echo "===== end node diagnostics @ ${target} ====="
+}
+
 # stage_wasm_modules <fixtures_dir> <config_cluster_yml> <caps_domain> <targets_json>
 # Copies the curated standard .wasm modules onto every node's modules_dir under
 # their reserved alias filename, then restarts sandboxd. Returns non-zero on any
