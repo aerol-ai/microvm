@@ -1,6 +1,6 @@
 [package]
 name = "aerolvm-sdk"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 authors = ["Aerol AI"]
 description = "A Rust SDK for the Aerol.ai MicroVM sandbox API"
