@@ -9,6 +9,7 @@
 name: single-node-wasm
 capabilities:
   - docker
+  - platform-volumes
   - wasm
   - domain
   - custom-domains

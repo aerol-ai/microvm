@@ -155,6 +155,32 @@ locals {
     )
   }
 
+  # Platform volumes are operator-backed named volumes. The integration overlay
+  # enables them without naming a bucket; in that case use this scenario's
+  # force-destroyed bundle bucket under a separate prefix so live volume bytes
+  # disappear with the test infrastructure.
+  platform_volumes_cfg = {
+    enabled             = try(local.cluster_ops.platform_volumes.enabled, false) ? "true" : "false"
+    backend             = try(local.cluster_ops.platform_volumes.backend, "s3")
+    max_per_tenant      = try(local.cluster_ops.platform_volumes.max_per_tenant, 0)
+    reclaim_interval    = try(local.cluster_ops.platform_volumes.reclaim_interval, "5m")
+    reclaim_mount_root  = try(local.cluster_ops.platform_volumes.reclaim_mount_root, "/var/lib/aerolvm/volume-reclaim")
+    reclaim_concurrency = try(local.cluster_ops.platform_volumes.reclaim_concurrency, 8)
+    s3_bucket = (
+      try(local.cluster_ops.platform_volumes.s3_bucket, "") != ""
+      ? local.cluster_ops.platform_volumes.s3_bucket
+      : aws_s3_bucket.bundle.bucket
+    )
+    s3_prefix            = try(local.cluster_ops.platform_volumes.s3_prefix, "volumes")
+    s3_region            = try(local.cluster_ops.platform_volumes.s3_region, "") != "" ? local.cluster_ops.platform_volumes.s3_region : var.aws_region
+    s3_endpoint          = try(local.cluster_ops.platform_volumes.s3_endpoint, "")
+    s3_access_key_id     = try(local.cluster_ops.platform_volumes.s3_access_key_id, "")
+    s3_secret_access_key = try(local.cluster_ops.platform_volumes.s3_secret_access_key, "")
+    nfs_server           = try(local.cluster_ops.platform_volumes.nfs_server, "")
+    nfs_export           = try(local.cluster_ops.platform_volumes.nfs_export, "")
+    nfs_options          = try(local.cluster_ops.platform_volumes.nfs_options, "")
+  }
+
   # AOCR (Phase 4 F17-F21) — resolved view for bootstrap.sh.tftpl. Non-secret
   # config (mirror host, upstreams, auto-import toggle, cluster_id, ...)
   # comes from the shared SoT in config/cluster.yml; secrets (wrap key,

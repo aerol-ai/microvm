@@ -3,6 +3,7 @@
 name: cluster-arm64
 capabilities:
   - docker
+  - platform-volumes
   - firecracker
   - domain
   - cluster

@@ -192,6 +192,8 @@ var Registry = []UseCase{
 	{ID: "UC-82", Title: "Volume persists across destroy; re-attach by name sees data", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
 	{ID: "UC-83", Title: "Two sandboxes share one volume (both read same data)", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
 	{ID: "UC-84", Title: "Read-only volume mount rejects writes", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
+	{ID: "UC-85", Title: "Platform volumes rejected on WASM runtime", Requires: []Capability{CapWasm, CapPlatformVolumes}, Implemented: true},
+	{ID: "UC-86", Title: "Platform volumes rejected on Firecracker runtime", Requires: []Capability{CapFirecracker, CapPlatformVolumes}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

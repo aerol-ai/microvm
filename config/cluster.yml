@@ -76,6 +76,28 @@ image_build_gc:
   interval: "10m"
   ttl: "24h"
 
+# --- Platform volumes ------------------------------------------------------
+# Operator-backed named persistent volumes. Disabled by default; integration
+# scenarios that advertise `platform-volumes` enable this block against their
+# throwaway S3 bundle bucket so the live suite exercises real mounts without
+# requiring a long-lived operator bucket.
+platform_volumes:
+  enabled: false
+  backend: "s3"
+  max_per_tenant: 0
+  reclaim_interval: "5m"
+  reclaim_mount_root: "/var/lib/aerolvm/volume-reclaim"
+  reclaim_concurrency: 8
+  s3_bucket: ""
+  s3_prefix: "volumes"
+  s3_region: ""
+  s3_endpoint: ""
+  s3_access_key_id: ""
+  s3_secret_access_key: ""
+  nfs_server: ""
+  nfs_export: ""
+  nfs_options: ""
+
 # --- Firecracker runtime bootstrap ---------------------------------------
 # Host-level Firecracker enablement is opt-in. The bootstrap path must
 # install the runtime binaries and provide a kernel image at the configured

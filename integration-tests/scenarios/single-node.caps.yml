@@ -3,6 +3,7 @@
 name: single-node
 capabilities:
   - docker
+  - platform-volumes
   - domain
   # custom-domains advertises that the AddCustomDomain API is enabled
   # (single-node.tfvars sets enable_custom_domains=true and the Terraform

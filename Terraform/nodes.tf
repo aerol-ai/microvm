@@ -177,6 +177,7 @@ resource "aws_instance" "seed" {
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
     wasm_cfg               = local.wasm_cfg
+    platform_volumes_cfg   = local.platform_volumes_cfg
   }))
 
   tags = merge(
@@ -354,6 +355,7 @@ resource "aws_instance" "joiner" {
     fleet_token            = local.fleet.token
     fleet_contract_refresh = local.fleet.contract_refresh
     wasm_cfg               = local.wasm_cfg
+    platform_volumes_cfg   = local.platform_volumes_cfg
   }))
 
   depends_on = [aws_instance.seed]

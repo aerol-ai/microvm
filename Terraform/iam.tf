@@ -103,6 +103,50 @@ resource "aws_iam_role_policy" "joiner_r" {
   policy = data.aws_iam_policy_document.joiner_r.json
 }
 
+locals {
+  platform_volumes_s3_iam = (
+    local.platform_volumes_cfg.enabled == "true"
+    && local.platform_volumes_cfg.backend == "s3"
+    && local.platform_volumes_cfg.s3_access_key_id == ""
+    && local.platform_volumes_cfg.s3_secret_access_key == ""
+  )
+  platform_volumes_s3_bucket_arn = "arn:aws:s3:::${local.platform_volumes_cfg.s3_bucket}"
+}
+
+data "aws_iam_policy_document" "platform_volumes_s3_rw" {
+  count = local.platform_volumes_s3_iam ? 1 : 0
+
+  statement {
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:HeadObject",
+    ]
+    resources = ["${local.platform_volumes_s3_bucket_arn}/${local.platform_volumes_cfg.s3_prefix}/*"]
+  }
+  statement {
+    actions   = ["s3:ListBucket"]
+    resources = [local.platform_volumes_s3_bucket_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "platform_volumes_seed_rw" {
+  count = local.platform_volumes_s3_iam ? 1 : 0
+
+  name   = "${var.cluster_name}-platform-volumes-rw"
+  role   = aws_iam_role.seed.id
+  policy = data.aws_iam_policy_document.platform_volumes_s3_rw[0].json
+}
+
+resource "aws_iam_role_policy" "platform_volumes_joiner_rw" {
+  count = local.platform_volumes_s3_iam ? 1 : 0
+
+  name   = "${var.cluster_name}-platform-volumes-rw"
+  role   = aws_iam_role.joiner.id
+  policy = data.aws_iam_policy_document.platform_volumes_s3_rw[0].json
+}
+
 resource "aws_iam_instance_profile" "seed" {
   name = "${var.cluster_name}-seed"
   role = aws_iam_role.seed.name

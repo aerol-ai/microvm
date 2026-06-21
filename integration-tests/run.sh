@@ -142,10 +142,11 @@ run_one() {
 
   # Capability checks read the structured list (not a substring grep, which
   # would false-match the word "domain" in a caps-file comment).
-  local caps_domain caps_wasm caps_cluster
+  local caps_domain caps_wasm caps_cluster caps_platform_volumes
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file")
   caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
   caps_cluster=$(yq -r '.capabilities | contains(["cluster"])' "$caps_file")
+  caps_platform_volumes=$(yq -r '.capabilities | contains(["platform-volumes"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
     leased=$(lease_domain)
   else
@@ -167,6 +168,14 @@ run_one() {
   yq '.auto_import.enabled = false
       | .fleet_control_plane.enabled = false
       | .wasm.enabled = '"$caps_wasm"'
+      | .platform_volumes.enabled = '"$caps_platform_volumes"'
+      | .platform_volumes.backend = "s3"
+      | .platform_volumes.s3_bucket = ""
+      | .platform_volumes.s3_prefix = "integration-platform-volumes/'"$scenario"'"
+      | .platform_volumes.s3_region = ""
+      | .platform_volumes.s3_endpoint = ""
+      | .platform_volumes.s3_access_key_id = ""
+      | .platform_volumes.s3_secret_access_key = ""
       | (.ingress.acme_ca // "") = "'"$acme_issuer"'"
       | (.ingress.domain_name) = "'"${leased}"'"' \
     "$CONFIG_CLUSTER" > "${overlay}/cluster.yml"
@@ -350,7 +359,7 @@ collect_failure_logs() {
 }
 
 if [[ "$SCENARIO" == "all" ]]; then
-  for s in single-node cluster-3-mixed cluster-hetero; do
+  for s in local-mode single-node single-node-wasm cluster-3-mixed cluster-3-mixed-wasm cluster-hetero single-node-fc-arm64 cluster-arm64; do
     ( run_one "$s" )
   done
 else

@@ -3,6 +3,7 @@
 name: cluster-hetero
 capabilities:
   - docker
+  - platform-volumes
   - firecracker
   - gvisor
   - wasm

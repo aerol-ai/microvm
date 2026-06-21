@@ -3,6 +3,7 @@
 name: cluster-3-mixed
 capabilities:
   - docker
+  - platform-volumes
   - domain
   - cluster
 

@@ -5,6 +5,7 @@ package suite
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -163,4 +164,46 @@ func TestPlatformVolumeReadOnlyRejectsWrites(t *testing.T) {
 	if err == nil && res.ExitCode == 0 {
 		t.Fatalf("write to read-only volume succeeded (exit=0, stdout=%q)", res.Stdout)
 	}
+}
+
+func expectPlatformVolumeRuntimeRejected(t *testing.T, runtime, image string) {
+	t.Helper()
+	c := client(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+		Image:   image,
+		Name:    harness.UniqueName(sc, t),
+		Runtime: runtime,
+		PlatformVolumes: []sdktypes.PlatformVolumeMount{{
+			Name: volumeName(t),
+			Path: "/vol",
+		}},
+	})
+	if err == nil {
+		_ = c.SDK().Destroy(ctx, sb.ID)
+		t.Fatalf("create with runtime=%s and platform volume succeeded; expected rejection", runtime)
+	}
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "volume") || !strings.Contains(lower, runtime) {
+		t.Fatalf("create with runtime=%s rejected with %q, want platform-volume runtime error", runtime, err)
+	}
+}
+
+// UC-85 - WASM has no bind-mounted container filesystem, so platform volumes
+// must be rejected instead of creating a sandbox where /vol never appears.
+func TestPlatformVolumeWasmRuntimeRejected(t *testing.T) {
+	harness.Require(t, sc, "UC-85")
+	ref := os.Getenv("AEROL_WASM_MODULE_REF")
+	if ref == "" {
+		t.Skip("AEROL_WASM_MODULE_REF not set")
+	}
+	expectPlatformVolumeRuntimeRejected(t, sdktypes.RuntimeWasm, ref)
+}
+
+// UC-86 - Firecracker rootfs mounts are block-device based; platform volumes are
+// Docker bind mounts and must fail fast on create.
+func TestPlatformVolumeFirecrackerRuntimeRejected(t *testing.T) {
+	harness.Require(t, sc, "UC-86")
+	expectPlatformVolumeRuntimeRejected(t, sdktypes.RuntimeFirecracker, harness.DefaultImage)
 }

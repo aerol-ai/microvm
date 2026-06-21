@@ -3,6 +3,7 @@
 name: single-node-fc-arm64
 capabilities:
   - docker
+  - platform-volumes
   - firecracker
   - domain
   - custom-domains

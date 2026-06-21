@@ -389,6 +389,21 @@ SB_IMAGE_BUILD_GC_TTL=${image_build_gc_ttl}
 SB_ENABLE_CUSTOM_DOMAINS=${enable_custom_domains}
 SB_CUSTOM_DOMAIN_VERIFY_PREFIX=${custom_domain_txt_prefix}
 SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX=${custom_domain_txt_value_prefix}
+SB_PLATFORM_VOLUMES_ENABLED=${platform_volumes_cfg.enabled}
+SB_PLATFORM_VOLUMES_BACKEND=${platform_volumes_cfg.backend}
+SB_PLATFORM_VOLUMES_MAX_PER_TENANT=${platform_volumes_cfg.max_per_tenant}
+SB_PLATFORM_VOLUMES_RECLAIM_INTERVAL=${platform_volumes_cfg.reclaim_interval}
+SB_PLATFORM_VOLUMES_RECLAIM_MOUNT_ROOT=${platform_volumes_cfg.reclaim_mount_root}
+SB_PLATFORM_VOLUMES_RECLAIM_CONCURRENCY=${platform_volumes_cfg.reclaim_concurrency}
+SB_PLATFORM_VOLUMES_S3_BUCKET=${platform_volumes_cfg.s3_bucket}
+SB_PLATFORM_VOLUMES_S3_PREFIX=${platform_volumes_cfg.s3_prefix}
+SB_PLATFORM_VOLUMES_S3_REGION=${platform_volumes_cfg.s3_region}
+SB_PLATFORM_VOLUMES_S3_ENDPOINT=${platform_volumes_cfg.s3_endpoint}
+SB_PLATFORM_VOLUMES_S3_ACCESS_KEY_ID=${platform_volumes_cfg.s3_access_key_id}
+SB_PLATFORM_VOLUMES_S3_SECRET_ACCESS_KEY=${platform_volumes_cfg.s3_secret_access_key}
+SB_PLATFORM_VOLUMES_NFS_SERVER=${platform_volumes_cfg.nfs_server}
+SB_PLATFORM_VOLUMES_NFS_EXPORT=${platform_volumes_cfg.nfs_export}
+SB_PLATFORM_VOLUMES_NFS_OPTIONS=${platform_volumes_cfg.nfs_options}
 EOF
 
 %{ if with_firecracker ~}

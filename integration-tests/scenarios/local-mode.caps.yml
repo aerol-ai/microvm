@@ -1,4 +1,6 @@
-# Local-mode has docker but no public domain/TLS — domain-gated use cases skip.
+# Local-mode install on a throwaway EC2 box. No public domain/TLS; run.sh
+# reaches sandboxd through an SSH tunnel to localhost:21212.
 name: local-mode
 capabilities:
   - docker
+  - platform-volumes
