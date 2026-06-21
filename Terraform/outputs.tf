@@ -53,6 +53,7 @@ output "integration_targets" {
       for n, inst in local.all_instances : {
         name       = n
         role       = local.nodes_resolved[n].role
+        seed       = n == local.seed_name
         public_ip  = inst.public_ip
         private_ip = inst.private_ip
         spot       = local.nodes_resolved[n].spot

@@ -90,7 +90,8 @@ type Agent struct {
 	// placementVersion tracks the highest placement version observed via
 	// shard/page/point reads. It keeps PlacementVersion() off the full-map
 	// endpoint on worker/ingress-only agents.
-	placementVersion atomic.Uint64
+	placementVersion          atomic.Uint64
+	lastNoControlPlaneLogUnix atomic.Int64
 }
 
 func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*Agent, error) {
@@ -774,6 +775,7 @@ func (a *Agent) doControlPlaneJSON(ctx context.Context, method, publicPath, inte
 func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, internalPath string, body []byte, out any) error {
 	members := a.controlPlaneMembers()
 	if len(members) == 0 {
+		a.logNoControlPlaneMembers(method, publicPath, internalPath)
 		return errors.New("cluster agent: no live server-role control-plane members")
 	}
 	var firstErr error
@@ -811,6 +813,94 @@ func (a *Agent) tryControlPlaneMember(ctx context.Context, m Member, method, pub
 		return errors.New("cluster agent: server API URL unknown for " + m.NodeID)
 	}
 	return a.doHTTPRequest(ctx, a.httpClient, strings.TrimRight(m.APIURL, "/")+publicPath, method, body, out)
+}
+
+func (a *Agent) logNoControlPlaneMembers(method, publicPath, internalPath string) {
+	if a == nil || a.logger == nil {
+		return
+	}
+	now := time.Now().Unix()
+	last := a.lastNoControlPlaneLogUnix.Load()
+	if last > 0 && now-last < 15 {
+		return
+	}
+	if !a.lastNoControlPlaneLogUnix.CompareAndSwap(last, now) {
+		return
+	}
+	total, alive, serverRole, self, dead, nonControlPlaneRole, missingEndpoint, candidates, visible := a.controlPlaneDiagnosticSnapshot()
+	a.logger.Warn("cluster agent: no usable server-role control-plane members in gossip view",
+		"method", method,
+		"public_path", publicPath,
+		"internal_path", internalPath,
+		"total_members", total,
+		"alive_members", alive,
+		"server_role_members", serverRole,
+		"self_members", self,
+		"dead_members", dead,
+		"non_control_plane_role_members", nonControlPlaneRole,
+		"missing_endpoint_members", missingEndpoint,
+		"usable_candidates", candidates,
+		"visible_members", visible,
+	)
+}
+
+func (a *Agent) controlPlaneDiagnosticSnapshot() (total, alive, serverRole, self, dead, nonControlPlaneRole, missingEndpoint, candidates int, visible []string) {
+	if a == nil || a.gossip == nil {
+		return
+	}
+	for _, m := range a.gossip.members() {
+		total++
+		if len(visible) < 16 {
+			visible = append(visible, controlPlaneMemberDiagnostic(m, a.nodeID))
+		}
+		if m.Alive {
+			alive++
+		} else {
+			dead++
+		}
+		if CanServeControlPlaneRole(m.Role) {
+			serverRole++
+		} else {
+			nonControlPlaneRole++
+		}
+		if m.NodeID == a.nodeID {
+			self++
+		}
+		if m.APIURL == "" && m.InternalURL == "" {
+			missingEndpoint++
+		}
+		if m.NodeID != "" && m.NodeID != a.nodeID && m.Alive && CanServeControlPlaneRole(m.Role) && (m.APIURL != "" || m.InternalURL != "") {
+			candidates++
+		}
+	}
+	return
+}
+
+func controlPlaneMemberDiagnostic(m Member, selfID string) string {
+	flags := make([]string, 0, 5)
+	if m.NodeID == selfID {
+		flags = append(flags, "self")
+	}
+	if !m.Alive {
+		flags = append(flags, "dead")
+	}
+	if !CanServeControlPlaneRole(m.Role) {
+		flags = append(flags, "role-not-control-plane")
+	}
+	if m.APIURL == "" && m.InternalURL == "" {
+		flags = append(flags, "missing-endpoint")
+	}
+	if len(flags) == 0 {
+		flags = append(flags, "candidate")
+	}
+	return fmt.Sprintf("%s(role=%q,api=%t,internal=%t,raft=%t,%s)",
+		m.NodeID,
+		m.Role,
+		m.APIURL != "",
+		m.InternalURL != "",
+		m.RaftAddr != "",
+		strings.Join(flags, "|"),
+	)
 }
 
 func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint, method string, body []byte, out any) error {

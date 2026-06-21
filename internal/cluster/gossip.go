@@ -272,13 +272,27 @@ func (i *gossipMemberIndex) recordMetricsLocked(now int64) {
 }
 
 type indexedEventDelegate struct {
-	index *gossipMemberIndex
-	next  memberlist.EventDelegate
+	index  *gossipMemberIndex
+	logger *slog.Logger
+	next   memberlist.EventDelegate
 }
 
 func (d *indexedEventDelegate) NotifyJoin(n *memberlist.Node) {
+	m := memberFromMemberlistNode(n)
 	if d.index != nil && n != nil {
-		d.index.upsert(memberFromMemberlistNode(n))
+		d.index.upsert(m)
+	}
+	if d.logger != nil && n != nil {
+		d.logger.Info("cluster gossip member joined",
+			"node_id", m.NodeID,
+			"role", m.Role,
+			"alive", m.Alive,
+			"api_url", m.APIURL,
+			"internal_url", m.InternalURL,
+			"raft_addr", m.RaftAddr,
+			"memberlist_name", n.Name,
+			"memberlist_addr", n.Address(),
+		)
 	}
 	if d.next != nil {
 		d.next.NotifyJoin(n)
@@ -286,10 +300,21 @@ func (d *indexedEventDelegate) NotifyJoin(n *memberlist.Node) {
 }
 
 func (d *indexedEventDelegate) NotifyLeave(n *memberlist.Node) {
+	m := memberFromMemberlistNode(n)
 	if d.index != nil && n != nil {
-		m := memberFromMemberlistNode(n)
 		m.Alive = false
 		d.index.upsert(m)
+	}
+	if d.logger != nil && n != nil {
+		d.logger.Warn("cluster gossip member left",
+			"node_id", m.NodeID,
+			"role", m.Role,
+			"api_url", m.APIURL,
+			"internal_url", m.InternalURL,
+			"raft_addr", m.RaftAddr,
+			"memberlist_name", n.Name,
+			"memberlist_addr", n.Address(),
+		)
 	}
 	if d.next != nil {
 		d.next.NotifyLeave(n)
@@ -297,8 +322,21 @@ func (d *indexedEventDelegate) NotifyLeave(n *memberlist.Node) {
 }
 
 func (d *indexedEventDelegate) NotifyUpdate(n *memberlist.Node) {
+	m := memberFromMemberlistNode(n)
 	if d.index != nil && n != nil {
-		d.index.upsert(memberFromMemberlistNode(n))
+		d.index.upsert(m)
+	}
+	if d.logger != nil && n != nil {
+		d.logger.Info("cluster gossip member updated",
+			"node_id", m.NodeID,
+			"role", m.Role,
+			"alive", m.Alive,
+			"api_url", m.APIURL,
+			"internal_url", m.InternalURL,
+			"raft_addr", m.RaftAddr,
+			"memberlist_name", n.Name,
+			"memberlist_addr", n.Address(),
+		)
 	}
 	if d.next != nil {
 		d.next.NotifyUpdate(n)
@@ -358,7 +396,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	delegate := newGossipDelegate(cfg.NodeID, cfg.NodeName, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, cfg.PublicHost, admitter)
 	memberIndex := newGossipMemberIndex()
 	mlCfg.Delegate = delegate
-	mlCfg.Events = &indexedEventDelegate{index: memberIndex, next: cfg.Events}
+	mlCfg.Events = &indexedEventDelegate{index: memberIndex, logger: logger, next: cfg.Events}
 	if len(cfg.SecretKey) > 0 {
 		// memberlist accepts 16/24/32-byte keys for AES-128/192/256-GCM. Anything
 		// else is rejected at construction so we surface a clear error rather
@@ -378,9 +416,33 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	// log meaningful state changes ourselves.
 	mlCfg.Logger = nil
 
+	if logger != nil {
+		logger.Info("cluster gossip starting",
+			"node_id", cfg.NodeID,
+			"role", cfg.Role,
+			"bind_addr", cfg.BindAddr,
+			"advertise_addr", cfg.AdvertiseAddr,
+			"api_url", cfg.APIURL,
+			"data_plane_host", cfg.DataPlaneHost,
+			"raft_addr", cfg.RaftAddr,
+			"internal_url", cfg.InternalURL,
+			"public_host", cfg.PublicHost,
+			"bootstrap_peers", cfg.BootstrapPeers,
+			"encrypted", len(cfg.SecretKey) > 0,
+			"node_meta_bytes", len(delegate.NodeMeta(512)),
+		)
+	}
+
 	ml, err := memberlist.Create(mlCfg)
 	if err != nil {
 		return nil, fmt.Errorf("gossip setup: memberlist.Create: %w", err)
+	}
+	if logger != nil {
+		logger.Info("cluster gossip listening",
+			"node_id", cfg.NodeID,
+			"memberlist_addr", ml.LocalNode().Address(),
+			"bootstrap_peers", cfg.BootstrapPeers,
+		)
 	}
 
 	if len(cfg.BootstrapPeers) > 0 {
@@ -389,7 +451,11 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 			_ = ml.Shutdown()
 			return nil, fmt.Errorf("gossip setup: join %v: %w", cfg.BootstrapPeers, err)
 		}
-		logger.Info("cluster gossip joined peers", "joined", joined, "peers", cfg.BootstrapPeers)
+		if logger != nil {
+			logger.Info("cluster gossip joined peers", "joined", joined, "peers", cfg.BootstrapPeers)
+		}
+	} else if logger != nil {
+		logger.Info("cluster gossip started without bootstrap peers", "node_id", cfg.NodeID)
 	}
 
 	interval := cfg.GossipInterval

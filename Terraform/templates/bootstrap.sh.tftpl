@@ -223,9 +223,43 @@ sudo /tmp/cluster-join.sh \
   --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 %{ endif ~}
 
+###############################################################################
+# 2c. Immediate cluster-mode diagnostics.
+#
+# The integration harness also collects these over SSH after failures, but this
+# block lands in /var/log/aerolvm-bootstrap.log during cloud-init itself. That
+# matters when sandboxd fails before the later collector can reach every node,
+# or when Terraform is using released cluster-init/join scripts that do not yet
+# include the same diagnostics.
+###############################################################################
+echo "[bootstrap] post cluster-mode diagnostics"
+sudo systemctl is-active sandboxd || true
+sudo systemctl show sandboxd \
+  -p ActiveState -p SubState -p MainPID -p NRestarts -p ExecMainStatus \
+  --no-pager || true
+echo "[bootstrap] listeners on cluster ports"
+sudo ss -ltnup 2>/dev/null | grep -E ':(7000|7001|7002|21212)\b' || echo "(nothing listening on cluster ports yet)"
+echo "[bootstrap] local /health"
+curl -sS --max-time 5 http://127.0.0.1:21212/health || true
+echo
+set +x
+BOOTSTRAP_PAT="$(sudo awk -F= '$1 == "SB_PAT_TOKEN" { print substr($0, length($1) + 2) }' /etc/sandboxd/sandboxd.env 2>/dev/null || true)"
+if [ -n "$${BOOTSTRAP_PAT}" ]; then
+  echo "[bootstrap] local /v1/cluster/members"
+  curl -sS --max-time 5 -H "Authorization: Bearer $${BOOTSTRAP_PAT}" \
+    http://127.0.0.1:21212/v1/cluster/members || true
+  echo
+  echo "[bootstrap] local /v1/cluster/leader"
+  curl -sS --max-time 5 -H "Authorization: Bearer $${BOOTSTRAP_PAT}" \
+    http://127.0.0.1:21212/v1/cluster/leader || true
+  echo
+fi
+unset BOOTSTRAP_PAT
+set -x
+
 %{ if with_firecracker ~}
 ###############################################################################
-# 2c. Firecracker host prerequisites
+# 2d. Firecracker host prerequisites
 #
 # install.sh does not yet know how to provision Firecracker hosts, so the
 # Terraform bootstrap handles the host-side prerequisites for nodes that opt

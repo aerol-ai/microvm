@@ -470,8 +470,43 @@ cat > /etc/systemd/system/sandboxd.service.d/cluster.conf <<'EOF'
 EnvironmentFile=/etc/sandboxd/cluster.env
 EOF
 
+restart_sandboxd_with_diagnostics() {
+	echo "[cluster-init] restarting sandboxd with cluster mode enabled"
+	if ! systemctl restart sandboxd; then
+		echo "[cluster-init] sandboxd restart failed; dumping status and recent journal" >&2
+		systemctl status sandboxd --no-pager -n 80 >&2 || true
+		journalctl -u sandboxd --no-pager -n 160 >&2 || true
+		exit 1
+	fi
+
+	echo "[cluster-init] sandboxd restart succeeded"
+	systemctl is-active sandboxd || true
+	systemctl show sandboxd \
+		-p ActiveState -p SubState -p MainPID -p NRestarts -p ExecMainStatus \
+		--no-pager || true
+	echo "[cluster-init] listeners on cluster ports"
+	ss -ltnup 2>/dev/null | grep -E ':(7000|7001|7002|21212)\b' || echo "(nothing listening on cluster ports yet)"
+	if command -v curl >/dev/null 2>&1; then
+		echo "[cluster-init] local /health"
+		curl -sS --max-time 5 "http://127.0.0.1:${SB_API_PORT_DEFAULT}/health" || true
+		echo
+		local pat
+		pat="$(read_sandboxd_env_value SB_PAT_TOKEN)"
+		if [[ -n "$pat" ]]; then
+			echo "[cluster-init] local /v1/cluster/members"
+			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
+				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/members" || true
+			echo
+			echo "[cluster-init] local /v1/cluster/leader"
+			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
+				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/leader" || true
+			echo
+		fi
+	fi
+}
+
 systemctl daemon-reload
-systemctl restart sandboxd
+restart_sandboxd_with_diagnostics
 
 cat <<EOF
 

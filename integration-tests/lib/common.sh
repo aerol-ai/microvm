@@ -58,13 +58,23 @@ wait_for_cloud_init() {
 dump_service_logs() {
   local target="$1" svc="$2" lines="${3:-200}"
   echo "===== ${svc} @ ${target} ====="
-  if ! ssh "${SSH_OPTS[@]}" "$target" "
+  if ! ssh -n "${SSH_OPTS[@]}" "$target" "
       echo '--- is-active / is-enabled ---'
       systemctl is-active ${svc}; systemctl is-enabled ${svc} 2>/dev/null || true
       echo '--- systemctl status (state, main PID, last exit, restarts) ---'
       sudo systemctl status ${svc} --no-pager -n 0 || true
       echo '--- listeners on :21212 (is the API actually bound?) ---'
       sudo ss -ltnp 2>/dev/null | grep -E ':21212\b' || echo '(nothing listening on 21212)'
+      if [[ '${svc}' == sandboxd ]]; then
+        echo '--- cluster/gossip/raft events (FULL boot journal, grepped) ---'
+        # The steady-state tail below loses the boot-time gossip/raft/memberlist
+        # handshake — exactly the lines that explain a stuck join. Pull them from
+        # the whole current-boot journal (-b) so they survive regardless of age.
+        sudo journalctl -u ${svc} -b --no-pager 2>/dev/null \
+          | grep -iE 'cluster|gossip|memberlist|serf|raft|swim|join|leav|voter|leader|peer|bootstrap|secret|encrypt|decrypt|mtls|handshake|advertise|bind' \
+          | grep -ivE 'request complete|drain-state lookup|placements lookup' \
+          || echo '(no cluster/gossip/raft lines in boot journal)'
+      fi
       echo '--- journal (last ${lines} lines) ---'
       sudo journalctl -u ${svc} --no-pager -n ${lines}
     " 2>&1; then
@@ -85,7 +95,7 @@ dump_service_logs() {
 dump_cluster_membership() {
   local target="$1" pat="$2" label="${3:-}"
   echo "===== cluster view @ ${target} ${label:+(${label})} ====="
-  if ! ssh "${SSH_OPTS[@]}" "$target" "
+  if ! ssh -n "${SSH_OPTS[@]}" "$target" "
       auth=''
       [[ -n '${pat}' ]] && auth='-H \"Authorization: Bearer ${pat}\"'
       echo '--- /v1/cluster/members (this node'\''s local view) ---'
@@ -116,7 +126,7 @@ dump_cluster_membership() {
 dump_node_diagnostics() {
   local target="$1" seed_private_ip="${2:-}" label="${3:-}"
   echo "===== node diagnostics @ ${target} ${label:+(${label})} ====="
-  if ! ssh "${SSH_OPTS[@]}" "$target" "
+  if ! ssh -n "${SSH_OPTS[@]}" "$target" "
       echo '--- identity (hostname / role tag / ip / routes) ---'
       hostname; echo
       ip -4 -o addr show scope global 2>/dev/null || true
