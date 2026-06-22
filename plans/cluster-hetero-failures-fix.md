@@ -223,12 +223,32 @@ partly downstream. exec/stream **does** upgrade (status 101) when owned locally.
 working case was local-owner; the failing case was cross-node forwarded. The
 drop point is **not located**.
 
-**Investigate (step 1, no fix yet):** reproduce by forcing a sessions/attach to a
-non-owner node; capture where the upgrade drops. Codex's steer: the likely cause
-is the **two-hop** sessions/toolbox path, request-context lifetime, or session
-close semantics — *not* generic `httputil.ReverseProxy` upgrade stripping (the
-repo already relies on ReverseProxy for upgrades). A `forward.go` unit test can
-pass while UC-45 still fails.
+**Investigation done (code-level, 2026-06-23) — two mechanical causes RULED OUT:**
+
+1. **Not HTTP/2-vs-websocket.** The cluster-internal mTLS channel is HTTP/1.1 on
+   both ends: `clientConfig()` / `serverConfig()` (`internal/cluster/tls.go:74,88`)
+   set no `NextProtos`, and the mtls proxy transport (`client.go:204`) has a
+   non-nil `TLSClientConfig` without `ForceAttemptHTTP2`, so Go does not
+   auto-enable h2. HTTP/1.1 supports the 101 upgrade + hijack a websocket needs.
+2. **Not a server write-timeout cutting the stream.** The owner's internal mTLS
+   server (`internal_server.go:105`) sets only `ReadHeaderTimeout: 10s` — no
+   `WriteTimeout` / `IdleTimeout` to kill a long-lived hijacked conn.
+
+The forward proxy (`forward.go:47`) is a standard upgrade-capable `ReverseProxy`,
+and the toolbox hop is the *same* `ServeToolboxReverseProxy` code that exec/stream
+(UC-44) upgrades through fine when local. So the delta is purely the **cross-node
+forward hop**, and the remaining suspect is the double-proxy 101 interaction:
+the ingress `ReverseProxy` must surface the owner's switched-protocol conn while
+the owner's internal server simultaneously hijacks for its own toolbox upgrade
+(ReverseProxy-over-ReverseProxy for a 101). This needs a live/integration
+reproduction to pin — not fixable blind.
+
+**Reproduction recipe (next step):** a two-node integration test (or the live
+cluster) that creates a session on node B, then dials
+`wss://<nodeA>/v1/sandboxes/<id>/sessions/<sid>/attach` so the request is
+forwarded A→B. Capture on both nodes whether the 101 is emitted by the toolbox,
+reaches node B's internal server, and survives the mTLS hop back to A. Codex's
+steer stands: it's the two-hop/close semantics, not generic proxy stripping.
 
 **Test requirement once located:** an **end-to-end v1 route test** through
 `clusterForwardWrap → sessionsProxy → ServeToolboxReverseProxy`, not just a
@@ -251,17 +271,30 @@ NOT rclone — `pkg/mounts/adapters/s3.go:29` shells out to `mount-s3`. (rclone 
 installed for a *different* mount type.) The earlier plan's "capture rclone
 stderr" was wrong and would not explain these failures.
 
-**Investigate (step 1, instrument):**
-1. Capture `mount-s3` stderr on failure in `pkg/mounts/adapters/s3.go` /
-   `pkg/mounts/manager.go` and surface it in the returned error (today it's
-   swallowed behind a bare "timed out waiting for mount").
-2. Audit the mount-process race: `mountOne` starts the FUSE process without
-   stderr capture, and timeout cleanup can race the supervisor's `cmd.Wait`
-   (`pkg/mounts/manager.go:266`). Fix diagnostics around process ownership first.
+**Instrumentation DONE (2026-06-23):**
+1. ✅ Capture `mount-s3` stdout+stderr into a capped buffer and surface the tail
+   in the returned error — `pkg/mounts/process.go` (new: `capturedOutput`,
+   `spawnMountProcess`, `mountWaitError`), wired into `mountOne` and the
+   supervisor restart in `pkg/mounts/manager.go`. The error keeps the
+   backward-compatible "timed out waiting for mount" phrase and now appends
+   `(mount tool output: …)`. Test: `pkg/mounts/process_test.go`.
+   - Liveness hint (alive-vs-exited) was prototyped then **dropped**: on the
+     failure path nobody reaps the process, so an exited tool lingers as a
+     zombie that a signal-0 probe still reports as "running". The captured
+     stderr is the reliable signal; a misleading hint is worse than none.
+
+**Still investigate-first (needs the captured stderr from a live run):**
+2. The fast-fail gap: a mount tool that exits immediately still burns the full
+   `SB_MOUNT_WAIT_TIMEOUT` because `waitForMountProbe` only polls the mountpoint.
+   Racing the probe against process exit needs a single-owner `cmd.Wait`
+   refactor (the supervisor also calls `cmd.Wait`), so it's deferred until the
+   stderr proves the actual failure is fast-exit vs. hang.
 3. Cross-node volume metadata: the lookup's role matters — worker/agent reads go
    through the agent control-plane endpoint; voters read local FSM. Identify
    **which role timed out** before changing any timeout/retry; the "longer
-   timeout" idea is a guess until then.
+   timeout" idea is a guess until then. (Server-side `/internal/volume` answered
+   in microseconds in the captured logs, so the bare-timeout was the mount, not
+   this lookup — but confirm with the new stderr.)
 
 **Files (TBD after instrument):** `pkg/mounts/adapters/s3.go`,
 `pkg/mounts/manager.go`, the volume-lookup client; tests in `pkg/mounts`.
@@ -381,14 +414,15 @@ Synthesized from this review. P1 blocks the scenario; P2 same-branch; P3 follow-
   - Surfaced by: Architecture review — public :2220 → ingress has no gateway (daemon.go:683)
   - Files: `pkg/daemon/daemon.go`, `pkg/daemon/daemon_test.go`; host-key call-out in code comment
   - Verify: `TestShouldStartSSHGateway` ✅ pass; integration UC-43/67 (live)
-- [ ] **T4 (P2, human: ~2h / CC: ~30min)** — pkg/mounts — Capture mount-s3 stderr + audit timeout/cmd.Wait race
-  - Surfaced by: Performance/Code review + Codex — stderr swallowed, race at manager.go:266; tool is mount-s3 not rclone (s3.go:29)
-  - Files: `pkg/mounts/adapters/s3.go`, `pkg/mounts/manager.go`
-  - Verify: forced-failure test surfaces stderr; then re-triage UC-81..84
-- [ ] **T5 (P2, human: ~2h / CC: ~30min)** — pkg/api/v1 — Reproduce + locate session-attach forward drop; add end-to-end route test
+- [x] **T4 (P2)** — pkg/mounts — Capture mount-s3 stdout+stderr, surface in error ✅ INSTRUMENT DONE
+  - Surfaced by: Performance/Code review + Codex — stderr swallowed; tool is mount-s3 not rclone (s3.go:29)
+  - Files: `pkg/mounts/process.go` (new), `pkg/mounts/manager.go`, `pkg/mounts/process_test.go` (new)
+  - Verify: `TestMountWaitErrorSurfacesToolOutput` ✅ pass. Fast-fail refactor + cross-node lookup still deferred to live re-triage.
+- [~] **T5 (P2)** — pkg/api/v1 — Locate session-attach forward drop 🔎 INVESTIGATED, not fixed
   - Surfaced by: Test review + Codex — root cause not located; forward unit test passes vacuously
-  - Files: TBD (`pkg/api/v1`, maybe `internal/cluster/forward.go`)
-  - Verify: e2e route test through clusterForwardWrap→sessionsProxy; integration UC-45
+  - Findings: ruled out h2 (both ends HTTP/1.1) and server write-timeout; narrowed to the double-proxy 101 interaction on the cross-node hop. Needs a 2-node reproduction.
+  - Files: TBD (`internal/cluster/forward.go` / internal server / `pkg/api/v1`)
+  - Verify: two-node integration test dialing a forwarded `/sessions/<id>/attach`; integration UC-45
 - [ ] **T6 (P3, human: — / CC: —)** — verify — Re-run UC-74 after B1; if still failing, fix both create-placement paths
   - Surfaced by: Codex — `cluster_handler.go` vs `clustercreate/` divergence
   - Files: `pkg/api/v1/cluster_handler.go`, `pkg/api/clustercreate/clustercreate.go`
