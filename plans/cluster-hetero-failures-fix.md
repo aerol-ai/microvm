@@ -132,8 +132,23 @@ leader saw it via gossip; `runtime:"gvisor"` create returned `status=started`.
 **PR call-out:** cluster-correctness — gVisor nodes were silently unschedulable;
 single-node unaffected. No FSM/placement code change.
 
-**B7 folds in here:** UC-74 (`CreateWithImage` "no placement target") is the same
-error class. After B1, re-run UC-74. If it still fails, the create-placement
+**B7 — UC-74 is NOT the same bug as B1 (confirmed live).** It's the local-only
+built-image placement gap: `CreateWithImage` = BuildImage (builds on the
+receiving ingress/server node, returns `aerolvm-build/<hash>`) then Create.
+`ImageRequiresLocalPlacement` pins the local-only tag to the building node, but
+ingress/server can't own sandboxes (`CanOwnSandboxRole` false) and no worker has
+the image → `ErrNoPlacementTarget`. Fix options (need design + live validation):
+(1) build on a worker via placement so the image lives where it can run;
+(2) push the build to AOCR so it's distributable and normal placement applies;
+(3) atomic build-on-placement-target. Recommend (2) — the AOCR push path already
+exists (snapshotPusher / ImageDistributionAOCR). NOT a quick fix; ticket it.
+
+**Full ticket: [`plans/b7-built-image-placement.md`](./b7-built-image-placement.md)** —
+code-traced root cause, the three options with tradeoffs/effort, recommended
+Option B, a ~30-min independent quick win (replace the bare `ErrNoPlacementTarget`
+with an actionable error), test plan (incl. a new UC-74b), and PR call-outs.
+
+After B1, re-run UC-74. If it still fails, the create-placement
 path differs from plain create — and note there are **two** create-placement
 implementations (`pkg/api/v1/cluster_handler.go` and
 `pkg/api/clustercreate/clustercreate.go`); fix both or confirm one delegates to
@@ -303,6 +318,32 @@ stderr" was wrong and would not explain these failures.
 partially-mounted-volume rollback rule.
 
 ---
+
+## 3b. Live re-run findings (2026-06-23, commit 1380f63 + fixes)
+
+Re-ran `make integration-cluster-hetero keep`: **60→65 pass**. B1/B4/B5 confirmed
+green live (UC-25, UC-43, UC-67, UC-45). Three further fixes landed from the
+fresh logs:
+
+- **B6 S3 mount — ROOT CAUSE FOUND + FIXED (committed 7f16c8c).** The
+  instrumentation surfaced the real error: `mount-s3: invalid value '…' for
+  '--prefix': prefix must end in '/'`. The adapter stripped the leading slash
+  but never added a trailing one. Fixed in `pkg/mounts/adapters/s3.go` +
+  regression test. Fixes UC-81..84 (needs redeploy to verify live).
+- **B2 firecracker — fixed the next layer (committed df42238).** The mkfs error
+  is gone; cold boot then failed at `PutBootSource: kernel file cannot be
+  opened`. Jailer mode requires chroot-relative paths to files staged inside the
+  chroot; the driver passed the absolute host kernel path (and absolute
+  rootfs/overlay). Added `chrootFilePath` to stage the kernel in and return bare
+  relative names. Fixes UC-24/44/88. **Follow-up:** `configureVMMForLoad`
+  (snapshot-load) needs the same path translation PLUS staging the snapshot
+  state/memory into the chroot — deferred (that path is skipped in this scenario).
+- **UC-74 (B7) — root cause confirmed live.** Reproduced: build returns a
+  `aerolvm-build/<hash>` tag; `ImageRequiresLocalPlacement` (image_distribution.go:190)
+  pins a local-only image to the building node; but the build runs on the
+  ingress/server that received the request, and `CanOwnSandboxRole`
+  (placement.go:355) is false for ingress/server → the image lives only where no
+  sandbox can run → `ErrNoPlacementTarget`. See B7 below.
 
 ## 4. Tickets (separate from this plan's PRs)
 

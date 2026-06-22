@@ -824,15 +824,32 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutMachineConfig: %w", err)
 	}
+	// In jailer mode firecracker is chrooted into the runDir, so every file
+	// path handed to its API must be chroot-relative and the file must live
+	// inside the chroot. The kernel lives elsewhere on the host, so stage it in;
+	// the rootfs/overlay were already built into the runDir, so staging is a
+	// no-op that just yields their basenames. In direct mode these return the
+	// original absolute paths unchanged. (Before this, the absolute kernel path
+	// failed with "kernel file cannot be opened: No such file or directory" the
+	// moment the OCI rootfs build started succeeding.)
+	runDir := filepath.Dir(rootfsPath)
+	kernelAPIPath, err := d.chrootFilePath(runDir, d.cfg.KernelImage, kernelFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage kernel: %w", err)
+	}
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage rootfs: %w", err)
+	}
 	if err := client.PutBootSource(ctx, firecracker.BootSource{
-		KernelImagePath: d.cfg.KernelImage,
+		KernelImagePath: kernelAPIPath,
 		BootArgs:        defaultBootArgs(),
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutBootSource: %w", err)
 	}
 	if err := client.PutDrive(ctx, rootDriveID, firecracker.Drive{
 		DriveID:      rootDriveID,
-		PathOnHost:   rootfsPath,
+		PathOnHost:   rootfsAPIPath,
 		IsRootDevice: true,
 		// Read-write rootfs in Phase 1 — the ext4 was created
 		// per-sandbox and dies with it. Read-only rootfs + per-
@@ -850,9 +867,13 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 	// file directly — no PATCH needed because the VMM hasn't booted
 	// yet and no snapshot state pins a placeholder path.
 	if overlayPath != "" {
+		overlayAPIPath, err := d.chrootFilePath(runDir, overlayPath, overlayFileName)
+		if err != nil {
+			return fmt.Errorf("firecracker runtime: stage overlay: %w", err)
+		}
 		if err := client.PutDrive(ctx, overlayDriveID, firecracker.Drive{
 			DriveID:    overlayDriveID,
-			PathOnHost: overlayPath,
+			PathOnHost: overlayAPIPath,
 			IsReadOnly: false,
 			CacheType:  "Writeback",
 		}); err != nil {
@@ -1536,6 +1557,32 @@ func (d *Driver) ClearNetworkBlockIngress(_ string) error {
 
 func (d *Driver) ClearNetworkBlockEgress(_ string) error {
 	return methodNotImplemented("ClearNetworkBlockEgress")
+}
+
+// chrootFilePath returns the path to hand to the firecracker API for a host
+// file, staging it into the jailer chroot when needed.
+//
+// In jailer mode firecracker is chrooted into runDir, so it can only open files
+// that live there, referenced by a path relative to the chroot root (the jailer
+// docs in jailer.go spell this out). srcAbs is hardlinked — or copied across
+// devices — to runDir/destName and destName is returned. When srcAbs already IS
+// runDir/destName (the rootfs and overlay are built in place) staging is a
+// no-op. In direct mode there is no chroot, so srcAbs is returned unchanged and
+// nothing is staged.
+func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error) {
+	if !d.cfg.UseJailer {
+		return srcAbs, nil
+	}
+	dst := filepath.Join(runDir, destName)
+	if srcAbs != dst {
+		// A leftover file from a previous attempt would make os.Link fail with
+		// EEXIST; clear it first so staging is idempotent across retries.
+		_ = os.Remove(dst)
+		if err := linkOrCopyRootfs(srcAbs, dst); err != nil {
+			return "", err
+		}
+	}
+	return destName, nil
 }
 
 // linkOrCopyRootfs makes dst point at the same bytes as src. Hard-link

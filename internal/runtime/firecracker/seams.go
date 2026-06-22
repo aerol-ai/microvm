@@ -189,6 +189,13 @@ const hostVsockUDSName = "vsock.sock"
 // debug runbook ("look in /srv/firecracker/<id>/rootfs.ext4") accurate.
 const rootfsFileName = "rootfs.ext4"
 
+// kernelFileName is the filename the guest kernel is staged under inside the
+// per-sandbox jailer chroot. In jailer mode firecracker is chrooted into the
+// runDir, so the kernel (which lives elsewhere on the host) must be hardlinked
+// in and referenced by this relative name; in direct mode the kernel is passed
+// by its original absolute path and this is unused.
+const kernelFileName = "vmlinux"
+
 // rootDriveID is the drive_id firecracker uses for the rootfs drive.
 // Mirrored from the firecracker example configs; the guest kernel boots
 // from this drive id.
