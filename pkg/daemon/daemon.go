@@ -680,7 +680,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 
-	if cfg.EnableSSHGateway && cfg.IsWorker() {
+	if shouldStartSSHGateway(cfg) {
 		sshCfg := sshgateway.Config{
 			ListenAddr:  cfg.SSHListenAddr,
 			HostKeyPath: cfg.SSHHostKeyPath,
@@ -1394,10 +1394,38 @@ func readBypassMarker(path string) bool {
 // unset we default to docker and then advertise each runtime the host actually
 // has enabled. Firecracker and WASM each gate on their own enable flag so a
 // host that wired the driver also tells the cluster it can place that runtime.
+//
+// gVisor is the exception: it has no SB_ENABLE_* flag (it rides on the docker
+// driver + a runsc OCI runtime registered in daemon.json). Its capability is
+// only advertised via SB_HOST_RUNTIMES — which install.sh --with-gvisor now
+// writes. But a node configured with SB_RUNTIME=gvisor as its *default* runtime
+// can clearly run gVisor too, so infer the advertisement from cfg.Runtime as
+// well. Without this, such a node runs gVisor locally yet is invisible to
+// cluster placement and every gVisor create is rejected with
+// ErrNoPlacementTarget (the same class of bug the firecracker/wasm flags fixed).
+// shouldStartSSHGateway decides whether this node binds the per-sandbox SSH
+// gateway. Workers run it because they own sandboxes locally. The ingress runs
+// it too: the public SSH endpoint (SB_SSH_LISTEN_ADDR, default :2220) and the
+// wildcard DNS both point at the ingress, so without a gateway there every
+// `ssh sandbox.<domain>` lands on a closed port (cluster-hetero UC-43/67:
+// "connection refused"). An ingress-hosted gateway bridges to the owning node
+// via Config.RemoteAPIBaseURL exactly like the worker path, so a connection for
+// a sandbox the ingress doesn't own is forwarded, not dropped.
+//
+// Multi-ingress note: every ingress that binds the gateway must present the
+// same SSH host key (SB_SSH_HOST_KEY_PATH material shared across ingress nodes)
+// or clients see host-key churn as they round-robin between ingress IPs.
+func shouldStartSSHGateway(cfg config.Config) bool {
+	return cfg.EnableSSHGateway && (cfg.IsWorker() || cfg.IsIngress())
+}
+
 func supportedRuntimesForConfig(cfg config.Config) []string {
 	runtimes := cfg.HostSupportedRuntimes
 	if len(runtimes) == 0 {
 		runtimes = []string{models.RuntimeDocker}
+	}
+	if cfg.Runtime == models.RuntimeGvisor {
+		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeGvisor)
 	}
 	if cfg.EnableFirecracker {
 		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeFirecracker)

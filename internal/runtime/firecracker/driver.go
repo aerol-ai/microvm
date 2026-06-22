@@ -512,9 +512,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return state, nil
 	}
 
-	// Step 2: spawn the VMM (creates the runDir we need before staging
-	// the rootfs). We spawn but do NOT yet Start — the rootfs must be
-	// in place inside the runDir before firecracker boots.
+	// Step 2: spawn the VMM. We spawn but do NOT yet Start — the rootfs must
+	// be in place inside the runDir before firecracker boots.
 	handle, err := d.spawn(d.cfg, allocID)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker runtime: spawn handle: %w", err)
@@ -534,6 +533,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			cleanupVMM()
 		}
 	}()
+
+	// Ensure the runDir exists before staging. In jailer mode handle.RunDir()
+	// is the chroot root (<chroot-base>/firecracker/<id>/root) which the jailer
+	// binary only materializes when it execs firecracker — i.e. at Start, AFTER
+	// we stage the rootfs into it here. Without this MkdirAll, the cold-boot OCI
+	// path's `mkfs.ext4 -d <bundle> <runDir>/rootfs.ext4` fails with "No such
+	// file or directory while trying to determine filesystem size" because its
+	// output directory doesn't exist yet. Pre-creating the chroot root as the
+	// daemon UID is safe: the jailer populates and re-owns the chroot contents
+	// at Start. Idempotent — a no-op on the direct-mode path where the spawner
+	// already created <RunDir>/<id>.
+	if err := os.MkdirAll(handle.RunDir(), 0o755); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: create runDir %s: %w", handle.RunDir(), err)
+	}
 
 	// Step 3: provision the rootfs.ext4 inside the runDir.
 	//
