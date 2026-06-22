@@ -2,10 +2,12 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/hashicorp/memberlist"
 )
 
@@ -85,4 +87,79 @@ func TestGossipRefreshLoopExitsOnCancel(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("runRefreshLoop did not exit")
 	}
+}
+
+func TestHasLiveControlPlaneMemberRequiresUsableServer(t *testing.T) {
+	nodes := []*memberlist.Node{
+		gossipTestNode(t, "worker", config.NodeRoleWorker, "http://worker:21212", "", memberlist.StateAlive),
+		gossipTestNode(t, "dead-server", config.NodeRoleServer, "http://dead-server:21212", "", memberlist.StateDead),
+		gossipTestNode(t, "missing-endpoint", config.NodeRoleServer, "", "", memberlist.StateAlive),
+	}
+
+	if hasLiveControlPlaneMember(nodes, "self") {
+		t.Fatal("hasLiveControlPlaneMember = true, want false without a live server endpoint")
+	}
+
+	nodes = append(nodes, gossipTestNode(t, "seed", config.NodeRoleServer, "http://seed:21212", "", memberlist.StateAlive))
+	if !hasLiveControlPlaneMember(nodes, "self") {
+		t.Fatal("hasLiveControlPlaneMember = false, want true for live server endpoint")
+	}
+
+	nodes = []*memberlist.Node{
+		gossipTestNode(t, "self", config.NodeRoleServer, "http://self:21212", "", memberlist.StateAlive),
+	}
+	if hasLiveControlPlaneMember(nodes, "self") {
+		t.Fatal("hasLiveControlPlaneMember = true, want false when the only server is self")
+	}
+}
+
+func TestMaybeRejoinBootstrapPeersOnlyWithoutControlPlane(t *testing.T) {
+	var calls int
+	gn := &gossipNode{
+		delegate:       &gossipDelegate{nodeID: "self"},
+		bootstrapPeers: []string{"10.42.1.215:7001"},
+		joinBootstrapPeers: func(peers []string) (int, error) {
+			calls++
+			if len(peers) != 1 || peers[0] != "10.42.1.215:7001" {
+				t.Fatalf("join peers = %v, want configured seed", peers)
+			}
+			return 1, nil
+		},
+	}
+
+	gn.maybeRejoinBootstrapPeers([]*memberlist.Node{
+		gossipTestNode(t, "worker", config.NodeRoleWorker, "http://worker:21212", "", memberlist.StateAlive),
+	})
+	if calls != 1 {
+		t.Fatalf("join calls = %d, want 1 when no live control-plane member is visible", calls)
+	}
+
+	gn.maybeRejoinBootstrapPeers([]*memberlist.Node{
+		gossipTestNode(t, "self", config.NodeRoleServer, "http://self:21212", "", memberlist.StateAlive),
+	})
+	if calls != 2 {
+		t.Fatalf("join calls = %d, want 2 when only self is visible as control plane", calls)
+	}
+
+	gn.maybeRejoinBootstrapPeers([]*memberlist.Node{
+		gossipTestNode(t, "server", config.NodeRoleServer, "http://server:21212", "", memberlist.StateAlive),
+		gossipTestNode(t, "worker", config.NodeRoleWorker, "http://worker:21212", "", memberlist.StateAlive),
+	})
+	if calls != 2 {
+		t.Fatalf("join calls = %d, want unchanged when a live control-plane member is visible", calls)
+	}
+}
+
+func gossipTestNode(t *testing.T, nodeID, role, apiURL, internalURL string, state memberlist.NodeStateType) *memberlist.Node {
+	t.Helper()
+	encoded, err := json.Marshal(nodeMeta{
+		NodeID:      nodeID,
+		APIURL:      apiURL,
+		InternalURL: internalURL,
+		Role:        role,
+	})
+	if err != nil {
+		t.Fatalf("marshal node meta: %v", err)
+	}
+	return &memberlist.Node{Name: nodeID, State: state, Meta: encoded}
 }
