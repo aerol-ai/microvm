@@ -143,6 +143,11 @@ the image → `ErrNoPlacementTarget`. Fix options (need design + live validation
 (3) atomic build-on-placement-target. Recommend (2) — the AOCR push path already
 exists (snapshotPusher / ImageDistributionAOCR). NOT a quick fix; ticket it.
 
+**Full ticket: [`plans/b7-built-image-placement.md`](./b7-built-image-placement.md)** —
+code-traced root cause, the three options with tradeoffs/effort, recommended
+Option B, a ~30-min independent quick win (replace the bare `ErrNoPlacementTarget`
+with an actionable error), test plan (incl. a new UC-74b), and PR call-outs.
+
 After B1, re-run UC-74. If it still fails, the create-placement
 path differs from plain create — and note there are **two** create-placement
 implementations (`pkg/api/v1/cluster_handler.go` and
