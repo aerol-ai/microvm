@@ -130,6 +130,10 @@ func TestSupportedRuntimesForConfig(t *testing.T) {
 		{name: "firecracker_enabled_advertises_fc", cfg: config.Config{EnableFirecracker: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
 		{name: "both_enabled", cfg: config.Config{EnableFirecracker: true, EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker, models.RuntimeWasm}},
 		{name: "explicit_host_runtimes_override", cfg: config.Config{HostSupportedRuntimes: []string{models.RuntimeGvisor}, EnableWasm: true}, want: []string{models.RuntimeGvisor, models.RuntimeWasm}},
+		// What install.sh --with-gvisor writes (SB_HOST_RUNTIMES=docker,gvisor):
+		// gVisor has no enable flag, so the install script must advertise it
+		// explicitly or placement rejects every gVisor create in cluster mode.
+		{name: "gvisor_install_advertises_gvisor", cfg: config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeGvisor}, EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeWasm}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
