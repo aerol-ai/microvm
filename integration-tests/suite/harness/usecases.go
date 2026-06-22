@@ -194,6 +194,20 @@ var Registry = []UseCase{
 	{ID: "UC-84", Title: "Read-only volume mount rejects writes", Requires: []Capability{CapDocker, CapPlatformVolumes}, Implemented: true},
 	{ID: "UC-85", Title: "Platform volumes rejected on WASM runtime", Requires: []Capability{CapWasm, CapPlatformVolumes}, Implemented: true},
 	{ID: "UC-86", Title: "Platform volumes rejected on Firecracker runtime", Requires: []Capability{CapFirecracker, CapPlatformVolumes}, Implemented: true},
+	// Regression guards for the cluster-hetero fix pass (plans/cluster-hetero-failures-fix.md).
+	// UC-87 guards B1: a node that runs a specialized runtime must ADVERTISE it
+	// in gossip capacity, or placement rejects every create for that runtime
+	// ("no worker placement target available"). The bug was a --with-gvisor node
+	// advertising only [docker wasm].
+	{ID: "UC-87", Title: "Specialized runtimes are advertised in gossip capacity", Requires: []Capability{CapCluster}, Implemented: true},
+	// UC-88 guards B2: the firecracker cold-boot OCI path must build a rootfs
+	// into the per-sandbox jailer chroot. The bug was mkfs writing into a chroot
+	// dir that didn't exist yet ("No such file or directory ... filesystem size").
+	{ID: "UC-88", Title: "Firecracker cold-boots a sandbox from a plain OCI image", Requires: []Capability{CapFirecracker}, Implemented: true},
+	// UC-89 guards B4: the SSH gateway must listen on the ingress public host.
+	// The bug gated it on IsWorker() only, so the public :2220 (which DNS points
+	// at the ingress) refused every connection.
+	{ID: "UC-89", Title: "SSH gateway listens on the ingress public host", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

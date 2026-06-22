@@ -50,6 +50,7 @@ type mountState struct {
 	hostPath   string
 	plan       adapters.Plan
 	cmd        *exec.Cmd
+	output     *capturedOutput // captured stdout+stderr of the FUSE mount tool
 	startedAt  time.Time
 	restarts   int
 	lastCrash  time.Time
@@ -292,22 +293,21 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 		return state, bind, nil
 	}
 
-	// User-space FUSE: spawn and supervise.
-	cmd := exec.Command(plan.Argv[0], plan.Argv[1:]...)
-	if len(plan.Env) > 0 {
-		cmd.Env = append(os.Environ(), plan.Env...)
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
+	// User-space FUSE: spawn and supervise. stdout+stderr are captured so a
+	// mount that never becomes ready surfaces the tool's own error instead of a
+	// bare "timed out waiting for mount" (cluster-hetero UC-81..84).
+	cmd, out, err := spawnMountProcess(plan)
+	if err != nil {
 		m.cleanupCred(plan)
 		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", err)
 	}
 	state.cmd = cmd
+	state.output = out
 
 	if err := waitForMountProbe(hostPath, m.waitTimeout); err != nil {
 		_ = killMount(cmd)
 		m.cleanupCred(plan)
-		return nil, ContainerBind{}, err
+		return nil, ContainerBind{}, mountWaitError(err, out)
 	}
 
 	if plan.UnlinkCred && plan.CredFile != "" {
@@ -358,6 +358,7 @@ func (m *Manager) superviseExit(state *mountState) {
 		"index", state.index,
 		"type", string(state.spec.Type),
 		"error", err,
+		"output", state.output.String(),
 		"restarts", state.restarts,
 		"within_30s", withinWindow,
 	)
@@ -373,17 +374,14 @@ func (m *Manager) superviseExit(state *mountState) {
 	if state.plan.CredFile != "" {
 		_ = writeCredFile(state.plan.CredFile, state.plan.CredBody)
 	}
-	cmd := exec.Command(state.plan.Argv[0], state.plan.Argv[1:]...)
-	if len(state.plan.Env) > 0 {
-		cmd.Env = append(os.Environ(), state.plan.Env...)
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
+	cmd, out, err := spawnMountProcess(state.plan)
+	if err != nil {
 		state.disabled = true
 		m.logger.Warn("mount restart spawn failed", "sandbox_id", state.sandboxID, "index", state.index, "error", err)
 		return
 	}
 	state.cmd = cmd
+	state.output = out
 
 	go m.superviseExit(state)
 }
