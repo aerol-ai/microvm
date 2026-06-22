@@ -429,6 +429,24 @@ Synthesized from this review. P1 blocks the scenario; P2 same-branch; P3 follow-
 - [ ] **T7 (P3 ticket)** — design — Decide B3 template routing (product catalogue vs test-only)
 - [ ] **T8 (P3 ticket)** — test — B8 triage WASM scheduling-vs-resolution before changing fixtures
 
+## 9b. New integration regression guards (added 2026-06-23)
+
+Behind the `integration` build tag in `integration-tests/suite/regression_fixes_test.go`,
+registered in `harness/usecases.go`. These pin the fixes more tightly than the
+broad full-suite UCs they sit beside:
+
+| UC | Guards | Asserts |
+|----|--------|---------|
+| UC-87 | B1 | every specialized runtime the scenario has a capability for (gvisor/firecracker/wasm) appears in some member's gossiped `capacity.supported_runtimes` — the layer that was broken, vs UC-25 which only checks a gVisor create happens to succeed |
+| UC-88 | B2 | a firecracker sandbox cold-boots from a plain OCI image (no template) and execs — forces the `mkfs.ext4` → jailer-chroot path UC-24 may skip via the template fast-path |
+| UC-89 | B4 | a raw TCP dial to the ingress public host `:2220` returns an `SSH-…` banner — proves a gateway is bound on the ingress, independent of sandbox routing/retry that UC-43 hides behind |
+
+Run on a live cluster via the existing `make integration-cluster-hetero` path; they
+SKIP where the scenario lacks the capability (e.g. UC-88 on a non-firecracker
+scenario). B6's error-surfacing is covered offline by `pkg/mounts/process_test.go`;
+a live negative volume test is deferred until the mount-s3 stderr from a real run
+confirms the failure shape.
+
 ## 10. Landing order
 
 1. **B1 daemon harden** (T1) — install.sh already shipped + verified.
