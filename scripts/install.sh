@@ -705,6 +705,17 @@ SB_L4_PORT_RANGE_END=23000
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
+	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
+	# /etc/docker/daemon.json lets a sandbox opt into runtime:"runsc", but
+	# the daemon still defaults SB_HOST_RUNTIMES to {"docker"} and only
+	# appends firecracker/wasm from their enable flags. In cluster mode that
+	# means a --with-gvisor node never advertises "gvisor" to placement, so
+	# every gVisor create is rejected with ErrNoPlacementTarget even though
+	# runsc is installed. Advertise it explicitly here so the host the runsc
+	# binary landed on also tells the cluster it can place gVisor sandboxes.
+	if [[ "$WITH_GVISOR" == "true" ]]; then
+		echo "SB_HOST_RUNTIMES=docker,gvisor" >> /etc/sandboxd/sandboxd.env
+	fi
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
 
