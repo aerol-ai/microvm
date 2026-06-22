@@ -143,11 +143,13 @@ func (d *gossipDelegate) MergeRemoteState([]byte, bool)   {}
 // gossipNode wraps memberlist + the delegate so Close can stop the refresh
 // loop alongside leaving the cluster.
 type gossipNode struct {
-	ml          *memberlist.Memberlist
-	delegate    *gossipDelegate
-	memberIndex *gossipMemberIndex
-	stopRefresh context.CancelFunc
-	logger      *slog.Logger
+	ml                 *memberlist.Memberlist
+	delegate           *gossipDelegate
+	memberIndex        *gossipMemberIndex
+	stopRefresh        context.CancelFunc
+	logger             *slog.Logger
+	bootstrapPeers     []string
+	joinBootstrapPeers func([]string) (int, error)
 }
 
 type gossipMemberIndex struct {
@@ -464,11 +466,13 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	}
 	refreshCtx, cancel := context.WithCancel(context.Background())
 	gn := &gossipNode{
-		ml:          ml,
-		delegate:    delegate,
-		memberIndex: memberIndex,
-		stopRefresh: cancel,
-		logger:      logger,
+		ml:                 ml,
+		delegate:           delegate,
+		memberIndex:        memberIndex,
+		stopRefresh:        cancel,
+		logger:             logger,
+		bootstrapPeers:     append([]string(nil), cfg.BootstrapPeers...),
+		joinBootstrapPeers: ml.Join,
 	}
 	gn.refreshMemberIndex()
 	go gn.runRefreshLoop(refreshCtx, interval)
@@ -490,8 +494,58 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 			return
 		case <-t.C:
 			g.refreshMemberIndex()
+			g.maybeRejoinBootstrapPeers(g.memberlistNodes())
 		}
 	}
+}
+
+func (g *gossipNode) memberlistNodes() []*memberlist.Node {
+	if g == nil || g.ml == nil {
+		return nil
+	}
+	return g.ml.Members()
+}
+
+func (g *gossipNode) maybeRejoinBootstrapPeers(nodes []*memberlist.Node) {
+	if g == nil || len(g.bootstrapPeers) == 0 || g.joinBootstrapPeers == nil {
+		return
+	}
+	selfNodeID := ""
+	if g.delegate != nil {
+		selfNodeID = g.delegate.nodeID
+	}
+	if hasLiveControlPlaneMember(nodes, selfNodeID) {
+		return
+	}
+	joined, err := g.joinBootstrapPeers(g.bootstrapPeers)
+	if err != nil {
+		if g.logger != nil {
+			g.logger.Warn("cluster gossip bootstrap rejoin failed", "peers", g.bootstrapPeers, "error", err)
+		}
+		return
+	}
+	if joined > 0 && g.logger != nil {
+		g.logger.Info("cluster gossip bootstrap rejoined peers", "joined", joined, "peers", g.bootstrapPeers)
+	}
+}
+
+func hasLiveControlPlaneMember(nodes []*memberlist.Node, selfNodeID string) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+	for _, n := range nodes {
+		if n == nil || n.State != memberlist.StateAlive {
+			continue
+		}
+		m := memberFromMemberlistNode(n)
+		if selfNodeID != "" && m.NodeID == selfNodeID {
+			continue
+		}
+		if m.NodeID != "" && CanServeControlPlaneRole(m.Role) && (m.APIURL != "" || m.InternalURL != "") {
+			return true
+		}
+	}
+	return false
 }
 
 // members returns peer state, including self. Self's metadata is sourced from
