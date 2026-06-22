@@ -132,6 +132,16 @@ func TestS3Build_PrefixTrailingSlash(t *testing.T) {
 			t.Errorf("Build(%q): --prefix = %q, want %q", source, got, want)
 		}
 	}
+
+	// A bucket-only source has no prefix, so mount-s3 must receive NO --prefix
+	// flag at all — emitting an empty "--prefix ''" would itself be rejected.
+	plan, err := (S3{}).Build("sb-x", 0, models.MountSpec{Source: "s3://bucket-only"}, "/mnt/t", "/creds")
+	if err != nil {
+		t.Fatalf("Build(bucket-only): %v", err)
+	}
+	if contains(plan.Argv, "--prefix") {
+		t.Errorf("bucket-only source emitted a --prefix flag: %v", plan.Argv)
+	}
 }
 
 func TestParseS3Source(t *testing.T) {

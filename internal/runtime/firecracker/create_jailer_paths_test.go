@@ -42,9 +42,10 @@ func TestCreate_JailerStagesKernelAndUsesRelativePaths(t *testing.T) {
 	vmm := &fakeVMM{}
 
 	d := New(Config{
-		KernelImage: hostKernel,
-		RunDir:      tmp,
-		UseJailer:   true,
+		KernelImage:    hostKernel,
+		RunDir:         tmp,
+		UseJailer:      true,
+		OverlayEnabled: true, // exercise the overlay PutDrive path too
 	}, nil)
 	d.SetPool(pool)
 	d.SetRootfsBuilder(rootfs)
@@ -59,10 +60,11 @@ func TestCreate_JailerStagesKernelAndUsesRelativePaths(t *testing.T) {
 	d.SetClientFactory(func(_ string) VMMClient { return client })
 
 	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{
-		Image:    "alpine:3.20",
-		CPU:      1,
-		MemoryMB: 256,
-		DiskGB:   1,
+		Image:         "alpine:3.20",
+		CPU:           1,
+		MemoryMB:      256,
+		DiskGB:        1,
+		OverlaySizeGB: 1,
 	}, "sb-jail", "tok", nil); err != nil {
 		t.Fatalf("Create (jailer): %v", err)
 	}
@@ -83,5 +85,10 @@ func TestCreate_JailerStagesKernelAndUsesRelativePaths(t *testing.T) {
 		t.Error("root drive never set")
 	} else if dr.PathOnHost != rootfsFileName {
 		t.Errorf("root drive path = %q, want relative %q", dr.PathOnHost, rootfsFileName)
+	}
+	if dr, ok := client.drives[overlayDriveID]; !ok {
+		t.Error("overlay drive never set")
+	} else if dr.PathOnHost != overlayFileName {
+		t.Errorf("overlay drive path = %q, want relative %q", dr.PathOnHost, overlayFileName)
 	}
 }
