@@ -31,7 +31,15 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		argv = append(argv, "--profile", "sandbox")
 	}
 	if prefix != "" {
-		argv = append(argv, "--prefix", strings.TrimPrefix(prefix, "/"))
+		// mountpoint-s3 requires --prefix to be a "directory" key: no leading
+		// slash and it MUST end in '/', else it rejects with
+		// "prefix must end in '/'". We normalize both ends so a caller passing
+		// "team/data" or "/team/data" mounts the same key space.
+		p := strings.TrimPrefix(prefix, "/")
+		if !strings.HasSuffix(p, "/") {
+			p += "/"
+		}
+		argv = append(argv, "--prefix", p)
 	}
 	if region := spec.Options["region"]; region != "" {
 		argv = append(argv, "--region", region)

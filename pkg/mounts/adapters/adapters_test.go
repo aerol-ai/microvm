@@ -45,7 +45,8 @@ func TestS3Build(t *testing.T) {
 	if err != nil {
 		t.Fatalf("S3.Build: %v", err)
 	}
-	wantPrefix := []string{"mount-s3", "bucket", "/mnt/target", "--foreground", "--profile", "sandbox", "--prefix", "prefix/sub"}
+	// mountpoint-s3 requires --prefix to end in '/', so the adapter appends one.
+	wantPrefix := []string{"mount-s3", "bucket", "/mnt/target", "--foreground", "--profile", "sandbox", "--prefix", "prefix/sub/"}
 	if !reflect.DeepEqual(plan.Argv[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("argv prefix mismatch: got=%v want=%v", plan.Argv[:len(wantPrefix)], wantPrefix)
 	}
@@ -100,6 +101,36 @@ func TestS3Build_InstanceRole(t *testing.T) {
 func TestS3Build_MissingBucket(t *testing.T) {
 	if _, err := (S3{}).Build("sb", 0, models.MountSpec{Source: "s3://"}, "/mnt", "/creds"); err == nil {
 		t.Fatal("expected error for missing bucket")
+	}
+}
+
+// TestS3Build_PrefixTrailingSlash is the regression guard for cluster-hetero
+// UC-81..84: mountpoint-s3 rejects a --prefix that doesn't end in '/'
+// ("error: invalid value '…' for '--prefix': prefix must end in '/'"), so the
+// adapter must normalize a non-empty prefix to end in exactly one slash and
+// carry no leading slash — whatever shape the volume key arrives in.
+func TestS3Build_PrefixTrailingSlash(t *testing.T) {
+	cases := map[string]string{
+		"s3://bucket/team/data":  "team/data/", // no trailing slash -> add one
+		"s3://bucket/team/data/": "team/data/", // already has one -> unchanged
+	}
+	for source, want := range cases {
+		plan, err := (S3{}).Build("sb-x", 0, models.MountSpec{Source: source}, "/mnt/t", "/creds")
+		if err != nil {
+			t.Fatalf("Build(%q): %v", source, err)
+		}
+		got := ""
+		for i, a := range plan.Argv {
+			if a == "--prefix" && i+1 < len(plan.Argv) {
+				got = plan.Argv[i+1]
+			}
+		}
+		if !strings.HasSuffix(got, "/") {
+			t.Errorf("Build(%q): --prefix %q does not end in '/'", source, got)
+		}
+		if got != want {
+			t.Errorf("Build(%q): --prefix = %q, want %q", source, got, want)
+		}
 	}
 }
 
