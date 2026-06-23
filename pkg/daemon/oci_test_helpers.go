@@ -33,7 +33,11 @@ echo fake > "$last/rootfs/bin/sh"
 	mkfs := writeOCIFake(t, bins, "mkfs.ext4", `
 out=""
 while [ $# -gt 0 ]; do
-  case "$1" in -d|-F) shift ;; *) out="$1"; shift ;; esac
+  case "$1" in
+    -d) shift 2 ;;
+    -F) shift ;;
+    *) if [ -z "$out" ]; then out="$1"; fi; shift ;;
+  esac
 done
 printf 'fake-ext4\n' > "$out"
 `)
