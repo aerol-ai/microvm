@@ -32,6 +32,7 @@ make integration-local                  # local-mode (--local install on a throw
 integration-tests/run.sh single-node --keep        # leave infra up for debugging
 integration-tests/run.sh single-node --prod-tls    # use real Let's Encrypt instead of staging
 make integration-cluster-hetero           # 8-node heterogeneous cluster (x86 fc)
+make integration-single-fc                # single-node-fc (x86 firecracker, c5.metal)
 make integration-arm64                    # arm64 firecracker single + cluster scenarios
 make integration-arm64-single             # single-node-fc-arm64 (Graviton metal)
 make integration-arm64-cluster            # cluster-arm64 (homogeneous arm64)

@@ -3,7 +3,7 @@ BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-wasm integration-cluster-mixed integration-cluster-mixed-wasm \
-	integration-cluster-hetero integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
+	integration-cluster-hetero integration-single-fc integration-arm64 integration-arm64-single integration-arm64-cluster integration-all integration-collect-logs integration-destroy integration-reap
 
 fmt:
 	$(GO) fmt ./...
@@ -93,6 +93,12 @@ integration-cluster-hetero:
 	# the bare-metal Firecracker box alone exceeds the account Spot vCPU quota,
 	# so --metal-on-demand is unnecessary here. Pass FLAGS=--keep to debug.
 	integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
+
+# Single-node x86 Firecracker on bare metal (c5.metal). Smallest scenario that
+# exercises the firecracker use cases (UC-24/47-50) without the full hetero
+# cluster. On-Demand only (the metal box exceeds the Spot vCPU quota).
+integration-single-fc:
+	integration-tests/run.sh single-node-fc $(RUN_FLAGS)
 
 integration-arm64-single:
 	integration-tests/run.sh single-node-fc-arm64 $(RUN_FLAGS)
