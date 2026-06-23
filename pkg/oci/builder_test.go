@@ -192,6 +192,59 @@ func TestBuild_PassesMinSizeMiB(t *testing.T) {
 	}
 }
 
+// TestBuild_AlwaysPassesSize is the regression guard for the single-node-fc
+// template-build failure (UC-47..50, UC-80):
+//
+//	mkfs.ext4 -d <bundle>/rootfs -F <out>: The file <out> does not exist
+//	and no size was specified.
+//
+// A zero MinSizeMiB (the default for a template create that didn't pick a
+// disk size) must NOT reach mke2fs without a size — mke2fs 1.46.5 refuses
+// to size a new file from -d alone. Build must compute a floor from the
+// unpacked rootfs and always pass an explicit "<n>M".
+func TestBuild_AlwaysPassesSize(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	b, _ := New(cfg)
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	res, err := b.Build(context.Background(), BuildRequest{
+		ImageRef: "docker://alpine:3.20",
+		OutPath:  out,
+		// MinSizeMiB intentionally left 0 — the failure case.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer res.CleanupDir()
+	contents, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if strings.Contains(string(contents), "no-size") {
+		t.Error("mkfs called WITHOUT a size for MinSizeMiB=0 — would EPERM/abort on mke2fs 1.46.5")
+	}
+}
+
+// TestExt4SizeMiB checks the size math directly: it must honor MinSizeMiB
+// as a floor, add headroom over a tiny rootfs, and round up to whole MiB.
+func TestExt4SizeMiB(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "f"), make([]byte, 1<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Tiny rootfs, no floor: payload (1MiB*1.5=2MiB) + headroom.
+	got, err := ext4SizeMiB(src, 0)
+	if err != nil {
+		t.Fatalf("ext4SizeMiB: %v", err)
+	}
+	if want := 2 + ext4HeadroomMiB; got != want {
+		t.Errorf("size = %d MiB, want %d", got, want)
+	}
+	// A larger MinSizeMiB wins as the floor.
+	if got, _ := ext4SizeMiB(src, 4096); got != 4096 {
+		t.Errorf("floor not honored: got %d, want 4096", got)
+	}
+}
+
 // TestBuild_StageFailure_SurfacesTail confirms a non-zero exit from any
 // stage carries the binary's stderr in the returned error. Operators
 // staring at a failed sandbox create need this; without it the only

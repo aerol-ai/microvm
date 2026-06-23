@@ -16,12 +16,12 @@
 //     read the OCI config from the staging dir directly so layer ordering
 //     is unambiguous.
 //
-//  3. mkfs.ext4 -d <bundle-dir>/rootfs/ -F <out.ext4>
+//  3. mkfs.ext4 -d <bundle-dir>/rootfs/ -F <out.ext4> <size>
 //     Build a single-file ext4 filesystem from the materialized rootfs.
-//     Size is auto-sized by mkfs.ext4 (the -d flag computes minimum
-//     necessary blocks plus the journal); the caller can set MinSizeMiB
-//     to round up so guest writes have headroom before the filesystem
-//     fills.
+//     The size is ALWAYS passed explicitly (mke2fs refuses to size a new
+//     file from -d alone); it is derived from the unpacked rootfs plus
+//     metadata/journal + guest headroom, floored by MinSizeMiB. See
+//     ext4SizeMiB / runMkfs.
 //
 // What does NOT live here: the per-sandbox overlay file (that's the
 // runtime driver's job; the overlay is a sparse file plus a writeback
@@ -223,23 +223,75 @@ func (b *Builder) runUmoci(ctx context.Context, ociDir, tag, bundleDir string) e
 }
 
 // runMkfs wraps stage 3. -d copies a directory in as the initial
-// contents; -F overwrites without prompting; we pass an explicit size in
-// MiB only when MinSizeMiB > 0 (mkfs.ext4's -d alone would size the
-// filesystem to the minimum needed, leaving zero room for guest writes).
+// contents; -F overwrites without prompting.
+//
+// We ALWAYS pass an explicit size. Contrary to the older assumption that
+// "mkfs.ext4 -d auto-sizes to the minimum", mke2fs (1.43+, including the
+// 1.46.5 that ships on the production hosts) refuses to size a new file
+// from -d alone — it exits with "The file <out> does not exist and no
+// size was specified." That is exactly the template-build failure seen in
+// single-node-fc (UC-47..50, UC-80) when MinSizeMiB came through as 0.
+//
+// The size is the larger of (a) a floor derived from the unpacked rootfs
+// plus ext4 metadata/journal + guest write headroom, and (b) the caller's
+// MinSizeMiB request. Computing (a) keeps zero-config template builds
+// working without forcing every caller to pick a disk size.
 func (b *Builder) runMkfs(ctx context.Context, rootfsSrc, outPath string, minSizeMiB int) error {
+	sizeMiB, err := ext4SizeMiB(rootfsSrc, minSizeMiB)
+	if err != nil {
+		return fmt.Errorf("oci: size rootfs %s: %w", rootfsSrc, err)
+	}
 	args := []string{
 		"-d", rootfsSrc,
 		"-F",
-	}
-	// Pinning the UUID would make build output deterministic, but mkfs
-	// doesn't accept a "-U <uuid>" option universally and the runtime
-	// driver doesn't rely on the UUID — skip it.
-	if minSizeMiB > 0 {
-		args = append(args, outPath, strconv.Itoa(minSizeMiB)+"M")
-	} else {
-		args = append(args, outPath)
+		// Pinning the UUID would make build output deterministic, but mkfs
+		// doesn't accept a "-U <uuid>" option universally and the runtime
+		// driver doesn't rely on the UUID — skip it.
+		outPath,
+		strconv.Itoa(sizeMiB) + "M",
 	}
 	return runStage(ctx, "mkfs.ext4", b.cfg.Mkfs4Bin, args)
+}
+
+// ext4 overhead constants used to turn the apparent size of the unpacked
+// rootfs into an ext4 image size that (a) actually fits the files plus
+// filesystem metadata + journal and (b) leaves the guest some room to
+// write before it hits ENOSPC on first boot.
+const (
+	// ext4MetadataNumer/ext4MetadataDenom grow the payload by 50% to cover
+	// inode tables, block bitmaps, the journal, and rounding slack. ext4 on
+	// a directory-seeded image needs noticeably more than the apparent file
+	// bytes; 1.5x is the conservative floor mke2fs itself trends toward.
+	ext4MetadataNumer = 3
+	ext4MetadataDenom = 2
+	// ext4HeadroomMiB is a fixed floor added on top so even a tiny rootfs
+	// (e.g. a scratch/alpine template) boots with writable space rather
+	// than a filesystem sized to the byte.
+	ext4HeadroomMiB = 128
+)
+
+// ext4SizeMiB computes the ext4 image size in MiB for the unpacked rootfs
+// at src, never returning less than minSizeMiB. It walks the tree summing
+// apparent file sizes, applies the metadata multiplier and fixed
+// headroom, and rounds up to whole MiB. A symlink or special file
+// contributes nothing (we follow nothing; only regular files hold bytes).
+func ext4SizeMiB(src string, minSizeMiB int) (int, error) {
+	var total int64
+	err := filepath.Walk(src, func(_ string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	const miB = 1 << 20
+	payloadMiB := int((total*ext4MetadataNumer/ext4MetadataDenom + miB - 1) / miB)
+	return max(payloadMiB+ext4HeadroomMiB, minSizeMiB), nil
 }
 
 // runStage executes one subprocess with bounded stderr capture, returning
