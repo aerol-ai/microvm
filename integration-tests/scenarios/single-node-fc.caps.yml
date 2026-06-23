@@ -1,0 +1,10 @@
+# Capabilities the single-node x86 Firecracker scenario can satisfy. The suite
+# skips any use case whose required capabilities aren't all present here. Mirror
+# of single-node-fc-arm64 but on an x86 bare-metal host.
+name: single-node-fc
+capabilities:
+  - docker
+  - platform-volumes
+  - firecracker
+  - domain
+  - custom-domains
